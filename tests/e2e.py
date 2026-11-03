@@ -351,14 +351,16 @@ class Harness:
         staging = self.root / "data" / "repos" / (pending[1][0] + ".init")
         self.git("init", "--bare", "--initial-branch=main", str(staging))
         (staging / "config.lock").write_text("interrupted config write\n")
-        # Model a crash after publication but before the ready transaction commits.
+        # Model a due retry after publication but before the ready transaction commits.
+        # A background worker may already have set a future retry deadline on the
+        # original row. Explicitly make this fixture due rather than racing it.
         existing_id = str(uuid.UUID(existing["id"]))
-        self.sql("UPDATE repositories SET state='provisioning' WHERE id='" + existing_id + "'")
+        self.sql("UPDATE repositories SET state='provisioning',next_retry_at=clock_timestamp() WHERE id='" + existing_id + "'")
         pending.append((existing_id, "recover-existing"))
         self.start()
         for repo_id, name in pending:
             body = json.loads(self.expect("/api/repos/alice/" + name, 200, token=self.alice))
-            assert body["state"] == "ready" and body["id"] == repo_id
+            assert body["state"] == "ready" and body["id"] == repo_id, {"name": name, "state": body["state"], "retry": self.sql("SELECT next_retry_at::text || ' attempts=' || provision_attempts::text FROM repositories WHERE id='" + repo_id + "'")}
             self.git("clone", self.base + body["clone_path"], str(self.root / name), token=self.alice)
             self.git("--git-dir=" + str(self.root / "data" / "repos" / (repo_id + ".git")), "fsck", "--full")
         return {"recovered": [name for _, name in pending], "method": "deterministic provisioning-state injection"}
