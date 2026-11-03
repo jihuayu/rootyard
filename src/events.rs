@@ -342,7 +342,17 @@ pub async fn fail(
 }
 
 pub async fn worker_once(pool: &Pool, consumer: &str, owner: Uuid, limit: i64) -> Result<usize> {
-    let claims = claim(pool, consumer, owner, limit, 60).await?;
+    worker_once_with_lease(pool, consumer, owner, limit, 60).await
+}
+
+pub async fn worker_once_with_lease(
+    pool: &Pool,
+    consumer: &str,
+    owner: Uuid,
+    limit: i64,
+    lease_seconds: i64,
+) -> Result<usize> {
+    let claims = claim(pool, consumer, owner, limit, lease_seconds).await?;
     let mut count = 0;
     for item in claims {
         match acknowledge(pool, &item).await {

@@ -2,6 +2,8 @@
 
 Verified locally on 2026-11-03 in a separate integration worktree. Parents are offline backup `041d962763d8be7ffbd3e20a9868d267f6fa2923` and recovery/metrics `e473b6a100c389b072bd03794009e4870e692e35`, both including the `373138a` baseline fixture correction. This record does not include the later cross-process-worker increment. No production database, deployment, traffic change or main-branch merge was involved.
 
+This historical two-way integration record is followed by [cross-process-worker integration verification](workers-integration-verification.md). Its executable and timings remain specific to the earlier tested increment.
+
 ## Exact runtime
 
 - Linux x86-64, Rust/cargo 1.99.1, Git client/server 2.56.0.

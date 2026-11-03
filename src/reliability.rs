@@ -202,6 +202,8 @@ pub async fn reconcile(
             &changes,
         )
         .await?;
+        // PG publication committed. Wake hints can be lost and never affect correctness.
+        state.dispatch.committed();
         if outcome == "unknown" {
             clear = false;
             recovering(state, repo, "push_outcome_unknown").await?;

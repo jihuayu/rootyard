@@ -22,6 +22,13 @@ ZERO = '0' * 40
 class BackupRecoveryHarness(BackupHarness):
     reason = 'Synthetic drill: native refs inspected; missing push audit evidence explicitly acknowledged.'
 
+    def __init__(self, args):
+        super().__init__(args)
+        # This fixture owns exact SQL state transitions via worker-once. A
+        # background worker stopped mid-lease may validly defer replay for 60s;
+        # lease recovery and concurrent workers are covered in separate suites.
+        self.env.update(ROOTYARD_OUTBOX_WORKER='false', ROOTYARD_WAKE_TRANSPORT='poll')
+
     def rows(self, select):
         return json.loads(self.sql("SELECT COALESCE(json_agg(t), '[]'::json) FROM (" + select + ") t"))
 

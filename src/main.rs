@@ -35,9 +35,44 @@ async fn run() -> Result<()> {
             anyhow::anyhow!("backup verification failed; incomplete, unsafe or mismatched files")
         });
     }
+    // Control-plane workers need only PostgreSQL, never Git or a data volume.
+    if args.len() == 1 && matches!(args[0].as_str(), "worker" | "worker-once") {
+        let url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+        let pool = db::pool(&url)?;
+        db::migrate(&pool).await?;
+        let settings = rootyard::dispatch::Settings::from_env()?;
+        if args[0] == "worker-once" {
+            let owner = uuid::Uuid::new_v4();
+            let mut count = 0;
+            for consumer in &settings.consumers {
+                count += rootyard::events::worker_once_with_lease(
+                    &pool,
+                    consumer,
+                    owner,
+                    settings.batch,
+                    settings.lease_seconds,
+                )
+                .await?;
+            }
+            println!("{count}");
+        } else {
+            let stop = tokio_util::sync::CancellationToken::new();
+            let mut task = tokio::spawn(rootyard::dispatch::worker(
+                pool,
+                settings,
+                Arc::new(tokio::sync::Notify::new()),
+                stop.clone(),
+            ));
+            eprintln!("rootyard: PostgreSQL delivery worker started (no Git storage access)");
+            tokio::select! {
+                _=shutdown()=>{ stop.cancel(); task.await?; },
+                result=&mut task=>{ result?; bail!("delivery worker stopped unexpectedly"); },
+            }
+        }
+        return Ok(());
+    }
     let config = Config::from_env()?;
     let pool = db::pool(&config.database_url)?;
-    let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("serve") {
         "backup" if args.len() == 3 && args[2] == "--offline" => {
             rootyard::backup::create(&config, std::path::Path::new(&args[1])).await
@@ -112,22 +147,15 @@ async fn run() -> Result<()> {
                 storage,
                 hooks,
                 transfer_metrics: Arc::new(rootyard::metrics::TransferCounters::default()),
+                dispatch: rootyard::dispatch::Signals::default(),
             };
             rootyard::reliability::recover_startup(&state).await?;
             println!(
                 "offline reconciliation finished; inspect repository states for unresolved incidents"
             );
         }
-        "worker-once" if args.len() == 1 => {
-            db::migrate(&pool).await?;
-            let owner = uuid::Uuid::new_v4();
-            let mut count = 0;
-            for consumer in ["audit-log", "ref-index"] {
-                count += rootyard::events::worker_once(&pool, consumer, owner, 64).await?;
-            }
-            println!("{count}");
-        }
         "serve" if args.len() <= 1 => {
+            let dispatch_settings = rootyard::dispatch::Settings::from_env()?;
             std::fs::read_to_string("/proc/self/stat")
                 .context("readable Linux procfs is required for writer cleanup")?;
             let storage = Storage::open(&config)?;
@@ -157,6 +185,7 @@ async fn run() -> Result<()> {
                 storage,
                 hooks,
                 transfer_metrics: Arc::new(rootyard::metrics::TransferCounters::default()),
+                dispatch: rootyard::dispatch::Signals::default(),
                 git_slots: slots,
             });
             rootyard::reliability::recover_startup(&state).await?;
@@ -184,6 +213,22 @@ async fn run() -> Result<()> {
             } else {
                 None
             };
+            let dispatch_stop = tokio_util::sync::CancellationToken::new();
+            let publish_task = tokio::spawn(rootyard::dispatch::publisher(
+                dispatch_settings.transport.clone(),
+                state.dispatch.remote.clone(),
+                dispatch_stop.clone(),
+            ));
+            let delivery_task = if state.config.outbox_worker {
+                Some(tokio::spawn(rootyard::dispatch::worker(
+                    state.pool.clone(),
+                    dispatch_settings,
+                    state.dispatch.local.clone(),
+                    dispatch_stop.clone(),
+                )))
+            } else {
+                None
+            };
             let worker_state = state.clone();
             let worker = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -195,13 +240,6 @@ async fn run() -> Result<()> {
                     {
                         eprintln!("rootyard: journal retry unavailable");
                     }
-                    if worker_state.config.outbox_worker
-                        && rootyard::reliability::worker_once(&worker_state)
-                            .await
-                            .is_err()
-                    {
-                        eprintln!("rootyard: durable worker retry unavailable");
-                    }
                     if rootyard::recover(&worker_state).await.is_err() {
                         eprintln!("rootyard: provisioning retry unavailable");
                     }
@@ -211,12 +249,17 @@ async fn run() -> Result<()> {
                 .with_graceful_shutdown(shutdown())
                 .await?;
             worker.abort();
+            dispatch_stop.cancel();
+            let _ = publish_task.await;
+            if let Some(task) = delivery_task {
+                let _ = task.await;
+            }
             if let Some(metrics_worker) = metrics_worker {
                 metrics_worker.abort();
             }
         }
         _ => bail!(
-            "usage: rootyard [serve | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup]"
+            "usage: rootyard [serve | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup]"
         ),
     }
     Ok(())

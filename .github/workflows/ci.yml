@@ -28,7 +28,7 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
       - name: Install matching PostgreSQL client and test tools
-        run: apt-get update && apt-get install -y --no-install-recommends git python3 postgresql-client-17
+        run: apt-get update && apt-get install -y --no-install-recommends git python3 postgresql-client-17 redis-server
       - name: Record tool versions
         run: |
           rustc --version
@@ -37,6 +37,7 @@ jobs:
           python3 --version
           psql --version
           pg_dump --version
+          redis-server --version
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
@@ -53,10 +54,14 @@ jobs:
         run: python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json
       - name: Exercise restored schema-003 recovery protections
         run: python3 tests/backup_recovery.py --binary target/debug/rootyard --report test-results/backup-recovery.json
+      - name: Exercise independent workers after fresh restore
+        run: python3 tests/restored_workers.py --binary target/debug/rootyard --report test-results/restored-workers.json
       - name: Exercise explicit recovery and metrics
         run: |
           python3 tests/recovery_ops.py --binary target/debug/rootyard --report test-results/recovery-ops.json
           python3 tests/metrics.py --binary target/debug/rootyard --report test-results/metrics.json
+      - name: Exercise cross-process delivery
+        run: ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server python3 tests/cross_process.py --binary target/debug/rootyard --report test-results/cross-process.json
       - name: Upload end-to-end report
         if: always()
         uses: actions/upload-artifact@v4
