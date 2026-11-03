@@ -55,6 +55,14 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         tx.batch_execute(include_str!("../migrations/003_recovery_operations.sql"))
             .await?;
     }
+    if tx
+        .query_opt("SELECT version FROM schema_migrations WHERE version=6", &[])
+        .await?
+        .is_none()
+    {
+        tx.batch_execute(include_str!("../migrations/006_forge_issues.sql"))
+            .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -122,6 +130,7 @@ pub struct Identity {
     pub token_id: Uuid,
     pub username: String,
     pub read_only: bool,
+    pub(crate) token_digest: Vec<u8>,
 }
 
 #[derive(Clone, Serialize)]

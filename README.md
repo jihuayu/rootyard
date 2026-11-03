@@ -132,3 +132,12 @@ The follow-on recovery increment supports offline inspection and explicit acknow
 PG-only `rootyard worker` processes can drain durable deliveries independently of Git storage. Optional Redis wake hints are advisory; periodic PostgreSQL scanning remains mandatory. See [cross-process workers](docs/cross-process-workers.md) for role separation, limits, and the unimplemented Kafka boundary.
 
 The backup/recovery and standalone-worker increments are integrated and tested together. See [fresh-restore worker verification](docs/workers-integration-verification.md), including the requirement to keep database-only workers stopped while a restore target is incomplete.
+
+## Initial private-owner Issue API
+
+The phase-six foundation adds owner-private Issues and comments with bounded
+keyset pagination, transactional local numbering, explicit token authorization
+and optimistic update versions. This does not add organization sharing, PRs,
+LFS, CI or a Web UI. See [the API and integration contract](docs/forge-issues.md).
+
+Private-owner Issues/comments are included in the exact schema006 backup contract. See [populated Forge restore verification](docs/forge-backup-verification.md) for content, numbering, authorization and recovery-state checks after a fresh-cluster restore.

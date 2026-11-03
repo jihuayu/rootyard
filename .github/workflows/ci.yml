@@ -44,7 +44,7 @@ jobs:
       - name: Verify durable PostgreSQL workers
         run: cargo test --locked --test outbox --test resolution_fences -- --ignored
       - run: cargo build --locked
-      - name: Verify schema-003 catalog and dump round trip
+      - name: Verify schema-006 catalog and dump round trip
         run: python3 tests/schema_contract.py --binary target/debug/rootyard
       - name: Exercise native Git end to end
         run: python3 tests/e2e.py --binary target/debug/rootyard --report test-results/e2e.json
@@ -62,6 +62,12 @@ jobs:
           python3 tests/metrics.py --binary target/debug/rootyard --report test-results/metrics.json
       - name: Exercise cross-process delivery
         run: ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server python3 tests/cross_process.py --binary target/debug/rootyard --report test-results/cross-process.json
+      - name: Exercise restored legacy upgrade backup
+        run: python3 tests/backup_upgrade.py --binary target/debug/rootyard --report test-results/backup-upgrade.json
+      - name: Exercise populated Forge backup and fresh restore
+        run: python3 tests/backup_forge.py --binary target/debug/rootyard --report test-results/backup-forge.json
+      - name: Exercise private-owner Issue and comment API
+        run: python3 tests/forge.py --binary target/debug/rootyard --report test-results/forge.json
       - name: Upload end-to-end report
         if: always()
         uses: actions/upload-artifact@v4

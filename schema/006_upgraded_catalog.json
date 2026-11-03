@@ -148,6 +148,259 @@
       "default": null,
       "generated": "",
       "identity": "",
+      "name": "tenant_id",
+      "not_null": true,
+      "position": 1,
+      "table": "forge_issue_comments",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 2,
+      "table": "forge_issue_comments",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "issue_number",
+      "not_null": true,
+      "position": 3,
+      "table": "forge_issue_comments",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "number",
+      "not_null": true,
+      "position": 4,
+      "table": "forge_issue_comments",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "author_id",
+      "not_null": true,
+      "position": 5,
+      "table": "forge_issue_comments",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "body",
+      "not_null": true,
+      "position": 6,
+      "table": "forge_issue_comments",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "1",
+      "generated": "",
+      "identity": "",
+      "name": "version",
+      "not_null": true,
+      "position": 7,
+      "table": "forge_issue_comments",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 8,
+      "table": "forge_issue_comments",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "updated_at",
+      "not_null": true,
+      "position": 9,
+      "table": "forge_issue_comments",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "tenant_id",
+      "not_null": true,
+      "position": 1,
+      "table": "forge_issue_counters",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 2,
+      "table": "forge_issue_counters",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": "1",
+      "generated": "",
+      "identity": "",
+      "name": "next_number",
+      "not_null": true,
+      "position": 3,
+      "table": "forge_issue_counters",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "tenant_id",
+      "not_null": true,
+      "position": 1,
+      "table": "forge_issues",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 2,
+      "table": "forge_issues",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "number",
+      "not_null": true,
+      "position": 3,
+      "table": "forge_issues",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "author_id",
+      "not_null": true,
+      "position": 4,
+      "table": "forge_issues",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "title",
+      "not_null": true,
+      "position": 5,
+      "table": "forge_issues",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": "''::text",
+      "generated": "",
+      "identity": "",
+      "name": "body",
+      "not_null": true,
+      "position": 6,
+      "table": "forge_issues",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": "'open'::text",
+      "generated": "",
+      "identity": "",
+      "name": "state",
+      "not_null": true,
+      "position": 7,
+      "table": "forge_issues",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "1",
+      "generated": "",
+      "identity": "",
+      "name": "version",
+      "not_null": true,
+      "position": 8,
+      "table": "forge_issues",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "1",
+      "generated": "",
+      "identity": "",
+      "name": "next_comment_number",
+      "not_null": true,
+      "position": 9,
+      "table": "forge_issues",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 10,
+      "table": "forge_issues",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "updated_at",
+      "not_null": true,
+      "position": 11,
+      "table": "forge_issues",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
       "name": "id",
       "not_null": true,
       "position": 1,
@@ -1030,6 +1283,186 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "FOREIGN KEY (author_id) REFERENCES public.users(id)",
+      "name": "forge_issue_comments_author_id_fkey",
+      "table": "forge_issue_comments",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((((octet_length(body) >= 1) AND (octet_length(body) <= 8192)) AND (btrim(body) <> ''::text)))",
+      "name": "forge_issue_comments_body_check",
+      "table": "forge_issue_comments",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((author_id = tenant_id))",
+      "name": "forge_issue_comments_check",
+      "table": "forge_issue_comments",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((number > 0))",
+      "name": "forge_issue_comments_number_check",
+      "table": "forge_issue_comments",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (tenant_id, repository_id, issue_number, number)",
+      "name": "forge_issue_comments_pkey",
+      "table": "forge_issue_comments",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (tenant_id, repository_id, issue_number) REFERENCES public.forge_issues(tenant_id, repository_id, number)",
+      "name": "forge_issue_comments_tenant_id_repository_id_issue_number_fkey",
+      "table": "forge_issue_comments",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((version > 0))",
+      "name": "forge_issue_comments_version_check",
+      "table": "forge_issue_comments",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((next_number > 0))",
+      "name": "forge_issue_counters_next_number_check",
+      "table": "forge_issue_counters",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (tenant_id, repository_id)",
+      "name": "forge_issue_counters_pkey",
+      "table": "forge_issue_counters",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id, tenant_id) REFERENCES public.repositories(id, owner_id)",
+      "name": "forge_issue_counters_repository_id_tenant_id_fkey",
+      "table": "forge_issue_counters",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (author_id) REFERENCES public.users(id)",
+      "name": "forge_issues_author_id_fkey",
+      "table": "forge_issues",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((octet_length(body) <= 8192))",
+      "name": "forge_issues_body_check",
+      "table": "forge_issues",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((author_id = tenant_id))",
+      "name": "forge_issues_check",
+      "table": "forge_issues",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((next_comment_number > 0))",
+      "name": "forge_issues_next_comment_number_check",
+      "table": "forge_issues",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((number > 0))",
+      "name": "forge_issues_number_check",
+      "table": "forge_issues",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (tenant_id, repository_id, number)",
+      "name": "forge_issues_pkey",
+      "table": "forge_issues",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id, tenant_id) REFERENCES public.repositories(id, owner_id)",
+      "name": "forge_issues_repository_id_tenant_id_fkey",
+      "table": "forge_issues",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((state = ANY (ARRAY['open'::text, 'closed'::text])))",
+      "name": "forge_issues_state_check",
+      "table": "forge_issues",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((((octet_length(title) >= 1) AND (octet_length(title) <= 256)) AND (btrim(title) <> ''::text) AND (title !~ '[[:cntrl:]]'::text)))",
+      "name": "forge_issues_title_check",
+      "table": "forge_issues",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((version > 0))",
+      "name": "forge_issues_version_check",
+      "table": "forge_issues",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "FOREIGN KEY (actor_id) REFERENCES public.users(id)",
       "name": "git_operations_actor_id_fkey",
       "table": "git_operations",
@@ -1237,7 +1670,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((((length(ref_name) >= 6) AND (length(ref_name) <= 1024)) AND (ref_name ~~ 'refs/%'::text)))",
+      "definition": "CHECK (((length(ref_name) >= 6) AND (length(ref_name) <= 1024) AND (ref_name ~~ 'refs/%'::text)))",
       "name": "outbox_events_ref_name_check",
       "table": "outbox_events",
       "type": "c",
@@ -1640,6 +2073,33 @@
       "valid": true
     },
     {
+      "definition": "CREATE UNIQUE INDEX forge_issue_comments_pkey ON public.forge_issue_comments USING btree (tenant_id, repository_id, issue_number, number)",
+      "live": true,
+      "name": "forge_issue_comments_pkey",
+      "ready": true,
+      "table": "forge_issue_comments",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX forge_issue_counters_pkey ON public.forge_issue_counters USING btree (tenant_id, repository_id)",
+      "live": true,
+      "name": "forge_issue_counters_pkey",
+      "ready": true,
+      "table": "forge_issue_counters",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX forge_issues_pkey ON public.forge_issues USING btree (tenant_id, repository_id, number)",
+      "live": true,
+      "name": "forge_issues_pkey",
+      "ready": true,
+      "table": "forge_issues",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX git_operations_id_repository_id_storage_generation_sequence_key ON public.git_operations USING btree (id, repository_id, storage_generation, sequence)",
       "live": true,
       "name": "git_operations_id_repository_id_storage_generation_sequence_key",
@@ -1865,6 +2325,36 @@
       "force_row_security": false,
       "kind": "r",
       "name": "event_deliveries",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "forge_issue_comments",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "forge_issue_counters",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "forge_issues",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",

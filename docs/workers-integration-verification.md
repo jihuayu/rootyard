@@ -2,6 +2,8 @@
 
 Local verification on 2026-11-03 integrates recovery/backup `89a536754441c492c36511aa781a093acca3ecd7` and cross-process workers `770d5bba327852c097f3dceef3f3de23de79822a` in a new worktree. No main-branch merge, deployment, production access or traffic change was performed. Schema003 remains unchanged.
 
+The subsequent schema006 integration and populated Issue/comment restore are documented in [Forge backup verification](forge-backup-verification.md). The hash and timings below belong to this earlier worker increment.
+
 ## Executable and environment
 
 - Fixed tested binary SHA-256: `5d9c3033119c6bcd2cc31813a95ddbb6e9fdec4511b870cb39c4b5a82ed7d1dd`.

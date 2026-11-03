@@ -42,6 +42,18 @@ With `ROOTYARD_TEST_DATABASE_URL` pointing at a disposable PostgreSQL database, 
 
 `python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json` needs a **synthetic PostgreSQL test administrator** with CREATEDB and permission for catalog-lock fault injection. It creates/drops only run-owned random databases, unlike the schema-only e2e harness. Optionally set `ROOTYARD_RESTORE_TEST_DATABASE_URL` for a separate disposable PostgreSQL server. Never run this against production. See [the contract](backup-restore.md) and [integrated test record](integration-verification.md).
 
-`python3 tests/schema_contract.py --binary target/debug/rootyard` compares pristine migrations and their PostgreSQL dump/restore round trip to both reviewed schema-003 catalog fixtures. `--write` is only a development aid; inspect every fixture change before accepting it. `python3 tests/backup_recovery.py --binary target/debug/rootyard --report test-results/backup-recovery.json` verifies exact eleven-table restoration, volume identity, recovery protection and authenticated new-generation pushes. Run `cargo test --test outbox --test resolution_fences -- --ignored`, `tests/recovery_ops.py` and `tests/metrics.py` as well; CI runs these alongside the original suites. All database tests require isolated synthetic resources, not production.
+`python3 tests/schema_contract.py --binary target/debug/rootyard` compares pristine migrations and their PostgreSQL dump/restore round trip and a restored003-to006 upgrade to all three reviewed schema-006 catalog fixtures. `--write` is only a development aid; inspect every fixture change before accepting it. `python3 tests/backup_recovery.py --binary target/debug/rootyard --report test-results/backup-recovery.json` verifies exact fourteen-table restoration, volume identity, recovery protection and authenticated new-generation pushes. Run `cargo test --test outbox --test resolution_fences -- --ignored`, `tests/recovery_ops.py` and `tests/metrics.py` as well; CI runs these alongside the original suites. All database tests require isolated synthetic resources, not production.
 
 `tests/restored_workers.py` adds fresh-database restore followed by real standalone workers with pending/expired leases, stale-generation retirement and a native post-restore push. `tests/cross_process.py` uses a run-owned Redis server when `ROOTYARD_TEST_REDIS_SERVER` is explicitly provided; CI requires the real Redis case and preserves its multicall executable name. See [worker integration verification](workers-integration-verification.md).
+
+## Private-owner Issue API tests
+
+With the same disposable PostgreSQL database, run
+`python3 tests/forge.py --binary target/debug/rootyard --report test-results/forge.json`.
+This is required in addition to the Git/reliability/recovery suites; default
+`cargo test` does not run these real HTTP/PostgreSQL cases. See the
+[Forge slice contract](forge-issues.md) for exact scope and remaining work.
+
+`tests/backup_forge.py` verifies populated Forge content, counters, versions and permissions across a fresh PostgreSQL/volume restore, including the write barrier and finite recovery point. Use the same synthetic CREATEDB administrators as the other backup suites. See [Forge backup verification](forge-backup-verification.md).
+
+`tests/backup_upgrade.py` exercises actual schema003 logical restore, migration006, populated Git/Forge backup and a fresh final restore. It does not manufacture the upgrade shape by editing CHECK constraints. CI runs the default successful path, never its local-only regression-rejection diagnostic.

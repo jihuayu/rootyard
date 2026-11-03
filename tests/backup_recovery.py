@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Schema-003 backup/restore acceptance on fresh synthetic databases and volumes.
+"""Recovery-history backup/restore acceptance on fresh synthetic databases and volumes.
 
 Requires CREATEDB on dedicated ROOTYARD_TEST_DATABASE_URL; an optional separate
 ROOTYARD_RESTORE_TEST_DATABASE_URL provides a second PostgreSQL server. Never use
@@ -163,7 +163,7 @@ class BackupRecoveryHarness(BackupHarness):
         restored = self.all_rows()
         (self.root / 'restored-sql-rows.json').write_text(json.dumps(restored, indent=2) + '\n')
         assert restored == self.source_rows, 'Full public table contents differ after restore'
-        assert self.sql('SELECT max(version) FROM schema_migrations') == '3'
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == '1,2,3,6'
         for fixture in (self.resolved, self.missing):
             assert self.sql("SELECT storage_generation FROM repositories WHERE id='" + fixture['repo']['id'] + "'") == '2'
         projection = self.rows("SELECT * FROM repository_ref_projection WHERE repository_id='" + self.resolved['repo']['id'] + "'")
