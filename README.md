@@ -122,3 +122,7 @@ export ROOTYARD_TEST_DATABASE_URL=postgresql://localhost/rootyard_test
 cargo test --test outbox -- --ignored
 python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
 ```
+
+## Workspace foundation experiment
+
+An opt-in `rootyard-workspace-lab` binary tests independent Linux agent directories, fixed base OIDs and local full-copy checkpoints preserving HEAD/index/worktree. It does not change the hosting service or provide FUSE, live capture, remote durability or multi-tenant isolation. Read the [scope, caller-quiescence requirement and recovery limits](docs/workspace-foundation.md) before use.
