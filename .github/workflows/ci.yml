@@ -51,6 +51,8 @@ jobs:
         run: |
           python3 tests/recovery_ops.py --binary target/debug/rootyard --report test-results/recovery-ops.json
           python3 tests/metrics.py --binary target/debug/rootyard --report test-results/metrics.json
+      - name: Exercise private-owner Issue and comment API
+        run: python3 tests/forge.py --binary target/debug/rootyard --report test-results/forge.json
       - name: Upload end-to-end report
         if: always()
         uses: actions/upload-artifact@v4

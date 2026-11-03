@@ -126,3 +126,10 @@ python3 tests/reliability.py --binary target/debug/rootyard --report test-result
 ## Explicit incident recovery and metrics
 
 The follow-on recovery increment supports offline inspection and explicit acknowledgment of an unknown-push audit gap without rewriting its outcome. It preserves immutable history, establishes an observed new-generation snapshot, and fences old ref-index effects. Read [the maintenance contract](docs/manual-recovery.md) before use. Optional [loopback-only metrics](docs/metrics.md) expose fixed-cardinality service health and durable backlog without repository or user labels. This is not distributed fencing or a substitute for verified backups.
+
+## Initial private-owner Issue API
+
+The phase-six foundation adds owner-private Issues and comments with bounded
+keyset pagination, transactional local numbering, explicit token authorization
+and optimistic update versions. This does not add organization sharing, PRs,
+LFS, CI or a Web UI. See [the API and integration contract](docs/forge-issues.md).

@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod events;
+pub mod forge;
 pub mod git_http;
 pub mod journal;
 pub mod maintenance;
@@ -92,6 +93,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/repos/{owner}/{name}/events",
             get(reliability::event_list),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/issues",
+            get(forge::list_issues).post(forge::create_issue),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/issues/{number}",
+            get(forge::get_issue).patch(forge::update_issue),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/issues/{number}/comments",
+            get(forge::list_comments).post(forge::create_comment),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/issues/{number}/comments/{comment_number}",
+            get(forge::get_comment).patch(forge::update_comment),
         )
         .fallback(|State(state): State<Arc<AppState>>, request| async move {
             git_http::handle(state, request).await

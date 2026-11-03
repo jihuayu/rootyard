@@ -37,3 +37,11 @@ Do not run benchmark or failure-injection tests against real repositories. Keep 
 ## Durable reliability tests
 
 With `ROOTYARD_TEST_DATABASE_URL` pointing at a disposable PostgreSQL database, run `cargo test --test outbox -- --ignored` and `python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json`. Both own random schemas and clean only their fixtures. CI runs these explicitly; a default cargo test alone does not execute the ignored PostgreSQL test. See [phase-two verification](phase-two-verification.md) for injected boundaries and untested infrastructure assumptions.
+
+## Private-owner Issue API tests
+
+With the same disposable PostgreSQL database, run
+`python3 tests/forge.py --binary target/debug/rootyard --report test-results/forge.json`.
+This is required in addition to the Git/reliability/recovery suites; default
+`cargo test` does not run these real HTTP/PostgreSQL cases. See the
+[Forge slice contract](forge-issues.md) for exact scope and remaining work.

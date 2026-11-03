@@ -17,6 +17,7 @@ pub async fn authenticate(pool: &Pool, headers: &HeaderMap) -> Result<Identity, 
         username: row.get(1),
         read_only: row.get(2),
         token_id: row.get(3),
+        token_digest: db::digest(&token),
     };
     if user.as_ref().is_some_and(|u| u != &identity.username) {
         return Err(Error::unauthorized());
