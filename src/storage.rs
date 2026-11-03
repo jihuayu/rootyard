@@ -17,6 +17,7 @@ use uuid::Uuid;
 pub struct Storage {
     pub root: PathBuf,
     pub lock_file: File,
+    pub volume_id: Uuid,
     locks: Mutex<HashMap<Uuid, Weak<AsyncMutex<()>>>>,
 }
 
@@ -36,6 +37,39 @@ impl Storage {
             .try_lock_exclusive()
             .context("data directory already in use; do not start another writer")?;
         crate::backup::ensure_not_restoring(&root)?;
+        let identity_path = root.join(".volume-id");
+        let volume_id = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&identity_path)
+        {
+            Ok(file) => {
+                use std::io::Read;
+                if !file.metadata()?.is_file() || file.metadata()?.len() != 36 {
+                    bail!("invalid volume identity file");
+                }
+                let mut bytes = String::new();
+                file.take(128).read_to_string(&mut bytes)?;
+                bytes.parse().context("invalid volume identity")?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                use std::io::Write;
+                let id = Uuid::new_v4();
+                let temporary = root.join(format!(".volume-id-{}.tmp", Uuid::new_v4()));
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&temporary)?;
+                file.write_all(id.to_string().as_bytes())?;
+                file.sync_all()?;
+                std::fs::rename(&temporary, &identity_path)?;
+                File::open(&root)?.sync_all()?;
+                id
+            }
+            Err(error) => return Err(error.into()),
+        };
         let repos = root.join("repos");
         std::fs::create_dir_all(&repos)?;
         if std::fs::symlink_metadata(&repos)?.file_type().is_symlink() {
@@ -45,6 +79,7 @@ impl Storage {
         Ok(Self {
             root,
             lock_file,
+            volume_id,
             locks: Mutex::new(HashMap::new()),
         })
     }

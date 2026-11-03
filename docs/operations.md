@@ -30,7 +30,7 @@ Revoking a token blocks subsequent authentication checks; it cannot retract byte
 
 The executable phase-two slice is `rootyard backup PATH --offline`, `rootyard backup-verify PATH` and `rootyard restore PATH --isolated --trust-backup`. Read [the full backup/restore contract](backup-restore.md) before using them. Backup refuses a live volume owner, freezes the supported PostgreSQL tables and copies a matched snapshot and full data tree. Restore requires a fresh dedicated database and a nonexistent data directory, verifies hashes and native integrity, preserves unknown evidence, and never starts a service or switches traffic.
 
-This is not an online or lossless-backup promise. Restore failures leave private partial material and may have an uncertain SQL commit; a persistent target guard blocks startup pending operator review. Do not overwrite targets, mix backup generations or remove the guard to bypass an incident. See [measured verification](backup-verification.md), not a successful dump alone, for the tested recovery boundary.
+This is not an online or lossless-backup promise. Restore failures leave private partial material and may have an uncertain SQL commit; a persistent target guard blocks startup pending operator review. Do not overwrite targets, mix backup generations or remove the guard to bypass an incident. See [measured integrated verification](integration-verification.md), not a successful dump alone, for the tested recovery boundary.
 
 ## Durable operation recovery (phase two A)
 

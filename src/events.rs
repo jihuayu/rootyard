@@ -116,6 +116,21 @@ pub async fn publish(
     }
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
+    // Shared repository lock orders publication against explicit offline resolution.
+    tx.query_one(
+        "SELECT id FROM repositories WHERE id=$1 FOR SHARE",
+        &[&operation.repository_id],
+    )
+    .await?;
+    ensure!(
+        tx.query_opt(
+            "SELECT operation_id FROM operation_resolutions WHERE operation_id=$1",
+            &[&operation.id]
+        )
+        .await?
+        .is_none(),
+        "resolved operation is immutable"
+    );
     tx.execute("INSERT INTO git_operations(id,repository_id,actor_id,token_id,actor_name,sequence,storage_generation,outcome,evidence) VALUES($1,$2,$3,$4,$5,$6,$7,'unknown',$8) ON CONFLICT(id) DO NOTHING", &[&operation.id,&operation.repository_id,&operation.actor_id,&operation.token_id,&operation.actor_name,&operation.sequence,&operation.storage_generation,&operation.evidence]).await?;
     let row = tx
         .query_one(
@@ -211,7 +226,7 @@ pub async fn claim(
     );
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    let rows=tx.query("SELECT e.* FROM event_deliveries d JOIN outbox_events e USING(event_id) JOIN git_operations o ON o.id=e.operation_id WHERE d.consumer=$1 AND o.outcome <> 'unknown' AND d.state <> 'delivered' AND d.next_attempt_at <= clock_timestamp() AND (d.state='pending' OR d.lease_until <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM outbox_events prior JOIN event_deliveries pd USING(event_id) WHERE pd.consumer=d.consumer AND pd.state <> 'delivered' AND prior.repository_id=e.repository_id AND prior.ref_name=e.ref_name AND (prior.storage_generation,prior.operation_sequence,prior.transaction_sequence)<(e.storage_generation,e.operation_sequence,e.transaction_sequence)) AND NOT EXISTS (SELECT 1 FROM git_operations unknown_op WHERE unknown_op.repository_id=e.repository_id AND unknown_op.outcome='unknown' AND (unknown_op.storage_generation,unknown_op.sequence)<(e.storage_generation,e.operation_sequence)) ORDER BY e.storage_generation,e.operation_sequence,e.transaction_sequence,e.event_id LIMIT $2 FOR UPDATE OF d SKIP LOCKED", &[&consumer,&limit]).await?;
+    let rows=tx.query("SELECT e.* FROM event_deliveries d JOIN outbox_events e USING(event_id) JOIN git_operations o ON o.id=e.operation_id WHERE d.consumer=$1 AND o.outcome <> 'unknown' AND d.state <> 'delivered' AND d.next_attempt_at <= clock_timestamp() AND (d.state='pending' OR d.lease_until <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM outbox_events prior JOIN event_deliveries pd USING(event_id) WHERE pd.consumer=d.consumer AND pd.state <> 'delivered' AND prior.repository_id=e.repository_id AND prior.ref_name=e.ref_name AND (prior.storage_generation,prior.operation_sequence,prior.transaction_sequence)<(e.storage_generation,e.operation_sequence,e.transaction_sequence)) AND NOT EXISTS (SELECT 1 FROM git_operations unknown_op WHERE unknown_op.repository_id=e.repository_id AND unknown_op.outcome='unknown' AND NOT EXISTS(SELECT 1 FROM operation_resolutions resolved WHERE resolved.operation_id=unknown_op.id) AND (unknown_op.storage_generation,unknown_op.sequence)<(e.storage_generation,e.operation_sequence)) ORDER BY e.storage_generation,e.operation_sequence,e.transaction_sequence,e.event_id LIMIT $2 FOR UPDATE OF d SKIP LOCKED", &[&consumer,&limit]).await?;
     let mut claims = Vec::new();
     for row in rows {
         let id: String = row.get("event_id");
@@ -243,9 +258,34 @@ async fn lock_valid_lease(tx: &Transaction<'_>, claim: &Claim) -> Result<bool> {
 pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
+    // Canonical event metadata, never the caller's Claim payload, chooses the
+    // repository. Repository -> delivery -> projection is the global lock order.
+    let Some(event)=tx.query_opt("SELECT repository_id,storage_generation,operation_sequence,transaction_sequence,ref_name,operation_id FROM outbox_events WHERE event_id=$1",&[&claim.event_id]).await? else {return Ok(false);};
+    let repository_id: Uuid = event.get(0);
+    let current: i64 = tx
+        .query_one(
+            "SELECT storage_generation FROM repositories WHERE id=$1 FOR SHARE",
+            &[&repository_id],
+        )
+        .await?
+        .get(0);
     if !lock_valid_lease(&tx, claim).await? {
         return Ok(false);
     }
+    let generation: i64 = event.get(1);
+    let sequence: i64 = event.get(2);
+    let ordinal: i64 = event.get(3);
+    let ref_name: String = event.get(4);
+    let operation_id: Uuid = event.get(5);
+    let blocked:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM git_operations o WHERE o.repository_id=$1 AND o.outcome='unknown' AND NOT EXISTS(SELECT 1 FROM operation_resolutions r WHERE r.operation_id=o.id) AND (o.storage_generation,o.sequence)<=($2,$3)) OR EXISTS(SELECT 1 FROM outbox_events p JOIN event_deliveries d USING(event_id) WHERE p.repository_id=$1 AND p.ref_name=$4 AND d.consumer=$5 AND d.state<>'delivered' AND (p.storage_generation,p.operation_sequence,p.transaction_sequence)<($2,$3,$6)) OR EXISTS(SELECT 1 FROM git_operations o WHERE o.id=$7 AND o.outcome='unknown')",&[&repository_id,&generation,&sequence,&ref_name,&claim.consumer,&ordinal,&operation_id]).await?.get(0);
+    if blocked {
+        return Ok(false);
+    }
+    ensure!(
+        generation <= current,
+        "event generation exceeds repository generation"
+    );
+    let superseded = claim.consumer == "ref-index" && generation < current;
     match claim.consumer.as_str() {
         "audit-log" => {
             tx.execute(
@@ -254,14 +294,20 @@ pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
             )
             .await?;
         }
-        "ref-index" => {
-            tx.execute("INSERT INTO repository_ref_projection(repository_id,ref_name,oid,deleted,storage_generation,operation_sequence,transaction_sequence,event_id) SELECT repository_id,ref_name,CASE WHEN new_oid ~ '^0+$' THEN NULL ELSE new_oid END,new_oid ~ '^0+$',storage_generation,operation_sequence,transaction_sequence,event_id FROM outbox_events WHERE event_id=$1 ON CONFLICT(repository_id,ref_name) DO UPDATE SET oid=EXCLUDED.oid,deleted=EXCLUDED.deleted,storage_generation=EXCLUDED.storage_generation,operation_sequence=EXCLUDED.operation_sequence,transaction_sequence=EXCLUDED.transaction_sequence,event_id=EXCLUDED.event_id,updated_at=clock_timestamp() WHERE (repository_ref_projection.storage_generation,repository_ref_projection.operation_sequence,repository_ref_projection.transaction_sequence)<(EXCLUDED.storage_generation,EXCLUDED.operation_sequence,EXCLUDED.transaction_sequence)", &[&claim.event_id]).await?;
+        "ref-index" if !superseded => {
+            tx.execute("INSERT INTO repository_ref_projection(repository_id,ref_name,oid,deleted,storage_generation,operation_sequence,transaction_sequence,event_id) SELECT repository_id,ref_name,CASE WHEN new_oid ~ '^0+$' THEN NULL ELSE new_oid END,new_oid ~ '^0+$',storage_generation,operation_sequence,transaction_sequence,event_id FROM outbox_events WHERE event_id=$1 ON CONFLICT(repository_id,ref_name) DO UPDATE SET oid=EXCLUDED.oid,deleted=EXCLUDED.deleted,storage_generation=EXCLUDED.storage_generation,operation_sequence=EXCLUDED.operation_sequence,transaction_sequence=EXCLUDED.transaction_sequence,event_id=EXCLUDED.event_id,source_kind='push_receipt',resolution_id=NULL,updated_at=clock_timestamp() WHERE (repository_ref_projection.storage_generation,repository_ref_projection.operation_sequence,repository_ref_projection.transaction_sequence)<(EXCLUDED.storage_generation,EXCLUDED.operation_sequence,EXCLUDED.transaction_sequence)", &[&claim.event_id]).await?;
         }
+        "ref-index" => {}
         _ => bail!("unknown consumer"),
     }
     // Effects may wait on another lock. Expiry is checked again before commit;
     // an expired fence rolls back the entire local effect.
-    let count=tx.execute("UPDATE event_deliveries SET state='delivered',lease_owner=NULL,lease_until=NULL,delivered_at=clock_timestamp(),last_error_code=NULL WHERE event_id=$1 AND consumer=$2 AND state='leased' AND lease_owner=$3 AND lease_generation=$4 AND lease_until>clock_timestamp()", &[&claim.event_id,&claim.consumer,&claim.lease_owner,&claim.generation]).await?;
+    let effect = if superseded {
+        "superseded_generation"
+    } else {
+        "applied"
+    };
+    let count=tx.execute("UPDATE event_deliveries SET state='delivered',lease_owner=NULL,lease_until=NULL,delivered_at=clock_timestamp(),last_error_code=NULL,effect=$5 WHERE event_id=$1 AND consumer=$2 AND state='leased' AND lease_owner=$3 AND lease_generation=$4 AND lease_until>clock_timestamp()", &[&claim.event_id,&claim.consumer,&claim.lease_owner,&claim.generation,&effect]).await?;
     if count == 0 {
         tx.rollback().await?;
         return Ok(false);

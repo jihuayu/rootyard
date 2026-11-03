@@ -10,7 +10,7 @@ pub fn pool(url: &str) -> Result<Pool> {
     let mut cfg: tokio_postgres::Config = url.parse()?;
     cfg.connect_timeout(std::time::Duration::from_secs(5));
     let options = format!(
-        "{} -c statement_timeout=5000 -c lock_timeout=3000",
+        "{} -c statement_timeout=5000 -c lock_timeout=3000 -c timezone=UTC",
         cfg.get_options().unwrap_or("")
     );
     cfg.options(&options);
@@ -42,6 +42,14 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         .is_none()
     {
         tx.batch_execute(include_str!("../migrations/002_reliability.sql"))
+            .await?;
+    }
+    if tx
+        .query_opt("SELECT version FROM schema_migrations WHERE version=3", &[])
+        .await?
+        .is_none()
+    {
+        tx.batch_execute(include_str!("../migrations/003_recovery_operations.sql"))
             .await?;
     }
     tx.commit().await?;

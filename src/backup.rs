@@ -21,14 +21,16 @@ const TABLES: &[&str] = &[
     "audit_events",
     "event_deliveries",
     "git_operations",
+    "operation_resolutions",
     "outbox_events",
+    "recovery_resolutions",
     "repositories",
     "repository_ref_projection",
     "schema_migrations",
     "tokens",
     "users",
 ];
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_MANIFEST: u64 = 256 * 1024 * 1024;
 
@@ -46,6 +48,7 @@ struct Entry {
 struct Repository {
     id: Uuid,
     generation: i64,
+    incident_revision: i64,
     state: String,
     recovery_reason: Option<String>,
     unknown_operations: i64,
@@ -58,6 +61,8 @@ struct Repository {
 struct Manifest {
     format: u32,
     backup_id: Uuid,
+    volume_id: Uuid,
+    schema_contract_sha256: String,
     boundary_unix_seconds: u64,
     rootyard_version: String,
     binary_sha256: String,
@@ -156,6 +161,29 @@ pub fn ensure_not_restoring(target: &Path) -> Result<()> {
         "incomplete restore guard blocks service startup"
     );
     Ok(())
+}
+fn volume_identity(root: &Path) -> Result<Uuid> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(root.join(".volume-id"))?;
+    let meta = file.metadata()?;
+    ensure!(
+        meta.is_file() && meta.len() == 36 && meta.nlink() == 1 && meta.mode() & 0o7777 == 0o600,
+        "missing or invalid volume identity"
+    );
+    let mut value = String::new();
+    file.read_to_string(&mut value)?;
+    Ok(value.parse()?)
+}
+fn schema_contract_digest() -> Result<String> {
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/003_catalog.json"))?;
+    let restored: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/003_restored_catalog.json"))?;
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&[
+        expected, restored,
+    ])?)))
 }
 fn volume_lock(root: &Path) -> Result<File> {
     let file = OpenOptions::new()
@@ -442,8 +470,17 @@ async fn pg(config: &Config) -> Result<Client> {
     client.batch_execute("SET application_name='rootyard-backup'; SET lock_timeout='5s'; SET statement_timeout='60s'").await?;
     Ok(client)
 }
-async fn database_scope(client: &(impl GenericClient + Sync)) -> Result<()> {
-    let extras: i64 = client.query_one("SELECT (SELECT count(*) FROM pg_namespace WHERE nspname NOT IN ('public','information_schema') AND nspname !~ '^pg_') + (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public' AND NOT (t.typrelid<>0 AND EXISTS(SELECT 1 FROM pg_class c WHERE c.oid=t.typrelid AND c.relkind='r')) AND NOT (t.typelem<>0 AND t.typtype='b' AND EXISTS(SELECT 1 FROM pg_type e JOIN pg_class c ON c.oid=e.typrelid WHERE e.oid=t.typelem AND e.typarray=t.oid AND c.relkind='r'))) + (SELECT count(*) FROM pg_extension WHERE extname<>'plpgsql') + (SELECT count(*) FROM pg_largeobject_metadata)", &[]).await?.get(0);
+async fn database_scope(client: &(impl GenericClient + Sync), empty: bool) -> Result<()> {
+    let extras: i64 = client.query_one("SELECT (SELECT count(*) FROM pg_namespace WHERE nspname NOT IN ('public','information_schema') AND nspname !~ '^pg_') + (SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public' AND NOT (t.typrelid<>0 AND EXISTS(SELECT 1 FROM pg_class c WHERE c.oid=t.typrelid AND c.relkind='r')) AND NOT (t.typelem<>0 AND t.typtype='b' AND EXISTS(SELECT 1 FROM pg_type e JOIN pg_class c ON c.oid=e.typrelid WHERE e.oid=t.typelem AND e.typarray=t.oid AND c.relkind='r'))) + (SELECT count(*) FROM pg_extension WHERE extname<>'plpgsql') + (SELECT count(*) FROM pg_largeobject_metadata)", &[]).await?.get(0);
+    let routines: i64 = client.query_one("SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public'", &[]).await?.get(0);
+    let other_objects: i64 = client.query_one("SELECT (SELECT count(*) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_conversion c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_operator c JOIN pg_namespace n ON n.oid=c.oprnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_opclass c JOIN pg_namespace n ON n.oid=c.opcnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_opfamily c JOIN pg_namespace n ON n.oid=c.opfnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_ts_config c JOIN pg_namespace n ON n.oid=c.cfgnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_ts_dict c JOIN pg_namespace n ON n.oid=c.dictnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_ts_parser c JOIN pg_namespace n ON n.oid=c.prsnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_ts_template c JOIN pg_namespace n ON n.oid=c.tmplnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_statistic_ext c JOIN pg_namespace n ON n.oid=c.stxnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_publication) + (SELECT count(oid) FROM pg_subscription WHERE subdbid=(SELECT oid FROM pg_database WHERE datname=current_database()))", &[]).await?.get(0);
+    ensure!(other_objects == 0, "unsupported database objects");
+    let event_triggers: i64 = client
+        .query_one("SELECT count(*) FROM pg_event_trigger", &[])
+        .await?
+        .get(0);
+    ensure!(!empty || routines == 0, "restore target contains routines");
+    ensure!(event_triggers == 0, "database event triggers unsupported");
     ensure!(
         extras == 0,
         "dedicated Rootyard database must not contain extra schemas, routines, types or extensions"
@@ -451,7 +488,7 @@ async fn database_scope(client: &(impl GenericClient + Sync)) -> Result<()> {
     Ok(())
 }
 async fn schema(client: &(impl GenericClient + Sync)) -> Result<Vec<i32>> {
-    database_scope(client).await?;
+    database_scope(client, false).await?;
     let names: Vec<String> = client.query("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S') ORDER BY c.relname", &[]).await?.iter().map(|r| r.get(0)).collect();
     ensure!(
         names == TABLES,
@@ -471,12 +508,28 @@ async fn schema(client: &(impl GenericClient + Sync)) -> Result<Vec<i32>> {
         .iter()
         .map(|r| r.get(0))
         .collect();
-    ensure!(versions == [1, 2], "unsupported migration version");
+    ensure!(versions == [1, 2, 3], "unsupported migration version");
+    client.batch_execute("SET search_path=pg_catalog").await?;
+    let actual: serde_json::Value = client
+        .query_one(include_str!("../schema/003_catalog.sql"), &[])
+        .await?
+        .get(0);
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/003_catalog.json"))?;
+    // PostgreSQL deparses BETWEEN into nested AND; reparsing its dump flattens
+    // that expression. Accept only these two entire reviewed canonical shapes,
+    // never arbitrary expression normalization or ignored constraints.
+    let restored: serde_json::Value =
+        serde_json::from_str(include_str!("../schema/003_restored_catalog.json"))?;
+    ensure!(
+        actual == expected || actual == restored,
+        "schema003 structure or protection differs from reviewed migrations"
+    );
     Ok(versions)
 }
 async fn repositories(client: &(impl GenericClient + Sync)) -> Result<Vec<Repository>> {
-    Ok(client.query("SELECT r.id,r.storage_generation,r.state,r.recovery_reason,(SELECT count(*) FROM public.git_operations o WHERE o.repository_id=r.id AND o.outcome='unknown') FROM public.repositories r ORDER BY r.id", &[]).await?.iter().map(|r| Repository {
-        id: r.get(0), generation: r.get(1), state: r.get(2), recovery_reason: r.get(3), unknown_operations: r.get(4), refs: None, head: None,
+    Ok(client.query("SELECT r.id,r.storage_generation,r.state,r.recovery_reason,r.incident_revision,(SELECT count(*) FROM public.git_operations o WHERE o.repository_id=r.id AND o.outcome='unknown') FROM public.repositories r ORDER BY r.id", &[]).await?.iter().map(|r| Repository {
+        id: r.get(0), generation: r.get(1), state: r.get(2), recovery_reason: r.get(3), incident_revision: r.get(4), unknown_operations: r.get(5), refs: None, head: None,
     }).collect())
 }
 async fn git_inventory(
@@ -560,6 +613,7 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     disjoint(&root, &destination)?;
     ensure_not_restoring(&root)?;
     let _volume = volume_lock(&root)?;
+    let volume_id = volume_identity(&root)?;
     let mut client = pg(config).await?;
     // Acquire this BEFORE beginning REPEATABLE READ: SELECT would otherwise fix
     // the snapshot before waiting for old transactions/migrations to commit.
@@ -591,6 +645,17 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         "this format is verified only with PostgreSQL 17"
     );
     let mut repos = repositories(&tx).await?;
+    let foreign_volumes: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM public.recovery_resolutions WHERE volume_id<>$1",
+            &[&volume_id],
+        )
+        .await?
+        .get(0);
+    ensure!(
+        foreign_volumes == 0,
+        "resolution history belongs to another volume"
+    );
     let source_inventory = inventory(&root)?;
     git_inventory(config, &root, &mut repos, false).await?;
     let id = Uuid::new_v4();
@@ -604,6 +669,7 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         "--no-password",
         "--lock-wait-timeout=5s",
         "--format=custom",
+        "--schema=public",
         "--no-owner",
         "--no-privileges",
         "--snapshot",
@@ -611,9 +677,6 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         "--file",
     ])
     .arg(staging.join("metadata.dump"));
-    for table in TABLES {
-        dump.arg(format!("--table=public.{table}"));
-    }
     checked(&mut dump).await?;
     fs::set_permissions(
         staging.join("metadata.dump"),
@@ -644,6 +707,8 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     let manifest = Manifest {
         format: FORMAT,
         backup_id: id,
+        volume_id,
+        schema_contract_sha256: schema_contract_digest()?,
         boundary_unix_seconds: boundary,
         rootyard_version: env!("CARGO_PKG_VERSION").into(),
         binary_sha256: hash(&std::env::current_exe()?)?,
@@ -714,8 +779,14 @@ fn verify(source: &Path) -> Result<Manifest> {
     );
     let manifest: Manifest = serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
     ensure!(
-        manifest.format == FORMAT && manifest.schema_versions == [1, 2],
+        manifest.format == FORMAT
+            && manifest.schema_versions == [1, 2, 3]
+            && manifest.schema_contract_sha256 == schema_contract_digest()?,
         "unsupported backup format"
+    );
+    ensure!(
+        volume_identity(&source.join("volume"))? == manifest.volume_id,
+        "backup volume identity mismatch"
     );
     let mut actual = inventory(&source.join("volume"))?
         .into_iter()
@@ -786,7 +857,7 @@ pub async fn restore(config: &Config, source: &Path) -> Result<()> {
     client
         .query_one("SELECT pg_advisory_lock(738390103)", &[])
         .await?;
-    database_scope(&client).await?;
+    database_scope(&client, true).await?;
     let object_count: i64 = client.query_one("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'", &[]).await?.get(0);
     ensure!(
         object_count == 0,
@@ -813,6 +884,10 @@ pub async fn restore(config: &Config, source: &Path) -> Result<()> {
         .collect();
     copy_volume(&source.join("volume"), &staging, &entries)?;
     let _volume = volume_lock(&staging)?;
+    ensure!(
+        volume_identity(&staging)? == manifest.volume_id,
+        "restored volume identity mismatch"
+    );
     let mut repos = manifest.repositories.clone();
     git_inventory(config, &staging, &mut repos, true).await?;
     ensure!(
@@ -828,6 +903,8 @@ pub async fn restore(config: &Config, source: &Path) -> Result<()> {
             "--dbname",
             "",
             "--single-transaction",
+            "--clean",
+            "--if-exists",
             "--exit-on-error",
             "--no-owner",
             "--no-privileges",
@@ -837,6 +914,17 @@ pub async fn restore(config: &Config, source: &Path) -> Result<()> {
     ensure!(
         schema(&client).await? == manifest.schema_versions,
         "restored schema mismatch"
+    );
+    let restored_foreign_volumes: i64 = client
+        .query_one(
+            "SELECT count(*) FROM public.recovery_resolutions WHERE volume_id<>$1",
+            &[&manifest.volume_id],
+        )
+        .await?
+        .get(0);
+    ensure!(
+        restored_foreign_volumes == 0,
+        "restored resolutions belong to another volume"
     );
     let mut metadata_repos = repositories(&client).await?;
     for repo in &mut metadata_repos {

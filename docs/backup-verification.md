@@ -1,6 +1,8 @@
 # Offline backup/restore verification
 
-Local verification date: 2026-11-03. Scope: the phase-two offline backup branch, stacked on durable events and the provisioning-test timing correction. No production instance was accessed, no deployment or traffic change was performed, and no pull request was opened.
+Local verification date: 2026-11-03. Historical scope: the schema-002 phase-two offline backup branch, stacked on durable events and the provisioning-test timing correction. No production instance was accessed, no deployment or traffic change was performed, and no pull request was opened.
+
+Current schema-003 integration results are recorded separately in [integration verification](integration-verification.md); the numbers below remain the original branch's evidence.
 
 ## Runtime and exact executable
 

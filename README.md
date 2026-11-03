@@ -123,4 +123,8 @@ cargo test --test outbox -- --ignored
 python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
 ```
 
-Offline backup and isolated restore are available as a phase-two increment. See [the backup/restore contract](docs/backup-restore.md) and [verification evidence](docs/backup-verification.md) before using the maintenance commands. This is not online replication or a zero-loss guarantee.
+Offline backup and isolated restore are available as a phase-two increment. See [the backup/restore contract](docs/backup-restore.md) and [integrated verification evidence](docs/integration-verification.md) before using the maintenance commands. This is not online replication or a zero-loss guarantee.
+
+## Explicit incident recovery and metrics
+
+The follow-on recovery increment supports offline inspection and explicit acknowledgment of an unknown-push audit gap without rewriting its outcome. It preserves immutable history, establishes an observed new-generation snapshot, and fences old ref-index effects. Read [the maintenance contract](docs/manual-recovery.md) before use. Optional [loopback-only metrics](docs/metrics.md) expose fixed-cardinality service health and durable backlog without repository or user labels. This is not distributed fencing or a substitute for verified backups.

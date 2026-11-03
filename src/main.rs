@@ -74,6 +74,50 @@ async fn run() -> Result<()> {
             }
             eprintln!("token revoked");
         }
+        "inspect-recovery" if args.len() == 2 => {
+            db::migrate(&pool).await?;
+            println!(
+                "{}",
+                rootyard::maintenance::inspect(&config, &pool, args[1].parse()?).await?
+            );
+        }
+        "resolve-unknown"
+            if args.len() == 8
+                && args[2] == "--expected-generation"
+                && args[4] == "--fingerprint"
+                && args[6] == "--acknowledge-audit-gap" =>
+        {
+            db::migrate(&pool).await?;
+            println!(
+                "{}",
+                rootyard::maintenance::resolve(
+                    &config,
+                    &pool,
+                    args[1].parse()?,
+                    args[3].parse()?,
+                    &args[5],
+                    &args[7]
+                )
+                .await?
+            );
+        }
+        "reconcile" if args.len() == 1 => {
+            db::migrate(&pool).await?;
+            let storage = Storage::open(&config)?;
+            let hooks = rootyard::reliability::install_hooks(&storage.root)?;
+            let state = AppState {
+                git_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git)),
+                config,
+                pool,
+                storage,
+                hooks,
+                transfer_metrics: Arc::new(rootyard::metrics::TransferCounters::default()),
+            };
+            rootyard::reliability::recover_startup(&state).await?;
+            println!(
+                "offline reconciliation finished; inspect repository states for unresolved incidents"
+            );
+        }
         "worker-once" if args.len() == 1 => {
             db::migrate(&pool).await?;
             let owner = uuid::Uuid::new_v4();
@@ -112,6 +156,7 @@ async fn run() -> Result<()> {
                 pool,
                 storage,
                 hooks,
+                transfer_metrics: Arc::new(rootyard::metrics::TransferCounters::default()),
                 git_slots: slots,
             });
             rootyard::reliability::recover_startup(&state).await?;
@@ -121,6 +166,24 @@ async fn run() -> Result<()> {
                 "rootyard listening on {} (GitFS single-node)",
                 listener.local_addr()?
             );
+            let metrics_worker = if let Some(address) = state.config.metrics_bind {
+                let listener =
+                    tokio::net::TcpListener::bind(rootyard::metrics::validate_bind(address)?)
+                        .await?;
+                let router = rootyard::metrics::router(
+                    state.pool.clone(),
+                    state.git_slots.clone(),
+                    state.config.max_concurrent_git,
+                    state.transfer_metrics.clone(),
+                );
+                Some(tokio::spawn(async move {
+                    if axum::serve(listener, router).await.is_err() {
+                        eprintln!("rootyard: metrics listener stopped");
+                    }
+                }))
+            } else {
+                None
+            };
             let worker_state = state.clone();
             let worker = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -148,9 +211,12 @@ async fn run() -> Result<()> {
                 .with_graceful_shutdown(shutdown())
                 .await?;
             worker.abort();
+            if let Some(metrics_worker) = metrics_worker {
+                metrics_worker.abort();
+            }
         }
         _ => bail!(
-            "usage: rootyard [serve | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker-once | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup]"
+            "usage: rootyard [serve | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup]"
         ),
     }
     Ok(())

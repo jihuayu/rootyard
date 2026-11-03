@@ -41,14 +41,22 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - name: Verify durable PostgreSQL workers
-        run: cargo test --locked --test outbox -- --ignored
+        run: cargo test --locked --test outbox --test resolution_fences -- --ignored
       - run: cargo build --locked
+      - name: Verify schema-003 catalog and dump round trip
+        run: python3 tests/schema_contract.py --binary target/debug/rootyard
       - name: Exercise native Git end to end
         run: python3 tests/e2e.py --binary target/debug/rootyard --report test-results/e2e.json
       - name: Exercise durable push recovery
         run: python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
       - name: Exercise offline backup and fresh database restore
         run: python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json
+      - name: Exercise restored schema-003 recovery protections
+        run: python3 tests/backup_recovery.py --binary target/debug/rootyard --report test-results/backup-recovery.json
+      - name: Exercise explicit recovery and metrics
+        run: |
+          python3 tests/recovery_ops.py --binary target/debug/rootyard --report test-results/recovery-ops.json
+          python3 tests/metrics.py --binary target/debug/rootyard --report test-results/metrics.json
       - name: Upload end-to-end report
         if: always()
         uses: actions/upload-artifact@v4

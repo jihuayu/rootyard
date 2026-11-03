@@ -184,12 +184,14 @@ class BackupHarness(Harness):
         backup=subprocess.Popen([self.args.binary,"backup",str(destination),"--offline"],env=self.env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         try:
             deadline=time.monotonic()+20
+            # The last metadata query precedes frozen-volume hashing/copying.
+            # Match schema003's volume-history check, not the older repo query.
             while True:
-                pids=self.query(self.source_db,"SELECT pid FROM pg_stat_activity WHERE application_name='rootyard-backup' AND state='idle in transaction' AND query LIKE 'SELECT r.id,r.storage_generation%'")
+                pids=self.query(self.source_db,"SELECT pid FROM pg_stat_activity WHERE application_name='rootyard-backup' AND state='idle in transaction' AND query LIKE 'SELECT count(*) FROM public.recovery_resolutions WHERE volume_id%'")
                 if pids:
                     assert self.query(self.source_db,"SELECT pg_terminate_backend("+str(int(pids.splitlines()[0]))+")")=="t"
                     break
-                assert backup.poll() is None and time.monotonic()<deadline
+                assert backup.poll() is None and time.monotonic()<deadline, "Exporter did not reach frozen volume inventory stage"
                 time.sleep(.01)
             backup.communicate(timeout=30)
             assert backup.returncode!=0 and not destination.exists()
@@ -325,7 +327,7 @@ def main():
     finally:
         try:h.cleanup()
         except Exception as e:print(h.redact(e),file=sys.stderr);success=False
-        report=dict(passed=success,cases=h.results,limitations=["Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise.","Unknown evidence preserved, not automatically resolved."])
+        report=dict(passed=success,cases=h.results,binary_sha256=hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),limitations=["Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise.","Unknown evidence preserved, not automatically resolved."])
         if args.keep:report["retained_directory"]=str(h.root)
         if args.report:args.report.parent.mkdir(parents=True,exist_ok=True);args.report.write_text(json.dumps(report,indent=2)+"\n")
         print(json.dumps(report,indent=2))
