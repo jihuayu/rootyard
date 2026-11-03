@@ -159,3 +159,10 @@ Debug binary SHA-256:
 
 The reports distinguish actual process failures from the test-only SQL pause and
 reject triggers. No Kafka, Redis HA, remote proxy, or PG failover result is implied.
+
+The initial CI run exposed a test-fixture portability error: Debian's Redis 8
+`redis-server` entry point resolves to a multicall executable whose basename
+selects `redis-check-rdb` mode. The harness now preserves the configured
+executable's entry-point name rather than resolving its symlink. The same layout
+is reproduced locally; this changes only test startup, not production transport
+logic, and real Redis coverage is still required in CI.

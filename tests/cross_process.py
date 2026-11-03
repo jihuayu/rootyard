@@ -288,7 +288,10 @@ class CrossProcessHarness(Harness):
         candidate = shutil.which(explicit) if explicit is not None else shutil.which("redis-server")
         if explicit is not None and not candidate:
             raise AssertionError("Explicit ROOTYARD_TEST_REDIS_SERVER is not an executable; Redis coverage is required when configured")
-        return str(Path(candidate).resolve()) if candidate else None
+        # Preserve the redis-server entrypoint name in argv[0]. Debian may link
+        # it to a multicall redis-check-rdb binary, which selects its behavior
+        # by argv[0]; resolving symlinks would launch the RDB checker instead.
+        return os.path.abspath(candidate) if candidate else None
 
     def redis_recovery(self):
         self.redis_binary = self.resolve_redis()
