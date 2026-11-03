@@ -1,0 +1,132 @@
+git-packets-1793712383473209114.log
+22:26:23.598771 pkt-line.c:85           packet:          git< version 2
+22:26:23.598821 pkt-line.c:85           packet:          git< version 2
+22:26:23.598903 pkt-line.c:85           packet:        clone< version 2
+22:26:23.598954 pkt-line.c:85           packet:        clone> command=ls-refs
+22:26:23.598990 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:23.668271 pkt-line.c:85           packet:        clone> command=fetch
+22:26:23.668337 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712382779954159.log
+22:26:22.906888 pkt-line.c:85           packet:          git< version 2
+22:26:22.906939 pkt-line.c:85           packet:          git< version 2
+22:26:22.907001 pkt-line.c:85           packet:        clone< version 2
+22:26:22.907081 pkt-line.c:85           packet:        clone> command=ls-refs
+22:26:22.907106 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:23.018095 pkt-line.c:85           packet:        clone> command=fetch
+22:26:23.018133 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712382009123683.log
+22:26:22.107528 pkt-line.c:85           packet:          git< version 2
+22:26:22.107595 pkt-line.c:85           packet:          git< version 2
+22:26:22.107692 pkt-line.c:85           packet:        clone< version 2
+22:26:22.107746 pkt-line.c:85           packet:        clone> command=ls-refs
+22:26:22.107784 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:22.179199 pkt-line.c:85           packet:        clone> command=fetch
+22:26:22.179267 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712381115462660.log
+22:26:21.225585 pkt-line.c:85           packet:          git< version 2
+22:26:21.225632 pkt-line.c:85           packet:          git< version 2
+22:26:21.225709 pkt-line.c:85           packet:        fetch< version 2
+22:26:21.225761 pkt-line.c:85           packet:        fetch> command=ls-refs
+22:26:21.225850 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:21.301806 pkt-line.c:85           packet:        fetch> command=fetch
+22:26:21.301865 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712380679538164.log
+22:26:20.795406 pkt-line.c:85           packet:          git< version 2
+22:26:20.795457 pkt-line.c:85           packet:          git< version 2
+22:26:20.795536 pkt-line.c:85           packet:        fetch< version 2
+22:26:20.795587 pkt-line.c:85           packet:        fetch> command=ls-refs
+22:26:20.795615 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:20.862643 pkt-line.c:85           packet:        fetch> command=fetch
+22:26:20.863147 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712379984327143.log
+22:26:20.076218 pkt-line.c:85           packet:          git< version 2
+22:26:20.076267 pkt-line.c:85           packet:          git< version 2
+22:26:20.076348 pkt-line.c:85           packet:        clone< version 2
+22:26:20.076400 pkt-line.c:85           packet:        clone> command=ls-refs
+22:26:20.076431 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:20.139535 pkt-line.c:85           packet:        clone> command=fetch
+22:26:20.139572 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712379762254802.log
+22:26:19.847936 pkt-line.c:85           packet:          git< version 2
+22:26:19.847984 pkt-line.c:85           packet:          git< version 2
+22:26:19.848077 pkt-line.c:85           packet:        fetch< version 2
+22:26:19.848140 pkt-line.c:85           packet:        fetch> command=ls-refs
+22:26:19.848170 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:19.913314 pkt-line.c:85           packet:        fetch> command=fetch
+22:26:19.913374 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712379011661755.log
+22:26:19.133814 pkt-line.c:85           packet:          git< version 2
+22:26:19.133880 pkt-line.c:85           packet:          git< version 2
+22:26:19.133959 pkt-line.c:85           packet:        clone< version 2
+22:26:19.134034 pkt-line.c:85           packet:        clone> command=ls-refs
+22:26:19.134066 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:19.213642 pkt-line.c:85           packet:        clone> command=fetch
+22:26:19.213691 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712378230635434.log
+22:26:18.328065 pkt-line.c:85           packet:          git< version 2
+22:26:18.328136 pkt-line.c:85           packet:          git< version 2
+22:26:18.328279 pkt-line.c:85           packet:        clone< version 2
+22:26:18.328341 pkt-line.c:85           packet:        clone> command=ls-refs
+22:26:18.328392 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:18.411967 pkt-line.c:85           packet:        clone> command=fetch
+22:26:18.412069 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712377486710102.log
+22:26:17.588120 pkt-line.c:85           packet:          git< version 2
+22:26:17.588180 pkt-line.c:85           packet:          git< version 2
+22:26:17.588261 pkt-line.c:85           packet:        clone< version 2
+22:26:17.588314 pkt-line.c:85           packet:        clone> command=ls-refs
+22:26:17.588350 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:17.649987 pkt-line.c:85           packet:        clone> command=fetch
+22:26:17.650104 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712377239600728.log
+22:26:17.329226 pkt-line.c:85           packet:          git< version 2
+22:26:17.329289 pkt-line.c:85           packet:          git< version 2
+22:26:17.329380 pkt-line.c:85           packet:        clone< version 2
+22:26:17.329432 pkt-line.c:85           packet:        clone> command=ls-refs
+22:26:17.329468 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:17.405372 pkt-line.c:85           packet:        clone> command=fetch
+22:26:17.405433 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712376998080512.log
+22:26:17.097704 pkt-line.c:85           packet:          git< version 2
+22:26:17.097762 pkt-line.c:85           packet:          git< version 2
+22:26:17.097847 pkt-line.c:85           packet:        clone< version 2
+22:26:17.097898 pkt-line.c:85           packet:        clone> command=ls-refs
+22:26:17.098207 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:17.163929 pkt-line.c:85           packet:        clone> command=fetch
+22:26:17.163991 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712373143412120.log
+22:26:13.219172 pkt-line.c:85           packet:          git< version 2
+22:26:13.219223 pkt-line.c:85           packet:          git< version 2
+22:26:13.219306 pkt-line.c:85           packet:    ls-remote< version 2
+22:26:13.219464 pkt-line.c:85           packet:    ls-remote> command=ls-refs
+22:26:13.219499 pkt-line.c:85           packet:          git< command=ls-refs
+
+git-packets-1793712372610595872.log
+22:26:12.684902 pkt-line.c:85           packet:          git< version 2
+22:26:12.685154 pkt-line.c:85           packet:          git< version 2
+22:26:12.685233 pkt-line.c:85           packet:        fetch< version 2
+22:26:12.685297 pkt-line.c:85           packet:        fetch> command=ls-refs
+22:26:12.685343 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:12.740487 pkt-line.c:85           packet:        fetch> command=fetch
+22:26:12.740542 pkt-line.c:85           packet:          git< command=fetch
+
+git-packets-1793712372118634319.log
+22:26:12.185577 pkt-line.c:85           packet:          git< version 2
+22:26:12.185639 pkt-line.c:85           packet:          git< version 2
+22:26:12.185726 pkt-line.c:85           packet:        clone< version 2
+22:26:12.185937 pkt-line.c:85           packet:        clone> command=ls-refs
+22:26:12.185969 pkt-line.c:85           packet:          git< command=ls-refs
+22:26:12.232617 pkt-line.c:85           packet:        clone> command=fetch
+22:26:12.232723 pkt-line.c:85           packet:          git< command=fetch

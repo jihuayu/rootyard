@@ -5,6 +5,15 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Single-node Git hosting with PostgreSQL metadata and native Git storage"
 rust-version = "1.85"
+default-run = "rootyard"
+
+[features]
+pando-lab = []
+
+[[bin]]
+name = "rootyard-pando-lab"
+path = "src/bin/rootyard-pando-lab.rs"
+required-features = ["pando-lab"]
 
 [dependencies]
 anyhow = "1"
