@@ -3,10 +3,11 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+COPY schema ./schema
 RUN cargo build --release --locked
 
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates postgresql-client-17 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 rootyard \
     && useradd --uid 10001 --gid rootyard --no-create-home rootyard \

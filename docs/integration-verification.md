@@ -22,7 +22,7 @@ Verified locally on 2026-11-03 in a separate integration worktree. Parents are o
 - `tests/backup.py`: all seven groups passed.
 - `tests/backup_recovery.py`: all six groups passed.
 
-These commands and the added schema/restore tests are also wired into CI. The exact published commit's CI is a separate result and must be checked before merge; this record establishes local results only. CI's default database service is one cluster; the local cross-cluster result above is not inferred from CI.
+These commands and the added schema/restore tests are also wired into CI. A separate container job builds the actual Dockerfile and checks the unprivileged hook executable, Git and PostgreSQL 17 dump/restore clients. Packaging review added the embedded schema fixtures to the build context and the matching PostgreSQL clients to the runtime image. No local Docker daemon was available, so image-build evidence must come from that CI job, not the local Rust tests. The exact published commit's CI is a separate result and must be checked before merge; this record establishes local results only. CI's default database service is one cluster; the local cross-cluster result above is not inferred from CI.
 
 ## Restored schema-003 evidence
 

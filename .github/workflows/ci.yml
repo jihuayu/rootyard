@@ -64,3 +64,18 @@ jobs:
           name: e2e-report
           path: test-results/*.json
           if-no-files-found: ignore
+
+  container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build deployable image with embedded schema contracts
+        run: docker build --tag rootyard:ci .
+      - name: Verify unprivileged executable and maintenance clients
+        run: |
+          test "$(docker run --rm rootyard:ci --rootyard-hook-self-check)" = rootyard-hook-v1
+          docker run --rm --entrypoint pg_dump rootyard:ci --version | grep 'PostgreSQL) 17\.'
+          docker run --rm --entrypoint pg_restore rootyard:ci --version | grep 'PostgreSQL) 17\.'
+          docker run --rm --entrypoint git rootyard:ci --version
+          test "$(docker run --rm --entrypoint id rootyard:ci -u)" = 10001
