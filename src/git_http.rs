@@ -1,7 +1,7 @@
 use crate::{
     AppState, Error, auth,
     db::{self, Repository},
-    storage,
+    journal, reliability, storage,
 };
 use axum::{
     body::Body,
@@ -53,9 +53,25 @@ impl Process {
         unsafe {
             libc::kill(-self.pid, libc::SIGKILL);
         }
+        self.wait_group_quiescent().await;
         let status = self.child.wait().await?;
         self.pid = 0;
         Ok(status)
+    }
+    async fn wait_group_quiescent(&self) {
+        // Keep leader unreaped, reserving PGID, until every member is dead or
+        // zombie. SIGKILL delivery alone is not proof a descendant stopped.
+        let started = Instant::now();
+        let mut reported = false;
+        while !matches!(group_quiescent(self.pid), Ok(true)) {
+            if !reported && started.elapsed() > std::time::Duration::from_secs(5) {
+                eprintln!(
+                    "rootyard: process group cleanup blocked; retaining write lock and capacity"
+                );
+                reported = true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
     async fn stop(&mut self) {
         if let Some(input) = &self.input {
@@ -73,9 +89,48 @@ impl Process {
         unsafe {
             libc::kill(-self.pid, libc::SIGKILL);
         }
+        self.wait_group_quiescent().await;
         let _ = self.child.wait().await;
         self.pid = 0;
     }
+}
+fn group_quiescent(group: i32) -> io::Result<bool> {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        // Controlled Git children never change user identity. A restricted
+        // /proc may deny other users' processes; they cannot belong to our group.
+        use std::os::unix::fs::MetadataExt;
+        match entry.metadata() {
+            Ok(meta) if meta.uid() != unsafe { libc::geteuid() } => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+            _ => {}
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some((_, rest)) = stat.rsplit_once(") ") else {
+            return Err(io::Error::other("invalid proc stat"));
+        };
+        let fields: Vec<_> = rest.split_whitespace().collect();
+        if fields.len() < 3 {
+            return Err(io::Error::other("invalid proc stat"));
+        }
+        if fields[2].parse::<i32>().ok() == Some(group) && fields[0] != "Z" && fields[0] != "X" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -95,6 +150,13 @@ impl Drop for Process {
 }
 
 pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
+    // A disconnected caller cannot cancel cleanup between acquiring the write
+    // lock and starting the response producer. The owned task retains all guards.
+    tokio::spawn(execute(state, request))
+        .await
+        .map_err(Error::internal)?
+}
+async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
     let (parts, body) = request.into_parts();
     let (owner, name, endpoint, service) =
         route(&parts.method, parts.uri.path(), parts.uri.query())?;
@@ -122,7 +184,7 @@ pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Resp
     if repo.state != "ready" {
         return Err(Error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "repository provisioning",
+            "repository not ready; recovery may be required",
         ));
     }
     validate_headers(
@@ -147,6 +209,11 @@ pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Resp
     } else {
         None
     };
+    if write_guard.is_some() {
+        reliability::before_push(&state, &repo)
+            .await
+            .map_err(Error::internal)?;
+    }
     let path = state
         .storage
         .verify_path(repo.id)
@@ -169,6 +236,12 @@ pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Resp
         .get(header::CONTENT_ENCODING)
         .is_some_and(|v| v == "gzip" || v == "x-gzip");
     let mut cmd = state.storage.git(&state.config);
+    if write_guard.is_some() {
+        cmd.arg("-c").arg(format!(
+            "core.hooksPath={}",
+            state.storage.root.join("managed-hooks").display()
+        ));
+    }
     cmd.arg("http-backend")
         .env("GIT_PROJECT_ROOT", state.storage.root.join("repos"))
         .env("PATH_INFO", format!("/{}.git/{endpoint}", repo.id))
@@ -228,7 +301,28 @@ pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Resp
             Ok(())
         });
     }
-    let mut child = cmd.spawn().map_err(Error::internal)?;
+    let operation = if write_guard.is_some() {
+        let operation = journal::begin(
+            &state.storage.root,
+            repo.id,
+            identity.id,
+            identity.username.clone(),
+            identity.token_id,
+            repo.storage_generation,
+        )
+        .map_err(Error::internal)?;
+        cmd.env("ROOTYARD_JOURNAL_OPERATION", &operation.path);
+        Some(operation)
+    } else {
+        None
+    };
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = reliability::complete(&state, operation).await;
+            return Err(Error::internal(error));
+        }
+    };
     let pid = child.id().ok_or_else(Error::bad_request)? as i32;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
@@ -281,10 +375,18 @@ pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Resp
         pid,
     };
     let mut stdout = BufReader::with_capacity(16 * 1024, stdout);
-    let headers = tokio::time::timeout_at(deadline, read_headers(&mut stdout))
-        .await
-        .map_err(|_| Error::timeout())?
-        .map_err(Error::internal)?;
+    let headers = match tokio::time::timeout_at(deadline, read_headers(&mut stdout)).await {
+        Ok(Ok(headers)) => headers,
+        result => {
+            process.stop().await;
+            let _ = reliability::complete(&state, operation).await;
+            return Err(match result {
+                Err(_) => Error::timeout(),
+                Ok(Err(error)) => Error::internal(error),
+                _ => unreachable!(),
+            });
+        }
+    };
     let mut response = Response::builder()
         .status(headers.0)
         .header(header::CONTENT_TYPE, headers.1)
@@ -302,7 +404,7 @@ pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Resp
     tokio::spawn(async move {
         let _permit: OwnedSemaphorePermit = permit;
         let _write_guard: Option<OwnedMutexGuard<()>> = write_guard;
-        let _state = state;
+        let state = state;
         let transfer = async {
             let mut total = 0u64;
             let mut buf = vec![0u8; 32 * 1024];
@@ -356,6 +458,10 @@ pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Resp
         process.stop().await;
         // Drop is also a last-resort guard if this task itself is cancelled.
         drop(process);
+        if reliability::complete(&state, operation).await.is_err() {
+            producer_failed.store(true, std::sync::atomic::Ordering::Release);
+            eprintln!("rootyard: push evidence requires recovery");
+        }
         drop(sender);
     });
     let stream = async_stream::try_stream! {

@@ -10,12 +10,13 @@ pub async fn authenticate(pool: &Pool, headers: &HeaderMap) -> Result<Identity, 
     let (user, token) = credentials(headers)?;
     let client = pool.get().await.map_err(Error::internal)?;
     let row = client.query_opt(
-        "SELECT u.id, u.username, t.read_only FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.digest=$1 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())", &[&db::digest(&token)])
+        "SELECT u.id, u.username, t.read_only, t.id FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.digest=$1 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())", &[&db::digest(&token)])
         .await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
     let identity = Identity {
         id: row.get(0),
         username: row.get(1),
         read_only: row.get(2),
+        token_id: row.get(3),
     };
     if user.as_ref().is_some_and(|u| u != &identity.username) {
         return Err(Error::unauthorized());

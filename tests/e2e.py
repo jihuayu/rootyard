@@ -88,7 +88,7 @@ class Harness:
         self.secrets.extend([result["token"], base64.b64encode((result["username"] + ":" + result["token"]).encode()).decode()])
         return result
 
-    def http(self, path, token=None, method="GET", body=None, content_type=None, basic=False, extra_headers=None):
+    def http(self, path, token=None, method="GET", body=None, content_type=None, basic=False, extra_headers=None, allow_incomplete=False):
         headers = {}
         if token:
             headers["Authorization"] = ("Basic " + base64.b64encode((token["username"] + ":" + token["token"]).encode()).decode()) if basic else "Bearer " + token["token"]
@@ -101,7 +101,13 @@ class Harness:
         req = urllib.request.Request(self.base + path, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
-                return r.status, r.read(), dict(r.headers)
+                try:
+                    data = r.read()
+                except http.client.IncompleteRead as error:
+                    if not allow_incomplete:
+                        raise
+                    data = error.partial
+                return r.status, data, dict(r.headers)
         except urllib.error.HTTPError as e:
             return e.code, e.read(), dict(e.headers)
 
@@ -274,13 +280,13 @@ class Harness:
         header = b"PACK\0\0\0\2\0\0\0\0"
         return header + hashlib.sha1(header).digest()
 
-    def update_ref(self, old, new, ref, barrier=None):
+    def update_ref(self, old, new, ref, barrier=None, repo=None):
         if barrier:
             barrier.wait(timeout=10)
         command = f"{old} {new} {ref}".encode() + b"\0report-status atomic\n"
-        return self.http(self.repo["clone_path"] + "/git-receive-pack", token=self.alice,
+        return self.http((repo or self.repo)["clone_path"] + "/git-receive-pack", token=self.alice,
                          method="POST", body=self.pkt(command)+b"0000"+self.empty_pack(),
-                         content_type="application/x-git-receive-pack-request")
+                         content_type="application/x-git-receive-pack-request", allow_incomplete=True)
 
     def parallel(self):
         start = time.monotonic()
@@ -290,14 +296,20 @@ class Harness:
         assert all(p.returncode == 0 for p in results)
         # Both competing updates advertise exactly the same old OID. Existing objects
         # remove pack transfer as a confounder and exercise receive-pack's ref lock.
-        self.git("push", "origin", self.first + ":refs/heads/race", cwd=self.work, token=self.alice)
+        # An ambiguous rejected RPC can intentionally block its repository in
+        # phase two. Isolate the race so later independent scenarios remain valid.
+        race_repo = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice, body={"name": "cas-race"}))
+        race_remote = self.base + race_repo["clone_path"]
+        self.git("push", race_remote, self.first + ":refs/heads/race", self.second + ":refs/heads/main", cwd=self.work, token=self.alice)
         barrier = threading.Barrier(2)
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            jobs = [pool.submit(self.update_ref, self.first, self.second, "refs/heads/race", barrier) for _ in range(2)]
+            jobs = [pool.submit(self.update_ref, self.first, self.second, "refs/heads/race", barrier, race_repo) for _ in range(2)]
             responses = [job.result() for job in jobs]
         assert sum(b"ok refs/heads/race\n" in body for _, body, _ in responses) == 1, "Expected exactly one successful old-OID compare-and-swap"
         assert sum(b"ng refs/heads/race " in body for _, body, _ in responses) == 1, "Expected one rejected old-OID compare-and-swap"
-        self.git("--git-dir=" + str(self.bare), "fsck", "--full")
+        race_bare = self.root / "data/repos" / (race_repo["id"] + ".git")
+        assert self.git("--git-dir=" + str(race_bare), "rev-parse", "refs/heads/race").stdout.decode().strip() == self.second
+        self.git("--git-dir=" + str(race_bare), "fsck", "--full")
         return {"parallel_pushes": 4, "elapsed_seconds": round(elapsed, 4), "benchmark": False}
 
     def broken_uploads(self):

@@ -13,6 +13,8 @@ pub struct Config {
     pub git_timeout: Duration,
     pub git_memory_bytes: u64,
     pub max_repo_bytes: u64,
+    pub max_pending_deliveries: i64,
+    pub outbox_worker: bool,
 }
 
 impl Config {
@@ -50,6 +52,13 @@ impl Config {
             git_timeout: Duration::from_secs(number("ROOTYARD_GIT_TIMEOUT_SECONDS", 120)?),
             git_memory_bytes: number("ROOTYARD_GIT_MEMORY_BYTES", 1024 * 1024 * 1024)?,
             max_repo_bytes: number("ROOTYARD_MAX_REPO_BYTES", 1024 * 1024 * 1024)?,
+            max_pending_deliveries: number("ROOTYARD_MAX_PENDING_DELIVERIES", 100_000)?
+                .try_into()?,
+            outbox_worker: match env::var("ROOTYARD_OUTBOX_WORKER").as_deref() {
+                Ok("false") => false,
+                Ok("true") | Err(_) => true,
+                _ => bail!("ROOTYARD_OUTBOX_WORKER must be true or false"),
+            },
         })
     }
 }

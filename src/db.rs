@@ -36,6 +36,14 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         .await?;
     tx.batch_execute(include_str!("../migrations/001_initial.sql"))
         .await?;
+    if tx
+        .query_opt("SELECT version FROM schema_migrations WHERE version=2", &[])
+        .await?
+        .is_none()
+    {
+        tx.batch_execute(include_str!("../migrations/002_reliability.sql"))
+            .await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -100,6 +108,7 @@ pub async fn issue_token(
 #[derive(Clone)]
 pub struct Identity {
     pub id: Uuid,
+    pub token_id: Uuid,
     pub username: String,
     pub read_only: bool,
 }

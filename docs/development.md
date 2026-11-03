@@ -33,3 +33,7 @@ See [the verification record](verification.md) for the tested versions, confirme
 Process restart and injected provisioning interruptions can establish recovery for those boundaries. The harness also exercises an offline paired backup/restore: stop writes, dump the owned schema, copy the full data tree, restore the schema, and verify refs, a fresh clone, fsck and read-only/revoked-token behavior. This is not a full deployment restore into a new external database. These tests do not establish hard power-loss safety, cross-store push atomicity, full audit completeness, high availability, production disaster recovery, or a throughput SLA. A rejected client request can have an unknown result if ref updates occurred before the connection failed.
 
 Do not run benchmark or failure-injection tests against real repositories. Keep local database credentials, tokens, test reports with sensitive data, build output and repository volumes out of version control. Review `git diff` and `git status` before committing.
+
+## Durable reliability tests
+
+With `ROOTYARD_TEST_DATABASE_URL` pointing at a disposable PostgreSQL database, run `cargo test --test outbox -- --ignored` and `python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json`. Both own random schemas and clean only their fixtures. CI runs these explicitly; a default cargo test alone does not execute the ignored PostgreSQL test. See [phase-two verification](phase-two-verification.md) for injected boundaries and untested infrastructure assumptions.

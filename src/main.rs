@@ -2,8 +2,30 @@ use anyhow::{Context, Result, bail};
 use rootyard::{AppState, config::Config, db, storage::Storage};
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let args: Vec<_> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "--rootyard-hook-self-check" {
+        println!("rootyard-hook-v1");
+        return Ok(());
+    }
+    let name = std::path::Path::new(&args[0])
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("");
+    match name {
+        "reference-transaction" => {
+            return rootyard::journal::run_hook(args.get(1).map(String::as_str).unwrap_or(""));
+        }
+        "post-receive" => return rootyard::journal::run_post_receive(),
+        "pre-receive" => return rootyard::journal::run_pre_receive(),
+        _ => {}
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+async fn run() -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("Rootyard phase one currently supports Linux only");
     }
@@ -38,7 +60,18 @@ async fn main() -> Result<()> {
             }
             eprintln!("token revoked");
         }
+        "worker-once" if args.len() == 1 => {
+            db::migrate(&pool).await?;
+            let owner = uuid::Uuid::new_v4();
+            let mut count = 0;
+            for consumer in ["audit-log", "ref-index"] {
+                count += rootyard::events::worker_once(&pool, consumer, owner, 64).await?;
+            }
+            println!("{count}");
+        }
         "serve" if args.len() <= 1 => {
+            std::fs::read_to_string("/proc/self/stat")
+                .context("readable Linux procfs is required for writer cleanup")?;
             let storage = Storage::open(&config)?;
             let version = storage.git(&config).arg("--version").output().await?;
             let text = String::from_utf8(version.stdout)?;
@@ -56,12 +89,15 @@ async fn main() -> Result<()> {
             }
             db::migrate(&pool).await?;
             let slots = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git));
+            let hooks = rootyard::reliability::install_hooks(&storage.root)?;
             let state = Arc::new(AppState {
                 config,
                 pool,
                 storage,
+                hooks,
                 git_slots: slots,
             });
+            rootyard::reliability::recover_startup(&state).await?;
             rootyard::recover(&state).await?;
             let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
             eprintln!(
@@ -73,6 +109,19 @@ async fn main() -> Result<()> {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
                     interval.tick().await;
+                    if rootyard::reliability::recover_pending(&worker_state)
+                        .await
+                        .is_err()
+                    {
+                        eprintln!("rootyard: journal retry unavailable");
+                    }
+                    if worker_state.config.outbox_worker
+                        && rootyard::reliability::worker_once(&worker_state)
+                            .await
+                            .is_err()
+                    {
+                        eprintln!("rootyard: durable worker retry unavailable");
+                    }
                     if rootyard::recover(&worker_state).await.is_err() {
                         eprintln!("rootyard: provisioning retry unavailable");
                     }
@@ -84,7 +133,7 @@ async fn main() -> Result<()> {
             worker.abort();
         }
         _ => bail!(
-            "usage: rootyard [serve | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID]"
+            "usage: rootyard [serve | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker-once]"
         ),
     }
     Ok(())

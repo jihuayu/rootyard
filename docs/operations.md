@@ -47,3 +47,9 @@ Because writes are stopped across both captures, this avoids claiming online ato
 5. Test read-only restrictions, revocation and a controlled write on a disposable restored repository. Only then switch traffic. Record measured data loss and restore duration rather than asserting RPO/RTO targets that have not been tested.
 
 A successful dump or a passing process-restart test alone does not validate disaster recovery, hardware failure behavior or power-loss durability.
+
+## Durable operation recovery (phase two A)
+
+Read [ADR 002](reliability.md) before upgrading. Migration 002 is incremental and keeps native Git authoritative. The data volume now must allow execution of the private hook runner; startup performs a harmless execution probe and requests verify actual executable access. A `noexec` data volume fails closed. Linux procfs must expose every service-UID process for safe descendant cleanup.
+
+Keep the entire data directory, not only `repos/`, in coordinated offline backups. Do not remove journals or sequence counters, manually clear an unknown operation, or lower a generation. An unknown result may mean Git changed refs even if the client received an error. Owner operation summaries are available at `/api/repos/{owner}/{name}/operations`. PostgreSQL holds full bounded evidence. `rootyard worker-once` drains one bounded batch for each built-in consumer; it does not resolve unknown writes.

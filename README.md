@@ -110,3 +110,15 @@ Never run `docker compose down -v` unless you intend to destroy the development 
 - [Verification record and remaining limits](docs/verification.md)
 
 Licensed under Apache-2.0.
+
+## Phase-two reliability increment
+
+GitFS writes now retain durable operation evidence and post-receive receipts, with explicit unknown/recovering states. PostgreSQL atomically stores audit evidence and durable events; fenced local consumers maintain audit and ref projections. This does not replace Git refs with PostgreSQL refs or enable HA. See [reliability contract and operations](docs/reliability.md) and [phase-two verification](docs/phase-two-verification.md).
+
+Run the added tests against an isolated test database:
+
+```sh
+export ROOTYARD_TEST_DATABASE_URL=postgresql://localhost/rootyard_test
+cargo test --test outbox -- --ignored
+python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
+```

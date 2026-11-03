@@ -3,7 +3,10 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod events;
 pub mod git_http;
+pub mod journal;
+pub mod reliability;
 pub mod storage;
 
 use axum::{
@@ -23,6 +26,7 @@ pub struct AppState {
     pub config: config::Config,
     pub pool: Pool,
     pub storage: storage::Storage,
+    pub hooks: reliability::HookInstallation,
     pub git_slots: Arc<Semaphore>,
 }
 
@@ -74,6 +78,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health/ready", get(ready))
         .route("/api/repos", post(create_repo).get(list_repos))
         .route("/api/repos/{owner}/{name}", get(get_repo))
+        .route(
+            "/api/repos/{owner}/{name}/operations",
+            get(reliability::operations),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/events",
+            get(reliability::event_list),
+        )
         .fallback(|State(state): State<Arc<AppState>>, request| async move {
             git_http::handle(state, request).await
         })
