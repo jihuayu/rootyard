@@ -8,6 +8,9 @@ use uuid::Uuid;
 
 pub fn pool(url: &str) -> Result<Pool> {
     let mut cfg: tokio_postgres::Config = url.parse()?;
+    if matches!(cfg.get_ssl_mode(), tokio_postgres::config::SslMode::Require) {
+        bail!("PostgreSQL TLS requires a local TLS proxy; no silent downgrade");
+    }
     cfg.connect_timeout(std::time::Duration::from_secs(5));
     let options = format!(
         "{} -c statement_timeout=5000 -c lock_timeout=3000 -c timezone=UTC",

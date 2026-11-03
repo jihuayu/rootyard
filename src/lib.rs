@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod dispatch;
 pub mod events;
 pub mod git_http;
 pub mod journal;
@@ -25,6 +26,7 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 pub struct AppState {
+    pub dispatch: dispatch::Signals,
     pub config: config::Config,
     pub pool: Pool,
     pub storage: storage::Storage,
