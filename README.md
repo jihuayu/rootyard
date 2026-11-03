@@ -122,3 +122,7 @@ export ROOTYARD_TEST_DATABASE_URL=postgresql://localhost/rootyard_test
 cargo test --test outbox -- --ignored
 python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
 ```
+
+## Explicit incident recovery and metrics
+
+The follow-on recovery increment supports offline inspection and explicit acknowledgment of an unknown-push audit gap without rewriting its outcome. It preserves immutable history, establishes an observed new-generation snapshot, and fences old ref-index effects. Read [the maintenance contract](docs/manual-recovery.md) before use. Optional [loopback-only metrics](docs/metrics.md) expose fixed-cardinality service health and durable backlog without repository or user labels. This is not distributed fencing or a substitute for verified backups.

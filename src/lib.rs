@@ -6,6 +6,8 @@ pub mod db;
 pub mod events;
 pub mod git_http;
 pub mod journal;
+pub mod maintenance;
+pub mod metrics;
 pub mod reliability;
 pub mod storage;
 
@@ -27,6 +29,7 @@ pub struct AppState {
     pub pool: Pool,
     pub storage: storage::Storage,
     pub hooks: reliability::HookInstallation,
+    pub transfer_metrics: Arc<metrics::TransferCounters>,
     pub git_slots: Arc<Semaphore>,
 }
 
@@ -83,6 +86,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(reliability::operations),
         )
         .route(
+            "/api/repos/{owner}/{name}/resolutions",
+            get(reliability::resolutions),
+        )
+        .route(
             "/api/repos/{owner}/{name}/events",
             get(reliability::event_list),
         )
@@ -107,6 +114,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> Result<&'static str, Error
             "storage unavailable",
         ));
     }
+    reliability::verify_hooks(&state).map_err(Error::internal)?;
     Ok("ready")
 }
 #[derive(Deserialize)]

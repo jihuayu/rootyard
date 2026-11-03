@@ -149,6 +149,60 @@ impl Drop for Process {
     }
 }
 
+/// Bounded read-only maintenance command using the same process-group cleanup.
+pub(crate) async fn collect_git_output(
+    mut command: tokio::process::Command,
+    limit: usize,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Vec<u8>> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    let pid = child
+        .id()
+        .ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let drain = tokio::spawn(async move {
+        let mut bytes = [0u8; 4096];
+        while matches!(stderr.read(&mut bytes).await,Ok(n) if n>0) {}
+    });
+    let mut process = Process {
+        child,
+        input: None,
+        stderr: drain,
+        pid,
+    };
+    let mut output = Vec::new();
+    let result = tokio::time::timeout(timeout, async {
+        (&mut stdout)
+            .take(limit as u64 + 1)
+            .read_to_end(&mut output)
+            .await?;
+        if output.len() > limit {
+            return Err(io::Error::other("maintenance output exceeds limit"));
+        }
+        if !process.finish().await?.success() {
+            return Err(io::Error::other("read-only Git command failed"));
+        }
+        Ok::<(), io::Error>(())
+    })
+    .await;
+    process.stop().await;
+    result.map_err(|_| io::Error::other("maintenance Git command timed out"))??;
+    Ok(output)
+}
+
 pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
     // A disconnected caller cannot cancel cleanup between acquiring the write
     // lock and starting the response producer. The owned task retains all guards.
@@ -328,11 +382,13 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     let stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
     let max_input = state.config.max_request_bytes;
+    let input_metrics = state.transfer_metrics.clone();
     let input = tokio::spawn(async move {
         let mut wire_bytes = 0u64;
         let stream = body.into_data_stream().map(move |chunk| {
             let chunk = chunk.map_err(io::Error::other)?;
             wire_bytes = wire_bytes.saturating_add(chunk.len() as u64);
+            input_metrics.add_received_bytes(chunk.len() as u64);
             if wire_bytes > max_input {
                 return Err(io::Error::other("request wire size limit exceeded"));
             }
@@ -379,6 +435,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         Ok(Ok(headers)) => headers,
         result => {
             process.stop().await;
+            state.transfer_metrics.record_failure();
             let _ = reliability::complete(&state, operation).await;
             return Err(match result {
                 Err(_) => Error::timeout(),
@@ -399,7 +456,9 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     // Drive pipes independently of response polling. Otherwise a client that stops
     // reading could freeze the deadline, retain its permit and block a repository.
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
-    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(
+        headers.0.is_client_error() || headers.0.is_server_error(),
+    ));
     let producer_failed = failed.clone();
     tokio::spawn(async move {
         let _permit: OwnedSemaphorePermit = permit;
@@ -438,6 +497,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                     .send(Bytes::copy_from_slice(&buf[..n]))
                     .await
                     .map_err(|_| io::Error::other("client disconnected"))?;
+                state.transfer_metrics.add_sent_bytes(n as u64);
             }
             if let Some(input) = process.input.as_mut() {
                 input.await.map_err(io::Error::other)??;
@@ -461,6 +521,11 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         if reliability::complete(&state, operation).await.is_err() {
             producer_failed.store(true, std::sync::atomic::Ordering::Release);
             eprintln!("rootyard: push evidence requires recovery");
+        }
+        if producer_failed.load(std::sync::atomic::Ordering::Acquire) {
+            state.transfer_metrics.record_failure();
+        } else {
+            state.transfer_metrics.record_success();
         }
         drop(sender);
     });

@@ -250,6 +250,21 @@ pub fn begin(
     Ok(op)
 }
 
+pub fn sequence(data_root: &Path, repository_id: Uuid) -> Result<i64> {
+    safe_path(data_root)?;
+    let path = data_root
+        .join("journal")
+        .join(repository_id.to_string())
+        .join("sequence");
+    if !exists(&path)? {
+        return Ok(0);
+    }
+    let bytes = read(&path)?;
+    ensure!(bytes.len() <= 32, "invalid journal counter");
+    let value = std::str::from_utf8(&bytes)?.parse::<i64>()?;
+    ensure!(value >= 0, "negative journal counter");
+    Ok(value)
+}
 pub fn pending(data_root: &Path, repository_id: Uuid) -> Result<Vec<Operation>> {
     safe_path(data_root)?;
     let repo = data_root.join("journal").join(repository_id.to_string());
@@ -273,6 +288,11 @@ pub fn pending(data_root: &Path, repository_id: Uuid) -> Result<Vec<Operation>> 
         );
         result.push(op);
     }
+    let mut identities = std::collections::HashSet::new();
+    ensure!(
+        result.iter().all(|o| identities.insert(o.id)),
+        "duplicate journal operation identity"
+    );
     result.sort_by_key(|o| o.sequence);
     ensure!(
         result.windows(2).all(|w| w[0].sequence != w[1].sequence),
@@ -455,6 +475,18 @@ pub fn mark_corrupt(op: &Operation) -> Result<()> {
     atomic(&op.path.join("corrupt"), b"", false)
 }
 
+/// Canonical bounded evidence for operator inspection and immutable resolution.
+pub fn evidence(op: &Operation) -> Result<serde_json::Value> {
+    Ok(
+        serde_json::json!({"operation":op,"reference_events":events(op)?,"requested":requests(op)?,"post_receive":receipts(op)?,"finished":is_finished(op)?,"interrupted":is_interrupted(op)?}),
+    )
+}
+pub fn evidence_digest(op: &Operation) -> Result<String> {
+    use sha2::Digest;
+    Ok(hex::encode(sha2::Sha256::digest(serde_json::to_vec(
+        &evidence(op)?,
+    )?)))
+}
 pub fn finish(op: &Operation) -> Result<()> {
     validate(op)?;
     atomic(&op.path.join("finished"), b"", false)

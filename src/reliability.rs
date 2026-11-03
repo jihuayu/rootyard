@@ -124,6 +124,15 @@ pub async fn reconcile(
     };
     let mut clear = true;
     for operation in pending {
+        match crate::maintenance::retire_if_resolved(&state.pool, &state.storage, &operation).await
+        {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                recovering(state, repo, "resolved_journal_changed").await?;
+                return Err(error);
+            }
+        }
         if startup && !journal::is_finished(&operation)? {
             journal::mark_interrupted(&operation)?;
             journal::finish(&operation)?;
@@ -203,7 +212,7 @@ pub async fn reconcile(
     if clear {
         // Only clear our own temporary ambiguity flag, never an unrelated
         // storage incident, and never while a durable unknown barrier remains.
-        state.pool.get().await?.execute("UPDATE repositories r SET state='ready',recovery_reason=NULL WHERE id=$1 AND state='recovering' AND recovery_reason='push_outcome_unknown' AND NOT EXISTS(SELECT 1 FROM git_operations o WHERE o.repository_id=r.id AND o.outcome='unknown')",&[&repo]).await?;
+        state.pool.get().await?.execute("UPDATE repositories r SET state='ready',recovery_reason=NULL WHERE id=$1 AND state='recovering' AND recovery_reason='push_outcome_unknown' AND NOT EXISTS(SELECT 1 FROM git_operations o WHERE o.repository_id=r.id AND o.outcome='unknown' AND NOT EXISTS(SELECT 1 FROM operation_resolutions covered WHERE covered.operation_id=o.id))",&[&repo]).await?;
     }
     Ok(clear)
 }
@@ -231,6 +240,20 @@ pub async fn before_push(state: &AppState, repo: &db::Repository) -> Result<()> 
         row.get::<_, String>(0) == "ready" && row.get::<_, i64>(1) == repo.storage_generation,
         "repository changed or recovery required"
     );
+    let maximum: i64 = state
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT COALESCE(max(sequence),0) FROM git_operations WHERE repository_id=$1",
+            &[&repo.id],
+        )
+        .await?
+        .get(0);
+    if !matches!(journal::sequence(&state.storage.root,repo.id),Ok(value) if value>=maximum) {
+        recovering(state, repo.id, "journal_sequence_mismatch").await?;
+        anyhow::bail!("journal sequence missing or behind durable operation history");
+    }
     ensure!(
         events::pending_count(&state.pool).await? < state.config.max_pending_deliveries,
         "durable event backlog limit reached"
@@ -357,7 +380,7 @@ pub async fn operations(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     let id = authorized_repo(&state, &headers, &owner, &name).await?;
-    let rows=state.pool.get().await.map_err(Error::internal)?.query("SELECT jsonb_build_object('id',id,'sequence',sequence,'storage_generation',storage_generation,'outcome',outcome,'actor',actor_name,'created_at',created_at,'settled_at',settled_at,'evidence_summary',jsonb_build_object('reference_event_count',jsonb_array_length(COALESCE(evidence->'reference_events','[]'::jsonb)),'receipt_count',CASE WHEN jsonb_typeof(evidence->'post_receive')='array' THEN jsonb_array_length(evidence->'post_receive') ELSE NULL END,'invalid_journal',evidence->'invalid_journal')) FROM git_operations WHERE repository_id=$1 ORDER BY storage_generation DESC,sequence DESC LIMIT 100",&[&id]).await.map_err(Error::internal)?;
+    let rows=state.pool.get().await.map_err(Error::internal)?.query("SELECT jsonb_build_object('id',id,'sequence',sequence,'storage_generation',storage_generation,'outcome',outcome,'resolution_id',(SELECT resolution_id FROM operation_resolutions covered WHERE covered.operation_id=git_operations.id),'actor',actor_name,'created_at',created_at,'settled_at',settled_at,'evidence_summary',jsonb_build_object('reference_event_count',jsonb_array_length(COALESCE(evidence->'reference_events','[]'::jsonb)),'receipt_count',CASE WHEN jsonb_typeof(evidence->'post_receive')='array' THEN jsonb_array_length(evidence->'post_receive') ELSE NULL END,'invalid_journal',evidence->'invalid_journal')) FROM git_operations WHERE repository_id=$1 ORDER BY storage_generation DESC,sequence DESC LIMIT 100",&[&id]).await.map_err(Error::internal)?;
     Ok((
         StatusCode::OK,
         [(header::CACHE_CONTROL, "no-store")],
@@ -375,7 +398,26 @@ pub async fn event_list(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     let id = authorized_repo(&state, &headers, &owner, &name).await?;
-    let rows=state.pool.get().await.map_err(Error::internal)?.query("SELECT to_jsonb(e) FROM outbox_events e WHERE repository_id=$1 ORDER BY storage_generation DESC,operation_sequence DESC,transaction_sequence DESC LIMIT 1000",&[&id]).await.map_err(Error::internal)?;
+    let rows=state.pool.get().await.map_err(Error::internal)?.query("SELECT to_jsonb(e)||jsonb_build_object('operation_outcome',o.outcome,'resolution_id',r.resolution_id,'delivery_effects',(SELECT jsonb_object_agg(consumer,effect) FROM event_deliveries WHERE event_id=e.event_id)) FROM outbox_events e JOIN git_operations o ON o.id=e.operation_id LEFT JOIN operation_resolutions r ON r.operation_id=o.id WHERE e.repository_id=$1 ORDER BY e.storage_generation DESC,e.operation_sequence DESC,e.transaction_sequence DESC LIMIT 1000",&[&id]).await.map_err(Error::internal)?;
+    Ok((
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(
+            rows.iter()
+                .map(|r| r.get::<_, serde_json::Value>(0))
+                .collect::<Vec<_>>(),
+        ),
+    )
+        .into_response())
+}
+
+pub async fn resolutions(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let id = authorized_repo(&state, &headers, &owner, &name).await?;
+    let rows=state.pool.get().await.map_err(Error::internal)?.query("SELECT jsonb_build_object('id',id,'old_generation',old_generation,'new_generation',new_generation,'incident_revision',incident_revision,'inspected_fingerprint',inspected_fingerprint,'reason',reason,'created_at',created_at,'ref_count',jsonb_array_length(snapshot->'refs'),'covered_operations',(SELECT count(*) FROM operation_resolutions covered WHERE covered.resolution_id=recovery_resolutions.id)) FROM recovery_resolutions WHERE repository_id=$1 ORDER BY new_generation DESC LIMIT 100",&[&id]).await.map_err(Error::internal)?;
     Ok((
         StatusCode::OK,
         [(header::CACHE_CONTROL, "no-store")],

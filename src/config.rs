@@ -15,6 +15,7 @@ pub struct Config {
     pub max_repo_bytes: u64,
     pub max_pending_deliveries: i64,
     pub outbox_worker: bool,
+    pub metrics_bind: Option<SocketAddr>,
 }
 
 impl Config {
@@ -40,6 +41,10 @@ impl Config {
             bail!("PostgreSQL TLS is not built in: use a local TLS proxy, not sslmode=require");
         }
         Ok(Self {
+            metrics_bind: env::var("ROOTYARD_METRICS_BIND")
+                .ok()
+                .map(|v| crate::metrics::validate_bind(v.parse()?))
+                .transpose()?,
             database_url,
             data_dir,
             bind: env::var("ROOTYARD_BIND")
