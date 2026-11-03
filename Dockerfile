@@ -1,4 +1,6 @@
 FROM rust:1-trixie AS build
+RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ make pkg-config python3 \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src

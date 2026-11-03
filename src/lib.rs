@@ -7,6 +7,7 @@ pub mod dispatch;
 pub mod events;
 pub mod git_http;
 pub mod journal;
+pub mod kafka_wake;
 pub mod maintenance;
 pub mod metrics;
 pub mod reliability;

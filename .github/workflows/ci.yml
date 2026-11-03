@@ -28,7 +28,12 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
       - name: Install matching PostgreSQL client and test tools
-        run: apt-get update && apt-get install -y --no-install-recommends git python3 postgresql-client-17 redis-server
+        run: apt-get update && apt-get install -y --no-install-recommends git python3 postgresql-client-17 redis-server openjdk-21-jre-headless curl ca-certificates
+      - name: Prepare verified isolated Kafka distribution
+        run: |
+          curl -fsSL --retry 3 https://downloads.apache.org/kafka/4.4.0/kafka_2.13-4.4.0.tgz -o /tmp/rootyard-kafka.tgz
+          echo "f5ceba8a265ab6bb2d68362b1f6859a95e15d60ef92ba83b43fdf065b557dc18e98d6383c15b9977320e25b3a2c8b6f11decb17b0fa6c0f163423793a0eb95cb  /tmp/rootyard-kafka.tgz" | sha512sum -c -
+          tar -xzf /tmp/rootyard-kafka.tgz -C /tmp
       - name: Record tool versions
         run: |
           rustc --version
@@ -38,6 +43,7 @@ jobs:
           psql --version
           pg_dump --version
           redis-server --version
+          java -version
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
@@ -54,6 +60,8 @@ jobs:
           python3 tests/metrics.py --binary target/debug/rootyard --report test-results/metrics.json
       - name: Exercise cross-process delivery
         run: ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server python3 tests/cross_process.py --binary target/debug/rootyard --report test-results/cross-process.json
+      - name: Exercise real Kafka advisory wakes
+        run: ROOTYARD_TEST_KAFKA_HOME=/tmp/kafka_2.13-4.4.0 python3 tests/kafka_wakes.py --binary target/debug/rootyard --report test-results/kafka.json
       - name: Upload end-to-end report
         if: always()
         uses: actions/upload-artifact@v4
@@ -61,3 +69,11 @@ jobs:
           name: e2e-report
           path: test-results/*.json
           if-no-files-found: ignore
+
+  container-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container with native Kafka client
+        run: docker build --tag rootyard:ci .

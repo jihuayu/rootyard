@@ -77,7 +77,15 @@ impl Settings {
                         .unwrap_or_else(|_| "rootyard:outbox:v1".into());
                     Some(Arc::new(RedisWake::new(address, channel)?))
                 }
-                _ => bail!("wake transport must be poll or redis; Kafka is not implemented"),
+                Ok("kafka") => Some(Arc::new(crate::kafka_wake::KafkaWake::new(
+                    std::env::var("ROOTYARD_KAFKA_BOOTSTRAP_SERVERS")
+                        .context("ROOTYARD_KAFKA_BOOTSTRAP_SERVERS is required")?,
+                    std::env::var("ROOTYARD_KAFKA_TOPIC")
+                        .context("ROOTYARD_KAFKA_TOPIC is required")?,
+                    std::env::var("ROOTYARD_KAFKA_GROUP")
+                        .context("ROOTYARD_KAFKA_GROUP is required")?,
+                )?)),
+                _ => bail!("wake transport must be poll, redis or kafka"),
             };
         Ok(Self {
             poll: Duration::from_millis(number("ROOTYARD_WORKER_POLL_MS", 5000, 50, 60_000)?),
