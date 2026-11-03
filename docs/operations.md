@@ -26,27 +26,11 @@ A force-killed Git operation can leave `.lock` files in a **ready** repository. 
 
 Revoking a token blocks subsequent authentication checks; it cannot retract bytes already delivered or necessarily cancel an operation already authenticated.
 
-## Coordinated offline backup procedure
+## Coordinated offline backup and isolated restore
 
-This is an operator procedure, not automated backup infrastructure or an RPO/RTO guarantee. The integration harness exercises a smaller offline paired dump/restore drill for its own schema and Git tree; it does not validate a fresh external database or production disaster recovery.
+The executable phase-two slice is `rootyard backup PATH --offline`, `rootyard backup-verify PATH` and `rootyard restore PATH --isolated --trust-backup`. Read [the full backup/restore contract](backup-restore.md) before using them. Backup refuses a live volume owner, freezes the supported PostgreSQL tables and copies a matched snapshot and full data tree. Restore requires a fresh dedicated database and a nonexistent data directory, verifies hashes and native integrity, preserves unknown evidence, and never starts a service or switches traffic.
 
-1. Block new HTTP requests at the ingress and stop Rootyard. Wait for its Git children to exit. Do not leave another writer or maintenance task accessing the volume.
-2. Also stop administrative metadata changes such as creating users/tokens. The database and Git files must remain unchanged throughout the backup window.
-3. Capture a PostgreSQL custom-format dump using `pg_dump --format=custom` for the Rootyard database. Record PostgreSQL, Git and Rootyard versions and the configuration needed for restoration, excluding plaintext secrets from ordinary manifests.
-4. Snapshot or copy the **entire** durable data directory, preserving ownership, modes, symlinks and all Git files, including hidden files. Do not copy just refs or loose objects. Preserve the database dump and volume snapshot as a single named backup set.
-5. Check the dump is readable and the snapshot is complete. Encrypt/restrict backup access and retain checksums. Only then restart the service and reopen ingress.
-
-Because writes are stopped across both captures, this avoids claiming online atomicity between a database snapshot and changing Git state. Crash consistency of a raw volume snapshot remains a property of the storage implementation.
-
-## Restore drill
-
-1. Restore into an isolated environment with ingress disabled and no running Rootyard process. Use a fresh PostgreSQL database and an empty destination volume.
-2. Restore the matching database dump and whole data-directory snapshot. Restore service ownership and permissions. Never combine unrelated backup generations or mount the same volume into two servers.
-3. Start the matching Rootyard version and allow startup recovery. Inspect failures before making the instance writable. Upgrade only as a separate verified step.
-4. Compare repository IDs, owners, states and expected refs/OIDs to the backup inventory. Run `git fsck --full` against each bare repository while no writes or maintenance occur. Authenticate a standard Git client and clone/fetch representative repositories; compare file content and refs.
-5. Test read-only restrictions, revocation and a controlled write on a disposable restored repository. Only then switch traffic. Record measured data loss and restore duration rather than asserting RPO/RTO targets that have not been tested.
-
-A successful dump or a passing process-restart test alone does not validate disaster recovery, hardware failure behavior or power-loss durability.
+This is not an online or lossless-backup promise. Restore failures leave private partial material and may have an uncertain SQL commit; a persistent target guard blocks startup pending operator review. Do not overwrite targets, mix backup generations or remove the guard to bypass an incident. See [measured verification](backup-verification.md), not a successful dump alone, for the tested recovery boundary.
 
 ## Durable operation recovery (phase two A)
 

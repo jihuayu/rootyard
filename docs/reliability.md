@@ -43,4 +43,4 @@ The ref projection is a rebuildable asynchronous cache and is never used to adve
 
 ## Remaining phase-two gates
 
-Formal backup manifests and isolated new-environment restores with measured RPO/RTO; metrics and durable incident visibility; manual recovery and routing/generation controls; independent process/node workers and message adapters; fault tests covering actual PostgreSQL outage/ambiguous commit replies, every Git commit interruption boundary, disk exhaustion and corruption; production storage fencing and failover. None is implied by loopback tests or this increment.
+[Offline backup manifests and isolated restore drills](backup-restore.md) are now a separate stacked increment; online/PITR backup and production RPO/RTO remain open. Remaining work includes metrics and durable incident visibility; manual recovery and routing/generation controls; independent process/node workers and message adapters; fault tests covering actual PostgreSQL outage/ambiguous commit replies, every Git commit interruption boundary, disk exhaustion and corruption; production storage fencing and failover. None is implied by loopback tests or this increment.

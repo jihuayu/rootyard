@@ -1,6 +1,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 pub mod auth;
+pub mod backup;
 pub mod config;
 pub mod db;
 pub mod events;

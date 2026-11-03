@@ -122,3 +122,5 @@ export ROOTYARD_TEST_DATABASE_URL=postgresql://localhost/rootyard_test
 cargo test --test outbox -- --ignored
 python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
 ```
+
+Offline backup and isolated restore are available as a phase-two increment. See [the backup/restore contract](docs/backup-restore.md) and [verification evidence](docs/backup-verification.md) before using the maintenance commands. This is not online replication or a zero-loss guarantee.

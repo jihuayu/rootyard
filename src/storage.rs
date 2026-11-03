@@ -22,6 +22,7 @@ pub struct Storage {
 
 impl Storage {
     pub fn open(config: &Config) -> Result<Self> {
+        crate::backup::ensure_not_restoring(&config.data_dir)?;
         std::fs::create_dir_all(&config.data_dir)?;
         let root = config.data_dir.canonicalize()?;
         let lock_file = OpenOptions::new()
@@ -34,6 +35,7 @@ impl Storage {
         lock_file
             .try_lock_exclusive()
             .context("data directory already in use; do not start another writer")?;
+        crate::backup::ensure_not_restoring(&root)?;
         let repos = root.join("repos");
         std::fs::create_dir_all(&repos)?;
         if std::fs::symlink_metadata(&repos)?.file_type().is_symlink() {

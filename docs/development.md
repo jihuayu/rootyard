@@ -37,3 +37,7 @@ Do not run benchmark or failure-injection tests against real repositories. Keep 
 ## Durable reliability tests
 
 With `ROOTYARD_TEST_DATABASE_URL` pointing at a disposable PostgreSQL database, run `cargo test --test outbox -- --ignored` and `python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json`. Both own random schemas and clean only their fixtures. CI runs these explicitly; a default cargo test alone does not execute the ignored PostgreSQL test. See [phase-two verification](phase-two-verification.md) for injected boundaries and untested infrastructure assumptions.
+
+## Offline backup and isolated restore tests
+
+`python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json` needs a **synthetic PostgreSQL test administrator** with CREATEDB and permission for catalog-lock fault injection. It creates/drops only run-owned random databases, unlike the schema-only e2e harness. Optionally set `ROOTYARD_RESTORE_TEST_DATABASE_URL` for a separate disposable PostgreSQL server. Never run this against production. See [the contract](backup-restore.md) and [test record](backup-verification.md).

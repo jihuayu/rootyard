@@ -29,10 +29,24 @@ async fn run() -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("Rootyard phase one currently supports Linux only");
     }
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|s| s == "backup-verify") && args.len() == 2 {
+        return rootyard::backup::check(std::path::Path::new(&args[1])).map_err(|_| {
+            anyhow::anyhow!("backup verification failed; incomplete, unsafe or mismatched files")
+        });
+    }
     let config = Config::from_env()?;
     let pool = db::pool(&config.database_url)?;
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str).unwrap_or("serve") {
+        "backup" if args.len() == 3 && args[2] == "--offline" => {
+            rootyard::backup::create(&config, std::path::Path::new(&args[1])).await
+                .map_err(|_| anyhow::anyhow!("backup failed; requires stopped writers, supported dedicated database and safe new destination; partial files may remain"))?;
+        }
+        "restore" if args.len() == 4 && args[2] == "--isolated" && args[3] == "--trust-backup" => {
+            rootyard::backup::restore(&config, std::path::Path::new(&args[1])).await
+                .map_err(|_| anyhow::anyhow!("restore failed; keep target isolated and inspect or discard the fresh targets; database commit may have completed; never retry over existing state"))?;
+        }
         "migrate" if args.len() == 1 => {
             db::migrate(&pool).await?;
             eprintln!("database migrations applied");
@@ -88,6 +102,9 @@ async fn run() -> Result<()> {
                 bail!("Git 2.43 or newer is required");
             }
             db::migrate(&pool).await?;
+            // A restore can install its guard while this server waits for the
+            // migration advisory lock; recheck before any recovery or serving.
+            rootyard::backup::ensure_not_restoring(&storage.root)?;
             let slots = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git));
             let hooks = rootyard::reliability::install_hooks(&storage.root)?;
             let state = Arc::new(AppState {
@@ -133,7 +150,7 @@ async fn run() -> Result<()> {
             worker.abort();
         }
         _ => bail!(
-            "usage: rootyard [serve | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker-once]"
+            "usage: rootyard [serve | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker-once | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup]"
         ),
     }
     Ok(())
