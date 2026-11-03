@@ -1,0 +1,11 @@
+.git
+.github
+target
+data
+.env
+.env.*
+*.log
+reports
+rootyard-test-*
+test-results
+__pycache__

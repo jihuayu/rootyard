@@ -1,0 +1,7 @@
+/target/
+/.env
+/data/
+/test-results*.json
+__pycache__/
+/test-results/
+/.env.*

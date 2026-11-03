@@ -1,0 +1,52 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    container: rust:1-trixie
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_PASSWORD: rootyard-ci-only
+          POSTGRES_DB: rootyard_test
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard:rootyard-ci-only@postgres:5432/rootyard_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust tools
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Install matching PostgreSQL client and test tools
+        run: apt-get update && apt-get install -y --no-install-recommends git python3 postgresql-client-17
+      - name: Record tool versions
+        run: |
+          rustc --version
+          cargo --version
+          git --version
+          python3 --version
+          psql --version
+          pg_dump --version
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked
+      - name: Exercise native Git end to end
+        run: python3 tests/e2e.py --binary target/debug/rootyard --report test-results/e2e.json
+      - name: Upload end-to-end report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report
+          path: test-results/e2e.json
+          if-no-files-found: ignore
