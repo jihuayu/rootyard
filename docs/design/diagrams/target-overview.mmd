@@ -1,0 +1,18 @@
+flowchart TB
+  U[开发者与 Git 客户端] --> GW[Git 协议网关]
+  A[Agent Sandbox] --> V[VFS 与本地缓存]
+  V --> W[Workspace 服务]
+  UI[Web UI 与 API] --> F[Forge Issue PR Review]
+  W --> N[Namespace 与 Git View]
+  W --> E[事件日志与 Checkpoint]
+  GW --> O[对象读取与发布内核]
+  N --> O
+  F --> O
+  O --> DB[(数据库 事务元数据)]
+  O --> OBJ[(对象存储 pack 索引和 LFS)]
+  W --> OBJ
+  O --> REDIS[(Redis 缓存与协调)]
+  W --> REDIS
+  F --> CI[外部 CI]
+  DB --> Q[Outbox 后台任务]
+  Q --> GC[压实 索引 GC]

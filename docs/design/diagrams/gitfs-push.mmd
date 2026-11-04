@@ -1,0 +1,20 @@
+sequenceDiagram
+  participant C as Git 客户端
+  participant S as Rootyard 主服务
+  participant G as 原生 receive-pack
+  participant V as GitFS 与持久 journal
+  participant P as PostgreSQL
+  C->>S: 认证后的 push
+  S->>V: 先持久化操作意图与边界
+  S->>G: 有限资源与期限内运行
+  G->>G: quarantine / 校验 / ref 更新
+  G->>V: 原生 refs 与成功子集 receipt
+  G-->>C: 经服务返回 Git 协议结果
+  S->>V: 扫描与对账证据
+  alt 结果可证实
+    S->>P: 事务写审计、事件与投递
+  else 证据不足
+    S->>P: 显式 unknown / recovering
+  end
+  Note over V,P: 不是 GitFS 与 PG 的分布式原子事务
+  Note over C,V: 丢失响应后先查询 refs 与操作状态

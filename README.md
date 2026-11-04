@@ -104,6 +104,8 @@ Never run `docker compose down -v` unless you intend to destroy the development 
 
 ## Further reading
 
+- [Complete design documents, implementation status and architecture diagrams](docs/design/README.md)
+- [All documentation and verification records](docs/README.md)
 - [Architecture and phase-one decisions](docs/architecture.md)
 - [Operations, recovery and coordinated backup/restore](docs/operations.md)
 - [Development and verification](docs/development.md)

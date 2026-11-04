@@ -1,0 +1,101 @@
+{
+  "source_title": "Rootyard Git 平台技术设计与实施路线",
+  "source_url": "https://chatgpt.com/space/page_81800ca4cf288191872091af9e0c97c3",
+  "source_updated_at": "2026-11-04T01:28:10.845333Z",
+  "source_sequence": 9,
+  "exported_at": "2026-11-04",
+  "implementation_baseline": "1fd05a393fe24653687fa3e868f9dca2fb0c9a67",
+  "source_block_count": 823,
+  "export_policy": "All 823 source Markdown blocks in order; exactly two private ChatGPT conversation URLs replaced with their titles and a privacy note. No other source-body changes.",
+  "source_body_sha256": "eb8fe4af83253cb4881e3afd1e0debdd3f14a525eb12dd984d7f3b47c20394d4",
+  "chapters": [
+    {
+      "file": "01-overview.md",
+      "title": "总体目标与技术架构",
+      "first_block": 1,
+      "last_block": 106,
+      "block_count": 106,
+      "body_sha256": "35c291ecd7a3dd150ad06924e451cecf6433d81e40a33e032f25b9e0bbc8c7a1"
+    },
+    {
+      "file": "02-git-storage.md",
+      "title": "Git 存储事务与协议契约",
+      "first_block": 107,
+      "last_block": 224,
+      "block_count": 118,
+      "body_sha256": "620a282af7b6d06d49eb4a4d9139e6d301118469e454d435ac770c0ce6a33364"
+    },
+    {
+      "file": "03-workspace-vfs.md",
+      "title": "Workspace 与 VFS 契约",
+      "first_block": 225,
+      "last_block": 337,
+      "block_count": 113,
+      "body_sha256": "0620fae6d5de897f1cccc85a5bf10e675563b39eba6b7cdbd07b9021a078727e"
+    },
+    {
+      "file": "04-forge.md",
+      "title": "Forge 与工程任务",
+      "first_block": 338,
+      "last_block": 362,
+      "block_count": 25,
+      "body_sha256": "a971e892594ea3d458e0511ecd2e05acb95dd61bc1e73dcfcb4056281bcb9db3"
+    },
+    {
+      "file": "05-services.md",
+      "title": "版本基线与服务规划",
+      "first_block": 363,
+      "last_block": 545,
+      "block_count": 183,
+      "body_sha256": "41eff4570ed9a38a5e35db992d5fd7bb14dee2a6e20d01e635b35aefda824676"
+    },
+    {
+      "file": "06-message-layer.md",
+      "title": "一期后端与可替换消息层",
+      "first_block": 546,
+      "last_block": 568,
+      "block_count": 23,
+      "body_sha256": "8206f5bc07a9b8a5df1dccc667d59b92d4e161bae790e16adf94b7fddd786334"
+    },
+    {
+      "file": "07-distributed-scaling.md",
+      "title": "分布式与横向扩容",
+      "first_block": 569,
+      "last_block": 721,
+      "block_count": 153,
+      "body_sha256": "00283c75d009cb2adb6fed5f01c762fcec628e8d659e1b3120ba287971cd5443"
+    },
+    {
+      "file": "08-roadmap.md",
+      "title": "分期实施与预研闸门",
+      "first_block": 722,
+      "last_block": 751,
+      "block_count": 30,
+      "body_sha256": "f3ddf5eca5fd44cba22189b500b2d478ecbd3142f2bf3faf8ff387dac07bfabd"
+    },
+    {
+      "file": "09-workspace-git-research.md",
+      "title": "Workspace 与 Git 预研记录",
+      "first_block": 752,
+      "last_block": 765,
+      "block_count": 14,
+      "body_sha256": "68e3a0442fe89629957b466de3e719ff94e5fb8fae139f91e46cc91ca3ed3269"
+    },
+    {
+      "file": "10-distributed-storage-research.md",
+      "title": "分布式存储故障预研记录",
+      "first_block": 766,
+      "last_block": 785,
+      "block_count": 20,
+      "body_sha256": "ba17d44067ba4f7093b71ddda080eb643ab594287a4f88d218f1df264eb82842"
+    },
+    {
+      "file": "11-ci-read-mirrors.md",
+      "title": "CI 只读镜像与 clone 加速",
+      "first_block": 786,
+      "last_block": 823,
+      "block_count": 38,
+      "body_sha256": "eca9f709e85808353afac2ac49a04aa680e1a68907f8f68fd65c93abfe3bbf52"
+    }
+  ]
+}
