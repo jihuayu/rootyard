@@ -820,16 +820,17 @@ mod tests {
         assert!(events(&op).unwrap().is_empty());
     }
     fn batch(count: usize) -> Vec<u8> {
-        (0..count)
-            .map(|i| {
-                format!(
-                    "{} {} refs/heads/branch-{i}\n",
-                    "0".repeat(40),
-                    "a".repeat(40)
-                )
-            })
-            .collect::<String>()
-            .into_bytes()
+        let mut bytes = Vec::new();
+        for i in 0..count {
+            writeln!(
+                bytes,
+                "{} {} refs/heads/branch-{i}",
+                "0".repeat(40),
+                "a".repeat(40)
+            )
+            .unwrap();
+        }
+        bytes
     }
     #[test]
     fn pre_receive_admits_4096_ordered_unique_refs() {

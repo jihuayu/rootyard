@@ -10,6 +10,7 @@ use axum::{
 };
 use deadpool_postgres::Transaction;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::Arc;
 use tokio_postgres::Row;
 use uuid::Uuid;
@@ -134,6 +135,77 @@ fn body_valid(body: &str, required: bool) -> bool {
             .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
 }
 
+// Keys are opaque client operation identifiers, never authentication credentials.
+// A repository-local namespace also prevents a key from silently changing targets.
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<&str>, Error> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(Error::bad_request());
+    }
+    let key = value.to_str().map_err(|_| Error::bad_request())?;
+    if !(1..=128).contains(&key.len())
+        || !key
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(Error::bad_request());
+    }
+    Ok(Some(key))
+}
+
+async fn creation_replay(
+    tx: &Transaction<'_>,
+    actor: Uuid,
+    repo: Uuid,
+    key: &str,
+    request: &Value,
+) -> Result<Option<Value>, Error> {
+    // The unique key serializes competing creators, including across processes.
+    // Its placeholder, resource, allocation and saved response commit together.
+    // If the first creator aborts, an INSERT waiter can become the new creator.
+    let inserted = tx.execute(
+        "INSERT INTO forge_creation_requests (tenant_id,repository_id,idempotency_key,request) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+        &[&actor, &repo, &key, &request],
+    ).await.map_err(Error::internal)?;
+    if inserted == 1 {
+        return Ok(None);
+    }
+    // Separate READ COMMITTED statement observes the winner after the INSERT
+    // conflict wait. Never allocate again if a stored record is incomplete.
+    let row = tx.query_one(
+        "SELECT request,response FROM forge_creation_requests WHERE tenant_id=$1 AND repository_id=$2 AND idempotency_key=$3",
+        &[&actor, &repo, &key],
+    ).await.map_err(Error::internal)?;
+    if row.get::<_, Value>("request") != *request {
+        return Err(Error(StatusCode::CONFLICT, "idempotency key conflict"));
+    }
+    row.get::<_, Option<Value>>("response")
+        .map(Some)
+        .ok_or_else(|| Error::internal("incomplete creation record"))
+}
+
+async fn record_creation(
+    tx: &Transaction<'_>,
+    actor: Uuid,
+    repo: Uuid,
+    key: Option<&str>,
+    response: &Value,
+) -> Result<(), Error> {
+    if let Some(key) = key {
+        let changed = tx.execute(
+            "UPDATE forge_creation_requests SET response=$4 WHERE tenant_id=$1 AND repository_id=$2 AND idempotency_key=$3 AND response IS NULL",
+            &[&actor, &repo, &key, &response],
+        ).await.map_err(Error::internal)?;
+        if changed != 1 {
+            return Err(Error::internal("creation record was not finalized"));
+        }
+    }
+    Ok(())
+}
+
 async fn authorize(
     tx: &Transaction<'_>,
     actor: &db::Identity,
@@ -144,7 +216,7 @@ async fn authorize(
     if owner != actor.username || !db::valid_name(name) {
         return Err(Error::not_found());
     }
-    // Keep lock order token/user -> repository -> counter/issue/comment.
+    // Keep lock order token/user -> repository -> creation key -> counter/issue/comment.
     // Revoke and read_only updates must wait for these transaction-scoped locks.
     tx.query_opt(
         "SELECT t.id FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND u.username=$3 FOR SHARE OF t,u",
@@ -216,13 +288,23 @@ pub async fn create_issue(
     if !title_valid(&input.title) || !body_valid(&input.body, false) {
         return Err(Error::bad_request());
     }
+    let key = idempotency_key(&headers)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+    if let Some(key) = key {
+        let request =
+            serde_json::json!({"operation":"issue", "title":input.title, "body":input.body});
+        if let Some(response) = creation_replay(&tx, actor.id, repo, key, &request).await? {
+            finish(tx, &actor, true).await?;
+            return Ok(json(StatusCode::CREATED, response));
+        }
+    }
     tx.execute("INSERT INTO forge_issue_counters (tenant_id,repository_id) VALUES($1,$2) ON CONFLICT DO NOTHING", &[&actor.id, &repo]).await.map_err(Error::internal)?;
     let number: i64 = tx.query_one("UPDATE forge_issue_counters SET next_number=next_number+1 WHERE tenant_id=$1 AND repository_id=$2 RETURNING next_number-1", &[&actor.id, &repo]).await.map_err(Error::internal)?.get(0);
     let row = tx.query_one(&format!("INSERT INTO forge_issues (tenant_id,repository_id,number,author_id,title,body) VALUES($1,$2,$3,$1,$4,$5) RETURNING {ISSUE_FIELDS}"), &[&actor.id, &repo, &number, &input.title, &input.body]).await.map_err(Error::internal)?;
-    let issue = Issue::row(&row);
+    let issue = serde_json::to_value(Issue::row(&row)).map_err(Error::internal)?;
+    record_creation(&tx, actor.id, repo, key, &issue).await?;
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::CREATED, issue))
 }
@@ -309,12 +391,22 @@ pub async fn create_comment(
     if !body_valid(&input.body, true) {
         return Err(Error::bad_request());
     }
+    let key = idempotency_key(&headers)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+    if let Some(key) = key {
+        let request =
+            serde_json::json!({"operation":"comment", "issue_number":number, "body":input.body});
+        if let Some(response) = creation_replay(&tx, actor.id, repo, key, &request).await? {
+            finish(tx, &actor, true).await?;
+            return Ok(json(StatusCode::CREATED, response));
+        }
+    }
     let comment_number: i64 = tx.query_opt("UPDATE forge_issues SET next_comment_number=next_comment_number+1 WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 RETURNING next_comment_number-1", &[&actor.id,&repo,&number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?.get(0);
     let row = tx.query_one(&format!("INSERT INTO forge_issue_comments (tenant_id,repository_id,issue_number,number,author_id,body) VALUES($1,$2,$3,$4,$1,$5) RETURNING {COMMENT_FIELDS}"), &[&actor.id,&repo,&number,&comment_number,&input.body]).await.map_err(Error::internal)?;
-    let comment = Comment::row(&row);
+    let comment = serde_json::to_value(Comment::row(&row)).map_err(Error::internal)?;
+    record_creation(&tx, actor.id, repo, key, &comment).await?;
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::CREATED, comment))
 }
@@ -390,6 +482,35 @@ pub async fn update_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn idempotency_header_boundaries() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(idempotency_key(&headers).unwrap(), None);
+        for key in ["a".to_owned(), "A9._:-".to_owned(), "x".repeat(128)] {
+            headers.insert("idempotency-key", key.parse().unwrap());
+            assert_eq!(idempotency_key(&headers).unwrap(), Some(key.as_str()));
+        }
+        for key in [
+            "".to_owned(),
+            "x".repeat(129),
+            "two words".to_owned(),
+            "x,y".to_owned(),
+            "x/y".to_owned(),
+        ] {
+            headers.insert("idempotency-key", key.parse().unwrap());
+            assert!(idempotency_key(&headers).is_err());
+        }
+        headers.insert("idempotency-key", "one".parse().unwrap());
+        headers.append("idempotency-key", "one".parse().unwrap());
+        assert!(idempotency_key(&headers).is_err());
+        headers.clear();
+        headers.insert(
+            "idempotency-key",
+            axum::http::HeaderValue::from_bytes(b"nonascii\xff").unwrap(),
+        );
+        assert!(idempotency_key(&headers).is_err());
+    }
+
     #[test]
     fn input_and_pagination_boundaries() {
         assert!(title_valid(&"a".repeat(256)));

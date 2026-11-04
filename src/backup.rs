@@ -20,6 +20,7 @@ use uuid::Uuid;
 const TABLES: &[&str] = &[
     "audit_events",
     "event_deliveries",
+    "forge_creation_requests",
     "forge_issue_comments",
     "forge_issue_counters",
     "forge_issues",
@@ -33,7 +34,7 @@ const TABLES: &[&str] = &[
     "tokens",
     "users",
 ];
-const FORMAT: u32 = 3;
+const FORMAT: u32 = 4;
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_MANIFEST: u64 = 256 * 1024 * 1024;
 
@@ -181,11 +182,11 @@ fn volume_identity(root: &Path) -> Result<Uuid> {
 }
 fn schema_contract_digest() -> Result<String> {
     let expected: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/006_catalog.json"))?;
+        serde_json::from_str(include_str!("../schema/007_catalog.json"))?;
     let restored: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/006_restored_catalog.json"))?;
+        serde_json::from_str(include_str!("../schema/007_restored_catalog.json"))?;
     let upgraded: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/006_upgraded_catalog.json"))?;
+        serde_json::from_str(include_str!("../schema/007_upgraded_catalog.json"))?;
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&[
         expected, restored, upgraded,
     ])?)))
@@ -513,25 +514,36 @@ async fn schema(client: &(impl GenericClient + Sync)) -> Result<Vec<i32>> {
         .iter()
         .map(|r| r.get(0))
         .collect();
-    ensure!(versions == [1, 2, 3, 6], "unsupported migration version");
+    ensure!(versions == [1, 2, 3, 6, 7], "unsupported migration version");
     client.batch_execute("SET search_path=pg_catalog").await?;
     let actual: serde_json::Value = client
-        .query_one(include_str!("../schema/006_catalog.sql"), &[])
+        .query_one(include_str!("../schema/007_catalog.sql"), &[])
         .await?
         .get(0);
     let expected: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/006_catalog.json"))?;
+        serde_json::from_str(include_str!("../schema/007_catalog.json"))?;
     // PostgreSQL reparses BETWEEN-derived CHECKs when restoring a dump. A
-    // restored schema003 upgraded to006 retains its normalized old ref CHECK
+    // restored schema003 upgraded to007 retains its normalized old ref CHECK
     // alongside the two new native Forge CHECKs. Accept only these three entire
     // reviewed shapes, never arbitrary normalization or ignored constraints.
     let restored: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/006_restored_catalog.json"))?;
+        serde_json::from_str(include_str!("../schema/007_restored_catalog.json"))?;
     let upgraded: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/006_upgraded_catalog.json"))?;
+        serde_json::from_str(include_str!("../schema/007_upgraded_catalog.json"))?;
     ensure!(
         actual == expected || actual == restored || actual == upgraded,
-        "schema006 structure or protection differs from reviewed migrations"
+        "schema007 structure or protection differs from reviewed migrations"
+    );
+    let incomplete: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM public.forge_creation_requests WHERE response IS NULL)",
+            &[],
+        )
+        .await?
+        .get(0);
+    ensure!(
+        !incomplete,
+        "incomplete Forge creation request in committed snapshot"
     );
     Ok(versions)
 }
@@ -788,7 +800,7 @@ fn verify(source: &Path) -> Result<Manifest> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
     ensure!(
         manifest.format == FORMAT
-            && manifest.schema_versions == [1, 2, 3, 6]
+            && manifest.schema_versions == [1, 2, 3, 6, 7]
             && manifest.schema_contract_sha256 == schema_contract_digest()?,
         "unsupported backup format"
     );

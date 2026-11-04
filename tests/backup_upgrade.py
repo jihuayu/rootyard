@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real schema003 logical restore -> migrate006 -> nonempty Git/Forge backup.
+"""Real schema003 logical restore -> migrate007 -> nonempty Git/Forge backup.
 
 Requires dedicated synthetic PostgreSQL administrators with CREATEDB. The old
 schema is built from migrations 001/002/003, never from an unavailable historical
@@ -44,22 +44,22 @@ class BackupUpgradeHarness(BackupRecoveryHarness):
         assert self.sql("SELECT owner_id::text || ':' || name FROM repositories WHERE id='" + self.legacy_repo + "'") == self.legacy_user + ':legacy-repo'
         self.cli('migrate')
         self.cli('migrate')
-        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == '1,2,3,6'
-        assert self.sql("SELECT count(*) FROM pg_tables WHERE schemaname='public'") == '14'
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == '1,2,3,6,7'
+        assert self.sql("SELECT count(*) FROM pg_tables WHERE schemaname='public'") == '15'
         assert self.sql("SELECT username FROM users WHERE id='" + self.legacy_user + "'") == 'legacy-owner'
         assert self.sql("SELECT name FROM repositories WHERE id='" + self.legacy_repo + "'") == 'legacy-repo'
         # Record the actual third catalog for review; this test never changes or
         # weakens the fixture contract on behalf of the implementation.
-        catalog_sql = (Path(__file__).resolve().parents[1] / 'schema/006_catalog.sql').read_text()
+        catalog_sql = (Path(__file__).resolve().parents[1] / 'schema/007_catalog.sql').read_text()
         self.upgraded_catalog = json.loads(self.run(['psql', self.db, '-X', '-qAt', '-v', 'ON_ERROR_STOP=1',
                                                     '-c', 'SET search_path=pg_catalog; ' + catalog_sql]).stdout)
         schema_dir = Path(__file__).resolve().parents[1] / 'schema'
-        assert self.upgraded_catalog == json.loads((schema_dir / '006_upgraded_catalog.json').read_text())
-        assert self.upgraded_catalog != json.loads((schema_dir / '006_catalog.json').read_text())
-        assert self.upgraded_catalog != json.loads((schema_dir / '006_restored_catalog.json').read_text())
-        (self.root / 'actual-restored003-upgraded006-catalog.json').write_text(json.dumps(self.upgraded_catalog, indent=2, sort_keys=True) + '\n')
-        return dict(real_schema003_dump_and_restore=True, old_tables=11, upgraded_tables=14,
-                    exact_versions=[1, 2, 3, 6], legacy_identity_and_repository_preserved=True,
+        assert self.upgraded_catalog == json.loads((schema_dir / '007_upgraded_catalog.json').read_text())
+        assert self.upgraded_catalog != json.loads((schema_dir / '007_catalog.json').read_text())
+        assert self.upgraded_catalog != json.loads((schema_dir / '007_restored_catalog.json').read_text())
+        (self.root / 'actual-restored003-upgraded007-catalog.json').write_text(json.dumps(self.upgraded_catalog, indent=2, sort_keys=True) + '\n')
+        return dict(real_schema003_dump_and_restore=True, old_tables=11, upgraded_tables=15,
+                    exact_versions=[1, 2, 3, 6, 7], legacy_identity_and_repository_preserved=True,
                     repeated_migrate=True, historical_binary_required=False,
                     manual_constraint_rewrite=False)
 
@@ -97,21 +97,21 @@ class BackupUpgradeHarness(BackupRecoveryHarness):
     def backup_upgraded_source(self):
         if self.args.expect_schema_rejection:
             result = self.backup_command(check=False)
-            assert result.returncode != 0, 'Pre-fix binary unexpectedly accepted restored003->006 source'
+            assert result.returncode != 0, 'Pre-fix binary unexpectedly accepted restored003->007 source'
             assert b'backup failed; requires stopped writers, supported dedicated database and safe new destination' in result.stderr, self.redact(result.stderr.decode())
             assert not self.backup.exists(), 'Rejected backup unexpectedly published a destination'
             return dict(expected_regression_reproduced=True, known_third_catalog_rejected=True, detailed_internal_error_intentionally_redacted=True,
                         backup_not_published=True)
         result = self.lock_and_snapshot()
         self.source_rows = self.all_rows()
-        assert len(self.source_rows) == 14
+        assert len(self.source_rows) == 15
         assert len(self.source_rows['forge_issues']) == 3
         assert len(self.source_rows['forge_issue_comments']) == 6
         assert self.source_rows['forge_issue_counters'][0]['next_number'] == 4
         manifest = json.loads((self.backup / 'manifest.json').read_text())
-        assert manifest['schema_versions'] == [1, 2, 3, 6]
-        return {**result, 'restored003_upgraded006_catalog_accepted': True,
-                'all_14_tables_backed_up': True, 'populated_forge_backed_up': True}
+        assert manifest['schema_versions'] == [1, 2, 3, 6, 7]
+        return {**result, 'restored003_upgraded007_catalog_accepted': True,
+                'all_15_tables_backed_up': True, 'populated_forge_backed_up': True}
 
     def post_boundary_writes(self):
         result = self.write_after_backup()
@@ -129,8 +129,8 @@ class BackupUpgradeHarness(BackupRecoveryHarness):
         result = json.loads(self.restore_command().stdout)
         self.db = self.target_db
         self.env.update(DATABASE_URL=self.db, ROOTYARD_DATA_DIR=str(self.target))
-        assert self.all_rows() == self.source_rows, 'All 14 restored table contents must exactly equal the backup boundary'
-        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == '1,2,3,6'
+        assert self.all_rows() == self.source_rows, 'All 15 restored table contents must exactly equal the backup boundary'
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == '1,2,3,6,7'
         assert self.sql("SELECT username FROM users WHERE id='" + self.legacy_user + "'") == 'legacy-owner'
         assert self.sql("SELECT owner_id::text || ':' || name FROM repositories WHERE id='" + self.legacy_repo + "'") == self.legacy_user + ':legacy-repo'
         self.start()
@@ -157,7 +157,7 @@ class BackupUpgradeHarness(BackupRecoveryHarness):
         assert changed['version'] == 3
         self.stop()
         return dict(fresh_database_and_volume=True, separate_pg_server=self.admin != self.restore_admin,
-                    full_14_table_rows_exact=True, legacy_identity_and_repository_preserved=True,
+                    full_15_table_rows_exact=True, legacy_identity_and_repository_preserved=True,
                     genuine_authenticated_clone_fsck_content=True, populated_forge_exact=True,
                     owner_read_only_revoked_permissions=True, restored_number_and_cas=True,
                     post_boundary_git_commit_not_recovered=1, post_boundary_forge_changes_not_recovered=2,
@@ -178,9 +178,9 @@ def main():
     h = BackupUpgradeHarness(args)
     success = False
     try:
-        groups = [('schema003_logical_restore_then_migrate006', h.legacy_dump_restore),
+        groups = [('schema003_logical_restore_then_migrate007', h.legacy_dump_restore),
                   ('upgraded_real_git_and_forge_source', h.upgraded_source),
-                  ('backup_restored003_upgraded006_source', h.backup_upgraded_source)]
+                  ('backup_restored003_upgraded007_source', h.backup_upgraded_source)]
         if not args.expect_schema_rejection:
             groups += [('post_backup_acknowledged_writes', h.post_boundary_writes),
                        ('fresh_database_volume_restore_and_clone', h.restore_upgraded_source)]

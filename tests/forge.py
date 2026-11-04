@@ -34,11 +34,11 @@ class ForgeHarness(Harness):
 
     def migration(self):
         self.stop()
-        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6"
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6,7"
         self.cli("migrate")
         self.cli("migrate")
         # Remove only this test's empty Forge slice to reconstruct a real upgrade.
-        self.sql("DROP TABLE forge_issue_comments,forge_issues,forge_issue_counters; DELETE FROM schema_migrations WHERE version=6; CREATE TABLE forge_issue_comments(dummy integer)")
+        self.sql("DROP TABLE forge_creation_requests,forge_issue_comments,forge_issues,forge_issue_counters; DELETE FROM schema_migrations WHERE version IN (6,7); CREATE TABLE forge_issue_comments(dummy integer)")
         failed = self.run([self.args.binary, "migrate"], check=False)
         assert failed.returncode != 0
         assert self.sql("SELECT count(*) FROM schema_migrations WHERE version=6") == "0"
@@ -46,7 +46,18 @@ class ForgeHarness(Harness):
         self.sql("DROP TABLE forge_issue_comments")
         self.cli("migrate")
         self.cli("migrate")
-        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6"
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6,7"
+        # A conflicting migration007 rolls back its version marker without
+        # affecting the already installed Issue/comment schema.
+        self.sql("DROP TABLE forge_creation_requests; DELETE FROM schema_migrations WHERE version=7; CREATE TABLE forge_creation_requests(dummy integer)")
+        failed = self.run([self.args.binary, "migrate"], check=False)
+        assert failed.returncode != 0
+        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version=7") == "0"
+        assert self.sql("SELECT count(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name IN ('forge_issues','forge_issue_counters','forge_issue_comments')") == "3"
+        self.sql("DROP TABLE forge_creation_requests")
+        self.cli("migrate")
+        self.cli("migrate")
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6,7"
         assert self.sql("SELECT count(*) FROM repositories") == "3"
         self.start()
 
@@ -310,7 +321,7 @@ def main():
         report = dict(passed=success, cases=harness.results,
                       binary_sha256=hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                       limitations=["Personal owner-only tenancy, not organization/member ACLs.",
-                                   "POST creation is not idempotent; inspect after an uncertain response before retrying.",
+                                   "POST creation without Idempotency-Key is not idempotent; inspect uncertain outcomes before retrying.",
                                    "No PR, Review, LFS, CI, Web UI, content rendering, deletion or quota enforcement.",
                                    "Restart and SQL faults do not prove power-loss safety or deployment disaster recovery."])
         if args.report:

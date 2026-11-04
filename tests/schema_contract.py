@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check exact schema006 catalogs, including an upgrade from restored schema003.
+"""Check exact schema007 catalogs, including an upgrade from restored schema003.
 
 Only use disposable PostgreSQL with CREATEDB. --write generates fixtures for
 review; it does not establish their correctness or accept production drift.
@@ -26,7 +26,7 @@ def main():
     prefix = 'rootyard_contract_' + uuid.uuid4().hex
     created = []
     binary = str(Path(args.binary).resolve())
-    sql = 'SET search_path=pg_catalog;' + Path('schema/006_catalog.sql').read_text()
+    sql = 'SET search_path=pg_catalog;' + Path('schema/007_catalog.sql').read_text()
 
     def run(command, db=admin):
         env = os.environ.copy()
@@ -60,7 +60,7 @@ def main():
             run([binary, 'migrate'], fresh)
             actual = catalog(fresh)
             restored_db = database('restored')
-            roundtrip(fresh, restored_db, temporary / 'schema006.dump')
+            roundtrip(fresh, restored_db, temporary / 'schema007.dump')
             restored = catalog(restored_db)
 
             # A real schema003 restore normalizes its ref-name CHECK before the
@@ -72,19 +72,29 @@ def main():
             roundtrip(legacy, upgraded_db, temporary / 'schema003.dump')
             run([binary, 'migrate'], upgraded_db)
             upgraded = catalog(upgraded_db)
+            # A restored schema006 upgraded to007 must match the full-restored
+            # shape: migration007 introduces no BETWEEN normalization variance.
+            legacy6 = database('legacy6')
+            for migration in ['001_initial.sql', '002_reliability.sql', '003_recovery_operations.sql', '006_forge_issues.sql']:
+                run(['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-f', str(Path('migrations') / migration)], legacy6)
+            upgraded6 = database('upgrade6')
+            roundtrip(legacy6, upgraded6, temporary / 'schema006.dump')
+            run([binary, 'migrate'], upgraded6)
+            assert catalog(upgraded6) == restored, 'Restored006 upgrade differs from full restore contract'
+
             upgraded_restored_db = database('upgrade_rt')
-            roundtrip(upgraded_db, upgraded_restored_db, temporary / 'upgraded006.dump')
+            roundtrip(upgraded_db, upgraded_restored_db, temporary / 'upgraded007.dump')
             assert catalog(upgraded_restored_db) == restored, 'Upgraded schema did not converge on the full restore contract'
 
-        for filename, value in [('006_catalog.json', actual), ('006_restored_catalog.json', restored),
-                                ('006_upgraded_catalog.json', upgraded)]:
+        for filename, value in [('007_catalog.json', actual), ('007_restored_catalog.json', restored),
+                                ('007_upgraded_catalog.json', upgraded)]:
             path = Path('schema') / filename
             if args.write:
                 path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
             else:
                 assert value == json.loads(path.read_text()), 'Canonical schema fixture differs: ' + filename
-        print(json.dumps(dict(canonical_schema006=True, roundtrip_schema006=True,
-                              restored003_upgrade006=True, upgraded006_roundtrip=True,
+        print(json.dumps(dict(canonical_schema007=True, roundtrip_schema007=True,
+                              restored003_upgrade007=True, restored006_upgrade007=True, upgraded007_roundtrip=True,
                               tables=len(actual['tables']), functions=len(actual['functions']), triggers=len(actual['triggers']))))
     finally:
         for name in reversed(created):

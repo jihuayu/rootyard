@@ -17,7 +17,7 @@ Another authenticated owner receives the same 404 as a nonexistent repository.
 Repositories must be `ready`; provisioning/recovering repositories return 409.
 
 Each request opens a PostgreSQL transaction and acquires locks in the order
-`token/user -> repository -> allocation counter/Issue/comment`. Token and
+`token/user -> repository -> optional creation key -> allocation counter/Issue/comment`. Token and
 repository rows are share-locked until commit. The request rechecks token owner,
 revocation, read-only status and expiry using the database clock after acquiring
 the locks, and again immediately before commit. A token revoked before this
@@ -83,14 +83,56 @@ invalid domain input 400, malformed/unknown JSON input 400/422, oversized JSON
 use Axum's default error format. A server error intentionally does not expose
 SQL or token contents.
 
-POST creation is **not idempotent** across retries. A lost HTTP response can hide
-a committed Issue/comment. Inspect current records before retrying uncertain
-creation; do not assume an error or connection loss means rollback. The supplied
-SQL-failure tests establish rollback only at the deliberately injected boundary.
+### Retrying creation
+
+Both POST routes accept an optional `Idempotency-Key` header. Existing requests
+without it retain non-idempotent behavior: each successful POST allocates a new
+resource. A lost response without a key requires inspecting current records
+before retrying; an error or disconnection alone does not prove rollback.
+
+A key must be exactly one header containing 1–128 ASCII letters, digits, `.`, `_`,
+`:` or `-`. Empty, repeated and comma-combined headers are rejected with 400.
+Use a fresh unpredictable operation identifier, such as a UUID, for each intended
+creation, and persist it before sending the request. A key is not a credential.
+
+The key namespace is the authenticated personal user and repository, shared by
+Issue and comment creation. The same key and same validated request return the
+original 201 JSON, including the original timestamps and version, without a new
+number or row. JSON field order, whitespace and escape spelling do not matter;
+an omitted Issue body equals an empty body. Text is otherwise compared exactly,
+without Unicode normalization. Changing the title/body, operation type or target
+Issue under the same key returns 409. Different users or repositories may use
+the same key independently. Invalid requests are not recorded.
+
+Replay returns the **creation response**, not current content: later edits or
+closure do not replace it. GET the resource to see its current state. Replays
+still require a current write-capable token and a ready repository. Revoked,
+expired or read-only tokens cannot replay, and a Basic username must still match.
+A replacement write token for the same user can retry an earlier key because
+idempotency is scoped to the user, not to one token. Token locks and the final
+expiry check apply to both initial creation and replay.
+
+A unique PostgreSQL key serializes simultaneous attempts. The key record,
+allocation, resource and original response commit in one transaction. A rolled
+back attempt leaves none of them, allowing a waiting retry to create once. A
+committed attempt with a lost response can be retried with the same key. An
+incomplete stored response fails closed with 503 instead of creating a duplicate.
+There is no separate in-memory cache or time-limited reservation to lose on
+process restart. SQL-failure tests prove only their deliberately injected
+boundaries, not all possible database/network failures.
+
+Keys have no automatic expiry and must not be deleted or reused within the same
+database history. Each record is bounded, but this is not a repository storage
+quota or rate limit. Backup and restore include the records; keys committed only
+after the recovery point are lost along with their resources and may create
+again after restore. Idempotency does not bridge disaster-recovery timelines or
+provide external exactly-once effects. Review current restored content before
+resuming uncertain pre-cutover operations.
 
 ## Migration and integration
 
-`006_forge_issues.sql` is recorded as version 6. The existing migrator explicitly
+`006_forge_issues.sql` is recorded as version 6, and
+`007_forge_idempotency.sql` as version 7. The existing migrator explicitly
 checks each supported version, so gaps 4/5 are valid on this branch. It runs
 under the existing advisory lock in the same transaction as all pending schema
 changes. The migration creates:
@@ -98,6 +140,8 @@ changes. The migration creates:
 - `forge_issue_counters` with a composite primary/foreign key.
 - `forge_issues` with scoped numbering, author/state/version/text constraints.
 - `forge_issue_comments` with a composite Issue foreign key.
+- `forge_creation_requests` with a personal-owner/repository-scoped unique key,
+  bounded key/request/response values and the original creation response.
 
 The existing phase-two `repositories_owner_identity` unique index on
 `repositories(id,owner_id)` is reused; no repository constraint is replaced.
@@ -107,11 +151,13 @@ The migration is executed once through `db::migrate`; do not rerun its raw SQL
 manually. Repeated migrator calls are safe and tested. An interrupted/conflicting
 schema migration rolls back all of that migration's changes and version record.
 
-The integrated branch includes format-3 offline backup and isolated restore for
-exactly `[1,2,3,6]`, with all fourteen tables in the snapshot lock list. All three reviewed
-canonical catalog forms include the three Forge tables, composite keys, checks,
+The integrated branch includes format-4 offline backup and isolated restore for
+exactly `[1,2,3,6,7]`, with all fifteen tables in the snapshot lock list. All three reviewed
+canonical catalog forms include all four Forge tables, composite keys, checks,
 indexes and internal-trigger enabled state. The full public dump preserves Issue
-and comment contents, revisions, timestamps and allocation counters. No arbitrary
+and comment contents, revisions, timestamps, allocation counters and creation
+idempotency records. A committed incomplete response is rejected before backup
+and during restore validation. No arbitrary
 schema or migration versions are accepted. Earlier format/schema archives need
 their matching original executable and a separate reviewed upgrade.
 
@@ -133,10 +179,13 @@ removes only its fixtures. This covers migration replay/atomic failure, HTTP
 contracts, privacy, read-only/expired/revoked tokens, forged author input,
 relational isolation, UTF-8/request bounds, pagination, concurrent allocation,
 CAS updates, injected insert rollback, authorization races and process restart.
+Run `tests/forge_idempotency.py` for the optional key contract, concurrent retries,
+transaction rollback, permission races and durable original-response replay.
+See [the idempotency verification record](forge-idempotency-verification.md).
 
 Still absent: organization/shared-repository permissions, PRs/revisions/reviews,
 checks, merge/CAS integration, task/thread/ChangeSet relations, LFS, external CI,
-webhooks, Web UI, Markdown rendering, deletion, quotas and idempotent creation.
+webhooks, Web UI, Markdown rendering, deletion and quotas.
 No throughput, HA, power-loss or production recovery guarantee is made. Adding PRs
 later must bind reviews/checks to immutable revisions and exact base/head OIDs;
 Issue text and comment changes must not become code revision identities.
