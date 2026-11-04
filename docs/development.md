@@ -22,7 +22,7 @@ python3 tests/e2e.py --binary target/debug/rootyard --report test-results/e2e.js
 
 Add `--keep` to retain temporary storage for debugging; treat retained data as private. The JSON report can be retained as a verification artifact; CI uploads it even when a test step fails.
 
-The harness is the executable source of truth for covered cases. Review its output and the exact tested versions before describing compatibility or reliability. GitHub Actions runs formatting, linting, Rust tests and the Python harness inside an official Rust Debian 13 container against a PostgreSQL 17 service (on an Ubuntu runner). The job installs PostgreSQL 17 client tools explicitly; an older `pg_dump` cannot dump a newer server.
+The harness is the executable source of truth for covered cases. Review its output and the exact tested versions before describing compatibility or reliability. GitHub Actions runs formatting, linting, Rust tests and the Python harness inside an official Rust Debian 13 container against a PostgreSQL 17 service (on an Ubuntu runner). The job enables Docker's init reaper, matching Compose, so orphaned Git grandchildren are reaped after timeout cleanup. It installs PostgreSQL 17 client tools explicitly; an older `pg_dump` cannot dump a newer server.
 
 Important acceptance areas include real client clone/commit/push/fetch, file modes and symlinks, ref updates and conflicts, protocol negotiation, atomic pushes, invalid authentication, owner isolation, malformed paths, read-only/revoked tokens, stream limits, interrupted operations, concurrency, restart survival and provisioning recovery. A checklist item is not proof it has been executed: report unsupported or untested cases explicitly.
 

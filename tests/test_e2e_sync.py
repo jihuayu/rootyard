@@ -54,6 +54,25 @@ class GitChildObservationTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "connection ended"):
             self.observe(lambda: {}, response=b"")
 
+    def test_disappearing_proc_entry_is_reaped(self):
+        harness = object.__new__(Harness)
+        with patch("e2e.Path.read_text", side_effect=ProcessLookupError):
+            harness.assert_reaped({123: "100"}, "test upload")
+
+    def test_reused_pid_is_not_reported_as_surviving(self):
+        harness = object.__new__(Harness)
+        stat = "123 (git) " + " ".join(["S", "1", "123"] + ["0"] * 16 + ["101"])
+        with patch("e2e.Path.read_text", return_value=stat):
+            harness.assert_reaped({123: "100"}, "test upload")
+
+    def test_zombie_is_not_reported_as_reaped(self):
+        harness = object.__new__(Harness)
+        stat = "123 (git) " + " ".join(["Z", "1", "123"] + ["0"] * 16 + ["100"])
+        with patch("e2e.Path.read_text", return_value=stat), \
+                patch("e2e.time.monotonic", side_effect=[0, 3]):
+            with self.assertRaisesRegex(AssertionError, "'state': 'Z'"):
+                harness.assert_reaped({123: "100"}, "test upload")
+
 
 if __name__ == "__main__":
     unittest.main()

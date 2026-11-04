@@ -7,7 +7,10 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    container: rust:1-trixie
+    container:
+      image: rust:1-trixie
+      # Match compose.yaml: orphaned Git grandchildren need an init reaper.
+      options: --init
     timeout-minutes: 20
     services:
       postgres:

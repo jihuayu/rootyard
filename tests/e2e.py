@@ -448,7 +448,7 @@ class Harness:
                     queue.append(child)
         return found
 
-    def assert_reaped(self, children):
+    def assert_reaped(self, children, operation):
         until = time.monotonic() + 2
         while True:
             remaining = []
@@ -456,12 +456,13 @@ class Harness:
                 try:
                     stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
                     if stat[19] == starttime:
-                        remaining.append(pid)
-                except FileNotFoundError:
+                        remaining.append({"pid": pid, "state": stat[0], "parent": int(stat[1]),
+                                          "group": int(stat[2]), "starttime": stat[19]})
+                except (FileNotFoundError, ProcessLookupError):
                     pass
             if not remaining:
                 return
-            assert time.monotonic() < until, "Git descendants survived the operation deadline: " + str(remaining)
+            assert time.monotonic() < until, f"Git descendants survived {operation} deadline: {remaining}"
             time.sleep(.05)
 
     def wait_for_git_children(self, sock, sent_at, operation):
@@ -509,7 +510,7 @@ class Harness:
                 sock.sendall(wire("git-upload-pack", body))
                 children = self.wait_for_git_children(sock, sent_at, "blocked streaming")
                 time.sleep(max(0, sent_at + 4 - time.monotonic()))
-                self.assert_reaped(children)
+                self.assert_reaped(children, "blocked streaming")
                 self.expect(path + "/info/refs?service=git-upload-pack", 200, token=self.alice)
             command = self.pkt(("0" * 40 + " " + "f" * 40 + " refs/heads/stalled").encode() + b"\0report-status\n") + b"0000"
             with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
@@ -517,7 +518,7 @@ class Harness:
                 sock.sendall(wire("git-receive-pack", command + b"PACK", 100000))
                 children = self.wait_for_git_children(sock, sent_at, "incomplete upload")
                 time.sleep(max(0, sent_at + 4 - time.monotonic()))
-                self.assert_reaped(children)
+                self.assert_reaped(children, "incomplete upload")
                 self.expect(path + "/info/refs?service=git-upload-pack", 200, token=self.alice)
             self.git("push", "origin", "HEAD:after-stalled", cwd=self.work, token=self.alice)
             assert not self.git("ls-remote", self.remote, "stalled", token=self.alice).stdout
