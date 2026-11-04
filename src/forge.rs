@@ -57,6 +57,38 @@ impl Page {
         Ok((after, limit))
     }
 }
+// Issue filtering has its own extractor so comment lists still reject `state`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuePage {
+    after: Option<i64>,
+    limit: Option<i64>,
+    state: Option<IssueState>,
+}
+impl IssuePage {
+    fn bounds(&self) -> Result<(i64, i64), Error> {
+        Page {
+            after: self.after,
+            limit: self.limit,
+        }
+        .bounds()
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum IssueState {
+    Open,
+    Closed,
+}
+impl IssueState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Issue {
     repository_id: Uuid,
@@ -312,15 +344,16 @@ pub async fn create_issue(
 pub async fn list_issues(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
-    Query(page): Query<Page>,
+    Query(page): Query<IssuePage>,
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let (after, limit) = page.bounds()?;
+    let filter = page.state.as_ref().map(IssueState::as_str);
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo = authorize(&tx, &actor, &owner, &name, false).await?;
-    let rows = tx.query(&format!("SELECT {ISSUE_FIELDS} FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND number>$3 ORDER BY number LIMIT $4"), &[&actor.id, &repo, &after, &(limit+1)]).await.map_err(Error::internal)?;
+    let rows = tx.query(&format!("SELECT {ISSUE_FIELDS} FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND number>$3 AND ($5::text IS NULL OR state=$5) ORDER BY number LIMIT $4"), &[&actor.id, &repo, &after, &(limit+1), &filter]).await.map_err(Error::internal)?;
     let more = rows.len() > limit as usize;
     let items: Vec<_> = rows.iter().take(limit as usize).map(Issue::row).collect();
     let next_after = if more {
@@ -482,6 +515,42 @@ pub async fn update_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn issue_filter_query_contract() {
+        for (query, expected) in [
+            ("", None),
+            ("?state=open", Some("open")),
+            ("?state=closed&after=4&limit=2", Some("closed")),
+        ] {
+            let uri = format!("/issues{query}").parse().unwrap();
+            let Query(page) = Query::<IssuePage>::try_from_uri(&uri).unwrap();
+            assert_eq!(page.state.as_ref().map(IssueState::as_str), expected);
+            assert!(page.bounds().is_ok());
+        }
+        for query in [
+            "?state=",
+            "?state=all",
+            "?state=Open",
+            "?state=open&state=closed",
+            "?state=open&state=open",
+            "?state=open&unknown=1",
+        ] {
+            let uri = format!("/issues{query}").parse().unwrap();
+            assert!(Query::<IssuePage>::try_from_uri(&uri).is_err());
+        }
+        let uri = "/comments?state=open".parse().unwrap();
+        assert!(Query::<Page>::try_from_uri(&uri).is_err());
+        for query in [
+            "?state=open&after=-1",
+            "?state=closed&limit=0",
+            "?state=open&limit=101",
+        ] {
+            let uri = format!("/issues{query}").parse().unwrap();
+            let Query(page) = Query::<IssuePage>::try_from_uri(&uri).unwrap();
+            assert!(page.bounds().is_err());
+        }
+    }
+
     #[test]
     fn idempotency_header_boundaries() {
         let mut headers = HeaderMap::new();

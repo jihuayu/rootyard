@@ -58,6 +58,10 @@ This is required in addition to the Git/reliability/recovery suites; default
 rollback, response-loss and authorization-race coverage. Run it with the same
 isolated database and `--binary`/`--report` arguments.
 
+`tests/forge_state_filter.py` covers optional open/closed Issue filtering, sparse
+keyset pages, state changes between requests and the existing access boundaries.
+Run it with the same isolated database and binary/report arguments.
+
 `tests/backup_forge.py` verifies populated Forge content, counters, versions and permissions across a fresh PostgreSQL/volume restore, including the write barrier and finite recovery point. Use the same synthetic CREATEDB administrators as the other backup suites. See [Forge backup verification](forge-backup-verification.md).
 
 `tests/backup_upgrade.py` exercises actual schema003 logical restore, migrations006/007, populated Git/Forge backup and a fresh final restore. It does not manufacture the upgrade shape by editing CHECK constraints. CI runs the default successful path, never its local-only regression-rejection diagnostic.

@@ -48,7 +48,7 @@ All paths below are relative to `/api/repos/{owner}/{name}`.
 | Method and path | Body/query | Result |
 | --- | --- | --- |
 | POST `/issues` | `{"title":"Example","body":"optional text"}` | 201 Issue |
-| GET `/issues` | `?after=0&limit=50` | 200 paged Issues |
+| GET `/issues` | `?after=0&limit=50&state=open` (`state` optional) | 200 paged Issues |
 | GET `/issues/{number}` | none | 200 Issue |
 | PATCH `/issues/{number}` | `{"expected_version":1,"title":"optional","body":"optional","state":"closed"}` | 200 new Issue version |
 | POST `/issues/{number}/comments` | `{"body":"Comment text"}` | 201 comment |
@@ -60,7 +60,7 @@ All paths below are relative to `/api/repos/{owner}/{name}`.
 mutable field is required for Issue PATCH; omitted/null optional fields are
 unchanged. Version and resource numbers are positive signed 64-bit integers.
 Unknown request fields and duplicate query fields are rejected. No delete,
-state filter, labels, assignees, search or PR linkage is implied.
+labels, assignees, search or PR linkage is implied.
 
 List responses are `{"items":[...],"next_after":7}`. `next_after` is null when no
 further row was observed. Results are ascending immutable local numbers;
@@ -68,6 +68,22 @@ further row was observed. Results are ascending immutable local numbers;
 1–100. Keyset pagination is a live view, not a transaction snapshot spanning
 multiple HTTP requests. New rows can appear on later pages; edits do not reorder
 existing rows. Reusing a number cursor never changes repository authorization.
+
+Issue lists optionally accept `state=open` or `state=closed`. Omitting `state`
+returns both states, preserving the original API. Values are case-sensitive;
+empty, unknown and repeated values return 400. Comment lists do not accept
+`state`. Filtering happens before the page limit, so `next_after` identifies the
+last returned matching Issue only when another matching Issue was observed.
+
+The filter is a live view too. Closing or reopening an Issue ahead of the cursor
+can add or remove it from later pages. A newly matching Issue at or below the
+cursor is not revisited; restart at `after=0` to reconsider earlier numbers.
+Changing filters while retaining a cursor simply keeps its numeric lower bound,
+so restart pagination when switching filters if the full new result is needed.
+Reads, filtering and cursors never grant write access or bypass a recovering
+repository's freeze. The existing tenant/repository/number primary-key index remains available;
+no migration or backup format changes. Sparse state matches can require
+scanning many rows, so this slice makes no large-repository throughput promise.
 
 Titles must be nonblank, at most 256 UTF-8 bytes and have no control characters.
 Issue bodies can be empty; comment bodies must be nonblank. Bodies are at most
@@ -182,6 +198,9 @@ CAS updates, injected insert rollback, authorization races and process restart.
 Run `tests/forge_idempotency.py` for the optional key contract, concurrent retries,
 transaction rollback, permission races and durable original-response replay.
 See [the idempotency verification record](forge-idempotency-verification.md).
+Run `tests/forge_state_filter.py` for filtered pagination, live state changes,
+strict query validation and unchanged authorization boundaries. See
+[the state-filter verification record](forge-state-filter-verification.md).
 
 Still absent: organization/shared-repository permissions, PRs/revisions/reviews,
 checks, merge/CAS integration, task/thread/ChangeSet relations, LFS, external CI,
