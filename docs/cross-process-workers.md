@@ -1,7 +1,8 @@
 # ADR 004: PostgreSQL deliveries with advisory wake transports
 
 Status: implemented for standalone memory hints, polling workers, and Redis
-Pub/Sub hints. Kafka is **not implemented or accepted** in this increment.
+Pub/Sub hints. A later [Kafka adapter increment](kafka-wakes.md) adds an isolated
+Kafka profile under the same advisory contract.
 This is not GitFS multi-writer routing, automatic failover, or storage fencing.
 
 ## Authority and delivery contract
@@ -57,7 +58,7 @@ downgraded.
 | `ROOTYARD_WORKER_POLL_MS` | `5000` | 50–60000; periodic idle rescan interval |
 | `ROOTYARD_WORKER_BATCH` | `64` | 1–1000 claims per consumer per scan |
 | `ROOTYARD_WORKER_LEASE_SECONDS` | `60` | 1–3600; short leases may expire during work and cause retries |
-| `ROOTYARD_WAKE_TRANSPORT` | `poll` | `poll` or `redis`; other values fail startup |
+| `ROOTYARD_WAKE_TRANSPORT` | `poll` | `poll`, `redis` or `kafka`; other values fail startup |
 | `ROOTYARD_REDIS_ADDRESS` | none | Required for Redis, numeric loopback socket address with nonzero port |
 | `ROOTYARD_WAKE_CHANNEL` | `rootyard:outbox:v1` | 1–128 ASCII alphanumeric, colon, underscore or hyphen |
 
@@ -106,11 +107,12 @@ That behavior is intentional for hints; PG polling is mandatory, including when
 Redis is configured. See the [Redis Pub/Sub contract](https://redis.io/docs/latest/develop/pubsub/)
 and [RESP specification](https://redis.io/docs/latest/develop/reference/protocol-spec/).
 
-A future Kafka adapter could implement the same **advisory** interface; it must
+The Kafka adapter implements the same **advisory** interface; it must
 not reinterpret offsets as PG effect acknowledgments, rely on broker ordering
 instead of PG per-ref barriers, or move durable authority into an in-memory queue.
-Kafka client integration, broker restart/rebalance, authentication, and deployment
-are unimplemented and untested. Generic fake-adapter tests do not certify Kafka.
+The separate [Kafka contract and tests](kafka-wakes.md) describe its implemented
+local broker slice and remaining authentication/deployment limits. Generic
+fake-adapter tests do not certify Kafka.
 External side-effect consumers would require their own durable idempotency and
 acknowledgment protocol and are outside this interface.
 
