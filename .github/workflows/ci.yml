@@ -124,6 +124,10 @@ jobs:
         run: python3 tests/forge_state_filter.py --binary target/debug/rootyard --report test-results/forge-state-filter.json
       - name: Exercise local workspace semantics
         run: python3 tests/workspaces.py --binary target/debug/rootyard-workspace-lab --report test-results/workspaces.json
+      - name: Exercise Namespace, Git View and cross-repository ChangeSet semantics
+        run: python3 tests/git_views.py --binary target/debug/rootyard-view-lab --report test-results/git-views.json
+      - name: Validate design archive and documentation navigation
+        run: python3 scripts/check_design_docs.py
       - name: Upload end-to-end report
         if: always()
         uses: actions/upload-artifact@v4

@@ -22,6 +22,7 @@
 - [私有 owner Issue API](forge-issues.md)
 - [CI source pin 与只读镜像](ci-mirror.md)
 - [Workspace 本地实验](workspace-foundation.md)
+- [Namespace、Git View 与跨仓 ChangeSet 实验](git-view-foundation.md)
 - [Pando 存储实验](../experimental/pando/README.md)
 
 ## 已有验证记录
