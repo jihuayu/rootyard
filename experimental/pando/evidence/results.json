@@ -1,0 +1,199 @@
+{
+  "passed": true,
+  "checks": {
+    "roundtrip": {
+      "passed": true,
+      "seconds": 1.425,
+      "detail": {
+        "clone_fetch_protocols": [
+          0,
+          2
+        ],
+        "annotated_tag_and_delete": true
+      }
+    },
+    "acl_checks": {
+      "passed": true,
+      "seconds": 0.186,
+      "detail": {
+        "reader": [
+          403,
+          403
+        ],
+        "": [
+          401,
+          401
+        ],
+        "bob": [
+          403,
+          403
+        ]
+      }
+    },
+    "atomic_checks": {
+      "passed": true,
+      "seconds": 0.788,
+      "detail": {
+        "constraint_rollback": true,
+        "multi_ref_commit": true,
+        "directory_file_conflict": true
+      }
+    },
+    "raw_atomic_native_rejection": {
+      "passed": true,
+      "seconds": 0.642,
+      "detail": {
+        "missing-oid": {
+          "all_refs_rejected": true,
+          "refs_objects_manifests_generations_changes_unchanged": true,
+          "response": "000eunpack ok\n004cng refs/heads/atomic-valid-missing-oid pando-validation-or-CAS-rejected\n003bng refs/heads/atomic-missing missing necessary objects\n0000"
+        },
+        "invalid-ref": {
+          "all_refs_rejected": true,
+          "refs_objects_manifests_generations_changes_unchanged": true,
+          "response": "000eunpack ok\n004cng refs/heads/atomic-valid-invalid-ref pando-validation-or-CAS-rejected\n0041ng refs/heads/invalid..name pando-validation-or-CAS-rejected\n0000"
+        },
+        "outside-refs": {
+          "all_refs_rejected": true,
+          "refs_objects_manifests_generations_changes_unchanged": true,
+          "response": "000eunpack ok\n004dng refs/heads/atomic-valid-outside-refs pando-validation-or-CAS-rejected\n0031ng UNSUPPORTED fail to run proc-receive hook\n0000"
+        }
+      }
+    },
+    "loopback_hostaddr": {
+      "passed": true,
+      "seconds": 0.003,
+      "detail": {
+        "nonloopback_hostaddr_rejected_during_config_load": true,
+        "no_database_operation_requested": true
+      }
+    },
+    "faults": {
+      "passed": true,
+      "seconds": 2.351,
+      "detail": {
+        "before-objects": {
+          "client_failed": true,
+          "authoritative_state_unchanged": true,
+          "retry_succeeded": true
+        },
+        "after-objects": {
+          "client_failed": true,
+          "authoritative_state_unchanged": true,
+          "retry_succeeded": true
+        },
+        "before-commit": {
+          "client_failed": true,
+          "authoritative_state_unchanged": true,
+          "retry_succeeded": true
+        },
+        "after-commit": {
+          "client_failed": true,
+          "server_committed": true,
+          "retry_did_not_republish": true
+        }
+      }
+    },
+    "cas": {
+      "passed": true,
+      "seconds": 0.991,
+      "detail": {
+        "successful_writers": 1,
+        "rejected_writers": 1,
+        "generation_delta": 1,
+        "losing_batch_extra_ref_absent": true
+      }
+    },
+    "storage_fence": {
+      "passed": true,
+      "seconds": 0.781,
+      "detail": {
+        "stale_writer_rejected": true,
+        "refs_objects_changes_unchanged": true
+      }
+    },
+    "commit_acl_revocation": {
+      "passed": true,
+      "seconds": 0.604,
+      "detail": {
+        "write_revoked_after_pack_ready": true,
+        "commit_rejected": true,
+        "refs_objects_manifests_generations_changes_unchanged": true
+      }
+    },
+    "isolation": {
+      "passed": true,
+      "seconds": 1.331,
+      "detail": {
+        "cross_repo_read_denied": true,
+        "foreign_oid_fetch_denied": true,
+        "same_repo_unreachable_oid_denied_from_empty_client": true
+      }
+    },
+    "snapshot": {
+      "passed": true,
+      "seconds": 0.932,
+      "detail": {
+        "stable_advertisement": true,
+        "old_snapshot_pack_received": true,
+        "new_read_advances": true,
+        "principal_bound": true,
+        "repository_bound_even_with_acl": true,
+        "revoked_acl_denied": true
+      }
+    },
+    "cold_restart": {
+      "passed": true,
+      "seconds": 0.428,
+      "detail": {
+        "fresh_process_clone_fsck": true,
+        "deleted_caches": true,
+        "snapshot_survives_restart": true,
+        "expired_snapshot_denied": true
+      }
+    },
+    "thin_pack": {
+      "passed": true,
+      "seconds": 1.02,
+      "detail": {
+        "actual_thin_bytes": 321,
+        "isolated_index_pack_unresolved_delta": true,
+        "existing_base_push_and_clone_fsck": true,
+        "missing_base_push_no_publication": true
+      }
+    },
+    "pack_integrity": {
+      "passed": true,
+      "seconds": 0.421,
+      "detail": {
+        "pack_and_idx_checksums_verified": 14,
+        "corrupt_read_denied": true,
+        "missing_published_pack_denied": true,
+        "restored_clone_fsck": true
+      }
+    }
+  },
+  "limits": [
+    "Synthetic repositories and loopback-only ephemeral PostgreSQL.",
+    "Local immutable packs are not an S3/R2 service or durability certification.",
+    "Fault injection is process-level; no HA, failover, power-loss or committed-object GC certification."
+  ],
+  "versions": {
+    "postgres": "PostgreSQL 17.11 (Debian 17.11-0+deb13u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+    "git": "git version 2.56.0",
+    "settings": [
+      {
+        "name": "fsync",
+        "setting": "on"
+      },
+      {
+        "name": "full_page_writes",
+        "setting": "on"
+      },
+      {
+        "name": "synchronous_commit",
+        "setting": "on"
+      }
+    ]
+  }
+}

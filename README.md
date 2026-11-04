@@ -156,3 +156,7 @@ old branch value. The mirror checks authoritative PostgreSQL permissions for eve
 Git request. See [the read-mirror contract](docs/ci-mirror.md) for configuration,
 retained pins, verification and current limits. This is not automatic replication,
 a CI scheduler, multi-writer support or high availability.
+
+## Workspace foundation experiment
+
+An opt-in `rootyard-workspace-lab` binary tests independent Linux agent directories, fixed base OIDs and local full-copy checkpoints preserving HEAD/index/worktree. It does not change the hosting service or provide FUSE, live capture, remote durability or multi-tenant isolation. Read the [scope, caller-quiescence requirement and recovery limits](docs/workspace-foundation.md) before use.

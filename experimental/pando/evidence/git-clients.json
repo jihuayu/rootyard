@@ -1,0 +1,919 @@
+[
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n * [new branch]      HEAD -> main\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=0",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/clone-v0"
+    ],
+    "cwd": "",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/clone-v0'...\nwarning: redirecting to http://127.0.0.1:38745/snapshots/40c66ea2-7cd8-4ccc-8ea9-0ab85388ba5e/faab3dec-4681-4bd4-9472-fca067846c1f.git/\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/clone-v0",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/clone-v2"
+    ],
+    "cwd": "",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/clone-v2'...\nwarning: redirecting to http://127.0.0.1:38745/snapshots/1bd0a193-7156-4319-ac6f-6fb2b199c71c/faab3dec-4681-4bd4-9472-fca067846c1f.git/\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/clone-v2",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n   5ebc484..af3aa13  HEAD -> main\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=0",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "fetch",
+      "origin"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/clone-v0",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "warning: redirecting to http://127.0.0.1:38745/snapshots/bc4cbe95-3f11-4a1d-98fe-ade5dadbc53f/faab3dec-4681-4bd4-9472-fca067846c1f.git/\nFrom http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f\n   5ebc484..af3aa13  main       -> origin/main\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/clone-v0",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "fetch",
+      "origin"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/clone-v2",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "warning: redirecting to http://127.0.0.1:38745/snapshots/c0b5b523-9627-4203-bb44-d2696754922f/faab3dec-4681-4bd4-9472-fca067846c1f.git/\nFrom http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f\n   5ebc484..af3aa13  main       -> origin/main\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/clone-v2",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "--atomic",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "refs/tags/v1",
+      "HEAD:refs/heads/delete-me"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n * [new tag]         v1 -> v1\n * [new branch]      HEAD -> delete-me\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      ":refs/heads/delete-me"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n - [deleted]         delete-me\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/forbidden"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 128,
+    "stdout": "",
+    "stderr": "fatal: unable to access 'http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git/': The requested URL returned error: 403\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "--atomic",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/good",
+      "HEAD:refs/heads/reject"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 1,
+    "stdout": "",
+    "stderr": "remote: pando lab hook rejected: db error: ERROR: new row for relation \"refs\" violates check constraint \"test_reject\"        \nremote: DETAIL: Failing row contains (faab3dec-4681-4bd4-9472-fca067846c1f, refs/heads/reject, af3aa137af72bd02026098eed5398ce268d60520).        \nTo http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n ! [remote rejected] HEAD -> good (pando-validation-or-CAS-rejected)\n ! [remote rejected] HEAD -> reject (pando-validation-or-CAS-rejected)\nerror: failed to push some refs to 'http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git'\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "--atomic",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/alpha",
+      "HEAD:refs/heads/beta"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n * [new branch]      HEAD -> alpha\n * [new branch]      HEAD -> beta\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "--atomic",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/path",
+      "HEAD:refs/heads/path/child"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 1,
+    "stdout": "",
+    "stderr": "remote: pando lab hook rejected: ref directory/file conflict        \nTo http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n ! [remote rejected] HEAD -> path (pando-validation-or-CAS-rejected)\n ! [remote rejected] HEAD -> path/child (pando-validation-or-CAS-rejected)\nerror: failed to push some refs to 'http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git'\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 1,
+    "stdout": "",
+    "stderr": "remote: error: proc-receive exited abnormally        \nTo http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n ! [remote rejected] HEAD -> main (fail to run proc-receive hook)\nerror: failed to push some refs to 'http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git'\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n   af3aa13..37552a3  HEAD -> main\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 1,
+    "stdout": "",
+    "stderr": "remote: error: proc-receive exited abnormally        \nTo http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n ! [remote rejected] HEAD -> main (fail to run proc-receive hook)\nerror: failed to push some refs to 'http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git'\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n   37552a3..819c371  HEAD -> main\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 1,
+    "stdout": "",
+    "stderr": "remote: error: proc-receive exited abnormally        \nTo http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n ! [remote rejected] HEAD -> main (fail to run proc-receive hook)\nerror: failed to push some refs to 'http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git'\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n   819c371..0e8a79c  HEAD -> main\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 1,
+    "stdout": "",
+    "stderr": "remote: error: proc-receive exited abnormally        \nTo http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n ! [remote rejected] HEAD -> main (fail to run proc-receive hook)\nerror: failed to push some refs to 'http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git'\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Everything up-to-date\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/after-commit-clone"
+    ],
+    "cwd": "",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/after-commit-clone'...\nwarning: redirecting to http://127.0.0.1:38745/snapshots/8fc692ed-64cb-45d4-8d4d-d1cc668853c7/faab3dec-4681-4bd4-9472-fca067846c1f.git/\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/after-commit-clone",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/race-a"
+    ],
+    "cwd": "",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/race-a'...\nwarning: redirecting to http://127.0.0.1:38745/snapshots/7ed83c50-581d-4e56-b939-e74eacc3eb00/faab3dec-4681-4bd4-9472-fca067846c1f.git/\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/race-a",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/race-b"
+    ],
+    "cwd": "",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/race-b'...\nwarning: redirecting to http://127.0.0.1:38745/snapshots/c2117975-cf3b-4e2f-9012-fc2150491cf8/faab3dec-4681-4bd4-9472-fca067846c1f.git/\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/race-b",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "--atomic",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main",
+      "HEAD:refs/heads/race-b"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/race-b",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n   9c158eb..91c65ac  HEAD -> main\n * [new branch]      HEAD -> race-b\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "--atomic",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main",
+      "HEAD:refs/heads/race-a"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/race-a",
+    "rc": 1,
+    "stdout": "",
+    "stderr": "remote: pando lab hook rejected: compare-and-swap conflict        \nTo http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n ! [remote rejected] HEAD -> main (pando-validation-or-CAS-rejected)\n ! [remote rejected] HEAD -> race-a (pando-validation-or-CAS-rejected)\nerror: failed to push some refs to 'http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git'\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/storage-fence"
+    ],
+    "cwd": "",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/storage-fence'...\nwarning: redirecting to http://127.0.0.1:38745/snapshots/5ae4cb96-bd7a-498e-a5f2-5577a43152c7/faab3dec-4681-4bd4-9472-fca067846c1f.git/\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/storage-fence",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/storage-fence",
+    "rc": 1,
+    "stdout": "",
+    "stderr": "remote: pando lab hook rejected: stale storage generation        \nTo http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n ! [remote rejected] HEAD -> main (pando-validation-or-CAS-rejected)\nerror: failed to push some refs to 'http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git'\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/acl-revocation-writer"
+    ],
+    "cwd": "",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/acl-revocation-writer'...\nwarning: redirecting to http://127.0.0.1:38745/snapshots/a344faf4-5512-4a55-8f8c-02d3e7bddbe3/faab3dec-4681-4bd4-9472-fca067846c1f.git/\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/acl-revocation-writer",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/acl-revocation-writer",
+    "rc": 1,
+    "stdout": "",
+    "stderr": "remote: pando lab hook rejected: write access revoked        \nTo http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n ! [remote rejected] HEAD -> main (pando-validation-or-CAS-rejected)\nerror: failed to push some refs to 'http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git'\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: bob",
+      "push",
+      "http://127.0.0.1:38745/repos/8f84f5be-f65d-4e00-a658-3f587c6b2ffc.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/other",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/8f84f5be-f65d-4e00-a658-3f587c6b2ffc.git\n * [new branch]      HEAD -> main\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "fetch",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "3e3f1ecd4d97d478b0d4163760129ca1bc66395d"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 128,
+    "stdout": "",
+    "stderr": "warning: redirecting to http://127.0.0.1:38745/snapshots/70eb45ee-cb69-41da-a0d2-1bb3fb150818/faab3dec-4681-4bd4-9472-fca067846c1f.git/\nfatal: remote error: upload-pack: not our ref 3e3f1ecd4d97d478b0d4163760129ca1bc66395d\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/orphan-writer"
+    ],
+    "cwd": "",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/orphan-writer'...\nwarning: redirecting to http://127.0.0.1:38745/snapshots/26af1243-b309-4d88-8d40-42c3716702f1/faab3dec-4681-4bd4-9472-fca067846c1f.git/\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/orphan-writer",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/orphan-only"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/orphan-writer",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n * [new branch]      HEAD -> orphan-only\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      ":refs/heads/orphan-only"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/orphan-writer",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n - [deleted]         orphan-only\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "fetch",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "d508233fc7d357d644f43c43ae9b6a9856c36050"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/empty-orphan-reader",
+    "rc": 128,
+    "stdout": "",
+    "stderr": "warning: redirecting to http://127.0.0.1:38745/snapshots/95d81a63-b815-468b-af23-11e6c1217e95/faab3dec-4681-4bd4-9472-fca067846c1f.git/\nfatal: remote error: upload-pack: not our ref d508233fc7d357d644f43c43ae9b6a9856c36050\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "fetch",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "warning: redirecting to http://127.0.0.1:38745/snapshots/4ea2e42e-ad43-4fcf-b295-e7e928151c88/faab3dec-4681-4bd4-9472-fca067846c1f.git/\nFrom http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f\n * branch            HEAD       -> FETCH_HEAD\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:38745/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git\n   91c65ac..1373701  HEAD -> main\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:36017/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/cold-restart"
+    ],
+    "cwd": "",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/cold-restart'...\nwarning: redirecting to http://127.0.0.1:36017/snapshots/80659149-71bd-42cd-95d8-e63f385be9d5/faab3dec-4681-4bd4-9472-fca067846c1f.git/\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/cold-restart",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "push",
+      "http://127.0.0.1:36017/repos/ba9adea6-3911-481a-b145-373e2269db15.git",
+      "HEAD:refs/heads/main"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/thin-source",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "To http://127.0.0.1:36017/repos/ba9adea6-3911-481a-b145-373e2269db15.git\n * [new branch]      HEAD -> main\n"
+  },
+  {
+    "argv": [
+      "git",
+      "--git-dir=/tmp/rootyard-pando-lab-c__ldf86/thin-no-bases.git",
+      "index-pack",
+      "--fix-thin",
+      "--stdin"
+    ],
+    "rc": 128,
+    "stdout": "",
+    "stderr": "fatal: pack has 1 unresolved delta\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "clone",
+      "http://127.0.0.1:36017/repos/ba9adea6-3911-481a-b145-373e2269db15.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/thin-roundtrip"
+    ],
+    "cwd": "",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/thin-roundtrip'...\nwarning: redirecting to http://127.0.0.1:36017/snapshots/d50f664d-6af9-42d3-a3fe-66ef341c8181/ba9adea6-3911-481a-b145-373e2269db15.git/\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/thin-roundtrip",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:36017/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/corrupt-read"
+    ],
+    "cwd": "",
+    "rc": 128,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/corrupt-read'...\nfatal: unable to access 'http://127.0.0.1:36017/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git/': The requested URL returned error: 503\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:36017/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/missing-pack"
+    ],
+    "cwd": "",
+    "rc": 128,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/missing-pack'...\nfatal: unable to access 'http://127.0.0.1:36017/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git/': The requested URL returned error: 503\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: reader",
+      "clone",
+      "http://127.0.0.1:36017/repos/faab3dec-4681-4bd4-9472-fca067846c1f.git",
+      "/tmp/rootyard-pando-lab-c__ldf86/restored-packs"
+    ],
+    "cwd": "",
+    "rc": 0,
+    "stdout": "",
+    "stderr": "Cloning into '/tmp/rootyard-pando-lab-c__ldf86/restored-packs'...\nwarning: redirecting to http://127.0.0.1:36017/snapshots/43a83b6c-4ace-4d57-bd33-f7b0d8d6c795/faab3dec-4681-4bd4-9472-fca067846c1f.git/\n"
+  },
+  {
+    "argv": [
+      "git",
+      "-c",
+      "protocol.version=2",
+      "-c",
+      "http.extraHeader=X-Pando-Principal: alice",
+      "fsck",
+      "--full",
+      "--strict"
+    ],
+    "cwd": "/tmp/rootyard-pando-lab-c__ldf86/restored-packs",
+    "rc": 0,
+    "stdout": "",
+    "stderr": ""
+  }
+]

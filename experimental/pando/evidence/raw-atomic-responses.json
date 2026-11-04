@@ -1,0 +1,14 @@
+{
+  "raw-atomic-outside-refs-response.bin": {
+    "sha256": "93517fa54bcbcc08fe1b188d6b2d623ef0f219b725973fcce84291efff0e6aef",
+    "response": "000eunpack ok\n004dng refs/heads/atomic-valid-outside-refs pando-validation-or-CAS-rejected\n0031ng UNSUPPORTED fail to run proc-receive hook\n0000"
+  },
+  "raw-atomic-invalid-ref-response.bin": {
+    "sha256": "70c49ee3fd8313faca0a6176ac8fc1adafc2d369e2bda0d5ed6d9508a3ebcf39",
+    "response": "000eunpack ok\n004cng refs/heads/atomic-valid-invalid-ref pando-validation-or-CAS-rejected\n0041ng refs/heads/invalid..name pando-validation-or-CAS-rejected\n0000"
+  },
+  "raw-atomic-missing-oid-response.bin": {
+    "sha256": "905963856740de7b742f57804d7d484b611a17cbabf75dd16ec451f9befef088",
+    "response": "000eunpack ok\n004cng refs/heads/atomic-valid-missing-oid pando-validation-or-CAS-rejected\n003bng refs/heads/atomic-missing missing necessary objects\n0000"
+  }
+}
