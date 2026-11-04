@@ -61,11 +61,11 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
 
     def assert_catalog(self, filename):
         schema = Path(__file__).resolve().parents[1] / 'schema'
-        query = (schema / '007_catalog.sql').read_text()
+        query = (schema / '008_catalog.sql').read_text()
         catalog = json.loads(self.run(['psql', self.db, '-X', '-qAt', '-v',
                                        'ON_ERROR_STOP=1', '-c',
                                        'SET search_path=pg_catalog; ' + query]).stdout)
-        assert catalog == json.loads((schema / filename).read_text()), 'Schema007 catalog changed'
+        assert catalog == json.loads((schema / filename).read_text()), 'Schema008 catalog changed'
 
     def native_ref(self, name):
         value = self.git('--no-replace-objects', '--git-dir=' + str(self.bare),
@@ -112,9 +112,9 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         self.drain()
         self.source_metadata = self.metadata()
         assert len(self.source_metadata) == 3
-        self.assert_catalog('007_catalog.json')
+        self.assert_catalog('008_catalog.json')
         self.source_rows = self.all_rows()
-        assert len(self.source_rows) == 15
+        assert len(self.source_rows) == 16
         self.pin_operations = [row for row in self.source_rows['git_operations']
                                if row['evidence'].get('kind') == 'observed_immutable_ci_root']
         assert len(self.pin_operations) == 2
@@ -124,13 +124,13 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         self.backup_result = json.loads(self.backup_command().stdout)
         self.cli('backup-verify', str(self.backup))
         manifest = json.loads((self.backup / 'manifest.json').read_text())
-        assert manifest['format'] == 4 and manifest['schema_versions'] == [1, 2, 3, 6, 7]
+        assert manifest['format'] == 5 and manifest['schema_versions'] == [1, 2, 3, 6, 7, 8]
         assert all((self.backup / 'volume' / 'ci-pins' / name).read_bytes() == data
                    for name, data in self.source_metadata.items())
         return dict(root_created_before_source_delete_and_first_mirror=True,
                     unreachable_from_ordinary_refs_survives_gc=True,
                     exact_intent_and_receipt_backed_up=True, receipt_absence_fixture=True,
-                    generic_unknown_preserved=True, full_public_tables=15, backup_format=4)
+                    generic_unknown_preserved=True, full_public_tables=16, backup_format=5)
 
     def corrupt_backups_rejected(self):
         relative = Path('volume/ci-pins') / self.repo['id'] / (self.job + '.pinned.json')
@@ -160,7 +160,7 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         self.mirror_env['DATABASE_URL'] = self.db
         self.bare = self.target / 'repos' / (self.repo['id'] + '.git')
         assert self.all_rows() == self.source_rows
-        self.assert_catalog('007_restored_catalog.json')
+        self.assert_catalog('008_restored_catalog.json')
         assert self.metadata() == self.source_metadata
         assert (self.target / '.volume-id').read_bytes() == self.marker
         for plan in (self.plan, self.pending_plan):
@@ -188,7 +188,7 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         clone = self.clone_at(self.target_oid, 'restored-first-ever-mirror-clone')
         assert (clone / 'ci-only.txt').read_text() == 'retained before any mirror synchronization\n'
         self.prepare(token=self.bob, code=404)
-        return dict(all_15_tables_exact_before_startup=True, volume_metadata_and_roots_exact=True,
+        return dict(all_16_tables_exact_before_startup=True, volume_metadata_and_roots_exact=True,
                     pending_receipt_retry_without_new_operation=True,
                     private_tenant_and_read_only_enforced=True,
                     first_mirror_sync_after_restore_and_source_deletion=True,

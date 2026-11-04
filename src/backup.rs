@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 const TABLES: &[&str] = &[
     "audit_events",
+    "ci_checkout_jobs",
     "event_deliveries",
     "forge_creation_requests",
     "forge_issue_comments",
@@ -34,7 +35,7 @@ const TABLES: &[&str] = &[
     "tokens",
     "users",
 ];
-const FORMAT: u32 = 4;
+const FORMAT: u32 = 5;
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_MANIFEST: u64 = 256 * 1024 * 1024;
 
@@ -180,16 +181,37 @@ fn volume_identity(root: &Path) -> Result<Uuid> {
     file.read_to_string(&mut value)?;
     Ok(value.parse()?)
 }
-fn schema_contract_digest() -> Result<String> {
-    let expected: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/007_catalog.json"))?;
-    let restored: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/007_restored_catalog.json"))?;
-    let upgraded: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/007_upgraded_catalog.json"))?;
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&[
-        expected, restored, upgraded,
-    ])?)))
+fn schema_catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
+    let catalogs = match format {
+        4 => [
+            include_str!("../schema/007_catalog.json"),
+            include_str!("../schema/007_restored_catalog.json"),
+            include_str!("../schema/007_upgraded_catalog.json"),
+        ],
+        5 => [
+            include_str!("../schema/008_catalog.json"),
+            include_str!("../schema/008_restored_catalog.json"),
+            include_str!("../schema/008_upgraded_catalog.json"),
+        ],
+        _ => bail!("unsupported backup format"),
+    };
+    Ok([
+        serde_json::from_str(catalogs[0])?,
+        serde_json::from_str(catalogs[1])?,
+        serde_json::from_str(catalogs[2])?,
+    ])
+}
+fn schema_versions(format: u32) -> Result<Vec<i32>> {
+    match format {
+        4 => Ok(vec![1, 2, 3, 6, 7]),
+        5 => Ok(vec![1, 2, 3, 6, 7, 8]),
+        _ => bail!("unsupported backup format"),
+    }
+}
+fn schema_contract_digest(format: u32) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
+        &schema_catalogs(format)?,
+    )?)))
 }
 fn volume_lock(root: &Path) -> Result<File> {
     let file = OpenOptions::new()
@@ -493,16 +515,21 @@ async fn database_scope(client: &(impl GenericClient + Sync), empty: bool) -> Re
     );
     Ok(())
 }
-async fn schema(client: &(impl GenericClient + Sync)) -> Result<Vec<i32>> {
+async fn schema(client: &(impl GenericClient + Sync), format: u32) -> Result<Vec<i32>> {
     database_scope(client, false).await?;
+    let tables = TABLES
+        .iter()
+        .copied()
+        .filter(|t| format != 4 || *t != "ci_checkout_jobs")
+        .collect::<Vec<_>>();
     let names: Vec<String> = client.query("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S') ORDER BY c.relname", &[]).await?.iter().map(|r| r.get(0)).collect();
     ensure!(
-        names == TABLES,
+        names == tables,
         "backup supports only the exact Rootyard public schema"
     );
     let regular: i64 = client.query_one("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r' AND c.relpersistence='p'", &[]).await?.get(0);
     ensure!(
-        regular == TABLES.len() as i64,
+        regular == tables.len() as i64,
         "only permanent Rootyard tables supported"
     );
     let versions: Vec<i32> = client
@@ -514,25 +541,22 @@ async fn schema(client: &(impl GenericClient + Sync)) -> Result<Vec<i32>> {
         .iter()
         .map(|r| r.get(0))
         .collect();
-    ensure!(versions == [1, 2, 3, 6, 7], "unsupported migration version");
+    ensure!(
+        versions == schema_versions(format)?,
+        "unsupported migration version"
+    );
     client.batch_execute("SET search_path=pg_catalog").await?;
+    // Both versions use this catalog projection. Version-specific immutable
+    // fixtures below, not the query text, define the accepted schema shapes.
     let actual: serde_json::Value = client
-        .query_one(include_str!("../schema/007_catalog.sql"), &[])
+        .query_one(include_str!("../schema/008_catalog.sql"), &[])
         .await?
         .get(0);
-    let expected: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/007_catalog.json"))?;
-    // PostgreSQL reparses BETWEEN-derived CHECKs when restoring a dump. A
-    // restored schema003 upgraded to007 retains its normalized old ref CHECK
-    // alongside the two new native Forge CHECKs. Accept only these three entire
-    // reviewed shapes, never arbitrary normalization or ignored constraints.
-    let restored: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/007_restored_catalog.json"))?;
-    let upgraded: serde_json::Value =
-        serde_json::from_str(include_str!("../schema/007_upgraded_catalog.json"))?;
+    // Only complete reviewed catalog shapes are accepted. In particular a
+    // legacy format4 archive must restore schema007, never a schema008 hybrid.
     ensure!(
-        actual == expected || actual == restored || actual == upgraded,
-        "schema007 structure or protection differs from reviewed migrations"
+        schema_catalogs(format)?.contains(&actual),
+        "schema structure or protection differs from reviewed migrations"
     );
     let incomplete: bool = client
         .query_one(
@@ -653,7 +677,7 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     tx.batch_execute(&format!("LOCK TABLE {list} IN SHARE MODE"))
         .await?;
     // No snapshot-taking SELECT occurs before all DML/DDL table locks are held.
-    let versions = schema(&tx).await?;
+    let versions = schema(&tx, FORMAT).await?;
     let snapshot: String = tx
         .query_one("SELECT pg_export_snapshot()", &[])
         .await?
@@ -728,7 +752,7 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         format: FORMAT,
         backup_id: id,
         volume_id,
-        schema_contract_sha256: schema_contract_digest()?,
+        schema_contract_sha256: schema_contract_digest(FORMAT)?,
         boundary_unix_seconds: boundary,
         rootyard_version: env!("CARGO_PKG_VERSION").into(),
         binary_sha256: hash(&std::env::current_exe()?)?,
@@ -799,9 +823,9 @@ fn verify(source: &Path) -> Result<Manifest> {
     );
     let manifest: Manifest = serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
     ensure!(
-        manifest.format == FORMAT
-            && manifest.schema_versions == [1, 2, 3, 6, 7]
-            && manifest.schema_contract_sha256 == schema_contract_digest()?,
+        matches!(manifest.format, 4 | 5)
+            && manifest.schema_versions == schema_versions(manifest.format)?
+            && manifest.schema_contract_sha256 == schema_contract_digest(manifest.format)?,
         "unsupported backup format"
     );
     ensure!(
@@ -863,14 +887,19 @@ pub fn check(source: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn restore(config: &Config, source: &Path) -> Result<()> {
+pub async fn restore(config: &Config, source: &Path, allow_legacy_schema007: bool) -> Result<()> {
     let started = Instant::now();
     let source = absolute(source, true)?;
     let target = absolute(&config.data_dir, false)?;
     disjoint(&source, &target)?;
     let manifest = verify(&source)?;
     ensure!(
-        manifest.binary_sha256 == hash(&std::env::current_exe()?)?,
+        !allow_legacy_schema007 || manifest.format == 4,
+        "legacy opt-in requires format4/schema007"
+    );
+    ensure!(
+        (allow_legacy_schema007 && manifest.format == 4)
+            || manifest.binary_sha256 == hash(&std::env::current_exe()?)?,
         "restore requires the exact backup binary; upgrade separately"
     );
     let client = pg(config).await?;
@@ -932,7 +961,7 @@ pub async fn restore(config: &Config, source: &Path) -> Result<()> {
         .arg(source.join("metadata.dump"));
     checked(&mut restore).await?;
     ensure!(
-        schema(&client).await? == manifest.schema_versions,
+        schema(&client, manifest.format).await? == manifest.schema_versions,
         "restored schema mismatch"
     );
     let restored_foreign_volumes: i64 = client
@@ -957,6 +986,17 @@ pub async fn restore(config: &Config, source: &Path) -> Result<()> {
         metadata_repos == manifest.repositories,
         "restored metadata mismatch"
     );
+    // A backup can predate cancellation. Never resurrect any previously issued
+    // checkout bearer after restoring old authority; plan and native pins remain
+    // evidence, not permission to mint a credential for the same job again.
+    if manifest.format == 5 {
+        client.execute("UPDATE public.ci_checkout_jobs SET revoked=true WHERE plan IS NOT NULL AND NOT revoked", &[]).await?;
+        let unsafe_grants: bool = client.query_one("SELECT EXISTS (SELECT 1 FROM public.ci_checkout_jobs WHERE plan IS NOT NULL AND NOT revoked)", &[]).await?.get(0);
+        ensure!(
+            !unsafe_grants,
+            "restored checkout credentials were not invalidated"
+        );
+    }
     ensure!(!target.exists(), "destination appeared during restore");
     publish(&staging, &target)?;
     File::open(target.parent().unwrap())?.sync_all()?;

@@ -78,8 +78,12 @@ async fn run() -> Result<()> {
             rootyard::backup::create(&config, std::path::Path::new(&args[1])).await
                 .map_err(|_| anyhow::anyhow!("backup failed; requires stopped writers, supported dedicated database and safe new destination; partial files may remain"))?;
         }
-        "restore" if args.len() == 4 && args[2] == "--isolated" && args[3] == "--trust-backup" => {
-            rootyard::backup::restore(&config, std::path::Path::new(&args[1])).await
+        "restore"
+            if (args.len() == 4 || (args.len() == 5 && args[4] == "--allow-legacy-schema007"))
+                && args[2] == "--isolated"
+                && args[3] == "--trust-backup" =>
+        {
+            rootyard::backup::restore(&config, std::path::Path::new(&args[1]), args.len() == 5).await
                 .map_err(|_| anyhow::anyhow!("restore failed; keep target isolated and inspect or discard the fresh targets; database commit may have completed; never retry over existing state"))?;
         }
         "migrate" if args.len() == 1 => {
@@ -272,7 +276,7 @@ async fn run() -> Result<()> {
             }
         }
         _ => bail!(
-            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup]"
+            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007]]"
         ),
     }
     Ok(())

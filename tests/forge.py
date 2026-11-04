@@ -34,7 +34,7 @@ class ForgeHarness(Harness):
 
     def migration(self):
         self.stop()
-        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6,7"
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6,7,8"
         self.cli("migrate")
         self.cli("migrate")
         # Remove only this test's empty Forge slice to reconstruct a real upgrade.
@@ -46,7 +46,7 @@ class ForgeHarness(Harness):
         self.sql("DROP TABLE forge_issue_comments")
         self.cli("migrate")
         self.cli("migrate")
-        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6,7"
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6,7,8"
         # A conflicting migration007 rolls back its version marker without
         # affecting the already installed Issue/comment schema.
         self.sql("DROP TABLE forge_creation_requests; DELETE FROM schema_migrations WHERE version=7; CREATE TABLE forge_creation_requests(dummy integer)")
@@ -57,7 +57,7 @@ class ForgeHarness(Harness):
         self.sql("DROP TABLE forge_creation_requests")
         self.cli("migrate")
         self.cli("migrate")
-        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6,7"
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6,7,8"
         assert self.sql("SELECT count(*) FROM repositories") == "3"
         self.start()
 

@@ -26,6 +26,13 @@ pub async fn authenticate(pool: &Pool, headers: &HeaderMap) -> Result<Identity, 
 }
 
 fn credentials(headers: &HeaderMap) -> Result<(Option<String>, String), Error> {
+    credentials_for(headers, "ryt_")
+}
+
+pub(crate) fn credentials_for(
+    headers: &HeaderMap,
+    prefix: &str,
+) -> Result<(Option<String>, String), Error> {
     if headers.get_all(header::AUTHORIZATION).iter().count() != 1 {
         return Err(Error::unauthorized());
     }
@@ -50,7 +57,7 @@ fn credentials(headers: &HeaderMap) -> Result<(Option<String>, String), Error> {
         return Err(Error::unauthorized());
     };
     if token.len() != 68
-        || !token.starts_with("ryt_")
+        || !token.starts_with(prefix)
         || !token[4..].bytes().all(|b| b.is_ascii_hexdigit())
     {
         return Err(Error::unauthorized());

@@ -11,7 +11,7 @@ jobs:
       image: rust:1-trixie
       # Match compose.yaml: orphaned Git grandchildren need an init reaper.
       options: --init
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17
@@ -55,7 +55,7 @@ jobs:
       - name: Verify durable PostgreSQL workers
         run: cargo test --locked --test outbox --test resolution_fences -- --ignored
       - run: cargo build --locked
-      - name: Verify schema-007 catalog and dump round trip
+      - name: Verify schema-008 catalog and dump round trip
         run: python3 tests/schema_contract.py --binary target/debug/rootyard
       - name: Verify end-to-end harness synchronization
         run: python3 -m unittest discover -s tests -p 'test_e2e_sync.py'
@@ -65,6 +65,19 @@ jobs:
         run: python3 tests/ci_mirror.py --binary target/debug/rootyard --report test-results/ci-mirror.json
       - name: Exercise exact-target source retention and mirror preparation
         run: python3 tests/ci_source_pins.py --binary target/debug/rootyard --report test-results/ci-source-pins.json
+      - name: Exercise isolated job checkout authorization and object closure
+        run: python3 tests/ci_job_checkouts.py --binary target/debug/rootyard --report test-results/ci-job-checkouts.json
+      - name: Build frozen schema007 binary for genuine legacy restore
+        run: |
+          legacy=08b10e9976c012343c48e4fd6a5981e0266b8c53
+          git fetch --no-tags origin "$legacy"
+          test "$(git rev-parse FETCH_HEAD)" = "$legacy"
+          mkdir -p target/legacy-source
+          git archive "$legacy" | tar -x -C target/legacy-source
+          CARGO_TARGET_DIR="$PWD/target/legacy-build" cargo build --locked --manifest-path target/legacy-source/Cargo.toml --bin rootyard
+          cp target/legacy-build/debug/rootyard target/rootyard-schema007
+      - name: Exercise checkout backup revocation and genuine schema007 restore
+        run: python3 tests/backup_ci_checkouts.py --binary target/debug/rootyard --legacy-binary target/rootyard-schema007 --report test-results/backup-ci-checkouts.json
       - name: Exercise source-pin paired backup and restore
         run: python3 tests/backup_ci_pins.py --binary target/debug/rootyard --report test-results/backup-ci-pins.json
       - name: Exercise durable push recovery

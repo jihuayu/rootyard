@@ -21,7 +21,7 @@ from restored_workers import RestoredWorkers
 
 FORGE_TABLES = ('forge_creation_requests', 'forge_issue_counters', 'forge_issues', 'forge_issue_comments')
 EXPECTED_TABLES = {
-    'schema_migrations', 'users', 'tokens', 'repositories', 'git_operations',
+    'ci_checkout_jobs', 'schema_migrations', 'users', 'tokens', 'repositories', 'git_operations',
     'outbox_events', 'event_deliveries', 'audit_events', 'repository_ref_projection',
     'recovery_resolutions', 'operation_resolutions', *FORGE_TABLES,
 }
@@ -94,13 +94,13 @@ class BackupForgeHarness(RestoredWorkers):
     def populated_source(self):
         result = super().pending_source()
         assert set(self.source_rows) == EXPECTED_TABLES
-        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == '1,2,3,6,7'
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == '1,2,3,6,7,8'
         assert len(self.source_rows['forge_issues']) == 9
         assert len(self.source_rows['forge_issue_comments']) == 27
         assert len(self.source_rows['forge_issue_counters']) == 3
         assert len(self.source_rows['forge_creation_requests']) == 36
         self.initial_git_authority = self.git_authority()
-        return {**result, 'full_public_table_count': 15, 'forge_issues': 9,
+        return {**result, 'full_public_table_count': 16, 'forge_issues': 9,
                 'forge_comments': 27, 'personal_owners': 2, 'unicode_revisions_and_states': True,
                 'forge_did_not_mutate_git_or_outbox': True}
 
@@ -173,10 +173,10 @@ class BackupForgeHarness(RestoredWorkers):
         assert self.comment_counters[(repo, number)] == 2
         assert self.git_authority() == self.initial_git_authority
         manifest = json.loads((self.backup / 'manifest.json').read_text())
-        assert manifest['schema_versions'] == [1, 2, 3, 6, 7]
-        assert manifest['format'] == 4
+        assert manifest['schema_versions'] == [1, 2, 3, 6, 7, 8]
+        assert manifest['format'] == 5
         return dict(forge_tables_uncommitted_writer=True, backup_waited_on_share_barrier=True,
-                    pre_boundary_commit_included=True, full_public_table_count=15,
+                    pre_boundary_commit_included=True, full_public_table_count=16,
                     issue_rows=10, comment_rows=28, issue_counter_after_commit=number + 1,
                     git_authority_unchanged=True)
 
@@ -210,7 +210,7 @@ class BackupForgeHarness(RestoredWorkers):
         assert self.forge_rows() == self.backed_up_forge
         assert self.sql("SELECT count(*) FROM forge_issues WHERE title='after backup issue'") == '0'
         assert self.sql("SELECT count(*) FROM forge_issue_comments WHERE body IN ('after backup comment','unbacked comment edit')") == '0'
-        return {**result, 'full_public_table_count': 15, 'all_forge_rows_and_counters_exact': True,
+        return {**result, 'full_public_table_count': 16, 'all_forge_rows_and_counters_exact': True,
                 'post_boundary_creations_and_edits_not_recovered': 4,
                 'snapshot_counters_restored_not_global_monotonic_after_data_loss': True}
 
@@ -324,7 +324,7 @@ def main():
                          ('incomplete_creation_key_rejected', h.incomplete_key_rejected),
                          ('forge_commit_before_backup_barrier', h.commit_barrier),
                          ('acknowledged_forge_after_backup_boundary', h.post_boundary),
-                         ('fresh_pg_volume_exact_15_table_restore', h.restore_forge_exact),
+                         ('fresh_pg_volume_exact_16_table_restore', h.restore_forge_exact),
                          ('restored_forge_content_and_permissions', h.restored_forge_access),
                          ('restored_forge_numbering_cas_and_git_isolation', h.restored_forge_mutations),
                          ('restored_independent_workers_preserve_forge', h.workers_preserve_forge),

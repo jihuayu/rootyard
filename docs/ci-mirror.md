@@ -27,7 +27,7 @@ reuse a directory. The primary and mirror can run concurrently with separate
 volume locks. The mirror does not run migrations, reconcile primary repository
 storage, provision repositories, or run primary background workers. It does not
 install write hooks or require an executable data volume. Use a PostgreSQL role
-restricted to reading users, tokens and repository metadata where practical; the
+restricted to reading users, tokens, repositories and ci_checkout_jobs where practical; the
 mirror still depends on the primary database for current authorization.
 
 The configured primary URL is fixed by the operator, not supplied in sync
@@ -54,7 +54,7 @@ HTTP 200 is a verified durable source-retention receipt. Its fields are
 `object_format: "sha1"`, `target_oid`,
 `retention_ref: "refs/rootyard-ci/jobs/<job UUID>"`, and `state: "pinned"`.
 The writable owner is the controller authority in this release; there is no
-separate controller role or job-scoped token. Read-only tokens cannot create
+separate controller role. Job-scoped runner credentials are described below; ordinary read-only tokens cannot create
 source roots. Unknown, revoked, expired, or other-owner tokens fail closed.
 
 The same job UUID is immutable within its repository, including across storage
@@ -90,7 +90,7 @@ these two explicit steps. A source root can be pinned while a mirror is still
 unready. An old generation cannot become ready merely because its objects remain
 on disk. `storage_generation` is a storage/recovery fence, not `source_epoch`, a
 publication watermark, authorization policy version, or cross-repository version.
-Those richer checkout-plan fields, job cancellation and scheduling are not
+Those source-publication watermark fields and scheduling are not
 implemented. There is no inferred expiry or automatic release.
 
 ## Primary retention, recovery and backup
@@ -131,9 +131,11 @@ these roots, accurately labeled `recovery_snapshot`.
 Metadata lives on the primary volume because retaining a native Git ref is a
 GitFS operation. Existing **paired offline backups** include intent/receipt files,
 journals and native roots in the checksummed full-volume inventory together with
-PostgreSQL audit/recovery state. Schema 007 and backup format 4 remain unchanged.
+PostgreSQL audit/recovery state. Checkout authorization adds schema 008 and backup
+format 5; exact schema 007 / format 4 restore remains an explicit compatibility path.
 Do not restore only the database or only these files. Restoring does not change
-job generation identity; existing recovery fences still apply. Do not downgrade
+source-pin generation identity; existing recovery fences still apply. Every restored
+issued job credential is permanently revoked before restore completion. Do not downgrade
 to an older binary that lacks the namespace guard or typed journal decoder while
 these roots exist. The mirror volume remains separate and is not a primary backup.
 
@@ -169,8 +171,8 @@ https://mirror.example/ci/{commit_oid}/git/{owner}/{name}.git
 
 Only trusted controller/mirror validation jobs may use the current owner read
 token through a protected secret mechanism. These credentials are owner-wide;
-delivery to untrusted CI runners is **unsupported** until separately scoped
-credentials exist. A read-only token still reads every repository of that owner.
+never deliver them to untrusted runners. Use the separately issued job credential
+below instead. An ordinary read-only token still reads every repository of that owner.
 Do not put tokens in the URL. Standard Git clone and fetch use this URL without a
 custom client protocol. The mirror advertises only `refs/heads/main`, with `HEAD`
 pointing to that branch and both resolving to the requested commit. This is a
@@ -268,3 +270,109 @@ Pin metadata checks catch selected corruption and path/HEAD changes; they are no
 a complete defense against a hostile process that can rewrite the service's data
 volume. Do not grant other users write access to this volume. Snapshot publication
 uses fsync and rename, but power-loss behavior still requires storage-specific tests.
+
+## Bounded job checkout credentials
+
+Configure the same operator-selected UUID `ROOTYARD_CI_MIRROR_AUDIENCE` on the
+primary and the one intended mirror. A missing audience disables job issuance
+and job reads. It is not derived from a request Host header or caller-selected
+URL. Manual owner-authorized sync remains separate and must happen before reads;
+job credentials cannot sync, prepare or ask the primary for objects.
+
+After creating a durable source pin, the writable owner/controller requests:
+
+```http
+POST /api/repos/{owner}/{name}/ci-checkouts
+Authorization: Bearer <controller-owner-token>
+Content-Type: application/json
+
+{"job_id":"<same source-pin UUID>","target_oid":"<full lowercase SHA-1>","storage_generation":1,"mirror_audience":"<configured UUID>","expires_unix":<absolute Unix seconds>}
+```
+
+Expiry must be in the next hour according to the authoritative database clock.
+The primary holds its repository writer lock while verifying the exact durable
+intent, pinned receipt and native retention ref and until grant commit. It locks
+and freshly checks issuer, owner and ready repository authority before committing.
+A database row never fabricates a source retention receipt. A crash between pinning
+and issuance may leave retained but unusable bytes.
+
+The first successful response contains `plan` and a random `ryj_` credential in
+`token`. The immutable version-1 plan binds owner/repository/job UUIDs, storage
+generation, SHA-1 object format, full target OID, SHA-256 of the exact source
+receipt bytes, configured mirror audience and absolute expiry. Storage generation
+is not a source publication epoch or version. Only the credential digest and
+authorization metadata are persisted. Responses are `Cache-Control: no-store`.
+
+**Credential delivery is one-time.** An exact retry returns the same plan and
+`credential_issued: true`, but no token; it never rotates or extends authorization.
+A lost response or lost token requires a new explicit job UUID and source pin.
+Changing an existing plan, cancelling it or revoking its credential prevents
+issuance for that job forever. Do not use a new ID to circumvent cancellation.
+
+The runner supplies the job token through an HTTP Authorization secret injection
+mechanism to the exact mirror URL above. Bearer and Basic (matching owner username)
+are accepted. Never put it in URLs, remote configuration, logs or committed files.
+Job tokens authorize only upload-pack discovery/RPC for that repository, target
+and configured mirror. They cannot use primary Git, primary APIs, mirror sync or
+prepare, other repositories/targets, receive-pack or static object/pack URLs.
+
+Each request freshly checks the database grant, expiry, cancellation, credential
+revocation, issuer token revocation/read-only status/expiry, owner and repository
+ready state/storage generation. The check is repeated after potentially slow
+object preparation immediately before Git starts. Database failure denies the
+request; no stale authorization cache is used. Revocation affects new admissions,
+not a stream already admitted before the change. No running-stream interruption
+or zero-duration race-free revocation guarantee is claimed.
+
+The controller can POST to `.../ci-checkouts/{job_id}/cancel` or `/revoke`.
+Cancellation creates a permanent tombstone even before issuance, serializing
+cancel/first-issue races. Revoke applies only to an issued grant. Both transitions
+are monotonic and cannot reset metadata, expiry or terminal state. There is no
+renewal, cancellation cleanup or credential cleanup API in this slice.
+
+The 1,024 native source-pin admission bound does not cap SQL cancellation
+tombstones created before issuance. Only trusted writable controllers can create
+these records, but they are permanent and unbounded. This slice does not claim
+production resource controls for that SQL growth.
+
+### Target closure, not hidden references
+
+An owner-token legacy pin uses alternates into a full snapshot and is **not** a
+privacy boundary. A job token never serves that view. It gets a separate
+`job-views/{storage_generation}-{target_oid}.git` containing only the target
+commit, all its ancestors, their trees and blobs. This grants full reachable
+history, not path-level secrecy; gitlinks do not authorize submodule repositories
+and LFS content is not included or automatically authorized.
+
+Preparation writes a fresh non-thin pack without delta/object reuse, checks its
+actual object set against the source target's full reachability set, verifies
+native `fsck --full --strict`, then fsyncs and atomically publishes. No alternates,
+external delta bases, unrelated objects, extra refs, replacement refs, grafts,
+shallow/promisor metadata, hooks or arbitrary configuration are allowed. Reuse
+revalidates the strict on-disk grammar, exact target identity, native integrity
+and physical-object-set equality. Git replacement semantics are disabled.
+
+This intentionally conservative materialization duplicates objects and checks
+them on each request. Object enumeration is capped at 64 MiB per command and
+fails closed beyond that bound. Existing Git process, CPU, memory, file-size and
+repository limits apply. The trusted operator controls the mirror filesystem;
+a hostile same-UID process able to race file mutations is outside this boundary.
+No scheduler, automatic fallback/sync, GC, shallow/partial clone promise, or
+production scale claim is added. Validate deployment-specific capacity separately.
+
+`tests/ci_job_checkouts.py` exercises native protocol v0/v2, exact target clones,
+known unrelated commit/blob wants, physical closure equality, endpoint scoping,
+terminal races, live authority changes, corrupted views and slow-preparation
+revocation/database failure. `tests/backup_ci_checkouts.py` covers restored grant
+invalidation and a genuine historical format-4 archive, including explicit
+`--allow-legacy-schema007` compatibility opt-in. See the execution reports for
+actual results; synthetic tests do not establish host/disk power-loss guarantees.
+
+Job upload-pack RPCs inspect at most the first 65,520-byte protocol packet before
+committing HTTP response headers. A complete native `ERR` refusal returns an
+explicit HTTP 403 with a generic message, after process-group cleanup. This
+avoids losing the native denial to an input BrokenPipe or failed-stream flush
+race. Successful prefixes are replayed unchanged through the normal output quota,
+deadline and process-exit checks; an incomplete or failed PACK never becomes a
+clean successful response. The bounded packet inspection does not parse or
+authorize object wants in place of native Git and the isolated object closure.

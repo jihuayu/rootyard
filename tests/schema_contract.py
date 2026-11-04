@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check exact schema007 catalogs, including an upgrade from restored schema003.
+"""Check exact schema008 catalogs, including an upgrade from restored schema003.
 
 Only use disposable PostgreSQL with CREATEDB. --write generates fixtures for
 review; it does not establish their correctness or accept production drift.
@@ -18,6 +18,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', default='target/debug/rootyard')
     parser.add_argument('--write', action='store_true')
+    parser.add_argument('--sql-migrate', action='store_true', help='Generate fixtures with reviewed migrations before building the binary')
     args = parser.parse_args()
     admin = os.environ.get('ROOTYARD_TEST_DATABASE_URL')
     if not admin:
@@ -26,7 +27,7 @@ def main():
     prefix = 'rootyard_contract_' + uuid.uuid4().hex
     created = []
     binary = str(Path(args.binary).resolve())
-    sql = 'SET search_path=pg_catalog;' + Path('schema/007_catalog.sql').read_text()
+    sql = 'SET search_path=pg_catalog;' + Path('schema/008_catalog.sql').read_text()
 
     def run(command, db=admin):
         env = os.environ.copy()
@@ -46,6 +47,15 @@ def main():
         created.append(name)
         return urllib.parse.urlunsplit(parts._replace(path='/' + name, query=''))
 
+    def migrate(db):
+        if args.sql_migrate:
+            versions = run(['psql', '-X', '-qAt', '-c', "SELECT version FROM schema_migrations"], db) if run(['psql', '-X', '-qAt', '-c', "SELECT to_regclass('public.schema_migrations') IS NOT NULL"], db).strip() == 't' else ''
+            for path in sorted(Path('migrations').glob('*.sql')):
+                if str(int(path.name[:3])) not in versions.split():
+                    run(['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-f', str(path)], db)
+        else:
+            run([binary, 'migrate'], db)
+
     def catalog(db):
         return json.loads(run(['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-c', sql], db))
 
@@ -57,10 +67,10 @@ def main():
         with tempfile.TemporaryDirectory(prefix='rootyard-contract-') as temporary:
             temporary = Path(temporary)
             fresh = database('fresh')
-            run([binary, 'migrate'], fresh)
+            migrate(fresh)
             actual = catalog(fresh)
             restored_db = database('restored')
-            roundtrip(fresh, restored_db, temporary / 'schema007.dump')
+            roundtrip(fresh, restored_db, temporary / 'schema008.dump')
             restored = catalog(restored_db)
 
             # A real schema003 restore normalizes its ref-name CHECK before the
@@ -70,31 +80,40 @@ def main():
                 run(['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-f', str(Path('migrations') / migration)], legacy)
             upgraded_db = database('upgraded')
             roundtrip(legacy, upgraded_db, temporary / 'schema003.dump')
-            run([binary, 'migrate'], upgraded_db)
+            migrate(upgraded_db)
             upgraded = catalog(upgraded_db)
-            # A restored schema006 upgraded to007 must match the full-restored
-            # shape: migration007 introduces no BETWEEN normalization variance.
+            # A restored schema006 upgraded to008 must match the full-restored
+            # shape: migration008 introduces no BETWEEN normalization variance.
             legacy6 = database('legacy6')
             for migration in ['001_initial.sql', '002_reliability.sql', '003_recovery_operations.sql', '006_forge_issues.sql']:
                 run(['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-f', str(Path('migrations') / migration)], legacy6)
             upgraded6 = database('upgrade6')
             roundtrip(legacy6, upgraded6, temporary / 'schema006.dump')
-            run([binary, 'migrate'], upgraded6)
+            migrate(upgraded6)
             assert catalog(upgraded6) == restored, 'Restored006 upgrade differs from full restore contract'
 
+            legacy7 = database('legacy7')
+            for path in sorted(Path('migrations').glob('*.sql')):
+                if int(path.name[:3]) < 8:
+                    run(['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-f', str(path)], legacy7)
+            upgraded7 = database('upgrade7')
+            roundtrip(legacy7, upgraded7, temporary / 'schema007.dump')
+            migrate(upgraded7)
+            assert catalog(upgraded7) == restored, 'Restored007 upgrade differs from full restore contract'
+
             upgraded_restored_db = database('upgrade_rt')
-            roundtrip(upgraded_db, upgraded_restored_db, temporary / 'upgraded007.dump')
+            roundtrip(upgraded_db, upgraded_restored_db, temporary / 'upgraded008.dump')
             assert catalog(upgraded_restored_db) == restored, 'Upgraded schema did not converge on the full restore contract'
 
-        for filename, value in [('007_catalog.json', actual), ('007_restored_catalog.json', restored),
-                                ('007_upgraded_catalog.json', upgraded)]:
+        for filename, value in [('008_catalog.json', actual), ('008_restored_catalog.json', restored),
+                                ('008_upgraded_catalog.json', upgraded)]:
             path = Path('schema') / filename
             if args.write:
                 path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
             else:
                 assert value == json.loads(path.read_text()), 'Canonical schema fixture differs: ' + filename
-        print(json.dumps(dict(canonical_schema007=True, roundtrip_schema007=True,
-                              restored003_upgrade007=True, restored006_upgrade007=True, upgraded007_roundtrip=True,
+        print(json.dumps(dict(canonical_schema008=True, roundtrip_schema008=True,
+                              restored003_upgrade008=True, restored006_upgrade008=True, restored007_upgrade008=True, upgraded008_roundtrip=True,
                               tables=len(actual['tables']), functions=len(actual['functions']), triggers=len(actual['triggers']))))
     finally:
         for name in reversed(created):

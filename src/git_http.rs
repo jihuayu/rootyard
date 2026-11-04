@@ -151,12 +151,21 @@ impl Drop for Process {
 
 /// Bounded read-only maintenance command using the same process-group cleanup.
 pub(crate) async fn collect_git_output(
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     limit: usize,
     timeout: std::time::Duration,
 ) -> anyhow::Result<Vec<u8>> {
+    collect_git_output_input(command, limit, timeout, Stdio::null()).await
+}
+
+pub(crate) async fn collect_git_output_input(
+    mut command: tokio::process::Command,
+    limit: usize,
+    timeout: std::time::Duration,
+    input: Stdio,
+) -> anyhow::Result<Vec<u8>> {
     command
-        .stdin(Stdio::null())
+        .stdin(input)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     unsafe {
@@ -219,39 +228,53 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         (None, parts.uri.path())
     };
     let (owner, name, endpoint, service) = route(&parts.method, route_path, parts.uri.query())?;
-    let identity = auth::authenticate(&state.pool, &parts.headers).await?;
-    if owner != identity.username {
-        return Err(Error::not_found());
-    }
     let write = service == "git-receive-pack";
-    if write {
-        if pin_oid.is_some() {
-            return Err(Error(
-                StatusCode::FORBIDDEN,
-                "read mirror never accepts pushes; use the primary",
-            ));
-        }
-        auth::writable(&identity)?;
-    }
-    let row = state
-        .pool
-        .get()
-        .await
-        .map_err(Error::internal)?
-        .query_opt(
-            &format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT),
-            &[&identity.id, &name],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    let repo = Repository::from_row(&row);
-    if repo.state != "ready" {
+    if write && pin_oid.is_some() {
         return Err(Error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "repository not ready; recovery may be required",
+            StatusCode::FORBIDDEN,
+            "read mirror never accepts pushes; use the primary",
         ));
     }
+    let job = pin_oid.is_some() && auth::credentials_for(&parts.headers, "ryj_").is_ok();
+    let (identity, repo, job_plan) = if job {
+        let (identity, repo, plan) = crate::ci_checkouts::authenticate(
+            &state,
+            &parts.headers,
+            owner,
+            name,
+            pin_oid.unwrap(),
+        )
+        .await?;
+        (identity, repo, Some(plan))
+    } else {
+        let identity = auth::authenticate(&state.pool, &parts.headers).await?;
+        if owner != identity.username {
+            return Err(Error::not_found());
+        }
+        if write {
+            auth::writable(&identity)?;
+        }
+        let row = state
+            .pool
+            .get()
+            .await
+            .map_err(Error::internal)?
+            .query_opt(
+                &format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT),
+                &[&identity.id, &name],
+            )
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(Error::not_found)?;
+        let repo = Repository::from_row(&row);
+        if repo.state != "ready" {
+            return Err(Error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repository not ready; recovery may be required",
+            ));
+        }
+        (identity, repo, None)
+    };
     validate_headers(
         &parts.headers,
         &parts.method,
@@ -280,7 +303,11 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             .map_err(Error::internal)?;
     }
     let path = if let Some(oid) = pin_oid {
-        crate::mirror::pinned_path(&state, &repo, oid).await?
+        if job {
+            crate::mirror::job_path(&state, &repo, oid).await?
+        } else {
+            crate::mirror::pinned_path(&state, &repo, oid).await?
+        }
     } else {
         state
             .storage
@@ -311,6 +338,9 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         .get(header::CONTENT_ENCODING)
         .is_some_and(|v| v == "gzip" || v == "x-gzip");
     let mut cmd = state.storage.git(&state.config);
+    if job {
+        cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
+    }
     if write_guard.is_some() {
         cmd.arg("-c").arg(format!(
             "core.hooksPath={}",
@@ -391,6 +421,19 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     } else {
         None
     };
+    if let Some(plan) = &job_plan {
+        let (_, _, current) = crate::ci_checkouts::authenticate(
+            &state,
+            &parts.headers,
+            owner,
+            name,
+            pin_oid.unwrap(),
+        )
+        .await?;
+        if &current != plan {
+            return Err(Error::unauthorized());
+        }
+    }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -465,6 +508,36 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             });
         }
     };
+    // A native upload-pack refusal is an ERR pkt-line followed by a nonzero
+    // exit. Publishing a streaming 200 first is racy: an input BrokenPipe or
+    // final body error can discard the queued ERR before HTTP flushes it.
+    // Inspect just the first bounded packet for job RPCs before committing
+    // headers. Never turn a failed/truncated PACK into a successful response.
+    let prefix = if job && parts.method == Method::POST && headers.0.is_success() {
+        match tokio::time::timeout_at(
+            deadline,
+            job_response_prefix(&mut stdout, state.config.max_output_bytes),
+        )
+        .await
+        {
+            Ok(Ok((prefix, false))) => prefix,
+            result => {
+                process.stop().await;
+                state.transfer_metrics.record_failure();
+                return Err(match result {
+                    Ok(Ok((_, true))) => Error(StatusCode::FORBIDDEN, "Git target request denied"),
+                    Err(_) => Error::timeout(),
+                    Ok(Err(error)) => Error::internal(error),
+                    _ => unreachable!(),
+                });
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    // Reinsert the inspected bytes unchanged. Existing transfer accounting,
+    // process-exit checks, input errors and deadlines still cover every byte.
+    let mut stdout = std::io::Cursor::new(prefix).chain(stdout);
     let mut response = Response::builder()
         .status(headers.0)
         .header(header::CONTENT_TYPE, headers.1)
@@ -562,6 +635,39 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     response
         .body(Body::from_stream(stream))
         .map_err(Error::internal)
+}
+
+/// Buffer at most one protocol pkt-line (65,520 bytes, including its header).
+/// Only a complete initial ERR packet is a refusal. Raw PACK, delimiters and
+/// successful protocol packets remain ordinary streamed output; malformed or
+/// truncated prefixes fail rather than masquerading as a clean Git response.
+async fn job_response_prefix(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    maximum: u64,
+) -> io::Result<(Vec<u8>, bool)> {
+    if maximum < 4 {
+        return Err(io::Error::other("Git response size limit exceeded"));
+    }
+    let mut prefix = vec![0; 4];
+    reader.read_exact(&mut prefix).await?;
+    let length = std::str::from_utf8(&prefix)
+        .ok()
+        .and_then(|v| usize::from_str_radix(v, 16).ok());
+    if let Some(length) = length {
+        if length == 3 || length > 65520 || length as u64 > maximum {
+            return Err(io::Error::other("invalid or oversized Git response packet"));
+        }
+        if length >= 4 {
+            prefix.resize(length, 0);
+            reader.read_exact(&mut prefix[4..]).await?;
+        }
+    } else if prefix != b"PACK" {
+        return Err(io::Error::other("invalid Git response packet prefix"));
+    }
+    let denied = prefix
+        .get(4..)
+        .is_some_and(|payload| payload.starts_with(b"ERR "));
+    Ok((prefix, denied))
 }
 
 fn route<'a>(
@@ -688,6 +794,45 @@ async fn read_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn job_refusal_prefix_is_bounded_complete_and_preserves_success() {
+        for bytes in [b"0008NAK\nPACKpartial".as_slice(), b"PACKpartial", b"0000"] {
+            let mut source = bytes;
+            let (prefix, denied) = job_response_prefix(&mut source, 1024).await.unwrap();
+            assert!(!denied);
+            assert_eq!([prefix, source.to_vec()].concat(), bytes);
+        }
+        let packet = b"0013ERR not our ref";
+        let mut err_then_pack = &b"0013ERR not our refPACKmust-not-be-served"[..];
+        assert_eq!(
+            job_response_prefix(&mut err_then_pack, 1024).await.unwrap(),
+            (packet.to_vec(), true)
+        );
+        assert_eq!(err_then_pack, b"PACKmust-not-be-served");
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let write = tokio::spawn(async move {
+            for byte in packet {
+                writer.write_all(&[*byte]).await.unwrap();
+            }
+        });
+        assert_eq!(
+            job_response_prefix(&mut reader, 1024).await.unwrap(),
+            (packet.to_vec(), true)
+        );
+        write.await.unwrap();
+        for bytes in [
+            b"0013ERR short".as_slice(),
+            b"00",
+            b"ffff",
+            b"0008NA",
+            b"0003",
+            b"oops",
+        ] {
+            assert!(job_response_prefix(&mut &bytes[..], 1024).await.is_err());
+        }
+        assert!(job_response_prefix(&mut &packet[..], 8).await.is_err());
+        assert!(job_response_prefix(&mut &packet[..], 3).await.is_err());
+    }
     #[test]
     fn rejects_unsafe_routes() {
         for path in [

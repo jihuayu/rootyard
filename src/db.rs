@@ -71,6 +71,14 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         tx.batch_execute(include_str!("../migrations/007_forge_idempotency.sql"))
             .await?;
     }
+    if tx
+        .query_opt("SELECT version FROM schema_migrations WHERE version=8", &[])
+        .await?
+        .is_none()
+    {
+        tx.batch_execute(include_str!("../migrations/008_ci_checkouts.sql"))
+            .await?;
+    }
     tx.commit().await?;
     Ok(())
 }

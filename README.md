@@ -144,7 +144,7 @@ Issue/comment creation retries replay the original response. Issue lists support
 optional open/closed state filters with number-keyset pagination. This does not add organization sharing, PRs,
 LFS, CI or a Web UI. See [the API and integration contract](docs/forge-issues.md).
 
-Private-owner Issues/comments are included in the exact schema007 backup contract, including durable creation retry records. See [populated Forge restore verification](docs/forge-backup-verification.md) for content, numbering, authorization and recovery-state checks after a fresh-cluster restore.
+Private-owner Issues/comments are included in the exact schema008 backup contract, including durable creation retry records. See [populated Forge restore verification](docs/forge-backup-verification.md) for content, numbering, authorization and recovery-state checks after a fresh-cluster restore.
 
 ## Exact-commit CI read mirrors
 

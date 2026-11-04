@@ -510,6 +510,46 @@ async fn pin_inner(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(value)).into_response())
 }
 
+/// Verify retained native truth under the caller-held repository writer lock.
+/// The receipt is evidence of retention, never an authorization source.
+pub(crate) async fn verify_receipt(state: &AppState, expected: &Intent) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    expected.validate()?;
+    ensure!(
+        load_intent(&state.storage.root, expected.repository_id, expected.job_id)? == *expected,
+        "source intent differs"
+    );
+    let bytes = journal::read(
+        &directory(&state.storage.root, expected.repository_id)
+            .join(format!("{}.pinned.json", expected.job_id)),
+    )?;
+    ensure!(
+        bytes == serde_json::to_vec(expected)?,
+        "source receipt differs"
+    );
+    let path = state.storage.verify_path(expected.repository_id)?;
+    for forbidden in [
+        "shallow",
+        "info/grafts",
+        "objects/info/alternates",
+        "objects/info/http-alternates",
+    ] {
+        ensure!(
+            !journal::exists(&path.join(forbidden))?,
+            "unsupported source object topology"
+        );
+    }
+    ensure!(
+        roots(state, expected.repository_id)
+            .await?
+            .get(&expected.retention_ref)
+            == Some(&expected.target_oid),
+        "source retention missing or changed"
+    );
+    commit(state, expected.repository_id, &expected.target_oid).await?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

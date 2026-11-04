@@ -4,9 +4,9 @@ Status: phase two, integrated with durable events and explicit incident recovery
 
 ## Supported boundary
 
-Use the exact Rootyard executable that made the backup, Git >= 2.43, PostgreSQL 17 and matching `pg_dump`/`pg_restore` clients. Keep that executable separately in your trusted release archive. The manifest includes its SHA-256; the copied hook runner is evidence, never an executable used by the restore tool.
+Except for the explicit legacy schema007 compatibility option below, use the exact Rootyard executable that made the backup, Git >= 2.43, PostgreSQL 17 and matching `pg_dump`/`pg_restore` clients. Keep that executable separately in your trusted release archive. The manifest includes its SHA-256; the copied hook runner is evidence, never an executable used by the restore tool.
 
-This integrated slice supports only a dedicated database with the exact reviewed schema-007 structure and migration versions `[1, 2, 3, 6, 7]`: fifteen tables, five functions and six non-internal triggers. A fixed catalog contract checks columns/defaults, constraints, indexes, function definitions and attributes, enabled triggers, rules and row-security policies against the migrations; simply retaining expected table/function names is insufficient. Backup format 4 binds this contract and the existing volume UUID. Earlier format-1/schema-002, format-2/schema-003 and format-3/schema-006 archives require their original trusted executable and a separate reviewed upgrade, not this restore command. Unknown tables, non-public application schemas, additional/modified routines, user-defined types, extensions other than plpgsql, large objects, non-permanent/non-ordinary tables and connection `options` are rejected. The connection must explicitly name one host, a user and a database; URLs and passwords are never passed as subprocess arguments. There is no automatic migration on backup or restore. Future schema versions or catalog/deparser changes require an explicit reviewed contract update and another fresh-database restore drill. Database roles, ACLs, configuration, credentials, extensions and tablespaces are not portable backup inputs; restoration owns the imported tables as the destination service identity and does not import owners/ACLs.
+This integrated slice supports only a dedicated database with the exact reviewed schema-008 structure and migration versions `[1, 2, 3, 6, 7, 8]`: sixteen tables, six functions and eight non-internal triggers. A fixed catalog contract checks columns/defaults, constraints, indexes, function definitions and attributes, enabled triggers, rules and row-security policies against the migrations; simply retaining expected table/function names is insufficient. Backup format 5 binds this contract and the existing volume UUID. Earlier format-1/schema-002, format-2/schema-003 and format-3/schema-006 archives require their original trusted executable and a separate reviewed upgrade, not this restore command. Unknown tables, non-public application schemas, additional/modified routines, user-defined types, extensions other than plpgsql, large objects, non-permanent/non-ordinary tables and connection `options` are rejected. The connection must explicitly name one host, a user and a database; URLs and passwords are never passed as subprocess arguments. There is no automatic migration on backup or restore. Future schema versions or catalog/deparser changes require an explicit reviewed contract update and another fresh-database restore drill. Database roles, ACLs, configuration, credentials, extensions and tablespaces are not portable backup inputs; restoration owns the imported tables as the destination service identity and does not import owners/ACLs.
 
 The existing data directory, the backup's parent, the destination's parent and all their ancestors must be real operator-controlled directories. Do not use symlink paths, hostile shared writable parents, nested mounts or concurrent manual filesystem changes. Only the three managed hook symlinks pointing to `.runner` are accepted. Other symlinks, hard-linked regular files, special files, setuid/setgid/sticky modes and non-UTF-8 filenames are rejected. Repositories using alternates/http-alternates, shallow/promisor/partial-clone object storage, commondir/linked-worktree routing or include configuration are rejected rather than depending on the source machine to pass integrity checks.
 
@@ -44,7 +44,7 @@ Backup barrier lock waits are limited to five seconds, and pg_dump uses `--lock-
 A PostgreSQL dump can execute SQL selected by its producer. Hashes detect corruption, **not authenticity**. Use only a trusted backup; do not inspect unknown archives by executing them. `--trust-backup` is an explicit trust decision, not a sandbox.
 
 1. Create a fresh, unused dedicated PostgreSQL 17 database and a private destination parent, with no public ingress, service process, external workers or other clients. The destination data directory itself must not exist. Keep standalone `worker`, `worker-once`, embedded workers and every other target database client stopped until restore succeeds and the target is reviewed. Firewall/credentials/process isolation remains an operator responsibility: `--isolated` does not prove that arbitrary clients cannot connect later.
-2. Configure `DATABASE_URL` for that new database and `ROOTYARD_DATA_DIR` for the new path. Use the same trusted binary as the backup. Do not point at the source database: the nonempty-database check rejects it, even if a different DSN spelling or proxy is used.
+2. Configure `DATABASE_URL` for that new database and `ROOTYARD_DATA_DIR` for the new path. Use the same trusted binary as the backup, or the explicit schema007 compatibility option below. Do not point at the source database: the nonempty-database check rejects it, even if a different DSN spelling or proxy is used.
 3. Run:
 
 ```sh
@@ -79,6 +79,35 @@ The backup records its stopped-writer boundary time. Work acknowledged **after**
 python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json
 ```
 
-The schema contract fixtures are generated only from pristine synthetic migrations and their real pg_dump/pg_restore and restored003-upgrade007 paths using `tests/schema_contract.py`. PostgreSQL normalizes three BETWEEN-derived CHECK expressions on the round trip, so exactly three complete reviewed catalog shapes are accepted: pristine007, fully restored007, and restored003 subsequently upgraded through migration007. The last has a normalized old ref CHECK beside native new Forge CHECKs. No arbitrary expression normalization is performed. Do not regenerate fixtures from an altered production database to bypass a rejection. `tests/backup_recovery.py` additionally proves all fifteen tables, resolution protections, volume identity and authenticated operation after a cross-cluster restore.
+The schema contract fixtures are generated only from pristine synthetic migrations and their real pg_dump/pg_restore and restored003-upgrade008 paths using `tests/schema_contract.py`. PostgreSQL normalizes three BETWEEN-derived CHECK expressions on the round trip, so exactly three complete reviewed catalog shapes are accepted: pristine008, fully restored008, and restored003 subsequently upgraded through migration008. The last has a normalized old ref CHECK beside native new Forge CHECKs. No arbitrary expression normalization is performed. Do not regenerate fixtures from an altered production database to bypass a rejection. `tests/backup_recovery.py` additionally proves all sixteen tables, resolution protections, volume identity and authenticated operation after a cross-cluster restore.
 
 See [the populated Forge integration record](forge-backup-verification.md) and [the earlier recovery integration record](integration-verification.md) and [the original schema-002 drill](backup-verification.md) for actual measured outcomes and remaining gaps. PostgreSQL's [snapshot lock ordering](https://www.postgresql.org/docs/17/sql-lock.html), [pg_dump snapshot/lock behavior](https://www.postgresql.org/docs/17/app-pgdump.html) and [pg_restore trust/transaction boundary](https://www.postgresql.org/docs/17/app-pgrestore.html) are the underlying contracts.
+
+### Schema008 and CI checkout authority
+
+New backups use format5 with the exact schema008 catalog and include
+`ci_checkout_jobs` grants and permanent cancellation tombstones. The paired
+volume still supplies source-pin files and native Git roots; SQL rows alone do
+not prove retention. All restored issued checkout grants are permanently marked
+revoked before the restore guard is removed. This deliberately differs from the
+backup's `revoked` values: restoring a snapshot taken before cancellation must
+never resurrect an old bearer. Plans, tombstones and source pins remain intact.
+Use a new job ID and establish its source pin before issuing a new checkout.
+This automatic invalidation is specific to job checkout credentials. Ordinary
+owner tokens retain the existing backup-boundary restore behavior; reconcile
+post-backup owner-token revocations before reopening external ingress.
+
+Format4/schema007 archives remain readable against their original, exact
+catalogs and contract digest. Restoring an archive made by a different historical
+binary requires the explicit final option `--allow-legacy-schema007`:
+
+```
+rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schema007
+```
+
+This opt-in is rejected for format5. It bypasses only the exact-binary hash
+comparison for an already verified format4/schema007 archive. All archive
+checksums, isolated target requirements, restored schema and repository identity
+checks remain mandatory. Restore verifies schema007 before any later `migrate`
+upgrades it to schema008. Neither checksums nor this compatibility flag establish
+archive authenticity; use only trusted, operator-controlled archives.
