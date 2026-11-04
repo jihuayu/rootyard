@@ -141,11 +141,12 @@ async fn run() -> Result<()> {
             let storage = Storage::open(&config)?;
             let hooks = rootyard::reliability::install_hooks(&storage.root)?;
             let state = AppState {
+                mirror_primary: None,
                 git_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git)),
                 config,
                 pool,
                 storage,
-                hooks,
+                hooks: Some(hooks),
                 transfer_metrics: Arc::new(rootyard::metrics::TransferCounters::default()),
                 dispatch: rootyard::dispatch::Signals::default(),
             };
@@ -153,6 +154,17 @@ async fn run() -> Result<()> {
             println!(
                 "offline reconciliation finished; inspect repository states for unresolved incidents"
             );
+        }
+        "serve-mirror" if args.len() == 1 => {
+            let state = rootyard::mirror::open(config, pool).await?;
+            let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
+            eprintln!(
+                "rootyard read mirror listening on {}",
+                listener.local_addr()?
+            );
+            axum::serve(listener, rootyard::mirror::router(state))
+                .with_graceful_shutdown(shutdown())
+                .await?;
         }
         "serve" if args.len() <= 1 => {
             let dispatch_settings = rootyard::dispatch::Settings::from_env()?;
@@ -180,10 +192,11 @@ async fn run() -> Result<()> {
             let slots = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git));
             let hooks = rootyard::reliability::install_hooks(&storage.root)?;
             let state = Arc::new(AppState {
+                mirror_primary: None,
                 config,
                 pool,
                 storage,
-                hooks,
+                hooks: Some(hooks),
                 transfer_metrics: Arc::new(rootyard::metrics::TransferCounters::default()),
                 dispatch: rootyard::dispatch::Signals::default(),
                 git_slots: slots,
@@ -259,7 +272,7 @@ async fn run() -> Result<()> {
             }
         }
         _ => bail!(
-            "usage: rootyard [serve | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup]"
+            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup]"
         ),
     }
     Ok(())

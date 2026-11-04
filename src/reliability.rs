@@ -78,6 +78,10 @@ fn executable_access(path: &FsPath) -> Result<()> {
 }
 pub fn verify_hooks(state: &AppState) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    let hooks = state
+        .hooks
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("write hooks not installed"))?;
     let dir = state.storage.root.join("managed-hooks");
     ensure!(
         !std::fs::symlink_metadata(&dir)?.file_type().is_symlink(),
@@ -91,8 +95,8 @@ pub fn verify_hooks(state: &AppState) -> Result<()> {
         "invalid hook executable"
     );
     ensure!(
-        hook_identity(&meta) == state.hooks.identity
-            && hook_identity(&state.hooks.executable.metadata()?) == state.hooks.identity,
+        hook_identity(&meta) == hooks.identity
+            && hook_identity(&hooks.executable.metadata()?) == hooks.identity,
         "hook executable changed"
     );
     executable_access(&dir.join(".runner"))?;

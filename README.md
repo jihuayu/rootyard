@@ -142,3 +142,14 @@ Issue/comment creation retries replay the original response. This does not add o
 LFS, CI or a Web UI. See [the API and integration contract](docs/forge-issues.md).
 
 Private-owner Issues/comments are included in the exact schema007 backup contract, including durable creation retry records. See [populated Forge restore verification](docs/forge-backup-verification.md) for content, numbering, authorization and recovery-state checks after a fresh-cluster restore.
+
+## Exact-commit CI read mirrors
+
+An opt-in `serve-mirror` process can serve CI clones from a separate private local
+volume while the primary remains the only writer. Explicit sync uses native Git
+transport, validates a complete snapshot, and publishes it atomically. Exact-OID
+URLs clone a fixed commit and reject missing data instead of silently building an
+old branch value. The mirror checks authoritative PostgreSQL permissions for every
+Git request. See [the read-mirror contract](docs/ci-mirror.md) for configuration,
+retained pins, verification and current limits. This is not automatic replication,
+a CI scheduler, multi-writer support or high availability.

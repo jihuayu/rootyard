@@ -212,14 +212,25 @@ pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Resp
 }
 async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
     let (parts, body) = request.into_parts();
-    let (owner, name, endpoint, service) =
-        route(&parts.method, parts.uri.path(), parts.uri.query())?;
+    let (pin_oid, route_path) = if state.mirror_primary.is_some() {
+        let (oid, path) = crate::mirror::ci_route(parts.uri.path())?;
+        (Some(oid), path)
+    } else {
+        (None, parts.uri.path())
+    };
+    let (owner, name, endpoint, service) = route(&parts.method, route_path, parts.uri.query())?;
     let identity = auth::authenticate(&state.pool, &parts.headers).await?;
     if owner != identity.username {
         return Err(Error::not_found());
     }
     let write = service == "git-receive-pack";
     if write {
+        if pin_oid.is_some() {
+            return Err(Error(
+                StatusCode::FORBIDDEN,
+                "read mirror never accepts pushes; use the primary",
+            ));
+        }
         auth::writable(&identity)?;
     }
     let row = state
@@ -268,10 +279,20 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             .await
             .map_err(Error::internal)?;
     }
-    let path = state
-        .storage
-        .verify_path(repo.id)
-        .map_err(Error::internal)?;
+    let path = if let Some(oid) = pin_oid {
+        crate::mirror::pinned_path(&state, &repo, oid).await?
+    } else {
+        state
+            .storage
+            .verify_path(repo.id)
+            .map_err(Error::internal)?
+    };
+    let project_root = path.parent().ok_or_else(Error::bad_request)?.to_path_buf();
+    let repository_dir = path
+        .file_name()
+        .ok_or_else(Error::bad_request)?
+        .to_string_lossy()
+        .into_owned();
     if write_guard.is_some() {
         let quota = state.config.max_repo_bytes;
         let size = tokio::task::spawn_blocking(move || storage::disk_bytes(&path, quota))
@@ -297,8 +318,8 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         ));
     }
     cmd.arg("http-backend")
-        .env("GIT_PROJECT_ROOT", state.storage.root.join("repos"))
-        .env("PATH_INFO", format!("/{}.git/{endpoint}", repo.id))
+        .env("GIT_PROJECT_ROOT", project_root)
+        .env("PATH_INFO", format!("/{repository_dir}/{endpoint}"))
         .env("GIT_HTTP_EXPORT_ALL", "1")
         .env("REQUEST_METHOD", parts.method.as_str())
         .env("QUERY_STRING", parts.uri.query().unwrap_or(""))

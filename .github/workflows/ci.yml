@@ -48,6 +48,8 @@ jobs:
         run: python3 tests/schema_contract.py --binary target/debug/rootyard
       - name: Exercise native Git end to end
         run: python3 tests/e2e.py --binary target/debug/rootyard --report test-results/e2e.json
+      - name: Exercise exact-commit CI read mirror
+        run: python3 tests/ci_mirror.py --binary target/debug/rootyard --report test-results/ci-mirror.json
       - name: Exercise durable push recovery
         run: python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
       - name: Exercise offline backup and fresh database restore

@@ -11,6 +11,7 @@ pub mod git_http;
 pub mod journal;
 pub mod maintenance;
 pub mod metrics;
+pub mod mirror;
 pub mod reliability;
 pub mod storage;
 
@@ -28,11 +29,12 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 pub struct AppState {
+    pub mirror_primary: Option<String>,
     pub dispatch: dispatch::Signals,
     pub config: config::Config,
     pub pool: Pool,
     pub storage: storage::Storage,
-    pub hooks: reliability::HookInstallation,
+    pub hooks: Option<reliability::HookInstallation>,
     pub transfer_metrics: Arc<metrics::TransferCounters>,
     pub git_slots: Arc<Semaphore>,
 }

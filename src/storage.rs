@@ -23,6 +23,12 @@ pub struct Storage {
 
 impl Storage {
     pub fn open(config: &Config) -> Result<Self> {
+        Self::open_role(config, false)
+    }
+    pub fn open_mirror(config: &Config) -> Result<Self> {
+        Self::open_role(config, true)
+    }
+    fn open_role(config: &Config, mirror: bool) -> Result<Self> {
         crate::backup::ensure_not_restoring(&config.data_dir)?;
         std::fs::create_dir_all(&config.data_dir)?;
         let root = config.data_dir.canonicalize()?;
@@ -37,6 +43,52 @@ impl Storage {
             .try_lock_exclusive()
             .context("data directory already in use; do not start another writer")?;
         crate::backup::ensure_not_restoring(&root)?;
+        // A read replica must never be accidentally restarted as the writer.
+        let marker = root.join(".rootyard-mirror");
+        let marker_exists = match std::fs::symlink_metadata(&marker) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if mirror {
+            if marker_exists {
+                use std::io::Read;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&marker)?;
+                if !file.metadata()?.is_file()
+                    || file.metadata()?.len() != b"rootyard-read-mirror-v1\n".len() as u64
+                {
+                    bail!("invalid mirror role marker");
+                }
+                let mut bytes = Vec::new();
+                file.take(25).read_to_end(&mut bytes)?;
+                if bytes != b"rootyard-read-mirror-v1\n" {
+                    bail!("invalid mirror role marker");
+                }
+            } else {
+                for entry in std::fs::read_dir(&root)? {
+                    if entry?.file_name() != ".rootyard.lock" {
+                        bail!(
+                            "mirror requires a fresh dedicated volume, not an existing data directory"
+                        );
+                    }
+                }
+                use std::io::Write;
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&marker)?;
+                file.write_all(b"rootyard-read-mirror-v1\n")?;
+                file.sync_all()?;
+                File::open(&root)?.sync_all()?;
+            }
+        } else if marker_exists {
+            bail!("read mirror volumes cannot be opened by writer or maintenance commands");
+        }
         let identity_path = root.join(".volume-id");
         let volume_id = match OpenOptions::new()
             .read(true)
@@ -221,7 +273,7 @@ async fn checked(cmd: &mut tokio::process::Command) -> Result<()> {
     }
     Ok(())
 }
-fn sync_tree(path: &Path) -> Result<()> {
+pub(crate) fn sync_tree(path: &Path) -> Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
         bail!("unexpected symlink during initialization");
