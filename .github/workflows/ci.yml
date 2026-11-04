@@ -32,11 +32,13 @@ jobs:
           rustup default stable
       - name: Install matching PostgreSQL client and test tools
         run: apt-get update && apt-get install -y --no-install-recommends git python3 postgresql-client-17 redis-server gcc g++ make pkg-config openjdk-21-jre-headless curl ca-certificates
+      - name: Test bounded Kafka download helper
+        run: python3 -m unittest discover -s tests -p 'test_download_ci_kafka.py'
       - name: Prepare verified isolated Kafka distribution
+        timeout-minutes: 5
         run: |
-          curl -fsSL --retry 3 https://downloads.apache.org/kafka/4.4.0/kafka_2.13-4.4.0.tgz -o /tmp/rootyard-kafka.tgz
-          echo "f5ceba8a265ab6bb2d68362b1f6859a95e15d60ef92ba83b43fdf065b557dc18e98d6383c15b9977320e25b3a2c8b6f11decb17b0fa6c0f163423793a0eb95cb  /tmp/rootyard-kafka.tgz" | sha512sum -c -
-          tar -xzf /tmp/rootyard-kafka.tgz -C /tmp
+          python3 scripts/download_ci_kafka.py test-results/ci-tools/rootyard-kafka.tgz
+          tar -xzf test-results/ci-tools/rootyard-kafka.tgz -C test-results/ci-tools
       - name: Record tool versions
         run: |
           rustc --version
@@ -80,7 +82,7 @@ jobs:
       - name: Exercise cross-process delivery
         run: ROOTYARD_TEST_REDIS_SERVER=/usr/bin/redis-server python3 tests/cross_process.py --binary target/debug/rootyard --report test-results/cross-process.json
       - name: Exercise real Kafka advisory wakes
-        run: ROOTYARD_TEST_KAFKA_HOME=/tmp/kafka_2.13-4.4.0 python3 tests/kafka_wakes.py --binary target/debug/rootyard --report test-results/kafka.json
+        run: ROOTYARD_TEST_KAFKA_HOME="$GITHUB_WORKSPACE/test-results/ci-tools/kafka_2.13-4.4.0" python3 tests/kafka_wakes.py --binary target/debug/rootyard --report test-results/kafka.json
       - name: Exercise restored legacy upgrade backup
         run: python3 tests/backup_upgrade.py --binary target/debug/rootyard --report test-results/backup-upgrade.json
       - name: Exercise populated Forge backup and fresh restore
