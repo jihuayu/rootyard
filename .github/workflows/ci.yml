@@ -70,12 +70,28 @@ jobs:
       - name: Build frozen schema007 binary for genuine legacy restore
         run: |
           legacy=08b10e9976c012343c48e4fd6a5981e0266b8c53
-          git fetch --no-tags origin "$legacy"
-          test "$(git rev-parse FETCH_HEAD)" = "$legacy"
-          mkdir -p target/legacy-source
-          git archive "$legacy" | tar -x -C target/legacy-source
-          CARGO_TARGET_DIR="$PWD/target/legacy-build" cargo build --locked --manifest-path target/legacy-source/Cargo.toml --bin rootyard
-          cp target/legacy-build/debug/rootyard target/rootyard-schema007
+          workspace="$PWD"
+          umask 077
+          mkdir -p "$workspace/target"
+          legacy_root=$(mktemp -d "$workspace/target/legacy-source.XXXXXX")
+          trap 'rm -rf "$legacy_root"' EXIT
+          mkdir "$legacy_root/home" "$legacy_root/repo"
+          # Never invoke Git against the inherited checkout or inherit its config.
+          git_owned() {
+            env -i PATH="$PATH" HOME="$legacy_root/home" \
+              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_TERMINAL_PROMPT=0 timeout 180 git -C "$legacy_root/repo" "$@"
+          }
+          git_owned init --template=
+          git_owned fetch --no-tags --depth=1 https://github.com/jihuayu/rootyard.git "$legacy"
+          test "$(git_owned rev-parse --verify 'FETCH_HEAD^{commit}')" = "$legacy"
+          git_owned checkout --detach "$legacy"
+          test "$(git_owned rev-parse --verify HEAD)" = "$legacy"
+          (
+            cd "$legacy_root/repo"
+            CARGO_TARGET_DIR="$workspace/target/legacy-build" cargo build --locked --manifest-path Cargo.toml --bin rootyard
+          )
+          cp "$workspace/target/legacy-build/debug/rootyard" "$workspace/target/rootyard-schema007"
       - name: Exercise checkout backup revocation and genuine schema007 restore
         run: python3 tests/backup_ci_checkouts.py --binary target/debug/rootyard --legacy-binary target/rootyard-schema007 --report test-results/backup-ci-checkouts.json
       - name: Exercise source-pin paired backup and restore
