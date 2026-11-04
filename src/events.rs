@@ -286,6 +286,10 @@ pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
         "event generation exceeds repository generation"
     );
     let superseded = claim.consumer == "ref-index" && generation < current;
+    // CI maintenance has exact root-observation evidence, not a native push
+    // receipt. Keep its outbox/audit trail, but never label it push_receipt in
+    // the user ref projection. Explicit recovery snapshots remain independent.
+    let ci_maintenance: bool = tx.query_one("SELECT COALESCE(evidence->>'kind'='observed_immutable_ci_root',false) FROM git_operations WHERE id=$1", &[&operation_id]).await?.get(0);
     match claim.consumer.as_str() {
         "audit-log" => {
             tx.execute(
@@ -294,7 +298,7 @@ pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
             )
             .await?;
         }
-        "ref-index" if !superseded => {
+        "ref-index" if !superseded && !ci_maintenance => {
             tx.execute("INSERT INTO repository_ref_projection(repository_id,ref_name,oid,deleted,storage_generation,operation_sequence,transaction_sequence,event_id) SELECT repository_id,ref_name,CASE WHEN new_oid ~ '^0+$' THEN NULL ELSE new_oid END,new_oid ~ '^0+$',storage_generation,operation_sequence,transaction_sequence,event_id FROM outbox_events WHERE event_id=$1 ON CONFLICT(repository_id,ref_name) DO UPDATE SET oid=EXCLUDED.oid,deleted=EXCLUDED.deleted,storage_generation=EXCLUDED.storage_generation,operation_sequence=EXCLUDED.operation_sequence,transaction_sequence=EXCLUDED.transaction_sequence,event_id=EXCLUDED.event_id,source_kind='push_receipt',resolution_id=NULL,updated_at=clock_timestamp() WHERE (repository_ref_projection.storage_generation,repository_ref_projection.operation_sequence,repository_ref_projection.transaction_sequence)<(EXCLUDED.storage_generation,EXCLUDED.operation_sequence,EXCLUDED.transaction_sequence)", &[&claim.event_id]).await?;
         }
         "ref-index" => {}

@@ -75,3 +75,11 @@ It checks pinned clone/fetch, source unavailability, retained snapshots, replace
 refs, authorization and role/generation fences. See [the mirror contract](ci-mirror.md).
 Rust unit tests additionally exercise native Git pinned views without PostgreSQL;
 those do not replace the authenticated HTTP integration suite.
+
+`tests/ci_source_pins.py` covers authenticated exact-target source retention,
+reserved push rejection, restart/interruption boundaries and mirror preparation.
+`tests/backup_ci_pins.py` needs the same synthetic CREATEDB administrator as the
+backup suites and verifies paired source-plan/receipt/native-root restoration.
+Run both with `--binary target/debug/rootyard --report <output.json>` in addition
+to the original mirror and recovery suites; see the source-retention contract in
+[ci-mirror.md](ci-mirror.md). Do not infer production CI readiness from these tests.

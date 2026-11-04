@@ -28,6 +28,9 @@ pub struct Operation {
     pub token_id: Uuid,
     pub sequence: i64,
     pub storage_generation: i64,
+    /// Exact maintenance capability, persisted before spawning Git. Never supplied by push clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_pin: Option<crate::ci_pins::Intent>,
     #[serde(skip)]
     pub path: PathBuf,
 }
@@ -53,7 +56,7 @@ pub struct HookEvent {
     pub changes: Vec<RefChange>,
 }
 
-fn safe_path(path: &Path) -> Result<()> {
+pub(crate) fn safe_path(path: &Path) -> Result<()> {
     ensure!(path.is_absolute(), "journal path must be absolute");
     let mut p = PathBuf::new();
     for c in path.components() {
@@ -71,7 +74,7 @@ fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
-fn mkdir(path: &Path) -> Result<()> {
+pub(crate) fn mkdir(path: &Path) -> Result<()> {
     match fs::create_dir(path) {
         Ok(()) => {
             fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
@@ -87,7 +90,7 @@ fn mkdir(path: &Path) -> Result<()> {
     );
     Ok(())
 }
-fn read(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn read(path: &Path) -> Result<Vec<u8>> {
     safe_path(path)?;
     let mut f = OpenOptions::new()
         .read(true)
@@ -111,7 +114,7 @@ fn read(path: &Path) -> Result<Vec<u8>> {
     );
     Ok(bytes)
 }
-fn exists(path: &Path) -> Result<bool> {
+pub(crate) fn exists(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
             safe_path(path)?;
@@ -123,7 +126,7 @@ fn exists(path: &Path) -> Result<bool> {
 }
 // Only the serialized sequence counter is replaceable. Immutable records must
 // either be absent or contain exactly the same bytes.
-fn atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
+pub(crate) fn atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
     let parent = path.parent().context("record parent")?;
     safe_path(parent)?;
     if exists(path)? && !replace {
@@ -192,6 +195,15 @@ fn load(path: &Path) -> Result<Operation> {
         "unexpected journal layout"
     );
     op.path = path.to_path_buf();
+    if let Some(intent) = &op.ci_pin {
+        intent.validate()?;
+        ensure!(
+            intent.repository_id == op.repository_id
+                && intent.owner_id == op.actor_id
+                && intent.storage_generation == op.storage_generation,
+            "maintenance identity mismatch"
+        );
+    }
     Ok(op)
 }
 fn validate(op: &Operation) -> Result<()> {
@@ -206,6 +218,45 @@ pub fn begin(
     actor_name: String,
     token_id: Uuid,
     storage_generation: i64,
+) -> Result<Operation> {
+    begin_inner(
+        data_root,
+        repository_id,
+        actor_id,
+        actor_name,
+        token_id,
+        storage_generation,
+        None,
+    )
+}
+
+pub(crate) fn begin_ci(
+    data_root: &Path,
+    actor_name: String,
+    token_id: Uuid,
+    intent: &crate::ci_pins::Intent,
+) -> Result<Operation> {
+    intent.validate()?;
+    begin_inner(
+        data_root,
+        intent.repository_id,
+        intent.owner_id,
+        actor_name,
+        token_id,
+        intent.storage_generation,
+        Some(intent.clone()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn begin_inner(
+    data_root: &Path,
+    repository_id: Uuid,
+    actor_id: Uuid,
+    actor_name: String,
+    token_id: Uuid,
+    storage_generation: i64,
+    ci_pin: Option<crate::ci_pins::Intent>,
 ) -> Result<Operation> {
     safe_path(data_root)?;
     ensure!(
@@ -236,17 +287,23 @@ pub fn begin(
         token_id,
         sequence,
         storage_generation,
+        ci_pin,
         path: PathBuf::new(),
     };
     op.path = repo.join(op_name(&op));
-    fs::create_dir(&op.path)?;
-    fs::set_permissions(&op.path, fs::Permissions::from_mode(0o700))?;
-    sync_dir(&repo)?;
+    // Publish a complete operation atomically. A crash during admission may
+    // reserve a sequence or leave ignored staging, never a malformed visible
+    // operation directory. No Git child receives the path until this finishes.
+    let staging = repo.join(format!(".tmp-operation-{}", op.id));
+    fs::create_dir(&staging)?;
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
     atomic(
-        &op.path.join("operation.json"),
+        &staging.join("operation.json"),
         &serde_json::to_vec(&op)?,
         false,
     )?;
+    fs::rename(&staging, &op.path)?;
+    sync_dir(&repo)?;
     Ok(op)
 }
 
@@ -535,6 +592,7 @@ fn record(op: &Operation, phase: HookPhase, input: &[u8]) -> Result<()> {
     let _lock = hook_lock(op)?;
     ensure!(!is_finished(op)?, "operation already finished");
     let changes = parse(input)?;
+    validate_namespace(op, &changes)?;
     let (previous, total_bytes) = events_with_size(op)?;
     ensure!(previous.len() < MAX_ENTRIES - 7, "too many hook events");
     let ordinal = previous
@@ -603,8 +661,43 @@ fn record_request(op: &Operation, input: &[u8]) -> Result<()> {
 /// does not mark corruption: there is no ambiguous publication at this stage.
 pub fn run_pre_receive() -> Result<()> {
     let (op, input) = hook_input()?;
+    // No maintenance capability can turn a receive-pack into a privileged writer.
+    ensure!(
+        op.ci_pin.is_none(),
+        "maintenance operations cannot receive pushes"
+    );
+    let changes = parse(&input)?;
+    validate_namespace(&op, &changes)?;
     record_request(&op, &input)
 }
+/// A grant authorizes exactly one absent-to-target update, not an inheritable bypass.
+fn validate_namespace(op: &Operation, changes: &[RefChange]) -> Result<()> {
+    if let Some(intent) = &op.ci_pin {
+        ensure!(
+            changes == [intent.change()],
+            "maintenance transaction differs from exact grant"
+        );
+        let root = op
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .context("missing volume root")?;
+        ensure!(
+            crate::ci_pins::load_intent(root, intent.repository_id, intent.job_id)? == *intent,
+            "maintenance intent changed"
+        );
+    } else {
+        ensure!(
+            changes
+                .iter()
+                .all(|c| !crate::ci_pins::reserved(&c.ref_name)),
+            "CI retention namespace is controller-only"
+        );
+    }
+    Ok(())
+}
+
 fn hook_input() -> Result<(Operation, Vec<u8>)> {
     let path = PathBuf::from(
         std::env::var_os("ROOTYARD_JOURNAL_OPERATION")
@@ -666,6 +759,31 @@ mod tests {
             new.to_string().repeat(40)
         )
         .into_bytes()
+    }
+    #[test]
+    fn interrupted_admission_staging_preserves_sequence_gap() {
+        let (root, op) = setup();
+        let repo = op.path.parent().unwrap();
+        let staging = repo.join(".tmp-operation-interrupted");
+        mkdir(&staging).unwrap();
+        atomic(&staging.join("operation.json"), b"incomplete", false).unwrap();
+        atomic(&repo.join("sequence"), b"2", true).unwrap();
+        assert_eq!(
+            pending(root.path(), op.repository_id).unwrap(),
+            vec![op.clone()]
+        );
+        let next = begin(
+            root.path(),
+            op.repository_id,
+            op.actor_id,
+            op.actor_name,
+            op.token_id,
+            1,
+        )
+        .unwrap();
+        assert_eq!(next.sequence, 3);
+        assert_eq!(pending(root.path(), next.repository_id).unwrap().len(), 2);
+        assert!(staging.exists());
     }
     #[test]
     fn lifecycle_and_monotonic_sequence() {

@@ -1,4 +1,4 @@
-# Exact-commit CI read mirror: first slice
+# Exact-commit CI source retention and read mirror
 
 The primary remains the only Git writer and authoritative repository store.
 `rootyard serve-mirror` starts a separate, read-only smart-HTTP service using its
@@ -36,6 +36,114 @@ Tokens are sent to this configured primary for the requested owner's repository
 sync, so configure only the trusted primary. Do not embed credentials in URLs or
 logs. Protect the mirror's own external endpoint with HTTPS as well.
 
+## Trusted-controller checkout flow
+
+This slice accepts an **exact SHA-1 commit**, not a branch/tag expression. A
+trusted controller uses its writable owner token only against the primary:
+
+```http
+POST /api/repos/{owner}/{name}/ci-pins
+Authorization: Bearer <controller-owner-token>
+Content-Type: application/json
+
+{"job_id":"<caller UUID>","target_oid":"<40 lowercase hex>","storage_generation":1}
+```
+
+HTTP 200 is a verified durable source-retention receipt. Its fields are
+`version: 1`, `job_id`, `owner_id`, `repository_id`, `storage_generation`,
+`object_format: "sha1"`, `target_oid`,
+`retention_ref: "refs/rootyard-ci/jobs/<job UUID>"`, and `state: "pinned"`.
+The writable owner is the controller authority in this release; there is no
+separate controller role or job-scoped token. Read-only tokens cannot create
+source roots. Unknown, revoked, expired, or other-owner tokens fail closed.
+
+The same job UUID is immutable within its repository, including across storage
+generations. Identical retries verify/converge on the same root; a different OID
+or generation is HTTP 409. Expected-generation mismatch is 409; a recovering
+repository is unavailable. Missing objects and noncommits are 409; malformed
+inputs are 400. Replacement refs are disabled for type/identity checks. Neither
+annotated tags nor symbolic names are peeled/resolved by this API.
+
+The controller must perform these steps in order:
+
+1. Obtain the primary pinned receipt **before** deleting/moving the target's last
+   ordinary source ref or asking a mirror to copy it.
+2. Perform the manual full `mirror-sync` described below.
+3. Send `POST /api/repos/{owner}/{name}/mirror-prepare` to the mirror with
+   `{"target_oid":"<same OID>","storage_generation":1}` and an owner read token.
+4. Match `repository_id`, `storage_generation`, `object_format`, and `target_oid`
+   against the source receipt. A 200 prepare response also supplies opaque
+   `snapshot` identity and `clone_path: "/ci/<OID>/git/<owner>/<name>.git"`.
+5. Use ordinary Git clone with that path, verify the full `git rev-parse HEAD`
+   equals the receipt's OID, and bind the build result to it. Fail on mismatch.
+
+Preparation does not sync or contact the primary Git service. It durably pins a
+complete local snapshot, revalidates pin metadata, actual commit type and full
+Git fsck, then rechecks current authorization/generation before reporting ready.
+It works while the primary is stopped if PostgreSQL remains available. The old
+exact-commit Git URL still lazily establishes a snapshot pin for compatibility.
+
+**Source retention and mirror readiness are separate receipts.** Mirror prepare
+has no primary-volume job metadata and does not approve a job, verify its source
+receipt, or promise source retention. The controller owns matching and retrying
+these two explicit steps. A source root can be pinned while a mirror is still
+unready. An old generation cannot become ready merely because its objects remain
+on disk. `storage_generation` is a storage/recovery fence, not `source_epoch`, a
+publication watermark, authorization policy version, or cross-repository version.
+Those richer checkout-plan fields, job cancellation and scheduling are not
+implemented. There is no inferred expiry or automatic release.
+
+## Primary retention, recovery and backup
+
+All ordinary pushes reject creation, update and deletion of `refs/rootyard-ci`
+and every descendant. Mandatory pre-receive rejects the **whole** mixed push,
+including non-atomic pushes, before ref changes; reference-transaction also
+checks the boundary. Preexisting unmanaged refs, symbolic refs and namespace
+ancestor collisions make activation fail. They are never overwritten or removed.
+Operators must investigate collisions; the API does not migrate user refs.
+
+Under the existing repository writer mutex and recovery/backlog/quota fences,
+the primary persists a versioned intent at
+`ci-pins/<repository UUID>/<job UUID>.json`, records a typed exact-create operation
+in the normal durable journal, uses native Git `update-ref --no-deref` with
+zero-old-OID CAS, verifies the retained commit, and writes the immutable
+`<job UUID>.pinned.json` receipt. A journal grant authorizes only that one exact
+absent-to-OID maintenance change. It is not a push flag or inherited environment
+bypass. Hooks reject any other transaction or a receive-pack using that grant.
+GitFS remains the authority for objects and refs.
+
+Crash before intent publication has no job. Intent-only state requires a new
+authenticated POST retry to create its root. Startup can settle an interrupted
+CAS journal from the exact native root; the next POST verifies or completes its
+pinned receipt. No success is returned from an intent alone. A root with missing receipt is verified before
+completing the receipt. Changed/corrupt roots or evidence fail closed. Once a CI
+operation is imported as `unknown`, later ref observation cannot promote it to
+success: existing explicit operator recovery/resolution is required. Recovery
+preserves that history, old-generation intents and native roots. Reusing an old
+job ID in the new generation is forbidden; create a new job explicitly.
+
+CI operations retain exact-change outbox and audit-log events with operation
+evidence kind `observed_immutable_ci_root`, never fabricated post-receive data.
+The `ref-index` consumer acknowledges those events without projecting internal
+CI roots as `push_receipt`. Explicit offline recovery snapshots may include
+these roots, accurately labeled `recovery_snapshot`.
+
+Metadata lives on the primary volume because retaining a native Git ref is a
+GitFS operation. Existing **paired offline backups** include intent/receipt files,
+journals and native roots in the checksummed full-volume inventory together with
+PostgreSQL audit/recovery state. Schema 007 and backup format 4 remain unchanged.
+Do not restore only the database or only these files. Restoring does not change
+job generation identity; existing recovery fences still apply. Do not downgrade
+to an older binary that lacks the namespace guard or typed journal decoder while
+these roots exist. The mirror volume remains separate and is not a primary backup.
+
+Admission is bounded to 1,024 primary job intents per repository, including old
+generations and pending intents, and 1,024 generation/OID mirror mappings per
+repository. New requests beyond the bound are HTTP 429; existing identical
+retries remain possible. Native repository byte quota, Git process limits and
+outbox backlog gates still apply. These limits are not garbage collection:
+operators must plan storage; this release does not expire, release or delete pins.
+
 ## Explicit sync
 
 Send `POST /api/repos/{owner}/{name}/mirror-sync` with an ordinary owner token.
@@ -59,7 +167,10 @@ Use the complete lowercase 40-character commit object ID in the Git URL:
 https://mirror.example/ci/{commit_oid}/git/{owner}/{name}.git
 ```
 
-Supply the normal owner read token using your CI platform's secret mechanism.
+Only trusted controller/mirror validation jobs may use the current owner read
+token through a protected secret mechanism. These credentials are owner-wide;
+delivery to untrusted CI runners is **unsupported** until separately scoped
+credentials exist. A read-only token still reads every repository of that owner.
 Do not put tokens in the URL. Standard Git clone and fetch use this URL without a
 custom client protocol. The mirror advertises only `refs/heads/main`, with `HEAD`
 pointing to that branch and both resolving to the requested commit. This is a
@@ -76,8 +187,9 @@ all writes target the primary:
 git -C checkout remote set-url --push origin https://primary.example/git/owner/name.git
 ```
 
-For CI, keep the injected credential read-only unless a separate, explicitly
-authorized write job needs it. The server cannot change a standard client's local
+For trusted validation jobs, keep injected credentials read-only. Do not deliver
+the writable controller token to runners. Separate scoped write-back credentials
+remain future work. The server cannot change a standard client's local
 remote configuration; an attempted push to the mirror is rejected, never forwarded.
 
 The mirror checks that the exact object is a commit in a complete snapshot for
@@ -123,7 +235,15 @@ python3 tests/ci_mirror.py --binary target/debug/rootyard \
   --report test-results/ci-mirror.json
 ```
 
-CI runs this harness and retains its report. `--keep` retains temporary private
+CI runs this harness plus `tests/ci_source_pins.py` and
+`tests/backup_ci_pins.py`, and retains their reports. Source-pin coverage includes
+pre-first-sync source-ref deletion, concurrent job retries/conflicts, reserved
+namespace rejection, synthetic durable interruption boundaries, current
+authorization and generation fences. Paired-backup coverage uses a fresh owned
+database and restored volume. Synthetic boundary fixtures do not establish
+hardware power-loss behavior. A real SHA-256 upstream fixture also verifies
+that a resolving 40-character prefix cannot create a source pin, and unsupported
+mirror sync preserves the prior published snapshot/config byte-for-byte. `--keep` retains temporary private
 files for diagnosis; it does not preserve the SQL schema. Implemented test cases
 cover ordinary pinned clone/fetch and fsck, primary branch movement, absent commits,
 separate-process local packs with the primary stopped, sync failure preservation,

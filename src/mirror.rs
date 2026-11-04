@@ -94,6 +94,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health/live", get(|| async { "ok" }))
         .route("/health/ready", get(ready))
         .route("/api/repos/{owner}/{name}/mirror-sync", post(sync))
+        .route("/api/repos/{owner}/{name}/mirror-prepare", post(prepare))
         .fallback(|State(state): State<Arc<AppState>>, request| async move {
             git_http::handle(state, request).await
         })
@@ -146,6 +147,98 @@ async fn repository(
         ));
     }
     Ok(repo)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareRequest {
+    target_oid: String,
+    storage_generation: i64,
+}
+async fn prepare(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<PrepareRequest>,
+) -> Result<Response, Error> {
+    tokio::spawn(async move {
+        if !crate::ci_pins::valid_oid(&input.target_oid) || input.storage_generation <= 0 {
+            return Err(Error::bad_request());
+        }
+        let repo = repository(&state, &headers, &owner, &name).await?;
+        if repo.storage_generation != input.storage_generation {
+            return Err(Error(StatusCode::CONFLICT, "repository generation changed"));
+        }
+        let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
+            Error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Git capacity exhausted; retry later",
+            )
+        })?;
+        let pin = pinned_path(&state, &repo, &input.target_oid).await?;
+        let root = state.storage.root.join("repos").join(repo.id.to_string());
+        let snapshot: Snapshot = serde_json::from_slice(
+            &read_regular(
+                &root.join(format!(
+                    "pin-{}-{}.json",
+                    input.storage_generation, input.target_oid
+                )),
+                4096,
+            )
+            .map_err(Error::internal)?,
+        )
+        .map_err(Error::internal)?;
+        if snapshot.repository_id != repo.id
+            || snapshot.storage_generation != repo.storage_generation
+        {
+            return Err(Error::internal("mirror pin identity changed"));
+        }
+        validate_pin(
+            &pin,
+            &input.target_oid,
+            &root.join(snapshot.snapshot.to_string()),
+        )
+        .map_err(Error::internal)?;
+        // Explicit readiness rechecks the actual commit after restart, rather
+        // than trusting a receipt alone. Snapshot fsck was completed at sync.
+        let mut cmd = mirror_git(&state);
+        cmd.arg("--git-dir")
+            .arg(&pin)
+            .args(["cat-file", "-t", &input.target_oid]);
+        if git_http::collect_git_output(cmd, 128, state.config.git_timeout)
+            .await
+            .map_err(Error::internal)?
+            != b"commit\n"
+        {
+            return Err(Error::internal("prepared mirror target is not a commit"));
+        }
+        let mut cmd = mirror_git(&state);
+        cmd.arg("--git-dir").arg(&pin).args([
+            "fsck",
+            "--full",
+            "--strict",
+            "--no-reflogs",
+            "--no-dangling",
+        ]);
+        git_http::collect_git_output(cmd, 64 * 1024, state.config.git_timeout)
+            .await
+            .map_err(Error::internal)?;
+        let current = repository(&state, &headers, &owner, &name).await?;
+        if current.id != repo.id || current.storage_generation != repo.storage_generation {
+            return Err(Error(StatusCode::CONFLICT, "repository generation changed"));
+        }
+        Ok((
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({
+                "repository_id":repo.id, "storage_generation":repo.storage_generation,
+                "object_format":"sha1", "target_oid":input.target_oid, "snapshot":snapshot.snapshot,
+                "clone_path":format!("/ci/{}/git/{owner}/{name}.git",input.target_oid)
+            })),
+        )
+            .into_response())
+    })
+    .await
+    .map_err(Error::internal)?
 }
 
 async fn sync(
@@ -233,6 +326,15 @@ async fn sync_snapshot(
         {
             bail!("mirror snapshot size limit reached");
         }
+        let mut command = mirror_git(&state);
+        command
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["rev-parse", "--show-object-format"]);
+        if git_http::collect_git_output(command, 128, state.config.git_timeout).await? != b"sha1\n"
+        {
+            bail!("mirror supports only SHA-1 repositories");
+        }
         // Do not retain credential helpers, source remotes, or writable transport settings.
         std::fs::write(bare.join("config"), bare_config())?;
         private_directory(&stage.join("pins"))?;
@@ -290,7 +392,7 @@ fn atomic_file(root: &FsPath, name: &str, bytes: &[u8]) -> Result<()> {
     File::open(root)?.sync_all()?;
     Ok(())
 }
-fn mirror_git(state: &AppState) -> Command {
+pub(crate) fn mirror_git(state: &AppState) -> Command {
     let mut cmd = state.storage.git(&state.config);
     cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
     let memory = state.config.git_memory_bytes;
@@ -381,6 +483,26 @@ pub(crate) async fn pinned_path(
     // A concurrent request may have established this pin while we waited. Pins
     // survive later snapshots that drop the original ref, but never generations.
     let (snapshot, pinned) = load()?;
+    if !pinned {
+        let mut count = 0;
+        let mut entries = 0;
+        for entry in std::fs::read_dir(&root).map_err(Error::internal)? {
+            entries += 1;
+            if entries > 100_000 {
+                return Err(Error::internal("mirror directory exceeds bound"));
+            }
+            let entry = entry.map_err(Error::internal)?;
+            if entry.file_name().to_string_lossy().starts_with("pin-") {
+                count += 1;
+            }
+        }
+        if count >= crate::ci_pins::MAX_PINS {
+            return Err(Error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "mirror pin admission limit reached",
+            ));
+        }
+    }
     let snapshot_root = root.join(snapshot.snapshot.to_string());
     let bare = snapshot_root.join("repository.git");
     for path in [

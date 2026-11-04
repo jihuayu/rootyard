@@ -137,6 +137,24 @@ pub async fn reconcile(
                 return Err(error);
             }
         }
+        if operation.ci_pin.is_some() {
+            // Once imported as unknown, this is an operator recovery boundary.
+            // Later ref observation cannot retroactively resolve audit history.
+            let known = state
+                .pool
+                .get()
+                .await?
+                .query_opt(
+                    "SELECT outcome FROM git_operations WHERE id=$1",
+                    &[&operation.id],
+                )
+                .await?;
+            if known.is_some_and(|row| row.get::<_, String>(0) == "unknown") {
+                clear = false;
+                recovering(state, repo, "push_outcome_unknown").await?;
+                continue;
+            }
+        }
         if startup && !journal::is_finished(&operation)? {
             journal::mark_interrupted(&operation)?;
             journal::finish(&operation)?;
@@ -148,47 +166,83 @@ pub async fn reconcile(
             journal::receipts(&operation),
             journal::requests(&operation),
         );
-        let (outcome, changes, evidence) = match evidence {
-            (Ok(raw), Ok(receipt), Ok(requested)) => {
-                let valid = finished && operation.storage_generation == generation;
-                let repeated = receipt.as_ref().is_some_and(|items| {
-                    let mut seen = std::collections::HashSet::new();
-                    items.iter().any(|item| !seen.insert(&item.ref_name))
-                });
-                let outcome = if !valid || repeated {
-                    "unknown"
-                } else if receipt.is_some() {
-                    "recorded"
-                } else if !interrupted && raw.iter().all(|event| event.changes.is_empty()) {
-                    "no_ref_changes"
+        let (outcome, changes, evidence) = if operation.ci_pin.is_some() {
+            match (
+                finished && operation.storage_generation == generation,
+                if finished && operation.storage_generation == generation {
+                    crate::ci_pins::observed_operation(state, &operation).await
                 } else {
-                    "unknown"
-                };
-                let changes = receipt
-                    .as_ref()
-                    .filter(|_| outcome == "recorded")
-                    .map(|items| {
-                        items
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, item)| item.ref_name.starts_with("refs/"))
-                            .map(|(index, item)| events::RefEventInput {
-                                transaction_sequence: index as i64 + 1,
-                                ref_name: item.ref_name.clone(),
-                                old_oid: item.old_oid.clone(),
-                                new_oid: item.new_oid.clone(),
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let evidence = serde_json::json!({"version":1,"finished":finished,"interrupted":interrupted,"reference_events":raw,"requested":requested,"post_receive":receipt,"storage_generation_matches":operation.storage_generation==generation,"repeated_receipt_refs":repeated});
-                (outcome, changes, evidence)
+                    Ok(None)
+                },
+            ) {
+                (true, Ok(Some(changes))) => {
+                    let outcome = if changes.is_empty() {
+                        "no_ref_changes"
+                    } else {
+                        "recorded"
+                    };
+                    let changes = changes
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| events::RefEventInput {
+                            transaction_sequence: index as i64 + 1,
+                            ref_name: item.ref_name.clone(),
+                            old_oid: item.old_oid.clone(),
+                            new_oid: item.new_oid.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    let evidence = serde_json::json!({"version":1,"kind":"observed_immutable_ci_root","intent":operation.ci_pin,"finished":finished,"interrupted":interrupted,"reference_events":journal::events(&operation)?,"retained":!changes.is_empty()});
+                    (outcome, changes, evidence)
+                }
+                _ => (
+                    "unknown",
+                    Vec::new(),
+                    serde_json::json!({"version":1,"kind":"ci_retention_unverified","intent":operation.ci_pin,"finished":finished,"storage_generation_matches":operation.storage_generation==generation}),
+                ),
             }
-            _ => (
-                "unknown",
-                Vec::new(),
-                serde_json::json!({"version":1,"finished":finished,"invalid_journal":true}),
-            ),
+        } else {
+            match evidence {
+                (Ok(raw), Ok(receipt), Ok(requested)) => {
+                    let valid = finished && operation.storage_generation == generation;
+                    let repeated = receipt.as_ref().is_some_and(|items| {
+                        let mut seen = std::collections::HashSet::new();
+                        items.iter().any(|item| !seen.insert(&item.ref_name))
+                    });
+                    let outcome = if !valid || repeated {
+                        "unknown"
+                    } else if receipt.is_some() {
+                        "recorded"
+                    } else if !interrupted && raw.iter().all(|event| event.changes.is_empty()) {
+                        "no_ref_changes"
+                    } else {
+                        "unknown"
+                    };
+                    let changes = receipt
+                        .as_ref()
+                        .filter(|_| outcome == "recorded")
+                        .map(|items| {
+                            items
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, item)| item.ref_name.starts_with("refs/"))
+                                .map(|(index, item)| events::RefEventInput {
+                                    transaction_sequence: index as i64 + 1,
+                                    ref_name: item.ref_name.clone(),
+                                    old_oid: item.old_oid.clone(),
+                                    new_oid: item.new_oid.clone(),
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let evidence = serde_json::json!({"version":1,"finished":finished,"interrupted":interrupted,"reference_events":raw,"requested":requested,"post_receive":receipt,"storage_generation_matches":operation.storage_generation==generation,"repeated_receipt_refs":repeated});
+                    (outcome, changes, evidence)
+                }
+                _ => (
+                    "unknown",
+                    Vec::new(),
+                    serde_json::json!({"version":1,"finished":finished,"invalid_journal":true}),
+                ),
+            }
         };
         events::publish(
             &state.pool,
@@ -386,7 +440,7 @@ pub async fn operations(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     let id = authorized_repo(&state, &headers, &owner, &name).await?;
-    let rows=state.pool.get().await.map_err(Error::internal)?.query("SELECT jsonb_build_object('id',id,'sequence',sequence,'storage_generation',storage_generation,'outcome',outcome,'resolution_id',(SELECT resolution_id FROM operation_resolutions covered WHERE covered.operation_id=git_operations.id),'actor',actor_name,'created_at',created_at,'settled_at',settled_at,'evidence_summary',jsonb_build_object('reference_event_count',jsonb_array_length(COALESCE(evidence->'reference_events','[]'::jsonb)),'receipt_count',CASE WHEN jsonb_typeof(evidence->'post_receive')='array' THEN jsonb_array_length(evidence->'post_receive') ELSE NULL END,'invalid_journal',evidence->'invalid_journal')) FROM git_operations WHERE repository_id=$1 ORDER BY storage_generation DESC,sequence DESC LIMIT 100",&[&id]).await.map_err(Error::internal)?;
+    let rows=state.pool.get().await.map_err(Error::internal)?.query("SELECT jsonb_build_object('id',id,'sequence',sequence,'storage_generation',storage_generation,'outcome',outcome,'resolution_id',(SELECT resolution_id FROM operation_resolutions covered WHERE covered.operation_id=git_operations.id),'actor',actor_name,'created_at',created_at,'settled_at',settled_at,'evidence_summary',jsonb_build_object('kind',COALESCE(evidence->>'kind','receive_pack'),'reference_event_count',jsonb_array_length(COALESCE(evidence->'reference_events','[]'::jsonb)),'receipt_count',CASE WHEN jsonb_typeof(evidence->'post_receive')='array' THEN jsonb_array_length(evidence->'post_receive') ELSE NULL END,'invalid_journal',evidence->'invalid_journal')) FROM git_operations WHERE repository_id=$1 ORDER BY storage_generation DESC,sequence DESC LIMIT 100",&[&id]).await.map_err(Error::internal)?;
     Ok((
         StatusCode::OK,
         [(header::CACHE_CONTROL, "no-store")],

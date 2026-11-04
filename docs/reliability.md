@@ -12,19 +12,45 @@ Status: phase-two increment A. GitFS remains the only authority for refs and obj
 6. The owned supervisor retains the mutex and capacity permit through input/output cleanup. It observes the leader without reaping, terminates remaining group members and waits until all members are stopped before reaping the leader. A stuck uninterruptible process retains admission rather than permitting another writer. CGI-header failures and downstream cancellation follow this same ownership rule.
 7. Persist the operation, original evidence and successful-subset outbox events in one PostgreSQL transaction. Retire the local journal only after PostgreSQL confirms commit. A failed or lost commit response leaves the journal for idempotent replay. A durable retirement rename makes interrupted cleanup safe.
 
-Operation outcomes are deliberately limited:
+For ordinary receive-pack operations, outcomes are deliberately limited:
 
 - `recorded`: a complete post-receive receipt was captured; successful changes are recorded. This is **not** whole-push success. Repeated target refs in one receipt are conservatively ambiguous.
 - `no_ref_changes`: the writer stopped normally with verified hooks and no nonempty reference callback or receipt exists. Unfinished operations recovered after restart do not gain this classification merely because evidence is absent. Empty native callback lists are allowed.
 - `unknown`: incomplete/corrupt evidence, missing success receipt after nonempty reference callbacks, repeated receipt refs, unfinished runtime operation, or generation mismatch. No successful update events are created by the gateway for this state. The repository enters `recovering`, blocks further Git operations and remains inspectable through owner-authenticated metadata/audit APIs.
 
-Current refs, reflogs, matching OIDs, callback phase pairing, and successful client status are never used to manufacture a successful operation. No unknown push is automatically replayed. This is intentionally conservative: an actually rejected update may require recovery if evidence cannot prove the successful subset. For example, Git 2.56 may emit a nonempty preparing callback for a stale CAS that is then rejected; without a success receipt the operation remains unknown and the repository is blocked.
+For receive-pack, current refs, reflogs, matching OIDs, callback phase pairing, and successful client status are never used to manufacture a successful operation. No unknown push is automatically replayed. This is intentionally conservative: an actually rejected update may require recovery if evidence cannot prove the successful subset. For example, Git 2.56 may emit a nonempty preparing callback for a stale CAS that is then rejected; without a success receipt the operation remains unknown and the repository is blocked.
 
 Startup may mark retained operations stopped only after obtaining the volume flock inherited by old Git descendants. Runtime recovery cannot assume an unfinished writer stopped. A complete receipt can settle an interrupted operation and clear only Rootyard's own unknown-outcome flag when no other unknown operation remains. Other incident reasons stay blocked. Every five seconds it attempts retained journals under the same repository mutex, skipping busy repositories; it does not remove unknown evidence or ready-repository Git lock files.
 
+## Exact CI maintenance exception
+
+[CI source retention](ci-mirror.md) uses a separate typed journal operation. Its
+immutable grant contains the owner/repository/job/generation and exactly one
+zero-old-OID-to-target create. It cannot authorize receive-pack, another ref,
+an update, or deletion. The source intent is persisted before the grant and CAS.
+After proving children stopped, reconciliation may classify this **maintenance**
+operation from its exact immutable native retention root, current owner/generation,
+and validated intent/hook evidence. A present exact commit is `recorded`; an
+absent root with no committed callback or prior pinned receipt is
+`no_ref_changes`. Missing/mismatched evidence is `unknown`. This exception does
+not infer any ordinary push's successful subset. An already-imported unknown CI
+operation is never reclassified from later root observations; operator resolution
+remains required and immutable.
+
+The operation evidence kind is `observed_immutable_ci_root` (or
+`ci_retention_unverified` for unknown); `/operations` includes that kind in its
+bounded evidence summary. The exact maintenance change uses ordinal 1 and keeps
+its outbox/audit event. `ref-index` applies its internal-namespace exclusion policy
+and acknowledges delivery with effect `applied`, without writing a misleading
+`push_receipt` row. Stale-generation ref-index events still use
+`superseded_generation`. Explicit recovery snapshots can include all native roots
+with source kind `recovery_snapshot`; they are intentionally broader than this
+incremental user-ref projection. Source receipts and mirror-ready snapshots are
+separate contracts, not shared job state.
+
 ## Durable outbox
 
-`git_operations`, `outbox_events` and independent `event_deliveries` rows commit atomically. Stable event IDs hash the operation UUID, successful receipt ordinal and ref name. The schema's `transaction_sequence` is this **receipt line ordinal**, not a Git-native transaction identifier. Original callback order remains in the evidence JSON. No callback list is collapsed by ref.
+`git_operations`, `outbox_events` and independent `event_deliveries` rows commit atomically. Stable event IDs hash the operation UUID, successful receipt ordinal and ref name. For receive-pack, the schema's `transaction_sequence` is this **receipt line ordinal**, not a Git-native transaction identifier. Original callback order remains in the evidence JSON. No callback list is collapsed by ref.
 
 The built-in `audit-log` and `ref-index` consumers use PostgreSQL row locks, `SKIP LOCKED`, expiring leases, owner UUIDs and increasing claim generations. Acknowledgment rechecks its fence after obtaining the row lock and again after its effect. The effect and delivery acknowledgment commit together. Expired workers cannot acknowledge a later claim. Pending earlier events prevent per-ref delivery from overtaking; unknown earlier operations block later operations for that repository. No maximum global event ID is used as a commit watermark.
 

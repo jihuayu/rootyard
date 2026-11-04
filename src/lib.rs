@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod backup;
+pub mod ci_pins;
 pub mod config;
 pub mod db;
 pub mod dispatch;
@@ -88,6 +89,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health/ready", get(ready))
         .route("/api/repos", post(create_repo).get(list_repos))
         .route("/api/repos/{owner}/{name}", get(get_repo))
+        .route("/api/repos/{owner}/{name}/ci-pins", post(ci_pins::pin))
         .route(
             "/api/repos/{owner}/{name}/operations",
             get(reliability::operations),
