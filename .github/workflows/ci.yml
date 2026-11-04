@@ -46,6 +46,8 @@ jobs:
       - run: cargo build --locked
       - name: Verify schema-007 catalog and dump round trip
         run: python3 tests/schema_contract.py --binary target/debug/rootyard
+      - name: Verify end-to-end harness synchronization
+        run: python3 -m unittest discover -s tests -p 'test_e2e_sync.py'
       - name: Exercise native Git end to end
         run: python3 tests/e2e.py --binary target/debug/rootyard --report test-results/e2e.json
       - name: Exercise exact-commit CI read mirror

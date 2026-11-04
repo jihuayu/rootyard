@@ -15,6 +15,7 @@ import http.client
 import json
 import os
 import random
+import select
 from pathlib import Path
 import shutil
 import signal
@@ -463,6 +464,27 @@ class Harness:
             assert time.monotonic() < until, "Git descendants survived the operation deadline: " + str(remaining)
             time.sleep(.05)
 
+    def wait_for_git_children(self, sock, sent_at, operation):
+        # Authentication, recovery checks and journal fsync precede spawn. A
+        # fixed 100 ms sleep races those steps on shared CI runners. Require an
+        # actual streaming response AND live descendants, without draining the
+        # response or extending the operation's original deadline assertion.
+        until = sent_at + 2
+        while time.monotonic() < until:
+            response_started = False
+            if select.select([sock], [], [], 0)[0]:
+                prefix = sock.recv(1024, socket.MSG_PEEK)
+                assert prefix, f"{operation} connection ended before observing Git children"
+                if b"\r\n" in prefix:
+                    status = prefix.split(b"\r\n", 1)[0].split()
+                    assert len(status) >= 2 and status[1] == b"200", f"{operation} did not start streaming: {status!r}"
+                    response_started = True
+            children = self.descendants()
+            if response_started and children:
+                return children
+            time.sleep(.01)
+        raise AssertionError(f"No streaming Git child observed during {operation} within 2 seconds")
+
     def slow_client_deadlines(self):
         (self.work / "large.bin").write_bytes(random.Random(43).randbytes(12 * 1024 * 1024))
         self.git("add", "large.bin", cwd=self.work)
@@ -483,20 +505,18 @@ class Harness:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
                 sock.settimeout(10)
                 sock.connect(("127.0.0.1", self.port))
+                sent_at = time.monotonic()
                 sock.sendall(wire("git-upload-pack", body))
-                assert b"200" in sock.recv(128), "Upload-pack did not start streaming"
-                children = self.descendants()
-                assert children, "No Git child observed during blocked streaming"
-                time.sleep(4)
+                children = self.wait_for_git_children(sock, sent_at, "blocked streaming")
+                time.sleep(max(0, sent_at + 4 - time.monotonic()))
                 self.assert_reaped(children)
                 self.expect(path + "/info/refs?service=git-upload-pack", 200, token=self.alice)
             command = self.pkt(("0" * 40 + " " + "f" * 40 + " refs/heads/stalled").encode() + b"\0report-status\n") + b"0000"
             with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+                sent_at = time.monotonic()
                 sock.sendall(wire("git-receive-pack", command + b"PACK", 100000))
-                time.sleep(.1)
-                children = self.descendants()
-                assert children, "No Git child observed during incomplete upload"
-                time.sleep(4)
+                children = self.wait_for_git_children(sock, sent_at, "incomplete upload")
+                time.sleep(max(0, sent_at + 4 - time.monotonic()))
                 self.assert_reaped(children)
                 self.expect(path + "/info/refs?service=git-upload-pack", 200, token=self.alice)
             self.git("push", "origin", "HEAD:after-stalled", cwd=self.work, token=self.alice)
