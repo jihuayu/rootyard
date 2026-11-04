@@ -21,8 +21,10 @@ SHA512 = (
     "f5ceba8a265ab6bb2d68362b1f6859a95e15d60ef92ba83b43fdf065b557dc18e98d6383"
     "c15b9977320e25b3a2c8b6f11decb17b0fa6c0f163423793a0eb95cb"
 )
+# Apache recommends this CDN for release artifacts:
+# https://infra.apache.org/release-publishing.html
 URLS = (
-    f"https://downloads.apache.org/kafka/4.4.0/{ARTIFACT}",
+    f"https://dlcdn.apache.org/kafka/4.4.0/{ARTIFACT}",
     f"https://archive.apache.org/dist/kafka/4.4.0/{ARTIFACT}",
 )
 ATTEMPTS_PER_SOURCE = 2
