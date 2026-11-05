@@ -172,6 +172,13 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
             }
             return json_reply(StatusCode::OK, &object_store::status(config, repo).await?);
         }
+        if tail == "lifecycle" {
+            let db = config.db().await?;
+            if !permitted(&db, repo, principal, false).await? {
+                return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
+            }
+            return json_reply(StatusCode::OK, &lifecycle::status(config, repo).await?);
+        }
     }
     if token.is_none() && parts.method == "POST" && tail == "repack" {
         let db = config.db().await?;
@@ -204,6 +211,39 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
         return json_reply(
             StatusCode::OK,
             &repack::repack_repo(config, repo, &opts).await?,
+        );
+    }
+    if token.is_none() && parts.method == "POST" && tail == "lifecycle" {
+        let db = config.db().await?;
+        if !permitted(&db, repo, principal, true).await? {
+            return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
+        }
+        let state_row = db
+            .query_opt(
+                "SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1",
+                &[&repo],
+            )
+            .await?;
+        let Some(state_row) = state_row else {
+            return Ok(reply(StatusCode::NOT_FOUND, "unknown repository"));
+        };
+        let write_paused: bool = state_row.get(0);
+        let storage_backend: String = state_row.get(1);
+        if write_paused || storage_backend != "pando" {
+            return Ok(reply(
+                StatusCode::CONFLICT,
+                "repository writes paused or routed to gitfs",
+            ));
+        }
+        let raw_body = to_bytes(body, 64 * 1024).await?;
+        let opts: lifecycle::LifecycleEvaluateOptions = if raw_body.is_empty() {
+            lifecycle::LifecycleEvaluateOptions::default()
+        } else {
+            serde_json::from_slice(&raw_body)?
+        };
+        return json_reply(
+            StatusCode::OK,
+            &lifecycle::evaluate_lifecycle(config, repo, &opts).await?,
         );
     }
     let service = match (parts.method.as_str(), tail.as_str()) {

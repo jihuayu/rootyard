@@ -29,11 +29,12 @@ class CiMirrorTrack3Test(unittest.TestCase):
         lines = mirror_rs.read_text().splitlines()
         self.assertLess(
             len(lines),
-            150,
-            f"src/mirror.rs must stay under 150 lines (got {len(lines)})",
+            140,
+            f"src/mirror.rs must stay under 140 lines (got {len(lines)})",
         )
         source = mirror_rs.read_text()
         for decl in (
+            "pub mod auto_origin;",
             "pub mod eviction;",
             "pub mod limiter;",
             "pub mod observability;",
@@ -45,12 +46,15 @@ class CiMirrorTrack3Test(unittest.TestCase):
         ):
             self.assertIn(decl, source, f"Missing declaration in src/mirror.rs: {decl}")
 
-        for submod in ("eviction.rs", "limiter.rs", "observability.rs", "sync.rs", "views.rs"):
+        for submod in ("auto_origin.rs", "eviction.rs", "limiter.rs", "observability.rs", "sync.rs", "views.rs"):
             sub_path = ROOT / "src" / "mirror" / submod
             self.assertTrue(sub_path.is_file(), f"Missing submodule {sub_path}")
             sub_lines = len(sub_path.read_text().splitlines())
             self.assertGreaterEqual(sub_lines, 40, f"{submod} is unexpectedly tiny ({sub_lines} lines)")
             self.assertLessEqual(sub_lines, 700, f"{submod} exceeds modular size bound ({sub_lines} lines)")
+        auto_origin_lines = len((ROOT / "src" / "mirror" / "auto_origin.rs").read_text().splitlines())
+        self.assertGreaterEqual(auto_origin_lines, 120)
+        self.assertLess(auto_origin_lines, 450)
 
     def test_staged_migration_030_ci_mirror_sql_contract(self):
         sql_path = ROOT / "src" / "mirror" / "030_ci_mirror.sql"
@@ -339,6 +343,218 @@ class CiMirrorTrack3Test(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+
+    def test_m18_auto_origin_source_and_serde_contracts(self):
+        mirror_rs_path = ROOT / "src" / "mirror.rs"
+        auto_origin_path = ROOT / "src" / "mirror" / "auto_origin.rs"
+        self.assertTrue(auto_origin_path.is_file(), "src/mirror/auto_origin.rs must exist")
+        mirror_lines = len(mirror_rs_path.read_text().splitlines())
+        auto_lines = len(auto_origin_path.read_text().splitlines())
+        self.assertLess(mirror_lines, 140)
+        self.assertGreaterEqual(auto_lines, 120)
+        self.assertLess(auto_lines, 450)
+
+        mirror_src = mirror_rs_path.read_text()
+        self.assertIn("pub mod auto_origin;", mirror_src)
+        self.assertIn('"/api/repos/{owner}/{name}/mirror-auto-fetch"', mirror_src)
+        self.assertIn('"/api/repos/{owner}/{name}/mirror-runners"', mirror_src)
+
+        auto_src = auto_origin_path.read_text()
+        for struct_name in (
+            "pub struct AutoFetchRequest",
+            "pub struct AutoFetchResponse",
+            "pub struct RunnerQueueRequest",
+            "pub struct RunnerRegistration",
+            "pub struct RunnerJobClaim",
+            "pub struct RunnerQueueState",
+            "pub struct RunnerQueueResponse",
+        ):
+            self.assertIn(struct_name, auto_src)
+        self.assertGreaterEqual(
+            auto_src.count("#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]"),
+            7,
+        )
+        self.assertGreaterEqual(auto_src.count("#[serde(deny_unknown_fields)]"), 7)
+        for snippet in (
+            "pub async fn auto_fetch(",
+            "pub async fn list_runners(",
+            "pub async fn claim_or_heartbeat_runner(",
+            "tokio::sync::Notify",
+            "pinned_path(&state.storage, repo.id, repo.storage_generation, &req.target_oid)",
+            'state.storage.root.join("mirror-runners").join(format!("{}.json", repo.id))',
+            "ci_checkout_jobs",
+            '"hit"',
+            '"miss_fetched"',
+            '"coalesced_wait"',
+            "StatusCode::CONFLICT",
+        ):
+            self.assertIn(snippet, auto_src, f"Missing M18 contract snippet in auto_origin.rs: {snippet}")
+
+    def test_m18_singleflight_auto_origin_fetch_and_runner_queue_lifecycle(self):
+        harness = object.__new__(ci_mirror.MirrorHarness)
+        harness.root = Path("/tmp/fake-m18-mirror-root")
+        harness.bare = Path("/tmp/fake-m18-primary-bare")
+        harness.repo = {"id": str(uuid.uuid4())}
+        harness.alice = {"username": "alice", "token": "ryt_alice_secret"}
+        harness.bob = {"username": "bob", "token": "ryt_bob_secret"}
+        harness.reader = {"username": "alice", "token": "ryt_reader_secret"}
+        harness.first = "a" * 40
+        harness.second = "b" * 40
+        harness.third = "c" * 40
+
+        cached_oids = set()
+        inflight_oids = set()
+        runners = {}
+        claims = {}
+
+        def fake_mirror_expect(path, codes, token=None, method="GET", body=None):
+            ok_codes = codes if isinstance(codes, tuple) else (codes,)
+            if path.endswith("/mirror-auto-fetch"):
+                oid = (body or {}).get("target_oid", "")
+                gen = (body or {}).get("storage_generation", 1)
+                force = bool((body or {}).get("force_refresh", False))
+                if len(oid) != 40 or any(c not in "0123456789abcdef" for c in oid) or oid == "0" * 40:
+                    self.assertIn(400, ok_codes)
+                    return b"bad_request"
+                if gen != 1:
+                    self.assertIn(409, ok_codes)
+                    return b"conflict"
+                if oid in inflight_oids:
+                    status = "coalesced_wait"
+                    coalesced = True
+                    waiters = 1
+                elif not force and oid in cached_oids:
+                    status = "hit"
+                    coalesced = False
+                    waiters = 0
+                else:
+                    cached_oids.add(oid)
+                    status = "miss_fetched"
+                    coalesced = False
+                    waiters = 0
+                return json.dumps(
+                    {
+                        "repository_id": harness.repo["id"],
+                        "storage_generation": 1,
+                        "target_oid": oid,
+                        "snapshot_id": str(uuid.uuid4()),
+                        "cache_status": status,
+                        "coalesced": coalesced,
+                        "coalesced_waiters": waiters,
+                        "duration_ms": 5,
+                    }
+                ).encode()
+
+            if path.endswith("/mirror-runners"):
+                if method == "GET":
+                    return json.dumps(
+                        {
+                            "repository_id": harness.repo["id"],
+                            "storage_generation": 1,
+                            "action": "list",
+                            "runner_id": None,
+                            "cluster_zone": None,
+                            "active_claim": None,
+                            "reaped_jobs": [],
+                            "runners": list(runners.values()),
+                            "claims": list(claims.values()),
+                        }
+                    ).encode()
+                act = body["action"]
+                rid = body["runner_id"]
+                zone = body["cluster_zone"]
+                now = body.get("now_unix", 1000)
+                ttl = body.get("lease_ttl_secs", 300)
+                runners[rid] = {
+                    "runner_id": rid,
+                    "cluster_zone": zone,
+                    "registered_at_unix": runners.get(rid, {}).get("registered_at_unix", now),
+                    "last_heartbeat_unix": now,
+                    "lease_expires_unix": now + ttl,
+                    "active_job_id": runners.get(rid, {}).get("active_job_id"),
+                    "active_attempt": runners.get(rid, {}).get("active_attempt"),
+                }
+                active_claim = None
+                reaped_jobs = []
+                if act == "claim":
+                    jid = body["job_id"]
+                    c = claims.get(
+                        jid,
+                        {
+                            "job_id": jid,
+                            "target_oid": body.get("target_oid", harness.first),
+                            "storage_generation": 1,
+                            "status": "queued",
+                            "attempt": 0,
+                            "claimed_by": None,
+                            "cluster_zone": None,
+                            "claimed_at_unix": None,
+                            "heartbeat_at_unix": None,
+                            "lease_expires_unix": None,
+                        },
+                    )
+                    c["attempt"] += 1
+                    c["status"] = "claimed"
+                    c["claimed_by"] = rid
+                    c["cluster_zone"] = zone
+                    c["claimed_at_unix"] = now
+                    c["heartbeat_at_unix"] = now
+                    c["lease_expires_unix"] = now + ttl
+                    claims[jid] = c
+                    active_claim = dict(c)
+                elif act == "reap_expired":
+                    for jid, c in claims.items():
+                        if c["status"] == "claimed" and c["lease_expires_unix"] <= now:
+                            c["status"] = "queued"
+                            c["claimed_by"] = None
+                            c["cluster_zone"] = None
+                            c["lease_expires_unix"] = None
+                            reaped_jobs.append(jid)
+                elif act in ("heartbeat", "complete"):
+                    jid = body["job_id"]
+                    c = claims[jid]
+                    req_attempt = body.get("attempt")
+                    if (
+                        c["status"] != "claimed"
+                        or c["claimed_by"] != rid
+                        or c["lease_expires_unix"] <= now
+                        or (req_attempt is not None and req_attempt != c["attempt"])
+                    ):
+                        self.assertIn(409, ok_codes)
+                        return b"stale_runner_conflict"
+                    c["heartbeat_at_unix"] = now
+                    if act == "complete":
+                        c["status"] = "completed"
+                        c["lease_expires_unix"] = None
+                    else:
+                        c["lease_expires_unix"] = now + ttl
+                    active_claim = dict(c)
+                return json.dumps(
+                    {
+                        "repository_id": harness.repo["id"],
+                        "storage_generation": 1,
+                        "action": act,
+                        "runner_id": rid,
+                        "cluster_zone": zone,
+                        "active_claim": active_claim,
+                        "reaped_jobs": reaped_jobs,
+                        "runners": list(runners.values()),
+                        "claims": list(claims.values()),
+                    }
+                ).encode()
+            return b"{}"
+
+        harness.mirror_expect = fake_mirror_expect
+        result = harness.coalesced_auto_fetch_and_runner_queue()
+        self.assertTrue(result["auto_origin_fetch_verified"])
+        self.assertTrue(result["cross_cluster_runner_queue_verified"])
+
+        # Verify singleflight coalesced waiter response when an origin fetch is already in-flight.
+        inflight_oids.add(harness.second)
+        coalesced_resp = harness.auto_fetch({"target_oid": harness.second, "storage_generation": 1})
+        self.assertEqual(coalesced_resp["cache_status"], "coalesced_wait")
+        self.assertTrue(coalesced_resp["coalesced"])
+        self.assertGreaterEqual(coalesced_resp["coalesced_waiters"], 1)
 
 
 if __name__ == "__main__":

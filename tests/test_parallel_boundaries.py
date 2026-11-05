@@ -153,6 +153,17 @@ class ParallelBoundariesTest(unittest.TestCase):
         self.assertTrue(w_path.is_file())
         self.assertLess(len(w_path.read_text().splitlines()), 600)
 
+    def test_tier4_modularity_exists(self):
+        for rel, cap in (
+            ("src/mirror/auto_origin.rs", 450),
+            ("src/pando_lab/lifecycle.rs", 450),
+            ("src/workspace_lab/writable_view.rs", 500),
+            ("src/sharding/rebalance.rs", 500),
+        ):
+            p = ROOT / rel
+            self.assertTrue(p.is_file(), f"Missing Tier-4 submodule {rel}")
+            self.assertLess(len(p.read_text().splitlines()), cap)
+
 
 if __name__ == "__main__":
     unittest.main()

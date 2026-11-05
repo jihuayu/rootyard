@@ -233,6 +233,8 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
             "/api/repos/{owner}/{name}/mirror-evict": ["POST"],
             "/api/repos/{owner}/{name}/mirror-prune": ["POST"],
             "/api/repos/{owner}/{name}/mirror-status": ["GET"],
+            "/api/repos/{owner}/{name}/mirror-auto-fetch": ["POST"],
+            "/api/repos/{owner}/{name}/mirror-runners": ["GET", "POST"],
             "/metrics": ["GET"],
         }
         self.assertEqual(route_map, expected)
@@ -582,8 +584,8 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
             "webhooks": (["models.rs", "signing.rs", "delivery.rs", "handlers.rs"], 550),
             "members": (["models.rs", "rbac.rs", "audit.rs"], 550),
             "web": (["models.rs", "sanitize.rs", "templates.rs", "handlers.rs"], 600),
-            "sharding": (["models.rs", "router.rs", "fencing.rs", "failover.rs"], 600),
-            "mirror": (["eviction.rs", "limiter.rs", "observability.rs", "sync.rs", "views.rs"], 700),
+            "sharding": (["models.rs", "router.rs", "fencing.rs", "failover.rs", "rebalance.rs"], 600),
+            "mirror": (["auto_origin.rs", "eviction.rs", "limiter.rs", "observability.rs", "sync.rs", "views.rs"], 700),
             "pando_lab": (
                 [
                     "mod.rs",
@@ -597,11 +599,22 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
                     "rollback.rs",
                     "object_store.rs",
                     "repack.rs",
+                    "lifecycle.rs",
                 ],
                 850,
             ),
             "workspace_lab": (
-                ["core.rs", "manifest.rs", "ignore.rs", "sync.rs", "view.rs", "remote.rs", "namespace.rs", "vfs.rs"],
+                [
+                    "core.rs",
+                    "manifest.rs",
+                    "ignore.rs",
+                    "sync.rs",
+                    "view.rs",
+                    "remote.rs",
+                    "namespace.rs",
+                    "vfs.rs",
+                    "writable_view.rs",
+                ],
                 1150,
             ),
         }
@@ -637,11 +650,15 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
             "src/members/models.rs",
             "src/web/models.rs",
             "src/sharding/models.rs",
+            "src/sharding/rebalance.rs",
             "src/mirror/eviction.rs",
+            "src/mirror/auto_origin.rs",
+            "src/pando_lab/lifecycle.rs",
             "src/workspace_lab/manifest.rs",
             "src/workspace_lab/remote.rs",
             "src/workspace_lab/namespace.rs",
             "src/workspace_lab/vfs.rs",
+            "src/workspace_lab/writable_view.rs",
         )
         for rel in model_files:
             text = (ROOT / rel).read_text(encoding="utf-8")

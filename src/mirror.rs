@@ -1,5 +1,6 @@
 //! Explicit, full-snapshot read mirrors with bounded concurrency, observability,
 //! and safe LRU/watermark eviction preserving active CI pins and checkout leases.
+pub mod auto_origin;
 pub mod eviction;
 pub mod limiter;
 pub mod observability;
@@ -74,6 +75,11 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/repos/{owner}/{name}/mirror-sync", post(sync::sync))
         .route("/api/repos/{owner}/{name}/mirror-prepare", post(sync::prepare))
+        .route("/api/repos/{owner}/{name}/mirror-auto-fetch", post(auto_origin::auto_fetch))
+        .route(
+            "/api/repos/{owner}/{name}/mirror-runners",
+            get(auto_origin::list_runners).post(auto_origin::claim_or_heartbeat_runner),
+        )
         .route("/api/repos/{owner}/{name}/mirror-evict", post(eviction::evict))
         .route("/api/repos/{owner}/{name}/mirror-prune", post(eviction::prune))
         .route("/api/repos/{owner}/{name}/mirror-status", get(observability::status))

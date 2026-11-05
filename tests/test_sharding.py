@@ -29,8 +29,8 @@ class ShardingTrack4ContractTest(unittest.TestCase):
         sharding_lines = sharding_src.splitlines()
         self.assertLess(
             len(sharding_lines),
-            100,
-            f"src/sharding.rs must remain < 100 lines, got {len(sharding_lines)}",
+            95,
+            f"src/sharding.rs must remain < 95 lines, got {len(sharding_lines)}",
         )
         self.assertIn("pub const MIGRATION_060_SQL: &str", sharding_src)
         self.assertIn("pub fn routes() -> Router<Arc<AppState>>", sharding_src)
@@ -45,7 +45,7 @@ class ShardingTrack4ContractTest(unittest.TestCase):
         self.assertNotIn("/:", sharding_src)
         self.assertNotIn("{*", sharding_src)
 
-        for sub in ("models", "router", "fencing", "failover"):
+        for sub in ("models", "router", "fencing", "failover", "rebalance"):
             self.assertIn(f"pub mod {sub};", sharding_src)
             sub_path = ROOT / "src/sharding" / f"{sub}.rs"
             self.assertTrue(sub_path.is_file(), f"Missing submodule {sub_path}")
@@ -68,11 +68,13 @@ class ShardingTrack4ContractTest(unittest.TestCase):
             "/api/shards/nodes/{node_id}",
             "/api/shards/nodes/{node_id}/lease",
             "/api/shards/buckets",
+            "/api/shards/rebalance",
             "/api/repos/{owner}/{name}/shard-route",
             "/api/repos/{owner}/{name}/shard-route/resolve",
             "/api/repos/{owner}/{name}/shard-fence",
             "/api/repos/{owner}/{name}/shard-failover",
             "/api/repos/{owner}/{name}/shard-degrade",
+            "/api/repos/{owner}/{name}/shard-dr-drill",
         )
         for route in expected_routes:
             self.assertIn(route, sharding_src, f"Route {route} missing from src/sharding.rs")
@@ -81,6 +83,28 @@ class ShardingTrack4ContractTest(unittest.TestCase):
         router_src = (ROOT / "src/sharding/router.rs").read_text(encoding="utf-8")
         fencing_src = (ROOT / "src/sharding/fencing.rs").read_text(encoding="utf-8")
         failover_src = (ROOT / "src/sharding/failover.rs").read_text(encoding="utf-8")
+        rebalance_src = (ROOT / "src/sharding/rebalance.rs").read_text(encoding="utf-8")
+        rebalance_lines = rebalance_src.splitlines()
+
+        self.assertGreaterEqual(
+            len(rebalance_lines),
+            150,
+            f"src/sharding/rebalance.rs must be >= 150 lines, got {len(rebalance_lines)}",
+        )
+        self.assertLess(
+            len(rebalance_lines),
+            500,
+            f"src/sharding/rebalance.rs must be < 500 lines, got {len(rebalance_lines)}",
+        )
+        self.assertGreaterEqual(rebalance_src.count("#[serde(deny_unknown_fields)]"), 6)
+        self.assertGreaterEqual(rebalance_src.count("#[derive(Clone, Debug, Serialize, Deserialize)]"), 6)
+        for fn_sig in (
+            "pub async fn list_rebalances(",
+            "pub async fn execute_rebalance(",
+            "pub async fn list_dr_drills(",
+            "pub async fn execute_dr_drill(",
+        ):
+            self.assertIn(fn_sig, rebalance_src, f"Missing {fn_sig} in src/sharding/rebalance.rs")
 
         self.assertGreaterEqual(models_src.count("#[serde(deny_unknown_fields)]"), 8)
         self.assertIn("pub fn deterministic_bucket_id(", models_src)
@@ -451,6 +475,209 @@ class ShardingTrack4ContractTest(unittest.TestCase):
         self.assertTrue(rec["write_admitted"])
         self.assertEqual(eng.resolve_repo_route(alice, "alice", "deg-repo", op="write")[0], 200)
 
+    def test_online_bucket_and_repository_rebalance_state_machine(self):
+        eng = sharding.ShardingReferenceEngine()
+        self.addCleanup(eng.close)
+        alice = eng.create_user("alice")
+        repo = eng.create_repo(alice, "reb-repo", storage_generation=1)
+        eng.upsert_node(
+            alice,
+            "node-a",
+            "http://node-a:8080",
+            role="primary",
+            status="healthy",
+            capacity_bytes=1000,
+            used_bytes=100,
+            lease_ttl_seconds=60,
+        )
+        eng.upsert_node(
+            alice,
+            "node-b",
+            "http://node-b:8080",
+            role="primary",
+            status="healthy",
+            capacity_bytes=1000,
+            used_bytes=200,
+            lease_ttl_seconds=60,
+        )
+        eng.upsert_node(
+            alice,
+            "node-full",
+            "http://node-full:8080",
+            role="primary",
+            status="healthy",
+            capacity_bytes=500,
+            used_bytes=500,
+            lease_ttl_seconds=60,
+        )
+        eng.upsert_node(
+            alice,
+            "node-unhealthy",
+            "http://node-unhealthy:8080",
+            role="primary",
+            status="degraded",
+            capacity_bytes=1000,
+            used_bytes=0,
+            lease_ttl_seconds=60,
+        )
+        eng.upsert_node(
+            alice,
+            "node-expired",
+            "http://node-expired:8080",
+            role="primary",
+            status="healthy",
+            capacity_bytes=1000,
+            used_bytes=0,
+            lease_ttl_seconds=10,
+            now_unix=100,
+        )
+
+        b_reb = sharding.deterministic_bucket_id(repo["id"])
+        eng.upsert_bucket(alice, b_reb, "node-a", ["node-b"])
+        eng.configure_repo_route(alice, "alice", "reb-repo", primary_node_id="node-a", read_replica_nodes=["node-b"])
+
+        # Validation rejections: bucket >= 1024 (400), source == target (409), full capacity (409), unhealthy (409), expired lease (409)
+        self.assertEqual(eng.execute_rebalance(alice, 1024, "node-a", "node-b")[0], 400)
+        self.assertEqual(eng.execute_rebalance(alice, b_reb, "node-a", "node-a")[0], 409)
+        self.assertEqual(eng.execute_rebalance(alice, b_reb, "node-a", "node-full")[0], 409)
+        self.assertEqual(eng.execute_rebalance(alice, b_reb, "node-a", "node-unhealthy")[0], 409)
+        self.assertEqual(
+            eng.execute_rebalance(alice, b_reb, "node-a", "node-expired", now_unix=500)[0],
+            409,
+        )
+
+        # Dry-run validates 4 phases without mutating bucket or repository route
+        st_dry, dry = eng.execute_rebalance(
+            alice, b_reb, "node-a", "node-b", repository_id=repo["id"], dry_run=True, reason="Dry run check"
+        )
+        self.assertEqual(st_dry, 200)
+        self.assertTrue(dry["dry_run"])
+        self.assertEqual(dry["phases"], ["drain", "sync", "fence", "cutover"])
+        self.assertEqual(eng.get_repo_route(alice, "alice", "reb-repo")[1]["primary_node_id"], "node-a")
+
+        # Live 4-phase online bucket + repository rebalance
+        st_reb, reb = eng.execute_rebalance(
+            alice, b_reb, "node-a", "node-b", repository_id=repo["id"], dry_run=False, reason="Hotspot evacuation"
+        )
+        self.assertEqual(st_reb, 200)
+        self.assertFalse(reb["dry_run"])
+        self.assertEqual(reb["state"], "completed")
+        self.assertEqual(reb["phases"], ["drain", "sync", "fence", "cutover"])
+        self.assertEqual(reb["new_route_epoch"], reb["old_route_epoch"] + 1)
+        self.assertEqual(reb["fenced_epoch"], reb["old_route_epoch"])
+        self.assertGreaterEqual(reb["fencing_token"], reb["new_route_epoch"])
+        self.assertEqual(reb["storage_generation"], 2)
+
+        # Old node-a split-brain write is rejected with 409; new node-b is admitted with 200
+        self.assertEqual(
+            eng.apply_or_verify_fence(alice, "alice", "reb-repo", action="verify", writer_node_id="node-a")[0],
+            409,
+        )
+        self.assertEqual(
+            eng.apply_or_verify_fence(alice, "alice", "reb-repo", action="verify", writer_node_id="node-b")[0],
+            200,
+        )
+
+        # Volume fence marker updated on disk and audit log recorded 'shard.rebalanced'
+        m_st, marker = eng.read_volume_marker(repo["id"])
+        self.assertEqual(m_st, 200)
+        self.assertIsNotNone(marker)
+        self.assertEqual(marker["fenced_node_id"], "node-a")
+        self.assertEqual(marker["storage_generation"], 2)
+        audit_actions = [r["action"] for r in eng.conn.execute("SELECT action FROM repository_audit_log").fetchall()]
+        self.assertIn("shard.rebalanced", audit_actions)
+
+        st_list, listed = eng.list_rebalances(alice)
+        self.assertEqual(st_list, 200)
+        self.assertGreaterEqual(len(listed["items"]), 1)
+        self.assertEqual(listed["items"][0]["target_node_id"], "node-b")
+
+    def test_measured_rpo_rto_disaster_recovery_drill_and_sla_enforcement(self):
+        eng = sharding.ShardingReferenceEngine()
+        self.addCleanup(eng.close)
+        alice = eng.create_user("alice")
+        repo = eng.create_repo(alice, "dr-repo", storage_generation=1)
+        eng.upsert_node(alice, "node-a", "http://node-a:8080", role="primary", status="healthy")
+        eng.upsert_node(alice, "node-b", "http://node-b:8080", role="replica", status="healthy")
+        eng.configure_repo_route(alice, "alice", "dr-repo", primary_node_id="node-a", read_replica_nodes=["node-b"])
+
+        # Passing RPO/RTO drill with verify_rollback=True
+        st_ok, drill_ok = eng.execute_dr_drill(
+            alice,
+            "alice",
+            "dr-repo",
+            primary_node_id="node-a",
+            standby_node_id="node-b",
+            target_rpo_secs=10,
+            target_rto_ms=500,
+            simulated_lag_secs=2,
+            simulated_takeover_ms=120,
+            verify_rollback=True,
+        )
+        self.assertEqual(st_ok, 200)
+        self.assertTrue(drill_ok["rpo_met"])
+        self.assertTrue(drill_ok["rto_met"])
+        self.assertTrue(drill_ok["sla_met"])
+        self.assertTrue(drill_ok["rolled_back"])
+        self.assertEqual(drill_ok["active_primary_node_id"], "node-a")
+        self.assertEqual(
+            drill_ok["phases"],
+            ["outage_simulated", "fenced", "standby_promoted", "read_write_verified", "rollback_verified"],
+        )
+
+        # Durable drill receipt persisted under <repo_dir>/rootyard-dr-drill.json and logged in repository_audit_log
+        r_st, disk_receipt = eng.read_dr_drill_receipt(repo["id"])
+        self.assertEqual(r_st, 200)
+        self.assertIsNotNone(disk_receipt)
+        self.assertEqual(disk_receipt["drill_id"], drill_ok["drill_id"])
+        audit_actions = [r["action"] for r in eng.conn.execute("SELECT action FROM repository_audit_log").fetchall()]
+        self.assertIn("shard.dr_drill", audit_actions)
+
+        # RPO SLA breach (simulated_lag_secs=25 > target_rpo_secs=5) -> 409 Conflict and safely rolled back to node-a
+        st_rpo, drill_rpo = eng.execute_dr_drill(
+            alice,
+            "alice",
+            "dr-repo",
+            primary_node_id="node-a",
+            standby_node_id="node-b",
+            target_rpo_secs=5,
+            target_rto_ms=500,
+            simulated_lag_secs=25,
+            simulated_takeover_ms=100,
+            verify_rollback=False,
+        )
+        self.assertEqual(st_rpo, 409)
+        self.assertFalse(drill_rpo["rpo_met"])
+        self.assertTrue(drill_rpo["rto_met"])
+        self.assertFalse(drill_rpo["sla_met"])
+        self.assertTrue(drill_rpo["rolled_back"])
+        self.assertEqual(drill_rpo["active_primary_node_id"], "node-a")
+        self.assertEqual(eng.get_repo_route(alice, "alice", "dr-repo")[1]["primary_node_id"], "node-a")
+
+        # RTO SLA breach (simulated_takeover_ms=900 > target_rto_ms=250) -> 409 Conflict and safely rolled back to node-a
+        st_rto, drill_rto = eng.execute_dr_drill(
+            alice,
+            "alice",
+            "dr-repo",
+            primary_node_id="node-a",
+            standby_node_id="node-b",
+            target_rpo_secs=10,
+            target_rto_ms=250,
+            simulated_lag_secs=1,
+            simulated_takeover_ms=900,
+            verify_rollback=False,
+        )
+        self.assertEqual(st_rto, 409)
+        self.assertTrue(drill_rto["rpo_met"])
+        self.assertFalse(drill_rto["rto_met"])
+        self.assertFalse(drill_rto["sla_met"])
+        self.assertTrue(drill_rto["rolled_back"])
+        self.assertEqual(drill_rto["active_primary_node_id"], "node-a")
+
+        st_drills, drills = eng.list_dr_drills(alice, "alice", "dr-repo")
+        self.assertEqual(st_drills, 200)
+        self.assertGreaterEqual(len(drills["items"]), 1)
+
     def test_access_boundaries_and_e2e_harness_contract(self):
         eng = sharding.ShardingReferenceEngine()
         self.addCleanup(eng.close)
@@ -466,26 +693,49 @@ class ShardingTrack4ContractTest(unittest.TestCase):
         # 401 unauthenticated
         self.assertEqual(eng.get_repo_route(None, "alice", "sec-repo")[0], 401)
         self.assertEqual(eng.list_nodes(None)[0], 401)
+        self.assertEqual(eng.list_rebalances(None)[0], 401)
+        self.assertEqual(eng.list_dr_drills(None, "alice", "sec-repo")[0], 401)
 
         # 404 non-member on private repo
         self.assertEqual(eng.get_repo_route(outsider, "alice", "sec-repo")[0], 404)
         self.assertEqual(eng.get_fence_status(outsider, "alice", "sec-repo")[0], 404)
+        self.assertEqual(eng.list_dr_drills(outsider, "alice", "sec-repo")[0], 404)
 
-        # Read member can view route & fence status (200), but Write member cannot mutate shard config/fence/failover (403)
+        # Read member can view route & fence status (200), but Write member cannot mutate shard config/fence/failover/dr-drill (403)
         self.assertEqual(eng.get_repo_route(carol_read, "alice", "sec-repo")[0], 200)
         self.assertEqual(eng.get_fence_status(carol_read, "alice", "sec-repo")[0], 200)
         self.assertEqual(eng.configure_repo_route(bob_write, "alice", "sec-repo", required_op_sequence=1)[0], 403)
         self.assertEqual(eng.apply_or_verify_fence(bob_write, "alice", "sec-repo", action="fence")[0], 403)
         self.assertEqual(eng.execute_failover(bob_write, "alice", "sec-repo", "node-b")[0], 403)
         self.assertEqual(eng.degrade_or_recover_repo(bob_write, "alice", "sec-repo", mode="degrade")[0], 403)
+        self.assertEqual(eng.list_dr_drills(bob_write, "alice", "sec-repo")[0], 403)
+        self.assertEqual(
+            eng.execute_dr_drill(bob_write, "alice", "sec-repo", "node-a", "node-b", 10, 500)[0],
+            403,
+        )
 
         # Read-only token on Admin actor rejected with 403 on mutations
         self.assertEqual(eng.upsert_node(alice_ro, "node-ro", "http://ro:8080")[0], 403)
         self.assertEqual(eng.degrade_or_recover_repo(alice_ro, "alice", "sec-repo", mode="degrade")[0], 403)
+        self.assertEqual(eng.execute_rebalance(alice_ro, 0, "node-a", "node-b")[0], 403)
+        self.assertEqual(
+            eng.execute_dr_drill(alice_ro, "alice", "sec-repo", "node-a", "node-b", 10, 500)[0],
+            403,
+        )
 
         # Unknown fields / invalid values rejected with 400
         self.assertEqual(
             eng.upsert_node(alice, "node-x", "http://x:8080", extra_fields={"unexpected": 1})[0],
+            400,
+        )
+        self.assertEqual(
+            eng.execute_rebalance(alice, 0, "node-a", "node-b", extra_fields={"unexpected": 1})[0],
+            400,
+        )
+        self.assertEqual(
+            eng.execute_dr_drill(
+                alice, "alice", "sec-repo", "node-a", "node-b", 10, 500, extra_fields={"unexpected": 1}
+            )[0],
             400,
         )
 
@@ -502,6 +752,8 @@ class ShardingTrack4ContractTest(unittest.TestCase):
             "read_write_watermark_routing_and_replica_fallback",
             "automated_four_stage_failover_state_machine",
             "read_only_degradation_drill_and_recovery",
+            "online_bucket_and_repo_rebalance",
+            "rpo_rto_disaster_recovery_drill",
             "access_and_boundaries",
             "run_all",
         ):

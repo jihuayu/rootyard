@@ -3,6 +3,7 @@
 pub mod failover;
 pub mod fencing;
 pub mod models;
+pub mod rebalance;
 pub mod router;
 
 use crate::AppState;
@@ -33,6 +34,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(router::list_buckets).post(router::upsert_bucket),
         )
         .route(
+            "/api/shards/rebalance",
+            get(rebalance::list_rebalances).post(rebalance::execute_rebalance),
+        )
+        .route(
             "/api/repos/{owner}/{name}/shard-route",
             get(router::get_repo_route).put(router::configure_repo_route),
         )
@@ -51,5 +56,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/repos/{owner}/{name}/shard-degrade",
             post(failover::degrade_or_recover_repo),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/shard-dr-drill",
+            get(rebalance::list_dr_drills).post(rebalance::execute_dr_drill),
         )
 }

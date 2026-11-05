@@ -48,6 +48,15 @@
 | **Track 3（M15）：Workspace 惰性稀疏 VFS 与按需水化** | 惰性稀疏 VFS 挂载（`vfs-mount`）、按需 CAS 水化（`vfs-hydrate`）、写时复制（CoW）脏追踪（`vfs-status`）与干净缓存淘汰（`vfs-evict`） | `src/workspace_lab/vfs.rs`、`src/workspace_lab.rs` | `tests/workspace.py`、`tests/test_workspace_vfs.py` |
 | **Track 4（M16）：多节点仓库分片、Epoch 写屏障与故障切换** | 1024 虚拟分桶一致哈希路由、节点租约管理、`before_push` 跨节点脑裂写屏障、自动主从故障切换与只读降级演练 | `src/sharding.rs`、`src/sharding/`（`models.rs`、`router.rs`、`fencing.rs`、`failover.rs`、`060_sharding_fencing.sql`） | `tests/sharding.py`、`tests/test_sharding.py` |
 
+### 2.4 第四梯队并行轨道（Phase 4）
+
+| 轨道 | 负责范围 | 专属源码文件 / 目录 | 专属测试文件 |
+| --- | --- | --- | --- |
+| **Track 1（M18）：CI Mirror 单飞自动回源与跨集群 Runner 队列** | 缓存缺失时按 `(repository_id, target_oid)` 单飞合并自动回源拉取（`mirror-auto-fetch`）、跨集群 Runner 注册/心跳/租约过期重领作业队列（`mirror-runners`） | `src/mirror/auto_origin.rs`、`src/mirror.rs` | `tests/ci_mirror.py`、`tests/test_ci_mirror.py` |
+| **Track 2（M19）：Pando 自动 Compaction 生命周期与 KMS 信封加密** | 碎片率驱动后台自动 Compaction 评估（`lifecycle-evaluate`）、冷数据本地驱逐与按需透明回源水化、KMS/SSE-C 信封加密与无停机密钥轮转（`kms-rotate`） | `src/pando_lab/lifecycle.rs`、`src/pando_lab/mod.rs`、`src/pando_lab/http.rs`、`experimental/pando/schema.sql` | `tests/test_pando_repack_object_store.py` |
+| **Track 3（M20）：Workspace 可写虚拟 Namespace 与多 Agent 路径租约** | 多 Agent 路径前缀排他租约锁（`agent-lease`）、可写虚拟 Namespace 反向路径映射（`namespace-write`）与跨仓两阶段原子回写（`namespace-commit-back`） | `src/workspace_lab/writable_view.rs`、`src/workspace_lab.rs` | `tests/workspace.py`、`tests/test_workspace_remote_namespace.py` |
+| **Track 4（M21）：多节点分片在线重平衡与 RPO/RTO 灾备演练** | 四阶段在线虚拟桶/仓库重平衡迁移（`drain` → `sync` → `fence` → `cutover`，`/api/shards/rebalance`）、实测 RPO/RTO 灾备切换演练与 SLA 门禁（`/api/repos/{owner}/{name}/shard-dr-drill`） | `src/sharding/rebalance.rs`、`src/sharding.rs` | `tests/sharding.py`、`tests/test_sharding.py` |
+
 ---
 
 ## 3. 共享底座接口契约

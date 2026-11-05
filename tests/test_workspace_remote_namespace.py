@@ -28,12 +28,13 @@ class WorkspaceRemoteNamespaceContractTests(unittest.TestCase):
         facade_lines = facade_text.splitlines()
         self.assertLess(
             len(facade_lines),
-            150,
-            f"src/workspace_lab.rs has {len(facade_lines)} lines (limit < 150)",
+            148,
+            f"src/workspace_lab.rs has {len(facade_lines)} lines (limit < 148)",
         )
         for mod_decl in (
             '#[path = "workspace_lab/remote.rs"]',
             '#[path = "workspace_lab/namespace.rs"]',
+            '#[path = "workspace_lab/writable_view.rs"]',
         ):
             self.assertIn(mod_decl, facade_text)
         for subcmd in (
@@ -42,6 +43,9 @@ class WorkspaceRemoteNamespaceContractTests(unittest.TestCase):
             '"namespace-mount"',
             '"verify-namespace"',
             '"namespace-git-view"',
+            '"agent-lease"',
+            '"namespace-write"',
+            '"namespace-commit-back"',
         ):
             self.assertIn(subcmd, facade_text)
 
@@ -67,6 +71,29 @@ class WorkspaceRemoteNamespaceContractTests(unittest.TestCase):
                 f"{sub_name} has {len(sub_lines)} lines (limit < 600)",
             )
             self.assertIn("#[serde(deny_unknown_fields)]", sub_text)
+
+        wv_path = ROOT / "src" / "workspace_lab" / "writable_view.rs"
+        self.assertTrue(wv_path.is_file(), f"Missing {wv_path}")
+        wv_text = wv_path.read_text(encoding="utf-8")
+        wv_lines = wv_text.splitlines()
+        self.assertGreaterEqual(
+            len(wv_lines),
+            150,
+            f"writable_view.rs has {len(wv_lines)} lines (minimum >= 150)",
+        )
+        self.assertLess(
+            len(wv_lines),
+            500,
+            f"writable_view.rs has {len(wv_lines)} lines (limit < 500)",
+        )
+        struct_count = wv_text.count("pub struct ")
+        deny_count = wv_text.count("#[serde(deny_unknown_fields)]")
+        self.assertGreaterEqual(struct_count, 6)
+        self.assertEqual(
+            struct_count,
+            deny_count,
+            "Every struct in writable_view.rs must have #[serde(deny_unknown_fields)]",
+        )
 
     def test_remote_and_namespace_types_and_docs_are_present(self):
         remote_text = (ROOT / "src" / "workspace_lab" / "remote.rs").read_text(encoding="utf-8")
@@ -96,6 +123,18 @@ class WorkspaceRemoteNamespaceContractTests(unittest.TestCase):
         ):
             self.assertIn(item, ns_text)
 
+        wv_text = (ROOT / "src" / "workspace_lab" / "writable_view.rs").read_text(encoding="utf-8")
+        for item in (
+            "pub struct AgentLeaseEntry",
+            "pub struct AgentLeaseTable",
+            "pub struct NamespaceWriteReport",
+            "pub struct CrossRepoCommitReceipt",
+            "pub fn cmd_agent_lease",
+            "pub fn cmd_namespace_write",
+            "pub fn cmd_namespace_commit_back",
+        ):
+            self.assertIn(item, wv_text)
+
         doc_text = (ROOT / "docs" / "workspace-foundation.md").read_text(encoding="utf-8")
         for cmd in (
             "push-remote",
@@ -105,6 +144,7 @@ class WorkspaceRemoteNamespaceContractTests(unittest.TestCase):
             "namespace-git-view",
         ):
             self.assertIn(cmd, doc_text)
+
 
 
 class WorkspaceRemoteCasTests(unittest.TestCase):
@@ -429,5 +469,463 @@ class WorkspaceNamespaceViewTests(unittest.TestCase):
             harness.cleanup()
 
 
+class WorkspaceWritableNamespaceAndLeaseTests(unittest.TestCase):
+    """Unit, integration, and adversarial tests for Milestone M20:
+    Workspace Writable Namespace Reverse Mapping & Multi-Agent Lease Locks.
+    """
+
+    def test_deterministic_reverse_path_mapping_and_unmapped_or_traversal_rejection(self):
+        harness = WorkspaceHarness()
+        try:
+            root, src_auth, store, base_auth = harness.fixture(
+                "m20-reverse-map",
+                {
+                    "src/main.rs": b"fn main() {}\n",
+                    "legacy.txt": b"remove me\n",
+                },
+            )
+            src_billing = root / "source-billing"
+            harness.git("init", "-b", "main", src_billing)
+            harness.write(src_billing, "invoice.py", b"RATE = 10\n")
+            harness.git("add", "--all", cwd=src_billing)
+            harness.git("commit", "-m", "billing init", cwd=src_billing)
+            base_billing = harness.oid(src_billing)
+
+            src_shared = root / "source-shared"
+            harness.git("init", "-b", "main", src_shared)
+            harness.write(src_shared, "util.h", b"#pragma once\n")
+            harness.git("add", "--all", cwd=src_shared)
+            harness.git("commit", "-m", "shared init", cwd=src_shared)
+            base_shared = harness.oid(src_shared)
+
+            ws_auth, _ = harness.init(store, src_auth, base_auth, "agent-auth")
+            ws_billing, _ = harness.init(store, src_billing, base_billing, "agent-billing")
+            ws_shared, _ = harness.init(store, src_shared, base_shared, "agent-shared")
+            cp_auth = harness.checkpoint(store, ws_auth)
+            cp_billing = harness.checkpoint(store, ws_billing)
+            cp_shared = harness.checkpoint(store, ws_shared)
+
+            ns = harness.data(
+                "namespace-mount",
+                store,
+                "tri-repo-ns",
+                f"services/auth={cp_auth['checkpoint_id']}",
+                f"services/billing={cp_billing['checkpoint_id']}",
+                f"libs/shared={cp_shared['checkpoint_id']}",
+            )
+            ns_id = ns["namespace_id"]
+
+            # Reject unmapped root paths, unmapped intermediate paths, leading '/', '..', and .git
+            for bad_path in (
+                "root_level.txt",
+                "services/unmapped_file.txt",
+                "services/auth",
+                "../escape.txt",
+                "services/auth/../../outside.txt",
+                "/services/auth/src/main.rs",
+                "services/auth/.git/HEAD",
+                ".rootyard-namespace.json",
+            ):
+                res = harness.lab(
+                    "namespace-write",
+                    store,
+                    ns_id,
+                    "agent-writer",
+                    bad_path,
+                    "payload\n",
+                    check=False,
+                )
+                self.assertNotEqual(
+                    res.returncode, 0, f"Expected bad/unmapped path {bad_path} to fail"
+                )
+
+            # Segment normalization ('services//auth/./src/main.rs') maps deterministically
+            w_auth = harness.data(
+                "namespace-write",
+                store,
+                ns_id,
+                "agent-writer",
+                "services//auth/./src/main.rs",
+                "fn main() { println!(\"v2\"); }\n",
+            )
+            self.assertEqual(w_auth["path"], "services/auth/src/main.rs")
+            self.assertEqual(w_auth["mount_path"], "services/auth")
+            self.assertEqual(w_auth["repo_rel_path"], "src/main.rs")
+            self.assertEqual(w_auth["base_checkpoint_id"], cp_auth["checkpoint_id"])
+            self.assertEqual(w_auth["workspace_id"], ws_auth["workspace_id"])
+            self.assertEqual(w_auth["change"], "modified")
+
+            w_del = harness.data(
+                "namespace-write",
+                store,
+                ns_id,
+                "agent-writer",
+                "services/auth/legacy.txt",
+                "DELETE",
+            )
+            self.assertEqual(w_del["mount_path"], "services/auth")
+            self.assertEqual(w_del["repo_rel_path"], "legacy.txt")
+            self.assertEqual(w_del["operation"], "delete")
+            self.assertEqual(w_del["change"], "deleted")
+
+            w_shared = harness.data(
+                "namespace-write",
+                store,
+                ns_id,
+                "agent-writer",
+                "libs/shared/new_header.h",
+                "#define VERSION 2\n",
+            )
+            self.assertEqual(w_shared["mount_path"], "libs/shared")
+            self.assertEqual(w_shared["repo_rel_path"], "new_header.h")
+            self.assertEqual(w_shared["base_checkpoint_id"], cp_shared["checkpoint_id"])
+            self.assertEqual(w_shared["change"], "added")
+            self.assertEqual(w_shared["pending_writes_count"], 3)
+        finally:
+            harness.cleanup()
+
+    def test_multi_agent_overlapping_prefix_lease_conflict_and_expired_takeover(self):
+        harness = WorkspaceHarness()
+        try:
+            _, src_a, store, base_a = harness.fixture(
+                "m20-leases",
+                {"src/lib.rs": b"pub fn a() {}\n"},
+            )
+            ws_a, _ = harness.init(store, src_a, base_a, "agent-alpha")
+            cp_a = harness.checkpoint(store, ws_a)
+            ns = harness.data(
+                "namespace-mount",
+                store,
+                "lease-ns",
+                f"services/auth={cp_a['checkpoint_id']}",
+                f"libs/core={cp_a['checkpoint_id']}",
+            )
+            ns_id = ns["namespace_id"]
+
+            # Agent-alpha acquires lease on services/auth (epoch 1)
+            l1 = harness.data(
+                "agent-lease",
+                store,
+                ns_id,
+                "agent-alpha",
+                "acquire",
+                "--prefix",
+                "services/auth",
+                "--ttl-secs",
+                "300",
+            )
+            self.assertEqual(l1["lease_epoch"], 1)
+            self.assertEqual(l1["state"], "acquired")
+            self.assertTrue((store / "leases" / f"{ns_id}.json").is_file())
+
+            # Agent-beta can acquire non-overlapping prefix libs/core concurrently (epoch 2)
+            l2 = harness.data(
+                "agent-lease",
+                store,
+                ns_id,
+                "agent-beta",
+                "acquire",
+                "--prefix",
+                "libs/core",
+                "--ttl-secs",
+                "300",
+            )
+            self.assertEqual(l2["lease_epoch"], 2)
+            self.assertEqual(l2["active_leases"], 2)
+
+            # Agent-beta cannot acquire overlapping prefix (exact, child, parent, or root)
+            for conflict_prefix in ("services/auth", "services/auth/src", "services", ""):
+                res_c = harness.lab(
+                    "agent-lease",
+                    store,
+                    ns_id,
+                    "agent-beta",
+                    "acquire",
+                    "--prefix",
+                    conflict_prefix,
+                    check=False,
+                )
+                self.assertNotEqual(
+                    res_c.returncode,
+                    0,
+                    f"Overlapping prefix '{conflict_prefix}' must be rejected",
+                )
+
+            # Agent-beta cannot write under services/auth while agent-alpha holds lease
+            res_w = harness.lab(
+                "namespace-write",
+                store,
+                ns_id,
+                "agent-beta",
+                "services/auth/src/lib.rs",
+                "unauthorized\n",
+                check=False,
+            )
+            self.assertNotEqual(res_w.returncode, 0)
+
+            # Release agent-alpha's lease, then re-acquire with --ttl-secs 0 so it expires immediately
+            rel = harness.data(
+                "agent-lease",
+                store,
+                ns_id,
+                "agent-alpha",
+                "release",
+                "--prefix",
+                "services/auth",
+                "--epoch",
+                "1",
+            )
+            self.assertEqual(rel["state"], "released")
+
+            l3 = harness.data(
+                "agent-lease",
+                store,
+                ns_id,
+                "agent-alpha",
+                "acquire",
+                "--prefix",
+                "services/auth",
+                "--ttl-secs",
+                "0",
+            )
+            self.assertEqual(l3["lease_epoch"], 3)
+
+            # Agent-beta takes over expired prefix -> bumps lease_epoch to 4
+            l4 = harness.data(
+                "agent-lease",
+                store,
+                ns_id,
+                "agent-beta",
+                "acquire",
+                "--prefix",
+                "services/auth/src",
+                "--ttl-secs",
+                "300",
+            )
+            self.assertEqual(l4["lease_epoch"], 4)
+            self.assertEqual(l4["state"], "acquired")
+
+            # Stale epoch renewal and stale epoch write by agent-alpha (epoch 3) must fail
+            self.assertNotEqual(
+                harness.lab(
+                    "agent-lease",
+                    store,
+                    ns_id,
+                    "agent-alpha",
+                    "renew",
+                    "--prefix",
+                    "services/auth",
+                    "--epoch",
+                    "3",
+                    check=False,
+                ).returncode,
+                0,
+            )
+            self.assertNotEqual(
+                harness.lab(
+                    "namespace-write",
+                    store,
+                    ns_id,
+                    "agent-alpha",
+                    "services/auth/src/lib.rs",
+                    "stale write\n",
+                    "--lease-epoch",
+                    "3",
+                    check=False,
+                ).returncode,
+                0,
+            )
+
+            # Agent-beta succeeds with current epoch 4
+            w_ok = harness.data(
+                "namespace-write",
+                store,
+                ns_id,
+                "agent-beta",
+                "services/auth/src/lib.rs",
+                "pub fn a() { /* epoch 4 */ }\n",
+                "--lease-epoch",
+                "4",
+            )
+            self.assertEqual(w_ok["lease_epoch"], 4)
+            self.assertEqual(w_ok["state"], "staged")
+        finally:
+            harness.cleanup()
+
+    def test_atomic_two_phase_cross_repo_commit_back_and_base_drift_rollback(self):
+        harness = WorkspaceHarness()
+        try:
+            root, src_a, store, base_a = harness.fixture(
+                "m20-commit-back",
+                {
+                    "api.rs": b"pub fn api() -> u32 { 1 }\n",
+                    "drop.txt": b"temporary\n",
+                },
+            )
+            src_b = root / "source-b"
+            harness.git("init", "-b", "main", src_b)
+            harness.write(src_b, "lib.rs", b"pub fn lib() -> u32 { 10 }\n")
+            harness.git("add", "--all", cwd=src_b)
+            harness.git("commit", "-m", "b base", cwd=src_b)
+            base_b = harness.oid(src_b)
+
+            src_c = root / "source-c"
+            harness.git("init", "-b", "main", src_c)
+            harness.write(src_c, "readme.txt", b"untouched mount\n")
+            harness.git("add", "--all", cwd=src_c)
+            harness.git("commit", "-m", "c base", cwd=src_c)
+            base_c = harness.oid(src_c)
+
+            ws_a, repo_a = harness.init(store, src_a, base_a, "agent-a")
+            ws_b, repo_b = harness.init(store, src_b, base_b, "agent-b")
+            ws_c, _ = harness.init(store, src_c, base_c, "agent-c")
+            cp_a = harness.checkpoint(store, ws_a)
+            cp_b = harness.checkpoint(store, ws_b)
+            cp_c = harness.checkpoint(store, ws_c)
+
+            ns = harness.data(
+                "namespace-mount",
+                store,
+                "commit-back-ns",
+                f"services/api={cp_a['checkpoint_id']}",
+                f"libs/core={cp_b['checkpoint_id']}",
+                f"docs/guide={cp_c['checkpoint_id']}",
+            )
+            ns_id = ns["namespace_id"]
+
+            lease = harness.data(
+                "agent-lease",
+                store,
+                ns_id,
+                "agent-coord",
+                "acquire",
+                "--ttl-secs",
+                "300",
+            )
+            ep = str(lease["lease_epoch"])
+
+            # Stage cross-repo writes across services/api and libs/core (docs/guide untouched)
+            harness.data(
+                "namespace-write",
+                store,
+                ns_id,
+                "agent-coord",
+                "services/api/api.rs",
+                "pub fn api() -> u32 { 2 }\n",
+                "--lease-epoch",
+                ep,
+            )
+            harness.data(
+                "namespace-write",
+                store,
+                ns_id,
+                "agent-coord",
+                "services/api/drop.txt",
+                "DELETE",
+                "--lease-epoch",
+                ep,
+            )
+            harness.data(
+                "namespace-write",
+                store,
+                ns_id,
+                "agent-coord",
+                "libs/core/added.rs",
+                "pub const EXTRA: u32 = 5;\n",
+                "--lease-epoch",
+                ep,
+            )
+
+            receipt = harness.data(
+                "namespace-commit-back",
+                store,
+                ns_id,
+                "agent-coord",
+                "--quiescent",
+                "--lease-epoch",
+                ep,
+            )
+            self.assertEqual(receipt["state"], "committed")
+            self.assertEqual(receipt["phase"], "committed")
+            self.assertEqual(receipt["previous_revision"], 1)
+            self.assertEqual(receipt["namespace_revision"], 2)
+            self.assertEqual(receipt["touched_mounts_count"], 2)
+            self.assertEqual(receipt["total_writes_committed"], 3)
+            self.assertTrue(Path(receipt["receipt_path"]).is_file())
+
+            # Verify derived checkpoints and changesets were persisted, and docs/guide was untouched
+            by_mount = {mc["mount_path"]: mc for mc in receipt["mount_commits"]}
+            self.assertEqual(sorted(by_mount.keys()), ["libs/core", "services/api"])
+            self.assertEqual(by_mount["services/api"]["modified"], 1)
+            self.assertEqual(by_mount["services/api"]["deleted"], 1)
+            self.assertEqual(by_mount["libs/core"]["added"], 1)
+            for mc in receipt["mount_commits"]:
+                self.assertNotEqual(mc["new_checkpoint_id"], mc["previous_checkpoint_id"])
+                self.assertTrue((store / "checkpoints" / mc["new_checkpoint_id"] / "manifest.json").is_file())
+                self.assertTrue((store / "changesets" / mc["changeset_id"] / "changeset.json").is_file())
+
+            bv_by_mount = {bv["mount_path"]: bv for bv in receipt["base_vector"]}
+            self.assertEqual(bv_by_mount["docs/guide"]["checkpoint_id"], cp_c["checkpoint_id"])
+            self.assertEqual(
+                bv_by_mount["services/api"]["checkpoint_id"],
+                by_mount["services/api"]["new_checkpoint_id"],
+            )
+
+            # Verify constituent workspaces and namespace verification at revision 2
+            self.assertEqual((repo_a / "api.rs").read_bytes(), b"pub fn api() -> u32 { 2 }\n")
+            self.assertFalse((repo_a / "drop.txt").exists())
+            self.assertEqual((repo_b / "added.rs").read_bytes(), b"pub const EXTRA: u32 = 5;\n")
+            ver2 = harness.data("verify-namespace", store, ns_id)
+            self.assertTrue(ver2["verified"])
+            self.assertEqual(ver2["namespace_revision"], 2)
+
+            # Phase 1 Prepare conflict rollback: stage writes, then drift constituent workspace repo_b
+            harness.data(
+                "namespace-write",
+                store,
+                ns_id,
+                "agent-coord",
+                "services/api/api.rs",
+                "pub fn api() -> u32 { 3 }\n",
+                "--lease-epoch",
+                ep,
+            )
+            harness.data(
+                "namespace-write",
+                store,
+                ns_id,
+                "agent-coord",
+                "libs/core/lib.rs",
+                "pub fn lib() -> u32 { 20 }\n",
+                "--lease-epoch",
+                ep,
+            )
+            # Induce base drift in repo_b
+            harness.write(repo_b, "lib.rs", b"pub fn lib() -> u32 { 999 /* drift */ }\n")
+
+            commits_before = set((store / "namespaces" / ns_id / "commits").iterdir())
+            res_drift = harness.lab(
+                "namespace-commit-back",
+                store,
+                ns_id,
+                "agent-coord",
+                "--quiescent",
+                "--lease-epoch",
+                ep,
+                check=False,
+            )
+            self.assertNotEqual(res_drift.returncode, 0)
+            commits_after = set((store / "namespaces" / ns_id / "commits").iterdir())
+            self.assertEqual(commits_before, commits_after)
+            # Verify repo_a was NOT mutated by partial commit and namespace view rolled back cleanly to rev 2
+            self.assertEqual((repo_a / "api.rs").read_bytes(), b"pub fn api() -> u32 { 2 }\n")
+            ver_rollback = harness.data("verify-namespace", store, ns_id)
+            self.assertTrue(ver_rollback["verified"])
+            self.assertEqual(ver_rollback["namespace_revision"], 2)
+        finally:
+            harness.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()
+

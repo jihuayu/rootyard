@@ -257,7 +257,7 @@ def _sim_get_pack_files(
 class PandoObjectStoreAndRepackContractTests(unittest.TestCase):
     def test_pando_submodules_exist_respect_line_caps_and_forbid_unsafe(self):
         pando_dir = ROOT / "src" / "pando_lab"
-        for new_mod in ("object_store.rs", "repack.rs"):
+        for new_mod in ("object_store.rs", "repack.rs", "lifecycle.rs"):
             path = pando_dir / new_mod
             self.assertTrue(path.is_file(), f"Missing src/pando_lab/{new_mod}")
             text = path.read_text(encoding="utf-8")
@@ -266,6 +266,21 @@ class PandoObjectStoreAndRepackContractTests(unittest.TestCase):
             self.assertLess(lines, 600, f"src/pando_lab/{new_mod} exceeds 600 lines ({lines} lines)")
             self.assertNotIn("unsafe ", text, f"Forbidden unsafe in src/pando_lab/{new_mod}")
             self.assertIn("#[cfg(test)]", text)
+
+        lifecycle_text = (pando_dir / "lifecycle.rs").read_text(encoding="utf-8")
+        lifecycle_lines = len(lifecycle_text.splitlines())
+        self.assertGreaterEqual(lifecycle_lines, 120)
+        self.assertLess(lifecycle_lines, 450)
+        struct_count = lifecycle_text.count("pub struct ")
+        self.assertGreaterEqual(struct_count, 6)
+        self.assertEqual(
+            lifecycle_text.count("#[serde(deny_unknown_fields)]"),
+            struct_count,
+            "All structs in src/pando_lab/lifecycle.rs must have #[serde(deny_unknown_fields)]",
+        )
+
+        self.assertLess(len((pando_dir / "mod.rs").read_text(encoding="utf-8").splitlines()), 600)
+        self.assertLess(len((pando_dir / "http.rs").read_text(encoding="utf-8").splitlines()), 500)
 
         for name in (
             "mod.rs",
@@ -279,6 +294,7 @@ class PandoObjectStoreAndRepackContractTests(unittest.TestCase):
             "rollback.rs",
             "object_store.rs",
             "repack.rs",
+            "lifecycle.rs",
         ):
             path = pando_dir / name
             text = path.read_text(encoding="utf-8")
@@ -289,6 +305,7 @@ class PandoObjectStoreAndRepackContractTests(unittest.TestCase):
 
     def test_mod_rs_preserves_config_load_first_and_wires_object_store_and_repack_cli(self):
         mod_text = (ROOT / "src" / "pando_lab" / "mod.rs").read_text(encoding="utf-8")
+        self.assertIn("pub mod lifecycle;", mod_text)
         self.assertIn("pub mod object_store;", mod_text)
         self.assertIn("pub mod repack;", mod_text)
         run_section = mod_text.split("pub async fn run() -> Result<()> {", 1)[1]
@@ -302,16 +319,28 @@ class PandoObjectStoreAndRepackContractTests(unittest.TestCase):
             'Some("object-store-get")',
             'Some("object-store-verify")',
             'Some("object-store-status")',
+            'Some("lifecycle-evaluate")',
+            'Some("kms-rotate")',
         ):
             self.assertIn(subcmd, mod_text)
+        for flag in ("--max-packs", "--cold-evict-local", "--auto-repack"):
+            self.assertIn(flag, mod_text)
 
     def test_schema_sql_defines_object_store_pinned_roots_and_repacks_without_between(self):
         schema_text = (ROOT / "experimental" / "pando" / "schema.sql").read_text(encoding="utf-8")
         self.assertNotIn("BETWEEN", schema_text.upper())
+        self.assertNotIn("BIGSERIAL", schema_text.upper())
         for token in (
             "CREATE TABLE IF NOT EXISTS pando_lab.pinned_roots",
             "CREATE TABLE IF NOT EXISTS pando_lab.object_store_manifests",
             "CREATE TABLE IF NOT EXISTS pando_lab.repacks",
+            "CREATE TABLE IF NOT EXISTS pando_lab.lifecycle_policies",
+            "CREATE TABLE IF NOT EXISTS pando_lab.kms_envelopes",
+            "max_active_packs INTEGER NOT NULL DEFAULT 4 CHECK (max_active_packs >= 1 AND max_active_packs <= 1000)",
+            "cold_transition_age_secs BIGINT NOT NULL DEFAULT 86400 CHECK (cold_transition_age_secs >= 0)",
+            "kms_key_id TEXT NOT NULL DEFAULT 'kms-local-default-v1' CHECK (length(btrim(kms_key_id)) >= 3 AND length(kms_key_id) <= 128)",
+            "cipher_suite TEXT NOT NULL DEFAULT 'AES-256-GCM-HMAC-SHA256' CHECK (cipher_suite IN ('AES-256-GCM-HMAC-SHA256', 'CHACHA20-POLY1305-SHA256'))",
+            "storage_tier TEXT NOT NULL DEFAULT 'hot' CHECK (storage_tier IN ('hot', 'cold_archive'))",
             "pando.allow_repack_mutation",
             "immutable_manifest",
             "immutable_object",
@@ -324,8 +353,12 @@ class PandoObjectStoreAndRepackContractTests(unittest.TestCase):
         self.assertIn("repack::packs_status", http_text)
         self.assertIn('tail == "object-store"', http_text)
         self.assertIn("object_store::status", http_text)
+        self.assertIn('tail == "lifecycle"', http_text)
+        self.assertIn("lifecycle::status", http_text)
         self.assertIn('parts.method == "POST" && tail == "repack"', http_text)
         self.assertIn("repack::repack_repo", http_text)
+        self.assertIn('parts.method == "POST" && tail == "lifecycle"', http_text)
+        self.assertIn("lifecycle::evaluate_lifecycle", http_text)
 
     def test_main_server_forge_and_browse_expose_backend_and_storage_route_endpoints(self):
         forge_text = (ROOT / "src" / "forge.rs").read_text(encoding="utf-8")
@@ -864,6 +897,323 @@ class PandoLabHarnessAndMainGatewayRoutingOfflineTests(unittest.TestCase):
 
             code_conflict, _ = patch_backend("gitfs", expected_gen=1)
             self.assertEqual(code_conflict, 409)
+
+
+def _compute_kms_envelope_mac(key_id: str, key_version: int, pack_sha256: str, idx_sha256: str) -> str:
+    trimmed = key_id.strip()
+    if len(trimmed) < 3 or len(trimmed) > 128:
+        raise ValueError(f"invalid kms_key_id '{key_id}'")
+    if key_version < 1:
+        raise ValueError("kms_key_version must be >= 1")
+    for digest in (pack_sha256, idx_sha256):
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("invalid sha256 hex digest")
+    preimage = f"{trimmed}||{key_version}||{pack_sha256}||{idx_sha256}".encode("utf-8")
+    return _sha256_hex(preimage)
+
+
+def _envelope_path(root: Path, repo_id: str, pack_id: str) -> Path:
+    return root / "object_store" / "envelopes" / repo_id / f"{pack_id}.json"
+
+
+def _write_kms_envelope(
+    root: Path,
+    repo_id: str,
+    pack_id: str,
+    pack_sha256: str,
+    idx_sha256: str,
+    key_id: str = "kms-local-default-v1",
+    key_version: int = 1,
+    cipher_suite: str = "AES-256-GCM-HMAC-SHA256",
+    storage_tier: str = "hot",
+) -> dict:
+    if cipher_suite not in ("AES-256-GCM-HMAC-SHA256", "CHACHA20-POLY1305-SHA256"):
+        raise ValueError(f"unsupported cipher_suite {cipher_suite}")
+    if storage_tier not in ("hot", "cold_archive"):
+        raise ValueError(f"unsupported storage_tier {storage_tier}")
+    mac = _compute_kms_envelope_mac(key_id, key_version, pack_sha256, idx_sha256)
+    record = {
+        "schema": "rootyard.pando.kms-envelope.v1",
+        "repo": repo_id,
+        "pack_id": pack_id,
+        "key_id": key_id.strip(),
+        "key_version": key_version,
+        "cipher_suite": cipher_suite,
+        "pack_sha256": pack_sha256,
+        "idx_sha256": idx_sha256,
+        "plaintext_sha256": pack_sha256,
+        "envelope_mac": mac,
+        "storage_tier": storage_tier,
+    }
+    target = _envelope_path(root, repo_id, pack_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return record
+
+
+def _verify_kms_envelope_file(root: Path, repo_id: str, pack_id: str, exp_pack_sha: str, exp_idx_sha: str) -> dict:
+    target = _envelope_path(root, repo_id, pack_id)
+    if not target.is_file():
+        raise FileNotFoundError(f"missing KMS envelope file {target}")
+    env = json.loads(target.read_text(encoding="utf-8"))
+    if env.get("schema") != "rootyard.pando.kms-envelope.v1":
+        raise RuntimeError("invalid envelope schema")
+    if env.get("repo") != repo_id or env.get("pack_id") != pack_id:
+        raise RuntimeError("envelope repo/pack_id mismatch")
+    if env.get("pack_sha256") != exp_pack_sha or env.get("idx_sha256") != exp_idx_sha:
+        raise RuntimeError("envelope pack/idx sha256 mismatch")
+    if env.get("plaintext_sha256") != exp_pack_sha:
+        raise RuntimeError("envelope plaintext_sha256 mismatch")
+    expected_mac = _compute_kms_envelope_mac(
+        env["key_id"], int(env["key_version"]), env["pack_sha256"], env["idx_sha256"]
+    )
+    if env.get("envelope_mac") != expected_mac:
+        raise RuntimeError("KMS envelope MAC verification failed")
+    return env
+
+
+def _compute_fragmentation(root: Path, repo_id: str, packs: list[dict]) -> dict:
+    total_pack_bytes = 0
+    total_idx_bytes = 0
+    total_objs = 0
+    unique_oids = set()
+    for p in packs:
+        pid = p["pack_id"]
+        _sim_get_pack_files(
+            root,
+            root / "objects",
+            repo_id,
+            pid,
+            expected_pack_sha256=p["pack_sha256"],
+            expected_idx_sha256=p["idx_sha256"],
+        )
+        obj_dir = root / "objects" / repo_id
+        pb = (obj_dir / f"{pid}.pack").read_bytes()
+        ib = (obj_dir / f"{pid}.idx").read_bytes()
+        total_pack_bytes += len(pb)
+        total_idx_bytes += len(ib)
+        resolved = _verify_git_pack(pb)
+        total_objs += len(resolved)
+        for o in resolved:
+            unique_oids.add(o["oid"])
+    dup_objs = max(0, total_objs - len(unique_oids))
+    ratio = (dup_objs / total_objs) if total_objs > 0 else 0.0
+    return {
+        "active_packs": len(packs),
+        "total_pack_bytes": total_pack_bytes,
+        "total_idx_bytes": total_idx_bytes,
+        "total_objects_across_packs": total_objs,
+        "unique_objects": len(unique_oids),
+        "duplicate_objects": dup_objs,
+        "duplicate_object_ratio": ratio,
+    }
+
+
+class PandoLifecycleCompactionAndKmsEnvelopeTests(unittest.TestCase):
+    def _build_repo_packs(self, root: Path, repo_id: str) -> tuple[list[dict], list[str]]:
+        work = root / "work"
+        subprocess.run(["git", "init", "--initial-branch=main", str(work)], check=True, capture_output=True)
+        obj_dir = root / "objects" / repo_id
+        obj_dir.mkdir(parents=True, exist_ok=True)
+
+        def make_commit(fname: str, content: str, msg: str) -> str:
+            (work / fname).write_text(content, encoding="utf-8")
+            subprocess.run(["git", "-C", str(work), "add", fname], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(work), "-c", "user.name=T", "-c", "user.email=t@e.c", "commit", "-m", msg],
+                check=True,
+                capture_output=True,
+            )
+            return subprocess.check_output(["git", "-C", str(work), "rev-parse", "HEAD"], text=True).strip()
+
+        def write_pack(revs: str) -> dict:
+            pid = str(uuid.uuid4())
+            p_bytes = subprocess.run(
+                ["git", "-C", str(work), "pack-objects", "--stdout", "--revs"],
+                input=revs.encode(),
+                check=True,
+                capture_output=True,
+            ).stdout
+            p_path = obj_dir / f"{pid}.pack"
+            p_path.write_bytes(p_bytes)
+            subprocess.run(["git", "-C", str(work), "index-pack", "--strict", str(p_path)], check=True, capture_output=True)
+            i_bytes = (obj_dir / f"{pid}.idx").read_bytes()
+            return {"pack_id": pid, "pack_sha256": _sha256_hex(p_bytes), "idx_sha256": _sha256_hex(i_bytes)}
+
+        c1 = make_commit("shared.txt", "shared base content\n" * 8, "c1")
+        p1 = write_pack(f"{c1}\n")
+        c2_pin = make_commit("pin.txt", "pinned root content\n" * 8, "c2")
+        # Include c1 again in p2 so duplicate objects exist across active packs before compaction
+        p2 = write_pack(f"{c2_pin}\n")
+        c3_main = make_commit("main.txt", "main tip content\n" * 8, "c3")
+        p3 = write_pack(f"{c3_main}\n^{c2_pin}\n")
+        return [p1, p2, p3], [c3_main, c2_pin]
+
+    def test_lifecycle_evaluate_compaction_fragmentation_and_kms_envelope_persistence(self):
+        with tempfile.TemporaryDirectory(prefix="pando-lifecycle-eval-") as tmp:
+            root = Path(tmp)
+            repo_id = str(uuid.uuid4())
+            packs, roots = self._build_repo_packs(root, repo_id)
+            for p in packs:
+                _sim_put_pack_files(root, root / "objects", repo_id, p["pack_id"])
+
+            frag_before = _compute_fragmentation(root, repo_id, packs)
+            self.assertEqual(frag_before["active_packs"], 3)
+            self.assertGreater(frag_before["duplicate_objects"], 0)
+            self.assertGreater(frag_before["duplicate_object_ratio"], 0.0)
+
+            # Policy with max_active_packs=2 and auto_repack_enabled=True triggers compaction
+            staging = root / "compact.git"
+            subprocess.run(["git", "init", "--bare", "--initial-branch=main", str(staging)], check=True, capture_output=True)
+            obj_dir = root / "objects" / repo_id
+            for p in packs:
+                subprocess.run(
+                    ["git", f"--git-dir={staging}", "index-pack", "--stdin", "--strict"],
+                    input=(obj_dir / f"{p['pack_id']}.pack").read_bytes(),
+                    check=True,
+                    capture_output=True,
+                )
+            comp_id = str(uuid.uuid4())
+            comp_bytes = subprocess.run(
+                ["git", f"--git-dir={staging}", "pack-objects", "--stdout", "--revs", "--delta-base-offset"],
+                input=("\n".join(roots) + "\n").encode(),
+                check=True,
+                capture_output=True,
+            ).stdout
+            comp_pack_path = obj_dir / f"{comp_id}.pack"
+            comp_pack_path.write_bytes(comp_bytes)
+            subprocess.run(["git", f"--git-dir={staging}", "index-pack", "--strict", str(comp_pack_path)], check=True, capture_output=True)
+            comp_idx_bytes = (obj_dir / f"{comp_id}.idx").read_bytes()
+            for old_p in packs:
+                (obj_dir / f"{old_p['pack_id']}.pack").unlink()
+                (obj_dir / f"{old_p['pack_id']}.idx").unlink()
+
+            compacted_pack = {
+                "pack_id": comp_id,
+                "pack_sha256": _sha256_hex(comp_bytes),
+                "idx_sha256": _sha256_hex(comp_idx_bytes),
+            }
+            _sim_put_pack_files(root, root / "objects", repo_id, comp_id)
+            frag_after = _compute_fragmentation(root, repo_id, [compacted_pack])
+            self.assertEqual(frag_after["active_packs"], 1)
+            self.assertEqual(frag_after["duplicate_objects"], 0)
+            self.assertEqual(frag_after["duplicate_object_ratio"], 0.0)
+            self.assertEqual(frag_after["unique_objects"], frag_before["unique_objects"])
+
+            env = _write_kms_envelope(
+                root,
+                repo_id,
+                comp_id,
+                compacted_pack["pack_sha256"],
+                compacted_pack["idx_sha256"],
+                key_id="kms-local-default-v1",
+                key_version=1,
+            )
+            verified = _verify_kms_envelope_file(
+                root, repo_id, comp_id, compacted_pack["pack_sha256"], compacted_pack["idx_sha256"]
+            )
+            self.assertEqual(verified["envelope_mac"], env["envelope_mac"])
+
+    def test_cold_tier_local_eviction_read_through_hydration_and_tamper_rejection(self):
+        with tempfile.TemporaryDirectory(prefix="pando-lifecycle-cold-") as tmp:
+            root = Path(tmp)
+            repo_id = str(uuid.uuid4())
+            packs, _ = self._build_repo_packs(root, repo_id)
+            pack = packs[0]
+            pid = pack["pack_id"]
+            _sim_put_pack_files(root, root / "objects", repo_id, pid)
+            env = _write_kms_envelope(
+                root,
+                repo_id,
+                pid,
+                pack["pack_sha256"],
+                pack["idx_sha256"],
+                key_id="kms-cold-key-v1",
+                key_version=1,
+                storage_tier="cold_archive",
+            )
+            self.assertEqual(env["storage_tier"], "cold_archive")
+
+            local_pack = root / "objects" / repo_id / f"{pid}.pack"
+            local_idx = root / "objects" / repo_id / f"{pid}.idx"
+            orig_pack_bytes = local_pack.read_bytes()
+
+            # Evict local .pack while keeping .idx and remote object-store copy intact
+            local_pack.unlink()
+            self.assertFalse(local_pack.exists())
+            self.assertTrue(local_idx.is_file())
+
+            # Verified cold hydration checks KMS envelope MAC + .idx then rehydrates .pack from object store
+            _verify_kms_envelope_file(root, repo_id, pid, pack["pack_sha256"], pack["idx_sha256"])
+            hydrated = _sim_get_pack_files(
+                root,
+                root / "objects",
+                repo_id,
+                pid,
+                expected_pack_sha256=pack["pack_sha256"],
+                expected_idx_sha256=pack["idx_sha256"],
+            )
+            self.assertFalse(hydrated["cache_hit"])
+            self.assertTrue(hydrated["rehydrated_from_object_store"])
+            self.assertEqual(local_pack.read_bytes(), orig_pack_bytes)
+
+            # Tamper with KMS envelope MAC on disk -> verification must fail closed
+            env_file = _envelope_path(root, repo_id, pid)
+            tampered = json.loads(env_file.read_text(encoding="utf-8"))
+            tampered["envelope_mac"] = "f" * 64
+            env_file.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                _verify_kms_envelope_file(root, repo_id, pid, pack["pack_sha256"], pack["idx_sha256"])
+
+    def test_kms_key_rotation_rewraps_envelopes_without_mutating_immutable_pack_bytes(self):
+        with tempfile.TemporaryDirectory(prefix="pando-kms-rotate-") as tmp:
+            root = Path(tmp)
+            repo_id = str(uuid.uuid4())
+            packs, _ = self._build_repo_packs(root, repo_id)
+            obj_dir = root / "objects" / repo_id
+
+            before_bytes = {
+                p["pack_id"]: (
+                    (obj_dir / f"{p['pack_id']}.pack").read_bytes(),
+                    (obj_dir / f"{p['pack_id']}.idx").read_bytes(),
+                )
+                for p in packs
+            }
+            initial_macs = {}
+            for p in packs:
+                env = _write_kms_envelope(
+                    root,
+                    repo_id,
+                    p["pack_id"],
+                    p["pack_sha256"],
+                    p["idx_sha256"],
+                    key_id="kms-local-default-v1",
+                    key_version=1,
+                )
+                initial_macs[p["pack_id"]] = env["envelope_mac"]
+
+            # Rotate to kms-prod-rotated-v2 (version increments 1 -> 2)
+            for p in packs:
+                _verify_kms_envelope_file(root, repo_id, p["pack_id"], p["pack_sha256"], p["idx_sha256"])
+                rotated = _write_kms_envelope(
+                    root,
+                    repo_id,
+                    p["pack_id"],
+                    p["pack_sha256"],
+                    p["idx_sha256"],
+                    key_id="kms-prod-rotated-v2",
+                    key_version=2,
+                )
+                self.assertEqual(rotated["key_id"], "kms-prod-rotated-v2")
+                self.assertEqual(rotated["key_version"], 2)
+                self.assertNotEqual(rotated["envelope_mac"], initial_macs[p["pack_id"]])
+                _verify_kms_envelope_file(root, repo_id, p["pack_id"], p["pack_sha256"], p["idx_sha256"])
+                # Verify immutable pack and idx bytes were never mutated
+                self.assertEqual((obj_dir / f"{p['pack_id']}.pack").read_bytes(), before_bytes[p["pack_id"]][0])
+                self.assertEqual((obj_dir / f"{p['pack_id']}.idx").read_bytes(), before_bytes[p["pack_id"]][1])
+
+            with self.assertRaises(ValueError):
+                _compute_kms_envelope_mac("ab", 2, packs[0]["pack_sha256"], packs[0]["idx_sha256"])
 
 
 if __name__ == "__main__":

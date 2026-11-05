@@ -26,6 +26,9 @@ from pulls import PullsHarness  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 VIRTUAL_BUCKET_COUNT = 1024
 VOLUME_FENCE_MARKER_FILE = "rootyard-shard-fence.json"
+DR_DRILL_RECEIPT_FILE = "rootyard-dr-drill.json"
+REBALANCE_LOG_FILE = "rootyard-rebalances.json"
+REBALANCE_PHASES = ["drain", "sync", "fence", "cutover"]
 DEFAULT_NODE_ID = "shard-primary-0"
 DEFAULT_NODE_ENDPOINT = "http://127.0.0.1:8080"
 DEFAULT_CAPACITY_BYTES = 107_374_182_400
@@ -1340,9 +1343,502 @@ class ShardingReferenceEngine:
             "volume_marker": marker,
         }
 
+    def rebalance_log_path(self) -> Path:
+        return self.data_dir / "repos" / REBALANCE_LOG_FILE
+
+    def dr_drill_receipt_path(self, repo_id: str) -> Path:
+        return self.repo_path(repo_id) / DR_DRILL_RECEIPT_FILE
+
+    def read_dr_drill_receipt(self, repo_id: str) -> tuple[int, dict | None]:
+        path = self.dr_drill_receipt_path(repo_id)
+        if not path.exists():
+            return 200, None
+        if path.is_symlink():
+            return 409, None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return 409, None
+        if not isinstance(data, dict) or "measured_rpo_secs" not in data or "measured_rto_ms" not in data:
+            return 409, None
+        return 200, data
+
+    def write_dr_drill_receipt(self, repo_id: str, receipt: dict) -> None:
+        repo_dir = self.repo_path(repo_id)
+        if not repo_dir.exists():
+            return
+        tmp = repo_dir / f".tmp-{uuid.uuid4()}"
+        payload = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(str(tmp), str(self.dr_drill_receipt_path(repo_id)))
+
+    def _append_rebalance_receipt(self, receipt: dict) -> None:
+        path = self.rebalance_log_path()
+        items: list[dict] = []
+        if path.is_file():
+            try:
+                items = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                items = []
+        items.insert(0, receipt)
+        items = items[:100]
+        path.write_text(json.dumps(items, indent=2) + "\n", encoding="utf-8")
+
+    def list_rebalances(self, actor: dict | None) -> tuple[int, dict]:
+        if actor is None:
+            return 401, {"error": "valid credentials required"}
+        path = self.rebalance_log_path()
+        items: list[dict] = []
+        if path.is_file():
+            try:
+                items = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return 409, {"error": "malformed rebalance log"}
+        return 200, {"items": items}
+
+    def execute_rebalance(
+        self,
+        actor: dict | None,
+        bucket_id: int,
+        source_node_id: str,
+        target_node_id: str,
+        repository_id: str | None = None,
+        dry_run: bool = False,
+        reason: str = "online bucket rebalance",
+        now_unix: int | None = None,
+        extra_fields: dict | None = None,
+    ) -> tuple[int, dict]:
+        if actor is None:
+            return 401, {"error": "valid credentials required"}
+        if actor.get("read_only"):
+            return 403, {"error": "write permission required"}
+        if extra_fields:
+            return 400, {"error": "unknown fields rejected"}
+        if (
+            not (0 <= bucket_id < VIRTUAL_BUCKET_COUNT)
+            or not NODE_ID_RE.match(source_node_id)
+            or not NODE_ID_RE.match(target_node_id)
+            or not reason.strip()
+            or len(reason) > 1024
+        ):
+            return 400, {"error": "invalid request"}
+        if source_node_id == target_node_id:
+            return 409, {"error": "source_node_id and target_node_id must differ"}
+
+        now = self._clock if now_unix is None else now_unix
+        src_row = self.conn.execute("SELECT * FROM shard_nodes WHERE node_id = ?", (source_node_id,)).fetchone()
+        tgt_row = self.conn.execute("SELECT * FROM shard_nodes WHERE node_id = ?", (target_node_id,)).fetchone()
+        if src_row is None or tgt_row is None:
+            return 404, {"error": "not found"}
+        if tgt_row["status"] != "healthy" or tgt_row["role"] == "fenced":
+            return 409, {"error": "target shard node is unhealthy or fenced"}
+        if tgt_row["lease_expires_unix"] <= now:
+            return 409, {"error": "target shard node does not have an active lease"}
+        if tgt_row["used_bytes"] >= tgt_row["capacity_bytes"]:
+            return 409, {"error": "target shard node has insufficient capacity"}
+
+        b_row = self.conn.execute("SELECT * FROM shard_virtual_buckets WHERE bucket_id = ?", (bucket_id,)).fetchone()
+        if b_row is not None and b_row["primary_node_id"] != source_node_id:
+            return 409, {"error": "bucket primary_node_id does not match source_node_id"}
+        old_b_epoch = b_row["route_epoch"] if b_row is not None else 1
+        new_b_epoch = old_b_epoch + 1
+        b_replicas = [
+            r for r in (json.loads(b_row["read_replica_nodes"]) if b_row is not None else []) if r != target_node_id
+        ]
+        op_id = str(uuid.uuid4())
+        phases = list(REBALANCE_PHASES)
+
+        if repository_id is not None:
+            r_meta = self.conn.execute(
+                "SELECT r.id, r.owner_id, r.name, r.storage_generation, u.username FROM repositories r "
+                "JOIN users u ON u.id = r.owner_id WHERE r.id = ?",
+                (repository_id,),
+            ).fetchone()
+            if r_meta is None:
+                return 404, {"error": "not found"}
+            st, acc = self._authorize_repo(actor, r_meta["username"], r_meta["name"], "admin")
+            if st != 200 or acc is None:
+                return st, acc or {}
+            repo_dir = self.repo_path(repository_id)
+            if not repo_dir.is_dir() or repo_dir.is_symlink():
+                return 409, {"error": "bare Git repository volume verification failed"}
+            has_locks = any((repo_dir / lk).exists() for lk in ("HEAD.lock", "packed-refs.lock", "config.lock"))
+            route = self._load_or_init_route(acc["owner_id"], repository_id)
+            if route["primary_node_id"] != source_node_id:
+                return 409, {"error": "repository primary_node_id does not match source_node_id"}
+            if route["in_flight_writes"] > 0 or has_locks:
+                return 409, {"error": "cannot drain repository with active in-flight writes or Git lock files"}
+
+            old_epoch = route["route_epoch"]
+            new_epoch = old_epoch + 1
+            new_token = max(route["fencing_token"], old_epoch) + 1
+            new_gen = acc["storage_generation"] + 1
+
+            if dry_run:
+                return 200, {
+                    "id": op_id,
+                    "bucket_id": bucket_id,
+                    "source_node_id": source_node_id,
+                    "target_node_id": target_node_id,
+                    "repository_id": repository_id,
+                    "dry_run": True,
+                    "state": "dry_run",
+                    "phases": phases,
+                    "old_route_epoch": old_epoch,
+                    "new_route_epoch": new_epoch,
+                    "fencing_token": new_token,
+                    "fenced_epoch": old_epoch,
+                    "storage_generation": new_gen,
+                    "reason": reason.strip(),
+                    "volume_marker": None,
+                    "updated_unix": now,
+                }
+
+            if b_row is None:
+                self.conn.execute(
+                    "INSERT INTO shard_virtual_buckets (bucket_id, primary_node_id, read_replica_nodes, route_epoch) VALUES (?, ?, ?, ?)",
+                    (bucket_id, target_node_id, json.dumps(b_replicas), new_b_epoch),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE shard_virtual_buckets SET primary_node_id = ?, read_replica_nodes = ?, route_epoch = route_epoch + 1 WHERE bucket_id = ?",
+                    (target_node_id, json.dumps(b_replicas), bucket_id),
+                )
+            self.conn.execute(
+                "UPDATE shard_nodes SET role = 'primary', status = 'healthy', lease_epoch = MAX(lease_epoch, ?), version = version + 1 WHERE node_id = ?",
+                (new_epoch, target_node_id),
+            )
+            self.conn.execute(
+                "UPDATE repositories SET storage_generation = storage_generation + 1 WHERE id = ?",
+                (repository_id,),
+            )
+            rem_replicas = [r for r in route["read_replica_nodes"] if r != target_node_id]
+            self.conn.execute(
+                "UPDATE repository_shard_routes SET bucket_id = ?, primary_node_id = ?, read_replica_nodes = ?, "
+                "explicit_override = 1, route_epoch = ?, fencing_token = ?, fenced_epoch = ?, draining = 0, "
+                "read_only_degraded = 0, degraded_reason = '', in_flight_writes = 0, required_generation = ?, version = version + 1 "
+                "WHERE tenant_id = ? AND repository_id = ?",
+                (
+                    bucket_id,
+                    target_node_id,
+                    json.dumps(rem_replicas),
+                    new_epoch,
+                    new_token,
+                    old_epoch,
+                    new_gen,
+                    acc["owner_id"],
+                    repository_id,
+                ),
+            )
+            marker = {
+                "version": 1,
+                "repository_id": repository_id,
+                "primary_node_id": target_node_id,
+                "route_epoch": new_epoch,
+                "fencing_token": new_token,
+                "fenced_epoch": old_epoch,
+                "storage_generation": new_gen,
+                "fenced_node_id": source_node_id,
+                "read_only_degraded": False,
+                "updated_unix": now,
+            }
+            self.write_volume_marker(repository_id, marker)
+            snapshot = {
+                "operation": "rebalance",
+                "bucket_id": bucket_id,
+                "phases": phases,
+                "source_node_id": source_node_id,
+                "target_node_id": target_node_id,
+                "old_route_epoch": old_epoch,
+                "new_route_epoch": new_epoch,
+                "fencing_token": new_token,
+                "storage_generation": new_gen,
+            }
+            self.conn.execute(
+                "INSERT INTO shard_failover_operations "
+                "(id, tenant_id, repository_id, old_primary_node_id, new_primary_node_id, old_route_epoch, new_route_epoch, "
+                "fencing_token, storage_generation, state, reason, snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'promoted', ?, ?)",
+                (
+                    op_id,
+                    acc["owner_id"],
+                    repository_id,
+                    source_node_id,
+                    target_node_id,
+                    old_epoch,
+                    new_epoch,
+                    new_token,
+                    new_gen,
+                    reason.strip(),
+                    json.dumps(snapshot),
+                ),
+            )
+            self._record_audit(
+                acc["owner_id"],
+                repository_id,
+                actor,
+                "shard.rebalanced",
+                "shard_rebalance",
+                target_node_id,
+                snapshot,
+            )
+            self.conn.commit()
+            receipt = {
+                "id": op_id,
+                "bucket_id": bucket_id,
+                "source_node_id": source_node_id,
+                "target_node_id": target_node_id,
+                "repository_id": repository_id,
+                "dry_run": False,
+                "state": "completed",
+                "phases": phases,
+                "old_route_epoch": old_epoch,
+                "new_route_epoch": new_epoch,
+                "fencing_token": new_token,
+                "fenced_epoch": old_epoch,
+                "storage_generation": new_gen,
+                "reason": reason.strip(),
+                "volume_marker": marker,
+                "updated_unix": now,
+            }
+            self._append_rebalance_receipt(receipt)
+            return 200, receipt
+
+        if not dry_run:
+            if b_row is None:
+                self.conn.execute(
+                    "INSERT INTO shard_virtual_buckets (bucket_id, primary_node_id, read_replica_nodes, route_epoch) VALUES (?, ?, ?, ?)",
+                    (bucket_id, target_node_id, json.dumps(b_replicas), new_b_epoch),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE shard_virtual_buckets SET primary_node_id = ?, read_replica_nodes = ?, route_epoch = route_epoch + 1 WHERE bucket_id = ?",
+                    (target_node_id, json.dumps(b_replicas), bucket_id),
+                )
+            self.conn.execute(
+                "UPDATE shard_nodes SET role = 'primary', status = 'healthy', lease_epoch = MAX(lease_epoch, ?), version = version + 1 WHERE node_id = ?",
+                (new_b_epoch, target_node_id),
+            )
+            self.conn.execute(
+                "UPDATE repository_shard_routes SET primary_node_id = ?, read_replica_nodes = ?, "
+                "route_epoch = route_epoch + 1, fencing_token = MAX(fencing_token, route_epoch) + 1, "
+                "fenced_epoch = route_epoch, version = version + 1 WHERE bucket_id = ? AND explicit_override = 0",
+                (target_node_id, json.dumps(b_replicas), bucket_id),
+            )
+            self.conn.commit()
+
+        receipt = {
+            "id": op_id,
+            "bucket_id": bucket_id,
+            "source_node_id": source_node_id,
+            "target_node_id": target_node_id,
+            "repository_id": None,
+            "dry_run": dry_run,
+            "state": "dry_run" if dry_run else "completed",
+            "phases": phases,
+            "old_route_epoch": old_b_epoch,
+            "new_route_epoch": new_b_epoch,
+            "fencing_token": new_b_epoch,
+            "fenced_epoch": old_b_epoch,
+            "storage_generation": 1,
+            "reason": reason.strip(),
+            "volume_marker": None,
+            "updated_unix": now,
+        }
+        if not dry_run:
+            self._append_rebalance_receipt(receipt)
+        return 200, receipt
+
+    def list_dr_drills(self, actor: dict | None, owner: str, name: str) -> tuple[int, dict]:
+        st, acc = self._authorize_repo(actor, owner, name, "admin")
+        if st != 200 or acc is None:
+            return st, acc or {}
+        r_st, latest = self.read_dr_drill_receipt(acc["repo_id"])
+        if r_st != 200:
+            return 409, {"error": "corrupt DR drill receipt"}
+        rows = self.conn.execute(
+            "SELECT details FROM repository_audit_log WHERE tenant_id = ? AND repository_id = ? AND action = 'shard.dr_drill' ORDER BY id DESC LIMIT 50",
+            (acc["owner_id"], acc["repo_id"]),
+        ).fetchall()
+        items = [json.loads(r["details"]) for r in rows]
+        if not items and latest is not None:
+            items.append(latest)
+        return 200, {"repository_id": acc["repo_id"], "latest": latest, "items": items}
+
+    def execute_dr_drill(
+        self,
+        actor: dict | None,
+        owner: str,
+        name: str,
+        primary_node_id: str,
+        standby_node_id: str,
+        target_rpo_secs: int,
+        target_rto_ms: int,
+        simulated_lag_secs: int | None = None,
+        simulated_takeover_ms: int | None = None,
+        verify_rollback: bool = False,
+        now_unix: int | None = None,
+        extra_fields: dict | None = None,
+    ) -> tuple[int, dict]:
+        st, acc = self._authorize_repo(actor, owner, name, "admin")
+        if st != 200 or acc is None:
+            return st, acc or {}
+        if extra_fields:
+            return 400, {"error": "unknown fields rejected"}
+        if (
+            not NODE_ID_RE.match(primary_node_id)
+            or not NODE_ID_RE.match(standby_node_id)
+            or target_rpo_secs < 0
+            or target_rto_ms < 1
+            or (simulated_lag_secs is not None and simulated_lag_secs < 0)
+            or (simulated_takeover_ms is not None and simulated_takeover_ms < 0)
+        ):
+            return 400, {"error": "invalid request"}
+        if primary_node_id == standby_node_id:
+            return 409, {"error": "primary_node_id and standby_node_id must differ"}
+
+        now = self._clock if now_unix is None else now_unix
+        route = self._load_or_init_route(acc["owner_id"], acc["repo_id"])
+        p_row = self.conn.execute("SELECT * FROM shard_nodes WHERE node_id = ?", (primary_node_id,)).fetchone()
+        s_row = self.conn.execute("SELECT * FROM shard_nodes WHERE node_id = ?", (standby_node_id,)).fetchone()
+        if p_row is None or s_row is None:
+            return 404, {"error": "not found"}
+        if route["primary_node_id"] != primary_node_id:
+            return 409, {"error": "repository primary_node_id does not match drill primary_node_id"}
+        if s_row["status"] != "healthy" or s_row["role"] == "fenced":
+            return 409, {"error": "standby shard node is unhealthy or fenced"}
+
+        wm = route["replica_watermarks"].get(standby_node_id)
+        default_lag = max(0, route["required_op_sequence"] - wm.get("op_sequence", 0)) if isinstance(wm, dict) else 0
+        measured_rpo_secs = simulated_lag_secs if simulated_lag_secs is not None else default_lag
+        measured_rto_ms = simulated_takeover_ms if simulated_takeover_ms is not None else 1
+        rpo_met = measured_rpo_secs <= target_rpo_secs
+        rto_met = measured_rto_ms <= target_rto_ms
+        sla_met = rpo_met and rto_met
+
+        old_epoch = route["route_epoch"]
+        new_epoch = old_epoch + 1
+        new_token = max(route["fencing_token"], new_epoch) + 1
+        base_gen = max(acc["storage_generation"], route["required_generation"])
+        lease_exp = now + 60
+
+        if not sla_met:
+            active_primary = primary_node_id
+            fenced_node = None
+            rolled_back = True
+            new_gen = base_gen
+            status_str = "sla_breach"
+            phases = ["outage_simulated", "fenced", "sla_breach_aborted", "rolled_back"]
+            err_msg = "disaster recovery drill RPO/RTO SLA breach"
+            http_code = 409
+        elif verify_rollback:
+            active_primary = primary_node_id
+            fenced_node = None
+            rolled_back = True
+            new_gen = base_gen + 1
+            status_str = "passed"
+            phases = ["outage_simulated", "fenced", "standby_promoted", "read_write_verified", "rollback_verified"]
+            err_msg = None
+            http_code = 200
+        else:
+            active_primary = standby_node_id
+            fenced_node = primary_node_id
+            rolled_back = False
+            new_gen = base_gen + 1
+            status_str = "passed"
+            phases = ["outage_simulated", "fenced", "standby_promoted", "read_write_verified"]
+            err_msg = None
+            http_code = 200
+
+        if new_gen > acc["storage_generation"]:
+            self.conn.execute("UPDATE repositories SET storage_generation = ? WHERE id = ?", (new_gen, acc["repo_id"]))
+        if fenced_node is not None:
+            self.conn.execute(
+                "UPDATE shard_nodes SET role = 'fenced', status = 'fenced', fenced_epoch = MAX(fenced_epoch, ?), version = version + 1 WHERE node_id = ?",
+                (old_epoch, fenced_node),
+            )
+        self.conn.execute(
+            "UPDATE shard_nodes SET role = 'primary', status = 'healthy', lease_epoch = MAX(lease_epoch, ?), lease_expires_unix = MAX(lease_expires_unix, ?), version = version + 1 WHERE node_id = ?",
+            (new_epoch, lease_exp, active_primary),
+        )
+        rem_replicas = [r for r in route["read_replica_nodes"] if r != active_primary]
+        exp_ov = 1 if (route["explicit_override"] or not rolled_back) else 0
+        self.conn.execute(
+            "UPDATE repository_shard_routes SET primary_node_id = ?, read_replica_nodes = ?, explicit_override = ?, "
+            "route_epoch = ?, fencing_token = ?, fenced_epoch = ?, required_generation = ?, draining = 0, "
+            "read_only_degraded = 0, degraded_reason = '', in_flight_writes = 0, version = version + 1 "
+            "WHERE tenant_id = ? AND repository_id = ?",
+            (
+                active_primary,
+                json.dumps(rem_replicas),
+                exp_ov,
+                new_epoch,
+                new_token,
+                old_epoch,
+                new_gen,
+                acc["owner_id"],
+                acc["repo_id"],
+            ),
+        )
+        marker = {
+            "version": 1,
+            "repository_id": acc["repo_id"],
+            "primary_node_id": active_primary,
+            "route_epoch": new_epoch,
+            "fencing_token": new_token,
+            "fenced_epoch": old_epoch,
+            "storage_generation": new_gen,
+            "fenced_node_id": fenced_node,
+            "read_only_degraded": False,
+            "updated_unix": now,
+        }
+        self.write_volume_marker(acc["repo_id"], marker)
+        receipt = {
+            "drill_id": str(uuid.uuid4()),
+            "repository_id": acc["repo_id"],
+            "primary_node_id": primary_node_id,
+            "standby_node_id": standby_node_id,
+            "active_primary_node_id": active_primary,
+            "target_rpo_secs": target_rpo_secs,
+            "target_rto_ms": target_rto_ms,
+            "measured_rpo_secs": measured_rpo_secs,
+            "measured_rto_ms": measured_rto_ms,
+            "rpo_met": rpo_met,
+            "rto_met": rto_met,
+            "sla_met": sla_met,
+            "verify_rollback": verify_rollback,
+            "rolled_back": rolled_back,
+            "write_admitted": True,
+            "old_route_epoch": old_epoch,
+            "new_route_epoch": new_epoch,
+            "fencing_token": new_token,
+            "storage_generation": new_gen,
+            "status": status_str,
+            "phases": phases,
+            "error": err_msg,
+            "updated_unix": now,
+        }
+        self.write_dr_drill_receipt(acc["repo_id"], receipt)
+        assert actor is not None
+        self._record_audit(
+            acc["owner_id"],
+            acc["repo_id"],
+            actor,
+            "shard.dr_drill",
+            "shard_dr_drill",
+            active_primary,
+            receipt,
+        )
+        self.conn.commit()
+        return http_code, receipt
+
 
 class ShardingReferenceRunner:
-    """Executes all 9 Track 4 sharding & fencing cases against ShardingReferenceEngine."""
+    """Executes all 11 Track 4 sharding, fencing, rebalance & DR drill cases against ShardingReferenceEngine."""
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -1597,6 +2093,79 @@ class ShardingReferenceRunner:
         )
         assert st_rec == 200 and rec["read_only_degraded"] is False and rec["write_admitted"] is True
 
+    def online_bucket_and_repo_rebalance(self) -> None:
+        # Prepare healthy target shard-node-d with active lease and capacity
+        st_n, _ = self.engine.upsert_node(
+            self.alice,
+            "shard-node-d",
+            "http://shard-d.internal:8080",
+            role="primary",
+            status="healthy",
+            capacity_bytes=10_000,
+            used_bytes=2_000,
+            lease_ttl_seconds=300,
+            now_unix=1_700_000_180,
+        )
+        assert st_n == 201
+        bucket_id = deterministic_bucket_id(self.repo_forge["id"])
+        self.engine.upsert_bucket(self.alice, bucket_id, "shard-node-c", ["shard-node-b"])
+
+        # Rebalance bucket + repo from shard-node-c -> shard-node-d
+        st_reb, reb = self.engine.execute_rebalance(
+            self.alice,
+            bucket_id=bucket_id,
+            source_node_id="shard-node-c",
+            target_node_id="shard-node-d",
+            repository_id=self.repo_forge["id"],
+            reason="hotspot rebalance",
+            now_unix=1_700_000_190,
+        )
+        assert st_reb == 200
+        assert reb["phases"] == ["drain", "sync", "fence", "cutover"]
+        assert reb["target_node_id"] == "shard-node-d"
+        assert reb["new_route_epoch"] == reb["old_route_epoch"] + 1
+        assert self.engine.apply_or_verify_fence(
+            self.alice, "alice", "forge", action="verify", writer_node_id="shard-node-c", now_unix=1_700_000_195
+        )[0] == 409
+        assert self.engine.apply_or_verify_fence(
+            self.alice, "alice", "forge", action="verify", writer_node_id="shard-node-d", now_unix=1_700_000_195
+        )[0] == 200
+
+    def rpo_rto_disaster_recovery_drill(self) -> None:
+        # SLA breach rejected with 409 and leaves repository safely rolled back on shard-node-d
+        st_breach, breach = self.engine.execute_dr_drill(
+            self.alice,
+            "alice",
+            "forge",
+            primary_node_id="shard-node-d",
+            standby_node_id="shard-node-b",
+            target_rpo_secs=5,
+            target_rto_ms=200,
+            simulated_lag_secs=12,
+            simulated_takeover_ms=100,
+            now_unix=1_700_000_200,
+        )
+        assert st_breach == 409
+        assert breach["rpo_met"] is False and breach["rolled_back"] is True
+
+        # Passing drill with verify_rollback=True
+        st_pass, ok_rep = self.engine.execute_dr_drill(
+            self.alice,
+            "alice",
+            "forge",
+            primary_node_id="shard-node-d",
+            standby_node_id="shard-node-b",
+            target_rpo_secs=5,
+            target_rto_ms=200,
+            simulated_lag_secs=1,
+            simulated_takeover_ms=50,
+            verify_rollback=True,
+            now_unix=1_700_000_210,
+        )
+        assert st_pass == 200
+        assert ok_rep["rpo_met"] is True and ok_rep["rto_met"] is True and ok_rep["rolled_back"] is True
+        assert self.engine.dr_drill_receipt_path(self.repo_forge["id"]).is_file()
+
     def access_and_boundaries(self) -> None:
         # Unauthenticated -> 401
         assert self.engine.get_repo_route(None, "alice", "forge")[0] == 401
@@ -1605,6 +2174,12 @@ class ShardingReferenceRunner:
         # Write collaborator bob -> 403 Forbidden on admin shard mutations
         assert self.engine.configure_repo_route(self.bob, "alice", "forge", required_op_sequence=20)[0] == 403
         assert self.engine.degrade_or_recover_repo(self.bob, "alice", "forge", mode="degrade")[0] == 403
+        assert (
+            self.engine.execute_dr_drill(
+                self.bob, "alice", "forge", primary_node_id="shard-node-d", standby_node_id="shard-node-b", target_rpo_secs=5, target_rto_ms=200
+            )[0]
+            == 403
+        )
         # Out-of-range bucket_id -> 400 Bad Request
         assert self.engine.upsert_bucket(self.alice, -1, "shard-node-c")[0] == 400
         assert self.engine.upsert_bucket(self.alice, 1024, "shard-node-c")[0] == 400
@@ -1619,6 +2194,8 @@ class ShardingReferenceRunner:
             "read_write_watermark_routing_and_replica_fallback",
             "automated_four_stage_failover_state_machine",
             "read_only_degradation_drill_and_recovery",
+            "online_bucket_and_repo_rebalance",
+            "rpo_rto_disaster_recovery_drill",
             "access_and_boundaries",
         ):
             self.case(name, getattr(self, name))
@@ -1646,10 +2223,12 @@ class ShardingHarness(PullsHarness):
         self.ensure_migration_060()
         self.nodespath = "/api/shards/nodes"
         self.bucketspath = "/api/shards/buckets"
+        self.rebalancepath = "/api/shards/rebalance"
         self.routepath = "/api/repos/alice/forge/shard-route"
         self.fencepath = "/api/repos/alice/forge/shard-fence"
         self.failoverpath = "/api/repos/alice/forge/shard-failover"
         self.degradepath = "/api/repos/alice/forge/shard-degrade"
+        self.drdrillpath = "/api/repos/alice/forge/shard-dr-drill"
         self.outsider = self.issue_token("outsider", create_user=True)
 
     def migration(self) -> None:
@@ -1779,6 +2358,72 @@ class ShardingHarness(PullsHarness):
         )
         assert rec["read_only_degraded"] is False and rec["write_admitted"] is True
 
+    def online_bucket_and_repo_rebalance(self) -> None:
+        self.document(
+            self.nodespath,
+            code=201,
+            method="POST",
+            json_body={
+                "node_id": "shard-node-d",
+                "endpoint": "http://shard-d:8080",
+                "role": "primary",
+                "status": "healthy",
+                "lease_ttl_seconds": 300,
+                "now_unix": 1_700_000_180,
+            },
+        )
+        route = self.document(self.routepath, code=200)
+        self.document(
+            self.bucketspath,
+            code=200,
+            method="POST",
+            json_body={"bucket_id": route["bucket_id"], "primary_node_id": "shard-node-c", "read_replica_nodes": ["shard-node-b"]},
+        )
+        reb = self.document(
+            self.rebalancepath,
+            code=200,
+            method="POST",
+            json_body={
+                "bucket_id": route["bucket_id"],
+                "source_node_id": "shard-node-c",
+                "target_node_id": "shard-node-d",
+                "repository_id": route["repository_id"],
+                "reason": "hotspot rebalance",
+                "now_unix": 1_700_000_190,
+            },
+        )
+        assert reb["phases"] == ["drain", "sync", "fence", "cutover"]
+
+    def rpo_rto_disaster_recovery_drill(self) -> None:
+        self.document(
+            self.drdrillpath,
+            code=409,
+            method="POST",
+            json_body={
+                "primary_node_id": "shard-node-d",
+                "standby_node_id": "shard-node-b",
+                "target_rpo_secs": 5,
+                "target_rto_ms": 200,
+                "simulated_lag_secs": 15,
+                "simulated_takeover_ms": 100,
+            },
+        )
+        ok_drill = self.document(
+            self.drdrillpath,
+            code=200,
+            method="POST",
+            json_body={
+                "primary_node_id": "shard-node-d",
+                "standby_node_id": "shard-node-b",
+                "target_rpo_secs": 5,
+                "target_rto_ms": 200,
+                "simulated_lag_secs": 1,
+                "simulated_takeover_ms": 50,
+                "verify_rollback": True,
+            },
+        )
+        assert ok_drill["rpo_met"] is True and ok_drill["rto_met"] is True
+
     def access_and_boundaries(self) -> None:
         self.document(self.routepath, code=404, token=self.outsider)
         self.document(
@@ -1798,6 +2443,8 @@ class ShardingHarness(PullsHarness):
             "read_write_watermark_routing_and_replica_fallback",
             "automated_four_stage_failover_state_machine",
             "read_only_degradation_drill_and_recovery",
+            "online_bucket_and_repo_rebalance",
+            "rpo_rto_disaster_recovery_drill",
             "access_and_boundaries",
         ):
             self.case(name, getattr(self, name))

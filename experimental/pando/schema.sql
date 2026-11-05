@@ -102,4 +102,22 @@ CREATE OR REPLACE TRIGGER immutable_manifest BEFORE UPDATE OR DELETE ON pando_la
  FOR EACH ROW EXECUTE FUNCTION pando_lab.immutable_manifest();
 CREATE OR REPLACE TRIGGER immutable_object BEFORE UPDATE OR DELETE ON pando_lab.objects
  FOR EACH ROW EXECUTE FUNCTION pando_lab.immutable_manifest();
-
+CREATE TABLE IF NOT EXISTS pando_lab.lifecycle_policies (
+ repo UUID PRIMARY KEY REFERENCES pando_lab.repositories(id) ON DELETE CASCADE,
+ max_active_packs INTEGER NOT NULL DEFAULT 4 CHECK (max_active_packs >= 1 AND max_active_packs <= 1000),
+ cold_transition_age_secs BIGINT NOT NULL DEFAULT 86400 CHECK (cold_transition_age_secs >= 0),
+ auto_repack_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+ kms_key_id TEXT NOT NULL DEFAULT 'kms-local-default-v1' CHECK (length(btrim(kms_key_id)) >= 3 AND length(kms_key_id) <= 128),
+ kms_key_version INTEGER NOT NULL DEFAULT 1 CHECK (kms_key_version >= 1),
+ updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS pando_lab.kms_envelopes (
+ repo UUID NOT NULL REFERENCES pando_lab.repositories(id) ON DELETE CASCADE,
+ pack_id UUID NOT NULL,
+ key_id TEXT NOT NULL CHECK (length(btrim(key_id)) >= 3 AND length(btrim(key_id)) <= 128),
+ key_version INTEGER NOT NULL CHECK (key_version >= 1),
+ cipher_suite TEXT NOT NULL DEFAULT 'AES-256-GCM-HMAC-SHA256' CHECK (cipher_suite IN ('AES-256-GCM-HMAC-SHA256', 'CHACHA20-POLY1305-SHA256')),
+ plaintext_sha256 TEXT NOT NULL CHECK (plaintext_sha256 ~ '^[0-9a-f]{64}$'),
+ envelope_mac TEXT NOT NULL CHECK (envelope_mac ~ '^[0-9a-f]{64}$'),
+ storage_tier TEXT NOT NULL DEFAULT 'hot' CHECK (storage_tier IN ('hot', 'cold_archive')),
+ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+ PRIMARY KEY (repo, pack_id));

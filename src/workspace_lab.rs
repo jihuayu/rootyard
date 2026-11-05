@@ -16,6 +16,8 @@ pub mod sync;
 pub mod view;
 #[path = "workspace_lab/vfs.rs"]
 pub mod vfs;
+#[path = "workspace_lab/writable_view.rs"]
+pub mod writable_view;
 
 use anyhow::{Context, Result, bail, ensure};
 use std::{ffi::OsString, path::Path};
@@ -37,6 +39,7 @@ pub use vfs::{
     VfsStatusReport,
 };
 pub use view::ReadonlyViewReport;
+pub use writable_view::{AgentLeaseEntry, CrossRepoCommitReceipt, NamespaceWriteReport};
 
 const USAGE: &str = "usage: rootyard-workspace-lab \
 init STORE SOURCE AGENT BASE_OID --quiescent | \
@@ -56,8 +59,12 @@ namespace-git-view STORE NAMESPACE_ID [VIEW_PATH] | \
 vfs-mount STORE CHECKPOINT_ID AGENT [--remote-cas CAS_DIR] [--inline-threshold BYTES] [--hydrate-pattern GLOB...] | \
 vfs-hydrate STORE VFS_ID [PATH_OR_GLOB...] [--cow-write CONTENT_OR_FILE] [--prewarm] | \
 vfs-status STORE VFS_ID | \
-vfs-evict STORE VFS_ID [PATH_OR_GLOB...] [--quiescent] [--skip-dirty]";
+vfs-evict STORE VFS_ID [PATH_OR_GLOB...] [--quiescent] [--skip-dirty] | \
+agent-lease STORE NAMESPACE_OR_WS_ID AGENT_ID ACTION [--prefix REL_PATH] [--ttl-secs SECS] [--epoch EPOCH] | \
+namespace-write STORE NAMESPACE_ID AGENT_ID REL_PATH CONTENT_OR_DELETE [--lease-epoch EPOCH] | \
+namespace-commit-back STORE NAMESPACE_ID AGENT_ID [--quiescent] [--lease-epoch EPOCH]";
 
+#[rustfmt::skip]
 pub fn run(args: Vec<OsString>) -> Result<()> {
     ensure!(cfg!(target_os = "linux"), "workspace lab requires Linux");
     let command = args.first().and_then(|x| x.to_str()).context(USAGE)?;
@@ -67,30 +74,17 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         "inspect" | "status" | "vfs-status" => ensure!(args.len() == 3, "{USAGE}"),
         "apply" | "pull-remote" => ensure!(args.len() == 5, "{USAGE}"),
         "sync-dirty" => ensure!(args.len() == 4 || args.len() == 5, "{USAGE}"),
-        "verify-readonly-view" | "verify-namespace" | "namespace-git-view" => {
-            ensure!(args.len() == 3 || args.len() == 4, "{USAGE}")
-        }
-        "push-remote" => {
-            ensure!(args.len() == 4 || args.len() == 5, "{USAGE}");
-            if args.len() == 5 {
-                ensure!(args[4] == "--quiescent", "{USAGE}");
-            }
-        }
-        "namespace-mount" | "vfs-mount" | "vfs-hydrate" | "vfs-evict" => {
-            ensure!(args.len() >= 4, "{USAGE}")
-        }
+        "verify-readonly-view" | "verify-namespace" | "namespace-git-view" => ensure!(args.len() == 3 || args.len() == 4, "{USAGE}"),
+        "push-remote" => { ensure!(args.len() == 4 || (args.len() == 5 && args[4] == "--quiescent"), "{USAGE}"); }
+        "namespace-mount" | "vfs-mount" | "vfs-hydrate" | "vfs-evict" | "namespace-commit-back" => ensure!(args.len() >= 4, "{USAGE}"),
+        "agent-lease" => ensure!(args.len() >= 5, "{USAGE}"),
+        "namespace-write" => ensure!(args.len() >= 6, "{USAGE}"),
         _ => bail!(USAGE),
     }
     if matches!(command, "init" | "checkpoint" | "apply" | "sync-dirty") {
-        ensure!(
-            args.last().is_some_and(|x| x == "--quiescent"),
-            "stop ALL writers and explicitly pass --quiescent; this is a caller assumption, not a write barrier"
-        );
+        ensure!(args.last().is_some_and(|x| x == "--quiescent"), "stop ALL writers and explicitly pass --quiescent; this is a caller assumption, not a write barrier");
     }
-    // Reject overlap before creating even a store lock or staging directory.
-    if command == "init" {
-        core::check_source_store_overlap(&args[1], &args[2])?;
-    }
+    if command == "init" { core::check_source_store_overlap(&args[1], &args[2])?; }
     let store = Store::open(Path::new(&args[1]))?;
     let result = match command {
         "init" => store.cmd_init(&args[2], &args[3], &args[4])?,
@@ -100,31 +94,23 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         "status" => manifest::cmd_status(&store, &args[2])?,
         "changeset" => manifest::cmd_changeset(&store, &args[2], &args[3])?,
         "apply" => sync::cmd_apply(&store, &args[2], &args[3])?,
-        "sync-dirty" => {
-            let target = (args.len() == 5).then(|| args[3].as_os_str());
-            sync::cmd_sync_dirty(&store, &args[2], target)?
-        }
-        "verify-readonly-view" => {
-            let view_path = args.get(3).map(OsString::as_os_str);
-            view::cmd_verify_readonly_view(&store, &args[2], view_path)?
-        }
+        "sync-dirty" => sync::cmd_sync_dirty(&store, &args[2], (args.len() == 5).then(|| args[3].as_os_str()))?,
+        "verify-readonly-view" => view::cmd_verify_readonly_view(&store, &args[2], args.get(3).map(OsString::as_os_str))?,
         "push-remote" => remote::cmd_push_remote(&store, &args[2], &args[3], args.len() == 5)?,
         "pull-remote" => remote::cmd_pull_remote(&store, &args[2], &args[3], &args[4])?,
         "namespace-mount" => namespace::cmd_namespace_mount(&store, &args[2], &args[3..])?,
-        "verify-namespace" => {
-            let view_path = args.get(3).map(OsString::as_os_str);
-            namespace::cmd_verify_namespace(&store, &args[2], view_path)?
-        }
-        "namespace-git-view" => {
-            let view_path = args.get(3).map(OsString::as_os_str);
-            namespace::cmd_namespace_git_view(&store, &args[2], view_path)?
-        }
+        "verify-namespace" => namespace::cmd_verify_namespace(&store, &args[2], args.get(3).map(OsString::as_os_str))?,
+        "namespace-git-view" => namespace::cmd_namespace_git_view(&store, &args[2], args.get(3).map(OsString::as_os_str))?,
         "vfs-mount" => vfs::cmd_vfs_mount(&store, &args[2], &args[3], &args[4..])?,
         "vfs-hydrate" => vfs::cmd_vfs_hydrate(&store, &args[2], &args[3..])?,
         "vfs-status" => vfs::cmd_vfs_status(&store, &args[2])?,
         "vfs-evict" => vfs::cmd_vfs_evict(&store, &args[2], &args[3..])?,
+        "agent-lease" => writable_view::cmd_agent_lease(&store, &args[2], &args[3], &args[4], &args[5..])?,
+        "namespace-write" => writable_view::cmd_namespace_write(&store, &args[2], &args[3], &args[4], &args[5], &args[6..])?,
+        "namespace-commit-back" => writable_view::cmd_namespace_commit_back(&store, &args[2], &args[3], &args[4..])?,
         _ => unreachable!(),
     };
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
+

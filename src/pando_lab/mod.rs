@@ -4,6 +4,7 @@ pub mod export;
 pub mod graph;
 mod hook;
 mod http;
+pub mod lifecycle;
 pub mod migration;
 pub mod object_store;
 pub mod repack;
@@ -441,8 +442,69 @@ pub async fn run() -> Result<()> {
             let report = object_store::status(&config, repo).await?;
             println!("{}", serde_json::to_string(&report)?);
         }
+        Some("lifecycle-evaluate") if args.len() >= 2 => {
+            let repo: Uuid = args[1].parse()?;
+            let mut opts = lifecycle::LifecycleEvaluateOptions::default();
+            let mut i = 2usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--max-packs" => {
+                        opts.max_active_packs = Some(
+                            args.get(i + 1)
+                                .context("missing value for --max-packs")?
+                                .parse()?,
+                        );
+                        i += 2;
+                    }
+                    "--cold-age-secs" => {
+                        opts.cold_transition_age_secs = Some(
+                            args.get(i + 1)
+                                .context("missing value for --cold-age-secs")?
+                                .parse()?,
+                        );
+                        i += 2;
+                    }
+                    "--cold-evict-local" => {
+                        opts.cold_evict_local = true;
+                        i += 1;
+                    }
+                    "--auto-repack" => {
+                        opts.auto_repack_enabled = Some(true);
+                        i += 1;
+                    }
+                    "--no-auto-repack" => {
+                        opts.auto_repack_enabled = Some(false);
+                        i += 1;
+                    }
+                    "--kms-key-id" => {
+                        opts.kms_key_id = Some(
+                            args.get(i + 1)
+                                .context("missing value for --kms-key-id")?
+                                .clone(),
+                        );
+                        i += 2;
+                    }
+                    "--cipher-suite" => {
+                        opts.cipher_suite = Some(
+                            args.get(i + 1)
+                                .context("missing value for --cipher-suite")?
+                                .clone(),
+                        );
+                        i += 2;
+                    }
+                    other => bail!("unknown lifecycle-evaluate flag '{other}'"),
+                }
+            }
+            let report = lifecycle::evaluate_lifecycle(&config, repo, &opts).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("kms-rotate") if args.len() == 3 => {
+            let repo: Uuid = args[1].parse()?;
+            let report = lifecycle::rotate_kms_key(&config, repo, &args[2]).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
         _ => bail!(
-            "usage: rootyard-pando-lab init | create-repo <uuid> <principal> | serve | verify-delta <pack> | walk-graph <repo> [wants... ^haves...] | diff-export <repo> [^haves...] | gc [repo] | migrate <repo> <gitfs_path> | migrate-step <repo> <gitfs_path> <copy|verify|drain|fence|switchover> | rollback <repo> <gitfs_path> | migration-status <repo> | repack <repo> [--prune-superseded] [--no-object-store] [--pin-oid <oid>...] | pin-root <repo> <name> <oid> | unpin-root <repo> <name> | object-store-put <repo> <pack_id> [--chunk-size <bytes>] [--fail-after-chunks <n>] [--corrupt-chunk <part>] | object-store-get <repo> <pack_id> | object-store-verify <repo> | object-store-status <repo>"
+            "usage: rootyard-pando-lab init | create-repo <uuid> <principal> | serve | verify-delta <pack> | walk-graph <repo> [wants... ^haves...] | diff-export <repo> [^haves...] | gc [repo] | migrate <repo> <gitfs_path> | migrate-step <repo> <gitfs_path> <copy|verify|drain|fence|switchover> | rollback <repo> <gitfs_path> | migration-status <repo> | repack <repo> [--prune-superseded] [--no-object-store] [--pin-oid <oid>...] | pin-root <repo> <name> <oid> | unpin-root <repo> <name> | object-store-put <repo> <pack_id> [--chunk-size <bytes>] [--fail-after-chunks <n>] [--corrupt-chunk <part>] | object-store-get <repo> <pack_id> | object-store-verify <repo> | object-store-status <repo> | lifecycle-evaluate <repo> [--max-packs <n>] [--cold-evict-local] [--auto-repack] | kms-rotate <repo> <new_key_id>"
         ),
     }
     Ok(())

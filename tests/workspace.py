@@ -164,6 +164,9 @@ def _run_reference_cli(argv):
         "vfs-hydrate": tuple(range(4, 32)),
         "vfs-status": (3,),
         "vfs-evict": tuple(range(4, 32)),
+        "agent-lease": tuple(range(5, 16)),
+        "namespace-write": (6, 8),
+        "namespace-commit-back": tuple(range(4, 10)),
     }
     if cmd not in expected_lengths or len(argv) not in expected_lengths[cmd]:
         sys.stderr.write("usage: invalid arguments\n")
@@ -227,10 +230,11 @@ def _run_reference_cli(argv):
     if (store_root.stat().st_mode & 0o077) != 0:
         sys.stderr.write("store must be private (mode 0700)\n")
         return 1
-    for sub in ("workspaces", "checkpoints", "changesets", "views", "namespaces", "vfs", "staging"):
+    for sub in ("workspaces", "checkpoints", "changesets", "views", "namespaces", "vfs", "leases", "staging"):
         p = store_root / sub
         if not p.exists():
             p.mkdir(mode=0o700)
+
 
     git_ver = run_git(store_root, "--version").stdout.decode().strip()
 
@@ -1305,7 +1309,7 @@ def _run_reference_cli(argv):
             require(
                 man["schema"] == SCHEMA
                 and man["namespace_id"] == ns_id
-                and man["namespace_revision"] == 1
+                and man["namespace_revision"] >= 1
                 and man["state"] == "mounted"
                 and len(man["base_vector"]) >= 1,
                 "invalid namespace manifest",
@@ -2090,10 +2094,633 @@ def _run_reference_cli(argv):
                 "unhydrated_bytes": man["unhydrated_bytes"],
             }))
             return 0
+
+        def normalize_rel_segments(raw_str: str, allow_empty: bool = False) -> str:
+            require("\x00" not in raw_str and not raw_str.startswith("/"), "invalid path: leading '/' or NUL forbidden")
+            trimmed = raw_str.rstrip("/")
+            if allow_empty and trimmed in ("", ".", "*"):
+                return ""
+            segs = []
+            for seg in trimmed.split("/"):
+                if not seg or seg == ".":
+                    continue
+                require(seg not in ("..", ".git"), f"unsafe or .git path segment '{seg}'")
+                segs.append(seg)
+            if allow_empty and not segs:
+                return ""
+            joined = "/".join(segs)
+            require(bool(segs) and joined != ".rootyard-namespace.json", "invalid or reserved relative path")
+            return joined
+
+        def prefixes_overlap(a: str, b: str) -> bool:
+            return not a or not b or a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+        def prefix_covers(prefix: str, path: str) -> bool:
+            return not prefix or prefix == path or path.startswith(prefix + "/")
+
+        def load_lease_table(target_id: str, target_kind: str) -> dict:
+            leases_dir = store_root / "leases"
+            leases_dir.mkdir(mode=0o700, exist_ok=True)
+            p = leases_dir / f"{target_id}.json"
+            if not p.exists():
+                return {
+                    "schema": SCHEMA,
+                    "target_id": target_id,
+                    "target_kind": target_kind,
+                    "lease_epoch": 0,
+                    "leases": [],
+                }
+            raw = p.read_bytes()
+            sha_p = leases_dir / f"{target_id}.sha256"
+            if sha_p.exists():
+                require(hashlib.sha256(raw).hexdigest() == sha_p.read_text().strip(), "lease table checksum mismatch")
+            tbl = json.loads(raw)
+            require(tbl["schema"] == SCHEMA and tbl["target_id"] == target_id, "invalid lease table")
+            return tbl
+
+        def save_lease_table(tbl: dict):
+            leases_dir = store_root / "leases"
+            raw = json.dumps(tbl, indent=2).encode()
+            sha = write_atomic_file(leases_dir, f"{tbl['target_id']}.json", raw, 0o600)
+            write_atomic_file(leases_dir, f"{tbl['target_id']}.sha256", sha.encode(), 0o600)
+
+        def enforce_write_lease(ns_id: str, agent_id: str, rel_path: str, req_epoch):
+            lease_file = store_root / "leases" / f"{ns_id}.json"
+            if not lease_file.exists():
+                require(req_epoch is None, "conflict: lease_epoch specified but no active lease exists")
+                return None
+            now_s = int(time.time())
+            tbl = load_lease_table(ns_id, "namespace")
+            for l in tbl["leases"]:
+                if l["state"] == "active" and now_s >= l["expires_at"]:
+                    l["state"] = "expired"
+            save_lease_table(tbl)
+            for l in tbl["leases"]:
+                if l["state"] == "active" and prefixes_overlap(l["prefix"], rel_path) and l["agent_id"] != agent_id:
+                    raise RuntimeError(
+                        f"conflict: path '{rel_path}' is locked by active lease of agent '{l['agent_id']}' on prefix '{l['prefix']}' (epoch {l['lease_epoch']})"
+                    )
+            for l in tbl["leases"]:
+                if l["state"] == "active" and l["agent_id"] == agent_id and prefix_covers(l["prefix"], rel_path):
+                    if req_epoch is not None:
+                        require(
+                            req_epoch == l["lease_epoch"],
+                            f"conflict: stale or mismatched lease_epoch {req_epoch} (active epoch is {l['lease_epoch']})",
+                        )
+                    return l["lease_epoch"]
+            if req_epoch is not None:
+                raise RuntimeError(f"conflict: stale or inactive lease_epoch {req_epoch} for agent '{agent_id}' on '{rel_path}'")
+            for l in tbl["leases"]:
+                if l["agent_id"] == agent_id and l["state"] == "expired" and prefix_covers(l["prefix"], rel_path):
+                    raise RuntimeError(f"conflict: lease for agent '{agent_id}' covering '{rel_path}' has expired")
+            return None
+
+        if cmd == "agent-lease":
+            target_id = argv[2]
+            agent_id = argv[3]
+            action = argv[4]
+            require(is_uuid(target_id), "invalid target uuid")
+            valid_agent_name(agent_id)
+            if (store_root / "namespaces" / target_id).is_dir():
+                target_kind = "namespace"
+            elif (store_root / "workspaces" / target_id).is_dir():
+                target_kind = "workspace"
+            else:
+                raise RuntimeError(f"unknown namespace or workspace id: {target_id}")
+            prefix = ""
+            ttl_secs = 300
+            req_epoch = None
+            idx = 5
+            while idx < len(argv):
+                fl = argv[idx]
+                if fl == "--prefix":
+                    idx += 1
+                    require(idx < len(argv), "missing --prefix")
+                    prefix = normalize_rel_segments(argv[idx], True)
+                elif fl == "--ttl-secs":
+                    idx += 1
+                    require(idx < len(argv), "missing --ttl-secs")
+                    ttl_secs = int(argv[idx])
+                    require(0 <= ttl_secs <= 86400 * 30, "invalid --ttl-secs")
+                elif fl in ("--epoch", "--lease-epoch"):
+                    idx += 1
+                    require(idx < len(argv), "missing --epoch")
+                    req_epoch = int(argv[idx])
+                else:
+                    raise RuntimeError(f"unknown agent-lease flag: {fl}")
+                idx += 1
+
+            now_s = int(time.time())
+            tbl = load_lease_table(target_id, target_kind)
+            for l in tbl["leases"]:
+                if l["state"] == "active" and now_s >= l["expires_at"]:
+                    l["state"] = "expired"
+
+            if action == "acquire":
+                for l in tbl["leases"]:
+                    if l["state"] == "active" and prefixes_overlap(l["prefix"], prefix) and l["agent_id"] != agent_id:
+                        save_lease_table(tbl)
+                        raise RuntimeError(
+                            f"conflict: prefix '{prefix}' overlaps active lease held by '{l['agent_id']}' on '{l['prefix']}' (epoch {l['lease_epoch']})"
+                        )
+                if req_epoch is not None:
+                    require(req_epoch >= tbl["lease_epoch"], f"conflict: stale lease_epoch {req_epoch} < {tbl['lease_epoch']}")
+                tbl["leases"] = [
+                    l
+                    for l in tbl["leases"]
+                    if not (prefixes_overlap(l["prefix"], prefix) and (l["state"] != "active" or l["agent_id"] == agent_id))
+                ]
+                tbl["lease_epoch"] += 1
+                entry = {
+                    "lease_id": str(uuid.uuid4()),
+                    "target_id": target_id,
+                    "target_kind": target_kind,
+                    "agent_id": agent_id,
+                    "prefix": prefix,
+                    "lease_epoch": tbl["lease_epoch"],
+                    "ttl_secs": ttl_secs,
+                    "acquired_at": now_s,
+                    "expires_at": now_s + ttl_secs,
+                    "state": "active",
+                }
+                tbl["leases"].append(entry)
+                tbl["leases"].sort(key=lambda item: (item["prefix"], item["lease_epoch"]))
+                save_lease_table(tbl)
+                primary = dict(entry, state="acquired")
+            elif action == "renew":
+                pos = next((i for i, l in enumerate(tbl["leases"]) if l["agent_id"] == agent_id and l["prefix"] == prefix), None)
+                if pos is None:
+                    save_lease_table(tbl)
+                    raise RuntimeError(f"conflict: no lease found for agent '{agent_id}' on prefix '{prefix}' (stale lease_epoch)")
+                cur_ep = tbl["leases"][pos]["lease_epoch"]
+                if req_epoch is not None and (req_epoch != cur_ep or (cur_ep < tbl["lease_epoch"] and tbl["leases"][pos]["state"] != "active")):
+                    save_lease_table(tbl)
+                    raise RuntimeError(f"conflict: stale lease_epoch {req_epoch} (current lease epoch {cur_ep})")
+                if tbl["leases"][pos]["state"] != "active":
+                    save_lease_table(tbl)
+                    raise RuntimeError(f"conflict: lease expired for agent '{agent_id}' on prefix '{prefix}' (epoch {cur_ep})")
+                tbl["leases"][pos]["ttl_secs"] = ttl_secs
+                tbl["leases"][pos]["expires_at"] = now_s + ttl_secs
+                save_lease_table(tbl)
+                primary = dict(tbl["leases"][pos], state="renewed")
+            elif action == "release":
+                pos = next(
+                    (i for i, l in enumerate(tbl["leases"]) if l["agent_id"] == agent_id and l["prefix"] == prefix and l["state"] == "active"),
+                    None,
+                )
+                if pos is None:
+                    save_lease_table(tbl)
+                    raise RuntimeError(f"conflict: no active lease for agent '{agent_id}' on prefix '{prefix}'")
+                if req_epoch is not None:
+                    require(req_epoch == tbl["leases"][pos]["lease_epoch"], f"conflict: stale lease_epoch {req_epoch}")
+                tbl["leases"][pos]["state"] = "released"
+                save_lease_table(tbl)
+                primary = dict(tbl["leases"][pos])
+            elif action == "status":
+                save_lease_table(tbl)
+                primary = {
+                    "lease_id": "",
+                    "target_id": target_id,
+                    "target_kind": target_kind,
+                    "agent_id": agent_id,
+                    "prefix": prefix,
+                    "lease_epoch": tbl["lease_epoch"],
+                    "ttl_secs": 0,
+                    "acquired_at": now_s,
+                    "expires_at": now_s,
+                    "state": "status",
+                }
+            else:
+                raise RuntimeError(f"unsupported agent-lease action '{action}'")
+
+            active_count = sum(1 for l in tbl["leases"] if l["state"] == "active")
+            print(json.dumps({
+                "schema": SCHEMA,
+                "lease_id": primary["lease_id"],
+                "target_id": target_id,
+                "target_kind": target_kind,
+                "agent_id": agent_id,
+                "action": action,
+                "prefix": primary["prefix"],
+                "lease_epoch": primary["lease_epoch"],
+                "ttl_secs": primary["ttl_secs"],
+                "acquired_at": primary["acquired_at"],
+                "expires_at": primary["expires_at"],
+                "state": primary["state"],
+                "active_leases": active_count,
+                "leases": tbl["leases"],
+            }))
+            return 0
+
+        def load_pending_writes(ns_dir: Path, ns_id: str, rev: int) -> dict:
+            w_dir = ns_dir / "writable"
+            p_file = w_dir / "pending.json"
+            if not p_file.exists():
+                return {"schema": SCHEMA, "namespace_id": ns_id, "namespace_revision": rev, "writes": []}
+            raw = p_file.read_bytes()
+            sha_exp = (w_dir / "pending.sha256").read_text().strip()
+            require(hashlib.sha256(raw).hexdigest() == sha_exp, "pending writes checksum mismatch")
+            return json.loads(raw)
+
+        def save_pending_writes(ns_dir: Path, tbl: dict):
+            w_dir = ns_dir / "writable"
+            raw = json.dumps(tbl, indent=2).encode()
+            sha = write_atomic_file(w_dir, "pending.json", raw, 0o600)
+            write_atomic_file(w_dir, "pending.sha256", sha.encode(), 0o600)
+
+        def rebuild_namespace_tree(ns_dir: Path, base_vector: list) -> int:
+            stage_dir = store_root / "staging" / str(uuid.uuid4())
+            stage_tree = stage_dir / "tree"
+            stage_tree.mkdir(mode=0o700, parents=True)
+            total_entries = 0
+            for bv in base_vector:
+                cp_dir, cp_man = read_checkpoint(bv["checkpoint_id"])
+                total_entries += copy_worktree_to_mount(cp_dir / "repo", cp_man["entries"], stage_tree / bv["mount_path"], True)
+            tree_dir = ns_dir / "tree"
+            if tree_dir.exists():
+                shutil.rmtree(tree_dir)
+            os.replace(stage_tree, tree_dir)
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            return total_entries
+
+        if cmd == "namespace-write":
+            ns_id = argv[2]
+            agent_id = argv[3]
+            raw_path = argv[4]
+            content_str = argv[5]
+            valid_agent_name(agent_id)
+            req_epoch = None
+            idx = 6
+            while idx < len(argv):
+                fl = argv[idx]
+                if fl in ("--lease-epoch", "--epoch"):
+                    idx += 1
+                    require(idx < len(argv), "missing --lease-epoch")
+                    req_epoch = int(argv[idx])
+                else:
+                    raise RuntimeError(f"unknown namespace-write flag: {fl}")
+                idx += 1
+
+            ns_dir, man = read_namespace_manifest(ns_id)
+            rel_str = normalize_rel_segments(raw_path, False)
+            matched_bv = None
+            repo_rel_str = None
+            for bv in man["base_vector"]:
+                mp = bv["mount_path"]
+                if rel_str.startswith(mp + "/"):
+                    sub = rel_str[len(mp) + 1 :]
+                    if sub:
+                        matched_bv = bv
+                        repo_rel_str = normalize_rel_segments(sub, False)
+                        break
+            if matched_bv is None or not repo_rel_str:
+                raise RuntimeError(f"unmapped namespace path '{rel_str}': does not fall under any mounted repository prefix")
+
+            active_epoch = enforce_write_lease(ns_id, agent_id, rel_str, req_epoch)
+            _, cp_man = read_checkpoint(matched_bv["checkpoint_id"])
+            base_map = {
+                decode_path(e["path_base64"]): e
+                for e in cp_man["entries"]
+                if not decode_path(e["path_base64"]).startswith(b".git/")
+            }
+            rel_b = rel_str.encode("utf-8")
+            repo_rel_b = repo_rel_str.encode("utf-8")
+            base_entry = base_map.get(repo_rel_b)
+            tbl = load_pending_writes(ns_dir, ns_id, man["namespace_revision"])
+            staged_files_dir = ns_dir / "writable" / "files"
+            view_target = ns_dir / "tree" / rel_str
+
+            if content_str in ("--delete", "DELETE"):
+                require(
+                    base_entry is not None or any(w["path"] == rel_str and w["operation"] == "write" for w in tbl["writes"]),
+                    f"cannot delete non-existent path '{rel_str}'",
+                )
+                staged_p = staged_files_dir / rel_str
+                if staged_p.exists():
+                    staged_p.unlink()
+                if view_target.exists() or view_target.is_symlink():
+                    view_target.unlink()
+                operation = "delete"
+                change = "deleted"
+                file_mode = 0o644
+                size = None
+                sha256 = None
+            else:
+                cand = Path(content_str)
+                if cand.is_file() and not cand.is_symlink() and not str(cand.resolve()).startswith(str(store_root)):
+                    data = cand.read_bytes()
+                else:
+                    data = content_str.encode("utf-8")
+                sha256 = hashlib.sha256(data).hexdigest()
+                size = len(data)
+                file_mode = (0o755 if (base_entry["mode"] & 0o111) else 0o644) if base_entry is not None else 0o644
+                staged_dest = staged_files_dir / rel_str
+                write_atomic_file(staged_dest.parent, staged_dest.name, data, file_mode)
+                write_atomic_file(view_target.parent, view_target.name, data, (file_mode & 0o555) | 0o400)
+                operation = "write"
+                change = "modified" if base_entry is not None else "added"
+
+            tbl["writes"] = [w for w in tbl["writes"] if w["path"] != rel_str]
+            tbl["writes"].append({
+                "path": rel_str,
+                "path_base64": encode_path(rel_b),
+                "mount_path": matched_bv["mount_path"],
+                "repo_rel_path": repo_rel_str,
+                "repo_rel_path_base64": encode_path(repo_rel_b),
+                "base_checkpoint_id": matched_bv["checkpoint_id"],
+                "workspace_id": matched_bv["workspace_id"],
+                "base_oid": matched_bv["base_oid"],
+                "base_namespace_revision": man["namespace_revision"],
+                "agent_id": agent_id,
+                "operation": operation,
+                "change": change,
+                "mode": file_mode,
+                "size": size,
+                "sha256": sha256,
+                "lease_epoch": active_epoch,
+            })
+            tbl["writes"].sort(key=lambda item: item["path"])
+            save_pending_writes(ns_dir, tbl)
+            print(json.dumps({
+                "schema": SCHEMA,
+                "namespace_id": ns_id,
+                "namespace_revision": man["namespace_revision"],
+                "agent_id": agent_id,
+                "path": rel_str,
+                "path_base64": encode_path(rel_b),
+                "mount_path": matched_bv["mount_path"],
+                "repo_rel_path": repo_rel_str,
+                "repo_rel_path_base64": encode_path(repo_rel_b),
+                "base_checkpoint_id": matched_bv["checkpoint_id"],
+                "workspace_id": matched_bv["workspace_id"],
+                "base_oid": matched_bv["base_oid"],
+                "operation": operation,
+                "change": change,
+                "size": size,
+                "sha256": sha256,
+                "lease_epoch": active_epoch,
+                "pending_writes_count": len(tbl["writes"]),
+                "state": "staged",
+            }))
+            return 0
+
+        if cmd == "namespace-commit-back":
+            ns_id = argv[2]
+            agent_id = argv[3]
+            valid_agent_name(agent_id)
+            req_epoch = None
+            idx = 4
+            while idx < len(argv):
+                fl = argv[idx]
+                if fl == "--quiescent":
+                    pass
+                elif fl in ("--lease-epoch", "--epoch"):
+                    idx += 1
+                    require(idx < len(argv), "missing --lease-epoch")
+                    req_epoch = int(argv[idx])
+                else:
+                    raise RuntimeError(f"unknown namespace-commit-back flag: {fl}")
+                idx += 1
+
+            ns_dir, man = read_namespace_manifest(ns_id)
+            pending = load_pending_writes(ns_dir, ns_id, man["namespace_revision"])
+            require(bool(pending["writes"]), "no pending namespace writes to commit back")
+            active_epoch = req_epoch
+            for w in pending["writes"]:
+                ep = enforce_write_lease(ns_id, agent_id, w["path"], req_epoch)
+                if active_epoch is None:
+                    active_epoch = ep
+
+            writes_by_mount = {}
+            for w in pending["writes"]:
+                writes_by_mount.setdefault(w["mount_path"], []).append(w)
+
+            prepared = []
+            try:
+                require(pending["namespace_revision"] == man["namespace_revision"], "conflict: namespace revision drifted")
+                for bv in man["base_vector"]:
+                    cp_dir, cp_man = read_checkpoint(bv["checkpoint_id"])
+                    cp_repo = cp_dir / "repo"
+                    actual_sha = (cp_dir / "manifest.sha256").read_text().strip()
+                    actual_head = run_git(cp_repo, "rev-parse", "--verify", "HEAD").stdout.decode().strip()
+                    require(
+                        bv["base_oid"] == cp_man["workspace"]["base_oid"]
+                        and bv["head_oid"] == actual_head
+                        and bv["manifest_sha256"] == actual_sha,
+                        f"conflict: BaseVector drift on mount '{bv['mount_path']}'",
+                    )
+                    m_writes = writes_by_mount.get(bv["mount_path"])
+                    if not m_writes:
+                        continue
+                    for w in m_writes:
+                        require(
+                            w["base_checkpoint_id"] == bv["checkpoint_id"]
+                            and w["base_namespace_revision"] == man["namespace_revision"],
+                            f"conflict: staged write base checkpoint drifted on mount '{bv['mount_path']}'",
+                        )
+                    base_map = {
+                        decode_path(e["path_base64"]): e
+                        for e in cp_man["entries"]
+                        if not decode_path(e["path_base64"]).startswith(b".git/")
+                    }
+                    ws_dir = store_root / "workspaces" / bv["workspace_id"]
+                    if ws_dir.is_dir():
+                        _, ws = read_workspace(bv["workspace_id"])
+                        ws_repo = ws_dir / "repo"
+                        ws_head = run_git(ws_repo, "rev-parse", "--verify", "HEAD").stdout.decode().strip()
+                        require(
+                            ws["base_oid"] == bv["base_oid"]
+                            and ws_head == bv["head_oid"]
+                            and ws.get("parent_checkpoint_id") in (None, bv["checkpoint_id"]),
+                            f"conflict: constituent workspace '{bv['workspace_id']}' drifted from BaseVector checkpoint",
+                        )
+                        cls = classify_repo(ws_repo)
+                        curr_ws_map = {}
+                        for p_b in cls["managed_paths"]:
+                            ent = entry_for_rel(ws_repo, p_b)
+                            if ent is not None:
+                                curr_ws_map[p_b] = ent
+                        drift_delta, _ = compute_delta(base_map, curr_ws_map, True)
+                        require(not drift_delta, f"conflict: constituent workspace '{bv['workspace_id']}' has uncommitted base drift")
+
+                    stage_cp = store_root / "staging" / str(uuid.uuid4())
+                    stage_repo = stage_cp / "repo"
+                    copy_selected(cp_repo, stage_repo, walk_files(cp_repo).keys())
+                    for w in m_writes:
+                        target = stage_repo / w["repo_rel_path"]
+                        if w["operation"] == "delete":
+                            if target.exists() or target.is_symlink():
+                                target.unlink()
+                        else:
+                            data = (ns_dir / "writable" / "files" / w["path"]).read_bytes()
+                            write_atomic_file(target.parent, target.name, data, w["mode"])
+                    validate_repo(stage_repo, bv["base_oid"])
+                    new_entries = inventory(stage_repo)
+                    new_cp_id = str(uuid.uuid4())
+                    new_ws_meta = dict(cp_man["workspace"], parent_checkpoint_id=bv["checkpoint_id"])
+                    new_cp_man = {
+                        "schema": SCHEMA,
+                        "checkpoint_id": new_cp_id,
+                        "state": "local_complete",
+                        "workspace": new_ws_meta,
+                        "excluded_ignored_entries": cp_man["excluded_ignored_entries"],
+                        "entries": new_entries,
+                    }
+                    cp_bytes = json.dumps(new_cp_man, indent=2).encode()
+                    cp_sha = write_atomic_file(stage_cp, "manifest.json", cp_bytes, 0o600)
+                    write_atomic_file(stage_cp, "manifest.sha256", cp_sha.encode(), 0o600)
+
+                    new_map = {
+                        decode_path(e["path_base64"]): e
+                        for e in new_entries
+                        if not decode_path(e["path_base64"]).startswith(b".git/")
+                    }
+                    cs_entries, cs_counts = compute_delta(base_map, new_map, True)
+                    cs_id = str(uuid.uuid4())
+                    stage_cs = store_root / "staging" / str(uuid.uuid4())
+                    cs_files = stage_cs / "files"
+                    cs_files.mkdir(mode=0o700, parents=True)
+                    for ce in cs_entries:
+                        if ce["after"] is not None:
+                            rel_b = decode_path(ce["path_base64"])
+                            from_p = os.path.join(os.fsencode(stage_repo), rel_b)
+                            to_p = os.path.join(os.fsencode(cs_files), rel_b)
+                            os.makedirs(os.path.dirname(to_p), mode=0o700, exist_ok=True)
+                            st = os.lstat(from_p)
+                            if stat.S_ISLNK(st.st_mode):
+                                os.symlink(os.readlink(from_p), to_p)
+                            else:
+                                shutil.copyfile(from_p, to_p)
+                                os.chmod(to_p, st.st_mode & 0o777)
+                    cs_obj = {
+                        "schema": SCHEMA,
+                        "changeset_id": cs_id,
+                        "state": "local_complete",
+                        "base_oid": bv["base_oid"],
+                        "base_checkpoint_id": bv["checkpoint_id"],
+                        "source_checkpoint_id": new_cp_id,
+                        **cs_counts,
+                        "entries": cs_entries,
+                    }
+                    cs_bytes = json.dumps(cs_obj, indent=2).encode()
+                    cs_sha = write_atomic_file(stage_cs, "changeset.json", cs_bytes, 0o600)
+                    write_atomic_file(stage_cs, "changeset.sha256", cs_sha.encode(), 0o600)
+                    prepared.append((bv, stage_cp, new_cp_id, cp_sha, len(new_map), stage_cs, cs_obj))
+            except Exception:
+                for item in prepared:
+                    shutil.rmtree(item[1], ignore_errors=True)
+                    shutil.rmtree(item[5], ignore_errors=True)
+                try:
+                    rebuild_namespace_tree(ns_dir, man["base_vector"])
+                except Exception:
+                    pass
+                shutil.rmtree(ns_dir / "writable", ignore_errors=True)
+                raise
+
+            new_cp_by_mount = {}
+            mount_commits = []
+            for bv, stage_cp, new_cp_id, cp_sha, worktree_cnt, stage_cs, cs_obj in prepared:
+                os.replace(stage_cp, store_root / "checkpoints" / new_cp_id)
+                os.replace(stage_cs, store_root / "changesets" / cs_obj["changeset_id"])
+                ws_dir = store_root / "workspaces" / bv["workspace_id"]
+                if ws_dir.is_dir():
+                    _, ws = read_workspace(bv["workspace_id"])
+                    ws_repo = ws_dir / "repo"
+                    cp_repo = store_root / "checkpoints" / new_cp_id / "repo"
+                    for ce in cs_obj["entries"]:
+                        rel_b = decode_path(ce["path_base64"])
+                        dst = os.path.join(os.fsencode(ws_repo), rel_b)
+                        if ce["after"] is None and os.path.lexists(dst):
+                            os.unlink(dst)
+                        elif ce["after"] is not None:
+                            src_p = os.path.join(os.fsencode(cp_repo), rel_b)
+                            os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
+                            if os.path.lexists(dst):
+                                os.unlink(dst)
+                            st = os.lstat(src_p)
+                            if stat.S_ISLNK(st.st_mode):
+                                os.symlink(os.readlink(src_p), dst)
+                            else:
+                                shutil.copyfile(src_p, dst)
+                                os.chmod(dst, st.st_mode & 0o777)
+                    ws["parent_checkpoint_id"] = new_cp_id
+                    write_atomic_file(ws_dir, "workspace.json", json.dumps(ws, indent=2).encode(), 0o600)
+                new_cp_by_mount[bv["mount_path"]] = (new_cp_id, cp_sha, worktree_cnt)
+                mount_commits.append({
+                    "mount_path": bv["mount_path"],
+                    "workspace_id": bv["workspace_id"],
+                    "base_oid": bv["base_oid"],
+                    "previous_checkpoint_id": bv["checkpoint_id"],
+                    "new_checkpoint_id": new_cp_id,
+                    "changeset_id": cs_obj["changeset_id"],
+                    "added": cs_obj["added"],
+                    "modified": cs_obj["modified"],
+                    "deleted": cs_obj["deleted"],
+                    "mode_changed": cs_obj["mode_changed"],
+                    "type_changed": cs_obj["type_changed"],
+                    "entries_count": worktree_cnt,
+                })
+
+            previous_base_vector = [dict(bv) for bv in man["base_vector"]]
+            new_base_vector = []
+            for bv in man["base_vector"]:
+                nbv = dict(bv)
+                if nbv["mount_path"] in new_cp_by_mount:
+                    new_cp_id, cp_sha, cnt = new_cp_by_mount[nbv["mount_path"]]
+                    nbv["checkpoint_id"] = new_cp_id
+                    nbv["manifest_sha256"] = cp_sha
+                    nbv["entries_count"] = cnt
+                new_base_vector.append(nbv)
+
+            total_entries = rebuild_namespace_tree(ns_dir, new_base_vector)
+            new_rev = man["namespace_revision"] + 1
+            updated_manifest = {
+                "schema": SCHEMA,
+                "namespace_id": ns_id,
+                "name": man["name"],
+                "namespace_revision": new_rev,
+                "view_path": man["view_path"],
+                "mount_count": len(new_base_vector),
+                "total_entries": total_entries,
+                "state": "mounted",
+                "base_vector": new_base_vector,
+            }
+            ns_bytes = json.dumps(updated_manifest, indent=2).encode()
+            ns_sha = write_atomic_file(ns_dir, "namespace.json", ns_bytes, 0o600)
+            write_atomic_file(ns_dir, "namespace.sha256", ns_sha.encode(), 0o600)
+
+            commit_id = str(uuid.uuid4())
+            commits_dir = ns_dir / "commits"
+            receipt_path = commits_dir / f"{commit_id}.json"
+            receipt = {
+                "schema": SCHEMA,
+                "commit_id": commit_id,
+                "namespace_id": ns_id,
+                "name": man["name"],
+                "agent_id": agent_id,
+                "previous_revision": man["namespace_revision"],
+                "namespace_revision": new_rev,
+                "lease_epoch": active_epoch,
+                "phase": "committed",
+                "state": "committed",
+                "touched_mounts_count": len(mount_commits),
+                "total_writes_committed": len(pending["writes"]),
+                "mount_commits": mount_commits,
+                "previous_base_vector": previous_base_vector,
+                "base_vector": new_base_vector,
+                "receipt_path": str(receipt_path),
+            }
+            rec_bytes = json.dumps(receipt, indent=2).encode()
+            rec_sha = write_atomic_file(commits_dir, f"{commit_id}.json", rec_bytes, 0o600)
+            write_atomic_file(commits_dir, f"{commit_id}.sha256", rec_sha.encode(), 0o600)
+            shutil.rmtree(ns_dir / "writable", ignore_errors=True)
+            print(json.dumps(receipt))
+            return 0
     except Exception as exc:
         sys.stderr.write(f"error: {exc}\n")
         return 1
     return 1
+
 
 
 class WorkspaceHarness:
@@ -2659,6 +3286,125 @@ class WorkspaceHarness:
         require(not (mount_dir / "data/archive.tar").exists(), "Clean hydrated file should be evicted")
         return {"vfs_id": vfs["vfs_id"], "reclaimed_bytes": ev["reclaimed_bytes"]}
 
+    def writable_namespace_reverse_mapping_and_agent_leases(self):
+        root, src_a, store, base_a = self.fixture("writable-ns-leases", {
+            "service.txt": b"service-a v1\n",
+            "obsolete.txt": b"delete me\n",
+        })
+        src_b = root / "source-b"
+        self.git("init", "-b", "main", src_b)
+        self.write(src_b, "lib.py", b"def helper():\n    return 1\n")
+        self.git("add", "--all", cwd=src_b)
+        self.git("commit", "-m", "lib-b base", cwd=src_b)
+        base_b = self.oid(src_b)
+
+        ws_a, repo_a = self.init(store, src_a, base_a, "agent-a")
+        ws_b, repo_b = self.init(store, src_b, base_b, "agent-b")
+        cp_a = self.checkpoint(store, ws_a)
+        cp_b = self.checkpoint(store, ws_b)
+
+        ns = self.data(
+            "namespace-mount",
+            store,
+            "writable-stack",
+            f"services/auth={cp_a['checkpoint_id']}",
+            f"libs/core={cp_b['checkpoint_id']}",
+        )
+        ns_id = ns["namespace_id"]
+
+        # 1. Multi-agent lease lock barrier: overlapping prefix conflict & expired takeover
+        l1 = self.data("agent-lease", store, ns_id, "agent-a", "acquire", "--prefix", "services/auth", "--ttl-secs", "0")
+        require(l1["lease_epoch"] == 1 and l1["state"] == "acquired", f"Unexpected lease 1: {l1}")
+
+        l_core = self.data("agent-lease", store, ns_id, "agent-b", "acquire", "--prefix", "libs/core", "--ttl-secs", "300")
+        require(l_core["lease_epoch"] == 2 and l_core["state"] == "acquired", f"Unexpected lease core: {l_core}")
+
+        # Agent-b takes over expired services/auth/src prefix -> bumps lease_epoch monotonically
+        l2 = self.data("agent-lease", store, ns_id, "agent-b", "acquire", "--prefix", "services/auth", "--ttl-secs", "300")
+        require(l2["lease_epoch"] == 3 and l2["state"] == "acquired", f"Unexpected takeover lease: {l2}")
+
+        # Agent-a cannot acquire overlapping sub-prefix services/auth/src while agent-b holds services/auth
+        require(
+            self.lab("agent-lease", store, ns_id, "agent-a", "acquire", "--prefix", "services/auth/src", check=False).returncode != 0,
+            "Overlapping prefix lease acquisition by distinct agent must fail",
+        )
+        # Stale epoch renewal by agent-a must fail
+        require(
+            self.lab("agent-lease", store, ns_id, "agent-a", "renew", "--prefix", "services/auth", "--epoch", "1", check=False).returncode != 0,
+            "Stale-epoch lease renewal must fail",
+        )
+        # Stale epoch write by agent-a must fail
+        require(
+            self.lab("namespace-write", store, ns_id, "agent-a", "services/auth/service.txt", "hijack\n", "--lease-epoch", "1", check=False).returncode != 0,
+            "Stale-epoch namespace write must fail",
+        )
+
+        # 2. Reverse path mapping & unmapped/traversal rejection
+        for bad_path in ("unmapped_root.txt", "services/outside.txt", "../escape.txt", "/services/auth/service.txt", "services/auth/.git/config"):
+            require(
+                self.lab("namespace-write", store, ns_id, "agent-b", bad_path, "bad\n", "--lease-epoch", "3", check=False).returncode != 0,
+                f"Expected invalid/unmapped path {bad_path} to be rejected",
+            )
+
+        w1 = self.data(
+            "namespace-write", store, ns_id, "agent-b", "services/auth/service.txt", "service-a v2\n", "--lease-epoch", "3"
+        )
+        require(
+            w1["mount_path"] == "services/auth"
+            and w1["repo_rel_path"] == "service.txt"
+            and w1["base_checkpoint_id"] == cp_a["checkpoint_id"]
+            and w1["change"] == "modified",
+            f"Unexpected write report w1: {w1}",
+        )
+        w2 = self.data(
+            "namespace-write", store, ns_id, "agent-b", "services/auth/obsolete.txt", "DELETE", "--lease-epoch", "3"
+        )
+        require(w2["operation"] == "delete" and w2["change"] == "deleted", f"Unexpected delete report w2: {w2}")
+        w3 = self.data(
+            "namespace-write", store, ns_id, "agent-b", "libs/core/added.py", "X = 99\n", "--lease-epoch", "2"
+        )
+        require(
+            w3["mount_path"] == "libs/core"
+            and w3["repo_rel_path"] == "added.py"
+            and w3["base_checkpoint_id"] == cp_b["checkpoint_id"]
+            and w3["change"] == "added",
+            f"Unexpected write report w3: {w3}",
+        )
+
+        # 3. Atomic two-phase cross-repo commit-back
+        receipt = self.data("namespace-commit-back", store, ns_id, "agent-b", "--quiescent")
+        require(
+            receipt["state"] == "committed"
+            and receipt["previous_revision"] == 1
+            and receipt["namespace_revision"] == 2
+            and receipt["touched_mounts_count"] == 2
+            and Path(receipt["receipt_path"]).is_file(),
+            f"Unexpected commit-back receipt: {receipt}",
+        )
+        require((repo_a / "service.txt").read_bytes() == b"service-a v2\n", "repo_a service.txt not updated by commit-back")
+        require(not (repo_a / "obsolete.txt").exists(), "repo_a obsolete.txt not deleted by commit-back")
+        require((repo_b / "added.py").read_bytes() == b"X = 99\n", "repo_b added.py not created by commit-back")
+
+        # 4. Base-drift conflict rollback on Phase 1 prepare
+        self.data("namespace-write", store, ns_id, "agent-b", "services/auth/service.txt", "service-a v3\n", "--lease-epoch", "3")
+        # Induce uncommitted base drift in constituent workspace repo_a
+        self.write(repo_a, "service.txt", b"out-of-band drift in workspace\n")
+        require(
+            self.lab("namespace-commit-back", store, ns_id, "agent-b", "--quiescent", check=False).returncode != 0,
+            "Commit-back must fail closed when constituent workspace has base drift",
+        )
+        ver_after_rollback = self.data("verify-namespace", store, ns_id)
+        require(
+            ver_after_rollback["verified"] is True and ver_after_rollback["namespace_revision"] == 2,
+            f"Namespace failed verification or drifted revision after rollback: {ver_after_rollback}",
+        )
+        return {
+            "namespace_id": ns_id,
+            "commit_id": receipt["commit_id"],
+            "namespace_revision": receipt["namespace_revision"],
+            "lease_epoch": l2["lease_epoch"],
+        }
+
     def run_all(self):
         for method in [
             self.status_and_ignore_classification,
@@ -2666,6 +3412,7 @@ class WorkspaceHarness:
             self.apply_conflict_fails_closed,
             self.sync_dirty_incremental_and_ignore_exclusion,
             self.verify_readonly_view_and_tamper_detection,
+            self.writable_namespace_reverse_mapping_and_agent_leases,
         ]:
             started = time.monotonic()
             entry = {"name": method.__name__, "ok": False}
@@ -2720,6 +3467,16 @@ class WorkspaceLabTestSuite(unittest.TestCase):
             self.assertGreater(res_vfs["reclaimed_bytes"], 0)
         finally:
             harness.cleanup()
+
+    def test_workspace_writable_namespace_and_agent_leases(self):
+        harness = WorkspaceHarness()
+        try:
+            res = harness.writable_namespace_reverse_mapping_and_agent_leases()
+            self.assertEqual(res["namespace_revision"], 2)
+            self.assertEqual(res["lease_epoch"], 3)
+        finally:
+            harness.cleanup()
+
 
 
 def main():

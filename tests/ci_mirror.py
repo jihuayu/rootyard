@@ -182,6 +182,26 @@ class MirrorHarness(Harness):
         assert status in expected, (status, body[:300])
         return status, body.decode("utf-8", errors="replace"), headers
 
+    def auto_fetch(self, body, token=None, codes=200):
+        raw = self.mirror_expect(
+            "/api/repos/alice/demo/mirror-auto-fetch",
+            codes,
+            token=token or self.reader,
+            method="POST",
+            body=body,
+        )
+        return json.loads(raw) if codes == 200 else raw
+
+    def mirror_runners(self, body=None, method="POST", token=None, codes=200):
+        raw = self.mirror_expect(
+            "/api/repos/alice/demo/mirror-runners",
+            codes,
+            token=token or self.reader,
+            method=method,
+            body=body if method == "POST" else None,
+        )
+        return json.loads(raw) if codes == 200 else raw
+
     def setup_mirror(self):
         self.setup()
         self.api()
@@ -498,6 +518,107 @@ class MirrorHarness(Harness):
             assert secret not in metrics_text
         return {"status_endpoint_verified": True, "prometheus_metrics_verified": True}
 
+    def coalesced_auto_fetch_and_runner_queue(self):
+        # 1. Singleflight auto-origin fetch: invalid OID (400), generation mismatch (409), hit & miss.
+        self.auto_fetch({"target_oid": "not-a-valid-sha1"}, codes=400)
+        self.auto_fetch({"target_oid": "0" * 40}, codes=400)
+        self.auto_fetch({"target_oid": self.first, "storage_generation": 99}, codes=409)
+
+        miss = self.auto_fetch({"target_oid": self.first, "force_refresh": True, "storage_generation": 1})
+        assert miss["repository_id"] == self.repo["id"]
+        assert miss["target_oid"] == self.first
+        assert miss["cache_status"] == "miss_fetched"
+
+        hit = self.auto_fetch({"target_oid": self.first, "storage_generation": 1})
+        assert hit["cache_status"] == "hit" and hit["coalesced"] is False
+
+        # 2. Cross-cluster runner queue lifecycle across zones, lease epochs, and stale heartbeat rejection.
+        self.mirror_runners(
+            {"action": "register", "runner_id": "runner-east-1", "cluster_zone": "us-east-1a", "lease_ttl_secs": 60, "now_unix": 1000}
+        )
+        self.mirror_runners(
+            {"action": "register", "runner_id": "runner-west-2", "cluster_zone": "eu-west-1b", "lease_ttl_secs": 60, "now_unix": 1000}
+        )
+        listed = self.mirror_runners(method="GET")
+        assert len(listed["runners"]) >= 2
+
+        claimed = self.mirror_runners(
+            {
+                "action": "claim",
+                "runner_id": "runner-east-1",
+                "cluster_zone": "us-east-1a",
+                "job_id": "job-m18-1",
+                "target_oid": self.first,
+                "lease_ttl_secs": 60,
+                "now_unix": 1010,
+            }
+        )
+        assert claimed["active_claim"]["status"] == "claimed"
+        assert claimed["active_claim"]["attempt"] == 1
+
+        hb = self.mirror_runners(
+            {
+                "action": "heartbeat",
+                "runner_id": "runner-east-1",
+                "cluster_zone": "us-east-1a",
+                "job_id": "job-m18-1",
+                "attempt": 1,
+                "lease_ttl_secs": 60,
+                "now_unix": 1030,
+            }
+        )
+        assert hb["active_claim"]["lease_expires_unix"] == 1090
+
+        reaped = self.mirror_runners(
+            {
+                "action": "reap_expired",
+                "runner_id": "runner-west-2",
+                "cluster_zone": "eu-west-1b",
+                "now_unix": 1095,
+            }
+        )
+        assert "job-m18-1" in reaped["reaped_jobs"]
+
+        reclaimed = self.mirror_runners(
+            {
+                "action": "claim",
+                "runner_id": "runner-west-2",
+                "cluster_zone": "eu-west-1b",
+                "job_id": "job-m18-1",
+                "target_oid": self.first,
+                "lease_ttl_secs": 60,
+                "now_unix": 1100,
+            }
+        )
+        assert reclaimed["active_claim"]["attempt"] == 2
+        assert reclaimed["active_claim"]["claimed_by"] == "runner-west-2"
+
+        # Stale runner heartbeat with outdated attempt=1 must be rejected with 409 Conflict.
+        self.mirror_runners(
+            {
+                "action": "heartbeat",
+                "runner_id": "runner-east-1",
+                "cluster_zone": "us-east-1a",
+                "job_id": "job-m18-1",
+                "attempt": 1,
+                "now_unix": 1105,
+            },
+            codes=409,
+        )
+
+        done = self.mirror_runners(
+            {
+                "action": "complete",
+                "runner_id": "runner-west-2",
+                "cluster_zone": "eu-west-1b",
+                "job_id": "job-m18-1",
+                "attempt": 2,
+                "now_unix": 1110,
+            }
+        )
+        assert done["active_claim"]["status"] == "completed"
+        return {"auto_origin_fetch_verified": True, "cross_cluster_runner_queue_verified": True}
+
     def cleanup(self):
         self.stop_mirror()
         super().cleanup()
@@ -522,7 +643,8 @@ def main():
                      "authoritative_fences", "role_volume_guards",
                      "pin_listing_and_lease_coordinated_release",
                      "watermark_and_lru_eviction_safety",
-                     "sync_rate_limiting_and_observability"):
+                     "sync_rate_limiting_and_observability",
+                     "coalesced_auto_fetch_and_runner_queue"):
             harness.case(name, getattr(harness, name))
         success = True
     except Exception as error:

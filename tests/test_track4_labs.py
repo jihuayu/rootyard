@@ -234,6 +234,7 @@ class PandoModuleAndContractTests(unittest.TestCase):
             "rollback.rs",
             "object_store.rs",
             "repack.rs",
+            "lifecycle.rs",
         ):
             path = pando_dir / name
             self.assertTrue(path.is_file(), f"Missing src/pando_lab/{name}")
@@ -378,7 +379,7 @@ class WorkspaceModuleAndContractTests(unittest.TestCase):
         lines = root_file.read_text(encoding="utf-8").splitlines()
         self.assertLess(len(lines), 150, f"src/workspace_lab.rs has {len(lines)} lines (>= 150)")
         content = "\n".join(lines)
-        for submod in ("core", "ignore", "manifest", "sync", "view", "remote", "namespace", "vfs"):
+        for submod in ("core", "ignore", "manifest", "sync", "view", "remote", "namespace", "vfs", "writable_view"):
             self.assertIn(f'#[path = "workspace_lab/{submod}.rs"]', content)
             self.assertTrue((ROOT / "src" / "workspace_lab" / f"{submod}.rs").is_file())
 
@@ -403,6 +404,9 @@ class WorkspaceModuleAndContractTests(unittest.TestCase):
             "vfs-hydrate",
             "vfs-status",
             "vfs-evict",
+            "agent-lease",
+            "namespace-write",
+            "namespace-commit-back",
         ):
             self.assertIn(f'"{cmd}"', content)
 
