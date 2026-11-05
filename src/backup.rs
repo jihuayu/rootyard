@@ -20,18 +20,36 @@ use uuid::Uuid;
 const TABLES: &[&str] = &[
     "audit_events",
     "ci_checkout_jobs",
+    "ci_mirror_evictions",
     "event_deliveries",
+    "forge_branch_rules",
+    "forge_check_runs",
     "forge_creation_requests",
     "forge_issue_comments",
     "forge_issue_counters",
     "forge_issues",
+    "forge_pull_counters",
+    "forge_pull_reviews",
+    "forge_pulls",
+    "forge_webhook_callbacks",
+    "forge_webhook_deliveries",
+    "forge_webhooks",
     "git_operations",
+    "lfs_objects",
     "operation_resolutions",
     "outbox_events",
     "recovery_resolutions",
     "repositories",
+    "repository_audit_log",
+    "repository_collaborators",
     "repository_ref_projection",
+    "repository_shard_routes",
+    "repository_team_members",
+    "repository_teams",
     "schema_migrations",
+    "shard_failover_operations",
+    "shard_nodes",
+    "shard_virtual_buckets",
     "tokens",
     "users",
 ];
@@ -189,9 +207,9 @@ fn schema_catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
             include_str!("../schema/007_upgraded_catalog.json"),
         ],
         5 => [
-            include_str!("../schema/008_catalog.json"),
-            include_str!("../schema/008_restored_catalog.json"),
-            include_str!("../schema/008_upgraded_catalog.json"),
+            include_str!("../schema/060_catalog.json"),
+            include_str!("../schema/060_restored_catalog.json"),
+            include_str!("../schema/060_upgraded_catalog.json"),
         ],
         _ => bail!("unsupported backup format"),
     };
@@ -204,7 +222,7 @@ fn schema_catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
 fn schema_versions(format: u32) -> Result<Vec<i32>> {
     match format {
         4 => Ok(vec![1, 2, 3, 6, 7]),
-        5 => Ok(vec![1, 2, 3, 6, 7, 8]),
+        5 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
         _ => bail!("unsupported backup format"),
     }
 }
@@ -520,7 +538,31 @@ async fn schema(client: &(impl GenericClient + Sync), format: u32) -> Result<Vec
     let tables = TABLES
         .iter()
         .copied()
-        .filter(|t| format != 4 || *t != "ci_checkout_jobs")
+        .filter(|t| {
+            format != 4
+                || !matches!(
+                    *t,
+                    "ci_checkout_jobs"
+                        | "ci_mirror_evictions"
+                        | "forge_branch_rules"
+                        | "forge_check_runs"
+                        | "forge_pull_counters"
+                        | "forge_pull_reviews"
+                        | "forge_pulls"
+                        | "forge_webhook_callbacks"
+                        | "forge_webhook_deliveries"
+                        | "forge_webhooks"
+                        | "lfs_objects"
+                        | "repository_audit_log"
+                        | "repository_collaborators"
+                        | "repository_shard_routes"
+                        | "repository_team_members"
+                        | "repository_teams"
+                        | "shard_failover_operations"
+                        | "shard_nodes"
+                        | "shard_virtual_buckets"
+                )
+        })
         .collect::<Vec<_>>();
     let names: Vec<String> = client.query("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S') ORDER BY c.relname", &[]).await?.iter().map(|r| r.get(0)).collect();
     ensure!(
@@ -549,7 +591,7 @@ async fn schema(client: &(impl GenericClient + Sync), format: u32) -> Result<Vec
     // Both versions use this catalog projection. Version-specific immutable
     // fixtures below, not the query text, define the accepted schema shapes.
     let actual: serde_json::Value = client
-        .query_one(include_str!("../schema/008_catalog.sql"), &[])
+        .query_one(include_str!("../schema/060_catalog.sql"), &[])
         .await?
         .get(0);
     // Only complete reviewed catalog shapes are accepted. In particular a

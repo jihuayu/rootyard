@@ -19,6 +19,7 @@ import time
 import uuid
 
 from e2e import Harness
+from schema_baseline import SCHEMA_VERSION_CSV
 
 ZERO = "0" * 40
 
@@ -64,7 +65,7 @@ class ReliabilityHarness(Harness):
             h.sql("INSERT INTO users(id,username) VALUES('" + user + "','upgradeowner'); INSERT INTO repositories(id,owner_id,name) VALUES('" + repo + "','" + user + "','preserved')")
             h.cli("migrate")
             h.cli("migrate")
-            assert h.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == "1,2,3,6,7,8"
+            assert h.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == SCHEMA_VERSION_CSV
             assert h.sql("SELECT name FROM repositories WHERE id='" + repo + "'") == "preserved"
             assert h.sql("SELECT username FROM users WHERE id='" + user + "'") == "upgradeowner"
             assert h.sql("SELECT count(*) FROM git_operations") == "0"

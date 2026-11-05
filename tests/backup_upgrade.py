@@ -17,6 +17,15 @@ import uuid
 
 from backup_recovery import BackupRecoveryHarness
 from forge import ForgeHarness
+from schema_baseline import (
+    CATALOG_JSON_PATH,
+    CATALOG_SQL_PATH,
+    RESTORED_CATALOG_JSON_PATH,
+    SCHEMA_VERSIONS,
+    SCHEMA_VERSION_CSV,
+    TABLE_COUNT,
+    UPGRADED_CATALOG_JSON_PATH,
+)
 
 
 class BackupUpgradeHarness(BackupRecoveryHarness):
@@ -44,22 +53,21 @@ class BackupUpgradeHarness(BackupRecoveryHarness):
         assert self.sql("SELECT owner_id::text || ':' || name FROM repositories WHERE id='" + self.legacy_repo + "'") == self.legacy_user + ':legacy-repo'
         self.cli('migrate')
         self.cli('migrate')
-        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == '1,2,3,6,7,8'
-        assert self.sql("SELECT count(*) FROM pg_tables WHERE schemaname='public'") == '16'
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == SCHEMA_VERSION_CSV
+        assert self.sql("SELECT count(*) FROM pg_tables WHERE schemaname='public'") == str(TABLE_COUNT)
         assert self.sql("SELECT username FROM users WHERE id='" + self.legacy_user + "'") == 'legacy-owner'
         assert self.sql("SELECT name FROM repositories WHERE id='" + self.legacy_repo + "'") == 'legacy-repo'
         # Record the actual third catalog for review; this test never changes or
         # weakens the fixture contract on behalf of the implementation.
-        catalog_sql = (Path(__file__).resolve().parents[1] / 'schema/008_catalog.sql').read_text()
+        catalog_sql = CATALOG_SQL_PATH.read_text()
         self.upgraded_catalog = json.loads(self.run(['psql', self.db, '-X', '-qAt', '-v', 'ON_ERROR_STOP=1',
                                                     '-c', 'SET search_path=pg_catalog; ' + catalog_sql]).stdout)
-        schema_dir = Path(__file__).resolve().parents[1] / 'schema'
-        assert self.upgraded_catalog == json.loads((schema_dir / '008_upgraded_catalog.json').read_text())
-        assert self.upgraded_catalog != json.loads((schema_dir / '008_catalog.json').read_text())
-        assert self.upgraded_catalog != json.loads((schema_dir / '008_restored_catalog.json').read_text())
+        assert self.upgraded_catalog == json.loads(UPGRADED_CATALOG_JSON_PATH.read_text())
+        assert self.upgraded_catalog != json.loads(CATALOG_JSON_PATH.read_text())
+        assert self.upgraded_catalog != json.loads(RESTORED_CATALOG_JSON_PATH.read_text())
         (self.root / 'actual-restored003-upgraded008-catalog.json').write_text(json.dumps(self.upgraded_catalog, indent=2, sort_keys=True) + '\n')
-        return dict(real_schema003_dump_and_restore=True, old_tables=11, upgraded_tables=16,
-                    exact_versions=[1, 2, 3, 6, 7, 8], legacy_identity_and_repository_preserved=True,
+        return dict(real_schema003_dump_and_restore=True, old_tables=11, upgraded_tables=TABLE_COUNT,
+                    exact_versions=SCHEMA_VERSIONS, legacy_identity_and_repository_preserved=True,
                     repeated_migrate=True, historical_binary_required=False,
                     manual_constraint_rewrite=False)
 
@@ -104,12 +112,12 @@ class BackupUpgradeHarness(BackupRecoveryHarness):
                         backup_not_published=True)
         result = self.lock_and_snapshot()
         self.source_rows = self.all_rows()
-        assert len(self.source_rows) == 16
+        assert len(self.source_rows) == TABLE_COUNT
         assert len(self.source_rows['forge_issues']) == 3
         assert len(self.source_rows['forge_issue_comments']) == 6
         assert self.source_rows['forge_issue_counters'][0]['next_number'] == 4
         manifest = json.loads((self.backup / 'manifest.json').read_text())
-        assert manifest['schema_versions'] == [1, 2, 3, 6, 7, 8]
+        assert manifest['schema_versions'] == SCHEMA_VERSIONS
         return {**result, 'restored003_upgraded008_catalog_accepted': True,
                 'all_16_tables_backed_up': True, 'populated_forge_backed_up': True}
 
@@ -129,8 +137,8 @@ class BackupUpgradeHarness(BackupRecoveryHarness):
         result = json.loads(self.restore_command().stdout)
         self.db = self.target_db
         self.env.update(DATABASE_URL=self.db, ROOTYARD_DATA_DIR=str(self.target))
-        assert self.all_rows() == self.source_rows, 'All 16 restored table contents must exactly equal the backup boundary'
-        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == '1,2,3,6,7,8'
+        assert self.all_rows() == self.source_rows, 'All restored table contents must exactly equal the backup boundary'
+        assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == SCHEMA_VERSION_CSV
         assert self.sql("SELECT username FROM users WHERE id='" + self.legacy_user + "'") == 'legacy-owner'
         assert self.sql("SELECT owner_id::text || ':' || name FROM repositories WHERE id='" + self.legacy_repo + "'") == self.legacy_user + ':legacy-repo'
         self.start()

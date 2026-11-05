@@ -41,11 +41,9 @@ pub struct Claim {
     pub old_oid: String,
     pub new_oid: String,
 }
+pub const CONSUMERS: &[&str] = &["audit-log", "ref-index"];
 fn valid_consumer(consumer: &str) -> Result<()> {
-    ensure!(
-        matches!(consumer, "audit-log" | "ref-index"),
-        "unknown consumer"
-    );
+    ensure!(CONSUMERS.contains(&consumer), "unknown consumer");
     Ok(())
 }
 pub fn event_id(operation_id: Uuid, transaction_sequence: i64, ref_name: &str) -> String {

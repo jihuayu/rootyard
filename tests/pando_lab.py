@@ -565,6 +565,341 @@ class Lab:
         return {'pack_and_idx_checksums_verified': len(manifests), 'corrupt_read_denied': True,
                 'missing_published_pack_denied': True, 'restored_clone_fsck': True}
 
+    def incremental_pack_deduplication(self):
+        before_packs = {r['pack_id'] for r in self.rows(f"SELECT pack_id FROM pando_lab.manifests WHERE repo='{self.repo}'")}
+        inc_oid = self.commit(self.source, 'incremental delta-self-contained commit')
+        self.push(self.source, 'HEAD:refs/heads/main')
+        after_packs = {r['pack_id'] for r in self.rows(f"SELECT pack_id FROM pando_lab.manifests WHERE repo='{self.repo}'")}
+        new_packs = after_packs - before_packs
+        assert len(new_packs) == 1, new_packs
+        new_pack_id = next(iter(new_packs))
+        pack_file = self.store / 'objects' / self.repo / (new_pack_id + '.pack')
+        report = json.loads(self.cli('verify-delta', str(pack_file)))
+        pack_oids = {obj['oid'] for obj in report['objects']}
+        assert inc_oid in pack_oids
+        assert self.initial not in pack_oids, 'Incremental pack redundantly re-packed initial commit'
+        return {'incremental_pack_id': new_pack_id, 'object_count': report['object_count'], 'initial_commit_excluded': True}
+
+    def delta_and_graph_cli(self):
+        manifests = self.rows(f"SELECT pack_id FROM pando_lab.manifests WHERE repo='{self.repo}' ORDER BY pack_id")
+        verified = 0
+        for row in manifests:
+            pack_path = self.store / 'objects' / self.repo / (row['pack_id'] + '.pack')
+            rep = json.loads(self.cli('verify-delta', str(pack_path)))
+            assert rep['version'] == 2 and rep['object_count'] == len(rep['objects'])
+            verified += 1
+        thin = self.root / 'actual-thin.pack'
+        if thin.exists():
+            bad = self.run([self.binary, 'verify-delta', str(thin)], check=False)
+            assert bad.returncode != 0, 'Non-self-contained thin pack must be rejected by verify-delta'
+        head_oid = self.sql(f"SELECT oid FROM pando_lab.refs WHERE repo='{self.repo}' AND name='refs/heads/main'")
+        walk_full = json.loads(self.cli('walk-graph', self.repo))
+        assert walk_full['reachable_count'] == len(walk_full['reachable_oids']) and walk_full['commits'] >= 2
+        walk_inc = json.loads(self.cli('walk-graph', self.repo, head_oid, '^' + self.initial))
+        assert walk_inc['excluded_count'] > 0 and walk_inc['reachable_count'] < walk_full['reachable_count']
+        return {'packs_verified': verified, 'full_reachable': walk_full['reachable_count'], 'incremental_reachable': walk_inc['reachable_count']}
+
+    def dual_operator_diff_export(self):
+        rep = json.loads(self.cli('diff-export', self.repo))
+        assert rep['matched'] is True and rep['bit_for_bit_match'] is True, rep
+        assert rep['reachable_objects'] > 0 and rep['commits'] >= 2
+        rep_inc = json.loads(self.cli('diff-export', self.repo, '^' + self.initial))
+        assert rep_inc['matched'] is True and rep_inc['bit_for_bit_match'] is True, rep_inc
+        assert rep_inc['excluded_objects'] > 0
+        return {'full_diff_export_matched': True, 'incremental_diff_export_matched': True}
+
+    def refs_and_operations_api(self):
+        code, _, raw = self.http(f'/repos/{self.repo}.git/refs', principal='reader')
+        assert code == 200, (code, raw)
+        refs_payload = json.loads(raw.decode())
+        assert refs_payload['repo'] == self.repo and 'refs/heads/main' in refs_payload['refs']
+        code_unauth, _, _ = self.http(f'/repos/{self.repo}.git/refs', principal='bob')
+        assert code_unauth == 403, code_unauth
+        ops = self.rows(f"SELECT id,state FROM pando_lab.operations WHERE repo='{self.repo}' AND state='COMMITTED' LIMIT 1")
+        assert ops, 'Expected at least one committed operation'
+        op_id = ops[0]['id']
+        code_op, _, raw_op = self.http(f'/repos/{self.repo}.git/operations/{op_id}', principal='reader')
+        assert code_op == 200, (code_op, raw_op)
+        op_payload = json.loads(raw_op.decode())
+        assert op_payload['id'] == op_id and op_payload['state'] == 'COMMITTED'
+        return {'refs_endpoint_verified': True, 'operations_endpoint_verified': True}
+
+    def orphan_and_snapshot_gc(self):
+        gc_rep = json.loads(self.cli('gc', self.repo))
+        assert gc_rep['orphan_files_deleted'] >= 1, gc_rep
+        assert gc_rep['committed_packs_retained'] >= 1, gc_rep
+        self.clone('post-gc-clone')
+        return gc_rep
+
+    def online_migration_state_machine(self):
+        import uuid
+        self.mig_repo = str(uuid.uuid4())
+        self.cli('create-repo', self.mig_repo, 'alice')
+        self.sql(f"INSERT INTO pando_lab.acl(repo,principal,write_allowed) VALUES ('{self.mig_repo}','reader',false)")
+
+        gitfs_bare = self.root / 'gitfs-origin.git'
+        gitfs_work = self.root / 'gitfs-work'
+        self.git('init', '--bare', '--initial-branch=main', str(gitfs_bare))
+        self.git('init', '--initial-branch=main', str(gitfs_work))
+        c1 = self.commit(gitfs_work, 'gitfs commit 1')
+        self.git('push', str(gitfs_bare), 'HEAD:refs/heads/main', 'HEAD:refs/heads/feature', cwd=gitfs_work)
+        c2 = self.commit(gitfs_work, 'gitfs commit 2')
+        self.git('-c', 'user.name=Synthetic Pando', '-c', 'user.email=pando@example.invalid',
+                 'tag', '-a', 'v1.0', '-m', 'release v1.0', cwd=gitfs_work)
+        self.git('push', str(gitfs_bare), 'HEAD:refs/heads/main', 'refs/tags/v1.0', cwd=gitfs_work)
+        self.mig_gitfs = gitfs_bare
+
+        # Step 1: copy
+        copy_rep = json.loads(self.cli('migrate-step', self.mig_repo, str(gitfs_bare), 'copy'))
+        assert copy_rep['step'] == 'copy' and copy_rep['state'] == 'COPYING', copy_rep
+        assert copy_rep['storage_backend'] == 'gitfs' and copy_rep['migration_state'] == 'copying', copy_rep
+        assert copy_rep['write_paused'] is False and copy_rep['ref_count'] == 3, copy_rep
+        code_pre_switch, _, _ = self.http(self.url(self.mig_repo) + '/info/refs?service=git-receive-pack', principal='alice')
+        assert code_pre_switch == 409, code_pre_switch
+
+        # Step 2: verify
+        verify_rep = json.loads(self.cli('migrate-step', self.mig_repo, str(gitfs_bare), 'verify'))
+        assert verify_rep['step'] == 'verify' and verify_rep['state'] == 'VERIFIED', verify_rep
+        assert verify_rep['migration_state'] == 'verified', verify_rep
+        assert verify_rep['diff_report']['matched'] is True and verify_rep['diff_report']['bit_for_bit_match'] is True
+
+        # Incremental GitFS write arriving between verify and drain
+        c3 = self.commit(gitfs_work, 'gitfs pre-drain incremental commit 3')
+        self.git('push', str(gitfs_bare), 'HEAD:refs/heads/main', cwd=gitfs_work)
+        self.mig_c3 = c3
+
+        # Step 3: drain (pauses writes, fences GitFS, syncs incremental delta)
+        drain_rep = json.loads(self.cli('migrate-step', self.mig_repo, str(gitfs_bare), 'drain'))
+        assert drain_rep['step'] == 'drain' and drain_rep['state'] == 'DRAINED', drain_rep
+        assert drain_rep['migration_state'] == 'draining' and drain_rep['write_paused'] is True, drain_rep
+        assert drain_rep['incremental_objects_synced'] >= 1 and drain_rep['gitfs_fenced_readonly'] is True, drain_rep
+        assert drain_rep['diff_report']['bit_for_bit_match'] is True
+        c_blocked = self.commit(gitfs_work, 'blocked gitfs commit during drain')
+        assert self.git('push', str(gitfs_bare), 'HEAD:refs/heads/blocked', cwd=gitfs_work, check=False).returncode != 0
+        self.git('reset', '--hard', c3, cwd=gitfs_work)
+
+        # Step 4: fence (bumps storage_generation)
+        fence_rep = json.loads(self.cli('migrate-step', self.mig_repo, str(gitfs_bare), 'fence'))
+        assert fence_rep['step'] == 'fence' and fence_rep['state'] == 'FENCED', fence_rep
+        assert fence_rep['migration_state'] == 'fenced' and fence_rep['write_paused'] is True, fence_rep
+        assert fence_rep['new_storage_generation'] == fence_rep['old_storage_generation'] + 1, fence_rep
+
+        # Step 5: switchover (cuts authority to pando, keeps gitfs fenced read-only)
+        switch_rep = json.loads(self.cli('migrate-step', self.mig_repo, str(gitfs_bare), 'switchover'))
+        assert switch_rep['step'] == 'switchover' and switch_rep['state'] == 'SWITCHED_OVER', switch_rep
+        assert switch_rep['storage_backend'] == 'pando' and switch_rep['migration_state'] == 'switched_over', switch_rep
+        assert switch_rep['write_paused'] is False and switch_rep['gitfs_fenced_readonly'] is True, switch_rep
+
+        # Verify migration-status CLI and GET /repos/{id}.git/migration HTTP endpoint
+        status_cli = json.loads(self.cli('migration-status', self.mig_repo))
+        assert status_cli['storage_backend'] == 'pando' and status_cli['migration_state'] == 'switched_over', status_cli
+        code_mig, _, raw_mig = self.http(f'/repos/{self.mig_repo}.git/migration', principal='reader')
+        assert code_mig == 200, (code_mig, raw_mig)
+        status_http = json.loads(raw_mig.decode())
+        assert status_http['storage_backend'] == 'pando' and status_http['latest_migration']['state'] == 'SWITCHED_OVER'
+        code_mig_denied, _, _ = self.http(f'/repos/{self.mig_repo}.git/migration', principal='bob')
+        assert code_mig_denied == 403, code_mig_denied
+
+        # Clone migrated repository from Pando Smart HTTP and verify c3, feature, v1.0
+        mig_clone = self.clone('migrated-clone', repo=self.mig_repo, principal='alice')
+        assert self.git('rev-parse', 'HEAD', cwd=mig_clone).stdout.strip() == c3
+
+        # Also verify one-shot migrate command
+        one_shot_repo = str(uuid.uuid4())
+        self.cli('create-repo', one_shot_repo, 'alice')
+        gitfs_bare2 = self.root / 'gitfs-oneshot.git'
+        self.git('clone', '--bare', str(gitfs_bare), str(gitfs_bare2))
+        full_rep = json.loads(self.cli('migrate', one_shot_repo, str(gitfs_bare2)))
+        assert full_rep['step'] == 'full' and full_rep['state'] == 'SWITCHED_OVER', full_rep
+        assert full_rep['storage_backend'] == 'pando' and full_rep['diff_report']['bit_for_bit_match'] is True
+
+        return {
+            'migration_id': switch_rep['migration_id'],
+            'old_storage_generation': switch_rep['old_storage_generation'],
+            'new_storage_generation': switch_rep['new_storage_generation'],
+            'incremental_objects_synced': drain_rep['incremental_objects_synced'],
+            'one_shot_migrated': True,
+        }
+
+    def post_switchover_rollback_with_new_commits(self):
+        mig_clone = self.root / 'migrated-clone'
+        c4 = self.commit(mig_clone, 'post-switchover pando commit 4')
+        c5 = self.commit(mig_clone, 'post-switchover pando commit 5')
+        self.git('push', '--atomic', self.url(self.mig_repo),
+                 'HEAD:refs/heads/main', 'HEAD:refs/heads/post-switchover', ':refs/heads/feature',
+                 principal='alice', cwd=mig_clone)
+
+        # Before rollback, GitFS bare repo still has pre-switchover main (c3) and feature branch
+        gitfs_main_before = self.git('--git-dir=' + str(self.mig_gitfs), 'rev-parse', 'refs/heads/main').stdout.strip()
+        assert gitfs_main_before == self.mig_c3
+
+        # Execute rollback from Pando back to GitFS
+        rb_rep = json.loads(self.cli('rollback', self.mig_repo, str(self.mig_gitfs)))
+        assert rb_rep['direction'] == 'pando_to_gitfs' and rb_rep['state'] == 'ROLLED_BACK', rb_rep
+        assert rb_rep['storage_backend'] == 'gitfs' and rb_rep['migration_state'] == 'rolled_back', rb_rep
+        assert rb_rep['write_paused'] is True and rb_rep['gitfs_write_paused'] is False, rb_rep
+        assert rb_rep['post_switchover_commits'] >= 2 and rb_rep['deleted_refs_reconciled'] >= 1, rb_rep
+        assert rb_rep['gitfs_fsck_ok'] is True and rb_rep['diff_report']['bit_for_bit_match'] is True, rb_rep
+        assert rb_rep['new_storage_generation'] == rb_rep['old_storage_generation'] + 1, rb_rep
+
+        # Pando Smart HTTP receive-pack must now reject pushes (authority is back on GitFS)
+        c_pando_rejected = self.commit(mig_clone, 'rejected push to pando after rollback')
+        assert self.git('push', self.url(self.mig_repo), 'HEAD:refs/heads/main',
+                        principal='alice', cwd=mig_clone, check=False).returncode != 0
+        self.git('reset', '--hard', c5, cwd=mig_clone)
+
+        # Restored GitFS bare repository has c5, post-switchover branch, deleted feature branch, and passes fsck
+        self.git('--git-dir=' + str(self.mig_gitfs), 'fsck', '--full', '--strict')
+        assert self.git('--git-dir=' + str(self.mig_gitfs), 'rev-parse', 'refs/heads/main').stdout.strip() == c5
+        assert self.git('--git-dir=' + str(self.mig_gitfs), 'rev-parse', 'refs/heads/post-switchover').stdout.strip() == c5
+        assert self.git('--git-dir=' + str(self.mig_gitfs), 'rev-parse', '--verify', 'refs/heads/feature', check=False).returncode != 0
+
+        # Stale storage_generation push to GitFS is rejected by hooks/pre-receive, while current generation push succeeds
+        c6 = self.commit(mig_clone, 'post-rollback commit on restored gitfs')
+        stale_env = self.env.copy()
+        stale_env['ROOTYARD_EXPECTED_STORAGE_GENERATION'] = '1'
+        assert self.run(['git', 'push', str(self.mig_gitfs), 'HEAD:refs/heads/main'],
+                        cwd=mig_clone, env=stale_env, check=False).returncode != 0
+        self.git('push', str(self.mig_gitfs), 'HEAD:refs/heads/main', cwd=mig_clone)
+        assert self.git('--git-dir=' + str(self.mig_gitfs), 'rev-parse', 'refs/heads/main').stdout.strip() == c6
+
+        return {
+            'rollback_migration_id': rb_rep['migration_id'],
+            'post_switchover_commits': rb_rep['post_switchover_commits'],
+            'deleted_refs_reconciled': rb_rep['deleted_refs_reconciled'],
+            'new_storage_generation': rb_rep['new_storage_generation'],
+            'gitfs_restored_and_writable': True,
+        }
+
+    def object_store_cas_and_cache_recovery(self):
+        manifests = self.rows(
+            f"SELECT pack_id,pack_sha256,idx_sha256 FROM pando_lab.manifests WHERE repo='{self.repo}' ORDER BY pack_id"
+        )
+        assert manifests, 'Expected at least one committed manifest for object store test'
+        pack_id = manifests[0]['pack_id']
+
+        put_rep = json.loads(self.cli('object-store-put', self.repo, pack_id, '--chunk-size', '4096'))
+        assert put_rep['status'] == 'published' and put_rep['chunk_count'] >= 1, put_rep
+        assert put_rep['immutable_mode'] == '0444', put_rep
+
+        fail_res = self.run(
+            [self.binary, 'object-store-put', self.repo, pack_id, '--chunk-size', '64', '--fail-after-chunks', '1'],
+            check=False,
+        )
+        assert fail_res.returncode != 0, 'Fault injection --fail-after-chunks 1 must fail closed'
+        corrupt_res = self.run(
+            [self.binary, 'object-store-put', self.repo, pack_id, '--chunk-size', '64', '--corrupt-chunk', '1'],
+            check=False,
+        )
+        assert corrupt_res.returncode != 0, 'Corrupt chunk part must fail closed'
+        multipart_dir = self.store / 'multipart'
+        assert not multipart_dir.exists() or len(list(multipart_dir.iterdir())) == 0
+
+        local_pack = self.store / 'objects' / self.repo / f'{pack_id}.pack'
+        if local_pack.exists():
+            local_pack.unlink()
+        get_rep = json.loads(self.cli('object-store-get', self.repo, pack_id))
+        assert get_rep['rehydrated_from_object_store'] is True and get_rep['verified'] is True, get_rep
+        assert local_pack.is_file()
+
+        ver_rep = json.loads(self.cli('object-store-verify', self.repo))
+        assert ver_rep['verified'] is True and ver_rep['packs_verified'] >= 1, ver_rep
+
+        code_os, _, raw_os = self.http(f'/repos/{self.repo}.git/object-store', principal='reader')
+        assert code_os == 200, (code_os, raw_os)
+        os_status = json.loads(raw_os.decode())
+        assert os_status['repo'] == self.repo and os_status['object_store_manifests'] >= 1, os_status
+        code_os_denied, _, _ = self.http(f'/repos/{self.repo}.git/object-store', principal='bob')
+        assert code_os_denied == 403, code_os_denied
+
+        self.clone('post-object-store-rehydrated')
+        return {
+            'pack_id': pack_id,
+            'chunk_count': put_rep['chunk_count'],
+            'rehydrated': True,
+            'verified': True,
+        }
+
+    def multi_pack_repack_and_pinned_gc(self):
+        import uuid
+        repack_repo = str(uuid.uuid4())
+        self.cli('create-repo', repack_repo, 'alice')
+        self.sql(f"INSERT INTO pando_lab.acl(repo,principal,write_allowed) VALUES ('{repack_repo}','reader',false)")
+
+        repack_work = self.root / 'repack-work'
+        self.git('init', '--initial-branch=main', str(repack_work))
+        c1 = self.commit(repack_work, 'repack base commit 1')
+        self.git('push', '--atomic', self.url(repack_repo), 'HEAD:refs/heads/main', principal='alice', cwd=repack_work)
+
+        c2_pinned = self.commit(repack_work, 'repack pinned commit 2')
+        self.git('push', '--atomic', self.url(repack_repo), 'HEAD:refs/heads/pinned-temp', principal='alice', cwd=repack_work)
+        pin_rep = json.loads(self.cli('pin-root', repack_repo, 'ci-release-pin', c2_pinned))
+        assert pin_rep['pinned'] is True and pin_rep['oid'] == c2_pinned, pin_rep
+        self.git('push', '--atomic', self.url(repack_repo), ':refs/heads/pinned-temp', principal='alice', cwd=repack_work)
+
+        self.git('reset', '--hard', c1, cwd=repack_work)
+        c3_orphan = self.commit(repack_work, 'repack orphan commit 3')
+        self.git('push', '--atomic', self.url(repack_repo), 'HEAD:refs/heads/orphan-temp', principal='alice', cwd=repack_work)
+        self.git('push', '--atomic', self.url(repack_repo), ':refs/heads/orphan-temp', principal='alice', cwd=repack_work)
+
+        self.git('reset', '--hard', c1, cwd=repack_work)
+        c4_main = self.commit(repack_work, 'repack main commit 4')
+        self.git('push', '--atomic', self.url(repack_repo), 'HEAD:refs/heads/main', principal='alice', cwd=repack_work)
+
+        code_snap, snap_headers, _ = self.http(
+            f'/repos/{repack_repo}.git/info/refs?service=git-upload-pack',
+            principal='reader',
+            redirects=False,
+        )
+        assert code_snap == 302, code_snap
+        snap_loc = snap_headers['location']
+
+        code_packs_pre, _, raw_packs_pre = self.http(f'/repos/{repack_repo}.git/packs', principal='reader')
+        assert code_packs_pre == 200, (code_packs_pre, raw_packs_pre)
+        packs_pre = json.loads(raw_packs_pre.decode())
+        assert packs_pre['active_pack_count'] >= 3, packs_pre
+
+        code_repack_denied, _, _ = self.http(
+            f'/repos/{repack_repo}.git/repack', principal='bob', method='POST', body=b'{}'
+        )
+        assert code_repack_denied == 403, code_repack_denied
+
+        repack_body = json.dumps(
+            {'prune_superseded': True, 'pin_oids': [c2_pinned], 'sync_object_store': True}
+        ).encode()
+        code_repack, _, raw_repack = self.http(
+            f'/repos/{repack_repo}.git/repack', principal='alice', method='POST', body=repack_body
+        )
+        assert code_repack == 200, (code_repack, raw_repack)
+        rep = json.loads(raw_repack.decode())
+        assert rep['packs_before'] >= 3 and rep['packs_after'] == 1, rep
+        assert rep['compacted_pack_id'] is not None, rep
+        assert rep['unreachable_objects_pruned'] >= 1, rep
+        assert rep['pinned_roots_count'] >= 1 and rep['active_snapshots_count'] >= 1, rep
+        assert len(rep['snapshot_retained_packs']) >= 1, rep
+        assert rep['dual_operator_verified'] is True, rep
+
+        code_snap_read, _, _ = self.http(snap_loc, principal='reader', redirects=False)
+        assert code_snap_read == 200, code_snap_read
+
+        code_packs_post, _, raw_packs_post = self.http(f'/repos/{repack_repo}.git/packs', principal='reader')
+        assert code_packs_post == 200, (code_packs_post, raw_packs_post)
+        packs_post = json.loads(raw_packs_post.decode())
+        assert packs_post['active_pack_count'] == 1 and packs_post['latest_repack'] is not None, packs_post
+
+        repacked_clone = self.clone('repacked-clone', repo=repack_repo, principal='alice')
+        assert self.git('rev-parse', 'HEAD', cwd=repacked_clone).stdout.strip() == c4_main
+        unpin_rep = json.loads(self.cli('unpin-root', repack_repo, 'ci-release-pin'))
+        assert unpin_rep['unpinned'] is True, unpin_rep
+
+        return {
+            'repack_id': rep['repack_id'],
+            'packs_before': rep['packs_before'],
+            'packs_after': rep['packs_after'],
+            'unreachable_objects_pruned': rep['unreachable_objects_pruned'],
+            'snapshot_retained_packs': len(rep['snapshot_retained_packs']),
+        }
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -574,7 +909,15 @@ def main():
     lab = Lab(args)
     try:
         lab.setup()
-        for name in ('roundtrip', 'acl_checks', 'atomic_checks', 'raw_atomic_native_rejection', 'loopback_hostaddr', 'faults', 'cas', 'storage_fence', 'commit_acl_revocation', 'isolation', 'snapshot', 'cold_restart', 'thin_pack', 'pack_integrity'):
+        for name in (
+            'roundtrip', 'acl_checks', 'atomic_checks', 'raw_atomic_native_rejection',
+            'loopback_hostaddr', 'faults', 'cas', 'storage_fence', 'commit_acl_revocation',
+            'isolation', 'snapshot', 'cold_restart', 'thin_pack', 'pack_integrity',
+            'incremental_pack_deduplication', 'delta_and_graph_cli',
+            'dual_operator_diff_export', 'refs_and_operations_api', 'orphan_and_snapshot_gc',
+            'online_migration_state_machine', 'post_switchover_rollback_with_new_commits',
+            'object_store_cas_and_cache_recovery', 'multi_pack_repack_and_pinned_gc',
+        ):
             lab.check(name, getattr(lab, name))
         lab.results['passed'] = True
     except Exception:
@@ -586,3 +929,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+

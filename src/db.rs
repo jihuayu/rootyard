@@ -32,6 +32,24 @@ pub fn pool(url: &str) -> Result<Pool> {
     .build()?)
 }
 
+/// Post-001 migrations in execution order. Parallel tracks reserve disjoint ranges:
+/// 009..=019 (Forge PRs/Checks/Auth), 020..=029 (LFS/Browse), 030..=039 (CI Mirror/GC).
+pub const MIGRATIONS: &[(i32, &str)] = &[
+    (2, include_str!("../migrations/002_reliability.sql")),
+    (3, include_str!("../migrations/003_recovery_operations.sql")),
+    (6, include_str!("../migrations/006_forge_issues.sql")),
+    (7, include_str!("../migrations/007_forge_idempotency.sql")),
+    (8, include_str!("../migrations/008_ci_checkouts.sql")),
+    (9, include_str!("../migrations/009_forge_pulls.sql")),
+    (20, include_str!("../migrations/020_lfs_objects.sql")),
+    (30, include_str!("../migrations/030_ci_mirror.sql")),
+    (40, include_str!("../migrations/040_webhooks.sql")),
+    (50, include_str!("../migrations/050_members_rbac.sql")),
+    (60, include_str!("../migrations/060_sharding_fencing.sql")),
+];
+
+pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60];
+
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
@@ -39,45 +57,17 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         .await?;
     tx.batch_execute(include_str!("../migrations/001_initial.sql"))
         .await?;
-    if tx
-        .query_opt("SELECT version FROM schema_migrations WHERE version=2", &[])
-        .await?
-        .is_none()
-    {
-        tx.batch_execute(include_str!("../migrations/002_reliability.sql"))
-            .await?;
-    }
-    if tx
-        .query_opt("SELECT version FROM schema_migrations WHERE version=3", &[])
-        .await?
-        .is_none()
-    {
-        tx.batch_execute(include_str!("../migrations/003_recovery_operations.sql"))
-            .await?;
-    }
-    if tx
-        .query_opt("SELECT version FROM schema_migrations WHERE version=6", &[])
-        .await?
-        .is_none()
-    {
-        tx.batch_execute(include_str!("../migrations/006_forge_issues.sql"))
-            .await?;
-    }
-    if tx
-        .query_opt("SELECT version FROM schema_migrations WHERE version=7", &[])
-        .await?
-        .is_none()
-    {
-        tx.batch_execute(include_str!("../migrations/007_forge_idempotency.sql"))
-            .await?;
-    }
-    if tx
-        .query_opt("SELECT version FROM schema_migrations WHERE version=8", &[])
-        .await?
-        .is_none()
-    {
-        tx.batch_execute(include_str!("../migrations/008_ci_checkouts.sql"))
-            .await?;
+    for &(version, sql) in MIGRATIONS {
+        if tx
+            .query_opt(
+                "SELECT version FROM schema_migrations WHERE version=$1",
+                &[&version],
+            )
+            .await?
+            .is_none()
+        {
+            tx.batch_execute(sql).await?;
+        }
     }
     tx.commit().await?;
     Ok(())
@@ -198,5 +188,15 @@ mod tests {
         assert_eq!(digest("one").len(), 32);
         assert_eq!(digest("one"), digest("one"));
         assert_ne!(digest("one"), digest("two"));
+    }
+    #[test]
+    fn migrations_are_strictly_ordered_and_match_schema_versions() {
+        assert_eq!(SCHEMA_VERSIONS[0], 1);
+        assert_eq!(SCHEMA_VERSIONS.len(), MIGRATIONS.len() + 1);
+        for (i, &(version, sql)) in MIGRATIONS.iter().enumerate() {
+            assert_eq!(SCHEMA_VERSIONS[i + 1], version);
+            assert!(SCHEMA_VERSIONS[i] < version);
+            assert!(!sql.trim().is_empty());
+        }
     }
 }

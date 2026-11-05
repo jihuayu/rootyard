@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Unit tests for parallel development boundaries, router composition, and schema baseline sync."""
+import re
+from pathlib import Path
+import sys
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import schema_baseline  # noqa: E402
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class ParallelBoundariesTest(unittest.TestCase):
+    def test_schema_baseline_matches_rust_migrations_and_sql_files(self):
+        db_rs = (ROOT / "src/db.rs").read_text()
+        const_match = re.search(
+            r"pub const SCHEMA_VERSIONS:\s*&\[i32\]\s*=\s*&\[([0-9,\s]+)\];",
+            db_rs,
+        )
+        self.assertIsNotNone(const_match, "SCHEMA_VERSIONS missing in src/db.rs")
+        rust_versions = [
+            int(token.strip())
+            for token in const_match.group(1).split(",")
+            if token.strip()
+        ]
+        self.assertEqual(rust_versions, schema_baseline.SCHEMA_VERSIONS)
+
+        migration_pairs = re.findall(
+            r'\((\d+),\s*include_str!\("../migrations/([^"]+)"\)\)',
+            db_rs,
+        )
+        self.assertEqual(
+            [1] + [int(version) for version, _ in migration_pairs],
+            schema_baseline.SCHEMA_VERSIONS,
+        )
+        sql_files = sorted(p.name for p in (ROOT / "migrations").glob("*.sql"))
+        self.assertEqual(
+            ["001_initial.sql"] + [name for _, name in migration_pairs],
+            sql_files,
+        )
+
+    def test_backup_tables_match_schema_baseline(self):
+        backup_rs = (ROOT / "src/backup.rs").read_text()
+        tables_match = re.search(
+            r"const TABLES:\s*&\[&str\]\s*=\s*&\[(.*?)\];",
+            backup_rs,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(tables_match, "TABLES constant missing in src/backup.rs")
+        rust_tables = set(re.findall(r'"([^"]+)"', tables_match.group(1)))
+        self.assertEqual(rust_tables, schema_baseline.EXPECTED_TABLES)
+        self.assertEqual(len(rust_tables), schema_baseline.TABLE_COUNT)
+
+    def test_catalog_fixtures_exist(self):
+        for path in (
+            schema_baseline.CATALOG_SQL_PATH,
+            schema_baseline.CATALOG_JSON_PATH,
+            schema_baseline.RESTORED_CATALOG_JSON_PATH,
+            schema_baseline.UPGRADED_CATALOG_JSON_PATH,
+        ):
+            self.assertTrue(path.is_file(), f"Missing schema fixture: {path}")
+
+    def test_domain_routers_are_self_contained_and_merged_in_lib_rs(self):
+        lib_rs = (ROOT / "src/lib.rs").read_text()
+        domain_modules = (
+            "browse",
+            "ci_pins",
+            "ci_checkouts",
+            "reliability",
+            "forge",
+            "pulls",
+            "lfs",
+            "webhooks",
+            "members",
+            "web",
+            "sharding",
+        )
+        for mod_name in domain_modules:
+            mod_path = ROOT / "src" / f"{mod_name}.rs"
+            self.assertTrue(mod_path.is_file(), f"Missing domain module {mod_path}")
+            mod_source = mod_path.read_text()
+            self.assertIn(
+                "pub fn routes() -> Router<Arc<AppState>>",
+                mod_source,
+                f"{mod_name}.rs must expose pub fn routes() -> Router<Arc<AppState>>",
+            )
+            self.assertIn(
+                f".merge({mod_name}::routes())",
+                lib_rs,
+                f"src/lib.rs must merge {mod_name}::routes()",
+            )
+
+    def test_shared_auth_and_event_contracts_exist(self):
+        auth_rs = (ROOT / "src/auth.rs").read_text()
+        for signature in (
+            "pub fn idempotency_key(",
+            "pub async fn authorize_repo_with_role(",
+            "pub async fn authorize_repo(",
+            "pub async fn verify_token(",
+            "pub async fn finish_tx(",
+        ):
+            self.assertIn(signature, auth_rs)
+
+        events_rs = (ROOT / "src/events.rs").read_text()
+        dispatch_rs = (ROOT / "src/dispatch.rs").read_text()
+        self.assertIn("pub const CONSUMERS: &[&str]", events_rs)
+        self.assertIn("events::CONSUMERS", dispatch_rs)
+
+        pulls_handlers = (ROOT / "src/pulls/handlers.rs").read_text()
+        self.assertIn("crate::webhooks::delivery::on_pull_synchronized", pulls_handlers)
+
+    def test_tier2_modularity_and_staged_schemas_exist(self):
+        for dom in ("webhooks", "members"):
+            root_rs = ROOT / "src" / f"{dom}.rs"
+            self.assertTrue(root_rs.is_file())
+            self.assertFalse((ROOT / "src" / dom / "mod.rs").exists())
+            self.assertLess(len(root_rs.read_text().splitlines()), 100)
+
+        for sql_rel in ("src/webhooks/040_webhooks.sql", "src/members/050_members_rbac.sql"):
+            sql_path = ROOT / sql_rel
+            self.assertTrue(sql_path.is_file(), f"Missing staged schema {sql_rel}")
+            self.assertIsNone(re.search(r"\bBETWEEN\b", sql_path.read_text(), re.IGNORECASE))
+
+        for p_sub in ("migration.rs", "rollback.rs"):
+            p_path = ROOT / "src/pando_lab" / p_sub
+            self.assertTrue(p_path.is_file())
+            self.assertLess(len(p_path.read_text().splitlines()), 850)
+
+        for w_sub in ("remote.rs", "namespace.rs"):
+            w_path = ROOT / "src/workspace_lab" / w_sub
+            self.assertTrue(w_path.is_file())
+            self.assertLess(len(w_path.read_text().splitlines()), 600)
+
+    def test_tier3_modularity_and_staged_schemas_exist(self):
+        for dom in ("web", "sharding"):
+            root_rs = ROOT / "src" / f"{dom}.rs"
+            self.assertTrue(root_rs.is_file())
+            self.assertFalse((ROOT / "src" / dom / "mod.rs").exists())
+            self.assertLess(len(root_rs.read_text().splitlines()), 100)
+
+        sql_path = ROOT / "src/sharding/060_sharding_fencing.sql"
+        self.assertTrue(sql_path.is_file(), "Missing staged schema src/sharding/060_sharding_fencing.sql")
+        self.assertIsNone(re.search(r"\bBETWEEN\b", sql_path.read_text(), re.IGNORECASE))
+
+        for p_sub in ("object_store.rs", "repack.rs"):
+            p_path = ROOT / "src/pando_lab" / p_sub
+            self.assertTrue(p_path.is_file())
+            self.assertLess(len(p_path.read_text().splitlines()), 850)
+
+        w_path = ROOT / "src/workspace_lab/vfs.rs"
+        self.assertTrue(w_path.is_file())
+        self.assertLess(len(w_path.read_text().splitlines()), 600)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,313 @@
+//! Read-only HTTP handlers for Track 2A repository browsing endpoints.
+use crate::{
+    AppState, Error, auth,
+    browse::{
+        git_read,
+        models::{
+            self, BlobByOidQuery, BlobQuery, CommitsQuery, CompareQuery, RefsQuery, RefsResponse,
+            StorageRouteQuery, StorageRouteResponse, TreeByOidQuery, TreeQuery,
+        },
+    },
+};
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use std::sync::Arc;
+use tokio::sync::OwnedSemaphorePermit;
+use uuid::Uuid;
+
+fn json_ok(value: impl serde::Serialize) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(value),
+    )
+        .into_response()
+}
+
+fn acquire_git_slot(state: &AppState) -> Result<OwnedSemaphorePermit, Error> {
+    state.git_slots.clone().try_acquire_owned().map_err(|_| {
+        Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Git capacity exhausted; retry later",
+        )
+    })
+}
+
+pub async fn list_refs(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<RefsQuery>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let (prefix, after, limit) = query.validate()?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let repo_id: Uuid = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let storage_generation: i64 = tx
+        .query_one(
+            "SELECT storage_generation FROM repositories WHERE id=$1",
+            &[&repo_id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+
+    let _permit = acquire_git_slot(&state)?;
+    let (head, all_refs) = git_read::read_head_and_refs(&state, repo_id).await?;
+
+    let filtered: Vec<_> = all_refs
+        .into_iter()
+        .filter(|r| prefix.is_none_or(|p| r.name.starts_with(p)))
+        .filter(|r| after.is_none_or(|cursor| r.name.as_str() > cursor))
+        .take(limit + 1)
+        .collect();
+    let more = filtered.len() > limit;
+    let items: Vec<_> = filtered.into_iter().take(limit).collect();
+    let next_after = if more {
+        items.last().map(|r| r.name.clone())
+    } else {
+        None
+    };
+
+    auth::finish_tx(tx, &actor, false).await?;
+    Ok(json_ok(RefsResponse {
+        repository_id: repo_id,
+        storage_generation,
+        head,
+        items,
+        next_after,
+    }))
+}
+
+pub async fn list_commits(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<CommitsQuery>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let (spec, after, limit) = query.validate()?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+
+    let _permit = acquire_git_slot(&state)?;
+    let payload = git_read::list_commits(&state, repo_id, spec, after, limit).await?;
+
+    auth::finish_tx(tx, &actor, false).await?;
+    Ok(json_ok(payload))
+}
+
+pub async fn get_commit(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name, oid)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    if !models::valid_non_zero_oid(&oid) {
+        return Err(Error::bad_request());
+    }
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+
+    let _permit = acquire_git_slot(&state)?;
+    let detail = git_read::get_commit_detail(&state, repo_id, &oid).await?;
+
+    auth::finish_tx(tx, &actor, false).await?;
+    Ok(json_ok(detail))
+}
+
+pub async fn get_tree(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<TreeQuery>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let limit = models::validate_limit(query.limit)?;
+    let after = models::validate_tree_after(query.after.as_deref())?;
+    let rel_path = models::normalize_rel_path(query.path.as_deref())?;
+    if let Some(ref spec) = query.oid {
+        if !models::valid_revision_spec(spec) {
+            return Err(Error::bad_request());
+        }
+    }
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+
+    let _permit = acquire_git_slot(&state)?;
+    let tree = git_read::read_tree(
+        &state,
+        repo_id,
+        query.oid.as_deref(),
+        &rel_path,
+        after,
+        limit,
+    )
+    .await?;
+
+    auth::finish_tx(tx, &actor, false).await?;
+    Ok(json_ok(tree))
+}
+
+pub async fn get_tree_by_oid(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name, oid)): Path<(String, String, String)>,
+    Query(query): Query<TreeByOidQuery>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    if !models::valid_revision_spec(&oid) {
+        return Err(Error::bad_request());
+    }
+    let limit = models::validate_limit(query.limit)?;
+    let after = models::validate_tree_after(query.after.as_deref())?;
+    let rel_path = models::normalize_rel_path(query.path.as_deref())?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+
+    let _permit = acquire_git_slot(&state)?;
+    let tree = git_read::read_tree(&state, repo_id, Some(&oid), &rel_path, after, limit).await?;
+
+    auth::finish_tx(tx, &actor, false).await?;
+    Ok(json_ok(tree))
+}
+
+pub async fn get_blob(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<BlobQuery>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let clean_path = models::normalize_rel_path(query.path.as_deref())?;
+    if clean_path.is_empty() {
+        let Some(ref oid) = query.oid else {
+            return Err(Error::bad_request());
+        };
+        if !models::valid_non_zero_oid(oid) {
+            return Err(Error::bad_request());
+        }
+    } else if let Some(ref spec) = query.oid {
+        if !models::valid_revision_spec(spec) {
+            return Err(Error::bad_request());
+        }
+    }
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+
+    let _permit = acquire_git_slot(&state)?;
+    let blob =
+        git_read::read_blob(&state, repo_id, query.oid.as_deref(), query.path.as_deref()).await?;
+
+    auth::finish_tx(tx, &actor, false).await?;
+    Ok(json_ok(blob))
+}
+
+pub async fn get_blob_by_oid(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name, oid)): Path<(String, String, String)>,
+    Query(query): Query<BlobByOidQuery>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let clean_path = models::normalize_rel_path(query.path.as_deref())?;
+    if clean_path.is_empty() {
+        if !models::valid_non_zero_oid(&oid) {
+            return Err(Error::bad_request());
+        }
+    } else if !models::valid_revision_spec(&oid) {
+        return Err(Error::bad_request());
+    }
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+
+    let _permit = acquire_git_slot(&state)?;
+    let blob = git_read::read_blob(&state, repo_id, Some(&oid), query.path.as_deref()).await?;
+
+    auth::finish_tx(tx, &actor, false).await?;
+    Ok(json_ok(blob))
+}
+
+pub async fn compare_commits(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<CompareQuery>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    if !models::valid_revision_spec(&query.base) || !models::valid_revision_spec(&query.head) {
+        return Err(Error::bad_request());
+    }
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+
+    let _permit = acquire_git_slot(&state)?;
+    let comparison = git_read::compare_commits(&state, repo_id, &query.base, &query.head).await?;
+
+    auth::finish_tx(tx, &actor, false).await?;
+    Ok(json_ok(comparison))
+}
+
+pub async fn get_storage_route(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<StorageRouteQuery>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let requested_operation = query.validate()?.to_owned();
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let repo_id: Uuid = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let row = tx
+        .query_one(
+            "SELECT r.name, r.state, r.storage_backend, r.storage_generation, u.username \
+             FROM repositories r JOIN users u ON u.id = r.owner_id WHERE r.id = $1",
+            &[&repo_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    let status = crate::forge::build_backend_status(
+        &state,
+        repo_id,
+        row.get("username"),
+        row.get("name"),
+        row.get("state"),
+        row.get::<_, &str>("storage_backend"),
+        row.get("storage_generation"),
+    );
+    auth::finish_tx(tx, &actor, false).await?;
+    let selected_backend = if matches!(requested_operation.as_str(), "write" | "git-receive-pack") {
+        status.write_backend.clone()
+    } else {
+        status.read_backend.clone()
+    };
+    Ok(json_ok(StorageRouteResponse {
+        repository_id: status.repository_id,
+        owner: status.owner,
+        name: status.name,
+        storage_backend: status.storage_backend,
+        storage_generation: status.storage_generation,
+        state: status.state,
+        gateway_route: status.gateway_route,
+        read_backend: status.read_backend,
+        write_backend: status.write_backend,
+        requested_operation,
+        selected_backend,
+        write_paused: status.write_paused,
+        pando_ready: status.pando_ready,
+        gitfs_ready: status.gitfs_ready,
+    }))
+}

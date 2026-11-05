@@ -11,7 +11,7 @@ jobs:
       image: rust:1-trixie
       # Match compose.yaml: orphaned Git grandchildren need an init reaper.
       options: --init
-    timeout-minutes: 30
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:17
@@ -31,7 +31,10 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
       - name: Install matching PostgreSQL client and test tools
-        run: apt-get update && apt-get install -y --no-install-recommends git python3 postgresql-client-17 redis-server gcc g++ make pkg-config openjdk-21-jre-headless curl ca-certificates
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends git python3 postgresql-17 postgresql-client-17 redis-server gcc g++ make pkg-config openjdk-21-jre-headless curl ca-certificates
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
       - name: Test bounded Kafka download helper
         run: python3 -m unittest discover -s tests -p 'test_download_ci_kafka.py'
       - name: Prepare verified isolated Kafka distribution
@@ -47,18 +50,26 @@ jobs:
           python3 --version
           psql --version
           pg_dump --version
+          initdb --version
+          pg_ctl --version
           redis-server --version
           java -version
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets --features pando-lab -- -D warnings
+      - run: cargo test --locked --all-targets --features pando-lab
       - name: Verify durable PostgreSQL workers
         run: cargo test --locked --test outbox --test resolution_fences -- --ignored
-      - run: cargo build --locked
-      - name: Verify schema-008 catalog and dump round trip
+      - run: cargo build --locked --features pando-lab --bins
+      - name: Verify design documentation integrity
+        run: python3 scripts/check_design_docs.py
+      - name: Verify schema-030 catalog and dump round trip
         run: python3 tests/schema_contract.py --binary target/debug/rootyard
       - name: Verify end-to-end harness synchronization
         run: python3 -m unittest discover -s tests -p 'test_e2e_sync.py'
+      - name: Verify parallel track and schema baseline boundaries
+        run: python3 -m unittest discover -s tests -p 'test_parallel_boundaries.py'
+      - name: Run all Python unit and Tier-5 adversarial contract suites
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
       - name: Exercise native Git end to end
         run: python3 tests/e2e.py --binary target/debug/rootyard --report test-results/e2e.json
       - name: Exercise exact-commit CI read mirror
@@ -122,8 +133,36 @@ jobs:
         run: python3 tests/forge_idempotency.py --binary target/debug/rootyard --report test-results/forge-idempotency.json
       - name: Exercise Issue state-filter keyset lists
         run: python3 tests/forge_state_filter.py --binary target/debug/rootyard --report test-results/forge-state-filter.json
+      - name: Exercise Pull Request, Review, Check Run, Branch Rule, and Atomic Merge API
+        run: python3 tests/pulls.py --binary target/debug/rootyard --report test-results/pulls.json
+      - name: Exercise populated Pull Request paired backup and fresh restore
+        run: python3 tests/backup_pulls.py --binary target/debug/rootyard --report test-results/backup-pulls.json
+      - name: Exercise repository read-only Browse API and atomic multi-ref CAS transactions
+        run: python3 tests/browse.py --binary target/debug/rootyard --report test-results/browse.json
+      - name: Exercise Git LFS Batch API, streaming object storage, and paired backup
+        run: python3 tests/lfs.py --binary target/debug/rootyard --report test-results/lfs.json
       - name: Exercise local workspace semantics
         run: python3 tests/workspaces.py --binary target/debug/rootyard-workspace-lab --report test-results/workspaces.json
+      - name: Exercise workspace incremental sync, ignore rules, and read-only views
+        run: python3 tests/workspace.py --binary target/debug/rootyard-workspace-lab --report test-results/workspace.json
+      - name: Exercise Pando object store delta resolution, graph traversal, and differential export
+        run: |
+          chmod -R a+rX "$GITHUB_WORKSPACE" && runuser -u postgres -- env PATH="/usr/lib/postgresql/17/bin:$PATH" PG_SHARE="/usr/share/postgresql/17" python3 tests/pando_lab.py --binary target/debug/rootyard-pando-lab
+          mkdir -p test-results
+          latest_pando=$(ls -td /tmp/rootyard-pando-lab-* 2>/dev/null | head -1 || true)
+          if [ -n "$latest_pando" ] && [ -f "$latest_pando/results.json" ]; then
+            cp "$latest_pando/results.json" test-results/pando-lab.json
+          fi
+      - name: Exercise external CI webhooks, HMAC-SHA256 delivery, and auto PR CI pins
+        run: python3 tests/webhooks.py --binary target/debug/rootyard --report test-results/webhooks.json
+      - name: Exercise repository collaborators, teams, 5-role RBAC, and audit log
+        run: python3 tests/members.py --binary target/debug/rootyard --report test-results/members.json
+      - name: Exercise server-side HTML Web UI views, XSS sanitization, and PR/Issue workflows
+        run: python3 tests/web.py --binary target/debug/rootyard --report test-results/web.json
+      - name: Exercise multi-node repository sharding, epoch write fencing, and automated failover
+        run: python3 tests/sharding.py --binary target/debug/rootyard --report test-results/sharding.json
+      - name: Exercise 4-tier requirement-driven E2E test suite
+        run: ROOTYARD_E2E_REQUIRE_M5=1 ROOTYARD_E2E_REQUIRE_P2=1 ROOTYARD_E2E_REQUIRE_P3=1 python3 tests/e2e_tiers.py --tier all --binary target/debug/rootyard --report test-results/e2e-tiers.json
       - name: Upload end-to-end report
         if: always()
         uses: actions/upload-artifact@v4

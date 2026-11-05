@@ -51,14 +51,14 @@ impl Settings {
             Ok(value)
         }
         let consumers = std::env::var("ROOTYARD_WORKER_CONSUMERS")
-            .unwrap_or_else(|_| "audit-log,ref-index".into());
+            .unwrap_or_else(|_| crate::events::CONSUMERS.join(","));
         let consumers: Vec<String> = consumers.split(',').map(str::to_owned).collect();
         ensure!(
             !consumers.is_empty()
-                && consumers.len() <= 2
+                && consumers.len() <= crate::events::CONSUMERS.len()
                 && consumers
                     .iter()
-                    .all(|s| matches!(s.as_str(), "audit-log" | "ref-index")),
+                    .all(|s| crate::events::CONSUMERS.contains(&s.as_str())),
             "invalid worker consumers"
         );
         ensure!(

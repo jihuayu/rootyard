@@ -12,9 +12,44 @@ The ordinary Rootyard binary and its migration runner do not load this schema.
   change record, committed together in one transaction.
 - Native `proc-receive` adapts writes. Every HTTP request creates a disposable
   bare repository. No persistent bare repository is authoritative.
-- Self-contained immutable `.pack` and `.idx` files in a separate local store.
-  Each successful push currently writes the **entire reachable closure of its
-  new tips**, rather than a compact incremental storage representation.
+- Self-contained immutable `.pack` and `.idx` files in a separate local store,
+  with incremental delta-self-contained pack publication (`store::publish_pack`)
+  and pure-Rust streaming pack/delta verification (`delta::verify_pack`) enforcing
+  `OFS_DELTA`/`REF_DELTA` cycle, depth, and decompressed object size guards.
+- Native Rust commit, tree, and tag graph reachability walker (`graph::walk_reachable`)
+  supporting `want` roots and `have` exclusion closures, plus dual-operator
+  differential verification (`export::diff_export` / `diff-export`) comparing Pando
+  native Rust operators bit-for-bit against native `git`.
+- Read-only and compaction HTTP endpoints (`GET /repos/{id}.git/refs`,
+  `GET /repos/{id}.git/operations/{op_id}`, `GET /repos/{id}.git/migration`,
+  `GET /repos/{id}.git/packs`, `POST /repos/{id}.git/repack`, and
+  `GET /repos/{id}.git/object-store`) with principal ACL verification, plus CLI
+  subcommands (`verify-delta`, `walk-graph`, `diff-export`, `gc`, `migrate`,
+  `migrate-step`, `rollback`, `migration-status`, `repack`, `pin-root`,
+  `unpin-root`, `object-store-put`, `object-store-get`, `object-store-verify`,
+  `object-store-status`).
+- Content-addressable S3-compatible immutable Pack/Idx object storage backend
+  (`object_store.rs`) under `buckets/<bucket>/repos/<repo_id>/packs/<pack_id>.{pack,idx}`
+  with multipart chunk staging (`multipart/<upload_id>/part-<part_number>`),
+  per-chunk and full-object SHA-256 & byte-size verification, write-once `0o444`
+  immutability, signed CAS manifests (`manifests/<repo_id>/<pack_id>.json`),
+  fault-injection protection (`--fail-after-chunks`, `--corrupt-chunk`), and
+  transparent local cache miss read-through re-hydration.
+- Online multi-pack compaction (`repack.rs`: `repack <repo_id> [--prune-superseded] [--pin-oid <oid>...]`)
+  consolidating incremental `.pack` files into a single self-contained `.pack` + `.idx`
+  with reachability GC, strict protection of pinned roots (`pando_lab.pinned_roots`,
+  `refs/rootyard-ci/*`, `--pin-oid`) and active read snapshots (`pando_lab.snapshots`),
+  dual-operator verification, atomic `FOR UPDATE` manifest replacement, and safe
+  retirement of superseded pack files.
+- Repository-level 5-step online migration state machine (`migration.rs`:
+  `copy` -> `verify` -> `drain` -> `fence` -> `switchover`) from a GitFS bare
+  repository to Pando with incremental delta capture during drain, `storage_generation`
+  epoch fencing, and executable GitFS `hooks/pre-receive` read-only fencing.
+- Safe post-switchover rollback with new commits (`rollback.rs`: `rollback <repo> <gitfs_path>`)
+  that pauses Pando writes, reverse-synchronizes all committed Pando packs and
+  post-switchover commits/ref updates back to GitFS (`git index-pack --stdin --strict`
+  and `git update-ref`), verifies dual-operator parity and `git fsck --full --strict`,
+  bumps `storage_generation`, and cuts write authority back to GitFS.
 - Old-OID CAS, atomic multi-ref publication, final ref directory/file validation,
   commit-time repository ACL validation, and storage-generation fencing.
 - PG-persisted five-minute read snapshots spanning advertisement and subsequent
@@ -179,16 +214,44 @@ server logs and PostgreSQL logs in its printed run directory. Tests check:
   followed by a restored clone/fsck.
 - Configuration rejection before connection for non-loopback `hostaddr`, plus
   Rust tests for IPv4, IPv6, mixed address lists and valid loopback addresses.
+- Online GitFS-to-Pando 5-step migration (`copy` -> `verify` -> `drain` ->
+  `fence` -> `switchover`), incremental drain delta capture, GitFS read-only
+  `hooks/pre-receive` fencing, `GET /repos/{id}.git/migration`, and safe
+  post-switchover rollback with new commits (`rollback`) back to GitFS.
+
+## Online migration and rollback state machine
+
+1. `copy` (`migrate-step <repo> <gitfs_path> copy`): validates the source GitFS
+   bare repository (`git fsck --full --strict`), packages reachable objects into
+   an immutable Pando `.pack`/`.idx`, and populates `pando_lab.manifests`,
+   `pando_lab.objects`, and `pando_lab.refs` while keeping `storage_backend = 'gitfs'`.
+2. `verify` (`migrate-step <repo> <gitfs_path> verify`): runs dual-operator
+   `export::diff_export` and directly compares Pando refs and reachable object
+   closure byte-for-byte against the GitFS source repository.
+3. `drain` (`migrate-step <repo> <gitfs_path> drain`): sets `write_paused = true`,
+   installs the GitFS `hooks/pre-receive` write fence (`rootyard.writePaused = true`),
+   aborts non-terminal Pando operations, syncs any final incremental delta commits
+   created on GitFS since `copy`, and re-verifies dual-operator parity.
+4. `fence` (`migrate-step <repo> <gitfs_path> fence`): atomically increments
+   `storage_generation`, expires prior read snapshots, and updates
+   `rootyard.storageGeneration` on GitFS so stale writers fail closed.
+5. `switchover` (`migrate-step <repo> <gitfs_path> switchover`): keeps GitFS
+   fenced read-only (`rootyard.storageBackend = pando`, `rootyard.writePaused = true`),
+   verifies materialized `git fsck --full --strict`, and switches
+   `storage_backend = 'pando'`, `write_paused = false`, `migration_state = 'switched_over'`.
+6. `rollback` (`rollback <repo> <gitfs_path>`): pauses Pando writes, streams all
+   committed Pando packs into GitFS via `git index-pack --stdin --strict`,
+   reconciles updated and deleted refs in GitFS, verifies dual-operator `diff_export`
+   and `git fsck --full --strict`, increments `storage_generation`, and restores
+   `storage_backend = 'gitfs'` with GitFS unfenced and Pando write-fenced.
 
 ## Not implemented or not verified
 
-- GitFS-to-Pando migration, authority switch, drain/fence orchestration, reverse
-  synchronization after target writes, or migration rollback. The storage epoch
-  check is only a tested primitive, **not a completed migration workflow**.
+- Production main-server routing switchover (`rootyard::Storage` remains untouched
+  by this isolated lab binary).
 - Real S3/R2/MinIO consistency/durability, multi-host deployment, PG replication,
   failover, network partitions, disk power loss, media failure, or PITR coordination.
-- Object GC, orphan reclamation, snapshot cleanup/pins, pack compaction, incremental
-  pack dependency planning, deduplicated cross-repo storage, or capacity benchmarks.
+- Cross-repository pack deduplication, pack compaction, or capacity benchmarks.
 - Production authentication/TLS, branch-level authorization, LFS, SHA-256 repos,
   partial/shallow clone guarantees, push-options, arbitrary ref namespaces, force
   updates to branches, compressed HTTP request bodies, or full Git compatibility.

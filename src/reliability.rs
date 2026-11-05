@@ -2,13 +2,21 @@
 use crate::{AppState, Error, auth, db, events, journal};
 use anyhow::{Result, ensure};
 use axum::{
-    Json,
+    Json, Router,
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
+    routing::get,
 };
 use std::{fs::File, path::Path as FsPath, sync::Arc};
 use uuid::Uuid;
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/repos/{owner}/{name}/operations", get(operations))
+        .route("/api/repos/{owner}/{name}/resolutions", get(resolutions))
+        .route("/api/repos/{owner}/{name}/events", get(event_list))
+}
 
 pub struct HookInstallation {
     executable: File,
@@ -283,6 +291,9 @@ async fn recovering(state: &AppState, repo: Uuid, reason: &str) -> Result<()> {
 
 pub async fn before_push(state: &AppState, repo: &db::Repository) -> Result<()> {
     verify_hooks(state)?;
+    crate::sharding::fencing::check_before_push(state, repo)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.1))?;
     ensure!(
         reconcile(state, repo.id, repo.storage_generation, false).await?,
         "repository recovery required"

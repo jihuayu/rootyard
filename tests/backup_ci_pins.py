@@ -17,6 +17,13 @@ import uuid
 
 from backup_recovery import BackupRecoveryHarness
 from ci_mirror import MirrorHarness
+from schema_baseline import (
+    CATALOG_JSON_PATH,
+    CATALOG_SQL_PATH,
+    RESTORED_CATALOG_JSON_PATH,
+    SCHEMA_VERSIONS,
+    TABLE_COUNT,
+)
 
 
 class BackupCiPinsHarness(BackupRecoveryHarness):
@@ -59,13 +66,12 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         root = Path(self.env['ROOTYARD_DATA_DIR']) / 'ci-pins'
         return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob('*') if p.is_file()}
 
-    def assert_catalog(self, filename):
-        schema = Path(__file__).resolve().parents[1] / 'schema'
-        query = (schema / '008_catalog.sql').read_text()
+    def assert_catalog(self, path):
+        query = CATALOG_SQL_PATH.read_text()
         catalog = json.loads(self.run(['psql', self.db, '-X', '-qAt', '-v',
                                        'ON_ERROR_STOP=1', '-c',
                                        'SET search_path=pg_catalog; ' + query]).stdout)
-        assert catalog == json.loads((schema / filename).read_text()), 'Schema008 catalog changed'
+        assert catalog == json.loads(Path(path).read_text()), 'Schema catalog changed'
 
     def native_ref(self, name):
         value = self.git('--no-replace-objects', '--git-dir=' + str(self.bare),
@@ -112,9 +118,9 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         self.drain()
         self.source_metadata = self.metadata()
         assert len(self.source_metadata) == 3
-        self.assert_catalog('008_catalog.json')
+        self.assert_catalog(CATALOG_JSON_PATH)
         self.source_rows = self.all_rows()
-        assert len(self.source_rows) == 16
+        assert len(self.source_rows) == TABLE_COUNT
         self.pin_operations = [row for row in self.source_rows['git_operations']
                                if row['evidence'].get('kind') == 'observed_immutable_ci_root']
         assert len(self.pin_operations) == 2
@@ -124,13 +130,13 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         self.backup_result = json.loads(self.backup_command().stdout)
         self.cli('backup-verify', str(self.backup))
         manifest = json.loads((self.backup / 'manifest.json').read_text())
-        assert manifest['format'] == 5 and manifest['schema_versions'] == [1, 2, 3, 6, 7, 8]
+        assert manifest['format'] == 5 and manifest['schema_versions'] == SCHEMA_VERSIONS
         assert all((self.backup / 'volume' / 'ci-pins' / name).read_bytes() == data
                    for name, data in self.source_metadata.items())
         return dict(root_created_before_source_delete_and_first_mirror=True,
                     unreachable_from_ordinary_refs_survives_gc=True,
                     exact_intent_and_receipt_backed_up=True, receipt_absence_fixture=True,
-                    generic_unknown_preserved=True, full_public_tables=16, backup_format=5)
+                    generic_unknown_preserved=True, full_public_tables=TABLE_COUNT, backup_format=5)
 
     def corrupt_backups_rejected(self):
         relative = Path('volume/ci-pins') / self.repo['id'] / (self.job + '.pinned.json')
@@ -160,7 +166,7 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         self.mirror_env['DATABASE_URL'] = self.db
         self.bare = self.target / 'repos' / (self.repo['id'] + '.git')
         assert self.all_rows() == self.source_rows
-        self.assert_catalog('008_restored_catalog.json')
+        self.assert_catalog(RESTORED_CATALOG_JSON_PATH)
         assert self.metadata() == self.source_metadata
         assert (self.target / '.volume-id').read_bytes() == self.marker
         for plan in (self.plan, self.pending_plan):

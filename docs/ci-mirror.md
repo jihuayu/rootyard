@@ -5,10 +5,13 @@ The primary remains the only Git writer and authoritative repository store.
 own storage directory and the **same authoritative PostgreSQL database**. It
 serves Git packs locally, rather than proxying reads to the primary.
 
-This slice establishes a correctness boundary, not production CI capacity or
-high availability. Sync is synchronous and full-clone-only. There is no scheduler,
-incremental fetch, automatic fallback, snapshot garbage collection, or throughput
-SLA. Account and repository administration remain on the primary.
+This slice establishes an explicit correctness and capacity-management boundary.
+Sync is synchronous and full-clone-only with bounded per-repository and global
+concurrency (`ROOTYARD_MIRROR_MAX_CONCURRENT_SYNCS`), lease-coordinated source
+pin release (`DELETE /api/repos/{owner}/{name}/ci-pins/{job}`), safe LRU and
+watermark mirror eviction (`POST /api/repos/{owner}/{name}/mirror-evict` and
+`mirror-prune`), and mirror status/metrics observability. Account and repository
+administration remain on the primary.
 
 ## Configuration and storage separation
 
@@ -143,8 +146,10 @@ Admission is bounded to 1,024 primary job intents per repository, including old
 generations and pending intents, and 1,024 generation/OID mirror mappings per
 repository. New requests beyond the bound are HTTP 429; existing identical
 retries remain possible. Native repository byte quota, Git process limits and
-outbox backlog gates still apply. These limits are not garbage collection:
-operators must plan storage; this release does not expire, release or delete pins.
+outbox backlog gates still apply. Controllers can inspect active pins via
+`GET /api/repos/{owner}/{name}/ci-pins` and release completed pins via
+`DELETE /api/repos/{owner}/{name}/ci-pins/{job}` (or `POST .../release`) once
+no active checkout lease remains.
 
 ## Explicit sync
 
@@ -376,3 +381,117 @@ race. Successful prefixes are replayed unchanged through the normal output quota
 deadline and process-exit checks; an incomplete or failed PACK never becomes a
 clean successful response. The bounded packet inspection does not parse or
 authorize object wants in place of native Git and the isolated object closure.
+
+## Source pin listing and lease-coordinated release
+
+Trusted controllers and read-only owner tokens can list retained CI source pins on
+the primary or inspect a single job's pin metadata:
+
+```http
+GET /api/repos/{owner}/{name}/ci-pins
+Authorization: Bearer <owner-token>
+```
+
+```http
+GET /api/repos/{owner}/{name}/ci-pins/{job_id}
+Authorization: Bearer <owner-token>
+```
+
+Each entry reports `version`, `job_id`, `owner_id`, `repository_id`,
+`storage_generation`, `object_format`, `target_oid`, `retention_ref`, `state`
+(`"pinned"` or `"intent"`), and `active_checkout_lease` (`true` or `false`).
+
+When a CI build completes and its source pin is no longer needed, a writable
+owner/controller token can release the pin:
+
+```http
+DELETE /api/repos/{owner}/{name}/ci-pins/{job_id}
+Authorization: Bearer <controller-owner-token>
+```
+
+(`POST /api/repos/{owner}/{name}/ci-pins/{job_id}/release` is also accepted.)
+
+Release is coordinated with `ci_checkout_jobs` under the repository writer lock
+and per-job PostgreSQL advisory lock (`ci-checkout:{repo_id}:{job_id}`):
+
+1. If an active checkout lease exists (`plan IS NOT NULL`, `NOT cancelled`,
+   `NOT revoked`, and `expires_unix > extract(epoch FROM clock_timestamp())`),
+   release is rejected with **HTTP 409 Conflict** (`active checkout lease exists
+   for job`) and both `refs/rootyard-ci/jobs/{job_id}` and `<job_id>.pinned.json`
+   remain intact.
+2. Once the lease has expired, been cancelled, or been revoked, release executes
+   a crash-safe 3-step cleanup: removes `<job_id>.pinned.json`, deletes the
+   native retention ref `refs/rootyard-ci/jobs/{job_id}` via a journaled
+   `observed_immutable_ci_root` operation (`action: "released"`, `new_oid` zero),
+   and removes `<job_id>.json` to free a slot under the 1,024 `MAX_PINS` cap.
+3. Re-releasing an already-released job is idempotent and returns HTTP 200 with
+   `"state": "released", "released": true`.
+
+## Disk watermarks and safe LRU eviction
+
+Read mirrors support both automatic watermark eviction (via
+`ROOTYARD_MIRROR_HIGH_WATERMARK_BYTES`, `ROOTYARD_MIRROR_LOW_WATERMARK_BYTES`,
+and `ROOTYARD_MIRROR_MAX_SNAPSHOTS` after snapshot sync or closure
+materialization) and explicit operator/controller eviction:
+
+```http
+POST /api/repos/{owner}/{name}/mirror-evict
+Authorization: Bearer <owner-token>
+Content-Type: application/json
+
+{"target_bytes": 1073741824, "max_pins": 128, "max_job_views": 128, "max_snapshots": 4}
+```
+
+(`POST /api/repos/{owner}/{name}/mirror-prune` with an empty or `{}` body prunes
+all unprotected pins, unprotected job views, and unreferenced historical
+snapshots.)
+
+Eviction enforces strict fail-closed preservation invariants:
+
+- `current.json` and the active snapshot directory it references are **never**
+  evicted.
+- Any target OID protected by an active checkout lease in `ci_checkout_jobs` is
+  **never** evicted.
+- Any target OID retained by an active `refs/rootyard-ci/jobs/*` pin in the
+  current storage generation is **never** evicted.
+- A historical snapshot directory is evicted only after all retained
+  `pin-{generation}-{oid}.json` mappings referencing that snapshot have been
+  evicted.
+- Every eviction run that reclaims artifacts records a durable audit row in
+  `ci_mirror_evictions` (schema migration `030_ci_mirror.sql`) and returns an
+  `EvictionReport` with `eviction_id`, `evicted_pins`, `evicted_job_views`,
+  `evicted_snapshots`, `reclaimed_bytes`, `disk_bytes_before`, `disk_bytes_after`,
+  and `protected_oids`.
+
+## Concurrent sync rate limiting and mirror observability
+
+To prevent sync or closure-materialization stampedes on a read mirror,
+`serve-mirror` enforces bounded concurrency semaphores and per-repository
+in-flight serialization:
+
+- `ROOTYARD_MIRROR_MAX_CONCURRENT_SYNCS` (default `4`): maximum concurrent
+  `mirror-sync` operations across the mirror volume.
+- `ROOTYARD_MIRROR_MAX_CONCURRENT_CLOSURES` (default `4`): maximum concurrent
+  `job-views` reachability-closure pack materializations.
+- `ROOTYARD_MIRROR_SYNC_COOLDOWN_MS` (default `0`): optional minimum cooldown
+  between completed syncs of the same repository.
+- Concurrent sync requests for a repository that already has a sync in flight, or
+  requests that exceed the global semaphore/cooldown, fail immediately with
+  **HTTP 429 Too Many Requests** and increment rate-limit counters.
+
+Operators and controllers can inspect per-repository mirror state via:
+
+```http
+GET /api/repos/{owner}/{name}/mirror-status
+Authorization: Bearer <owner-token>
+```
+
+And scrape fixed-cardinality Prometheus metrics (`Cache-Control: no-store`) from
+`GET /metrics` on the mirror listener (`rootyard_mirror_sync_in_flight`,
+`rootyard_mirror_sync_limit`, `rootyard_mirror_syncs_total`,
+`rootyard_mirror_rate_limited_total`, `rootyard_mirror_evictions_total`,
+`rootyard_mirror_evicted_items_total`, `rootyard_mirror_reclaimed_bytes_total`,
+`rootyard_mirror_disk_bytes`, `rootyard_mirror_snapshots`,
+`rootyard_mirror_pins`, `rootyard_mirror_job_views`, and
+`rootyard_mirror_active_leases`).
+

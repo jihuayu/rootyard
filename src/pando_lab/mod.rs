@@ -1,6 +1,13 @@
 //! Lab code is deliberately separate from rootyard::Storage and all serving routes.
+pub mod delta;
+pub mod export;
+pub mod graph;
 mod hook;
 mod http;
+pub mod migration;
+pub mod object_store;
+pub mod repack;
+pub mod rollback;
 mod store;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -256,7 +263,187 @@ pub async fn run() -> Result<()> {
         }
         Some("serve") if args.len() == 1 => http::serve(Arc::new(config)).await?,
         Some("hook") if args.len() == 1 => hook::run(&config).await?,
-        _ => bail!("usage: rootyard-pando-lab init | create-repo <uuid> <principal> | serve"),
+        Some("verify-delta") if args.len() == 2 => {
+            let bytes = std::fs::read(&args[1])?;
+            let report = delta::verify_pack(&bytes, &delta::Limits::default())?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("walk-graph") if args.len() >= 2 => {
+            let repo: Uuid = args[1].parse()?;
+            let mut wants = Vec::new();
+            let mut haves = Vec::new();
+            let mut in_haves = false;
+            for arg in &args[2..] {
+                if arg == "--have" {
+                    in_haves = true;
+                } else if let Some(stripped) = arg.strip_prefix('^') {
+                    haves.push(stripped.to_owned());
+                } else if in_haves {
+                    haves.push(arg.clone());
+                    in_haves = false;
+                } else {
+                    wants.push(arg.clone());
+                }
+            }
+            let snap = store::snapshot(&config, repo).await?;
+            let mut obj_store = graph::ObjectStore::default();
+            for pack in &snap.packs {
+                object_store::ensure_local_pack_cached(&config, repo, pack)?;
+                let prefix = config
+                    .root
+                    .join("objects")
+                    .join(repo.to_string())
+                    .join(pack.id.to_string());
+                let pack_bytes = std::fs::read(prefix.with_extension("pack"))?;
+                let report = delta::verify_pack(&pack_bytes, &delta::Limits::default())?;
+                obj_store.insert_pack(&report);
+            }
+            if wants.is_empty() {
+                wants = snap.refs.values().cloned().collect();
+            }
+            let report = graph::walk_reachable(&obj_store, &wants, &haves)?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("diff-export") if args.len() >= 2 => {
+            let repo: Uuid = args[1].parse()?;
+            let mut haves = Vec::new();
+            let mut in_haves = false;
+            for arg in &args[2..] {
+                if arg == "--have" {
+                    in_haves = true;
+                } else if let Some(stripped) = arg.strip_prefix('^') {
+                    haves.push(stripped.to_owned());
+                } else if in_haves {
+                    haves.push(arg.clone());
+                    in_haves = false;
+                }
+            }
+            let report = export::diff_export(&config, repo, &haves).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("gc") if args.len() == 1 || args.len() == 2 => {
+            let repo = args.get(1).map(|s| s.parse::<Uuid>()).transpose()?;
+            let report = store::gc(&config, repo).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("migrate") if args.len() == 3 => {
+            let repo: Uuid = args[1].parse()?;
+            let report = migration::migrate_full(&config, repo, Path::new(&args[2])).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("migrate-step") if args.len() == 4 => {
+            let repo: Uuid = args[1].parse()?;
+            let report =
+                migration::migrate_step(&config, repo, Path::new(&args[2]), &args[3]).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("rollback") if args.len() == 3 => {
+            let repo: Uuid = args[1].parse()?;
+            let report = rollback::rollback(&config, repo, Path::new(&args[2])).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("migration-status") if args.len() == 2 => {
+            let repo: Uuid = args[1].parse()?;
+            let report = migration::status(&config, repo).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("repack") if args.len() >= 2 => {
+            let repo: Uuid = args[1].parse()?;
+            let mut opts = repack::RepackOptions::default();
+            let mut i = 2usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--prune-superseded" => {
+                        opts.prune_superseded = true;
+                        i += 1;
+                    }
+                    "--no-object-store" => {
+                        opts.sync_object_store = false;
+                        i += 1;
+                    }
+                    "--pin-oid" => {
+                        let oid = args.get(i + 1).context("missing value for --pin-oid")?;
+                        opts.pin_oids.push(oid.clone());
+                        i += 2;
+                    }
+                    other => bail!("unknown repack flag '{other}'"),
+                }
+            }
+            let report = repack::repack_repo(&config, repo, &opts).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("pin-root") if args.len() == 4 => {
+            let repo: Uuid = args[1].parse()?;
+            let report = repack::pin_root(&config, repo, &args[2], &args[3]).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("unpin-root") if args.len() == 3 => {
+            let repo: Uuid = args[1].parse()?;
+            let report = repack::unpin_root(&config, repo, &args[2]).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("object-store-put") if args.len() >= 3 => {
+            let repo: Uuid = args[1].parse()?;
+            let pack_id: Uuid = args[2].parse()?;
+            let mut opts = object_store::ObjectStorePutOptions::default();
+            let mut i = 3usize;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--chunk-size" => {
+                        opts.chunk_size = args
+                            .get(i + 1)
+                            .context("missing value for --chunk-size")?
+                            .parse()?;
+                        i += 2;
+                    }
+                    "--fail-after-chunks" => {
+                        opts.fail_after_chunks = Some(
+                            args.get(i + 1)
+                                .context("missing value for --fail-after-chunks")?
+                                .parse()?,
+                        );
+                        i += 2;
+                    }
+                    "--corrupt-chunk" => {
+                        opts.corrupt_chunk_part = Some(
+                            args.get(i + 1)
+                                .context("missing value for --corrupt-chunk")?
+                                .parse()?,
+                        );
+                        i += 2;
+                    }
+                    "--bucket" => {
+                        opts.bucket = args
+                            .get(i + 1)
+                            .context("missing value for --bucket")?
+                            .clone();
+                        i += 2;
+                    }
+                    other => bail!("unknown object-store-put flag '{other}'"),
+                }
+            }
+            let report = object_store::put_pack(&config, repo, pack_id, &opts).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("object-store-get") if args.len() == 3 => {
+            let repo: Uuid = args[1].parse()?;
+            let pack_id: Uuid = args[2].parse()?;
+            let report = object_store::get_pack(&config, repo, pack_id).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("object-store-verify") if args.len() == 2 => {
+            let repo: Uuid = args[1].parse()?;
+            let report = object_store::verify_repo_store(&config, repo).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        Some("object-store-status") if args.len() == 2 => {
+            let repo: Uuid = args[1].parse()?;
+            let report = object_store::status(&config, repo).await?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        _ => bail!(
+            "usage: rootyard-pando-lab init | create-repo <uuid> <principal> | serve | verify-delta <pack> | walk-graph <repo> [wants... ^haves...] | diff-export <repo> [^haves...] | gc [repo] | migrate <repo> <gitfs_path> | migrate-step <repo> <gitfs_path> <copy|verify|drain|fence|switchover> | rollback <repo> <gitfs_path> | migration-status <repo> | repack <repo> [--prune-superseded] [--no-object-store] [--pin-oid <oid>...] | pin-root <repo> <name> <oid> | unpin-root <repo> <name> | object-store-put <repo> <pack_id> [--chunk-size <bytes>] [--fail-after-chunks <n>] [--corrupt-chunk <part>] | object-store-get <repo> <pack_id> | object-store-verify <repo> | object-store-status <repo>"
+        ),
     }
     Ok(())
 }

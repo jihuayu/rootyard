@@ -21,6 +21,14 @@ fn reply(status: StatusCode, text: &str) -> Response<Body> {
         .unwrap()
 }
 
+fn json_reply(status: StatusCode, value: &impl Serialize) -> Result<Response<Body>> {
+    Ok(Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(serde_json::to_vec(value)?))?)
+}
+
 pub(super) async fn serve(config: Arc<Config>) -> Result<()> {
     let version = String::from_utf8(config.git(&config.root, &["--version"], b"").await?)?;
     let numbers: Vec<u32> = version
@@ -96,6 +104,108 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
         return Ok(reply(StatusCode::NOT_FOUND, "unknown repository"));
     };
     let repo: Uuid = id.parse()?;
+    if token.is_none() && parts.method == "GET" {
+        if tail == "refs" {
+            let db = config.db().await?;
+            if !permitted(&db, repo, principal, false).await? {
+                return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
+            }
+            let snap = store::snapshot(config, repo).await?;
+            return json_reply(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "repo": snap.repo,
+                    "generation": snap.generation,
+                    "storage_generation": snap.storage_generation,
+                    "refs": snap.refs,
+                    "pack_count": snap.packs.len(),
+                }),
+            );
+        }
+        if let Some(op_str) = tail.strip_prefix("operations/") {
+            let Ok(op_id) = op_str.parse::<Uuid>() else {
+                return Ok(reply(StatusCode::NOT_FOUND, "unknown operation"));
+            };
+            let db = config.db().await?;
+            if !permitted(&db, repo, principal, false).await? {
+                return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
+            }
+            let row = db
+                .query_opt(
+                    "SELECT id,repo,principal,state,commands,result FROM pando_lab.operations WHERE id=$1 AND repo=$2",
+                    &[&op_id, &repo],
+                )
+                .await?;
+            let Some(row) = row else {
+                return Ok(reply(StatusCode::NOT_FOUND, "operation not found"));
+            };
+            return json_reply(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "id": row.get::<_, Uuid>(0),
+                    "repo": row.get::<_, Uuid>(1),
+                    "principal": row.get::<_, String>(2),
+                    "state": row.get::<_, String>(3),
+                    "commands": row.get::<_, serde_json::Value>(4),
+                    "result": row.get::<_, Option<serde_json::Value>>(5),
+                }),
+            );
+        }
+        if tail == "migration" {
+            let db = config.db().await?;
+            if !permitted(&db, repo, principal, false).await? {
+                return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
+            }
+            return json_reply(StatusCode::OK, &migration::status(config, repo).await?);
+        }
+        if tail == "packs" {
+            let db = config.db().await?;
+            if !permitted(&db, repo, principal, false).await? {
+                return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
+            }
+            return json_reply(StatusCode::OK, &repack::packs_status(config, repo).await?);
+        }
+        if tail == "object-store" {
+            let db = config.db().await?;
+            if !permitted(&db, repo, principal, false).await? {
+                return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
+            }
+            return json_reply(StatusCode::OK, &object_store::status(config, repo).await?);
+        }
+    }
+    if token.is_none() && parts.method == "POST" && tail == "repack" {
+        let db = config.db().await?;
+        if !permitted(&db, repo, principal, true).await? {
+            return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
+        }
+        let state_row = db
+            .query_opt(
+                "SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1",
+                &[&repo],
+            )
+            .await?;
+        let Some(state_row) = state_row else {
+            return Ok(reply(StatusCode::NOT_FOUND, "unknown repository"));
+        };
+        let write_paused: bool = state_row.get(0);
+        let storage_backend: String = state_row.get(1);
+        if write_paused || storage_backend != "pando" {
+            return Ok(reply(
+                StatusCode::CONFLICT,
+                "repository writes paused or routed to gitfs",
+            ));
+        }
+        let raw_body = to_bytes(body, 64 * 1024).await?;
+        let opts: repack::RepackOptions = if raw_body.is_empty() {
+            repack::RepackOptions::default()
+        } else {
+            serde_json::from_slice(&raw_body)?
+        };
+        return json_reply(
+            StatusCode::OK,
+            &repack::repack_repo(config, repo, &opts).await?,
+        );
+    }
     let service = match (parts.method.as_str(), tail.as_str()) {
         ("GET", "info/refs") => match parts.uri.query() {
             Some("service=git-upload-pack") => "git-upload-pack",
@@ -113,6 +223,25 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
     }
     if token.is_some() && write {
         return Ok(reply(StatusCode::FORBIDDEN, "snapshot is read-only"));
+    }
+    if write {
+        let state_row = db
+            .query_opt(
+                "SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1",
+                &[&repo],
+            )
+            .await?;
+        let Some(state_row) = state_row else {
+            return Ok(reply(StatusCode::NOT_FOUND, "unknown repository"));
+        };
+        let write_paused: bool = state_row.get(0);
+        let storage_backend: String = state_row.get(1);
+        if write_paused || storage_backend != "pando" {
+            return Ok(reply(
+                StatusCode::CONFLICT,
+                "repository writes paused or routed to gitfs",
+            ));
+        }
     }
     let snapshot = if let Some(token) = token {
         let row=db.query_opt("SELECT generation,storage_generation,refs,packs FROM pando_lab.snapshots WHERE id=$1 AND repo=$2 AND principal=$3 AND expires_at>clock_timestamp()",&[&token,&repo,&principal]).await?;

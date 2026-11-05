@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod backup;
+pub mod browse;
 pub mod ci_checkouts;
 pub mod ci_pins;
 pub mod config;
@@ -12,11 +13,17 @@ pub mod forge;
 pub mod git_http;
 pub mod journal;
 pub mod kafka_wake;
+pub mod lfs;
 pub mod maintenance;
+pub mod members;
 pub mod metrics;
 pub mod mirror;
+pub mod pulls;
 pub mod reliability;
+pub mod sharding;
 pub mod storage;
+pub mod web;
+pub mod webhooks;
 
 use axum::{
     Json, Router,
@@ -90,47 +97,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health/ready", get(ready))
         .route("/api/repos", post(create_repo).get(list_repos))
         .route("/api/repos/{owner}/{name}", get(get_repo))
-        .route("/api/repos/{owner}/{name}/ci-pins", post(ci_pins::pin))
-        .route(
-            "/api/repos/{owner}/{name}/ci-checkouts",
-            post(ci_checkouts::issue),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/ci-checkouts/{job}/cancel",
-            post(ci_checkouts::cancel),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/ci-checkouts/{job}/revoke",
-            post(ci_checkouts::revoke),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/operations",
-            get(reliability::operations),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/resolutions",
-            get(reliability::resolutions),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/events",
-            get(reliability::event_list),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/issues",
-            get(forge::list_issues).post(forge::create_issue),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/issues/{number}",
-            get(forge::get_issue).patch(forge::update_issue),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/issues/{number}/comments",
-            get(forge::list_comments).post(forge::create_comment),
-        )
-        .route(
-            "/api/repos/{owner}/{name}/issues/{number}/comments/{comment_number}",
-            get(forge::get_comment).patch(forge::update_comment),
-        )
+        .merge(browse::routes())
+        .merge(ci_pins::routes())
+        .merge(ci_checkouts::routes())
+        .merge(reliability::routes())
+        .merge(forge::routes())
+        .merge(pulls::routes())
+        .merge(lfs::routes())
+        .merge(webhooks::routes())
+        .merge(members::routes())
+        .merge(web::routes())
+        .merge(sharding::routes())
         .fallback(|State(state): State<Arc<AppState>>, request| async move {
             git_http::handle(state, request).await
         })
@@ -255,26 +232,30 @@ async fn get_repo(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     let identity = auth::authenticate(&state.pool, &headers).await?;
-    if owner != identity.username || !db::valid_name(&name) {
+    if !db::valid_name(&owner) || !db::valid_name(&name) {
         return Err(Error::not_found());
     }
-    let row = state
-        .pool
-        .get()
-        .await
-        .map_err(Error::internal)?
-        .query_opt(
-            &format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT),
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let repo_id: Uuid = if owner == identity.username {
+        tx.query_opt(
+            "SELECT id FROM repositories WHERE owner_id=$1 AND name=$2",
             &[&identity.id, &name],
         )
         .await
         .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(db::Repository::from_row(&row)),
-    )
-        .into_response())
+        .ok_or_else(Error::not_found)?
+        .get("id")
+    } else {
+        auth::authorize_repo(&tx, &identity, &owner, &name, false).await?
+    };
+    let row = tx
+        .query_one(&format!("{} WHERE r.id=$1", db::REPO_SELECT), &[&repo_id])
+        .await
+        .map_err(Error::internal)?;
+    let repo = db::Repository::from_row(&row);
+    auth::finish_tx(tx, &identity, false).await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(repo)).into_response())
 }
 
 pub async fn recover(state: &AppState) -> anyhow::Result<usize> {

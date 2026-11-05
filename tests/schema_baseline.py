@@ -1,0 +1,30 @@
+"""Canonical schema baseline derived from migrations/ and schema/ fixtures.
+
+Centralizes version lists, table sets, and catalog paths so parallel tracks
+adding new migrations do not cause cross-suite test conflicts.
+"""
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+MIGRATIONS_DIR = ROOT / "migrations"
+SCHEMA_DIR = ROOT / "schema"
+
+SCHEMA_VERSIONS = sorted(
+    int(path.name.split("_", 1)[0]) for path in MIGRATIONS_DIR.glob("*.sql")
+)
+SCHEMA_VERSION_CSV = ",".join(str(v) for v in SCHEMA_VERSIONS)
+LATEST_VERSION = SCHEMA_VERSIONS[-1]
+LATEST_PREFIX = f"{LATEST_VERSION:03d}"
+
+CATALOG_SQL_PATH = SCHEMA_DIR / f"{LATEST_PREFIX}_catalog.sql"
+CATALOG_JSON_PATH = SCHEMA_DIR / f"{LATEST_PREFIX}_catalog.json"
+RESTORED_CATALOG_JSON_PATH = SCHEMA_DIR / f"{LATEST_PREFIX}_restored_catalog.json"
+UPGRADED_CATALOG_JSON_PATH = SCHEMA_DIR / f"{LATEST_PREFIX}_upgraded_catalog.json"
+
+EXPECTED_TABLES = {
+    entry["name"]
+    for entry in json.loads(CATALOG_JSON_PATH.read_text())["tables"]
+    if entry["kind"] == "r"
+}
+TABLE_COUNT = len(EXPECTED_TABLES)

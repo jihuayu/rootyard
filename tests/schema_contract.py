@@ -13,6 +13,8 @@ import tempfile
 import urllib.parse
 import uuid
 
+from schema_baseline import CATALOG_SQL_PATH, LATEST_PREFIX
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -27,7 +29,7 @@ def main():
     prefix = 'rootyard_contract_' + uuid.uuid4().hex
     created = []
     binary = str(Path(args.binary).resolve())
-    sql = 'SET search_path=pg_catalog;' + Path('schema/008_catalog.sql').read_text()
+    sql = 'SET search_path=pg_catalog;' + CATALOG_SQL_PATH.read_text()
 
     def run(command, db=admin):
         env = os.environ.copy()
@@ -105,8 +107,9 @@ def main():
             roundtrip(upgraded_db, upgraded_restored_db, temporary / 'upgraded008.dump')
             assert catalog(upgraded_restored_db) == restored, 'Upgraded schema did not converge on the full restore contract'
 
-        for filename, value in [('008_catalog.json', actual), ('008_restored_catalog.json', restored),
-                                ('008_upgraded_catalog.json', upgraded)]:
+        for filename, value in [(f'{LATEST_PREFIX}_catalog.json', actual),
+                                (f'{LATEST_PREFIX}_restored_catalog.json', restored),
+                                (f'{LATEST_PREFIX}_upgraded_catalog.json', upgraded)]:
             path = Path('schema') / filename
             if args.write:
                 path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')

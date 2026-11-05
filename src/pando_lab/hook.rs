@@ -77,6 +77,16 @@ pub(super) async fn pre_receive(config: &Config) -> Result<()> {
     let repo: Uuid = std::env::var("PANDO_REPO")?.parse()?;
     let principal = std::env::var("PANDO_PRINCIPAL")?;
     let c = config.db().await?;
+    let repo_row = c
+        .query_one(
+            "SELECT write_paused, storage_backend FROM pando_lab.repositories WHERE id=$1",
+            &[&repo],
+        )
+        .await?;
+    ensure!(
+        !repo_row.get::<_, bool>(0) && repo_row.get::<_, String>(1) == "pando",
+        "repository writes paused or storage backend is not pando"
+    );
     let n=c.execute("UPDATE pando_lab.operations SET state='PREPARED',commands=$4 WHERE id=$1 AND repo=$2 AND principal=$3 AND state='RECEIVING'",&[&op,&repo,&principal,&serde_json::to_value(&commands)?]).await?;
     ensure!(
         n == 1,
@@ -206,11 +216,21 @@ async fn publish(config: &Config, op: Uuid, commands: &[RefCommand]) -> Result<(
         }
     }
     let t = c.transaction().await?;
-    let row=t.query_one("SELECT generation,storage_generation FROM pando_lab.repositories WHERE id=$1 FOR UPDATE",&[&repo]).await?;
+    let row = t
+        .query_one(
+            "SELECT generation,storage_generation,write_paused,storage_backend FROM pando_lab.repositories WHERE id=$1 FOR UPDATE",
+            &[&repo],
+        )
+        .await?;
     let generation: i64 = row.get(0);
     ensure!(
         row.get::<_, i64>(1) == storage_generation,
         "stale storage generation"
+    );
+    ensure!(!row.get::<_, bool>(2), "repository writes paused");
+    ensure!(
+        row.get::<_, String>(3) == "pando",
+        "repository storage backend is not pando"
     );
     let acl = t
         .query_opt(

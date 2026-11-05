@@ -1,12 +1,17 @@
 //! Minimal private-owner Issue API. No organization or collaborator permissions
 //! are implied. Every query carries tenant/repository scope, every request fences
 //! token revocation and repository ownership with PostgreSQL row locks.
-use crate::{AppState, Error, auth, db};
+use crate::{
+    AppState, Error,
+    auth::{self, Role, authorize_repo_with_role as authorize, finish_tx as finish, idempotency_key},
+    db,
+};
 use axum::{
-    Json,
+    Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
+    routing::get,
 };
 use deadpool_postgres::Transaction;
 use serde::{Deserialize, Serialize};
@@ -14,6 +19,30 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio_postgres::Row;
 use uuid::Uuid;
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/api/repos/{owner}/{name}/issues",
+            get(list_issues).post(create_issue),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/issues/{number}",
+            get(get_issue).patch(update_issue),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/issues/{number}/comments",
+            get(list_comments).post(create_comment),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/issues/{number}/comments/{comment_number}",
+            get(get_comment).patch(update_comment),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/backend",
+            get(get_backend).patch(set_backend),
+        )
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -167,27 +196,6 @@ fn body_valid(body: &str, required: bool) -> bool {
             .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
 }
 
-// Keys are opaque client operation identifiers, never authentication credentials.
-// A repository-local namespace also prevents a key from silently changing targets.
-fn idempotency_key(headers: &HeaderMap) -> Result<Option<&str>, Error> {
-    let mut values = headers.get_all("idempotency-key").iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(Error::bad_request());
-    }
-    let key = value.to_str().map_err(|_| Error::bad_request())?;
-    if !(1..=128).contains(&key.len())
-        || !key
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b':' | b'-'))
-    {
-        return Err(Error::bad_request());
-    }
-    Ok(Some(key))
-}
-
 async fn creation_replay(
     tx: &Transaction<'_>,
     actor: Uuid,
@@ -237,63 +245,6 @@ async fn record_creation(
     }
     Ok(())
 }
-
-async fn authorize(
-    tx: &Transaction<'_>,
-    actor: &db::Identity,
-    owner: &str,
-    name: &str,
-    write: bool,
-) -> Result<Uuid, Error> {
-    if owner != actor.username || !db::valid_name(name) {
-        return Err(Error::not_found());
-    }
-    // Keep lock order token/user -> repository -> creation key -> counter/issue/comment.
-    // Revoke and read_only updates must wait for these transaction-scoped locks.
-    tx.query_opt(
-        "SELECT t.id FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND u.username=$3 FOR SHARE OF t,u",
-        &[&actor.token_id, &actor.id, &owner],
-    )
-    .await
-    .map_err(Error::internal)?
-    .ok_or_else(Error::unauthorized)?;
-    verify_token(tx, actor, write).await?;
-    let row = tx
-        .query_opt(
-            "SELECT id,state FROM repositories WHERE owner_id=$1 AND name=$2 FOR SHARE",
-            &[&actor.id, &name],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    if row.get::<_, String>("state") != "ready" {
-        return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
-    }
-    Ok(row.get("id"))
-}
-async fn verify_token(
-    tx: &Transaction<'_>,
-    actor: &db::Identity,
-    write: bool,
-) -> Result<(), Error> {
-    // A separate statement observes the real database clock *after* lock waits.
-    let row = tx.query_opt(
-        "SELECT read_only FROM tokens WHERE id=$1 AND user_id=$2 AND digest=$3 AND NOT revoked AND (expires_at IS NULL OR expires_at > clock_timestamp())",
-        &[&actor.token_id, &actor.id, &actor.token_digest],
-    )
-    .await
-    .map_err(Error::internal)?
-    .ok_or_else(Error::unauthorized)?;
-    if write && row.get::<_, bool>(0) {
-        return Err(Error(StatusCode::FORBIDDEN, "write permission required"));
-    }
-    Ok(())
-}
-async fn finish(tx: Transaction<'_>, actor: &db::Identity, write: bool) -> Result<(), Error> {
-    // Allocation/row waits must not turn an expired token into a successful write.
-    verify_token(&tx, actor, write).await?;
-    tx.commit().await.map_err(Error::internal)
-}
 async fn issue_exists(
     tx: &Transaction<'_>,
     actor: Uuid,
@@ -323,20 +274,21 @@ pub async fn create_issue(
     let key = idempotency_key(&headers)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+    let access = authorize(&tx, &actor, &owner, &name, Role::Triage).await?;
+    let (repo, tenant_id) = (access.repo_id, access.owner_id);
     if let Some(key) = key {
         let request =
             serde_json::json!({"operation":"issue", "title":input.title, "body":input.body});
-        if let Some(response) = creation_replay(&tx, actor.id, repo, key, &request).await? {
+        if let Some(response) = creation_replay(&tx, tenant_id, repo, key, &request).await? {
             finish(tx, &actor, true).await?;
             return Ok(json(StatusCode::CREATED, response));
         }
     }
-    tx.execute("INSERT INTO forge_issue_counters (tenant_id,repository_id) VALUES($1,$2) ON CONFLICT DO NOTHING", &[&actor.id, &repo]).await.map_err(Error::internal)?;
-    let number: i64 = tx.query_one("UPDATE forge_issue_counters SET next_number=next_number+1 WHERE tenant_id=$1 AND repository_id=$2 RETURNING next_number-1", &[&actor.id, &repo]).await.map_err(Error::internal)?.get(0);
-    let row = tx.query_one(&format!("INSERT INTO forge_issues (tenant_id,repository_id,number,author_id,title,body) VALUES($1,$2,$3,$1,$4,$5) RETURNING {ISSUE_FIELDS}"), &[&actor.id, &repo, &number, &input.title, &input.body]).await.map_err(Error::internal)?;
+    tx.execute("INSERT INTO forge_issue_counters (tenant_id,repository_id) VALUES($1,$2) ON CONFLICT DO NOTHING", &[&tenant_id, &repo]).await.map_err(Error::internal)?;
+    let number: i64 = tx.query_one("UPDATE forge_issue_counters SET next_number=next_number+1 WHERE tenant_id=$1 AND repository_id=$2 RETURNING next_number-1", &[&tenant_id, &repo]).await.map_err(Error::internal)?.get(0);
+    let row = tx.query_one(&format!("INSERT INTO forge_issues (tenant_id,repository_id,number,author_id,title,body) VALUES($1,$2,$3,$4,$5,$6) RETURNING {ISSUE_FIELDS}"), &[&tenant_id, &repo, &number, &actor.id, &input.title, &input.body]).await.map_err(Error::internal)?;
     let issue = serde_json::to_value(Issue::row(&row)).map_err(Error::internal)?;
-    record_creation(&tx, actor.id, repo, key, &issue).await?;
+    record_creation(&tx, tenant_id, repo, key, &issue).await?;
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::CREATED, issue))
 }
@@ -352,8 +304,9 @@ pub async fn list_issues(
     let filter = page.state.as_ref().map(IssueState::as_str);
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
-    let rows = tx.query(&format!("SELECT {ISSUE_FIELDS} FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND number>$3 AND ($5::text IS NULL OR state=$5) ORDER BY number LIMIT $4"), &[&actor.id, &repo, &after, &(limit+1), &filter]).await.map_err(Error::internal)?;
+    let access = authorize(&tx, &actor, &owner, &name, Role::Read).await?;
+    let (repo, tenant_id) = (access.repo_id, access.owner_id);
+    let rows = tx.query(&format!("SELECT {ISSUE_FIELDS} FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND number>$3 AND ($5::text IS NULL OR state=$5) ORDER BY number LIMIT $4"), &[&tenant_id, &repo, &after, &(limit+1), &filter]).await.map_err(Error::internal)?;
     let more = rows.len() > limit as usize;
     let items: Vec<_> = rows.iter().take(limit as usize).map(Issue::row).collect();
     let next_after = if more {
@@ -377,8 +330,9 @@ pub async fn get_issue(
     positive(number)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
-    let row = tx.query_opt(&format!("SELECT {ISSUE_FIELDS} FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND number=$3"), &[&actor.id,&repo,&number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let access = authorize(&tx, &actor, &owner, &name, Role::Read).await?;
+    let (repo, tenant_id) = (access.repo_id, access.owner_id);
+    let row = tx.query_opt(&format!("SELECT {ISSUE_FIELDS} FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND number=$3"), &[&tenant_id,&repo,&number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let issue = Issue::row(&row);
     finish(tx, &actor, false).await?;
     Ok(json(StatusCode::OK, issue))
@@ -405,9 +359,10 @@ pub async fn update_issue(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, true).await?;
-    issue_exists(&tx, actor.id, repo, number).await?;
-    let row = tx.query_opt(&format!("UPDATE forge_issues SET title=COALESCE($5,title),body=COALESCE($6,body),state=COALESCE($7,state),version=version+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 AND version=$4 RETURNING {ISSUE_FIELDS}"), &[&actor.id,&repo,&number,&input.expected_version,&input.title,&input.body,&input.state]).await.map_err(Error::internal)?.ok_or(Error(StatusCode::CONFLICT,"issue version conflict"))?;
+    let access = authorize(&tx, &actor, &owner, &name, Role::Triage).await?;
+    let (repo, tenant_id) = (access.repo_id, access.owner_id);
+    issue_exists(&tx, tenant_id, repo, number).await?;
+    let row = tx.query_opt(&format!("UPDATE forge_issues SET title=COALESCE($5,title),body=COALESCE($6,body),state=COALESCE($7,state),version=version+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 AND version=$4 RETURNING {ISSUE_FIELDS}"), &[&tenant_id,&repo,&number,&input.expected_version,&input.title,&input.body,&input.state]).await.map_err(Error::internal)?.ok_or(Error(StatusCode::CONFLICT,"issue version conflict"))?;
     let issue = Issue::row(&row);
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::OK, issue))
@@ -427,19 +382,20 @@ pub async fn create_comment(
     let key = idempotency_key(&headers)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+    let access = authorize(&tx, &actor, &owner, &name, Role::Triage).await?;
+    let (repo, tenant_id) = (access.repo_id, access.owner_id);
     if let Some(key) = key {
         let request =
             serde_json::json!({"operation":"comment", "issue_number":number, "body":input.body});
-        if let Some(response) = creation_replay(&tx, actor.id, repo, key, &request).await? {
+        if let Some(response) = creation_replay(&tx, tenant_id, repo, key, &request).await? {
             finish(tx, &actor, true).await?;
             return Ok(json(StatusCode::CREATED, response));
         }
     }
-    let comment_number: i64 = tx.query_opt("UPDATE forge_issues SET next_comment_number=next_comment_number+1 WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 RETURNING next_comment_number-1", &[&actor.id,&repo,&number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?.get(0);
-    let row = tx.query_one(&format!("INSERT INTO forge_issue_comments (tenant_id,repository_id,issue_number,number,author_id,body) VALUES($1,$2,$3,$4,$1,$5) RETURNING {COMMENT_FIELDS}"), &[&actor.id,&repo,&number,&comment_number,&input.body]).await.map_err(Error::internal)?;
+    let comment_number: i64 = tx.query_opt("UPDATE forge_issues SET next_comment_number=next_comment_number+1 WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 RETURNING next_comment_number-1", &[&tenant_id,&repo,&number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?.get(0);
+    let row = tx.query_one(&format!("INSERT INTO forge_issue_comments (tenant_id,repository_id,issue_number,number,author_id,body) VALUES($1,$2,$3,$4,$5,$6) RETURNING {COMMENT_FIELDS}"), &[&tenant_id,&repo,&number,&comment_number,&actor.id,&input.body]).await.map_err(Error::internal)?;
     let comment = serde_json::to_value(Comment::row(&row)).map_err(Error::internal)?;
-    record_creation(&tx, actor.id, repo, key, &comment).await?;
+    record_creation(&tx, tenant_id, repo, key, &comment).await?;
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::CREATED, comment))
 }
@@ -455,9 +411,10 @@ pub async fn list_comments(
     let (after, limit) = page.bounds()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
-    issue_exists(&tx, actor.id, repo, number).await?;
-    let rows = tx.query(&format!("SELECT {COMMENT_FIELDS} FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number>$4 ORDER BY number LIMIT $5"), &[&actor.id,&repo,&number,&after,&(limit+1)]).await.map_err(Error::internal)?;
+    let access = authorize(&tx, &actor, &owner, &name, Role::Read).await?;
+    let (repo, tenant_id) = (access.repo_id, access.owner_id);
+    issue_exists(&tx, tenant_id, repo, number).await?;
+    let rows = tx.query(&format!("SELECT {COMMENT_FIELDS} FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number>$4 ORDER BY number LIMIT $5"), &[&tenant_id,&repo,&number,&after,&(limit+1)]).await.map_err(Error::internal)?;
     let more = rows.len() > limit as usize;
     let items: Vec<_> = rows.iter().take(limit as usize).map(Comment::row).collect();
     let next_after = if more {
@@ -482,8 +439,9 @@ pub async fn get_comment(
     positive(comment_number)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
-    let row = tx.query_opt(&format!("SELECT {COMMENT_FIELDS} FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4"), &[&actor.id,&repo,&number,&comment_number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let access = authorize(&tx, &actor, &owner, &name, Role::Read).await?;
+    let (repo, tenant_id) = (access.repo_id, access.owner_id);
+    let row = tx.query_opt(&format!("SELECT {COMMENT_FIELDS} FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4"), &[&tenant_id,&repo,&number,&comment_number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let comment = Comment::row(&row);
     finish(tx, &actor, false).await?;
     Ok(json(StatusCode::OK, comment))
@@ -504,13 +462,151 @@ pub async fn update_comment(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, true).await?;
-    tx.query_opt("SELECT number FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4", &[&actor.id,&repo,&number,&comment_number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
-    let row = tx.query_opt(&format!("UPDATE forge_issue_comments SET body=$6,version=version+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4 AND version=$5 RETURNING {COMMENT_FIELDS}"), &[&actor.id,&repo,&number,&comment_number,&input.expected_version,&input.body]).await.map_err(Error::internal)?.ok_or(Error(StatusCode::CONFLICT,"comment version conflict"))?;
+    let access = authorize(&tx, &actor, &owner, &name, Role::Triage).await?;
+    let (repo, tenant_id) = (access.repo_id, access.owner_id);
+    tx.query_opt("SELECT number FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4", &[&tenant_id,&repo,&number,&comment_number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let row = tx.query_opt(&format!("UPDATE forge_issue_comments SET body=$6,version=version+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4 AND version=$5 RETURNING {COMMENT_FIELDS}"), &[&tenant_id,&repo,&number,&comment_number,&input.expected_version,&input.body]).await.map_err(Error::internal)?.ok_or(Error(StatusCode::CONFLICT,"comment version conflict"))?;
     let comment = Comment::row(&row);
     finish(tx, &actor, true).await?;
     Ok(json(StatusCode::OK, comment))
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendPatch {
+    pub storage_backend: String,
+    pub expected_storage_generation: Option<i64>,
+    #[serde(default)]
+    pub write_paused: bool,
+    #[serde(default)]
+    pub pando_ready: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageBackendMarker {
+    pub storage_backend: String,
+    pub storage_generation: i64,
+    #[serde(default)]
+    pub write_paused: bool,
+    #[serde(default)]
+    pub pando_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendStatusResponse {
+    pub repository_id: Uuid,
+    pub owner: String,
+    pub name: String,
+    pub storage_backend: String,
+    pub storage_generation: i64,
+    pub state: String,
+    pub gateway_route: String,
+    pub read_backend: String,
+    pub write_backend: String,
+    pub write_paused: bool,
+    pub pando_ready: bool,
+    pub gitfs_ready: bool,
+}
+
+pub(crate) fn read_repo_git_config_backend(repo_path: &std::path::Path) -> (Option<String>, bool) {
+    let Ok(cfg_text) = std::fs::read_to_string(repo_path.join("config")) else { return (None, false); };
+    let (mut in_ry, mut backend, mut paused) = (false, None, false);
+    for raw in cfg_text.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_ry = line[1..line.len() - 1].trim().eq_ignore_ascii_case("rootyard");
+        } else if in_ry {
+            if let Some((k, v)) = line.split_once('=') {
+                let (k, v) = (k.trim(), v.trim().trim_matches('"'));
+                if k.eq_ignore_ascii_case("storagebackend") && matches!(v, "gitfs" | "pando") {
+                    backend = Some(v.to_owned());
+                } else if k.eq_ignore_ascii_case("writepaused") {
+                    paused = v.eq_ignore_ascii_case("true") || v == "1" || v.eq_ignore_ascii_case("yes");
+                }
+            }
+        }
+    }
+    (backend, paused)
+}
+
+pub(crate) fn read_repo_backend_marker(repo_path: &std::path::Path) -> Option<StorageBackendMarker> {
+    serde_json::from_slice(&std::fs::read(repo_path.join("rootyard-storage-backend.json")).ok()?).ok()
+}
+
+fn write_repo_backend_marker(repo_path: &std::path::Path, marker: &StorageBackendMarker) -> std::io::Result<()> {
+    let tmp = repo_path.join(format!(".rootyard-storage-backend.tmp-{}", Uuid::new_v4()));
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    std::io::Write::write_all(&mut f, &serde_json::to_vec_pretty(marker)?)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, repo_path.join("rootyard-storage-backend.json"))?;
+    std::fs::File::open(repo_path)?.sync_all()
+}
+
+pub(crate) fn build_backend_status(
+    state: &AppState, repository_id: Uuid, owner: String, name: String, repo_state: String, db_backend: &str, storage_generation: i64,
+) -> BackendStatusResponse {
+    let repo_path = state.storage.repo_path(repository_id);
+    let gitfs_ready = repo_state == "ready" && state.storage.verify_path(repository_id).is_ok();
+    let marker = read_repo_backend_marker(&repo_path);
+    let (cfg_backend, cfg_paused) = read_repo_git_config_backend(&repo_path);
+    let is_pando = db_backend == "pando" || marker.as_ref().is_some_and(|m| m.storage_backend == "pando") || cfg_backend.as_deref() == Some("pando");
+    let storage_backend = if is_pando { "pando".to_owned() } else { "gitfs".to_owned() };
+    let write_paused = marker.as_ref().map(|m| m.write_paused).unwrap_or(cfg_paused);
+    let gateway_route = if is_pando { "pando_gateway".to_owned() } else { "gitfs_local".to_owned() };
+    let pando_ready = repo_state == "ready" && (is_pando || marker.as_ref().is_some_and(|m| m.pando_ready) || state.storage.root.join("pando").join("objects").join(repository_id.to_string()).is_dir());
+    BackendStatusResponse {
+        repository_id, owner, name, read_backend: storage_backend.clone(), write_backend: storage_backend.clone(),
+        storage_backend, storage_generation, state: repo_state, gateway_route, write_paused, pando_ready, gitfs_ready,
+    }
+}
+
+pub async fn get_backend(
+    State(state): State<Arc<AppState>>, Path((owner, name)): Path<(String, String)>, headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let row = tx.query_one("SELECT r.name, r.state, r.storage_backend, r.storage_generation, u.username FROM repositories r JOIN users u ON u.id = r.owner_id WHERE r.id = $1", &[&repo_id]).await.map_err(Error::internal)?;
+    let status = build_backend_status(&state, repo_id, row.get("username"), row.get("name"), row.get("state"), row.get::<_, &str>("storage_backend"), row.get("storage_generation"));
+    finish(tx, &actor, false).await?;
+    Ok(json(StatusCode::OK, status))
+}
+
+pub async fn set_backend(
+    State(state): State<Arc<AppState>>, Path((owner, name)): Path<(String, String)>, headers: HeaderMap, Json(input): Json<BackendPatch>,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    if !matches!(input.storage_backend.as_str(), "gitfs" | "pando") { return Err(Error::bad_request()); }
+    if let Some(expected) = input.expected_storage_generation { positive(expected)?; }
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let access = authorize(&tx, &actor, &owner, &name, Role::Admin).await?;
+    let repo_id = access.repo_id;
+    let _write_guard = state.storage.write_lock(repo_id).await;
+    let row = tx.query_one("SELECT r.name, r.state, r.storage_backend, r.storage_generation, u.username FROM repositories r JOIN users u ON u.id = r.owner_id WHERE r.id = $1 FOR UPDATE OF r", &[&repo_id]).await.map_err(Error::internal)?;
+    let current_gen: i64 = row.get("storage_generation");
+    if input.expected_storage_generation.is_some_and(|exp| exp != current_gen) {
+        return Err(Error(StatusCode::CONFLICT, "storage generation conflict"));
+    }
+    let updated = tx.query_one("UPDATE repositories SET storage_generation = storage_generation + 1 WHERE id = $1 RETURNING state, storage_generation", &[&repo_id]).await.map_err(Error::internal)?;
+    let (new_gen, repo_state): (i64, String) = (updated.get("storage_generation"), updated.get("state"));
+    let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
+    let marker = StorageBackendMarker { storage_backend: input.storage_backend.clone(), storage_generation: new_gen, write_paused: input.write_paused, pando_ready: input.pando_ready.unwrap_or(input.storage_backend == "pando") };
+    write_repo_backend_marker(&repo_path, &marker).map_err(Error::internal)?;
+    let (gen_str, paused_str) = (new_gen.to_string(), if input.write_paused { "true" } else { "false" });
+    let receive_pack = if !input.write_paused && input.storage_backend == "gitfs" { "true" } else { "false" };
+    for (k, v) in [("rootyard.storageBackend", input.storage_backend.as_str()), ("rootyard.storageGeneration", gen_str.as_str()), ("rootyard.writePaused", paused_str), ("http.receivepack", receive_pack)] {
+        let out = state.storage.git(&state.config).arg("--git-dir").arg(&repo_path).args(["config", k, v]).output().await.map_err(Error::internal)?;
+        if !out.status.success() { return Err(Error::internal("failed to update repository backend config")); }
+    }
+    crate::members::audit::record_audit_event(&tx, access.owner_id, repo_id, &actor, "repository.storage_backend.changed", "repository", &name, serde_json::json!({"storage_backend": input.storage_backend, "old_storage_generation": current_gen, "new_storage_generation": new_gen})).await?;
+    let status = build_backend_status(&state, repo_id, row.get("username"), row.get("name"), repo_state, &input.storage_backend, new_gen);
+    finish(tx, &actor, true).await?;
+    Ok(json(StatusCode::OK, status))
+}
+
 
 #[cfg(test)]
 mod tests {

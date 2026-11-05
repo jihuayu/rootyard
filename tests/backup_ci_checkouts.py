@@ -18,6 +18,13 @@ import uuid
 
 from backup_ci_pins import BackupCiPinsHarness
 from ci_job_checkouts import JobCheckoutHarness
+from schema_baseline import (
+    CATALOG_JSON_PATH,
+    RESTORED_CATALOG_JSON_PATH,
+    SCHEMA_VERSIONS,
+    SCHEMA_VERSION_CSV,
+    UPGRADED_CATALOG_JSON_PATH,
+)
 
 
 class CheckoutBackupHarness(BackupCiPinsHarness):
@@ -59,7 +66,7 @@ class CheckoutBackupHarness(BackupCiPinsHarness):
         self.backup_command()
         self.cli('backup-verify', str(self.backup))
         manifest = json.loads((self.backup / 'manifest.json').read_text())
-        assert manifest['format'] == 5 and manifest['schema_versions'] == [1, 2, 3, 6, 7, 8]
+        assert manifest['format'] == 5 and manifest['schema_versions'] == SCHEMA_VERSIONS
         assert self.raw.encode() not in (self.backup / 'metadata.dump').read_bytes()
         legacy_env = self.env.copy()
         legacy_env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target))
@@ -127,11 +134,10 @@ def legacy_restore(args):
         shutil.copytree(h.backup, hybrid, symlinks=True)
         changed = copy.deepcopy(manifest)
         changed['format'] = 5
-        changed['schema_versions'] = [1, 2, 3, 6, 7, 8]
+        changed['schema_versions'] = SCHEMA_VERSIONS
         changed['binary_sha256'] = hashlib.sha256(Path(args.binary).read_bytes()).hexdigest()
-        schema = Path(__file__).resolve().parents[1] / 'schema'
-        catalogs = [json.loads((schema / name).read_text()) for name in
-                    ['008_catalog.json', '008_restored_catalog.json', '008_upgraded_catalog.json']]
+        catalogs = [json.loads(path.read_text()) for path in
+                    [CATALOG_JSON_PATH, RESTORED_CATALOG_JSON_PATH, UPGRADED_CATALOG_JSON_PATH]]
         changed['schema_contract_sha256'] = hashlib.sha256(json.dumps(catalogs, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
         body = json.dumps(changed).encode()
         (hybrid / 'manifest.json').write_bytes(body)
@@ -143,7 +149,7 @@ def legacy_restore(args):
         assert not hybrid_target.exists()
         assert (h.root / '.hybrid-target.rootyard-restoring').exists()
         h.run([args.binary, 'migrate'], env=env)
-        assert h.query(h.target_db, "SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == '1,2,3,6,7,8'
+        assert h.query(h.target_db, "SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == SCHEMA_VERSION_CSV
         assert h.query(h.target_db, 'SELECT count(*) FROM ci_checkout_jobs') == '0'
         return dict(real_historical_binary_archive=True, no_manifest_rewriting=True,
                     explicit_legacy_opt_in_required=True, schema007_verified_before_upgrade=True,

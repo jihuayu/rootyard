@@ -8,7 +8,7 @@ A workspace contains a **complete independent copy** of native Git metadata and 
 
 Only Linux, case-sensitive local filesystems, ordinary files, internal relative symlinks and Unix execution bits are within scope. Agent names are labels, not authenticated identities. A store must be private (0700), owned and operated by a trusted single OS identity. **Do not expose this binary to untrusted users or untrusted repositories.** Use a dedicated empty store outside the source repository and outside the Git hosting data volume.
 
-This is the first slice of phase five. Namespace revision is fixed to 1 with one repository per workspace. There is no virtual mount tree or multi-repository BaseVector yet. Native paths remain native paths; no FUSE, live capture, watcher, daemon, automatic `git add`, commit, push, remote storage or HTTP interface is introduced.
+This laboratory spans single-repository workspace primitives, Phase-5 Track D cross-node remote CAS and multi-repository Namespace extensions (`push-remote`, `pull-remote`, `namespace-mount`, `verify-namespace`, `namespace-git-view`), and Phase-5 Track 3 on-demand VFS mounts (`vfs-mount`, `vfs-hydrate`, `vfs-status`, `vfs-evict`). Native paths remain native paths; no FUSE, live capture, watcher, daemon, automatic `git add`, commit, push, or HTTP interface is introduced.
 
 ## Commands
 
@@ -23,9 +23,23 @@ $LAB init /private/workspace-store /path/to/trusted/source agent-one "$BASE" --q
 $LAB checkpoint /private/workspace-store WORKSPACE_UUID --quiescent
 $LAB restore /private/workspace-store CHECKPOINT_UUID agent-two
 $LAB inspect /private/workspace-store WORKSPACE_UUID
+$LAB status /private/workspace-store WORKSPACE_UUID
+$LAB changeset /private/workspace-store BASE_CHECKPOINT_UUID SOURCE_CHECKPOINT_UUID
+$LAB apply /private/workspace-store WORKSPACE_UUID CHANGESET_UUID --quiescent
+$LAB sync-dirty /private/workspace-store SOURCE_WORKSPACE_UUID [TARGET_WORKSPACE_UUID] --quiescent
+$LAB verify-readonly-view /private/workspace-store CHECKPOINT_UUID [VIEW_PATH]
+$LAB push-remote /private/workspace-store WORKSPACE_OR_CHECKPOINT_UUID /private/remote-cas [--quiescent]
+$LAB pull-remote /private/workspace-store /private/remote-cas CHECKPOINT_UUID agent-three
+$LAB namespace-mount /private/workspace-store NAMESPACE_NAME apps/payments=CHECKPOINT_UUID_1 libs/common=CHECKPOINT_UUID_2
+$LAB verify-namespace /private/workspace-store NAMESPACE_UUID [VIEW_PATH]
+$LAB namespace-git-view /private/workspace-store NAMESPACE_UUID [VIEW_PATH]
+$LAB vfs-mount /private/workspace-store CHECKPOINT_UUID agent-four [--remote-cas /private/remote-cas] [--inline-threshold 4096] [--hydrate-pattern "src/**"]
+$LAB vfs-hydrate /private/workspace-store VFS_UUID "assets/*.bin" [--cow-write CONTENT_OR_FILE] [--prewarm]
+$LAB vfs-status /private/workspace-store VFS_UUID
+$LAB vfs-evict /private/workspace-store VFS_UUID "assets/*.bin" [--quiescent] [--skip-dirty]
 ```
 
-The store's parent must already exist. The tool creates the store itself with 0700 permissions if absent. Output is JSON with workspace/checkpoint UUIDs, base OID and repo path. IDs must be canonical UUIDs, not paths. `init` requires a normal independent `.git` directory and HEAD exactly equal to the supplied full base OID. It copies the current staged and unstaged state as well; it does not reset the source or implicitly check out a different commit. The source and store may not overlap. `restore` always creates a new workspace, never replaces an existing workspace. Forking means restoring the same completed local checkpoint under a new agent label.
+The store's parent must already exist. The tool creates the store itself with 0700 permissions if absent. Output is JSON with workspace/checkpoint UUIDs, base OID and repo path. IDs must be canonical UUIDs, not paths. `init` requires a normal independent `.git` directory and HEAD exactly equal to the supplied full base OID. It copies the current staged and unstaged state as well; it does not reset the source or implicitly check out a different commit. The source and store may not overlap. `restore` always creates a new workspace, never replaces an existing workspace. Forking means restoring the same completed local checkpoint under a new agent label. `status` reports clean/dirty state, staged/unstaged/untracked/unmerged paths, `.gitignore`/`.rootyardignore` classification, and SHA-256 `dirty_entries`. `changeset` computes an ordered checkpoint-to-checkpoint delta (`changesets/<uuid>/changeset.json` and `.sha256`), `apply` atomically applies a changeset with pre-flight conflict detection failing closed on any target divergence, `sync-dirty` incrementally synchronizes dirty managed files while excluding ignored files, and `verify-readonly-view` projects and validates immutable read-only (`mode & 0o555`) checkpoint views and detects tampering. `push-remote` and `pull-remote` synchronize local checkpoints and dirty-file manifests with a content-addressed remote store (`blobs/<sha256[0..2]>/<sha256>`) for cross-node workspace recovery. `namespace-mount`, `verify-namespace`, and `namespace-git-view` mount non-overlapping checkpoints under a pinned multi-repository `BaseVector`, verify read-only virtual namespace trees without upper `.git` directories, and project deterministic `task_snapshot` Git repositories passing `git clone` and `git fsck --full --strict`. `vfs-mount` builds a lazy sparse virtual workspace mount (`vfs/<uuid>/vfs.json`, `vfs.sha256`, and `mount/`) from a local or remote CAS checkpoint, materializing `.git` metadata and small or pattern-matched files (`--inline-threshold`, `--hydrate-pattern`) while keeping unaccessed large files `dehydrated`. `vfs-hydrate` transparently pulls and verifies (`O_NOFOLLOW`, SHA-256, and byte size) dehydrated blobs on demand, before Copy-on-Write modification (`--cow-write`), or during batch offline prewarm (`--prewarm`). `vfs-status` classifies entries into `dehydrated`, `hydrated_clean`, and `hydrated_dirty` while respecting `.gitignore` and `.rootyardignore` and reporting byte savings (`unhydrated_bytes`). `vfs-evict` reclaims disk space by dehydrating `hydrated_clean` files while strictly protecting `hydrated_dirty` Copy-on-Write files against eviction (failing closed with a conflict error unless `--skip-dirty` is passed).
 
 Pass an absolute qualified Git executable in `ROOTYARD_WORKSPACE_GIT`, or the binary uses `git` from PATH. The exact Git version string is captured. Restore rejects a different version; cross-version migration has not been implemented. No server environment variables or database connection are required.
 
@@ -33,7 +47,7 @@ Pass an absolute qualified Git executable in `ROOTYARD_WORKSPACE_GIT`, or the bi
 
 `--quiescent` is an explicit **caller assertion** that all editors, Git processes, build processes, background writers and open writable mappings are stopped until capture returns. The tool does not establish that condition. A store-wide advisory lock serializes this tool's operations only; it cannot fence other processes. A file-length change or Git lock is rejected where detected, but unchanged length, mtime or a successful scan does not prove a consistent instant. The lab therefore cannot offer strong checkpoint consistency for a live workspace.
 
-Checkpoints return `state=local_complete`, `durability=local_filesystem_only` and `consistency=caller_quiescent`. They are deliberately **not** named `COMMITTED`, which the full design reserves for complete remotely persisted dependencies and metadata publication. No cross-node recovery, power-loss RPO or production crash-safety claim follows from these local tests.
+Local-only checkpoints return `state=local_complete`, `durability=local_filesystem_only` and `consistency=caller_quiescent`. When `push-remote` persists a checkpoint to a content-addressed remote store (`REMOTE_CAS_DIR`), every referenced content blob and `dirty_manifest.json` are written via `.tmp-<uuid>`, `O_NOFOLLOW`, `fsync`, and read-back SHA-256 + byte-size verification before publishing `checkpoints/<uuid>/manifest.json` with `state=COMMITTED` and `durability=remote_cas_committed`, enabling `pull-remote` cross-node workspace restore.
 
 A local checkpoint captures:
 
@@ -42,9 +56,9 @@ A local checkpoint captures:
 - Complete supported `.git` contents, including local refs, reflogs, merge/rebase/cherry-pick/sequencer data and objects. This intentionally copies more history than the current commit alone.
 - Raw worktree bytes, symlink targets, deletion absence and ordinary permission bits. Worktree bytes are not reconstructed from index blobs or a diff.
 
-Managed worktree paths are the union of HEAD tree paths, every index stage's paths and Git's untracked/nonignored paths. Native `git ls-files --others --exclude-standard` implements ignore hierarchy and negation. A tracked file remains managed under an ignored parent. `git add -f` promotes a path via the index. `git rm --cached` leaves it managed through HEAD until the deletion is committed. Ignored untracked data remains in the original live workspace, but is excluded from init copies, checkpoints and forks. Ignore changes do not remove local files or rewrite older snapshots. Empty directories are not captured.
+Managed worktree paths are the union of HEAD tree paths, every index stage's paths and Git's untracked/nonignored paths that are also not excluded by `.rootyardignore`. Native `git ls-files --others --exclude-standard` together with hierarchical `.rootyardignore` evaluation implements ignore hierarchy and `!` negation. A tracked file remains managed under an ignored parent or matching `.rootyardignore`. `git add -f` promotes a path via the index. `git rm --cached` leaves it managed through HEAD until the deletion is committed. Ignored untracked data remains in the original live workspace, but is excluded from init copies, checkpoints, forks and `sync-dirty`. Ignore changes do not remove local files or rewrite older snapshots. Empty directories are not captured.
 
-Global/system Git configuration and global excludes/attributes are disabled for deterministic behavior. Repository `.gitignore` and `.git/info/exclude` apply. This is a deliberate narrower environment, not a claim to reproduce arbitrary user-global ignore policy. Restoring raw index bytes to newly created inodes invalidates ordinary stat observations. Optional Git lock/refresh writes are disabled while observing; unsupported index caches are rejected instead of being silently dropped.
+Global/system Git configuration and global excludes/attributes are disabled for deterministic behavior. Repository `.gitignore`, `.git/info/exclude`, and `.rootyardignore` apply. This is a deliberate narrower environment, not a claim to reproduce arbitrary user-global ignore policy. Restoring raw index bytes to newly created inodes invalidates ordinary stat observations. Optional Git lock/refresh writes are disabled while observing; unsupported index caches are rejected instead of being silently dropped.
 
 ## Publication, integrity and recovery
 
@@ -58,7 +72,25 @@ store/
   checkpoints/<uuid>/manifest.json
   checkpoints/<uuid>/manifest.sha256
   checkpoints/<uuid>/repo/
+  changesets/<uuid>/changeset.json
+  changesets/<uuid>/changeset.sha256
+  changesets/<uuid>/files/
+  views/<uuid>/repo/
+  namespaces/<uuid>/namespace.json
+  namespaces/<uuid>/namespace.sha256
+  namespaces/<uuid>/tree/<mount_path>/
+  namespaces/<uuid>/git-view/repo/
+  vfs/<uuid>/vfs.json
+  vfs/<uuid>/vfs.sha256
+  vfs/<uuid>/mount/
   staging/<uuid>/
+
+remote-cas/
+  blobs/<sha256[0..2]>/<sha256>
+  checkpoints/<uuid>/dirty_manifest.json
+  checkpoints/<uuid>/dirty_manifest.sha256
+  checkpoints/<uuid>/manifest.json
+  checkpoints/<uuid>/manifest.sha256
 ```
 
 A checkpoint is built in staging, ordinary files are individually fsynced, directory trees are fsynced, and the complete directory is renamed into `checkpoints/`, followed by parent-directory fsync. Restore checks manifest identity/state/version, manifest SHA-256, exact file inventory, every file/symlink hash, mode and size, native Git object integrity, index format and base OID before publication of a new workspace. Missing, modified or unexpected files fail closed. Destination copies are rechecked against the captured inventory before publication. This is corruption detection, **not** cryptographic authentication against an attacker who can rewrite both manifest and hashes.

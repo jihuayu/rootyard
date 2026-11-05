@@ -682,6 +682,87 @@ class Harness:
         self.equal(tree(restored), before, "EOL config caused checkout/filter normalization")
         return {"safe_local_config_accepted": True, "raw_worktree_eol_preserved": True}
 
+    def status_and_rootyardignore(self):
+        _, source, store, _ = self.fixture("status-rootyardignore", {
+            ".gitignore": b"*.log\n",
+            ".rootyardignore": b"# comment\n*.tmp\n!keep.tmp\nbuild/\n",
+            "plain.txt": b"base\n",
+        })
+        self.git("add", "--all", cwd=source)
+        self.git("commit", "--amend", "-m", "base with ignore files", cwd=source)
+        base = self.oid(source)
+        info, work = self.init(store, source, base)
+        clean = self.data("status", store, info["workspace_id"])
+        require(clean["clean"] is True and clean["is_dirty"] is False, "Expected clean workspace")
+        self.write(work, "plain.txt", b"changed\n")
+        self.write(work, "keep.tmp", b"negated\n")
+        self.write(work, "drop.tmp", b"ignored by rootyardignore\n")
+        self.write(work, "build/out.o", b"ignored dir\n")
+        self.write(work, "app.log", b"ignored by gitignore\n")
+        dirty = self.data("status", store, info["workspace_id"])
+        require(dirty["is_dirty"] is True and dirty["clean"] is False, "Expected dirty workspace")
+        require("keep.tmp" in dirty["untracked_paths"], "Negated .rootyardignore file missing")
+        for ign in ("drop.tmp", "build/out.o", "app.log"):
+            require(ign in dirty["ignored_paths"], f"Expected {ign} in ignored_paths")
+        return {"dirty_entries": dirty["dirty_entries_count"], "ignored_entries": dirty["ignored_entries_count"]}
+
+    def changeset_and_three_way_apply(self):
+        _, source, store, base = self.fixture("changeset-three-way", {
+            "plain.txt": b"base\n",
+            "delete-me.txt": b"delete\n",
+        })
+        ws_a, repo_a = self.init(store, source, base, "agent-a")
+        cp1 = self.checkpoint(store, ws_a)
+        ws_b, repo_b = self.restore(store, cp1, "agent-b")
+        self.write(repo_a, "plain.txt", b"modified\n")
+        (repo_a / "delete-me.txt").unlink()
+        self.write(repo_a, "added.txt", b"added\n")
+        cp2 = self.checkpoint(store, ws_a)
+        cs = self.data("changeset", store, cp1["checkpoint_id"], cp2["checkpoint_id"])
+        require(cs["added"] == 1 and cs["modified"] == 1 and cs["deleted"] == 1, "Unexpected changeset counts")
+        applied = self.data("apply", store, ws_b["workspace_id"], cs["changeset_id"], "--quiescent")
+        require(applied["state"] == "applied" and applied["applied_entries"] == 3, "Changeset apply failed")
+        self.equal(tree(repo_b), tree(repo_a), "Applied workspace differs from source")
+        self.write(repo_b, "plain.txt", b"diverged\n")
+        before_b = tree(repo_b)
+        self.rejected("apply", store, ws_b["workspace_id"], cs["changeset_id"], "--quiescent")
+        self.equal(tree(repo_b), before_b, "Conflicting apply mutated target")
+        return {"changeset_applied": True, "conflict_rejected": True}
+
+    def sync_dirty_incremental(self):
+        _, source, store, base = self.fixture("sync-dirty-inc", {
+            ".rootyardignore": b"*.scratch\n",
+            "plain.txt": b"base\n",
+        })
+        self.git("add", "--all", cwd=source)
+        self.git("commit", "--amend", "-m", "base", cwd=source)
+        base = self.oid(source)
+        ws_a, repo_a = self.init(store, source, base, "agent-a")
+        cp1 = self.checkpoint(store, ws_a)
+        ws_b, repo_b = self.restore(store, cp1, "agent-b")
+        self.write(repo_a, "plain.txt", b"dirty change\n")
+        self.write(repo_a, "new.txt", b"new managed\n")
+        self.write(repo_a, "ignored.scratch", b"ignored scratch\n")
+        res = self.data("sync-dirty", store, ws_a["workspace_id"], ws_b["workspace_id"], "--quiescent")
+        require(res["state"] == "synced" and res["synced_entries"] == 2, "sync-dirty unexpected counts")
+        require((repo_b / "plain.txt").read_bytes() == b"dirty change\n", "Dirty modification not synced")
+        require((repo_b / "new.txt").read_bytes() == b"new managed\n", "Dirty addition not synced")
+        require(not (repo_b / "ignored.scratch").exists(), "Ignored file leaked into target workspace")
+        return {"synced_entries": res["synced_entries"], "excluded_ignored": res["excluded_ignored_entries"]}
+
+    def verify_readonly_view(self):
+        root, source, store, base = self.fixture("verify-ro-view", {"plain.txt": b"readonly\n"})
+        ws, _ = self.init(store, source, base)
+        cp = self.checkpoint(store, ws)
+        view_path = root / "ro-view"
+        rep = self.data("verify-readonly-view", store, cp["checkpoint_id"], view_path)
+        require(rep["verified"] is True and rep["readonly"] is True, "Readonly view verification failed")
+        require(((view_path / "plain.txt").stat().st_mode & 0o222) == 0, "Projected file is writable")
+        (view_path / "plain.txt").chmod(0o644)
+        self.rejected("verify-readonly-view", store, cp["checkpoint_id"], view_path)
+        (view_path / "plain.txt").chmod(0o444)
+        return {"readonly_verified": True, "writable_tamper_rejected": True}
+
     def run_all(self):
         require(self.binary.is_file() and os.access(self.binary, os.X_OK),
                 "Build the opt-in rootyard-workspace-lab binary before running this harness")
@@ -694,6 +775,8 @@ class Harness:
             self.unsupported_native_indexes,
             self.recorded_git_version_mismatch, self.publication_failpoints,
             self.external_git_config_isolation, self.safe_config_and_raw_eol,
+            self.status_and_rootyardignore, self.changeset_and_three_way_apply,
+            self.sync_dirty_incremental, self.verify_readonly_view,
         ]:
             started = time.monotonic()
             entry = {"name": method.__name__, "ok": False}
