@@ -98,6 +98,43 @@ pub struct RefLease {
     pub changeset_id: String,
 }
 
+pub(crate) const PROVENANCE_KEY_ID: &str = "rootyard-local-v1";
+pub(crate) const PROVENANCE_SECRET: &[u8] = b"rootyard-view-lab-hmac-sha256-key-v1";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EpochCommitMap {
+    pub schema: u32,
+    pub view_id: String,
+    pub view_epoch: u64,
+    pub epochs: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenanceCommitRecord {
+    pub projected_commit_oid: String,
+    pub source_commit_oid: String,
+    pub view_epoch: u64,
+    pub projected_tree_oid: String,
+    pub projected_parent_oids: Vec<String>,
+    pub source_signed: bool,
+    pub source_signature_type: String,
+    pub original_signature_covers_projected_oid: bool,
+    pub platform_signature: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ViewProvenanceManifest {
+    pub schema: u32,
+    pub view_id: String,
+    pub strategy: String,
+    pub key_id: String,
+    pub view_epoch: u64,
+    pub commits: Vec<ProvenanceCommitRecord>,
+}
+
 pub struct Store {
     pub(crate) root: PathBuf,
     _lock: File,

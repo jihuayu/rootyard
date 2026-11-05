@@ -2,6 +2,7 @@
 pub mod git_read;
 pub mod handlers;
 pub mod models;
+pub mod object_format;
 pub mod transactions;
 
 use crate::AppState;
@@ -43,5 +44,17 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/repos/{owner}/{name}/storage-route",
             get(handlers::get_storage_route),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/object-format",
+            get(object_format::get_object_format),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/object-format/negotiate",
+            post(object_format::negotiate_object_format),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/object-format/drill",
+            post(object_format::run_object_format_drill),
         )
 }

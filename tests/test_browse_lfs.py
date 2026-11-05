@@ -34,6 +34,7 @@ class BrowseAndLfsContractTest(unittest.TestCase):
             ROOT / "src/browse/models.rs",
             ROOT / "src/browse/git_read.rs",
             ROOT / "src/browse/handlers.rs",
+            ROOT / "src/browse/object_format.rs",
             ROOT / "src/browse/transactions.rs",
             ROOT / "src/lfs/models.rs",
             ROOT / "src/lfs/storage.rs",
@@ -92,6 +93,9 @@ class BrowseAndLfsContractTest(unittest.TestCase):
             '"/api/repos/{owner}/{name}/blob/{oid}"',
             '"/api/repos/{owner}/{name}/compare"',
             '"/api/repos/{owner}/{name}/ref-transactions"',
+            '"/api/repos/{owner}/{name}/object-format"',
+            '"/api/repos/{owner}/{name}/object-format/negotiate"',
+            '"/api/repos/{owner}/{name}/object-format/drill"',
         ):
             self.assertIn(route, browse_all)
 
@@ -174,6 +178,7 @@ class BrowseAndLfsContractTest(unittest.TestCase):
                     "ref_transactions_atomic_cas",
                     "idempotency_and_concurrency",
                     "access_and_fences",
+                    "object_format_and_negotiation",
                 ),
             ),
             (

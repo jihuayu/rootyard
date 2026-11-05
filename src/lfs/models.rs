@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
+pub const LFS_HASH_ALGO: &str = "sha256";
 pub const MAX_BATCH_OBJECTS: usize = 100;
 
 pub fn valid_lfs_oid(oid: &str) -> bool {
@@ -169,6 +170,27 @@ pub fn parse_pointer(bytes: &[u8]) -> Option<BatchObjectSpec> {
     })
 }
 
+/// Verifies that a canonical Git LFS v1 pointer (`oid sha256:<64-hex>`) is valid alongside
+/// either a 40-hex SHA-1 or 64-hex SHA-256 Git blob OID, returning the parsed spec and repo format.
+pub fn verify_lfs_pointer_compatibility(
+    pointer_bytes: &[u8],
+    git_blob_oid: &str,
+) -> Option<(BatchObjectSpec, &'static str)> {
+    let spec = parse_pointer(pointer_bytes)?;
+    if !valid_lfs_oid(&spec.oid) {
+        return None;
+    }
+    let is_lower_hex = git_blob_oid
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let repo_format = match (git_blob_oid.len(), is_lower_hex) {
+        (40, true) => "sha1",
+        (64, true) => "sha256",
+        _ => return None,
+    };
+    Some((spec, repo_format))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +214,17 @@ mod tests {
             }
         );
         assert!(parse_pointer(b"not a pointer").is_none());
+
+        let sha1_blob = "b".repeat(40);
+        let sha256_blob = "c".repeat(64);
+        assert_eq!(
+            verify_lfs_pointer_compatibility(pointer.as_bytes(), &sha1_blob),
+            Some((parsed.clone(), "sha1"))
+        );
+        assert_eq!(
+            verify_lfs_pointer_compatibility(pointer.as_bytes(), &sha256_blob),
+            Some((parsed, "sha256"))
+        );
+        assert!(verify_lfs_pointer_compatibility(pointer.as_bytes(), "invalid").is_none());
     }
 }

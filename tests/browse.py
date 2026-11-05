@@ -548,6 +548,78 @@ class BrowseHarness(Harness):
                 f"UPDATE repositories SET state='ready', recovery_reason=NULL WHERE id='{self.repo['id']}'"
             )
 
+    def object_format_and_negotiation(self):
+        status_doc = self.document(self.repo_api("/object-format"), token=self.reader)
+        assert status_doc["repository_id"] == self.repo["id"]
+        assert status_doc["object_format"] == "sha1"
+        assert status_doc["oid_hex_len"] == 40
+        assert status_doc["raw_oid_bytes"] == 20
+        assert status_doc["lfs_hash_algo"] == "sha256"
+        assert status_doc["protocol_v2_supported"] is True
+        assert "object-format=sha1" in status_doc["capabilities"]
+        assert len(status_doc["compatibility_matrix"]) >= 4
+
+        neg_ok = self.document(
+            self.repo_api("/object-format/negotiate"),
+            200,
+            method="POST",
+            body={
+                "operation": "git-receive-pack",
+                "protocol_version": 2,
+                "client_object_format": "sha1",
+                "client_capabilities": ["atomic", "ofs-delta", "object-format=sha1"],
+                "client_agent": "git/2.43.0",
+            },
+        )
+        assert neg_ok["admitted"] is True
+        assert neg_ok["negotiated_object_format"] == "sha1"
+        assert "atomic" in neg_ok["admitted_capabilities"]
+
+        neg_conflict = self.document(
+            self.repo_api("/object-format/negotiate"),
+            409,
+            method="POST",
+            body={
+                "operation": "git-receive-pack",
+                "protocol_version": 2,
+                "client_object_format": "sha256",
+                "client_capabilities": ["atomic", "object-format=sha256"],
+            },
+        )
+        assert neg_conflict["admitted"] is False
+        assert neg_conflict["repository_object_format"] == "sha1"
+
+        drill_doc = self.document(
+            self.repo_api("/object-format/drill"),
+            200,
+            method="POST",
+            body={"verify_lfs_interop": True},
+        )
+        assert drill_doc["passed"] is True
+        assert drill_doc["sha1_drill"]["oid_hex_len"] == 40
+        assert drill_doc["sha256_drill"]["oid_hex_len"] == 64
+        assert len(drill_doc["sha256_drill"]["commit_oid"]) == 64
+        assert drill_doc["cross_format_ref_tx_rejected"] is True
+        assert drill_doc["lfs_sha256_in_both_formats"] is True
+
+        # Mixed SHA-1 + SHA-256 ref transaction must be rejected with 409 Conflict
+        self.document(
+            self.repo_api("/ref-transactions"),
+            409,
+            method="POST",
+            body={
+                "storage_generation": 1,
+                "atomic": True,
+                "updates": [
+                    {
+                        "ref_name": "refs/heads/mixed-format",
+                        "old_oid": ZERO_OID,
+                        "new_oid": "a" * 64,
+                    }
+                ],
+            },
+        )
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -570,6 +642,7 @@ def main():
             "ref_transactions_atomic_cas",
             "idempotency_and_concurrency",
             "access_and_fences",
+            "object_format_and_negotiation",
         ):
             harness.case(name, getattr(harness, name))
         success = True

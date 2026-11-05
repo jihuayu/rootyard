@@ -1,9 +1,9 @@
-//! Repository registration, namespace revision manifests, and mount path validation.
+//! Repository registration, namespace revision manifests, mount validation, and provenance verification.
 
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
     os::unix::ffi::OsStringExt,
@@ -12,13 +12,56 @@ use std::{
 
 use super::models::*;
 
+pub fn compute_provenance_signature(
+    vid: &str,
+    strat: &str,
+    ep: u64,
+    src: &str,
+    tree: &str,
+    parents: &[String],
+) -> String {
+    let mut key = [0u8; 64];
+    key[..PROVENANCE_SECRET.len()].copy_from_slice(PROVENANCE_SECRET);
+    let ipad: Vec<u8> = key.iter().map(|b| b ^ 0x36).collect();
+    let opad: Vec<u8> = key.iter().map(|b| b ^ 0x5c).collect();
+    let p_str = parents.join(",");
+    let msg = format!("rootyard-view-sig-v1\0{vid}\0{strat}\0{ep}\0{src}\0{tree}\0{p_str}");
+    let inner = Sha256::new()
+        .chain_update(&ipad)
+        .chain_update(msg)
+        .finalize();
+    let mac = Sha256::new()
+        .chain_update(&opad)
+        .chain_update(inner)
+        .finalize();
+    format!("hmac-sha256:{PROVENANCE_KEY_ID}:{}", hex::encode(mac))
+}
+
+pub(crate) fn make_provenance_record(
+    ctx: (&str, &str, u64),
+    oids: (&str, &str, &str),
+    parents: Vec<String>,
+    sig_info: (bool, String),
+) -> ProvenanceCommitRecord {
+    let sig = compute_provenance_signature(ctx.0, ctx.1, ctx.2, oids.1, oids.2, &parents);
+    ProvenanceCommitRecord {
+        projected_commit_oid: oids.0.to_owned(),
+        source_commit_oid: oids.1.to_owned(),
+        view_epoch: ctx.2,
+        projected_tree_oid: oids.2.to_owned(),
+        projected_parent_oids: parents,
+        source_signed: sig_info.0,
+        source_signature_type: sig_info.1,
+        original_signature_covers_projected_oid: false,
+        platform_signature: sig,
+    }
+}
+
 impl Store {
     pub fn list_repos(&self) -> Result<Vec<RepoMeta>> {
         let mut repos = Vec::new();
         for entry in fs::read_dir(self.root.join("repos"))? {
-            let entry = entry?;
-            let meta_path = entry.path().join("meta.json");
-            let bytes = read_regular(&meta_path, MAX_JSON)?;
+            let bytes = read_regular(&entry?.path().join("meta.json"), MAX_JSON)?;
             let meta: RepoMeta = serde_json::from_slice(&bytes)?;
             ensure!(meta.schema == SCHEMA, "unsupported repository schema");
             valid_id(&meta.repo_id)?;
@@ -40,29 +83,20 @@ impl Store {
 
     pub fn read_repo(&self, repo_id: &str) -> Result<RepoMeta> {
         valid_id(repo_id)?;
-        let bytes = read_regular(
-            &self.root.join("repos").join(repo_id).join("meta.json"),
-            MAX_JSON,
-        )?;
-        let meta: RepoMeta = serde_json::from_slice(&bytes)?;
-        ensure!(
-            meta.schema == SCHEMA && meta.repo_id == repo_id,
-            "invalid repository metadata"
-        );
+        let path = self.root.join("repos").join(repo_id).join("meta.json");
+        let meta: RepoMeta = serde_json::from_slice(&read_regular(&path, MAX_JSON)?)?;
+        let ok = meta.schema == SCHEMA && meta.repo_id == repo_id;
+        ensure!(ok, "invalid repository metadata");
         Ok(meta)
     }
 
     pub fn register_repo(&self, name: &str, source: &Path) -> Result<serde_json::Value> {
         ensure!(valid_name(name), "invalid repository name");
         self.ensure_not_overlapping(source)?;
-        ensure!(
-            self.list_repos()?.iter().all(|r| r.name != name),
-            "repository name already registered"
-        );
-        ensure!(
-            self.git_text(source, &["rev-parse", "--show-object-format"])? == "sha1",
-            "only SHA-1 repositories are supported"
-        );
+        let taken = self.list_repos()?.iter().any(|r| r.name == name);
+        ensure!(!taken, "repository name already registered");
+        let fmt = self.git_text(source, &["rev-parse", "--show-object-format"])?;
+        ensure!(fmt == "sha1", "only SHA-1 repositories are supported");
         let head_oid = self.git_text(source, &["rev-parse", "--verify", "HEAD^{commit}"])?;
         valid_oid(&head_oid)?;
 
@@ -71,9 +105,9 @@ impl Store {
         let bare = staging.0.join("repo.git");
         private_dir(&bare)?;
         self.git(&bare, &["init", "--bare", "--initial-branch=main"])?;
-        let source_str = source.to_str().context("source path must be UTF-8")?;
-        let refspec = format!("{head_oid}:refs/heads/main");
-        self.git(&bare, &["fetch", "--no-tags", source_str, &refspec])?;
+        let src_str = source.to_str().context("source path must be UTF-8")?;
+        let spec = format!("{head_oid}:refs/heads/main");
+        self.git(&bare, &["fetch", "--no-tags", src_str, &spec])?;
         self.git(&bare, &["fsck", "--full", "--strict"])?;
 
         let meta = RepoMeta {
@@ -83,20 +117,17 @@ impl Store {
             head_oid: head_oid.clone(),
             generation: 1,
         };
-        write_new(
-            &staging.0.join("meta.json"),
-            &serde_json::to_vec_pretty(&meta)?,
-            0o600,
-        )?;
+        let meta_bytes = serde_json::to_vec_pretty(&meta)?;
+        write_new(&staging.0.join("meta.json"), &meta_bytes, 0o600)?;
         sync_tree(&staging.0)?;
-        let destination = self.root.join("repos").join(&repo_id);
-        publish(&staging.0, &destination)?;
+        let dest = self.root.join("repos").join(&repo_id);
+        publish(&staging.0, &dest)?;
         Ok(serde_json::json!({
             "repo_id": repo_id,
             "name": name,
             "head_oid": head_oid,
             "generation": 1,
-            "repo_path": destination.join("repo.git").to_string_lossy(),
+            "repo_path": dest.join("repo.git").to_string_lossy(),
         }))
     }
 
@@ -105,53 +136,38 @@ impl Store {
         let mut meta = self.find_repo_by_name(name)?;
         self.ensure_no_active_lease(&meta.repo_id)?;
         let bare = self.repo_git_dir(&meta.repo_id);
-        let current_oid = self.git_text(&bare, &["rev-parse", "--verify", "refs/heads/main"])?;
-        ensure!(
-            current_oid == meta.head_oid,
-            "repository HEAD diverged from metadata"
-        );
+        let cur_oid = self.git_text(&bare, &["rev-parse", "--verify", "refs/heads/main"])?;
+        ensure!(cur_oid == meta.head_oid, "repository HEAD diverged");
         let new_oid = self.git_text(source, &["rev-parse", "--verify", "HEAD^{commit}"])?;
         valid_oid(&new_oid)?;
         ensure!(
-            new_oid != current_oid,
+            new_oid != cur_oid,
             "repository HEAD is already at target OID"
         );
 
-        let source_str = source.to_str().context("source path must be UTF-8")?;
-        let staging_ref = format!("refs/rootyard/advance/{}", new_id());
-        let refspec = format!("{new_oid}:{staging_ref}");
-        self.git(&bare, &["fetch", "--no-tags", source_str, &refspec])?;
-        let is_ancestor = self
-            .git_output_with_env(
-                &bare,
-                &["merge-base", "--is-ancestor", &current_oid, &new_oid],
-                &[],
-                None,
-            )?
+        let src_str = source.to_str().context("source path must be UTF-8")?;
+        let stg_ref = format!("refs/rootyard/advance/{}", new_id());
+        let spec = format!("{new_oid}:{stg_ref}");
+        self.git(&bare, &["fetch", "--no-tags", src_str, &spec])?;
+        let anc = ["merge-base", "--is-ancestor", &cur_oid, &new_oid];
+        let is_anc = self
+            .git_output_with_env(&bare, &anc, &[], None)?
             .status
             .success();
-        if !is_ancestor {
-            let _ = self.git(&bare, &["update-ref", "-d", &staging_ref]);
+        if !is_anc {
+            let _ = self.git(&bare, &["update-ref", "-d", &stg_ref]);
             bail!("non-fast-forward advance rejected");
         }
         self.git(&bare, &["fsck", "--full", "--strict"])?;
-        self.git(
-            &bare,
-            &["update-ref", "refs/heads/main", &new_oid, &current_oid],
-        )?;
-        let _ = self.git(&bare, &["update-ref", "-d", &staging_ref]);
+        let ref_args = ["update-ref", "refs/heads/main", &new_oid, &cur_oid];
+        self.git(&bare, &ref_args)?;
+        let _ = self.git(&bare, &["update-ref", "-d", &stg_ref]);
 
         let old_oid = meta.head_oid;
         meta.head_oid = new_oid.clone();
         meta.generation += 1;
-        write_atomic_json(
-            &self
-                .root
-                .join("repos")
-                .join(&meta.repo_id)
-                .join("meta.json"),
-            &meta,
-        )?;
+        let rdir = self.root.join("repos").join(&meta.repo_id);
+        write_atomic_json(&rdir.join("meta.json"), &meta)?;
         Ok(serde_json::json!({
             "repo_id": meta.repo_id,
             "name": meta.name,
@@ -177,15 +193,11 @@ impl Store {
             let mount_path = normalize_mount_path(mount_raw)?;
             valid_oid(base_oid)?;
             let repo = self.find_repo_by_name(repo_name)?;
-            ensure!(
-                seen_repos.insert(repo.repo_id.clone()),
-                "duplicate repository in namespace mounts"
-            );
+            let fresh = seen_repos.insert(repo.repo_id.clone());
+            ensure!(fresh, "duplicate repository in namespace mounts");
             let bare = self.repo_git_dir(&repo.repo_id);
-            ensure!(
-                self.git_text(&bare, &["cat-file", "-t", base_oid])? == "commit",
-                "base OID {base_oid} does not identify a commit in {repo_name}"
-            );
+            let obj_t = self.git_text(&bare, &["cat-file", "-t", base_oid])?;
+            ensure!(obj_t == "commit", "base OID {base_oid} is not a commit");
             parsed_mounts.push(MountEntry {
                 mount_path,
                 repo_id: repo.repo_id,
@@ -196,18 +208,16 @@ impl Store {
         parsed_mounts.sort_by(|a, b| a.mount_path.cmp(&b.mount_path));
         validate_non_overlapping_mounts(&parsed_mounts)?;
 
-        let mut max_revision = 0_u64;
+        let mut max_rev = 0_u64;
         for entry in fs::read_dir(self.root.join("namespaces"))? {
-            let entry = entry?;
-            let manifest_path = entry.path().join("manifest.json");
-            let bytes = read_regular(&manifest_path, MAX_JSON)?;
+            let bytes = read_regular(&entry?.path().join("manifest.json"), MAX_JSON)?;
             let rev: NamespaceRevision = serde_json::from_slice(&bytes)?;
-            if rev.namespace == namespace && rev.revision_number > max_revision {
-                max_revision = rev.revision_number;
+            if rev.namespace == namespace && rev.revision_number > max_rev {
+                max_rev = rev.revision_number;
             }
         }
         let revision_id = new_id();
-        let revision_number = max_revision + 1;
+        let revision_number = max_rev + 1;
 
         for mount in &parsed_mounts {
             let bare = self.repo_git_dir(&mount.repo_id);
@@ -228,8 +238,7 @@ impl Store {
         write_new(&staging.0.join("manifest.json"), &bytes, 0o600)?;
         write_new(&staging.0.join("manifest.sha256"), digest.as_bytes(), 0o600)?;
         sync_tree(&staging.0)?;
-        let dest = self.root.join("namespaces").join(&revision_id);
-        publish(&staging.0, &dest)?;
+        publish(&staging.0, &self.root.join("namespaces").join(&revision_id))?;
         Ok(serde_json::json!({
             "revision_id": revision_id,
             "namespace": namespace,
@@ -245,40 +254,191 @@ impl Store {
         require_directory(&dir)?;
         let bytes = read_regular(&dir.join("manifest.json"), MAX_JSON)?;
         let digest = read_regular(&dir.join("manifest.sha256"), 64)?;
+        let expected = hex::encode(Sha256::digest(&bytes));
         ensure!(
-            digest == hex::encode(Sha256::digest(&bytes)).as_bytes(),
+            digest == expected.as_bytes(),
             "namespace revision checksum mismatch"
         );
         let rev: NamespaceRevision = serde_json::from_slice(&bytes)?;
-        ensure!(
-            rev.schema == SCHEMA && rev.revision_id == revision_id,
-            "invalid namespace revision manifest"
-        );
+        let valid = rev.schema == SCHEMA && rev.revision_id == revision_id;
+        ensure!(valid, "invalid namespace revision manifest");
         validate_non_overlapping_mounts(&rev.mounts)?;
         Ok(rev)
+    }
+
+    pub(crate) fn inspect_source_signature(&self, bare: &Path, c: &str) -> Result<(bool, String)> {
+        let raw = self.git(bare, &["cat-file", "commit", c])?;
+        let text = String::from_utf8_lossy(&raw);
+        let hdrs = text.split("\n\n").next().unwrap_or("");
+        let signed = hdrs
+            .lines()
+            .any(|l| l.starts_with("gpgsig ") || l.starts_with("gpgsig-sha256 "));
+        if !signed {
+            return Ok((false, "none".into()));
+        }
+        let kind = if hdrs.contains("-----BEGIN SSH SIGNATURE-----") {
+            "ssh"
+        } else {
+            "gpg"
+        };
+        Ok((true, kind.into()))
+    }
+
+    pub(crate) fn write_view_provenance(
+        &self,
+        dir: &Path,
+        meta: &ViewMeta,
+        commits: Vec<ProvenanceCommitRecord>,
+        epochs: BTreeMap<String, BTreeMap<String, String>>,
+    ) -> Result<()> {
+        let manifest = ViewProvenanceManifest {
+            schema: SCHEMA,
+            view_id: meta.view_id.clone(),
+            strategy: meta.strategy.clone(),
+            key_id: PROVENANCE_KEY_ID.into(),
+            view_epoch: meta.view_epoch,
+            commits,
+        };
+        let epoch_map = EpochCommitMap {
+            schema: SCHEMA,
+            view_id: meta.view_id.clone(),
+            view_epoch: meta.view_epoch,
+            epochs,
+        };
+        write_atomic_json(&dir.join("provenance.json"), &manifest)?;
+        write_atomic_json(&dir.join("epoch_commit_map.json"), &epoch_map)
+    }
+
+    pub(crate) fn append_integrated_view_provenance(
+        &self,
+        meta: &ViewMeta,
+        src: &str,
+        tree: &str,
+        parent: &str,
+    ) -> Result<()> {
+        let dir = self.root.join("views").join(&meta.view_id);
+        let p_bytes = read_regular(&dir.join("provenance.json"), MAX_JSON)?;
+        let mut man: ViewProvenanceManifest = serde_json::from_slice(&p_bytes)?;
+        let e_bytes = read_regular(&dir.join("epoch_commit_map.json"), MAX_JSON)?;
+        let mut emap: EpochCommitMap = serde_json::from_slice(&e_bytes)?;
+        if !man
+            .commits
+            .iter()
+            .any(|c| c.projected_commit_oid == meta.head_oid)
+        {
+            let ctx = (
+                meta.view_id.as_str(),
+                meta.strategy.as_str(),
+                meta.view_epoch,
+            );
+            let oids = (meta.head_oid.as_str(), src, tree);
+            let rec =
+                make_provenance_record(ctx, oids, vec![parent.to_owned()], (false, "none".into()));
+            man.commits.push(rec);
+        }
+        let ep_entry = BTreeMap::from([(src.to_owned(), meta.head_oid.clone())]);
+        emap.epochs.insert(meta.view_epoch.to_string(), ep_entry);
+        self.write_view_provenance(&dir, meta, man.commits, emap.epochs)
+    }
+
+    pub fn verify_view(&self, view_id: &str) -> Result<serde_json::Value> {
+        let meta = self.read_view(view_id)?;
+        let view_dir = self.root.join("views").join(view_id);
+        let bare = self.view_git_dir(view_id);
+        self.git(&bare, &["fsck", "--full", "--strict"])?;
+        let p_bytes = read_regular(&view_dir.join("provenance.json"), MAX_JSON)?;
+        let man: ViewProvenanceManifest = serde_json::from_slice(&p_bytes)?;
+        let ok_man = man.schema == SCHEMA && man.view_id == view_id;
+        ensure!(ok_man, "invalid provenance manifest");
+        let main_oid = self.git_text(&bare, &["rev-parse", "--verify", "refs/heads/main"])?;
+        let rev_args = ["rev-list", "--topo-order", "--reverse", "refs/heads/main"];
+        let rev_out = self.git_text(&bare, &rev_args)?;
+        let reachable: Vec<&str> = rev_out
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let by_oid: BTreeMap<&str, &ProvenanceCommitRecord> = man
+            .commits
+            .iter()
+            .map(|r| (r.projected_commit_oid.as_str(), r))
+            .collect();
+        let (mut tampered, mut verified) = (Vec::new(), 0usize);
+        if main_oid != meta.head_oid
+            || man.view_epoch != meta.view_epoch
+            || man.strategy != meta.strategy
+            || man.key_id != PROVENANCE_KEY_ID
+        {
+            tampered.push(main_oid.clone());
+        }
+        for &oid in &reachable {
+            let t_spec = format!("{oid}^{{tree}}");
+            let tree = self.git_text(&bare, &["rev-parse", "--verify", &t_spec])?;
+            let p_line = self.git_text(&bare, &["rev-list", "--parents", "-n", "1", oid])?;
+            let parents: Vec<String> = p_line
+                .split_whitespace()
+                .skip(1)
+                .map(str::to_owned)
+                .collect();
+            let raw_bytes = self.git(&bare, &["cat-file", "commit", oid])?;
+            let raw = String::from_utf8_lossy(&raw_bytes);
+            let tr_sig = raw
+                .lines()
+                .find_map(|l| l.strip_prefix("Rootyard-View-Signature: "));
+            let ok = by_oid.get(oid).is_some_and(|rec| {
+                let (vid, st, src) = (&meta.view_id, &meta.strategy, &rec.source_commit_oid);
+                let exp =
+                    compute_provenance_signature(vid, st, rec.view_epoch, src, &tree, &parents);
+                (1..=meta.view_epoch).contains(&rec.view_epoch)
+                    && rec.projected_tree_oid == tree
+                    && rec.projected_parent_oids == parents
+                    && !rec.original_signature_covers_projected_oid
+                    && rec.platform_signature == exp
+                    && tr_sig.is_none_or(|t| t == exp)
+            });
+            if ok {
+                verified += 1;
+            } else if !tampered.contains(&oid.to_owned()) {
+                tampered.push(oid.to_owned());
+            }
+        }
+        for rec in &man.commits {
+            let p_oid = &rec.projected_commit_oid;
+            if !reachable.contains(&p_oid.as_str()) && !tampered.contains(p_oid) {
+                tampered.push(p_oid.clone());
+            }
+        }
+        let report = serde_json::json!({
+            "view_id": view_id,
+            "strategy": meta.strategy,
+            "view_epoch": meta.view_epoch,
+            "signature_verified": tampered.is_empty(),
+            "source_signed_commits": man.commits.iter().filter(|r| r.source_signed).count(),
+            "verified_projected_commits": verified,
+            "tampered_commits": tampered,
+        });
+        if !tampered.is_empty() {
+            println!("{}", serde_json::to_string(&report)?);
+            bail!("view provenance verification failed for {view_id}: tampered {tampered:?}");
+        }
+        Ok(report)
     }
 }
 
 pub fn normalize_mount_path(raw: &str) -> Result<String> {
-    let bytes = raw.as_bytes();
+    let b = raw.as_bytes();
+    let ok = !b.is_empty() && !b.contains(&0) && !b.starts_with(b"/") && !b.ends_with(b"/");
     ensure!(
-        !bytes.is_empty()
-            && !bytes.contains(&0)
-            && !bytes.starts_with(b"/")
-            && !bytes.ends_with(b"/"),
+        ok,
         "mount path must be a non-empty relative path without leading or trailing slash"
     );
     for part in raw.split('/') {
-        ensure!(
-            !part.is_empty() && part != "." && part != ".." && part != ".git",
-            "unsafe mount path component"
-        );
+        let valid = !part.is_empty() && part != "." && part != ".." && part != ".git";
+        ensure!(valid, "unsafe mount path component");
     }
-    let path = PathBuf::from(OsString::from_vec(bytes.to_vec()));
-    ensure!(
-        path.components().all(|c| matches!(c, Component::Normal(_))),
-        "unsafe relative mount path"
-    );
+    let path = PathBuf::from(OsString::from_vec(b.to_vec()));
+    let normal = path.components().all(|c| matches!(c, Component::Normal(_)));
+    ensure!(normal, "unsafe mount path");
     Ok(raw.to_owned())
 }
 
@@ -293,13 +453,9 @@ pub fn validate_non_overlapping_mounts(mounts: &[MountEntry]) -> Result<()> {
     for (i, left) in mounts.iter().enumerate() {
         normalize_mount_path(&left.mount_path)?;
         for right in &mounts[i + 1..] {
-            ensure!(
-                !path_within_mount(&left.mount_path, &right.mount_path)
-                    && !path_within_mount(&right.mount_path, &left.mount_path),
-                "overlapping namespace mounts {} and {}",
-                left.mount_path,
-                right.mount_path
-            );
+            let (lp, rp) = (&left.mount_path, &right.mount_path);
+            let overlap = path_within_mount(lp, rp) || path_within_mount(rp, lp);
+            ensure!(!overlap, "overlapping namespace mounts {lp} and {rp}");
         }
     }
     Ok(())
@@ -315,39 +471,20 @@ mod tests {
             assert!(normalize_mount_path(good).is_ok(), "{good}");
         }
         for bad in [
-            "",
-            "/libs/proto",
-            "libs/proto/",
-            "libs//proto",
-            "libs/../proto",
-            "libs/./proto",
-            ".git",
-            "libs/.git/config",
+            "", "/a", "a/", "a//b", "a/../b", "a/./b", ".git", "a/.git/b",
         ] {
             assert!(normalize_mount_path(bad).is_err(), "{bad}");
         }
-
-        let m1 = MountEntry {
-            mount_path: "libs/proto".into(),
+        let mk = |p: &str, n: &str, c: &str| MountEntry {
+            mount_path: p.into(),
             repo_id: new_id(),
-            repo_name: "proto".into(),
-            base_oid: "a".repeat(40),
+            repo_name: n.into(),
+            base_oid: c.repeat(40),
         };
-        let m2 = MountEntry {
-            mount_path: "libs/proto/v2".into(),
-            repo_id: new_id(),
-            repo_name: "proto2".into(),
-            base_oid: "b".repeat(40),
-        };
-        let m3 = MountEntry {
-            mount_path: "libs/proto-extra".into(),
-            repo_id: new_id(),
-            repo_name: "proto3".into(),
-            base_oid: "c".repeat(40),
-        };
-        let overlapping = [m1.clone(), m2];
-        let disjoint = [m1, m3];
-        assert!(validate_non_overlapping_mounts(&overlapping).is_err());
-        assert!(validate_non_overlapping_mounts(&disjoint).is_ok());
+        let a = mk("libs/proto", "p1", "a");
+        let b = mk("libs/proto/v2", "p2", "b");
+        let c = mk("libs/proto-ext", "p3", "c");
+        assert!(validate_non_overlapping_mounts(&[a.clone(), b]).is_err());
+        assert!(validate_non_overlapping_mounts(&[a, c]).is_ok());
     }
 }

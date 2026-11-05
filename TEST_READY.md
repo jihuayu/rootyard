@@ -3,8 +3,8 @@
 **Status**: `READY`
 **Test Suite Entrypoint**: `tests/e2e_tiers.py`
 **Infrastructure Design Document**: `TEST_INFRA.md`
-**Total Executable Tests**: `486` (`210` Tier 1 + `210` Tier 2 + `44` Tier 3 + `22` Tier 4)
-**Verification Result**: `486 passed, 0 failed, 0 errors, 0 skipped` (Exit Code `0`)
+**Total Executable Tests**: `591` (`255` Tier 1 + `255` Tier 2 + `54` Tier 3 + `27` Tier 4)
+**Verification Result**: `591 passed, 0 failed, 0 errors, 0 skipped` (Exit Code `0`)
 
 ---
 
@@ -12,17 +12,17 @@
 
 | Tier | Class Name | Required Minimum | Implemented Count | Pass | Fail / Error | Skipped | Status |
 |---|---|---:|---:|---:|---:|---:|---|
-| **Tier 1 — Feature Coverage** | `TestTier1FeatureCoverage` | 210 (5 × 42 features) | **210** | 210 | 0 | 0 | **PASS** |
-| **Tier 2 — Boundary & Corner Cases** | `TestTier2BoundaryAndCornerCases` | 210 (5 × 42 features) | **210** | 210 | 0 | 0 | **PASS** |
-| **Tier 3 — Cross-Feature Combinations** | `TestTier3CrossFeatureCombinations` | 42 (≥ 2 per feature) | **44** | 44 | 0 | 0 | **PASS** |
-| **Tier 4 — Real-World Scenarios** | `TestTier4RealWorldScenarios` | 20–22 scenarios | **22** | 22 | 0 | 0 | **PASS** |
-| **Total** | `tests/e2e_tiers.py` | **482–486** | **486** | **486** | **0** | **0** | **PASS** |
+| **Tier 1 — Feature Coverage** | `TestTier1FeatureCoverage` | 255 (5 × 51 features) | **255** | 255 | 0 | 0 | **PASS** |
+| **Tier 2 — Boundary & Corner Cases** | `TestTier2BoundaryAndCornerCases` | 255 (5 × 51 features) | **255** | 255 | 0 | 0 | **PASS** |
+| **Tier 3 — Cross-Feature Combinations** | `TestTier3CrossFeatureCombinations` | 51 (≥ 2 per feature) | **54** | 54 | 0 | 0 | **PASS** |
+| **Tier 4 — Real-World Scenarios** | `TestTier4RealWorldScenarios` | 25–27 scenarios | **27** | 27 | 0 | 0 | **PASS** |
+| **Total** | `tests/e2e_tiers.py` | **586–591** | **591** | **591** | **0** | **0** | **PASS** |
 
 ---
 
-## 2. Per-Feature Traceability Matrix (`F1`–`F42`)
+## 2. Per-Feature Traceability Matrix (`F1`–`F51`)
 
-Every feature `F1` through `F42` from `PROJECT.md` and `.agents/teamwork/ORIGINAL_REQUEST.md` is covered across all 4 tiers:
+Every feature `F1` through `F51` from `PROJECT.md` and `.agents/teamwork/ORIGINAL_REQUEST.md` is covered across all 4 tiers:
 
 | Feature ID | Feature Name | Track | Tier 1 Tests | Tier 2 Tests | Tier 3 Combinations | Tier 4 Scenarios | Total Tests |
 |---|---|---|---:|---:|---|---|---:|
@@ -41,7 +41,7 @@ Every feature `F1` through `F42` from `PROJECT.md` and `.agents/teamwork/ORIGINA
 | **F13** | CI Mirror Disk Watermark & Safe LRU Eviction | Track 3 | `test_t1_f13_01`..`05` (5) | `test_t2_f13_01`..`05` (5) | `t3_11`, `t3_12`, `t3_13`, `t3_23` | `S3`, `S6`, `S9`, `S14` | 18 |
 | **F14** | CI Source Pin Release & Lease Coordination | Track 3 | `test_t1_f14_01`..`05` (5) | `test_t2_f14_01`..`05` (5) | `t3_10`, `t3_11`, `t3_12`, `t3_23` | `S3`, `S6`, `S9`, `S14` | 18 |
 | **F15** | CI Mirror Concurrent Sync Rate Limiting & Observability | Track 3 | `test_t1_f15_01`..`05` (5) | `test_t2_f15_01`..`05` (5) | `t3_11`, `t3_13`, `t3_20`, `t3_23` | `S3`, `S6`, `S9`, `S10`, `S14` | 19 |
-| **F16** | Pando Streaming Delta Resolution & Graph Traversal | Track 4A | `test_t1_f16_01`..`05` (5) | `test_t2_f16_01`..`05` (5) | `t3_14`, `t3_15`, `t3_17`, `t3_27`, `t3_30`, `t3_37` | `S5`, `S8`, `S10`, `S12`, `S15`, `S18` | 22 |
+| **F16** | Pando Streaming Delta Resolution & Graph Traversal | Track 4A | `test_t1_f16_01`..`05` (5) | `test_t2_f16_01`..`05` (5) | `t3_14`, `t3_15`, `t3_17`, `t3_27`, `t3_30`, `t3_37`, `t3_49` | `S5`, `S8`, `S10`, `S12`, `S15`, `S18` | 23 |
 | **F17** | Pando Git Export Dual-Operator Differential Testing | Track 4A | `test_t1_f17_01`..`05` (5) | `test_t2_f17_01`..`05` (5) | `t3_14`, `t3_15`, `t3_17`, `t3_27`, `t3_30`, `t3_37` | `S5`, `S8`, `S10`, `S12`, `S15`, `S18` | 22 |
 | **F18** | Workspace Dirty-File Manifest, Ignore Rules & Read-Only View | Track 4B | `test_t1_f18_01`..`05` (5) | `test_t2_f18_01`..`05` (5) | `t3_16`, `t3_17`, `t3_29`, `t3_38` | `S4`, `S8`, `S10`, `S13`, `S15`, `S19` | 20 |
 | **F19** | Shared Schema Baseline Integration & Full E2E/Tier-5 Verification | M5 | `test_t1_f19_01`..`05` (5) | `test_t2_f19_01`..`05` (5) | `t3_09`, `t3_13`, `t3_20`, `t3_31` | `S2`, `S9`, `S10`, `S16` | 18 |
@@ -62,12 +62,21 @@ Every feature `F1` through `F42` from `PROJECT.md` and `.agents/teamwork/ORIGINA
 | **F34** | Track 1 — Untrusted Markdown XSS Sanitization & UTF-8 Boundary-Safe Large Blob Preview | M13 (Track 1) | `test_t1_f34_01`..`05` (5) | `test_t2_f34_01`..`05` (5) | `t3_33`, `t3_34`, `t3_35` | `S17`, `S20` | 15 |
 | **F35** | Track 2 — Pando S3-Compatible Object-Store Pack Upload/Download & CAS Verification | M14 (Track 2) | `test_t1_f35_01`..`05` (5) | `test_t2_f35_01`..`05` (5) | `t3_36`, `t3_37`, `t3_42` | `S18`, `S21` | 15 |
 | **F36** | Track 2 — Pando Multi-Pack Compaction / Repack & Storage Backend Gateway Routing | M14 (Track 2) | `test_t1_f36_01`..`05` (5) | `test_t2_f36_01`..`05` (5) | `t3_36`, `t3_37`, `t3_42` | `S18`, `S21` | 15 |
-| **F37** | Track 3 — Workspace-Lab Lazy Sparse VFS Mount & On-Demand CAS Blob Hydration | M15 (Track 3) | `test_t1_f37_01`..`05` (5) | `test_t2_f37_01`..`05` (5) | `t3_38`, `t3_39`, `t3_44` | `S19`, `S21` | 15 |
-| **F38** | Track 3 — Workspace-Lab Copy-on-Write Dirty File Tracking, Ignore-Aware Status & Clean Blob Eviction | M15 (Track 3) | `test_t1_f38_01`..`05` (5) | `test_t2_f38_01`..`05` (5) | `t3_38`, `t3_39`, `t3_44` | `S19`, `S21` | 15 |
-| **F39** | Track 4 — Multi-Node Repository Sharding Catalog, Deterministic Bucket Placement & Routing | M16 (Track 4) | `test_t1_f39_01`..`05` (5) | `test_t2_f39_01`..`05` (5) | `t3_40`, `t3_41`, `t3_42` | `S20`, `S21` | 15 |
-| **F40** | Track 4 — Epoch Storage Write Fencing, Automated Node Failover & Read-Only Degradation Drills | M16 (Track 4) | `test_t1_f40_01`..`05` (5) | `test_t2_f40_01`..`05` (5) | `t3_40`, `t3_41`, `t3_42` | `S20`, `S21` | 15 |
-| **F41** | Track 5 — 4-Tier E2E Test Harness Expansion & Per-Feature Filter Verification (486 Tests) | M12.5 (Track 5) | `test_t1_f41_01`..`05` (5) | `test_t2_f41_01`..`05` (5) | `t3_43`, `t3_44` | `S21`, `S22` | 14 |
+| **F37** | Track 3 — Workspace-Lab Lazy Sparse VFS Mount & On-Demand CAS Blob Hydration | M15 (Track 3) | `test_t1_f37_01`..`05` (5) | `test_t2_f37_01`..`05` (5) | `t3_38`, `t3_39`, `t3_44`, `t3_52` | `S19`, `S21` | 16 |
+| **F38** | Track 3 — Workspace-Lab Copy-on-Write Dirty File Tracking, Ignore-Aware Status & Clean Blob Eviction | M15 (Track 3) | `test_t1_f38_01`..`05` (5) | `test_t2_f38_01`..`05` (5) | `t3_38`, `t3_39`, `t3_44`, `t3_53` | `S19`, `S21` | 16 |
+| **F39** | Track 4 — Multi-Node Repository Sharding Catalog, Deterministic Bucket Placement & Routing | M16 (Track 4) | `test_t1_f39_01`..`05` (5) | `test_t2_f39_01`..`05` (5) | `t3_40`, `t3_41`, `t3_42`, `t3_50` | `S20`, `S21` | 16 |
+| **F40** | Track 4 — Epoch Storage Write Fencing, Automated Node Failover & Read-Only Degradation Drills | M16 (Track 4) | `test_t1_f40_01`..`05` (5) | `test_t2_f40_01`..`05` (5) | `t3_40`, `t3_41`, `t3_42`, `t3_51` | `S20`, `S21` | 16 |
+| **F41** | Track 5 — 4-Tier E2E Test Harness Expansion & Per-Feature Filter Verification (591 Tests) | M12.5 (Track 5) | `test_t1_f41_01`..`05` (5) | `test_t2_f41_01`..`05` (5) | `t3_43`, `t3_44` | `S21`, `S22` | 14 |
 | **F42** | Part 3 — Cross-Track Schema `060`, 11-Domain Router Non-Collision, Anti-Monolith Caps & Paired Backup | M17 (Part 3) | `test_t1_f42_01`..`05` (5) | `test_t2_f42_01`..`05` (5) | `t3_43`, `t3_44` | `S21`, `S22` | 14 |
+| **F43** | View-Lab Anti-Monolith Split, Namespace Pins & 3-Way Changeset Failpoint Recovery | Tier 5 Track 1 | `test_t1_f43_01`..`05` (5) | `test_t2_f43_01`..`05` (5) | `t3_45`, `t3_46`, `t3_54` | `S23`, `S27` | 15 |
+| **F44** | Long-Term History Projection Strategies (`deterministic_history` vs `task_snapshot`) | Tier 5 Track 1 | `test_t1_f44_01`..`05` (5) | `test_t2_f44_01`..`05` (5) | `t3_45`, `t3_47` | `S23`, `S27` | 14 |
+| **F45** | Cryptographic Source Commit & View Provenance HMAC-SHA256 Signature Verification | Tier 5 Track 1 | `test_t1_f45_01`..`05` (5) | `test_t2_f45_01`..`05` (5) | `t3_46`, `t3_47` | `S23`, `S27` | 14 |
+| **F46** | Git SHA-256 Object-Format Detection, Dual-Hash Validation & 32-Byte Packv2 Trailers | Tier 5 Track 2 | `test_t1_f46_01`..`05` (5) | `test_t2_f46_01`..`05` (5) | `t3_48`, `t3_49`, `t3_54` | `S24`, `S27` | 15 |
+| **F47** | Smart HTTP v1/v2 `object-format` Capability Negotiation & Compatibility Matrix Drills | Tier 5 Track 2 | `test_t1_f47_01`..`05` (5) | `test_t2_f47_01`..`05` (5) | `t3_48`, `t3_49` | `S24`, `S27` | 14 |
+| **F48** | Multi-Node 1/2/4-Node Sharding Concurrency, Failover & Pinned-Root Reachability | Tier 5 Track 3 | `test_t1_f48_01`..`05` (5) | `test_t2_f48_01`..`05` (5) | `t3_50`, `t3_51`, `t3_54` | `S25`, `S27` | 15 |
+| **F49** | P50/P95/P99 Latency Percentiles, Throughput & `/proc/self` Telemetry Report Generator | Tier 5 Track 3 | `test_t1_f49_01`..`05` (5) | `test_t2_f49_01`..`05` (5) | `t3_50`, `t3_51` | `S25`, `S27` | 14 |
+| **F50** | Workspace Virtual Mount Copy-on-Write Overlay Sandbox & Multi-Agent Isolation | Tier 5 Track 4 | `test_t1_f50_01`..`05` (5) | `test_t2_f50_01`..`05` (5) | `t3_52`, `t3_53`, `t3_54` | `S26`, `S27` | 15 |
+| **F51** | Workspace Mid-Write Power-Loss Crash Window WAL Journal Recovery Reconciliation | Tier 5 Track 4 | `test_t1_f51_01`..`05` (5) | `test_t2_f51_01`..`05` (5) | `t3_52`, `t3_53`, `t3_54` | `S26`, `S27` | 15 |
 
 ---
 
@@ -87,25 +96,29 @@ All fixture classes in `tests/e2e_tiers.py` use real `/usr/bin/git` subprocesses
 10. **`TrackBMembersRbacAuditEngine`**: Enforces `050_members_rbac.sql` (`repository_collaborators`, `repository_teams`, `repository_team_members`, `repository_audit_log`, and SQL `BEFORE INSERT` membership triggers), 5-level role hierarchy (`read < triage < write < maintain < admin`), `max(direct_role, max_team_role)` union resolution, `404` non-member isolation, `prevent_self_approval`, distinct `write`+ approver counting at merge time, and cursor-paginated `GET /api/repos/{owner}/{name}/audit`.
 11. **`Track1WebUiEngine`**: Implements Server-Side HTML Web UI views (`/web/repos/{owner}/{name}/...`), `Cookie: rootyard_token=...` and `X-Rootyard-Token` authentication, strict allowlist Markdown XSS sanitization (`render_safe_markdown`), security response headers (`Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`), and UTF-8 boundary-safe large blob preview (`build_blob_preview`).
 12. **`Track4ShardingFencingEngine`**: Enforces `060_sharding_fencing.sql` (`shard_nodes`, `shard_virtual_buckets`, `repository_shard_routes`, `shard_failover_operations`), deterministic `SHA-256(repository_id) % 1024` virtual bucket placement, SSRF validation, watermark-qualified replica read routing, dual PostgreSQL + on-disk `rootyard-shard-fence.json` (`0600`) epoch write fencing, atomic `draining -> fenced -> verified -> promoted` failover, and read-only degradation drills.
-13. **`SchemaBoundaryIntegrationFixture`**: Inspects live repository files (`src/db.rs`, `src/backup.rs`, `src/lib.rs`, `src/auth.rs`, `src/events.rs`, `src/dispatch.rs`, `migrations/*.sql`, `schema/*.json`, `tests/schema_baseline.py`, `scripts/check_design_docs.py`, `tests/test_parallel_boundaries.py`), anti-monolith line caps across all domain roots and submodules, Axum 0.8 route-table non-collision, Part 1 `050` closure, Track 5 42-feature/486-test completeness, and Part 3 `060` convergence.
+13. **`SchemaBoundaryIntegrationFixture`**: Inspects live repository files (`src/db.rs`, `src/backup.rs`, `src/lib.rs`, `src/auth.rs`, `src/events.rs`, `src/dispatch.rs`, `migrations/*.sql`, `schema/*.json`, `tests/schema_baseline.py`, `scripts/check_design_docs.py`, `tests/test_parallel_boundaries.py`), anti-monolith line caps across all domain roots and submodules, Axum 0.8 route-table non-collision, Part 1 `050` closure, Track 5 51-feature / 591-test completeness, and Part 3 `060` convergence.
+14. **`ViewLabHistorySignatureEngine` (`Tier5ViewLabHistoryAndSignatureFixture`)**: Verifies `src/view_lab.rs` (`< 120` lines) and `src/view_lab/{models,namespace,projection,changeset}.rs` (`< 500` lines each), manages bare Git repos with fast-forward and lease-epoch fencing, creates multi-repo namespaces with `.sha256` companion manifests and durable `refs/rootyard/namespace-pins/*`, materializes `project-subdir` and `create-task-view` Git repositories, performs 3-way `git merge-tree --write-tree` changeset integration with failpoints `86`/`87` recovery, projects multi-repo history via `deterministic_history` and `task_snapshot`, and verifies OpenPGP/SSH source commit signatures and RFC 2104 HMAC-SHA256 `Rootyard-View-Signature` provenance trailers.
+15. **`ObjectFormatDualHashEngine` (`Tier5DualHashObjectFormatFixture`)**: Initializes and inspects real SHA-1 (`40`-hex / `20`-byte) and SHA-256 (`64`-hex / `32`-byte) bare Git repositories, verifies canonical empty-tree and zero-OID constants, validates `20`-byte SHA-1 and `32`-byte SHA-256 packv2 stream trailers, browses dual-hash commits/trees/blobs, verifies 64-hex SHA-256 Git LFS content addressing, and executes Smart HTTP v1/v2 `object-format` capability advertisement, negotiation, `409 Conflict` cross-format rejection, and the 4-combination `(sha1, sha256) x (v1, v2)` compatibility matrix drill.
+16. **`ShardingClusterBenchmarkEngine` (`Tier5MultiNodeShardingBenchmarkFixture`)**: Provisions 1-, 2-, and 4-node sharded Git clusters across 1024 deterministic virtual buckets, executes multi-threaded concurrent `push`, `fetch`, `gc`, `cache_evict`, and live primary->replica `failover` workloads with `rootyard-shard-fence.json` split-brain write rejection, audits 100% post-stress reachability of `refs/rootyard-ci/jobs/*` pinned roots, computes monotonic `p50_ms <= p95_ms <= p99_ms` latency percentiles and throughput, collects real Linux `/proc/self/{stat,status,io}` telemetry, and generates JSON and Markdown scaling benchmark reports.
+17. **`WorkspaceOverlayCrashRecoveryEngine` (`Tier5WorkspaceOverlayAndCrashRecoveryFixture`)**: Mounts Copy-on-Write (`lower`/`upper`/`work`/`merged`) workspace overlays over immutable `0444`/`0555` lower checkpoints, enforces multi-agent sandbox isolation, tracks upper modifications/additions, `.wh.<name>` whiteout tombstones on cross-layer file/directory renames, `0644`/`0755`/`0600` mode transitions, and `git add -f` overrides, and injects and recovers all 4 mid-write power-loss crash windows (`before_wal_fsync`, `after_wal_before_publish`, `after_publish_before_ack`, `index_update_interrupted`) with `.tmp-*` cleanup, `.git/index.lock` removal, WAL journal SHA-256 verification, and `git fsck --full --strict` validation.
 
 ---
 
 ## 4. Execution Commands & Verification Output
 
 ```bash
-# Run all 4 tiers (486 tests)
+# Run all 4 tiers (591 tests)
 python3 tests/e2e_tiers.py --tier all
 
 # Run individual tiers
-python3 tests/e2e_tiers.py --tier 1   # 210 tests
-python3 tests/e2e_tiers.py --tier 2   # 210 tests
-python3 tests/e2e_tiers.py --tier 3   # 44 tests
-python3 tests/e2e_tiers.py --tier 4   # 22 tests
+python3 tests/e2e_tiers.py --tier 1   # 255 tests
+python3 tests/e2e_tiers.py --tier 2   # 255 tests
+python3 tests/e2e_tiers.py --tier 3   # 54 tests
+python3 tests/e2e_tiers.py --tier 4   # 27 tests
 
-# Run tests for any specific feature (F1..F42)
-python3 tests/e2e_tiers.py --feature F33
-for i in $(seq 32 42); do python3 tests/e2e_tiers.py --feature "F$i"; done
+# Run tests for any specific feature (F1..F51)
+python3 tests/e2e_tiers.py --feature F43
+for i in $(seq 43 51); do python3 tests/e2e_tiers.py --feature "F$i"; done
 
 # Run via Python standard unittest discovery
 python3 -m unittest tests/e2e_tiers.py
@@ -119,5 +132,6 @@ python3 -m unittest tests/e2e_tiers.py
   - `TEST_INFRA.md`
   - `tests/e2e_tiers.py`
   - `TEST_READY.md`
-- **Untouched Production & Track Files**: Zero modifications during `M12.5` (`E2E_R3`) to `src/**`, `migrations/**`, `schema/**`, `.github/**`, `docs/**`, `experimental/**`, `tests/test_tier5_adversarial.py`, or any other track-owned files.
+- **Untouched Production & Track Files**: Zero modifications during `E2E_R4` to `src/**`, `migrations/**`, `schema/**`, `.github/**`, `docs/**`, `experimental/**`, `tests/test_tier5_adversarial.py`, or any other track-owned files.
+
 

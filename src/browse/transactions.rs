@@ -3,7 +3,7 @@ use crate::{
     AppState, Error, auth,
     browse::{
         git_read,
-        models::{AppliedRefUpdate, RefTransactionRequest, RefTransactionResponse, ZERO_OID},
+        models::{AppliedRefUpdate, RefTransactionRequest, RefTransactionResponse},
     },
     db, events, journal, reliability, storage,
 };
@@ -206,6 +206,8 @@ async fn execute_ref_transaction_inner(
         ));
     }
 
+    let repo_format = crate::browse::object_format::detect_repo_object_format(&state, repo_id).await?;
+    let zero_oid = repo_format.zero_oid();
     let (head, current_refs) = git_read::read_head_and_refs(&state, repo_id).await?;
     let refs_map: HashMap<&str, &str> = current_refs
         .iter()
@@ -213,11 +215,19 @@ async fn execute_ref_transaction_inner(
         .collect();
 
     for u in &normalized_updates {
-        let actual_old = refs_map.get(u.ref_name.as_str()).copied().unwrap_or(ZERO_OID);
+        if !crate::browse::object_format::valid_oid_for_format(&u.old_oid, repo_format)
+            || !crate::browse::object_format::valid_oid_for_format(&u.new_oid, repo_format)
+        {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "ref transaction object format does not match repository",
+            ));
+        }
+        let actual_old = refs_map.get(u.ref_name.as_str()).copied().unwrap_or(zero_oid);
         if actual_old != u.old_oid {
             return Err(Error(StatusCode::CONFLICT, "reference old_oid mismatch"));
         }
-        if u.new_oid == ZERO_OID {
+        if u.new_oid == zero_oid {
             if head.target.as_deref() == Some(u.ref_name.as_str()) {
                 return Err(Error(
                     StatusCode::CONFLICT,

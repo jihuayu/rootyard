@@ -16,7 +16,7 @@ pub use models::*;
 
 pub fn run(args: Vec<OsString>) -> Result<()> {
     ensure!(cfg!(target_os = "linux"), "view lab requires Linux");
-    let usage = "usage: rootyard-view-lab register-repo | advance-repo | create-namespace | project-subdir | create-task-view | integrate-changeset | recover-changeset";
+    let usage = "usage: rootyard-view-lab register-repo | advance-repo | create-namespace | project-subdir | create-task-view | project-history | verify-view | integrate-changeset | recover-changeset";
     let command = args.first().and_then(|x| x.to_str()).context(usage)?;
     ensure!(args.len() >= 3, "{usage}");
     let store = Store::open(Path::new(&args[1]))?;
@@ -66,6 +66,11 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             let view_name = text_arg(&args[2])?;
             let revision_id = text_arg(&args[3])?;
             store.create_task_view(&view_name, &revision_id)?
+        }
+        "project-history" => store.project_history_cli(&args[2..])?,
+        "verify-view" => {
+            ensure!(args.len() == 3, "verify-view requires STORE VIEW_ID");
+            store.verify_view(&text_arg(&args[2])?)?
         }
         "integrate-changeset" => {
             ensure!(

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
-fn json_ok(value: impl serde::Serialize) -> Response {
+pub(crate) fn json_ok(value: impl serde::Serialize) -> Response {
     (
         StatusCode::OK,
         [(header::CACHE_CONTROL, "no-store")],
@@ -28,7 +28,7 @@ fn json_ok(value: impl serde::Serialize) -> Response {
         .into_response()
 }
 
-fn acquire_git_slot(state: &AppState) -> Result<OwnedSemaphorePermit, Error> {
+pub(crate) fn acquire_git_slot(state: &AppState) -> Result<OwnedSemaphorePermit, Error> {
     state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(
             StatusCode::SERVICE_UNAVAILABLE,

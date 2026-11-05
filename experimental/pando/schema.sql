@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS pando_lab.manifests (
  pack_sha256 text NOT NULL, idx_sha256 text NOT NULL,
  PRIMARY KEY(repo,pack_id));
 CREATE TABLE IF NOT EXISTS pando_lab.objects (
- repo uuid NOT NULL, oid text NOT NULL CHECK(oid ~ '^[0-9a-f]{40}$'),
+ repo uuid NOT NULL, oid text NOT NULL CHECK(oid ~ '^[0-9a-f]{40}([0-9a-f]{24})?$'),
  pack_id uuid NOT NULL, PRIMARY KEY(repo,oid),
  FOREIGN KEY(repo,pack_id) REFERENCES pando_lab.manifests(repo,pack_id));
 CREATE TABLE IF NOT EXISTS pando_lab.refs (
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS pando_lab.migrations (
 CREATE TABLE IF NOT EXISTS pando_lab.pinned_roots (
  repo uuid NOT NULL REFERENCES pando_lab.repositories,
  name text NOT NULL CHECK(octet_length(name)>=1 AND octet_length(name)<=256),
- oid text NOT NULL CHECK(oid ~ '^[0-9a-f]{40}$'),
+ oid text NOT NULL CHECK(oid ~ '^[0-9a-f]{40}([0-9a-f]{24})?$'),
  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  PRIMARY KEY(repo,name),
  FOREIGN KEY(repo,oid) REFERENCES pando_lab.objects(repo,oid));

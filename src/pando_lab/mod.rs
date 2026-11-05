@@ -6,6 +6,7 @@ mod hook;
 mod http;
 pub mod lifecycle;
 pub mod migration;
+pub mod object_format;
 pub mod object_store;
 pub mod repack;
 pub mod rollback;
@@ -503,8 +504,11 @@ pub async fn run() -> Result<()> {
             let report = lifecycle::rotate_kms_key(&config, repo, &args[2]).await?;
             println!("{}", serde_json::to_string(&report)?);
         }
+        Some("object-format-detect") | Some("verify-object-format") | Some("compat-matrix") => {
+            object_format::run_cli_command(&config, &args).await?;
+        }
         _ => bail!(
-            "usage: rootyard-pando-lab init | create-repo <uuid> <principal> | serve | verify-delta <pack> | walk-graph <repo> [wants... ^haves...] | diff-export <repo> [^haves...] | gc [repo] | migrate <repo> <gitfs_path> | migrate-step <repo> <gitfs_path> <copy|verify|drain|fence|switchover> | rollback <repo> <gitfs_path> | migration-status <repo> | repack <repo> [--prune-superseded] [--no-object-store] [--pin-oid <oid>...] | pin-root <repo> <name> <oid> | unpin-root <repo> <name> | object-store-put <repo> <pack_id> [--chunk-size <bytes>] [--fail-after-chunks <n>] [--corrupt-chunk <part>] | object-store-get <repo> <pack_id> | object-store-verify <repo> | object-store-status <repo> | lifecycle-evaluate <repo> [--max-packs <n>] [--cold-evict-local] [--auto-repack] | kms-rotate <repo> <new_key_id>"
+            "usage: rootyard-pando-lab init | create-repo <uuid> <principal> | serve | verify-delta <pack> | walk-graph <repo> [wants... ^haves...] | diff-export <repo> [^haves...] | gc [repo] | migrate <repo> <gitfs_path> | migrate-step <repo> <gitfs_path> <copy|verify|drain|fence|switchover> | rollback <repo> <gitfs_path> | migration-status <repo> | repack <repo> [--prune-superseded] [--no-object-store] [--pin-oid <oid>...] | pin-root <repo> <name> <oid> | unpin-root <repo> <name> | object-store-put <repo> <pack_id> [--chunk-size <bytes>] [--fail-after-chunks <n>] [--corrupt-chunk <part>] | object-store-get <repo> <pack_id> | object-store-verify <repo> | object-store-status <repo> | lifecycle-evaluate <repo> [--max-packs <n>] [--cold-evict-local] [--auto-repack] | kms-rotate <repo> <new_key_id> | object-format-detect <repo_or_path> | verify-object-format <repo> [--format <sha1|sha256>] | compat-matrix [<repo>] [--client-format <sha1|sha256>] [--protocol-v2]"
         ),
     }
     Ok(())

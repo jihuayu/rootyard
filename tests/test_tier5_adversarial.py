@@ -565,6 +565,7 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
             "members": 100,
             "web": 100,
             "sharding": 100,
+            "view_lab": 120,
             "mirror": 150,
             "workspace_lab": 150,
         }
@@ -579,12 +580,13 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
     def test_all_track_submodules_exist_and_satisfy_single_responsibility_line_bounds(self) -> None:
         expected_submodules = {
             "pulls": (["models.rs", "handlers.rs", "checks.rs", "rules.rs", "merge.rs"], 600),
-            "browse": (["models.rs", "git_read.rs", "handlers.rs", "transactions.rs"], 550),
+            "browse": (["models.rs", "git_read.rs", "handlers.rs", "transactions.rs", "object_format.rs"], 550),
             "lfs": (["models.rs", "storage.rs", "handlers.rs"], 550),
             "webhooks": (["models.rs", "signing.rs", "delivery.rs", "handlers.rs"], 550),
             "members": (["models.rs", "rbac.rs", "audit.rs"], 550),
             "web": (["models.rs", "sanitize.rs", "templates.rs", "handlers.rs"], 600),
-            "sharding": (["models.rs", "router.rs", "fencing.rs", "failover.rs", "rebalance.rs"], 600),
+            "sharding": (["models.rs", "router.rs", "fencing.rs", "failover.rs", "rebalance.rs", "benchmark.rs"], 600),
+            "view_lab": (["models.rs", "namespace.rs", "projection.rs", "changeset.rs"], 500),
             "mirror": (["auto_origin.rs", "eviction.rs", "limiter.rs", "observability.rs", "sync.rs", "views.rs"], 700),
             "pando_lab": (
                 [
@@ -600,6 +602,7 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
                     "object_store.rs",
                     "repack.rs",
                     "lifecycle.rs",
+                    "object_format.rs",
                 ],
                 850,
             ),
@@ -614,6 +617,7 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
                     "namespace.rs",
                     "vfs.rs",
                     "writable_view.rs",
+                    "crash_recovery.rs",
                 ],
                 1150,
             ),
@@ -635,6 +639,7 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
             "src/members.rs",
             "src/web.rs",
             "src/sharding.rs",
+            "src/view_lab.rs",
         ):
             src = (ROOT / entry_rel).read_text(encoding="utf-8")
             for sql_kw in ("SELECT ", "INSERT ", "UPDATE ", "DELETE "):
@@ -645,20 +650,25 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
         model_files = (
             "src/pulls/models.rs",
             "src/browse/models.rs",
+            "src/browse/object_format.rs",
             "src/lfs/models.rs",
             "src/webhooks/models.rs",
             "src/members/models.rs",
             "src/web/models.rs",
             "src/sharding/models.rs",
             "src/sharding/rebalance.rs",
+            "src/sharding/benchmark.rs",
+            "src/view_lab/models.rs",
             "src/mirror/eviction.rs",
             "src/mirror/auto_origin.rs",
             "src/pando_lab/lifecycle.rs",
+            "src/pando_lab/object_format.rs",
             "src/workspace_lab/manifest.rs",
             "src/workspace_lab/remote.rs",
             "src/workspace_lab/namespace.rs",
             "src/workspace_lab/vfs.rs",
             "src/workspace_lab/writable_view.rs",
+            "src/workspace_lab/crash_recovery.rs",
         )
         for rel in model_files:
             text = (ROOT / rel).read_text(encoding="utf-8")
@@ -1491,6 +1501,189 @@ class TestTier5Phase2CrossTrackAdversarial(e2e_tiers.BaseRootyardTestCase):
         gv = node_b.namespace_git_view("ns-ok")
         self.assertTrue(gv["fsck_passed"])
         self.assertEqual((Path(gv["view_repo_path"]) / "services/svc/svc.rs").read_bytes(), b"pub fn run() {}\n")
+
+
+class TestTier5Phase5TracksAdversarial(e2e_tiers.BaseRootyardTestCase):
+    """Class 8: White-box adversarial tests for Phase 5 Tracks 1, 2, 3, and 4 (F43-F51)."""
+
+    def test_tier5_f43_f44_f45_view_lab_history_projection_and_provenance_signature_tamper(self) -> None:
+        vfx = e2e_tiers.Tier5ViewLabHistoryAndSignatureFixture(self.tmp_path / "t5_view_lab_adv")
+        mod_report = vfx.verify_view_lab_modularity()
+        self.assertFalse(mod_report["mod_rs_exists"])
+        self.assertLess(mod_report["root_lines"], 120)
+        self.assertTrue(mod_report["gitignore_has_original_request"])
+
+        vfx.register_repo("repo-core", {"pkg/core/lib.rs": b"pub fn v1() {}\n"})
+        vfx.create_signed_source_commit("repo-core", {"pkg/core/lib.rs": b"pub fn v2() {}\n"}, sig_type="gpg_pgp")
+        vfx.create_namespace(
+            "ns-core",
+            "rev-1",
+            [{"repo_id": "repo-core", "subpath": "pkg/core", "mount_path": "core"}],
+        )
+
+        # Epoch 1 deterministic_history projection + incremental Epoch 2 reuse
+        ep1 = vfx.project_history("view-hist", "ns-core", "rev-1", strategy="deterministic_history", view_epoch=1)
+        self.assertGreaterEqual(ep1["newly_projected_commits"], 2)
+        self.assertTrue(vfx.verify_view("view-hist")["verified"])
+
+        vfx.create_signed_source_commit("repo-core", {"pkg/core/lib.rs": b"pub fn v3() {}\n"}, sig_type="ssh_sig")
+        vfx.create_namespace(
+            "ns-core",
+            "rev-2",
+            [{"repo_id": "repo-core", "subpath": "pkg/core", "mount_path": "core"}],
+        )
+        ep2 = vfx.project_history(
+            "view-hist",
+            "ns-core",
+            "rev-2",
+            strategy="deterministic_history",
+            view_epoch=2,
+            previous_epoch_map=ep1["history_map"],
+        )
+        self.assertGreaterEqual(ep2["reused_commits"], 2)
+        self.assertEqual(ep2["newly_projected_commits"], 1)
+
+        # Wrong HMAC secret key -> provenance signature verification fails closed
+        with self.assertRaisesRegex(ValueError, "HMAC signature verification failed"):
+            vfx.verify_view("view-hist", secret_key="wrong-adversarial-secret-key")
+
+        # Require signed source commits rejects initial unsigned root commit in history
+        with self.assertRaisesRegex(ValueError, "Unsigned source commit"):
+            vfx.project_history(
+                "view-strict-sig",
+                "ns-core",
+                "rev-2",
+                strategy="deterministic_history",
+                view_epoch=1,
+                require_signed_source=True,
+            )
+
+        # Malformed source commit signature rejected during projection
+        vfx.create_signed_source_commit("repo-core", {"pkg/core/lib.rs": b"pub fn bad() {}\n"}, sig_type="malformed")
+        vfx.create_namespace(
+            "ns-core",
+            "rev-bad",
+            [{"repo_id": "repo-core", "subpath": "pkg/core", "mount_path": "core"}],
+        )
+        with self.assertRaisesRegex(ValueError, "Malformed source commit signature"):
+            vfx.project_history("view-bad-sig", "ns-core", "rev-bad", strategy="task_snapshot", view_epoch=1)
+
+    def test_tier5_f46_f47_dual_hash_sha256_pack_trailer_and_smart_http_negotiation(self) -> None:
+        dfx = e2e_tiers.Tier5DualHashObjectFormatFixture(self.tmp_path / "t5_dual_hash_adv")
+        r1 = dfx.init_repo("repo-sha1", object_format="sha1")
+        r256 = dfx.init_repo("repo-sha256", object_format="sha256")
+        self.assertEqual((len(r1["head_oid"]), len(r256["head_oid"])), (40, 64))
+
+        # Packv2 trailer verification: 20-byte SHA-1 vs 32-byte SHA-256, and corrupt trailer rejection
+        p1 = dfx.verify_pack_trailer("repo-sha1", expected_format="sha1")
+        p256 = dfx.verify_pack_trailer("repo-sha256", expected_format="sha256")
+        self.assertEqual((p1["trailer_bytes"], p256["trailer_bytes"]), (20, 32))
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            dfx.verify_pack_trailer("repo-sha256", corrupt_last_byte=True)
+        with self.assertRaisesRegex(ValueError, "Object format mismatch"):
+            dfx.verify_pack_trailer("repo-sha256", expected_format="sha1")
+
+        # Cross-format negotiation rejected with 409; wrong OID length rejected with 422
+        st_mis, err_mis = dfx.negotiate_object_format(
+            "repo-sha256", protocol_version="v2", client_object_format="sha1", operation="push"
+        )
+        self.assertEqual((st_mis, err_mis["error"]), (409, "object_format_mismatch"))
+        st_len, _ = dfx.negotiate_object_format(
+            "repo-sha256",
+            protocol_version="v2",
+            client_object_format="sha256",
+            operation="fetch",
+            client_oid=r1["head_oid"],
+        )
+        self.assertEqual(st_len, 422)
+
+        # Full 4-combination Smart HTTP v1/v2 x SHA-1/SHA-256 + LFS compatibility matrix drill
+        matrix = dfx.run_compat_matrix_drill()
+        self.assertTrue(matrix["matrix_passed"])
+        self.assertEqual(matrix["combinations_tested"], 4)
+        self.assertEqual(matrix["cross_format_rejections_verified"], 4)
+
+    def test_tier5_f48_f49_multinode_sharding_benchmark_pinned_roots_and_proc_telemetry(self) -> None:
+        bfx = e2e_tiers.Tier5MultiNodeShardingBenchmarkFixture(self.tmp_path / "t5_bench_adv")
+
+        # Auth and parameter validation guards
+        self.assertEqual(bfx.http_post_benchmark(e2e_tiers.UNAUTH)[0], 401)
+        self.assertEqual(bfx.http_post_benchmark(e2e_tiers.ALICE_RO)[0], 403)
+        self.assertEqual(bfx.http_post_benchmark(e2e_tiers.ALICE, node_counts=(3,))[0], 400)
+
+        # Execute 1/2/4-node scaling benchmark with failover, GC, and pinned-root reachability verification
+        st_ok, rep = bfx.http_post_benchmark(
+            e2e_tiers.ALICE, node_counts=(1, 2, 4), worker_threads=2, ops_per_worker=4
+        )
+        self.assertEqual(st_ok, 200)
+        self.assertTrue(rep["all_pinned_roots_verified"])
+        self.assertTrue(rep["zero_split_brain"])
+        for tier_key in ("1_node", "2_node", "4_node"):
+            tier = rep["runs"][tier_key]
+            self.assertLessEqual(tier["p50_ms"], tier["p95_ms"])
+            self.assertLessEqual(tier["p95_ms"], tier["p99_ms"])
+            self.assertGreater(tier["telemetry"]["rss_kb"], 0)
+            self.assertEqual(tier["pinned_roots_verified"], tier["pinned_roots_total"])
+
+        st_md, md_doc = bfx.http_get_benchmark_report(e2e_tiers.ALICE, fmt="markdown")
+        self.assertEqual(st_md, 200)
+        self.assertIn("Rootyard Sharding Concurrency & Latency Benchmark Report", md_doc["markdown"])
+
+    def test_tier5_f50_f51_workspace_cow_overlay_sandbox_and_wal_power_loss_crash_recovery(self) -> None:
+        ofx = e2e_tiers.Tier5WorkspaceOverlayAndCrashRecoveryFixture(self.tmp_path / "t5_overlay_crash_adv")
+        ofx.init_lower_checkpoint(
+            "ckpt-base",
+            {
+                "src/lib.rs": b"pub fn base() {}\n",
+                "src/old_dir/mod.rs": b"pub mod sub;\n",
+                ".gitignore": b"*.log\nbuild/\n",
+            },
+        )
+        ofx.overlay_mount("ov-agent-1", "ckpt-base", agent_id="agent-alpha")
+
+        # Cross-agent access denied with PermissionError
+        with self.assertRaisesRegex(PermissionError, "isolation violation"):
+            ofx.overlay_write("ov-agent-1", "src/lib.rs", b"hacked\n", caller_agent_id="agent-beta")
+
+        # Cross-layer directory rename places whiteout tombstone on lower path while keeping lower 0o444 intact
+        ofx.overlay_rename("ov-agent-1", "src/old_dir", "src/new_dir", caller_agent_id="agent-alpha")
+        ofx.overlay_chmod("ov-agent-1", "src/lib.rs", 0o755, caller_agent_id="agent-alpha")
+        ofx.overlay_write("ov-agent-1", "debug.log", b"trace log\n", caller_agent_id="agent-alpha")
+        st_before_f = ofx.overlay_status("ov-agent-1", caller_agent_id="agent-alpha")
+        self.assertTrue(st_before_f["lower_intact"])
+        self.assertIn("src/old_dir/mod.rs", st_before_f["whiteouts"])
+        self.assertIn("debug.log", st_before_f["ignored"])
+
+        # git add -f synchronously promotes ignored file into tracked upper_added
+        st_after_f = ofx.overlay_git_add_f("ov-agent-1", "debug.log", caller_agent_id="agent-alpha")
+        self.assertIn("debug.log", st_after_f["force_added"])
+        self.assertIn("debug.log", st_after_f["upper_added"])
+        self.assertNotIn("debug.log", st_after_f["ignored"])
+
+        # Power-loss crash windows: before_wal_fsync, after_wal_before_publish, after_publish_before_ack, index_update_interrupted
+        for idx, win in enumerate(ofx.VALID_CRASH_WINDOWS):
+            ws_id = f"ws-crash-{idx}"
+            ofx.init_crash_workspace(ws_id, {"app.rs": b"fn v0() {}\n"})
+            ofx.crash_drill(ws_id, "app.rs", f"fn recovered_{win}() {{}}\n".encode("utf-8"), window=win)
+            rec = ofx.crash_recover(ws_id)
+            self.assertTrue(rec["recovered"])
+            self.assertTrue(rec["fsck_passed"])
+            self.assertFalse(rec["index_lock_exists"])
+            self.assertEqual(rec["leftover_tmp_files"], 0)
+            app_bytes = (Path(ofx.crash_workspaces[ws_id]["repo_dir"]) / "app.rs").read_bytes()
+            if win == "before_wal_fsync":
+                self.assertEqual(app_bytes, b"fn v0() {}\n")
+            else:
+                self.assertEqual(app_bytes, f"fn recovered_{win}() {{}}\n".encode("utf-8"))
+
+        # Corrupt WAL journal sha256 fails closed during crash_recover
+        ofx.init_crash_workspace("ws-corrupt-wal", {"app.rs": b"fn v0() {}\n"})
+        ofx.crash_drill("ws-corrupt-wal", "app.rs", b"fn v1() {}\n", window="after_wal_before_publish")
+        (Path(ofx.crash_workspaces["ws-corrupt-wal"]["wal_dir"]) / "journal.sha256").write_text(
+            "0" * 64 + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ValueError, "checksum corruption"):
+            ofx.crash_recover("ws-corrupt-wal")
 
 
 if __name__ == "__main__":

@@ -63,8 +63,8 @@ pub struct GraphWalkReport {
     pub reachable_oids: Vec<String>,
 }
 
-fn is_valid_oid(oid: &str) -> bool {
-    oid.len() == 40
+pub fn is_valid_oid(oid: &str) -> bool {
+    (oid.len() == 40 || oid.len() == 64)
         && oid
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -94,7 +94,11 @@ pub fn parse_commit(data: &[u8]) -> Result<ParsedCommit> {
     })
 }
 
-pub fn parse_tree(data: &[u8]) -> Result<Vec<TreeEntry>> {
+pub fn parse_tree_with_raw_oid_len(data: &[u8], raw_oid_len: usize) -> Result<Vec<TreeEntry>> {
+    ensure!(
+        raw_oid_len == 20 || raw_oid_len == 32,
+        "unsupported raw tree OID length {raw_oid_len}"
+    );
     let mut pos = 0usize;
     let mut entries = Vec::new();
     while pos < data.len() {
@@ -125,10 +129,10 @@ pub fn parse_tree(data: &[u8]) -> Result<Vec<TreeEntry>> {
             "invalid tree entry filename"
         );
         let name = String::from_utf8_lossy(name_bytes).into_owned();
-        let oid_end = nul_idx + 21;
+        let oid_end = nul_idx + 1 + raw_oid_len;
         ensure!(
             oid_end <= data.len(),
-            "truncated 20-byte OID in tree entry {name}"
+            "truncated {raw_oid_len}-byte OID in tree entry {name}"
         );
         let oid = hex::encode(&data[nul_idx + 1..oid_end]);
         entries.push(TreeEntry {
@@ -140,6 +144,10 @@ pub fn parse_tree(data: &[u8]) -> Result<Vec<TreeEntry>> {
         pos = oid_end;
     }
     Ok(entries)
+}
+
+pub fn parse_tree(data: &[u8]) -> Result<Vec<TreeEntry>> {
+    parse_tree_with_raw_oid_len(data, 20)
 }
 
 pub fn parse_tag(data: &[u8]) -> Result<ParsedTag> {
@@ -195,6 +203,7 @@ pub fn walk_reachable(
         let Some((obj_type, data)) = store.objects.get(&oid) else {
             continue;
         };
+        let raw_oid_len = if oid.len() == 64 { 32 } else { 20 };
         match obj_type {
             ObjectType::Tag => {
                 let tag = parse_tag(data)?;
@@ -208,7 +217,7 @@ pub fn walk_reachable(
                 }
             }
             ObjectType::Tree => {
-                for entry in parse_tree(data)? {
+                for entry in parse_tree_with_raw_oid_len(data, raw_oid_len)? {
                     if entry.kind != TreeEntryKind::Gitlink {
                         have_queue.push_back(entry.oid);
                     }
@@ -243,6 +252,7 @@ pub fn walk_reachable(
             continue;
         }
         visited.insert(oid.clone(), *obj_type);
+        let raw_oid_len = if oid.len() == 64 { 32 } else { 20 };
 
         match obj_type {
             ObjectType::Tag => {
@@ -257,7 +267,7 @@ pub fn walk_reachable(
                 }
             }
             ObjectType::Tree => {
-                for entry in parse_tree(data)? {
+                for entry in parse_tree_with_raw_oid_len(data, raw_oid_len)? {
                     match entry.kind {
                         TreeEntryKind::Tree => {
                             want_queue.push_back((entry.oid, Some(ObjectType::Tree)));

@@ -57,6 +57,15 @@
 | **Track 3（M20）：Workspace 可写虚拟 Namespace 与多 Agent 路径租约** | 多 Agent 路径前缀排他租约锁（`agent-lease`）、可写虚拟 Namespace 反向路径映射（`namespace-write`）与跨仓两阶段原子回写（`namespace-commit-back`） | `src/workspace_lab/writable_view.rs`、`src/workspace_lab.rs` | `tests/workspace.py`、`tests/test_workspace_remote_namespace.py` |
 | **Track 4（M21）：多节点分片在线重平衡与 RPO/RTO 灾备演练** | 四阶段在线虚拟桶/仓库重平衡迁移（`drain` → `sync` → `fence` → `cutover`，`/api/shards/rebalance`）、实测 RPO/RTO 灾备切换演练与 SLA 门禁（`/api/repos/{owner}/{name}/shard-dr-drill`） | `src/sharding/rebalance.rs`、`src/sharding.rs` | `tests/sharding.py`、`tests/test_sharding.py` |
 
+### 2.5 第五梯队并行轨道（Phase 5 / Tier 5）
+
+| 轨道 | 负责范围 | 专属源码文件 / 目录 | 专属测试文件 |
+| --- | --- | --- | --- |
+| **Track 1（M23 / M24）：`view_lab` 模块化解耦、长周期历史投影策略与签名溯源验签** | `src/view_lab.rs`（`< 120` 行门面）与 4 个子模块拆分、`deterministic_history` vs `task_snapshot` 增量 Epoch DAG 投影（`project-history`）、源提交 GPG/SSH 签名识别与平台 HMAC-SHA256 溯源签名验签（`verify-view`） | `src/view_lab.rs`、`src/view_lab/`（`models.rs`、`namespace.rs`、`projection.rs`、`changeset.rs`）、`docs/git-view-foundation.md` | `tests/git_views.py`、`tests/test_view_lab.py` |
+| **Track 2（M25）：Git SHA-256 双对象格式探测与 Smart HTTP v1/v2 协议能力协商** | `object-format=sha256` 仓库探测、SHA-1（40 位）/ SHA-256（64 位）双哈希与 Pack 尾部校验、Smart HTTP v1/v2 `object-format` 能力协商、跨格式推送/拉取拦截（`409 Conflict`）与兼容矩阵演练 | `src/browse/object_format.rs`、`src/browse.rs`、`src/pando_lab/object_format.rs`、`src/pando_lab/mod.rs`、`src/pando_lab/http.rs` | `tests/browse.py`、`tests/pando_lab.py`、`tests/test_browse_lfs.py`、`tests/test_object_format.py` |
+| **Track 3（M26）：多节点 1/2/4 节点并发压测、保留根可达性核验与 P50/P95/P99 遥测基准** | 1/2/4 节点并发 `push`/`fetch`/`GC`/缓存淘汰/故障切换压测、CI 保留根（`refs/rootyard-ci/jobs/*`）可达性校验、P50/P95/P99 延迟与 `/proc/self` 资源遥测及 JSON + Markdown 基准报告 | `src/sharding/benchmark.rs`、`src/sharding.rs` | `tests/benchmark_tiers.py`、`tests/test_benchmark_tiers.py`、`tests/sharding.py`、`tests/test_sharding.py` |
+| **Track 4（M27）：Workspace 虚拟挂载 CoW Overlay 沙箱与断电崩溃窗口 WAL 恢复演练** | 只读下层 + 可写上层 + Whiteout 墓碑 CoW Overlay 沙箱（跨层目录 `rename`、`chmod`、`git add -f` 忽略覆盖、多 Agent 隔离）与断电崩溃窗口（`before_wal_fsync` / `after_wal_before_publish` / `after_publish_before_ack`）WAL 恢复对账 | `src/workspace_lab/crash_recovery.rs`、`src/workspace_lab.rs`、`docs/workspace-foundation.md` | `tests/workspace.py`、`tests/test_workspace_crash_recovery.py`、`tests/test_workspace_vfs.py` |
+
 ---
 
 ## 3. 共享底座接口契约

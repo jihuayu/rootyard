@@ -523,6 +523,160 @@ class Harness:
             },
         )
 
+    def sign_head_commit(self, repo, sig_kind="ssh"):
+        raw = self.git("cat-file", "commit", "HEAD", cwd=repo).stdout.decode()
+        header, body = raw.split("\n\n", 1)
+        banner = "SSH SIGNATURE" if sig_kind == "ssh" else "PGP SIGNATURE"
+        gpgsig = (
+            f"gpgsig -----BEGIN {banner}-----\n"
+            " U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg\n"
+            f" -----END {banner}-----"
+        )
+        signed_raw = f"{header}\n{gpgsig}\n\n{body}".encode()
+        proc = subprocess.run(
+            [self.git_binary, "hash-object", "-t", "commit", "-w", "--stdin"],
+            cwd=repo,
+            env=self.env,
+            input=signed_raw,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        oid = proc.stdout.decode().strip()
+        self.git("reset", "--hard", oid, cwd=repo)
+        return oid
+
+    def test_long_term_history_projection_and_cryptographic_provenance(self):
+        case_dir, store = self.new_case("history-provenance")
+        mono, c1 = self.make_source_repo(
+            case_dir,
+            "mono-src",
+            {
+                "services/search/engine.rs": "pub fn v1() {}\n",
+                "other/outside.txt": "outside-v1\n",
+            },
+        )
+        # Commit 2: outside-only change (folded).
+        (mono / "other/outside.txt").write_text("outside-v2\n")
+        self.git("add", "other/outside.txt", cwd=mono)
+        self.git("commit", "-m", "outside only", cwd=mono)
+
+        # Branch with signed commit inside services/search.
+        self.git("checkout", "-b", "feature", cwd=mono)
+        (mono / "services/search/feature.rs").write_text("pub fn feat() {}\n")
+        self.git("add", "services/search/feature.rs", cwd=mono)
+        self.git("commit", "-m", "signed feature commit", cwd=mono)
+        c_feat = self.sign_head_commit(mono, "ssh")
+
+        # Main branch commit + merge commit to test merge topology preservation.
+        self.git("checkout", "main", cwd=mono)
+        (mono / "services/search/engine.rs").write_text("pub fn v2() {}\n")
+        self.git("add", "services/search/engine.rs", cwd=mono)
+        self.git("commit", "-m", "main v2", cwd=mono)
+        self.git("merge", "--no-ff", "feature", "-m", "merge feature", cwd=mono)
+        c_merge = self.sign_head_commit(mono, "gpg")
+
+        self.data("register-repo", store, "mono", mono, "--quiescent")
+
+        # 1. Project deterministic_history at Epoch 1.
+        hist_e1 = self.data(
+            "project-history",
+            store,
+            "search-hist",
+            "mono",
+            "--strategy",
+            "deterministic_history",
+            "--subdir",
+            "services/search",
+        )
+        require(hist_e1["view_epoch"] == 1, "Expected epoch 1")
+        require(hist_e1["projected_commits"] == 4, f"Expected 4 commits, got {hist_e1['projected_commits']}")
+        require(hist_e1["rewritten_history_commits"] == 4, "Expected 4 rewritten commits")
+        require(hist_e1["source_signed_commits"] == 2, "Expected 2 source-signed commits")
+
+        # Verify merge parent topology preserved in projected history.
+        proj_merge = hist_e1["commit_map"][c_merge]
+        merge_parents = (
+            self.git_oid("rev-list", "--parents", "-n", "1", proj_merge, cwd=hist_e1["repo_path"])
+            .split()[1:]
+        )
+        require(len(merge_parents) == 2, f"Expected 2 merge parents, got {merge_parents}")
+
+        ver1 = self.data("verify-view", store, hist_e1["view_id"])
+        require(ver1["signature_verified"] is True, "Epoch 1 provenance verification failed")
+        require(ver1["verified_projected_commits"] == 4, "Expected 4 verified commits")
+
+        # 2. Advance source repo and incrementally project Epoch 2 without rewriting Epoch 1.
+        (mono / "services/search/engine.rs").write_text("pub fn v3() {}\n")
+        self.git("add", "services/search/engine.rs", cwd=mono)
+        self.git("commit", "-m", "engine v3", cwd=mono)
+        self.data("advance-repo", store, "mono", mono, "--quiescent")
+
+        hist_e2 = self.data(
+            "project-history",
+            store,
+            "search-hist",
+            "mono",
+            "--strategy",
+            "deterministic_history",
+            "--subdir",
+            "services/search",
+        )
+        require(hist_e2["view_epoch"] == 2, "Expected epoch 2")
+        require(hist_e2["newly_projected_commits"] == 1, "Expected 1 newly projected commit")
+        require(hist_e2["reused_epoch_commits"] >= 4, "Expected prior epoch commits reused")
+        require(
+            hist_e2["commit_map"][c1] == hist_e1["commit_map"][c1]
+            and hist_e2["commit_map"][c_feat] == hist_e1["commit_map"][c_feat]
+            and hist_e2["commit_map"][c_merge] == hist_e1["commit_map"][c_merge],
+            "Prior epoch projected OIDs must remain immutable across epoch advancement",
+        )
+        ver2 = self.data("verify-view", store, hist_e2["view_id"])
+        require(ver2["signature_verified"] is True and ver2["view_epoch"] == 2, "Epoch 2 verify failed")
+
+        # 3. Project task_snapshot strategy (0 rewritten history commits) and test tamper detection.
+        snap = self.data(
+            "project-history",
+            store,
+            "search-snap",
+            "mono",
+            "--strategy",
+            "task_snapshot",
+            "--subdir",
+            "services/search",
+        )
+        require(
+            snap["projected_commits"] == 1 and snap["rewritten_history_commits"] == 0,
+            "task_snapshot must produce 1 root commit with 0 rewritten history commits",
+        )
+        ver_snap = self.data("verify-view", store, snap["view_id"])
+        require(ver_snap["signature_verified"] is True, "Snapshot provenance verification failed")
+
+        # Tamper with refs/heads/main in the snapshot view and assert verify-view fails closed.
+        tree_oid = self.git_oid("rev-parse", "refs/heads/main^{tree}", cwd=snap["repo_path"])
+        forged_oid = self.git_oid(
+            "commit-tree", tree_oid, "-m", "forged commit without provenance", cwd=snap["repo_path"]
+        )
+        self.git("update-ref", "refs/heads/main", forged_oid, cwd=snap["repo_path"])
+        tamper_res = self.lab("verify-view", store, snap["view_id"], check=False)
+        require(tamper_res.returncode != 0, "Tampered view must fail verify-view")
+        tamper_report = json.loads(tamper_res.stdout.decode())
+        require(
+            tamper_report["signature_verified"] is False
+            and forged_oid in tamper_report["tampered_commits"],
+            "Tampered commit OID not reported by verify-view",
+        )
+
+        self.record(
+            "long_term_history_projection_and_cryptographic_provenance",
+            {
+                "history_view_id": hist_e2["view_id"],
+                "snapshot_view_id": snap["view_id"],
+                "epoch_2_head": hist_e2["projected_head_oid"],
+                "tamper_detected_oid": forged_oid,
+            },
+        )
+
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
@@ -541,6 +695,7 @@ def main():
         harness.test_composite_view_and_two_phase_integration()
         harness.test_three_way_merge_and_zero_partial_success_on_conflict()
         harness.test_crash_failpoints_lease_fencing_and_roll_forward_recovery()
+        harness.test_long_term_history_projection_and_cryptographic_provenance()
         report = {
             "suite": "git-views",
             "passed": True,

@@ -357,14 +357,12 @@ impl Store {
             if meta.head_oid != target.candidate_oid {
                 meta.head_oid = target.candidate_oid.clone();
                 meta.generation += 1;
-                write_atomic_json(
-                    &self
-                        .root
-                        .join("repos")
-                        .join(&meta.repo_id)
-                        .join("meta.json"),
-                    &meta,
-                )?;
+                let meta_path = self
+                    .root
+                    .join("repos")
+                    .join(&meta.repo_id)
+                    .join("meta.json");
+                write_atomic_json(&meta_path, &meta)?;
             }
             if index == 0 && allow_mid_failpoint {
                 failpoint("mid_commit_after_first_repo");
@@ -429,13 +427,17 @@ impl Store {
         view.view_base_oid = projected_oid.clone();
         view.head_oid = projected_oid.clone();
         view.view_epoch += 1;
-        write_atomic_json(
-            &self
-                .root
-                .join("views")
-                .join(&view.view_id)
-                .join("view.json"),
+        let view_meta_path = self
+            .root
+            .join("views")
+            .join(&view.view_id)
+            .join("view.json");
+        write_atomic_json(&view_meta_path, &view)?;
+        self.append_integrated_view_provenance(
             &view,
+            &record.task_commit_oid,
+            &new_root_tree,
+            &record.view_base_oid,
         )?;
 
         record.state = "integrated".into();

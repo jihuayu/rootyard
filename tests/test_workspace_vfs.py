@@ -16,21 +16,42 @@ class WorkspaceVfsTestSuite(unittest.TestCase):
     def test_source_tree_line_caps_and_vfs_wiring(self):
         facade = REPO_ROOT / "src/workspace_lab.rs"
         vfs_rs = REPO_ROOT / "src/workspace_lab/vfs.rs"
+        crash_rs = REPO_ROOT / "src/workspace_lab/crash_recovery.rs"
         doc_md = REPO_ROOT / "docs/workspace-foundation.md"
 
         self.assertTrue(facade.is_file(), "Missing src/workspace_lab.rs")
         self.assertTrue(vfs_rs.is_file(), "Missing src/workspace_lab/vfs.rs")
+        self.assertTrue(crash_rs.is_file(), "Missing src/workspace_lab/crash_recovery.rs")
         self.assertTrue(doc_md.is_file(), "Missing docs/workspace-foundation.md")
 
         facade_lines = len(facade.read_text(encoding="utf-8").splitlines())
         vfs_lines = len(vfs_rs.read_text(encoding="utf-8").splitlines())
+        crash_lines = len(crash_rs.read_text(encoding="utf-8").splitlines())
         self.assertLess(facade_lines, 150, f"src/workspace_lab.rs={facade_lines} lines >= 150 cap")
         self.assertGreaterEqual(vfs_lines, 50, f"src/workspace_lab/vfs.rs={vfs_lines} lines < 50")
         self.assertLess(vfs_lines, 600, f"src/workspace_lab/vfs.rs={vfs_lines} lines >= 600 cap")
+        self.assertGreaterEqual(crash_lines, 50, f"src/workspace_lab/crash_recovery.rs={crash_lines} lines < 50")
+        self.assertLess(crash_lines, 500, f"src/workspace_lab/crash_recovery.rs={crash_lines} lines >= 500 cap")
 
         facade_src = facade.read_text(encoding="utf-8")
         self.assertIn("pub mod vfs;", facade_src)
-        for cmd in ("vfs-mount", "vfs-hydrate", "vfs-status", "vfs-evict"):
+        self.assertIn("pub mod crash_recovery;", facade_src)
+        for cmd in (
+            "vfs-mount",
+            "vfs-hydrate",
+            "vfs-status",
+            "vfs-evict",
+            "overlay-mount",
+            "overlay-op",
+            "overlay-write",
+            "overlay-delete",
+            "overlay-rename",
+            "overlay-chmod",
+            "overlay-git-add-f",
+            "overlay-status",
+            "crash-drill",
+            "crash-recover",
+        ):
             self.assertIn(f'"{cmd}"', facade_src, f"Command {cmd} not wired in src/workspace_lab.rs")
 
         vfs_src = vfs_rs.read_text(encoding="utf-8")
@@ -47,8 +68,34 @@ class WorkspaceVfsTestSuite(unittest.TestCase):
             preceding = vfs_src[max(0, idx - 160):idx]
             self.assertIn("#[serde(deny_unknown_fields)]", preceding, f"{struct_name} missing #[serde(deny_unknown_fields)]")
 
+        crash_src = crash_rs.read_text(encoding="utf-8")
+        for struct_name in (
+            "OverlayMountManifest",
+            "OverlayOpReport",
+            "OverlayStatusReport",
+            "CrashJournalEntry",
+            "CrashJournal",
+            "CrashDrillReport",
+            "CrashRecoveryReport",
+        ):
+            idx = crash_src.find(f"pub struct {struct_name}")
+            self.assertNotEqual(idx, -1, f"Missing struct {struct_name} in src/workspace_lab/crash_recovery.rs")
+            preceding = crash_src[max(0, idx - 160):idx]
+            self.assertIn("#[serde(deny_unknown_fields)]", preceding, f"{struct_name} missing #[serde(deny_unknown_fields)]")
+
         doc_text = doc_md.read_text(encoding="utf-8")
-        for token in ("vfs-mount", "vfs-hydrate", "vfs-status", "vfs-evict", "vfs/<uuid>/vfs.json"):
+        for token in (
+            "vfs-mount",
+            "vfs-hydrate",
+            "vfs-status",
+            "vfs-evict",
+            "vfs/<uuid>/vfs.json",
+            "overlay-mount",
+            "overlay-op",
+            "crash-drill",
+            "crash-recover",
+            "overlays/<uuid>/overlay.json",
+        ):
             self.assertIn(token, doc_text, f"docs/workspace-foundation.md missing {token}")
 
     def test_vfs_mount_lazy_catalog_and_inline_threshold(self):

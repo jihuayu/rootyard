@@ -164,6 +164,33 @@ class ParallelBoundariesTest(unittest.TestCase):
             self.assertTrue(p.is_file(), f"Missing Tier-4 submodule {rel}")
             self.assertLess(len(p.read_text().splitlines()), cap)
 
+    def test_tier5_modularity_exists(self):
+        view_lab_rs = ROOT / "src/view_lab.rs"
+        self.assertTrue(view_lab_rs.is_file(), "Missing src/view_lab.rs")
+        self.assertFalse((ROOT / "src/view_lab/mod.rs").exists(), "Forbidden src/view_lab/mod.rs")
+        self.assertLess(len(view_lab_rs.read_text().splitlines()), 120)
+
+        for sub in ("models.rs", "namespace.rs", "projection.rs", "changeset.rs"):
+            sub_path = ROOT / "src/view_lab" / sub
+            self.assertTrue(sub_path.is_file(), f"Missing view_lab submodule {sub}")
+            self.assertLess(len(sub_path.read_text().splitlines()), 500)
+
+        for rel, cap in (
+            ("src/browse/object_format.rs", 480),
+            ("src/pando_lab/object_format.rs", 480),
+            ("src/sharding/benchmark.rs", 480),
+            ("src/workspace_lab/crash_recovery.rs", 500),
+        ):
+            p = ROOT / rel
+            self.assertTrue(p.is_file(), f"Missing Tier-5 submodule {rel}")
+            self.assertLess(len(p.read_text().splitlines()), cap)
+
+        gitignore_txt = (ROOT / ".gitignore").read_text()
+        self.assertTrue(
+            "/ORIGINAL_REQUEST.md" in gitignore_txt or "ORIGINAL_REQUEST.md" in gitignore_txt,
+            "Missing /ORIGINAL_REQUEST.md in .gitignore",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

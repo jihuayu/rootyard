@@ -1,5 +1,6 @@
 //! Track 4: Multi-Node Consistent Shard Routing, Primary Lease & Epoch/Generation Storage Fencing,
 //! Automated 4-Stage Failover Takeover, and Read-Only Degradation Drills.
+pub mod benchmark;
 pub mod failover;
 pub mod fencing;
 pub mod models;
@@ -38,6 +39,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(rebalance::list_rebalances).post(rebalance::execute_rebalance),
         )
         .route(
+            "/api/shards/benchmark",
+            get(benchmark::list_cluster_benchmarks).post(benchmark::run_cluster_benchmark),
+        )
+        .route(
             "/api/repos/{owner}/{name}/shard-route",
             get(router::get_repo_route).put(router::configure_repo_route),
         )
@@ -60,5 +65,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/repos/{owner}/{name}/shard-dr-drill",
             get(rebalance::list_dr_drills).post(rebalance::execute_dr_drill),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/shard-benchmark",
+            get(benchmark::list_repo_benchmarks).post(benchmark::run_repo_benchmark),
         )
 }

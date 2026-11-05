@@ -900,6 +900,36 @@ class Lab:
             'snapshot_retained_packs': len(rep['snapshot_retained_packs']),
         }
 
+    def object_format_and_compat_matrix(self):
+        det = json.loads(self.cli('object-format-detect', self.repo))
+        assert det['object_format'] == 'sha1' and det['oid_hex_len'] == 40 and det['raw_oid_bytes'] == 20, det
+        ver = json.loads(self.cli('verify-object-format', self.repo, '--format', 'sha1'))
+        assert ver['verified'] is True and ver['packs_verified'] >= 1 and ver['dual_hashes_computed'] >= 2, ver
+        mat = json.loads(self.cli('compat-matrix', self.repo, '--client-format', 'sha1', '--protocol-v2'))
+        assert mat['passed'] is True and mat['negotiation_admitted'] is True, mat
+        assert mat['sha1_pack_objects_verified'] >= 4 and mat['sha256_pack_objects_verified'] >= 4, mat
+
+        code_get, _, raw_get = self.http(f'/repos/{self.repo}.git/object-format', principal='reader')
+        assert code_get == 200, (code_get, raw_get)
+        get_doc = json.loads(raw_get.decode())
+        assert get_doc['object_format'] == 'sha1' and get_doc['protocol_v2_capability'] == 'object-format=sha1'
+
+        code_conflict, _, raw_conflict = self.http(
+            f'/repos/{self.repo}.git/object-format',
+            principal='reader',
+            method='POST',
+            body=json.dumps({'client_object_format': 'sha256', 'protocol_version': 2}).encode(),
+        )
+        assert code_conflict == 409, (code_conflict, raw_conflict)
+        conflict_doc = json.loads(raw_conflict.decode())
+        assert conflict_doc['negotiation_admitted'] is False
+        return {
+            'detected_format': det['object_format'],
+            'verified_objects': ver['objects_verified'],
+            'sha256_pack_objects_verified': mat['sha256_pack_objects_verified'],
+            'cross_format_rejected': True,
+        }
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -917,6 +947,7 @@ def main():
             'dual_operator_diff_export', 'refs_and_operations_api', 'orphan_and_snapshot_gc',
             'online_migration_state_machine', 'post_switchover_rollback_with_new_commits',
             'object_store_cas_and_cache_recovery', 'multi_pack_repack_and_pinned_gc',
+            'object_format_and_compat_matrix',
         ):
             lab.check(name, getattr(lab, name))
         lab.results['passed'] = True
@@ -929,6 +960,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 

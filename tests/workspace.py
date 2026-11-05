@@ -167,6 +167,16 @@ def _run_reference_cli(argv):
         "agent-lease": tuple(range(5, 16)),
         "namespace-write": (6, 8),
         "namespace-commit-back": tuple(range(4, 10)),
+        "overlay-mount": tuple(range(4, 16)),
+        "overlay-op": tuple(range(4, 16)),
+        "overlay-write": tuple(range(5, 16)),
+        "overlay-delete": tuple(range(4, 16)),
+        "overlay-rename": tuple(range(5, 16)),
+        "overlay-chmod": tuple(range(5, 16)),
+        "overlay-git-add-f": tuple(range(4, 16)),
+        "overlay-status": (3,),
+        "crash-drill": tuple(range(4, 10)),
+        "crash-recover": (3,),
     }
     if cmd not in expected_lengths or len(argv) not in expected_lengths[cmd]:
         sys.stderr.write("usage: invalid arguments\n")
@@ -230,7 +240,7 @@ def _run_reference_cli(argv):
     if (store_root.stat().st_mode & 0o077) != 0:
         sys.stderr.write("store must be private (mode 0700)\n")
         return 1
-    for sub in ("workspaces", "checkpoints", "changesets", "views", "namespaces", "vfs", "leases", "staging"):
+    for sub in ("workspaces", "checkpoints", "changesets", "views", "namespaces", "vfs", "leases", "overlays", "staging"):
         p = store_root / sub
         if not p.exists():
             p.mkdir(mode=0o700)
@@ -2716,6 +2726,688 @@ def _run_reference_cli(argv):
             shutil.rmtree(ns_dir / "writable", ignore_errors=True)
             print(json.dumps(receipt))
             return 0
+
+        def norm_overlay_rel(raw_str: str) -> str:
+            require(
+                isinstance(raw_str, str)
+                and bool(raw_str)
+                and "\x00" not in raw_str
+                and not raw_str.startswith("/")
+                and not raw_str.startswith("cross-repo:"),
+                f"invalid or cross-repo overlay path: {raw_str}",
+            )
+            trimmed = raw_str.rstrip("/")
+            require(bool(trimmed), "empty overlay path")
+            for seg in trimmed.split("/"):
+                require(
+                    bool(seg) and seg not in (".", "..", ".git", ".rootyard-namespace.json"),
+                    f"unsafe overlay path segment: {seg}",
+                )
+            decode_path(encode_path(trimmed.encode("utf-8")))
+            return trimmed
+
+        def save_overlay_manifest(ov_dir: Path, man: dict):
+            man["whiteouts"] = sorted(set(man["whiteouts"]))
+            man["forced_managed_paths"] = sorted(set(man["forced_managed_paths"]))
+            man["upper_entries"] = inventory(ov_dir / "upper")
+            man["upper_entries_count"] = len(man["upper_entries"])
+            man["whiteouts_count"] = len(man["whiteouts"])
+            man["forced_managed_count"] = len(man["forced_managed_paths"])
+            raw = json.dumps(man, indent=2).encode()
+            sha = write_atomic_file(ov_dir, "overlay.json", raw, 0o600)
+            write_atomic_file(ov_dir, "overlay.sha256", sha.encode(), 0o600)
+
+        def read_overlay_manifest(ov_id: str):
+            require(is_uuid(ov_id), "invalid overlay uuid")
+            ov_dir = store_root / "overlays" / ov_id
+            require(ov_dir.is_dir() and not ov_dir.is_symlink(), f"unknown overlay {ov_id}")
+            raw = (ov_dir / "overlay.json").read_bytes()
+            sha = (ov_dir / "overlay.sha256").read_text().strip()
+            require(hashlib.sha256(raw).hexdigest() == sha, "overlay manifest checksum mismatch")
+            man = json.loads(raw)
+            require(man["schema"] == SCHEMA and man["overlay_id"] == ov_id, "invalid overlay manifest")
+            require(is_uuid(man["checkpoint_id"]), "invalid checkpoint_id")
+            valid_agent_name(man["agent_id"])
+            for sub in ("lower", "upper", "merged"):
+                require((ov_dir / sub).is_dir() and not (ov_dir / sub).is_symlink(), f"missing overlay {sub} dir")
+            for rel_b, st in walk_files(ov_dir / "lower").items():
+                if stat.S_ISREG(st.st_mode):
+                    require((st.st_mode & 0o222) == 0, f"lower layer file writable: {rel_b.decode('utf-8', errors='replace')}")
+            return ov_dir, man
+
+        def copy_entry_cow(root_dir: Path, rel_str: str, src_full: Path, force_mode=None):
+            dest = root_dir / rel_str
+            dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            st = src_full.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                target_b = os.readlink(os.fsencode(src_full))
+                if dest.exists() or dest.is_symlink():
+                    dest.unlink()
+                os.symlink(target_b, os.fsencode(dest))
+                validate_symlink(root_dir, rel_str.encode("utf-8"), target_b)
+                return 0o777, len(target_b), hashlib.sha256(target_b).hexdigest()
+            require(stat.S_ISREG(st.st_mode), "unsupported non-regular file")
+            data = src_full.read_bytes()
+            mode = force_mode if force_mode is not None else (0o755 if (st.st_mode & 0o111) else 0o644)
+            sha = write_atomic_file(dest.parent, dest.name, data, mode)
+            st_new = dest.lstat()
+            require((st_new.st_dev, st_new.st_ino) != (st.st_dev, st.st_ino), "CoW copy shares inode with source")
+            return mode, len(data), sha
+
+        if cmd == "overlay-mount":
+            cp_id = argv[2]
+            agent_id = argv[3]
+            require(is_uuid(cp_id), "invalid checkpoint uuid")
+            valid_agent_name(agent_id)
+            cas_arg = None
+            idx = 4
+            while idx < len(argv):
+                fl = argv[idx]
+                if fl == "--remote-cas":
+                    idx += 1
+                    require(idx < len(argv), "missing --remote-cas")
+                    cas_arg = argv[idx]
+                else:
+                    raise RuntimeError(f"unknown overlay-mount flag: {fl}")
+                idx += 1
+            remote_cas_path = None
+            if cas_arg is not None:
+                cas_root = open_remote_cas(cas_arg, False)
+                remote_cas_path = str(cas_root)
+                if not (store_root / "checkpoints" / cp_id).is_dir():
+                    import contextlib, io
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        rc = _run_reference_cli(["pull-remote", str(store_root), str(cas_root), cp_id, agent_id])
+                    require(rc == 0, "failed to pull remote checkpoint for overlay-mount")
+                    pulled = json.loads(buf.getvalue())
+                    if pulled.get("workspace_id"):
+                        shutil.rmtree(store_root / "workspaces" / pulled["workspace_id"], ignore_errors=True)
+            cp_dir, cp_man = read_checkpoint(cp_id)
+            cp_repo = cp_dir / "repo"
+            head_oid = run_git(cp_repo, "rev-parse", "--verify", "HEAD").stdout.decode().strip()
+            overlay_id = str(uuid.uuid4())
+            stage_dir = store_root / "staging" / str(uuid.uuid4())
+            s_lower = stage_dir / "lower"
+            s_upper = stage_dir / "upper"
+            s_merged = stage_dir / "merged"
+            s_lower.mkdir(mode=0o700, parents=True)
+            s_upper.mkdir(mode=0o700, parents=True)
+            copy_selected(cp_repo, s_merged, walk_files(cp_repo).keys())
+            lower_count = 0
+            for entry in cp_man["entries"]:
+                rel_b = decode_path(entry["path_base64"])
+                if rel_b == b".git" or rel_b.startswith(b".git/"):
+                    continue
+                rel_str = rel_b.decode("utf-8", errors="surrogateescape")
+                copy_entry_cow(s_lower, rel_str, cp_repo / rel_str, 0o555 if (entry["mode"] & 0o111) else 0o444)
+                if entry["kind"] == "file":
+                    os.chmod(s_lower / rel_str, 0o555 if (entry["mode"] & 0o111) else 0o444)
+                lower_count += 1
+            validate_repo(s_merged, cp_man["workspace"]["base_oid"])
+            ov_dir = store_root / "overlays" / overlay_id
+            man = {
+                "schema": SCHEMA,
+                "overlay_id": overlay_id,
+                "checkpoint_id": cp_id,
+                "workspace_id": cp_man["workspace"]["workspace_id"],
+                "agent_id": agent_id,
+                "base_oid": cp_man["workspace"]["base_oid"],
+                "head_oid": head_oid,
+                "remote_cas_path": remote_cas_path,
+                "lower_path": str(ov_dir / "lower"),
+                "upper_path": str(ov_dir / "upper"),
+                "merged_path": str(ov_dir / "merged"),
+                "state": "mounted",
+                "lower_entries_count": lower_count,
+                "upper_entries_count": 0,
+                "whiteouts_count": 0,
+                "forced_managed_count": 0,
+                "whiteouts": [],
+                "upper_entries": [],
+                "forced_managed_paths": [],
+            }
+            save_overlay_manifest(stage_dir, man)
+            os.replace(stage_dir, ov_dir)
+            print(json.dumps(man))
+            return 0
+
+        if cmd in ("overlay-op", "overlay-write", "overlay-delete", "overlay-rename", "overlay-chmod", "overlay-git-add-f", "overlay-status"):
+            ov_id = argv[2]
+            if cmd == "overlay-op":
+                op = argv[3]
+                rest = argv[4:]
+            else:
+                op = cmd[len("overlay-") :]
+                rest = argv[3:]
+            ov_dir, man = read_overlay_manifest(ov_id)
+            lower_dir = ov_dir / "lower"
+            upper_dir = ov_dir / "upper"
+            merged_dir = ov_dir / "merged"
+
+            if op == "status":
+                require(not rest, "overlay-status takes no extra arguments")
+                validate_repo(merged_dir, man["base_oid"])
+                for rel_b, l_st in walk_files(lower_dir).items():
+                    if stat.S_ISREG(l_st.st_mode):
+                        m_p = os.path.join(os.fsencode(merged_dir), rel_b)
+                        if os.path.lexists(m_p):
+                            m_st = os.lstat(m_p)
+                            if stat.S_ISREG(m_st.st_mode):
+                                require((l_st.st_dev, l_st.st_ino) != (m_st.st_dev, m_st.st_ino), "merged shares inode with lower")
+                cls = classify_repo(merged_dir)
+                head_oid = run_git(merged_dir, "rev-parse", "--verify", "HEAD").stdout.decode().strip()
+                staged_paths = sorted(
+                    p.decode("utf-8", errors="replace")
+                    for p in run_git(merged_dir, "diff-index", "--cached", "--name-only", "-z", "HEAD").stdout.split(b"\x00")
+                    if p
+                )
+                unstaged_paths = sorted(p.decode("utf-8", errors="replace") for p in compute_unstaged_set(merged_dir))
+                untracked_paths = sorted(p.decode("utf-8", errors="replace") for p in cls["untracked_paths"])
+                managed_paths = sorted(p.decode("utf-8", errors="replace") for p in cls["managed_paths"])
+                ignored_paths = sorted(p.decode("utf-8", errors="replace") for p in cls["ignored_paths"])
+                save_overlay_manifest(ov_dir, man)
+                upper_paths = [
+                    decode_path(e["path_base64"]).decode("utf-8", errors="replace")
+                    for e in man["upper_entries"]
+                ]
+                is_dirty = bool(staged_paths or unstaged_paths or untracked_paths or man["whiteouts"] or upper_paths)
+                print(json.dumps({
+                    "schema": SCHEMA,
+                    "overlay_id": man["overlay_id"],
+                    "checkpoint_id": man["checkpoint_id"],
+                    "workspace_id": man["workspace_id"],
+                    "agent_id": man["agent_id"],
+                    "base_oid": man["base_oid"],
+                    "head_oid": head_oid,
+                    "merged_path": str(merged_dir),
+                    "state": "mounted",
+                    "is_dirty": is_dirty,
+                    "clean": not is_dirty,
+                    "lower_entries_count": man["lower_entries_count"],
+                    "upper_entries_count": man["upper_entries_count"],
+                    "whiteouts_count": man["whiteouts_count"],
+                    "managed_entries_count": len(managed_paths),
+                    "ignored_entries_count": len(ignored_paths),
+                    "staged_paths": staged_paths,
+                    "unstaged_paths": unstaged_paths,
+                    "untracked_paths": untracked_paths,
+                    "managed_paths": managed_paths,
+                    "ignored_paths": ignored_paths,
+                    "whiteouts": man["whiteouts"],
+                    "upper_paths": upper_paths,
+                    "forced_managed_paths": man["forced_managed_paths"],
+                }))
+                return 0
+
+            src_opt = None
+            copied_up = False
+            whiteout_rec = False
+            forced_m = False
+            mode_opt = None
+            sz_opt = None
+            sha_opt = None
+
+            if op == "write":
+                require(len(rest) == 2, "overlay-write requires REL_PATH and CONTENT_OR_FILE")
+                p_str = norm_overlay_rel(rest[0])
+                val = rest[1]
+                cand = Path(val)
+                if cand.is_file() and not cand.is_symlink() and not str(cand.resolve()).startswith(str(store_root)):
+                    data = cand.read_bytes()
+                else:
+                    data = val.encode("utf-8")
+                mode = 0o644
+                for check_p in (merged_dir / p_str, lower_dir / p_str):
+                    if check_p.exists():
+                        mode = 0o755 if (check_p.lstat().st_mode & 0o111) else 0o644
+                        break
+                copied_up = (lower_dir / p_str).exists() or not (upper_dir / p_str).exists()
+                for root_d in (upper_dir, merged_dir):
+                    dst = root_d / p_str
+                    sha = write_atomic_file(dst.parent, dst.name, data, mode)
+                man["whiteouts"] = [w for w in man["whiteouts"] if w != p_str and not p_str.startswith(w + "/")]
+                forced_m = p_str in man["forced_managed_paths"]
+                mode_opt = mode
+                sz_opt = len(data)
+                sha_opt = sha
+                path_str = p_str
+            elif op == "delete":
+                require(len(rest) == 1, "overlay-delete requires REL_PATH")
+                p_str = norm_overlay_rel(rest[0])
+                m_full = merged_dir / p_str
+                u_full = upper_dir / p_str
+                l_full = lower_dir / p_str
+                require(
+                    m_full.exists() or m_full.is_symlink() or u_full.exists() or u_full.is_symlink() or l_full.exists() or l_full.is_symlink(),
+                    f"cannot delete non-existent path: {p_str}",
+                )
+                if m_full.is_dir() or l_full.is_dir():
+                    if u_full.exists():
+                        shutil.rmtree(u_full)
+                    if m_full.exists():
+                        shutil.rmtree(m_full)
+                    if l_full.is_dir():
+                        for sub_b in walk_files(l_full).keys():
+                            man["whiteouts"].append(f"{p_str}/{sub_b.decode('utf-8', errors='replace')}")
+                else:
+                    if u_full.exists() or u_full.is_symlink():
+                        u_full.unlink()
+                    if m_full.exists() or m_full.is_symlink():
+                        m_full.unlink()
+                man["whiteouts"].append(p_str)
+                whiteout_rec = True
+                path_str = p_str
+            elif op == "rename":
+                require(len(rest) == 2, "overlay-rename requires SRC_REL_PATH and DST_REL_PATH")
+                src_str = norm_overlay_rel(rest[0])
+                dst_str = norm_overlay_rel(rest[1])
+                require(src_str != dst_str and not dst_str.startswith(src_str + "/"), "invalid overlay rename target")
+                src_m = merged_dir / src_str
+                require(src_m.exists() or src_m.is_symlink(), f"missing rename source {src_str}")
+                if src_m.is_dir() and not src_m.is_symlink():
+                    for sub_b in walk_files(src_m).keys():
+                        sub_s = sub_b.decode("utf-8", errors="replace")
+                        f_s = f"{src_str}/{sub_s}"
+                        t_s = f"{dst_str}/{sub_s}"
+                        m, sz, sha = copy_entry_cow(upper_dir, t_s, merged_dir / f_s, None)
+                        copy_entry_cow(merged_dir, t_s, upper_dir / t_s, m)
+                        man["whiteouts"] = [w for w in man["whiteouts"] if w != t_s]
+                        man["whiteouts"].append(f_s)
+                        mode_opt, sz_opt, sha_opt = m, sz, sha
+                    if (upper_dir / src_str).exists():
+                        shutil.rmtree(upper_dir / src_str)
+                    shutil.rmtree(src_m)
+                else:
+                    m, sz, sha = copy_entry_cow(upper_dir, dst_str, src_m, None)
+                    copy_entry_cow(merged_dir, dst_str, upper_dir / dst_str, m)
+                    if (upper_dir / src_str).exists() or (upper_dir / src_str).is_symlink():
+                        (upper_dir / src_str).unlink()
+                    src_m.unlink()
+                    man["whiteouts"] = [w for w in man["whiteouts"] if w != dst_str]
+                    mode_opt, sz_opt, sha_opt = m, sz, sha
+                man["whiteouts"].append(src_str)
+                src_opt = src_str
+                copied_up = True
+                whiteout_rec = True
+                path_str = dst_str
+            elif op == "chmod":
+                require(len(rest) == 2, "overlay-chmod requires REL_PATH and MODE_OCTAL")
+                p_str = norm_overlay_rel(rest[0])
+                raw_m = rest[1].lstrip("0o").lstrip("0O") or "0"
+                mode = int(raw_m, 8)
+                require((mode & 0o7000) == 0 and (mode & 0o400) != 0, "invalid chmod mode")
+                m, sz, sha = copy_entry_cow(upper_dir, p_str, merged_dir / p_str, mode)
+                copy_entry_cow(merged_dir, p_str, upper_dir / p_str, m)
+                copied_up = True
+                mode_opt, sz_opt, sha_opt = m, sz, sha
+                path_str = p_str
+            elif op == "git-add-f":
+                require(len(rest) == 1, "overlay-git-add-f requires REL_PATH")
+                p_str = norm_overlay_rel(rest[0])
+                m, sz, sha = copy_entry_cow(upper_dir, p_str, merged_dir / p_str, None)
+                copy_entry_cow(merged_dir, p_str, upper_dir / p_str, m)
+                run_git(merged_dir, "add", "-f", "--", p_str)
+                man["forced_managed_paths"].append(p_str)
+                cls = classify_repo(merged_dir)
+                p_b = p_str.encode("utf-8")
+                require(p_b in cls["managed_paths"] and p_b not in cls["ignored_paths"], "git add -f failed to promote path")
+                copied_up = True
+                forced_m = True
+                mode_opt, sz_opt, sha_opt = m, sz, sha
+                path_str = p_str
+            else:
+                raise RuntimeError(f"unsupported overlay op: {op}")
+
+            save_overlay_manifest(ov_dir, man)
+            print(json.dumps({
+                "schema": SCHEMA,
+                "overlay_id": man["overlay_id"],
+                "agent_id": man["agent_id"],
+                "op": op,
+                "path": path_str,
+                "source_path": src_opt,
+                "copied_up": copied_up,
+                "whiteout_recorded": whiteout_rec,
+                "forced_managed": forced_m,
+                "mode": mode_opt,
+                "size": sz_opt,
+                "sha256": sha_opt,
+                "upper_entries_count": man["upper_entries_count"],
+                "whiteouts_count": man["whiteouts_count"],
+                "state": "applied",
+            }))
+            return 0
+
+        def resolve_crash_target(target_id: str):
+            require(is_uuid(target_id), "invalid target uuid")
+            ov_dir = store_root / "overlays" / target_id
+            ws_dir = store_root / "workspaces" / target_id
+            if ov_dir.is_dir():
+                _, man = read_overlay_manifest(target_id)
+                return ov_dir, ov_dir / "merged", "overlay", man["base_oid"], man["checkpoint_id"]
+            if ws_dir.is_dir():
+                _, ws = read_workspace(target_id)
+                return ws_dir, ws_dir / "repo", "workspace", ws["base_oid"], ws.get("parent_checkpoint_id")
+            raise RuntimeError(f"unknown overlay or workspace target: {target_id}")
+
+        def entry_digest(seq, tx, win, op, paths, scp, sdir, p_sha):
+            raw = f"{seq}:{tx}:{win}:{op}:{scp or ''}:{sdir or ''}:{p_sha}:{','.join(paths)}".encode("utf-8")
+            return hashlib.sha256(raw).hexdigest()
+
+        def load_crash_journal(target_dir: Path, target_id: str, kind: str, init_cp):
+            j_path = target_dir / "crash_journal.json"
+            if not j_path.exists():
+                return {
+                    "schema": SCHEMA,
+                    "target_id": target_id,
+                    "target_kind": kind,
+                    "last_committed_seq": 0,
+                    "committed_checkpoint_id": init_cp,
+                    "entries": [],
+                    "corrupt_tail_bytes": None,
+                }, False
+            raw = j_path.read_bytes()
+            sha_p = target_dir / "crash_journal.sha256"
+            sha_mismatch = (not sha_p.exists()) or (hashlib.sha256(raw).hexdigest() != sha_p.read_text().strip())
+            return json.loads(raw), sha_mismatch
+
+        def save_crash_journal(target_dir: Path, journal: dict, corrupt_sha: bool):
+            raw = json.dumps(journal, indent=2).encode()
+            sha = write_atomic_file(target_dir, "crash_journal.json", raw, 0o600)
+            if corrupt_sha:
+                sha = "corrupt_unfsynced_wal_tail_sha256"
+            write_atomic_file(target_dir, "crash_journal.sha256", sha.encode(), 0o600)
+
+        def dirty_worktree_paths(repo: Path, cp_id):
+            cls = classify_repo(repo)
+            out = set()
+            if cp_id and (store_root / "checkpoints" / cp_id).is_dir():
+                _, cp_man = read_checkpoint(cp_id)
+                base_map = {
+                    decode_path(e["path_base64"]): e
+                    for e in cp_man["entries"]
+                    if not decode_path(e["path_base64"]).startswith(b".git/")
+                }
+                exact_mode = True
+            else:
+                base_map = read_head_tree_map(repo)
+                exact_mode = False
+            for p_b in cls["managed_paths"]:
+                cur = entry_for_rel(repo, p_b)
+                b = base_map.get(p_b)
+                if not (b is not None and cur is not None and entries_equivalent(b, cur, exact_mode)):
+                    out.add(p_b.decode("utf-8", errors="replace"))
+            for p_b in base_map.keys():
+                if p_b not in cls["managed_paths"]:
+                    out.add(p_b.decode("utf-8", errors="replace"))
+            return sorted(out)
+
+        def stage_checkpoint_from_repo(repo: Path, base_oid: str, parent_cp):
+            validate_repo(repo, base_oid)
+            cp_id = str(uuid.uuid4())
+            stage_dir = store_root / "staging" / f"wal-{cp_id}"
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir)
+            stage_dir.mkdir(mode=0o700, parents=True)
+            stage_repo = stage_dir / "repo"
+            cls = classify_repo(repo)
+            all_walk = walk_files(repo)
+            selected = [k for k in all_walk.keys() if k.startswith(b".git/") or k in cls["managed_paths"]]
+            excluded = len(all_walk) - len(selected)
+            copy_selected(repo, stage_repo, selected)
+            entries = inventory(stage_repo)
+            ws = {
+                "schema": SCHEMA,
+                "workspace_id": str(uuid.uuid4()),
+                "agent_id": "wal-recovery",
+                "base_oid": base_oid,
+                "namespace_revision": 1,
+                "parent_checkpoint_id": parent_cp,
+                "git_version": git_ver,
+            }
+            man = {
+                "schema": SCHEMA,
+                "checkpoint_id": cp_id,
+                "state": "local_complete",
+                "workspace": ws,
+                "excluded_ignored_entries": excluded,
+                "entries": entries,
+            }
+            raw = json.dumps(man, indent=2).encode()
+            sha = write_atomic_file(stage_dir, "manifest.json", raw, 0o600)
+            write_atomic_file(stage_dir, "manifest.sha256", sha.encode(), 0o600)
+            return cp_id, stage_dir, sha
+
+        if cmd == "crash-drill":
+            target_id = argv[2]
+            raw_win = argv[3]
+            for fl in argv[4:]:
+                require(fl == "--quiescent", f"unknown crash-drill flag: {fl}")
+            window_map = {
+                "before_wal_fsync": "before_wal_fsync",
+                "after_wal_before_publish": "after_wal_before_publish",
+                "after_wal_fsync": "after_wal_before_publish",
+                "after_publish_before_ack": "after_publish_before_ack",
+                "index_update_interrupted": "index_update_interrupted",
+                "during_index_update": "index_update_interrupted",
+            }
+            require(raw_win in window_map, f"unsupported crash window: {raw_win}")
+            window = window_map[raw_win]
+            target_dir, repo_dir, kind, base_oid, init_cp = resolve_crash_target(target_id)
+            journal, _ = load_crash_journal(target_dir, target_id, kind, init_cp)
+            tx_id = str(uuid.uuid4())
+            seq = journal["last_committed_seq"] + 1
+            unsynced = dirty_worktree_paths(repo_dir, journal["committed_checkpoint_id"])
+            wal_persisted = False
+            publish_completed = False
+            index_lock_left = False
+            staged_cp_opt = None
+
+            if window == "before_wal_fsync":
+                if not unsynced:
+                    unsynced.append("unsynced_wal_write.tmp")
+                (target_dir / f".tmp-drill-wal-{tx_id}").write_bytes(b"uncommitted-wal-staging\n")
+                (repo_dir / f".tmp-drill-work-{tx_id}").write_bytes(b"uncommitted-worktree-staging\n")
+                journal["corrupt_tail_bytes"] = f"TRUNCATED_WAL_RECORD:{tx_id}"
+                journal["entries"].append({
+                    "seq": seq,
+                    "tx_id": tx_id,
+                    "window": window,
+                    "operation": "checkpoint_capture",
+                    "paths": list(unsynced),
+                    "staged_checkpoint_id": None,
+                    "staged_dir": None,
+                    "payload_sha256": "0" * 64,
+                    "entry_sha256": "CORRUPT_UNFSYNCED_ENTRY",
+                    "committed": False,
+                })
+                save_crash_journal(target_dir, journal, True)
+                tmp_cnt = 2
+            elif window == "after_wal_before_publish":
+                cp_id, s_dir, p_sha = stage_checkpoint_from_repo(repo_dir, base_oid, journal["committed_checkpoint_id"])
+                (target_dir / f".tmp-drill-prepub-{tx_id}").write_bytes(b"staging-marker\n")
+                wal_persisted = True
+                staged_cp_opt = cp_id
+                s_str = str(s_dir)
+                e_sha = entry_digest(seq, tx_id, window, "checkpoint_publish", unsynced, cp_id, s_str, p_sha)
+                journal["corrupt_tail_bytes"] = None
+                journal["entries"].append({
+                    "seq": seq,
+                    "tx_id": tx_id,
+                    "window": window,
+                    "operation": "checkpoint_publish",
+                    "paths": list(unsynced),
+                    "staged_checkpoint_id": cp_id,
+                    "staged_dir": s_str,
+                    "payload_sha256": p_sha,
+                    "entry_sha256": e_sha,
+                    "committed": False,
+                })
+                save_crash_journal(target_dir, journal, False)
+                unsynced = []
+                tmp_cnt = 1
+            else:
+                lock_p = repo_dir / ".git/index.lock"
+                if lock_p.exists():
+                    lock_p.unlink()
+                cp_id_opt = None
+                p_sha = hashlib.sha256(tx_id.encode("utf-8")).hexdigest()
+                if window == "after_publish_before_ack":
+                    cp_id, s_dir, sha = stage_checkpoint_from_repo(repo_dir, base_oid, journal["committed_checkpoint_id"])
+                    os.replace(s_dir, store_root / "checkpoints" / cp_id)
+                    cp_id_opt = cp_id
+                    p_sha = sha
+                    publish_completed = True
+                lock_p.write_bytes(b"interrupted-index-lock\n")
+                (repo_dir / f".git/.tmp-index-{tx_id}").write_bytes(b"temp-index\n")
+                wal_persisted = True
+                index_lock_left = True
+                staged_cp_opt = cp_id_opt
+                e_sha = entry_digest(seq, tx_id, window, "index_and_publish_ack", unsynced, cp_id_opt, None, p_sha)
+                journal["corrupt_tail_bytes"] = None
+                journal["entries"].append({
+                    "seq": seq,
+                    "tx_id": tx_id,
+                    "window": window,
+                    "operation": "index_and_publish_ack",
+                    "paths": list(unsynced),
+                    "staged_checkpoint_id": cp_id_opt,
+                    "staged_dir": None,
+                    "payload_sha256": p_sha,
+                    "entry_sha256": e_sha,
+                    "committed": False,
+                })
+                save_crash_journal(target_dir, journal, False)
+                tmp_cnt = 1
+
+            print(json.dumps({
+                "schema": SCHEMA,
+                "target_id": target_id,
+                "target_kind": kind,
+                "window": window,
+                "tx_id": tx_id,
+                "simulated_kill_code": 137,
+                "wal_persisted": wal_persisted,
+                "publish_completed": publish_completed,
+                "index_lock_left": index_lock_left,
+                "tmp_files_created": tmp_cnt,
+                "staged_checkpoint_id": staged_cp_opt,
+                "unsynced_paths": unsynced,
+                "state": f"crashed_{window}",
+            }))
+            return 0
+
+        if cmd == "crash-recover":
+            target_id = argv[2]
+            target_dir, repo_dir, kind, base_oid, init_cp = resolve_crash_target(target_id)
+
+            def purge_tmp(d: Path) -> int:
+                if not d.is_dir():
+                    return 0
+                cnt = 0
+                for child in list(d.iterdir()):
+                    if child.name.startswith(".tmp-") and child.is_file() and not child.is_symlink():
+                        child.unlink()
+                        cnt += 1
+                return cnt
+
+            purged = purge_tmp(target_dir) + purge_tmp(repo_dir) + purge_tmp(repo_dir / ".git")
+            lock_p = repo_dir / ".git/index.lock"
+            removed_lock = False
+            if lock_p.exists():
+                lock_p.unlink()
+                removed_lock = True
+
+            journal, sha_mismatch = load_crash_journal(target_dir, target_id, kind, init_cp)
+            win_rec = "none_idempotent"
+            action = "noop_already_recovered"
+            trunc_cnt = 0
+            replay_cnt = 0
+            unsynced = []
+
+            if (
+                journal["corrupt_tail_bytes"] is not None
+                or sha_mismatch
+                or (journal["entries"] and not journal["entries"][-1]["committed"] and journal["entries"][-1]["entry_sha256"].startswith("CORRUPT"))
+            ):
+                while journal["entries"] and not journal["entries"][-1]["committed"]:
+                    dropped = journal["entries"].pop()
+                    win_rec = dropped["window"]
+                    unsynced.extend(dropped["paths"])
+                    trunc_cnt += 1
+                journal["corrupt_tail_bytes"] = None
+                action = "truncated_corrupt_wal_tail"
+                save_crash_journal(target_dir, journal, False)
+            elif any(not e["committed"] for e in journal["entries"]):
+                for e in journal["entries"]:
+                    if e["committed"]:
+                        continue
+                    exp = entry_digest(
+                        e["seq"],
+                        e["tx_id"],
+                        e["window"],
+                        e["operation"],
+                        e["paths"],
+                        e["staged_checkpoint_id"],
+                        e["staged_dir"],
+                        e["payload_sha256"],
+                    )
+                    require(e["entry_sha256"] == exp, "uncommitted WAL entry checksum mismatch")
+                    win_rec = e["window"]
+                    cp_id = e["staged_checkpoint_id"]
+                    if cp_id:
+                        cp_dest = store_root / "checkpoints" / cp_id
+                        if not cp_dest.exists() and e["staged_dir"]:
+                            s_path = Path(e["staged_dir"])
+                            require(s_path.exists(), "missing staged checkpoint dir for WAL replay")
+                            os.replace(s_path, cp_dest)
+                        read_checkpoint(cp_id)
+                        journal["committed_checkpoint_id"] = cp_id
+                    e["committed"] = True
+                    journal["last_committed_seq"] = e["seq"]
+                    replay_cnt += 1
+                action = (
+                    "replayed_wal_and_published_checkpoint"
+                    if win_rec == "after_wal_before_publish"
+                    else "reconciled_lock_and_acked_wal"
+                )
+                save_crash_journal(target_dir, journal, False)
+
+            for d_p in dirty_worktree_paths(repo_dir, journal["committed_checkpoint_id"]):
+                if d_p not in unsynced:
+                    unsynced.append(d_p)
+            unsynced.sort()
+            purged += purge_tmp(repo_dir)
+            run_git(repo_dir, "status", "--porcelain=v2", "-z")
+            validate_repo(repo_dir, base_oid)
+            if kind == "overlay":
+                _, man = read_overlay_manifest(target_id)
+                if journal["committed_checkpoint_id"]:
+                    man["checkpoint_id"] = journal["committed_checkpoint_id"]
+                save_overlay_manifest(target_dir, man)
+            elif journal["committed_checkpoint_id"]:
+                _, ws = read_workspace(target_id)
+                ws["parent_checkpoint_id"] = journal["committed_checkpoint_id"]
+                write_atomic_file(target_dir, "workspace.json", json.dumps(ws, indent=2).encode(), 0o600)
+
+            print(json.dumps({
+                "schema": SCHEMA,
+                "target_id": target_id,
+                "target_kind": kind,
+                "window_recovered": win_rec,
+                "action_taken": action,
+                "truncated_corrupt_wal_entries": trunc_cnt,
+                "replayed_wal_entries": replay_cnt,
+                "purged_tmp_files": purged,
+                "removed_index_lock": removed_lock,
+                "committed_checkpoint_id": journal["committed_checkpoint_id"],
+                "unsynced_paths": unsynced,
+                "git_status_clean_or_consistent": True,
+                "fsck_passed": True,
+                "state": "recovered",
+            }))
+            return 0
     except Exception as exc:
         sys.stderr.write(f"error: {exc}\n")
         return 1
@@ -3405,6 +4097,81 @@ class WorkspaceHarness:
             "lease_epoch": l2["lease_epoch"],
         }
 
+    def overlay_sandbox_and_power_loss_crash_recovery(self):
+        _, source, store, _ = self.fixture("overlay-crash", {
+            ".gitignore": b"*.log\nbuild/\n",
+            ".rootyardignore": b"scratch/*\n",
+            "README.md": b"base readme\n",
+            "src/old.rs": b"pub fn old() -> u32 { 1 }\n",
+            "bin/run.sh": b"#!/bin/sh\necho v1\n",
+        })
+        (source / "bin/run.sh").chmod(0o644)
+        self.git("add", "--all", cwd=source)
+        self.git("commit", "--amend", "-m", "overlay fixture base", cwd=source)
+        base = self.oid(source)
+
+        ws, _ = self.init(store, source, base, "agent-init")
+        cp = self.checkpoint(store, ws)
+
+        ov_a = self.data("overlay-mount", store, cp["checkpoint_id"], "agent-alpha")
+        ov_b = self.data("overlay-mount", store, cp["checkpoint_id"], "agent-beta")
+        merged_a = Path(ov_a["merged_path"])
+        merged_b = Path(ov_b["merged_path"])
+        lower_a = Path(ov_a["lower_path"])
+
+        require(((lower_a / "README.md").stat().st_mode & 0o222) == 0, "lower layer must be read-only")
+        st_la = (lower_a / "README.md").stat()
+        st_ma = (merged_a / "README.md").stat()
+        st_mb = (merged_b / "README.md").stat()
+        require((st_la.st_dev, st_la.st_ino) != (st_ma.st_dev, st_ma.st_ino), "lower and merged share inode")
+        require((st_ma.st_dev, st_ma.st_ino) != (st_mb.st_dev, st_mb.st_ino), "agent overlays share inode")
+
+        # CoW write, chmod, rename, delete (whiteout), and git add -f
+        w_rep = self.data("overlay-write", store, ov_a["overlay_id"], "README.md", "alpha readme\n")
+        require(w_rep["copied_up"] is True and w_rep["state"] == "applied", f"Unexpected write report: {w_rep}")
+        require((merged_b / "README.md").read_bytes() == b"base readme\n", "Sibling overlay mutated by alpha write")
+
+        c_rep = self.data("overlay-chmod", store, ov_a["overlay_id"], "bin/run.sh", "0755")
+        require(c_rep["mode"] == 0o755 and ((merged_a / "bin/run.sh").stat().st_mode & 0o777) == 0o755, "chmod failed")
+
+        r_rep = self.data("overlay-rename", store, ov_a["overlay_id"], "src/old.rs", "src/new.rs")
+        require(r_rep["whiteout_recorded"] is True and not (merged_a / "src/old.rs").exists() and (merged_a / "src/new.rs").is_file(), "rename failed")
+
+        self.data("overlay-write", store, ov_a["overlay_id"], "build/forced.out", "forced artifact\n")
+        f_rep = self.data("overlay-git-add-f", store, ov_a["overlay_id"], "build/forced.out")
+        require(f_rep["forced_managed"] is True, "git-add-f failed")
+
+        st_rep = self.data("overlay-status", store, ov_a["overlay_id"])
+        require("build/forced.out" in st_rep["managed_paths"] and "build/forced.out" in st_rep["staged_paths"], "forced path not managed/staged")
+        require("src/old.rs" in st_rep["whiteouts"], "missing rename whiteout")
+
+        # Power-loss crash drills and recovery across all 4 windows
+        d1 = self.data("crash-drill", store, ov_a["overlay_id"], "before_wal_fsync", "--quiescent")
+        require(d1["wal_persisted"] is False and len(d1["unsynced_paths"]) > 0, f"Unexpected drill 1: {d1}")
+        rec1 = self.data("crash-recover", store, ov_a["overlay_id"])
+        require(rec1["truncated_corrupt_wal_entries"] == 1 and rec1["fsck_passed"] is True, f"Unexpected recover 1: {rec1}")
+
+        d2 = self.data("crash-drill", store, ov_a["overlay_id"], "after_wal_before_publish", "--quiescent")
+        require(d2["wal_persisted"] is True and d2["publish_completed"] is False, f"Unexpected drill 2: {d2}")
+        rec2 = self.data("crash-recover", store, ov_a["overlay_id"])
+        require(rec2["replayed_wal_entries"] == 1 and rec2["committed_checkpoint_id"] == d2["staged_checkpoint_id"], f"Unexpected recover 2: {rec2}")
+
+        d3 = self.data("crash-drill", store, ov_a["overlay_id"], "after_publish_before_ack", "--quiescent")
+        require(d3["publish_completed"] is True and d3["index_lock_left"] is True, f"Unexpected drill 3: {d3}")
+        rec3 = self.data("crash-recover", store, ov_a["overlay_id"])
+        require(rec3["removed_index_lock"] is True and rec3["replayed_wal_entries"] == 1, f"Unexpected recover 3: {rec3}")
+
+        d4 = self.data("crash-drill", store, ov_a["overlay_id"], "index_update_interrupted", "--quiescent")
+        require(d4["index_lock_left"] is True, f"Unexpected drill 4: {d4}")
+        rec4 = self.data("crash-recover", store, ov_a["overlay_id"])
+        require(rec4["removed_index_lock"] is True and rec4["fsck_passed"] is True, f"Unexpected recover 4: {rec4}")
+
+        return {
+            "overlay_id": ov_a["overlay_id"],
+            "committed_checkpoint_id": rec3["committed_checkpoint_id"],
+            "windows_recovered": 4,
+        }
+
     def run_all(self):
         for method in [
             self.status_and_ignore_classification,
@@ -3413,6 +4180,7 @@ class WorkspaceHarness:
             self.sync_dirty_incremental_and_ignore_exclusion,
             self.verify_readonly_view_and_tamper_detection,
             self.writable_namespace_reverse_mapping_and_agent_leases,
+            self.overlay_sandbox_and_power_loss_crash_recovery,
         ]:
             started = time.monotonic()
             entry = {"name": method.__name__, "ok": False}
@@ -3474,6 +4242,15 @@ class WorkspaceLabTestSuite(unittest.TestCase):
             res = harness.writable_namespace_reverse_mapping_and_agent_leases()
             self.assertEqual(res["namespace_revision"], 2)
             self.assertEqual(res["lease_epoch"], 3)
+        finally:
+            harness.cleanup()
+
+    def test_workspace_overlay_and_crash_recovery(self):
+        harness = WorkspaceHarness()
+        try:
+            res = harness.overlay_sandbox_and_power_loss_crash_recovery()
+            self.assertEqual(res["windows_recovered"], 4)
+            self.assertIn("overlay_id", res)
         finally:
             harness.cleanup()
 

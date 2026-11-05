@@ -6,16 +6,22 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+pub const ZERO_OID_SHA256: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 pub const MAX_BROWSE_BLOB_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_REF_UPDATES: usize = 128;
 
+pub fn is_zero_oid(oid: &str) -> bool {
+    oid == ZERO_OID || oid == ZERO_OID_SHA256
+}
+
 pub fn valid_oid(oid: &str) -> bool {
-    crate::ci_pins::valid_oid(oid)
+    crate::browse::object_format::detect_oid_format(oid).is_some()
 }
 
 pub fn valid_non_zero_oid(oid: &str) -> bool {
-    valid_oid(oid) && oid != ZERO_OID
+    valid_oid(oid) && !is_zero_oid(oid)
 }
 
 pub fn valid_public_ref(name: &str) -> bool {
@@ -404,6 +410,26 @@ impl RefTransactionRequest {
         if self.storage_generation.is_some_and(|g| g <= 0) {
             return Err(Error::bad_request());
         }
+        let mut tx_format = None;
+        for u in &self.updates {
+            for candidate in [&u.old_oid, &u.new_oid].into_iter().flatten() {
+                let fmt = crate::browse::object_format::detect_oid_format(candidate)
+                    .ok_or_else(Error::bad_request)?;
+                if let Some(prev) = tx_format {
+                    if prev != fmt {
+                        return Err(Error(
+                            StatusCode::CONFLICT,
+                            "mixed object formats in ref transaction are forbidden",
+                        ));
+                    }
+                } else {
+                    tx_format = Some(fmt);
+                }
+            }
+        }
+        let default_zero = tx_format
+            .unwrap_or(crate::browse::object_format::ObjectFormat::Sha1)
+            .zero_oid();
         let mut seen = HashSet::with_capacity(self.updates.len());
         let mut out = Vec::with_capacity(self.updates.len());
         for u in &self.updates {
@@ -413,8 +439,8 @@ impl RefTransactionRequest {
             if !seen.insert(u.ref_name.clone()) {
                 return Err(Error::bad_request());
             }
-            let old_oid = u.old_oid.clone().unwrap_or_else(|| ZERO_OID.to_owned());
-            let new_oid = u.new_oid.clone().unwrap_or_else(|| ZERO_OID.to_owned());
+            let old_oid = u.old_oid.clone().unwrap_or_else(|| default_zero.to_owned());
+            let new_oid = u.new_oid.clone().unwrap_or_else(|| default_zero.to_owned());
             if !valid_oid(&old_oid) || !valid_oid(&new_oid) || old_oid == new_oid {
                 return Err(Error::bad_request());
             }
@@ -426,12 +452,12 @@ impl RefTransactionRequest {
         }
         // Check directory/file prefix conflicts among target refs that will exist after the transaction.
         for (i, a) in out.iter().enumerate() {
-            if a.new_oid == ZERO_OID {
+            if is_zero_oid(&a.new_oid) {
                 continue;
             }
             let prefix = format!("{}/", a.ref_name);
             for (j, b) in out.iter().enumerate() {
-                if i != j && b.new_oid != ZERO_OID && b.ref_name.starts_with(&prefix) {
+                if i != j && !is_zero_oid(&b.new_oid) && b.ref_name.starts_with(&prefix) {
                     return Err(Error(
                         StatusCode::CONFLICT,
                         "reference directory/file prefix conflict",

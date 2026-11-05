@@ -393,9 +393,7 @@ mod tests {
         let dir = objects_root.join(repo.to_string());
         std::fs::create_dir_all(&dir).unwrap();
         let mut pack_bytes = Vec::from(&b"PACK\x00\x00\x00\x02\x00\x00\x00\x01\x34"[..]);
-        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(b"test").unwrap();
-        pack_bytes.extend_from_slice(&enc.finish().unwrap());
+        pack_bytes.extend_from_slice(&delta::compress_zlib_stored(b"test"));
         let tr = delta::sha1_digest(&pack_bytes);
         pack_bytes.extend_from_slice(&tr);
         let idx_bytes = b"idx-cold-tier-test".to_vec();

@@ -179,6 +179,43 @@ async fn serve_git(config: &Config, request: Request<Body>) -> Result<Response<B
             }
             return json_reply(StatusCode::OK, &lifecycle::status(config, repo).await?);
         }
+        if tail == "object-format" {
+            let db = config.db().await?;
+            if !permitted(&db, repo, principal, false).await? {
+                return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
+            }
+            return json_reply(
+                StatusCode::OK,
+                &object_format::detect_format(config, &repo.to_string()).await?,
+            );
+        }
+    }
+    if token.is_none() && parts.method == "POST" && tail == "object-format" {
+        let db = config.db().await?;
+        let raw_body = to_bytes(body, 64 * 1024).await?;
+        let req: object_format::PandoCompatRequest = if raw_body.is_empty() {
+            object_format::PandoCompatRequest::default()
+        } else {
+            serde_json::from_slice(&raw_body)?
+        };
+        let needs_write = req.run_drill.unwrap_or(false);
+        if !permitted(&db, repo, principal, needs_write).await? {
+            return Ok(reply(StatusCode::FORBIDDEN, "repository access denied"));
+        }
+        let proto_v2 = req.protocol_version.unwrap_or(2) >= 2;
+        let report = object_format::run_compat_matrix_drill(
+            config,
+            Some(repo),
+            req.client_object_format.as_deref(),
+            proto_v2,
+        )
+        .await?;
+        let status = if report.negotiation_admitted {
+            StatusCode::OK
+        } else {
+            StatusCode::CONFLICT
+        };
+        return json_reply(status, &report);
     }
     if token.is_none() && parts.method == "POST" && tail == "repack" {
         let db = config.db().await?;

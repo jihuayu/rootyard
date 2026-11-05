@@ -45,7 +45,7 @@ class ShardingTrack4ContractTest(unittest.TestCase):
         self.assertNotIn("/:", sharding_src)
         self.assertNotIn("{*", sharding_src)
 
-        for sub in ("models", "router", "fencing", "failover", "rebalance"):
+        for sub in ("benchmark", "models", "router", "fencing", "failover", "rebalance"):
             self.assertIn(f"pub mod {sub};", sharding_src)
             sub_path = ROOT / "src/sharding" / f"{sub}.rs"
             self.assertTrue(sub_path.is_file(), f"Missing submodule {sub_path}")
@@ -69,15 +69,34 @@ class ShardingTrack4ContractTest(unittest.TestCase):
             "/api/shards/nodes/{node_id}/lease",
             "/api/shards/buckets",
             "/api/shards/rebalance",
+            "/api/shards/benchmark",
             "/api/repos/{owner}/{name}/shard-route",
             "/api/repos/{owner}/{name}/shard-route/resolve",
             "/api/repos/{owner}/{name}/shard-fence",
             "/api/repos/{owner}/{name}/shard-failover",
             "/api/repos/{owner}/{name}/shard-degrade",
             "/api/repos/{owner}/{name}/shard-dr-drill",
+            "/api/repos/{owner}/{name}/shard-benchmark",
         )
         for route in expected_routes:
             self.assertIn(route, sharding_src, f"Route {route} missing from src/sharding.rs")
+
+        benchmark_src = (ROOT / "src/sharding/benchmark.rs").read_text(encoding="utf-8")
+        benchmark_lines = benchmark_src.splitlines()
+        self.assertGreaterEqual(len(benchmark_lines), 300)
+        self.assertLess(len(benchmark_lines), 480)
+        self.assertGreaterEqual(benchmark_src.count("#[serde(deny_unknown_fields)]"), 7)
+        self.assertGreaterEqual(benchmark_src.count("#[derive(Clone, Debug, Serialize, Deserialize)]"), 7)
+        for fn_sig in (
+            "pub async fn list_cluster_benchmarks(",
+            "pub async fn run_cluster_benchmark(",
+            "pub async fn list_repo_benchmarks(",
+            "pub async fn run_repo_benchmark(",
+            "pub fn compute_latency_percentiles(",
+            "pub fn collect_process_telemetry(",
+            "pub fn render_benchmark_markdown(",
+        ):
+            self.assertIn(fn_sig, benchmark_src, f"Missing {fn_sig} in src/sharding/benchmark.rs")
 
         models_src = (ROOT / "src/sharding/models.rs").read_text(encoding="utf-8")
         router_src = (ROOT / "src/sharding/router.rs").read_text(encoding="utf-8")
@@ -678,6 +697,52 @@ class ShardingTrack4ContractTest(unittest.TestCase):
         self.assertEqual(st_drills, 200)
         self.assertGreaterEqual(len(drills["items"]), 1)
 
+    def test_multi_node_benchmark_suite_and_pinned_root_reachability(self):
+        eng = sharding.ShardingReferenceEngine()
+        self.addCleanup(eng.close)
+        alice = eng.create_user("alice")
+        repo = eng.create_repo(alice, "bench-repo", storage_generation=1)
+
+        st_c, c_res = eng.run_cluster_benchmark(
+            alice,
+            node_counts=[1, 2, 4],
+            concurrency=8,
+            operations_per_tier=32,
+            pinned_roots=["refs/rootyard-ci/jobs/bench-1", "refs/rootyard-ci/jobs/bench-2"],
+        )
+        self.assertEqual(st_c, 200)
+        self.assertTrue(c_res["pinned_roots_verified"])
+        self.assertTrue(c_res["failover_verified"])
+        self.assertEqual([t["node_count"] for t in c_res["node_tiers"]], [1, 2, 4])
+        for tier in c_res["node_tiers"]:
+            self.assertEqual(tier["virtual_buckets_assigned"], 1024)
+            lat = tier["overall_latency"]
+            self.assertLessEqual(lat["min_us"], lat["p50_us"])
+            self.assertLessEqual(lat["p50_us"], lat["p95_us"])
+            self.assertLessEqual(lat["p95_us"], lat["p99_us"])
+            self.assertLessEqual(lat["p99_us"], lat["max_us"])
+            self.assertTrue(tier["pinned_root_check"]["all_reachable"])
+            self.assertEqual(tier["pinned_root_check"]["missing_objects"], 0)
+            self.assertGreaterEqual(tier["pinned_root_check"]["split_brain_writes_rejected"], 1)
+
+        st_r, r_res = eng.run_repo_benchmark(
+            alice, "alice", "bench-repo", node_counts=[1, 2, 4], concurrency=8, operations_per_tier=24
+        )
+        self.assertEqual(st_r, 200)
+        self.assertEqual(r_res["repository_id"], repo["id"])
+        self.assertTrue(eng.repo_benchmark_receipt_path(repo["id"]).is_file())
+        self.assertEqual(eng.list_repo_benchmarks(alice, "alice", "bench-repo")[0], 200)
+        self.assertEqual(eng.list_cluster_benchmarks(alice)[0], 200)
+
+        # Missing pinned objects fail closed with 409 Conflict
+        self.assertEqual(
+            eng.run_repo_benchmark(alice, "alice", "bench-repo", simulate_missing_pinned_objects=2)[0],
+            409,
+        )
+        # Invalid node_counts or invalid pinned_roots rejected with 400
+        self.assertEqual(eng.run_cluster_benchmark(alice, node_counts=[3])[0], 400)
+        self.assertEqual(eng.run_cluster_benchmark(alice, pinned_roots=["invalid-ref"])[0], 400)
+
     def test_access_boundaries_and_e2e_harness_contract(self):
         eng = sharding.ShardingReferenceEngine()
         self.addCleanup(eng.close)
@@ -695,11 +760,14 @@ class ShardingTrack4ContractTest(unittest.TestCase):
         self.assertEqual(eng.list_nodes(None)[0], 401)
         self.assertEqual(eng.list_rebalances(None)[0], 401)
         self.assertEqual(eng.list_dr_drills(None, "alice", "sec-repo")[0], 401)
+        self.assertEqual(eng.list_cluster_benchmarks(None)[0], 401)
+        self.assertEqual(eng.list_repo_benchmarks(None, "alice", "sec-repo")[0], 401)
 
         # 404 non-member on private repo
         self.assertEqual(eng.get_repo_route(outsider, "alice", "sec-repo")[0], 404)
         self.assertEqual(eng.get_fence_status(outsider, "alice", "sec-repo")[0], 404)
         self.assertEqual(eng.list_dr_drills(outsider, "alice", "sec-repo")[0], 404)
+        self.assertEqual(eng.list_repo_benchmarks(outsider, "alice", "sec-repo")[0], 404)
 
         # Read member can view route & fence status (200), but Write member cannot mutate shard config/fence/failover/dr-drill (403)
         self.assertEqual(eng.get_repo_route(carol_read, "alice", "sec-repo")[0], 200)
@@ -713,6 +781,8 @@ class ShardingTrack4ContractTest(unittest.TestCase):
             eng.execute_dr_drill(bob_write, "alice", "sec-repo", "node-a", "node-b", 10, 500)[0],
             403,
         )
+        self.assertEqual(eng.list_repo_benchmarks(bob_write, "alice", "sec-repo")[0], 403)
+        self.assertEqual(eng.run_repo_benchmark(bob_write, "alice", "sec-repo")[0], 403)
 
         # Read-only token on Admin actor rejected with 403 on mutations
         self.assertEqual(eng.upsert_node(alice_ro, "node-ro", "http://ro:8080")[0], 403)
@@ -722,6 +792,8 @@ class ShardingTrack4ContractTest(unittest.TestCase):
             eng.execute_dr_drill(alice_ro, "alice", "sec-repo", "node-a", "node-b", 10, 500)[0],
             403,
         )
+        self.assertEqual(eng.run_cluster_benchmark(alice_ro)[0], 403)
+        self.assertEqual(eng.run_repo_benchmark(alice_ro, "alice", "sec-repo")[0], 403)
 
         # Unknown fields / invalid values rejected with 400
         self.assertEqual(
@@ -736,6 +808,10 @@ class ShardingTrack4ContractTest(unittest.TestCase):
             eng.execute_dr_drill(
                 alice, "alice", "sec-repo", "node-a", "node-b", 10, 500, extra_fields={"unexpected": 1}
             )[0],
+            400,
+        )
+        self.assertEqual(
+            eng.run_cluster_benchmark(alice, extra_fields={"unexpected": 1})[0],
             400,
         )
 
@@ -754,6 +830,7 @@ class ShardingTrack4ContractTest(unittest.TestCase):
             "read_only_degradation_drill_and_recovery",
             "online_bucket_and_repo_rebalance",
             "rpo_rto_disaster_recovery_drill",
+            "multi_node_benchmark_and_pinned_root_reachability",
             "access_and_boundaries",
             "run_all",
         ):
