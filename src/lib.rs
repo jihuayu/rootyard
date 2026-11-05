@@ -1,28 +1,42 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+#[rustfmt::skip]
 pub mod auth;
 pub mod backup;
+#[rustfmt::skip]
 pub mod browse;
+#[rustfmt::skip]
 pub mod ci_checkouts;
+#[rustfmt::skip]
 pub mod ci_pins;
 pub mod config;
 pub mod db;
 pub mod dispatch;
 pub mod events;
+#[rustfmt::skip]
 pub mod forge;
 pub mod git_http;
 pub mod journal;
 pub mod kafka_wake;
+#[rustfmt::skip]
 pub mod lfs;
 pub mod maintenance;
+#[rustfmt::skip]
 pub mod members;
 pub mod metrics;
+#[rustfmt::skip]
 pub mod mirror;
+#[rustfmt::skip]
 pub mod pulls;
 pub mod reliability;
+#[rustfmt::skip]
 pub mod sharding;
 pub mod storage;
+pub mod view_lab;
+#[rustfmt::skip]
 pub mod web;
+#[rustfmt::skip]
 pub mod webhooks;
 
 use axum::{

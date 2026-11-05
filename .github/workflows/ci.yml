@@ -60,6 +60,7 @@ jobs:
       - name: Verify durable PostgreSQL workers
         run: cargo test --locked --test outbox --test resolution_fences -- --ignored
       - run: cargo build --locked --features pando-lab --bins
+      - run: cargo build --locked --bin rootyard-view-lab
       - name: Verify design documentation integrity
         run: python3 scripts/check_design_docs.py
       - name: Verify schema-030 catalog and dump round trip
@@ -145,6 +146,8 @@ jobs:
         run: python3 tests/workspaces.py --binary target/debug/rootyard-workspace-lab --report test-results/workspaces.json
       - name: Exercise workspace incremental sync, ignore rules, and read-only views
         run: python3 tests/workspace.py --binary target/debug/rootyard-workspace-lab --report test-results/workspace.json
+      - name: Exercise Namespace, Git View and cross-repository ChangeSet semantics
+        run: python3 tests/git_views.py --binary target/debug/rootyard-view-lab --report test-results/git-views.json
       - name: Exercise Pando object store delta resolution, graph traversal, and differential export
         run: |
           chmod -R a+rX "$GITHUB_WORKSPACE" && runuser -u postgres -- env PATH="/usr/lib/postgresql/17/bin:$PATH" PG_SHARE="/usr/share/postgresql/17" python3 tests/pando_lab.py --binary target/debug/rootyard-pando-lab

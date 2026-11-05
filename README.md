@@ -162,3 +162,8 @@ a CI scheduler, multi-writer support or high availability.
 ## Workspace foundation experiment
 
 An opt-in `rootyard-workspace-lab` binary tests independent Linux agent directories, fixed base OIDs and local full-copy checkpoints preserving HEAD/index/worktree. It does not change the hosting service or provide FUSE, live capture, remote durability or multi-tenant isolation. Read the [scope, caller-quiescence requirement and recovery limits](docs/workspace-foundation.md) before use.
+
+## Namespace, Git View and cross-repository ChangeSet experiment
+
+An opt-in `rootyard-view-lab` binary tests company Namespace `BaseVector` mounts, deterministic subdirectory history projection with unreachable-object pruning, composite multi-repository task snapshot views, and two-phase cross-repository ChangeSet integration (candidate staging, ordered per-repository ref leases, zero partial updates on conflict, and crash roll-forward recovery). See [the Git View and ChangeSet contract](docs/git-view-foundation.md).
+

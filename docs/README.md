@@ -30,6 +30,7 @@
 - [服务端 HTML Web UI、Markdown XSS 净化与大文件 UTF-8 截断预览](../src/web.rs)
 - [多节点仓库分片、一致哈希路由、Epoch 写屏障、自动故障切换、在线重平衡与 RPO/RTO 灾备演练](../src/sharding.rs)（含 [rebalance.rs](../src/sharding/rebalance.rs)、[060_sharding_fencing.sql](../src/sharding/060_sharding_fencing.sql)）
 - [Workspace 本地、增量同步、远程 CAS 恢复、多仓虚拟 Namespace、按需稀疏 VFS 与可写 Namespace 跨仓回写实验](workspace-foundation.md)（含 [remote.rs](../src/workspace_lab/remote.rs)、[namespace.rs](../src/workspace_lab/namespace.rs)、[vfs.rs](../src/workspace_lab/vfs.rs)、[writable_view.rs](../src/workspace_lab/writable_view.rs)）
+- [Namespace、Git View 与跨仓 ChangeSet 实验](git-view-foundation.md)（含 [view_lab.rs](../src/view_lab.rs)）
 - [Pando 存储、流式 Delta、图遍历、双算子导出、在线迁移/回滚、S3 对象存储、多 Pack 合并与生命周期 KMS 加密实验](../experimental/pando/README.md)（含 [migration.rs](../src/pando_lab/migration.rs)、[rollback.rs](../src/pando_lab/rollback.rs)、[object_store.rs](../src/pando_lab/object_store.rs)、[repack.rs](../src/pando_lab/repack.rs)、[lifecycle.rs](../src/pando_lab/lifecycle.rs)）
 - [Schema 030 数据库迁移与配对备份基线](../schema/030_catalog.sql)（及 [Schema 050](../schema/050_catalog.sql)、[Schema 060](../schema/060_catalog.sql)）
 
@@ -56,6 +57,7 @@
 - [CI Mirror 水位 LRU 淘汰、Pin 释放、单飞自动回源与跨集群 Runner 调度测试](../tests/ci_mirror.py)（含 [test_ci_mirror.py](../tests/test_ci_mirror.py)）
 - [Pando 流式 Delta、图遍历、双算子对拍、在线迁移/回滚、S3 Repack 与生命周期 KMS 轮转测试](../tests/pando_lab.py)（含 [test_pando_migration.py](../tests/test_pando_migration.py)、[test_pando_repack_object_store.py](../tests/test_pando_repack_object_store.py)）
 - [Workspace 脏清单、忽略规则、增量同步、远程 CAS、多仓虚拟 Namespace、稀疏 VFS 与可写 Namespace 跨仓回写测试](../tests/workspace.py)（含 [test_workspace_remote_namespace.py](../tests/test_workspace_remote_namespace.py)、[test_workspace_vfs.py](../tests/test_workspace_vfs.py)）
+- [Namespace、Git View 与跨仓 ChangeSet 二阶段集成测试](../tests/git_views.py)
 - [Schema 060 四级需求端到端验证套件](../tests/e2e_tiers.py)（含 [五级白盒对抗验证](../tests/test_tier5_adversarial.py)）
 
 验证记录是带版本和环境边界的历史结果。设计目标、测试代码存在和某次测试通过是不同状态，请结合对应契约阅读。

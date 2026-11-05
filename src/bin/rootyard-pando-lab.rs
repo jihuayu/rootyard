@@ -1,4 +1,5 @@
 //! Explicitly opt-in, loopback-only synthetic storage experiment. Never a GitFS switch.
+#[rustfmt::skip]
 #[path = "../pando_lab/mod.rs"]
 mod pando_lab;
 

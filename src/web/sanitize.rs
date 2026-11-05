@@ -326,7 +326,8 @@ fn render_inline_markdown(text: &str) -> String {
                 continue;
             }
         }
-        let next_special = rest[1..].find(['`', '!', '[', '*']).map_or(rest.len(), |p| p + 1);
+        let step = rest.chars().next().map_or(1, char::len_utf8);
+        let next_special = rest[step..].find(['`', '!', '[', '*']).map_or(rest.len(), |p| p + step);
         out.push_str(&rest[..next_special]);
         rest = &rest[next_special..];
     }

@@ -47,7 +47,7 @@ pub fn render_page_shell(
     let role = header.effective_role.as_str();
     let actor = escape_html(&header.actor_username);
     let backend = escape_html(&header.storage_backend);
-    let gen = header.storage_generation;
+    let generation = header.storage_generation;
     let title = escape_html(page_title);
     let base_url = format!("/web/repos/{owner}/{repo}");
     let audit_nav = if header.effective_role >= Role::Maintain {
@@ -57,7 +57,7 @@ pub fn render_page_shell(
     };
 
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\"/>\n<title>{title} — {owner}/{repo}</title>\n<style>body{{font-family:system-ui,sans-serif;margin:1.5rem;line-height:1.5}}nav a{{margin-right:1rem}}.badge{{padding:0.15rem 0.45rem;border-radius:4px;background:#eef}}.blob-truncation-banner{{padding:0.5rem;background:#fff3cd;border:1px solid #ffeeba}}</style>\n</head>\n<body data-view=\"{view_name}\" data-owner=\"{owner}\" data-repo=\"{repo}\" data-role=\"{role}\" data-actor=\"{actor}\" data-storage-backend=\"{backend}\" data-storage-generation=\"{gen}\">\n<header class=\"repo-header\" data-repo-id=\"{}\" data-repo-state=\"{}\">\n<h1><a href=\"{base_url}\">{owner}/{repo}</a> <span class=\"badge\" data-role-badge=\"{role}\">{role}</span></h1>\n<nav class=\"repo-nav\">\n<a href=\"{base_url}\" data-nav=\"overview\">Overview</a>\n<a href=\"{base_url}/tree\" data-nav=\"tree\">Files</a>\n<a href=\"{base_url}/commits\" data-nav=\"commits\">Commits</a>\n<a href=\"{base_url}/issues\" data-nav=\"issues\">Issues</a>\n<a href=\"{base_url}/pulls\" data-nav=\"pulls\">Pull Requests</a>\n{audit_nav}\n</nav>\n</header>\n<main class=\"repo-main\">\n{inner_html}\n</main>\n</body>\n</html>\n",
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\"/>\n<title>{title} — {owner}/{repo}</title>\n<style>body{{font-family:system-ui,sans-serif;margin:1.5rem;line-height:1.5}}nav a{{margin-right:1rem}}.badge{{padding:0.15rem 0.45rem;border-radius:4px;background:#eef}}.blob-truncation-banner{{padding:0.5rem;background:#fff3cd;border:1px solid #ffeeba}}</style>\n</head>\n<body data-view=\"{view_name}\" data-owner=\"{owner}\" data-repo=\"{repo}\" data-role=\"{role}\" data-actor=\"{actor}\" data-storage-backend=\"{backend}\" data-storage-generation=\"{generation}\">\n<header class=\"repo-header\" data-repo-id=\"{}\" data-repo-state=\"{}\">\n<h1><a href=\"{base_url}\">{owner}/{repo}</a> <span class=\"badge\" data-role-badge=\"{role}\">{role}</span></h1>\n<nav class=\"repo-nav\">\n<a href=\"{base_url}\" data-nav=\"overview\">Overview</a>\n<a href=\"{base_url}/tree\" data-nav=\"tree\">Files</a>\n<a href=\"{base_url}/commits\" data-nav=\"commits\">Commits</a>\n<a href=\"{base_url}/issues\" data-nav=\"issues\">Issues</a>\n<a href=\"{base_url}/pulls\" data-nav=\"pulls\">Pull Requests</a>\n{audit_nav}\n</nav>\n</header>\n<main class=\"repo-main\">\n{inner_html}\n</main>\n</body>\n</html>\n",
         header.repository_id,
         escape_html(&header.repo_state),
     )

@@ -797,7 +797,7 @@ async fn release_pin_inner(
     )
     .await
     .map_err(Error::internal)?;
-    if crate::ci_checkouts::has_active_lease_on(&tx, repo.id, job)
+    if crate::ci_checkouts::has_active_lease_on(&*tx, repo.id, job)
         .await
         .map_err(Error::internal)?
     {

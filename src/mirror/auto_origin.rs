@@ -107,9 +107,9 @@ pub fn valid_cluster_zone(v: &str) -> bool {
     (1..=64).contains(&v.len()) && v.bytes().all(ok)
 }
 
-pub fn pinned_path(storage: &Storage, repo_id: Uuid, gen: i64, oid: &str) -> PathBuf {
+pub fn pinned_path(storage: &Storage, repo_id: Uuid, generation: i64, oid: &str) -> PathBuf {
     let dir = storage.root.join("repos").join(repo_id.to_string());
-    dir.join(format!("pin-{gen}-{oid}.json"))
+    dir.join(format!("pin-{generation}-{oid}.json"))
 }
 
 fn read_pin_snap(storage: &Storage, repo: &db::Repository, oid: &str) -> Result<Snapshot, Error> {
@@ -155,15 +155,15 @@ pub async fn auto_fetch(
             let mut map = fmap.lock().expect("inflight");
             if let Some(notify) = map.get(&key).cloned() {
                 *wmap.lock().expect("waiters").entry(key.clone()).or_insert(0) += 1;
-                Some((notify.clone(), notify.notified()))
+                Some(notify)
             } else {
                 map.insert(key.clone(), Arc::new(tokio::sync::Notify::new()));
                 wmap.lock().expect("waiters").insert(key.clone(), 0);
                 None
             }
         };
-        let st = if let Some((_notify, notified)) = waiter {
-            notified.await;
+        let st = if let Some(notify) = waiter {
+            notify.notified().await;
             views::pinned_path(&state, &repo, &req.target_oid).await?;
             "coalesced_wait"
         } else {

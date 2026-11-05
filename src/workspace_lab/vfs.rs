@@ -258,7 +258,7 @@ fn evaluate_vfs_status(store: &Store, vfs_dir: &Path, man: &mut VfsMountManifest
             let p = mount_dir.join(&rel);
             let b = if p.is_file() { read_regular(&p, MAX_MANIFEST)? }
                 else { fetch_blob(store, &man.checkpoint_id, cas.as_deref(), &rel, &c.kind, c.size, &c.sha256)? };
-            ignore_rules.push((rel.components().count(), rel, f == ".gitignore", b));
+            ignore_rules.push((rel.components().count(), rel.clone(), f == ".gitignore", b));
         }
     }
     let disk_walk = walk(&mount_dir)?;

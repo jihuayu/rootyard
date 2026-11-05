@@ -4,7 +4,6 @@
 use crate::{
     AppState, Error,
     auth::{self, Role, authorize_repo_with_role as authorize, finish_tx as finish, idempotency_key},
-    db,
 };
 use axum::{
     Json, Router,

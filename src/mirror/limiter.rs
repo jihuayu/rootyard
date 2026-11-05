@@ -17,7 +17,7 @@ pub const DEFAULT_SYNC_COOLDOWN_MS: u64 = 0;
 static REGISTRY: LazyLock<Mutex<HashMap<Uuid, Arc<MirrorLimiter>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct RepoSyncSlot {
     in_flight: bool,
     last_completed: Option<Instant>,
@@ -32,6 +32,7 @@ pub struct MirrorLimiter {
     repo_slots: Arc<Mutex<HashMap<Uuid, RepoSyncSlot>>>,
 }
 
+#[derive(Debug)]
 pub struct SyncPermit {
     repo_id: Uuid,
     repo_slots: Arc<Mutex<HashMap<Uuid, RepoSyncSlot>>>,

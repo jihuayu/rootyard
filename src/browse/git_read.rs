@@ -27,7 +27,7 @@ pub(crate) fn git_cmd(state: &AppState, repo_id: Uuid) -> Result<Command, Error>
                 (libc::RLIMIT_NOFILE, 256),
             ] {
                 let value = libc::rlimit { rlim_cur: limit, rlim_max: limit };
-                if unsafe { libc::setrlimit(resource, &value) } == -1 {
+                if libc::setrlimit(resource, &value) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
             }
