@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Rootyard 4-Tier Requirement-Driven E2E Test Suite (F1-F51).
+"""Rootyard native suite dispatcher and explicit reference models (F1-F51).
 
-Executes 591 genuine requirement-driven tests across 4 tiers:
+With --reference-only, executes 591 historical reference-model tests across 4 tiers:
 - Tier 1 (`TestTier1FeatureCoverage`): 255 tests (5 per feature F1-F51)
 - Tier 2 (`TestTier2BoundaryAndCornerCases`): 255 tests (5 per feature F1-F51)
 - Tier 3 (`TestTier3CrossFeatureCombinations`): 54 cross-feature integration tests

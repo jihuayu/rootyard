@@ -1,6 +1,11 @@
 # Rootyard 4-Tier E2E Test Readiness Report (`TEST_READY.md`)
 
-**Status**: `READY`
+**Status**: `HISTORICAL REFERENCE-MODEL RESULTS — NOT NATIVE ACCEPTANCE`
+**Current delivery**: [Registered issues and evidence gates](docs/registered-task-delivery.md).
+The counts below describe historical Python/reference-model runs. They do not
+prove that a Rust executable was invoked or that production paths passed.
+`tests/e2e_tiers.py` now requires native execution by default; use
+`--reference-only` explicitly to reproduce reference-model results.
 **Test Suite Entrypoint**: `tests/e2e_tiers.py`
 **Infrastructure Design Document**: `TEST_INFRA.md`
 **Total Executable Tests**: `591` (`255` Tier 1 + `255` Tier 2 + `54` Tier 3 + `27` Tier 4)
