@@ -84,6 +84,20 @@ def main():
             time.sleep(.1)
         else:
             raise AssertionError("target storage resume readiness timeout")
+        dest_repo = node1_data / "repos" / (h.repo["id"] + ".git")
+        dest_repo.mkdir()
+        sentinel = dest_repo / "existing-target-sentinel"
+        sentinel.write_bytes(b"preserve old target on rejected transfer\n")
+        journal_dir = node1_data / "journal" / h.repo["id"]
+        journal_dir.mkdir(parents=True)
+        sequence = journal_dir / "sequence"
+        sequence.write_text("999999")
+        h.expect("/api/repos/alice/demo/shard-migrate", 409, token=h.alice, method="POST",
+                 body={"target_node_id": "node1", "expected_route_epoch": route["route_epoch"], "operation_id": operation_id})
+        assert sentinel.read_bytes() == b"preserve old target on rejected transfer\n"
+        unchanged = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
+        assert unchanged["primary_node_id"] == "shard-primary-0"
+        sequence.unlink()
         started = time.monotonic_ns()
         receipt = json.loads(h.expect("/api/repos/alice/demo/shard-migrate", 200, token=h.alice,
                                       method="POST", body={"target_node_id": "node1", "expected_route_epoch": route["route_epoch"], "operation_id": operation_id}))
@@ -91,7 +105,6 @@ def main():
         assert receipt["state"] == "completed" and receipt["target_node_id"] == "node1" and receipt["operation_id"] == operation_id
         new_route = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
         assert new_route["primary_node_id"] == "node1" and new_route["route_epoch"] > route["route_epoch"]
-        dest_repo = node1_data / "repos" / (h.repo["id"] + ".git")
         assert dest_repo.is_dir() and dest_repo.resolve() != h.bare.resolve()
         h.git("--git-dir=" + str(dest_repo), "fsck", "--full", "--strict")
         initial = h.git("--git-dir=" + str(dest_repo), "rev-parse", "refs/heads/main").stdout.decode().strip()
@@ -106,6 +119,7 @@ def main():
         assert h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == initial
         print(json.dumps({"result": "passed", "operation_id": receipt["operation_id"], "transfer_ms": duration_ms,
                           "partial_copy_rejected_before_cutover": True, "same_operation_resumed_after_target_restart": True,
+                          "ahead_journal_rejected_without_replacing_target": True,
                           "source_oid": initial, "destination_oid_after_push": final_tip,
                           "source_volume": str(h.bare), "destination_volume": str(dest_repo)}))
     finally:
