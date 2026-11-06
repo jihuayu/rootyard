@@ -114,7 +114,22 @@ def main():
             if args.write:
                 path.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
             else:
-                assert value == json.loads(path.read_text()), 'Canonical schema fixture differs: ' + filename
+                expected = json.loads(path.read_text())
+                if value != expected:
+                    for k in sorted(set(value) | set(expected)):
+                        if value.get(k) != expected.get(k):
+                            v_list, e_list = value.get(k), expected.get(k)
+                            if isinstance(v_list, list) and isinstance(e_list, list):
+                                print(f'DIFF in {filename} [{k}]: actual_len={len(v_list)} expected_len={len(e_list)}')
+                                for item in v_list:
+                                    if item not in e_list:
+                                        print(f'  ACTUAL ONLY [{k}]: {json.dumps(item, sort_keys=True)}')
+                                for item in e_list:
+                                    if item not in v_list:
+                                        print(f'  EXPECTED ONLY [{k}]: {json.dumps(item, sort_keys=True)}')
+                            else:
+                                print(f'DIFF in {filename} [{k}]: actual={v_list} expected={e_list}')
+                assert value == expected, 'Canonical schema fixture differs: ' + filename
         print(json.dumps(dict(canonical_schema008=True, roundtrip_schema008=True,
                               restored003_upgrade008=True, restored006_upgrade008=True, restored007_upgrade008=True, upgraded008_roundtrip=True,
                               tables=len(actual['tables']), functions=len(actual['functions']), triggers=len(actual['triggers']))))

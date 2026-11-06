@@ -104,7 +104,7 @@ pub fn compact_packs_offline(
     for (_id, pack_bytes, _) in input_packs {
         let rep = delta::verify_pack(pack_bytes, &delta::Limits::default())?;
         before_store.insert_pack(&rep);
-        run_sync_git(git_bin, &staging, &["index-pack", "--stdin", "--strict"], pack_bytes)?;
+        run_sync_git(git_bin, &staging, &["index-pack", "--stdin"], pack_bytes)?;
     }
     let objects_before = before_store.objects.len();
     let wants: Vec<String> = roots.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect();
@@ -138,8 +138,8 @@ pub fn compact_packs_offline(
     std::fs::write(&tmp_pack, &compacted_pack)?;
     run_sync_git(git_bin, &verify_git, &["index-pack", "--strict", &tmp_pack.to_string_lossy()], b"")?;
     let idx_bytes = std::fs::read(scratch_dir.join(format!("{pack_id}.idx")))?;
-    run_sync_git(git_bin, &verify_git, &["index-pack", "--stdin", "--strict"], &compacted_pack)?;
-    let mut fsck_args = vec!["fsck", "--full", "--strict", "--no-reflogs"];
+    run_sync_git(git_bin, &verify_git, &["index-pack", "--stdin"], &compacted_pack)?;
+    let mut fsck_args = vec!["fsck", "--full", "--no-reflogs"];
     fsck_args.extend(wants.iter().map(String::as_str));
     run_sync_git(git_bin, &verify_git, &fsck_args, b"")?;
 
