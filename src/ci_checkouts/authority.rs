@@ -74,7 +74,7 @@ pub async fn authenticate_principal(state:&AppState,headers:&HeaderMap,owner:&st
     if user.as_ref().is_some_and(|u|u!=owner){return Err(Error::unauthorized());}
     let digest=db::digest(&token);
     let sql=format!("SELECT i.plan,i.job_id,i.owner_id,i.repository_id,i.issuer_webhook_id, \
-      i.run_id,i.expires_unix,r.storage_generation {INTEGRATION_GRANT} \
+      i.run_id,i.expires_unix,r.storage_generation,r.object_format {INTEGRATION_GRANT} \
       AND i.credential_digest=$1 AND r.name=$2 AND EXISTS(SELECT 1 FROM namespaces u \
       WHERE u.id=r.owner_id AND u.slug=$3)");
     let client=state.pool.get().await.map_err(Error::internal)?;
@@ -82,11 +82,14 @@ pub async fn authenticate_principal(state:&AppState,headers:&HeaderMap,owner:&st
         .ok_or_else(Error::unauthorized)?;
     let plan:Plan=serde_json::from_value(row.get(0)).map_err(Error::internal)?;
     let repo_id:Uuid=row.get(3);
+    let repo_format:String=row.get(8);
     if plan.version!=1 || plan.job_id!=row.get::<_,Uuid>(1) ||
        plan.owner_id!=row.get::<_,Uuid>(2) || plan.repository_id!=repo_id ||
        plan.expires_unix!=row.get::<_,i64>(6) ||
        plan.storage_generation!=row.get::<_,i64>(7) ||
-       plan.target_oid!=oid || plan.object_format!=if oid.len()==40 {"sha1"}else{"sha256"} ||
+       plan.target_oid!=oid || !crate::ci_pins::valid_format(&plan.object_format) ||
+       plan.object_format!=repo_format ||
+       !crate::ci_pins::valid_oid_for_format(&plan.target_oid,&plan.object_format) ||
        plan.mirror_audience!=audience()? || plan.dependencies.version!=1 {
         return Err(Error::unauthorized());
     }
@@ -118,7 +121,7 @@ pub(crate) async fn authenticate(
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
     let sql=format!("{GRANTS} SELECT g.plan,g.owner_id,g.repository_id,g.issuer_token_id, \
-        g.expires_unix,r.storage_generation,u.slug AS username,g.job_id,t.user_id,ua.username AS actor_name \
+        g.expires_unix,r.storage_generation,u.slug AS username,g.job_id,t.user_id,ua.username AS actor_name,r.object_format \
         FROM grants g JOIN repositories r ON r.id=g.repository_id AND r.owner_id=g.owner_id \
         JOIN namespaces u ON u.id=g.owner_id JOIN tokens t ON t.id=g.issuer_token_id \
         JOIN users ua ON ua.id=t.user_id \
@@ -133,11 +136,14 @@ pub(crate) async fn authenticate(
     if rbac::resolve_effective_role_by_id(&tx,repo_id,owner_id,actor_id).await?
         .is_none_or(|r|r<Role::Read){return Err(Error::unauthorized());}
     let plan:Plan=serde_json::from_value(row.get(0)).map_err(Error::internal)?;
+    let repo_format:String=row.get(10);
     if plan.job_id!=row.get::<_,Uuid>(7) || plan.version!=1 ||
         plan.owner_id!=owner_id || plan.repository_id!=repo_id ||
         plan.expires_unix!=row.get::<_,i64>(4) ||
         plan.storage_generation!=row.get::<_,i64>(5) ||
-        plan.object_format!=if oid.len()==40 {"sha1"} else {"sha256"} ||
+        !crate::ci_pins::valid_format(&plan.object_format) ||
+        plan.object_format!=repo_format ||
+        !crate::ci_pins::valid_oid_for_format(&plan.target_oid,&plan.object_format) ||
         plan.target_oid!=oid || plan.mirror_audience!=audience()? ||
         plan.dependencies.version!=1 {return Err(Error::unauthorized());}
     tx.commit().await.map_err(Error::internal)?;

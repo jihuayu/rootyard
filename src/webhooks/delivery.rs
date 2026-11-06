@@ -189,10 +189,15 @@ pub(crate) async fn ensure_pull_ci_pin(
         reliability::before_push(state, repo).await.map_err(Error::internal)?;
     }
 
+    if !ci_pins::valid_format(&repo.object_format)
+        || !ci_pins::valid_oid_for_format(head_oid, &repo.object_format)
+    {
+        return Err(Error(StatusCode::CONFLICT, "CI pin target format differs from repository"));
+    }
     let intent = ci_pins::Intent {
         version: 1, job_id, owner_id, repository_id: repo.id,
         storage_generation: repo.storage_generation,
-        object_format: if head_oid.len()==40 {"sha1"} else {"sha256"}.into(),
+        object_format: repo.object_format.clone(),
         target_oid: head_oid.to_owned(), retention_ref: retention_ref.clone(),
     };
     let intent_bytes = serde_json::to_vec(&intent).map_err(Error::internal)?;
@@ -216,7 +221,7 @@ pub(crate) async fn ensure_pull_ci_pin(
         let repo_path = state.storage.verify_path(repo.id).map_err(Error::internal)?;
         let op = journal::begin_ci_service(&state.storage.root,&intent,principal_id)
             .map_err(Error::internal)?;
-        let zero="0".repeat(head_oid.len());
+        let zero=crate::pulls::models::zero_oid(&repo.object_format).ok_or_else(||Error::internal("invalid repository object format"))?;
         let old_expected = existing_ref.as_deref().unwrap_or(&zero);
         let mut update_cmd = state.storage.git(&state.config);
         update_cmd

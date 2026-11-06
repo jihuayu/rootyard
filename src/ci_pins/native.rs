@@ -12,6 +12,7 @@ pub(super) async fn run(state: &AppState, repo: Uuid, args: &[&str], limit: usiz
 }
 // Include symbolic targets so a symbolic ref cannot masquerade as immutable.
 pub(super) async fn roots(state: &AppState, repo: Uuid) -> Result<HashMap<String, String>> {
+    let format = object_format(state, repo).await?;
     let bytes = run(
         state,
         repo,
@@ -30,7 +31,7 @@ pub(super) async fn roots(state: &AppState, repo: Uuid) -> Result<HashMap<String
         ensure!(
             fields.len() == 3
                 && reserved(fields[0])
-                && valid_oid(fields[1])
+                && valid_oid_for_format(fields[1], &format)
                 && fields[2].is_empty(),
             "unsupported CI retention ref"
         );
@@ -68,7 +69,7 @@ pub(super) async fn roots(state: &AppState, repo: Uuid) -> Result<HashMap<String
                     .strip_suffix('\n')
                     .context("invalid CI ref content")?;
                 ensure!(
-                    valid_oid(value) && result.get(name).is_some_and(|oid| oid == value),
+                    valid_oid_for_format(value, &format) && result.get(name).is_some_and(|oid| oid == value),
                     "unlisted or symbolic CI ref collision"
                 );
             }
@@ -77,9 +78,9 @@ pub(super) async fn roots(state: &AppState, repo: Uuid) -> Result<HashMap<String
     Ok(result)
 }
 pub(super) async fn commit(state: &AppState, repo: Uuid, oid: &str) -> Result<()> {
+    let format = object_format(state, repo).await?;
     ensure!(
-        run(state, repo, &["rev-parse", "--show-object-format"], 128).await?
-            == if oid.len()==40 {b"sha1\n".as_slice()} else {b"sha256\n".as_slice()},
+        valid_oid_for_format(oid, &format),
         "CI object format differs from target"
     );
     ensure!(
@@ -87,6 +88,18 @@ pub(super) async fn commit(state: &AppState, repo: Uuid, oid: &str) -> Result<()
         "target is not an actual commit"
     );
     Ok(())
+}
+
+/// Inspect the repository's persisted object format instead of inferring it
+/// from the length of a caller-supplied OID.
+pub(super) async fn object_format(state: &AppState, repo: Uuid) -> Result<String> {
+    let bytes = run(state, repo, &["rev-parse", "--show-object-format"], 128).await?;
+    let format = std::str::from_utf8(&bytes)?.trim();
+    ensure!(
+        valid_format(format),
+        "unsupported repository object format"
+    );
+    Ok(format.to_owned())
 }
 
 /// Recover only a typed exact maintenance operation. Caller proves child completion

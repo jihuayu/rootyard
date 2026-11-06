@@ -4,7 +4,8 @@ use crate::{
     mirror::{
         Snapshot, eviction,
         sync::{
-            atomic_file, bare_config, mirror_git, private_directory, read_regular, verify_directory,
+            atomic_file, bare_config, init_bare_view, mirror_git, private_directory, read_regular,
+            verify_directory,
         },
     },
 };
@@ -43,6 +44,9 @@ pub(crate) async fn pinned_path(
         let snapshot: Snapshot = serde_json::from_slice(&bytes).map_err(Error::internal)?;
         if snapshot.repository_id != repo.id
             || snapshot.storage_generation != repo.storage_generation
+            || snapshot.object_format != repo.object_format
+            || !crate::ci_pins::valid_format(&snapshot.object_format)
+            || !crate::ci_pins::valid_oid_for_format(oid, &snapshot.object_format)
         {
             return Err(unavailable());
         }
@@ -56,7 +60,7 @@ pub(crate) async fn pinned_path(
     };
     if pinned {
         let pin = path_for(&snapshot);
-        validate_pin(&pin, oid, &root.join(snapshot.snapshot.to_string()))
+        validate_pin(&pin, oid, &root.join(snapshot.snapshot.to_string()), &snapshot.object_format)
             .map_err(Error::internal)?;
         eviction::touch_path(&pin_file);
         return Ok(pin);
@@ -99,7 +103,7 @@ pub(crate) async fn pinned_path(
     }
     let pin = path_for(&snapshot);
     if pin.try_exists().map_err(Error::internal)? {
-        validate_pin(&pin, oid, &snapshot_root).map_err(Error::internal)?;
+        validate_pin(&pin, oid, &snapshot_root, &snapshot.object_format).map_err(Error::internal)?;
         if !pinned {
             atomic_file(
                 &root,
@@ -126,14 +130,18 @@ pub(crate) async fn pinned_path(
     let temporary = snapshot_root
         .join("pins")
         .join(format!(".{}.staging", Uuid::new_v4()));
-    let result = (|| -> Result<()> {
+    let result = async {
+        init_bare_view(state, &temporary, &snapshot.object_format).await?;
         private_directory(&temporary)?;
         for name in ["objects", "objects/info", "refs", "refs/heads"] {
             private_directory(&temporary.join(name))?;
         }
         std::fs::write(temporary.join("HEAD"), b"ref: refs/heads/main\n")?;
         std::fs::write(temporary.join("refs/heads/main"), format!("{oid}\n"))?;
-        std::fs::write(temporary.join("config"), bare_config())?;
+        std::fs::write(
+            temporary.join("config"),
+            bare_config(&snapshot.object_format),
+        )?;
         let objects = bare.join("objects").canonicalize()?;
         let text = objects
             .to_str()
@@ -149,8 +157,9 @@ pub(crate) async fn pinned_path(
         std::fs::rename(&temporary, &pin)?;
         File::open(snapshot_root.join("pins"))?.sync_all()?;
         atomic_file(&root, &pin_name, &serde_json::to_vec(&snapshot)?)?;
-        Ok(())
-    })();
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
     if result.is_err() {
         let _ = std::fs::remove_dir_all(&temporary);
     }
@@ -158,7 +167,12 @@ pub(crate) async fn pinned_path(
     Ok(pin)
 }
 
-pub(crate) fn validate_pin(pin: &FsPath, oid: &str, snapshot: &FsPath) -> Result<()> {
+pub(crate) fn validate_pin(
+    pin: &FsPath,
+    oid: &str,
+    snapshot: &FsPath,
+    object_format: &str,
+) -> Result<()> {
     for path in [
         snapshot.to_path_buf(),
         snapshot.join("repository.git"),
@@ -173,8 +187,8 @@ pub(crate) fn validate_pin(pin: &FsPath, oid: &str, snapshot: &FsPath) -> Result
         verify_directory(&path)?;
     }
     if read_regular(&pin.join("HEAD"), 64)? != b"ref: refs/heads/main\n"
-        || read_regular(&pin.join("refs/heads/main"), 64)? != format!("{oid}\n").as_bytes()
-        || read_regular(&pin.join("config"), 4096)? != bare_config().as_bytes()
+        || read_regular(&pin.join("refs/heads/main"), 128)? != format!("{oid}\n").as_bytes()
+        || read_regular(&pin.join("config"), 4096)? != bare_config(object_format).as_bytes()
         || read_regular(&pin.join("objects/info/alternates"), 4096)?
             != format!("{}\n", snapshot.join("repository.git/objects").display()).as_bytes()
     {
@@ -339,6 +353,7 @@ mod tests {
         let snapshot = Snapshot {
             repository_id: repo.id,
             storage_generation: 1,
+            object_format: "sha1".into(),
             snapshot: Uuid::new_v4(),
         };
         let snapshot_root = repo_root.join(snapshot.snapshot.to_string());
@@ -363,7 +378,7 @@ mod tests {
             StatusCode::CONFLICT
         );
         let pin = pinned_path(&state, &repo, &oid).await.unwrap();
-        validate_pin(&pin, &oid, &snapshot_root).unwrap();
+        validate_pin(&pin, &oid, &snapshot_root, "sha1").unwrap();
         let mut clone = mirror_git(&state);
         clone
             .arg("clone")
@@ -405,4 +420,152 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
     }
+    #[tokio::test]
+    async fn sha256_native_pins_use_declared_object_format() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|p| p.join("git"))
+            .find(|p| p.is_file())
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        let run = |dir: &FsPath, args: &[&str]| -> String {
+            let output = std::process::Command::new(&git)
+                .current_dir(dir)
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "Git fixture failed: {args:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let source = root.join("sha256-source");
+        std::fs::create_dir(&source).unwrap();
+        run(
+            &source,
+            &[
+                "init",
+                "--object-format=sha256",
+                "--initial-branch=main",
+                "--template=",
+            ],
+        );
+        std::fs::write(source.join("hello"), b"sha256 object\n").unwrap();
+        run(&source, &["add", "hello"]);
+        run(
+            &source,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "sha256 first",
+            ],
+        );
+        let oid = run(&source, &["rev-parse", "HEAD"]);
+        assert_eq!(oid.len(), 64);
+        let config = Config {
+            database_url: "postgres://unused@127.0.0.1/unused".into(),
+            data_dir: root.join("mirror"),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            git,
+            max_request_bytes: 1024 * 1024,
+            max_output_bytes: 1024 * 1024,
+            max_concurrent_git: 2,
+            git_timeout: std::time::Duration::from_secs(20),
+            git_memory_bytes: 1024 * 1024 * 1024,
+            max_repo_bytes: 1024 * 1024 * 1024,
+            max_pending_deliveries: 100,
+            outbox_worker: false,
+            metrics_bind: None,
+        };
+        let state = AppState {
+            pool: db::pool(&config.database_url).unwrap(),
+            storage: Storage::open_mirror(&config).unwrap(),
+            config,
+            mirror_primary: Some("http://127.0.0.1".into()),
+            hooks: None,
+            git_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            transfer_metrics: Arc::new(crate::metrics::TransferCounters::default()),
+            dispatch: crate::dispatch::Signals::default(),
+        };
+        let repo = db::Repository {
+            id: Uuid::new_v4(),
+            name: "sha256".into(),
+            owner: "alice".into(),
+            state: "ready".into(),
+            clone_path: String::new(),
+            storage_backend: "gitfs".into(),
+            storage_generation: 1,
+            object_format: "sha256".into(),
+        };
+        let repo_root = state.storage.root.join("repos").join(repo.id.to_string());
+        private_directory(&repo_root).unwrap();
+        let snapshot = Snapshot {
+            repository_id: repo.id,
+            storage_generation: 1,
+            object_format: "sha256".into(),
+            snapshot: Uuid::new_v4(),
+        };
+        let snapshot_root = repo_root.join(snapshot.snapshot.to_string());
+        private_directory(&snapshot_root).unwrap();
+        private_directory(&snapshot_root.join("pins")).unwrap();
+        let mut clone = mirror_git(&state);
+        clone
+            .args(["clone", "--mirror", "--no-hardlinks"])
+            .arg(&source)
+            .arg(snapshot_root.join("repository.git"));
+        git_http::collect_git_output(clone, 4096, state.config.git_timeout)
+            .await
+            .unwrap();
+        atomic_file(
+            &repo_root,
+            "current.json",
+            &serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            pinned_path(&state, &repo, &"a".repeat(40))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        let pin = pinned_path(&state, &repo, &oid).await.unwrap();
+        validate_pin(&pin, &oid, &snapshot_root, "sha256").unwrap();
+        assert!(validate_pin(&pin, &oid, &snapshot_root, "sha1").is_err());
+        let pin_config = String::from_utf8(read_regular(&pin.join("config"), 4096).unwrap()).unwrap();
+        eprintln!("PIN_CONFIG={pin_config:?}");
+        assert!(pin_config.contains("repositoryformatversion = 1"));
+        assert!(pin_config.contains("objectFormat = sha256"));
+        let mut command = mirror_git(&state);
+        command
+            .arg("--git-dir")
+            .arg(&pin)
+            .args(["rev-parse", "--show-object-format"]);
+        assert_eq!(
+            git_http::collect_git_output(command, 128, state.config.git_timeout)
+                .await
+                .unwrap(),
+            b"sha256\n"
+        );
+        let mut command = mirror_git(&state);
+        command
+            .arg("--git-dir")
+            .arg(&pin)
+            .args(["cat-file", "-t", &oid]);
+        assert_eq!(
+            git_http::collect_git_output(command, 128, state.config.git_timeout)
+                .await
+                .unwrap(),
+            b"commit\n"
+        );
+    }
+
 }

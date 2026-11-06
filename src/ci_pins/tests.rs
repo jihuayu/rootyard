@@ -31,6 +31,41 @@ mod ci_pin_tests {
         }
     }
     #[test]
+    fn format_aware_oid_and_zero_oid_validation() {
+        let sha1 = "a".repeat(40);
+        let sha256 = "b".repeat(64);
+        assert!(valid_format("sha1") && valid_format("sha256"));
+        assert!(!valid_format("sha512"));
+        assert!(valid_oid_for_format(&sha1, "sha1"));
+        assert!(!valid_oid_for_format(&sha1, "sha256"));
+        assert!(valid_oid_for_format(&sha256, "sha256"));
+        assert!(!valid_oid_for_format(&sha256, "sha1"));
+        assert!(!valid_oid_for_format(&sha256, "sha512"));
+        assert!(nonzero_oid_for_format(&sha1, "sha1"));
+        assert!(!nonzero_oid_for_format(&"0".repeat(40), "sha1"));
+        assert!(!nonzero_oid_for_format(&"0".repeat(64), "sha256"));
+        assert_eq!(zero_oid_for_format("sha1"), Some("0".repeat(40)));
+        assert_eq!(zero_oid_for_format("sha256"), Some("0".repeat(64)));
+        assert_eq!(zero_oid_for_format("sha512"), None);
+        let sha256_intent = Intent {
+            version: 1,
+            job_id: Uuid::new_v4(),
+            owner_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            storage_generation: 1,
+            object_format: "sha256".into(),
+            target_oid: sha256,
+            retention_ref: String::new(),
+        };
+        let sha256_intent = Intent {
+            retention_ref: format!("{NAMESPACE}/jobs/{}", sha256_intent.job_id),
+            ..sha256_intent
+        };
+        sha256_intent.validate().unwrap();
+        let mixed = Intent { object_format: "sha1".into(), ..sha256_intent };
+        assert!(mixed.validate().is_err());
+    }
+    #[test]
     fn metadata_identity_and_receipt_are_immutable() {
         let root = tempfile::tempdir().unwrap();
         let intent = Intent {

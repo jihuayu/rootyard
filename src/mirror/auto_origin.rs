@@ -116,7 +116,10 @@ fn read_pin_snap(storage: &Storage, repo: &db::Repository, oid: &str) -> Result<
     let p = pinned_path(storage, repo.id, repo.storage_generation, oid);
     let bytes = read_regular(&p, 4096).map_err(Error::internal)?;
     let snap: Snapshot = serde_json::from_slice(&bytes).map_err(Error::internal)?;
-    if snap.repository_id != repo.id || snap.storage_generation != repo.storage_generation {
+    if snap.repository_id != repo.id || snap.storage_generation != repo.storage_generation
+        || snap.object_format != repo.object_format
+        || !crate::ci_pins::valid_oid_for_format(oid, &repo.object_format)
+    {
         return Err(Error::internal("mirror pin snapshot identity mismatch"));
     }
     Ok(snap)
@@ -132,13 +135,18 @@ pub async fn auto_fetch(
 ) -> ApiResult {
     let t0 = Instant::now();
     if !crate::ci_pins::valid_oid(&req.target_oid)
-        || req.target_oid == "0".repeat(40)
+        || req.target_oid.bytes().all(|b| b == b'0')
         || req.storage_generation.is_some_and(|g| g <= 0)
         || req.job_id.as_ref().is_some_and(|id| !valid_runner_id(id))
     {
         return Err(Error::bad_request());
     }
     let repo = crate::mirror::repository(&state, &headers, &owner, &name).await?;
+    if !crate::ci_pins::valid_format(&repo.object_format)
+        || !crate::ci_pins::valid_oid_for_format(&req.target_oid, &repo.object_format)
+    {
+        return Err(Error::bad_request());
+    }
     if req.storage_generation.is_some_and(|g| g != repo.storage_generation) {
         return Err(Error(StatusCode::CONFLICT, "repository generation changed"));
     }
@@ -254,7 +262,7 @@ pub async fn claim_or_heartbeat_runner(
     State(state): App, Path((owner, name)): RepoPath, headers: HeaderMap, Json(req): Json<RunnerQueueRequest>,
 ) -> ApiResult {
     let ttl = req.lease_ttl_secs.unwrap_or(300);
-    let bad_oid = req.target_oid.as_ref().is_some_and(|o| !crate::ci_pins::valid_oid(o) || o == &"0".repeat(40));
+    let bad_oid = req.target_oid.as_ref().is_some_and(|o| !crate::ci_pins::valid_oid(o) || o.bytes().all(|b| b == b'0'));
     if !valid_runner_id(&req.runner_id) || !valid_cluster_zone(&req.cluster_zone)
         || !(10..=3600).contains(&ttl) || req.now_unix.is_some_and(|n| n <= 0)
         || req.storage_generation.is_some_and(|g| g <= 0)
@@ -263,6 +271,11 @@ pub async fn claim_or_heartbeat_runner(
         return Err(Error::bad_request());
     }
     let repo = crate::mirror::repository(&state, &headers, &owner, &name).await?;
+    if req.target_oid.as_ref().is_some_and(|o|
+        !crate::ci_pins::valid_oid_for_format(o, &repo.object_format))
+    {
+        return Err(Error::bad_request());
+    }
     if req.storage_generation.is_some_and(|g| g != repo.storage_generation) {
         return Err(Error(StatusCode::CONFLICT, "repository generation changed"));
     }

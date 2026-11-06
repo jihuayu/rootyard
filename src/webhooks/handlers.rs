@@ -6,7 +6,8 @@ use crate::{
     db,
     pulls::models::{
         body_valid, context_valid, creation_replay, positive, record_creation,
-        valid_check_status_and_conclusion, valid_oid, verify_commit_exists,
+        valid_check_status_and_conclusion, valid_format, valid_oid_for_format,
+        verify_commit_exists,
     },
     webhooks::{
         delivery::{
@@ -454,7 +455,8 @@ pub async fn ci_callback(
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let hook_row = client
             .query_opt(
-                "SELECT r.id AS repo_id, r.owner_id AS tenant_id, r.state AS repo_state, w.secret, w.active, w.ci_contexts \
+                "SELECT r.id AS repo_id, r.owner_id AS tenant_id, r.state AS repo_state, \
+                 r.object_format AS repo_object_format, w.secret, w.active, w.ci_contexts \
                  FROM repositories r JOIN namespaces u ON u.id = r.owner_id \
                  JOIN forge_webhooks w ON w.repository_id = r.id AND w.tenant_id = r.owner_id \
                  WHERE u.slug=$1 AND r.name=$2 AND w.id=$3",
@@ -465,6 +467,7 @@ pub async fn ci_callback(
             .ok_or_else(Error::not_found)?;
 
         let (repo_id, tenant_id, secret): (Uuid, Uuid, String) = (hook_row.get("repo_id"), hook_row.get("tenant_id"), hook_row.get("secret"));
+        let object_format: String = hook_row.get("repo_object_format");
         if !verify_signature_header(&secret, &body, sig_header) {
             return Err(Error::unauthorized());
         }
@@ -486,7 +489,9 @@ pub async fn ci_callback(
         let context = input.context.clone().unwrap_or(default_ctx);
         let output = input.output.clone().unwrap_or_default();
 
-        if !valid_oid(&input.commit_oid)
+        if !valid_format(&object_format)
+            || !valid_oid_for_format(&input.commit_oid, &object_format)
+            || input.base_oid.as_ref().is_some_and(|oid| !valid_oid_for_format(oid, &object_format))
             || !context_valid(&context)
             || !valid_check_status_and_conclusion(&input.status, input.conclusion.as_deref())
             || !body_valid(&output, false)

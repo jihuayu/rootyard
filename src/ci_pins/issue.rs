@@ -38,6 +38,11 @@ pub(super) async fn pin_inner(
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     let repo = db::Repository::from_row(&row);
+    if !valid_format(&repo.object_format)
+        || !nonzero_oid_for_format(&input.target_oid, &repo.object_format)
+    {
+        return Err(Error::bad_request());
+    }
     if repo.storage_generation != input.storage_generation {
         return Err(Error(StatusCode::CONFLICT, "repository generation changed"));
     }
@@ -88,7 +93,7 @@ pub(super) async fn pin_inner(
         owner_id: actor.id,
         repository_id: repo.id,
         storage_generation: input.storage_generation,
-        object_format: if input.target_oid.len()==40 {"sha1"} else {"sha256"}.into(),
+        object_format: repo.object_format.clone(),
         target_oid: input.target_oid,
         retention_ref: format!("{NAMESPACE}/jobs/{}", input.job_id),
     };
