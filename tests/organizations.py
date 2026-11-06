@@ -35,6 +35,7 @@ class OrganizationHarness(Harness):
         self.doc("/api/repos/acme/project", 404, token=charlie)
         self.doc("/api/orgs/acme/members/bob", 201, method="PUT", body={"role": "read"})
         self.doc("/api/repos/acme/project", 200, token=self.bob)
+        assert self.doc("/api/repos/acme/project/backend", 200, token=self.bob)["owner"] == "acme"
 
         alice_work = self.root / "org-alice"
         self.git("clone", remote, str(alice_work), token=self.alice)
