@@ -19,6 +19,23 @@ pub struct Operation {
     #[serde(skip)]
     pub path: PathBuf,
 }
+pub struct ActiveGuard {
+    _file: File,
+}
+impl ActiveGuard {
+    pub fn operation_is_live(op:&Operation)->Result<bool> {
+        let path=op.path.join("active.lock");
+        if !exists(&path)? {return Ok(false);}
+        let file=OpenOptions::new().read(true).write(true)
+            .custom_flags(libc::O_NOFOLLOW).open(&path)?;
+        ensure!(file.metadata()?.is_file(),"invalid active operation lock");
+        match file.try_lock_exclusive() {
+            Ok(())=>Ok(false),
+            Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>Ok(true),
+            Err(error)=>Err(error.into()),
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RefChange {
@@ -211,7 +228,7 @@ pub fn begin(
     token_id: Uuid,
     storage_generation: i64,
 ) -> Result<Operation> {
-    begin_inner(
+    Ok(begin_inner(
         data_root,
         repository_id,
         actor_id,
@@ -220,7 +237,19 @@ pub fn begin(
         storage_generation,
         None,
         None,
-    )
+        false,
+    )?.0)
+}
+
+/// Admit a write whose network transfer can overlap independent refs. The
+/// returned guard must outlive the Git child and be dropped only after a
+/// terminal journal marker is durable. Runtime recovery skips live guards.
+pub fn begin_active(data_root:&Path,repository_id:Uuid,actor_id:Uuid,
+    actor_name:String,token_id:Uuid,storage_generation:i64)
+    ->Result<(Operation,ActiveGuard)> {
+    let (op,guard)=begin_inner(data_root,repository_id,actor_id,actor_name,
+        token_id,storage_generation,None,None,true)?;
+    Ok((op,guard.context("missing active admission lock")?))
 }
 
 pub(crate) fn begin_ci(
@@ -230,7 +259,7 @@ pub(crate) fn begin_ci(
     intent: &crate::ci_pins::Intent,
 ) -> Result<Operation> {
     intent.validate()?;
-    begin_inner(
+    Ok(begin_inner(
         data_root,
         intent.repository_id,
         intent.owner_id,
@@ -239,7 +268,8 @@ pub(crate) fn begin_ci(
         intent.storage_generation,
         Some(intent.clone()),
         None,
-    )
+        false,
+    )?.0)
 }
 
 /// Admit an exact CI retention ref operation under a non-login principal.
@@ -250,9 +280,9 @@ pub(crate) fn begin_ci_service(
 ) -> Result<Operation> {
     intent.validate()?;
     ensure!(!principal_id.is_nil(), "invalid CI service principal");
-    begin_inner(data_root, intent.repository_id, Uuid::nil(),
+    Ok(begin_inner(data_root, intent.repository_id, Uuid::nil(),
         "ci-scheduler".into(), Uuid::nil(), intent.storage_generation,
-        Some(intent.clone()), Some(principal_id))
+        Some(intent.clone()), Some(principal_id),false)?.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -265,7 +295,8 @@ fn begin_inner(
     storage_generation: i64,
     ci_pin: Option<crate::ci_pins::Intent>,
     service_principal_id: Option<Uuid>,
-) -> Result<Operation> {
+    active: bool,
+) -> Result<(Operation,Option<ActiveGuard>)> {
     safe_path(data_root)?;
     ensure!(
         storage_generation > 0 && !actor_name.is_empty() && actor_name.len() <= 4096,
@@ -319,9 +350,16 @@ fn begin_inner(
         &serde_json::to_vec(&op)?,
         false,
     )?;
+    let active_guard=if active {
+        let file=OpenOptions::new().read(true).write(true).create_new(true)
+            .mode(0o600).custom_flags(libc::O_NOFOLLOW)
+            .open(staging.join("active.lock"))?;
+        file.lock_exclusive()?;
+        Some(ActiveGuard { _file: file })
+    }else{None};
     fs::rename(&staging, &op.path)?;
     sync_dir(&repo)?;
-    Ok(op)
+    Ok((op,active_guard))
 }
 
 pub fn sequence(data_root: &Path, repository_id: Uuid) -> Result<i64> {
