@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 from urllib.parse import quote
 
+import ops_provenance
+
 
 def run(args, env=None, check=True, data=None):
     result = subprocess.run(args, env=env, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
@@ -92,10 +94,21 @@ def main():
         downgraded = env.copy()
         downgraded["DATABASE_URL"] = f"postgresql://agent:{quote(password)}@localhost:{port}/postgres?sslmode=disable"
         assert run([binary, "migrate"], env=downgraded, check=False).returncode != 0
-        report = {"kind": "native_postgresql_tls", "postgres_version": "17", "encrypted": True,
-                  "scram_sha256_authenticated": True, "wrong_password_rejected": True,
-                  "ca_validation_rejected_wrong_root": True, "hostname_validation_rejected_ip_mismatch": True,
-                  "explicit_downgrade_rejected": True, "binary": binary}
+        postgres_version = run(["psql", f"postgresql://agent@localhost:{port}/postgres?sslmode=verify-full",
+                                "-X", "-At", "-c", "SHOW server_version"], env=pg_env).stdout.decode().strip()
+        report = ops_provenance.base(
+            binary, __file__,
+            topology="one disposable PostgreSQL 17 server with a CA-signed localhost certificate and an external Rootyard client",
+            dataset="one migration/connection attempt per positive and negative TLS/auth case",
+            workload="Rootyard migrations over verify-full TLS plus wrong-password, wrong-root, hostname-mismatch and explicit sslmode=disable negative checks",
+            limits=["one local PostgreSQL server and loopback client",
+                    "proves client TLS/auth validation, not database HA or remote network policy"])
+        report.update({"kind": "native_postgresql_tls", "postgres_version": postgres_version,
+                  "encrypted": True, "scram_sha256_authenticated": True,
+                  "wrong_password_rejected": True,
+                  "ca_validation_rejected_wrong_root": True,
+                  "hostname_validation_rejected_ip_mismatch": True,
+                  "explicit_downgrade_rejected": True})
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"result": "passed", "report": str(args.report)}))

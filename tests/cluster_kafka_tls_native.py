@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Real Kafka KRaft SASL_SSL wake transport and broker outage recovery."""
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +12,7 @@ import tempfile
 import time
 
 from e2e import Harness
+import ops_provenance
 
 
 def run(args, env=None, check=True, data=None, timeout=30):
@@ -37,6 +37,7 @@ def main():
     args = parser.parse_args()
     args.binary = str(args.binary.resolve())
     kafka = args.kafka_home.resolve() / "bin"
+    kafka_version = run([str(kafka / "kafka-topics.sh"), "--version"], timeout=30).stdout.decode().strip()
     root = Path(tempfile.mkdtemp(prefix="rootyard-kafka-tls-"))
     broker_port, controller_port = free_port(), free_port()
     broker = None
@@ -183,12 +184,20 @@ def main():
                 break
             time.sleep(.25)
         assert final_offset > before_reconnect, "Kafka wake did not reconnect after broker restart"
-        report = {"kind": "native_kafka_sasl_ssl", "kafka_version": "3.9.1", "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
+        report = ops_provenance.base(
+            args.binary, __file__,
+            topology="one Rootyard writer and one task-owned Apache Kafka KRaft broker with a SASL_SSL listener; controller listener is local plaintext",
+            dataset="one private repository with acknowledged Git pushes before and during a broker outage",
+            workload="native Git push/fetch while a real Kafka wake transport uses SASL/PLAIN over verified TLS; client negative checks for wrong CA, hostname and password; broker stop and restart",
+            limits=["single local KRaft broker; controller listener is local plaintext",
+                    "no multi-broker Kafka failover",
+                    "Kafka wake is advisory and PostgreSQL remains the durable event authority"])
+        report.update({"kind": "native_kafka_sasl_ssl", "kafka_version": kafka_version,
+                  "postgres_version": h.sql("SHOW server_version"),
                   "wrong_ca_rejected": True, "wrong_hostname_rejected": True, "wrong_sasl_password_rejected": True,
                   "sasl_mechanism": "PLAIN over TLS", "initial_wake_offset": initial_offset,
                   "post_restart_wake_offset": final_offset, "git_push_during_broker_outage": during_outage,
-                  "git_push_after_reconnect": after_restart, "broker_restart_reconnected": True,
-                  "limits": ["single local KRaft broker; controller listener is local plaintext", "no multi-broker Kafka failover"]}
+                  "git_push_after_reconnect": after_restart, "broker_restart_reconnected": True})
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"result": "passed", "report": str(args.report), "initial_offset": initial_offset, "final_offset": final_offset}))
