@@ -16,7 +16,7 @@ pub struct ReportInput { pub attempt: i64, pub lease_generation: i64,
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatInput { pub attempt:i64, pub lease_generation:i64, pub runner_id:String }
 
-async fn integration(state: &AppState, owner: &str, name: &str, hook_id: Uuid,
+pub(crate) async fn integration(state: &AppState, owner: &str, name: &str, hook_id: Uuid,
     headers: &HeaderMap) -> Result<(Uuid,Uuid),Error> {
     let bearer = headers.get("authorization").and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer ")).ok_or_else(Error::unauthorized)?;
