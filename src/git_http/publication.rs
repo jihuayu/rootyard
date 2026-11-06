@@ -1,6 +1,6 @@
 //! A receive hook requests the parent-owned publication window. The hook exits
 //! before Git commits refs, so the parent retains both gates until Git stops.
-use crate::{AppState,journal, storage::ref_publication::PublicationGuard};
+use crate::{AppState,auth,db::Identity,journal,reliability,storage::{self,ref_publication::PublicationGuard}};
 use anyhow::{Context, Result, ensure};
 use rand::RngCore;
 use std::{io::{Read,Write}, net::{SocketAddr,TcpStream}, sync::Arc, time::Duration};
@@ -10,6 +10,7 @@ pub(super) struct Coordinator {
     listener: TcpListener,
     nonce: [u8;32],
     op: journal::Operation,
+    actor: Identity,
 }
 
 pub(super) struct Handle {
@@ -19,14 +20,16 @@ pub(super) struct Handle {
 }
 
 impl Coordinator {
-    pub fn bind(op: &journal::Operation) -> Result<Self> {
+    pub fn bind(op: &journal::Operation,actor:&Identity) -> Result<Self> {
         ensure!(op.requires_parent_publication, "operation does not require parent publication");
+        ensure!(op.actor_id==actor.id && op.token_id==actor.token_id,
+            "publication actor differs from admitted operation");
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(listener)?;
         let mut nonce = [0u8;32];
         rand::rng().fill_bytes(&mut nonce);
-        Ok(Self { listener, nonce, op: op.clone() })
+        Ok(Self { listener, nonce, op: op.clone(), actor:actor.clone() })
     }
 
     pub fn endpoint(&self) -> SocketAddr { self.listener.local_addr().expect("bound listener") }
@@ -49,12 +52,39 @@ impl Coordinator {
                         .ok().and_then(std::result::Result::ok).is_none() || attempt != self.nonce { continue; }
                     let window = guard.enter_window(&state.storage,deadline).await
                         .map_err(|e| anyhow::anyhow!(e.1))?;
+                    auth::verify_active(&state.pool,&self.actor,self.op.repository_id,true)
+                        .await.map_err(|e| anyhow::anyhow!(e.1))?;
+                    let repo_path=state.storage.verify_path(self.op.repository_id)?;
+                    let quota=state.config.max_repo_bytes;
+                    let bytes=tokio::task::spawn_blocking(move || storage::disk_bytes(&repo_path,quota)).await??;
+                    ensure!(bytes<quota,"repository quota reached before ref publication");
+                    let row=state.pool.get().await?.query_one(
+                        "SELECT storage_generation,state FROM repositories WHERE id=$1",
+                        &[&self.op.repository_id]).await?;
+                    ensure!(row.get::<_,i64>(0)==self.op.storage_generation &&
+                        row.get::<_,String>(1)=="ready","repository changed before ref publication");
+                    window.ensure_active().map_err(|e| anyhow::anyhow!(e.1))?;
                     journal::atomic(&self.op.path.join("publication.grant"), &self.nonce, false)?;
                     peer.write_all(b"1").await?;
                     granted_send.send_replace(true);
                     // The guard remains owned until child quiescence and
-                    // journal settlement, even though this hook has exited.
-                    let _ = stop_recv.await;
+                    // journal settlement. A reference-transaction preparing
+                    // hook must confirm that the parent still holds it; a
+                    // stale marker alone cannot authorize native CAS.
+                    loop {
+                        let (mut verifier, source) = tokio::select! {
+                            _ = &mut stop_recv => break,
+                            result = tokio::time::timeout_at(deadline,self.listener.accept()) =>
+                                result.context("publication verifier deadline")??,
+                        };
+                        if !source.ip().is_loopback() { continue; }
+                        let mut challenge=[0u8;32];
+                        if tokio::time::timeout(Duration::from_secs(1),verifier.read_exact(&mut challenge))
+                            .await.ok().and_then(std::result::Result::ok).is_none()
+                            || challenge != self.nonce { continue; }
+                        window.ensure_active().map_err(|e| anyhow::anyhow!(e.1))?;
+                        verifier.write_all(b"1").await?;
+                    }
                     window.ensure_active().map_err(|e| anyhow::anyhow!(e.1))?;
                     return Ok(());
                 }
@@ -71,6 +101,33 @@ impl Handle {
         if let Some(send) = self.stop.take() { let _ = send.send(()); }
         let _ = (&mut self.task).await;
     }
+    pub async fn abort(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+}
+
+/// Called only after the native process group has stopped. A granted parent
+/// still owns the repo mutex; if no pre-receive hook ran, acquire it now before
+/// removing the journal's active marker and reconciling terminal evidence.
+pub(super) async fn settle(state:&AppState,operation:Option<journal::Operation>,
+    active:Option<journal::ActiveGuard>,coordinator:Option<Handle>)->Result<()> {
+    let Some(operation)=operation else {return Ok(());};
+    let granted=coordinator.as_ref().is_some_and(Handle::granted);
+    let mut coordinator=coordinator;
+    if !granted {
+        if let Some(handle)=coordinator.take(){handle.abort().await;}
+    }
+    let _fallback=if granted {None} else {
+        Some(tokio::time::timeout(state.config.git_timeout,
+            state.storage.write_lock(operation.repository_id)).await
+            .context("terminal publication mutex timeout")?)
+    };
+    journal::finish(&operation)?;
+    drop(active);
+    let result=reliability::complete(state,Some(operation)).await;
+    if let Some(handle)=coordinator {handle.close().await;}
+    result
 }
 impl Drop for Handle {
     fn drop(&mut self) { self.task.abort(); }
@@ -118,9 +175,16 @@ mod tests {
         let mut url = reqwest::Url::parse(&base_url).unwrap();
         url.query_pairs_mut().append_pair("options",&format!("-csearch_path={schema}"));
         let pool = db::pool(url.as_str()).unwrap();
-        pool.get().await.unwrap().batch_execute("CREATE TABLE repositories(id uuid PRIMARY KEY,storage_generation bigint NOT NULL,state text NOT NULL)").await.unwrap();
+        db::migrate(&pool).await.unwrap();
+        let issued=db::issue_token(&pool,"alice",true,false).await.unwrap();
+        let actor_id:Uuid=serde_json::from_value(issued["user_id"].clone()).unwrap();
+        let token_id:Uuid=serde_json::from_value(issued["token_id"].clone()).unwrap();
+        let digest:Vec<u8>=pool.get().await.unwrap().query_one(
+            "SELECT digest FROM tokens WHERE id=$1",&[&token_id]).await.unwrap().get(0);
         let repo = Uuid::new_v4();
-        pool.get().await.unwrap().execute("INSERT INTO repositories VALUES($1,1,'ready')",&[&repo]).await.unwrap();
+        pool.get().await.unwrap().execute(
+            "INSERT INTO repositories(id,owner_id,name,state) VALUES($1,$2,'test','ready')",
+            &[&repo,&actor_id]).await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let config = Config { database_url:url.to_string(),data_dir:temp.path().join("data"),
             bind:"127.0.0.1:0".parse().unwrap(),git:"/usr/bin/git".into(),
@@ -133,21 +197,30 @@ mod tests {
             config,pool:pool.clone(),storage,hooks:None,
             transfer_metrics:Arc::new(metrics::TransferCounters::default()),
             git_slots:Arc::new(tokio::sync::Semaphore::new(1)) });
-        let (op,active) = journal::begin_active(&state.storage.root,repo,Uuid::new_v4(),
-            "alice".into(),Uuid::new_v4(),1).unwrap();
+        std::fs::create_dir_all(state.storage.repo_path(repo)).unwrap();
+        let (op,active) = journal::begin_active(&state.storage.root,repo,actor_id,
+            "alice".into(),token_id,1).unwrap();
+        let actor=Identity {id:actor_id,token_id,username:"alice".into(),
+            read_only:false,token_digest:digest};
         let guard = Arc::new(crate::storage::ref_publication::acquire(&pool,repo,1,
             &["refs/heads/topic".to_string()],Instant::now()+Duration::from_secs(3)).await.unwrap());
-        let coordinator = Coordinator::bind(&op).unwrap();
+        let coordinator = Coordinator::bind(&op,&actor).unwrap();
         let endpoint = coordinator.endpoint();
         let nonce = hex::decode(coordinator.nonce_hex()).unwrap();
         let handle = coordinator.start(guard.clone(),state.clone(),Instant::now()+Duration::from_secs(3));
-        let caller = tokio::task::spawn_blocking({let op=op.clone();move ||
+        let caller = tokio::task::spawn_blocking({let op=op.clone();let nonce=nonce.clone();move ||
             request_grant(&op,endpoint,&nonce,Duration::from_secs(3))});
         caller.await.unwrap().unwrap();
         assert!(handle.granted());
+        let verifier = tokio::task::spawn_blocking({let op=op.clone();let nonce=nonce.clone();move ||
+            request_grant(&op,endpoint,&nonce,Duration::from_secs(3))});
+        verifier.await.unwrap().unwrap();
         let blocked: bool = pool.get().await.unwrap().query_one(LOCK_TEST,&[&repo]).await.unwrap().get(0);
         assert!(!blocked,"hook ACK escaped without a parent-owned PostgreSQL publication lock");
         handle.close().await;
+        let stale = tokio::task::spawn_blocking({let op=op.clone();let nonce=nonce.clone();move ||
+            request_grant(&op,endpoint,&nonce,Duration::from_secs(1))});
+        assert!(stale.await.unwrap().is_err(),"stale grant marker authorized native CAS");
         drop(guard);
         drop(active);
         drop(state);
@@ -160,8 +233,5 @@ mod tests {
 
 pub fn verify_grant(op: &journal::Operation) -> Result<()> {
     if !op.requires_parent_publication { return Ok(()); }
-    let expected = hex::decode(std::env::var("ROOTYARD_PUBLICATION_NONCE")?)?;
-    ensure!(expected.len()==32 && journal::read(&op.path.join("publication.grant"))? == expected,
-        "parent publication window was not granted");
-    Ok(())
+    await_grant(op)
 }

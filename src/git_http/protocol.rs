@@ -44,7 +44,9 @@ pub(super) async fn receive_commands(reader: &mut (impl tokio::io::AsyncRead + U
             || refs.iter().any(|prior| prior==name) { return Err(Error::bad_request()); }
         refs.push(name.to_string());
     }
-    if refs.is_empty() { return Err(Error::bad_request()); }
+    // Git sends a standalone 0000 POST before streaming a pack larger than
+    // http.postBuffer. It has no ref commands and therefore needs no writer
+    // publication guard, but its exact bytes still go to native Git.
     Ok(ReceiveCommands { bytes, refs })
 }
 
@@ -78,6 +80,10 @@ mod receive_tests {
         assert!(receive_commands(&mut duplicate.as_slice(),40).await.is_err());
         let mut wrong_format = source.as_slice();
         assert!(receive_commands(&mut wrong_format,64).await.is_err());
+        let mut flush = b"0000".as_slice();
+        let empty = receive_commands(&mut flush,40).await.unwrap();
+        assert!(empty.refs.is_empty());
+        assert_eq!(empty.bytes,b"0000");
     }
 }
 
