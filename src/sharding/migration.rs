@@ -18,6 +18,8 @@ pub struct MigrationInput {
     target_node_id: String,
     operation_id: Option<Uuid>,
     expected_route_epoch: Option<i64>,
+    #[serde(default)]
+    replicate_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -40,7 +42,7 @@ pub struct MigrationReceipt {
 #[serde(deny_unknown_fields)]
 struct SnapshotReceipt { operation_id: Uuid, refs_sha256: String, state: String }
 
-async fn git_output(state: &AppState, args: &[&str], timeout: Duration) -> Result<Vec<u8>, Error> {
+pub(crate) async fn git_output(state: &AppState, args: &[&str], timeout: Duration) -> Result<Vec<u8>, Error> {
     let mut command: Command = state.storage.git(&state.config);
     command.args(args);
     let output = tokio::time::timeout(timeout, command.output()).await.map_err(|_| Error::timeout())?
@@ -50,7 +52,7 @@ async fn git_output(state: &AppState, args: &[&str], timeout: Duration) -> Resul
     Ok(output.stdout)
 }
 
-async fn refs_digest(state: &AppState, repo: &FsPath) -> Result<String, Error> {
+pub(crate) async fn refs_digest(state: &AppState, repo: &FsPath) -> Result<String, Error> {
     let path = repo.to_str().ok_or_else(Error::bad_request)?;
     let refs = git_output(state, &["--git-dir", path, "for-each-ref", "--format=%(refname) %(objectname)"], state.config.git_timeout).await?;
     if refs.is_empty() { return Err(conflict("empty repository cannot be replicated as ready")); }
@@ -228,6 +230,21 @@ pub async fn migrate_repository(
     if route.route_epoch != envelope.route_epoch || route.fencing_token != envelope.fencing_token {
         return Err(conflict("route changed during replication"));
     }
+    if input.replicate_only {
+        let mut watermarks = route.replica_watermarks.clone();
+        watermarks.insert(input.target_node_id.clone(), models::ReplicaWatermark {
+            storage_generation: generation, op_sequence: journal_sequence, verified: true,
+            updated_unix: models::unix_now(),
+        });
+        tx.execute("UPDATE repository_shard_routes SET replica_watermarks=$2, required_op_sequence=GREATEST(required_op_sequence,$3), version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 AND route_epoch=$4",
+            &[&access.repo_id, &serde_json::json!(watermarks), &journal_sequence, &route.route_epoch]).await.map_err(Error::internal)?;
+        record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.replica_verified", "shard_replication", &input.target_node_id,
+            serde_json::json!({"operation_id":operation_id,"refs_sha256":digest,"journal_sequence":journal_sequence})).await?;
+        auth::finish_tx(tx, &actor, true).await?;
+        return Ok(json(StatusCode::OK, MigrationReceipt { operation_id, repository_id: access.repo_id,
+            source_node_id: route.primary_node_id, target_node_id: input.target_node_id,
+            refs_sha256: digest, old_route_epoch: route.route_epoch, new_route_epoch: route.route_epoch, state: "verified" }));
+    }
     let new_epoch = route.route_epoch + 1;
     let new_token = route.fencing_token.max(new_epoch) + 1;
     let new_generation = generation + 1;
@@ -238,7 +255,12 @@ pub async fn migrate_repository(
     let upd = format!("UPDATE repository_shard_routes SET primary_node_id=$2, route_epoch=$3, fencing_token=$4, fenced_epoch=$5, required_generation=$6, explicit_override=true, read_replica_nodes='[]'::jsonb, replica_watermarks='{{}}'::jsonb, version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 RETURNING {REPO_ROUTE_FIELDS}");
     let moved = RepoShardRoute::row(&tx.query_one(&upd, &[&access.repo_id, &input.target_node_id, &new_epoch, &new_token, &route.route_epoch, &new_generation]).await.map_err(Error::internal)?);
     tx.execute("UPDATE shard_replication_operations SET state='completed', updated_at=clock_timestamp() WHERE id=$1 AND state='verified'", &[&operation_id]).await.map_err(Error::internal)?;
-    let marker = VolumeFenceMarker::from_route(&moved, new_generation, Some(route.primary_node_id.clone()), models::unix_now());
+    // Publish a retired marker on the *source* volume. The target process may
+    // publish its own active marker, but the source must never describe itself
+    // as the new writable target after cutover.
+    let mut marker = VolumeFenceMarker::from_route(&moved, new_generation, Some(route.primary_node_id.clone()), models::unix_now());
+    marker.primary_node_id = route.primary_node_id.clone();
+    marker.read_only_degraded = true;
     record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.migrated", "shard_replication", &input.target_node_id,
         serde_json::json!({"operation_id": operation_id, "refs_sha256": digest, "source": route.primary_node_id, "target": input.target_node_id})).await?;
     let transition_id = transitions::stage(&tx, &state, &marker).await?;
@@ -331,8 +353,8 @@ pub async fn receive_snapshot(
     if current_sequence > query.journal_sequence { return Err(conflict("destination journal sequence is ahead of transferred snapshot")); }
     journal::atomic(&journal_repo.join("sequence"), query.journal_sequence.to_string().as_bytes(), true).map_err(Error::internal)?;
     let client = state.pool.get().await.map_err(Error::internal)?;
-    let updated = client.execute("UPDATE shard_replication_operations SET state='verified', refs_sha256=$2, updated_at=clock_timestamp() WHERE id=$1 AND state IN ('copying','verified')",
-        &[&op_id, &measured]).await.map_err(Error::internal)?;
+    let updated = client.execute("UPDATE shard_replication_operations SET state='verified', refs_sha256=$2, journal_sequence=$3, updated_at=clock_timestamp() WHERE id=$1 AND state IN ('copying','verified')",
+        &[&op_id, &measured, &query.journal_sequence]).await.map_err(Error::internal)?;
     if updated != 1 { return Err(conflict("snapshot operation changed before publication")); }
     let final_path = state.storage.repo_path(repo_id);
     let backup = root.join(format!("{op_id}.previous-{}.git", Uuid::new_v4()));

@@ -112,9 +112,10 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (83, include_str!("../migrations/083_shard_replication.sql")),
     (84, include_str!("../migrations/084_transition_volume_binding.sql")),
     (85, include_str!("../migrations/085_cluster_authority.sql")),
+    (86, include_str!("../migrations/086_replication_sequence.sql")),
 ];
 
-pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 80, 81, 82, 83, 84, 85];
+pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 80, 81, 82, 83, 84, 85, 86];
 
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;

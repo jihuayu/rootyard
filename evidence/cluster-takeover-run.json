@@ -1,0 +1,24 @@
+{
+  "kind": "native_local_host_takeover",
+  "result": "passed",
+  "driver": "local_process_session_v1",
+  "binary_sha256": "fa8e256063ea049d9c9caea90ac16983c6d460b15acc7a3cfd17fdefe9fa9e3d",
+  "harness_sha256": "f2498425d328ad4508eeb5d3d4ef32e2f5d0eb4020ca05f3d49fa8da7a20e317",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "old_session_id": 171097,
+  "replication_operation_id": "95690b1d-5c2c-4eb4-9c5c-8d13132e5cfd",
+  "takeover_ms": 6412.709,
+  "stale_replica_rejected": true,
+  "old_writer_sigstop_then_killed": true,
+  "admitted_native_writer_paused_and_promotion_rejected": true,
+  "duplicate_live_node_identity_rejected": true,
+  "retired_source_volume_write_rejected_without_fence_env": true,
+  "old_writer_restart_blocked": true,
+  "acknowledged_tip": "b243e10b7e1026ffff20c58412d7ef6fe137d727",
+  "target_fsck": "passed",
+  "new_epoch": 2,
+  "limits": [
+    "single-host isolated process session driver",
+    "no cross-host storage fence or PostgreSQL HA"
+  ]
+}

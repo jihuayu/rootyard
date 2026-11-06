@@ -10,6 +10,8 @@ pub mod security;
 pub mod transitions;
 pub mod transport;
 pub mod migration;
+pub mod local_fence;
+pub mod controller;
 
 use crate::AppState;
 use axum::{

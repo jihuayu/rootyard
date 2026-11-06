@@ -205,9 +205,17 @@ async fn run() -> Result<()> {
                 dispatch: rootyard::dispatch::Signals::default(),
                 git_slots: slots,
             });
+            let local_fence = if std::env::var_os("ROOTYARD_LOCAL_FENCE_DIR").is_some() {
+                let node_id = std::env::var("ROOTYARD_NODE_ID")
+                    .context("local process fence requires ROOTYARD_NODE_ID")?;
+                rootyard::sharding::local_fence::register_local_process(&node_id)?
+            } else { false };
             rootyard::reliability::recover_startup(&state).await?;
             rootyard::recover(&state).await?;
             let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
+            let controller_task = if local_fence {
+                Some(tokio::spawn(rootyard::sharding::controller::run(state.clone())))
+            } else { None };
             eprintln!(
                 "rootyard listening on {} (GitFS single-node)",
                 listener.local_addr()?
@@ -266,6 +274,7 @@ async fn run() -> Result<()> {
                 .with_graceful_shutdown(shutdown())
                 .await?;
             worker.abort();
+            if let Some(task) = controller_task { task.abort(); }
             dispatch_stop.cancel();
             let _ = publish_task.await;
             if let Some(task) = delivery_task {
