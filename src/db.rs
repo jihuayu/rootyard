@@ -47,12 +47,13 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (50, include_str!("../migrations/050_members_rbac.sql")),
     (60, include_str!("../migrations/060_sharding_fencing.sql")),
     (110, include_str!("../migrations/110_audit_sequence.sql")),
+    (111, include_str!("../migrations/111_storage_jobs.sql")),
     (120, include_str!("../migrations/120_organizations.sql")),
     (121, include_str!("../migrations/121_lfs_locks.sql")),
     (125, include_str!("../migrations/125_web_sessions.sql")),
 ];
 
-pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 110, 120, 121, 125];
+pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 110, 111, 120, 121, 125];
 
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;

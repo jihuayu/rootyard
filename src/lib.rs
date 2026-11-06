@@ -34,6 +34,7 @@ pub mod reliability;
 #[rustfmt::skip]
 pub mod sharding;
 pub mod storage;
+pub mod storage_lifecycle;
 pub mod view_lab;
 #[rustfmt::skip]
 pub mod web;

@@ -11,7 +11,8 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
 };
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard,
+    RwLock as AsyncRwLock, OwnedRwLockReadGuard, OwnedRwLockWriteGuard};
 use uuid::Uuid;
 
 pub mod remote_objects;
@@ -21,6 +22,7 @@ pub struct Storage {
     pub lock_file: File,
     pub volume_id: Uuid,
     locks: Mutex<HashMap<Uuid, Weak<AsyncMutex<()>>>>,
+    readers: Mutex<HashMap<Uuid, Weak<AsyncRwLock<()>>>>,
 }
 
 impl Storage {
@@ -135,6 +137,7 @@ impl Storage {
             lock_file,
             volume_id,
             locks: Mutex::new(HashMap::new()),
+            readers: Mutex::new(HashMap::new()),
         })
     }
     pub fn repo_path(&self, id: Uuid) -> PathBuf {
@@ -153,6 +156,25 @@ impl Storage {
             }
         };
         lock.lock_owned().await
+    }
+    fn reader_gate(&self, id: Uuid) -> Arc<AsyncRwLock<()>> {
+        let mut map = self.readers.lock().expect("reader gate map poisoned");
+        map.retain(|_, value| value.strong_count() > 0);
+        if let Some(gate) = map.get(&id).and_then(Weak::upgrade) {
+            gate
+        } else {
+            let gate = Arc::new(AsyncRwLock::new(()));
+            map.insert(id, Arc::downgrade(&gate));
+            gate
+        }
+    }
+    /// Hold throughout a read transfer or snapshot that uses native objects.
+    pub async fn read_snapshot_lock(&self, id: Uuid) -> OwnedRwLockReadGuard<()> {
+        self.reader_gate(id).read_owned().await
+    }
+    /// Destructive maintenance takes write_lock first, then this barrier.
+    pub async fn maintenance_exclusive(&self, id: Uuid) -> OwnedRwLockWriteGuard<()> {
+        self.reader_gate(id).write_owned().await
     }
     pub fn verify_path(&self, id: Uuid) -> Result<PathBuf> {
         let path = self.repo_path(id);
