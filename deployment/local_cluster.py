@@ -69,6 +69,8 @@ def validate_env(values):
     url = validate_pg(values)
     if len(base64.b64decode(values["ROOTYARD_CLUSTER_HMAC_KEY"], validate=True)) < 32:
         raise ValueError("cluster HMAC key is too short")
+    if values.get("ROOTYARD_SCHEMA_MODE") != "external":
+        raise ValueError("service roles must use ROOTYARD_SCHEMA_MODE=external")
     for key, expected in {
         "ROOTYARD_WAKE_TRANSPORT": "kafka",
         "ROOTYARD_KAFKA_SECURITY_PROTOCOL": "SASL_SSL",
@@ -272,6 +274,8 @@ def _run_up(args):
     for _, item in roles:
         validate_env(item)
     db_users = [pg_preflight(item) for _, item in roles]
+    if db_users != [name for name, _ in roles]:
+        raise ValueError("PostgreSQL service login must match its fixed node or worker role")
     kafka_users = [item["ROOTYARD_KAFKA_SASL_USERNAME"] for _, item in roles]
     if len(set(db_users + [migrator_user])) != len(db_users) + 1:
         raise ValueError("migrator, data nodes, and worker need distinct PostgreSQL identities")

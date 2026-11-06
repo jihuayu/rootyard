@@ -71,6 +71,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--kafka-home", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--nodes", type=int, choices=(2, 4), default=2)
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
@@ -117,16 +118,16 @@ def main():
                        f"ssl_cert_file='{root / 'server.pem'}'\nssl_key_file='{root / 'server.key'}'\n")
         run(["pg_ctl", "-D", str(pgdata), "-l", str(root / "postgres.log"), "start"])
         pg_started = True
-        credentials = {role: secrets.token_hex(20) for role in ("migrator", "node0", "node1", "worker")}
+        service_roles = [*(f"node{index}" for index in range(args.nodes)), "worker"]
+        credentials = {role: secrets.token_hex(20) for role in ("migrator", *service_roles)}
         sql = "CREATE ROLE migrator LOGIN PASSWORD '" + credentials["migrator"] + "';\n"
-        for role in ("node0", "node1", "worker"):
+        for role in service_roles:
             sql += f"CREATE ROLE {role} LOGIN PASSWORD '{credentials[role]}';\n"
-            sql += f"GRANT migrator TO {role};\n"
         sql += "CREATE DATABASE rootyard OWNER migrator;\n"
         run(["psql", "-h", str(root), "-p", str(pg_port), "-U", "agent", "-d", "postgres",
              "-X", "-v", "ON_ERROR_STOP=1", "-f", "-"], data=sql.encode())
         # Separate broker credentials for each Rust role.
-        kafka_pass = {role: secrets.token_hex(18) for role in ("broker", "node0", "node1", "worker")}
+        kafka_pass = {role: secrets.token_hex(18) for role in ("broker", *service_roles)}
         store_pass = secrets.token_hex(18)
         run(["openssl", "pkcs12", "-export", "-in", str(root / "server.pem"),
              "-inkey", str(root / "server.key"), "-certfile", str(root / "ca.pem"),
@@ -189,9 +190,10 @@ def main():
         private(config / "migrator.env", "DATABASE_URL=postgresql://migrator:"
                 + credentials["migrator"] + f"@localhost:{pg_port}/rootyard?sslmode=require\n"
                 + f"ROOTYARD_PG_CA_PEM={ca}\n")
-        for role in ("node0", "node1", "worker"):
+        for role in service_roles:
             lines = [f"DATABASE_URL=postgresql://{role}:{credentials[role]}@localhost:{pg_port}/rootyard?sslmode=require",
-                     f"ROOTYARD_PG_CA_PEM={ca}", f"ROOTYARD_CLUSTER_HMAC_KEY={key}",
+                     f"ROOTYARD_PG_CA_PEM={ca}", "ROOTYARD_SCHEMA_MODE=external",
+                     f"ROOTYARD_CLUSTER_HMAC_KEY={key}",
                      "ROOTYARD_WAKE_TRANSPORT=kafka", f"ROOTYARD_KAFKA_BOOTSTRAP_SERVERS=localhost:{broker_port}",
                      f"ROOTYARD_KAFKA_TOPIC={topic}", f"ROOTYARD_KAFKA_GROUP=rootyard-{role}",
                      "ROOTYARD_KAFKA_SECURITY_PROTOCOL=SASL_SSL", f"ROOTYARD_KAFKA_CA_PEM={ca}",
@@ -202,10 +204,41 @@ def main():
         migrate_env.update(DATABASE_URL=f"postgresql://migrator:{credentials['migrator']}@localhost:{pg_port}/rootyard?sslmode=require",
                            ROOTYARD_PG_CA_PEM=ca, ROOTYARD_DATA_DIR=str(state / "node0" / "data"))
         run([str(binary), "migrate"], env=migrate_env)
-        account = json.loads(run([str(binary), "create-user", "alice"], env=migrate_env).stdout)
-        private(config / "operator.json", json.dumps(account))
+        roles_sql = Path(__file__).resolve().parents[1] / "deployment/local_cluster_roles.sql"
         grant_env = os.environ.copy()
         grant_env.update(PGPASSWORD=credentials["migrator"], PGSSLMODE="verify-full", PGSSLROOTCERT=ca)
+        run(["psql", "-h", "localhost", "-p", str(pg_port), "-U", "migrator", "-d", "rootyard",
+             "-X", "-v", "ON_ERROR_STOP=1", "-f", str(roles_sql)], env=grant_env)
+        for role in service_roles:
+            role_env = os.environ.copy()
+            role_env.update(PGPASSWORD=credentials[role], PGSSLMODE="verify-full", PGSSLROOTCERT=ca)
+            role_psql = ["psql", "-h", "localhost", "-p", str(pg_port), "-U", role,
+                         "-d", "rootyard", "-X", "-v", "ON_ERROR_STOP=1", "-At"]
+            identity = run([*role_psql, "-c", "SELECT current_user"], env=role_env)
+            assert identity.stdout.decode().strip() == role
+            denied = run([*role_psql, "-c", "CREATE TABLE public.runtime_must_not_own_schema(id integer)"],
+                         env=role_env, check=False)
+            assert denied.returncode != 0, f"{role} unexpectedly has DDL privilege"
+            denied = run([*role_psql, "-c", "UPDATE cluster_authority SET rotated_at=clock_timestamp() WHERE false"],
+                         env=role_env, check=False)
+            assert denied.returncode != 0, f"{role} unexpectedly mutates signing authority"
+            if role == "worker":
+                denied = run([*role_psql, "-c", "INSERT INTO users(id,username) VALUES (gen_random_uuid(),'forbidden')"],
+                             env=role_env, check=False)
+                assert denied.returncode != 0, "worker unexpectedly writes users"
+                denied = run([*role_psql, "-c", "UPDATE repositories SET storage_generation=storage_generation+1 WHERE false"],
+                             env=role_env, check=False)
+                assert denied.returncode != 0, "worker unexpectedly mutates repository metadata"
+                denied = run([*role_psql, "-c", "SELECT incarnation FROM cluster_authority"],
+                             env=role_env, check=False)
+                assert denied.returncode != 0, "worker unexpectedly reads signing authority"
+                worker_migrate_env = os.environ.copy()
+                worker_migrate_env.update(DATABASE_URL=f"postgresql://worker:{credentials['worker']}@localhost:{pg_port}/rootyard?sslmode=require",
+                                          ROOTYARD_PG_CA_PEM=ca)
+                assert run([str(binary), "migrate"], env=worker_migrate_env, check=False).returncode != 0, \
+                    "worker unexpectedly ran schema migration"
+        account = json.loads(run([str(binary), "create-user", "alice"], env=migrate_env).stdout)
+        private(config / "operator.json", json.dumps(account))
         run(["psql", "-h", "localhost", "-p", str(pg_port), "-U", "migrator", "-d", "rootyard",
              "-X", "-v", "ON_ERROR_STOP=1", "-c", "INSERT INTO cluster_operator_tokens(token_id,granted_by) VALUES ('"
              + account["token_id"] + "','native secure profile')"], env=grant_env)
@@ -217,24 +250,46 @@ def main():
         invalid = run([*profile_cmd, "up", "--binary", str(binary), "--env-dir", str(config),
                        "--state-dir", str(state), "--kafka-home", str(kafka_home),
                        "--operator-account", str(config / "operator.json"), "--base-port", str(bind_port),
-                       "--nodes", "2"], timeout=180, check=False)
+                       "--nodes", str(args.nodes)], timeout=180, check=False)
         assert invalid.returncode != 0 and not (state / "manifest.json").exists(), "wrong Kafka login accepted"
         assert not list(state.glob("*.kafka.properties")), "failed preflight retained client secrets"
         private(config / "node1.env", good_node1)
         run([*profile_cmd, "up", "--binary", str(binary), "--env-dir", str(config),
              "--state-dir", str(state), "--kafka-home", str(kafka_home),
              "--operator-account", str(config / "operator.json"), "--base-port", str(bind_port),
-             "--nodes", "2"], timeout=180)
+             "--nodes", str(args.nodes)], timeout=180)
         profile_started = True
         native_report = root / "profile.json"
         run([*profile_cmd, "verify", "--state-dir", str(state),
              "--account", str(config / "operator.json"), "--report", str(native_report)], timeout=120)
         report = json.loads(native_report.read_text())
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            delivered = run(["psql", "-h", "localhost", "-p", str(pg_port), "-U", "migrator",
+                             "-d", "rootyard", "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c",
+                             "SELECT COUNT(*) FROM event_deliveries WHERE state='delivered'"],
+                            env=grant_env).stdout.decode().strip()
+            if int(delivered) >= 2:
+                break
+            time.sleep(.2)
+        else:
+            worker_once_env = os.environ.copy()
+            worker_once_env.update(DATABASE_URL=f"postgresql://worker:{credentials['worker']}@localhost:{pg_port}/rootyard?sslmode=require",
+                                   ROOTYARD_PG_CA_PEM=ca, ROOTYARD_SCHEMA_MODE="external")
+            diagnostic = run([str(binary), "worker-once"], env=worker_once_env, check=False)
+            raise AssertionError("least-privilege worker did not deliver native Git outbox event: "
+                                 + diagnostic.stderr.decode(errors="replace")[-600:])
         report.update(kafka_version="4.4.0", postgres_tls="verify-full",
                       postgres_auth="SCRAM-SHA-256", kafka_auth="SASL/PLAIN over TLS",
                       wrong_kafka_role_password_rejected_before_start=True,
                       failed_preflight_secrets_cleaned=True,
                       sigterm_resistant_descendant_killed=True,
+                      runtime_ddl_denied=True, worker_user_write_denied=True,
+                      runtime_authority_update_denied=True, worker_repository_update_denied=True,
+                      worker_authority_read_denied=True,
+                      worker_schema_migration_denied=True,
+                      least_privilege_worker_deliveries=int(delivered),
+                      roles_sql_sha256=hashlib.sha256(roles_sql.read_bytes()).hexdigest(),
                       binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                       launcher_sha256=hashlib.sha256(launcher.read_bytes()).hexdigest())
         args.report.parent.mkdir(parents=True, exist_ok=True)

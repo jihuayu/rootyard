@@ -26,6 +26,7 @@ does not execute a shell or expand variables:
 ```text
 DATABASE_URL=postgresql://<role>:<url-encoded-password>@localhost:<pg-port>/rootyard?sslmode=require
 ROOTYARD_PG_CA_PEM=/absolute/private/pg-ca.pem
+ROOTYARD_SCHEMA_MODE=external
 ROOTYARD_CLUSTER_HMAC_KEY=<same-base64-encoded-32-or-more-random-bytes-on-all-nodes>
 ROOTYARD_WAKE_TRANSPORT=kafka
 ROOTYARD_KAFKA_BOOTSTRAP_SERVERS=localhost:<kafka-port>
@@ -42,11 +43,18 @@ For a local reference database, provision a TLS certificate with a SAN matching
 the hostname in every URL and use `hostssl ... scram-sha-256` with a final
 `hostnossl ... reject` rule in `pg_hba.conf`; enable `password_encryption =
 'scram-sha-256'`. The launcher checks TLS, certificate hostname and `current_user`
-for every role. The migration account and each data/worker account must have
-different login names. Currently each service calls schema migration on start,
-so the database roles need shared schema-owner privileges. This is **not** a
-least-privilege SQL grant profile; split runtime/migration DB permissions is
-future work. Use a dedicated database, never an unrelated shared schema.
+for every role. The migration account owns the schema and is the only login
+that runs `rootyard migrate`. Data and worker logins use
+`ROOTYARD_SCHEMA_MODE=external`: startup checks installed schema versions
+without DDL. The [local role grants](local_cluster_roles.sql) grant data nodes
+table DML while reserving cluster authority and operator grants for read-only
+access, and give the worker only outbox delivery and ref-projection rights.
+Run that SQL as the schema owner after migration and after every schema upgrade,
+before starting runtime roles. It grants whichever of the fixed `node0` through
+`node3` logins exist; adapt those names only for a different role scheme.
+The native profile verifies each runtime login is denied `CREATE TABLE`, that
+the worker cannot write users, and that a real Git push is delivered by the
+worker. Use a dedicated database, never an unrelated shared schema.
 
 Provision Kafka with a broker TLS certificate whose SAN matches the bootstrap
 hostname, SASL/PLAIN logins unique to each service role, and an existing wake
@@ -108,7 +116,8 @@ PostgreSQL backup/WAL and matching Git volume generation, run backup
 verification and offline reconciliation, rotate the cluster authority signing
 incarnation, then reopen ingress. For upgrade, take a PG+Git backup pair,
 quiesce writes, verify the new binary against the backup, migrate once with the
-migrator account, then roll data nodes one at a time only while routing keeps
-the assigned primary available. A schema migration is forward-only; rollback
+migrator account, reapply the runtime SQL grants, then roll data nodes one at a
+time while routing keeps the assigned primary available. A schema migration is
+forward-only; rollback
 requires the paired pre-upgrade PG+Git restore and authority rotation, not a
 binary downgrade against a newer schema.

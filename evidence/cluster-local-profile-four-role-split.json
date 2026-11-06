@@ -1,0 +1,43 @@
+{
+  "kind": "native_local_cluster_profile",
+  "binary_sha256": "179d98f6689bc7f97509271a5bed8e24fb8b7bd36870cf53997e0f1ec75cd27b",
+  "node_count": 4,
+  "postgres_roles": [
+    "node0",
+    "node1",
+    "node2",
+    "node3",
+    "worker"
+  ],
+  "kafka_roles": [
+    "node0",
+    "node1",
+    "node2",
+    "node3",
+    "worker"
+  ],
+  "repository_id": "fe6c37f8-1f53-4626-8a45-16b7d0b5dff6",
+  "acknowledged_oid": "6e9e61ce89bf99a6983f52ac18c063afffcc8617",
+  "owner_clone_oid": "6e9e61ce89bf99a6983f52ac18c063afffcc8617",
+  "routed_browse_oid": "6e9e61ce89bf99a6983f52ac18c063afffcc8617",
+  "kafka_offset_before": 0,
+  "kafka_offset_after": 1,
+  "verified_at_unix": 1793955555,
+  "scope": "single trusted Linux host, separate Rust processes/volumes with external TLS/SASL dependencies",
+  "kafka_version": "4.4.0",
+  "postgres_tls": "verify-full",
+  "postgres_auth": "SCRAM-SHA-256",
+  "kafka_auth": "SASL/PLAIN over TLS",
+  "wrong_kafka_role_password_rejected_before_start": true,
+  "failed_preflight_secrets_cleaned": true,
+  "sigterm_resistant_descendant_killed": true,
+  "runtime_ddl_denied": true,
+  "worker_user_write_denied": true,
+  "runtime_authority_update_denied": true,
+  "worker_repository_update_denied": true,
+  "worker_authority_read_denied": true,
+  "worker_schema_migration_denied": true,
+  "least_privilege_worker_deliveries": 2,
+  "roles_sql_sha256": "ecfcdd29911a73e5a301ff35e1027cbef8444bc2f594d2daa28357382c595ce2",
+  "launcher_sha256": "5c3c150bfaa464e67bf1b3e2a1c09daff0fd0066d5945f164436ce767caf0150"
+}
