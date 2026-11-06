@@ -172,6 +172,7 @@ async fn run() -> Result<()> {
         }
         "serve" if args.len() <= 1 => {
             let dispatch_settings = rootyard::dispatch::Settings::from_env()?;
+            let maintenance_policy = rootyard::storage_lifecycle::models::Policy::from_env()?;
             std::fs::read_to_string("/proc/self/stat")
                 .context("readable Linux procfs is required for writer cleanup")?;
             let storage = Storage::open(&config)?;
@@ -262,10 +263,16 @@ async fn run() -> Result<()> {
                     }
                 }
             });
+            let maintenance_stop = tokio_util::sync::CancellationToken::new();
+            let maintenance_task = maintenance_policy.enabled.then(|| tokio::spawn(
+                rootyard::storage_lifecycle::run(state.clone(), maintenance_stop.clone()),
+            ));
             axum::serve(listener, rootyard::router(state))
                 .with_graceful_shutdown(shutdown())
                 .await?;
             worker.abort();
+            maintenance_stop.cancel();
+            if let Some(task) = maintenance_task { task.await??; }
             dispatch_stop.cancel();
             let _ = publish_task.await;
             if let Some(task) = delivery_task {
