@@ -18,40 +18,24 @@ pub fn routes() -> Router<Arc<crate::AppState>> {
     Router::new()
         .route("/api/orgs", post(handlers::create_organization))
         .route("/api/orgs/{slug}", get(handlers::get_organization))
-        .route(
-            "/api/repos/{owner}/{name}/transfer",
-            post(handlers::transfer_ownership),
-        )
+        .route("/api/repos/{owner}/{name}/transfer", post(handlers::transfer_ownership))
         .route("/api/orgs/{slug}/members", get(handlers::list_members))
-        .route(
-            "/api/orgs/{slug}/members/{username}",
-            put(handlers::put_member).delete(handlers::delete_member),
-        )
-        .route(
-            "/api/orgs/{slug}/teams",
-            get(handlers::list_teams).post(handlers::create_team),
-        )
+        .route("/api/orgs/{slug}/members/{username}", put(handlers::put_member).delete(handlers::delete_member))
+        .route("/api/orgs/{slug}/teams", get(handlers::list_teams).post(handlers::create_team))
         .route(
             "/api/orgs/{slug}/teams/{team_slug}/members/{username}",
             put(handlers::put_team_member).delete(handlers::delete_team_member),
         )
 }
 
-pub async fn authorize_namespace_create(
-    tx: &Transaction<'_>,
-    actor: &Identity,
-    slug: &str,
-) -> Result<Uuid, Error> {
+pub async fn authorize_namespace_create(tx: &Transaction<'_>, actor: &Identity, slug: &str) -> Result<Uuid, Error> {
     if !db::valid_name(slug) {
         return Err(Error::not_found());
     }
     auth::writable(actor)?;
     auth::verify_token(tx, actor, true).await?;
     let row = tx
-        .query_opt(
-            "SELECT id, kind, user_id FROM namespaces WHERE slug=$1 FOR SHARE",
-            &[&slug],
-        )
+        .query_opt("SELECT id, kind, user_id FROM namespaces WHERE slug=$1 FOR SHARE", &[&slug])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
@@ -63,9 +47,7 @@ pub async fn authorize_namespace_create(
         }
         return Err(Error::not_found());
     }
-    tx.query_one("SELECT id FROM organizations WHERE id=$1 FOR SHARE", &[&id])
-        .await
-        .map_err(Error::internal)?;
+    tx.query_one("SELECT id FROM organizations WHERE id=$1 FOR SHARE", &[&id]).await.map_err(Error::internal)?;
     let role = tx
         .query_opt(
             "SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",
@@ -75,10 +57,7 @@ pub async fn authorize_namespace_create(
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     if Role::parse(role.get::<_, &str>(0))? < Role::Maintain {
-        return Err(Error(
-            axum::http::StatusCode::FORBIDDEN,
-            "organization maintain role required",
-        ));
+        return Err(Error(axum::http::StatusCode::FORBIDDEN, "organization maintain role required"));
     }
     Ok(id)
 }

@@ -2,9 +2,7 @@
 use super::{changesets, views};
 #[path = "reverse_git.rs"]
 mod reverse_git;
-use crate::{
-    AppState, Error, auth, browse::transactions, members::models::Role, storage::read_leases,
-};
+use crate::{AppState, Error, auth, browse::transactions, members::models::Role, storage::read_leases};
 use axum::{
     Json,
     extract::{Path, State},
@@ -17,9 +15,13 @@ use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
+    os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use uuid::Uuid;
 
@@ -41,12 +43,7 @@ impl Drop for Stage {
     }
 }
 
-fn replace_tree(
-    repo: &FsPath,
-    tree: &str,
-    parts: &[&str],
-    projected: &str,
-) -> Result<String, Error> {
+fn replace_tree(repo: &FsPath, tree: &str, parts: &[&str], projected: &str) -> Result<String, Error> {
     let raw = git(repo, &["ls-tree", "-z", tree])?;
     let mut entries = BTreeMap::<Vec<u8>, Vec<u8>>::new();
     for record in raw.split(|b| *b == 0).filter(|r| !r.is_empty()) {
@@ -110,13 +107,9 @@ fn build_source_commit(
     drop(output);
     let checkout = root.join("projected");
     let source_view_bytes =
-        crate::storage::disk_bytes(&projected_repo.join(".git"), 256 * 1024 * 1024)
-            .map_err(Error::internal)?;
+        crate::storage::disk_bytes(&projected_repo.join(".git"), 256 * 1024 * 1024).map_err(Error::internal)?;
     if source_view_bytes > 256 * 1024 * 1024 {
-        return Err(Error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "View Git store exceeds import budget",
-        ));
+        return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "View Git store exceeds import budget"));
     }
     git(
         root,
@@ -128,48 +121,19 @@ fn build_source_commit(
             checkout.to_str().ok_or_else(Error::bad_request)?,
         ],
     )?;
-    git(
-        &checkout,
-        &[
-            "bundle",
-            "verify",
-            file.to_str().ok_or_else(Error::bad_request)?,
-        ],
-    )?;
-    git(
-        &checkout,
-        &[
-            "fetch",
-            "--no-tags",
-            file.to_str().ok_or_else(Error::bad_request)?,
-            bundle_ref,
-        ],
-    )?;
+    git(&checkout, &["bundle", "verify", file.to_str().ok_or_else(Error::bad_request)?])?;
+    git(&checkout, &["fetch", "--no-tags", file.to_str().ok_or_else(Error::bad_request)?, bundle_ref])?;
     let candidate = git_oid(&checkout, &["rev-parse", "FETCH_HEAD^{commit}"])?;
-    git(
-        &checkout,
-        &[
-            "merge-base",
-            "--is-ancestor",
-            &view.projected_oid,
-            &candidate,
-        ],
-    )?;
+    git(&checkout, &["merge-base", "--is-ancestor", &view.projected_oid, &candidate])?;
     let candidate_bytes = verify_candidate_budget(&checkout, &candidate, &view.projected_oid)?;
-    let staged_bytes = crate::storage::disk_bytes(&checkout.join(".git"), 512 * 1024 * 1024)
-        .map_err(Error::internal)?;
+    let staged_bytes =
+        crate::storage::disk_bytes(&checkout.join(".git"), 512 * 1024 * 1024).map_err(Error::internal)?;
     if staged_bytes > 512 * 1024 * 1024 {
-        return Err(Error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "proposal staging exceeds 512 MiB",
-        ));
+        return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "proposal staging exceeds 512 MiB"));
     }
     git(&checkout, &["fsck", "--strict", "--no-reflogs", &candidate])?;
     let projected_tree = git_oid(&checkout, &["rev-parse", &format!("{candidate}^{{tree}}")])?;
-    let old_projected_tree = git_oid(
-        &checkout,
-        &["rev-parse", &format!("{}^{{tree}}", view.projected_oid)],
-    )?;
+    let old_projected_tree = git_oid(&checkout, &["rev-parse", &format!("{}^{{tree}}", view.projected_oid)])?;
     if projected_tree == old_projected_tree {
         return Err(Error(StatusCode::CONFLICT, "projected tree is unchanged"));
     }
@@ -177,18 +141,11 @@ fn build_source_commit(
     if current != view.source_oid {
         return Err(Error(StatusCode::CONFLICT, "source ref advanced"));
     }
-    let source_bytes =
-        crate::storage::disk_bytes(source, max_repo_bytes).map_err(Error::internal)?;
+    let source_bytes = crate::storage::disk_bytes(source, max_repo_bytes).map_err(Error::internal)?;
     if source_bytes.saturating_add(candidate_bytes) > max_repo_bytes {
-        return Err(Error(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "repository quota reached",
-        ));
+        return Err(Error(StatusCode::INSUFFICIENT_STORAGE, "repository quota reached"));
     }
-    git(
-        &checkout,
-        &["update-ref", "refs/heads/reverse-import", &candidate],
-    )?;
+    git(&checkout, &["update-ref", "refs/heads/reverse-import", &candidate])?;
     git(
         source,
         &[
@@ -199,17 +156,10 @@ fn build_source_commit(
             "refs/heads/reverse-import",
         ],
     )?;
-    if crate::storage::disk_bytes(source, max_repo_bytes).map_err(Error::internal)? > max_repo_bytes
-    {
-        return Err(Error(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "repository quota reached",
-        ));
+    if crate::storage::disk_bytes(source, max_repo_bytes).map_err(Error::internal)? > max_repo_bytes {
+        return Err(Error(StatusCode::INSUFFICIENT_STORAGE, "repository quota reached"));
     }
-    let old_tree = git_oid(
-        source,
-        &["rev-parse", &format!("{}^{{tree}}", view.source_oid)],
-    )?;
+    let old_tree = git_oid(source, &["rev-parse", &format!("{}^{{tree}}", view.source_oid)])?;
     let new_tree = if view.subdir.is_empty() {
         projected_tree
     } else {
@@ -217,12 +167,7 @@ fn build_source_commit(
         replace_tree(source, &old_tree, &parts, &projected_tree)?
     };
     let body = format!("Rootyard View {} proposal\n\n{}\n", view.id, message);
-    git_input(
-        source,
-        &["commit-tree", &new_tree, "-p", &view.source_oid],
-        body.as_bytes(),
-        Some(actor),
-    )
+    git_input(source, &["commit-tree", &new_tree, "-p", &view.source_oid], body.as_bytes(), Some(actor))
 }
 
 pub async fn create(
@@ -242,9 +187,7 @@ pub async fn create(
     {
         return Err(Error::bad_request());
     }
-    let bundle = STANDARD
-        .decode(&input.bundle_base64)
-        .map_err(|_| Error::bad_request())?;
+    let bundle = STANDARD.decode(&input.bundle_base64).map_err(|_| Error::bad_request())?;
     if bundle.is_empty() || bundle.len() > 16 * 1024 * 1024 {
         return Err(Error::bad_request());
     }
@@ -252,36 +195,28 @@ pub async fn create(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let ns = super::handlers::load(&state, &headers, view.namespace_id).await?;
-    let mount = ns
-        .mounts
-        .iter()
-        .find(|m| m.path == view.mount_path)
-        .ok_or_else(Error::not_found)?;
+    let mount = ns.mounts.iter().find(|m| m.path == view.mount_path).ok_or_else(Error::not_found)?;
     if mount.base_oid != view.source_oid {
         return Err(Error::not_found());
     }
-    let access =
-        auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Write)
-            .await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Write).await?;
     if access.repo_id != view.repository_id {
         return Err(Error::not_found());
     }
     let generation: i64 = tx
-        .query_one(
-            "SELECT storage_generation FROM repositories WHERE id=$1 AND state='ready'",
-            &[&access.repo_id],
-        )
+        .query_one("SELECT storage_generation FROM repositories WHERE id=$1 AND state='ready'", &[&access.repo_id])
         .await
         .map_err(Error::internal)?
         .get(0);
     tx.commit().await.map_err(Error::internal)?;
     drop(client);
-    let source_lease = read_leases::shared(
-        &state.pool,
-        access.repo_id,
-        tokio::time::Instant::now() + state.config.git_timeout,
-    )
-    .await?;
+    let source_lease =
+        read_leases::shared(&state.pool, access.repo_id, tokio::time::Instant::now() + state.config.git_timeout)
+            .await?;
+    let _local = tokio::time::timeout(state.config.git_timeout, state.storage.read_snapshot_lock(access.repo_id))
+        .await
+        .map_err(|_| Error::timeout())?;
+    source_lease.ensure_active()?;
     auth::verify_active(&state.pool, &actor, access.repo_id, true).await?;
     let _slot = state
         .git_slots
@@ -289,51 +224,61 @@ pub async fn create(
         .try_acquire_owned()
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted"))?;
     let _write = state.storage.write_lock(access.repo_id).await;
-    let source = state
-        .storage
-        .verify_path(access.repo_id)
-        .map_err(Error::internal)?;
-    let projected = state
-        .storage
-        .root
-        .join("workspace-service/views")
-        .join(id.to_string());
-    let stage = state
-        .storage
-        .root
-        .join("workspace-service/reverse")
-        .join(Uuid::new_v4().to_string());
+    let source = state.storage.verify_path(access.repo_id).map_err(Error::internal)?;
+    let projected = state.storage.root.join("workspace-service/views").join(id.to_string());
+    let stage = state.storage.root.join("workspace-service/reverse").join(Uuid::new_v4().to_string());
     let actor_name = actor.username.clone();
     let view_copy = view;
     let source_ref = input.source_ref.clone();
     let bundle_ref = input.bundle_ref.clone();
     let message = input.message.clone();
     let quota = state.config.max_repo_bytes;
-    let new_oid = tokio::task::spawn_blocking(move || {
-        build_source_commit(
-            &source,
-            &projected,
-            &stage,
-            &bundle,
-            &bundle_ref,
-            &view_copy,
-            &source_ref,
-            &actor_name,
-            &message,
-            quota,
-        )
-    })
-    .await
-    .map_err(Error::internal)??;
+    let volume_lock_fd = state.storage.lock_file.as_raw_fd();
+    // The local gate survives HTTP cancellation. A separate watcher also
+    // fences a lost cross-process PG lease while synchronous Git is active:
+    // reverse_git kills and reaps its whole process group before this returns.
+    let canceled = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let new_oid = std::thread::scope(|scope| {
+        let watcher_cancel = canceled.clone();
+        let watcher_finished = finished.clone();
+        let lease = &source_lease;
+        scope.spawn(move || {
+            while !watcher_finished.load(Ordering::Acquire) {
+                if lease.ensure_active().is_err() {
+                    watcher_cancel.store(true, Ordering::Release);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        let result = tokio::task::block_in_place(move || {
+            reverse_git::with_read_cancel(canceled, volume_lock_fd, || {
+                build_source_commit(
+                    &source,
+                    &projected,
+                    &stage,
+                    &bundle,
+                    &bundle_ref,
+                    &view_copy,
+                    &source_ref,
+                    &actor_name,
+                    &message,
+                    quota,
+                )
+            })
+        });
+        finished.store(true, Ordering::Release);
+        result
+    })?;
     source_lease.ensure_active()?;
+    drop(_local);
     drop(_write);
     drop(_slot);
     let mut pin_headers = headers.clone();
     let proposal_id = Uuid::new_v4();
-    pin_headers.insert(
-        "idempotency-key",
-        HeaderValue::from_str(&format!("pin-{}", Uuid::new_v4())).map_err(Error::internal)?,
-    );
+    pin_headers
+        .insert("idempotency-key", HeaderValue::from_str(&format!("pin-{}", Uuid::new_v4())).map_err(Error::internal)?);
     let pinned = transactions::create_proposal_pin(
         state.clone(),
         mount.owner.clone(),

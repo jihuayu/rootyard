@@ -13,25 +13,14 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub async fn run_once(
-    state: &Arc<AppState>,
-    policy: &Policy,
-    owner: Uuid,
-) -> Result<Option<JobOutcome>> {
+pub async fn run_once(state: &Arc<AppState>, policy: &Policy, owner: Uuid) -> Result<Option<JobOutcome>> {
     let Some(job) = jobs::claim(&state.pool, owner, policy).await? else {
         return Ok(None);
     };
     match run_claimed(state, policy, &job).await {
         Ok(outcome) => Ok(Some(outcome)),
         Err(error) => {
-            let accepted = jobs::finish(
-                &state.pool,
-                &job,
-                json!({}),
-                Some(&error.to_string()),
-                policy,
-            )
-            .await?;
+            let accepted = jobs::finish(&state.pool, &job, json!({}), Some(&error.to_string()), policy).await?;
             let status = if !accepted {
                 "superseded"
             } else if job.attempt < policy.max_attempts {
@@ -50,19 +39,12 @@ pub async fn run_once(
     }
 }
 
-async fn run_claimed(
-    state: &Arc<AppState>,
-    policy: &Policy,
-    job: &super::models::Job,
-) -> Result<JobOutcome> {
+async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models::Job) -> Result<JobOutcome> {
     // Backup and migration hold the exclusive variant. A short claim transaction
     // never holds this lock, so backup cannot deadlock on a worker claim.
     let mut barrier = state.pool.get().await?;
     let tx = barrier.transaction().await?;
-    let granted: bool = tx
-        .query_one("SELECT pg_try_advisory_xact_lock_shared(738390103)", &[])
-        .await?
-        .get(0);
+    let granted: bool = tx.query_one("SELECT pg_try_advisory_xact_lock_shared(738390103)", &[]).await?.get(0);
     if !granted {
         bail!("backup or migration barrier is active");
     }
@@ -73,16 +55,12 @@ async fn run_claimed(
     )
     .await
     .map_err(|_| anyhow::anyhow!("repository reader barrier unavailable"))?;
-    lease
-        .ensure_active()
-        .map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     let _readers = state.storage.maintenance_exclusive(job.repository_id).await;
     // A push may hold a shared transfer gate while waiting for the writer
     // mutex at final CAS. Taking this exclusive gate first lets it finish.
     let _write = state.storage.write_lock(job.repository_id).await;
-    lease
-        .ensure_active()
-        .map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     if !jobs::current(&state.pool, job).await? {
         bail!("maintenance claim or repository generation changed");
     }
@@ -90,12 +68,7 @@ async fn run_claimed(
         bail!("repository is not assigned to this primary");
     }
     let client = state.pool.get().await?;
-    let row = client
-        .query_one(
-            &format!("{} WHERE r.id=$1", db::REPO_SELECT),
-            &[&job.repository_id],
-        )
-        .await?;
+    let row = client.query_one(&format!("{} WHERE r.id=$1", db::REPO_SELECT), &[&job.repository_id]).await?;
     let repo = db::Repository::from_row(&row);
     crate::sharding::fencing::check_before_push(state, &repo)
         .await
@@ -104,19 +77,8 @@ async fn run_claimed(
     let cancel = CancellationToken::new();
     let task = async {
         if job.kind == "gitfs_unreachable_mark" {
-            gc::mark(
-                state,
-                job.repository_id,
-                job.tenant_id,
-                job.repository_generation,
-                policy,
-                &cancel,
-            )
-            .await
-        } else if matches!(
-            job.kind.as_str(),
-            "gitfs_tombstone_delete" | "gitfs_cache_evict"
-        ) {
+            gc::mark(state, job.repository_id, job.tenant_id, job.repository_generation, policy, &cancel).await
+        } else if matches!(job.kind.as_str(), "gitfs_tombstone_delete" | "gitfs_cache_evict") {
             bail!("physical deletion requires complete reader lease coverage")
         } else {
             gitfs::execute(state, job.repository_id, &job.kind, policy, &cancel).await
@@ -125,8 +87,7 @@ async fn run_claimed(
     tokio::pin!(task);
     let mut safety = tokio::time::interval(Duration::from_millis(200));
     safety.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut renew =
-        tokio::time::interval(Duration::from_secs((policy.lease_seconds / 3).max(1) as u64));
+    let mut renew = tokio::time::interval(Duration::from_secs((policy.lease_seconds / 3).max(1) as u64));
     renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result = loop {
         tokio::select! {
@@ -150,9 +111,7 @@ async fn run_claimed(
         }
     };
     let result = result?;
-    lease
-        .ensure_active()
-        .map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     if !jobs::current(&state.pool, job).await? {
         bail!("maintenance lease expired before result publication");
     }
@@ -164,20 +123,12 @@ async fn run_claimed(
                 "UPDATE storage_maintenance_repo_state SET last_repack_at=clock_timestamp(), \
              last_repack_loose_count=$3,last_repack_pack_count=$4 WHERE repository_id=$1 \
              AND tenant_id=$2 AND last_scan_generation=$5",
-                &[
-                    &job.repository_id,
-                    &job.tenant_id,
-                    &counts.loose,
-                    &counts.packs,
-                    &job.repository_generation,
-                ],
+                &[&job.repository_id, &job.tenant_id, &counts.loose, &counts.packs, &job.repository_generation],
             )
             .await?;
     }
     let accepted = jobs::finish(&state.pool, job, result, None, policy).await?;
-    lease
-        .ensure_active()
-        .map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     tx.commit().await?;
     Ok(JobOutcome {
         job_id: job.id,

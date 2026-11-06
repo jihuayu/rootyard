@@ -9,6 +9,54 @@ from tests.e2e import Harness
 
 
 class WorkspaceServiceTest(unittest.TestCase):
+    def test_conflicted_native_index_round_trips_through_checkpoint(self):
+        h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        try:
+            h.setup(); h.api(); h.roundtrip()
+            ws=json.loads(h.expect("/api/workspaces",201,token=h.alice,method="POST",
+                body={"owner":"alice","repository":"demo","agent_id":"conflict","base_oid":h.second},
+                extra_headers={"Idempotency-Key":"conflict-create"}))
+            repo=h.root/"data/workspace-service/workspaces"/ws["id"]
+            h.git("config","user.name","Conflict actor",cwd=repo)
+            h.git("config","user.email","actor@example.invalid",cwd=repo)
+            h.git("switch","-c","feature",cwd=repo)
+            (repo/"hello.txt").write_text("feature\n")
+            (repo/"build.c").write_text("int main(void){return 0;}\n")
+            h.git("add","hello.txt","build.c",cwd=repo)
+            h.git("commit","-m","feature change",cwd=repo)
+            h.git("switch","-c","main-conflict",h.second,cwd=repo)
+            (repo/"hello.txt").write_text("main\n")
+            h.git("commit","-am","main change",cwd=repo)
+            self.assertNotEqual(h.git("merge","--no-edit","feature",cwd=repo,check=False).returncode,0)
+            stages=h.git("ls-files","-u",cwd=repo).stdout
+            status=h.git("status","--porcelain=v1","-z",cwd=repo).stdout
+            diff=h.git("diff","--binary",cwd=repo).stdout
+            self.assertEqual(len(stages.splitlines()),3)
+            self.assertIn(b"UU hello.txt",status)
+            self.assertTrue((repo/"build.c").is_file())
+            deadline=time.monotonic()+8
+            while True:
+                current=json.loads(h.expect(f"/api/workspaces/{ws['id']}",200,token=h.alice))
+                if current["revision"]>0:break
+                self.assertLess(time.monotonic(),deadline,"native Git conflict was not captured")
+                time.sleep(.1)
+            cp=json.loads(h.expect(f"/api/workspaces/{ws['id']}/checkpoints",201,
+                token=h.alice,method="POST",body={"expected_workspace_revision":current["revision"],
+                    "lease_epoch":ws["lease_epoch"]},
+                extra_headers={"Idempotency-Key":"conflict-checkpoint"}))
+            h.stop(hard=True);h.start()
+            restored=json.loads(h.expect(f"/api/checkpoints/{cp['checkpoint_id']}/restore",201,
+                token=h.alice,method="POST",body={"agent_id":"conflict-restored"},
+                extra_headers={"Idempotency-Key":"conflict-restore"}))
+            copy=h.root/"data/workspace-service/workspaces"/restored["id"]
+            self.assertEqual(h.git("ls-files","-u",cwd=copy).stdout,stages)
+            self.assertEqual(h.git("status","--porcelain=v1","-z",cwd=copy).stdout,status)
+            self.assertEqual(h.git("diff","--binary",cwd=copy).stdout,diff)
+            self.assertEqual((copy/"hello.txt").read_bytes(),(repo/"hello.txt").read_bytes())
+            h.run(["gcc","build.c","-o","build"],cwd=copy)
+            h.run([str(copy/"build")],cwd=copy)
+        finally:h.cleanup()
+
     def test_create_edit_checkpoint_fork_restore_restart(self):
         h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
         try:

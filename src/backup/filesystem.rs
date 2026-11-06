@@ -2,10 +2,7 @@
 use super::*;
 
 pub(super) fn hash(path: &Path) -> Result<String> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
     ensure!(file.metadata()?.is_file(), "expected regular file");
     let mut digest = Sha256::new();
     let mut buf = [0; 128 * 1024];
@@ -27,16 +24,8 @@ use std::os::unix::fs::DirBuilderExt;
 // No symlink components, '..', root alias, or ambiguous relative paths. Parents
 // must exist and be operator-controlled. A hostile same-UID writer is unsupported.
 pub(super) fn absolute(path: &Path, exists: bool) -> Result<PathBuf> {
-    let path = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    ensure!(
-        path.components()
-            .all(|c| matches!(c, Component::RootDir | Component::Normal(_))),
-        "noncanonical path"
-    );
+    let path = if path.is_absolute() { path.to_owned() } else { std::env::current_dir()?.join(path) };
+    ensure!(path.components().all(|c| matches!(c, Component::RootDir | Component::Normal(_))), "noncanonical path");
     ensure!(path.file_name().is_some(), "root path is not a target");
     let mut current = PathBuf::new();
     let count = path.components().count();
@@ -46,10 +35,7 @@ pub(super) fn absolute(path: &Path, exists: bool) -> Result<PathBuf> {
             break;
         }
         let meta = fs::symlink_metadata(&current)?;
-        ensure!(
-            meta.is_dir() && !meta.file_type().is_symlink(),
-            "path component is not a real directory"
-        );
+        ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "path component is not a real directory");
     }
     if !exists {
         ensure!(
@@ -60,18 +46,11 @@ pub(super) fn absolute(path: &Path, exists: bool) -> Result<PathBuf> {
     Ok(path)
 }
 pub(super) fn disjoint(a: &Path, b: &Path) -> Result<()> {
-    ensure!(
-        !a.starts_with(b) && !b.starts_with(a),
-        "source and destination overlap"
-    );
+    ensure!(!a.starts_with(b) && !b.starts_with(a), "source and destination overlap");
     Ok(())
 }
 pub(super) fn restore_guard_path(target: &Path) -> Result<PathBuf> {
-    let path = if target.is_absolute() {
-        target.to_owned()
-    } else {
-        std::env::current_dir()?.join(target)
-    };
+    let path = if target.is_absolute() { target.to_owned() } else { std::env::current_dir()?.join(target) };
     let mut name = std::ffi::OsString::from(".");
     name.push(path.file_name().context("invalid restore target")?);
     name.push(".rootyard-restoring");
@@ -81,8 +60,7 @@ pub(super) fn restore_guard_path(target: &Path) -> Result<PathBuf> {
 /// leftover guard after discarding/recovering BOTH isolated targets.
 pub fn ensure_not_restoring(target: &Path) -> Result<()> {
     ensure!(
-        fs::symlink_metadata(restore_guard_path(target)?)
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        fs::symlink_metadata(restore_guard_path(target)?).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
         "incomplete restore guard blocks service startup"
     );
     Ok(())
@@ -102,90 +80,42 @@ pub(super) fn volume_identity(root: &Path) -> Result<Uuid> {
     Ok(value.parse()?)
 }
 pub(super) fn volume_lock(root: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(root.join(".rootyard.lock"))?;
+    let file =
+        OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOFOLLOW).open(root.join(".rootyard.lock"))?;
     let meta = file.metadata()?;
     ensure!(meta.is_file() && meta.nlink() == 1, "invalid volume lock");
-    file.try_lock_exclusive()
-        .context("offline backup requires Rootyard and all Git descendants to be stopped")?;
+    file.try_lock_exclusive().context("offline backup requires Rootyard and all Git descendants to be stopped")?;
     Ok(file)
 }
 pub(super) fn allowed_link(path: &str, target: &str) -> bool {
-    matches!(
-        path,
-        "managed-hooks/pre-receive"
-            | "managed-hooks/post-receive"
-            | "managed-hooks/reference-transaction"
-    ) && target == ".runner"
+    matches!(path, "managed-hooks/pre-receive" | "managed-hooks/post-receive" | "managed-hooks/reference-transaction")
+        && target == ".runner"
 }
 pub(super) fn inventory(root: &Path) -> Result<BTreeMap<String, Entry>> {
     let meta = fs::symlink_metadata(root)?;
-    ensure!(
-        meta.is_dir() && !meta.file_type().is_symlink(),
-        "volume root must be a real directory"
-    );
+    ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "volume root must be a real directory");
     let mut entries = BTreeMap::new();
     fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<String, Entry>) -> Result<()> {
         let mut children = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
         children.sort_by_key(|e| e.file_name());
         for child in children {
             let path = child.path();
-            let name = path
-                .strip_prefix(root)?
-                .to_str()
-                .context("non UTF-8 filename unsupported")?
-                .to_owned();
-            ensure!(
-                name.len() <= 4096 && !name.contains(['\n', '\r']),
-                "invalid filename"
-            );
-            ensure!(
-                entries.len() < MAX_ENTRIES,
-                "backup file count exceeds bound"
-            );
+            let name = path.strip_prefix(root)?.to_str().context("non UTF-8 filename unsupported")?.to_owned();
+            ensure!(name.len() <= 4096 && !name.contains(['\n', '\r']), "invalid filename");
+            ensure!(entries.len() < MAX_ENTRIES, "backup file count exceeds bound");
             let meta = fs::symlink_metadata(&path)?;
-            ensure!(
-                meta.dev() == fs::metadata(root)?.dev(),
-                "nested mount unsupported"
-            );
+            ensure!(meta.dev() == fs::metadata(root)?.dev(), "nested mount unsupported");
             let mode = meta.mode() & 0o7777;
             ensure!(mode & 0o7000 == 0, "special file modes unsupported");
             let entry = if meta.file_type().is_symlink() {
-                let target = fs::read_link(&path)?
-                    .to_str()
-                    .context("non UTF-8 link")?
-                    .to_owned();
-                ensure!(
-                    allowed_link(&name, &target),
-                    "unsupported or external symlink"
-                );
-                Entry {
-                    kind: "symlink".into(),
-                    mode,
-                    bytes: 0,
-                    sha256: None,
-                    target: Some(target),
-                }
+                let target = fs::read_link(&path)?.to_str().context("non UTF-8 link")?.to_owned();
+                ensure!(allowed_link(&name, &target), "unsupported or external symlink");
+                Entry { kind: "symlink".into(), mode, bytes: 0, sha256: None, target: Some(target) }
             } else if meta.is_file() {
                 ensure!(meta.nlink() == 1, "hard-linked files unsupported");
-                Entry {
-                    kind: "file".into(),
-                    mode,
-                    bytes: meta.len(),
-                    sha256: Some(hash(&path)?),
-                    target: None,
-                }
+                Entry { kind: "file".into(), mode, bytes: meta.len(), sha256: Some(hash(&path)?), target: None }
             } else if meta.is_dir() {
-                Entry {
-                    kind: "directory".into(),
-                    mode,
-                    bytes: 0,
-                    sha256: None,
-                    target: None,
-                }
+                Entry { kind: "directory".into(), mode, bytes: 0, sha256: None, target: None }
             } else {
                 bail!("special files unsupported");
             };
@@ -199,32 +129,16 @@ pub(super) fn inventory(root: &Path) -> Result<BTreeMap<String, Entry>> {
     visit(root, root, &mut entries)?;
     Ok(entries)
 }
-pub(super) fn copy_volume(
-    source: &Path,
-    target: &Path,
-    entries: &BTreeMap<String, Entry>,
-) -> Result<()> {
+pub(super) fn copy_volume(source: &Path, target: &Path, entries: &BTreeMap<String, Entry>) -> Result<()> {
     private_dir(target)?;
     for (name, entry) in entries {
-        ensure!(
-            Path::new(name)
-                .components()
-                .all(|c| matches!(c, Component::Normal(_))),
-            "invalid manifest path"
-        );
+        ensure!(Path::new(name).components().all(|c| matches!(c, Component::Normal(_))), "invalid manifest path");
         let dest = target.join(name);
         match entry.kind.as_str() {
             "directory" => private_dir(&dest)?,
             "file" => {
-                let mut input = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(source.join(name))?;
-                let mut output = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&dest)?;
+                let mut input = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(source.join(name))?;
+                let mut output = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&dest)?;
                 std::io::copy(&mut input, &mut output)?;
                 output.set_permissions(fs::Permissions::from_mode(entry.mode))?;
                 output.sync_all()?;
@@ -244,10 +158,7 @@ pub(super) fn copy_volume(
         }
     }
     File::open(target)?.sync_all()?;
-    ensure!(
-        inventory(target)? == *entries,
-        "copied volume checksum mismatch"
-    );
+    ensure!(inventory(target)? == *entries, "copied volume checksum mismatch");
     Ok(())
 }
 pub(super) fn publish(source: &Path, target: &Path) -> Result<()> {
@@ -255,13 +166,7 @@ pub(super) fn publish(source: &Path, target: &Path) -> Result<()> {
     let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
     let target = std::ffi::CString::new(target.as_os_str().as_bytes())?;
     let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            target.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
+        libc::renameat2(libc::AT_FDCWD, source.as_ptr(), libc::AT_FDCWD, target.as_ptr(), libc::RENAME_NOREPLACE)
     };
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -269,11 +174,7 @@ pub(super) fn publish(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())

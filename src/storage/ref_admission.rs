@@ -111,9 +111,7 @@ pub async fn admit(
             let degraded: bool = row.get(3);
             let fenced: i64 = row.get(4);
             if epoch <= 0 || draining || degraded || fenced >= epoch {
-                return Err(conflict(
-                    "repository route is draining, degraded, or fenced",
-                ));
+                return Err(conflict("repository route is draining, degraded, or fenced"));
             }
             match crate::sharding::transport::node_id()? {
                 Some(local) if local == primary => {}
@@ -121,11 +119,8 @@ pub async fn admit(
                     return Err(conflict("local storage node is not the repository primary"));
                 }
                 None => {
-                    let count: i64 = tx
-                        .query_one("SELECT COUNT(*) FROM shard_nodes", &[])
-                        .await
-                        .map_err(Error::internal)?
-                        .get(0);
+                    let count: i64 =
+                        tx.query_one("SELECT COUNT(*) FROM shard_nodes", &[]).await.map_err(Error::internal)?.get(0);
                     if count > 1 {
                         return Err(conflict("cluster writer requires a local node identity"));
                     }
@@ -140,41 +135,24 @@ pub async fn admit(
                 .map_err(Error::internal)?
                 .get(0);
             if installed {
-                let count: i64 = tx
-                    .query_one("SELECT COUNT(*) FROM shard_nodes", &[])
-                    .await
-                    .map_err(Error::internal)?
-                    .get(0);
+                let count: i64 =
+                    tx.query_one("SELECT COUNT(*) FROM shard_nodes", &[]).await.map_err(Error::internal)?.get(0);
                 if count > 1 {
-                    return Err(conflict(
-                        "cluster writer requires a durable repository route",
-                    ));
+                    return Err(conflict("cluster writer requires a durable repository route"));
                 }
             }
             1
         }
     };
     let row = tx
-        .query_opt(
-            "SELECT storage_generation,state FROM repositories WHERE id=$1",
-            &[&repository_id],
-        )
+        .query_opt("SELECT storage_generation,state FROM repositories WHERE id=$1", &[&repository_id])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     if row.get::<_, i64>(0) != generation || row.get::<_, String>(1) != "ready" {
-        return Err(conflict(
-            "repository generation or state changed during ref admission",
-        ));
+        return Err(conflict("repository generation or state changed during ref admission"));
     }
-    auth::verify_repo_write_access(
-        &*tx,
-        actor.id,
-        actor.token_id,
-        repository_id,
-        auth::web_scope_enabled(),
-    )
-    .await?;
+    auth::verify_repo_write_access(&*tx, actor.id, actor.token_id, repository_id, auth::web_scope_enabled()).await?;
     let writer_id = Uuid::new_v4();
     let node_id = crate::sharding::transport::node_id()?;
     tx.execute(
@@ -185,12 +163,7 @@ pub async fn admit(
     .await
     .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
-    Ok(Admission {
-        writer_id,
-        repository_id,
-        shard_epoch,
-        refs: names,
-    })
+    Ok(Admission { writer_id, repository_id, shard_epoch, refs: names })
 }
 
 /// A writer that never reached Git release its admission without publishing.
@@ -254,8 +227,8 @@ pub async fn fence_epoch(
 /// Settlement inside the exact transaction that publishes `git_operations` and
 /// outbox events. It re-verifies the route epoch, the token/role authority and
 /// the ADMITTED state before allowing any row to become visible.
-pub async fn settle_in_tx(
-    tx: &Transaction<'_>,
+pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
+    tx: &C,
     repository_id: Uuid,
     admission: &crate::events::AdmissionRecord,
     actor_id: Uuid,
@@ -270,8 +243,8 @@ pub async fn settle_in_tx(
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("ref admission is missing"))?;
-    let state = State::parse(row.get::<_, String>(0).as_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid ref admission state"))?;
+    let state =
+        State::parse(row.get::<_, String>(0).as_str()).ok_or_else(|| anyhow::anyhow!("invalid ref admission state"))?;
     if state == State::Committed {
         // Terminal replay after a crash between outbox commit and journal
         // retirement. The original settlement already ran in one transaction.
@@ -306,15 +279,13 @@ pub async fn settle_in_tx(
         if epoch != admitted_epoch || draining || degraded || fenced >= epoch {
             anyhow::bail!("ref admission route epoch changed or is fenced");
         }
-        if let Some(local) =
-            crate::sharding::transport::node_id().map_err(|error| anyhow::anyhow!(error.1))?
-        {
+        if let Some(local) = crate::sharding::transport::node_id().map_err(|error| anyhow::anyhow!(error.1))? {
             if local != primary {
                 anyhow::bail!("ref admission writer is not the current repository primary");
             }
         }
     }
-    auth::verify_repo_write_access(&**tx, actor_id, token_id, repository_id, false)
+    auth::verify_repo_write_access(tx, actor_id, token_id, repository_id, false)
         .await
         .map_err(|error| anyhow::anyhow!(error.1))?;
     let terminal = match outcome {
@@ -325,11 +296,7 @@ pub async fn settle_in_tx(
         .execute(
             "UPDATE git_ref_admissions SET state=$3,settled_at=clock_timestamp() \
              WHERE writer_id=$1 AND shard_epoch=$2 AND state='ADMITTED'",
-            &[
-                &admission.writer_id,
-                &admission.shard_epoch,
-                &terminal.as_str(),
-            ],
+            &[&admission.writer_id, &admission.shard_epoch, &terminal.as_str()],
         )
         .await?;
     if changed != 1 {
@@ -340,10 +307,7 @@ pub async fn settle_in_tx(
 
 /// True when a journal operation can no longer publish refs: its admission was
 /// fenced/aborted, its route epoch moved, or its node lost primary status.
-pub async fn operation_is_fenced(
-    state: &AppState,
-    operation: &journal::Operation,
-) -> anyhow::Result<bool> {
+pub async fn operation_is_fenced(state: &AppState, operation: &journal::Operation) -> anyhow::Result<bool> {
     if !operation.requires_parent_publication || operation.shard_epoch <= 0 {
         return Ok(false);
     }
@@ -367,8 +331,8 @@ pub async fn operation_is_fenced(
         // A pre-admission journal (upgrade boundary) keeps the legacy path.
         return Ok(false);
     };
-    let state = State::parse(row.get::<_, String>(0).as_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid ref admission state"))?;
+    let state =
+        State::parse(row.get::<_, String>(0).as_str()).ok_or_else(|| anyhow::anyhow!("invalid ref admission state"))?;
     match state {
         State::Committed => return Ok(false),
         State::Aborted | State::FencedAborted => return Ok(true),
@@ -389,10 +353,9 @@ pub async fn operation_is_fenced(
     {
         return Ok(true);
     }
-    if let (Some(local), Some(primary)) = (
-        crate::sharding::transport::node_id().map_err(|error| anyhow::anyhow!(error.1))?,
-        primary,
-    ) {
+    if let (Some(local), Some(primary)) =
+        (crate::sharding::transport::node_id().map_err(|error| anyhow::anyhow!(error.1))?, primary)
+    {
         if local != primary {
             return Ok(true);
         }
@@ -403,10 +366,7 @@ pub async fn operation_is_fenced(
 /// Restore every requested ref whose current value is still this writer's new
 /// OID, then durably mark and retire the journal. The caller holds the local
 /// repository write lock (and the writer process must be quiescent).
-pub async fn rollback_fenced(
-    state: &AppState,
-    operation: &journal::Operation,
-) -> anyhow::Result<()> {
+pub async fn rollback_fenced(state: &AppState, operation: &journal::Operation) -> anyhow::Result<()> {
     if !operation.requires_parent_publication || operation.shard_epoch <= 0 {
         return Ok(());
     }
@@ -429,11 +389,7 @@ pub async fn rollback_fenced(
     Ok(())
 }
 
-async fn rollback_refs(
-    state: &AppState,
-    repository_id: Uuid,
-    changes: &[journal::RefChange],
-) -> anyhow::Result<()> {
+async fn rollback_refs(state: &AppState, repository_id: Uuid, changes: &[journal::RefChange]) -> anyhow::Result<()> {
     for change in changes {
         let observed = match crate::browse::git_read::run_git(
             state,
@@ -450,24 +406,12 @@ async fn rollback_refs(
         if observed.as_deref() != Some(change.new_oid.as_str()) {
             continue;
         }
-        let mut command = crate::browse::git_read::git_cmd(state, repository_id)
-            .map_err(|error| anyhow::anyhow!(error.1))?;
+        let mut command =
+            crate::browse::git_read::git_cmd(state, repository_id).map_err(|error| anyhow::anyhow!(error.1))?;
         if all_zero(&change.old_oid) {
-            command.args([
-                "update-ref",
-                "-d",
-                "--no-deref",
-                &change.ref_name,
-                &change.new_oid,
-            ]);
+            command.args(["update-ref", "-d", "--no-deref", &change.ref_name, &change.new_oid]);
         } else {
-            command.args([
-                "update-ref",
-                "--no-deref",
-                &change.ref_name,
-                &change.old_oid,
-                &change.new_oid,
-            ]);
+            command.args(["update-ref", "--no-deref", &change.ref_name, &change.old_oid, &change.new_oid]);
         }
         crate::git_http::collect_git_output(command, 4096, state.config.git_timeout).await?;
     }
@@ -539,16 +483,9 @@ mod tests {
         let base_url = std::env::var("ROOTYARD_TEST_DATABASE_URL").ok()?;
         let admin = db::pool(&base_url).unwrap();
         let schema = format!("ref_admission_{}", Uuid::new_v4().simple());
-        admin
-            .get()
-            .await
-            .unwrap()
-            .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
-            .await
-            .unwrap();
+        admin.get().await.unwrap().batch_execute(&format!("CREATE SCHEMA \"{schema}\"")).await.unwrap();
         let mut url = reqwest::Url::parse(&base_url).unwrap();
-        url.query_pairs_mut()
-            .append_pair("options", &format!("-csearch_path={schema}"));
+        url.query_pairs_mut().append_pair("options", &format!("-csearch_path={schema}"));
         let pool = db::pool(url.as_str()).unwrap();
         db::migrate(&pool).await.unwrap();
         let issued = db::issue_token(&pool, "alice", true, false).await.unwrap();
@@ -562,13 +499,8 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        let actor = Identity {
-            id: actor_id,
-            token_id,
-            username: "alice".into(),
-            read_only: false,
-            token_digest: digest,
-        };
+        let actor =
+            Identity { id: actor_id, token_id, username: "alice".into(), read_only: false, token_digest: digest };
         let repo = Uuid::new_v4();
         pool.get()
             .await
@@ -617,16 +549,7 @@ mod tests {
             return;
         };
         let refs = vec!["refs/heads/main".to_string()];
-        let admission = admit(
-            &pool,
-            repo,
-            1,
-            &actor,
-            &refs,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
+        let admission = admit(&pool, repo, 1, &actor, &refs, Instant::now() + Duration::from_secs(5)).await.unwrap();
         let mut client = pool.get().await.unwrap();
         let tx = client.transaction().await.unwrap();
         tx.execute(
@@ -643,10 +566,7 @@ mod tests {
             .get()
             .await
             .unwrap()
-            .query_one(
-                "SELECT state FROM git_ref_admissions WHERE writer_id=$1",
-                &[&admission.writer_id],
-            )
+            .query_one("SELECT state FROM git_ref_admissions WHERE writer_id=$1", &[&admission.writer_id])
             .await
             .unwrap()
             .get(0);
@@ -657,32 +577,17 @@ mod tests {
                 admission.writer_id,
                 &actor,
                 repo,
-                Some(events::AdmissionRecord {
-                    writer_id: admission.writer_id,
-                    shard_epoch: admission.shard_epoch,
-                }),
+                Some(events::AdmissionRecord { writer_id: admission.writer_id, shard_epoch: admission.shard_epoch }),
                 "recorded",
             ),
             &[],
         )
         .await;
         assert!(result.is_err(), "fenced admission published SQL settlement");
-        let operations: i64 = pool
-            .get()
-            .await
-            .unwrap()
-            .query_one("SELECT COUNT(*) FROM git_operations", &[])
-            .await
-            .unwrap()
-            .get(0);
-        let outbox: i64 = pool
-            .get()
-            .await
-            .unwrap()
-            .query_one("SELECT COUNT(*) FROM outbox_events", &[])
-            .await
-            .unwrap()
-            .get(0);
+        let operations: i64 =
+            pool.get().await.unwrap().query_one("SELECT COUNT(*) FROM git_operations", &[]).await.unwrap().get(0);
+        let outbox: i64 =
+            pool.get().await.unwrap().query_one("SELECT COUNT(*) FROM outbox_events", &[]).await.unwrap().get(0);
         assert_eq!((operations, outbox), (0, 0));
     }
 
@@ -692,16 +597,7 @@ mod tests {
             return;
         };
         let refs = vec!["refs/heads/main".to_string()];
-        let admission = admit(
-            &pool,
-            repo,
-            1,
-            &actor,
-            &refs,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
+        let admission = admit(&pool, repo, 1, &actor, &refs, Instant::now() + Duration::from_secs(5)).await.unwrap();
         let client = db::connect_url(&url).await.unwrap();
         ensure_hook_admitted(
             &client,
@@ -717,6 +613,7 @@ mod tests {
                 requires_parent_publication: true,
                 shard_epoch: admission.shard_epoch,
                 ci_pin: None,
+                proposal_pin: None,
                 path: std::path::PathBuf::new(),
             },
         )
@@ -725,10 +622,7 @@ mod tests {
         pool.get()
             .await
             .unwrap()
-            .execute(
-                "UPDATE tokens SET revoked=true WHERE id=$1",
-                &[&actor.token_id],
-            )
+            .execute("UPDATE tokens SET revoked=true WHERE id=$1", &[&actor.token_id])
             .await
             .unwrap();
         let result = events::publish(
@@ -737,40 +631,25 @@ mod tests {
                 admission.writer_id,
                 &actor,
                 repo,
-                Some(events::AdmissionRecord {
-                    writer_id: admission.writer_id,
-                    shard_epoch: admission.shard_epoch,
-                }),
+                Some(events::AdmissionRecord { writer_id: admission.writer_id, shard_epoch: admission.shard_epoch }),
                 "recorded",
             ),
             &[],
         )
         .await;
         assert!(result.is_err(), "revoked token settled a ref operation");
-        let operations: i64 = pool
-            .get()
-            .await
-            .unwrap()
-            .query_one("SELECT COUNT(*) FROM git_operations", &[])
-            .await
-            .unwrap()
-            .get(0);
+        let operations: i64 =
+            pool.get().await.unwrap().query_one("SELECT COUNT(*) FROM git_operations", &[]).await.unwrap().get(0);
         assert_eq!(operations, 0);
         let state: String = pool
             .get()
             .await
             .unwrap()
-            .query_one(
-                "SELECT state FROM git_ref_admissions WHERE writer_id=$1",
-                &[&admission.writer_id],
-            )
+            .query_one("SELECT state FROM git_ref_admissions WHERE writer_id=$1", &[&admission.writer_id])
             .await
             .unwrap()
             .get(0);
-        assert_eq!(
-            state, "ADMITTED",
-            "revocation must not fabricate a settled admission"
-        );
+        assert_eq!(state, "ADMITTED", "revocation must not fabricate a settled admission");
     }
 
     #[tokio::test]
@@ -779,16 +658,7 @@ mod tests {
             return;
         };
         let refs = vec!["refs/heads/main".to_string()];
-        let admission = admit(
-            &pool,
-            repo,
-            1,
-            &actor,
-            &refs,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
+        let admission = admit(&pool, repo, 1, &actor, &refs, Instant::now() + Duration::from_secs(5)).await.unwrap();
         let change = events::RefEventInput {
             transaction_sequence: 1,
             ref_name: "refs/heads/main".into(),
@@ -799,36 +669,22 @@ mod tests {
             admission.writer_id,
             &actor,
             repo,
-            Some(events::AdmissionRecord {
-                writer_id: admission.writer_id,
-                shard_epoch: admission.shard_epoch,
-            }),
+            Some(events::AdmissionRecord { writer_id: admission.writer_id, shard_epoch: admission.shard_epoch }),
             "recorded",
         );
-        events::publish(&pool, &body, std::slice::from_ref(&change))
-            .await
-            .unwrap();
+        events::publish(&pool, &body, std::slice::from_ref(&change)).await.unwrap();
         let state: String = pool
             .get()
             .await
             .unwrap()
-            .query_one(
-                "SELECT state FROM git_ref_admissions WHERE writer_id=$1",
-                &[&admission.writer_id],
-            )
+            .query_one("SELECT state FROM git_ref_admissions WHERE writer_id=$1", &[&admission.writer_id])
             .await
             .unwrap()
             .get(0);
         assert_eq!(state, "COMMITTED");
         events::publish(&pool, &body, &[change]).await.unwrap();
-        let outbox: i64 = pool
-            .get()
-            .await
-            .unwrap()
-            .query_one("SELECT COUNT(*) FROM outbox_events", &[])
-            .await
-            .unwrap()
-            .get(0);
+        let outbox: i64 =
+            pool.get().await.unwrap().query_one("SELECT COUNT(*) FROM outbox_events", &[]).await.unwrap().get(0);
         assert_eq!(outbox, 1);
     }
 }

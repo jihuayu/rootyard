@@ -13,7 +13,10 @@ use uuid::Uuid;
 async fn batch(state: &AppState, id: Uuid, after: i64) -> Result<Vec<Value>, Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let rows = client.query("SELECT revision,kind,payload FROM workspace_events WHERE workspace_id=$1 AND revision>$2 ORDER BY revision LIMIT 100", &[&id,&after]).await.map_err(Error::internal)?;
-    Ok(rows.iter().map(|r| json!({"revision":r.get::<_,i64>(0),"kind":r.get::<_,String>(1),"payload":r.get::<_,Value>(2)})).collect())
+    Ok(rows
+        .iter()
+        .map(|r| json!({"revision":r.get::<_,i64>(0),"kind":r.get::<_,String>(1),"payload":r.get::<_,Value>(2)}))
+        .collect())
 }
 
 pub async fn list(
@@ -28,10 +31,7 @@ pub async fn list(
         return Err(Error::bad_request());
     }
     let events = batch(&state, id, after).await?;
-    let gap = events
-        .first()
-        .and_then(|v| v["revision"].as_i64())
-        .is_some_and(|first| first > after + 1);
+    let gap = events.first().and_then(|v| v["revision"].as_i64()).is_some_and(|first| first > after + 1);
     Ok(Json(if gap {
         json!({"kind":"RESYNC_REQUIRED","snapshot_revision":ws.revision})
     } else {

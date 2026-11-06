@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS pando_repository_states (
 
 CREATE TABLE IF NOT EXISTS pando_refs (
     repository_id UUID NOT NULL REFERENCES pando_repository_states(repository_id) ON DELETE CASCADE,
-    ref_name TEXT NOT NULL CHECK (octet_length(ref_name) BETWEEN 6 AND 1024 AND ref_name LIKE 'refs/%' AND ref_name !~ '[[:cntrl:]]'),
+    ref_name TEXT NOT NULL CHECK (octet_length(ref_name) >= 6 AND octet_length(ref_name) <= 1024 AND ref_name LIKE 'refs/%' AND ref_name !~ '[[:cntrl:]]'),
     oid TEXT NOT NULL CHECK (oid ~ '^[0-9a-f]{40}$' OR oid ~ '^[0-9a-f]{64}$'),
     updated_generation BIGINT NOT NULL CHECK (updated_generation > 0),
     PRIMARY KEY (repository_id,ref_name)

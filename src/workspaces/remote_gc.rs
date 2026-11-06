@@ -11,11 +11,7 @@ use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub(super) async fn lock_key(
-    tx: &deadpool_postgres::Transaction<'_>,
-    tenant: Uuid,
-    digest: &str,
-) -> Result<(), Error> {
+pub(super) async fn lock_key(tx: &deadpool_postgres::Transaction<'_>, tenant: Uuid, digest: &str) -> Result<(), Error> {
     tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':' || $2::text, 702))",
         &[&tenant, &digest],
@@ -33,10 +29,7 @@ pub async fn abandon(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let row = tx
-        .query_opt(
-            "SELECT workspace_id,state FROM workspace_checkpoints WHERE id=$1",
-            &[&cp],
-        )
+        .query_opt("SELECT workspace_id,state FROM workspace_checkpoints WHERE id=$1", &[&cp])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
@@ -44,10 +37,7 @@ pub async fn abandon(
     let status: String = row.get(1);
     service::authorized(&state, &headers, workspace_id, Role::Write).await?;
     if status == "committed" {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "committed checkpoint is a retention root",
-        ));
+        return Err(Error(StatusCode::CONFLICT, "committed checkpoint is a retention root"));
     }
     if status != "failed" {
         let changed = tx
@@ -70,10 +60,7 @@ pub async fn abandon(
     tx.commit().await.map_err(Error::internal)?;
     // A transport failure leaves the staging rows as the retryable tombstone.
     let removed = collect_once(&state).await.unwrap_or(0);
-    Ok((
-        StatusCode::OK,
-        Json(json!({"checkpoint_id":cp,"state":"failed","objects_collected":removed})),
-    ))
+    Ok((StatusCode::OK, Json(json!({"checkpoint_id":cp,"state":"failed","objects_collected":removed}))))
 }
 
 pub async fn collect_once(state: &AppState) -> Result<usize, Error> {
@@ -115,10 +102,7 @@ pub async fn collect_once(state: &AppState) -> Result<usize, Error> {
             continue;
         }
         let key = remote::key(tenant, &digest)?;
-        store
-            .delete(&key, tokio::time::Instant::now() + Duration::from_secs(30))
-            .await
-            .map_err(Error::internal)?;
+        store.delete(&key, tokio::time::Instant::now() + Duration::from_secs(30)).await.map_err(Error::internal)?;
         tx.execute(
             "DELETE FROM workspace_remote_staging_objects s USING workspace_checkpoints c WHERE s.checkpoint_id=c.id AND s.tenant_id=$1 AND s.digest=$2 AND c.state='failed'",
             &[&tenant, &digest],

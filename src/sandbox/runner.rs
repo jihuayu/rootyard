@@ -1,3 +1,4 @@
+use super::terminal;
 use crate::{AppState, Error, workspace_lab::core, workspaces::service};
 use std::{
     fs::{self, OpenOptions},
@@ -10,15 +11,10 @@ use std::{
 use tokio::process::Command;
 use uuid::Uuid;
 
+#[allow(clippy::large_enum_variant)] // one owned claim per job; indirection would only add an allocation
 pub(super) enum Source {
-    Workspace {
-        id: Uuid,
-        live: bool,
-    },
-    Ci {
-        checkout: PathBuf,
-        claim: Box<crate::webhooks::claimed::ClaimedRun>,
-    },
+    Workspace { id: Uuid, live: bool },
+    Ci { checkout: PathBuf, claim: crate::webhooks::claimed::ClaimedRun },
 }
 
 enum Mode {
@@ -32,19 +28,15 @@ fn mode(job: Uuid) -> Result<Mode, Error> {
     if std::env::var("ROOTYARD_SANDBOX_MODE").as_deref() != Ok("cgroup") {
         return Err(Error::internal("sandbox cgroup mode required"));
     }
-    let base =
-        PathBuf::from(std::env::var("ROOTYARD_SANDBOX_CGROUP_ROOT").map_err(Error::internal)?);
+    let base = PathBuf::from(std::env::var("ROOTYARD_SANDBOX_CGROUP_ROOT").map_err(Error::internal)?);
     if !base.starts_with("/sys/fs/cgroup/") || !base.join("cgroup.controllers").exists() {
         return Err(Error::internal("delegated cgroup v2 root required"));
     }
     let group = base.join(job.to_string());
     fs::create_dir(&group).map_err(Error::internal)?;
-    for (name, value) in [
-        ("memory.max", "536870912"),
-        ("memory.swap.max", "0"),
-        ("pids.max", "64"),
-        ("cpu.max", "50000 100000"),
-    ] {
+    for (name, value) in
+        [("memory.max", "536870912"), ("memory.swap.max", "0"), ("pids.max", "64"), ("cpu.max", "50000 100000")]
+    {
         if fs::write(group.join(name), value).is_err() {
             let _ = fs::remove_dir(&group);
             return Err(Error::internal("sandbox cgroup controller unavailable"));
@@ -67,12 +59,7 @@ fn attach_group(group: &Path, pid: i32) -> Result<(), Error> {
         let Some(rest) = stat.rsplit_once(") ").map(|(_, r)| r) else {
             continue;
         };
-        if rest
-            .split_whitespace()
-            .nth(2)
-            .and_then(|v| v.parse::<i32>().ok())
-            == Some(pid)
-        {
+        if rest.split_whitespace().nth(2).and_then(|v| v.parse::<i32>().ok()) == Some(pid) {
             let _ = fs::write(group.join("cgroup.procs"), candidate.to_string());
         }
     }
@@ -84,10 +71,7 @@ pub fn job_root(state: &AppState, id: Uuid) -> PathBuf {
 }
 
 fn limit(resource: libc::__rlimit_resource_t, soft: u64) -> std::io::Result<()> {
-    let lim = libc::rlimit {
-        rlim_cur: soft,
-        rlim_max: soft,
-    };
+    let lim = libc::rlimit { rlim_cur: soft, rlim_max: soft };
     if unsafe { libc::setrlimit(resource, &lim) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -96,17 +80,47 @@ fn limit(resource: libc::__rlimit_resource_t, soft: u64) -> std::io::Result<()> 
 fn leader_exited(pid: i32) -> std::io::Result<bool> {
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
     let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as u32,
-            info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
+        libc::waitid(libc::P_PID, pid as u32, info.as_mut_ptr(), libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
     };
     if result != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { info.assume_init().si_pid() != 0 })
+}
+async fn open_start_gate(state: &AppState, job: Uuid, source: &Source, root: &Path) -> Result<(), Error> {
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let row = tx
+        .query_opt(
+            "SELECT state FROM sandbox_jobs WHERE id=$1 AND host_id=$2 FOR UPDATE",
+            &[&job, &state.storage.volume_id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    if row.get::<_, String>(0) != "running" {
+        return Err(Error::internal("sandbox cancelled before start"));
+    }
+    let authorized = match source {
+        Source::Ci { claim, .. } => super::ci::gate_authorized(&tx, claim).await?,
+        Source::Workspace { .. } => tx
+            .query_opt(
+                "SELECT 1 FROM workspaces w JOIN sandbox_jobs j \
+            ON j.workspace_id=w.id WHERE j.id=$1 AND j.lease_epoch=w.lease_epoch \
+            AND j.host_id=w.host_id AND w.lease_until>clock_timestamp()+interval '2 seconds' \
+            FOR SHARE OF w",
+                &[&job],
+            )
+            .await
+            .map_err(Error::internal)?
+            .is_some(),
+    };
+    if !authorized {
+        return Err(Error::internal("sandbox authority expired before start"));
+    }
+    fs::write(root.join("control/start"), b"start").map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(())
 }
 
 pub async fn launch(
@@ -116,18 +130,9 @@ pub async fn launch(
     argv: Vec<String>,
     timeout_seconds: u64,
     live: bool,
+    terminal: bool,
 ) -> Result<(), Error> {
-    launch_source(
-        state,
-        job,
-        Source::Workspace {
-            id: workspace,
-            live,
-        },
-        argv,
-        timeout_seconds,
-    )
-    .await
+    launch_source(state, job, Source::Workspace { id: workspace, live }, argv, timeout_seconds, terminal).await
 }
 
 pub(super) async fn launch_ci(
@@ -137,18 +142,9 @@ pub(super) async fn launch_ci(
     claim: crate::webhooks::claimed::ClaimedRun,
     argv: Vec<String>,
     timeout_seconds: u64,
+    terminal: bool,
 ) -> Result<(), Error> {
-    launch_source(
-        state,
-        job,
-        Source::Ci {
-            checkout,
-            claim: Box::new(claim),
-        },
-        argv,
-        timeout_seconds,
-    )
-    .await
+    launch_source(state, job, Source::Ci { checkout, claim }, argv, timeout_seconds, terminal).await
 }
 
 async fn launch_source(
@@ -157,12 +153,11 @@ async fn launch_source(
     source: Source,
     argv: Vec<String>,
     timeout_seconds: u64,
+    terminal: bool,
 ) -> Result<(), Error> {
     let live = matches!(&source, Source::Workspace { live: true, .. });
     if live && std::env::var("ROOTYARD_SANDBOX_MODE").as_deref() != Ok("dev") {
-        return Err(Error::internal(
-            "live FUSE workspace requires dev namespace mode",
-        ));
+        return Err(Error::internal("live FUSE workspace requires dev namespace mode"));
     }
     let isolation = mode(job)?;
     let root = job_root(&state, job);
@@ -188,6 +183,8 @@ async fn launch_source(
         .mode(0o600)
         .open(root.join("stderr.log"))
         .map_err(Error::internal)?;
+    let pty = if terminal { Some(terminal::Pty::open()?) } else { None };
+    let drain_output = if terminal { Some(stdout.try_clone().map_err(Error::internal)?) } else { None };
     let ctl = root.join("control");
     fs::create_dir(&ctl).map_err(Error::internal)?;
     let mut command = Command::new("bwrap");
@@ -261,14 +258,21 @@ async fn launch_source(
                 .args(argv.iter().map(String::as_str));
         }
     }
-    command
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .stdin(Stdio::null());
+    if let Some(ref pty) = pty {
+        command
+            .stdin(Stdio::from(pty.slave.try_clone().map_err(Error::internal)?))
+            .stdout(Stdio::from(pty.slave.try_clone().map_err(Error::internal)?))
+            .stderr(Stdio::from(pty.slave.try_clone().map_err(Error::internal)?));
+    } else {
+        command.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr)).stdin(Stdio::null());
+    }
     command.kill_on_drop(true);
     unsafe {
         command.pre_exec(move || {
             if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if terminal && libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             limit(libc::RLIMIT_CPU, timeout_seconds + 2)?;
@@ -282,12 +286,14 @@ async fn launch_source(
         });
     }
     let mut child = command.spawn().map_err(Error::internal)?;
-    let pid = child
-        .id()
-        .ok_or_else(|| Error::internal("sandbox process missing pid"))? as i32;
+    let pid = child.id().ok_or_else(|| Error::internal("sandbox process missing pid"))? as i32;
+    if let Some(pty) = pty {
+        pty.drain(job, drain_output.expect("terminal output file"));
+    }
     if let Mode::Cgroup(group) = &isolation {
         if attach_group(group, pid).is_err() {
             let _ = crate::git_http::stop_group_child(&mut child).await;
+            terminal::close(job);
             let _ = fs::write(group.join("cgroup.kill"), "1");
             let _ = fs::remove_dir(group);
             return Err(Error::internal("sandbox cgroup attach failed"));
@@ -304,19 +310,35 @@ async fn launch_source(
     }}).await.unwrap_or_else(|_|Err(Error::timeout()));
     if let Err(error) = registration {
         let _ = crate::git_http::stop_group_child(&mut child).await;
+        terminal::close(job);
         if let Mode::Cgroup(group) = &isolation {
             let _ = fs::write(group.join("cgroup.kill"), "1");
             let _ = fs::remove_dir(group);
         }
         return Err(error);
     }
-    if let Err(error) = fs::write(root.join("control/start"), b"start") {
+    if let Ok(delay) = std::env::var("ROOTYARD_TEST_SANDBOX_GATE_PAUSE_MS") {
+        if let Ok(delay) = delay.parse::<u64>() {
+            tokio::time::sleep(Duration::from_millis(delay.min(2000))).await;
+        }
+    }
+    if let Err(error) = open_start_gate(&state, job, &source, &root).await {
         let _ = crate::git_http::stop_group_child(&mut child).await;
+        terminal::close(job);
         if let Mode::Cgroup(group) = &isolation {
             let _ = fs::write(group.join("cgroup.kill"), "1");
             let _ = fs::remove_dir(group);
         }
-        return Err(Error::internal(error));
+        if let Ok(client) = state.pool.get().await {
+            let _ = client
+                .execute(
+                    "UPDATE sandbox_jobs SET state='failed',pid=NULL,finished_at=clock_timestamp() \
+                WHERE id=$1 AND state='running'",
+                    &[&job],
+                )
+                .await;
+        }
+        return Err(error);
     }
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
@@ -351,10 +373,7 @@ async fn launch_source(
             tokio::time::sleep(Duration::from_millis(200)).await;
         };
         if let Source::Ci { claim, .. } = &source {
-            if !super::ci::still_active(&state, claim, job)
-                .await
-                .unwrap_or(false)
-            {
+            if !super::ci::still_active(&state, claim, job).await.unwrap_or(false) {
                 state_name = "cancelled";
                 code = None;
             }
@@ -362,6 +381,7 @@ async fn launch_source(
         if let Ok(client) = state.pool.get().await {
             let _=client.execute("UPDATE sandbox_jobs SET state=$2,exit_code=$3,finished_at=clock_timestamp(),pid=NULL WHERE id=$1 AND state='running'", &[&job,&state_name,&code]).await;
         }
+        terminal::close(job);
         if let Mode::Cgroup(group) = isolation {
             let _ = fs::write(group.join("cgroup.kill"), "1");
             let _ = fs::remove_dir(group);
@@ -381,10 +401,7 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
         .await
         .map_err(Error::internal)?;
     let rows = client
-        .query(
-            "SELECT id,pid FROM sandbox_jobs WHERE host_id=$1 AND state='running'",
-            &[&state.storage.volume_id],
-        )
+        .query("SELECT id,pid FROM sandbox_jobs WHERE host_id=$1 AND state='running'", &[&state.storage.volume_id])
         .await
         .map_err(Error::internal)?;
     for row in rows {

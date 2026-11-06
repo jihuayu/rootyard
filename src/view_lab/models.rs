@@ -150,21 +150,14 @@ impl Drop for Staging {
 
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
-        let absolute = if root.is_absolute() {
-            root.to_path_buf()
-        } else {
-            std::env::current_dir()?.join(root)
-        };
+        let absolute = if root.is_absolute() { root.to_path_buf() } else { std::env::current_dir()?.join(root) };
         no_symlink_components(&absolute)?;
         if !absolute.exists() {
             private_dir(&absolute)?;
         }
         require_directory(&absolute)?;
         let root = fs::canonicalize(absolute)?;
-        ensure!(
-            fs::metadata(&root)?.permissions().mode() & 0o077 == 0,
-            "store must be private (mode 0700)"
-        );
+        ensure!(fs::metadata(&root)?.permissions().mode() & 0o077 == 0, "store must be private (mode 0700)");
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -173,16 +166,8 @@ impl Store {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(root.join(".lock"))?;
-        lock.try_lock_exclusive()
-            .context("view store busy; retry after other lab operation")?;
-        for name in [
-            "repos",
-            "namespaces",
-            "views",
-            "changesets",
-            "leases",
-            "staging",
-        ] {
+        lock.try_lock_exclusive().context("view store busy; retry after other lab operation")?;
+        for name in ["repos", "namespaces", "views", "changesets", "leases", "staging"] {
             let path = root.join(name);
             if !path.exists() {
                 private_dir(&path)?;
@@ -190,25 +175,11 @@ impl Store {
             require_directory(&path)?;
         }
         let git = std::env::var_os("ROOTYARD_VIEW_GIT").unwrap_or_else(|| "git".into());
-        let store = Self {
-            root,
-            _lock: lock,
-            git,
-        };
+        let store = Self { root, _lock: lock, git };
         let version_text = store.git_text(&store.root, &["--version"])?;
-        let version = version_text
-            .split_whitespace()
-            .nth(2)
-            .context("invalid Git version")?;
-        let parts: Vec<u32> = version
-            .split('.')
-            .take(2)
-            .map(str::parse)
-            .collect::<std::result::Result<_, _>>()?;
-        ensure!(
-            parts.len() == 2 && (parts[0], parts[1]) >= (2, 39),
-            "Git 2.39 or newer is required"
-        );
+        let version = version_text.split_whitespace().nth(2).context("invalid Git version")?;
+        let parts: Vec<u32> = version.split('.').take(2).map(str::parse).collect::<std::result::Result<_, _>>()?;
+        ensure!(parts.len() == 2 && (parts[0], parts[1]) >= (2, 39), "Git 2.39 or newer is required");
         Ok(store)
     }
 
@@ -269,11 +240,7 @@ impl Store {
 
     pub(crate) fn git(&self, repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
         let result = self.git_output_with_env(repo, args, &[], None)?;
-        ensure!(
-            result.status.success(),
-            "native Git command {} failed",
-            args.first().unwrap_or(&"git")
-        );
+        ensure!(result.status.success(), "native Git command {} failed", args.first().unwrap_or(&"git"));
         Ok(result.stdout)
     }
 
@@ -285,11 +252,7 @@ impl Store {
         stdin_bytes: &[u8],
     ) -> Result<Vec<u8>> {
         let result = self.git_output_with_env(repo, args, extra_env, Some(stdin_bytes))?;
-        ensure!(
-            result.status.success(),
-            "native Git command {} failed",
-            args.first().unwrap_or(&"git")
-        );
+        ensure!(result.status.success(), "native Git command {} failed", args.first().unwrap_or(&"git"));
         Ok(result.stdout)
     }
 
@@ -304,10 +267,7 @@ impl Store {
     }
 
     pub(crate) fn ensure_not_overlapping(&self, source: &Path) -> Result<()> {
-        ensure!(
-            !source.starts_with(&self.root) && !self.root.starts_with(source),
-            "source and store must not overlap"
-        );
+        ensure!(!source.starts_with(&self.root) && !self.root.starts_with(source), "source and store must not overlap");
         Ok(())
     }
 
@@ -339,9 +299,7 @@ pub(crate) fn valid_name(name: &str) -> bool {
     !bytes.is_empty()
         && bytes.len() <= 63
         && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-')
+        && bytes.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-')
 }
 
 pub(crate) fn new_id() -> String {
@@ -353,19 +311,14 @@ pub fn text_arg(value: &OsString) -> Result<String> {
 }
 
 pub(crate) fn valid_id(id: &str) -> Result<()> {
-    ensure!(
-        Uuid::parse_str(id)?.to_string() == id,
-        "invalid canonical id"
-    );
+    ensure!(Uuid::parse_str(id)?.to_string() == id, "invalid canonical id");
     Ok(())
 }
 
 pub(crate) fn valid_oid(oid: &str) -> Result<()> {
     ensure!(
         oid.len() == 40
-            && oid
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && oid.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             && oid.bytes().any(|b| b != b'0'),
         "OID must be a non-zero 40-character lowercase SHA-1 hex string"
     );
@@ -379,40 +332,25 @@ pub(crate) fn private_dir(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn require_directory(path: &Path) -> Result<()> {
-    ensure!(
-        fs::symlink_metadata(path)?.file_type().is_dir(),
-        "expected a real directory, not a symlink"
-    );
+    ensure!(fs::symlink_metadata(path)?.file_type().is_dir(), "expected a real directory, not a symlink");
     Ok(())
 }
 
 pub(crate) fn no_symlink_components(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
-        ensure!(
-            !matches!(component, Component::ParentDir),
-            "parent traversal is unsupported"
-        );
+        ensure!(!matches!(component, Component::ParentDir), "parent traversal is unsupported");
         current.push(component);
         if let Ok(meta) = fs::symlink_metadata(&current) {
-            ensure!(
-                !meta.file_type().is_symlink(),
-                "symlink directory component unsupported"
-            );
+            ensure!(!meta.file_type().is_symlink(), "symlink directory component unsupported");
         }
     }
     Ok(())
 }
 
 pub(crate) fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    ensure!(
-        file.metadata()?.is_file() && file.metadata()?.len() <= limit,
-        "invalid or oversized file"
-    );
+    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    ensure!(file.metadata()?.is_file() && file.metadata()?.len() <= limit, "invalid or oversized file");
     let mut bytes = Vec::new();
     (&mut file).take(limit + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= limit, "file exceeded limit");
@@ -420,12 +358,8 @@ pub(crate) fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut file =
+        OpenOptions::new().write(true).create_new(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -433,11 +367,7 @@ pub(crate) fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 
 pub(crate) fn write_atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path.parent().context("missing parent directory")?;
-    let tmp = parent.join(format!(
-        ".{}.tmp.{}",
-        path.file_name().unwrap().to_string_lossy(),
-        new_id()
-    ));
+    let tmp = parent.join(format!(".{}.tmp.{}", path.file_name().unwrap().to_string_lossy(), new_id()));
     let bytes = serde_json::to_vec_pretty(value)?;
     write_new(&tmp, &bytes, 0o600)?;
     fs::rename(&tmp, path)?;
@@ -461,25 +391,12 @@ pub(crate) fn publish(from: &Path, to: &Path) -> Result<()> {
     fs::rename(from, to)?;
     File::open(to.parent().unwrap())?
         .sync_all()
-        .with_context(|| {
-            format!(
-                "publication result uncertain; inspect {} before retrying",
-                to.display()
-            )
-        })?;
+        .with_context(|| format!("publication result uncertain; inspect {} before retrying", to.display()))?;
     Ok(())
 }
 
 pub(crate) fn failpoint(point: &str) {
-    if std::env::var("ROOTYARD_VIEW_TEST_FAILPOINT")
-        .ok()
-        .as_deref()
-        == Some(point)
-    {
-        std::process::exit(if point == "before_commit_point" {
-            86
-        } else {
-            87
-        });
+    if std::env::var("ROOTYARD_VIEW_TEST_FAILPOINT").ok().as_deref() == Some(point) {
+        std::process::exit(if point == "before_commit_point" { 86 } else { 87 });
     }
 }

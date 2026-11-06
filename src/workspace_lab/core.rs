@@ -72,11 +72,8 @@ impl Drop for Staging {
 pub fn check_source_store_overlap(store_arg: &OsStr, source_arg: &OsStr) -> Result<()> {
     let source = fs::canonicalize(source_arg).context("source directory unavailable")?;
     let requested = Path::new(store_arg);
-    let absolute = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(requested)
-    };
+    let absolute =
+        if requested.is_absolute() { requested.to_path_buf() } else { std::env::current_dir()?.join(requested) };
     no_symlink_components(&absolute)?;
     let prospective = if absolute.exists() {
         fs::canonicalize(&absolute)?
@@ -93,21 +90,14 @@ pub fn check_source_store_overlap(store_arg: &OsStr, source_arg: &OsStr) -> Resu
 
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
-        let absolute = if root.is_absolute() {
-            root.to_path_buf()
-        } else {
-            std::env::current_dir()?.join(root)
-        };
+        let absolute = if root.is_absolute() { root.to_path_buf() } else { std::env::current_dir()?.join(root) };
         no_symlink_components(&absolute)?;
         if !absolute.exists() {
             private_dir(&absolute)?;
         }
         require_directory(&absolute)?;
         let root = fs::canonicalize(absolute)?;
-        ensure!(
-            fs::metadata(&root)?.permissions().mode() & 0o077 == 0,
-            "store must be private (mode 0700)"
-        );
+        ensure!(fs::metadata(&root)?.permissions().mode() & 0o077 == 0, "store must be private (mode 0700)");
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -116,16 +106,8 @@ impl Store {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(root.join(".lock"))?;
-        lock.try_lock_exclusive()
-            .context("workspace store busy; retry after other lab operation")?;
-        for name in [
-            "workspaces",
-            "checkpoints",
-            "changesets",
-            "views",
-            "namespaces",
-            "staging",
-        ] {
+        lock.try_lock_exclusive().context("workspace store busy; retry after other lab operation")?;
+        for name in ["workspaces", "checkpoints", "changesets", "views", "namespaces", "staging"] {
             let path = root.join(name);
             if !path.exists() {
                 private_dir(&path)?;
@@ -133,36 +115,15 @@ impl Store {
             require_directory(&path)?;
         }
         let git = std::env::var_os("ROOTYARD_WORKSPACE_GIT").unwrap_or_else(|| "git".into());
-        let mut store = Self {
-            root,
-            _lock: lock,
-            git,
-            git_version: String::new(),
-        };
+        let mut store = Self { root, _lock: lock, git, git_version: String::new() };
         store.git_version = store.git_text(&store.root, &["--version"])?;
-        let version = store
-            .git_version
-            .split_whitespace()
-            .nth(2)
-            .context("invalid Git version")?;
-        let parts: Vec<u32> = version
-            .split('.')
-            .take(2)
-            .map(str::parse)
-            .collect::<std::result::Result<_, _>>()?;
-        ensure!(
-            parts.len() == 2 && (parts[0], parts[1]) >= (2, 43),
-            "Git 2.43 or newer is required"
-        );
+        let version = store.git_version.split_whitespace().nth(2).context("invalid Git version")?;
+        let parts: Vec<u32> = version.split('.').take(2).map(str::parse).collect::<std::result::Result<_, _>>()?;
+        ensure!(parts.len() == 2 && (parts[0], parts[1]) >= (2, 43), "Git 2.43 or newer is required");
         Ok(store)
     }
 
-    pub fn cmd_init(
-        &self,
-        source_arg: &OsStr,
-        agent_arg: &OsStr,
-        base_arg: &OsStr,
-    ) -> Result<serde_json::Value> {
+    pub fn cmd_init(&self, source_arg: &OsStr, agent_arg: &OsStr, base_arg: &OsStr) -> Result<serde_json::Value> {
         let source = fs::canonicalize(source_arg).context("source directory unavailable")?;
         ensure!(
             !source.starts_with(&self.root) && !self.root.starts_with(&source),
@@ -174,10 +135,7 @@ impl Store {
         valid_oid(&base_oid)?;
         self.validate_repo(&source, &base_oid)?;
         let head = self.git_text(&source, &["rev-parse", "--verify", "HEAD"])?;
-        ensure!(
-            head == base_oid,
-            "initial HEAD must equal the fixed full base OID"
-        );
+        ensure!(head == base_oid, "initial HEAD must equal the fixed full base OID");
         let workspace = Workspace {
             schema: SCHEMA,
             workspace_id: new_id(),
@@ -210,22 +168,12 @@ impl Store {
             entries,
         };
         let bytes = serde_json::to_vec_pretty(&manifest)?;
-        ensure!(
-            bytes.len() as u64 <= MAX_MANIFEST,
-            "manifest limit exceeded"
-        );
+        ensure!(bytes.len() as u64 <= MAX_MANIFEST, "manifest limit exceeded");
         write_new(&staging.0.join("manifest.json"), &bytes, 0o600)?;
-        write_new(
-            &staging.0.join("manifest.sha256"),
-            hex::encode(Sha256::digest(&bytes)).as_bytes(),
-            0o600,
-        )?;
+        write_new(&staging.0.join("manifest.sha256"), hex::encode(Sha256::digest(&bytes)).as_bytes(), 0o600)?;
         sync_tree(&staging.0)?;
         failpoint("before_publish");
-        publish(
-            &staging.0,
-            &self.root.join("checkpoints").join(&checkpoint_id),
-        )?;
+        publish(&staging.0, &self.root.join("checkpoints").join(&checkpoint_id))?;
         failpoint("after_publish");
         Ok(serde_json::json!({
             "checkpoint_id": checkpoint_id,
@@ -238,11 +186,7 @@ impl Store {
         }))
     }
 
-    pub fn cmd_restore(
-        &self,
-        checkpoint_arg: &OsStr,
-        agent_arg: &OsStr,
-    ) -> Result<serde_json::Value> {
+    pub fn cmd_restore(&self, checkpoint_arg: &OsStr, agent_arg: &OsStr) -> Result<serde_json::Value> {
         let id = text_arg(checkpoint_arg)?;
         valid_id(&id)?;
         let agent_id = text_arg(agent_arg)?;
@@ -274,31 +218,22 @@ impl Store {
             digest_trimmed == hex::encode(Sha256::digest(&bytes)).as_bytes(),
             "checkpoint manifest checksum mismatch"
         );
-        let manifest: Manifest =
-            serde_json::from_slice(&bytes).context("invalid checkpoint manifest")?;
+        let manifest: Manifest = serde_json::from_slice(&bytes).context("invalid checkpoint manifest")?;
         ensure!(
-            manifest.schema == SCHEMA
-                && manifest.checkpoint_id == id
-                && manifest.state == "local_complete",
+            manifest.schema == SCHEMA && manifest.checkpoint_id == id && manifest.state == "local_complete",
             "unsupported or incomplete checkpoint"
         );
         self.validate_workspace(&manifest.workspace)?;
         validate_entries(&manifest.entries)?;
         let source = checkpoint.join("repo");
-        ensure!(
-            inventory(&source)? == manifest.entries,
-            "checkpoint contents missing, unexpected or corrupt"
-        );
+        ensure!(inventory(&source)? == manifest.entries, "checkpoint contents missing, unexpected or corrupt");
         self.validate_repo(&source, &manifest.workspace.base_oid)?;
         Ok((checkpoint, manifest))
     }
 
     pub fn replace_dir_atomic(&self, staging_dir: &Path, target_dir: &Path) -> Result<()> {
         sync_tree(staging_dir)?;
-        let backup = self
-            .root
-            .join("staging")
-            .join(format!("backup-{}", new_id()));
+        let backup = self.root.join("staging").join(format!("backup-{}", new_id()));
         fs::rename(target_dir, &backup)?;
         if let Err(err) = fs::rename(staging_dir, target_dir) {
             let _ = fs::rename(&backup, target_dir);
@@ -381,10 +316,7 @@ impl Store {
     }
 
     pub fn validate_workspace(&self, workspace: &Workspace) -> Result<()> {
-        ensure!(
-            workspace.schema == SCHEMA && workspace.namespace_revision == 1,
-            "unsupported workspace schema"
-        );
+        ensure!(workspace.schema == SCHEMA && workspace.namespace_revision == 1, "unsupported workspace schema");
         valid_id(&workspace.workspace_id)?;
         valid_agent(&workspace.agent_id)?;
         valid_oid(&workspace.base_oid)?;
@@ -401,10 +333,8 @@ impl Store {
     pub fn read_workspace(&self, id: &str) -> Result<Workspace> {
         let directory = self.root.join("workspaces").join(id);
         require_directory(&directory)?;
-        let workspace: Workspace = serde_json::from_slice(&read_regular(
-            &directory.join("workspace.json"),
-            MAX_MANIFEST,
-        )?)?;
+        let workspace: Workspace =
+            serde_json::from_slice(&read_regular(&directory.join("workspace.json"), MAX_MANIFEST)?)?;
         self.validate_workspace(&workspace)?;
         ensure!(workspace.workspace_id == id, "workspace identity mismatch");
         Ok(workspace)
@@ -425,37 +355,21 @@ impl Store {
             copy_all(source, &destination)?;
         }
         if let Some(entries) = expected {
-            ensure!(
-                inventory(&destination)? == entries,
-                "checkpoint changed while restoring"
-            );
+            ensure!(inventory(&destination)? == entries, "checkpoint changed while restoring");
         }
         self.validate_repo(&destination, &workspace.base_oid)?;
-        write_new(
-            &staging.0.join("workspace.json"),
-            &serde_json::to_vec_pretty(&workspace)?,
-            0o600,
-        )?;
+        write_new(&staging.0.join("workspace.json"), &serde_json::to_vec_pretty(&workspace)?, 0o600)?;
         sync_tree(&staging.0)?;
-        publish(
-            &staging.0,
-            &self.root.join("workspaces").join(&workspace.workspace_id),
-        )?;
+        publish(&staging.0, &self.root.join("workspaces").join(&workspace.workspace_id))?;
         Ok(self.result(&workspace))
     }
 
     pub fn validate_repo(&self, repo: &Path, base_oid: &str) -> Result<()> {
         require_directory(repo)?;
-        require_directory(&repo.join(".git"))
-            .context("only independent native .git directories are supported")?;
-        for item in [
-            "commondir",
-            "gitdir",
-            "objects/info/alternates",
-            "objects/info/http-alternates",
-            "shallow",
-            "info/grafts",
-        ] {
+        require_directory(&repo.join(".git")).context("only independent native .git directories are supported")?;
+        for item in
+            ["commondir", "gitdir", "objects/info/alternates", "objects/info/http-alternates", "shallow", "info/grafts"]
+        {
             ensure!(
                 !repo.join(".git").join(item).try_exists()?,
                 "external Git storage, shallow repositories and grafts are unsupported"
@@ -463,14 +377,8 @@ impl Store {
         }
         let git_files = walk(&repo.join(".git"))?;
         for (path, metadata) in &git_files {
-            ensure!(
-                !metadata.file_type().is_symlink(),
-                "symlinks inside .git are unsupported"
-            );
-            ensure!(
-                metadata.is_file(),
-                "special files inside .git are unsupported"
-            );
+            ensure!(!metadata.file_type().is_symlink(), "symlinks inside .git are unsupported");
+            ensure!(metadata.is_file(), "special files inside .git are unsupported");
             ensure!(
                 !path.as_os_str().as_bytes().ends_with(b".lock"),
                 "checkpoint busy: Git lock exists; do not delete it blindly"
@@ -484,15 +392,9 @@ impl Store {
             }
         }
         // Parse local config without include expansion before other Git commands.
-        let config = self.git(
-            repo,
-            &["config", "--local", "--no-includes", "--null", "--list"],
-        )?;
+        let config = self.git(repo, &["config", "--local", "--no-includes", "--null", "--list"])?;
         for record in config.split(|b| *b == 0).filter(|x| !x.is_empty()) {
-            let split = record
-                .iter()
-                .position(|b| *b == b'\n')
-                .context("invalid Git config")?;
+            let split = record.iter().position(|b| *b == b'\n').context("invalid Git config")?;
             let key = std::str::from_utf8(&record[..split])?;
             let value = std::str::from_utf8(&record[split + 1..])?;
             let allowed = match key {
@@ -513,17 +415,13 @@ impl Store {
             self.git_text(repo, &["rev-parse", "--show-object-format"])? == "sha1",
             "only SHA-1 repositories are currently qualified"
         );
-        ensure!(
-            self.git_text(repo, &["rev-parse", "--is-bare-repository"])? == "false",
-            "bare repository unsupported"
-        );
+        ensure!(self.git_text(repo, &["rev-parse", "--is-bare-repository"])? == "false", "bare repository unsupported");
         ensure!(
             self.git_text(repo, &["cat-file", "-t", base_oid])? == "commit",
             "base OID must identify a complete local commit"
         );
         ensure!(
-            self.git_text(repo, &["rev-parse", "--verify", "HEAD^{commit}"])
-                .is_ok(),
+            self.git_text(repo, &["rev-parse", "--verify", "HEAD^{commit}"]).is_ok(),
             "unborn HEAD unsupported by this slice"
         );
         let index = repo.join(".git/index");
@@ -531,11 +429,7 @@ impl Store {
             validate_index(&read_regular(&index, MAX_MANIFEST)?)?;
         }
         ensure!(
-            self.git(
-                repo,
-                &["for-each-ref", "--format=%(refname)", "refs/replace/"]
-            )?
-            .is_empty(),
+            self.git(repo, &["for-each-ref", "--format=%(refname)", "refs/replace/"])?.is_empty(),
             "replacement refs are unsupported"
         );
         {
@@ -586,43 +480,25 @@ impl Store {
 }
 
 pub(crate) fn validate_index(bytes: &[u8]) -> Result<()> {
-    ensure!(
-        bytes.len() >= 32 && &bytes[..4] == b"DIRC",
-        "invalid native Git index"
-    );
+    ensure!(bytes.len() >= 32 && &bytes[..4] == b"DIRC", "invalid native Git index");
     let version = u32::from_be_bytes(bytes[4..8].try_into()?);
-    ensure!(
-        matches!(version, 2 | 3),
-        "only index v2/v3 supported; unknown extensions are not silently discarded"
-    );
+    ensure!(matches!(version, 2 | 3), "only index v2/v3 supported; unknown extensions are not silently discarded");
     let count = u32::from_be_bytes(bytes[8..12].try_into()?) as usize;
     ensure!(count <= MAX_ENTRIES, "index entry limit exceeded");
     let end = bytes.len() - 20;
     let mut cursor: usize = 12;
     for _ in 0..count {
         let start = cursor;
-        ensure!(
-            cursor.checked_add(62).is_some_and(|n| n <= end),
-            "truncated index entry"
-        );
+        ensure!(cursor.checked_add(62).is_some_and(|n| n <= end), "truncated index entry");
         let flags = u16::from_be_bytes(bytes[cursor + 60..cursor + 62].try_into()?);
         cursor += 62;
         if flags & 0x4000 != 0 {
-            ensure!(
-                version == 3 && cursor + 2 <= end,
-                "invalid extended index flags"
-            );
+            ensure!(version == 3 && cursor + 2 <= end, "invalid extended index flags");
             let extended = u16::from_be_bytes(bytes[cursor..cursor + 2].try_into()?);
-            ensure!(
-                extended & !0x2000 == 0,
-                "skip-worktree or unknown index flags unsupported"
-            );
+            ensure!(extended & !0x2000 == 0, "skip-worktree or unknown index flags unsupported");
             cursor += 2;
         }
-        let nul = bytes[cursor..end]
-            .iter()
-            .position(|b| *b == 0)
-            .context("unterminated index path")?;
+        let nul = bytes[cursor..end].iter().position(|b| *b == 0).context("unterminated index path")?;
         relative_path(&bytes[cursor..cursor + nul])?;
         cursor += nul + 1;
         cursor = start + (cursor - start).div_ceil(8) * 8;
@@ -636,9 +512,7 @@ pub(crate) fn validate_index(bytes: &[u8]) -> Result<()> {
             "unsupported index extension (split/sparse/fsmonitor/untracked cache or unknown)"
         );
         let size = u32::from_be_bytes(bytes[cursor + 4..cursor + 8].try_into()?) as usize;
-        cursor = cursor
-            .checked_add(8 + size)
-            .context("index extension overflow")?;
+        cursor = cursor.checked_add(8 + size).context("index extension overflow")?;
         ensure!(cursor <= end, "truncated index extension");
     }
     Ok(())
@@ -651,29 +525,19 @@ pub(crate) fn text_arg(value: &OsStr) -> Result<String> {
     Ok(value.to_str().context("argument must be UTF-8")?.to_owned())
 }
 pub(crate) fn valid_id(id: &str) -> Result<()> {
-    ensure!(
-        Uuid::parse_str(id)?.to_string() == id,
-        "invalid canonical id"
-    );
+    ensure!(Uuid::parse_str(id)?.to_string() == id, "invalid canonical id");
     Ok(())
 }
 pub(crate) fn valid_agent(id: &str) -> Result<()> {
     ensure!(
-        !id.is_empty()
-            && id.len() <= 63
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        !id.is_empty() && id.len() <= 63 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
         "invalid agent identity"
     );
     Ok(())
 }
 pub(crate) fn valid_oid(oid: &str) -> Result<()> {
     ensure!(
-        oid.len() == 40
-            && oid
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         "base OID must be a full lowercase SHA-1 commit OID"
     );
     Ok(())
@@ -684,45 +548,25 @@ pub(crate) fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 pub(crate) fn require_directory(path: &Path) -> Result<()> {
-    ensure!(
-        fs::symlink_metadata(path)?.file_type().is_dir(),
-        "expected a real directory, not a symlink"
-    );
+    ensure!(fs::symlink_metadata(path)?.file_type().is_dir(), "expected a real directory, not a symlink");
     Ok(())
 }
 pub(crate) fn no_symlink_components(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
-        ensure!(
-            !matches!(component, Component::ParentDir),
-            "parent traversal is unsupported"
-        );
+        ensure!(!matches!(component, Component::ParentDir), "parent traversal is unsupported");
         current.push(component);
         if let Ok(meta) = fs::symlink_metadata(&current) {
-            ensure!(
-                !meta.file_type().is_symlink(),
-                "symlink directory component unsupported"
-            );
+            ensure!(!meta.file_type().is_symlink(), "symlink directory component unsupported");
         }
     }
     Ok(())
 }
 pub(crate) fn relative_path(bytes: &[u8]) -> Result<PathBuf> {
-    ensure!(
-        !bytes.is_empty() && !bytes.contains(&0) && !bytes.ends_with(b"/"),
-        "invalid path"
-    );
-    ensure!(
-        !bytes
-            .split(|b| *b == b'/')
-            .any(|x| x.is_empty() || x == b"." || x == b".."),
-        "unsafe path component"
-    );
+    ensure!(!bytes.is_empty() && !bytes.contains(&0) && !bytes.ends_with(b"/"), "invalid path");
+    ensure!(!bytes.split(|b| *b == b'/').any(|x| x.is_empty() || x == b"." || x == b".."), "unsafe path component");
     let path = PathBuf::from(OsString::from_vec(bytes.to_vec()));
-    ensure!(
-        path.components().all(|c| matches!(c, Component::Normal(_))),
-        "unsafe relative path"
-    );
+    ensure!(path.components().all(|c| matches!(c, Component::Normal(_))), "unsafe relative path");
     Ok(path)
 }
 pub(crate) fn encode_path(path: &Path) -> String {
@@ -735,20 +579,9 @@ pub(crate) fn display_path(path: &Path) -> String {
     String::from_utf8_lossy(path.as_os_str().as_bytes()).into_owned()
 }
 pub(crate) fn validate_symlink(root: &Path, path: &Path, target: &Path) -> Result<()> {
-    ensure!(
-        !target.as_os_str().is_empty() && !target.is_absolute(),
-        "absolute or empty symlink target unsupported"
-    );
-    let mut resolved: Vec<OsString> = path
-        .parent()
-        .unwrap()
-        .components()
-        .map(|c| c.as_os_str().to_owned())
-        .collect();
-    let mut pending: VecDeque<OsString> = target
-        .components()
-        .map(|c| c.as_os_str().to_owned())
-        .collect();
+    ensure!(!target.as_os_str().is_empty() && !target.is_absolute(), "absolute or empty symlink target unsupported");
+    let mut resolved: Vec<OsString> = path.parent().unwrap().components().map(|c| c.as_os_str().to_owned()).collect();
+    let mut pending: VecDeque<OsString> = target.components().map(|c| c.as_os_str().to_owned()).collect();
     let mut links = 0;
     while let Some(component) = pending.pop_front() {
         if component == "." {
@@ -759,10 +592,7 @@ pub(crate) fn validate_symlink(root: &Path, path: &Path, target: &Path) -> Resul
             continue;
         }
         resolved.push(component);
-        ensure!(
-            resolved.first().is_none_or(|x| x != ".git"),
-            "symlink into Git metadata unsupported"
-        );
+        ensure!(resolved.first().is_none_or(|x| x != ".git"), "symlink into Git metadata unsupported");
         let location: PathBuf = resolved.iter().collect();
         match fs::symlink_metadata(root.join(location)) {
             Ok(meta) if meta.file_type().is_symlink() => {
@@ -772,10 +602,7 @@ pub(crate) fn validate_symlink(root: &Path, path: &Path, target: &Path) -> Resul
                 let link = fs::read_link(root.join(location))?;
                 ensure!(!link.is_absolute(), "symlink chain escapes repository");
                 resolved.pop();
-                let components: Vec<_> = link
-                    .components()
-                    .map(|c| c.as_os_str().to_owned())
-                    .collect();
+                let components: Vec<_> = link.components().map(|c| c.as_os_str().to_owned()).collect();
                 for part in components.into_iter().rev() {
                     pending.push_front(part);
                 }
@@ -790,11 +617,7 @@ pub(crate) fn validate_symlink(root: &Path, path: &Path, target: &Path) -> Resul
 
 pub(crate) fn walk(root: &Path) -> Result<BTreeMap<PathBuf, fs::Metadata>> {
     require_directory(root)?;
-    fn visit(
-        root: &Path,
-        relative: &Path,
-        output: &mut BTreeMap<PathBuf, fs::Metadata>,
-    ) -> Result<()> {
+    fn visit(root: &Path, relative: &Path, output: &mut BTreeMap<PathBuf, fs::Metadata>) -> Result<()> {
         for child in fs::read_dir(root.join(relative))? {
             let child = child?;
             let path = relative.join(child.file_name());
@@ -822,19 +645,11 @@ pub(crate) fn copy_all(source: &Path, destination: &Path) -> Result<()> {
     copy_selected(source, destination, &walk(source)?.into_keys().collect())
 }
 
-pub(crate) fn copy_single_entry(
-    source: &Path,
-    destination: &Path,
-    relative: &Path,
-    total: &mut u64,
-) -> Result<()> {
+pub(crate) fn copy_single_entry(source: &Path, destination: &Path, relative: &Path, total: &mut u64) -> Result<()> {
     let from = source.join(relative);
     let to = destination.join(relative);
     let metadata = fs::symlink_metadata(&from)?;
-    ensure!(
-        metadata.permissions().mode() & 0o7000 == 0,
-        "special permission bits unsupported"
-    );
+    ensure!(metadata.permissions().mode() & 0o7000 == 0, "special permission bits unsupported");
     let mut directory = destination.to_path_buf();
     for component in relative.parent().unwrap().components() {
         directory.push(component);
@@ -847,32 +662,17 @@ pub(crate) fn copy_single_entry(
         fs::remove_file(&to)?;
     }
     if metadata.file_type().is_symlink() {
-        ensure!(
-            !relative.starts_with(".git"),
-            "symlink Git metadata unsupported"
-        );
+        ensure!(!relative.starts_with(".git"), "symlink Git metadata unsupported");
         let target = fs::read_link(&from)?;
         validate_symlink(source, relative, &target)?;
         symlink(target, &to)?;
     } else {
         ensure!(metadata.is_file(), "special file cannot be copied");
-        *total = total
-            .checked_add(metadata.len())
-            .context("copy size overflow")?;
+        *total = total.checked_add(metadata.len()).context("copy size overflow")?;
         ensure!(*total <= MAX_BYTES, "workspace copy limit is 1 GiB");
-        let mut input = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&from)?;
-        ensure!(
-            input.metadata()?.is_file(),
-            "copy input is not a regular file"
-        );
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&to)?;
+        let mut input = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&from)?;
+        ensure!(input.metadata()?.is_file(), "copy input is not a regular file");
+        let mut output = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&to)?;
         let mut buffer = [0_u8; 64 * 1024];
         let mut copied = 0_u64;
         loop {
@@ -881,29 +681,17 @@ pub(crate) fn copy_single_entry(
                 break;
             }
             copied += count as u64;
-            ensure!(
-                copied <= metadata.len(),
-                "source grew during capture; quiescence required"
-            );
+            ensure!(copied <= metadata.len(), "source grew during capture; quiescence required");
             output.write_all(&buffer[..count])?;
         }
-        ensure!(
-            copied == metadata.len(),
-            "source changed during capture; quiescence required"
-        );
-        output.set_permissions(fs::Permissions::from_mode(
-            metadata.permissions().mode() & 0o777,
-        ))?;
+        ensure!(copied == metadata.len(), "source changed during capture; quiescence required");
+        output.set_permissions(fs::Permissions::from_mode(metadata.permissions().mode() & 0o777))?;
         output.sync_all()?;
     }
     Ok(())
 }
 
-pub(crate) fn copy_selected(
-    source: &Path,
-    destination: &Path,
-    selected: &BTreeSet<PathBuf>,
-) -> Result<()> {
+pub(crate) fn copy_selected(source: &Path, destination: &Path, selected: &BTreeSet<PathBuf>) -> Result<()> {
     private_dir(destination)?;
     let mut total = 0_u64;
     for relative in selected {
@@ -929,20 +717,13 @@ pub(crate) fn entry_for_path(root: &Path, path: &Path) -> Result<Option<Entry>> 
         return Ok(None);
     }
     let (kind, bytes, mode) = if meta.file_type().is_symlink() {
-        ensure!(
-            !path.starts_with(".git"),
-            "symlink Git metadata unsupported"
-        );
+        ensure!(!path.starts_with(".git"), "symlink Git metadata unsupported");
         let target = fs::read_link(&full)?;
         validate_symlink(root, path, &target)?;
         ("symlink", target.into_os_string().into_vec(), 0o777)
     } else {
         ensure!(meta.is_file(), "special checkpoint file");
-        (
-            "file",
-            read_regular(&full, MAX_BYTES)?,
-            meta.permissions().mode() & 0o777,
-        )
+        ("file", read_regular(&full, MAX_BYTES)?, meta.permissions().mode() & 0o777)
     };
     Ok(Some(Entry {
         path_base64: encode_path(path),
@@ -958,10 +739,7 @@ pub(crate) fn inventory(root: &Path) -> Result<Vec<Entry>> {
     let mut total = 0_u64;
     for (path, meta) in walk(root)? {
         let (kind, bytes, mode) = if meta.file_type().is_symlink() {
-            ensure!(
-                !path.starts_with(".git"),
-                "symlink Git metadata unsupported"
-            );
+            ensure!(!path.starts_with(".git"), "symlink Git metadata unsupported");
             let target = fs::read_link(root.join(&path))?;
             validate_symlink(root, &path, &target)?;
             ("symlink", target.into_os_string().into_vec(), 0o777)
@@ -969,11 +747,7 @@ pub(crate) fn inventory(root: &Path) -> Result<Vec<Entry>> {
             ensure!(meta.is_file(), "special checkpoint file");
             total = total.checked_add(meta.len()).context("size overflow")?;
             ensure!(total <= MAX_BYTES, "checkpoint size limit exceeded");
-            (
-                "file",
-                read_regular(&root.join(&path), MAX_BYTES)?,
-                meta.permissions().mode() & 0o777,
-            )
+            ("file", read_regular(&root.join(&path), MAX_BYTES)?, meta.permissions().mode() & 0o777)
         };
         entries.push(Entry {
             path_base64: STANDARD.encode(path.as_os_str().as_bytes()),
@@ -987,10 +761,7 @@ pub(crate) fn inventory(root: &Path) -> Result<Vec<Entry>> {
 }
 
 pub(crate) fn validate_entries(entries: &[Entry]) -> Result<()> {
-    ensure!(
-        entries.len() <= MAX_ENTRIES,
-        "manifest entry limit exceeded"
-    );
+    ensure!(entries.len() <= MAX_ENTRIES, "manifest entry limit exceeded");
     let mut paths = BTreeSet::new();
     for entry in entries {
         let path = relative_path(&STANDARD.decode(&entry.path_base64)?)?;
@@ -1007,14 +778,8 @@ pub(crate) fn validate_entries(entries: &[Entry]) -> Result<()> {
 }
 
 pub(crate) fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    ensure!(
-        file.metadata()?.is_file() && file.metadata()?.len() <= limit,
-        "invalid or oversized file"
-    );
+    let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    ensure!(file.metadata()?.is_file() && file.metadata()?.len() <= limit, "invalid or oversized file");
     let mut bytes = Vec::new();
     (&mut file).take(limit + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= limit, "file exceeded limit");
@@ -1022,11 +787,7 @@ pub(crate) fn read_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).mode(mode).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -1048,21 +809,12 @@ pub(crate) fn publish(from: &Path, to: &Path) -> Result<()> {
     fs::rename(from, to)?;
     File::open(to.parent().unwrap())?
         .sync_all()
-        .with_context(|| {
-            format!(
-                "publication result uncertain; inspect {} before retrying",
-                to.display()
-            )
-        })?;
+        .with_context(|| format!("publication result uncertain; inspect {} before retrying", to.display()))?;
     Ok(())
 }
 
 pub(crate) fn failpoint(point: &str) {
-    if std::env::var("ROOTYARD_WORKSPACE_TEST_FAILPOINT")
-        .ok()
-        .as_deref()
-        == Some(point)
-    {
+    if std::env::var("ROOTYARD_WORKSPACE_TEST_FAILPOINT").ok().as_deref() == Some(point) {
         std::process::exit(if point == "before_publish" { 86 } else { 87 });
     }
 }

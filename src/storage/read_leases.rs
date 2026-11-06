@@ -14,9 +14,9 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const SHARED: &str = "SELECT pg_try_advisory_xact_lock_shared(hashtextextended('rootyard-data-v1:' || $1::uuid::text, 0))";
-const EXCLUSIVE: &str =
-    "SELECT pg_try_advisory_xact_lock(hashtextextended('rootyard-data-v1:' || $1::uuid::text, 0))";
+const SHARED: &str =
+    "SELECT pg_try_advisory_xact_lock_shared(hashtextextended('rootyard-data-v1:' || $1::uuid::text, 0))";
+const EXCLUSIVE: &str = "SELECT pg_try_advisory_xact_lock(hashtextextended('rootyard-data-v1:' || $1::uuid::text, 0))";
 
 pub struct Lease {
     active: watch::Receiver<Option<Instant>>,
@@ -47,10 +47,7 @@ impl Lease {
         if fresh && !self.task.is_finished() {
             Ok(())
         } else {
-            Err(Error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "storage read lease lost",
-            ))
+            Err(Error(StatusCode::SERVICE_UNAVAILABLE, "storage read lease lost"))
         }
     }
 
@@ -78,18 +75,10 @@ impl Drop for Lease {
 }
 
 fn unavailable() -> Error {
-    Error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "storage snapshot barrier unavailable",
-    )
+    Error(StatusCode::SERVICE_UNAVAILABLE, "storage snapshot barrier unavailable")
 }
 
-async fn acquire(
-    pool: &Pool,
-    repo_id: Uuid,
-    deadline: Instant,
-    write: bool,
-) -> Result<Lease, Error> {
+async fn acquire(pool: &Pool, repo_id: Uuid, deadline: Instant, write: bool) -> Result<Lease, Error> {
     // The application pool has 16 connections. Leave at least half for
     // authorization, publication, and maintenance queries while streams run.
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -108,25 +97,32 @@ async fn acquire(
         let result: anyhow::Result<()> = async {
             let mut client = pool.get().await?;
             let tx = client.transaction().await?;
-            tx.batch_execute("SET LOCAL idle_in_transaction_session_timeout='5s'; SET LOCAL statement_timeout='3s'").await?;
+            tx.batch_execute("SET LOCAL idle_in_transaction_session_timeout='5s'; SET LOCAL statement_timeout='3s'")
+                .await?;
             let sql = if write { EXCLUSIVE } else { SHARED };
             loop {
                 let granted: bool = tx.query_one(sql, &[&repo_id]).await?.get(0);
-                if granted { break; }
-                if Instant::now() >= deadline { anyhow::bail!("snapshot lease deadline"); }
+                if granted {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!("snapshot lease deadline");
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             active_send.send_replace(Some(Instant::now()));
-            if let Some(sender) = ready_send.take() { let _ = sender.send(Ok(())); }
+            if let Some(sender) = ready_send.take() {
+                let _ = sender.send(Ok(()));
+            }
             let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 heartbeat.tick().await;
-                tokio::time::timeout(Duration::from_millis(1500),
-                    tx.simple_query("SELECT 1")).await??;
+                tokio::time::timeout(Duration::from_millis(1500), tx.simple_query("SELECT 1")).await??;
                 active_send.send_replace(Some(Instant::now()));
             }
-        }.await;
+        }
+        .await;
         if result.is_err() {
             if let Some(sender) = ready_send.take() {
                 let _ = sender.send(Err(()));
@@ -136,11 +132,7 @@ async fn acquire(
     })));
     let outcome = tokio::time::timeout_at(deadline, ready_recv).await;
     match outcome {
-        Ok(Ok(Ok(()))) => Ok(Lease {
-            active,
-            task: pending.0.take().expect("pending lease task"),
-            _slot: slot,
-        }),
+        Ok(Ok(Ok(()))) => Ok(Lease { active, task: pending.0.take().expect("pending lease task"), _slot: slot }),
         _ => Err(unavailable()),
     }
 }
@@ -167,33 +159,15 @@ mod tests {
         let readers = crate::db::pool(&url).unwrap();
         let collector = crate::db::pool(&url).unwrap();
         let repo = Uuid::new_v4();
-        let read = shared(&readers, repo, Instant::now() + Duration::from_secs(3))
-            .await
-            .unwrap();
+        let read = shared(&readers, repo, Instant::now() + Duration::from_secs(3)).await.unwrap();
         assert!(read.ensure_active().is_ok());
-        assert!(
-            exclusive(
-                &collector,
-                repo,
-                Instant::now() + Duration::from_millis(200)
-            )
-            .await
-            .is_err()
-        );
+        assert!(exclusive(&collector, repo, Instant::now() + Duration::from_millis(200)).await.is_err());
         read.ensure_active().unwrap();
         drop(read);
-        let collect = exclusive(&collector, repo, Instant::now() + Duration::from_secs(3))
-            .await
-            .unwrap();
-        assert!(
-            shared(&readers, repo, Instant::now() + Duration::from_millis(200))
-                .await
-                .is_err()
-        );
+        let collect = exclusive(&collector, repo, Instant::now() + Duration::from_secs(3)).await.unwrap();
+        assert!(shared(&readers, repo, Instant::now() + Duration::from_millis(200)).await.is_err());
         drop(collect);
-        let resumed = shared(&readers, repo, Instant::now() + Duration::from_secs(3))
-            .await
-            .unwrap();
+        let resumed = shared(&readers, repo, Instant::now() + Duration::from_secs(3)).await.unwrap();
         resumed.ensure_active().unwrap();
     }
 
@@ -205,29 +179,21 @@ mod tests {
         let waiting_pool = crate::db::pool(&url).unwrap();
         let blocker_pool = crate::db::pool(&url).unwrap();
         let repo = Uuid::new_v4();
-        let blocker = exclusive(&blocker_pool, repo, Instant::now() + Duration::from_secs(3))
-            .await
-            .unwrap();
+        let blocker = exclusive(&blocker_pool, repo, Instant::now() + Duration::from_secs(3)).await.unwrap();
         let worker_pool = waiting_pool.clone();
-        let waiting = tokio::spawn(async move {
-            shared(&worker_pool, repo, Instant::now() + Duration::from_secs(10)).await
-        });
+        let waiting =
+            tokio::spawn(async move { shared(&worker_pool, repo, Instant::now() + Duration::from_secs(10)).await });
         for _ in 0..100 {
             if waiting_pool.status().size > 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            waiting_pool.status().size > 0,
-            "test waiter never reached PostgreSQL"
-        );
+        assert!(waiting_pool.status().size > 0, "test waiter never reached PostgreSQL");
         waiting.abort();
         assert!(waiting.await.is_err());
         drop(blocker);
-        let after = exclusive(&blocker_pool, repo, Instant::now() + Duration::from_secs(3))
-            .await
-            .unwrap();
+        let after = exclusive(&blocker_pool, repo, Instant::now() + Duration::from_secs(3)).await.unwrap();
         after.ensure_active().unwrap();
     }
 
@@ -265,13 +231,7 @@ mod tests {
             }
         });
         let pool = crate::db::pool(endpoint.as_str()).unwrap();
-        let lease = shared(
-            &pool,
-            Uuid::new_v4(),
-            Instant::now() + Duration::from_secs(3),
-        )
-        .await
-        .unwrap();
+        let lease = shared(&pool, Uuid::new_v4(), Instant::now() + Duration::from_secs(3)).await.unwrap();
         lease.ensure_active().unwrap();
         pause_send.send(true).unwrap();
         let result = tokio::time::timeout(
@@ -282,14 +242,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            result.is_err(),
-            "blackholed heartbeat left a native read running"
-        );
-        assert!(
-            lease.ensure_active().is_err(),
-            "blackholed lease remained active"
-        );
+        assert!(result.is_err(), "blackholed heartbeat left a native read running");
+        assert!(lease.ensure_active().is_err(), "blackholed lease remained active");
         drop(lease);
         proxy.abort();
     }

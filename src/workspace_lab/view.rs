@@ -1,7 +1,7 @@
 use super::core::{
-    Entry, MAX_BYTES, MAX_MANIFEST, SCHEMA, Store, copy_all, decode_path, display_path,
-    no_symlink_components, private_dir, publish, read_regular, require_directory, sync_tree,
-    text_arg, valid_id, validate_index, validate_symlink, walk,
+    Entry, MAX_BYTES, MAX_MANIFEST, SCHEMA, Store, copy_all, decode_path, display_path, no_symlink_components,
+    private_dir, publish, read_regular, require_directory, sync_tree, text_arg, valid_id, validate_index,
+    validate_symlink, walk,
 };
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -42,11 +42,8 @@ pub fn cmd_verify_readonly_view(
 
     let view_repo = if let Some(arg) = view_arg {
         let requested = Path::new(arg);
-        let absolute = if requested.is_absolute() {
-            requested.to_path_buf()
-        } else {
-            std::env::current_dir()?.join(requested)
-        };
+        let absolute =
+            if requested.is_absolute() { requested.to_path_buf() } else { std::env::current_dir()?.join(requested) };
         no_symlink_components(&absolute)?;
         let checkpoints_root = store.root.join("checkpoints");
         let workspaces_root = store.root.join("workspaces");
@@ -65,10 +62,7 @@ pub fn cmd_verify_readonly_view(
     };
 
     if !view_repo.exists() {
-        ensure!(
-            fs::symlink_metadata(&view_repo).is_err(),
-            "readonly view path cannot be a dangling symlink"
-        );
+        ensure!(fs::symlink_metadata(&view_repo).is_err(), "readonly view path cannot be a dangling symlink");
         if let Some(parent) = view_repo.parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent)?;
@@ -113,11 +107,7 @@ pub fn cmd_verify_readonly_view(
         let cp_meta = fs::symlink_metadata(checkpoint_repo.join(path))?;
 
         if meta.file_type().is_symlink() {
-            ensure!(
-                expected.kind == "symlink",
-                "file kind mismatch in readonly view for {}",
-                display_path(path)
-            );
+            ensure!(expected.kind == "symlink", "file kind mismatch in readonly view for {}", display_path(path));
             let target = fs::read_link(&full)?;
             validate_symlink(&view_repo, path, &target)?;
             let bytes = target.into_os_string().into_vec();
@@ -139,21 +129,9 @@ pub fn cmd_verify_readonly_view(
                 display_path(path)
             );
             let mode = meta.permissions().mode();
-            ensure!(
-                mode & 0o7000 == 0,
-                "special permission bits in readonly view: {}",
-                display_path(path)
-            );
-            ensure!(
-                mode & 0o222 == 0,
-                "writable file detected in readonly view: {}",
-                display_path(path)
-            );
-            ensure!(
-                mode & 0o444 != 0,
-                "unreadable file in readonly view: {}",
-                display_path(path)
-            );
+            ensure!(mode & 0o7000 == 0, "special permission bits in readonly view: {}", display_path(path));
+            ensure!(mode & 0o222 == 0, "writable file detected in readonly view: {}", display_path(path));
+            ensure!(mode & 0o444 != 0, "unreadable file in readonly view: {}", display_path(path));
             ensure!(
                 (mode & 0o111) == (expected.mode & 0o111),
                 "executable permission bit mismatch in readonly view: {}",

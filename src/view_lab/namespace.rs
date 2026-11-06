@@ -26,14 +26,8 @@ pub fn compute_provenance_signature(
     let opad: Vec<u8> = key.iter().map(|b| b ^ 0x5c).collect();
     let p_str = parents.join(",");
     let msg = format!("rootyard-view-sig-v1\0{vid}\0{strat}\0{ep}\0{src}\0{tree}\0{p_str}");
-    let inner = Sha256::new()
-        .chain_update(&ipad)
-        .chain_update(msg)
-        .finalize();
-    let mac = Sha256::new()
-        .chain_update(&opad)
-        .chain_update(inner)
-        .finalize();
+    let inner = Sha256::new().chain_update(&ipad).chain_update(msg).finalize();
+    let mac = Sha256::new().chain_update(&opad).chain_update(inner).finalize();
     format!("hmac-sha256:{PROVENANCE_KEY_ID}:{}", hex::encode(mac))
 }
 
@@ -75,10 +69,7 @@ impl Store {
 
     pub fn find_repo_by_name(&self, name: &str) -> Result<RepoMeta> {
         ensure!(valid_name(name), "invalid repository name");
-        self.list_repos()?
-            .into_iter()
-            .find(|r| r.name == name)
-            .with_context(|| format!("repository {name} not found"))
+        self.list_repos()?.into_iter().find(|r| r.name == name).with_context(|| format!("repository {name} not found"))
     }
 
     pub fn read_repo(&self, repo_id: &str) -> Result<RepoMeta> {
@@ -140,20 +131,14 @@ impl Store {
         ensure!(cur_oid == meta.head_oid, "repository HEAD diverged");
         let new_oid = self.git_text(source, &["rev-parse", "--verify", "HEAD^{commit}"])?;
         valid_oid(&new_oid)?;
-        ensure!(
-            new_oid != cur_oid,
-            "repository HEAD is already at target OID"
-        );
+        ensure!(new_oid != cur_oid, "repository HEAD is already at target OID");
 
         let src_str = source.to_str().context("source path must be UTF-8")?;
         let stg_ref = format!("refs/rootyard/advance/{}", new_id());
         let spec = format!("{new_oid}:{stg_ref}");
         self.git(&bare, &["fetch", "--no-tags", src_str, &spec])?;
         let anc = ["merge-base", "--is-ancestor", &cur_oid, &new_oid];
-        let is_anc = self
-            .git_output_with_env(&bare, &anc, &[], None)?
-            .status
-            .success();
+        let is_anc = self.git_output_with_env(&bare, &anc, &[], None)?.status.success();
         if !is_anc {
             let _ = self.git(&bare, &["update-ref", "-d", &stg_ref]);
             bail!("non-fast-forward advance rejected");
@@ -179,10 +164,7 @@ impl Store {
 
     pub fn create_namespace(&self, namespace: &str, specs: &[String]) -> Result<serde_json::Value> {
         ensure!(valid_name(namespace), "invalid namespace name");
-        ensure!(
-            !specs.is_empty(),
-            "at least one mount specification is required"
-        );
+        ensure!(!specs.is_empty(), "at least one mount specification is required");
 
         let mut parsed_mounts = Vec::new();
         let mut seen_repos = BTreeSet::new();
@@ -255,10 +237,7 @@ impl Store {
         let bytes = read_regular(&dir.join("manifest.json"), MAX_JSON)?;
         let digest = read_regular(&dir.join("manifest.sha256"), 64)?;
         let expected = hex::encode(Sha256::digest(&bytes));
-        ensure!(
-            digest == expected.as_bytes(),
-            "namespace revision checksum mismatch"
-        );
+        ensure!(digest == expected.as_bytes(), "namespace revision checksum mismatch");
         let rev: NamespaceRevision = serde_json::from_slice(&bytes)?;
         let valid = rev.schema == SCHEMA && rev.revision_id == revision_id;
         ensure!(valid, "invalid namespace revision manifest");
@@ -270,17 +249,11 @@ impl Store {
         let raw = self.git(bare, &["cat-file", "commit", c])?;
         let text = String::from_utf8_lossy(&raw);
         let hdrs = text.split("\n\n").next().unwrap_or("");
-        let signed = hdrs
-            .lines()
-            .any(|l| l.starts_with("gpgsig ") || l.starts_with("gpgsig-sha256 "));
+        let signed = hdrs.lines().any(|l| l.starts_with("gpgsig ") || l.starts_with("gpgsig-sha256 "));
         if !signed {
             return Ok((false, "none".into()));
         }
-        let kind = if hdrs.contains("-----BEGIN SSH SIGNATURE-----") {
-            "ssh"
-        } else {
-            "gpg"
-        };
+        let kind = if hdrs.contains("-----BEGIN SSH SIGNATURE-----") { "ssh" } else { "gpg" };
         Ok((true, kind.into()))
     }
 
@@ -299,12 +272,8 @@ impl Store {
             view_epoch: meta.view_epoch,
             commits,
         };
-        let epoch_map = EpochCommitMap {
-            schema: SCHEMA,
-            view_id: meta.view_id.clone(),
-            view_epoch: meta.view_epoch,
-            epochs,
-        };
+        let epoch_map =
+            EpochCommitMap { schema: SCHEMA, view_id: meta.view_id.clone(), view_epoch: meta.view_epoch, epochs };
         write_atomic_json(&dir.join("provenance.json"), &manifest)?;
         write_atomic_json(&dir.join("epoch_commit_map.json"), &epoch_map)
     }
@@ -321,19 +290,10 @@ impl Store {
         let mut man: ViewProvenanceManifest = serde_json::from_slice(&p_bytes)?;
         let e_bytes = read_regular(&dir.join("epoch_commit_map.json"), MAX_JSON)?;
         let mut emap: EpochCommitMap = serde_json::from_slice(&e_bytes)?;
-        if !man
-            .commits
-            .iter()
-            .any(|c| c.projected_commit_oid == meta.head_oid)
-        {
-            let ctx = (
-                meta.view_id.as_str(),
-                meta.strategy.as_str(),
-                meta.view_epoch,
-            );
+        if !man.commits.iter().any(|c| c.projected_commit_oid == meta.head_oid) {
+            let ctx = (meta.view_id.as_str(), meta.strategy.as_str(), meta.view_epoch);
             let oids = (meta.head_oid.as_str(), src, tree);
-            let rec =
-                make_provenance_record(ctx, oids, vec![parent.to_owned()], (false, "none".into()));
+            let rec = make_provenance_record(ctx, oids, vec![parent.to_owned()], (false, "none".into()));
             man.commits.push(rec);
         }
         let ep_entry = BTreeMap::from([(src.to_owned(), meta.head_oid.clone())]);
@@ -353,16 +313,9 @@ impl Store {
         let main_oid = self.git_text(&bare, &["rev-parse", "--verify", "refs/heads/main"])?;
         let rev_args = ["rev-list", "--topo-order", "--reverse", "refs/heads/main"];
         let rev_out = self.git_text(&bare, &rev_args)?;
-        let reachable: Vec<&str> = rev_out
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        let by_oid: BTreeMap<&str, &ProvenanceCommitRecord> = man
-            .commits
-            .iter()
-            .map(|r| (r.projected_commit_oid.as_str(), r))
-            .collect();
+        let reachable: Vec<&str> = rev_out.lines().map(str::trim).filter(|s| !s.is_empty()).collect();
+        let by_oid: BTreeMap<&str, &ProvenanceCommitRecord> =
+            man.commits.iter().map(|r| (r.projected_commit_oid.as_str(), r)).collect();
         let (mut tampered, mut verified) = (Vec::new(), 0usize);
         if main_oid != meta.head_oid
             || man.view_epoch != meta.view_epoch
@@ -375,20 +328,13 @@ impl Store {
             let t_spec = format!("{oid}^{{tree}}");
             let tree = self.git_text(&bare, &["rev-parse", "--verify", &t_spec])?;
             let p_line = self.git_text(&bare, &["rev-list", "--parents", "-n", "1", oid])?;
-            let parents: Vec<String> = p_line
-                .split_whitespace()
-                .skip(1)
-                .map(str::to_owned)
-                .collect();
+            let parents: Vec<String> = p_line.split_whitespace().skip(1).map(str::to_owned).collect();
             let raw_bytes = self.git(&bare, &["cat-file", "commit", oid])?;
             let raw = String::from_utf8_lossy(&raw_bytes);
-            let tr_sig = raw
-                .lines()
-                .find_map(|l| l.strip_prefix("Rootyard-View-Signature: "));
+            let tr_sig = raw.lines().find_map(|l| l.strip_prefix("Rootyard-View-Signature: "));
             let ok = by_oid.get(oid).is_some_and(|rec| {
                 let (vid, st, src) = (&meta.view_id, &meta.strategy, &rec.source_commit_oid);
-                let exp =
-                    compute_provenance_signature(vid, st, rec.view_epoch, src, &tree, &parents);
+                let exp = compute_provenance_signature(vid, st, rec.view_epoch, src, &tree, &parents);
                 (1..=meta.view_epoch).contains(&rec.view_epoch)
                     && rec.projected_tree_oid == tree
                     && rec.projected_parent_oids == parents
@@ -428,10 +374,7 @@ impl Store {
 pub fn normalize_mount_path(raw: &str) -> Result<String> {
     let b = raw.as_bytes();
     let ok = !b.is_empty() && !b.contains(&0) && !b.starts_with(b"/") && !b.ends_with(b"/");
-    ensure!(
-        ok,
-        "mount path must be a non-empty relative path without leading or trailing slash"
-    );
+    ensure!(ok, "mount path must be a non-empty relative path without leading or trailing slash");
     for part in raw.split('/') {
         let valid = !part.is_empty() && part != "." && part != ".." && part != ".git";
         ensure!(valid, "unsafe mount path component");
@@ -443,9 +386,7 @@ pub fn normalize_mount_path(raw: &str) -> Result<String> {
 }
 
 pub fn path_within_mount(path: &str, mount_prefix: &str) -> bool {
-    path == mount_prefix
-        || (path.starts_with(mount_prefix)
-            && path.as_bytes().get(mount_prefix.len()) == Some(&b'/'))
+    path == mount_prefix || (path.starts_with(mount_prefix) && path.as_bytes().get(mount_prefix.len()) == Some(&b'/'))
 }
 
 pub fn validate_non_overlapping_mounts(mounts: &[MountEntry]) -> Result<()> {
@@ -470,9 +411,7 @@ mod tests {
         for good in ["libs/proto", "services/search", "a/b/c"] {
             assert!(normalize_mount_path(good).is_ok(), "{good}");
         }
-        for bad in [
-            "", "/a", "a/", "a//b", "a/../b", "a/./b", ".git", "a/.git/b",
-        ] {
+        for bad in ["", "/a", "a/", "a//b", "a/../b", "a/./b", ".git", "a/.git/b"] {
             assert!(normalize_mount_path(bad).is_err(), "{bad}");
         }
         let mk = |p: &str, n: &str, c: &str| MountEntry {

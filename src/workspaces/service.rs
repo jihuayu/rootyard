@@ -17,16 +17,10 @@ pub fn workspace_root(state: &AppState) -> PathBuf {
     state.storage.root.join("workspace-service")
 }
 pub fn workspace_repo(state: &AppState, id: Uuid) -> PathBuf {
-    if super::mounts::enabled() {
-        super::mounts::mount_path(state, id)
-    } else {
-        super::mounts::lower_path(state, id)
-    }
+    if super::mounts::enabled() { super::mounts::mount_path(state, id) } else { super::mounts::lower_path(state, id) }
 }
 pub fn checkpoint_repo(state: &AppState, id: Uuid) -> PathBuf {
-    workspace_root(state)
-        .join("checkpoints")
-        .join(id.to_string())
+    workspace_root(state).join("checkpoints").join(id.to_string())
 }
 pub fn conflict() -> Error {
     Error(StatusCode::CONFLICT, "workspace version or lease conflict")
@@ -66,49 +60,14 @@ pub fn git(repo: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
     Ok(output.stdout)
 }
 
-pub fn clone_repo(source: &FsPath, dest: &FsPath) -> Result<(), Error> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(Error::internal)?;
-    }
-    let output = Command::new("git")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "clone",
-            "--no-hardlinks",
-            "--",
-        ])
-        .arg(source)
-        .arg(dest)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(Error::internal)?;
-    if !output.status.success() {
-        return Err(Error::internal("native git clone failed"));
-    }
-    Ok(())
-}
-
-pub async fn authorized(
-    state: &AppState,
-    headers: &HeaderMap,
-    id: Uuid,
-    role: Role,
-) -> Result<Workspace, Error> {
+pub async fn authorized(state: &AppState, headers: &HeaderMap, id: Uuid, role: Role) -> Result<Workspace, Error> {
     let actor = auth::authenticate(&state.pool, headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let sql = format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1");
-    let row = tx
-        .query_opt(&sql, &[&id])
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
+    let row = tx.query_opt(&sql, &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let ws = Workspace::from_row(&row);
-    let access =
-        auth::authorize_repo_with_role(&tx, &actor, &ws.owner, &ws.repository, role).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &ws.owner, &ws.repository, role).await?;
     if access.repo_id != ws.repository_id {
         return Err(Error::not_found());
     }
@@ -139,23 +98,14 @@ async fn locked_inner(
     require_mount: bool,
 ) -> Result<Workspace, Error> {
     let sql = format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1");
-    let row = tx
-        .query_opt(&sql, &[&id])
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
+    let row = tx.query_opt(&sql, &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let initial = Workspace::from_row(&row);
-    let access =
-        auth::authorize_repo_with_role(tx, actor, &initial.owner, &initial.repository, role)
-            .await?;
+    let access = auth::authorize_repo_with_role(tx, actor, &initial.owner, &initial.repository, role).await?;
     if access.repo_id != initial.repository_id {
         return Err(Error::not_found());
     }
     let row = tx
-        .query_one(
-            &format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1 FOR UPDATE"),
-            &[&id],
-        )
+        .query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1 FOR UPDATE"), &[&id])
         .await
         .map_err(Error::internal)?;
     let ws = Workspace::from_row(&row);
@@ -197,10 +147,7 @@ pub async fn lease(
     }
     if ws.host_id != state.storage.volume_id {
         let expired: bool = tx
-            .query_one(
-                "SELECT lease_until<=clock_timestamp() FROM workspaces WHERE id=$1",
-                &[&id],
-            )
+            .query_one("SELECT lease_until<=clock_timestamp() FROM workspaces WHERE id=$1", &[&id])
             .await
             .map_err(Error::internal)?
             .get(0);
@@ -208,26 +155,41 @@ pub async fn lease(
             return Err(conflict());
         }
         let cp = ws.last_checkpoint_id.ok_or_else(conflict)?;
-        let row = tx.query_opt("SELECT state,captured_revision FROM workspace_checkpoints WHERE id=$1 AND workspace_id=$2", &[&cp,&id]).await.map_err(Error::internal)?.ok_or_else(conflict)?;
+        let row = tx
+            .query_opt(
+                "SELECT state,captured_revision FROM workspace_checkpoints WHERE id=$1 AND workspace_id=$2",
+                &[&cp, &id],
+            )
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(conflict)?;
         if row.get::<_, String>(0) != "committed" || ws.revision != row.get::<_, i64>(1) + 1 {
             return Err(conflict());
         }
         let tenant: Uuid = tx
-            .query_one(
-                "SELECT owner_id FROM repositories WHERE id=$1",
-                &[&ws.repository_id],
-            )
+            .query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&ws.repository_id])
             .await
             .map_err(Error::internal)?
             .get(0);
-        super::remote::ensure_local(&state, cp, ws.repository_id, tenant).await?;
-        materialize_takeover(&state, id, cp)?;
+        if super::mounts::enabled() {
+            super::lazy::prepare(&state, id, cp, ws.repository_id, tenant).await?;
+        } else {
+            super::remote::ensure_local(&state, cp, ws.repository_id, tenant).await?;
+            materialize_takeover(&state, id, cp)?;
+        }
     } else if !super::mounts::lower_path(&state, id).join(".git").is_dir() {
         return Err(conflict());
     }
     let same_host = ws.host_id == state.storage.volume_id;
     let commit = async {
-        let active: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM sandbox_jobs WHERE workspace_id=$1 AND state IN ('queued','running'))", &[&id]).await.map_err(Error::internal)?.get(0);
+        let active: bool = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM sandbox_jobs WHERE workspace_id=$1 AND state IN ('queued','running'))",
+                &[&id],
+            )
+            .await
+            .map_err(Error::internal)?
+            .get(0);
         if active {
             return Err(conflict());
         }
@@ -236,28 +198,19 @@ pub async fn lease(
             return Err(conflict());
         }
         let row = tx
-            .query_one(
-                &format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"),
-                &[&id],
-            )
+            .query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id])
             .await
             .map_err(Error::internal)?;
         let deadline: i64 = tx
-            .query_one(
-                "SELECT EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces WHERE id=$1",
-                &[&id],
-            )
+            .query_one("SELECT EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces WHERE id=$1", &[&id])
             .await
             .map_err(Error::internal)?
             .get(0);
         tx.commit().await.map_err(Error::internal)?;
         Ok((Workspace::from_row(&row), deadline))
     };
-    let (saved, deadline) = if same_host {
-        super::mounts::with_frozen_async(id, commit).await?
-    } else {
-        commit.await?
-    };
+    let (saved, deadline) =
+        if same_host { super::mounts::with_frozen_async(id, commit).await? } else { commit.await? };
     super::mounts::ensure(&state, id, deadline)?;
     Ok(Json(saved))
 }
@@ -282,9 +235,7 @@ fn materialize_takeover(state: &AppState, id: Uuid, cp: Uuid) -> Result<(), Erro
         core::copy_all(&source, &stage).map_err(Error::internal)?;
         core::sync_tree(&stage).map_err(Error::internal)?;
         fs::rename(&stage, &destination).map_err(Error::internal)?;
-        fs::File::open(parent)
-            .and_then(|f| f.sync_all())
-            .map_err(Error::internal)
+        fs::File::open(parent).and_then(|f| f.sync_all()).map_err(Error::internal)
     })();
     if copied.is_err() {
         let _ = fs::remove_dir_all(&stage);
@@ -296,7 +247,7 @@ pub async fn fence_restored(pool: &deadpool_postgres::Pool) -> Result<(), Error>
     let mut client = pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     tx.execute("UPDATE workspaces SET lease_epoch=lease_epoch+1,lease_until=clock_timestamp()-interval '1 second' WHERE state='ready'", &[]).await.map_err(Error::internal)?;
-    tx.execute("UPDATE sandbox_jobs SET state='cancelled',pid=NULL,finished_at=clock_timestamp() WHERE state IN ('queued','running')", &[]).await.map_err(Error::internal)?;
+    tx.execute("UPDATE sandbox_jobs SET state='cancelled',pid=NULL,finished_at=clock_timestamp() WHERE state IN ('queued','preparing','running')", &[]).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)
 }
 
@@ -306,32 +257,20 @@ pub async fn create(
     Json(input): Json<CreateWorkspace>,
 ) -> Result<(StatusCode, Json<Workspace>), Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
-    let key = auth::idempotency_key(&headers)?
-        .ok_or_else(Error::bad_request)?
-        .to_owned();
+    let key = auth::idempotency_key(&headers)?.ok_or_else(Error::bad_request)?.to_owned();
     if input.agent_id.is_empty()
         || input.agent_id.len() > 128
-        || !input
-            .agent_id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+        || !input.agent_id.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
     {
         return Err(Error::bad_request());
     }
     let digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(&(
-            &input.owner,
-            &input.repository,
-            &input.agent_id,
-            &input.base_oid,
-        ))
-        .map_err(Error::internal)?,
+        serde_json::to_vec(&(&input.owner, &input.repository, &input.agent_id, &input.base_oid))
+            .map_err(Error::internal)?,
     ));
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo =
-        auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write)
-            .await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write).await?;
     creation_lock(&tx, actor.id, &key).await?;
     if let Some(row) = tx.query_opt("SELECT request_sha256,workspace_id FROM workspace_creations WHERE actor_id=$1 AND idempotency_key=$2 FOR UPDATE", &[&actor.id,&key]).await.map_err(Error::internal)? {
         let existing: String = row.get(0);
@@ -344,44 +283,53 @@ pub async fn create(
         return Ok((StatusCode::OK, Json(saved)));
     }
     let id = Uuid::new_v4();
-    let source_lease = read_leases::shared(
-        &state.pool,
-        repo.repo_id,
-        tokio::time::Instant::now() + state.config.git_timeout,
-    )
-    .await?;
-    let refreshed =
-        auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write)
-            .await?;
+    let source_lease =
+        read_leases::shared(&state.pool, repo.repo_id, tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _local = tokio::time::timeout(state.config.git_timeout, state.storage.read_snapshot_lock(repo.repo_id))
+        .await
+        .map_err(|_| Error::timeout())?;
+    source_lease.ensure_active()?;
+    let refreshed = auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write).await?;
     if refreshed.repo_id != repo.repo_id {
         return Err(Error::not_found());
     }
-    let source = state
-        .storage
-        .verify_path(repo.repo_id)
-        .map_err(Error::internal)?;
+    let source = state.storage.verify_path(repo.repo_id).map_err(Error::internal)?;
     let dest = super::mounts::lower_path(&state, id);
-    clone_repo(&source, &dest)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(Error::internal)?;
+    }
+    let mut clone = state.storage.git(&state.config);
+    clone
+        .args(["-c", "core.hooksPath=/dev/null", "clone", "--no-local", "--no-hardlinks", "--"])
+        .arg(&source)
+        .arg(&dest);
+    source_lease
+        .guard(crate::git_http::collect_git_output(clone, 4096, state.config.git_timeout))
+        .await?
+        .map_err(Error::internal)?;
     source_lease.ensure_active()?;
+    drop(_local);
+    drop(source_lease);
     if let Some(base) = &input.base_oid {
         if !crate::browse::models::valid_non_zero_oid(base) {
             return Err(Error::bad_request());
         }
-        let head =
-            String::from_utf8(git(&dest, &["rev-parse", "HEAD"])?).map_err(Error::internal)?;
+        let head = String::from_utf8(git(&dest, &["rev-parse", "HEAD"])?).map_err(Error::internal)?;
         if head.trim() != base {
             return Err(conflict());
         }
     }
     let host_id = state.storage.volume_id;
     tx.execute("INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,state,host_id,lease_until) VALUES($1,$2,$3,$4,$5,$6,'ready',$7,clock_timestamp()+interval '5 minutes')", &[&id,&repo.repo_id,&input.owner,&input.repository,&input.agent_id,&actor.id,&host_id]).await.map_err(Error::internal)?;
-    tx.execute("INSERT INTO workspace_creations(actor_id,idempotency_key,request_sha256,workspace_id) VALUES($1,$2,$3,$4)", &[&actor.id,&key,&digest,&id]).await.map_err(Error::internal)?;
+    tx.execute(
+        "INSERT INTO workspace_creations(actor_id,idempotency_key,request_sha256,workspace_id) VALUES($1,$2,$3,$4)",
+        &[&actor.id, &key, &digest, &id],
+    )
+    .await
+    .map_err(Error::internal)?;
     super::capture::record_current_at(&tx, id, &dest).await?;
     let row = tx
-        .query_one(
-            &format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"),
-            &[&id],
-        )
+        .query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id])
         .await
         .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;

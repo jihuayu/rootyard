@@ -27,6 +27,33 @@ pub(crate) fn proposal_pin_ref(id: Uuid) -> String {
     format!("{PROPOSAL_REFS}/{id}")
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProposalIntent {
+    pub proposal_id: Uuid,
+    pub repository_id: Uuid,
+    pub target_oid: String,
+}
+impl ProposalIntent {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.proposal_id.is_nil()
+                && !self.repository_id.is_nil()
+                && crate::ci_pins::valid_oid(&self.target_oid)
+                && self.target_oid.bytes().any(|b| b != b'0'),
+            "invalid proposal pin intent"
+        );
+        Ok(())
+    }
+    pub(crate) fn change(&self) -> crate::journal::RefChange {
+        crate::journal::RefChange {
+            ref_name: proposal_pin_ref(self.proposal_id),
+            old_oid: "0".repeat(self.target_oid.len()),
+            new_oid: self.target_oid.clone(),
+        }
+    }
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/namespaces", post(handlers::create))
@@ -37,13 +64,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/namespaces/{id}/changesets", post(changesets::create))
         .route("/api/changesets/{id}", get(changesets::get))
         .route("/api/changesets/{id}/review", post(changesets::review))
-        .route(
-            "/api/changesets/{id}/integrate",
-            post(changesets::integrate),
-        )
+        .route("/api/changesets/{id}/integrate", post(changesets::integrate))
         .route("/api/changesets/{id}/recover", post(changesets::recover))
-        .route(
-            "/api/views/{id}/changesets",
-            post(reverse::create).layer(DefaultBodyLimit::max(reverse::BODY_LIMIT)),
-        )
+        .route("/api/views/{id}/changesets", post(reverse::create).layer(DefaultBodyLimit::max(reverse::BODY_LIMIT)))
 }

@@ -14,80 +14,37 @@ impl Store {
         ensure!(valid_name(task_name), "invalid task branch name");
 
         let view = self.read_view(view_id)?;
-        ensure!(
-            view.strategy == "task_snapshot",
-            "only task_snapshot views accept changeset integration"
-        );
-        let revision_id = view
-            .revision_id
-            .as_deref()
-            .context("task view missing revision_id")?;
+        ensure!(view.strategy == "task_snapshot", "only task_snapshot views accept changeset integration");
+        let revision_id = view.revision_id.as_deref().context("task view missing revision_id")?;
         let revision = self.read_namespace_revision(revision_id)?;
         let view_bare = self.view_git_dir(view_id);
 
-        let view_base_oid = self.git_text(
-            &view_bare,
-            &["rev-parse", "--verify", "refs/rootyard/view-base"],
-        )?;
-        ensure!(
-            view_base_oid == view.view_base_oid,
-            "view base ref diverged from metadata"
-        );
-        let task_commit_oid = self.git_text(
-            &view_bare,
-            &["rev-parse", "--verify", &format!("{task_ref}^{{commit}}")],
-        )?;
-        ensure!(
-            task_commit_oid != view_base_oid,
-            "task branch has no changes relative to view base"
-        );
+        let view_base_oid = self.git_text(&view_bare, &["rev-parse", "--verify", "refs/rootyard/view-base"])?;
+        ensure!(view_base_oid == view.view_base_oid, "view base ref diverged from metadata");
+        let task_commit_oid =
+            self.git_text(&view_bare, &["rev-parse", "--verify", &format!("{task_ref}^{{commit}}")])?;
+        ensure!(task_commit_oid != view_base_oid, "task branch has no changes relative to view base");
         let is_ancestor = self
             .git_output_with_env(
                 &view_bare,
-                &[
-                    "merge-base",
-                    "--is-ancestor",
-                    &view_base_oid,
-                    &task_commit_oid,
-                ],
+                &["merge-base", "--is-ancestor", &view_base_oid, &task_commit_oid],
                 &[],
                 None,
             )?
             .status
             .success();
-        ensure!(
-            is_ancestor,
-            "task branch commit must descend from the current view base"
-        );
+        ensure!(is_ancestor, "task branch commit must descend from the current view base");
 
-        let mount_prefixes: Vec<&str> = revision
-            .mounts
-            .iter()
-            .map(|m| m.mount_path.as_str())
-            .collect();
-        let ls_out = self.git(
-            &view_bare,
-            &["ls-tree", "-r", "-z", "--name-only", &task_commit_oid],
-        )?;
-        let diff_out = self.git(
-            &view_bare,
-            &[
-                "diff-tree",
-                "-r",
-                "-z",
-                "--name-only",
-                &view_base_oid,
-                &task_commit_oid,
-            ],
-        )?;
+        let mount_prefixes: Vec<&str> = revision.mounts.iter().map(|m| m.mount_path.as_str()).collect();
+        let ls_out = self.git(&view_bare, &["ls-tree", "-r", "-z", "--name-only", &task_commit_oid])?;
+        let diff_out =
+            self.git(&view_bare, &["diff-tree", "-r", "-z", "--name-only", &view_base_oid, &task_commit_oid])?;
         for output in [ls_out, diff_out] {
             for raw in output.split(|b| *b == 0).filter(|x| !x.is_empty()) {
                 let path = std::str::from_utf8(raw).context("non-UTF-8 path")?;
                 normalize_mount_path(path)?;
                 ensure!(
-                    mount_prefixes
-                        .iter()
-                        .any(|prefix| path_within_mount(path, prefix)),
+                    mount_prefixes.iter().any(|prefix| path_within_mount(path, prefix)),
                     "path {path} is outside all mounted repositories"
                 );
             }
@@ -100,15 +57,10 @@ impl Store {
         let mut modified_mounts = Vec::new();
         for mount in &revision.mounts {
             let base_tree_spec = format!("{}:{}", view_base_oid, mount.mount_path);
-            let base_subtree =
-                self.git_text(&view_bare, &["rev-parse", "--verify", &base_tree_spec])?;
+            let base_subtree = self.git_text(&view_bare, &["rev-parse", "--verify", &base_tree_spec])?;
             let task_tree_spec = format!("{}:{}", task_commit_oid, mount.mount_path);
-            let task_subtree_out = self.git_output_with_env(
-                &view_bare,
-                &["rev-parse", "--verify", &task_tree_spec],
-                &[],
-                None,
-            )?;
+            let task_subtree_out =
+                self.git_output_with_env(&view_bare, &["rev-parse", "--verify", &task_tree_spec], &[], None)?;
             ensure!(
                 task_subtree_out.status.success(),
                 "mounted directory {} cannot be deleted entirely from view",
@@ -125,10 +77,7 @@ impl Store {
                 modified_mounts.push((mount.clone(), base_subtree, task_subtree));
             }
         }
-        ensure!(
-            !modified_mounts.is_empty(),
-            "task commit modifies no mounted repository trees"
-        );
+        ensure!(!modified_mounts.is_empty(), "task commit modifies no mounted repository trees");
         modified_mounts.sort_by(|a, b| a.0.repo_id.cmp(&b.0.repo_id));
 
         let view_str = view_bare.to_str().context("path must be UTF-8")?;
@@ -137,20 +86,13 @@ impl Store {
         for (mount, _base_subtree, task_subtree) in &modified_mounts {
             self.ensure_no_active_lease(&mount.repo_id)?;
             let repo_bare = self.repo_git_dir(&mount.repo_id);
-            let current_main =
-                self.git_text(&repo_bare, &["rev-parse", "--verify", "refs/heads/main"])?;
+            let current_main = self.git_text(&repo_bare, &["rev-parse", "--verify", "refs/heads/main"])?;
             let input_ref = format!("refs/rootyard/changesets/{changeset_id}/input");
             let refspec = format!("{task_commit_oid}:{input_ref}");
             self.git(&repo_bare, &["fetch", "--no-tags", view_str, &refspec])?;
 
-            let current_base_commit = self.git_text(
-                &view_bare,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    &format!("refs/rootyard/mounts/{}", mount.repo_id),
-                ],
-            )?;
+            let current_base_commit = self
+                .git_text(&view_bare, &["rev-parse", "--verify", &format!("refs/rootyard/mounts/{}", mount.repo_id)])?;
 
             let merged_tree = if current_main == current_base_commit {
                 task_subtree.clone()
@@ -192,10 +134,7 @@ impl Store {
                     };
                     let cs_file = changeset_dir.join("changeset.json");
                     write_atomic_json(&cs_file, &aborted)?;
-                    bail!(
-                        "three-way merge conflict in {}; aborted in Phase 1 with zero main updates",
-                        mount.repo_name
-                    );
+                    bail!("three-way merge conflict in {}; aborted in Phase 1 with zero main updates", mount.repo_name);
                 }
                 String::from_utf8(merge_out.stdout)?
                     .lines()
@@ -247,10 +186,7 @@ impl Store {
                 ref_name: "refs/heads/main".into(),
                 changeset_id: changeset_id.clone(),
             };
-            let lease_path = self
-                .root
-                .join("leases")
-                .join(format!("{}.json", target.repo_id));
+            let lease_path = self.root.join("leases").join(format!("{}.json", target.repo_id));
             write_new(&lease_path, &serde_json::to_vec_pretty(&lease)?, 0o600)?;
         }
         File::open(self.root.join("leases"))?.sync_all()?;
@@ -274,20 +210,15 @@ impl Store {
         // Pre-commit verification under held leases before the irreversible Commit Point.
         for target in &record.targets {
             let repo_bare = self.repo_git_dir(&target.repo_id);
-            let actual_main =
-                self.git_text(&repo_bare, &["rev-parse", "--verify", "refs/heads/main"])?;
+            let actual_main = self.git_text(&repo_bare, &["rev-parse", "--verify", "refs/heads/main"])?;
             let candidate_ref = format!("refs/rootyard/changesets/{changeset_id}/candidate");
-            let actual_cand =
-                self.git_text(&repo_bare, &["rev-parse", "--verify", &candidate_ref])?;
+            let actual_cand = self.git_text(&repo_bare, &["rev-parse", "--verify", &candidate_ref])?;
             if actual_main != target.expected_old_oid || actual_cand != target.candidate_oid {
                 self.release_leases(&record.targets, &changeset_id)?;
                 self.cleanup_candidates(&record.targets, &changeset_id);
                 record.state = "aborted_cas_mismatch".into();
                 write_atomic_json(&cs_file, &record)?;
-                bail!(
-                    "pre-commit CAS mismatch on {}; aborted before commit point",
-                    target.repo_name
-                );
+                bail!("pre-commit CAS mismatch on {}; aborted before commit point", target.repo_name);
             }
         }
 
@@ -301,17 +232,10 @@ impl Store {
 
     pub fn recover_changeset(&self, changeset_id: &str) -> Result<serde_json::Value> {
         valid_id(changeset_id)?;
-        let path = self
-            .root
-            .join("changesets")
-            .join(changeset_id)
-            .join("changeset.json");
+        let path = self.root.join("changesets").join(changeset_id).join("changeset.json");
         let bytes = read_regular(&path, MAX_JSON)?;
         let mut record: ChangesetRecord = serde_json::from_slice(&bytes)?;
-        ensure!(
-            record.schema == SCHEMA && record.changeset_id == changeset_id,
-            "invalid changeset record"
-        );
+        ensure!(record.schema == SCHEMA && record.changeset_id == changeset_id, "invalid changeset record");
         match record.state.as_str() {
             "staged" => {
                 // Crashed before the Commit Point: clean up candidate refs and leases.
@@ -336,8 +260,7 @@ impl Store {
     ) -> Result<serde_json::Value> {
         for (index, target) in record.targets.iter().enumerate() {
             let repo_bare = self.repo_git_dir(&target.repo_id);
-            let current_main =
-                self.git_text(&repo_bare, &["rev-parse", "--verify", "refs/heads/main"])?;
+            let current_main = self.git_text(&repo_bare, &["rev-parse", "--verify", "refs/heads/main"])?;
             if current_main != target.candidate_oid {
                 ensure!(
                     current_main == target.expected_old_oid,
@@ -345,23 +268,14 @@ impl Store {
                 );
                 self.git(
                     &repo_bare,
-                    &[
-                        "update-ref",
-                        "refs/heads/main",
-                        &target.candidate_oid,
-                        &target.expected_old_oid,
-                    ],
+                    &["update-ref", "refs/heads/main", &target.candidate_oid, &target.expected_old_oid],
                 )?;
             }
             let mut meta = self.read_repo(&target.repo_id)?;
             if meta.head_oid != target.candidate_oid {
                 meta.head_oid = target.candidate_oid.clone();
                 meta.generation += 1;
-                let meta_path = self
-                    .root
-                    .join("repos")
-                    .join(&meta.repo_id)
-                    .join("meta.json");
+                let meta_path = self.root.join("repos").join(&meta.repo_id).join("meta.json");
                 write_atomic_json(&meta_path, &meta)?;
             }
             if index == 0 && allow_mid_failpoint {
@@ -371,18 +285,14 @@ impl Store {
 
         // Re-project the composite view's canonical refs/heads/main to match the new source tips.
         let mut view = self.read_view(&record.view_id)?;
-        let revision_id = view
-            .revision_id
-            .as_deref()
-            .context("task view missing revision_id")?;
+        let revision_id = view.revision_id.as_deref().context("task view missing revision_id")?;
         let revision = self.read_namespace_revision(revision_id)?;
         let view_bare = self.view_git_dir(&record.view_id);
 
         let mut mount_trees = Vec::new();
         for mount in &revision.mounts {
             let repo_bare = self.repo_git_dir(&mount.repo_id);
-            let repo_main =
-                self.git_text(&repo_bare, &["rev-parse", "--verify", "refs/heads/main"])?;
+            let repo_main = self.git_text(&repo_bare, &["rev-parse", "--verify", "refs/heads/main"])?;
             let repo_str = repo_bare.to_str().context("path must be UTF-8")?;
             let mount_ref = format!("refs/rootyard/mounts/{}", mount.repo_id);
             let refspec = format!("{repo_main}:{mount_ref}");
@@ -412,14 +322,8 @@ impl Store {
             msg.as_bytes(),
         )?;
         let projected_oid = String::from_utf8(proj_out)?.trim().to_owned();
-        self.git(
-            &view_bare,
-            &["update-ref", "refs/heads/main", &projected_oid],
-        )?;
-        self.git(
-            &view_bare,
-            &["update-ref", "refs/rootyard/view-base", &projected_oid],
-        )?;
+        self.git(&view_bare, &["update-ref", "refs/heads/main", &projected_oid])?;
+        self.git(&view_bare, &["update-ref", "refs/rootyard/view-base", &projected_oid])?;
         let integrated_ref = format!("refs/rootyard/integrated/{}", record.changeset_id);
         self.git(&view_bare, &["update-ref", &integrated_ref, &projected_oid])?;
         self.git(&view_bare, &["fsck", "--full", "--strict"])?;
@@ -427,42 +331,22 @@ impl Store {
         view.view_base_oid = projected_oid.clone();
         view.head_oid = projected_oid.clone();
         view.view_epoch += 1;
-        let view_meta_path = self
-            .root
-            .join("views")
-            .join(&view.view_id)
-            .join("view.json");
+        let view_meta_path = self.root.join("views").join(&view.view_id).join("view.json");
         write_atomic_json(&view_meta_path, &view)?;
-        self.append_integrated_view_provenance(
-            &view,
-            &record.task_commit_oid,
-            &new_root_tree,
-            &record.view_base_oid,
-        )?;
+        self.append_integrated_view_provenance(&view, &record.task_commit_oid, &new_root_tree, &record.view_base_oid)?;
 
         record.state = "integrated".into();
         record.projected_view_oid = Some(projected_oid);
-        let changeset_path = self
-            .root
-            .join("changesets")
-            .join(&record.changeset_id)
-            .join("changeset.json");
+        let changeset_path = self.root.join("changesets").join(&record.changeset_id).join("changeset.json");
         write_atomic_json(&changeset_path, record)?;
 
         self.release_leases(&record.targets, &record.changeset_id)?;
         Ok(serde_json::to_value(&*record)?)
     }
 
-    pub(crate) fn release_leases(
-        &self,
-        targets: &[ChangesetTarget],
-        changeset_id: &str,
-    ) -> Result<()> {
+    pub(crate) fn release_leases(&self, targets: &[ChangesetTarget], changeset_id: &str) -> Result<()> {
         for target in targets {
-            let lease_path = self
-                .root
-                .join("leases")
-                .join(format!("{}.json", target.repo_id));
+            let lease_path = self.root.join("leases").join(format!("{}.json", target.repo_id));
             if lease_path.try_exists()? {
                 let bytes = read_regular(&lease_path, MAX_JSON)?;
                 let lease: RefLease = serde_json::from_slice(&bytes)?;

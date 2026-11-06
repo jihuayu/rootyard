@@ -2,12 +2,47 @@
 import argparse
 import base64
 import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from tests.e2e import Harness
 
 
 class NamespaceServiceTest(unittest.TestCase):
+    def test_view_keeps_pinned_commit_after_source_branch_deleted(self):
+        h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
+        try:
+            h.setup();h.api();h.roundtrip()
+            h.git("switch","-c","ephemeral",h.second,cwd=h.work)
+            (h.work/"pkg").mkdir()
+            (h.work/"pkg"/"lib.rs").write_text("pub fn pinned() -> u32 { 42 }\n")
+            h.git("add","pkg/lib.rs",cwd=h.work)
+            h.git("commit","-m","pinned only",cwd=h.work)
+            pinned=h.git("rev-parse","HEAD",cwd=h.work).stdout.decode().strip()
+            h.git("push","origin","HEAD:refs/heads/ephemeral",cwd=h.work,token=h.alice)
+            ns=json.loads(h.expect("/api/namespaces",201,token=h.alice,method="POST",
+                body={"name":"pinned-source","mounts":[{"path":"pkg","owner":"alice",
+                    "repository":"demo","base_oid":pinned}]}))
+            h.git("push","origin",":refs/heads/ephemeral",cwd=h.work,token=h.alice)
+            h.git("--git-dir="+str(h.bare),"reflog","expire","--expire=now","--all")
+            refs=h.git("--git-dir="+str(h.bare),"for-each-ref","--contains",pinned,
+                "--format=%(refname)").stdout.decode().strip()
+            self.assertEqual(refs,"")
+            view=json.loads(h.expect(f"/api/namespaces/{ns['id']}/views",201,token=h.alice,
+                method="POST",body={"mount_path":"pkg","subdir":"pkg"}))
+            self.assertEqual(view["source_oid"],pinned)
+            bundle=h.expect(f"/api/views/{view['id']}/bundle",200,token=h.alice)
+            archive=h.root/"pinned.bundle";archive.write_bytes(bundle)
+            checkout=h.root/"pinned-clone"
+            h.git("clone",str(archive),str(checkout))
+            self.assertEqual((checkout/"lib.rs").read_text(),"pub fn pinned() -> u32 { 42 }\n")
+        finally:h.cleanup()
+
     def test_pinned_subdir_view_and_git_bundle(self):
         h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
         try:
@@ -41,10 +76,72 @@ class NamespaceServiceTest(unittest.TestCase):
             h.git("bundle","create",str(proposal),"--all",cwd=clone)
             h.expect("/api/repos/alice/demo/collaborators",201,token=h.alice,
                 method="POST",body={"username":"bob","role":"maintain"})
+            # A real source Git child must stop when its PostgreSQL reader
+            # backend dies; another process may then acquire the GC lock.
+            real_git=shutil.which("git",path=h.env["PATH"])
+            wrapper_dir=h.root/"reverse-bin";wrapper_dir.mkdir()
+            wrapper=wrapper_dir/"git"
+            wrapper_pid=h.root/"reverse-parent.pid"
+            source_child=h.root/"reverse-source.pid"
+            wrapper.write_text("#!/usr/bin/env python3\n"
+                "import os,pathlib,subprocess,sys,time\n"
+                "args=sys.argv[1:]\n"
+                f"real={real_git!r}\n"
+                f"source={str(h.bare)!r}\n"
+                "if '-C' in args and args[args.index('-C')+1]==source "
+                "and 'rev-parse' in args and '--verify' in args:\n"
+                f" pathlib.Path({str(wrapper_pid)!r}).write_text(str(os.getpid()))\n"
+                " child=subprocess.Popen([real,'--git-dir='+source,'cat-file','--batch'],"
+                "stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+                f" pathlib.Path({str(source_child)!r}).write_text(str(child.pid))\n"
+                f" child.stdin.write({(base+chr(10)).encode()!r});child.stdin.flush()\n"
+                " while True:time.sleep(.1)\n"
+                "os.execv(real,[real]+args)\n")
+            wrapper.chmod(0o700)
+            old_path=h.env["PATH"]
+            h.stop();h.env["PATH"]=str(wrapper_dir)+":"+old_path;h.start()
+            def live(pid):
+                try:return Path(f"/proc/{pid}/stat").read_text().rsplit(") ",1)[1][0] not in ("Z","X")
+                except FileNotFoundError:return False
+            proposal_body={"bundle_base64":base64.b64encode(proposal.read_bytes()).decode(),
+                "bundle_ref":"refs/heads/projected","source_ref":"refs/heads/main",
+                "message":"Update package value"}
+            workers=ThreadPoolExecutor(max_workers=2)
+            try:
+                request=workers.submit(lambda:h.http(f"/api/views/{view['id']}/changesets",
+                    token=h.alice,method="POST",body=proposal_body))
+                deadline=time.monotonic()+8
+                while not source_child.exists():
+                    self.assertFalse(request.done(),"reverse import ended before source read")
+                    self.assertLess(time.monotonic(),deadline,"reverse source Git did not start")
+                    time.sleep(.02)
+                repo_id=h.bare.stem
+                key=f"hashtextextended('rootyard-data-v1:{repo_id}',0)"
+                waiter=workers.submit(lambda:h.sql(f"BEGIN; SELECT pg_advisory_xact_lock({key}); SELECT 1; COMMIT;"))
+                pids=[int(x) for x in h.sql("WITH k AS (SELECT "+key+" n) "
+                    "SELECT DISTINCT l.pid FROM pg_locks l,k WHERE l.locktype='advisory' "
+                    "AND l.mode='ShareLock' AND l.granted AND "
+                    "l.classid::bigint=((k.n >> 32) & 4294967295) AND "
+                    "l.objid::bigint=(k.n & 4294967295)").splitlines()]
+                self.assertTrue(pids,"reverse source has no PostgreSQL read lease")
+                self.assertFalse(waiter.done(),"exclusive collector did not wait for source")
+                for pid in pids:self.assertEqual(h.sql(f"SELECT pg_terminate_backend({pid})"),"t")
+                started=time.monotonic()
+                status,raw,_=request.result(timeout=5)
+                self.assertEqual(status,503,raw[:300])
+                self.assertLess(time.monotonic()-started,4)
+                self.assertIn("1",waiter.result(timeout=5))
+                for pid in (int(wrapper_pid.read_text()),int(source_child.read_text())):
+                    deadline=time.monotonic()+3
+                    while live(pid) and time.monotonic()<deadline:time.sleep(.02)
+                    self.assertFalse(live(pid),f"reverse source child {pid} outlived lease loss")
+            finally:
+                if wrapper_pid.exists() and live(int(wrapper_pid.read_text())):
+                    os.killpg(int(wrapper_pid.read_text()),signal.SIGKILL)
+                workers.shutdown(wait=False,cancel_futures=True)
+            h.stop();h.env["PATH"]=old_path;h.start()
             cs=json.loads(h.expect(f"/api/views/{view['id']}/changesets",201,token=h.alice,
-                method="POST",body={"bundle_base64":base64.b64encode(proposal.read_bytes()).decode(),
-                    "bundle_ref":"refs/heads/projected","source_ref":"refs/heads/main",
-                    "message":"Update package value"}))
+                method="POST",body=proposal_body))
             self.assertEqual(cs["state"],"proposed")
             pins=h.git("--git-dir="+str(h.bare),"for-each-ref","--format=%(refname) %(objectname)",
                 "refs/heads/rootyard-proposals").stdout.decode().strip().splitlines()

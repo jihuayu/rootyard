@@ -1,5 +1,8 @@
 //! CI pin tests implementation.
 use super::*;
+#[cfg(test)]
+mod ci_pin_tests {
+    use super::*;
     #[test]
     fn exact_oid_and_reserved_namespace() {
         assert!(valid_oid(&"a".repeat(40)));
@@ -71,3 +74,4 @@ use super::*;
         };
         assert!(changed.validate().is_err());
     }
+}

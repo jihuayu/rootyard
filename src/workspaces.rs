@@ -7,6 +7,8 @@ mod checkpoints;
 mod events;
 #[path = "workspaces/files.rs"]
 mod files;
+#[path = "workspaces/lazy.rs"]
+pub(crate) mod lazy;
 #[path = "workspaces/models.rs"]
 mod models;
 #[path = "workspaces/mounts.rs"]
@@ -31,16 +33,11 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/workspaces", post(service::create))
         .route("/api/workspaces/{id}", get(service::get))
         .route("/api/workspaces/{id}/lease", post(service::lease))
+        .route("/api/workspaces/{id}/prewarm", post(mounts::prewarm))
         .route("/api/workspaces/{id}/fork", post(checkpoints::fork))
-        .route(
-            "/api/workspaces/{id}/files",
-            get(files::get).put(files::put),
-        )
+        .route("/api/workspaces/{id}/files", get(files::get).put(files::put))
         .route("/api/workspaces/{id}/git", post(files::git))
-        .route(
-            "/api/workspaces/{id}/checkpoints",
-            post(checkpoints::create),
-        )
+        .route("/api/workspaces/{id}/checkpoints", post(checkpoints::create))
         .route("/api/workspaces/{id}/events", get(events::list))
         .route("/api/workspaces/{id}/events/stream", get(events::stream))
         .route("/api/checkpoints/{id}/restore", post(checkpoints::restore))

@@ -17,9 +17,7 @@ pub(super) async fn prepare(
     oid_len: usize,
     deadline: Instant,
 ) -> Result<PreparedInput, Error> {
-    let gzipped = headers
-        .get(header::CONTENT_ENCODING)
-        .is_some_and(|v| v == "gzip" || v == "x-gzip");
+    let gzipped = headers.get(header::CONTENT_ENCODING).is_some_and(|v| v == "gzip" || v == "x-gzip");
     let mut wire_bytes = 0u64;
     let stream = body.into_data_stream().map(move |chunk| {
         let chunk = chunk.map_err(io::Error::other)?;
@@ -32,8 +30,7 @@ pub(super) async fn prepare(
     });
     let reader = tokio_util::io::StreamReader::new(stream);
     let mut reader: Pin<Box<dyn tokio::io::AsyncRead + Send>> = if gzipped {
-        let mut decoder =
-            async_compression::tokio::bufread::GzipDecoder::new(BufReader::new(reader));
+        let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(BufReader::new(reader));
         decoder.multiple_members(true);
         Box::pin(decoder)
     } else {
@@ -48,11 +45,7 @@ pub(super) async fn prepare(
     } else {
         None
     };
-    Ok(PreparedInput {
-        reader,
-        commands,
-        gzipped,
-    })
+    Ok(PreparedInput { reader, commands, gzipped })
 }
 
 pub(super) async fn write_input(
@@ -60,11 +53,7 @@ pub(super) async fn write_input(
     mut stdin: tokio::process::ChildStdin,
     maximum: u64,
 ) -> io::Result<()> {
-    let prefix = prepared
-        .commands
-        .take()
-        .map(|commands| commands.bytes)
-        .unwrap_or_default();
+    let prefix = prepared.commands.take().map(|commands| commands.bytes).unwrap_or_default();
     let mut decoded = prefix.len() as u64;
     if decoded > maximum {
         return Err(io::Error::other("decoded request size limit exceeded"));

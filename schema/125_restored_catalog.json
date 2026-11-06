@@ -3539,6 +3539,237 @@
       "name": "id",
       "not_null": true,
       "position": 1,
+      "table": "pando_pack_manifests",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 2,
+      "table": "pando_pack_manifests",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "tenant_id",
+      "not_null": true,
+      "position": 3,
+      "table": "pando_pack_manifests",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "storage_generation",
+      "not_null": true,
+      "position": 4,
+      "table": "pando_pack_manifests",
+      "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "object_format",
+      "not_null": true,
+      "position": 5,
+      "table": "pando_pack_manifests",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "manifest",
+      "not_null": true,
+      "position": 6,
+      "table": "pando_pack_manifests",
+      "type": "jsonb"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 7,
+      "table": "pando_pack_manifests",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 1,
+      "table": "pando_refs",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "ref_name",
+      "not_null": true,
+      "position": 2,
+      "table": "pando_refs",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "oid",
+      "not_null": true,
+      "position": 3,
+      "table": "pando_refs",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "updated_generation",
+      "not_null": true,
+      "position": 4,
+      "table": "pando_refs",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 1,
+      "table": "pando_repository_states",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "tenant_id",
+      "not_null": true,
+      "position": 2,
+      "table": "pando_repository_states",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "storage_generation",
+      "not_null": true,
+      "position": 3,
+      "table": "pando_repository_states",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "1",
+      "generated": "",
+      "identity": "",
+      "name": "ref_generation",
+      "not_null": true,
+      "position": 4,
+      "table": "pando_repository_states",
+      "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "object_format",
+      "not_null": true,
+      "position": 5,
+      "table": "pando_repository_states",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "state",
+      "not_null": true,
+      "position": 6,
+      "table": "pando_repository_states",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "'{}'::uuid[]",
+      "generated": "",
+      "identity": "",
+      "name": "pack_ids",
+      "not_null": true,
+      "position": 7,
+      "table": "pando_repository_states",
+      "type": "uuid[]"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 8,
+      "table": "pando_repository_states",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "updated_at",
+      "not_null": true,
+      "position": 9,
+      "table": "pando_repository_states",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "name": "operation_sequence",
+      "not_null": true,
+      "position": 10,
+      "table": "pando_repository_states",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "id",
+      "not_null": true,
+      "position": 1,
       "table": "recovery_resolutions",
       "type": "uuid"
     },
@@ -4729,6 +4960,17 @@
       "position": 21,
       "table": "sandbox_jobs",
       "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "name": "terminal",
+      "not_null": true,
+      "position": 22,
+      "table": "sandbox_jobs",
+      "type": "boolean"
     },
     {
       "collation": null,
@@ -9125,6 +9367,177 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK ((jsonb_typeof(manifest) = 'object'::text))",
+      "name": "pando_pack_manifests_manifest_check",
+      "table": "pando_pack_manifests",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((object_format = ANY (ARRAY['sha1'::text, 'sha256'::text])))",
+      "name": "pando_pack_manifests_object_format_check",
+      "table": "pando_pack_manifests",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (id)",
+      "name": "pando_pack_manifests_pkey",
+      "table": "pando_pack_manifests",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "UNIQUE (repository_id, id)",
+      "name": "pando_pack_manifests_repository_id_id_key",
+      "table": "pando_pack_manifests",
+      "type": "u",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id, tenant_id) REFERENCES public.repositories(id, owner_id) ON DELETE CASCADE",
+      "name": "pando_pack_manifests_repository_id_tenant_id_fkey",
+      "table": "pando_pack_manifests",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((storage_generation > 0))",
+      "name": "pando_pack_manifests_storage_generation_check",
+      "table": "pando_pack_manifests",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((oid ~ '^[0-9a-f]{40}$'::text) OR (oid ~ '^[0-9a-f]{64}$'::text)))",
+      "name": "pando_refs_oid_check",
+      "table": "pando_refs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (repository_id, ref_name)",
+      "name": "pando_refs_pkey",
+      "table": "pando_refs",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((octet_length(ref_name) >= 6) AND (octet_length(ref_name) <= 1024) AND (ref_name ~~ 'refs/%'::text) AND (ref_name !~ '[[:cntrl:]]'::text)))",
+      "name": "pando_refs_ref_name_check",
+      "table": "pando_refs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES public.pando_repository_states(repository_id) ON DELETE CASCADE",
+      "name": "pando_refs_repository_id_fkey",
+      "table": "pando_refs",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((updated_generation > 0))",
+      "name": "pando_refs_updated_generation_check",
+      "table": "pando_refs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((object_format = ANY (ARRAY['sha1'::text, 'sha256'::text])))",
+      "name": "pando_repository_states_object_format_check",
+      "table": "pando_repository_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((operation_sequence >= 0))",
+      "name": "pando_repository_states_operation_sequence_check",
+      "table": "pando_repository_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((cardinality(pack_ids) <= 10000))",
+      "name": "pando_repository_states_pack_ids_check",
+      "table": "pando_repository_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (repository_id)",
+      "name": "pando_repository_states_pkey",
+      "table": "pando_repository_states",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((ref_generation > 0))",
+      "name": "pando_repository_states_ref_generation_check",
+      "table": "pando_repository_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id, tenant_id) REFERENCES public.repositories(id, owner_id) ON DELETE CASCADE",
+      "name": "pando_repository_states_repository_id_tenant_id_fkey",
+      "table": "pando_repository_states",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((state = ANY (ARRAY['copying'::text, 'serving'::text, 'rollback'::text])))",
+      "name": "pando_repository_states_state_check",
+      "table": "pando_repository_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((storage_generation > 0))",
+      "name": "pando_repository_states_storage_generation_check",
+      "table": "pando_repository_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "CHECK ((new_generation = (old_generation + 1)))",
       "name": "recovery_resolutions_check",
       "table": "recovery_resolutions",
@@ -9260,7 +9673,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((storage_backend = 'gitfs'::text))",
+      "definition": "CHECK ((storage_backend = ANY (ARRAY['gitfs'::text, 'pando'::text])))",
       "name": "repositories_storage_backend_check",
       "table": "repositories",
       "type": "c",
@@ -9782,7 +10195,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((state = ANY (ARRAY['queued'::text, 'running'::text, 'succeeded'::text, 'failed'::text, 'cancelled'::text, 'timed_out'::text])))",
+      "definition": "CHECK ((state = ANY (ARRAY['queued'::text, 'preparing'::text, 'running'::text, 'succeeded'::text, 'failed'::text, 'cancelled'::text, 'timed_out'::text])))",
       "name": "sandbox_jobs_state_check",
       "table": "sandbox_jobs",
       "type": "c",
@@ -10259,7 +10672,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((kind = ANY (ARRAY['gitfs_stage_cleanup'::text, 'gitfs_repack'::text, 'gitfs_cache_hydrate'::text, 'gitfs_cache_evict'::text, 'gitfs_unreachable_mark'::text, 'gitfs_tombstone_delete'::text])))",
+      "definition": "CHECK ((kind = ANY (ARRAY['gitfs_stage_cleanup'::text, 'gitfs_repack'::text, 'gitfs_cache_hydrate'::text, 'gitfs_cache_evict'::text, 'gitfs_unreachable_mark'::text, 'gitfs_tombstone_delete'::text, 'pando_repack'::text, 'pando_cache_hydrate'::text, 'pando_cache_evict'::text, 'pando_unreachable_mark'::text, 'pando_tombstone_delete'::text])))",
       "name": "storage_maintenance_jobs_kind_check",
       "table": "storage_maintenance_jobs",
       "type": "c",
@@ -11889,6 +12302,60 @@
       "valid": true
     },
     {
+      "definition": "CREATE UNIQUE INDEX pando_pack_manifests_pkey ON public.pando_pack_manifests USING btree (id)",
+      "live": true,
+      "name": "pando_pack_manifests_pkey",
+      "ready": true,
+      "table": "pando_pack_manifests",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX pando_pack_manifests_repository_id_id_key ON public.pando_pack_manifests USING btree (repository_id, id)",
+      "live": true,
+      "name": "pando_pack_manifests_repository_id_id_key",
+      "ready": true,
+      "table": "pando_pack_manifests",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX pando_pack_manifests_repository_idx ON public.pando_pack_manifests USING btree (repository_id, storage_generation, created_at, id)",
+      "live": true,
+      "name": "pando_pack_manifests_repository_idx",
+      "ready": true,
+      "table": "pando_pack_manifests",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX pando_refs_pkey ON public.pando_refs USING btree (repository_id, ref_name)",
+      "live": true,
+      "name": "pando_refs_pkey",
+      "ready": true,
+      "table": "pando_refs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX pando_refs_repository_oid_idx ON public.pando_refs USING btree (repository_id, oid)",
+      "live": true,
+      "name": "pando_refs_repository_oid_idx",
+      "ready": true,
+      "table": "pando_refs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX pando_repository_states_pkey ON public.pando_repository_states USING btree (repository_id)",
+      "live": true,
+      "name": "pando_repository_states_pkey",
+      "ready": true,
+      "table": "pando_repository_states",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX recovery_resolutions_id_repository_id_key ON public.recovery_resolutions USING btree (id, repository_id)",
       "live": true,
       "name": "recovery_resolutions_id_repository_id_key",
@@ -12935,6 +13402,36 @@
       "force_row_security": false,
       "kind": "r",
       "name": "outbox_events",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "pando_pack_manifests",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "pando_refs",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "pando_repository_states",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",

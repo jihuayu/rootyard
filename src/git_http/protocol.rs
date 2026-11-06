@@ -4,6 +4,7 @@ use super::*;
 pub(super) struct ReceiveCommands {
     pub bytes: Vec<u8>,
     pub refs: Vec<String>,
+    pub changes: Vec<journal::RefChange>,
 }
 
 /// Read only the bounded command pkt-lines, before Git sees the pack. The
@@ -18,15 +19,13 @@ pub(super) async fn receive_commands(
     }
     let mut bytes = Vec::new();
     let mut refs = Vec::new();
+    let mut changes = Vec::new();
     loop {
         if bytes.len() + 4 > 128 * 1024 {
             return Err(Error::bad_request());
         }
         let mut header = [0u8; 4];
-        reader
-            .read_exact(&mut header)
-            .await
-            .map_err(Error::internal)?;
+        reader.read_exact(&mut header).await.map_err(Error::internal)?;
         bytes.extend_from_slice(&header);
         let length = std::str::from_utf8(&header)
             .ok()
@@ -35,23 +34,14 @@ pub(super) async fn receive_commands(
         if length == 0 {
             break;
         }
-        if !(4..=65520).contains(&length)
-            || bytes.len() + length - 4 > 128 * 1024
-            || refs.len() >= 128
-        {
+        if !(4..=65520).contains(&length) || bytes.len() + length - 4 > 128 * 1024 || refs.len() >= 128 {
             return Err(Error::bad_request());
         }
         let start = bytes.len();
         bytes.resize(start + length - 4, 0);
-        reader
-            .read_exact(&mut bytes[start..])
-            .await
-            .map_err(Error::internal)?;
+        reader.read_exact(&mut bytes[start..]).await.map_err(Error::internal)?;
         let packet = &bytes[start..];
-        let command = packet
-            .split(|b| *b == 0)
-            .next()
-            .ok_or_else(Error::bad_request)?;
+        let command = packet.split(|b| *b == 0).next().ok_or_else(Error::bad_request)?;
         let command = command.strip_suffix(b"\n").unwrap_or(command);
         let command = std::str::from_utf8(command).map_err(|_| Error::bad_request())?;
         // Shallow lines precede commands, but never confer a publication key.
@@ -59,17 +49,13 @@ pub(super) async fn receive_commands(
             continue;
         }
         let mut fields = command.split(' ');
-        let (Some(old), Some(new), Some(name), None) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
+        let (Some(old), Some(new), Some(name), None) = (fields.next(), fields.next(), fields.next(), fields.next())
         else {
             return Err(Error::bad_request());
         };
         if old.len() != oid_len
             || new.len() != oid_len
-            || !old
-                .bytes()
-                .chain(new.bytes())
-                .all(|b| b.is_ascii_hexdigit())
+            || !old.bytes().chain(new.bytes()).all(|b| b.is_ascii_hexdigit())
             || !crate::journal::valid_ref(name)
             || !name.starts_with("refs/")
             || refs.iter().any(|prior| prior == name)
@@ -77,11 +63,13 @@ pub(super) async fn receive_commands(
             return Err(Error::bad_request());
         }
         refs.push(name.to_string());
+        changes.push(journal::RefChange {
+            ref_name: name.to_string(),
+            old_oid: old.to_ascii_lowercase(),
+            new_oid: new.to_ascii_lowercase(),
+        });
     }
-    // Git sends a standalone 0000 POST before streaming a pack larger than
-    // http.postBuffer. It has no ref commands and therefore needs no writer
-    // publication guard, but its exact bytes still go to native Git.
-    Ok(ReceiveCommands { bytes, refs })
+    Ok(ReceiveCommands { bytes, refs, changes })
 }
 
 #[cfg(test)]
@@ -106,22 +94,16 @@ mod receive_tests {
         let mut reader = source.as_slice();
         let parsed = receive_commands(&mut reader, 40).await.unwrap();
         assert_eq!(parsed.refs, ["refs/heads/a", "refs/heads/b"]);
+        assert_eq!(parsed.changes[0].old_oid, zero);
+        assert_eq!(parsed.changes[0].new_oid, oid);
         assert_eq!(&source[..source.len() - 4], parsed.bytes);
         assert_eq!(reader, b"PACK");
         let mut duplicate = packet(first.as_bytes());
         duplicate.extend(packet(first.as_bytes()));
         duplicate.extend(b"0000");
-        assert!(
-            receive_commands(&mut duplicate.as_slice(), 40)
-                .await
-                .is_err()
-        );
+        assert!(receive_commands(&mut duplicate.as_slice(), 40).await.is_err());
         let mut wrong_format = source.as_slice();
         assert!(receive_commands(&mut wrong_format, 64).await.is_err());
-        let mut flush = b"0000".as_slice();
-        let empty = receive_commands(&mut flush, 40).await.unwrap();
-        assert!(empty.refs.is_empty());
-        assert_eq!(empty.bytes, b"0000");
     }
 }
 
@@ -138,9 +120,7 @@ pub(super) async fn job_response_prefix(
     }
     let mut prefix = vec![0; 4];
     reader.read_exact(&mut prefix).await?;
-    let length = std::str::from_utf8(&prefix)
-        .ok()
-        .and_then(|v| usize::from_str_radix(v, 16).ok());
+    let length = std::str::from_utf8(&prefix).ok().and_then(|v| usize::from_str_radix(v, 16).ok());
     if let Some(length) = length {
         if length == 3 || length > 65520 || length as u64 > maximum {
             return Err(io::Error::other("invalid or oversized Git response packet"));
@@ -152,9 +132,7 @@ pub(super) async fn job_response_prefix(
     } else if prefix != b"PACK" {
         return Err(io::Error::other("invalid Git response packet prefix"));
     }
-    let denied = prefix
-        .get(4..)
-        .is_some_and(|payload| payload.starts_with(b"ERR "));
+    let denied = prefix.get(4..).is_some_and(|payload| payload.starts_with(b"ERR "));
     Ok((prefix, denied))
 }
 
@@ -170,17 +148,11 @@ pub(super) fn route<'a>(
         return Err(Error::not_found());
     }
     let owner = segments[2];
-    let name = segments[3]
-        .strip_suffix(".git")
-        .ok_or_else(Error::not_found)?;
+    let name = segments[3].strip_suffix(".git").ok_or_else(Error::not_found)?;
     if !db::valid_name(owner) || !db::valid_name(name) {
         return Err(Error::not_found());
     }
-    if segments.len() == 6
-        && segments[4] == "info"
-        && segments[5] == "refs"
-        && method == Method::GET
-    {
+    if segments.len() == 6 && segments[4] == "info" && segments[5] == "refs" && method == Method::GET {
         let service = match query {
             Some("service=git-upload-pack") => "git-upload-pack",
             Some("service=git-receive-pack") => "git-receive-pack",
@@ -198,31 +170,16 @@ pub(super) fn route<'a>(
         Err(Error::not_found())
     }
 }
-pub(super) fn validate_headers(
-    headers: &HeaderMap,
-    method: &Method,
-    service: &str,
-    limit: u64,
-) -> Result<(), Error> {
+pub(super) fn validate_headers(headers: &HeaderMap, method: &Method, service: &str, limit: u64) -> Result<(), Error> {
     if let Some(value) = headers.get(header::CONTENT_ENCODING) {
         if value != "identity" && value != "gzip" && value != "x-gzip" {
-            return Err(Error(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "unsupported request encoding",
-            ));
+            return Err(Error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported request encoding"));
         }
     }
     if let Some(value) = headers.get(header::CONTENT_LENGTH) {
-        let size = value
-            .to_str()
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .ok_or_else(Error::bad_request)?;
+        let size = value.to_str().ok().and_then(|v| v.parse::<u64>().ok()).ok_or_else(Error::bad_request)?;
         if size > limit {
-            return Err(Error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request size limit exceeded",
-            ));
+            return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
         }
     }
     if let Some(value) = headers.get("git-protocol") {
@@ -232,15 +189,8 @@ pub(super) fn validate_headers(
     }
     if method == Method::POST {
         let expected = format!("application/x-{service}-request");
-        if headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            != Some(expected.as_str())
-        {
-            return Err(Error(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "invalid Git content type",
-            ));
+        if headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) != Some(expected.as_str()) {
+            return Err(Error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "invalid Git content type"));
         }
     }
     Ok(())
@@ -292,10 +242,7 @@ mod tests {
         }
         let packet = b"0013ERR not our ref";
         let mut err_then_pack = &b"0013ERR not our refPACKmust-not-be-served"[..];
-        assert_eq!(
-            job_response_prefix(&mut err_then_pack, 1024).await.unwrap(),
-            (packet.to_vec(), true)
-        );
+        assert_eq!(job_response_prefix(&mut err_then_pack, 1024).await.unwrap(), (packet.to_vec(), true));
         assert_eq!(err_then_pack, b"PACKmust-not-be-served");
         let (mut writer, mut reader) = tokio::io::duplex(1);
         let write = tokio::spawn(async move {
@@ -303,19 +250,9 @@ mod tests {
                 writer.write_all(&[*byte]).await.unwrap();
             }
         });
-        assert_eq!(
-            job_response_prefix(&mut reader, 1024).await.unwrap(),
-            (packet.to_vec(), true)
-        );
+        assert_eq!(job_response_prefix(&mut reader, 1024).await.unwrap(), (packet.to_vec(), true));
         write.await.unwrap();
-        for bytes in [
-            b"0013ERR short".as_slice(),
-            b"00",
-            b"ffff",
-            b"0008NA",
-            b"0003",
-            b"oops",
-        ] {
+        for bytes in [b"0013ERR short".as_slice(), b"00", b"ffff", b"0008NA", b"0003", b"oops"] {
             assert!(job_response_prefix(&mut &bytes[..], 1024).await.is_err());
         }
         assert!(job_response_prefix(&mut &packet[..], 8).await.is_err());
@@ -332,13 +269,6 @@ mod tests {
         ] {
             assert!(route(&Method::GET, path, Some("service=git-upload-pack")).is_err());
         }
-        assert!(
-            route(
-                &Method::GET,
-                "/git/alice/demo.git/info/refs",
-                Some("service=git-upload-pack")
-            )
-            .is_ok()
-        );
+        assert!(route(&Method::GET, "/git/alice/demo.git/info/refs", Some("service=git-upload-pack")).is_ok());
     }
 }

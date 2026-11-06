@@ -12,18 +12,14 @@ use super::models::*;
 use super::namespace::{make_provenance_record, normalize_mount_path};
 
 impl Store {
-    pub fn project_subdir(
-        &self,
-        view_name: &str,
-        repo_name: &str,
-        subdir_raw: &str,
-    ) -> Result<serde_json::Value> {
+    pub fn project_subdir(&self, view_name: &str, repo_name: &str, subdir_raw: &str) -> Result<serde_json::Value> {
         let strat = "subdirectory_projection";
         self.project_repo_history(view_name, repo_name, Some(subdir_raw), strat, None, false)
     }
 
     pub fn project_history_cli(&self, args: &[OsString]) -> Result<serde_json::Value> {
-        let usage = "project-history requires STORE VIEW_NAME TARGET_SPEC [--strategy ...] [--subdir ...] [--epoch ...]";
+        let usage =
+            "project-history requires STORE VIEW_NAME TARGET_SPEC [--strategy ...] [--subdir ...] [--epoch ...]";
         ensure!(args.len() >= 2, "{usage}");
         let view_name = text_arg(&args[0])?;
         let mut target = text_arg(&args[1])?;
@@ -44,29 +40,14 @@ impl Store {
         let valid_strat = matches!(strategy.as_str(), "deterministic_history" | "task_snapshot");
         ensure!(valid_strat, "unsupported projection strategy {strategy}");
         if valid_id(&target).is_ok() && self.root.join("namespaces").join(&target).exists() {
-            ensure!(
-                subdir.is_none(),
-                "--subdir cannot be combined with a namespace target"
-            );
+            ensure!(subdir.is_none(), "--subdir cannot be combined with a namespace target");
             if strategy == "task_snapshot" {
                 return self.create_task_view(&view_name, &target);
             }
             let rev = self.read_namespace_revision(&target)?;
-            target = rev
-                .mounts
-                .first()
-                .context("empty namespace mounts")?
-                .repo_name
-                .clone();
+            target = rev.mounts.first().context("empty namespace mounts")?.repo_name.clone();
         }
-        self.project_repo_history(
-            &view_name,
-            &target,
-            subdir.as_deref(),
-            &strategy,
-            epoch,
-            true,
-        )
+        self.project_repo_history(&view_name, &target, subdir.as_deref(), &strategy, epoch, true)
     }
 
     fn find_view_by_name(&self, view_name: &str) -> Result<Option<ViewMeta>> {
@@ -95,56 +76,39 @@ impl Store {
         let src_head = self.git_text(&src_bare, &["rev-parse", "--verify", "refs/heads/main"])?;
 
         let existing = self.find_view_by_name(view_name)?;
-        ensure!(
-            attach_trailer || existing.is_none(),
-            "view name already exists"
-        );
+        ensure!(attach_trailer || existing.is_none(), "view name already exists");
 
-        let (view_id, view_epoch, mut commit_map, mut epochs, mut prov_commits, staging) =
-            if let Some(prev) = &existing {
-                let same_cfg = prev.strategy == strategy
-                    && prev.source_repo_id.as_deref() == Some(repo.repo_id.as_str())
-                    && prev.subdir_path == subdir;
-                ensure!(
-                    same_cfg,
-                    "existing view configuration mismatch for epoch projection"
-                );
-                let next_ep = requested_epoch.unwrap_or(prev.view_epoch + 1);
-                ensure!(
-                    next_ep > prev.view_epoch,
-                    "view_epoch must exceed {}",
-                    prev.view_epoch
-                );
-                let vdir = self.root.join("views").join(&prev.view_id);
-                let load = |f: &str| read_regular(&vdir.join(f), MAX_JSON);
-                let cmap: BTreeMap<String, String> = if strategy == "task_snapshot" {
-                    BTreeMap::new()
-                } else {
-                    serde_json::from_slice(&load("commit_map.json")?)?
-                };
-                let emap: EpochCommitMap = serde_json::from_slice(&load("epoch_commit_map.json")?)?;
-                let pman: ViewProvenanceManifest =
-                    serde_json::from_slice(&load("provenance.json")?)?;
-                let kept = if strategy == "task_snapshot" {
-                    Vec::new()
-                } else {
-                    pman.commits
-                };
-                (prev.view_id.clone(), next_ep, cmap, emap.epochs, kept, None)
+        let (view_id, view_epoch, mut commit_map, mut epochs, mut prov_commits, staging) = if let Some(prev) = &existing
+        {
+            let same_cfg = prev.strategy == strategy
+                && prev.source_repo_id.as_deref() == Some(repo.repo_id.as_str())
+                && prev.subdir_path == subdir;
+            ensure!(same_cfg, "existing view configuration mismatch for epoch projection");
+            let next_ep = requested_epoch.unwrap_or(prev.view_epoch + 1);
+            ensure!(next_ep > prev.view_epoch, "view_epoch must exceed {}", prev.view_epoch);
+            let vdir = self.root.join("views").join(&prev.view_id);
+            let load = |f: &str| read_regular(&vdir.join(f), MAX_JSON);
+            let cmap: BTreeMap<String, String> = if strategy == "task_snapshot" {
+                BTreeMap::new()
             } else {
-                let ep = requested_epoch.unwrap_or(1);
-                ensure!(ep >= 1, "view_epoch must be at least 1");
-                let stg = self.stage()?;
-                let vbare = stg.0.join("repo.git");
-                private_dir(&vbare)?;
-                self.git(&vbare, &["init", "--bare", "--initial-branch=main"])?;
-                let (cmap, emap) = (BTreeMap::new(), BTreeMap::new());
-                (new_id(), ep, cmap, emap, Vec::new(), Some(stg))
+                serde_json::from_slice(&load("commit_map.json")?)?
             };
+            let emap: EpochCommitMap = serde_json::from_slice(&load("epoch_commit_map.json")?)?;
+            let pman: ViewProvenanceManifest = serde_json::from_slice(&load("provenance.json")?)?;
+            let kept = if strategy == "task_snapshot" { Vec::new() } else { pman.commits };
+            (prev.view_id.clone(), next_ep, cmap, emap.epochs, kept, None)
+        } else {
+            let ep = requested_epoch.unwrap_or(1);
+            ensure!(ep >= 1, "view_epoch must be at least 1");
+            let stg = self.stage()?;
+            let vbare = stg.0.join("repo.git");
+            private_dir(&vbare)?;
+            self.git(&vbare, &["init", "--bare", "--initial-branch=main"])?;
+            let (cmap, emap) = (BTreeMap::new(), BTreeMap::new());
+            (new_id(), ep, cmap, emap, Vec::new(), Some(stg))
+        };
 
-        let view_dir = staging
-            .as_ref()
-            .map_or_else(|| self.root.join("views").join(&view_id), |s| s.0.clone());
+        let view_dir = staging.as_ref().map_or_else(|| self.root.join("views").join(&view_id), |s| s.0.clone());
         let view_bare = view_dir.join("repo.git");
         let src_str = src_bare.to_str().context("path must be UTF-8")?;
         let tmp_ref = format!("{src_head}:refs/rootyard/tmp-source");
@@ -161,15 +125,10 @@ impl Store {
                 .map(str::to_owned)
                 .collect()
         };
-        ensure!(
-            !source_commits.is_empty(),
-            "source repository has no commits"
-        );
+        ensure!(!source_commits.is_empty(), "source repository has no commits");
 
-        let mut commit_tree_map: BTreeMap<String, String> = prov_commits
-            .iter()
-            .map(|r| (r.projected_commit_oid.clone(), r.projected_tree_oid.clone()))
-            .collect();
+        let mut commit_tree_map: BTreeMap<String, String> =
+            prov_commits.iter().map(|r| (r.projected_commit_oid.clone(), r.projected_tree_oid.clone())).collect();
         let (mut newly_projected, mut reused_commits) = (0usize, 0usize);
 
         for src_oid in &source_commits {
@@ -179,8 +138,7 @@ impl Store {
             }
             let mut mapped_parents = Vec::new();
             if strategy != "task_snapshot" {
-                let p_line =
-                    self.git_text(&view_bare, &["rev-list", "--parents", "-n", "1", src_oid])?;
+                let p_line = self.git_text(&view_bare, &["rev-list", "--parents", "-n", "1", src_oid])?;
                 for parent_src in p_line.split_whitespace().skip(1) {
                     if let Some(m) = commit_map.get(parent_src)
                         && !mapped_parents.contains(m)
@@ -190,12 +148,8 @@ impl Store {
                 }
             }
 
-            let spec = subdir.as_ref().map_or_else(
-                || format!("{src_oid}^{{tree}}"),
-                |s| format!("{src_oid}:{s}"),
-            );
-            let t_out =
-                self.git_output_with_env(&view_bare, &["rev-parse", "--verify", &spec], &[], None)?;
+            let spec = subdir.as_ref().map_or_else(|| format!("{src_oid}^{{tree}}"), |s| format!("{src_oid}:{s}"));
+            let t_out = self.git_output_with_env(&view_bare, &["rev-parse", "--verify", &spec], &[], None)?;
             let subtree_oid = if t_out.status.success() {
                 let cand = String::from_utf8(t_out.stdout)?.trim().to_owned();
                 (self.git_text(&view_bare, &["cat-file", "-t", &cand])? == "tree").then_some(cand)
@@ -211,9 +165,7 @@ impl Store {
 
             if strategy != "task_snapshot"
                 && !mapped_parents.is_empty()
-                && mapped_parents
-                    .iter()
-                    .all(|p| commit_tree_map.get(p) == Some(&subtree_oid))
+                && mapped_parents.iter().all(|p| commit_tree_map.get(p) == Some(&subtree_oid))
             {
                 commit_map.insert(src_oid.clone(), mapped_parents[0].clone());
                 continue;
@@ -260,24 +212,13 @@ impl Store {
             newly_projected += 1;
         }
 
-        let projected_head = commit_map
-            .get(&src_head)
-            .context("subdirectory never appeared in source history")?
-            .clone();
-        self.git(
-            &view_bare,
-            &["update-ref", "refs/heads/main", &projected_head],
-        )?;
+        let projected_head =
+            commit_map.get(&src_head).context("subdirectory never appeared in source history")?.clone();
+        self.git(&view_bare, &["update-ref", "refs/heads/main", &projected_head])?;
         if strategy == "task_snapshot" {
-            self.git(
-                &view_bare,
-                &["update-ref", "refs/rootyard/view-base", &projected_head],
-            )?;
+            self.git(&view_bare, &["update-ref", "refs/rootyard/view-base", &projected_head])?;
         }
-        self.git(
-            &view_bare,
-            &["update-ref", "-d", "refs/rootyard/tmp-source"],
-        )?;
+        self.git(&view_bare, &["update-ref", "-d", "refs/rootyard/tmp-source"])?;
         self.git(&view_bare, &["repack", "-adq"])?;
         self.git(&view_bare, &["prune", "--expire=now"])?;
         self.git(&view_bare, &["fsck", "--full", "--strict"])?;
@@ -326,11 +267,7 @@ impl Store {
         }))
     }
 
-    pub fn create_task_view(
-        &self,
-        view_name: &str,
-        revision_id: &str,
-    ) -> Result<serde_json::Value> {
+    pub fn create_task_view(&self, view_name: &str, revision_id: &str) -> Result<serde_json::Value> {
         ensure!(valid_name(view_name), "invalid view name");
         let revision = self.read_namespace_revision(revision_id)?;
         let staging = self.stage()?;
@@ -371,10 +308,7 @@ impl Store {
         let base_out = self.git_with_input(&view_bare, &c_args, &env, msg.as_bytes())?;
         let base_oid = String::from_utf8(base_out)?.trim().to_owned();
         self.git(&view_bare, &["update-ref", "refs/heads/main", &base_oid])?;
-        self.git(
-            &view_bare,
-            &["update-ref", "refs/rootyard/view-base", &base_oid],
-        )?;
+        self.git(&view_bare, &["update-ref", "refs/rootyard/view-base", &base_oid])?;
         self.git(&view_bare, &["fsck", "--full", "--strict"])?;
 
         let view_id = new_id();
@@ -390,10 +324,7 @@ impl Store {
             head_oid: base_oid.clone(),
             view_epoch: 1,
         };
-        let src_oid = revision
-            .mounts
-            .first()
-            .map_or_else(|| base_oid.clone(), |m| m.base_oid.clone());
+        let src_oid = revision.mounts.first().map_or_else(|| base_oid.clone(), |m| m.base_oid.clone());
         let ctx = (view_id.as_str(), "task_snapshot", 1);
         let oids = (base_oid.as_str(), src_oid.as_str(), root_tree.as_str());
         let rec = make_provenance_record(ctx, oids, Vec::new(), (any_signed, sig_kind));
@@ -423,15 +354,8 @@ impl Store {
         }))
     }
 
-    pub(crate) fn build_composite_tree(
-        &self,
-        bare: &Path,
-        mounts: &[(String, String)],
-    ) -> Result<String> {
-        let split: Vec<(Vec<&str>, &str)> = mounts
-            .iter()
-            .map(|(p, t)| (p.split('/').collect(), t.as_str()))
-            .collect();
+    pub(crate) fn build_composite_tree(&self, bare: &Path, mounts: &[(String, String)]) -> Result<String> {
+        let split: Vec<(Vec<&str>, &str)> = mounts.iter().map(|(p, t)| (p.split('/').collect(), t.as_str())).collect();
         self.build_tree_level(bare, &split)
     }
 
@@ -446,14 +370,10 @@ impl Store {
                 ensure!(fresh, "overlapping mount tree entry");
             } else {
                 ensure!(!direct.contains_key(head), "overlapping mount tree entry");
-                nested
-                    .entry(head)
-                    .or_default()
-                    .push((comps[1..].to_vec(), *tree_oid));
+                nested.entry(head).or_default().push((comps[1..].to_vec(), *tree_oid));
             }
         }
-        let mut entries: BTreeMap<&str, String> =
-            direct.into_iter().map(|(k, v)| (k, v.to_owned())).collect();
+        let mut entries: BTreeMap<&str, String> = direct.into_iter().map(|(k, v)| (k, v.to_owned())).collect();
         for (name, children) in nested {
             entries.insert(name, self.build_tree_level(bare, &children)?);
         }
@@ -469,10 +389,7 @@ impl Store {
         valid_id(view_id)?;
         let path = self.root.join("views").join(view_id).join("view.json");
         let meta: ViewMeta = serde_json::from_slice(&read_regular(&path, MAX_JSON)?)?;
-        ensure!(
-            meta.schema == SCHEMA && meta.view_id == view_id,
-            "invalid view metadata"
-        );
+        ensure!(meta.schema == SCHEMA && meta.view_id == view_id, "invalid view metadata");
         Ok(meta)
     }
 

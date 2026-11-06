@@ -1,9 +1,18 @@
 //! Service-owned FUSE sessions for ordinary workspace filesystem access.
+use super::lazy;
 use crate::{
     AppState, Error,
-    workspace_lab::fuse_mount::{MutationGate, Overlay},
+    members::models::Role,
+    workspace_lab::fuse_mount::{LazySource, MutationGate, Overlay},
+};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
 };
 use fuser::{BackgroundSession, MountOption};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     fs,
@@ -16,6 +25,7 @@ use uuid::Uuid;
 struct Mounted {
     _session: BackgroundSession,
     gate: Arc<MutationGate>,
+    lazy: Option<Arc<lazy::Reader>>,
 }
 static MOUNTS: OnceLock<Mutex<HashMap<Uuid, Mounted>>> = OnceLock::new();
 fn registry() -> &'static Mutex<HashMap<Uuid, Mounted>> {
@@ -26,18 +36,10 @@ pub fn enabled() -> bool {
     std::env::var("ROOTYARD_WORKSPACE_MOUNT_MODE").as_deref() == Ok("fuse")
 }
 pub fn lower_path(state: &AppState, id: Uuid) -> PathBuf {
-    state
-        .storage
-        .root
-        .join("workspace-service/workspaces")
-        .join(id.to_string())
+    state.storage.root.join("workspace-service/workspaces").join(id.to_string())
 }
 pub fn mount_path(state: &AppState, id: Uuid) -> PathBuf {
-    state
-        .storage
-        .root
-        .join("workspace-service/mounts")
-        .join(id.to_string())
+    state.storage.root.join("workspace-service/mounts").join(id.to_string())
 }
 pub fn mounted(id: Uuid) -> bool {
     !enabled() || registry().lock().unwrap().contains_key(&id)
@@ -83,10 +85,7 @@ pub fn with_frozen<T>(id: Uuid, work: impl FnOnce() -> Result<T, Error>) -> Resu
         .ok_or_else(|| Error::internal("workspace FUSE mount missing"))?;
     gate.freeze(work)
 }
-pub async fn with_frozen_async<T>(
-    id: Uuid,
-    work: impl Future<Output = Result<T, Error>>,
-) -> Result<T, Error> {
+pub async fn with_frozen_async<T>(id: Uuid, work: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
     if !enabled() {
         return work.await;
     }
@@ -125,33 +124,64 @@ pub fn ensure(state: &AppState, id: Uuid, until: i64) -> Result<(), Error> {
     if !lower.join(".git").is_dir() {
         return Err(Error::internal("workspace lower Git state missing"));
     }
-    let upper = state
-        .storage
-        .root
-        .join("workspace-service/uppers")
-        .join(id.to_string());
+    let upper = state.storage.root.join("workspace-service/uppers").join(id.to_string());
     let mountpoint = mount_path(state, id);
     fs::create_dir_all(&upper).map_err(Error::internal)?;
     fs::create_dir_all(&mountpoint).map_err(Error::internal)?;
     let gate = MutationGate::new(until);
-    let overlay = Overlay::new_with_gate(lower, upper, gate.clone()).map_err(Error::internal)?;
+    let lazy = lazy::Reader::open(state, id)?;
+    let source: Option<Arc<dyn LazySource>> = lazy.clone().map(|reader| reader as Arc<dyn LazySource>);
+    let overlay = Overlay::new_with_gate_and_lazy(lower, upper, gate.clone(), source).map_err(Error::internal)?;
     let session = fuser::spawn_mount2(
         overlay,
         &mountpoint,
-        &[
-            MountOption::FSName("rootyard-workspace".into()),
-            MountOption::DefaultPermissions,
-        ],
+        &[MountOption::FSName("rootyard-workspace".into()), MountOption::DefaultPermissions],
     )
     .map_err(Error::internal)?;
-    registry.insert(
-        id,
-        Mounted {
-            _session: session,
-            gate,
-        },
-    );
+    registry.insert(id, Mounted { _session: session, gate, lazy });
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Prewarm {
+    paths: Vec<String>,
+}
+pub async fn prewarm(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(input): Json<Prewarm>,
+) -> Result<Json<Value>, Error> {
+    let ws = super::service::authorized(&state, &headers, id, Role::Write).await?;
+    if ws.host_id != state.storage.volume_id || input.paths.is_empty() || input.paths.len() > 4 {
+        return Err(Error(StatusCode::CONFLICT, "workspace prewarm requires local lease and up to four paths"));
+    }
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let live: bool = client
+        .query_one("SELECT lease_until>clock_timestamp() FROM workspaces WHERE id=$1", &[&id])
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    if !live {
+        return Err(super::service::conflict());
+    }
+    let reader = registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .and_then(|m| m.lazy.clone())
+        .ok_or(Error(StatusCode::CONFLICT, "workspace has no remote lazy baseline"))?;
+    let paths: Vec<PathBuf> = input
+        .paths
+        .iter()
+        .map(|p| crate::browse::models::normalize_rel_path(Some(p)).map(PathBuf::from))
+        .collect::<Result<_, _>>()?;
+    let (count, bytes) = tokio::task::spawn_blocking(move || reader.prewarm(&paths))
+        .await
+        .map_err(Error::internal)?
+        .map_err(Error::internal)?;
+    Ok(Json(json!({"hydrated_files":count,"hydrated_bytes":bytes})))
 }
 pub async fn ensure_from_database(state: &AppState, id: Uuid) -> Result<(), Error> {
     if !enabled() {

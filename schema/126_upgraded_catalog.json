@@ -3863,6 +3863,17 @@
     },
     {
       "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "name": "operation_sequence",
+      "not_null": true,
+      "position": 10,
+      "table": "pando_repository_states",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
       "default": null,
       "generated": "",
       "identity": "",
@@ -5059,6 +5070,17 @@
       "position": 21,
       "table": "sandbox_jobs",
       "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "name": "terminal",
+      "not_null": true,
+      "position": 22,
+      "table": "sandbox_jobs",
+      "type": "boolean"
     },
     {
       "collation": null,
@@ -9608,7 +9630,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((((octet_length(ref_name) >= 6) AND (octet_length(ref_name) <= 1024)) AND (ref_name ~~ 'refs/%'::text) AND (ref_name !~ '[[:cntrl:]]'::text)))",
+      "definition": "CHECK (((octet_length(ref_name) >= 6) AND (octet_length(ref_name) <= 1024) AND (ref_name ~~ 'refs/%'::text) AND (ref_name !~ '[[:cntrl:]]'::text)))",
       "name": "pando_refs_ref_name_check",
       "table": "pando_refs",
       "type": "c",
@@ -9637,6 +9659,15 @@
       "deferred": false,
       "definition": "CHECK ((object_format = ANY (ARRAY['sha1'::text, 'sha256'::text])))",
       "name": "pando_repository_states_object_format_check",
+      "table": "pando_repository_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((operation_sequence >= 0))",
+      "name": "pando_repository_states_operation_sequence_check",
       "table": "pando_repository_states",
       "type": "c",
       "validated": true

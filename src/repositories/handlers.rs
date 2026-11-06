@@ -31,39 +31,25 @@ pub(super) async fn create_repo(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let owner = input.owner.as_deref().unwrap_or(&identity.username);
     let owner_id = organizations::authorize_namespace_create(&tx, &identity, owner).await?;
-    let format = input
-        .object_format
-        .unwrap_or(browse::object_format::ObjectFormat::Sha1);
+    let format = input.object_format.unwrap_or(browse::object_format::ObjectFormat::Sha1);
     let id = Uuid::new_v4();
     let created=tx.execute("INSERT INTO repositories (id,owner_id,name,object_format) VALUES ($1,$2,$3,$4) ON CONFLICT (owner_id,name) DO NOTHING",&[&id,&owner_id,&input.name,&format.as_str()]).await.map_err(Error::internal)?==1;
     let row = tx
-        .query_one(
-            &format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT),
-            &[&owner_id, &input.name],
-        )
+        .query_one(&format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT), &[&owner_id, &input.name])
         .await
         .map_err(Error::internal)?;
     let mut repo = db::Repository::from_row(&row);
-    if input
-        .object_format
-        .is_some_and(|requested| requested.as_str() != repo.object_format)
-    {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "repository object format cannot change",
-        ));
+    if input.object_format.is_some_and(|requested| requested.as_str() != repo.object_format) {
+        return Err(Error(StatusCode::CONFLICT, "repository object format cannot change"));
     }
     auth::finish_tx(tx, &identity, true).await?;
     drop(client);
-    if repo.state == "provisioning"
-        && sharding::transport::is_local_primary_for_repo(&state, owner_id, repo.id).await?
+    if repo.state == "provisioning" && sharding::transport::is_local_primary_for_repo(&state, owner_id, repo.id).await?
     {
-        let _slot = state.git_slots.try_acquire().map_err(|_| {
-            Error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Git capacity exhausted; retry later",
-            )
-        })?;
+        let _slot = state
+            .git_slots
+            .try_acquire()
+            .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
         if state
             .storage
             .provision_with_format(
@@ -80,10 +66,7 @@ pub(super) async fn create_repo(
                 .get()
                 .await
                 .map_err(Error::internal)?
-                .execute(
-                    "UPDATE repositories SET state='ready' WHERE id=$1 AND state='provisioning'",
-                    &[&repo.id],
-                )
+                .execute("UPDATE repositories SET state='ready' WHERE id=$1 AND state='provisioning'", &[&repo.id])
                 .await
                 .map_err(Error::internal)?;
             repo.state = "ready".into();
@@ -100,10 +83,7 @@ pub(super) async fn create_repo(
     };
     Ok((status, [(header::CACHE_CONTROL, "no-store")], Json(repo)).into_response())
 }
-pub(super) async fn list_repos(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Response, Error> {
+pub(super) async fn list_repos(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, Error> {
     let identity = auth::authenticate(&state.pool, &headers).await?;
     let rows = state
         .pool
@@ -119,14 +99,7 @@ pub(super) async fn list_repos(
         )
         .await
         .map_err(Error::internal)?;
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(
-            rows.iter()
-                .map(db::Repository::from_row)
-                .collect::<Vec<_>>(),
-        ),
-    )
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(rows.iter().map(db::Repository::from_row).collect::<Vec<_>>()))
         .into_response())
 }
 pub(super) async fn get_repo(
@@ -141,21 +114,16 @@ pub(super) async fn get_repo(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id: Uuid = if owner == identity.username {
-        tx.query_opt(
-            "SELECT id FROM repositories WHERE owner_id=$1 AND name=$2",
-            &[&identity.id, &name],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?
-        .get("id")
+        tx.query_opt("SELECT id FROM repositories WHERE owner_id=$1 AND name=$2", &[&identity.id, &name])
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(Error::not_found)?
+            .get("id")
     } else {
         auth::authorize_repo(&tx, &identity, &owner, &name, false).await?
     };
-    let row = tx
-        .query_one(&format!("{} WHERE r.id=$1", db::REPO_SELECT), &[&repo_id])
-        .await
-        .map_err(Error::internal)?;
+    let row =
+        tx.query_one(&format!("{} WHERE r.id=$1", db::REPO_SELECT), &[&repo_id]).await.map_err(Error::internal)?;
     let repo = db::Repository::from_row(&row);
     auth::finish_tx(tx, &identity, false).await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(repo)).into_response())
@@ -188,13 +156,14 @@ pub async fn recover(state: &AppState) -> anyhow::Result<usize> {
             break;
         };
         state.pool.get().await?.execute("UPDATE repositories SET next_retry_at=clock_timestamp()+interval '30 seconds', provision_attempts=provision_attempts+1 WHERE id=$1 AND state='provisioning'", &[&id]).await?;
-        match state
-            .storage
-            .provision_with_format(&state.config, id, format)
-            .await
-        {
+        match state.storage.provision_with_format(&state.config, id, format).await {
             Ok(()) => {
-                state.pool.get().await?.execute("UPDATE repositories SET state='ready' WHERE id=$1 AND state='provisioning'",&[&id]).await?;
+                state
+                    .pool
+                    .get()
+                    .await?
+                    .execute("UPDATE repositories SET state='ready' WHERE id=$1 AND state='provisioning'", &[&id])
+                    .await?;
                 recovered += 1;
             }
             Err(_) => eprintln!("rootyard: repository {id} provisioning requires retry"),

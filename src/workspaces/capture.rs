@@ -8,23 +8,18 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub(super) fn fingerprint(repo: &Path) -> Result<String, Error> {
+    if let Some(fingerprint) = super::lazy::fingerprint(repo)? {
+        return Ok(fingerprint);
+    }
     let entries = core::inventory(repo).map_err(Error::internal)?;
     let raw = serde_json::to_vec(&entries).map_err(Error::internal)?;
     Ok(hex::encode(Sha256::digest(&raw)))
 }
 
-pub async fn record_current(
-    tx: &deadpool_postgres::Transaction<'_>,
-    state: &AppState,
-    id: Uuid,
-) -> Result<(), Error> {
+pub async fn record_current(tx: &deadpool_postgres::Transaction<'_>, state: &AppState, id: Uuid) -> Result<(), Error> {
     record_current_at(tx, id, &service::workspace_repo(state, id)).await
 }
-pub async fn record_current_at(
-    tx: &deadpool_postgres::Transaction<'_>,
-    id: Uuid,
-    path: &Path,
-) -> Result<(), Error> {
+pub async fn record_current_at(tx: &deadpool_postgres::Transaction<'_>, id: Uuid, path: &Path) -> Result<(), Error> {
     let value = fingerprint(path)?;
     tx.execute("INSERT INTO workspace_capture_state(workspace_id,fingerprint) VALUES($1,$2) ON CONFLICT(workspace_id) DO UPDATE SET fingerprint=$2,scanned_at=clock_timestamp()", &[&id,&value]).await.map_err(Error::internal)?;
     Ok(())
@@ -45,27 +40,26 @@ pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
         return Err(service::conflict());
     }
     let previous = tx
-        .query_opt(
-            "SELECT fingerprint FROM workspace_capture_state WHERE workspace_id=$1 FOR UPDATE",
-            &[&id],
-        )
+        .query_opt("SELECT fingerprint FROM workspace_capture_state WHERE workspace_id=$1 FOR UPDATE", &[&id])
         .await
         .map_err(Error::internal)?;
-    let changed = previous
-        .as_ref()
-        .is_some_and(|r| r.get::<_, String>(0) != b);
+    let changed = previous.as_ref().is_some_and(|r| r.get::<_, String>(0) != b);
     tx.execute("INSERT INTO workspace_capture_state(workspace_id,fingerprint) VALUES($1,$2) ON CONFLICT(workspace_id) DO UPDATE SET fingerprint=$2,scanned_at=clock_timestamp()", &[&id,&b]).await.map_err(Error::internal)?;
     if changed {
         let next = revision + 1;
-        let payload =
-            json!({"revision":next,"lease_epoch":epoch,"fingerprint":b,"source":"native_scan"});
+        let payload = json!({"revision":next,"lease_epoch":epoch,"fingerprint":b,"source":"native_scan"});
         tx.execute(
             "UPDATE workspaces SET revision=$2 WHERE id=$1 AND lease_epoch=$3 AND host_id=$4",
             &[&id, &next, &epoch, &state.storage.volume_id],
         )
         .await
         .map_err(Error::internal)?;
-        tx.execute("INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'external_capture',$3)", &[&id,&next,&payload]).await.map_err(Error::internal)?;
+        tx.execute(
+            "INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'external_capture',$3)",
+            &[&id, &next, &payload],
+        )
+        .await
+        .map_err(Error::internal)?;
     }
     tx.commit().await.map_err(Error::internal)?;
     Ok(changed)

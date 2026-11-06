@@ -63,34 +63,26 @@ pub fn event_id(operation_id: Uuid, transaction_sequence: i64, ref_name: &str) -
     hex::encode(hash.finalize())
 }
 fn valid_oid(oid: &str) -> bool {
-    matches!(oid.len(), 40 | 64)
-        && oid
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Replay verifies immutable metadata and events. Unknown evidence may grow;
 /// terminal publication must contain the complete, identical transaction set.
-pub async fn publish(
-    pool: &Pool,
-    operation: &OperationRecord,
-    changes: &[RefEventInput],
-) -> Result<()> {
-    ensure!(
-        matches!(
-            operation.outcome.as_str(),
-            "unknown" | "recorded" | "no_ref_changes"
-        ),
-        "invalid outcome"
-    );
-    ensure!(
-        operation.sequence > 0 && operation.storage_generation > 0,
-        "invalid operation sequence"
-    );
-    ensure!(
-        crate::db::valid_name(&operation.actor_name),
-        "invalid actor name"
-    );
+pub async fn publish(pool: &Pool, operation: &OperationRecord, changes: &[RefEventInput]) -> Result<()> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    publish_in_tx(&tx, operation, changes).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Insert/replay the operation and its exact outbox set within a caller-owned
+/// transaction. Pando uses this with the authoritative ref/pack CAS so neither
+/// side can commit independently.
+pub async fn publish_in_tx(tx: &Transaction<'_>, operation: &OperationRecord, changes: &[RefEventInput]) -> Result<()> {
+    ensure!(matches!(operation.outcome.as_str(), "unknown" | "recorded" | "no_ref_changes"), "invalid outcome");
+    ensure!(operation.sequence > 0 && operation.storage_generation > 0, "invalid operation sequence");
+    ensure!(crate::db::valid_name(&operation.actor_name), "invalid actor name");
     let service = operation.service_principal_id.is_some();
     if service {
         ensure!(
@@ -101,16 +93,10 @@ pub async fn publish(
             "invalid CI service operation"
         );
     } else {
-        ensure!(
-            !operation.actor_id.is_nil() && !operation.token_id.is_nil(),
-            "invalid human operation"
-        );
+        ensure!(!operation.actor_id.is_nil() && !operation.token_id.is_nil(), "invalid human operation");
     }
     ensure!(changes.len() <= 100_000, "too many ref events");
-    ensure!(
-        operation.outcome != "no_ref_changes" || changes.is_empty(),
-        "no_ref_changes contains events"
-    );
+    ensure!(operation.outcome != "no_ref_changes" || changes.is_empty(), "no_ref_changes contains events");
     let mut ids = std::collections::HashSet::new();
     for change in changes {
         ensure!(
@@ -121,40 +107,25 @@ pub async fn publish(
             "invalid ref event"
         );
         ensure!(
-            valid_oid(&change.old_oid)
-                && valid_oid(&change.new_oid)
-                && change.old_oid.len() == change.new_oid.len(),
+            valid_oid(&change.old_oid) && valid_oid(&change.new_oid) && change.old_oid.len() == change.new_oid.len(),
             "invalid event oid"
         );
         ensure!(
-            ids.insert(event_id(
-                operation.id,
-                change.transaction_sequence,
-                &change.ref_name
-            )),
+            ids.insert(event_id(operation.id, change.transaction_sequence, &change.ref_name)),
             "duplicate ref event"
         );
     }
-    let mut client = pool.get().await?;
-    let tx = client.transaction().await?;
     // Shared repository lock orders publication against explicit offline resolution.
-    tx.query_one(
-        "SELECT id FROM repositories WHERE id=$1 FOR SHARE",
-        &[&operation.repository_id],
-    )
-    .await?;
+    tx.query_one("SELECT id FROM repositories WHERE id=$1 FOR SHARE", &[&operation.repository_id]).await?;
     ensure!(
-        tx.query_opt(
-            "SELECT operation_id FROM operation_resolutions WHERE operation_id=$1",
-            &[&operation.id]
-        )
-        .await?
-        .is_none(),
+        tx.query_opt("SELECT operation_id FROM operation_resolutions WHERE operation_id=$1", &[&operation.id])
+            .await?
+            .is_none(),
         "resolved operation is immutable"
     );
     if let Some(admission) = &operation.admission {
         crate::storage::ref_admission::settle_in_tx(
-            &tx,
+            tx,
             operation.repository_id,
             admission,
             operation.actor_id,
@@ -167,12 +138,7 @@ pub async fn publish(
     let human_token = (!service).then_some(operation.token_id);
     let initial_outcome = "unknown";
     tx.execute("INSERT INTO git_operations(id,repository_id,actor_id,token_id,service_principal_id,actor_name,sequence,storage_generation,outcome,evidence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO NOTHING", &[&operation.id,&operation.repository_id,&human_actor,&human_token,&operation.service_principal_id,&operation.actor_name,&operation.sequence,&operation.storage_generation,&initial_outcome,&operation.evidence]).await?;
-    let row = tx
-        .query_one(
-            "SELECT * FROM git_operations WHERE id=$1 FOR UPDATE",
-            &[&operation.id],
-        )
-        .await?;
+    let row = tx.query_one("SELECT * FROM git_operations WHERE id=$1 FOR UPDATE", &[&operation.id]).await?;
     ensure!(
         row.get::<_, Uuid>("repository_id") == operation.repository_id
             && row.get::<_, Option<Uuid>>("actor_id") == human_actor
@@ -184,21 +150,11 @@ pub async fn publish(
         "operation replay metadata mismatch"
     );
     let previous: String = row.get("outcome");
-    ensure!(
-        previous == "unknown" || previous == operation.outcome,
-        "terminal operation outcome mismatch"
-    );
-    let existing = tx
-        .query(
-            "SELECT event_id FROM outbox_events WHERE operation_id=$1",
-            &[&operation.id],
-        )
-        .await?;
+    ensure!(previous == "unknown" || previous == operation.outcome, "terminal operation outcome mismatch");
+    let existing = tx.query("SELECT event_id FROM outbox_events WHERE operation_id=$1", &[&operation.id]).await?;
     if operation.outcome != "unknown" || previous != "unknown" {
         ensure!(
-            existing
-                .iter()
-                .all(|row| ids.contains(&row.get::<_, String>(0))),
+            existing.iter().all(|row| ids.contains(&row.get::<_, String>(0))),
             "operation replay omitted existing events"
         );
     }
@@ -207,10 +163,7 @@ pub async fn publish(
             row.get::<_, serde_json::Value>("evidence") == operation.evidence,
             "terminal operation evidence mismatch"
         );
-        ensure!(
-            existing.len() == changes.len(),
-            "terminal operation cannot gain events"
-        );
+        ensure!(existing.len() == changes.len(), "terminal operation cannot gain events");
     }
     for change in changes {
         let id = event_id(operation.id, change.transaction_sequence, &change.ref_name);
@@ -227,7 +180,6 @@ pub async fn publish(
         tx.execute("INSERT INTO event_deliveries(event_id,consumer) VALUES($1,'audit-log'),($1,'ref-index') ON CONFLICT DO NOTHING", &[&id]).await?;
     }
     tx.execute("UPDATE git_operations SET outcome=$2,evidence=$3,settled_at=CASE WHEN $2='unknown' THEN NULL ELSE COALESCE(settled_at,clock_timestamp()) END WHERE id=$1", &[&operation.id,&operation.outcome,&operation.evidence]).await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -248,18 +200,9 @@ fn claim_from_row(row: &Row, consumer: &str, owner: Uuid, generation: i64) -> Cl
     }
 }
 
-pub async fn claim(
-    pool: &Pool,
-    consumer: &str,
-    owner: Uuid,
-    limit: i64,
-    lease_seconds: i64,
-) -> Result<Vec<Claim>> {
+pub async fn claim(pool: &Pool, consumer: &str, owner: Uuid, limit: i64, lease_seconds: i64) -> Result<Vec<Claim>> {
     valid_consumer(consumer)?;
-    ensure!(
-        (1..=1000).contains(&limit) && (1..=3600).contains(&lease_seconds),
-        "invalid claim bounds"
-    );
+    ensure!((1..=1000).contains(&limit) && (1..=3600).contains(&lease_seconds), "invalid claim bounds");
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
     let rows=tx.query("SELECT e.* FROM event_deliveries d JOIN outbox_events e USING(event_id) JOIN git_operations o ON o.id=e.operation_id WHERE d.consumer=$1 AND o.outcome <> 'unknown' AND d.state <> 'delivered' AND d.next_attempt_at <= clock_timestamp() AND (d.state='pending' OR d.lease_until <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM outbox_events prior JOIN event_deliveries pd USING(event_id) WHERE pd.consumer=d.consumer AND pd.state <> 'delivered' AND prior.repository_id=e.repository_id AND prior.ref_name=e.ref_name AND (prior.storage_generation,prior.operation_sequence,prior.transaction_sequence)<(e.storage_generation,e.operation_sequence,e.transaction_sequence)) AND NOT EXISTS (SELECT 1 FROM git_operations unknown_op WHERE unknown_op.repository_id=e.repository_id AND unknown_op.outcome='unknown' AND NOT EXISTS(SELECT 1 FROM operation_resolutions resolved WHERE resolved.operation_id=unknown_op.id) AND (unknown_op.storage_generation,unknown_op.sequence)<(e.storage_generation,e.operation_sequence)) ORDER BY e.storage_generation,e.operation_sequence,e.transaction_sequence,e.event_id LIMIT $2 FOR UPDATE OF d SKIP LOCKED", &[&consumer,&limit]).await?;
@@ -299,10 +242,7 @@ pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
     let Some(event)=tx.query_opt("SELECT repository_id,storage_generation,operation_sequence,transaction_sequence,ref_name,operation_id FROM outbox_events WHERE event_id=$1",&[&claim.event_id]).await? else {return Ok(false);};
     let repository_id: Uuid = event.get(0);
     let current: i64 = tx
-        .query_one(
-            "SELECT storage_generation FROM repositories WHERE id=$1 FOR SHARE",
-            &[&repository_id],
-        )
+        .query_one("SELECT storage_generation FROM repositories WHERE id=$1 FOR SHARE", &[&repository_id])
         .await?
         .get(0);
     if !lock_valid_lease(&tx, claim).await? {
@@ -317,22 +257,22 @@ pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
     if blocked {
         return Ok(false);
     }
-    ensure!(
-        generation <= current,
-        "event generation exceeds repository generation"
-    );
+    ensure!(generation <= current, "event generation exceeds repository generation");
     let superseded = claim.consumer == "ref-index" && generation < current;
     // CI maintenance has exact root-observation evidence, not a native push
     // receipt. Keep its outbox/audit trail, but never label it push_receipt in
     // the user ref projection. Explicit recovery snapshots remain independent.
-    let ci_maintenance: bool = tx.query_one("SELECT COALESCE(evidence->>'kind'='observed_immutable_ci_root',false) FROM git_operations WHERE id=$1", &[&operation_id]).await?.get(0);
+    let ci_maintenance: bool = tx
+        .query_one(
+            "SELECT COALESCE(evidence->>'kind'='observed_immutable_ci_root',false) FROM git_operations WHERE id=$1",
+            &[&operation_id],
+        )
+        .await?
+        .get(0);
     match claim.consumer.as_str() {
         "audit-log" => {
-            tx.execute(
-                "INSERT INTO audit_events(event_id) VALUES($1) ON CONFLICT DO NOTHING",
-                &[&claim.event_id],
-            )
-            .await?;
+            tx.execute("INSERT INTO audit_events(event_id) VALUES($1) ON CONFLICT DO NOTHING", &[&claim.event_id])
+                .await?;
         }
         "ref-index" if !superseded && !ci_maintenance => {
             tx.execute("INSERT INTO repository_ref_projection(repository_id,ref_name,oid,deleted,storage_generation,operation_sequence,transaction_sequence,event_id) SELECT repository_id,ref_name,CASE WHEN new_oid ~ '^0+$' THEN NULL ELSE new_oid END,new_oid ~ '^0+$',storage_generation,operation_sequence,transaction_sequence,event_id FROM outbox_events WHERE event_id=$1 ON CONFLICT(repository_id,ref_name) DO UPDATE SET oid=EXCLUDED.oid,deleted=EXCLUDED.deleted,storage_generation=EXCLUDED.storage_generation,operation_sequence=EXCLUDED.operation_sequence,transaction_sequence=EXCLUDED.transaction_sequence,event_id=EXCLUDED.event_id,source_kind='push_receipt',resolution_id=NULL,updated_at=clock_timestamp() WHERE (repository_ref_projection.storage_generation,repository_ref_projection.operation_sequence,repository_ref_projection.transaction_sequence)<(EXCLUDED.storage_generation,EXCLUDED.operation_sequence,EXCLUDED.transaction_sequence)", &[&claim.event_id]).await?;
@@ -342,11 +282,7 @@ pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
     }
     // Effects may wait on another lock. Expiry is checked again before commit;
     // an expired fence rolls back the entire local effect.
-    let effect = if superseded {
-        "superseded_generation"
-    } else {
-        "applied"
-    };
+    let effect = if superseded { "superseded_generation" } else { "applied" };
     let count=tx.execute("UPDATE event_deliveries SET state='delivered',lease_owner=NULL,lease_until=NULL,delivered_at=clock_timestamp(),last_error_code=NULL,effect=$5 WHERE event_id=$1 AND consumer=$2 AND state='leased' AND lease_owner=$3 AND lease_generation=$4 AND lease_until>clock_timestamp()", &[&claim.event_id,&claim.consumer,&claim.lease_owner,&claim.generation,&effect]).await?;
     if count == 0 {
         tx.rollback().await?;
@@ -356,19 +292,12 @@ pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
     Ok(true)
 }
 
-pub async fn fail(
-    pool: &Pool,
-    claim: &Claim,
-    error_code: &str,
-    delay_seconds: i64,
-) -> Result<bool> {
+pub async fn fail(pool: &Pool, claim: &Claim, error_code: &str, delay_seconds: i64) -> Result<bool> {
     ensure!((0..=86400).contains(&delay_seconds), "invalid retry delay");
     ensure!(
         !error_code.is_empty()
             && error_code.len() <= 64
-            && error_code
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            && error_code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
         "invalid error code"
     );
     let mut client = pool.get().await?;
@@ -399,9 +328,7 @@ pub async fn worker_once_with_lease(
             Ok(true) => count += 1,
             Ok(false) => {}
             Err(error) => {
-                fail(pool, &item, "local_effect_failed", 5)
-                    .await
-                    .context("reschedule local consumer")?;
+                fail(pool, &item, "local_effect_failed", 5).await.context("reschedule local consumer")?;
                 return Err(error);
             }
         }
@@ -413,10 +340,7 @@ pub async fn pending_count(pool: &Pool) -> Result<i64> {
     Ok(pool
         .get()
         .await?
-        .query_one(
-            "SELECT count(*) FROM event_deliveries WHERE state <> 'delivered'",
-            &[],
-        )
+        .query_one("SELECT count(*) FROM event_deliveries WHERE state <> 'delivered'", &[])
         .await?
         .get(0))
 }
