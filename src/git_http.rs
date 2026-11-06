@@ -24,7 +24,7 @@ mod process;
 mod protocol;
 use process::Process;
 pub(crate) use process::{collect_git_output, collect_git_output_input,
-    finish_group_child, stop_group_child};
+    finish_group_child, stop_group_child, kill_group_child};
 use protocol::{job_response_prefix, route, validate_headers, read_headers};
 
 async fn transfer_authorized(

@@ -147,6 +147,16 @@ pub(crate) async fn stop_group_child(child: &mut Child) -> io::Result<()> {
     Ok(())
 }
 
+/// Lease-loss path: SIGKILL immediately, then retain the unreaped leader until
+/// every descendant stops. The caller keeps its local data guard throughout.
+pub(crate) async fn kill_group_child(child: &mut Child) -> io::Result<()> {
+    let pid = child.id().ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
+    unsafe { libc::kill(-pid, libc::SIGKILL); }
+    wait_group_child_quiescent(pid).await;
+    let _ = child.wait().await?;
+    Ok(())
+}
+
 async fn wait_group_child_quiescent(pid: i32) {
     let started = Instant::now();
     let mut reported = false;
@@ -343,6 +353,13 @@ mod process_tests {
         assert!(finish_group_child(&mut finished.child).await.unwrap().success());
         finished.pid = 0;
         assert_not_running(finished_child).await;
+        assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists());
+
+        let (mut lost_lease, lost_child) = orphan_group().await;
+        let leader = lost_lease.pid;
+        kill_group_child(&mut lost_lease.child).await.unwrap();
+        lost_lease.pid = 0;
+        assert_not_running(lost_child).await;
         assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists());
 
         let (mut cancelled, cancelled_child) = orphan_group().await;
