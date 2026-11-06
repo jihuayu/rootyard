@@ -275,6 +275,14 @@ fn begin_inner(
     mkdir(&journal)?;
     let repo = journal.join(repository_id.to_string());
     mkdir(&repo)?;
+    // Admission is short, but multiple independent ref writers may now enter
+    // it concurrently. A separate persistent inode is required because the
+    // sequence counter itself is atomically replaced after each reservation.
+    let sequence_lock = OpenOptions::new().read(true).write(true).create(true)
+        .mode(0o600).custom_flags(libc::O_NOFOLLOW)
+        .open(repo.join("sequence.lock"))?;
+    ensure!(sequence_lock.metadata()?.is_file(), "invalid journal admission lock");
+    sequence_lock.lock_exclusive()?;
     let counter = repo.join("sequence");
     let previous: i64 = if exists(&counter)? {
         std::str::from_utf8(&read(&counter)?)?.parse()?
@@ -344,7 +352,8 @@ pub fn pending(data_root: &Path, repository_id: Uuid) -> Result<Vec<Operation>> 
             .file_name()
             .and_then(|s| s.to_str())
             .context("invalid journal filename")?;
-        if name == "sequence" || name.starts_with(".tmp-") || name.starts_with(".retired-") {
+        if name == "sequence" || name == "sequence.lock"
+            || name.starts_with(".tmp-") || name.starts_with(".retired-") {
             continue;
         }
         let op = load(&path).context("corrupt pending operation")?;
