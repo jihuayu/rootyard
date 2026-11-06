@@ -248,9 +248,6 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         (identity, repo, Some(plan))
     } else {
         let identity = auth::authenticate(&state.pool, &parts.headers).await?;
-        if owner != identity.username {
-            return Err(Error::not_found());
-        }
         if write {
             auth::writable(&identity)?;
         }
@@ -260,13 +257,17 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             .await
             .map_err(Error::internal)?
             .query_opt(
-                &format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT),
-                &[&identity.id, &name],
+                &format!("{} WHERE u.username=$1 AND r.name=$2", db::REPO_SELECT),
+                &[&owner, &name],
             )
             .await
             .map_err(Error::internal)?
             .ok_or_else(Error::not_found)?;
         let repo = Repository::from_row(&row);
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        auth::authorize_repo(&tx, &identity, owner, name, write).await?;
+        auth::finish_tx(tx, &identity, false).await?;
         if repo.state != "ready" {
             return Err(Error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -322,7 +323,8 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         .into_owned();
     if write_guard.is_some() {
         let quota = state.config.max_repo_bytes;
-        let size = tokio::task::spawn_blocking(move || storage::disk_bytes(&path, quota))
+        let check_path = path.clone();
+        let size = tokio::task::spawn_blocking(move || storage::disk_bytes(&check_path, quota))
             .await
             .map_err(Error::internal)?
             .map_err(Error::internal)?;
@@ -346,6 +348,10 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             "core.hooksPath={}",
             state.storage.root.join("managed-hooks").display()
         ));
+        cmd.env("ROOTYARD_DATABASE_URL", &state.config.database_url)
+            .env("ROOTYARD_GIT_PATH", &state.config.git)
+            .env("ROOTYARD_GIT_DIR", &path)
+            .env("ROOTYARD_GIT_TIMEOUT_SECONDS", state.config.git_timeout.as_secs().to_string());
     }
     cmd.arg("http-backend")
         .env("GIT_PROJECT_ROOT", project_root)

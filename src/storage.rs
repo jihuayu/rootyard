@@ -164,6 +164,11 @@ impl Storage {
         Ok(path)
     }
     pub async fn provision(&self, config: &Config, id: Uuid) -> Result<()> {
+        self.provision_with_format(config, id, crate::browse::object_format::ObjectFormat::Sha1).await
+    }
+    pub async fn provision_with_format(
+        &self, config: &Config, id: Uuid, format: crate::browse::object_format::ObjectFormat,
+    ) -> Result<()> {
         let _lock = self.write_lock(id).await;
         let final_path = self.repo_path(id);
         if final_path.exists() {
@@ -192,15 +197,10 @@ impl Storage {
             // staging tree and its config.lock cannot belong to an active writer.
             std::fs::remove_dir_all(&staging)?;
         }
+        let format_arg = format!("--object-format={}", format.as_str());
         checked(
             self.git(config)
-                .args([
-                    "init",
-                    "--bare",
-                    "--object-format=sha1",
-                    "--initial-branch=main",
-                    "--template=",
-                ])
+                .args(["init", "--bare", &format_arg, "--initial-branch=main", "--template="])
                 .arg(&staging),
         )
         .await?;
