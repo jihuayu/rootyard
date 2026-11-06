@@ -10,6 +10,11 @@ pub fn workspace_repo(state: &AppState, id: Uuid) -> PathBuf { workspace_root(st
 pub fn checkpoint_repo(state: &AppState, id: Uuid) -> PathBuf { workspace_root(state).join("checkpoints").join(id.to_string()) }
 pub fn conflict() -> Error { Error(StatusCode::CONFLICT, "workspace version or lease conflict") }
 
+pub(crate) async fn creation_lock(tx:&deadpool_postgres::Transaction<'_>,actor:Uuid,key:&str)->Result<(),Error>{
+    tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text || ':' || $2::text, 709))",&[&actor,&key]).await.map_err(Error::internal)?;
+    Ok(())
+}
+
 pub fn git(repo: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
     let output = Command::new("git").arg("-c").arg("core.hooksPath=/dev/null")
         .arg("--no-replace-objects").arg("-C").arg(repo).args(args)
@@ -89,6 +94,7 @@ pub async fn create(State(state): State<Arc<AppState>>, headers: HeaderMap, Json
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo = auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write).await?;
+    creation_lock(&tx,actor.id,&key).await?;
     if let Some(row) = tx.query_opt("SELECT request_sha256,workspace_id FROM workspace_creations WHERE actor_id=$1 AND idempotency_key=$2 FOR UPDATE", &[&actor.id,&key]).await.map_err(Error::internal)? {
         let existing: String = row.get(0);
         if existing != digest { return Err(conflict()); }
