@@ -165,11 +165,19 @@ class PullsHarness(ForgeHarness):
         assert (
             self.sql("SELECT count(*) FROM schema_migrations WHERE version=9") == "1"
         )
-        self.sql(
-            "DROP TABLE forge_pull_reviews, forge_pulls, forge_pull_counters, forge_check_runs, forge_branch_rules; "
-            "DELETE FROM schema_migrations WHERE version=9; "
-            "CREATE TABLE forge_pull_reviews(dummy integer)"
+        drops = (
+            "DROP TABLE forge_pull_reviews, forge_pulls, forge_pull_counters, "
+            "forge_check_runs, forge_branch_rules"
         )
+        replay = "DELETE FROM schema_migrations WHERE version=9"
+        if 9 in SCHEMA_VERSIONS:
+            # Dropping these tables also discards the migration 72 constraints and
+            # triggers plus the migration 107 columns and its trusted-context table.
+            # Replaying only version 9 would leave the current schema marked applied
+            # but physically older, poisoning every later case in this schema.
+            drops += ", forge_trusted_check_contexts"
+            replay = "DELETE FROM schema_migrations WHERE version IN (9,72,107)"
+        self.sql(drops + "; " + replay + "; CREATE TABLE forge_pull_reviews(dummy integer)")
         if 9 in SCHEMA_VERSIONS:
             failed = self.run([self.args.binary, "migrate"], check=False)
         else:
@@ -213,6 +221,17 @@ class PullsHarness(ForgeHarness):
         assert (
             self.sql("SELECT count(*) FROM schema_migrations WHERE version=9") == "1"
         )
+        if 9 in SCHEMA_VERSIONS:
+            assert self.sql(
+                "SELECT string_agg(column_name,',' ORDER BY column_name) "
+                "FROM information_schema.columns WHERE table_schema=current_schema() "
+                "AND table_name='forge_check_runs' AND column_name IN "
+                "('issuer_webhook_id','ci_run_id','ci_base_oid','ci_lease_generation')"
+            ) == "ci_base_oid,ci_lease_generation,ci_run_id,issuer_webhook_id"
+            assert self.sql(
+                "SELECT count(*) FROM information_schema.tables WHERE "
+                "table_schema=current_schema() AND table_name='forge_trusted_check_contexts'"
+            ) == "1"
         self.start()
 
     def lifecycle_and_diff(self):

@@ -57,7 +57,7 @@ pub(crate) async fn authorize_claimed_run(
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client
         .query_opt(
-            "SELECT c.job_id,c.source_url,i.plan,i.expires_unix \
+            "SELECT c.job_id,c.source_url,i.plan,i.expires_unix,r.object_format \
          FROM ci_runs c \
          JOIN forge_trusted_check_contexts b ON b.repository_id=c.repository_id \
            AND b.context=c.context AND b.webhook_id=$3 AND b.active=true \
@@ -95,6 +95,7 @@ pub(crate) async fn authorize_claimed_run(
     let job_id: Uuid = row.get("job_id");
     let expires_unix: i64 = row.get("expires_unix");
     let plan: Plan = serde_json::from_value(row.get("plan")).map_err(Error::internal)?;
+    let repo_format: String = row.get("object_format");
     if plan.version != 1
         || plan.job_id != job_id
         || plan.owner_id != tenant_id
@@ -102,12 +103,9 @@ pub(crate) async fn authorize_claimed_run(
         || plan.target_oid != head_oid
         || plan.storage_generation != storage_generation
         || plan.expires_unix != expires_unix
-        || plan.object_format
-            != if head_oid.len() == 40 {
-                "sha1"
-            } else {
-                "sha256"
-            }
+        || !ci_pins::valid_format(&plan.object_format)
+        || plan.object_format != repo_format
+        || !ci_pins::valid_oid_for_format(&plan.target_oid, &plan.object_format)
         || plan.mirror_audience != ci_checkouts::audience()?
         || plan.dependencies.version != 1
     {

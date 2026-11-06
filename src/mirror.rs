@@ -29,7 +29,13 @@ use uuid::Uuid;
 pub(crate) struct Snapshot {
     pub repository_id: Uuid,
     pub storage_generation: i64,
+    #[serde(default = "default_snapshot_object_format")]
+    pub object_format: String,
     pub snapshot: Uuid,
+}
+
+fn default_snapshot_object_format() -> String {
+    "sha1".to_owned()
 }
 
 pub async fn open(config: Config, pool: Pool) -> Result<Arc<AppState>> {

@@ -83,6 +83,11 @@ async fn issue_inner(
     {
         return Err(Error::bad_request());
     }
+    if !ci_pins::valid_format(&repo.object_format)
+        || !ci_pins::valid_oid_for_format(&input.target_oid, &repo.object_format)
+    {
+        return Err(Error::bad_request());
+    }
     if input.mirror_audience != audience()? {
         return Err(Error(StatusCode::CONFLICT, "mirror audience differs"));
     }
@@ -104,7 +109,7 @@ async fn issue_inner(
         owner_id: actor.id,
         repository_id: repo.id,
         storage_generation: input.storage_generation,
-        object_format: if input.target_oid.len()==40 {"sha1"} else {"sha256"}.into(),
+        object_format: repo.object_format.clone(),
         target_oid: input.target_oid,
         retention_ref: format!("refs/rootyard-ci/jobs/{}", input.job_id),
     };
@@ -132,12 +137,19 @@ async fn issue_inner(
     let mut delegated = Vec::new();
     for sub in &plan.dependencies.submodules {
         let client=state.pool.get().await.map_err(Error::internal)?;
-        let owner_id:Uuid=client.query_one("SELECT owner_id FROM repositories WHERE id=$1",&[&sub.repository_id])
-            .await.map_err(Error::internal)?.get(0);
+        let sub_row=client.query_one("SELECT owner_id,object_format FROM repositories WHERE id=$1",&[&sub.repository_id])
+            .await.map_err(Error::internal)?;
+        let owner_id:Uuid=sub_row.get(0);
+        let sub_format:String=sub_row.get(1);
         drop(client);
+        if !ci_pins::valid_format(&sub_format)
+            || !ci_pins::valid_oid_for_format(&sub.target_oid,&sub_format)
+        {
+            return Err(Error(StatusCode::CONFLICT,"submodule object format differs from pin"));
+        }
         let sub_intent=ci_pins::Intent{version:1,job_id:sub.job_id,owner_id,
             repository_id:sub.repository_id,storage_generation:sub.storage_generation,
-            object_format:if sub.target_oid.len()==40 {"sha1"} else {"sha256"}.into(),target_oid:sub.target_oid.clone(),
+            object_format:sub_format,target_oid:sub.target_oid.clone(),
             retention_ref:format!("refs/rootyard-ci/jobs/{}",sub.job_id)};
         let sub_receipt=ci_pins::verify_receipt(&state,&sub_intent).await
             .map_err(|_|Error(StatusCode::CONFLICT,"verified submodule pin required"))?;

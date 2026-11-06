@@ -7,7 +7,7 @@ use crate::{
     pulls::{
         models::{
             MergeInput, PULL_FIELDS, PullRequest, body_valid, creation_replay, git_cmd, json,
-            positive, record_creation, resolve_ref_oid, valid_oid,
+            positive, record_creation, resolve_ref_oid, valid_oid, valid_oid_for_format,
         },
         rules,
     },
@@ -89,6 +89,11 @@ async fn merge_pull_inner(
                 "repository storage generation mismatch",
             ));
         }
+    }
+    if !valid_oid_for_format(&input.expected_head_oid, &repo.object_format)
+        || !valid_oid_for_format(&input.expected_base_oid, &repo.object_format)
+    {
+        return Err(Error::bad_request());
     }
 
     // The immutable PR base ref chooses the exact publication key before any
@@ -236,6 +241,9 @@ async fn merge_pull_inner(
             StatusCode::CONFLICT,
             "live head branch ref does not exist",
         ))?;
+    if !valid_oid_for_format(&live_head, &repo.object_format) {
+        return Err(Error::internal("live head OID differs from repository object format"));
+    }
     if live_head != input.expected_head_oid {
         return Err(Error(
             StatusCode::CONFLICT,
@@ -248,6 +256,9 @@ async fn merge_pull_inner(
             StatusCode::CONFLICT,
             "live base branch ref does not exist",
         ))?;
+    if !valid_oid_for_format(&live_base, &repo.object_format) {
+        return Err(Error::internal("live base OID differs from repository object format"));
+    }
     if live_base != input.expected_base_oid {
         return Err(Error(
             StatusCode::CONFLICT,
@@ -286,7 +297,7 @@ async fn merge_pull_inner(
             .map_err(|_| Error(StatusCode::CONFLICT, "merge conflict detected"))?;
         let tree_str = std::str::from_utf8(&tree_out).map_err(Error::internal)?;
         let tree_oid = tree_str.lines().next().unwrap_or("").trim();
-        if !valid_oid(tree_oid) {
+        if !valid_oid_for_format(tree_oid, &repo.object_format) {
             return Err(Error::internal("invalid tree oid from git merge-tree"));
         }
         let default_msg = format!("Merge pull request #{} from {}", number, pull.head_ref);
@@ -320,7 +331,7 @@ async fn merge_pull_inner(
             .map_err(Error::internal)?
             .trim()
             .to_owned();
-        if !valid_oid(&commit_oid) {
+        if !valid_oid_for_format(&commit_oid, &repo.object_format) {
             return Err(Error::internal("invalid commit oid from git commit-tree"));
         }
         commit_oid

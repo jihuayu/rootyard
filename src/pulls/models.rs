@@ -13,6 +13,7 @@ use tokio_postgres::Row;
 use uuid::Uuid;
 
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+pub const ZERO_OID_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 pub const PULL_FIELDS: &str = "repository_id,number,author_id,title,body,state,head_ref,base_ref,head_oid,base_oid,merge_commit_oid,merged_storage_generation,version,created_at::text,updated_at::text";
 pub const REVIEW_FIELDS: &str = "repository_id,pull_number,number,author_id,state,commit_oid,pull_version,body,created_at::text";
 pub const CHECK_FIELDS: &str = "repository_id,commit_oid,context,attempt,sequence,status,conclusion,output,created_at::text,updated_at::text";
@@ -316,6 +317,22 @@ pub fn body_valid(body: &str, required: bool) -> bool {
             .chars()
             .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
 }
+pub fn valid_format(format: &str) -> bool {
+    matches!(format, "sha1" | "sha256")
+}
+
+pub fn oid_hex_len(format: &str) -> Option<usize> {
+    match format {
+        "sha1" => Some(40),
+        "sha256" => Some(64),
+        _ => None,
+    }
+}
+
+pub fn zero_oid(format: &str) -> Option<String> {
+    oid_hex_len(format).map(|len| "0".repeat(len))
+}
+
 pub fn valid_oid(oid: &str) -> bool {
     matches!(oid.len(), 40 | 64)
         && oid.bytes().any(|b| b != b'0')
@@ -325,7 +342,25 @@ pub fn valid_oid(oid: &str) -> bool {
 }
 
 pub fn valid_oid_for_format(oid: &str, format: &str) -> bool {
-    valid_oid(oid) && oid.len() == if format == "sha256" { 64 } else { 40 }
+    oid_hex_len(format).is_some_and(|len| oid.len() == len) && valid_oid(oid)
+}
+
+/// Load the repository's immutable Git object format for the current
+/// transaction. Callers validate inbound OIDs against this value instead of
+/// inferring a format from the supplied hex length.
+pub async fn repository_object_format(
+    tx: &Transaction<'_>,
+    repo: Uuid,
+) -> Result<String, Error> {
+    let format: String = tx
+        .query_one("SELECT object_format FROM repositories WHERE id=$1", &[&repo])
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    if !valid_format(&format) {
+        return Err(Error::internal("invalid repository object format"));
+    }
+    Ok(format)
 }
 pub fn context_valid(context: &str) -> bool {
     !context.trim().is_empty() && context.len() <= 128 && !context.chars().any(char::is_control)
@@ -562,6 +597,16 @@ mod tests {
         for bad_oid in ["", ZERO_OID, "0123456789ABCDEF0123456789abcdef01234567", "0123456789abcdef0123456789abcdef0123456", "0123456789abcdef0123456789abcdef0123456g"] {
             assert!(!valid_oid(bad_oid));
         }
+        let sha1 = "a".repeat(40);
+        let sha256 = "b".repeat(64);
+        assert!(valid_oid_for_format(&sha1, "sha1"));
+        assert!(!valid_oid_for_format(&sha1, "sha256"));
+        assert!(valid_oid_for_format(&sha256, "sha256"));
+        assert!(!valid_oid_for_format(&sha256, "sha1"));
+        assert!(!valid_oid_for_format(&sha1, "sha512"));
+        assert_eq!(zero_oid("sha1").as_deref(), Some(ZERO_OID));
+        assert_eq!(zero_oid("sha256").as_deref(), Some(ZERO_OID_SHA256));
+        assert!(zero_oid("sha512").is_none());
         assert!(valid_check_status_and_conclusion("queued", None));
         assert!(valid_check_status_and_conclusion("in_progress", None));
         assert!(!valid_check_status_and_conclusion("queued", Some("success")));

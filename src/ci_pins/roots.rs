@@ -8,6 +8,11 @@ pub async fn git_dir_pinned_roots(
     if !git_dir.exists() {
         return Ok(HashMap::new());
     }
+    let mut format_cmd = crate::mirror::mirror_git(state);
+    format_cmd.arg("--git-dir").arg(git_dir).args(["rev-parse","--show-object-format"]);
+    let format_raw = git_http::collect_git_output(format_cmd, 128, state.config.git_timeout).await?;
+    let format = std::str::from_utf8(&format_raw)?.trim();
+    ensure!(valid_format(format), "unsupported mirror object format");
     let mut cmd = crate::mirror::mirror_git(state);
     cmd.arg("--git-dir").arg(git_dir).args([
         "for-each-ref",
@@ -21,7 +26,7 @@ pub async fn git_dir_pinned_roots(
         let fields: Vec<_> = line.split('\0').collect();
         if fields.len() == 3
             && reserved(fields[0])
-            && valid_oid(fields[1])
+            && valid_oid_for_format(fields[1], format)
             && fields[2].is_empty()
         {
             result.insert(fields[0].to_owned(), fields[1].to_owned());

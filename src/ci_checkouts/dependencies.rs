@@ -53,7 +53,7 @@ async fn blob(state:&AppState,repo:Uuid,oid:&str,cap:usize)->Result<Vec<u8>,Erro
     git(state,repo,&["cat-file","blob",oid],cap).await
 }
 
-fn parse_tree(raw:&[u8])->Result<Vec<(String,String,String,Option<usize>,String)>,Error>{
+fn parse_tree(raw:&[u8],object_format:&str)->Result<Vec<(String,String,String,Option<usize>,String)>,Error>{
     let mut entries=Vec::new();
     for record in raw.split(|b|*b==0).filter(|r|!r.is_empty()) {
         let text=std::str::from_utf8(record).map_err(|_|unsafe_dependency())?;
@@ -63,7 +63,7 @@ fn parse_tree(raw:&[u8])->Result<Vec<(String,String,String,Option<usize>,String)
         let kind=parts.next().ok_or_else(unsafe_dependency)?;
         let oid=parts.next().ok_or_else(unsafe_dependency)?;
         let size=parts.next().and_then(|n|n.parse::<usize>().ok());
-        if !ci_pins::valid_oid(oid) || path.is_empty() || path.starts_with('/') ||
+        if !ci_pins::valid_oid_for_format(oid,object_format) || path.is_empty() || path.starts_with('/') ||
             path.split('/').any(|s|s.is_empty() || s=="." || s=="..") { return Err(unsafe_dependency()); }
         entries.push((mode.into(),kind.into(),oid.into(),size,path.into()));
         if entries.len()>10_000 { return Err(unsafe_dependency()); }
@@ -158,7 +158,10 @@ async fn check_lfs(state:&AppState,repo:&db::Repository,oid:&str,size:i64)->Resu
 /// submodule is resolved and authorized as a separate repository source.
 pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Repository,
     root_job_id:Uuid,target:&str,history:&str,tags:&[String])->Result<Manifest,Error>{
-    if !matches!(history,"full"|"target") || tags.len()>32 {return Err(Error::bad_request());}
+    if !matches!(history,"full"|"target") || tags.len()>32
+        || !ci_pins::valid_format(&root_repo.object_format)
+        || !ci_pins::valid_oid_for_format(target,&root_repo.object_format)
+    {return Err(Error::bad_request());}
     let mut result=Manifest{version:1,history:history.into(),tags:Vec::new(),
         lfs:Vec::new(),submodules:Vec::new()};
     let tag_lease=if tags.is_empty(){None}else{Some(
@@ -173,7 +176,7 @@ pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Reposito
         let out=tag_lease.as_ref().ok_or_else(unsafe_dependency)?
             .guard(git(state,root_repo.id,&["rev-parse","--verify",&name],128)).await??;
         let oid=std::str::from_utf8(&out).map_err(|_|unsafe_dependency())?.trim();
-        if !ci_pins::valid_oid(oid) {return Err(unsafe_dependency());}
+        if !ci_pins::valid_oid_for_format(oid,&root_repo.object_format) {return Err(unsafe_dependency());}
         result.tags.push(TagDependency{name:tag.clone(),object_oid:oid.into()});
     }
     if let Some(lease)=tag_lease {lease.ensure_active()?;}
@@ -189,7 +192,8 @@ pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Reposito
         let lease=crate::storage::read_leases::shared(&state.pool,source.repo.id,
             tokio::time::Instant::now()+state.config.git_timeout).await?;
         let entries=parse_tree(&lease.guard(git(state,source.repo.id,
-            &["ls-tree","-rzl","--full-tree",&source.oid],4*1024*1024)).await??)?;
+            &["ls-tree","-rzl","--full-tree",&source.oid],4*1024*1024)).await??,
+            &source.repo.object_format)?;
         let module_oid=entries.iter().find(|e|e.4==".gitmodules" && e.1=="blob").map(|e|e.2.clone());
         let gitlinks:Vec<_>=entries.iter().filter(|e|e.0=="160000" && e.1=="commit").collect();
         let modules=if gitlinks.is_empty(){HashMap::new()}else{
@@ -213,7 +217,10 @@ pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Reposito
         for (relative,commit_oid,url) in links {
             let (owner,name)=relative_source(&source.repo.owner,&url)?;
             let nested=permitted_repo(state,principal,&owner,&name).await?;
-            if nested.state!="ready" || nested.storage_backend!="gitfs" {return Err(unsafe_dependency());}
+            if nested.state!="ready" || nested.storage_backend!="gitfs"
+                || !ci_pins::valid_format(&nested.object_format)
+                || !ci_pins::valid_oid_for_format(&commit_oid,&nested.object_format)
+            {return Err(unsafe_dependency());}
             let path=format!("{}{}",source.prefix,relative);
             let mut hash=Sha256::new();
             hash.update(b"rootyard-submodule-pin-v1\0");hash.update(root_job_id.as_bytes());
@@ -306,9 +313,12 @@ async fn verify_dependencies(state:&AppState,plan:&super::Plan,mirror:bool)->Res
             crate::mirror::pinned_path(state,&repo,&sub.target_oid).await?;
         } else {
             let owner_id:Uuid=row.get("owner_id");
+            if !ci_pins::valid_oid_for_format(&sub.target_oid,&repo.object_format) {
+                return Err(unsafe_dependency());
+            }
             let intent=ci_pins::Intent{version:1,job_id:sub.job_id,owner_id,
                 repository_id:repo.id,storage_generation:repo.storage_generation,
-                object_format:if sub.target_oid.len()==40 {"sha1"} else {"sha256"}.into(),
+                object_format:repo.object_format.clone(),
                 target_oid:sub.target_oid.clone(),
                 retention_ref:format!("refs/rootyard-ci/jobs/{}",sub.job_id)};
             let lock=state.storage.write_lock(repo.id).await;

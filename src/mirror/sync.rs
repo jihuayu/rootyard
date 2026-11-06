@@ -93,6 +93,9 @@ pub(crate) async fn prepare(
         if repo.storage_generation != input.storage_generation {
             return Err(Error(StatusCode::CONFLICT, "repository generation changed"));
         }
+        if !crate::ci_pins::valid_oid_for_format(&input.target_oid, &repo.object_format) {
+            return Err(Error::bad_request());
+        }
         let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
             Error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -114,6 +117,7 @@ pub(crate) async fn prepare(
         .map_err(Error::internal)?;
         if snapshot.repository_id != repo.id
             || snapshot.storage_generation != repo.storage_generation
+            || snapshot.object_format != repo.object_format
         {
             return Err(Error::internal("mirror pin identity changed"));
         }
@@ -121,8 +125,12 @@ pub(crate) async fn prepare(
             &pin,
             &input.target_oid,
             &root.join(snapshot.snapshot.to_string()),
+            &repo.object_format,
         )
         .map_err(Error::internal)?;
+        if detect_git_format(&state, &pin).await.map_err(Error::internal)? != repo.object_format {
+            return Err(Error::internal("prepared mirror object format changed"));
+        }
         // Explicit readiness rechecks the actual commit after restart, rather
         // than trusting a receipt alone. Snapshot fsck was completed at sync.
         let mut cmd = mirror_git(&state);
@@ -156,7 +164,7 @@ pub(crate) async fn prepare(
             [(header::CACHE_CONTROL, "no-store")],
             Json(serde_json::json!({
                 "repository_id":repo.id, "storage_generation":repo.storage_generation,
-                "object_format":"sha1", "target_oid":input.target_oid, "snapshot":snapshot.snapshot,
+                "object_format":repo.object_format, "target_oid":input.target_oid, "snapshot":snapshot.snapshot,
                 "clone_path":format!("/ci/{}/git/{owner}/{name}.git",input.target_oid)
             })),
         )
@@ -191,6 +199,9 @@ async fn sync_snapshot(
     scope: Option<IntegrationScope>,
 ) -> Result<Response, Error> {
     let repo = repository(&state, &headers, &owner, &name).await?;
+    if !crate::ci_pins::valid_format(&repo.object_format) {
+        return Err(Error::internal("invalid repository object format"));
+    }
     if let Some(scope)=&scope {scope.validate_source(&state,repo.id).await?;}
     let mut sync_permit = limiter::for_state(&state).try_acquire_sync(&state, repo.id)?;
     let _permit = state.git_slots.clone().try_acquire_owned().map_err(|_| {
@@ -207,6 +218,7 @@ async fn sync_snapshot(
     let snapshot = Snapshot {
         repository_id: repo.id,
         storage_generation: repo.storage_generation,
+        object_format: repo.object_format.clone(),
         snapshot: Uuid::new_v4(),
     };
     let stage = root.join(format!(".{}.staging", snapshot.snapshot));
@@ -263,17 +275,12 @@ async fn sync_snapshot(
         {
             bail!("mirror snapshot size limit reached");
         }
-        let mut command = mirror_git(&state);
-        command
-            .arg("--git-dir")
-            .arg(&bare)
-            .args(["rev-parse", "--show-object-format"]);
-        if git_http::collect_git_output(command, 128, state.config.git_timeout).await? != b"sha1\n"
-        {
-            bail!("mirror supports only SHA-1 repositories");
+        let detected = detect_git_format(&state, &bare).await?;
+        if detected != repo.object_format {
+            bail!("mirror source object format differs from repository");
         }
         // Do not retain credential helpers, source remotes, or writable transport settings.
-        std::fs::write(bare.join("config"), bare_config())?;
+        std::fs::write(bare.join("config"), bare_config(&repo.object_format))?;
         private_directory(&stage.join("pins"))?;
         let sync_stage = stage.clone();
         tokio::task::spawn_blocking(move || crate::storage::sync_tree(&sync_stage)).await??;
@@ -304,8 +311,59 @@ async fn sync_snapshot(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(snapshot)).into_response())
 }
 
-pub(crate) fn bare_config() -> &'static str {
+pub(crate) fn bare_config(object_format: &str) -> String {
+    if object_format == "sha256" {
+        return concat!(
+            "[core]\n\trepositoryformatversion = 1\n\tbare = true\n\thooksPath = /dev/null\n",
+            "[extensions]\n\tobjectFormat = sha256\n",
+            "[http]\n\treceivepack = false\n\tgetanyfile = false\n",
+            "[uploadpack]\n\tallowFilter = false\n\tallowAnySHA1InWant = false\n",
+            "\tallowTipSHA1InWant = false\n\tallowReachableSHA1InWant = false\n",
+            "[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n",
+            "[pack]\n\tthreads = 1\n\twindowMemory = 32m\n\tdeltaCacheSize = 32m\n"
+        )
+        .to_owned();
+    }
     "[core]\n\tbare = true\n\thooksPath = /dev/null\n[http]\n\treceivepack = false\n\tgetanyfile = false\n[uploadpack]\n\tallowFilter = false\n\tallowAnySHA1InWant = false\n\tallowTipSHA1InWant = false\n\tallowReachableSHA1InWant = false\n[gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n[pack]\n\tthreads = 1\n\twindowMemory = 32m\n\tdeltaCacheSize = 32m\n"
+        .to_owned()
+}
+
+/// Initialize a disposable bare Git directory with an explicit object format.
+/// The format must never be inferred from ambient Git defaults because a
+/// SHA-256 source cannot be materialized into a SHA-1 repository.
+pub(crate) async fn init_bare_view(
+    state: &AppState,
+    path: &FsPath,
+    object_format: &str,
+) -> Result<()> {
+    if !matches!(object_format, "sha1" | "sha256") {
+        bail!("unsupported repository object format");
+    }
+    let format_arg = format!("--object-format={object_format}");
+    let mut cmd = mirror_git(state);
+    cmd.args([
+        "init",
+        "--bare",
+        &format_arg,
+        "--initial-branch=main",
+        "--template=",
+    ])
+    .arg(path);
+    git_http::collect_git_output(cmd, 4096, state.config.git_timeout).await?;
+    Ok(())
+}
+
+pub(crate) async fn detect_git_format(state: &AppState, git_dir: &FsPath) -> Result<String> {
+    let mut cmd = mirror_git(state);
+    cmd.arg("--git-dir")
+        .arg(git_dir)
+        .args(["rev-parse", "--show-object-format"]);
+    let bytes = git_http::collect_git_output(cmd, 128, state.config.git_timeout).await?;
+    let format = std::str::from_utf8(&bytes)?.trim();
+    if !matches!(format, "sha1" | "sha256") {
+        bail!("unsupported repository object format");
+    }
+    Ok(format.to_owned())
 }
 
 pub(crate) fn private_directory(path: &FsPath) -> Result<()> {

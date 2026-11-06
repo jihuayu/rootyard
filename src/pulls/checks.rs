@@ -4,8 +4,8 @@ use crate::{
     auth::{self, authorize_repo as authorize, finish_tx as finish, idempotency_key},
     pulls::models::{
         CHECK_FIELDS, CheckRun, CheckRunInput, Page, body_valid, context_valid, creation_replay,
-        json, positive, record_creation, valid_check_status_and_conclusion, valid_oid,
-        verify_commit_exists,
+        json, positive, record_creation, valid_check_status_and_conclusion, valid_format,
+        valid_oid, valid_oid_for_format, verify_commit_exists,
     },
 };
 use axum::{
@@ -42,7 +42,8 @@ async fn require_repo_oid_format(state:&AppState,repo:uuid::Uuid,oid:&str)->Resu
         .args(["rev-parse","--show-object-format"]);
     let format=git_http::collect_git_output(cmd,128,state.config.git_timeout).await
         .map_err(Error::internal)?;
-    if format!=if oid.len()==40 {b"sha1\n".as_slice()} else {b"sha256\n".as_slice()} {
+    let detected=std::str::from_utf8(&format).map_err(Error::internal)?.trim();
+    if !valid_format(detected) || !valid_oid_for_format(oid, detected) {
         return Err(Error(StatusCode::CONFLICT,"check commit OID format differs from repository"));
     }
     Ok(())

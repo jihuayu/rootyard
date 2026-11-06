@@ -9,8 +9,8 @@ use crate::{
             NewPull, NewReview, PULL_FIELDS, Page, PullDiffResponse, PullPage, PullPatch,
             PullRequest, PullReview, PullStateFilter, REVIEW_FIELDS, body_valid, creation_replay,
             git_cmd, json, merge_base, normalize_branch_ref, positive, pull_exists,
-            record_creation, repo_tenant_id, resolve_ref_oid, title_valid, valid_oid,
-            valid_review_state,
+            record_creation, repo_tenant_id, repository_object_format, resolve_ref_oid, title_valid,
+            valid_oid, valid_oid_for_format, valid_review_state,
         },
         rules,
     },
@@ -90,6 +90,12 @@ pub async fn create_pull(
     let repo = authorize(&tx, &actor, &owner, &name, true).await?;
     if repo != lease_repo { return Err(Error(StatusCode::CONFLICT, "repository route changed")); }
     let tenant_id = repo_tenant_id(&tx, repo).await?;
+    let object_format = repository_object_format(&tx, repo).await?;
+    if input.head_oid.as_ref().is_some_and(|h| !valid_oid_for_format(h, &object_format))
+        || input.base_oid.as_ref().is_some_and(|b| !valid_oid_for_format(b, &object_format))
+    {
+        return Err(Error::bad_request());
+    }
     if let Some(key) = key {
         let request = sjson!({
             "operation": "pull",
@@ -116,6 +122,11 @@ pub async fn create_pull(
         .ok_or(Error(StatusCode::CONFLICT, "base branch ref does not exist"))?;
     source_lease.ensure_active()?;
     drop(_slot);
+    if !valid_oid_for_format(&live_head_oid, &object_format)
+        || !valid_oid_for_format(&live_base_oid, &object_format)
+    {
+        return Err(Error::internal("live branch OID differs from repository object format"));
+    }
 
     if input.head_oid.as_ref().is_some_and(|expected| expected != &live_head_oid) {
         return Err(Error(StatusCode::CONFLICT, "head_oid does not match live branch ref"));
@@ -222,6 +233,12 @@ pub async fn update_pull(
         return Err(Error(StatusCode::CONFLICT, "repository route changed"));
     }
     let tenant_id = repo_tenant_id(&tx, repo).await?;
+    let object_format = repository_object_format(&tx, repo).await?;
+    if input.head_oid.as_ref().is_some_and(|v| !valid_oid_for_format(v, &object_format))
+        || input.base_oid.as_ref().is_some_and(|v| !valid_oid_for_format(v, &object_format))
+    {
+        return Err(Error::bad_request());
+    }
     let lock_q = "SELECT state, version, head_ref, base_ref FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 FOR UPDATE";
     let existing = tx.query_opt(lock_q, &[&tenant_id, &repo, &number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let current_state: String = existing.get("state");
@@ -248,6 +265,9 @@ pub async fn update_pull(
             let live_head = lease.guard(resolve_ref_oid(&state, repo, &head_ref))
                 .await??
                 .ok_or(Error(StatusCode::CONFLICT, "head branch ref does not exist"))?;
+            if !valid_oid_for_format(&live_head, &object_format) {
+                return Err(Error::internal("head branch OID differs from repository object format"));
+            }
             if &live_head != new_head {
                 return Err(Error(StatusCode::CONFLICT, "head_oid does not match live branch ref"));
             }
@@ -256,6 +276,9 @@ pub async fn update_pull(
             let live_base = lease.guard(resolve_ref_oid(&state, repo, &base_ref))
                 .await??
                 .ok_or(Error(StatusCode::CONFLICT, "base branch ref does not exist"))?;
+            if !valid_oid_for_format(&live_base, &object_format) {
+                return Err(Error::internal("base branch OID differs from repository object format"));
+            }
             if &live_base != new_base {
                 return Err(Error(StatusCode::CONFLICT, "base_oid does not match live branch ref"));
             }
@@ -367,6 +390,10 @@ pub async fn create_review(
     let min_role = if input.state == "commented" { Role::Triage } else { Role::Write };
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, min_role).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
+    let object_format = repository_object_format(&tx, repo).await?;
+    if !valid_oid_for_format(&input.commit_oid, &object_format) {
+        return Err(Error::bad_request());
+    }
     if let Some(key) = key {
         let request = sjson!({
             "operation": "pull_review",

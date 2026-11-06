@@ -1,6 +1,9 @@
 //! Exact-object native Git view for bounded primary-origin CI fallback.
 use super::Plan;
-use crate::{AppState, Error, ci_pins, db, git_http, journal, mirror::sync::private_directory};
+use crate::{
+    AppState, Error, ci_pins, db, git_http, journal,
+    mirror::sync::{init_bare_view, private_directory},
+};
 use anyhow::ensure;
 use axum::http::StatusCode;
 use std::{
@@ -63,19 +66,24 @@ fn refs(plan: &Plan) -> anyhow::Result<Vec<(String, String)>> {
                 && !tag.name.starts_with('-')
                 && !tag.name.contains("@{")
                 && seen.insert(tag.name.clone())
-                && ci_pins::valid_oid(&tag.object_oid),
+                && ci_pins::valid_oid_for_format(&tag.object_oid, &plan.object_format),
             "invalid CI tag"
         );
         values.push((format!("refs/tags/{}", tag.name), tag.object_oid.clone()));
     }
     Ok(values)
 }
-async fn objects(state: &AppState, path: &Path, args: &[&str]) -> anyhow::Result<BTreeSet<String>> {
+async fn objects(
+    state: &AppState,
+    path: &Path,
+    args: &[&str],
+    object_format: &str,
+) -> anyhow::Result<BTreeSet<String>> {
     let raw = git(state, path, args, 64 * 1024 * 1024).await?;
     let mut out = BTreeSet::new();
     for line in std::str::from_utf8(&raw)?.lines() {
         ensure!(
-            ci_pins::valid_oid(line),
+            ci_pins::valid_oid_for_format(line, object_format),
             "invalid CI view object enumeration"
         );
         out.insert(line.into());
@@ -96,6 +104,7 @@ async fn expected(state: &AppState, path: &Path, plan: &Plan) -> anyhow::Result<
                 &plan.target_oid,
                 "--",
             ],
+            &plan.object_format,
         )
         .await?
     } else {
@@ -109,6 +118,7 @@ async fn expected(state: &AppState, path: &Path, plan: &Plan) -> anyhow::Result<
                 &plan.target_oid,
                 "--",
             ],
+            &plan.object_format,
         )
         .await?
     };
@@ -124,13 +134,18 @@ async fn expected(state: &AppState, path: &Path, plan: &Plan) -> anyhow::Result<
                     &tag.object_oid,
                     "--",
                 ],
+                &plan.object_format,
             )
             .await?,
         );
     }
     Ok(result)
 }
-async fn actual(state: &AppState, path: &Path) -> anyhow::Result<BTreeSet<String>> {
+async fn actual(
+    state: &AppState,
+    path: &Path,
+    plan: &Plan,
+) -> anyhow::Result<BTreeSet<String>> {
     objects(
         state,
         path,
@@ -139,6 +154,7 @@ async fn actual(state: &AppState, path: &Path) -> anyhow::Result<BTreeSet<String
             "--batch-all-objects",
             "--batch-check=%(objectname)",
         ],
+        &plan.object_format,
     )
     .await
 }
@@ -279,7 +295,7 @@ async fn validate(state: &AppState, path: &Path, plan: &Plan, source: &Path) -> 
     )
     .await?;
     ensure!(
-        expected(state, source, plan).await? == actual(state, path).await?,
+        expected(state, source, plan).await? == actual(state, path, plan).await?,
         "CI origin view contains missing or extra objects"
     );
     Ok(())
@@ -307,8 +323,10 @@ async fn origin_job_path_inner(
     if state.mirror_primary.is_some()
         || repo.id != plan.repository_id
         || repo.storage_generation != plan.storage_generation
+        || plan.object_format != repo.object_format
+        || !ci_pins::valid_format(&plan.object_format)
+        || !ci_pins::valid_oid_for_format(&plan.target_oid, &plan.object_format)
         || !matches!(plan.dependencies.history.as_str(), "full" | "target")
-        || plan.target_oid.len() != if plan.object_format == "sha1" { 40 } else { 64 }
     {
         return Err(Error::unauthorized());
     }
@@ -352,6 +370,7 @@ async fn origin_job_path_inner(
     let view = stage.join("view.git");
     let result = async {
         private_directory(&stage)?;
+        init_bare_view(state, &view, &plan.object_format).await?;
         private_directory(&view)?;
         for part in [
             "objects",
@@ -403,7 +422,10 @@ async fn origin_job_path_inner(
         )
         .await?;
         ensure!(
-            ci_pins::valid_oid(std::str::from_utf8(&output)?.trim()),
+            ci_pins::valid_oid_for_format(
+                std::str::from_utf8(&output)?.trim(),
+                &plan.object_format
+            ),
             "CI origin pack identity invalid"
         );
         validate(state, &view, plan, &source).await?;

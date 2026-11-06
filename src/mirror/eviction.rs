@@ -614,6 +614,7 @@ mod tests {
         let cur_meta = Snapshot {
             repository_id: repo_id,
             storage_generation: 1,
+            object_format: "sha1".into(),
             snapshot: cur_snap,
         };
         sync::atomic_file(
@@ -636,6 +637,7 @@ mod tests {
             let meta = Snapshot {
                 repository_id: repo_id,
                 storage_generation: 1,
+                object_format: "sha1".into(),
                 snapshot: snap,
             };
             sync::atomic_file(
