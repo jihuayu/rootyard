@@ -55,3 +55,6 @@ pub struct RestoreRequest { pub agent_id: String }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsQuery { pub after_revision: Option<i64> }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseRequest { pub expected_lease_epoch: i64 }
