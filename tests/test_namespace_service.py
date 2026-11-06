@@ -46,6 +46,19 @@ class NamespaceServiceTest(unittest.TestCase):
                     "bundle_ref":"refs/heads/projected","source_ref":"refs/heads/main",
                     "message":"Update package value"}))
             self.assertEqual(cs["state"],"proposed")
+            pins=h.git("--git-dir="+str(h.bare),"for-each-ref","--format=%(refname) %(objectname)",
+                "refs/heads/rootyard-proposals").stdout.decode().strip().splitlines()
+            self.assertEqual(len(pins),1)
+            pin, pinned_oid=pins[0].split()
+            self.assertEqual(pinned_oid,cs["steps"][0]["new_oid"])
+            self.assertNotEqual(h.git("push","origin",":"+pin,cwd=h.work,token=h.alice,check=False).returncode,0)
+            self.assertNotEqual(h.git("push","--force","origin","HEAD:"+pin,
+                cwd=h.work,token=h.alice,check=False).returncode,0)
+            for old_oid,new_oid in ((pinned_oid,"0"*40),(pinned_oid,base)):
+                status,_,_=h.http("/api/repos/alice/demo/ref-transactions",token=h.alice,method="POST",
+                    body={"atomic":True,"updates":[{"ref_name":pin,"old_oid":old_oid,"new_oid":new_oid}]})
+                self.assertEqual(status,400)
+            self.assertEqual(h.git("--git-dir="+str(h.bare),"rev-parse",pin).stdout.decode().strip(),pinned_oid)
             self.assertEqual(h.git("--git-dir="+str(h.bare),"rev-parse","refs/heads/main").stdout.decode().strip(),base)
             h.expect(f"/api/changesets/{cs['id']}/review",200,token=h.bob,method="POST")
             done=json.loads(h.expect(f"/api/changesets/{cs['id']}/integrate",200,token=h.alice,method="POST"))

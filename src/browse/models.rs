@@ -25,7 +25,7 @@ pub fn valid_non_zero_oid(oid: &str) -> bool {
 }
 
 pub fn valid_public_ref(name: &str) -> bool {
-    if crate::ci_pins::reserved(name) {
+    if crate::ci_pins::reserved(name) || crate::namespace_service::proposal_ref_reserved(name) {
         return false;
     }
     let suffix = if let Some(rest) = name.strip_prefix("refs/heads/") {
@@ -54,6 +54,7 @@ pub fn valid_revision_spec(spec: &str) -> bool {
         || spec.len() > 1024
         || spec.starts_with('-')
         || crate::ci_pins::reserved(spec)
+        || crate::namespace_service::proposal_ref_reserved(spec)
         || spec.contains("rootyard-ci")
         || spec.contains("..")
         || spec.contains("@{")
@@ -398,6 +399,13 @@ pub struct RefTransactionResponse {
 
 impl RefTransactionRequest {
     pub fn normalize(&self) -> Result<Vec<AppliedRefUpdate>, Error> {
+        self.normalize_with_proposal_pin(None)
+    }
+
+    pub(crate) fn normalize_with_proposal_pin(
+        &self,
+        proposal_pin: Option<Uuid>,
+    ) -> Result<Vec<AppliedRefUpdate>, Error> {
         if !self.atomic {
             return Err(Error(
                 StatusCode::BAD_REQUEST,
@@ -433,7 +441,9 @@ impl RefTransactionRequest {
         let mut seen = HashSet::with_capacity(self.updates.len());
         let mut out = Vec::with_capacity(self.updates.len());
         for u in &self.updates {
-            if !valid_public_ref(&u.ref_name) {
+            let trusted_pin = proposal_pin
+                .is_some_and(|id| u.ref_name == crate::namespace_service::proposal_pin_ref(id));
+            if !valid_public_ref(&u.ref_name) && !trusted_pin {
                 return Err(Error::bad_request());
             }
             if !seen.insert(u.ref_name.clone()) {
@@ -444,11 +454,19 @@ impl RefTransactionRequest {
             if !valid_oid(&old_oid) || !valid_oid(&new_oid) || old_oid == new_oid {
                 return Err(Error::bad_request());
             }
+            if trusted_pin && (!is_zero_oid(&old_oid) || is_zero_oid(&new_oid)) {
+                return Err(Error::bad_request());
+            }
             out.push(AppliedRefUpdate {
                 ref_name: u.ref_name.clone(),
                 old_oid,
                 new_oid,
             });
+        }
+        if let Some(id) = proposal_pin {
+            if out.len() != 1 || out[0].ref_name != crate::namespace_service::proposal_pin_ref(id) {
+                return Err(Error::bad_request());
+            }
         }
         // Check directory/file prefix conflicts among target refs that will exist after the transaction.
         for (i, a) in out.iter().enumerate() {
@@ -484,6 +502,8 @@ mod tests {
             "refs/tags/",
             "refs/rootyard-ci/jobs/123",
             "refs/rootyard-ci",
+            "refs/heads/rootyard-proposals",
+            "refs/heads/rootyard-proposals/00000000-0000-0000-0000-000000000001",
             "refs/remotes/origin/main",
             "refs/heads/..bad",
             "refs/heads/.hidden",

@@ -2,21 +2,13 @@
 use super::{changesets, views};
 #[path = "reverse_git.rs"]
 mod reverse_git;
-use crate::{
-    auth,
-    browse::{
-        models::{RefTransactionRequest, RefUpdateInput},
-        transactions,
-    },
-    members::models::Role,
-    AppState, Error,
-};
+use crate::{AppState, Error, auth, browse::transactions, members::models::Role};
 use axum::{
+    Json,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    Json,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use reverse_git::{git, git_input, git_oid, verify_candidate_budget};
 use serde::Deserialize;
 use std::{
@@ -327,25 +319,19 @@ pub async fn create(
     drop(_write);
     drop(_slot);
     let mut pin_headers = headers.clone();
-    let pin_ref = format!("refs/heads/rootyard-proposals/{}", Uuid::new_v4());
+    let proposal_id = Uuid::new_v4();
     pin_headers.insert(
         "idempotency-key",
         HeaderValue::from_str(&format!("pin-{}", Uuid::new_v4())).map_err(Error::internal)?,
     );
-    let pin = RefTransactionRequest {
-        storage_generation: Some(generation),
-        atomic: true,
-        updates: vec![RefUpdateInput {
-            ref_name: pin_ref,
-            old_oid: None,
-            new_oid: Some(new_oid.clone()),
-        }],
-    };
-    let pinned = transactions::execute_ref_transaction(
-        State(state.clone()),
-        Path((mount.owner.clone(), mount.repository.clone())),
+    let pinned = transactions::create_proposal_pin(
+        state.clone(),
+        mount.owner.clone(),
+        mount.repository.clone(),
         pin_headers,
-        Json(pin),
+        proposal_id,
+        new_oid.clone(),
+        generation,
     )
     .await?;
     if !pinned.status().is_success() {
