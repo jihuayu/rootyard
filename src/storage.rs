@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 pub mod remote_objects;
 pub mod encrypted_objects;
+pub mod read_leases;
 
 pub struct Storage {
     pub root: PathBuf,

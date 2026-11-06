@@ -19,6 +19,12 @@ def packet(payload):
 
 
 class RevocationHarness(MirrorHarness):
+    def barrier_available(self):
+        repo = uuid.UUID(self.repo["id"])
+        output = self.sql("BEGIN; SELECT pg_try_advisory_xact_lock("
+            f"hashtextextended('rootyard-data-v1:{repo}', 0)); ROLLBACK")
+        return "t" in output.splitlines()
+
     def stream_until_revoked(self, base, path, token, target, revoke):
         url = urllib.parse.urlsplit(base)
         connection = http.client.HTTPConnection(url.hostname, url.port, timeout=5)
@@ -31,6 +37,7 @@ class RevocationHarness(MirrorHarness):
             assert response.status == 200, (response.status, response.read(200))
             first = response.read(4096)
             assert first, "upload-pack returned no data before revocation"
+            assert not self.barrier_available(), "physical GC lock bypassed active Git stream"
             received = len(first)
             started = time.monotonic()
             revoke()
@@ -49,7 +56,14 @@ class RevocationHarness(MirrorHarness):
             assert interrupted, f"Git transfer completed or stalled after revocation ({received} bytes)"
             assert received < 32 * 1024 * 1024, "entire pack escaped after revocation"
             assert elapsed < 5, f"transfer cancellation took {elapsed:.2f}s"
-            return {"received_before_abort": received, "abort_seconds": round(elapsed, 3)}
+            for _ in range(30):
+                if self.barrier_available():
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("physical GC lock remained held after transfer abort")
+            return {"received_before_abort": received, "abort_seconds": round(elapsed, 3),
+                    "gc_blocked_while_active": True, "gc_unblocked_after_abort": True}
         finally:
             connection.close()
 
