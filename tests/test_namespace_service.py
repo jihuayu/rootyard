@@ -14,6 +14,35 @@ from tests.e2e import Harness
 
 
 class NamespaceServiceTest(unittest.TestCase):
+    def test_view_keeps_pinned_commit_after_source_branch_deleted(self):
+        h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
+        try:
+            h.setup();h.api();h.roundtrip()
+            h.git("switch","-c","ephemeral",h.second,cwd=h.work)
+            (h.work/"pkg").mkdir()
+            (h.work/"pkg"/"lib.rs").write_text("pub fn pinned() -> u32 { 42 }\n")
+            h.git("add","pkg/lib.rs",cwd=h.work)
+            h.git("commit","-m","pinned only",cwd=h.work)
+            pinned=h.git("rev-parse","HEAD",cwd=h.work).stdout.decode().strip()
+            h.git("push","origin","HEAD:refs/heads/ephemeral",cwd=h.work,token=h.alice)
+            ns=json.loads(h.expect("/api/namespaces",201,token=h.alice,method="POST",
+                body={"name":"pinned-source","mounts":[{"path":"pkg","owner":"alice",
+                    "repository":"demo","base_oid":pinned}]}))
+            h.git("push","origin",":refs/heads/ephemeral",cwd=h.work,token=h.alice)
+            h.git("--git-dir="+str(h.bare),"reflog","expire","--expire=now","--all")
+            refs=h.git("--git-dir="+str(h.bare),"for-each-ref","--contains",pinned,
+                "--format=%(refname)").stdout.decode().strip()
+            self.assertEqual(refs,"")
+            view=json.loads(h.expect(f"/api/namespaces/{ns['id']}/views",201,token=h.alice,
+                method="POST",body={"mount_path":"pkg","subdir":"pkg"}))
+            self.assertEqual(view["source_oid"],pinned)
+            bundle=h.expect(f"/api/views/{view['id']}/bundle",200,token=h.alice)
+            archive=h.root/"pinned.bundle";archive.write_bytes(bundle)
+            checkout=h.root/"pinned-clone"
+            h.git("clone",str(archive),str(checkout))
+            self.assertEqual((checkout/"lib.rs").read_text(),"pub fn pinned() -> u32 { 42 }\n")
+        finally:h.cleanup()
+
     def test_pinned_subdir_view_and_git_bundle(self):
         h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
         try:
