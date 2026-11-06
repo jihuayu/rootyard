@@ -63,15 +63,10 @@ class LockPolicyHarness(Harness):
         self.git("add","safe.txt",cwd=self.bob_work)
         self.git("commit","-m","safe change",cwd=self.bob_work)
         self.git("push","origin","HEAD:refs/heads/allowed",cwd=self.bob_work,token=self.alice)
-        lock_base="/git/alice/lock-policy.git/info/lfs/locks"
-        status,body,_=self.http(lock_base+"?path=docs%2Flocked.txt",token=self.bob)
-        assert status==200,(status,body)
-        lock_id=json.loads(body)["locks"][0]["id"]
-        status,body,_=self.http(lock_base+"/"+lock_id+"/unlock",token=self.bob,
-                                 method="POST",body=b"{}",content_type=LFS_MIME)
-        assert status==200,(status,body)
+        unlock=self.git("lfs","unlock","docs/locked.txt",cwd=self.work,token=self.bob)
+        assert b"Unlocked docs/locked.txt" in unlock.stdout
         return {"ancestor":ancestor,"tip":tip,"new_ref_denied":True,
-                "unlocked_new_ref_allowed":True}
+                "unlocked_new_ref_allowed":True,"stock_branch_switch_unlock":True}
 
     def verify_body_cursor(self):
         base="/git/alice/lock-policy.git/info/lfs/locks"
