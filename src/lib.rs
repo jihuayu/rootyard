@@ -17,6 +17,7 @@ pub mod events;
 #[rustfmt::skip]
 pub mod forge;
 pub mod git_http;
+pub mod pando_gateway;
 pub mod journal;
 pub mod kafka_wake;
 #[rustfmt::skip]
