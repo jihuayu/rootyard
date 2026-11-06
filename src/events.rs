@@ -69,6 +69,21 @@ pub async fn publish(
     operation: &OperationRecord,
     changes: &[RefEventInput],
 ) -> Result<()> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    publish_in_tx(&*tx, operation, changes).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Insert/replay the operation and its exact outbox set within a caller-owned
+/// transaction. Pando uses this with the authoritative ref/pack CAS so neither
+/// side can commit independently.
+pub async fn publish_in_tx(
+    tx: &Transaction<'_>,
+    operation: &OperationRecord,
+    changes: &[RefEventInput],
+) -> Result<()> {
     ensure!(
         matches!(
             operation.outcome.as_str(),
@@ -123,8 +138,6 @@ pub async fn publish(
             "duplicate ref event"
         );
     }
-    let mut client = pool.get().await?;
-    let tx = client.transaction().await?;
     // Shared repository lock orders publication against explicit offline resolution.
     tx.query_one(
         "SELECT id FROM repositories WHERE id=$1 FOR SHARE",
@@ -204,7 +217,6 @@ pub async fn publish(
         tx.execute("INSERT INTO event_deliveries(event_id,consumer) VALUES($1,'audit-log'),($1,'ref-index') ON CONFLICT DO NOTHING", &[&id]).await?;
     }
     tx.execute("UPDATE git_operations SET outcome=$2,evidence=$3,settled_at=CASE WHEN $2='unknown' THEN NULL ELSE COALESCE(settled_at,clock_timestamp()) END WHERE id=$1", &[&operation.id,&operation.outcome,&operation.evidence]).await?;
-    tx.commit().await?;
     Ok(())
 }
 
