@@ -10,28 +10,18 @@ use uuid::Uuid;
 
 pub async fn run_once(state: &Arc<AppState>, policy: &Policy, owner: Uuid) -> Result<Option<JobOutcome>> {
     let Some(job)=jobs::claim(&state.pool,owner,policy).await? else { return Ok(None) };
-    let outcome=run_claimed(state,policy,&job).await;
-    let (result,error)=match outcome {
-        Ok(value) => (value,None),
-        Err(error) => (json!({}),Some(error.to_string())),
-    };
-    let accepted=jobs::finish(&state.pool,&job,result,error.as_deref(),policy).await?;
-    let status=if !accepted { "superseded" } else if error.is_none() { "succeeded" } else if job.attempt<policy.max_attempts { "queued" } else { "failed" };
-    if accepted && error.is_none() && job.kind=="gitfs_repack" {
-        let counts=gitfs::count(state,job.repository_id,&CancellationToken::new()).await?;
-        let client=state.pool.get().await?;
-        client.execute(
-            "UPDATE storage_maintenance_repo_state SET last_repack_at=clock_timestamp(), \
-             last_repack_loose_count=$3,last_repack_pack_count=$4 WHERE repository_id=$1 \
-             AND tenant_id=$2 AND last_scan_generation=$5",
-            &[&job.repository_id,&job.tenant_id,&counts.loose,&counts.packs,&job.repository_generation],
-        ).await?;
+    match run_claimed(state,policy,&job).await {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(error) => {
+            let accepted=jobs::finish(&state.pool,&job,json!({}),Some(&error.to_string()),policy).await?;
+            let status=if !accepted { "superseded" } else if job.attempt<policy.max_attempts { "queued" } else { "failed" };
+            Ok(Some(JobOutcome {job_id:job.id,kind:job.kind.clone(),repository_id:job.repository_id,
+                attempt:job.attempt,state:status.into()}))
+        }
     }
-    Ok(Some(JobOutcome {job_id:job.id,kind:job.kind,repository_id:job.repository_id,
-        attempt:job.attempt,state:status.into()}))
 }
 
-async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models::Job) -> Result<serde_json::Value> {
+async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models::Job) -> Result<JobOutcome> {
     // Backup and migration hold the exclusive variant. A short claim transaction
     // never holds this lock, so backup cannot deadlock on a worker claim.
     let mut barrier=state.pool.get().await?;
@@ -70,6 +60,18 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
     };
     let result=result?;
     if !jobs::current(&state.pool,job).await? { bail!("maintenance lease expired before result publication"); }
+    if job.kind=="gitfs_repack" {
+        let counts=gitfs::count(state,job.repository_id,&CancellationToken::new()).await?;
+        let client=state.pool.get().await?;
+        client.execute(
+            "UPDATE storage_maintenance_repo_state SET last_repack_at=clock_timestamp(), \
+             last_repack_loose_count=$3,last_repack_pack_count=$4 WHERE repository_id=$1 \
+             AND tenant_id=$2 AND last_scan_generation=$5",
+            &[&job.repository_id,&job.tenant_id,&counts.loose,&counts.packs,&job.repository_generation],
+        ).await?;
+    }
+    let accepted=jobs::finish(&state.pool,job,result,None,policy).await?;
     tx.commit().await?;
-    Ok(result)
+    Ok(JobOutcome {job_id:job.id,kind:job.kind.clone(),repository_id:job.repository_id,
+        attempt:job.attempt,state:if accepted {"succeeded"} else {"superseded"}.into()})
 }
