@@ -46,6 +46,7 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (40, include_str!("../migrations/040_webhooks.sql")),
     (50, include_str!("../migrations/050_members_rbac.sql")),
     (60, include_str!("../migrations/060_sharding_fencing.sql")),
+    (70, include_str!("../migrations/070_repository_object_format.sql")),
     (80, include_str!("../migrations/080_cluster_security.sql")),
     (81, include_str!("../migrations/081_shard_marker_transitions.sql")),
     (82, include_str!("../migrations/082_cluster_transport_nonces.sql")),
@@ -54,7 +55,7 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (120, include_str!("../migrations/120_organizations.sql")),
 ];
 
-pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 80, 81, 82, 90, 110, 120];
+pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 80, 81, 82, 90, 110, 120];
 
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;
@@ -154,6 +155,7 @@ pub struct Repository {
     pub clone_path: String,
     pub storage_backend: String,
     pub storage_generation: i64,
+    pub object_format: String,
 }
 
 impl Repository {
@@ -168,11 +170,12 @@ impl Repository {
             state: row.get("state"),
             storage_backend: row.get("storage_backend"),
             storage_generation: row.get("storage_generation"),
+            object_format: row.get("object_format"),
         }
     }
 }
 
-pub const REPO_SELECT: &str = "SELECT r.id, r.name, r.state, r.storage_backend, r.storage_generation, ns.slug AS username FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id";
+pub const REPO_SELECT: &str = "SELECT r.id, r.name, r.state, r.storage_backend, r.storage_generation, r.object_format, ns.slug AS username FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id";
 
 #[cfg(test)]
 mod tests {

@@ -593,6 +593,7 @@ mod tests {
             clone_path: String::new(),
             storage_backend: "gitfs".into(),
             storage_generation: 1,
+            object_format: "sha1".into(),
         };
         let repo_root = state.storage.root.join("repos").join(repo.id.to_string());
         private_directory(&repo_root).unwrap();

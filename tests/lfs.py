@@ -2,11 +2,13 @@
 """Git LFS Batch API, verified streaming object storage, and paired backup/restore tests."""
 import argparse
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
 import stat
 import sys
+import time
 import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -279,6 +281,22 @@ class LfsHarness(Harness):
             code=404,
         )
 
+        # The repository owner is the LFS tenant even when Bob is the actor.
+        self.expect("/api/repos/alice/demo/collaborators/bob", 201, token=self.alice,
+                    method="PUT", body={"role": "admin"})
+        self.lfs_get(f"/git/alice/demo.git/info/lfs/objects/{self.oid}/{self.size}",
+                     token=self.bob, code=200)
+        bob_bytes = b"collaborator upload" * 32
+        bob_oid = hashlib.sha256(bob_bytes).hexdigest()
+        bob_batch = self.lfs_batch("upload", [{"oid": bob_oid, "size": len(bob_bytes)}], token=self.bob)
+        self.lfs_put(bob_batch["objects"][0]["actions"]["upload"]["href"], bob_bytes, token=self.bob)
+        self.lfs_verify("/git/alice/demo.git/info/lfs/verify", bob_oid, len(bob_bytes), token=self.bob)
+        assert self.lfs_get(f"/git/alice/demo.git/info/lfs/objects/{bob_oid}/{len(bob_bytes)}",
+                            token=self.alice)[1] == bob_bytes
+        self.expect("/api/repos/alice/demo/collaborators/bob", 200, token=self.alice, method="DELETE")
+        self.lfs_get(f"/git/alice/demo.git/info/lfs/objects/{self.oid}/{self.size}",
+                     token=self.bob, code=404)
+
         # Cross-repository isolation within same owner
         other_dl = self.lfs_batch(
             "download",
@@ -315,6 +333,83 @@ class LfsHarness(Harness):
             self.sql(
                 f"UPDATE repositories SET state='ready', recovery_reason=NULL WHERE id='{self.repo['id']}'"
             )
+
+    def _partial_put(self, oid, size, token):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.putrequest("PUT", f"/git/alice/demo.git/info/lfs/objects/{oid}/{size}")
+        conn.putheader("Authorization", "Bearer " + token["token"])
+        conn.putheader("Content-Type", "application/octet-stream")
+        conn.putheader("Content-Length", str(size))
+        conn.endheaders()
+        return conn
+
+    def _await_staging(self):
+        directory = self.root / "data" / "lfs" / self.repo["id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if list(directory.glob(".tmp-*")):
+                return
+            time.sleep(.02)
+        raise AssertionError("LFS staging file did not appear")
+
+    def concurrent_upload_revocation(self):
+        payload = os.urandom(1024)
+        oid = hashlib.sha256(payload).hexdigest()
+        self.lfs_batch("upload", [{"oid": oid, "size": len(payload)}], token=self.alice)
+        second = self.account("create-token", "alice")
+        a = self._partial_put(oid, len(payload), self.alice)
+        a.send(payload[:1])
+        self._await_staging()
+        b = self._partial_put(oid, len(payload), second)
+        b.send(payload[:1])
+        time.sleep(.15)  # B has read the pending reservation and queued for the lock.
+        self.sql(f"UPDATE tokens SET revoked=true WHERE id='{second['token_id']}'")
+        a.send(payload[1:])
+        response_a = a.getresponse()
+        assert response_a.status == 200, response_a.read()
+        response_a.read()
+        a.close()
+        response_b = b.getresponse()
+        assert response_b.status == 401, response_b.read()
+        response_b.read()
+        b.close()
+        assert self.lfs_get(f"/git/alice/demo.git/info/lfs/objects/{oid}/{len(payload)}", token=self.alice)[1] == payload
+        assert self.sql(f"SELECT state FROM lfs_objects WHERE repository_id='{self.repo['id']}' AND oid='{oid}'") == "ready"
+
+    def stalled_body_deadline(self):
+        self.stop()
+        self.env["ROOTYARD_GIT_TIMEOUT_SECONDS"] = "1"
+        self.start()
+        try:
+            for trickle in (False, True):
+                payload = os.urandom(1024)
+                oid = hashlib.sha256(payload).hexdigest()
+                self.lfs_batch("upload", [{"oid": oid, "size": len(payload)}], token=self.alice)
+                conn = self._partial_put(oid, len(payload), self.alice)
+                conn.send(payload[:1])
+                self._await_staging()
+                if trickle:
+                    for byte in payload[1:5]:
+                        time.sleep(.3)
+                        try:
+                            conn.send(bytes([byte]))
+                        except OSError:
+                            break
+                else:
+                    time.sleep(1.3)
+                response = conn.getresponse()
+                assert response.status == 504, response.read()
+                response.read()
+                conn.close()
+                assert list((self.root / "data" / "lfs" / self.repo["id"]).glob(".tmp-*")) == []
+                next_payload = os.urandom(64)
+                next_oid = hashlib.sha256(next_payload).hexdigest()
+                batch = self.lfs_batch("upload", [{"oid": next_oid, "size": len(next_payload)}], token=self.alice)
+                self.lfs_put(batch["objects"][0]["actions"]["upload"]["href"], next_payload, token=self.alice)
+        finally:
+            self.stop()
+            self.env.pop("ROOTYARD_GIT_TIMEOUT_SECONDS", None)
+            self.start()
 
     def corrupted_on_disk_blob_fails_closed(self):
         original = self.obj_file.read_bytes()
@@ -377,6 +472,8 @@ def main():
             "batch_upload_stream_verify_and_download",
             "hash_and_size_mismatch_rejection",
             "permissions_and_tenant_isolation",
+            "concurrent_upload_revocation",
+            "stalled_body_deadline",
             "corrupted_on_disk_blob_fails_closed",
             "paired_backup_and_restore",
         ):
