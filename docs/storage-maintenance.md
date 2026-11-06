@@ -7,12 +7,17 @@ are control-plane consumers and never touch the Git volume.
 The scheduler samples `git count-objects -v` for ready repositories on the
 local primary. `ROOTYARD_STORAGE_REPACK_LOOSE_OBJECTS` (default 1024) and
 `ROOTYARD_STORAGE_REPACK_PACKS` (default 8) cause a nonpruning repack when
-counts cross the thresholds. The last completed repack records a count
-baseline, so unchanged counts do not produce repeated packs. The scheduler
-also queues cleanup of stale LFS `.tmp-<uuid>` upload files and an unreachable
-object inspection. `ROOTYARD_STORAGE_SCAN_PERIOD_SECONDS` (default 3600),
+counts cross the thresholds, then rebuilds the reachable commit-graph cache.
+The last completed repack records a count baseline, so unchanged counts do not
+produce repeated packs. The scheduler
+also queues cleanup of stale LFS `.tmp-<uuid>` upload files and a bounded Git
+reachability scan. Unreachable OIDs become durable grace-period tombstones;
+reflogs and native CI pin refs remain roots. `ROOTYARD_STORAGE_SCAN_PERIOD_SECONDS` (default 3600),
 `ROOTYARD_STORAGE_STAGE_AGE_SECONDS` (default 3600), and
 `ROOTYARD_STORAGE_MAINTENANCE_POLL_SECONDS` (default 5) control those tasks.
+The cache eviction age is `ROOTYARD_STORAGE_CACHE_MAX_AGE_SECONDS` (default
+seven days), but eviction remains disabled with physical cleanup until every
+source reader uses a durable lease.
 
 Jobs in `storage_maintenance_jobs` carry repository and tenant identities, a
 storage generation, a short lease, an attempt count, and a claim generation.
@@ -23,8 +28,7 @@ the local write lock, and the local reader gate while running native Git.
 It checks the shard primary and storage fence after admission. Git children
 inherit the data-volume flock and receive a Linux parent-death signal.
 
-Repacking currently retains old packs and `git fsck` only reports unreachable
-objects. Physical tombstone deletion and pack pruning remain disabled pending
+Repacking currently retains old packs. Physical tombstone deletion and pack pruning remain disabled pending
 complete durable lease coverage across all source readers, including CI and
 workspace paths. An unavailable lease, backup barrier, shard route, or job
 generation fails closed and retries within the configured attempt limit.
