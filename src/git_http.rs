@@ -304,7 +304,12 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     }
     let path = if let Some(oid) = pin_oid {
         if job {
-            crate::mirror::job_path(&state, &repo, oid).await?
+            crate::mirror::job_path(
+                &state,
+                &repo,
+                job_plan.as_ref().ok_or_else(Error::unauthorized)?,
+            )
+            .await?
         } else {
             crate::mirror::pinned_path(&state, &repo, oid).await?
         }
