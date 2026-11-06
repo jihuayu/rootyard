@@ -24,6 +24,8 @@ mod process;
 mod protocol;
 #[path = "git_http/receive.rs"]
 mod receive;
+#[path = "git_http/publication.rs"]
+pub(crate) mod publication;
 use process::Process;
 pub(crate) use process::{collect_git_output, collect_git_output_input,
     finish_group_child, stop_group_child};

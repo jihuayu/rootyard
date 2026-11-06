@@ -13,6 +13,8 @@ pub struct Operation {
     pub service_principal_id: Option<Uuid>,
     pub sequence: i64,
     pub storage_generation: i64,
+    #[serde(default)]
+    pub requires_parent_publication: bool,
     /// Exact maintenance capability, persisted before spawning Git. Never supplied by push clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_pin: Option<crate::ci_pins::Intent>,
@@ -335,6 +337,7 @@ fn begin_inner(
         service_principal_id,
         sequence,
         storage_generation,
+        requires_parent_publication: active,
         ci_pin,
         path: PathBuf::new(),
     };

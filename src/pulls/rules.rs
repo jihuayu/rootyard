@@ -31,17 +31,18 @@ pub struct PolicyEvaluation {
     pub reason: Option<&'static str>,
 }
 
-async fn policy_write_lock(state: &AppState, owner: &str, name: &str)
-    -> Result<tokio::sync::OwnedMutexGuard<()>, Error> {
+async fn policy_ref_guard(state: &AppState, owner: &str, name: &str, branch_ref:&str)
+    -> Result<crate::storage::ref_publication::PublicationGuard, Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client.query_opt(
-        "SELECT r.id FROM repositories r JOIN namespaces u ON u.id=r.owner_id WHERE u.slug=$1 AND r.name=$2",
+        "SELECT r.id,r.storage_generation FROM repositories r JOIN namespaces u ON u.id=r.owner_id WHERE u.slug=$1 AND r.name=$2",
         &[&owner,&name],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let repo_id: Uuid = row.get(0);
+    let generation: i64 = row.get(1);
     drop(client);
-    tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo_id))
-        .await.map_err(|_| Error::timeout())
+    crate::storage::ref_publication::acquire(&state.pool,repo_id,generation,
+        &[branch_ref.to_owned()],tokio::time::Instant::now()+state.config.git_timeout).await
 }
 
 async fn has_self_approval_col(tx: &Transaction<'_>) -> Result<bool, Error> {
@@ -128,7 +129,9 @@ async fn upsert_branch_rule_inner(
     }
 
     let key = idempotency_key(&headers)?;
-    let _policy_guard = policy_write_lock(&state, &owner, &name).await?;
+    let publication = policy_ref_guard(&state, &owner, &name, &branch_ref).await?;
+    let _policy_guard = publication.enter_window(&state.storage,
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain).await?;
@@ -319,7 +322,9 @@ pub async fn delete_branch_rule(
 ) -> Result<Response, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let branch_ref = normalize_branch_ref(&branch)?;
-    let _policy_guard = policy_write_lock(&state, &owner, &name).await?;
+    let publication = policy_ref_guard(&state, &owner, &name, &branch_ref).await?;
+    let _policy_guard = publication.enter_window(&state.storage,
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain).await?;

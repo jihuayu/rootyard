@@ -102,6 +102,7 @@ fn events_with_size(op: &Operation) -> Result<(Vec<HookEvent>, usize)> {
         if name == "operation.json"
             || name == "hook.lock"
             || name == "active.lock"
+            || name == "publication.grant"
             || name == "finished"
             || name == "interrupted"
             || name == "post-receive.json"
@@ -359,6 +360,7 @@ pub fn run_pre_receive() -> Result<()> {
     );
     let changes = parse(&input)?;
     validate_namespace(&op, &changes)?;
+    crate::git_http::publication::await_grant(&op)?;
     crate::browse::policy::validate_hook(&op, &changes)?;
     record_request(&op, &input)
 }
@@ -415,6 +417,7 @@ pub fn run_hook(state: &str) -> Result<()> {
     };
     let (op, input) = hook_input()?;
     if phase == HookPhase::Preparing {
+        crate::git_http::publication::verify_grant(&op)?;
         crate::browse::policy::validate_hook_fence(&op)?;
     }
     let result = record(&op, phase, &input);
