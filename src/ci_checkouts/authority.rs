@@ -64,8 +64,10 @@ pub async fn integration_hook_for_plan(state:&AppState,plan:&Plan)->Result<Optio
 
 pub async fn authenticate_principal(state:&AppState,headers:&HeaderMap,owner:&str,
     name:&str,oid:&str)->Result<(CheckoutPrincipal,db::Repository,Plan),Error>{
-    if let Ok((identity,repo,plan))=authenticate(state,headers,owner,name,oid).await {
-        return Ok((CheckoutPrincipal::User(identity),repo,plan));
+    match authenticate(state,headers,owner,name,oid).await {
+        Ok((identity,repo,plan))=>return Ok((CheckoutPrincipal::User(identity),repo,plan)),
+        Err(error) if error.0==axum::http::StatusCode::UNAUTHORIZED=>{},
+        Err(error)=>return Err(error),
     }
     let (user,token)=auth::credentials_for(headers,"ryj_")?;
     if user.as_ref().is_some_and(|u|u!=owner){return Err(Error::unauthorized());}
