@@ -205,16 +205,16 @@ pub(crate) async fn ensure_pull_ci_pin(
     let existing_ref = resolve_ref_oid(state, repo.id, &retention_ref).await?;
     if existing_ref.as_deref() != Some(head_oid) {
         let client = state.pool.get().await.map_err(Error::internal)?;
-        let token_id: Uuid = client
-            .query_opt("SELECT id FROM tokens WHERE user_id=$1 ORDER BY NOT revoked DESC, created_at DESC LIMIT 1", &[&owner_id])
-            .await
-            .map_err(Error::internal)?
-            .map(|r| r.get("id"))
-            .ok_or_else(|| Error::internal("missing owner token for CI pin journal"))?;
+        client.execute("INSERT INTO ci_service_principals(id,repository_id,kind,active) \
+            VALUES($1,$2,'ci-pin',true) ON CONFLICT(repository_id,kind) DO NOTHING",
+            &[&Uuid::new_v4(),&repo.id]).await.map_err(Error::internal)?;
+        let principal_id:Uuid=client.query_opt("SELECT id FROM ci_service_principals \
+            WHERE repository_id=$1 AND kind='ci-pin' AND active=true",&[&repo.id])
+            .await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?.get(0);
         drop(client);
 
         let repo_path = state.storage.verify_path(repo.id).map_err(Error::internal)?;
-        let op = journal::begin(&state.storage.root, repo.id, owner_id, repo.owner.clone(), token_id, repo.storage_generation)
+        let op = journal::begin_ci_service(&state.storage.root,&intent,principal_id)
             .map_err(Error::internal)?;
         let zero="0".repeat(head_oid.len());
         let old_expected = existing_ref.as_deref().unwrap_or(&zero);
@@ -239,9 +239,9 @@ pub(crate) async fn ensure_pull_ci_pin(
             "finished": true, "interrupted": false, "reference_events": [], "retained": true,
         });
         let record = events::OperationRecord {
-            id: op.id, repository_id: repo.id, actor_id: owner_id, token_id,
-            service_principal_id: None,
-            actor_name: repo.owner.clone(), sequence: op.sequence,
+            id: op.id, repository_id: repo.id, actor_id: op.actor_id, token_id: op.token_id,
+            service_principal_id: op.service_principal_id,
+            actor_name: op.actor_name.clone(), sequence: op.sequence,
             storage_generation: repo.storage_generation, outcome: "recorded".into(), evidence,
         };
         events::publish(&state.pool, &record, &changes).await.map_err(Error::internal)?;
