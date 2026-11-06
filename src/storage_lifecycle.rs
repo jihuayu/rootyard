@@ -4,6 +4,7 @@
 #[path = "storage_lifecycle/models.rs"] pub mod models;
 #[path = "storage_lifecycle/jobs.rs"] pub mod jobs;
 #[path = "storage_lifecycle/gitfs.rs"] pub mod gitfs;
+#[path = "storage_lifecycle/gc.rs"] pub mod gc;
 #[path = "storage_lifecycle/scheduler.rs"] pub mod scheduler;
 #[path = "storage_lifecycle/worker.rs"] pub mod worker;
 

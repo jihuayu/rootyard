@@ -117,12 +117,6 @@ pub async fn execute(state: &AppState, repo: Uuid, kind: &str, policy: &Policy, 
             let deleted=tokio::task::spawn_blocking(move || clean_staging(&dir,age,&cancel)).await??;
             Ok(json!({"staging_files_deleted":deleted}))
         }
-        "gitfs_unreachable_mark" => {
-            // A mark is diagnostic only: roots include refs, CI pins, workspace refs,
-            // retained snapshots and backup epochs; no physical deletion is enabled.
-            let report=run_git(state, repo, &["fsck", "--no-reflogs", "--unreachable", "--no-progress"], cancel, 512*1024).await?;
-            Ok(json!({"unreachable_lines":report.lines().take(8192).count(),"deleted":false}))
-        }
         "gitfs_cache_evict" | "gitfs_tombstone_delete" => bail!("destructive cleanup requires durable cross-process reader leases"),
         _ => bail!("unknown storage maintenance job kind"),
     }
