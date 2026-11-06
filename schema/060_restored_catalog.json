@@ -3203,7 +3203,7 @@
     },
     {
       "collation": null,
-      "default": "107374182400",
+      "default": "'107374182400'::bigint",
       "generated": "",
       "identity": "",
       "name": "capacity_bytes",
