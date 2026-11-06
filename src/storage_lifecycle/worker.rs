@@ -48,10 +48,8 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
     let task=async {
         if job.kind=="gitfs_unreachable_mark" {
             gc::mark(state,job.repository_id,job.tenant_id,job.repository_generation,policy,&cancel).await
-        } else if job.kind=="gitfs_tombstone_delete" && gc::PHYSICAL_DELETE_ENABLED {
-            gc::delete_due(state,job.repository_id,job.tenant_id,job.repository_generation,&lease,&cancel).await
-        } else if job.kind=="gitfs_cache_evict" && !gc::PHYSICAL_DELETE_ENABLED {
-            bail!("cache eviction requires complete reader lease coverage")
+        } else if matches!(job.kind.as_str(), "gitfs_tombstone_delete" | "gitfs_cache_evict") {
+            bail!("physical deletion requires complete reader lease coverage")
         } else {
             gitfs::execute(state,job.repository_id,&job.kind,policy,&cancel).await
         }
