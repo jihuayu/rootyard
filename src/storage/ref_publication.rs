@@ -1,14 +1,25 @@
 //! Owned, cross-process ref publication admission. The caller retains this
 //! guard across native Git's prepare/commit phases; hook subprocesses never
 //! attempt to keep a PostgreSQL transaction alive after they exit.
-use crate::{Error, storage::read_leases};
+use crate::{Error, storage::{Storage,read_leases}};
 use axum::http::StatusCode;
 use deadpool_postgres::Pool;
 use std::{future::Future, sync::{Arc, OnceLock}};
-use tokio::{sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore}, task::JoinHandle, time::{Duration, Instant}};
+use tokio::{sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, OwnedMutexGuard, Semaphore}, task::JoinHandle, time::{Duration, Instant}};
 use uuid::Uuid;
 
 const LOCK_REF: &str = "SELECT pg_try_advisory_xact_lock(hashtextextended('rootyard-ref-v1:' || $1::uuid::text || ':' || $2::text, 0))";
+const LOCK_REPOSITORY: &str = "SELECT pg_try_advisory_xact_lock(hashtextextended('rootyard-publication-v1:' || $1::uuid::text, 0))";
+
+type WindowRequest = oneshot::Sender<Result<(),Error>>;
+
+pub struct PublicationWindow<'a> {
+    guard: &'a PublicationGuard,
+    _local: OwnedMutexGuard<()>,
+}
+impl PublicationWindow<'_> {
+    pub fn ensure_active(&self) -> Result<(), Error> { self.guard.ensure_active() }
+}
 
 pub struct PublicationGuard {
     repository_id: Uuid,
@@ -16,6 +27,7 @@ pub struct PublicationGuard {
     refs: Vec<String>,
     data: read_leases::Lease,
     active: watch::Receiver<Option<Instant>>,
+    window_tx: mpsc::Sender<WindowRequest>,
     owner: JoinHandle<()>,
     _slot: OwnedSemaphorePermit,
 }
@@ -24,6 +36,24 @@ impl PublicationGuard {
     pub fn repository_id(&self) -> Uuid { self.repository_id }
     pub fn storage_generation(&self) -> i64 { self.storage_generation }
     pub fn refs(&self) -> &[String] { &self.refs }
+
+    /// Enter the short repository-wide publication window on the SAME PG
+    /// session that owns exact-ref locks. This adds no pooled connection.
+    /// Call only after input/object preparation; retain through native CAS,
+    /// durable journal settlement, and any policy-dependent response.
+    pub async fn enter_window<'a>(&'a self, storage: &Storage,
+        deadline: Instant) -> Result<PublicationWindow<'a>,Error> {
+        self.ensure_active()?;
+        let (send, recv) = oneshot::channel();
+        tokio::time::timeout_at(deadline, self.window_tx.send(send)).await
+            .map_err(|_| unavailable())?.map_err(|_| unavailable())?;
+        tokio::time::timeout_at(deadline, recv).await
+            .map_err(|_| unavailable())?.map_err(|_| unavailable())??;
+        let local = tokio::time::timeout_at(deadline, storage.write_lock(self.repository_id))
+            .await.map_err(|_| unavailable())?;
+        self.ensure_active()?;
+        Ok(PublicationWindow { guard: self, _local: local })
+    }
 
     pub fn ensure_active(&self) -> Result<(), Error> {
         self.data.ensure_active()?;
@@ -87,6 +117,7 @@ pub async fn acquire(pool: &Pool, repository_id: Uuid, generation: i64,
     let owner_names = names.clone();
     let (ready_send, ready_recv) = oneshot::channel::<Result<(), Error>>();
     let (active_send, active) = watch::channel(None);
+    let (window_tx, mut window_rx) = mpsc::channel::<WindowRequest>(1);
     let mut pending = Pending(Some(tokio::spawn(async move {
         let mut ready_send = Some(ready_send);
         let result: Result<(), Error> = async {
@@ -122,7 +153,28 @@ pub async fn acquire(pool: &Pool, repository_id: Uuid, generation: i64,
                 let mut tick = tokio::time::interval(Duration::from_secs(1));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
-                    tick.tick().await;
+                    tokio::select! {
+                        _ = tick.tick() => {},
+                        request = window_rx.recv() => {
+                            if let Some(request) = request {
+                                loop {
+                                    if request.is_closed() { break; }
+                                    let granted: bool = tx.query_one(LOCK_REPOSITORY, &[&repository_id])
+                                        .await.map_err(Error::internal)?.get(0);
+                                    let row = tx.query_opt("SELECT storage_generation,state FROM repositories WHERE id=$1",
+                                        &[&repository_id]).await.map_err(Error::internal)?
+                                        .ok_or_else(Error::not_found)?;
+                                    if row.get::<_, i64>(0) != generation || row.get::<_, String>(1) != "ready" {
+                                        return Err(Error(StatusCode::CONFLICT, "repository generation or state changed"));
+                                    }
+                                    active_send.send_replace(Some(Instant::now()));
+                                    if granted { let _ = request.send(Ok(())); break; }
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let row = tokio::time::timeout(Duration::from_millis(1500),
                         tx.query_opt("SELECT storage_generation,state FROM repositories WHERE id=$1",
                             &[&repository_id])).await.map_err(|_| unavailable())?
@@ -141,7 +193,7 @@ pub async fn acquire(pool: &Pool, repository_id: Uuid, generation: i64,
     match result {
         Ok(Ok(Ok(()))) => Ok(PublicationGuard {
             repository_id, storage_generation: generation, refs: names,
-            data, active, owner: pending.0.take().expect("pending publication task"), _slot: slot,
+            data, active, window_tx, owner: pending.0.take().expect("pending publication task"), _slot: slot,
         }),
         Ok(Ok(Err(error))) => Err(error),
         _ => Err(unavailable()),
@@ -170,10 +222,20 @@ mod tests {
         let first = acquire(&pool, repo, 1, &a, until()).await.unwrap();
         let independent = acquire(&pool, repo, 1, &b, until()).await.unwrap();
         independent.ensure_active().unwrap();
+        let (grant_send, grant_recv) = oneshot::channel();
+        first.window_tx.send(grant_send).await.unwrap();
+        grant_recv.await.unwrap().unwrap();
+        let (blocked_send, blocked_recv) = oneshot::channel();
+        independent.window_tx.send(blocked_send).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(150),blocked_recv).await.is_err(),
+            "different ref entered repository publication window concurrently");
         assert!(acquire(&pool, repo, 1, &a, Instant::now()+Duration::from_millis(200)).await.is_err());
         let group = vec![a[0].clone(), b[0].clone()];
         assert!(acquire(&pool, repo, 1, &group, Instant::now()+Duration::from_millis(200)).await.is_err());
         drop(first);
+        let (after_send, after_recv) = oneshot::channel();
+        independent.window_tx.send(after_send).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1),after_recv).await.unwrap().unwrap().unwrap();
         let free_a = acquire(&pool, repo, 1, &a, until()).await.unwrap();
         free_a.ensure_active().unwrap();
         drop(free_a);
