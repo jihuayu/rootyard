@@ -5,11 +5,11 @@ use crate::{
         git_read,
         models::{AppliedRefUpdate, RefTransactionRequest, RefTransactionResponse},
     },
-    db, events, journal, reliability, storage,
+    db::{self, Identity}, events, journal, reliability, storage,
 };
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -100,10 +100,11 @@ pub fn build_update_ref_stdin_payload(updates: &[AppliedRefUpdate]) -> Vec<u8> {
 pub async fn execute_ref_transaction(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
+    Extension(actor): Extension<Identity>,
     headers: HeaderMap,
     Json(input): Json<RefTransactionRequest>,
 ) -> Result<Response, Error> {
-    tokio::spawn(async move { execute_ref_transaction_inner(state, owner, name, headers, input, None).await })
+    tokio::spawn(async move { execute_ref_transaction_inner(state, owner, name, actor, headers, input, None).await })
         .await
         .map_err(Error::internal)?
 }
@@ -128,8 +129,9 @@ pub(crate) async fn create_proposal_pin(
             new_oid: Some(target_oid),
         }],
     };
+    let actor = auth::authenticate(&state.pool, &headers).await?;
     tokio::spawn(async move {
-        execute_ref_transaction_inner(state, owner, name, headers, request, Some(proposal_id)).await
+        execute_ref_transaction_inner(state, owner, name, actor, headers, request, Some(proposal_id)).await
     })
     .await
     .map_err(Error::internal)?
@@ -139,11 +141,11 @@ async fn execute_ref_transaction_inner(
     state: Arc<AppState>,
     owner: String,
     name: String,
+    actor: Identity,
     headers: HeaderMap,
     input: RefTransactionRequest,
     proposal_pin: Option<Uuid>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     auth::writable(&actor)?;
     let idem_key = auth::idempotency_key(&headers)?.map(str::to_owned);
     let normalized_updates = input.normalize_with_proposal_pin(proposal_pin)?;

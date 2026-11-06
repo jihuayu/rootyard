@@ -20,11 +20,12 @@ const MAX_REFS: usize = 4096;
 
 #[path = "journal/core.rs"]
 mod core;
-pub use core::{Operation, RefChange, HookPhase, HookEvent, begin, sequence, pending};
+pub use core::{Operation, RefChange, HookPhase, HookEvent, ActiveGuard,
+    begin, begin_active, sequence, pending};
 pub(crate) use core::{safe_path, mkdir, read, exists, atomic, begin_ci, begin_ci_service};
 use core::{load, entries, sync_dir, validate, op_name};
 
-fn valid_ref(s: &str) -> bool {
+pub(crate) fn valid_ref(s: &str) -> bool {
     if s.len() > 1024 {
         return false;
     }
@@ -100,6 +101,7 @@ fn events_with_size(op: &Operation) -> Result<(Vec<HookEvent>, usize)> {
             .context("invalid event filename")?;
         if name == "operation.json"
             || name == "hook.lock"
+            || name == "active.lock"
             || name == "finished"
             || name == "interrupted"
             || name == "post-receive.json"

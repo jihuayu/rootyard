@@ -136,6 +136,13 @@ pub async fn reconcile(
     };
     let mut clear = true;
     for operation in pending {
+        // Independent-ref pushes no longer hold the repository transfer lock.
+        // Their owned active.lock is published before the operation directory
+        // becomes visible and survives until the child has stopped and a
+        // terminal marker is durable. Never infer their outcome mid-transfer.
+        if !startup && journal::ActiveGuard::operation_is_live(&operation)? {
+            continue;
+        }
         match crate::maintenance::retire_if_resolved(&state.pool, &state.storage, &operation).await
         {
             Ok(true) => continue,
@@ -163,7 +170,7 @@ pub async fn reconcile(
                 continue;
             }
         }
-        if startup && !journal::is_finished(&operation)? {
+        if !journal::is_finished(&operation)? {
             journal::mark_interrupted(&operation)?;
             journal::finish(&operation)?;
         }

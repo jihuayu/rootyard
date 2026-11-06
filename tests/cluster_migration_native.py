@@ -115,6 +115,12 @@ def main():
         h.git("push", node1 + h.repo["clone_path"], "HEAD:main", cwd=h.work, token=h.alice)
         h.git("fetch", node1 + h.repo["clone_path"], "refs/heads/main", cwd=h.copy, token=h.reader)
         assert h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip() == final_tip
+        routed_refs = json.loads(h.expect("/api/repos/alice/demo/refs", 200, token=h.reader))
+        assert routed_refs["head"]["oid"] == final_tip, "retired source served stale browse refs"
+        routed_blob = json.loads(h.expect("/api/repos/alice/demo/blob?oid=" + final_tip +
+                                          "&path=hello.txt", 200, token=h.reader))
+        assert routed_blob["content"] == "commit after migration\n"
+        h.expect("/api/repos/alice/demo/refs", (403, 404), token=h.bob)
         assert h.git("--git-dir=" + str(dest_repo), "rev-parse", "refs/heads/main").stdout.decode().strip() == final_tip
         assert h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == initial
         retired = json.loads((h.bare / "rootyard-shard-fence.json").read_text())
@@ -123,6 +129,7 @@ def main():
         print(json.dumps({"result": "passed", "operation_id": receipt["operation_id"], "transfer_ms": duration_ms,
                           "partial_copy_rejected_before_cutover": True, "same_operation_resumed_after_target_restart": True,
                           "ahead_journal_rejected_without_replacing_target": True,
+                          "browse_read_from_retired_ingress_reached_new_owner": True,
                           "source_oid": initial, "destination_oid_after_push": final_tip,
                           "source_volume": str(h.bare), "destination_volume": str(dest_repo)}))
     finally:

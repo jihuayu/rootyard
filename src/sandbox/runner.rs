@@ -10,6 +10,11 @@ use std::{
 use tokio::process::Command;
 use uuid::Uuid;
 
+pub(super) enum Source {
+    Workspace { id: Uuid, live: bool },
+    Ci { checkout: PathBuf, claim: crate::webhooks::claimed::ClaimedRun },
+}
+
 enum Mode {
     Dev,
     Cgroup(PathBuf),
@@ -82,6 +87,13 @@ fn limit(resource: libc::__rlimit_resource_t, soft: u64) -> std::io::Result<()> 
     }
     Ok(())
 }
+fn leader_exited(pid:i32)->std::io::Result<bool>{
+    let mut info=std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let result=unsafe {libc::waitid(libc::P_PID,pid as u32,info.as_mut_ptr(),
+        libc::WEXITED|libc::WNOHANG|libc::WNOWAIT)};
+    if result!=0 {return Err(std::io::Error::last_os_error());}
+    Ok(unsafe {info.assume_init().si_pid()!=0})
+}
 
 pub async fn launch(
     state: Arc<AppState>,
@@ -91,6 +103,22 @@ pub async fn launch(
     timeout_seconds: u64,
     live: bool,
 ) -> Result<(), Error> {
+    launch_source(state,job,Source::Workspace{id:workspace,live},argv,timeout_seconds).await
+}
+
+pub(super) async fn launch_ci(
+    state: Arc<AppState>, job: Uuid, checkout: PathBuf,
+    claim: crate::webhooks::claimed::ClaimedRun,
+    argv: Vec<String>, timeout_seconds: u64,
+) -> Result<(), Error> {
+    launch_source(state,job,Source::Ci{checkout,claim},argv,timeout_seconds).await
+}
+
+async fn launch_source(
+    state: Arc<AppState>, job: Uuid, source: Source,
+    argv: Vec<String>, timeout_seconds: u64,
+) -> Result<(), Error> {
+    let live=matches!(&source,Source::Workspace{live:true,..});
     if live && std::env::var("ROOTYARD_SANDBOX_MODE").as_deref() != Ok("dev") {
         return Err(Error::internal(
             "live FUSE workspace requires dev namespace mode",
@@ -102,7 +130,11 @@ pub async fn launch(
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(Error::internal)?;
     let workspace_dir = root.join("workspace");
     if !live {
-        core::copy_all(&service::workspace_repo(&state, workspace), &workspace_dir)
+        let source_path=match &source {
+            Source::Workspace{id,..}=>service::workspace_repo(&state,*id),
+            Source::Ci{checkout,..}=>checkout.clone(),
+        };
+        core::copy_all(&source_path, &workspace_dir)
             .map_err(Error::internal)?;
     }
     let stdout = OpenOptions::new()
@@ -158,7 +190,10 @@ pub async fn launch(
     match &isolation {
         Mode::Dev => {
             let source = if live {
-                service::workspace_repo(&state, workspace)
+                match &source {
+                    Source::Workspace{id,..}=>service::workspace_repo(&state,*id),
+                    Source::Ci{..}=>unreachable!(),
+                }
             } else {
                 workspace_dir.clone()
             };
@@ -205,67 +240,75 @@ pub async fn launch(
         .ok_or_else(|| Error::internal("sandbox process missing pid"))? as i32;
     if let Mode::Cgroup(group) = &isolation {
         if attach_group(group, pid).is_err() {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-            let _ = child.wait().await;
+            let _=crate::git_http::stop_group_child(&mut child).await;
+            let _=fs::write(group.join("cgroup.kill"),"1");
+            let _=fs::remove_dir(group);
             return Err(Error::internal("sandbox cgroup attach failed"));
         }
     }
-    let registration=async {
-        let client=state.pool.get().await.map_err(Error::internal)?;
-        let changed=client.execute("UPDATE sandbox_jobs j SET state='running',pid=$2,started_at=clock_timestamp() FROM workspaces w WHERE j.id=$1 AND j.state='queued' AND j.workspace_id=w.id AND j.lease_epoch=w.lease_epoch AND j.host_id=w.host_id AND w.lease_until>clock_timestamp()", &[&job,&pid]).await.map_err(Error::internal)?;
-        if changed!=1 { return Err(Error::internal("sandbox job was not queued")); }
-        Ok::<_,Error>(())
-    }.await;
+    let registration=tokio::time::timeout(Duration::from_secs(5),async {match &source {
+        Source::Workspace{..}=>async {
+            let client=state.pool.get().await.map_err(Error::internal)?;
+            let changed=client.execute("UPDATE sandbox_jobs j SET state='running',pid=$2,started_at=clock_timestamp() FROM workspaces w WHERE j.id=$1 AND j.state='queued' AND j.workspace_id=w.id AND j.lease_epoch=w.lease_epoch AND j.host_id=w.host_id AND w.lease_until>clock_timestamp()", &[&job,&pid]).await.map_err(Error::internal)?;
+            if changed!=1 { return Err(Error::internal("sandbox job was not queued")); }
+            Ok::<_,Error>(())
+        }.await,
+        Source::Ci{claim,..}=>super::ci::mark_running(&state,claim,job,pid).await,
+    }}).await.unwrap_or_else(|_|Err(Error::timeout()));
     if let Err(error) = registration {
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+        let _=crate::git_http::stop_group_child(&mut child).await;
+        if let Mode::Cgroup(group)=&isolation {
+            let _=fs::write(group.join("cgroup.kill"),"1");
+            let _=fs::remove_dir(group);
         }
-        let _ = child.wait().await;
         return Err(error);
     }
     if let Err(error) = fs::write(root.join("control/start"), b"start") {
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+        let _=crate::git_http::stop_group_child(&mut child).await;
+        if let Mode::Cgroup(group)=&isolation {
+            let _=fs::write(group.join("cgroup.kill"),"1");
+            let _=fs::remove_dir(group);
         }
-        let _ = child.wait().await;
         return Err(Error::internal(error));
     }
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
-        let (state_name, code) = loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => break ("succeeded", status.code()),
-                Ok(Some(status)) => break ("failed", status.code()),
+        let (mut state_name, mut code) = loop {
+            match leader_exited(pid) {
+                Ok(true)=>match crate::git_http::finish_group_child(&mut child).await {
+                    Ok(status) if status.success()=>break ("succeeded",status.code()),
+                    Ok(status)=>break ("failed",status.code()),
+                    Err(_)=>break ("failed",None),
+                },
                 Err(_) => break ("failed", None),
-                Ok(None) => {}
+                Ok(false) => {}
             }
             if tokio::time::Instant::now() >= deadline {
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
-                let _ = child.wait().await;
+                let _=crate::git_http::stop_group_child(&mut child).await;
                 break ("timed_out", None);
             }
-            let lease_live = match state.pool.get().await {
-                Ok(client) => client
-                    .query_opt("SELECT j.state,j.lease_epoch=w.lease_epoch AND j.host_id=w.host_id AND w.lease_until>clock_timestamp() AS lease_live FROM sandbox_jobs j JOIN workspaces w ON w.id=j.workspace_id WHERE j.id=$1", &[&job])
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|row| row.get::<_, String>(0) == "running" && row.get::<_, bool>(1)),
-                Err(_) => false,
+            let lease_live = match &source {
+                Source::Workspace{..}=>match state.pool.get().await {
+                    Ok(client) => client
+                        .query_opt("SELECT j.state,j.lease_epoch=w.lease_epoch AND j.host_id=w.host_id AND w.lease_until>clock_timestamp() AS lease_live FROM sandbox_jobs j JOIN workspaces w ON w.id=j.workspace_id WHERE j.id=$1", &[&job])
+                        .await.ok().flatten()
+                        .is_some_and(|row| row.get::<_, String>(0) == "running" && row.get::<_, bool>(1)),
+                    Err(_) => false,
+                },
+                Source::Ci{claim,..}=>super::ci::still_active(&state,claim,job).await.unwrap_or(false),
             };
             if !lease_live {
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
-                let _ = child.wait().await;
+                let _=crate::git_http::stop_group_child(&mut child).await;
                 break ("cancelled", None);
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         };
+        if let Source::Ci{claim,..}=&source {
+            if !super::ci::still_active(&state,claim,job).await.unwrap_or(false) {
+                state_name="cancelled";
+                code=None;
+            }
+        }
         if let Ok(client) = state.pool.get().await {
             let _=client.execute("UPDATE sandbox_jobs SET state=$2,exit_code=$3,finished_at=clock_timestamp(),pid=NULL WHERE id=$1 AND state='running'", &[&job,&state_name,&code]).await;
         }
@@ -279,6 +322,9 @@ pub async fn launch(
 
 pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
+    let abandoned=client.query("SELECT id FROM sandbox_jobs WHERE host_id=$1 \
+        AND state IN ('queued','preparing')",&[&state.storage.volume_id])
+        .await.map_err(Error::internal)?;
     let rows = client
         .query(
             "SELECT id,pid FROM sandbox_jobs WHERE host_id=$1 AND state='running'",
@@ -291,6 +337,12 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
         let pid: Option<i32> = row.get(1);
         let _ = pid; // --die-with-parent kills the namespace on service crash.
         client.execute("UPDATE sandbox_jobs SET state='failed',finished_at=clock_timestamp(),pid=NULL WHERE id=$1 AND state='running'", &[&id]).await.map_err(Error::internal)?;
+    }
+    client.execute("UPDATE sandbox_jobs SET state='failed',finished_at=clock_timestamp() WHERE host_id=$1 AND state IN ('queued','preparing')", &[&state.storage.volume_id]).await.map_err(Error::internal)?;
+    for row in abandoned {
+        let id:Uuid=row.get(0);
+        let root=job_root(state,id);
+        if root.exists() {fs::remove_dir_all(root).map_err(Error::internal)?;}
     }
     Ok(())
 }

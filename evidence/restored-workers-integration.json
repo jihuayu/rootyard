@@ -1,0 +1,82 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "backup_pending_and_expired_deliveries",
+      "status": "passed",
+      "seconds": 31.486,
+      "detail": {
+        "pending_delivery_rows": 2,
+        "expired_lease_rows": 2,
+        "unexpired_lease_rows": 1,
+        "old_generation_lease_fixture": true,
+        "immutable_resolution_rows": 2,
+        "no_embedded_workers": true
+      }
+    },
+    {
+      "name": "fresh_database_volume_exact_restore",
+      "status": "passed",
+      "seconds": 8.5171,
+      "detail": {
+        "durable_rows_exact_with_authority_rotated": true,
+        "volume_id_byte_exact": true,
+        "journal_files_byte_exact": true,
+        "recovery_snapshot_provenance": true,
+        "delivery_effects_preserved": true,
+        "separate_pg_server": false,
+        "restore_seconds": 7.830507226
+      }
+    },
+    {
+      "name": "restored_independent_pg_workers",
+      "status": "passed",
+      "seconds": 0.7686,
+      "detail": {
+        "two_pg_only_workers": true,
+        "no_volume_access": true,
+        "restored_expired_leases_reclaimed": true,
+        "unexpired_lease_respected": true,
+        "pending_effects_once": true,
+        "stale_generation_retired": true,
+        "recovery_snapshot_unchanged": true,
+        "resolved_unknown_frozen": true
+      }
+    },
+    {
+      "name": "post_restore_git_and_worker_effects",
+      "status": "passed",
+      "seconds": 2.0861,
+      "detail": {
+        "authenticated_clone_fsck": true,
+        "revoked_read_only_preserved": true,
+        "unresolved_repo_blocked": true,
+        "real_generation2_push": true,
+        "independent_workers_once": true,
+        "repeated_worker_no_changes": true
+      }
+    }
+  ],
+  "binary_sha256": "884ca118acd0cb5013f09d677d186fe661014e3e59a7ffc607eb0dc9d99b889c",
+  "limitations": [
+    "Synthetic local PG clusters; no production failover guarantee.",
+    "Expired and old-generation lease rows are explicit fixtures; native push events are real.",
+    "PostgreSQL transactional effects only; Redis remains an optional non-durable wake hint."
+  ],
+  "native_build": {
+    "version": 1,
+    "binary_sha256": "884ca118acd0cb5013f09d677d186fe661014e3e59a7ffc607eb0dc9d99b889c",
+    "source_inputs_sha256": "ea810844b8f5f4b8f9b7d94336f0ae5cc3a8b8bd0ff4716d75814934615f8c51",
+    "workspace_commit": "495415c097d4996c002d1902b78e392628b9e91c",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard"
+    ],
+    "unstripped_binary_sha256": "fc787bea3ed1de3a4399be532edb00fd2375c1bd6e327f253d537762b93e98c9",
+    "transformation": "strip --strip-debug"
+  }
+}

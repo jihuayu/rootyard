@@ -51,12 +51,13 @@ const INTEGRATION_GRANT: &str = "FROM ci_integration_checkout_jobs i \
 
 pub async fn integration_hook_for_plan(state:&AppState,plan:&Plan)->Result<Option<Uuid>,Error>{
     let client=state.pool.get().await.map_err(Error::internal)?;
-    let sql=format!("SELECT i.issuer_webhook_id,i.plan {INTEGRATION_GRANT} \
-      AND i.repository_id=$1 AND i.job_id=$2 AND r.storage_generation=$3");
-    let row=client.query_opt(&sql,&[&plan.repository_id,&plan.job_id,&plan.storage_generation])
+    let sql=format!("SELECT DISTINCT i.issuer_webhook_id,i.plan {INTEGRATION_GRANT} \
+      AND i.repository_id=$1 AND i.job_id=$2 AND r.storage_generation=$3 AND i.plan=$4");
+    let expected=serde_json::to_value(plan).map_err(Error::internal)?;
+    let row=client.query_opt(&sql,&[&plan.repository_id,&plan.job_id,&plan.storage_generation,&expected])
         .await.map_err(Error::internal)?;
     match row {
-        Some(row) if row.get::<_,serde_json::Value>(1)==serde_json::to_value(plan).map_err(Error::internal)?
+        Some(row) if row.get::<_,serde_json::Value>(1)==expected
             =>Ok(Some(row.get(0))),
         _=>Ok(None),
     }
@@ -64,8 +65,10 @@ pub async fn integration_hook_for_plan(state:&AppState,plan:&Plan)->Result<Optio
 
 pub async fn authenticate_principal(state:&AppState,headers:&HeaderMap,owner:&str,
     name:&str,oid:&str)->Result<(CheckoutPrincipal,db::Repository,Plan),Error>{
-    if let Ok((identity,repo,plan))=authenticate(state,headers,owner,name,oid).await {
-        return Ok((CheckoutPrincipal::User(identity),repo,plan));
+    match authenticate(state,headers,owner,name,oid).await {
+        Ok((identity,repo,plan))=>return Ok((CheckoutPrincipal::User(identity),repo,plan)),
+        Err(error) if error.0==axum::http::StatusCode::UNAUTHORIZED=>{},
+        Err(error)=>return Err(error),
     }
     let (user,token)=auth::credentials_for(headers,"ryj_")?;
     if user.as_ref().is_some_and(|u|u!=owner){return Err(Error::unauthorized());}

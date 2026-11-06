@@ -4516,7 +4516,7 @@
       "generated": "",
       "identity": "",
       "name": "workspace_id",
-      "not_null": true,
+      "not_null": false,
       "position": 2,
       "table": "sandbox_jobs",
       "type": "uuid"
@@ -4560,7 +4560,7 @@
       "generated": "",
       "identity": "",
       "name": "actor_id",
-      "not_null": true,
+      "not_null": false,
       "position": 6,
       "table": "sandbox_jobs",
       "type": "uuid"
@@ -4685,6 +4685,50 @@
       "position": 17,
       "table": "sandbox_jobs",
       "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "ci_hook_id",
+      "not_null": false,
+      "position": 18,
+      "table": "sandbox_jobs",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "ci_runner_id",
+      "not_null": false,
+      "position": 19,
+      "table": "sandbox_jobs",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "ci_head_oid",
+      "not_null": false,
+      "position": 20,
+      "table": "sandbox_jobs",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "ci_storage_generation",
+      "not_null": false,
+      "position": 21,
+      "table": "sandbox_jobs",
+      "type": "bigint"
     },
     {
       "collation": null,
@@ -9702,10 +9746,37 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "FOREIGN KEY (ci_hook_id) REFERENCES public.forge_webhooks(id)",
+      "name": "sandbox_jobs_ci_hook_id_fkey",
+      "table": "sandbox_jobs",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (ci_run_id) REFERENCES public.ci_runs(id)",
+      "name": "sandbox_jobs_ci_run_fkey",
+      "table": "sandbox_jobs",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "PRIMARY KEY (id)",
       "name": "sandbox_jobs_pkey",
       "table": "sandbox_jobs",
       "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((((workspace_id IS NOT NULL) AND (actor_id IS NOT NULL) AND (ci_run_id IS NULL) AND (ci_attempt IS NULL) AND (ci_lease_generation IS NULL) AND (ci_hook_id IS NULL) AND (ci_runner_id IS NULL) AND (ci_head_oid IS NULL) AND (ci_storage_generation IS NULL)) OR ((workspace_id IS NULL) AND (actor_id IS NULL) AND (ci_run_id IS NOT NULL) AND (ci_attempt > 0) AND (ci_lease_generation > 0) AND (ci_hook_id IS NOT NULL) AND ((length(ci_runner_id) >= 1) AND (length(ci_runner_id) <= 64)) AND ((ci_head_oid COLLATE \"C\") ~ '^[0-9a-f]+$'::text) AND (length(ci_head_oid) = ANY (ARRAY[40, 64])) AND (ci_storage_generation > 0) AND (workspace_access = 'private'::text))))",
+      "name": "sandbox_jobs_principal_check",
+      "table": "sandbox_jobs",
+      "type": "c",
       "validated": true
     },
     {
@@ -12037,6 +12108,15 @@
       "definition": "CREATE INDEX sandbox_jobs_active_workspace_idx ON public.sandbox_jobs USING btree (workspace_id, lease_epoch) WHERE (state = ANY (ARRAY['queued'::text, 'running'::text]))",
       "live": true,
       "name": "sandbox_jobs_active_workspace_idx",
+      "ready": true,
+      "table": "sandbox_jobs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX sandbox_jobs_ci_attempt_unique ON public.sandbox_jobs USING btree (ci_run_id, ci_attempt, ci_lease_generation) WHERE (ci_run_id IS NOT NULL)",
+      "live": true,
+      "name": "sandbox_jobs_ci_attempt_unique",
       "ready": true,
       "table": "sandbox_jobs",
       "tablespace": null,

@@ -29,6 +29,36 @@ fn setup() -> (tempfile::TempDir, Operation) {
     (root, op)
 }
 #[test]
+fn concurrent_admission_reserves_unique_durable_sequences() {
+    let root=tempfile::tempdir().unwrap();
+    let repo=Uuid::new_v4();
+    let operations=std::thread::scope(|scope| {
+        let handles=(0..48).map(|_|scope.spawn(||begin(root.path(),repo,Uuid::new_v4(),
+            "parallel-actor".into(),Uuid::new_v4(),1).unwrap())).collect::<Vec<_>>();
+        handles.into_iter().map(|h|h.join().unwrap()).collect::<Vec<_>>()
+    });
+    let mut sequences=operations.iter().map(|op|op.sequence).collect::<Vec<_>>();
+    sequences.sort_unstable();
+    assert_eq!(sequences,(1..=48).collect::<Vec<_>>());
+    assert_eq!(sequence(root.path(),repo).unwrap(),48);
+    assert_eq!(pending(root.path(),repo).unwrap().len(),48);
+}
+#[test]
+fn active_admission_is_visible_before_other_recovery_scans() {
+    let root=tempfile::tempdir().unwrap();
+    let repo=Uuid::new_v4();
+    let (op,guard)=begin_active(root.path(),repo,Uuid::new_v4(),
+        "active-actor".into(),Uuid::new_v4(),1).unwrap();
+    assert!(ActiveGuard::operation_is_live(&op).unwrap());
+    assert_eq!(pending(root.path(),repo).unwrap(),vec![op.clone()]);
+    assert!(events(&op).unwrap().is_empty());
+    drop(guard);
+    assert!(!ActiveGuard::operation_is_live(&op).unwrap());
+    mark_interrupted(&op).unwrap();
+    finish(&op).unwrap();
+    assert!(is_interrupted(&op).unwrap());
+}
+#[test]
 fn ci_service_journal_has_no_human_identity() {
     let root = tempfile::tempdir().unwrap();
     let job_id = Uuid::new_v4();

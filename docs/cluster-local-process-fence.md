@@ -21,9 +21,12 @@ cluster-operator token. Use `role=primary` for the initial owner and
 nonzero `lease_ttl_seconds` such as `5`. The processes renew their leases while
 healthy. The HMAC key authenticates short-lived, one-use, repository/actor/
 epoch-bound internal requests. Git requests arriving at a different node are
-streamed to the owner; the destination rechecks the actor's token, RBAC, and
-route. A missing node identity in a multi-node cluster blocks Git ingress,
-provisioning, and native writes.
+streamed to the owner. Git-backed browse GETs and atomic ref-transaction POSTs
+use the same owner route; the destination rechecks the actor's token, RBAC,
+route epoch, and storage generation before its handler accesses GitFS. Browse
+handlers also recheck authorization after waiting for the PostgreSQL data
+lease. A missing node identity in a multi-node cluster blocks Git and browse
+ingress, provisioning, and native writes.
 
 From the current owner, call `POST /api/repos/{owner}/{name}/shard-migrate`
 with `{"target_node_id":"node1","replicate_only":true}` and an optional
@@ -77,7 +80,8 @@ python3 tests/cluster_kafka_tls_native.py --binary target/debug/rootyard --kafka
 These tests require the PostgreSQL 17 binaries, `ROOTYARD_TEST_DATABASE_URL`,
 native Git, and a built Rust binary. The workload report measures 1/2/4
 processes with distinct volumes, Git push/fetch, acknowledged-commit survival,
-and process restart RTO. The takeover report also exercises a paused admitted
+cross-node browse/ref-transaction routing, signed delegation replay/tamper
+rejection, and process restart RTO. The takeover report also exercises a paused admitted
 Git writer, stale replica rejection, a physically stopped source session,
 duplicate node identities, an unusable trusted fence directory that blocks
 promotion, controller restart without duplicate promotion, and old-volume
