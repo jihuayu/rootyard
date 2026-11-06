@@ -316,15 +316,15 @@ async fn merge_pull_inner(
         old_oid: input.expected_base_oid.clone(),
         new_oid: merged_oid.clone(),
     };
-    crate::lfs::publication::validate_new_refs(
+    Box::pin(crate::lfs::publication::validate_new_refs(
         &state,
         &tx,
         repo_id,
         tenant_id,
         std::slice::from_ref(&ref_change),
-    )
+    ))
     .await?;
-    crate::lfs::locks::validate_new_refs_with_client(
+    Box::pin(crate::lfs::locks::validate_new_refs_with_client(
         &*tx,
         &repo_path,
         &state.config.git,
@@ -332,7 +332,7 @@ async fn merge_pull_inner(
         repo_id,
         actor.id,
         &[ref_change],
-    )
+    ))
     .await?;
 
     auth::verify_token(&tx, &actor, true).await?;

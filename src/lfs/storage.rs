@@ -1,9 +1,12 @@
 //! Verified streaming object storage and atomic staging for Track 2B Git LFS.
+use crate::storage::remote_objects::{ObjectKey, RemoteObjectStore};
 use crate::{AppState, Error, journal, lfs::models, storage};
 use anyhow::{Context, Result, ensure};
 use axum::{body::Body, http::StatusCode};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
 use std::{
     fs::{self, File, OpenOptions},
     io::Read,
@@ -11,8 +14,90 @@ use std::{
     path::{Path, PathBuf},
 };
 use tokio::io::AsyncWriteExt;
+use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
+
+fn remote_store(data_root: &Path) -> Result<Option<RemoteObjectStore>> {
+    if std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_none() {
+        return Ok(None);
+    }
+    Ok(Some(RemoteObjectStore::from_env(
+        data_root.join("remote-objects"),
+    )?))
+}
+
+pub async fn publish_remote(
+    state: &AppState,
+    repo_id: Uuid,
+    tenant_id: Uuid,
+    oid: &str,
+    size: u64,
+) -> Result<(), Error> {
+    let Some(store) = remote_store(&state.storage.root).map_err(Error::internal)? else {
+        return Ok(());
+    };
+    let key = ObjectKey::new(tenant_id, "lfs", oid).map_err(Error::internal)?;
+    let path = object_path(&state.storage.root, repo_id, oid).map_err(Error::internal)?;
+    store
+        .put_file(&key, &path, size, Instant::now() + state.config.git_timeout)
+        .await
+        .map_err(Error::internal)?;
+    Ok(())
+}
+
+pub async fn ensure_readable(
+    data_root: &Path,
+    repo_id: Uuid,
+    tenant_id: Uuid,
+    oid: &str,
+    size: u64,
+    deadline: Instant,
+) -> Result<bool> {
+    let local_good = verify_local_until(data_root, repo_id, oid, size, deadline).await?;
+    let Some(store) = remote_store(data_root)? else {
+        return Ok(local_good);
+    };
+    let key = ObjectKey::new(tenant_id, "lfs", oid)?;
+    if local_good {
+        if store
+            .head(&key, deadline)
+            .await?
+            .is_none_or(|head| head.size != size)
+        {
+            let path = object_path(data_root, repo_id, oid)?;
+            store.put_file(&key, &path, size, deadline).await?;
+        }
+        return Ok(true);
+    }
+    if store
+        .head(&key, deadline)
+        .await?
+        .is_none_or(|head| head.size != size)
+    {
+        return Ok(false);
+    }
+    let dir = ensure_repo_lfs_dir(data_root, repo_id)?;
+    let dest = dir.join(oid);
+    store.get_to_file(&key, &dest, size, deadline).await?;
+    tokio::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).await?;
+    verify_local_until(data_root, repo_id, oid, size, deadline).await
+}
+
+async fn verify_local_until(
+    data_root: &Path,
+    repo_id: Uuid,
+    oid: &str,
+    size: u64,
+    deadline: Instant,
+) -> Result<bool> {
+    let root = data_root.to_path_buf();
+    let oid = oid.to_owned();
+    tokio::task::spawn_blocking(move || {
+        verify_object_integrity_bounded(&root, repo_id, &oid, size, deadline)
+    })
+    .await?
+}
 
 /// RAII guard that removes the temporary `.tmp-<uuid>` upload file on drop unless disarmed.
 pub struct StagingFileGuard {
@@ -90,6 +175,22 @@ pub fn verify_object_integrity(
     oid: &str,
     expected_size: u64,
 ) -> Result<bool> {
+    verify_object_integrity_bounded(
+        data_root,
+        repo_id,
+        oid,
+        expected_size,
+        Instant::now() + Duration::from_secs(24 * 60 * 60),
+    )
+}
+
+fn verify_object_integrity_bounded(
+    data_root: &Path,
+    repo_id: Uuid,
+    oid: &str,
+    expected_size: u64,
+    deadline: Instant,
+) -> Result<bool> {
     let path = object_path(data_root, repo_id, oid)?;
     if !journal::exists(&path)? {
         return Ok(false);
@@ -110,6 +211,10 @@ pub fn verify_object_integrity(
     let mut total = 0u64;
     let mut buf = [0u8; 64 * 1024];
     loop {
+        ensure!(
+            Instant::now() < deadline,
+            "LFS integrity verification timed out"
+        );
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
@@ -132,7 +237,10 @@ pub async fn check_repo_quota(
     repo_id: Uuid,
     additional_bytes: u64,
 ) -> Result<(), Error> {
-    let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
+    let repo_path = state
+        .storage
+        .verify_path(repo_id)
+        .map_err(Error::internal)?;
     let lfs_dir = repo_lfs_dir(&state.storage.root, repo_id);
     let quota = state.config.max_repo_bytes;
     let used = tokio::task::spawn_blocking(move || -> Result<u64> {
@@ -246,16 +354,19 @@ pub async fn stream_to_staging_and_publish(
 pub async fn open_verified_download_stream(
     state: &AppState,
     repo_id: Uuid,
+    tenant_id: Uuid,
     oid: &str,
     expected_size: u64,
 ) -> Result<Body, Error> {
-    let root = state.storage.root.clone();
-    let oid_owned = oid.to_owned();
-    let verified = tokio::task::spawn_blocking(move || {
-        verify_object_integrity(&root, repo_id, &oid_owned, expected_size)
-    })
+    let verified = ensure_readable(
+        &state.storage.root,
+        repo_id,
+        tenant_id,
+        oid,
+        expected_size,
+        Instant::now() + state.config.git_timeout,
+    )
     .await
-    .map_err(Error::internal)?
     .map_err(Error::internal)?;
 
     if !verified {
