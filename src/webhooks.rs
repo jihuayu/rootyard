@@ -63,12 +63,20 @@ pub fn routes() -> Router<Arc<AppState>> {
             axum::routing::put(trust::bind).delete(trust::revoke),
         )
         .route(
+            "/api/repos/{owner}/{name}/ci-source-grants/{hook_id}",
+            axum::routing::put(trust::source_grant).delete(trust::source_revoke),
+        )
+        .route(
             "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/claim",
             post(runs::claim),
         )
         .route(
             "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/report",
             post(runs::report),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/heartbeat",
+            post(runs::heartbeat),
         )
         .route(
             "/api/repos/{owner}/{name}/ci-mirrors/{mirror_id}/heartbeat",

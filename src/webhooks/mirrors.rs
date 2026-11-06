@@ -1,6 +1,6 @@
 //! Primary-side registry of mirror target readiness used by the CI scheduler.
 use crate::{AppState, Error, auth, ci_pins, members::models::Role};
-use axum::{Json, extract::{Path,State}, http::{HeaderMap,StatusCode}, response::{IntoResponse,Response}};
+use axum::{Json, extract::{Path,State}, http::{HeaderMap,StatusCode,header}, response::{IntoResponse,Response}};
 use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -49,5 +49,5 @@ pub async fn heartbeat(
           &ready,&input.capacity,&input.active],
     ).await.map_err(Error::internal)?;
     auth::finish_tx(tx,&actor,true).await?;
-    Ok((StatusCode::OK,Json(serde_json::json!({"mirror_id":mirror_id,"ready_oids":input.ready_oids}))).into_response())
+    Ok((StatusCode::OK,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"mirror_id":mirror_id,"ready_oids":input.ready_oids}))).into_response())
 }

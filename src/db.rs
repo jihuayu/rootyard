@@ -122,13 +122,15 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (105, include_str!("../migrations/105_webhook_claims.sql")),
     (106, include_str!("../migrations/106_ci_runs.sql")),
     (107, include_str!("../migrations/107_trusted_checks.sql")),
+    (108, include_str!("../migrations/108_ci_dependency_grants.sql")),
+    (109, include_str!("../migrations/109_ci_integration_jobs.sql")),
     (110, include_str!("../migrations/110_audit_sequence.sql")),
     (120, include_str!("../migrations/120_organizations.sql")),
     (121, include_str!("../migrations/121_lfs_locks.sql")),
     (125, include_str!("../migrations/125_web_sessions.sql")),
 ];
 
-pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 80, 81, 82, 83, 84, 85, 90, 91, 92, 93, 94, 95, 105, 106, 107, 110, 120, 121, 125];
+pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 80, 81, 82, 83, 84, 85, 90, 91, 92, 93, 94, 95, 105, 106, 107, 108, 109, 110, 120, 121, 125];
 
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;
@@ -248,7 +250,11 @@ impl Repository {
     }
 }
 
+<<<<<<< HEAD
 pub const REPO_SELECT: &str = "SELECT r.id, r.name, r.state, r.storage_backend, r.storage_generation, r.object_format, ns.slug AS username FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id";
+=======
+pub const REPO_SELECT: &str = "SELECT r.id, r.owner_id, r.name, r.state, r.storage_backend, r.storage_generation, u.username FROM repositories r JOIN users u ON u.id = r.owner_id";
+>>>>>>> 7eb56f2 (feat(ci): bind run checkouts to dependency and service authority)
 
 #[cfg(test)]
 mod tests {

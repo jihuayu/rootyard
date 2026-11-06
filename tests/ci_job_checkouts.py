@@ -115,7 +115,8 @@ class JobCheckoutHarness(SourcePinHarness):
                         repository_id=self.repo["id"], storage_generation=1,
                         object_format="sha1", target_oid=self.second,
                         source_receipt_sha256=hashlib.sha256(receipt.read_bytes()).hexdigest(),
-                        mirror_audience=self.audience, expires_unix=self.body["expires_unix"])
+                        mirror_audience=self.audience, expires_unix=self.body["expires_unix"],
+                        dependencies=dict(version=1, history="full", tags=[], lfs=[], submodules=[]))
         assert self.grant["plan"] == expected, self.grant["plan"]
         digest = self.sql("SELECT encode(credential_digest, 'hex') FROM ci_checkout_jobs "
                           f"WHERE repository_id='{self.repo['id']}' AND job_id='{self.body['job_id']}'")
@@ -706,7 +707,7 @@ def main():
                       binary_sha256=hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                       limitations=["Isolated loopback services and synthetic fixtures, not production performance or power-loss validation.",
                                    "Database failures use renamed run-owned schema tables, not a database network outage.",
-                                   "Revocation is an admission fence, not termination of an already streaming Git pack."])
+                                   "Active-stream termination is tested separately with a throttled transfer."])
         if args.report:
             args.report.parent.mkdir(parents=True, exist_ok=True)
             args.report.write_text(json.dumps(report, indent=2) + "\n")

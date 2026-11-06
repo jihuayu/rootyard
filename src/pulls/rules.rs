@@ -360,16 +360,16 @@ pub async fn evaluate_branch_policy(
     base_ref: &str,
     head_oid: &str,
 ) -> Result<PolicyEvaluation, Error> {
-    let (tenant_id, pull_author_id): (Uuid, Uuid) = match tx
+    let (tenant_id, pull_author_id, candidate_base): (Uuid, Uuid, Option<String>) = match tx
         .query_opt(
-            "SELECT tenant_id, author_id FROM forge_pulls WHERE repository_id=$1 AND number=$2",
+            "SELECT tenant_id, author_id, base_oid FROM forge_pulls WHERE repository_id=$1 AND number=$2",
             &[&repository_id, &pull_number],
         )
         .await
         .map_err(Error::internal)?
     {
-        Some(r) => (r.get("tenant_id"), r.get("author_id")),
-        None => (tenant_id, tenant_id),
+        Some(r) => (r.get("tenant_id"), r.get("author_id"),Some(r.get("base_oid"))),
+        None => (tenant_id, tenant_id,None),
     };
 
     let rule_row = tx
@@ -458,51 +458,9 @@ pub async fn evaluate_branch_policy(
 
     let mut missing_or_failed_checks = Vec::new();
     for ctx in &required_checks {
-        let binding = tx.query_opt(
-            "SELECT b.webhook_id,b.active,w.active AS hook_active FROM forge_trusted_check_contexts b \
-             LEFT JOIN forge_webhooks w ON w.id=b.webhook_id WHERE b.repository_id=$1 AND b.context=$2",
-            &[&repository_id,ctx],
-        ).await.map_err(Error::internal)?;
-        let check_row = tx
-            .query_opt(
-                "SELECT status,conclusion,attempt,issuer_webhook_id,ci_run_id,ci_base_oid,ci_lease_generation \
-                 FROM forge_check_runs WHERE tenant_id=$1 AND repository_id=$2 AND commit_oid=$3 AND context=$4",
-                &[&tenant_id, &repository_id, &head_oid, ctx],
-            )
-            .await
-            .map_err(Error::internal)?;
-        let passed = match check_row {
-            Some(r) => {
-                let status: String = r.get("status");
-                let conclusion: Option<String> = r.get("conclusion");
-                let basic = status == "completed" && conclusion.as_deref() == Some("success");
-                if let Some(ref binding) = binding {
-                    let hook: Option<Uuid> = binding.get("webhook_id");
-                    let active: bool = binding.get("active");
-                    let hook_active: Option<bool> = binding.get("hook_active");
-                    let run_id: Option<Uuid> = r.get("ci_run_id");
-                    let base: Option<String> = r.get("ci_base_oid");
-                    let generation: Option<i64> = r.get("ci_lease_generation");
-                    let issuer: Option<Uuid> = r.get("issuer_webhook_id");
-                    let run_matches = if let (Some(run_id),Some(base),Some(generation)) = (run_id,base,generation) {
-                        tx.query_one(
-                            "SELECT EXISTS(SELECT 1 FROM ci_runs c JOIN forge_pulls p \
-                             ON p.repository_id=c.repository_id AND p.number=c.pull_number \
-                             WHERE c.id=$1 AND c.repository_id=$2 AND c.pull_number=$3 \
-                               AND c.context=$4 AND c.head_oid=$5 AND c.base_oid=$6 \
-                               AND c.state='completed' AND c.conclusion='success' \
-                               AND c.attempt=$7 AND c.lease_generation=$8 \
-                               AND p.state='open' AND p.version=c.pull_version \
-                               AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid)",
-                            &[&run_id,&repository_id,&pull_number,ctx,&head_oid,&base,
-                              &r.get::<_,i64>("attempt"),&generation],
-                        ).await.map_err(Error::internal)?.get(0)
-                    } else { false };
-                    basic && active && hook_active==Some(true) && hook.is_some() && issuer==hook && run_matches
-                } else { basic }
-            }
-            None => false,
-        };
+        let passed = crate::webhooks::trust::trusted_check_passed(
+            &**tx, repository_id, head_oid, ctx, candidate_base.as_deref(),
+        ).await?;
         if !passed {
             missing_or_failed_checks.push(ctx.clone());
         }

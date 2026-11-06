@@ -37,17 +37,18 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 pub(crate) const MAX_PINS: usize = 1024;
 const NAMESPACE: &str = "refs/rootyard-ci";
-const ZERO: &str = "0000000000000000000000000000000000000000";
 
 pub(crate) fn reserved(name: &str) -> bool {
     name == NAMESPACE || name.starts_with("refs/rootyard-ci/")
 }
 pub(crate) fn valid_oid(oid: &str) -> bool {
-    oid.len() == 40
+    matches!(oid.len(),40|64)
         && oid
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+fn zero_oid(oid:&str)->String {"0".repeat(oid.len())}
+fn nonzero_oid(oid:&str)->bool {valid_oid(oid) && oid.bytes().any(|b|b!=b'0')}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Intent {
@@ -64,10 +65,10 @@ impl Intent {
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.version == 1
-                && self.object_format == "sha1"
+                && self.object_format == if self.target_oid.len()==40 {"sha1"} else {"sha256"}
                 && self.storage_generation > 0
                 && valid_oid(&self.target_oid)
-                && self.target_oid != ZERO
+                && nonzero_oid(&self.target_oid)
                 && self.retention_ref == format!("{NAMESPACE}/jobs/{}", self.job_id),
             "invalid CI intent"
         );
@@ -76,7 +77,7 @@ impl Intent {
     pub(crate) fn change(&self) -> journal::RefChange {
         journal::RefChange {
             ref_name: self.retention_ref.clone(),
-            old_oid: ZERO.into(),
+            old_oid: zero_oid(&self.target_oid),
             new_oid: self.target_oid.clone(),
         }
     }
@@ -231,8 +232,9 @@ async fn roots(state: &AppState, repo: Uuid) -> Result<HashMap<String, String>> 
 }
 async fn commit(state: &AppState, repo: Uuid, oid: &str) -> Result<()> {
     ensure!(
-        run(state, repo, &["rev-parse", "--show-object-format"], 128).await? == b"sha1\n",
-        "CI requires SHA-1 repository"
+        run(state, repo, &["rev-parse", "--show-object-format"], 128).await?
+            == if oid.len()==40 {b"sha1\n".as_slice()} else {b"sha256\n".as_slice()},
+        "CI object format differs from target"
     );
     ensure!(
         run(state, repo, &["cat-file", "-t", oid], 128).await? == b"commit\n",
@@ -328,7 +330,7 @@ async fn pin_inner(
     if owner != actor.username || !db::valid_name(&owner) || !db::valid_name(&name) {
         return Err(Error::not_found());
     }
-    if !valid_oid(&input.target_oid) || input.target_oid == ZERO || input.storage_generation <= 0 {
+    if !nonzero_oid(&input.target_oid) || input.storage_generation <= 0 {
         return Err(Error::bad_request());
     }
     let row = state
@@ -394,7 +396,7 @@ async fn pin_inner(
         owner_id: actor.id,
         repository_id: repo.id,
         storage_generation: input.storage_generation,
-        object_format: "sha1".into(),
+        object_format: if input.target_oid.len()==40 {"sha1"} else {"sha256"}.into(),
         target_oid: input.target_oid,
         retention_ref: format!("{NAMESPACE}/jobs/{}", input.job_id),
     };
@@ -477,7 +479,7 @@ async fn pin_inner(
                 "--no-deref",
                 &intent.retention_ref,
                 &intent.target_oid,
-                ZERO,
+                &zero_oid(&intent.target_oid),
             ]);
         // collect_git_output owns/kills/waits for the entire child process group.
         // A failed/timeout command is not evidence of rollback; reconcile refs.
@@ -700,7 +702,7 @@ async fn release_pin_inner(
         || req
             .target_oid
             .as_ref()
-            .is_some_and(|oid| !valid_oid(oid) || oid == ZERO)
+            .is_some_and(|oid| !nonzero_oid(oid))
         || req.storage_generation.is_some_and(|g| g <= 0)
     {
         return Err(Error::bad_request());
@@ -880,7 +882,7 @@ async fn release_pin_inner(
                 transaction_sequence: 1,
                 ref_name: intent.retention_ref.clone(),
                 old_oid: intent.target_oid.clone(),
-                new_oid: ZERO.into(),
+                new_oid: zero_oid(&intent.target_oid),
             }];
             let evidence = serde_json::json!({
                 "version": 1,
@@ -1014,7 +1016,7 @@ pub async fn active_pinned_oids(
     for row in rows {
         let ref_name: String = row.get(0);
         let new_oid: String = row.get(1);
-        if new_oid == ZERO {
+        if new_oid.bytes().all(|b|b==b'0') {
             released_refs.insert(ref_name);
         } else if valid_oid(&new_oid) {
             oids.insert(new_oid);

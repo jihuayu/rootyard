@@ -91,6 +91,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health/live", get(|| async { "ok" }))
         .route("/health/ready", get(ready))
         .merge(routes())
+        .merge(crate::ci_checkouts::mirror_routes())
         .fallback(|State(state): State<Arc<AppState>>, request| async move {
             git_http::handle(state, request).await
         })

@@ -2,7 +2,7 @@
 //! orchestration (`on_pull_synchronized`), and SSRF-safe HTTP/1.1 delivery with exponential backoff.
 use crate::{
     AppState, Error, ci_pins, db, events, git_http, journal,
-    pulls::models::{PULL_FIELDS, PullRequest, ZERO_OID, resolve_ref_oid},
+    pulls::models::{PULL_FIELDS, PullRequest, resolve_ref_oid},
     reliability,
     webhooks::{
         claims,
@@ -171,7 +171,7 @@ pub async fn sync_outbox_events(
 }
 
 #[rustfmt::skip]
-async fn ensure_pull_ci_pin(
+pub(crate) async fn ensure_pull_ci_pin(
     state: &AppState,
     repo: &db::Repository,
     owner_id: Uuid,
@@ -191,7 +191,8 @@ async fn ensure_pull_ci_pin(
 
     let intent = ci_pins::Intent {
         version: 1, job_id, owner_id, repository_id: repo.id,
-        storage_generation: repo.storage_generation, object_format: "sha1".into(),
+        storage_generation: repo.storage_generation,
+        object_format: if head_oid.len()==40 {"sha1"} else {"sha256"}.into(),
         target_oid: head_oid.to_owned(), retention_ref: retention_ref.clone(),
     };
     let intent_bytes = serde_json::to_vec(&intent).map_err(Error::internal)?;
@@ -215,7 +216,8 @@ async fn ensure_pull_ci_pin(
         let repo_path = state.storage.verify_path(repo.id).map_err(Error::internal)?;
         let op = journal::begin(&state.storage.root, repo.id, owner_id, repo.owner.clone(), token_id, repo.storage_generation)
             .map_err(Error::internal)?;
-        let old_expected = existing_ref.as_deref().unwrap_or(ZERO_OID);
+        let zero="0".repeat(head_oid.len());
+        let old_expected = existing_ref.as_deref().unwrap_or(&zero);
         let mut update_cmd = state.storage.git(&state.config);
         update_cmd
             .args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects", "--git-dir"])
