@@ -57,6 +57,7 @@ async fn verify(pool: &Pool) -> Result<()> {
         storage_generation: 1,
         outcome: "recorded".into(),
         evidence: serde_json::json!({"fixture":"known receipt"}),
+        admission: None,
     };
     events::publish(pool, &op, &[change()]).await?;
     let first = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 60).await?.remove(0);

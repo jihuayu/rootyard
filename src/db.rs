@@ -143,11 +143,12 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (120, include_str!("../migrations/120_organizations.sql")),
     (121, include_str!("../migrations/121_lfs_locks.sql")),
     (125, include_str!("../migrations/125_web_sessions.sql")),
+    (126, include_str!("../migrations/126_ref_admissions.sql")),
 ];
 
 pub const SCHEMA_VERSIONS: &[i32] = &[
     1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 72, 73, 74, 75, 80, 81, 82, 83, 84, 85, 86, 90, 91, 92, 93, 94, 95,
-    96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 116, 120, 121, 125,
+    96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 116, 120, 121, 125, 126,
 ];
 
 pub async fn migrate(pool: &Pool) -> Result<()> {

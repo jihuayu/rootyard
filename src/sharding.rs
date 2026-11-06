@@ -12,6 +12,7 @@ pub mod transport;
 pub mod migration;
 pub mod local_fence;
 pub mod controller;
+mod locks;
 
 use crate::AppState;
 use axum::{

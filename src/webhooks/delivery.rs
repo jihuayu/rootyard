@@ -182,9 +182,11 @@ pub(crate) async fn ensure_pull_ci_pin(
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later")
     })?;
-    let _write_guard = tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo.id))
-        .await
-        .map_err(|_| Error::timeout())?;
+    let publication = crate::storage::ref_publication::acquire(&state.pool,repo.id,
+        repo.storage_generation,std::slice::from_ref(&retention_ref),
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let _write_guard = publication.enter_window(&state.storage,
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
     if state.hooks.is_some() {
         reliability::before_push(state, repo).await.map_err(Error::internal)?;
     }
@@ -243,6 +245,7 @@ pub(crate) async fn ensure_pull_ci_pin(
             service_principal_id: op.service_principal_id,
             actor_name: op.actor_name.clone(), sequence: op.sequence,
             storage_generation: repo.storage_generation, outcome: "recorded".into(), evidence,
+            admission: None,
         };
         events::publish(&state.pool, &record, &changes).await.map_err(Error::internal)?;
         state.dispatch.committed();
