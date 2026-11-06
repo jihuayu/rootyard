@@ -128,6 +128,8 @@ pub async fn migrate_repository(
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
     require_operator(&tx, &actor).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
+    let authority_incarnation: Uuid = tx.query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
+        .await.map_err(Error::internal)?.get(0);
     auth::finish_tx(tx, &actor, false).await?;
     if transport::node_id()?.as_deref() != Some(route.primary_node_id.as_str()) {
         return Err(conflict("migration must run on source storage node"));
@@ -188,7 +190,7 @@ pub async fn migrate_repository(
     let digest = refs_digest(&state, &repo).await?;
     let path = format!("/internal/shards/{}/snapshot/{}?refs_sha256={digest}&journal_sequence={journal_sequence}", access.repo_id, operation_id);
     let envelope = Envelope {
-        version: 1, nonce: Uuid::new_v4(), expires_unix: models::unix_now() + ENVELOPE_LIFETIME_SECONDS,
+        version: 1, authority_incarnation, nonce: Uuid::new_v4(), expires_unix: models::unix_now() + ENVELOPE_LIFETIME_SECONDS,
         actor_id: actor.id, token_id: actor.token_id, repository_id: access.repo_id,
         target_node_id: input.target_node_id.clone(), route_epoch: route.route_epoch,
         fencing_token: route.fencing_token, storage_generation: generation,
@@ -211,6 +213,9 @@ pub async fn migrate_repository(
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let current_incarnation: Uuid = tx.query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
+        .await.map_err(Error::internal)?.get(0);
+    if current_incarnation != authority_incarnation { return Err(conflict("metadata authority changed during transfer")); }
     auth::verify_token(&tx, &actor, true).await?;
     require_operator(&tx, &actor).await?;
     let confirmed = tx.query_opt("SELECT refs_sha256 FROM shard_replication_operations WHERE id = $1 AND repository_id = $2 AND state = 'verified' FOR UPDATE",
@@ -261,6 +266,9 @@ pub async fn receive_snapshot(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let current_incarnation: Uuid = tx.query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
+        .await.map_err(Error::internal)?.get(0);
+    if current_incarnation != env.authority_incarnation { return Err(Error::unauthorized()); }
     let nonce_inserted = tx.execute("INSERT INTO cluster_transport_nonces(nonce,expires_at) VALUES($1,to_timestamp($2::bigint::double precision)) ON CONFLICT DO NOTHING", &[&env.nonce, &env.expires_unix]).await.map_err(Error::internal)?;
     if nonce_inserted != 1 { return Err(Error::unauthorized()); }
     let row = tx.query_opt("SELECT u.username,t.read_only,t.digest FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())",
@@ -315,12 +323,6 @@ pub async fn receive_snapshot(
     configure_target(&state, &staging, repo_id).await?;
     let stage_sync = staging.clone();
     tokio::task::spawn_blocking(move || crate::storage::sync_tree(&stage_sync)).await.map_err(Error::internal)?.map_err(Error::internal)?;
-    let final_path = state.storage.repo_path(repo_id);
-    let backup = root.join(format!("{op_id}.previous.git"));
-    clean_staging(&backup)?;
-    if final_path.exists() { fs::rename(&final_path, &backup).map_err(Error::internal)?; }
-    fs::rename(&staging, &final_path).map_err(Error::internal)?;
-    sync_parent(final_path.parent().ok_or_else(Error::bad_request)?)?;
     let journal_root = state.storage.root.join("journal");
     journal::mkdir(&journal_root).map_err(Error::internal)?;
     let journal_repo = journal_root.join(repo_id.to_string());
@@ -328,10 +330,32 @@ pub async fn receive_snapshot(
     let current_sequence = journal::sequence(&state.storage.root, repo_id).map_err(Error::internal)?;
     if current_sequence > query.journal_sequence { return Err(conflict("destination journal sequence is ahead of transferred snapshot")); }
     journal::atomic(&journal_repo.join("sequence"), query.journal_sequence.to_string().as_bytes(), true).map_err(Error::internal)?;
-    clean_staging(&backup)?;
-    clean_staging(&bundle)?;
     let client = state.pool.get().await.map_err(Error::internal)?;
-    client.execute("UPDATE shard_replication_operations SET state='verified', refs_sha256=$2, updated_at=clock_timestamp() WHERE id=$1 AND state IN ('copying','verified')",
+    let updated = client.execute("UPDATE shard_replication_operations SET state='verified', refs_sha256=$2, updated_at=clock_timestamp() WHERE id=$1 AND state IN ('copying','verified')",
         &[&op_id, &measured]).await.map_err(Error::internal)?;
+    if updated != 1 { return Err(conflict("snapshot operation changed before publication")); }
+    let final_path = state.storage.repo_path(repo_id);
+    let backup = root.join(format!("{op_id}.previous-{}.git", Uuid::new_v4()));
+    let had_previous = match fs::symlink_metadata(&final_path) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => true,
+        Ok(_) => return Err(conflict("unsafe existing target repository")),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(Error::internal(err)),
+    };
+    if had_previous { fs::rename(&final_path, &backup).map_err(Error::internal)?; }
+    if let Err(error) = fs::rename(&staging, &final_path) {
+        if had_previous { fs::rename(&backup, &final_path).map_err(Error::internal)?; }
+        return Err(Error::internal(error));
+    }
+    if let Err(error) = sync_parent(final_path.parent().ok_or_else(Error::bad_request)?) {
+        let failed = root.join(format!("{op_id}.failed-{}.git", Uuid::new_v4()));
+        fs::rename(&final_path, &failed).map_err(Error::internal)?;
+        if had_previous { fs::rename(&backup, &final_path).map_err(Error::internal)?; }
+        let _ = clean_staging(&failed);
+        return Err(error);
+    }
+    // A failed cleanup leaves a private staging copy, never a false transfer failure.
+    let _ = clean_staging(&backup);
+    let _ = clean_staging(&bundle);
     Ok(json(StatusCode::OK, SnapshotReceipt { operation_id: op_id, refs_sha256: measured, state: "verified".into() }))
 }
