@@ -1,5 +1,5 @@
 //! Signed CI-run sandbox execution bound to one claimed candidate and checkout plan.
-use super::runner;
+use super::{runner, terminal};
 use crate::{AppState, Error, ci_checkouts, db, storage::read_leases, webhooks::claimed::{ClaimedRun, authorize_claimed_run}};
 use axum::{Json, extract::{Path, Query, State}, http::{HeaderMap, StatusCode}};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -13,21 +13,24 @@ use uuid::Uuid;
 pub struct ClaimTuple {
     runner_id:String, attempt:i64, lease_generation:i64,
     head_oid:String, storage_generation:i64,
+    #[serde(default)] offset:Option<u64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartCi {
     #[serde(flatten)] claim:ClaimTuple,
     argv:Vec<String>, timeout_seconds:Option<u64>,
+    #[serde(default)] terminal:bool,
 }
 #[derive(Serialize)]
 pub struct CiJob {
     pub id:Uuid, pub run_id:Uuid, pub state:String,
     pub exit_code:Option<i32>, pub timeout_seconds:i32,
+    pub terminal:bool,
 }
 fn job(row:&tokio_postgres::Row)->CiJob {
     CiJob{id:row.get("id"),run_id:row.get("ci_run_id"),state:row.get("state"),
-        exit_code:row.get("exit_code"),timeout_seconds:row.get("timeout_seconds")}
+        exit_code:row.get("exit_code"),timeout_seconds:row.get("timeout_seconds"),terminal:row.get("terminal")}
 }
 async fn authorize(state:&AppState,headers:&HeaderMap,owner:&str,name:&str,
     hook:Uuid,run:Uuid,tuple:&ClaimTuple)->Result<ClaimedRun,Error>{
@@ -40,7 +43,7 @@ pub async fn start(State(state):State<Arc<AppState>>,
     headers:HeaderMap,Json(input):Json<StartCi>,
 )->Result<(StatusCode,Json<CiJob>),Error>{
     let claim=authorize(&state,&headers,&owner,&name,hook,run,&input.claim).await?;
-    let result=start_ci(state,claim,input.argv,input.timeout_seconds.unwrap_or(60)).await?;
+    let result=start_ci(state,claim,input.argv,input.timeout_seconds.unwrap_or(60),input.terminal).await?;
     Ok((StatusCode::CREATED,Json(result)))
 }
 pub async fn status(State(state):State<Arc<AppState>>,
@@ -75,6 +78,37 @@ pub async fn logs(State(state):State<Arc<AppState>>,
     Ok(Json(json!({"job_id":id,"stdout_base64":STANDARD.encode(stdout),
         "stderr_base64":STANDARD.encode(stderr)})))
 }
+pub async fn terminal_input(State(state):State<Arc<AppState>>,
+    Path((owner,name,hook,run,id)):Path<(String,String,Uuid,Uuid,Uuid)>,
+    headers:HeaderMap,Query(tuple):Query<ClaimTuple>,Json(input):Json<terminal::Input>,
+)->Result<Json<serde_json::Value>,Error>{
+    let claim=authorize(&state,&headers,&owner,&name,hook,run,&tuple).await?;
+    let job=load_job(&state,&claim,id).await?;
+    if !job.terminal {return Err(Error::not_found());}
+    if job.state!="running" {return Err(Error(StatusCode::CONFLICT,"terminal is not running"));}
+    Ok(Json(terminal::write_input(id,input)?))
+}
+pub async fn terminal_output(State(state):State<Arc<AppState>>,
+    Path((owner,name,hook,run,id)):Path<(String,String,Uuid,Uuid,Uuid)>,
+    headers:HeaderMap,Query(tuple):Query<ClaimTuple>,
+)->Result<Json<serde_json::Value>,Error>{
+    let claim=authorize(&state,&headers,&owner,&name,hook,run,&tuple).await?;
+    let job=load_job(&state,&claim,id).await?;
+    if !job.terminal {return Err(Error::not_found());}
+    Ok(Json(terminal::read_output(&runner::job_root(&state,id).join("stdout.log"),
+        terminal::OutputQuery{offset:tuple.offset})?))
+}
+pub async fn terminal_resize(State(state):State<Arc<AppState>>,
+    Path((owner,name,hook,run,id)):Path<(String,String,Uuid,Uuid,Uuid)>,
+    headers:HeaderMap,Query(tuple):Query<ClaimTuple>,Json(size):Json<terminal::Resize>,
+)->Result<Json<serde_json::Value>,Error>{
+    let claim=authorize(&state,&headers,&owner,&name,hook,run,&tuple).await?;
+    let job=load_job(&state,&claim,id).await?;
+    if !job.terminal {return Err(Error::not_found());}
+    if job.state!="running" {return Err(Error(StatusCode::CONFLICT,"terminal is not running"));}
+    terminal::resize(id,size.rows,size.columns)?;
+    Ok(Json(json!({"rows":size.rows,"columns":size.columns})))
+}
 fn read_log(path:PathBuf)->Result<Vec<u8>,Error>{
     use std::{io::Read,os::unix::fs::OpenOptionsExt};
     let file=std::fs::OpenOptions::new().read(true)
@@ -87,7 +121,7 @@ fn read_log(path:PathBuf)->Result<Vec<u8>,Error>{
 }
 
 pub(crate) async fn start_ci(state:Arc<AppState>,claim:ClaimedRun,
-    argv:Vec<String>,timeout_seconds:u64)->Result<CiJob,Error>{
+    argv:Vec<String>,timeout_seconds:u64,terminal:bool)->Result<CiJob,Error>{
     if claim.source!="origin" {return Err(Error(StatusCode::CONFLICT,
         "in-service CI sandbox requires an origin checkout; mirror jobs use the external runner"));}
     if !(1..=3600).contains(&timeout_seconds) || argv.is_empty() || argv.len()>64 ||
@@ -98,34 +132,35 @@ pub(crate) async fn start_ci(state:Arc<AppState>,claim:ClaimedRun,
     let client=state.pool.get().await.map_err(Error::internal)?;
     let id=Uuid::new_v4();
     let raw=json!(argv);
-    let inserted=client.execute("INSERT INTO sandbox_jobs(id,workspace_id,actor_id,host_id,state,argv,timeout_seconds,lease_epoch,workspace_access,ci_run_id,ci_attempt,ci_lease_generation,ci_hook_id,ci_runner_id,ci_head_oid,ci_storage_generation) \
-        VALUES($1,NULL,NULL,$2,'queued',$3,$4,0,'private',$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING",
+    let inserted=client.execute("INSERT INTO sandbox_jobs(id,workspace_id,actor_id,host_id,state,argv,timeout_seconds,lease_epoch,workspace_access,ci_run_id,ci_attempt,ci_lease_generation,ci_hook_id,ci_runner_id,ci_head_oid,ci_storage_generation,terminal) \
+        VALUES($1,NULL,NULL,$2,'queued',$3,$4,0,'private',$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING",
         &[&id,&state.storage.volume_id,&raw,&(timeout_seconds as i32),&claim.run_id,
           &claim.attempt,&claim.lease_generation,&claim.hook_id,&claim.runner_id,
-          &claim.head_oid,&claim.storage_generation]).await.map_err(Error::internal)?;
+          &claim.head_oid,&claim.storage_generation,&terminal]).await.map_err(Error::internal)?;
     if inserted==0 {
-        let row=client.query_one("SELECT id,ci_run_id,state,exit_code,timeout_seconds,argv,ci_head_oid,ci_storage_generation,ci_runner_id,ci_hook_id FROM sandbox_jobs \
+        let row=client.query_one("SELECT id,ci_run_id,state,exit_code,timeout_seconds,argv,ci_head_oid,ci_storage_generation,ci_runner_id,ci_hook_id,terminal FROM sandbox_jobs \
             WHERE ci_run_id=$1 AND ci_attempt=$2 AND ci_lease_generation=$3",
             &[&claim.run_id,&claim.attempt,&claim.lease_generation]).await.map_err(Error::internal)?;
         if row.get::<_,serde_json::Value>("argv")!=raw || row.get::<_,i32>("timeout_seconds")!=timeout_seconds as i32 ||
             row.get::<_,String>("ci_head_oid")!=claim.head_oid || row.get::<_,i64>("ci_storage_generation")!=claim.storage_generation ||
-            row.get::<_,String>("ci_runner_id")!=claim.runner_id || row.get::<_,Uuid>("ci_hook_id")!=claim.hook_id {
+            row.get::<_,String>("ci_runner_id")!=claim.runner_id || row.get::<_,Uuid>("ci_hook_id")!=claim.hook_id ||
+            row.get::<_,bool>("terminal")!=terminal {
             return Err(Error(StatusCode::CONFLICT,"CI sandbox attempt already exists"));
         }
         let existing=job(&row);
         if existing.state=="queued" {
-            spawn_preparation(state.clone(),claim,existing.id,argv,timeout_seconds);
+            spawn_preparation(state.clone(),claim,existing.id,argv,timeout_seconds,terminal);
         }
         return Ok(existing);
     }
-    spawn_preparation(state.clone(),claim.clone(),id,argv,timeout_seconds);
+    spawn_preparation(state.clone(),claim.clone(),id,argv,timeout_seconds,terminal);
     load_job(&state,&claim,id).await
 }
 
 fn spawn_preparation(state:Arc<AppState>,claim:ClaimedRun,id:Uuid,
-    argv:Vec<String>,timeout_seconds:u64){
+    argv:Vec<String>,timeout_seconds:u64,terminal:bool){
     tokio::spawn(async move {
-        if let Err(error)=prepare_and_launch(state.clone(),claim,id,argv,timeout_seconds).await {
+        if let Err(error)=prepare_and_launch(state.clone(),claim,id,argv,timeout_seconds,terminal).await {
             // A database outage leaves the queued row retryable. Once preparation
             // was claimed, record a terminal result; cancellation remains final.
             eprintln!("rootyard: CI sandbox preparation failed ({})",error.0);
@@ -143,7 +178,7 @@ fn spawn_preparation(state:Arc<AppState>,claim:ClaimedRun,id:Uuid,
 }
 
 async fn prepare_and_launch(state:Arc<AppState>,claim:ClaimedRun,id:Uuid,
-    argv:Vec<String>,timeout_seconds:u64)->Result<(),Error>{
+    argv:Vec<String>,timeout_seconds:u64,terminal:bool)->Result<(),Error>{
     let client=state.pool.get().await.map_err(Error::internal)?;
     let changed=client.execute("UPDATE sandbox_jobs SET state='preparing' WHERE id=$1 \
         AND host_id=$2 AND ci_run_id=$3 AND ci_attempt=$4 AND ci_lease_generation=$5 \
@@ -156,7 +191,7 @@ async fn prepare_and_launch(state:Arc<AppState>,claim:ClaimedRun,id:Uuid,
         .unwrap_or_else(|_|Err(Error::timeout()));
     let launch=match prepared {
         Ok(()) => match still_claimed(&state,&claim).await {
-            Ok(true)=>runner::launch_ci(state.clone(),id,checkout,claim,argv,timeout_seconds).await,
+            Ok(true)=>runner::launch_ci(state.clone(),id,checkout,claim,argv,timeout_seconds,terminal).await,
             Ok(false)=>Err(Error(StatusCode::CONFLICT,"CI claim changed during preparation")),
             Err(error)=>Err(error),
         },
@@ -269,7 +304,7 @@ pub(super) async fn gate_authorized(tx:&deadpool_postgres::Transaction<'_>,
 }
 async fn load_job(state:&AppState,claim:&ClaimedRun,id:Uuid)->Result<CiJob,Error>{
     let client=state.pool.get().await.map_err(Error::internal)?;
-    let row=client.query_opt("SELECT id,ci_run_id,state,exit_code,timeout_seconds FROM sandbox_jobs \
+    let row=client.query_opt("SELECT id,ci_run_id,state,exit_code,timeout_seconds,terminal FROM sandbox_jobs \
         WHERE id=$1 AND ci_run_id=$2 AND ci_attempt=$3 AND ci_lease_generation=$4 AND ci_hook_id=$5 \
         AND ci_runner_id=$6 AND ci_head_oid=$7 AND ci_storage_generation=$8",
         &[&id,&claim.run_id,&claim.attempt,&claim.lease_generation,&claim.hook_id,

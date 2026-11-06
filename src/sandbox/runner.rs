@@ -1,3 +1,4 @@
+use super::terminal;
 use crate::{AppState, Error, workspace_lab::core, workspaces::service};
 use std::{
     fs::{self, OpenOptions},
@@ -121,21 +122,22 @@ pub async fn launch(
     argv: Vec<String>,
     timeout_seconds: u64,
     live: bool,
+    terminal: bool,
 ) -> Result<(), Error> {
-    launch_source(state,job,Source::Workspace{id:workspace,live},argv,timeout_seconds).await
+    launch_source(state,job,Source::Workspace{id:workspace,live},argv,timeout_seconds,terminal).await
 }
 
 pub(super) async fn launch_ci(
     state: Arc<AppState>, job: Uuid, checkout: PathBuf,
     claim: crate::webhooks::claimed::ClaimedRun,
-    argv: Vec<String>, timeout_seconds: u64,
+    argv: Vec<String>, timeout_seconds: u64, terminal: bool,
 ) -> Result<(), Error> {
-    launch_source(state,job,Source::Ci{checkout,claim},argv,timeout_seconds).await
+    launch_source(state,job,Source::Ci{checkout,claim},argv,timeout_seconds,terminal).await
 }
 
 async fn launch_source(
     state: Arc<AppState>, job: Uuid, source: Source,
-    argv: Vec<String>, timeout_seconds: u64,
+    argv: Vec<String>, timeout_seconds: u64, terminal: bool,
 ) -> Result<(), Error> {
     let live=matches!(&source,Source::Workspace{live:true,..});
     if live && std::env::var("ROOTYARD_SANDBOX_MODE").as_deref() != Ok("dev") {
@@ -168,6 +170,8 @@ async fn launch_source(
         .mode(0o600)
         .open(root.join("stderr.log"))
         .map_err(Error::internal)?;
+    let pty = if terminal { Some(terminal::Pty::open()?) } else { None };
+    let drain_output = if terminal { Some(stdout.try_clone().map_err(Error::internal)?) } else { None };
     let ctl = root.join("control");
     fs::create_dir(&ctl).map_err(Error::internal)?;
     let mut command = Command::new("bwrap");
@@ -233,14 +237,20 @@ async fn launch_source(
                 .args(argv.iter().map(String::as_str));
         }
     }
-    command
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .stdin(Stdio::null());
+    if let Some(ref pty) = pty {
+        command.stdin(Stdio::from(pty.slave.try_clone().map_err(Error::internal)?))
+            .stdout(Stdio::from(pty.slave.try_clone().map_err(Error::internal)?))
+            .stderr(Stdio::from(pty.slave.try_clone().map_err(Error::internal)?));
+    } else {
+        command.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr)).stdin(Stdio::null());
+    }
     command.kill_on_drop(true);
     unsafe {
         command.pre_exec(move || {
             if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if terminal && libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             limit(libc::RLIMIT_CPU, timeout_seconds + 2)?;
@@ -257,9 +267,11 @@ async fn launch_source(
     let pid = child
         .id()
         .ok_or_else(|| Error::internal("sandbox process missing pid"))? as i32;
+    if let Some(pty) = pty { pty.drain(job, drain_output.expect("terminal output file")); }
     if let Mode::Cgroup(group) = &isolation {
         if attach_group(group, pid).is_err() {
             let _=crate::git_http::stop_group_child(&mut child).await;
+            terminal::close(job);
             let _=fs::write(group.join("cgroup.kill"),"1");
             let _=fs::remove_dir(group);
             return Err(Error::internal("sandbox cgroup attach failed"));
@@ -276,6 +288,7 @@ async fn launch_source(
     }}).await.unwrap_or_else(|_|Err(Error::timeout()));
     if let Err(error) = registration {
         let _=crate::git_http::stop_group_child(&mut child).await;
+        terminal::close(job);
         if let Mode::Cgroup(group)=&isolation {
             let _=fs::write(group.join("cgroup.kill"),"1");
             let _=fs::remove_dir(group);
@@ -289,6 +302,7 @@ async fn launch_source(
     }
     if let Err(error) = open_start_gate(&state,job,&source,&root).await {
         let _=crate::git_http::stop_group_child(&mut child).await;
+        terminal::close(job);
         if let Mode::Cgroup(group)=&isolation {
             let _=fs::write(group.join("cgroup.kill"),"1");
             let _=fs::remove_dir(group);
@@ -340,6 +354,7 @@ async fn launch_source(
         if let Ok(client) = state.pool.get().await {
             let _=client.execute("UPDATE sandbox_jobs SET state=$2,exit_code=$3,finished_at=clock_timestamp(),pid=NULL WHERE id=$1 AND state='running'", &[&job,&state_name,&code]).await;
         }
+        terminal::close(job);
         if let Mode::Cgroup(group) = isolation {
             let _ = fs::write(group.join("cgroup.kill"), "1");
             let _ = fs::remove_dir(group);
