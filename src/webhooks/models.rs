@@ -205,6 +205,14 @@ pub struct CiCallbackInput {
     pub output: Option<String>,
     #[serde(default)]
     pub pull_number: Option<i64>,
+    #[serde(default)]
+    pub ci_run_id: Option<Uuid>,
+    #[serde(default)]
+    pub ci_job_id: Option<Uuid>,
+    #[serde(default)]
+    pub base_oid: Option<String>,
+    #[serde(default)]
+    pub lease_generation: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -307,6 +315,18 @@ fn ipv6_is_blocked_non_loopback(ip: Ipv6Addr) -> bool {
         || (segs[0] & 0xfe00) == 0xfc00
         || (segs[0] & 0xffc0) == 0xfe80
         || (segs[0] == 0x2001 && segs[1] == 0x0db8)
+}
+
+/// DNS answers are validated at connection time, then pinned into the HTTP client's
+/// resolver so a second lookup cannot substitute a private address.
+pub fn permitted_peer(host_is_loopback: bool, ip: IpAddr) -> bool {
+    if host_is_loopback {
+        return ip.is_loopback();
+    }
+    match ip {
+        IpAddr::V4(v4) => !ipv4_is_blocked_non_loopback(v4),
+        IpAddr::V6(v6) => !ipv6_is_blocked_non_loopback(v6),
+    }
 }
 
 /// Validates a webhook target URL against SSRF rules.

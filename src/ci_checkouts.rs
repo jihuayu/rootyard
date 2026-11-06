@@ -301,6 +301,31 @@ pub(crate) async fn authenticate(
     Ok((identity, repo, plan))
 }
 
+/// Active transfer authority check. Call at least once per second while serving a
+/// checkout stream; every failure or unavailable database ends the transfer.
+pub(crate) async fn still_authorized(
+    state: &AppState,
+    job_id: Uuid,
+    credential_digest: &str,
+    repository_id: Uuid,
+    storage_generation: i64,
+) -> Result<bool, Error> {
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let row = client.query_one(
+        "SELECT EXISTS (SELECT 1 FROM ci_checkout_jobs j \
+         JOIN repositories r ON r.id=j.repository_id AND r.owner_id=j.owner_id \
+         JOIN tokens t ON t.id=j.issuer_token_id AND t.user_id=j.owner_id \
+         WHERE j.job_id=$1 AND j.repository_id=$2 AND j.credential_digest=$3 \
+           AND NOT j.cancelled AND NOT j.revoked \
+           AND j.expires_unix > extract(epoch FROM clock_timestamp()) \
+           AND NOT t.revoked AND NOT t.read_only \
+           AND (t.expires_at IS NULL OR t.expires_at>clock_timestamp()) \
+           AND r.state='ready' AND r.storage_generation=$4)",
+        &[&job_id,&repository_id,&credential_digest,&storage_generation],
+    ).await.map_err(Error::internal)?;
+    Ok(row.get(0))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveLease {
     pub job_id: Uuid,

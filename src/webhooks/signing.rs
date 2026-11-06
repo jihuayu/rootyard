@@ -4,17 +4,13 @@ use crate::{
     Error,
     auth::idempotency_key,
     pulls::models::{CHECK_FIELDS, CheckRun},
-    webhooks::models::{CiCallbackInput, validate_webhook_url},
+    webhooks::models::{CiCallbackInput, permitted_peer, validate_webhook_url},
 };
 use axum::http::{HeaderMap, StatusCode};
 use deadpool_postgres::Transaction;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use std::{net::SocketAddr, time::Duration};
 use uuid::Uuid;
 
 pub const SIGNATURE_PREFIX: &str = "sha256=";
@@ -168,13 +164,17 @@ pub fn resolve_callback_identity(
         "attempt": input.attempt,
         "sequence": input.sequence,
         "output": output,
+        "ci_run_id": input.ci_run_id,
+        "ci_job_id": input.ci_job_id,
+        "base_oid": input.base_oid,
+        "lease_generation": input.lease_generation,
     });
     let req_sha256 = sha256_hex(&serde_json::to_vec(&canonical_req).map_err(Error::internal)?);
     Ok((event_id, req_sha256))
 }
 
-/// Dispatches a signed HTTP/1.1 POST request over `tokio::net::TcpStream` with SSRF verification
-/// and strict connect/read/write timeouts.
+/// Dispatches over a verified TLS-capable HTTP transport. DNS is resolved and checked
+/// before use, then pinned to prevent a second lookup from bypassing SSRF policy.
 pub async fn send_http11_webhook(
     url: &str,
     timeout_ms: i64,
@@ -187,68 +187,36 @@ pub async fn send_http11_webhook(
 ) -> Result<u16, String> {
     let target =
         validate_webhook_url(url).map_err(|_| "invalid or SSRF-blocked target URL".to_owned())?;
-    if target.scheme == "https" && !target.is_loopback {
-        return Err("outbound TLS transport not configured in isolated environment".to_owned());
-    }
     let timeout_dur = Duration::from_millis(timeout_ms.clamp(100, 30_000) as u64);
-    let addr_str = if target.host.contains(':') {
-        format!("[{}]:{}", target.host, target.port)
-    } else {
-        format!("{}:{}", target.host, target.port)
-    };
-
-    let mut stream = tokio::time::timeout(timeout_dur, TcpStream::connect(&addr_str))
-        .await
-        .map_err(|_| "webhook connection timed out".to_owned())?
-        .map_err(|e| format!("webhook connect error: {e}"))?;
-    if let Ok(peer) = stream.peer_addr() {
-        if target.is_loopback && !peer.ip().is_loopback() {
-            return Err("resolved peer address is not loopback".to_owned());
-        }
+    let addresses: Vec<SocketAddr> = tokio::time::timeout(timeout_dur,
+        tokio::net::lookup_host((target.host.as_str(), target.port)))
+        .await.map_err(|_| "webhook DNS timed out".to_owned())?
+        .map_err(|e| format!("webhook DNS error: {e}"))?.collect();
+    if addresses.is_empty() || addresses.iter().any(|a| !permitted_peer(target.is_loopback, a.ip())) {
+        return Err("webhook DNS resolved to a blocked address".to_owned());
     }
-
-    let request_head = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Rootyard-Hookshot/1.0\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Rootyard-Event: {}\r\nX-Rootyard-Delivery: {}\r\nX-Rootyard-Hook-Id: {}\r\nX-Rootyard-Signature-256: {}\r\nX-Rootyard-Attempt: {}\r\nConnection: close\r\n\r\n",
-        target.path_and_query,
-        target.host_header,
-        body_bytes.len(),
-        event_type,
-        delivery_id,
-        hook_id,
-        signature_256,
-        attempt,
-    );
-    tokio::time::timeout(timeout_dur, async {
-        stream.write_all(request_head.as_bytes()).await?;
-        stream.write_all(body_bytes).await?;
-        stream.flush().await
-    })
-    .await
-    .map_err(|_| "webhook write timed out".to_owned())?
-    .map_err(|e| format!("webhook write error: {e}"))?;
-
-    let mut buf = vec![0u8; 4096];
-    let n = tokio::time::timeout(timeout_dur, stream.read(&mut buf))
-        .await
-        .map_err(|_| "webhook read timed out".to_owned())?
-        .map_err(|e| format!("webhook read error: {e}"))?;
-    if n == 0 {
-        return Err("empty HTTP response from webhook receiver".to_owned());
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout_dur).connect_timeout(timeout_dur)
+        .redirect(reqwest::redirect::Policy::none()).no_proxy()
+        .resolve(&target.host, addresses[0]);
+    if let Ok(pem_path) = std::env::var("ROOTYARD_WEBHOOK_CA_FILE") {
+        let pem = std::fs::read(pem_path).map_err(|_| "webhook CA file unreadable".to_owned())?;
+        let cert = reqwest::Certificate::from_pem(&pem)
+            .map_err(|_| "invalid webhook CA certificate".to_owned())?;
+        builder = builder.add_root_certificate(cert);
     }
-    let head_str = String::from_utf8_lossy(&buf[..n]);
-    let mut parts = head_str.lines().next().unwrap_or("").split_whitespace();
-    let proto = parts.next().unwrap_or("");
-    let code_str = parts.next().unwrap_or("");
-    if !proto.starts_with("HTTP/1.") {
-        return Err("invalid HTTP response status line".to_owned());
-    }
-    let code: u16 = code_str
-        .parse()
-        .map_err(|_| "malformed HTTP status code".to_owned())?;
-    if !(100..=599).contains(&code) {
-        return Err("HTTP status code out of range".to_owned());
-    }
-    Ok(code)
+    let client = builder.build().map_err(|e| format!("webhook client error: {e}"))?;
+    let response = client.post(url)
+        .header("User-Agent", "Rootyard-Hookshot/1.0")
+        .header("Content-Type", "application/json")
+        .header("X-Rootyard-Event", event_type)
+        .header("X-Rootyard-Delivery", delivery_id.to_string())
+        .header("X-Rootyard-Hook-Id", hook_id.to_string())
+        .header("X-Rootyard-Signature-256", signature_256)
+        .header("X-Rootyard-Attempt", attempt.to_string())
+        .body(body_bytes.to_vec()).send().await
+        .map_err(|e| format!("webhook transport error: {e:?}"))?;
+    Ok(response.status().as_u16())
 }
 
 /// Upserts a commit-bound `CheckRun` from a verified webhook callback with monotonic
