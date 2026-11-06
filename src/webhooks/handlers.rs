@@ -164,9 +164,12 @@ pub async fn update_webhook(
         if let Some(v) = patch.expected_version {
             positive(v)?;
         }
+        let policy_repo=crate::webhooks::trust::policy_repo_id(&state,&owner,&name).await?;
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
+        crate::webhooks::trust::lock_policy_tx(&tx,policy_repo).await?;
         let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+        if repo!=policy_repo{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
 
         let existing = tx
             .query_opt(&format!("SELECT {WEBHOOK_FIELDS}, secret FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3 FOR UPDATE"), &[&actor.id, &repo, &hook_id])
@@ -225,9 +228,12 @@ pub async fn delete_webhook(
     tokio::spawn(async move {
         ensure_schema(&state.pool).await?;
         let actor = auth::authenticate(&state.pool, &headers).await?;
+        let policy_repo=crate::webhooks::trust::policy_repo_id(&state,&owner,&name).await?;
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
+        crate::webhooks::trust::lock_policy_tx(&tx,policy_repo).await?;
         let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+        if repo!=policy_repo{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
         let deleted = tx
             .execute("DELETE FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3", &[&actor.id, &repo, &hook_id])
             .await
