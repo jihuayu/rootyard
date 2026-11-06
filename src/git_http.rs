@@ -64,7 +64,8 @@ pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Resp
 }
 async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
     let (parts, body) = request.into_parts();
-    let (pin_oid, route_path) = if state.mirror_primary.is_some() {
+    let (pin_oid, route_path) = if state.mirror_primary.is_some()
+        || parts.uri.path().starts_with("/ci/") {
         let (oid, path) = crate::mirror::ci_route(parts.uri.path())?;
         (Some(oid), path)
     } else {
@@ -82,6 +83,9 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         &state, &parts.headers, &parts.method, &parts.uri,
     ).await?;
     let job = pin_oid.is_some() && auth::credentials_for(&parts.headers, "ryj_").is_ok();
+    if pin_oid.is_some() && state.mirror_primary.is_none() && !job {
+        return Err(Error::unauthorized());
+    }
     let (identity, repo, job_plan, job_principal) = if let Some((identity, repo)) = delegation {
         (Some(identity), repo, None, None)
     } else if job {
@@ -159,12 +163,12 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     } else {
         None
     };
-    let read_guard = if write_guard.is_none() {
+    let snapshot_lease = if write_guard.is_none() {
+        Some(storage::read_leases::shared(&state.pool, repo.id, deadline).await?)
+    } else { None };
+    let read_guard = if snapshot_lease.is_some() {
         Some(tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(repo.id))
             .await.map_err(|_| Error::timeout())?)
-    } else { None };
-    let snapshot_lease = if read_guard.is_some() {
-        Some(storage::read_leases::shared(&state.pool, repo.id, deadline).await?)
     } else { None };
     if snapshot_lease.is_some() {
         transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
@@ -177,14 +181,14 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     }
     let path = if let Some(oid) = pin_oid {
         if job {
-            crate::ci_checkouts::dependencies::verify_on_mirror(
-                &state, job_plan.as_ref().ok_or_else(Error::unauthorized)?).await?;
-            crate::mirror::job_path(
-                &state,
-                &repo,
-                job_plan.as_ref().ok_or_else(Error::unauthorized)?,
-            )
-            .await?
+            let plan = job_plan.as_ref().ok_or_else(Error::unauthorized)?;
+            if state.mirror_primary.is_some() {
+                crate::ci_checkouts::dependencies::verify_on_mirror(&state, plan).await?;
+                crate::mirror::job_path(&state, &repo, plan).await?
+            } else {
+                crate::ci_checkouts::origin_job_path(&state, &repo, plan,
+                    snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?).await?
+            }
         } else {
             crate::mirror::pinned_path(&state, &repo, oid).await?
         }

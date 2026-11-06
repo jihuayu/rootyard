@@ -200,9 +200,9 @@ pub async fn get_object_format(
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = handlers::acquire_git_slot(&state)?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let object_format = detect_repo_object_format(&state, repo_id).await?;
     _lease.ensure_active()?;
@@ -235,9 +235,9 @@ pub async fn negotiate_object_format(
     auth::finish_tx(tx, &actor, is_write).await?;
     drop(client);
     let _permit = handlers::acquire_git_slot(&state)?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, is_write).await?;
     let repo_fmt = detect_repo_object_format(&state, repo_id).await?;
     _lease.ensure_active()?;
@@ -372,9 +372,9 @@ pub async fn run_object_format_drill(
     auth::finish_tx(tx, &actor, true).await?;
     drop(client);
     let _permit = handlers::acquire_git_slot(&state)?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, true).await?;
 
     let journal_root = state.storage.root.join("journal");

@@ -392,7 +392,7 @@ pub(crate) fn mirror_git(state: &AppState) -> Command {
 pub(crate) fn ci_route(path: &str) -> Result<(&str, &str), Error> {
     let tail = path.strip_prefix("/ci/").ok_or_else(Error::not_found)?;
     let (oid, rest) = tail.split_once('/').ok_or_else(Error::not_found)?;
-    if oid.len() != 40
+    if !matches!(oid.len(), 40 | 64)
         || !oid
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
