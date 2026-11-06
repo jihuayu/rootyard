@@ -13,7 +13,7 @@ use std::{io, process::Stdio, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::Child,
-    sync::{OwnedMutexGuard, OwnedSemaphorePermit},
+    sync::{OwnedMutexGuard, OwnedRwLockReadGuard, OwnedSemaphorePermit},
     task::JoinHandle,
     time::Instant,
 };
@@ -159,6 +159,10 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     } else {
         None
     };
+    let read_guard = if write_guard.is_none() {
+        Some(tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(repo.id))
+            .await.map_err(|_| Error::timeout())?)
+    } else { None };
     if write_guard.is_some() {
         reliability::before_push(&state, &repo)
             .await
@@ -438,6 +442,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     tokio::spawn(async move {
         let _permit: OwnedSemaphorePermit = permit;
         let _write_guard: Option<OwnedMutexGuard<()>> = write_guard;
+        let _read_guard: Option<OwnedRwLockReadGuard<()>> = read_guard;
         let state = state;
         let transfer = async {
             let mut total = 0u64;

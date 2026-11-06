@@ -198,6 +198,7 @@ pub async fn get_object_format(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
     let _permit = handlers::acquire_git_slot(&state)?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let object_format = detect_repo_object_format(&state, repo_id).await?;
     auth::finish_tx(tx, &actor, false).await?;
     Ok(handlers::json_ok(ObjectFormatStatusResponse {
@@ -226,6 +227,7 @@ pub async fn negotiate_object_format(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, is_write).await?;
     let _permit = handlers::acquire_git_slot(&state)?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let repo_fmt = detect_repo_object_format(&state, repo_id).await?;
     auth::finish_tx(tx, &actor, false).await?;
 
@@ -356,6 +358,7 @@ pub async fn run_object_format_drill(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, true).await?;
     let _permit = handlers::acquire_git_slot(&state)?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
 
     let journal_root = state.storage.root.join("journal");
     journal::mkdir(&journal_root).map_err(Error::internal)?;
