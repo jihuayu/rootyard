@@ -89,6 +89,7 @@ pub async fn put(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id
     tx.execute("UPDATE workspaces SET revision=$2,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1", &[&id,&revision]).await.map_err(Error::internal)?;
     tx.execute("INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'file_put',$3)", &[&id,&revision,&result]).await.map_err(Error::internal)?;
     tx.execute("INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) VALUES($1,$2,$3,$4,'file_put','committed',$5)", &[&Uuid::new_v4(),&id,&key,&hash,&result]).await.map_err(Error::internal)?;
+    super::capture::record_current(&tx,&state,id).await?;
     tx.commit().await.map_err(Error::internal)?;
     Ok(Json(result))
 }
@@ -125,6 +126,7 @@ pub async fn git(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id
     tx.execute("UPDATE workspaces SET revision=$2,git_generation=$3,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1", &[&id,&revision,&generation]).await.map_err(Error::internal)?;
     tx.execute("INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'git',$3)", &[&id,&revision,&result]).await.map_err(Error::internal)?;
     tx.execute("INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) VALUES($1,$2,$3,$4,'git','committed',$5)", &[&Uuid::new_v4(),&id,&key,&request_hash,&result]).await.map_err(Error::internal)?;
+    super::capture::record_current(&tx,&state,id).await?;
     tx.commit().await.map_err(Error::internal)?;
     Ok(Json(result))
 }
