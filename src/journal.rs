@@ -358,7 +358,7 @@ pub fn pending(data_root: &Path, repository_id: Uuid) -> Result<Vec<Operation>> 
     Ok(result)
 }
 
-fn valid_ref(s: &str) -> bool {
+pub(crate) fn valid_ref(s: &str) -> bool {
     if s.len() > 1024 {
         return false;
     }
