@@ -16,7 +16,7 @@ pub(super) async fn fence(client: &Client) -> Result<()> {
          UPDATE public.workspaces SET lease_epoch=lease_epoch+1,
              lease_until=clock_timestamp()-interval '1 second' WHERE state='ready';
          UPDATE public.sandbox_jobs SET state='cancelled',pid=NULL,finished_at=clock_timestamp()
-             WHERE state IN ('queued','running');
+             WHERE state IN ('queued','preparing','running');
          UPDATE public.tokens SET revoked=true WHERE kind='browser';
          UPDATE public.web_sessions SET revoked=true;
          COMMIT;"

@@ -14,6 +14,12 @@ use uuid::Uuid;
 fn unavailable() -> Error {
     Error(StatusCode::CONFLICT, "CI origin source is not retained")
 }
+struct StagingDirectory(PathBuf);
+impl Drop for StagingDirectory {
+    fn drop(&mut self) {
+        if self.0.exists() { let _=std::fs::remove_dir_all(&self.0); }
+    }
+}
 fn config(format: &str) -> String {
     let version = if format == "sha256" { 1 } else { 0 };
     let extension = if format == "sha256" {
@@ -342,6 +348,7 @@ async fn origin_job_path_inner(
     private_directory(&root).map_err(Error::internal)?;
     private_directory(&directory).map_err(Error::internal)?;
     let stage = directory.join(format!(".{}.staging", Uuid::new_v4()));
+    let _cleanup=StagingDirectory(stage.clone());
     let view = stage.join("view.git");
     let result = async {
         private_directory(&stage)?;
@@ -412,9 +419,6 @@ async fn origin_job_path_inner(
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    if stage.exists() {
-        let _ = std::fs::remove_dir_all(&stage);
-    }
     result.map_err(Error::internal)?;
     Ok(destination)
 }
