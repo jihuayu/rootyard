@@ -6,6 +6,9 @@ pub mod fencing;
 pub mod models;
 pub mod rebalance;
 pub mod router;
+pub mod security;
+pub mod transitions;
+pub mod transport;
 
 use crate::AppState;
 use axum::{
