@@ -1,6 +1,86 @@
 //! Smart HTTP request and response syntax validation.
 use super::*;
 
+pub(super) struct ReceiveCommands {
+    pub bytes: Vec<u8>,
+    pub refs: Vec<String>,
+}
+
+/// Read only the bounded command pkt-lines, before Git sees the pack. The
+/// exact bytes are replayed to http-backend after the parent owns every ref
+/// lease. A malformed/unsupported request fails before any native child runs.
+pub(super) async fn receive_commands(reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    oid_len: usize) -> Result<ReceiveCommands, Error> {
+    if !matches!(oid_len, 40 | 64) { return Err(Error::bad_request()); }
+    let mut bytes = Vec::new();
+    let mut refs = Vec::new();
+    loop {
+        if bytes.len() + 4 > 128 * 1024 { return Err(Error::bad_request()); }
+        let mut header = [0u8;4];
+        reader.read_exact(&mut header).await.map_err(Error::internal)?;
+        bytes.extend_from_slice(&header);
+        let length = std::str::from_utf8(&header).ok()
+            .and_then(|h| usize::from_str_radix(h, 16).ok())
+            .ok_or_else(Error::bad_request)?;
+        if length == 0 { break; }
+        if !(4..=65520).contains(&length) || bytes.len() + length - 4 > 128 * 1024
+            || refs.len() >= 128 { return Err(Error::bad_request()); }
+        let start = bytes.len();
+        bytes.resize(start + length - 4, 0);
+        reader.read_exact(&mut bytes[start..]).await.map_err(Error::internal)?;
+        let packet = &bytes[start..];
+        let command = packet.split(|b| *b == 0).next().ok_or_else(Error::bad_request)?;
+        let command = command.strip_suffix(b"\n").unwrap_or(command);
+        let command = std::str::from_utf8(command).map_err(|_| Error::bad_request())?;
+        // Shallow lines precede commands, but never confer a publication key.
+        if refs.is_empty() && command.starts_with("shallow ") { continue; }
+        let mut fields = command.split(' ');
+        let (Some(old),Some(new),Some(name),None) =
+            (fields.next(),fields.next(),fields.next(),fields.next())
+            else { return Err(Error::bad_request()); };
+        if old.len()!=oid_len || new.len()!=oid_len
+            || !old.bytes().chain(new.bytes()).all(|b| b.is_ascii_hexdigit())
+            || !crate::journal::valid_ref(name) || !name.starts_with("refs/")
+            || refs.iter().any(|prior| prior==name) { return Err(Error::bad_request()); }
+        refs.push(name.to_string());
+    }
+    if refs.is_empty() { return Err(Error::bad_request()); }
+    Ok(ReceiveCommands { bytes, refs })
+}
+
+#[cfg(test)]
+mod receive_tests {
+    use super::*;
+
+    fn packet(command: &[u8]) -> Vec<u8> {
+        let mut bytes = format!("{:04x}",command.len()+4).into_bytes();
+        bytes.extend_from_slice(command);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn command_prefix_tracks_exact_refs_and_replays_pack() {
+        let oid = "1".repeat(40);
+        let zero = "0".repeat(40);
+        let first = format!("{zero} {oid} refs/heads/a\0report-status atomic\n");
+        let second = format!("{zero} {oid} refs/heads/b\n");
+        let mut source = packet(first.as_bytes());
+        source.extend(packet(second.as_bytes()));
+        source.extend(b"0000PACK");
+        let mut reader = source.as_slice();
+        let parsed = receive_commands(&mut reader,40).await.unwrap();
+        assert_eq!(parsed.refs,["refs/heads/a","refs/heads/b"]);
+        assert_eq!(&source[..source.len()-4],parsed.bytes);
+        assert_eq!(reader,b"PACK");
+        let mut duplicate = packet(first.as_bytes());
+        duplicate.extend(packet(first.as_bytes()));
+        duplicate.extend(b"0000");
+        assert!(receive_commands(&mut duplicate.as_slice(),40).await.is_err());
+        let mut wrong_format = source.as_slice();
+        assert!(receive_commands(&mut wrong_format,64).await.is_err());
+    }
+}
+
 /// Buffer at most one protocol pkt-line (65,520 bytes, including its header).
 /// Only a complete initial ERR packet is a refusal. Raw PACK, delimiters and
 /// successful protocol packets remain ordinary streamed output; malformed or

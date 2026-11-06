@@ -25,7 +25,7 @@ mod protocol;
 use process::Process;
 pub(crate) use process::{collect_git_output, collect_git_output_input,
     finish_group_child, stop_group_child};
-use protocol::{job_response_prefix, route, validate_headers, read_headers};
+use protocol::{job_response_prefix, receive_commands, route, validate_headers, read_headers};
 
 async fn transfer_authorized(
     state: &AppState,
@@ -155,6 +155,35 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         )
     })?;
     let deadline = Instant::now() + state.config.git_timeout;
+    let gzipped = parts.headers.get(header::CONTENT_ENCODING)
+        .is_some_and(|v| v == "gzip" || v == "x-gzip");
+    let max_input = state.config.max_request_bytes;
+    let input_metrics = state.transfer_metrics.clone();
+    let mut wire_bytes = 0u64;
+    let stream = body.into_data_stream().map(move |chunk| {
+        let chunk = chunk.map_err(io::Error::other)?;
+        wire_bytes = wire_bytes.saturating_add(chunk.len() as u64);
+        input_metrics.add_received_bytes(chunk.len() as u64);
+        if wire_bytes > max_input {
+            return Err(io::Error::other("request wire size limit exceeded"));
+        }
+        Ok(chunk)
+    });
+    let reader = tokio_util::io::StreamReader::new(stream);
+    let mut input_reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = if gzipped {
+        let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(BufReader::new(reader));
+        decoder.multiple_members(true);
+        Box::pin(decoder)
+    } else { Box::pin(reader) };
+    let receive = if write && parts.method == Method::POST {
+        let oid_len = if repo.object_format == "sha256" { 64 } else { 40 };
+        Some(tokio::time::timeout_at(deadline, receive_commands(&mut input_reader, oid_len))
+            .await.map_err(|_| Error::timeout())??)
+    } else { None };
+    let ref_guard = if let Some(commands) = &receive {
+        Some(storage::ref_publication::acquire(&state.pool, repo.id,
+            repo.storage_generation, &commands.refs, deadline).await?)
+    } else { None };
     let write_guard = if write && parts.method == Method::POST {
         Some(
             tokio::time::timeout_at(deadline, state.storage.write_lock(repo.id))
@@ -220,10 +249,6 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             ));
         }
     }
-    let gzipped = parts
-        .headers
-        .get(header::CONTENT_ENCODING)
-        .is_some_and(|v| v == "gzip" || v == "x-gzip");
     let mut cmd = state.storage.git(&state.config);
     if job {
         cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
@@ -352,32 +377,14 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
-    let max_input = state.config.max_request_bytes;
-    let input_metrics = state.transfer_metrics.clone();
+    let input_prefix = receive.map(|commands| commands.bytes).unwrap_or_default();
     let input = tokio::spawn(async move {
-        let mut wire_bytes = 0u64;
-        let stream = body.into_data_stream().map(move |chunk| {
-            let chunk = chunk.map_err(io::Error::other)?;
-            wire_bytes = wire_bytes.saturating_add(chunk.len() as u64);
-            input_metrics.add_received_bytes(chunk.len() as u64);
-            if wire_bytes > max_input {
-                return Err(io::Error::other("request wire size limit exceeded"));
-            }
-            Ok(chunk)
-        });
-        let reader = tokio_util::io::StreamReader::new(stream);
-        let mut reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = if gzipped {
-            let mut decoder =
-                async_compression::tokio::bufread::GzipDecoder::new(BufReader::new(reader));
-            decoder.multiple_members(true);
-            Box::pin(decoder)
-        } else {
-            Box::pin(reader)
-        };
-        let mut decoded_bytes = 0u64;
+        let mut decoded_bytes = input_prefix.len() as u64;
+        if decoded_bytes > max_input { return Err(io::Error::other("decoded request size limit exceeded")); }
+        stdin.write_all(&input_prefix).await?;
         let mut buf = [0u8; 32 * 1024];
         loop {
-            let n = reader.read(&mut buf).await?;
+            let n = input_reader.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
@@ -471,6 +478,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     tokio::spawn(async move {
         let _permit: OwnedSemaphorePermit = permit;
         let _write_guard: Option<OwnedMutexGuard<()>> = write_guard;
+        let ref_guard = ref_guard;
         let _read_guard: Option<OwnedRwLockReadGuard<()>> = read_guard;
         let snapshot_lease = snapshot_lease;
         let state = state;
@@ -481,6 +489,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             recheck_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
                 job_principal.as_ref(), &admitted_repo, write).await?;
+            if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
             if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
             loop {
                 let next = if let Some(input) = process.input.as_mut() {
@@ -491,6 +500,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                             value.map_err(io::Error::other).and_then(|v|v).map(|_|None)
                         }
                         _ = recheck_tick.tick() => {
+                            if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
                             transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
                                 job_principal.as_ref(), &admitted_repo, write).await?;
                             if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
@@ -502,6 +512,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                     tokio::select! {
                         value = stdout.read(&mut buf) => value.map(Some),
                         _ = recheck_tick.tick() => {
+                            if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
                             transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
                                 job_principal.as_ref(), &admitted_repo, write).await?;
                             if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
@@ -518,6 +529,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 }
                 transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
                     job_principal.as_ref(), &admitted_repo, write).await?;
+                if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
                 if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
                 total = total.saturating_add(n as u64);
                 if total > max_output {
@@ -527,6 +539,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                     tokio::select! {
                         slot = sender.reserve() => break slot.map_err(|_| io::Error::other("client disconnected"))?,
                         _ = recheck_tick.tick() => {
+                            if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
                             transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
                                 job_principal.as_ref(), &admitted_repo, write).await?;
                             if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
@@ -545,6 +558,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 return Err(io::Error::other("Git subprocess failed"));
             }
             if write {
+                if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
                 crate::sharding::fencing::check_before_push(&state, &admitted_repo).await
                     .map_err(|_| io::Error::other("storage fence changed during Git write"))?;
             }
