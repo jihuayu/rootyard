@@ -77,7 +77,7 @@ impl Process {
         self.pid = 0;
     }
 }
-fn group_quiescent(group: i32) -> io::Result<bool> {
+pub(crate) fn group_quiescent(group: i32) -> io::Result<bool> {
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
         if entry.file_name().to_string_lossy().parse::<u32>().is_err() {

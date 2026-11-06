@@ -71,21 +71,20 @@ pub async fn create(
         owner_id = Some(access.owner_id);
         let source_lease=read_leases::shared(&state.pool,access.repo_id,
             tokio::time::Instant::now()+state.config.git_timeout).await?;
+        let _local=tokio::time::timeout(state.config.git_timeout,
+            state.storage.read_snapshot_lock(access.repo_id)).await.map_err(|_|Error::timeout())?;
+        source_lease.ensure_active()?;
         let refreshed=auth::authorize_repo_with_role(&tx,&actor,&m.owner,&m.repository,Role::Read).await?;
         if refreshed.repo_id!=access.repo_id { return Err(Error::not_found()); }
         let repo = state
             .storage
             .verify_path(access.repo_id)
             .map_err(Error::internal)?;
-        let output = std::process::Command::new("git")
-            .arg("--git-dir")
-            .arg(&repo)
-            .args(["cat-file", "-e", &format!("{}^{{commit}}", m.base_oid)])
-            .output()
-            .map_err(Error::internal)?;
-        if !output.status.success() {
-            return Err(Error::bad_request());
-        }
+        let mut git=state.storage.git(&state.config);
+        git.arg("--git-dir").arg(&repo)
+            .args(["cat-file","-e",&format!("{}^{{commit}}",m.base_oid)]);
+        source_lease.guard(crate::git_http::collect_git_output(git,128,state.config.git_timeout))
+            .await?.map_err(|_|Error::bad_request())?;
         source_lease.ensure_active()?;
         repo_ids.push(access.repo_id);
     }

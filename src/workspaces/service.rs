@@ -66,31 +66,6 @@ pub fn git(repo: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
     Ok(output.stdout)
 }
 
-pub fn clone_repo(source: &FsPath, dest: &FsPath) -> Result<(), Error> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(Error::internal)?;
-    }
-    let output = Command::new("git")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "clone",
-            "--no-hardlinks",
-            "--",
-        ])
-        .arg(source)
-        .arg(dest)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(Error::internal)?;
-    if !output.status.success() {
-        return Err(Error::internal("native git clone failed"));
-    }
-    Ok(())
-}
-
 pub async fn authorized(
     state: &AppState,
     headers: &HeaderMap,
@@ -308,12 +283,22 @@ pub async fn create(
     let id = Uuid::new_v4();
     let source_lease=read_leases::shared(&state.pool,repo.repo_id,
         tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let _local=tokio::time::timeout(state.config.git_timeout,
+        state.storage.read_snapshot_lock(repo.repo_id)).await.map_err(|_|Error::timeout())?;
+    source_lease.ensure_active()?;
     let refreshed=auth::authorize_repo_with_role(&tx,&actor,&input.owner,&input.repository,Role::Write).await?;
     if refreshed.repo_id!=repo.repo_id { return Err(Error::not_found()); }
     let source = state.storage.verify_path(repo.repo_id).map_err(Error::internal)?;
     let dest = super::mounts::lower_path(&state, id);
-    clone_repo(&source, &dest)?;
+    if let Some(parent)=dest.parent(){std::fs::create_dir_all(parent).map_err(Error::internal)?;}
+    let mut clone=state.storage.git(&state.config);
+    clone.args(["-c","core.hooksPath=/dev/null","clone","--no-local","--no-hardlinks","--"])
+        .arg(&source).arg(&dest);
+    source_lease.guard(crate::git_http::collect_git_output(clone,4096,state.config.git_timeout))
+        .await?.map_err(Error::internal)?;
     source_lease.ensure_active()?;
+    drop(_local);
+    drop(source_lease);
     if let Some(base) = &input.base_oid {
         if !crate::browse::models::valid_non_zero_oid(base) {
             return Err(Error::bad_request());

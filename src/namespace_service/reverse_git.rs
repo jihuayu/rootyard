@@ -91,7 +91,27 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
             libc::kill(-pid, libc::SIGKILL);
         }
     }
-    let status = child.wait().map_err(Error::internal)?;
+    // Leave the leader unreaped while killing and draining the process group.
+    // Otherwise a lease-loss read could outlive its local GC gate.
+    loop {
+        let mut info=std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let rc=unsafe {libc::waitid(libc::P_PID,pid as u32,info.as_mut_ptr(),
+            libc::WEXITED|libc::WNOHANG|libc::WNOWAIT)};
+        if rc!=0 {return Err(Error::internal(std::io::Error::last_os_error()));}
+        if unsafe {info.assume_init().si_pid()!=0} {break;}
+        thread::sleep(Duration::from_millis(10));
+    }
+    unsafe {libc::kill(-pid,libc::SIGKILL);}
+    let started=std::time::Instant::now();
+    let mut reported=false;
+    while !matches!(crate::git_http::group_quiescent(pid),Ok(true)) {
+        if !reported && started.elapsed()>Duration::from_secs(5) {
+            eprintln!("rootyard: reverse Git group cleanup blocked; retaining source gate");
+            reported=true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status=child.wait().map_err(Error::internal)?;
     let _ = done.send(());
     let _ = watchdog.join();
     if let Some(writer) = writer {
