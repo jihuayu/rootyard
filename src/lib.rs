@@ -25,6 +25,7 @@ pub mod maintenance;
 #[rustfmt::skip]
 pub mod members;
 pub mod metrics;
+pub mod namespace_service;
 #[rustfmt::skip]
 pub mod mirror;
 #[rustfmt::skip]
@@ -127,6 +128,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(sharding::routes())
         .merge(workspaces::routes())
         .merge(sandbox::routes())
+        .merge(namespace_service::routes())
         .fallback(|State(state): State<Arc<AppState>>, request| async move {
             git_http::handle(state, request).await
         })
