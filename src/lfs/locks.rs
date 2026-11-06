@@ -41,21 +41,43 @@ fn valid_path(path: &str) -> bool {
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
-#[derive(Deserialize)]
-pub struct NewLock {
-    pub path: String,
+fn valid_lock_ref(reference: Option<&LockRef>) -> bool {
+    reference.is_none_or(|r| !r.name.is_empty() && r.name.len()<=1024
+        && !r.name.chars().any(char::is_control))
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockRef { pub name: String }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewLock {
+    pub path: String,
+    #[serde(rename="ref")]
+    pub reference: Option<LockRef>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnlockRequest {
     #[serde(default)]
     pub force: bool,
+    #[serde(rename="ref")]
+    pub reference: Option<LockRef>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListQuery {
     pub path: Option<String>,
     pub id: Option<Uuid>,
     pub cursor: Option<Uuid>,
     pub limit: Option<i64>,
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifyInput {
+    cursor: Option<Uuid>,
+    limit: Option<i64>,
+    #[serde(rename="ref")]
+    reference: Option<LockRef>,
 }
 #[derive(Serialize)]
 pub struct LockOwner {
@@ -96,7 +118,7 @@ pub async fn create_lock(
 ) -> Res {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let repo = models::normalize_repo_name(&repo_raw)?;
-    if !valid_path(&input.path) {
+    if !valid_path(&input.path) || !valid_lock_ref(input.reference.as_ref()) {
         return Err(Error::bad_request());
     }
     let key = auth::idempotency_key(&headers)?;
@@ -183,11 +205,19 @@ pub async fn verify_locks(
     Path((owner, repo_raw)): Path<(String, String)>,
     Query(query): Query<ListQuery>,
     headers: HeaderMap,
-    _body: axum::body::Bytes,
+    body: axum::body::Bytes,
 ) -> Res {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let repo = models::normalize_repo_name(&repo_raw)?;
-    let limit = query.limit.unwrap_or(100);
+    let input = if body.is_empty() { VerifyInput::default() }
+        else { serde_json::from_slice::<VerifyInput>(&body).map_err(|_| Error::bad_request())? };
+    if !valid_lock_ref(input.reference.as_ref())
+        || input.cursor.is_some() && query.cursor.is_some() && input.cursor!=query.cursor
+        || input.limit.is_some() && query.limit.is_some() && input.limit!=query.limit {
+        return Err(Error::bad_request());
+    }
+    let cursor=input.cursor.or(query.cursor);
+    let limit = input.limit.or(query.limit).unwrap_or(100);
     if !(1..=100).contains(&limit) {
         return Err(Error::bad_request());
     }
@@ -195,7 +225,7 @@ pub async fn verify_locks(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, repo, Role::Write).await?;
     let rows = tx.query("SELECT l.id,l.path,to_char(l.locked_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS locked_at,u.username,l.owner_user_id FROM lfs_locks l JOIN users u ON u.id=l.owner_user_id WHERE l.tenant_id=$1 AND l.repository_id=$2 AND ($3::uuid IS NULL OR l.id>$3) ORDER BY l.id LIMIT $4",
-        &[&access.owner_id,&access.repo_id,&query.cursor,&(limit+1)]).await.map_err(Error::internal)?;
+        &[&access.owner_id,&access.repo_id,&cursor,&(limit+1)]).await.map_err(Error::internal)?;
     let mut ours = Vec::new();
     let mut theirs = Vec::new();
     for row in rows.iter().take(limit as usize) {
@@ -227,6 +257,7 @@ pub async fn unlock(
 ) -> Res {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let repo = models::normalize_repo_name(&repo_raw)?;
+    if !valid_lock_ref(input.reference.as_ref()) { return Err(Error::bad_request()); }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, repo, Role::Write).await?;
@@ -270,22 +301,53 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
     changes: &[RefChange],
 ) -> Result<(), Error> {
     let mut paths = std::collections::BTreeSet::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let mut inspected_commits = 0usize;
+    if changes.len() > 256 {
+        return Err(Error(StatusCode::CONFLICT, "LFS lock ref inspection exceeded limit"));
+    }
     for change in changes {
         if change.new_oid.bytes().all(|b| b == b'0') {
             continue;
         }
-        let args = if change.old_oid.bytes().all(|b| b == b'0') {
-            vec![
-                "diff-tree",
-                "--root",
-                "--no-commit-id",
-                "-r",
-                "-z",
-                "--name-only",
-                change.new_oid.as_str(),
-            ]
-        } else {
-            vec![
+        let valid_oid = |oid: &str| matches!(oid.len(), 40 | 64)
+            && oid.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !valid_oid(&change.old_oid) || !valid_oid(&change.new_oid)
+            || change.old_oid.len()!=change.new_oid.len() {
+            return Err(Error(StatusCode::CONFLICT, "LFS lock Git object ID mismatch"));
+        }
+        // A new branch can introduce an earlier commit A that edits a locked
+        // path and a tip B that edits only an unrelated path. A tip-only diff
+        // misses A. Inspect every commit not reachable from any existing ref;
+        // a 4097th commit fails closed instead of silently truncating history.
+        let count = super::publication::git_input(
+            git_dir,git_bin,remaining(),
+            &["rev-list","--count","--max-count=4097",&change.new_oid,"--not","--all"],&[],
+        ).await?;
+        let count:usize=std::str::from_utf8(&count).ok().and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| Error(StatusCode::CONFLICT,"invalid LFS lock history count"))?;
+        inspected_commits=inspected_commits.saturating_add(count);
+        if inspected_commits>4096 {
+            return Err(Error(StatusCode::CONFLICT,"LFS lock history inspection exceeded limit"));
+        }
+        let raw = super::publication::git_input(
+            git_dir,git_bin,remaining(),
+            &["log","--root","-m","--format=","--name-only","-z","--no-renames", "--no-ext-diff",
+              &change.new_oid,"--not","--all"],&[],
+        ).await?;
+        for part in raw.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            let path = std::str::from_utf8(part)
+                .map_err(|_| Error(StatusCode::CONFLICT, "non-UTF8 locked path inspection"))?;
+            paths.insert(path.to_owned());
+            if paths.len() > 20_000 {
+                return Err(Error(StatusCode::CONFLICT,"LFS lock path inspection exceeded limit"));
+            }
+        }
+        // A ref can move to history already reachable under another branch;
+        // its new commits set is empty but its visible tree may still change.
+        if change.old_oid.bytes().any(|b| b != b'0') {
+            let raw = super::publication::git_input(git_dir,git_bin,remaining(),&[
                 "diff",
                 "--no-ext-diff",
                 "--no-renames",
@@ -293,18 +355,14 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
                 "-z",
                 change.old_oid.as_str(),
                 change.new_oid.as_str(),
-            ]
-        };
-        let raw = super::publication::git_input(git_dir, git_bin, timeout, &args, &[]).await?;
-        for part in raw.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-            let path = std::str::from_utf8(part)
-                .map_err(|_| Error(StatusCode::CONFLICT, "non-UTF8 locked path inspection"))?;
-            paths.insert(path.to_owned());
-            if paths.len() > 20_000 {
-                return Err(Error(
-                    StatusCode::CONFLICT,
-                    "LFS lock path inspection exceeded limit",
-                ));
+            ],&[]).await?;
+            for part in raw.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+                let path = std::str::from_utf8(part)
+                    .map_err(|_| Error(StatusCode::CONFLICT, "non-UTF8 locked path inspection"))?;
+                paths.insert(path.to_owned());
+                if paths.len() > 20_000 {
+                    return Err(Error(StatusCode::CONFLICT,"LFS lock path inspection exceeded limit"));
+                }
             }
         }
     }
