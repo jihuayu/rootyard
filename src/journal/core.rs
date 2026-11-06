@@ -16,6 +16,9 @@ pub struct Operation {
     /// Exact maintenance capability, persisted before spawning Git. Never supplied by push clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_pin: Option<crate::ci_pins::Intent>,
+    /// Internal, absent-to-target proposal pin. Never supplied by Git clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proposal_pin: Option<crate::namespace_service::ProposalIntent>,
     #[serde(skip)]
     pub path: PathBuf,
 }
@@ -181,6 +184,7 @@ pub(super) fn load(path: &Path) -> Result<Operation> {
     );
     op.path = path.to_path_buf();
     if let Some(intent) = &op.ci_pin {
+        ensure!(op.proposal_pin.is_none(),"mixed controller capabilities");
         intent.validate()?;
         ensure!(intent.repository_id == op.repository_id
             && intent.storage_generation == op.storage_generation,
@@ -195,6 +199,10 @@ pub(super) fn load(path: &Path) -> Result<Operation> {
     } else {
         ensure!(op.service_principal_id.is_none() && !op.actor_id.is_nil()
             && !op.token_id.is_nil(), "invalid human journal identity");
+        if let Some(intent)=&op.proposal_pin {
+            intent.validate()?;
+            ensure!(intent.repository_id==op.repository_id,"proposal pin repository mismatch");
+        }
     }
     Ok(op)
 }
@@ -220,6 +228,7 @@ pub fn begin(
         storage_generation,
         None,
         None,
+        None,
     )
 }
 
@@ -239,6 +248,7 @@ pub(crate) fn begin_ci(
         intent.storage_generation,
         Some(intent.clone()),
         None,
+        None,
     )
 }
 
@@ -252,7 +262,16 @@ pub(crate) fn begin_ci_service(
     ensure!(!principal_id.is_nil(), "invalid CI service principal");
     begin_inner(data_root, intent.repository_id, Uuid::nil(),
         "ci-scheduler".into(), Uuid::nil(), intent.storage_generation,
-        Some(intent.clone()), Some(principal_id))
+        Some(intent.clone()), Some(principal_id),None)
+}
+
+pub(crate) fn begin_proposal(data_root:&Path,repository_id:Uuid,actor_id:Uuid,
+    actor_name:String,token_id:Uuid,storage_generation:i64,
+    intent:crate::namespace_service::ProposalIntent)->Result<Operation>{
+    intent.validate()?;
+    ensure!(intent.repository_id==repository_id,"proposal pin repository mismatch");
+    begin_inner(data_root,repository_id,actor_id,actor_name,token_id,
+        storage_generation,None,None,Some(intent))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -265,6 +284,7 @@ fn begin_inner(
     storage_generation: i64,
     ci_pin: Option<crate::ci_pins::Intent>,
     service_principal_id: Option<Uuid>,
+    proposal_pin: Option<crate::namespace_service::ProposalIntent>,
 ) -> Result<Operation> {
     safe_path(data_root)?;
     ensure!(
@@ -297,6 +317,7 @@ fn begin_inner(
         sequence,
         storage_generation,
         ci_pin,
+        proposal_pin,
         path: PathBuf::new(),
     };
     op.path = repo.join(op_name(&op));

@@ -311,15 +311,16 @@ async fn execute_ref_transaction_inner(
         .seek(SeekFrom::Start(0))
         .map_err(Error::internal)?;
 
-    let operation = journal::begin(
-        &state.storage.root,
-        repo_id,
-        actor.id,
-        actor.username.clone(),
-        actor.token_id,
-        current_generation,
-    )
-    .map_err(Error::internal)?;
+    let operation = if let Some(proposal_id)=proposal_pin {
+        let intent=crate::namespace_service::ProposalIntent{
+            proposal_id,repository_id:repo_id,target_oid:requested[0].new_oid.clone(),
+        };
+        journal::begin_proposal(&state.storage.root,repo_id,actor.id,
+            actor.username.clone(),actor.token_id,current_generation,intent)
+    } else {
+        journal::begin(&state.storage.root,repo_id,actor.id,
+            actor.username.clone(),actor.token_id,current_generation)
+    }.map_err(Error::internal)?;
     journal::record_ref_transaction_intent(&operation, &requested).map_err(Error::internal)?;
 
     let mut cmd = git_read::git_cmd(&state, repo_id)?;
