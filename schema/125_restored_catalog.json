@@ -4963,6 +4963,17 @@
     },
     {
       "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "name": "terminal",
+      "not_null": true,
+      "position": 22,
+      "table": "sandbox_jobs",
+      "type": "boolean"
+    },
+    {
+      "collation": null,
       "default": null,
       "generated": "",
       "identity": "",
