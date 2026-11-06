@@ -57,7 +57,7 @@ pub fn read_volume_marker_at(repo_dir: &StdPath) -> Result<Option<VolumeFenceMar
 
 pub fn write_volume_marker_at(repo_dir: &StdPath, marker: &VolumeFenceMarker) -> Result<(), Error> {
     if !repo_dir.exists() {
-        return Ok(());
+        return Err(conflict("repository volume missing during shard marker publication"));
     }
     let path = repo_dir.join(VOLUME_FENCE_MARKER_FILE);
     let bytes = serde_json::to_vec_pretty(marker).map_err(Error::internal)?;
@@ -184,6 +184,42 @@ pub async fn check_before_push(state: &AppState, repo: &RepoState) -> Result<(),
     evaluate_write_barrier(&route, &primary, repo.storage_generation, marker.as_ref(), None, unix_now())
 }
 
+/// The native Git hook repeats the barrier immediately before ref publication.
+/// It must run for both pre-receive and reference-transaction preparing events.
+pub async fn check_hook_fence(
+    client: &tokio_postgres::Client,
+    repo_id: Uuid,
+    repo_dir: &StdPath,
+    admitted_generation: i64,
+) -> Result<(), Error> {
+    let marker = read_volume_marker_at(repo_dir)?;
+    let pending = client.query_opt(
+        "SELECT id FROM shard_marker_transitions WHERE repository_id=$1 AND state='pending' LIMIT 1",
+        &[&repo_id],
+    ).await.map_err(Error::internal)?.is_some();
+    if pending { return Err(conflict("shard marker transition pending")); }
+    let repo_generation: i64 = client.query_one(
+        "SELECT storage_generation FROM repositories WHERE id=$1", &[&repo_id],
+    ).await.map_err(Error::internal)?.get(0);
+    if admitted_generation != repo_generation {
+        return Err(conflict("admitted writer storage generation is stale"));
+    }
+    let r_sql = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id=$1");
+    let Some(row) = client.query_opt(&r_sql, &[&repo_id]).await.map_err(Error::internal)? else {
+        if marker.is_some() { return Err(conflict("shard marker exists without route")); }
+        return Ok(());
+    };
+    let route = RepoShardRoute::row(&row);
+    if let Ok(local_node) = std::env::var("ROOTYARD_NODE_ID")
+        && local_node != route.primary_node_id {
+        return Err(conflict("native Git writer is not current storage primary"));
+    }
+    let n_sql = format!("SELECT {SHARD_NODE_FIELDS} FROM shard_nodes WHERE node_id=$1");
+    let primary = client.query_opt(&n_sql, &[&route.primary_node_id]).await.map_err(Error::internal)?
+        .as_ref().map(ShardNode::row).ok_or_else(|| conflict("shard primary missing"))?;
+    evaluate_write_barrier(&route, &primary, repo_generation, marker.as_ref(), None, unix_now())
+}
+
 pub async fn get_fence_status(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
@@ -301,7 +337,7 @@ pub async fn apply_or_verify_fence(
         let marker = VolumeFenceMarker::from_route(&updated, new_gen, Some(target_node.clone()), now);
         let details = sjson!({ "fenced_epoch": f_epoch, "fencing_token": new_token, "storage_generation": new_gen });
         record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.fenced", "shard_fence", &target_node, details).await?;
-        let transition_id = transitions::stage(&tx, &marker).await?;
+        let transition_id = transitions::stage(&tx, &state, &marker).await?;
         transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
         return Ok(json(StatusCode::OK, FenceStatusResponse::from_route(&updated, new_gen, false, Some(marker))));
     }
@@ -325,7 +361,7 @@ pub async fn apply_or_verify_fence(
     let marker = VolumeFenceMarker::from_route(&updated, new_gen, None, now);
     let details = sjson!({ "route_epoch": new_route_epoch, "fencing_token": new_token, "storage_generation": new_gen });
     record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.unfenced", "shard_fence", &updated.primary_node_id, details).await?;
-    let transition_id = transitions::stage(&tx, &marker).await?;
+    let transition_id = transitions::stage(&tx, &state, &marker).await?;
     transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
     let admitted = !updated.read_only_degraded;
     Ok(json(StatusCode::OK, FenceStatusResponse::from_route(&updated, new_gen, admitted, Some(marker))))

@@ -375,6 +375,13 @@ pub async fn upsert_bucket(State(state): App, headers: HeaderMap, Json(input): J
 
     let b_sql = format!("SELECT {BUCKET_FIELDS} FROM shard_virtual_buckets WHERE bucket_id = $1");
     let existing = tx.query_opt(&b_sql, &[&input.bucket_id]).await.map_err(Error::internal)?.map(|r| VirtualBucket::row(&r));
+    let affected: i64 = tx.query_one(
+        "SELECT COUNT(*) FROM repository_shard_routes WHERE bucket_id=$1 AND NOT explicit_override",
+        &[&input.bucket_id],
+    ).await.map_err(Error::internal)?.get(0);
+    if affected > 0 && existing.as_ref().is_none_or(|b| b.primary_node_id != input.primary_node_id || b.read_replica_nodes != replicas) {
+        return Err(conflict("bucket placement has repositories; use verified repository migration"));
+    }
     if input.expected_route_epoch.is_some_and(|e| e != existing.as_ref().map_or(0, |b| b.route_epoch)) {
         return Err(conflict("virtual bucket route_epoch conflict"));
     }
