@@ -28,9 +28,11 @@ class PullsHarness(ForgeHarness):
     def issue_token(
         self, username: str, create_user: bool = False, read_only: bool = False
     ) -> dict:
-        cmd = ["issue-token", "--username", username]
         if create_user:
-            cmd.append("--create-user")
+            res = self.account("create-user", username)
+            if not read_only:
+                return res
+        cmd = ["create-token", username]
         if read_only:
             cmd.append("--read-only")
         return self.account(*cmd)
@@ -43,10 +45,11 @@ class PullsHarness(ForgeHarness):
         if headers is not None:
             kwargs["extra_headers"] = headers
         status, body, resp_headers = self.http(path, token=token or self.alice, **kwargs)
+        norm_headers = {k.lower(): v for k, v in resp_headers.items()}
         expected = code if isinstance(code, tuple) else (code,)
         assert status in expected, f"{path}: expected {code}, got {status}: {body[:200]!r}"
-        assert resp_headers.get("cache-control") == "no-store", resp_headers
-        assert "application/json" in resp_headers.get("content-type", "")
+        assert norm_headers.get("cache-control") == "no-store", norm_headers
+        assert "application/json" in norm_headers.get("content-type", ""), norm_headers
         return json.loads(body)
 
     def ensure_migration_009(self):
@@ -93,6 +96,7 @@ class PullsHarness(ForgeHarness):
 
     def setup(self):
         super().setup()
+        self.alice_read = self.reader
         self.ensure_migration_009()
         self.pullspath = "/api/repos/alice/forge/pulls"
         self.checkspath = "/api/repos/alice/forge/checks"

@@ -139,12 +139,13 @@ class WebhooksHarness(PullsHarness):
         status, body, headers = self.http(
             path,
             method="POST",
-            raw_body=raw,
+            body=raw,
             extra_headers=hdrs,
         )
+        norm_headers = {k.lower(): v for k, v in headers.items()}
         expected = code if isinstance(code, tuple) else (code,)
         assert status in expected, f"{path}: expected {code}, got {status}: {body[:200]!r}"
-        assert headers.get("cache-control") == "no-store", headers
+        assert norm_headers.get("cache-control") == "no-store", norm_headers
         return json.loads(body)
 
     def setup(self):

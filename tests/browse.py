@@ -51,7 +51,7 @@ class BrowseHarness(Harness):
         (self.work / "assets" / "logo.bin").write_bytes(self.logo_bytes)
         self.git("add", "src/lib.rs", "src/sub/mod.rs", "assets/logo.bin", cwd=self.work)
         self.git("commit", "-m", "third commit with nested tree and binary", cwd=self.work)
-        self.third = self.git("rev-parse", "HEAD", cwd=self.work)
+        self.third = self.git("rev-parse", "HEAD", cwd=self.work).stdout.decode().strip()
         self.git("push", "origin", "HEAD:refs/heads/main", cwd=self.work, token=self.alice)
 
         # Create feature branch with an extra commit -> self.feature_oid
@@ -59,7 +59,7 @@ class BrowseHarness(Harness):
         (self.work / "feature.txt").write_text("feature work\n")
         self.git("add", "feature.txt", cwd=self.work)
         self.git("commit", "-m", "feature commit", cwd=self.work)
-        self.feature_oid = self.git("rev-parse", "HEAD", cwd=self.work)
+        self.feature_oid = self.git("rev-parse", "HEAD", cwd=self.work).stdout.decode().strip()
         self.git("push", "origin", "HEAD:refs/heads/feature", cwd=self.work, token=self.alice)
 
         # Push lightweight tag v1.0 pointing to self.second
@@ -224,7 +224,7 @@ class BrowseHarness(Harness):
         (self.work / "divergent.txt").write_text("divergent line\n")
         self.git("add", "divergent.txt", cwd=self.work)
         self.git("commit", "-m", "divergent commit", cwd=self.work)
-        self.divergent_oid = self.git("rev-parse", "HEAD", cwd=self.work)
+        self.divergent_oid = self.git("rev-parse", "HEAD", cwd=self.work).stdout.decode().strip()
         self.git("push", "origin", "HEAD:refs/heads/divergent", cwd=self.work, token=self.alice)
 
         cmp_div = self.document(
