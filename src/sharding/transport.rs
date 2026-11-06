@@ -17,6 +17,7 @@ type HmacSha256 = Hmac<Sha256>;
 #[serde(deny_unknown_fields)]
 pub(crate) struct Envelope {
     pub(crate) version: u8,
+    pub(crate) authority_incarnation: Uuid,
     pub(crate) nonce: Uuid,
     pub(crate) expires_unix: i64,
     pub(crate) actor_id: Uuid,
@@ -121,6 +122,8 @@ pub fn route_git_request<'a>(state: &'a Arc<AppState>, request: &Request<Body>)
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, owner, name, if write { Role::Write } else { Role::Read }).await?;
+    let authority_incarnation: Uuid = tx.query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
+        .await.map_err(Error::internal)?.get(0);
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     let repo_generation: i64 = tx.query_one("SELECT storage_generation FROM repositories WHERE id = $1", &[&access.repo_id]).await.map_err(Error::internal)?.get(0);
     let primary = fetch_node(&tx, &route.primary_node_id).await?.ok_or_else(|| conflict("primary shard node missing"))?;
@@ -134,7 +137,7 @@ pub fn route_git_request<'a>(state: &'a Arc<AppState>, request: &Request<Body>)
     auth::finish_tx(tx, &actor, false).await?;
     if selected.target_node_id == local_node { return Ok(None); }
     let env = Envelope {
-        version: 1, nonce: Uuid::new_v4(), expires_unix: models::unix_now() + ENVELOPE_LIFETIME_SECONDS,
+        version: 1, authority_incarnation, nonce: Uuid::new_v4(), expires_unix: models::unix_now() + ENVELOPE_LIFETIME_SECONDS,
         actor_id: actor.id, token_id: actor.token_id, repository_id: access.repo_id,
         target_node_id: selected.target_node_id, route_epoch: selected.route_epoch,
         fencing_token: selected.fencing_token, storage_generation: selected.storage_generation,
@@ -236,6 +239,9 @@ pub async fn authenticate_delegation(state: &Arc<AppState>, headers: &HeaderMap,
     let (owner, name, write) = parse_git(method, uri).ok_or_else(Error::not_found)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    let current_incarnation: Uuid = tx.query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
+        .await.map_err(Error::internal)?.get(0);
+    if env.authority_incarnation != current_incarnation { return Err(Error::unauthorized()); }
     let inserted = tx.execute(
         "INSERT INTO cluster_transport_nonces(nonce, expires_at) VALUES ($1, to_timestamp($2::bigint::double precision)) ON CONFLICT DO NOTHING",
         &[&env.nonce, &env.expires_unix],
@@ -270,4 +276,17 @@ pub async fn authenticate_delegation(state: &Arc<AppState>, headers: &HeaderMap,
     let repo = Repository::from_row(&repo_row);
     auth::finish_tx(tx, &actor, false).await?;
     Ok(Some((actor, repo)))
+}
+
+/// Metadata restore must rotate the authority before any client traffic resumes.
+pub async fn rotate_authority(pool: &deadpool_postgres::Pool) -> anyhow::Result<Uuid> {
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    let incarnation: Uuid = tx.query_one(
+        "UPDATE cluster_authority SET incarnation=gen_random_uuid(), rotated_at=clock_timestamp() WHERE singleton=true RETURNING incarnation",
+        &[],
+    ).await?.get(0);
+    tx.execute("DELETE FROM cluster_transport_nonces", &[]).await?;
+    tx.commit().await?;
+    Ok(incarnation)
 }

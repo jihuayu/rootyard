@@ -1,16 +1,16 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::{fs::File, io::BufReader, sync::Arc};
 use tokio_postgres::NoTls;
+use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
 pub fn pool(url: &str) -> Result<Pool> {
     let mut cfg: tokio_postgres::Config = url.parse()?;
-    if matches!(cfg.get_ssl_mode(), tokio_postgres::config::SslMode::Require) {
-        bail!("PostgreSQL TLS requires a local TLS proxy; no silent downgrade");
-    }
+    ensure_mode(&cfg)?;
     cfg.connect_timeout(std::time::Duration::from_secs(5));
     let options = format!(
         "{} -c statement_timeout=5000 -c lock_timeout=3000 -c timezone=UTC",
@@ -18,18 +18,78 @@ pub fn pool(url: &str) -> Result<Pool> {
     );
     cfg.options(&options);
     cfg.application_name("rootyard");
-    Ok(Pool::builder(Manager::from_config(
-        cfg,
-        NoTls,
-        ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        },
-    ))
+    let options = ManagerConfig { recycling_method: RecyclingMethod::Fast };
+    let manager = if cfg.get_ssl_mode() == tokio_postgres::config::SslMode::Require {
+        Manager::from_config(cfg, tls_connector()?, options)
+    } else {
+        Manager::from_config(cfg, NoTls, options)
+    };
+    Ok(Pool::builder(manager)
     .runtime(deadpool_postgres::Runtime::Tokio1)
     .max_size(16)
     .wait_timeout(Some(std::time::Duration::from_secs(5)))
     .create_timeout(Some(std::time::Duration::from_secs(5)))
     .build()?)
+}
+
+fn ensure_mode(cfg: &tokio_postgres::Config) -> Result<()> {
+    if std::env::var_os("ROOTYARD_PG_CA_PEM").is_some()
+        && cfg.get_ssl_mode() != tokio_postgres::config::SslMode::Require {
+        bail!("ROOTYARD_PG_CA_PEM requires sslmode=require; refusing PostgreSQL TLS downgrade");
+    }
+    Ok(())
+}
+
+fn tls_connector() -> Result<MakeRustlsConnect> {
+    let ca_path = std::env::var("ROOTYARD_PG_CA_PEM")
+        .context("sslmode=require needs ROOTYARD_PG_CA_PEM for certificate and hostname validation")?;
+    let mut reader = BufReader::new(File::open(ca_path).context("PostgreSQL CA file unavailable")?);
+    let mut roots = rustls::RootCertStore::empty();
+    let mut count = 0;
+    for cert in rustls_pemfile::certs(&mut reader) {
+        roots.add(cert.context("invalid PostgreSQL CA certificate")?)
+            .context("invalid PostgreSQL CA certificate")?;
+        count += 1;
+    }
+    ensure!(count > 0, "PostgreSQL CA file contains no certificates");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("PostgreSQL TLS protocol configuration failed")?
+        .with_root_certificates(roots);
+    let client_cert = std::env::var("ROOTYARD_PG_CLIENT_CERT_PEM").ok();
+    let client_key = std::env::var("ROOTYARD_PG_CLIENT_KEY_PEM").ok();
+    let config = match (client_cert, client_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path)?))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            ensure!(!certs.is_empty(), "PostgreSQL client certificate file is empty");
+            let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(key_path)?))?
+                .context("PostgreSQL client private key missing")?;
+            builder.with_client_auth_cert(certs, key).context("invalid PostgreSQL client certificate or key")?
+        }
+        (None, None) => builder.with_no_client_auth(),
+        _ => bail!("PostgreSQL client certificate and key must be configured together"),
+    };
+    Ok(MakeRustlsConnect::new(config))
+}
+
+/// Direct connections (backup, hooks) use the same TLS and hostname policy as the pool.
+pub async fn connect_config(cfg: tokio_postgres::Config) -> Result<tokio_postgres::Client> {
+    ensure_mode(&cfg)?;
+    if cfg.get_ssl_mode() == tokio_postgres::config::SslMode::Require {
+        let (client, connection) = cfg.connect(tls_connector()?).await?;
+        tokio::spawn(async move { let _ = connection.await; });
+        Ok(client)
+    } else {
+        let (client, connection) = cfg.connect(NoTls).await?;
+        tokio::spawn(async move { let _ = connection.await; });
+        Ok(client)
+    }
+}
+
+pub async fn connect_url(url: &str) -> Result<tokio_postgres::Client> {
+    connect_config(url.parse()?).await
 }
 
 /// Post-001 migrations in execution order. Parallel tracks reserve disjoint ranges:
@@ -52,6 +112,7 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (82, include_str!("../migrations/082_cluster_transport_nonces.sql")),
     (83, include_str!("../migrations/083_shard_replication.sql")),
     (84, include_str!("../migrations/084_transition_volume_binding.sql")),
+    (85, include_str!("../migrations/085_cluster_authority.sql")),
     (90, include_str!("../migrations/090_workspaces.sql")),
     (91, include_str!("../migrations/091_workspace_capture.sql")),
     (92, include_str!("../migrations/092_sandbox_jobs.sql")),
@@ -65,7 +126,7 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (125, include_str!("../migrations/125_web_sessions.sql")),
 ];
 
-pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 80, 81, 82, 83, 84, 90, 91, 92, 93, 105, 106, 107, 110, 120, 121, 125];
+pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 80, 81, 82, 83, 84, 85, 90, 91, 92, 93, 105, 106, 107, 110, 120, 121, 125];
 
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;

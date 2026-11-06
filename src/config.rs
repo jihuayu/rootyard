@@ -34,12 +34,7 @@ impl Config {
             .canonicalize()
             .context("ROOTYARD_GIT must point to Git")?;
         let database_url = env::var("DATABASE_URL").context("DATABASE_URL is required")?;
-        // TLS termination for PG belongs to a private local proxy in phase one.
-        // Never silently downgrade a request for TLS.
-        let pg: tokio_postgres::Config = database_url.parse().context("invalid DATABASE_URL")?;
-        if matches!(pg.get_ssl_mode(), tokio_postgres::config::SslMode::Require) {
-            bail!("PostgreSQL TLS is not built in: use a local TLS proxy, not sslmode=require");
-        }
+        let _pg: tokio_postgres::Config = database_url.parse().context("invalid DATABASE_URL")?;
         Ok(Self {
             metrics_bind: env::var("ROOTYARD_METRICS_BIND")
                 .ok()
