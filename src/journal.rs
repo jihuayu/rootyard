@@ -376,7 +376,7 @@ fn valid_ref(s: &str) -> bool {
             .any(|b| b <= 32 || b == 127 || b"~^:?*[\\".contains(&b))
 }
 fn valid_oid(s: &str) -> bool {
-    s.len() == 40
+    matches!(s.len(), 40 | 64)
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
@@ -395,6 +395,7 @@ fn parse(input: &[u8]) -> Result<Vec<RefChange>> {
             fields.len() == 3
                 && valid_oid(fields[0])
                 && valid_oid(fields[1])
+                && fields[0].len() == fields[1].len()
                 && valid_ref(fields[2]),
             "unsupported reference transaction payload"
         );
@@ -410,7 +411,7 @@ fn valid_changes(changes: &[RefChange]) -> bool {
     changes.len() <= MAX_REFS
         && changes
             .iter()
-            .all(|c| valid_ref(&c.ref_name) && valid_oid(&c.old_oid) && valid_oid(&c.new_oid))
+            .all(|c| valid_ref(&c.ref_name) && valid_oid(&c.old_oid) && valid_oid(&c.new_oid) && c.old_oid.len() == c.new_oid.len())
 }
 
 /// Raw diagnostic evidence only. Native transactions can nest and their
@@ -657,6 +658,28 @@ fn record_request(op: &Operation, input: &[u8]) -> Result<()> {
     );
     atomic(&op.path.join("pre-receive.json"), &bytes, false)
 }
+
+/// Durable request evidence for a server-side CAS transaction. This must be
+/// written before spawning Git so a missing child acknowledgement is recoverable.
+pub fn record_ref_transaction_intent(op: &Operation, changes: &[RefChange]) -> Result<()> {
+    validate_request(changes)?;
+    let mut input = Vec::new();
+    for change in changes {
+        input.extend_from_slice(format!("{} {} {}\n", change.old_oid, change.new_oid, change.ref_name).as_bytes());
+    }
+    record_request(op, &input)
+}
+
+/// Record a successful native acknowledgement before PostgreSQL settlement.
+pub fn record_ref_transaction_receipt(op: &Operation, changes: &[RefChange]) -> Result<()> {
+    validate_request(changes)?;
+    let mut input = Vec::new();
+    for change in changes {
+        input.extend_from_slice(format!("{} {} {}\n", change.old_oid, change.new_oid, change.ref_name).as_bytes());
+    }
+    record(op, HookPhase::Committed, &input)?;
+    record_receipt(op, &input)
+}
 /// A failure rejects the whole push before any ref transaction. It deliberately
 /// does not mark corruption: there is no ambiguous publication at this stage.
 pub fn run_pre_receive() -> Result<()> {
@@ -668,6 +691,7 @@ pub fn run_pre_receive() -> Result<()> {
     );
     let changes = parse(&input)?;
     validate_namespace(&op, &changes)?;
+    crate::browse::policy::validate_hook(&op, &changes)?;
     record_request(&op, &input)
 }
 /// A grant authorizes exactly one absent-to-target update, not an inheritable bypass.
@@ -739,6 +763,21 @@ pub fn run_post_receive() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ref_transaction_intent_precedes_receipt_and_accepts_sha256() {
+        let (_root, op) = setup();
+        let changes = vec![RefChange {
+            ref_name: "refs/heads/main".into(),
+            old_oid: "0".repeat(64),
+            new_oid: "a".repeat(64),
+        }];
+        record_ref_transaction_intent(&op, &changes).unwrap();
+        assert_eq!(requests(&op).unwrap(), Some(changes.clone()));
+        assert_eq!(receipts(&op).unwrap(), None);
+        record_ref_transaction_receipt(&op, &changes).unwrap();
+        assert_eq!(receipts(&op).unwrap(), Some(changes));
+        assert_eq!(events(&op).unwrap()[0].phase, HookPhase::Committed);
+    }
     fn setup() -> (tempfile::TempDir, Operation) {
         let root = tempfile::tempdir().unwrap();
         let op = begin(

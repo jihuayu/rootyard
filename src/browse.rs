@@ -3,6 +3,7 @@ pub mod git_read;
 pub mod handlers;
 pub mod models;
 pub mod object_format;
+pub mod policy;
 pub mod transactions;
 
 use crate::AppState;

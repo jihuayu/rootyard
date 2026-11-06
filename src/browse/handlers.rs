@@ -58,14 +58,8 @@ pub async fn list_refs(
         .get(0);
 
     let _permit = acquire_git_slot(&state)?;
-    let (head, all_refs) = git_read::read_head_and_refs(&state, repo_id).await?;
-
-    let filtered: Vec<_> = all_refs
-        .into_iter()
-        .filter(|r| prefix.is_none_or(|p| r.name.starts_with(p)))
-        .filter(|r| after.is_none_or(|cursor| r.name.as_str() > cursor))
-        .take(limit + 1)
-        .collect();
+    let head = git_read::read_head(&state, repo_id).await?;
+    let filtered = git_read::page_refs(&state, repo_id, prefix, after, limit).await?;
     let more = filtered.len() > limit;
     let items: Vec<_> = filtered.into_iter().take(limit).collect();
     let next_after = if more {

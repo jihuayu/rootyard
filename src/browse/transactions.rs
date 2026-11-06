@@ -120,7 +120,7 @@ async fn execute_ref_transaction_inner(
     let idem_key = auth::idempotency_key(&headers)?.map(str::to_owned);
     let normalized_updates = input.normalize()?;
 
-    if owner != actor.username || !db::valid_name(&owner) || !db::valid_name(&name) {
+    if !db::valid_name(&owner) || !db::valid_name(&name) {
         return Err(Error::not_found());
     }
     let repo_row = state
@@ -129,8 +129,8 @@ async fn execute_ref_transaction_inner(
         .await
         .map_err(Error::internal)?
         .query_opt(
-            &format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT),
-            &[&actor.id, &name],
+            &format!("{} WHERE u.username=$1 AND r.name=$2", db::REPO_SELECT),
+            &[&owner, &name],
         )
         .await
         .map_err(Error::internal)?
@@ -251,6 +251,11 @@ async fn execute_ref_transaction_inner(
         }
     }
 
+    let requested: Vec<journal::RefChange> = normalized_updates.iter().map(|u| journal::RefChange {
+        ref_name: u.ref_name.clone(), old_oid: u.old_oid.clone(), new_oid: u.new_oid.clone(),
+    }).collect();
+    crate::browse::policy::validate(&*tx, repo_id, &requested, &state.config.git, &repo_path, state.config.git_timeout).await?;
+
     auth::verify_token(&tx, &actor, true).await?;
 
     let journal_root = state.storage.root.join("journal");
@@ -273,6 +278,17 @@ async fn execute_ref_transaction_inner(
         .seek(SeekFrom::Start(0))
         .map_err(Error::internal)?;
 
+    let operation = journal::begin(
+        &state.storage.root,
+        repo_id,
+        actor.id,
+        actor.username.clone(),
+        actor.token_id,
+        current_generation,
+    )
+    .map_err(Error::internal)?;
+    journal::record_ref_transaction_intent(&operation, &requested).map_err(Error::internal)?;
+
     let mut cmd = git_read::git_cmd(&state, repo_id)?;
     cmd.args(["update-ref", "--stdin", "-z", "--no-deref"]);
     if let Err(err) = crate::git_http::collect_git_output_input(
@@ -283,24 +299,37 @@ async fn execute_ref_transaction_inner(
     )
     .await
     {
-        if err.to_string().contains("timed out") {
-            return Err(Error::timeout());
+        // Git can report a definite CAS conflict or commit all refs and lose
+        // its acknowledgement. Observe the refs after the child is reaped,
+        // while the repository lock still excludes another writer.
+        let mut all_old = true;
+        let mut all_new = true;
+        for change in &requested {
+            let observed = match git_read::run_git(&state, repo_id,
+                &["show-ref", "--verify", "--hash", &change.ref_name], 128).await {
+                Ok(raw) => Some(String::from_utf8_lossy(&raw).trim().to_owned()),
+                Err(e) if e.0 == StatusCode::NOT_FOUND => Some(zero_oid.to_owned()),
+                Err(_) => None,
+            };
+            all_old &= observed.as_deref() == Some(change.old_oid.as_str());
+            all_new &= observed.as_deref() == Some(change.new_oid.as_str());
         }
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "reference transaction conflict",
-        ));
+        if all_old {
+            journal::finish(&operation).map_err(Error::internal)?;
+            tx.rollback().await.map_err(Error::internal)?;
+            reliability::complete(&state, Some(operation)).await.map_err(Error::internal)?;
+            return Err(Error(StatusCode::CONFLICT, "reference transaction conflict"));
+        }
+        if !all_new {
+            journal::mark_interrupted(&operation).map_err(Error::internal)?;
+            journal::finish(&operation).map_err(Error::internal)?;
+            tx.rollback().await.map_err(Error::internal)?;
+            let _ = reliability::reconcile(&state, repo_id, current_generation, false).await;
+            if err.to_string().contains("timed out") { return Err(Error::timeout()); }
+            return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "reference transaction outcome requires recovery"));
+        }
     }
-
-    let operation = journal::begin(
-        &state.storage.root,
-        repo_id,
-        actor.id,
-        actor.username.clone(),
-        actor.token_id,
-        current_generation,
-    )
-    .map_err(Error::internal)?;
+    journal::record_ref_transaction_receipt(&operation, &requested).map_err(Error::internal)?;
     journal::finish(&operation).map_err(Error::internal)?;
 
     let event_inputs: Vec<events::RefEventInput> = normalized_updates
