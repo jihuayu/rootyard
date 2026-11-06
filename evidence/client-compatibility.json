@@ -1,0 +1,316 @@
+{
+  "passed": true,
+  "backend": "native",
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "seconds": 0.7475,
+      "detail": null
+    },
+    {
+      "name": "api",
+      "status": "passed",
+      "seconds": 0.1585,
+      "detail": null
+    },
+    {
+      "name": "roundtrip",
+      "status": "passed",
+      "seconds": 1.315,
+      "detail": null
+    },
+    {
+      "name": "independent_roundtrips",
+      "status": "passed",
+      "seconds": 14.3788,
+      "detail": {
+        "jgit": {
+          "head": "a44559406d62cf06f4b432e8e0a04e1d3a512e16",
+          "fsck": 0,
+          "status": "",
+          "payload_sha256": "38dc14a5af1c723fa92150050736f5b614d3360d526ec89c4f0c87931039ddcc",
+          "pushed_oid": "f53e53d410999f3dd63836b187989eb4e71556fe",
+          "nonmember_rejected": true
+        },
+        "libgit2": {
+          "head": "a44559406d62cf06f4b432e8e0a04e1d3a512e16",
+          "fsck": 0,
+          "status": "",
+          "payload_sha256": "38dc14a5af1c723fa92150050736f5b614d3360d526ec89c4f0c87931039ddcc",
+          "pushed_oid": "76eca6a1ec1d1b1509ab35b0e10717d3ccc6dc79",
+          "nonmember_rejected": true
+        }
+      }
+    },
+    {
+      "name": "stock_protocol_states",
+      "status": "passed",
+      "seconds": 1.9477,
+      "detail": {
+        "protocols": {
+          "0": {
+            "head": "a44559406d62cf06f4b432e8e0a04e1d3a512e16",
+            "fsck": 0,
+            "status": "",
+            "payload_sha256": "38dc14a5af1c723fa92150050736f5b614d3360d526ec89c4f0c87931039ddcc"
+          },
+          "1": {
+            "head": "a44559406d62cf06f4b432e8e0a04e1d3a512e16",
+            "fsck": 0,
+            "status": "",
+            "payload_sha256": "38dc14a5af1c723fa92150050736f5b614d3360d526ec89c4f0c87931039ddcc"
+          },
+          "2": {
+            "head": "a44559406d62cf06f4b432e8e0a04e1d3a512e16",
+            "fsck": 0,
+            "status": "",
+            "payload_sha256": "38dc14a5af1c723fa92150050736f5b614d3360d526ec89c4f0c87931039ddcc"
+          }
+        },
+        "atomic_rejected_without_partial_refs": true,
+        "annotated_tag": true,
+        "detached_dirty_index_preserved": true
+      }
+    },
+    {
+      "name": "filter_and_symbolic_refs",
+      "status": "passed",
+      "seconds": 0.3711,
+      "detail": {
+        "symbolic_head": "ref: refs/heads/main\tHEAD\na44559406d62cf06f4b432e8e0a04e1d3a512e16\tHEAD\n",
+        "partial_clone": "unsupported",
+        "filter_advertised": false,
+        "client_fallback": "Cloning into '/tmp/rootyard-e2e-0ffvto5q/filter-unsupported'...\nwarning: filtering not recognized by server, ignoring\n",
+        "full_blob_sha256": "38dc14a5af1c723fa92150050736f5b614d3360d526ec89c4f0c87931039ddcc",
+        "ssh": "unsupported: no SSH endpoint is provided"
+      }
+    },
+    {
+      "name": "sha256_clients",
+      "status": "passed",
+      "seconds": 2.6229,
+      "detail": {
+        "stock_git": {
+          "state": "passed",
+          "head": "e259c08fe46942b65b2b318b52afedba19d8ca3b2546e7ce33a383d08163571b",
+          "fsck": 0,
+          "content_sha256": "bb95a8c9a11fa0d731f0c6b50865ffbe3202b6603eea73f505a9f440f3d980de"
+        },
+        "independent_clients": {
+          "jgit": {
+            "state": "unsupported",
+            "exit_code": 1,
+            "reason": "Exception in thread \"main\" org.eclipse.jgit.api.errors.TransportException: Premature EOF\n\tat org.eclipse.jgit.api.FetchCommand.call(FetchCommand.java:249)\n\tat org.eclipse.jgit.api.CloneCommand.fetch(CloneCommand.java:322)\n\tat org.eclipse.jgit.api.CloneCommand.call(CloneCommand.java:191)\n\tat JGitProbe.main(JGitProbe.java:16)\nCaused by: org.eclipse.jgit.errors.TransportException: Premature EOF\n\tat org.eclipse.jgit.transport.BasePackConnection.lsRefs(BasePackConnection.java:313)\n\tat org.eclipse.jgit.transport.TransportHttp$SmartHttpFetchConnection.<init>(TransportHttp.java:1552)\n\tat org.eclipse.jgit.transport.TransportHttp.getConnection(TransportHttp.java:368)\n\tat org.eclipse.jgit.transport.TransportHttp.openFetch(TransportHttp.java:468)\n\tat org.eclipse.jgit.transport.FetchProcess.executeImp(FetchProcess.java:171)\n\tat org.eclipse.jgit.transport.FetchProcess.execute(FetchProcess.java:111)\n\tat org.eclipse.jgit.transport.Transport.fetch(Transport.java:1459)\n\tat org.eclipse.jgit.api.FetchCommand.call(FetchCommand.java:238)\n\tat org.eclipse.jgit.api.CloneCommand.fetch(CloneCommand.java:322)\n\tat org.eclipse.jgit.api.CloneCommand.call(CloneCommand.java:191)\n\tat JGitProbe.main(JGitProbe.java:16)\n\tat java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)\n\tat java.base/java.lang.reflect.Method.invoke(Method.java:580)\n\tat jdk.compiler/com.sun.tools.javac.launcher.Main.execute(Main.java:484)\n\tat jdk.compiler/com.sun.tools.javac.launcher.Main.run(Main.java:208)\n\tat jdk.compiler/com.sun.tools.javac.launcher.Main.main(Main.java:135)\nCaused by: java.io.IOException: Premature EOF\n\tat java.base/sun.net.www.http.ChunkedInputStream.readAheadBlocking(ChunkedInputStream.java:567)\n\tat java.base/sun.net.www.http.ChunkedInputStream.readAhead(ChunkedInputStream.java:611)\n\tat java.base/sun.net.www.http.ChunkedInputStream.read(ChunkedInputStream.java:705)\n\tat java.base/java.io.FilterInputStream.read(FilterInputStream.java:119)\n\tat java.base/sun.net.www.protocol.http.HttpURLConnection$HttpInputStream.read(HttpURLConnection.java:3733)\n\tat org.eclipse.jgit.util.io.UnionInputStream.read(UnionInputStream.java:114)\n\tat java.base/java.io.InputStream.readNBytes(InputStream.java:509)\n\tat org.eclipse.jgit.util.IO.readFully(IO.java:142)\n\tat org.eclipse.jgit.transport.PacketLineIn.readLength(PacketLineIn.java:305)\n\tat org.eclipse.jgit.transport.PacketLineIn.readString(PacketLineIn.java:169)\n\tat org.eclipse.jgit.transport.BasePackConnection.readLine(BasePackConnection.java:197)\n\tat org.eclipse.jgit.transport.BasePackConnection.lsRefsImpl(BasePackConnection.java:336)\n\tat org.eclipse.jgit.transport.BasePackConnection.lsRefs(BasePackConnection.java:307)\n\t... 15 more\n"
+          },
+          "libgit2": {
+            "state": "unsupported",
+            "exit_code": 1,
+            "reason": "Traceback (most recent call last):\n  File \"/workspace/rootyard/tests/clients/libgit2_probe.py\", line 18, in <module>\n    repo = pygit2.clone_repository(remote, directory, callbacks=callbacks)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/.rootyard-tools/client-venv/lib/python3.12/site-packages/pygit2/__init__.py\", line 542, in clone_repository\n    payload.check_error(err)\n  File \"/workspace/.rootyard-tools/client-venv/lib/python3.12/site-packages/pygit2/callbacks.py\", line 111, in check_error\n    check_error(error_code)\n  File \"/workspace/.rootyard-tools/client-venv/lib/python3.12/site-packages/pygit2/errors.py\", line 67, in check_error\n    raise GitError(message)\n_pygit2.GitError: unknown remote object format 'sha256'\n"
+          }
+        }
+      }
+    },
+    {
+      "name": "thin_delta_pack",
+      "status": "passed",
+      "seconds": 1.2259,
+      "detail": {
+        "head": "b9c83deeb55eeae6f9a8a0ffa9edfe2638af99e7",
+        "local_verified_delta_objects": 47,
+        "push_thin_requested": true,
+        "received_content_sha256": {
+          "delta-0.bin": "b175dc95fb5431a43c60301489751a6a20684a6a27e948a5a2d99819256e4298",
+          "delta-1.bin": "18689b7e4288d96b8854955ade6dbb0bcd33cf812d2b64818284b02c32a88cfe",
+          "delta-2.bin": "8e9e4b04f8cad0ec4c6c4765af91bdbeaace8c169a973e1a49582997ad52a1ce",
+          "delta-3.bin": "27865455198ae8ecc4ecdb768b79d133323c41e998cc8f847c9a74e28a87b797",
+          "delta-4.bin": "b5a22d39b83b789736f33f4c0f5da6eb0fd9e3a14b247e7c603948b099bfa704",
+          "delta-5.bin": "ae37aad6ed7cb46d8f27517a59740c5b4b8c72af65ef852a26865588f79e23c6",
+          "delta-6.bin": "da1be5b1e0bc8ce1776585f9acc0b91259172c00d78acb7e9cb65f347007eb26",
+          "delta-7.bin": "10685e916558ce275e95d2af69d50baaa33ba78eb4819287e24d0e04f7221cde",
+          "delta-8.bin": "b8894e98b2f5ce1c0260bc5fbe8c07468d1c8e90c9f31df2a82e20a86c52476f",
+          "delta-9.bin": "01114f03d196184561ab3f7afe0da055d2c120f0cd2dabf952cb68a73db16f44",
+          "delta-10.bin": "0856716873bb75ee6f01fcd25d62408a6f43ec88ba4f4b5e563fc16a04def861",
+          "delta-11.bin": "b8208255bcb9ef4e637f103ab3f3158f8ea161c638c4804aeb3fcb38c6c3be0e",
+          "delta-12.bin": "ef959584e465400ba138a3df62fc598a19edbc3ee5137f36f036ce398d148806",
+          "delta-13.bin": "d268ec41723eb9cfbd371269219a746f5afe3369178d0744fbcfb61e89a3f65a",
+          "delta-14.bin": "ecf345798729e2e27d21b7caf437c5164654bb2d96fc92a91ebf11692a11831e",
+          "delta-15.bin": "8aaf81c33f594a92e95dfbf401e1726854d3b2835471719681650da1157ad82b",
+          "delta-16.bin": "b1e289baa9880f130796af80df14f26b591d72011e0297c1bc1744ef253c9347",
+          "delta-17.bin": "df7cf0bc58f02e22cae92246acddc30d10d7920616ce40616719d4c8536c0a30",
+          "delta-18.bin": "228e5896edbd5efca5034e97dcc4573bd19a53e0999d795a2e702fbc08b6850a",
+          "delta-19.bin": "632a35829f6ea2637f1866214059e24672f8373adb1db773dac20385150382fc",
+          "delta-20.bin": "85bed7b49f1901757d58be6a98ec64dd85466b2d5c91356ef920d41074163b86",
+          "delta-21.bin": "ef41ebd3df0beff140003d51dff417947e17adedf9b8e1c03b7e22da983341a1",
+          "delta-22.bin": "568c200e33dbed039681a734c796b8149ce60c836a639f75b58036e53009db53",
+          "delta-23.bin": "2dccde5800debb7da9b3bff7e4cd6123b05f9317994b921cd40957511f1ffe09"
+        },
+        "fsck": 0,
+        "packet_transcript": "06:18:06.940384 pkt-line.c:85           packet:          git< # service=git-receive-pack\n06:18:06.940441 pkt-line.c:85           packet:          git< 0000\n06:18:06.940446 pkt-line.c:85           packet:          git< 5ac411c1689e7c0394d57e97d2affd9a94212729 refs/heads/delta-test\\0report-status report-status-v2 delete-refs side-band-64k quiet atomic ofs-delta object-format=sha1 agent=git/2.52.0-Linux\n06:18:06.940456 pkt-line.c:85           packet:          git< 965e9f82cd511f7a548122e573c35bec8dc2a406 refs/heads/fetch-jgit\n06:18:06.940457 pkt-line.c:85           packet:          git< fc88e262fa87b26e5a88997daedc4f3e63bc2729 refs/heads/fetch-libgit2\n06:18:06.940459 pkt-line.c:85           packet:          git< f53e53d410999f3dd63836b187989eb4e71556fe refs/heads/jgit\n06:18:06.940460 pkt-line.c:85           packet:          git< 76eca6a1ec1d1b1509ab35b0e10717d3ccc6dc79 refs/heads/libgit2\n06:18:06.940461 pkt-line.c:85           packet:          git< a44559406d62cf06f4b432e8e0a04e1d3a512e16 refs/heads/main\n06:18:06.940462 pkt-line.c:85           packet:          git< 533375957841863c36cb5d75be51e91c6c69e387 refs/tags/compat-tag\n06:18:06.940464 pkt-line.c:85           packet:          git< 0000\n06:18:06.940851 pkt-line.c:85           packet:          git> HEAD:refs/heads/delta-test\n06:18:06.940855 pkt-line.c:85           packet:          git> 0000\n06:18:06.942456 pkt-line.c:85           packet:          git< HEAD:refs/heads/delta-test\n06:18:06.942487 pkt-line.c:85           packet:          git< 0000\n06:18:06.942491 pkt-line.c:85           packet:          git< 5ac411c1689e7c0394d57e97d2affd9a94212729 refs/heads/delta-test\\0report-status report-status-v2 delete-refs side-band-64k quiet atomic ofs-delta object-format=sha1 agent=git/2.52.0-Linux\n06:18:06.942500 pkt-line.c:85           packet:          git< 965e9f82cd511f7a548122e573c35bec8dc2a406 refs/heads/fetch-jgit\n06:18:06.942502 pkt-line.c:85           packet:          git< fc88e262fa87b26e5a88997daedc4f3e63bc2729 refs/heads/fetch-libgit2\n06:18:06.942504 pkt-line.c:85           packet:          git< f53e53d410999f3dd63836b187989eb4e71556fe refs/heads/jgit\n06:18:06.942506 pkt-line.c:85           packet:          git< 76eca6a1ec1d1b1509ab35b0e10717d3ccc6dc79 refs/heads/libgit2\n06:18:06.942507 pkt-line.c:85           packet:          git< a44559406d62cf06f4b432e8e0a04e1d3a512e16 refs/heads/main\n06:18:06.942509 pkt-line.c:85           packet:          git< 533375957841863c36cb5d75be51e91c6c69e387 refs/tags/compat-tag\n06:18:06.942510 pkt-line.c:85           packet:          git< 0000\n06:18:06.942823 pkt-line.c:85           packet:          git> 5ac411c1689e7c0394d57e97d2affd9a94212729 b9c83deeb55eeae6f9a8a0ffa9edfe2638af99e7 refs/heads/delta-test\\0 report-status-v2 side-band-64k quiet object-format=sha1 agent=git/2.52.0-Linux\n06:18:06.942826 pkt-line.c:85           packet:          git> 0000\n06:18:06.942860 pkt-line.c:85           packet:          git< 00bb5ac411c1689e7c0394d57e97d2affd9a94212729 b9c83deeb55eeae6f9a8a0ffa9edfe2638af99e7 refs/heads/delta-test\\0 report-status-v2 side-band-64k quiet object-format=sha1 agent=git/2.52.0-Linux0000\n06:18:06.945401 pkt-line.c:85           packet:          git< PACK ...\n06:18:06.945596 pkt-line.c:85           packet:          git> 0000\n06:18:07.098541 pkt-line.c:85           packet:     sideband< \\1000eunpack ok001dok refs/heads/delta-test0000\n06:18:07.098593 pkt-line.c:85           packet:          git< unpack ok\n06:18:07.098616 pkt-line.c:85           packet:          git< ok refs/heads/delta-test\n06:18:07.098622 pkt-line.c:85           packet:          git< 0000\n06:18:07.098624 pkt-line.c:85           packet:          git> 0000\n06:18:07.125264 pkt-line.c:85           packet:     sideband< 0000\n"
+      }
+    },
+    {
+      "name": "stock_lfs",
+      "status": "passed",
+      "seconds": 1.5248,
+      "detail": {
+        "version": "git-lfs/3.6.1 (GitHub; linux amd64; go 1.24.4)",
+        "payload_sha256": "48b2f7d6513ab27bf1a001ea3247f7fd124ce2bcee4cf7c125e9d6bd22bad634",
+        "stock_git_fsck": 0,
+        "stock_lfs_fsck": 0,
+        "lock_unlock": true
+      }
+    }
+  ],
+  "versions": {
+    "build": {
+      "attested": true,
+      "version": 1,
+      "binary_sha256": "96d76361ac34af39a9abaa550e2dccb5bc5474c327b6b7fdb97bd0bced4e3916",
+      "source_inputs_sha256": "452eb0cb1fea646d22650a7c7e3a5506cd72a7359d14907f743f5c7ce95accd6",
+      "workspace_commit": "6c30bc33b81e30789c6fed45bb035a68aa70021f",
+      "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--bin",
+        "rootyard"
+      ],
+      "unstripped_binary_sha256": "5536ebd867a29419b30c2556e1dbde6420c0bdf6bd0ff72c4fef92736a811bd8",
+      "transformation": "strip --strip-debug"
+    },
+    "git": "git version 2.52.0",
+    "workspace_commit": "6c30bc33b81e30789c6fed45bb035a68aa70021f",
+    "libgit2": "1.19.0 1.9.1",
+    "jgit_jars": {
+      "jetty-ee11-servlet-12.1.12.jar": "af76ee845345f184d96d8f6c926e64f8bda4cf858013598d392ad604d37e6bac",
+      "org.eclipse.jgit-7.8.1.202611041320-r.jar": "acca09a77e74440fd24af72c8af4c496e42650d8092a4691a2935d9ce21d05d7",
+      "org.eclipse.jgit.ssh.jsch-7.8.1.202611041320-r.jar": "4f89db74e4b9b1eb74b9a03ccf740f5b2f2ee29bde8826c7f8eaba309b574f8c",
+      "sshd-osgi-2.19.0.jar": "0b6b9371c6a97430390b84c23c58f4470927a747e74704a0ca7d19a09a66fe37",
+      "commons-logging-1.4.0.jar": "d175dbd751dd782a63bde28c7a039520e971f25e84b79c19b8435edc3603e0dc",
+      "slf4j-simple-2.0.18.jar": "8268bd018a5709b07209e0d8ca6221a37584ba1bc12ba985b8335a82c648bdd0",
+      "spring-boot-jarmode-tools-3.5.10.jar": "defcc09cac4988fd164012369911208b0dff243d8662cf17fec40707eb73427f",
+      "xz-1.12.jar": "3e158a87bd73d8afb4b6e8239c013b7d049c48563f45860ce99cd2e448cf4a6b",
+      "bcpg-jdk18on-1.85.jar": "39426367dc247dfaae9b1253457a39298b6b9a6c28a39b908bca829e315323dd",
+      "org.eclipse.jgit.http.apache-7.8.1.202611041320-r.jar": "ed1ebf69955d715911c3caf1ddb1e8d2798b1fe98111e358338de358b6bf8284",
+      "jetty-http-12.1.12.jar": "5476e16ef7e28883dba3669ee06491021e4a9aeba9a76f901a3f5c2bb5252a3e",
+      "bcpkix-jdk18on-1.85.jar": "c9f82b2d4e99c4bbdfccf684e52cc06ea06a0b567bfd0d08f9c5a3f417055996",
+      "httpcore-4.4.16.jar": "6c9b3dd142a09dc468e23ad39aad6f75a0f2b85125104469f026e52a474e464f",
+      "args4j-2.37.jar": "5a13b0f7ff519183e55b8f453b8faaa23b92ccf0443f1fac515fedf2246bdc18",
+      "jetty-io-12.1.12.jar": "a809a6a534adccfaa08bca94aa54328e3ac858973ccddbda770f7e9e0f5099fc",
+      "bcprov-jdk18on-1.85.2.jar": "986b0fb92ec10e0c66b43e036ce0077e6150cfaecd1db9fb92b56672e157afe5",
+      "error_prone_annotations-2.48.0.jar": "b49c5c958316ed67a09c699dda9aa749caf434d51d863dea599ef36a49b9c855",
+      "jsch-0.1.55.jar": "d492b15a6d2ea3f1cc39c422c953c40c12289073dbe8360d98c0f6f9ec74fc44",
+      "org.eclipse.jgit.archive-7.8.1.202611041320-r.jar": "f1b5a9b6d70769e51c66e3d8ef95e5104fef49254069f6b0a4627a0cf2a5b19b",
+      "commons-lang3-3.18.0.jar": "4eeeae8d20c078abb64b015ec158add383ac581571cddc45c68f0c9ae0230720",
+      "commons-codec-1.22.1.jar": "78a5d732fbd715e2d10bd7150d2f8030bae57267f8aacc5c88f642cb6c2e5d3f",
+      "org.eclipse.jgit.ssh.apache-7.8.1.202611041320-r.jar": "41c3c3e9a63016fb87e657b21c5077aca71e2d08a14f8e87491b370a0b9204b8",
+      "jetty-server-12.1.12.jar": "9ba04bb8d011444a10873a51b1cb8297c04f70db55c8a8d9efcc3a9b97896787",
+      "jna-5.19.1.jar": "4fb141dd8ef6b0585ffceea4bc49602fbc6312fa977e2c488794ea3e6aafecae",
+      "slf4j-api-2.0.18.jar": "44508fd1576500688c790b190acdd16fec4f8c79a3e0b900afd70503cf055f55",
+      "jetty-util-12.1.12.jar": "f6fbfa61cfcca032ff82ad8ff3b66a14374047f15486521dbc89a6c0df19ccf2",
+      "jzlib-1.1.3.jar": "89b1360f407381bf61fde411019d8cbd009ebb10cff715f3669017a031027560",
+      "jakarta.servlet-api-6.1.0.jar": "8a31f465f3593bf2351531a5c952014eb839da96a605b5825b93dd54714c48c4",
+      "org.eclipse.jgit.gpg.bc-7.8.1.202611041320-r.jar": "6ece9cef96892d5f6d1654650f2cb101d8bd71370405f3c158f44978dbae9470",
+      "httpclient-4.5.14.jar": "c8bc7e1c51a6d4ce72f40d2ebbabf1c4b68bfe76e732104b04381b493478e9d6",
+      "org.eclipse.jgit.lfs.server-7.8.1.202611041320-r.jar": "6689b90a8e3c03b3e4c915f644aca2b5c54d58b775f5c88b0ddf7ceaef69ca3d",
+      "bcutil-jdk18on-1.85.jar": "590f55ed5d68529239898a4a5c4f730b6e37f45d1cfa3fbe51f8485abe32c42d",
+      "commons-compress-1.28.0.jar": "e1522945218456f3649a39bc4afd70ce4bd466221519dba7d378f2141a4642ca",
+      "org.osgi.core-6.0.0.jar": "1c1bb435eb34cbf1f743653da38f604d45d53fbc95979053768cd3fc293cb931",
+      "jetty-security-12.1.12.jar": "fcc0206c1ac66b632ef29a59ccf76c3f3737a62ef54694b1d111eeb2e6efe804",
+      "org.eclipse.jgit.lfs-7.8.1.202611041320-r.jar": "968c524e4ea46292f690e4fa74bebc6fe73c6f66d51aa52726d3163e434efa53",
+      "jcl-over-slf4j-2.0.18.jar": "ec5c36d57d2dbe100f84878f944575cb7871da32c7a115b8d7e0721277045d67",
+      "commons-io-2.20.0.jar": "df90bba0fe3cb586b7f164e78fe8f8f4da3f2dd5c27fa645f888100ccc25dd72",
+      "JavaEWAH-1.2.3.jar": "d65226949713c4c61a784f41c51167e7b0316f93764398ebba9e4336b3d954c2",
+      "gson-2.14.0.jar": "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
+      "org.eclipse.jgit.ui-7.8.1.202611041320-r.jar": "9db3ad7656c5f3b06eb49203cd5e124ae506155cb8c1d607773f861c8c07b63b",
+      "jetty-session-12.1.12.jar": "73aea4cdd91f2027da1a09cd5953b661625017971d53d8e1ff342f8547752b06",
+      "sshd-sftp-2.19.0.jar": "a3ad30d2feba9fad589c7ad9117fcd9d332823697d59eb424fe2902f4d805575",
+      "org.eclipse.jgit.ssh.apache.agent-7.8.1.202611041320-r.jar": "5c0cc01d6e132688f601594245097e4009b2b5407b91eb95d6beb731da6fa315",
+      "jna-platform-5.19.1.jar": "3b3864f5b449e9c3c24b16861524b622b086563f44e0cd8384c8efc5a6052f82"
+    },
+    "postgres": "PostgreSQL 17.11 (Debian 17.11-0+deb13u1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit"
+  },
+  "binary_sha256": "96d76361ac34af39a9abaa550e2dccb5bc5474c327b6b7fdb97bd0bced4e3916",
+  "transcripts": [
+    {
+      "client": "jgit",
+      "operation": "clone",
+      "exit_code": 0,
+      "stdout": "a44559406d62cf06f4b432e8e0a04e1d3a512e16\n",
+      "stderr": ""
+    },
+    {
+      "client": "jgit",
+      "operation": "push",
+      "exit_code": 0,
+      "stdout": "f53e53d410999f3dd63836b187989eb4e71556fe\n",
+      "stderr": ""
+    },
+    {
+      "client": "jgit",
+      "operation": "fetch",
+      "exit_code": 0,
+      "stdout": "f53e53d410999f3dd63836b187989eb4e71556fe\n",
+      "stderr": ""
+    },
+    {
+      "client": "jgit",
+      "operation": "clone",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Exception in thread \"main\" org.eclipse.jgit.api.errors.InvalidRemoteException: Invalid remote: origin\n\tat org.eclipse.jgit.api.FetchCommand.call(FetchCommand.java:246)\n\tat org.eclipse.jgit.api.CloneCommand.fetch(CloneCommand.java:322)\n\tat org.eclipse.jgit.api.CloneCommand.call(CloneCommand.java:191)\n\tat JGitProbe.main(JGitProbe.java:16)\nCaused by: org.eclipse.jgit.errors.NoRemoteRepositoryException: http://127.0.0.1:58117/git/alice/demo.git: http://127.0.0.1:58117/git/alice/demo.git/info/refs?service=git-upload-pack not found: Not Found\n\tat org.eclipse.jgit.transport.TransportHttp.createNotFoundException(TransportHttp.java:610)\n\tat org.eclipse.jgit.transport.TransportHttp.connect(TransportHttp.java:678)\n\tat org.eclipse.jgit.transport.TransportHttp.openFetch(TransportHttp.java:466)\n\tat org.eclipse.jgit.transport.FetchProcess.executeImp(FetchProcess.java:171)\n\tat org.eclipse.jgit.transport.FetchProcess.execute(FetchProcess.java:111)\n\tat org.eclipse.jgit.transport.Transport.fetch(Transport.java:1459)\n\tat org.eclipse.jgit.api.FetchCommand.call(FetchCommand.java:238)\n\tat org.eclipse.jgit.api.CloneCommand.fetch(CloneCommand.java:322)\n\tat org.eclipse.jgit.api.CloneCommand.call(CloneCommand.java:191)\n\tat JGitProbe.main(JGitProbe.java:16)\n\tat java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)\n\tat java.base/java.lang.reflect.Method.invoke(Method.java:580)\n\tat jdk.compiler/com.sun.tools.javac.launcher.Main.execute(Main.java:484)\n\tat jdk.compiler/com.sun.tools.javac.launcher.Main.run(Main.java:208)\n\tat jdk.compiler/com.sun.tools.javac.launcher.Main.main(Main.java:135)\n"
+    },
+    {
+      "client": "libgit2",
+      "operation": "clone",
+      "exit_code": 0,
+      "stdout": "a44559406d62cf06f4b432e8e0a04e1d3a512e16\n",
+      "stderr": ""
+    },
+    {
+      "client": "libgit2",
+      "operation": "push",
+      "exit_code": 0,
+      "stdout": "76eca6a1ec1d1b1509ab35b0e10717d3ccc6dc79\n",
+      "stderr": ""
+    },
+    {
+      "client": "libgit2",
+      "operation": "fetch",
+      "exit_code": 0,
+      "stdout": "76eca6a1ec1d1b1509ab35b0e10717d3ccc6dc79\n",
+      "stderr": ""
+    },
+    {
+      "client": "libgit2",
+      "operation": "clone",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Traceback (most recent call last):\n  File \"/workspace/rootyard/tests/clients/libgit2_probe.py\", line 18, in <module>\n    repo = pygit2.clone_repository(remote, directory, callbacks=callbacks)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/.rootyard-tools/client-venv/lib/python3.12/site-packages/pygit2/__init__.py\", line 542, in clone_repository\n    payload.check_error(err)\n  File \"/workspace/.rootyard-tools/client-venv/lib/python3.12/site-packages/pygit2/callbacks.py\", line 111, in check_error\n    check_error(error_code)\n  File \"/workspace/.rootyard-tools/client-venv/lib/python3.12/site-packages/pygit2/errors.py\", line 67, in check_error\n    raise GitError(message)\n_pygit2.GitError: unexpected http status code: 404\n"
+    },
+    {
+      "client": "jgit",
+      "operation": "clone",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Exception in thread \"main\" org.eclipse.jgit.api.errors.TransportException: Premature EOF\n\tat org.eclipse.jgit.api.FetchCommand.call(FetchCommand.java:249)\n\tat org.eclipse.jgit.api.CloneCommand.fetch(CloneCommand.java:322)\n\tat org.eclipse.jgit.api.CloneCommand.call(CloneCommand.java:191)\n\tat JGitProbe.main(JGitProbe.java:16)\nCaused by: org.eclipse.jgit.errors.TransportException: Premature EOF\n\tat org.eclipse.jgit.transport.BasePackConnection.lsRefs(BasePackConnection.java:313)\n\tat org.eclipse.jgit.transport.TransportHttp$SmartHttpFetchConnection.<init>(TransportHttp.java:1552)\n\tat org.eclipse.jgit.transport.TransportHttp.getConnection(TransportHttp.java:368)\n\tat org.eclipse.jgit.transport.TransportHttp.openFetch(TransportHttp.java:468)\n\tat org.eclipse.jgit.transport.FetchProcess.executeImp(FetchProcess.java:171)\n\tat org.eclipse.jgit.transport.FetchProcess.execute(FetchProcess.java:111)\n\tat org.eclipse.jgit.transport.Transport.fetch(Transport.java:1459)\n\tat org.eclipse.jgit.api.FetchCommand.call(FetchCommand.java:238)\n\tat org.eclipse.jgit.api.CloneCommand.fetch(CloneCommand.java:322)\n\tat org.eclipse.jgit.api.CloneCommand.call(CloneCommand.java:191)\n\tat JGitProbe.main(JGitProbe.java:16)\n\tat java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)\n\tat java.base/java.lang.reflect.Method.invoke(Method.java:580)\n\tat jdk.compiler/com.sun.tools.javac.launcher.Main.execute(Main.java:484)\n\tat jdk.compiler/com.sun.tools.javac.launcher.Main.run(Main.java:208)\n\tat jdk.compiler/com.sun.tools.javac.launcher.Main.main(Main.java:135)\nCaused by: java.io.IOException: Premature EOF\n\tat java.base/sun.net.www.http.ChunkedInputStream.readAheadBlocking(ChunkedInputStream.java:567)\n\tat java.base/sun.net.www.http.ChunkedInputStream.readAhead(ChunkedInputStream.java:611)\n\tat java.base/sun.net.www.http.ChunkedInputStream.read(ChunkedInputStream.java:705)\n\tat java.base/java.io.FilterInputStream.read(FilterInputStream.java:119)\n\tat java.base/sun.net.www.protocol.http.HttpURLConnection$HttpInputStream.read(HttpURLConnection.java:3733)\n\tat org.eclipse.jgit.util.io.UnionInputStream.read(UnionInputStream.java:114)\n\tat java.base/java.io.InputStream.readNBytes(InputStream.java:509)\n\tat org.eclipse.jgit.util.IO.readFully(IO.java:142)\n\tat org.eclipse.jgit.transport.PacketLineIn.readLength(PacketLineIn.java:305)\n\tat org.eclipse.jgit.transport.PacketLineIn.readString(PacketLineIn.java:169)\n\tat org.eclipse.jgit.transport.BasePackConnection.readLine(BasePackConnection.java:197)\n\tat org.eclipse.jgit.transport.BasePackConnection.lsRefsImpl(BasePackConnection.java:336)\n\tat org.eclipse.jgit.transport.BasePackConnection.lsRefs(BasePackConnection.java:307)\n\t... 15 more\n"
+    },
+    {
+      "client": "libgit2",
+      "operation": "clone",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "Traceback (most recent call last):\n  File \"/workspace/rootyard/tests/clients/libgit2_probe.py\", line 18, in <module>\n    repo = pygit2.clone_repository(remote, directory, callbacks=callbacks)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/workspace/.rootyard-tools/client-venv/lib/python3.12/site-packages/pygit2/__init__.py\", line 542, in clone_repository\n    payload.check_error(err)\n  File \"/workspace/.rootyard-tools/client-venv/lib/python3.12/site-packages/pygit2/callbacks.py\", line 111, in check_error\n    check_error(error_code)\n  File \"/workspace/.rootyard-tools/client-venv/lib/python3.12/site-packages/pygit2/errors.py\", line 67, in check_error\n    raise GitError(message)\n_pygit2.GitError: unknown remote object format 'sha256'\n"
+    }
+  ],
+  "unsupported": [
+    "SSH",
+    "partial clone filters",
+    "JGit/libgit2 SHA-256"
+  ],
+  "unverified": [
+    "Independent-client LFS extensions beyond stock git-lfs"
+  ]
+}

@@ -12,11 +12,13 @@ from pathlib import Path
 import sys
 
 from e2e import Harness
+from client_features import ClientFeatures
+from native_evidence import build_record
 
 CLIENTS = Path(__file__).parent / "clients"
 
 
-class Compatibility(Harness):
+class Compatibility(ClientFeatures, Harness):
     def independent(self, implementation, operation, directory, refspec=None, token=None, check=True):
         env = self.env.copy()
         account = token or self.alice
@@ -128,14 +130,16 @@ def main():
     success = False
     versions = {}
     try:
+        versions["build"] = build_record(args.binary)
         versions["git"] = h.git("--version").stdout.decode().strip()
-        versions["source_commit"] = h.git("rev-parse", "HEAD", cwd=Path(__file__).resolve().parents[1]).stdout.decode().strip()
+        versions["workspace_commit"] = h.git("rev-parse", "HEAD", cwd=Path(__file__).resolve().parents[1]).stdout.decode().strip()
         versions["libgit2"] = h.run([os.environ["ROOTYARD_PYGIT2_PYTHON"], "-c",
                                     "import pygit2; print(pygit2.__version__, pygit2.LIBGIT2_VERSION)"]).stdout.decode().strip()
         versions["jgit_jars"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                                  for p in Path(os.environ["ROOTYARD_JGIT_CLASSPATH"].rstrip("*")).glob("*.jar")}
         assert versions["jgit_jars"], "JGit classpath must contain version-pinned jars"
-        for name in ("setup", "api", "roundtrip", "independent_roundtrips", "stock_protocol_states"):
+        for name in ("setup", "api", "roundtrip", "independent_roundtrips", "stock_protocol_states",
+                     "filter_and_symbolic_refs", "sha256_clients", "thin_delta_pack", "stock_lfs"):
             h.case(name, getattr(h, name))
         versions["postgres"] = h.sql("SELECT version()")
         success = True
@@ -146,8 +150,8 @@ def main():
         report = {"passed": success, "backend": "native", "cases": h.results, "versions": versions,
                   "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                   "transcripts": h.transcripts,
-                  "unverified": ["SHA-256 full-service matrix (awaiting #38)", "SSH (not supported)",
-                                 "LFS lock client matrix (awaiting #41)", "filter/partial-clone negotiation"]}
+                  "unsupported": ["SSH", "partial clone filters", "JGit/libgit2 SHA-256"],
+                  "unverified": ["Independent-client LFS extensions beyond stock git-lfs"]}
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"passed": success, "cases": h.results}, indent=2))
     return 0 if success else 1
