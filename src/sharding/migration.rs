@@ -161,21 +161,11 @@ pub async fn migrate_repository(
     if transport::node_id()?.as_deref() != Some(route.primary_node_id.as_str()) {
         return Err(conflict("migration must run on source storage node"));
     }
-    // Cross-process physical GC takes the exclusive PostgreSQL data lease.
-    // Acquire the shared lease before any local gate so there is one global
-    // lock order across readers, migration, and destructive maintenance.
-    let lock_deadline = tokio::time::Instant::now() + state.config.git_timeout;
-    let source_lease = crate::storage::read_leases::shared(
-        &state.pool, access.repo_id, lock_deadline).await?;
-    let source_gate = tokio::time::timeout_at(
-        lock_deadline, state.storage.maintenance_exclusive(access.repo_id))
-        .await.map_err(|_| Error::timeout())?;
-    // This local lock waits for admitted writers and covers the source bundle
-    // snapshot. The durable drain below keeps later pushes out after release.
-    let _write_lock = tokio::time::timeout_at(
-        lock_deadline, state.storage.write_lock(access.repo_id))
-        .await.map_err(|_| Error::timeout())?;
-    source_lease.ensure_active()?;
+    // Stage the durable drain only after admitted writers and publication
+    // windows have finished, in the same ordered exclusive barrier used for
+    // native replacement and final cutover.
+    let source = super::locks::exclusive(&state, access.repo_id).await?;
+    source.ensure_active()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, true).await?;
@@ -204,14 +194,15 @@ pub async fn migrate_repository(
     let journal_sequence = journal::sequence(&state.storage.root, access.repo_id).map_err(Error::internal)?;
     let generation: i64 = tx.query_one("SELECT storage_generation FROM repositories WHERE id = $1 FOR UPDATE", &[&access.repo_id]).await.map_err(Error::internal)?.get(0);
     let operation_id = input.operation_id.unwrap_or_else(Uuid::new_v4);
-    let prior = tx.query_opt("SELECT source_node_id, target_node_id, source_route_epoch, source_generation, state FROM shard_replication_operations WHERE id = $1", &[&operation_id]).await.map_err(Error::internal)?;
+    let prior = tx.query_opt("SELECT repository_id, source_node_id, target_node_id, source_route_epoch, source_generation, state FROM shard_replication_operations WHERE id = $1", &[&operation_id]).await.map_err(Error::internal)?;
     if let Some(row) = prior {
-        let source: String = row.get(0);
-        let destination: String = row.get(1);
-        let epoch: i64 = row.get(2);
-        let prior_generation: i64 = row.get(3);
-        let state: String = row.get(4);
-        if source != route.primary_node_id || destination != input.target_node_id || epoch != route.route_epoch
+        let prior_repo: Uuid = row.get(0);
+        let source: String = row.get(1);
+        let destination: String = row.get(2);
+        let epoch: i64 = row.get(3);
+        let prior_generation: i64 = row.get(4);
+        let state: String = row.get(5);
+        if prior_repo != access.repo_id || source != route.primary_node_id || destination != input.target_node_id || epoch != route.route_epoch
             || prior_generation != generation || state == "completed" || state == "aborted" {
             return Err(conflict("replication operation cannot resume against changed placement"));
         }
@@ -230,21 +221,19 @@ pub async fn migrate_repository(
     let stage = staging_root(&state)?;
     let bundle = stage.join(format!("{operation_id}.bundle"));
     clean_staging(&bundle)?;
-    source_lease.ensure_active()?;
-    git_output_lease(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout, &source_lease).await?;
-    source_lease.ensure_active()?;
-    git_output_lease(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "bundle", "create", bundle.to_str().ok_or_else(Error::bad_request)?, "--all"], state.config.git_timeout, &source_lease).await?;
-    source_lease.ensure_active()?;
+    source.ensure_active()?;
+    git_output_lease(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout, &source.lease).await?;
+    source.ensure_active()?;
+    git_output_lease(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "bundle", "create", bundle.to_str().ok_or_else(Error::bad_request)?, "--all"], state.config.git_timeout, &source.lease).await?;
+    source.ensure_active()?;
     File::open(&bundle).and_then(|f| f.sync_all()).map_err(Error::internal)?;
     sync_parent(&stage)?;
-    let digest = refs_digest_lease(&state, &repo, &source_lease).await?;
-    source_lease.ensure_active()?;
+    let digest = refs_digest_lease(&state, &repo, &source.lease).await?;
+    source.ensure_active()?;
     // The bundle is now immutable in private staging. The target must acquire
     // the exclusive PG data barrier before replacing its native repository;
-    // holding the source's shared barrier across HTTP would deadlock it.
-    drop(_write_lock);
-    drop(source_gate);
-    drop(source_lease);
+    // holding the source's exclusive barrier across HTTP would deadlock it.
+    drop(source);
     let path = format!("/internal/shards/{}/snapshot/{}?refs_sha256={digest}&journal_sequence={journal_sequence}", access.repo_id, operation_id);
     let envelope = Envelope {
         version: 1, authority_incarnation, nonce: Uuid::new_v4(), expires_unix: models::unix_now() + ENVELOPE_LIFETIME_SECONDS,

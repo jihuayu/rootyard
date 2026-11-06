@@ -40,6 +40,8 @@ def main():
         assert status in (200, 201), status
         h.api()
         h.roundtrip()
+        second_repo = json.loads(h.expect("/api/repos", 201, method="POST", token=h.alice,
+                                          body={"name": "independent"}))
         source_sequence_file = h.root / "data" / "journal" / h.repo["id"] / "sequence"
         initial_sequence = int(source_sequence_file.read_text())
         port = free_port()
@@ -72,6 +74,18 @@ def main():
         operation_id = str(uuid.uuid4())
         h.expect("/api/repos/alice/demo/shard-migrate", 409, token=h.alice, method="POST",
                  body={"target_node_id": "node1", "expected_route_epoch": route["route_epoch"], "operation_id": operation_id})
+        second_route = json.loads(h.expect("/api/repos/alice/independent/shard-route", 200, token=h.alice))
+        assert second_route["primary_node_id"] == route["primary_node_id"]
+        assert second_route["route_epoch"] == route["route_epoch"]
+        first_generation = h.sql("SELECT storage_generation FROM repositories WHERE id='" + h.repo["id"] + "'")
+        second_generation = h.sql("SELECT storage_generation FROM repositories WHERE id='" + second_repo["id"] + "'")
+        assert first_generation == second_generation, "collision fixture must match source generation"
+        h.expect("/api/repos/alice/independent/shard-migrate", 409, token=h.alice, method="POST",
+                 body={"target_node_id": "node1", "expected_route_epoch": second_route["route_epoch"],
+                       "operation_id": operation_id})
+        second_unchanged = json.loads(h.expect("/api/repos/alice/independent/shard-route", 200, token=h.alice))
+        assert second_unchanged["draining"] is False, "foreign operation UUID drained another repository"
+        assert h.sql("SELECT COUNT(*) FROM shard_replication_operations WHERE repository_id='" + second_repo["id"] + "'") == "0"
         assert int(source_sequence_file.read_text()) == initial_sequence, "partial transfer wrote source journal"
         unchanged = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
         assert unchanged["primary_node_id"] == "shard-primary-0" and unchanged["route_epoch"] == route["route_epoch"]
@@ -123,9 +137,10 @@ def main():
         repo_state = h.sql("SELECT state || ':' || COALESCE(recovery_reason,'') FROM repositories WHERE id='" + h.repo["id"] + "'")
         assert repo_state == "ready:", "failed drained push poisoned repository state: " + repo_state
         assert h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == h.second
-        # A real PostgreSQL shared object lease holds target replacement back.
-        # Source must release its shared lease before target takes exclusive,
-        # and a paused reader must retain the old target path until release.
+        # Pause the real target process so source can finish its exclusive
+        # drain/snapshot and release that lease. Then acquire a native PG
+        # reader before resuming the target. The target's exclusive install
+        # must wait while that independent reader holds the data barrier.
         hold_env = h.env.copy()
         db_url = urlsplit(h.db)
         hold_env.update(PGHOST=db_url.hostname, PGPORT=str(db_url.port or 5432),
@@ -137,25 +152,35 @@ def main():
         lock_sql = ("BEGIN; SELECT pg_advisory_xact_lock_shared(hashtextextended("
                     "'rootyard-data-v1:' || '" + h.repo["id"] + "'::uuid::text,0)); "
                     "SELECT pg_sleep(4); COMMIT;")
-        held_reader = subprocess.Popen(["psql", "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c", lock_sql],
-                                       env=hold_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if held_reader.poll() is not None:
-                _, error = held_reader.communicate()
-                raise AssertionError("native PG shared lock command failed: " + error.decode(errors="replace")[-300:])
-            acquired = h.sql("SELECT COUNT(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid "
-                             "WHERE a.application_name='rootyard-migration-held-reader' AND l.locktype='advisory' "
-                             "AND l.mode='ShareLock' AND l.granted")
-            if acquired == "1":
-                break
-            time.sleep(.02)
-        else:
-            raise AssertionError("native reader failed to acquire PostgreSQL shared object lease")
+        source_bundle = h.root / "data" / "shard-staging" / (operation_id + ".bundle")
+        if source_bundle.exists():
+            source_bundle.unlink()
+        os.killpg(target.pid, signal.SIGSTOP)
         started = time.monotonic_ns()
         with ThreadPoolExecutor(max_workers=1) as pool:
             pending = pool.submit(h.http, "/api/repos/alice/demo/shard-migrate", token=h.alice,
                                   method="POST", body={"target_node_id": "node1", "expected_route_epoch": route["route_epoch"], "operation_id": operation_id})
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not source_bundle.exists():
+                assert not pending.done(), "migration failed before source bundle"
+                time.sleep(.02)
+            assert source_bundle.exists(), "source did not start a real Git bundle"
+            held_reader = subprocess.Popen(["psql", "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c", lock_sql],
+                                           env=hold_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if held_reader.poll() is not None:
+                    _, error = held_reader.communicate()
+                    raise AssertionError("native PG shared lock command failed: " + error.decode(errors="replace")[-300:])
+                acquired = h.sql("SELECT COUNT(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid "
+                                 "WHERE a.application_name='rootyard-migration-held-reader' AND l.locktype='advisory' "
+                                 "AND l.mode='ShareLock' AND l.granted")
+                if acquired == "1":
+                    break
+                time.sleep(.02)
+            else:
+                raise AssertionError("native reader failed to acquire PostgreSQL shared object lease")
+            os.killpg(target.pid, signal.SIGCONT)
             time.sleep(.6)
             assert not pending.done(), "migration bypassed held PostgreSQL reader"
             assert sentinel.is_file(), "target path replaced before exclusive data barrier"
@@ -204,6 +229,8 @@ def main():
                           "ahead_journal_rejected_without_replacing_target": True,
                           "failed_transfer_drained_source_writes": True,
                           "target_exclusive_barrier_waited_for_native_reader": True,
+                          "target_process_paused_until_source_barrier_released": True,
+                          "foreign_repository_operation_uuid_rejected_without_drain": True,
                           "browse_read_from_retired_ingress_reached_new_owner": True,
                           "source_oid": initial, "destination_oid_after_push": final_tip,
                           "source_volume": str(h.bare), "destination_volume": str(dest_repo),
