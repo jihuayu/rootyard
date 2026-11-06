@@ -1,0 +1,43 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "populated_capability_restore",
+      "status": "passed",
+      "seconds": 20.4574,
+      "detail": {
+        "fresh_database_and_volume": true,
+        "organization_inherited_access": true,
+        "lfs_lock_identity_preserved": true,
+        "lfs_bytes_preserved": true,
+        "workspace_bytes_preserved": true,
+        "old_workspace_lease_rejected": true,
+        "renewed_lease_accepted": true,
+        "browser_session_revoked": true,
+        "cluster_authority_rotated": true,
+        "stock_git_clone_fsck": true,
+        "remote_lfs_hydrated_without_target_endpoint": true
+      }
+    }
+  ],
+  "binary_sha256": "ce584c94b69b0e1a4439de981ba4a777f5e8d9109cd4a1ea691b063f4025c861",
+  "limitations": [
+    "Loopback service and PostgreSQL; no hardware failure guarantee."
+  ],
+  "native_build": {
+    "version": 1,
+    "binary_sha256": "ce584c94b69b0e1a4439de981ba4a777f5e8d9109cd4a1ea691b063f4025c861",
+    "source_inputs_sha256": "2432a4925e758e11eaeb2ad04ebfbf1c9674916e70552d6e546c6667edae8ca3",
+    "workspace_commit": "82e8fdf2dd01f6f730e1df2d1707a04305ab0c5d",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard"
+    ],
+    "unstripped_binary_sha256": "91c94ac167aa956d50c5053c7cbc17de511c8d836b3a79314328d9f21101dd3b",
+    "transformation": "strip --strip-debug"
+  }
+}
