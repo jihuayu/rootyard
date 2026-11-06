@@ -48,7 +48,13 @@ impl Overlay {
         paths.insert(1, PathBuf::new());
         let mut ids = BTreeMap::new();
         ids.insert(PathBuf::new(), 1);
-        let whiteouts = if upper.join(".rootyard-whiteouts.json").exists() {
+        let whiteout_meta = match fs::symlink_metadata(upper.join(".rootyard-whiteouts.json")) {
+            Ok(meta) if meta.is_file() => true,
+            Ok(_) => return Err(io::Error::from_raw_os_error(libc::EPERM)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+        let whiteouts = if whiteout_meta {
             serde_json::from_slice::<Vec<String>>(&fs::read(
                 upper.join(".rootyard-whiteouts.json"),
             )?)
@@ -89,7 +95,7 @@ impl Overlay {
             || name.as_bytes().contains(&b'/')
             || name == "."
             || name == ".."
-            || name == ".rootyard-whiteouts.json"
+            || name.as_bytes().starts_with(b".rootyard-whiteouts.")
         {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
@@ -195,7 +201,7 @@ impl Overlay {
             if let Ok(dir) = walk_dir(root, p, false) {
                 for item in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
                     let name = item?.file_name();
-                    if name != ".rootyard-whiteouts.json" && name != ".rootyard-whiteouts.tmp" {
+                    if !name.as_bytes().starts_with(b".rootyard-whiteouts.") {
                         names.insert(name);
                     }
                 }
@@ -246,10 +252,14 @@ impl Overlay {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        let tmp = self.upper.join(".rootyard-whiteouts.tmp");
-        fs::write(&tmp, serde_json::to_vec(&names)?)?;
-        File::open(&tmp)?.sync_all()?;
-        fs::rename(tmp, self.upper.join(".rootyard-whiteouts.json"))?;
+        let tmp_name = format!(".rootyard-whiteouts.{}.tmp", uuid::Uuid::new_v4());
+        let tmp = Entry::new(&self.upper, Path::new(&tmp_name), false)?;
+        let target = Entry::new(&self.upper, Path::new(".rootyard-whiteouts.json"), false)?;
+        let mut file = tmp.open(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, 0o600)?;
+        use io::Write;
+        file.write_all(&serde_json::to_vec(&names)?)?;
+        file.sync_all()?;
+        tmp.rename_to(&target)?;
         File::open(&self.upper)?.sync_all()
     }
     fn err(e: io::Error) -> i32 {
