@@ -12,6 +12,11 @@ fn run(git: &Path, args: &[&str], cwd: &Path) {
     let status = Command::new(git).args(args).current_dir(cwd).status().unwrap();
     assert!(status.success(), "Git fixture command failed: {args:?}");
 }
+fn run_output(git: &Path, args: &[&str], cwd: &Path) -> String {
+    let output = Command::new(git).args(args).current_dir(cwd).output().unwrap();
+    assert!(output.status.success(), "Git fixture command failed: {args:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
 fn deadline() -> Instant { Instant::now() + Duration::from_secs(300) }
 
 async fn concurrent_views(state: Arc<AppState>, repository: db::Repository) {
@@ -144,6 +149,8 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
             .args(["rev-parse", "refs/heads/main"]).output().unwrap();
         assert!(actual.status.success());
         assert_eq!(String::from_utf8(actual.stdout).unwrap().trim(), ids["commit_oid"].as_str().unwrap());
+        assert_eq!(run_output(&git,&["--git-dir",snapshot.path().to_str().unwrap(),
+            "symbolic-ref","HEAD"],&root),"refs/heads/main");
         let remote = RemoteObjectStore::from_env(root.join("unused-local")).unwrap();
         let mut client = pool.get().await.unwrap();
         let weak = client.transaction().await.unwrap();
@@ -175,7 +182,7 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
         assert_eq!(std::fs::metadata(second.join(format!("pack-{pack_id}.pack"))).unwrap().len(),
             manifest.pack.plaintext_bytes);
         let client_work = root.join(format!("push-client-{}",Uuid::new_v4()));
-        run(&git,["clone","--branch","main",snapshot.path().to_str().unwrap(),
+        run(&git,["clone",snapshot.path().to_str().unwrap(),
             client_work.to_str().unwrap()].as_slice(),&root);
         std::fs::write(client_work.join("after.txt"),b"commit after Pando materialization\n").unwrap();
         run(&git,&["add","after.txt"],&client_work);

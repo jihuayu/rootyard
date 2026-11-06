@@ -18,6 +18,7 @@ pub struct Snapshot {
     path: PathBuf,
     pub storage_generation: i64,
     pub ref_generation: i64,
+    pub head_ref: String,
     pub refs: BTreeMap<String, String>,
     pub source_packs: Vec<Uuid>,
 }
@@ -53,7 +54,7 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
         let client = state.pool.get().await?;
         let row = client.query_one(
             "SELECT r.owner_id,r.storage_backend,r.storage_generation,r.object_format, \
-             s.state,s.ref_generation,s.pack_ids FROM repositories r \
+             s.state,s.ref_generation,s.head_ref,s.pack_ids FROM repositories r \
              JOIN pando_repository_states s ON s.repository_id=r.id \
              WHERE r.id=$1 AND s.tenant_id=r.owner_id AND \
              s.storage_generation=r.storage_generation AND s.object_format=r.object_format",
@@ -61,6 +62,7 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
         let tenant: Uuid = row.get("owner_id");
         let generation: i64 = row.get("storage_generation");
         let ref_generation: i64 = row.get("ref_generation");
+        let head_ref: String = row.get("head_ref");
         let pack_ids: Vec<Uuid> = row.get("pack_ids");
         ensure!(row.get::<_, &str>("storage_backend") == "pando" &&
             row.get::<_, &str>("state") == "serving" &&
@@ -69,6 +71,8 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
             "Pando repository has no serving authoritative snapshot");
         ensure!(!pack_ids.is_empty() && pack_ids.len() <= MAX_PACKS,
             "Pando pack snapshot exceeds bounded view");
+        ensure!(head_ref.starts_with("refs/heads/") && crate::journal::valid_ref(&head_ref),
+            "Pando advertised HEAD is invalid");
         let rows = client.query("SELECT ref_name,oid FROM pando_refs \
             WHERE repository_id=$1 ORDER BY ref_name LIMIT $2",
             &[&repo.id,&((MAX_REFS + 1) as i64)]).await?;
@@ -97,10 +101,12 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         let path = root.join(format!(".snapshot-{}", Uuid::new_v4()));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-        let snapshot = Snapshot { path, storage_generation: generation, ref_generation, refs,
+        let snapshot = Snapshot { path, storage_generation: generation, ref_generation, head_ref, refs,
             source_packs: pack_ids.clone() };
         let format_arg = format!("--object-format={}", repo.object_format);
         run_git(state, snapshot.path(), &["init", "--bare", &format_arg], lease, deadline).await?;
+        run_git(state, snapshot.path(), &["symbolic-ref","HEAD",&snapshot.head_ref],
+            lease,deadline).await?;
         let store = PackStore::from_env(state.storage.root.join("pando-pack-work"),
             state.config.git.clone())?;
         let pack_dir = snapshot.path.join("objects/pack");
