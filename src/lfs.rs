@@ -53,6 +53,10 @@ pub fn routes() -> Router<Arc<AppState>> {
 
     Router::new()
         .route(
+            "/api/repos/{owner}/{name}/lfs/upload-waiters",
+            get(handlers::upload_waiters),
+        )
+        .route(
             "/git/{owner}/{name}/info/lfs/locks",
             get(locks::list_locks).post(locks::create_lock),
         )
