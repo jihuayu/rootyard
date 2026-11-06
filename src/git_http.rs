@@ -18,6 +18,10 @@ use tokio::{
     time::Instant,
 };
 
+#[path = "git_http/process.rs"]
+mod process;
+pub(crate) use process::{collect_git_output, collect_git_output_input, finish_group_child, stop_group_child};
+
 struct Process {
     child: Child,
     input: Option<JoinHandle<io::Result<()>>>,
@@ -147,69 +151,6 @@ impl Drop for Process {
         }
         self.stderr.abort();
     }
-}
-
-/// Bounded read-only maintenance command using the same process-group cleanup.
-pub(crate) async fn collect_git_output(
-    command: tokio::process::Command,
-    limit: usize,
-    timeout: std::time::Duration,
-) -> anyhow::Result<Vec<u8>> {
-    collect_git_output_input(command, limit, timeout, Stdio::null()).await
-}
-
-pub(crate) async fn collect_git_output_input(
-    mut command: tokio::process::Command,
-    limit: usize,
-    timeout: std::time::Duration,
-    input: Stdio,
-) -> anyhow::Result<Vec<u8>> {
-    command
-        .stdin(input)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn()?;
-    let pid = child
-        .id()
-        .ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let drain = tokio::spawn(async move {
-        let mut bytes = [0u8; 4096];
-        while matches!(stderr.read(&mut bytes).await,Ok(n) if n>0) {}
-    });
-    let mut process = Process {
-        child,
-        input: None,
-        stderr: drain,
-        pid,
-    };
-    let mut output = Vec::new();
-    let result = tokio::time::timeout(timeout, async {
-        (&mut stdout)
-            .take(limit as u64 + 1)
-            .read_to_end(&mut output)
-            .await?;
-        if output.len() > limit {
-            return Err(io::Error::other("maintenance output exceeds limit"));
-        }
-        if !process.finish().await?.success() {
-            return Err(io::Error::other("read-only Git command failed"));
-        }
-        Ok::<(), io::Error>(())
-    })
-    .await;
-    process.stop().await;
-    result.map_err(|_| io::Error::other("maintenance Git command timed out"))??;
-    Ok(output)
 }
 
 pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
