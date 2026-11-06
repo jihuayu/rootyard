@@ -27,9 +27,12 @@ pub async fn merge_pull(
     headers: HeaderMap,
     Json(input): Json<MergeInput>,
 ) -> Result<Response, Error> {
-    tokio::spawn(async move { merge_pull_inner(state, owner, name, number, headers, input).await })
-        .await
-        .map_err(Error::internal)?
+    let web_scope = auth::web_scope_enabled();
+    tokio::spawn(auth::inherit_web_scope(web_scope, async move {
+        merge_pull_inner(state, owner, name, number, headers, input).await
+    }))
+    .await
+    .map_err(Error::internal)?
 }
 
 async fn merge_pull_inner(

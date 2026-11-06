@@ -18,7 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-pub const CSP_HEADER_VALUE: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+pub const CSP_HEADER_VALUE: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 pub fn html_response(status: StatusCode, body: String) -> Response {
     (
@@ -57,7 +57,7 @@ pub fn render_page_shell(
     };
 
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\"/>\n<title>{title} — {owner}/{repo}</title>\n<style>body{{font-family:system-ui,sans-serif;margin:1.5rem;line-height:1.5}}nav a{{margin-right:1rem}}.badge{{padding:0.15rem 0.45rem;border-radius:4px;background:#eef}}.blob-truncation-banner{{padding:0.5rem;background:#fff3cd;border:1px solid #ffeeba}}</style>\n</head>\n<body data-view=\"{view_name}\" data-owner=\"{owner}\" data-repo=\"{repo}\" data-role=\"{role}\" data-actor=\"{actor}\" data-storage-backend=\"{backend}\" data-storage-generation=\"{generation}\">\n<header class=\"repo-header\" data-repo-id=\"{}\" data-repo-state=\"{}\">\n<h1><a href=\"{base_url}\">{owner}/{repo}</a> <span class=\"badge\" data-role-badge=\"{role}\">{role}</span></h1>\n<nav class=\"repo-nav\">\n<a href=\"{base_url}\" data-nav=\"overview\">Overview</a>\n<a href=\"{base_url}/tree\" data-nav=\"tree\">Files</a>\n<a href=\"{base_url}/commits\" data-nav=\"commits\">Commits</a>\n<a href=\"{base_url}/issues\" data-nav=\"issues\">Issues</a>\n<a href=\"{base_url}/pulls\" data-nav=\"pulls\">Pull Requests</a>\n{audit_nav}\n</nav>\n</header>\n<main class=\"repo-main\">\n{inner_html}\n</main>\n</body>\n</html>\n",
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\"/>\n<title>{title} — {owner}/{repo}</title>\n<script src=\"/web/app.js\" defer></script>\n<style>body{{font-family:system-ui,sans-serif;margin:1.5rem;line-height:1.5}}nav a{{margin-right:1rem}}.badge{{padding:0.15rem 0.45rem;border-radius:4px;background:#eef}}.blob-truncation-banner{{padding:0.5rem;background:#fff3cd;border:1px solid #ffeeba}}</style>\n</head>\n<body data-view=\"{view_name}\" data-owner=\"{owner}\" data-repo=\"{repo}\" data-role=\"{role}\" data-actor=\"{actor}\" data-storage-backend=\"{backend}\" data-storage-generation=\"{generation}\">\n<header class=\"repo-header\" data-repo-id=\"{}\" data-repo-state=\"{}\">\n<h1><a href=\"{base_url}\">{owner}/{repo}</a> <span class=\"badge\" data-role-badge=\"{role}\">{role}</span></h1>\n<nav class=\"repo-nav\">\n<a href=\"/web/repos\">My repositories</a>\n<a href=\"{base_url}\" data-nav=\"overview\">Overview</a>\n<a href=\"{base_url}/tree\" data-nav=\"tree\">Files</a>\n<a href=\"{base_url}/commits\" data-nav=\"commits\">Commits</a>\n<a href=\"{base_url}/issues\" data-nav=\"issues\">Issues</a>\n<a href=\"{base_url}/pulls\" data-nav=\"pulls\">Pull Requests</a>\n{audit_nav}\n</nav>\n<form method=\"post\" action=\"/web/logout\"><button type=\"submit\">Sign out</button></form>\n</header>\n<main class=\"repo-main\">\n{inner_html}\n</main>\n</body>\n</html>\n",
         header.repository_id,
         escape_html(&header.repo_state),
     )
@@ -92,7 +92,9 @@ pub fn render_repo_overview(data: &OverviewViewData) -> String {
     }
 
     let readme_section = if let Some(ref html) = data.readme_html {
-        format!("<section class=\"readme-panel markdown-body\" data-readme=\"true\">\n{html}</section>\n")
+        format!(
+            "<section class=\"readme-panel markdown-body\" data-readme=\"true\">\n{html}</section>\n"
+        )
     } else {
         String::new()
     };
@@ -152,7 +154,9 @@ pub fn render_blob_view(header: &RepoHeaderCtx, blob: &BlobPreview) -> String {
         } else {
             String::new()
         };
-        format!("{md_block}<pre class=\"blob-code\" data-text-preview=\"true\"><code>{code}</code></pre>\n")
+        format!(
+            "{md_block}<pre class=\"blob-code\" data-text-preview=\"true\"><code>{code}</code></pre>\n"
+        )
     };
 
     let inner = format!(
@@ -291,8 +295,17 @@ pub fn render_issues_list_view(
     }
     let filter_str = escape_html(state_filter.unwrap_or("all"));
     let next_str = next_after.map_or_else(|| "none".to_owned(), |n| n.to_string());
+    let create_form = if header.effective_role >= Role::Triage {
+        format!(
+            "<form data-web-action=\"issue\" action=\"/web/repos/{}/{}/issues\"><h2>New issue</h2><label>Title <input name=\"title\" required></label><label>Details <textarea name=\"body\"></textarea></label><button>Create issue</button><p class=\"form-result\" role=\"status\"></p></form>",
+            escape_html(&header.owner),
+            escape_html(&header.name)
+        )
+    } else {
+        String::new()
+    };
     let inner = format!(
-        "<section class=\"issues-list\" data-state-filter=\"{filter_str}\" data-issue-count=\"{}\" data-next-after=\"{next_str}\">\n<ul class=\"issue-items\">\n{rows}</ul>\n</section>",
+        "<section class=\"issues-list\" data-state-filter=\"{filter_str}\" data-issue-count=\"{}\" data-next-after=\"{next_str}\">\n<ul class=\"issue-items\">\n{rows}</ul>\n{create_form}</section>",
         items.len(),
     );
     render_page_shell(header, "issues-list", "Issues", &inner)
@@ -313,8 +326,18 @@ pub fn render_issue_detail_view(
         ));
     }
     let issue_body_md = render_safe_markdown(&issue.issue.body);
+    let comment_form = if header.effective_role >= Role::Triage {
+        format!(
+            "<form data-web-action=\"comment\" action=\"/web/repos/{}/{}/issues/{}/comments\"><label>Comment <textarea name=\"body\" required></textarea></label><button>Add comment</button><p class=\"form-result\" role=\"status\"></p></form>",
+            escape_html(&header.owner),
+            escape_html(&header.name),
+            issue.issue.number
+        )
+    } else {
+        String::new()
+    };
     let inner = format!(
-        "<article class=\"issue-detail\" data-issue-number=\"{}\" data-issue-state=\"{}\" data-issue-version=\"{}\" data-issue-author=\"{}\">\n<h2>#{} {}</h2>\n<div class=\"issue-body markdown-body\">{issue_body_md}</div>\n<ol class=\"issue-comments-list\" data-comment-count=\"{}\">\n{comments_html}</ol>\n</article>",
+        "<article class=\"issue-detail\" data-issue-number=\"{}\" data-issue-state=\"{}\" data-issue-version=\"{}\" data-issue-author=\"{}\">\n<h2>#{} {}</h2>\n<div class=\"issue-body markdown-body\">{issue_body_md}</div>\n<ol class=\"issue-comments-list\" data-comment-count=\"{}\">\n{comments_html}</ol>\n{comment_form}</article>",
         issue.issue.number,
         escape_html(&issue.issue.state),
         issue.issue.version,
@@ -347,8 +370,17 @@ pub fn render_pulls_list_view(
     }
     let filter_str = escape_html(state_filter.unwrap_or("all"));
     let next_str = next_after.map_or_else(|| "none".to_owned(), |n| n.to_string());
+    let create_form = if header.effective_role >= Role::Write {
+        format!(
+            "<form data-web-action=\"pull\" action=\"/web/repos/{}/{}/pulls\"><h2>New pull request</h2><label>Title <input name=\"title\" required></label><label>Source branch <input name=\"head_ref\" required></label><label>Target branch <input name=\"base_ref\" value=\"main\" required></label><label>Details <textarea name=\"body\"></textarea></label><button>Create pull request</button><p class=\"form-result\" role=\"status\"></p></form>",
+            escape_html(&header.owner),
+            escape_html(&header.name)
+        )
+    } else {
+        String::new()
+    };
     let inner = format!(
-        "<section class=\"pulls-list\" data-state-filter=\"{filter_str}\" data-pull-count=\"{}\" data-next-after=\"{next_str}\">\n<ul class=\"pull-items\">\n{rows}</ul>\n</section>",
+        "<section class=\"pulls-list\" data-state-filter=\"{filter_str}\" data-pull-count=\"{}\" data-next-after=\"{next_str}\">\n<ul class=\"pull-items\">\n{rows}</ul>\n{create_form}</section>",
         items.len(),
     );
     render_page_shell(header, "pulls-list", "Pull Requests", &inner)
@@ -371,8 +403,28 @@ pub fn render_pull_detail_view(header: &RepoHeaderCtx, data: &PullDetailViewData
     }
     let checks_html = format_checks_list_html(&data.checks);
     let reason = escape_html(data.policy.reason.unwrap_or("ok"));
+    let review_form = if data.can_approve {
+        format!(
+            "<form data-web-action=\"review\" action=\"/web/repos/{}/{}/pulls/{}/reviews\"><label>Review <textarea name=\"body\"></textarea></label><button>Approve</button><p class=\"form-result\" role=\"status\"></p></form>",
+            escape_html(&header.owner),
+            escape_html(&header.name),
+            pr.number
+        )
+    } else {
+        String::new()
+    };
+    let merge_form = if data.can_merge {
+        format!(
+            "<form data-web-action=\"merge\" action=\"/web/repos/{}/{}/pulls/{}/merge\"><button>Merge pull request</button><p class=\"form-result\" role=\"status\"></p></form>",
+            escape_html(&header.owner),
+            escape_html(&header.name),
+            pr.number
+        )
+    } else {
+        String::new()
+    };
     let inner = format!(
-        "<article class=\"pull-detail\" data-pull-number=\"{}\" data-pull-state=\"{}\" data-pull-version=\"{}\" data-head-ref=\"{}\" data-base-ref=\"{}\" data-head-oid=\"{}\" data-base-oid=\"{}\" data-merge-allowed=\"{}\" data-required-approvals=\"{}\" data-current-approvals=\"{}\" data-policy-reason=\"{reason}\" data-self-approval-disallowed=\"{}\" data-can-approve=\"{}\" data-can-merge=\"{}\">\n<h2>#{} {}</h2>\n<div class=\"pull-body markdown-body\">{body_md}</div>\n<section class=\"pull-reviews\" data-review-count=\"{}\"><ol>\n{reviews_html}</ol></section>\n<section class=\"checks-panel\" data-commit-oid=\"{}\" data-check-count=\"{}\">{checks_html}</section>\n<pre class=\"diff-view\">{}</pre>\n</article>",
+        "<article class=\"pull-detail\" data-pull-number=\"{}\" data-pull-state=\"{}\" data-pull-version=\"{}\" data-head-ref=\"{}\" data-base-ref=\"{}\" data-head-oid=\"{}\" data-base-oid=\"{}\" data-merge-allowed=\"{}\" data-required-approvals=\"{}\" data-current-approvals=\"{}\" data-policy-reason=\"{reason}\" data-self-approval-disallowed=\"{}\" data-can-approve=\"{}\" data-can-merge=\"{}\">\n<h2>#{} {}</h2>\n<div class=\"pull-body markdown-body\">{body_md}</div>\n<section class=\"pull-reviews\" data-review-count=\"{}\"><ol>\n{reviews_html}</ol></section>\n<section class=\"checks-panel\" data-commit-oid=\"{}\" data-check-count=\"{}\">{checks_html}</section>\n<pre class=\"diff-view\">{}</pre>\n{review_form}{merge_form}</article>",
         pr.number,
         escape_html(&pr.state),
         pr.version,
@@ -463,7 +515,10 @@ mod tests {
         let resp = html_response(StatusCode::OK, "<p>ok</p>".to_owned());
         assert_eq!(resp.status(), StatusCode::OK);
         let h = resp.headers();
-        assert_eq!(h.get(header::CONTENT_SECURITY_POLICY).unwrap(), CSP_HEADER_VALUE);
+        assert_eq!(
+            h.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            CSP_HEADER_VALUE
+        );
         assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
         assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
         assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
