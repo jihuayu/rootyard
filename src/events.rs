@@ -262,7 +262,7 @@ pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
     let repository_id: Uuid = event.get(0);
     let current: i64 = tx
         .query_one(
-            "SELECT storage_generation FROM repositories WHERE id=$1 FOR SHARE",
+            "SELECT rootyard_worker_repository_generation($1, current_schema())",
             &[&repository_id],
         )
         .await?

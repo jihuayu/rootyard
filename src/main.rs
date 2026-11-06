@@ -39,7 +39,7 @@ async fn run() -> Result<()> {
     if args.len() == 1 && matches!(args[0].as_str(), "worker" | "worker-once") {
         let url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
         let pool = db::pool(&url)?;
-        db::migrate(&pool).await?;
+        db::prepare_runtime_schema(&pool).await?;
         let settings = rootyard::dispatch::Settings::from_env()?;
         if args[0] == "worker-once" {
             let owner = uuid::Uuid::new_v4();
@@ -189,7 +189,7 @@ async fn run() -> Result<()> {
             {
                 bail!("Git 2.43 or newer is required");
             }
-            db::migrate(&pool).await?;
+            db::prepare_runtime_schema(&pool).await?;
             // A restore can install its guard while this server waits for the
             // migration advisory lock; recheck before any recovery or serving.
             rootyard::backup::ensure_not_restoring(&storage.root)?;
