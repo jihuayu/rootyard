@@ -111,7 +111,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health/ready", get(ready))
         .route("/api/repos", post(create_repo).get(list_repos))
         .route("/api/repos/{owner}/{name}", get(get_repo))
-        .merge(browse::routes())
+        .merge(browse::routes(state.clone()))
         .merge(ci_pins::routes())
         .merge(ci_checkouts::routes())
         .merge(reliability::routes())

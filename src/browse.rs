@@ -12,7 +12,7 @@ use axum::{
 };
 use std::sync::Arc;
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/repos/{owner}/{name}/refs", get(handlers::list_refs))
         .route(
@@ -57,4 +57,6 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/repos/{owner}/{name}/object-format/drill",
             post(object_format::run_object_format_drill),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state, crate::sharding::transport::browse_middleware))
 }

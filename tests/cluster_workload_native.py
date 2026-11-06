@@ -3,6 +3,7 @@
 import argparse
 import base64
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 from e2e import Harness
 
@@ -24,11 +26,12 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def request(base, path, token, method="GET", body=None):
-    headers = {"Authorization": "Bearer " + token["token"]}
+def request(base, path, token, method="GET", body=None, extra_headers=None):
+    headers = {"Authorization": "Bearer " + token["token"]} if token else {}
     if body is not None:
         body = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
+    headers.update(extra_headers or {})
     req = urllib.request.Request(base + path, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=20) as response:
@@ -128,6 +131,57 @@ def main():
             assert status in (200, 201), status
             bases.append(base)
 
+        browse_path = "/api/repos/alice/demo"
+        status, raw = request(bases[1], browse_path + "/refs", h.reader)
+        assert status == 200 and json.loads(raw)["head"]["oid"] == h.second
+        status, raw = request(bases[2], browse_path + "/blob?oid=" + h.second + "&path=hello.txt", h.reader)
+        assert status == 200 and json.loads(raw)["content"] == "second\n"
+        status, _ = request(bases[3], browse_path + "/refs", h.bob)
+        assert status in (403, 404), "foreign tenant read through browse ingress"
+        # The destination consumes a signed, repository/actor/path-bound
+        # delegation once. Replays and cross-path use fail before a handler.
+        status, route_raw = request(bases[0], browse_path + "/shard-route", h.alice)
+        assert status == 200
+        active_route = json.loads(route_raw)
+        envelope = {"version": 1,
+                    "authority_incarnation": h.sql("SELECT incarnation::text FROM cluster_authority WHERE singleton=true"),
+                    "nonce": str(uuid.uuid4()), "expires_unix": int(time.time()) + 30,
+                    "actor_id": h.sql("SELECT id::text FROM users WHERE username='alice'"),
+                    "token_id": h.reader["token_id"], "repository_id": h.repo["id"],
+                    "target_node_id": "shard-primary-0",
+                    "route_epoch": active_route["route_epoch"],
+                    "fencing_token": active_route["fencing_token"],
+                    "storage_generation": 1, "method": "GET",
+                    "path_and_query": browse_path + "/refs"}
+        payload = json.dumps(envelope, separators=(",", ":")).encode()
+        signing_key = base64.b64decode(h.env["ROOTYARD_CLUSTER_HMAC_KEY"])
+        b64 = lambda data: base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+        delegation = b64(payload) + "." + b64(hmac.new(signing_key, payload, hashlib.sha256).digest())
+        header = {"x-rootyard-cluster-delegation": delegation}
+        assert request(bases[0], browse_path + "/refs", None, extra_headers=header)[0] == 200
+        assert request(bases[0], browse_path + "/refs", None, extra_headers=header)[0] == 401
+        assert request(bases[0], browse_path + "/commits", None, extra_headers=header)[0] == 401
+        assert request(bases[0], browse_path + "/refs", None,
+                       extra_headers={"x-rootyard-cluster-delegation": "malformed"})[0] == 401
+        ref_name = "refs/heads/cluster-route-proof"
+        tx_body = {"storage_generation": 1, "atomic": True,
+                   "updates": [{"ref_name": ref_name, "old_oid": "0" * 40, "new_oid": h.second}]}
+        idem = {"Idempotency-Key": "native-cluster-browse-route"}
+        status, raw = request(bases[1], browse_path + "/ref-transactions",
+                              h.alice, "POST", tx_body, idem)
+        assert status == 200, (status, raw[:300])
+        operation_id = json.loads(raw)["operation_id"]
+        status, repeated = request(bases[2], browse_path + "/ref-transactions",
+                                   h.alice, "POST", tx_body, idem)
+        assert status == 200 and json.loads(repeated)["operation_id"] == operation_id
+        status, raw = request(bases[3], browse_path + "/refs", h.reader)
+        assert status == 200 and ref_name in [item["name"] for item in json.loads(raw)["items"]]
+        report["browse_routing"] = {"read_ingress_nodes": [1, 2, 3],
+                                    "owner_only_ref_transaction_idempotent_across_ingress": True,
+                                    "unrelated_tenant_denied": True,
+                                    "delegation_replay_cross_path_and_tamper_rejected": True,
+                                    "ref_transaction_operation_id": operation_id}
+
         for tier in (1, 2, 4):
             push_ms, fetch_ms = [], []
             started = time.monotonic()
@@ -138,7 +192,13 @@ def main():
                 h.git("commit", "-am", f"native tier {tier} #{sequence}", cwd=h.work)
                 tip = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
                 began = time.monotonic_ns()
-                h.git("push", base + repo_path, "HEAD:main", cwd=h.work, token=h.alice)
+                pushed = h.git("push", base + repo_path, "HEAD:main", cwd=h.work,
+                               token=h.alice, check=False)
+                assert pushed.returncode == 0, (
+                    f"tier {tier} ingress {base} push rejected: "
+                    + h.redact(pushed.stderr.decode(errors="replace")[-350:])
+                    + "; repo=" + h.sql("SELECT state || ':' || COALESCE(recovery_reason,'') FROM repositories WHERE id='" + h.repo["id"] + "'")
+                    + "; outcomes=" + h.sql("SELECT outcome || ':' || COUNT(*) FROM git_operations WHERE repository_id='" + h.repo["id"] + "' GROUP BY outcome"))
                 push_latency = round((time.monotonic_ns() - began) / 1e6, 3)
                 began = time.monotonic_ns()
                 h.git("fetch", base + repo_path, "refs/heads/main", cwd=h.copy, token=h.reader)
@@ -165,6 +225,9 @@ def main():
         status, _ = request(bases[1], repo_path + "/info/refs?service=git-upload-pack", h.reader)
         report["failure"]["read_while_owner_stopped_status"] = status
         assert status >= 500, "unreachable owner did not fail closed"
+        status, _ = request(bases[2], browse_path + "/refs", h.reader)
+        report["failure"]["browse_while_owner_stopped_status"] = status
+        assert status >= 500, "unreachable owner browse did not fail closed"
         h.start()
         recovered_at = time.monotonic_ns()
         h.git("fetch", bases[1] + repo_path, "refs/heads/main", cwd=h.copy, token=h.reader)

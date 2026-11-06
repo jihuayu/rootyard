@@ -1,6 +1,6 @@
 //! Read-only HTTP handlers for Track 2A repository browsing endpoints.
 use crate::{
-    AppState, Error, auth,
+    AppState, Error, auth, db::Identity,
     browse::{
         git_read,
         models::{
@@ -11,8 +11,8 @@ use crate::{
 };
 use axum::{
     Json,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::{Extension, Path, Query, State},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use std::sync::Arc;
@@ -41,9 +41,8 @@ pub async fn list_refs(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<RefsQuery>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Identity>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     let (prefix, after, limit) = query.validate()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
@@ -89,9 +88,8 @@ pub async fn list_commits(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<CommitsQuery>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Identity>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     let (spec, after, limit) = query.validate()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
@@ -114,9 +112,8 @@ pub async fn list_commits(
 pub async fn get_commit(
     State(state): State<Arc<AppState>>,
     Path((owner, name, oid)): Path<(String, String, String)>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Identity>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     if !models::valid_non_zero_oid(&oid) {
         return Err(Error::bad_request());
     }
@@ -142,9 +139,8 @@ pub async fn get_tree(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<TreeQuery>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Identity>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     let limit = models::validate_limit(query.limit)?;
     let after = models::validate_tree_after(query.after.as_deref())?;
     let rel_path = models::normalize_rel_path(query.path.as_deref())?;
@@ -183,9 +179,8 @@ pub async fn get_tree_by_oid(
     State(state): State<Arc<AppState>>,
     Path((owner, name, oid)): Path<(String, String, String)>,
     Query(query): Query<TreeByOidQuery>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Identity>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     if !models::valid_revision_spec(&oid) {
         return Err(Error::bad_request());
     }
@@ -214,9 +209,8 @@ pub async fn get_blob(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<BlobQuery>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Identity>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     let clean_path = models::normalize_rel_path(query.path.as_deref())?;
     if clean_path.is_empty() {
         let Some(ref oid) = query.oid else {
@@ -253,9 +247,8 @@ pub async fn get_blob_by_oid(
     State(state): State<Arc<AppState>>,
     Path((owner, name, oid)): Path<(String, String, String)>,
     Query(query): Query<BlobByOidQuery>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Identity>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     let clean_path = models::normalize_rel_path(query.path.as_deref())?;
     if clean_path.is_empty() {
         if !models::valid_non_zero_oid(&oid) {
@@ -286,9 +279,8 @@ pub async fn compare_commits(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<CompareQuery>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Identity>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     if !models::valid_revision_spec(&query.base) || !models::valid_revision_spec(&query.head) {
         return Err(Error::bad_request());
     }
@@ -314,9 +306,8 @@ pub async fn get_storage_route(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
     Query(query): Query<StorageRouteQuery>,
-    headers: HeaderMap,
+    Extension(actor): Extension<Identity>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     let requested_operation = query.validate()?.to_owned();
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
