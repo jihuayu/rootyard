@@ -27,7 +27,7 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
     );
     let manifest: Manifest = serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
     ensure!(
-        matches!(manifest.format, 4 | 5 | 6)
+        matches!(manifest.format, 4..=6)
             && manifest.schema_versions == schema_versions(manifest.format)?
             && manifest.schema_contract_sha256 == schema_contract_digest(manifest.format)?,
         "unsupported backup format"

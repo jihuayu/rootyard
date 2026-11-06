@@ -329,7 +329,7 @@ pub async fn stage(
                 state,
                 repo,
                 snapshot,
-                &[pack.clone()],
+                std::slice::from_ref(&pack),
                 &changes,
                 lease,
                 deadline

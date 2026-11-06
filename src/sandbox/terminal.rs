@@ -160,7 +160,10 @@ pub(super) fn input(id: Uuid, bytes: &[u8]) -> Result<usize, Error> {
         .expect("terminal registry")
         .get(&id)
         .cloned()
-        .ok_or_else(|| Error(StatusCode::CONFLICT, "terminal is not running on this host"))?;
+        .ok_or(Error(
+            StatusCode::CONFLICT,
+            "terminal is not running on this host",
+        ))?;
     match control.writer.lock().expect("terminal writer").write(bytes) {
         Ok(0) => Err(Error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -183,7 +186,10 @@ pub(super) fn resize(id: Uuid, rows: u16, columns: u16) -> Result<(), Error> {
         .expect("terminal registry")
         .get(&id)
         .cloned()
-        .ok_or_else(|| Error(StatusCode::CONFLICT, "terminal is not running on this host"))?;
+        .ok_or(Error(
+            StatusCode::CONFLICT,
+            "terminal is not running on this host",
+        ))?;
     let size = libc::winsize {
         ws_row: rows,
         ws_col: columns,

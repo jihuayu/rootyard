@@ -150,7 +150,7 @@ pub async fn heartbeat(
            AND c.runner_id=$6 AND c.lease_expires_unix>extract(epoch FROM clock_timestamp()) \
          RETURNING c.lease_expires_unix",
         &[&run_id,&repo,&hook_id,&input.attempt,&input.lease_generation,&input.runner_id],
-    ).await.map_err(Error::internal)?.ok_or_else(||Error(StatusCode::CONFLICT,"CI run lease changed"))?;
+    ).await.map_err(Error::internal)?.ok_or(Error(StatusCode::CONFLICT,"CI run lease changed"))?;
     Ok((StatusCode::OK,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({
         "run_id":run_id,"attempt":input.attempt,"lease_generation":input.lease_generation,
         "lease_expires_unix":row.get::<_,i64>(0)}))).into_response())

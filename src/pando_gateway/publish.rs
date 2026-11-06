@@ -239,7 +239,7 @@ pub async fn publish(
             new_oid: change.new_oid.clone(),
         })
         .collect();
-    events::publish_in_tx(&*tx, &record, &events)
+    events::publish_in_tx(&tx, &record, &events)
         .await
         .map_err(Error::internal)?;
     window.ensure_active()?;

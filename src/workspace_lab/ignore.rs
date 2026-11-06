@@ -253,8 +253,8 @@ fn match_bracket(p: &[char], c: char) -> Option<(bool, usize)> {
         (false, 0)
     };
     let mut found_close = None;
-    for i in idx..p.len() {
-        if p[i] == ']' && i > idx {
+    for (i, character) in p.iter().enumerate().skip(idx) {
+        if *character == ']' && i > idx {
             found_close = Some(i);
             break;
         }

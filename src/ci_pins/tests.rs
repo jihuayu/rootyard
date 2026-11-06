@@ -1,7 +1,7 @@
 //! CI pin tests implementation.
 use super::*;
 #[cfg(test)]
-mod tests {
+mod ci_pin_tests {
     use super::*;
     #[test]
     fn exact_oid_and_reserved_namespace() {

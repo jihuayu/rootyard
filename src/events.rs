@@ -71,7 +71,7 @@ pub async fn publish(
 ) -> Result<()> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    publish_in_tx(&*tx, operation, changes).await?;
+    publish_in_tx(&tx, operation, changes).await?;
     tx.commit().await?;
     Ok(())
 }

@@ -212,6 +212,9 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     )
     .await?;
     let ref_guard = if let Some(commands) = &input.commands {
+        if commands.changes.len() != commands.refs.len() {
+            return Err(Error::bad_request());
+        }
         Some(
             storage::ref_publication::acquire(
                 &state.pool,

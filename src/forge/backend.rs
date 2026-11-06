@@ -12,8 +12,6 @@ pub struct BackendPatch {
     pub expected_storage_generation: Option<i64>,
     #[serde(default)]
     pub write_paused: bool,
-    #[serde(default)]
-    pub pando_ready: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

@@ -3,7 +3,7 @@ use crate::{AppState, Error, workspace_lab::core, workspaces::service};
 use std::{
     fs::{self, OpenOptions},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::Duration,
@@ -11,6 +11,7 @@ use std::{
 use tokio::process::Command;
 use uuid::Uuid;
 
+#[allow(clippy::large_enum_variant)] // one owned claim per job; indirection would only add an allocation
 pub(super) enum Source {
     Workspace {
         id: Uuid,
@@ -53,7 +54,7 @@ fn mode(job: Uuid) -> Result<Mode, Error> {
     }
     Ok(Mode::Cgroup(group))
 }
-fn attach_group(group: &PathBuf, pid: i32) -> Result<(), Error> {
+fn attach_group(group: &Path, pid: i32) -> Result<(), Error> {
     // Bubblewrap's shell gate prevents user code from running until descendants
     // have been moved. The direct process is attached first, then any forks.
     fs::write(group.join("cgroup.procs"), pid.to_string()).map_err(Error::internal)?;
@@ -113,7 +114,7 @@ async fn open_start_gate(
     state: &AppState,
     job: Uuid,
     source: &Source,
-    root: &PathBuf,
+    root: &Path,
 ) -> Result<(), Error> {
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
