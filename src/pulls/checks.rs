@@ -1,6 +1,6 @@
 //! HTTP handlers for commit-bound Check Runs with monotonic `(attempt, sequence)` enforcement.
 use crate::{
-    AppState, Error,
+    AppState, Error, git_http,
     auth::{self, authorize_repo as authorize, finish_tx as finish, idempotency_key},
     pulls::models::{
         CHECK_FIELDS, CheckRun, CheckRunInput, Page, body_valid, context_valid, creation_replay,
@@ -15,6 +15,21 @@ use axum::{
     response::Response,
 };
 use std::sync::Arc;
+
+async fn require_repo_oid_format(state:&AppState,repo:uuid::Uuid,oid:&str)->Result<(),Error>{
+    let _slot=state.git_slots.clone().try_acquire_owned().map_err(|_|Error(
+        StatusCode::SERVICE_UNAVAILABLE,"Git capacity exhausted; retry later"))?;
+    let path=state.storage.verify_path(repo).map_err(Error::internal)?;
+    let mut cmd=state.storage.git(&state.config);
+    cmd.args(["--no-replace-objects","--git-dir"]).arg(path)
+        .args(["rev-parse","--show-object-format"]);
+    let format=git_http::collect_git_output(cmd,128,state.config.git_timeout).await
+        .map_err(Error::internal)?;
+    if format!=if oid.len()==40 {b"sha1\n".as_slice()} else {b"sha256\n".as_slice()} {
+        return Err(Error(StatusCode::CONFLICT,"check commit OID format differs from repository"));
+    }
+    Ok(())
+}
 
 pub async fn upsert_check_run(
     State(state): State<Arc<AppState>>,
@@ -67,6 +82,7 @@ async fn upsert_check_inner(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+    require_repo_oid_format(&state,repo,&commit_oid).await?;
     let trusted: bool = tx.query_one(
         "SELECT EXISTS(SELECT 1 FROM forge_trusted_check_contexts WHERE repository_id=$1 AND context=$2)",
         &[&repo,&input.context],
@@ -203,6 +219,7 @@ pub async fn list_commit_checks(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    require_repo_oid_format(&state,repo,&oid).await?;
     let rows = tx
         .query(
             &format!(
@@ -251,6 +268,7 @@ pub async fn list_pull_checks(
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?
         .get("head_oid");
+    require_repo_oid_format(&state,repo,&head_oid).await?;
     let rows = tx
         .query(
             &format!(

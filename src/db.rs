@@ -49,9 +49,11 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (105, include_str!("../migrations/105_webhook_claims.sql")),
     (106, include_str!("../migrations/106_ci_runs.sql")),
     (107, include_str!("../migrations/107_trusted_checks.sql")),
+    (108, include_str!("../migrations/108_ci_dependency_grants.sql")),
+    (109, include_str!("../migrations/109_ci_integration_jobs.sql")),
 ];
 
-pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 105, 106, 107];
+pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 105, 106, 107, 108, 109];
 
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;
@@ -169,7 +171,7 @@ impl Repository {
     }
 }
 
-pub const REPO_SELECT: &str = "SELECT r.id, r.name, r.state, r.storage_backend, r.storage_generation, u.username FROM repositories r JOIN users u ON u.id = r.owner_id";
+pub const REPO_SELECT: &str = "SELECT r.id, r.owner_id, r.name, r.state, r.storage_backend, r.storage_generation, u.username FROM repositories r JOIN users u ON u.id = r.owner_id";
 
 #[cfg(test)]
 mod tests {
