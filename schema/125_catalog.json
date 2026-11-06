@@ -5087,6 +5087,17 @@
       "default": null,
       "generated": "",
       "identity": "",
+      "name": "journal_sequence",
+      "not_null": false,
+      "position": 11,
+      "table": "shard_replication_operations",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
       "name": "bucket_id",
       "not_null": true,
       "position": 1,
@@ -5344,6 +5355,204 @@
       "not_null": true,
       "position": 3,
       "table": "workspace_capture_state",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "changeset_id",
+      "not_null": true,
+      "position": 1,
+      "table": "workspace_changeset_steps",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "ordinal",
+      "not_null": true,
+      "position": 2,
+      "table": "workspace_changeset_steps",
+      "type": "integer"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 3,
+      "table": "workspace_changeset_steps",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "mount_path",
+      "not_null": true,
+      "position": 4,
+      "table": "workspace_changeset_steps",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "owner_slug",
+      "not_null": true,
+      "position": 5,
+      "table": "workspace_changeset_steps",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_name",
+      "not_null": true,
+      "position": 6,
+      "table": "workspace_changeset_steps",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "ref_name",
+      "not_null": true,
+      "position": 7,
+      "table": "workspace_changeset_steps",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "old_oid",
+      "not_null": true,
+      "position": 8,
+      "table": "workspace_changeset_steps",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "new_oid",
+      "not_null": true,
+      "position": 9,
+      "table": "workspace_changeset_steps",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "storage_generation",
+      "not_null": true,
+      "position": 10,
+      "table": "workspace_changeset_steps",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "name": "applied",
+      "not_null": true,
+      "position": 11,
+      "table": "workspace_changeset_steps",
+      "type": "boolean"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "id",
+      "not_null": true,
+      "position": 1,
+      "table": "workspace_changesets",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "namespace_id",
+      "not_null": true,
+      "position": 2,
+      "table": "workspace_changesets",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "state",
+      "not_null": true,
+      "position": 3,
+      "table": "workspace_changesets",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "creator_id",
+      "not_null": true,
+      "position": 4,
+      "table": "workspace_changesets",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "reviewer_id",
+      "not_null": false,
+      "position": 5,
+      "table": "workspace_changesets",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 6,
+      "table": "workspace_changesets",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "updated_at",
+      "not_null": true,
+      "position": 7,
+      "table": "workspace_changesets",
       "type": "timestamp with time zone"
     },
     {
@@ -9273,6 +9482,15 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK ((journal_sequence >= 0))",
+      "name": "shard_replication_operations_journal_sequence_check",
+      "table": "shard_replication_operations",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "PRIMARY KEY (id)",
       "name": "shard_replication_operations_pkey",
       "table": "shard_replication_operations",
@@ -9502,6 +9720,87 @@
       "name": "workspace_capture_state_workspace_id_fkey",
       "table": "workspace_capture_state",
       "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (changeset_id) REFERENCES public.workspace_changesets(id)",
+      "name": "workspace_changeset_steps_changeset_id_fkey",
+      "table": "workspace_changeset_steps",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((ordinal >= 0))",
+      "name": "workspace_changeset_steps_ordinal_check",
+      "table": "workspace_changeset_steps",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (changeset_id, ordinal)",
+      "name": "workspace_changeset_steps_pkey",
+      "table": "workspace_changeset_steps",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES public.repositories(id)",
+      "name": "workspace_changeset_steps_repository_id_fkey",
+      "table": "workspace_changeset_steps",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (creator_id) REFERENCES public.users(id)",
+      "name": "workspace_changesets_creator_id_fkey",
+      "table": "workspace_changesets",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (namespace_id) REFERENCES public.workspace_namespaces(id)",
+      "name": "workspace_changesets_namespace_id_fkey",
+      "table": "workspace_changesets",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (id)",
+      "name": "workspace_changesets_pkey",
+      "table": "workspace_changesets",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (reviewer_id) REFERENCES public.users(id)",
+      "name": "workspace_changesets_reviewer_id_fkey",
+      "table": "workspace_changesets",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((state = ANY (ARRAY['proposed'::text, 'reviewed'::text, 'integrating'::text, 'partial'::text, 'complete'::text, 'conflict'::text])))",
+      "name": "workspace_changesets_state_check",
+      "table": "workspace_changesets",
+      "type": "c",
       "validated": true
     },
     {
@@ -11137,6 +11436,24 @@
       "valid": true
     },
     {
+      "definition": "CREATE UNIQUE INDEX workspace_changeset_steps_pkey ON public.workspace_changeset_steps USING btree (changeset_id, ordinal)",
+      "live": true,
+      "name": "workspace_changeset_steps_pkey",
+      "ready": true,
+      "table": "workspace_changeset_steps",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX workspace_changesets_pkey ON public.workspace_changesets USING btree (id)",
+      "live": true,
+      "name": "workspace_changesets_pkey",
+      "ready": true,
+      "table": "workspace_changesets",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX workspace_checkpoints_pkey ON public.workspace_checkpoints USING btree (id)",
       "live": true,
       "name": "workspace_checkpoints_pkey",
@@ -11860,6 +12177,26 @@
       "force_row_security": false,
       "kind": "r",
       "name": "workspace_capture_state",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "workspace_changeset_steps",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "workspace_changesets",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",
