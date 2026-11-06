@@ -63,16 +63,18 @@ applied in SQL before the bounded `limit + 1` read.
 
 ### Cursor contract
 
-A cursor is `v1:<job-id>` naming a job that was already returned for **this**
-repository. The server resolves the ordering key from that durable row, so a
-client cannot inject a timestamp or offset, and a cursor does not widen the
-repository scope. A wrongly formatted value, an unknown id, or a job id that
-belongs to another repository is `400 invalid request`; the response does not
-distinguish "does not exist" from "belongs elsewhere". Cursors are positions,
-not snapshot tokens: reuse a cursor with the same `state` filter, and rows
-created later than the cursor are not returned by that pagination run. If the
-cursor row were ever removed (for example with its repository) the client must
-restart without `after`.
+A cursor is `v1:<job-id>` naming a durable job of **this** repository (normally
+one returned by an earlier page). The server resolves the ordering key from that
+row, so a client cannot inject a timestamp or offset, and a cursor does not
+widen the repository scope. A correctly formatted job of the same repository is
+accepted as a position even if no page has returned it yet; it only selects rows
+on the authorized side of that job. A wrongly formatted value, an unknown id, or
+a job id that belongs to another repository is `400 invalid request`; the
+response does not distinguish "does not exist" from "belongs elsewhere".
+Cursors are positions, not snapshot tokens: reuse a cursor with the same
+`state` filter, and rows created later than the cursor are not returned by that
+pagination run. If the cursor row were ever removed (for example with its
+repository) the client must restart without `after`.
 
 ## Detail
 

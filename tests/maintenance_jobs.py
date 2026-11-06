@@ -89,7 +89,8 @@ class MaintenanceJobsHarness(Harness):
         self.maint = self.repo("maint-jobs")
         self.other = self.repo("other-maint")
         bob_repo = self.repo("bob-maint", token=self.bob)
-        self.maint_path = "/api/repos/alice/maint-jobs/maintenance-jobs"
+        self.maint_repo_path = "/api/repos/alice/maint-jobs"
+        self.maint_path = self.maint_repo_path + "/maintenance-jobs"
         self.other_path = "/api/repos/alice/other-maint/maintenance-jobs"
         self.bob_path = "/api/repos/bob/bob-maint/maintenance-jobs"
         # Two rows share one created_at so the id tiebreak is exercised.
@@ -198,10 +199,17 @@ class MaintenanceJobsHarness(Harness):
         assert len(full["items"]) == 30 and full["next_after"] is None
         single = self.jobs("/api/repos/alice/many-maint/maintenance-jobs", limit=1)
         assert single["next_after"] == "v1:" + single["items"][0]["id"], single
-        # Cursors are repository-scoped positions, never other repositories' rows.
+        # Cursors are repository-scoped positions. A job id of another
+        # repository (or no job at all) is rejected; a job of the same
+        # repository is a valid position even before a page returned it.
         for foreign in (self.other_jobs[0], self.bob_job, str(uuid.uuid4())):
             self.jobs(self.maint_path, after="v1:" + foreign, code=400)
+        for foreign in (self.other_jobs[0], self.inserted["queued"], str(uuid.uuid4())):
             self.jobs(self.bob_path, after="v1:" + foreign, code=400, token=self.bob)
+        assert self.jobs(self.bob_path, after="v1:" + self.bob_job, token=self.bob) == \
+            {"items": [], "next_after": None}
+        same = self.jobs(self.other_path, after="v1:" + self.other_jobs[0])
+        assert {job["id"] for job in same["items"]} <= set(self.other_jobs), same
         return "Pages of every size reproduce one newest-first order including an exact " \
                "timestamp tie; state filter, 25/100 bounds and repository-scoped cursors hold"
 
@@ -232,7 +240,7 @@ class MaintenanceJobsHarness(Harness):
         # read/triage/write collaborators cannot inspect; maintain/admin can.
         for role, code in (("read", 403), ("triage", 403), ("write", 403),
                            ("maintain", 200), ("admin", 200)):
-            self.expect(self.maint_path + "/collaborators/bob",
+            self.expect(self.maint_repo_path + "/collaborators/bob",
                         (200, 201), token=self.alice, method="PUT", body={"role": role})
             self.jobs(self.maint_path, token=self.bob, code=code)
             self.job_detail(self.maint_path, self.inserted["queued"], token=self.bob, code=code)
