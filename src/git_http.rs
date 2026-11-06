@@ -22,10 +22,12 @@ use tokio::{
 mod process;
 #[path = "git_http/protocol.rs"]
 mod protocol;
+#[path = "git_http/receive.rs"]
+mod receive;
 use process::Process;
 pub(crate) use process::{collect_git_output, collect_git_output_input,
     finish_group_child, stop_group_child};
-use protocol::{job_response_prefix, receive_commands, route, validate_headers, read_headers};
+use protocol::{job_response_prefix, route, validate_headers, read_headers};
 
 async fn transfer_authorized(
     state: &AppState,
@@ -155,32 +157,11 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         )
     })?;
     let deadline = Instant::now() + state.config.git_timeout;
-    let gzipped = parts.headers.get(header::CONTENT_ENCODING)
-        .is_some_and(|v| v == "gzip" || v == "x-gzip");
     let max_input = state.config.max_request_bytes;
-    let input_metrics = state.transfer_metrics.clone();
-    let mut wire_bytes = 0u64;
-    let stream = body.into_data_stream().map(move |chunk| {
-        let chunk = chunk.map_err(io::Error::other)?;
-        wire_bytes = wire_bytes.saturating_add(chunk.len() as u64);
-        input_metrics.add_received_bytes(chunk.len() as u64);
-        if wire_bytes > max_input {
-            return Err(io::Error::other("request wire size limit exceeded"));
-        }
-        Ok(chunk)
-    });
-    let reader = tokio_util::io::StreamReader::new(stream);
-    let mut input_reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = if gzipped {
-        let mut decoder = async_compression::tokio::bufread::GzipDecoder::new(BufReader::new(reader));
-        decoder.multiple_members(true);
-        Box::pin(decoder)
-    } else { Box::pin(reader) };
-    let receive = if write && parts.method == Method::POST {
-        let oid_len = if repo.object_format == "sha256" { 64 } else { 40 };
-        Some(tokio::time::timeout_at(deadline, receive_commands(&mut input_reader, oid_len))
-            .await.map_err(|_| Error::timeout())??)
-    } else { None };
-    let ref_guard = if let Some(commands) = &receive {
+    let input = receive::prepare(body, &parts.headers, max_input,
+        state.transfer_metrics.clone(), write && parts.method == Method::POST,
+        if repo.object_format == "sha256" { 64 } else { 40 }, deadline).await?;
+    let ref_guard = if let Some(commands) = &input.commands {
         Some(storage::ref_publication::acquire(&state.pool, repo.id,
             repo.storage_generation, &commands.refs, deadline).await?)
     } else { None };
@@ -299,7 +280,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     if let Some(value) = parts
         .headers
         .get(header::CONTENT_LENGTH)
-        .filter(|_| !gzipped)
+        .filter(|_| !input.gzipped)
     {
         cmd.env(
             "CONTENT_LENGTH",
@@ -374,28 +355,10 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         }
     };
     let pid = child.id().ok_or_else(Error::bad_request)? as i32;
-    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
-    let input_prefix = receive.map(|commands| commands.bytes).unwrap_or_default();
-    let input = tokio::spawn(async move {
-        let mut decoded_bytes = input_prefix.len() as u64;
-        if decoded_bytes > max_input { return Err(io::Error::other("decoded request size limit exceeded")); }
-        stdin.write_all(&input_prefix).await?;
-        let mut buf = [0u8; 32 * 1024];
-        loop {
-            let n = input_reader.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            decoded_bytes = decoded_bytes.saturating_add(n as u64);
-            if decoded_bytes > max_input {
-                return Err(io::Error::other("decoded request size limit exceeded"));
-            }
-            stdin.write_all(&buf[..n]).await?;
-        }
-        stdin.shutdown().await
-    });
+    let input = tokio::spawn(receive::write_input(input, stdin, max_input));
     let stderr = tokio::spawn(async move {
         // Drain continuously, bounded memory. Do not forward untrusted Git diagnostics
         // into logs where paths, commit data or secrets could be disclosed.
