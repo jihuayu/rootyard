@@ -53,9 +53,11 @@ pub(super) async fn pin_inner(
             "Git capacity exhausted; retry later",
         )
     })?;
-    let _lock = tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo.id))
-        .await
-        .map_err(|_| Error::timeout())?;
+    let publication = storage::ref_publication::acquire(&state.pool,repo.id,
+        repo.storage_generation,&[format!("{NAMESPACE}/jobs/{}",input.job_id)],
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let _lock = publication.enter_window(&state.storage,
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
     reliability::before_push(&state, &repo)
         .await
         .map_err(Error::internal)?;

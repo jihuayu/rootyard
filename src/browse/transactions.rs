@@ -171,12 +171,13 @@ async fn execute_ref_transaction_inner(
             "Git capacity exhausted; retry later",
         )
     })?;
-    let _write_guard = tokio::time::timeout(
-        state.config.git_timeout,
-        state.storage.write_lock(repo.id),
-    )
-    .await
-    .map_err(|_| Error::timeout())?;
+    let ref_names = normalized_updates.iter().map(|update| update.ref_name.clone())
+        .collect::<Vec<_>>();
+    let publication = storage::ref_publication::acquire(&state.pool,repo.id,
+        repo.storage_generation,&ref_names,
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let _write_guard = publication.enter_window(&state.storage,
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
