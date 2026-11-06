@@ -51,6 +51,15 @@ pub async fn create(State(state):State<Arc<AppState>>,headers:HeaderMap,Path(id)
     let temp=projection_root(&state).join(format!("stage-{vid}"));
     let final_path=projection_root(&state).join(vid.to_string());
     source_lease.guard(clone(&state,&source,&temp,None)).await??;
+    // A namespace BaseVector can outlive every source branch that named it.
+    // Clone transfers visible refs; fetch the exact pinned commit while the
+    // hosted source still has a live cross-process read lease.
+    let mut pinned=state.storage.git(&state.config);
+    pinned.arg("-C").arg(&temp)
+        .args(["fetch","--no-tags","--no-write-fetch-head","--"])
+        .arg(&source).arg(&mount.base_oid);
+    source_lease.guard(crate::git_http::collect_git_output(pinned,4096,state.config.git_timeout))
+        .await?.map_err(|_|Error(StatusCode::CONFLICT,"Git View pinned source is unavailable"))?;
     source_lease.ensure_active()?;
     drop(_local);
     drop(source_lease);
