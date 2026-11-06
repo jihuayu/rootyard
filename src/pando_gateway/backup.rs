@@ -27,6 +27,13 @@ pub struct PandoBackupManifest {
 }
 
 async fn inventory<C: GenericClient + Sync>(client: &C, repo_id: Uuid) -> Result<PandoBackupManifest> {
+    let level: String = client.query_one("SHOW transaction_isolation",&[]).await?.get(0);
+    ensure!(matches!(level.as_str(), "repeatable read" | "serializable"),
+        "Pando backup requires a repeatable-read caller transaction");
+    // A bare Client in autocommit mode can report repeatable-read as its
+    // default yet use a different snapshot for every query. Force an XID and
+    // require the same transaction at the end of enumeration.
+    let transaction_id: String = client.query_one("SELECT txid_current()::text",&[]).await?.get(0);
     let row = client.query_one("SELECT r.owner_id,r.storage_backend,r.storage_generation,r.object_format, \
         s.state,s.ref_generation,s.pack_ids FROM repositories r \
         JOIN pando_repository_states s ON s.repository_id=r.id AND s.tenant_id=r.owner_id \
@@ -57,6 +64,9 @@ async fn inventory<C: GenericClient + Sync>(client: &C, repo_id: Uuid) -> Result
     ensure!(records.len() <= MAX_REFS, "Pando ref closure exceeds bound");
     let mut refs = BTreeMap::new();
     for record in records { refs.insert(record.get(0), record.get(1)); }
+    let after_id: String = client.query_one("SELECT txid_current()::text",&[]).await?.get(0);
+    ensure!(transaction_id == after_id,
+        "Pando backup caller changed PostgreSQL snapshots during enumeration");
     Ok(PandoBackupManifest { version: 1, repository_id: repo_id, tenant_id,
         storage_generation: row.get("storage_generation"),
         ref_generation: row.get("ref_generation"), object_format: row.get("object_format"),

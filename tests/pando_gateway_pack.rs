@@ -119,7 +119,12 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
         assert_eq!(String::from_utf8(actual.stdout).unwrap().trim(), ids["commit_oid"].as_str().unwrap());
         let remote = RemoteObjectStore::from_env(root.join("unused-local")).unwrap();
         let mut client = pool.get().await.unwrap();
+        let weak = client.transaction().await.unwrap();
+        assert!(Box::pin(backup::export_closure(&*weak,&remote,repo,
+            &root.join("must-not-publish"),deadline())).await.is_err());
+        weak.rollback().await.unwrap();
         let tx = client.transaction().await.unwrap();
+        tx.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await.unwrap();
         let backup_dir = root.join(format!("backup-{}", Uuid::new_v4()));
         eprintln!("pando fixture: exporting encrypted backup closure");
         let backup_manifest = Box::pin(backup::export_closure(&*tx,&remote,repo,&backup_dir,deadline())).await.unwrap();
