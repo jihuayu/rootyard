@@ -1,0 +1,18 @@
+{
+  "kind": "native_kafka_sasl_ssl",
+  "kafka_version": "3.9.1",
+  "binary_sha256": "fa8e256063ea049d9c9caea90ac16983c6d460b15acc7a3cfd17fdefe9fa9e3d",
+  "wrong_ca_rejected": true,
+  "wrong_hostname_rejected": true,
+  "wrong_sasl_password_rejected": true,
+  "sasl_mechanism": "PLAIN over TLS",
+  "initial_wake_offset": 2,
+  "post_restart_wake_offset": 3,
+  "git_push_during_broker_outage": "ebb47c788df3f8a79c3f77be8439f03c5ec8ac4c",
+  "git_push_after_reconnect": "3f711da0087aef817bc7045c365a86b2f4594a38",
+  "broker_restart_reconnected": true,
+  "limits": [
+    "single local KRaft broker; controller listener is local plaintext",
+    "no multi-broker Kafka failover"
+  ]
+}

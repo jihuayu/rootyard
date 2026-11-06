@@ -104,6 +104,8 @@ def main():
             time.sleep(.1)
         else:
             raise AssertionError("synchronous PostgreSQL standby did not connect")
+        observed_commit = sql(p_port, root, "SHOW synchronous_commit")
+        assert observed_commit == "remote_apply", "primary is not synchronously applying standby WAL"
 
         primary_url = f"postgresql://agent:{quote(db_password)}@localhost:{p_port}/postgres?sslmode=require"
         standby_url = f"postgresql://agent:{quote(db_password)}@localhost:{s_port}/postgres?sslmode=require"
@@ -153,7 +155,7 @@ def main():
         h.git("fetch", h.base + h.repo["clone_path"], "refs/heads/main", cwd=h.copy, token=h.reader)
         assert h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip() == new_tip
         report = {"kind": "native_postgresql_streaming_promote", "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
-                  "postgres_version": sql(s_port, root, "SHOW server_version"), "synchronous_commit": "remote_apply",
+                  "postgres_version": sql(s_port, root, "SHOW server_version"), "synchronous_commit": observed_commit,
                   "standby_sync_state_before_failure": "sync", "postgresql_failure": "pg_ctl immediate stop",
                   "read_statuses_during_failure": read_events, "acknowledged_oid_before_failure": ack,
                   "rpo_lost_acknowledged_commits": 0,
