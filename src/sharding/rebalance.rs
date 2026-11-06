@@ -243,7 +243,7 @@ pub async fn execute_rebalance(
 
     if let Some(repo_id) = input.repository_id {
         let _guard = state.storage.write_lock(repo_id).await;
-        let meta = tx.query_opt("SELECT u.username, r.name, r.storage_generation FROM repositories r JOIN users u ON u.id = r.owner_id WHERE r.id = $1 FOR UPDATE", &[&repo_id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+        let meta = tx.query_opt("SELECT u.slug, r.name, r.storage_generation FROM repositories r JOIN namespaces u ON u.id = r.owner_id WHERE r.id = $1 FOR UPDATE", &[&repo_id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
         let (owner_name, repo_name, repo_gen): (String, String, i64) = (meta.get(0), meta.get(1), meta.get(2));
         let access = auth::authorize_repo_with_role(&tx, &actor, &owner_name, &repo_name, Role::Admin).await?;
         let repo_dir = state.storage.verify_path(repo_id).map_err(|_| conflict("bare Git repository volume verification failed"))?;

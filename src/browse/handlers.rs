@@ -267,8 +267,8 @@ pub async fn get_storage_route(
     let repo_id: Uuid = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
     let row = tx
         .query_one(
-            "SELECT r.name, r.state, r.storage_backend, r.storage_generation, u.username \
-             FROM repositories r JOIN users u ON u.id = r.owner_id WHERE r.id = $1",
+            "SELECT r.name, r.state, r.storage_backend, r.storage_generation, u.slug AS username \
+             FROM repositories r JOIN namespaces u ON u.id = r.owner_id WHERE r.id = $1",
             &[&repo_id],
         )
         .await

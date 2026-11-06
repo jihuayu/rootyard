@@ -268,7 +268,7 @@ pub async fn on_pull_synchronized(
     let client = state.pool.get().await.map_err(Error::internal)?;
     let repo_row = client
         .query_opt(
-            &format!("{}, r.owner_id FROM repositories r JOIN users u ON u.id = r.owner_id WHERE r.id=$1", db::REPO_SELECT.split(" FROM ").next().unwrap_or("")),
+            &format!("{} WHERE r.id=$1", db::REPO_SELECT),
             &[&repository_id],
         )
         .await

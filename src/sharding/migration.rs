@@ -275,7 +275,7 @@ pub async fn receive_snapshot(
         &[&env.token_id, &env.actor_id]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
     let actor = db::Identity { id: env.actor_id, token_id: env.token_id, username: row.get(0), read_only: row.get(1), token_digest: row.get(2) };
     require_operator(&tx, &actor).await?;
-    let repo = tx.query_one("SELECT u.username,r.name,r.storage_generation,r.owner_id FROM repositories r JOIN users u ON u.id=r.owner_id WHERE r.id=$1", &[&repo_id]).await.map_err(Error::internal)?;
+    let repo = tx.query_one("SELECT u.slug,r.name,r.storage_generation,r.owner_id FROM repositories r JOIN namespaces u ON u.id=r.owner_id WHERE r.id=$1", &[&repo_id]).await.map_err(Error::internal)?;
     let owner: String = repo.get(0);
     let name: String = repo.get(1);
     let generation: i64 = repo.get(2);

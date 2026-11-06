@@ -23,8 +23,8 @@ async fn integration(state: &AppState, owner: &str, name: &str, hook_id: Uuid,
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client.query_opt(
         "SELECT r.id,r.owner_id,w.secret,w.active FROM repositories r \
-         JOIN users u ON u.id=r.owner_id JOIN forge_webhooks w ON w.repository_id=r.id \
-         WHERE u.username=$1 AND r.name=$2 AND w.id=$3 AND r.state='ready'",
+         JOIN namespaces u ON u.id=r.owner_id JOIN forge_webhooks w ON w.repository_id=r.id \
+         WHERE u.slug=$1 AND r.name=$2 AND w.id=$3 AND r.state='ready'",
         &[&owner,&name,&hook_id],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let secret: String = row.get(2);

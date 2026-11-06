@@ -35,7 +35,7 @@ async fn policy_write_lock(state: &AppState, owner: &str, name: &str)
     -> Result<tokio::sync::OwnedMutexGuard<()>, Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client.query_opt(
-        "SELECT r.id FROM repositories r JOIN users u ON u.id=r.owner_id WHERE u.username=$1 AND r.name=$2",
+        "SELECT r.id FROM repositories r JOIN namespaces u ON u.id=r.owner_id WHERE u.slug=$1 AND r.name=$2",
         &[&owner,&name],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let repo_id: Uuid = row.get(0);

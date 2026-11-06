@@ -8310,7 +8310,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((((length(ref_name) >= 6) AND (length(ref_name) <= 1024)) AND (ref_name ~~ 'refs/%'::text)))",
+      "definition": "CHECK (((length(ref_name) >= 6) AND (length(ref_name) <= 1024) AND (ref_name ~~ 'refs/%'::text)))",
       "name": "outbox_events_ref_name_check",
       "table": "outbox_events",
       "type": "c",

@@ -124,9 +124,9 @@ async fn permitted_repo(state:&AppState,principal:Principal<'_>,owner:&str,name:
     let repo_id=match principal {
         Principal::User(actor)=>auth::authorize_repo_with_role(&tx,actor,owner,name,Role::Read).await?.repo_id,
         Principal::Integration(hook_id)=>tx.query_opt(
-            "SELECT r.id FROM repositories r JOIN users u ON u.id=r.owner_id \
+            "SELECT r.id FROM repositories r JOIN namespaces u ON u.id=r.owner_id \
              JOIN ci_integration_source_grants g ON g.repository_id=r.id \
-             WHERE u.username=$1 AND r.name=$2 AND g.issuer_webhook_id=$3 AND g.active=true \
+             WHERE u.slug=$1 AND r.name=$2 AND g.issuer_webhook_id=$3 AND g.active=true \
                AND r.state='ready'",
             &[&owner,&name,&hook_id],
         ).await.map_err(Error::internal)?.ok_or_else(unsafe_dependency)?.get(0),
