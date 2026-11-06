@@ -166,6 +166,27 @@ pub(super) async fn open_client(
     Ok((actor, client))
 }
 
+/// Serialize member-policy mutations before acquiring role row locks. This
+/// prevents two administrators changing each other's roles from taking
+/// reciprocal SHARE→UPDATE upgrades and deadlocking.
+pub(super) async fn serialize_member_mutation(
+    tx: &Transaction<'_>, actor: &Identity, owner: &str, name: &str,
+) -> Result<(), Error> {
+    if !db::valid_name(owner) || !db::valid_name(name) {
+        return Err(Error::not_found());
+    }
+    tx.query_opt(
+        "SELECT t.id FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND u.username=$3 FOR SHARE OF t,u",
+        &[&actor.token_id, &actor.id, &actor.username],
+    ).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
+    auth::verify_token(tx, actor, true).await?;
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1 || '/' || $2, 7329))",
+        &[&owner, &name],
+    ).await.map_err(Error::internal)?;
+    Ok(())
+}
+
 pub(super) async fn finish_audit(
     tx: Transaction<'_>,
     acc: RepoAccess,
@@ -288,6 +309,7 @@ async fn upsert_collaborator_inner(
     }
     let key = idempotency_key(&h)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    serialize_member_mutation(&tx, &actor, &o, &n).await?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;
     if uid == acc.owner_id {
@@ -378,6 +400,7 @@ pub async fn remove_collaborator(State(s): App, Path((o, n, u)): SubPath, h: Hea
         return Err(Error::bad_request());
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
+    serialize_member_mutation(&tx, &actor, &o, &n).await?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     if u == o {
         return Err(Error(
