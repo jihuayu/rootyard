@@ -65,7 +65,7 @@ async fn authorized_job(state: &AppState, headers: &HeaderMap, id: Uuid) -> Resu
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
-    if row.get::<_,Option<Uuid>>("workspace_id").is_none() {
+    if row.get::<_, Option<Uuid>>("workspace_id").is_none() {
         return Err(Error::not_found());
     }
     let job = job(&row);
@@ -131,9 +131,17 @@ pub async fn start(
     tx.execute("INSERT INTO sandbox_jobs(id,workspace_id,actor_id,host_id,state,argv,timeout_seconds,lease_epoch,workspace_access,terminal) VALUES($1,$2,$3,$4,'queued',$5,$6,$7,$8,$9)", &[&job_id,&id,&ws.creator_id,&state.storage.volume_id,&argv,&(timeout as i32),&input.lease_epoch,&access,&input.terminal]).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     let args: Vec<String> = serde_json::from_value(argv).map_err(Error::internal)?;
-    if runner::launch(state.clone(), job_id, id, args, timeout, live_workspace, input.terminal)
-        .await
-        .is_err()
+    if runner::launch(
+        state.clone(),
+        job_id,
+        id,
+        args,
+        timeout,
+        live_workspace,
+        input.terminal,
+    )
+    .await
+    .is_err()
     {
         client
             .execute(
@@ -196,29 +204,53 @@ pub async fn logs(
     ))
 }
 
-async fn terminal_job(state:&AppState,headers:&HeaderMap,id:Uuid,write:bool)->Result<Job,Error>{
-    let job=authorized_job(state,headers,id).await?;
-    if !job.terminal {return Err(Error::not_found());}
+async fn terminal_job(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: Uuid,
+    write: bool,
+) -> Result<Job, Error> {
+    let job = authorized_job(state, headers, id).await?;
+    if !job.terminal {
+        return Err(Error::not_found());
+    }
     if write {
-        service::authorized(state,headers,job.workspace_id,Role::Write).await?;
-        if job.state!="running" {return Err(Error(StatusCode::CONFLICT,"terminal is not running"));}
+        service::authorized(state, headers, job.workspace_id, Role::Write).await?;
+        if job.state != "running" {
+            return Err(Error(StatusCode::CONFLICT, "terminal is not running"));
+        }
     }
     Ok(job)
 }
-pub async fn terminal_input(State(state):State<Arc<AppState>>,headers:HeaderMap,
-    Path(id):Path<Uuid>,Json(input):Json<terminal::Input>)->Result<Json<Value>,Error>{
-    terminal_job(&state,&headers,id,true).await?;
-    Ok(Json(terminal::write_input(id,input)?))
+pub async fn terminal_input(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(input): Json<terminal::Input>,
+) -> Result<Json<Value>, Error> {
+    terminal_job(&state, &headers, id, true).await?;
+    Ok(Json(terminal::write_input(id, input)?))
 }
-pub async fn terminal_output(State(state):State<Arc<AppState>>,headers:HeaderMap,
-    Path(id):Path<Uuid>,Query(query):Query<terminal::OutputQuery>)->Result<Json<Value>,Error>{
-    terminal_job(&state,&headers,id,false).await?;
-    Ok(Json(terminal::read_output(&runner::job_root(&state,id).join("stdout.log"),query)?))
+pub async fn terminal_output(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Query(query): Query<terminal::OutputQuery>,
+) -> Result<Json<Value>, Error> {
+    terminal_job(&state, &headers, id, false).await?;
+    Ok(Json(terminal::read_output(
+        &runner::job_root(&state, id).join("stdout.log"),
+        query,
+    )?))
 }
-pub async fn terminal_resize(State(state):State<Arc<AppState>>,headers:HeaderMap,
-    Path(id):Path<Uuid>,Json(size):Json<terminal::Resize>)->Result<Json<Value>,Error>{
-    terminal_job(&state,&headers,id,true).await?;
-    terminal::resize(id,size.rows,size.columns)?;
+pub async fn terminal_resize(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(size): Json<terminal::Resize>,
+) -> Result<Json<Value>, Error> {
+    terminal_job(&state, &headers, id, true).await?;
+    terminal::resize(id, size.rows, size.columns)?;
     Ok(Json(json!({"rows":size.rows,"columns":size.columns})))
 }
 

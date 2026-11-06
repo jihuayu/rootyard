@@ -1,24 +1,36 @@
 //! Owned, cross-process ref publication admission. The caller retains this
 //! guard across native Git's prepare/commit phases; hook subprocesses never
 //! attempt to keep a PostgreSQL transaction alive after they exit.
-use crate::{Error, storage::{Storage,read_leases}};
+use crate::{
+    Error,
+    storage::{Storage, read_leases},
+};
 use axum::http::StatusCode;
 use deadpool_postgres::Pool;
-use std::{future::Future, sync::{Arc, OnceLock}};
-use tokio::{sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, OwnedMutexGuard, Semaphore}, task::JoinHandle, time::{Duration, Instant}};
+use std::{
+    future::Future,
+    sync::{Arc, OnceLock},
+};
+use tokio::{
+    sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
+    task::JoinHandle,
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
 const LOCK_REF: &str = "SELECT pg_try_advisory_xact_lock(hashtextextended('rootyard-ref-v1:' || $1::uuid::text || ':' || $2::text, 0))";
 const LOCK_REPOSITORY: &str = "SELECT pg_try_advisory_xact_lock(hashtextextended('rootyard-publication-v1:' || $1::uuid::text, 0))";
 
-type WindowRequest = oneshot::Sender<Result<(),Error>>;
+type WindowRequest = oneshot::Sender<Result<(), Error>>;
 
 pub struct PublicationWindow<'a> {
     guard: &'a PublicationGuard,
     _local: OwnedMutexGuard<()>,
 }
 impl PublicationWindow<'_> {
-    pub fn ensure_active(&self) -> Result<(), Error> { self.guard.ensure_active() }
+    pub fn ensure_active(&self) -> Result<(), Error> {
+        self.guard.ensure_active()
+    }
 }
 
 pub struct PublicationGuard {
@@ -33,34 +45,58 @@ pub struct PublicationGuard {
 }
 
 impl PublicationGuard {
-    pub fn repository_id(&self) -> Uuid { self.repository_id }
-    pub fn storage_generation(&self) -> i64 { self.storage_generation }
-    pub fn refs(&self) -> &[String] { &self.refs }
+    pub fn repository_id(&self) -> Uuid {
+        self.repository_id
+    }
+    pub fn storage_generation(&self) -> i64 {
+        self.storage_generation
+    }
+    pub fn refs(&self) -> &[String] {
+        &self.refs
+    }
 
     /// Enter the short repository-wide publication window on the SAME PG
     /// session that owns exact-ref locks. This adds no pooled connection.
     /// Call only after input/object preparation; retain through native CAS,
     /// durable journal settlement, and any policy-dependent response.
-    pub async fn enter_window<'a>(&'a self, storage: &Storage,
-        deadline: Instant) -> Result<PublicationWindow<'a>,Error> {
+    pub async fn enter_window<'a>(
+        &'a self,
+        storage: &Storage,
+        deadline: Instant,
+    ) -> Result<PublicationWindow<'a>, Error> {
         self.ensure_active()?;
         let (send, recv) = oneshot::channel();
-        tokio::time::timeout_at(deadline, self.window_tx.send(send)).await
-            .map_err(|_| unavailable())?.map_err(|_| unavailable())?;
-        tokio::time::timeout_at(deadline, recv).await
-            .map_err(|_| unavailable())?.map_err(|_| unavailable())??;
+        tokio::time::timeout_at(deadline, self.window_tx.send(send))
+            .await
+            .map_err(|_| unavailable())?
+            .map_err(|_| unavailable())?;
+        tokio::time::timeout_at(deadline, recv)
+            .await
+            .map_err(|_| unavailable())?
+            .map_err(|_| unavailable())??;
         let local = tokio::time::timeout_at(deadline, storage.write_lock(self.repository_id))
-            .await.map_err(|_| unavailable())?;
+            .await
+            .map_err(|_| unavailable())?;
         self.ensure_active()?;
-        Ok(PublicationWindow { guard: self, _local: local })
+        Ok(PublicationWindow {
+            guard: self,
+            _local: local,
+        })
     }
 
     pub fn ensure_active(&self) -> Result<(), Error> {
         self.data.ensure_active()?;
-        if self.active.borrow().as_ref().is_some_and(|seen|
-            Instant::now().duration_since(*seen) < Duration::from_secs(3))
-            && !self.owner.is_finished() { Ok(()) }
-        else { Err(unavailable()) }
+        if self
+            .active
+            .borrow()
+            .as_ref()
+            .is_some_and(|seen| Instant::now().duration_since(*seen) < Duration::from_secs(3))
+            && !self.owner.is_finished()
+        {
+            Ok(())
+        } else {
+            Err(unavailable())
+        }
     }
 
     /// Cancel native work if either the ref or maintenance lease is lost.
@@ -78,16 +114,25 @@ impl PublicationGuard {
 }
 
 impl Drop for PublicationGuard {
-    fn drop(&mut self) { self.owner.abort(); }
+    fn drop(&mut self) {
+        self.owner.abort();
+    }
 }
 
 struct Pending(Option<JoinHandle<()>>);
 impl Drop for Pending {
-    fn drop(&mut self) { if let Some(task) = self.0.take() { task.abort(); } }
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 fn unavailable() -> Error {
-    Error(StatusCode::SERVICE_UNAVAILABLE, "ref publication guard unavailable")
+    Error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ref publication guard unavailable",
+    )
 }
 
 fn valid_ref(name: &str) -> bool {
@@ -98,20 +143,32 @@ fn valid_ref(name: &str) -> bool {
 /// barrier. Generation is checked before granting and on every heartbeat.
 /// At most four guards use pooled PostgreSQL connections at once, leaving
 /// capacity for the eight native read leases and ordinary SQL work.
-pub async fn acquire(pool: &Pool, repository_id: Uuid, generation: i64,
-    refs: &[String], deadline: Instant) -> Result<PublicationGuard, Error> {
-    if generation <= 0 || refs.is_empty() || refs.len() > 128
-        || refs.iter().any(|name| !valid_ref(name)) {
+pub async fn acquire(
+    pool: &Pool,
+    repository_id: Uuid,
+    generation: i64,
+    refs: &[String],
+    deadline: Instant,
+) -> Result<PublicationGuard, Error> {
+    if generation <= 0
+        || refs.is_empty()
+        || refs.len() > 128
+        || refs.iter().any(|name| !valid_ref(name))
+    {
         return Err(Error::bad_request());
     }
     let mut names = refs.to_vec();
     names.sort();
     names.dedup();
-    if names.len() != refs.len() { return Err(Error::bad_request()); }
+    if names.len() != refs.len() {
+        return Err(Error::bad_request());
+    }
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     let slots = SLOTS.get_or_init(|| Arc::new(Semaphore::new(4))).clone();
-    let slot = tokio::time::timeout_at(deadline, slots.acquire_owned()).await
-        .map_err(|_| unavailable())?.map_err(|_| unavailable())?;
+    let slot = tokio::time::timeout_at(deadline, slots.acquire_owned())
+        .await
+        .map_err(|_| unavailable())?
+        .map_err(|_| unavailable())?;
     let data = read_leases::shared(pool, repository_id, deadline).await?;
     let owner_pool = pool.clone();
     let owner_names = names.clone();
@@ -186,14 +243,22 @@ pub async fn acquire(pool: &Pool, repository_id: Uuid, generation: i64,
                 }
             }
         }.await;
-        if let Some(sender) = ready_send.take() { let _ = sender.send(result); }
+        if let Some(sender) = ready_send.take() {
+            let _ = sender.send(result);
+        }
         active_send.send_replace(None);
     })));
     let result = tokio::time::timeout_at(deadline, ready_recv).await;
     match result {
         Ok(Ok(Ok(()))) => Ok(PublicationGuard {
-            repository_id, storage_generation: generation, refs: names,
-            data, active, window_tx, owner: pending.0.take().expect("pending publication task"), _slot: slot,
+            repository_id,
+            storage_generation: generation,
+            refs: names,
+            data,
+            active,
+            window_tx,
+            owner: pending.0.take().expect("pending publication task"),
+            _slot: slot,
         }),
         Ok(Ok(Err(error))) => Err(error),
         _ => Err(unavailable()),
@@ -206,16 +271,30 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_exact_ref_contention_and_atomic_group_admission() {
-        let Ok(base_url) = std::env::var("ROOTYARD_TEST_DATABASE_URL") else { return; };
+        let Ok(base_url) = std::env::var("ROOTYARD_TEST_DATABASE_URL") else {
+            return;
+        };
         let admin = crate::db::pool(&base_url).unwrap();
         let schema = format!("ref_guard_{}", Uuid::new_v4().simple());
-        admin.get().await.unwrap().batch_execute(&format!("CREATE SCHEMA {schema}")).await.unwrap();
+        admin
+            .get()
+            .await
+            .unwrap()
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await
+            .unwrap();
         let mut url = reqwest::Url::parse(&base_url).unwrap();
-        url.query_pairs_mut().append_pair("options", &format!("-csearch_path={schema}"));
+        url.query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
         let pool = crate::db::pool(url.as_str()).unwrap();
         pool.get().await.unwrap().batch_execute("CREATE TABLE repositories(id uuid PRIMARY KEY, storage_generation bigint NOT NULL, state text NOT NULL)").await.unwrap();
         let repo = Uuid::new_v4();
-        pool.get().await.unwrap().execute("INSERT INTO repositories VALUES($1,1,'ready')", &[&repo]).await.unwrap();
+        pool.get()
+            .await
+            .unwrap()
+            .execute("INSERT INTO repositories VALUES($1,1,'ready')", &[&repo])
+            .await
+            .unwrap();
         let until = || Instant::now() + Duration::from_secs(2);
         let a = vec!["refs/heads/a".to_string()];
         let b = vec!["refs/heads/b".to_string()];
@@ -227,15 +306,43 @@ mod tests {
         grant_recv.await.unwrap().unwrap();
         let (blocked_send, blocked_recv) = oneshot::channel();
         independent.window_tx.send(blocked_send).await.unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(150),blocked_recv).await.is_err(),
-            "different ref entered repository publication window concurrently");
-        assert!(acquire(&pool, repo, 1, &a, Instant::now()+Duration::from_millis(200)).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), blocked_recv)
+                .await
+                .is_err(),
+            "different ref entered repository publication window concurrently"
+        );
+        assert!(
+            acquire(
+                &pool,
+                repo,
+                1,
+                &a,
+                Instant::now() + Duration::from_millis(200)
+            )
+            .await
+            .is_err()
+        );
         let group = vec![a[0].clone(), b[0].clone()];
-        assert!(acquire(&pool, repo, 1, &group, Instant::now()+Duration::from_millis(200)).await.is_err());
+        assert!(
+            acquire(
+                &pool,
+                repo,
+                1,
+                &group,
+                Instant::now() + Duration::from_millis(200)
+            )
+            .await
+            .is_err()
+        );
         drop(first);
         let (after_send, after_recv) = oneshot::channel();
         independent.window_tx.send(after_send).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1),after_recv).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), after_recv)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let free_a = acquire(&pool, repo, 1, &a, until()).await.unwrap();
         free_a.ensure_active().unwrap();
         drop(free_a);
@@ -250,25 +357,58 @@ mod tests {
             let writer_ready = ready_send.clone();
             writers.push(tokio::spawn(async move {
                 let name = vec![format!("refs/heads/parallel-{index}")];
-                let guard = acquire(&writer_pool, repo, 1, &name,
-                    Instant::now()+Duration::from_secs(5)).await.unwrap();
+                let guard = acquire(
+                    &writer_pool,
+                    repo,
+                    1,
+                    &name,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
                 writer_ready.send(()).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 guard.ensure_active().unwrap();
             }));
         }
         for _ in 0..4 {
-            tokio::time::timeout(Duration::from_secs(3),ready_recv.recv()).await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(3), ready_recv.recv())
+                .await
+                .unwrap()
+                .unwrap();
         }
         // Four writers use at most four of the eight data lease slots plus
         // four ref-owner sessions. Authorization still obtains a pool session.
         tokio::time::timeout(Duration::from_millis(500), async {
-            pool.get().await.unwrap().query_one("SELECT count(*) FROM repositories WHERE id=$1", &[&repo]).await.unwrap()
-        }).await.expect("writer guard pool starvation");
-        for writer in writers { writer.await.unwrap(); }
-        pool.get().await.unwrap().execute("UPDATE repositories SET storage_generation=2 WHERE id=$1", &[&repo]).await.unwrap();
+            pool.get()
+                .await
+                .unwrap()
+                .query_one("SELECT count(*) FROM repositories WHERE id=$1", &[&repo])
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("writer guard pool starvation");
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        pool.get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE repositories SET storage_generation=2 WHERE id=$1",
+                &[&repo],
+            )
+            .await
+            .unwrap();
         assert!(acquire(&pool, repo, 1, &a, until()).await.is_err());
         drop(pool);
-        admin.get().await.unwrap().batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await.unwrap();
+        admin
+            .get()
+            .await
+            .unwrap()
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 }

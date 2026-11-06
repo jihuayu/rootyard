@@ -17,10 +17,13 @@ use tokio::{io::AsyncReadExt, process::Command};
 use tokio_postgres::{Client, GenericClient};
 use uuid::Uuid;
 
-mod catalog;
 mod authority;
+mod catalog;
 mod lfs_inventory;
-use catalog::{FORMAT, catalogs as schema_catalogs, digest as schema_contract_digest, versions as schema_versions};
+use catalog::{
+    FORMAT, catalogs as schema_catalogs, digest as schema_contract_digest,
+    versions as schema_versions,
+};
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_MANIFEST: u64 = 256 * 1024 * 1024;
 
@@ -70,10 +73,10 @@ struct Manifest {
 
 mod filesystem;
 mod postgres;
-mod snapshot;
 mod restore;
+mod snapshot;
+pub use filesystem::ensure_not_restoring;
 use filesystem::*;
 use postgres::*;
-pub use filesystem::ensure_not_restoring;
-pub use snapshot::create;
 pub use restore::{check, restore};
+pub use snapshot::create;

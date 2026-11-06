@@ -25,9 +25,11 @@ mod protocol;
 #[path = "git_http/receive.rs"]
 mod receive;
 use process::Process;
-pub(crate) use process::{collect_git_output, collect_git_output_input,
-    finish_group_child, stop_group_child, group_quiescent};
-use protocol::{job_response_prefix, route, validate_headers, read_headers};
+pub(crate) use process::{
+    collect_git_output, collect_git_output_input, finish_group_child, group_quiescent,
+    stop_group_child,
+};
+use protocol::{job_response_prefix, read_headers, route, validate_headers};
 
 async fn transfer_authorized(
     state: &AppState,
@@ -39,18 +41,31 @@ async fn transfer_authorized(
 ) -> io::Result<()> {
     if let Some(plan) = job_plan {
         let digest = match job_principal {
-            Some(crate::ci_checkouts::authority::CheckoutPrincipal::User(user)) => &user.token_digest,
-            Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration { token_digest, .. }) => token_digest,
+            Some(crate::ci_checkouts::authority::CheckoutPrincipal::User(user)) => {
+                &user.token_digest
+            }
+            Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration {
+                token_digest,
+                ..
+            }) => token_digest,
             None => return Err(io::Error::other("missing checkout principal")),
         };
-        match crate::ci_checkouts::still_authorized(state, plan.job_id, digest,
-            repo.id, repo.storage_generation).await {
+        match crate::ci_checkouts::still_authorized(
+            state,
+            plan.job_id,
+            digest,
+            repo.id,
+            repo.storage_generation,
+        )
+        .await
+        {
             Ok(true) => Ok(()),
             _ => Err(io::Error::other("checkout authority revoked")),
         }
     } else {
         let user = identity.ok_or_else(|| io::Error::other("missing Git actor"))?;
-        auth::verify_active(&state.pool, user, repo.id, write).await
+        auth::verify_active(&state.pool, user, repo.id, write)
+            .await
             .map_err(|_| io::Error::other("Git authority revoked"))
     }
 }
@@ -67,13 +82,13 @@ pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Resp
 }
 async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
     let (parts, body) = request.into_parts();
-    let (pin_oid, route_path) = if state.mirror_primary.is_some()
-        || parts.uri.path().starts_with("/ci/") {
-        let (oid, path) = crate::mirror::ci_route(parts.uri.path())?;
-        (Some(oid), path)
-    } else {
-        (None, parts.uri.path())
-    };
+    let (pin_oid, route_path) =
+        if state.mirror_primary.is_some() || parts.uri.path().starts_with("/ci/") {
+            let (oid, path) = crate::mirror::ci_route(parts.uri.path())?;
+            (Some(oid), path)
+        } else {
+            (None, parts.uri.path())
+        };
     let (owner, name, endpoint, service) = route(&parts.method, route_path, parts.uri.query())?;
     let write = service == "git-receive-pack";
     if write && pin_oid.is_some() {
@@ -83,8 +98,12 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         ));
     }
     let delegation = crate::sharding::transport::authenticate_delegation(
-        &state, &parts.headers, &parts.method, &parts.uri,
-    ).await?;
+        &state,
+        &parts.headers,
+        &parts.method,
+        &parts.uri,
+    )
+    .await?;
     let job = pin_oid.is_some() && auth::credentials_for(&parts.headers, "ryj_").is_ok();
     if pin_oid.is_some() && state.mirror_primary.is_none() && !job {
         return Err(Error::unauthorized());
@@ -125,11 +144,18 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         let repo = Repository::from_row(&row);
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        auth::authorize_repo(&tx, &identity, owner, name, write).await.map_err(|error| {
-            if error.0 == StatusCode::CONFLICT && error.1 == "repository is not ready" {
-                Error(StatusCode::SERVICE_UNAVAILABLE, "repository not ready; recovery may be required")
-            } else { error }
-        })?;
+        auth::authorize_repo(&tx, &identity, owner, name, write)
+            .await
+            .map_err(|error| {
+                if error.0 == StatusCode::CONFLICT && error.1 == "repository is not ready" {
+                    Error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "repository not ready; recovery may be required",
+                    )
+                } else {
+                    error
+                }
+            })?;
         auth::finish_tx(tx, &identity, false).await?;
         if repo.state != "ready" {
             return Err(Error(
@@ -140,13 +166,22 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         (Some(identity), repo, None, None)
     };
     if repo.storage_backend == "pando" && (write || pin_oid.is_some()) {
-        return Err(Error(StatusCode::SERVICE_UNAVAILABLE,
-            "Pando publication and pinned checkout are not ready"));
+        return Err(Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Pando publication and pinned checkout are not ready",
+        ));
     }
     let remote_user = match &job_principal {
-        Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration { hook_id, job_id, .. }) =>
-            format!("ci-job:{job_id}/integration:{hook_id}"),
-        _ => identity.as_ref().ok_or_else(Error::unauthorized)?.username.clone(),
+        Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration {
+            hook_id,
+            job_id,
+            ..
+        }) => format!("ci-job:{job_id}/integration:{hook_id}"),
+        _ => identity
+            .as_ref()
+            .ok_or_else(Error::unauthorized)?
+            .username
+            .clone(),
     };
     validate_headers(
         &parts.headers,
@@ -162,13 +197,34 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     })?;
     let deadline = Instant::now() + state.config.git_timeout;
     let max_input = state.config.max_request_bytes;
-    let input = receive::prepare(body, &parts.headers, max_input,
-        state.transfer_metrics.clone(), write && parts.method == Method::POST,
-        if repo.object_format == "sha256" { 64 } else { 40 }, deadline).await?;
+    let input = receive::prepare(
+        body,
+        &parts.headers,
+        max_input,
+        state.transfer_metrics.clone(),
+        write && parts.method == Method::POST,
+        if repo.object_format == "sha256" {
+            64
+        } else {
+            40
+        },
+        deadline,
+    )
+    .await?;
     let ref_guard = if let Some(commands) = &input.commands {
-        Some(storage::ref_publication::acquire(&state.pool, repo.id,
-            repo.storage_generation, &commands.refs, deadline).await?)
-    } else { None };
+        Some(
+            storage::ref_publication::acquire(
+                &state.pool,
+                repo.id,
+                repo.storage_generation,
+                &commands.refs,
+                deadline,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let write_guard = if write && parts.method == Method::POST {
         Some(
             tokio::time::timeout_at(deadline, state.storage.write_lock(repo.id))
@@ -180,14 +236,29 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     };
     let snapshot_lease = if write_guard.is_none() {
         Some(storage::read_leases::shared(&state.pool, repo.id, deadline).await?)
-    } else { None };
+    } else {
+        None
+    };
     let read_guard = if snapshot_lease.is_some() {
-        Some(tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(repo.id))
-            .await.map_err(|_| Error::timeout())?)
-    } else { None };
+        Some(
+            tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(repo.id))
+                .await
+                .map_err(|_| Error::timeout())?,
+        )
+    } else {
+        None
+    };
     if snapshot_lease.is_some() {
-        transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
-            job_principal.as_ref(), &repo, write).await.map_err(|_| Error::unauthorized())?;
+        transfer_authorized(
+            &state,
+            identity.as_ref(),
+            job_plan.as_ref(),
+            job_principal.as_ref(),
+            &repo,
+            write,
+        )
+        .await
+        .map_err(|_| Error::unauthorized())?;
     }
     if write_guard.is_some() {
         reliability::before_push(&state, &repo)
@@ -196,9 +267,15 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     }
     let pando_snapshot = if repo.storage_backend == "pando" {
         let lease = snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?;
-        Some(Box::pin(crate::pando_gateway::snapshot::materialize(
-            &state, &repo, lease, deadline)).await?)
-    } else { None };
+        Some(
+            Box::pin(crate::pando_gateway::snapshot::materialize(
+                &state, &repo, lease, deadline,
+            ))
+            .await?,
+        )
+    } else {
+        None
+    };
     let path = if let Some(snapshot) = &pando_snapshot {
         snapshot.path().to_owned()
     } else if let Some(oid) = pin_oid {
@@ -209,8 +286,11 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 crate::mirror::job_path(&state, &repo, plan).await?
             } else {
                 let lease = snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?;
-                lease.guard(crate::ci_checkouts::origin_job_path(
-                    &state, &repo, plan, lease)).await??
+                lease
+                    .guard(crate::ci_checkouts::origin_job_path(
+                        &state, &repo, plan, lease,
+                    ))
+                    .await??
             }
         } else {
             crate::mirror::pinned_path(&state, &repo, oid).await?
@@ -254,20 +334,30 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             .env("ROOTYARD_GIT_PATH", &state.config.git)
             .env("ROOTYARD_GIT_DIR", &path)
             .env("ROOTYARD_DATA_ROOT", &state.storage.root)
-            .env("ROOTYARD_GIT_TIMEOUT_SECONDS", state.config.git_timeout.as_secs().to_string());
+            .env(
+                "ROOTYARD_GIT_TIMEOUT_SECONDS",
+                state.config.git_timeout.as_secs().to_string(),
+            );
         if let Ok(node_id) = std::env::var("ROOTYARD_NODE_ID") {
             cmd.env("ROOTYARD_NODE_ID", node_id);
         }
         // Storage::git clears the inherited environment. Forward only the
         // server's trusted transport inputs required by managed native hooks.
         for name in [
-            "ROOTYARD_PG_CA_PEM", "ROOTYARD_PG_CLIENT_CERT_PEM", "ROOTYARD_PG_CLIENT_KEY_PEM",
-            "ROOTYARD_OBJECT_STORE_ENDPOINT", "ROOTYARD_OBJECT_STORE_BUCKET",
-            "ROOTYARD_OBJECT_STORE_REGION", "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
-            "ROOTYARD_OBJECT_STORE_SECRET_KEY", "ROOTYARD_OBJECT_STORE_SESSION_TOKEN",
+            "ROOTYARD_PG_CA_PEM",
+            "ROOTYARD_PG_CLIENT_CERT_PEM",
+            "ROOTYARD_PG_CLIENT_KEY_PEM",
+            "ROOTYARD_OBJECT_STORE_ENDPOINT",
+            "ROOTYARD_OBJECT_STORE_BUCKET",
+            "ROOTYARD_OBJECT_STORE_REGION",
+            "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
+            "ROOTYARD_OBJECT_STORE_SECRET_KEY",
+            "ROOTYARD_OBJECT_STORE_SESSION_TOKEN",
             "ROOTYARD_LFS_POINTER_VERIFY_BYTES",
         ] {
-            if let Some(value) = std::env::var_os(name) { cmd.env(name, value); }
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
         }
     }
     cmd.arg("http-backend")
@@ -423,8 +513,16 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     } else {
         Vec::new()
     };
-    if let Err(error) = transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
-        job_principal.as_ref(), &repo, write).await {
+    if let Err(error) = transfer_authorized(
+        &state,
+        identity.as_ref(),
+        job_plan.as_ref(),
+        job_principal.as_ref(),
+        &repo,
+        write,
+    )
+    .await
+    {
         process.stop().await;
         let _ = reliability::complete(&state, operation).await;
         return Err(Error::internal(error));
@@ -462,10 +560,25 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             let mut buf = vec![0u8; 32 * 1024];
             let mut recheck_tick = tokio::time::interval(std::time::Duration::from_secs(1));
             recheck_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
-                job_principal.as_ref(), &admitted_repo, write).await?;
-            if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
-            if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
+            transfer_authorized(
+                &state,
+                identity.as_ref(),
+                job_plan.as_ref(),
+                job_principal.as_ref(),
+                &admitted_repo,
+                write,
+            )
+            .await?;
+            if let Some(guard) = &ref_guard {
+                guard
+                    .ensure_active()
+                    .map_err(|_| io::Error::other("ref publication guard lost"))?;
+            }
+            if let Some(lease) = &snapshot_lease {
+                lease
+                    .ensure_active()
+                    .map_err(|_| io::Error::other("storage read lease lost"))?;
+            }
             loop {
                 let next = if let Some(input) = process.input.as_mut() {
                     tokio::select! {
@@ -502,10 +615,25 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 if n == 0 {
                     break;
                 }
-                transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
-                    job_principal.as_ref(), &admitted_repo, write).await?;
-                if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
-                if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
+                transfer_authorized(
+                    &state,
+                    identity.as_ref(),
+                    job_plan.as_ref(),
+                    job_principal.as_ref(),
+                    &admitted_repo,
+                    write,
+                )
+                .await?;
+                if let Some(guard) = &ref_guard {
+                    guard
+                        .ensure_active()
+                        .map_err(|_| io::Error::other("ref publication guard lost"))?;
+                }
+                if let Some(lease) = &snapshot_lease {
+                    lease
+                        .ensure_active()
+                        .map_err(|_| io::Error::other("storage read lease lost"))?;
+                }
                 total = total.saturating_add(n as u64);
                 if total > max_output {
                     return Err(io::Error::other("Git response size limit exceeded"));
@@ -533,8 +661,13 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 return Err(io::Error::other("Git subprocess failed"));
             }
             if write {
-                if let Some(guard) = &ref_guard { guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?; }
-                crate::sharding::fencing::check_before_push(&state, &admitted_repo).await
+                if let Some(guard) = &ref_guard {
+                    guard
+                        .ensure_active()
+                        .map_err(|_| io::Error::other("ref publication guard lost"))?;
+                }
+                crate::sharding::fencing::check_before_push(&state, &admitted_repo)
+                    .await
                     .map_err(|_| io::Error::other("storage fence changed during Git write"))?;
             }
             Ok::<(), io::Error>(())

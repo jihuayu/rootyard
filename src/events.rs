@@ -101,13 +101,18 @@ pub async fn publish_in_tx(
     );
     let service = operation.service_principal_id.is_some();
     if service {
-        ensure!(operation.actor_id.is_nil() && operation.token_id.is_nil()
-            && operation.actor_name == "ci-scheduler"
-            && operation.evidence["kind"] == "observed_immutable_ci_root",
-            "invalid CI service operation");
+        ensure!(
+            operation.actor_id.is_nil()
+                && operation.token_id.is_nil()
+                && operation.actor_name == "ci-scheduler"
+                && operation.evidence["kind"] == "observed_immutable_ci_root",
+            "invalid CI service operation"
+        );
     } else {
-        ensure!(!operation.actor_id.is_nil() && !operation.token_id.is_nil(),
-            "invalid human operation");
+        ensure!(
+            !operation.actor_id.is_nil() && !operation.token_id.is_nil(),
+            "invalid human operation"
+        );
     }
     ensure!(changes.len() <= 100_000, "too many ref events");
     ensure!(

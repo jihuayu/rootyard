@@ -94,7 +94,9 @@ struct NamespaceProvenance {
 
 fn parse_and_validate_mount_path(raw: &str) -> Result<PathBuf> {
     let path = relative_path(raw.as_bytes())?;
-    let has_git = path.components().any(|c| c.as_os_str() == OsStr::new(".git"));
+    let has_git = path
+        .components()
+        .any(|c| c.as_os_str() == OsStr::new(".git"));
     ensure!(
         !has_git && path != Path::new(".rootyard-namespace.json"),
         "mount path cannot contain .git or reserved metadata name"
@@ -195,7 +197,10 @@ fn read_namespace(store: &Store, namespace_id: &str) -> Result<(PathBuf, Namespa
     let mut pairs = Vec::with_capacity(manifest.base_vector.len());
     for bv in &manifest.base_vector {
         let mp = parse_and_validate_mount_path(&bv.mount_path)?;
-        ensure!(decode_path(&bv.mount_path_base64)? == mp, "mount_path_base64 mismatch");
+        ensure!(
+            decode_path(&bv.mount_path_base64)? == mp,
+            "mount_path_base64 mismatch"
+        );
         valid_id(&bv.checkpoint_id)?;
         pairs.push((mp, bv.checkpoint_id.clone()));
     }
@@ -237,12 +242,17 @@ pub fn cmd_namespace_mount(
 ) -> Result<serde_json::Value> {
     let name = text_arg(name_arg)?;
     valid_agent(&name)?;
-    ensure!(!mount_args.is_empty(), "namespace-mount requires at least one mount");
+    ensure!(
+        !mount_args.is_empty(),
+        "namespace-mount requires at least one mount"
+    );
 
     let mut parsed_mounts: Vec<(PathBuf, String)> = Vec::with_capacity(mount_args.len());
     for raw_arg in mount_args {
         let text = text_arg(raw_arg)?;
-        let (m_raw, cp_raw) = text.split_once('=').context("mount must be PATH=CHECKPOINT_ID")?;
+        let (m_raw, cp_raw) = text
+            .split_once('=')
+            .context("mount must be PATH=CHECKPOINT_ID")?;
         let mount_path = parse_and_validate_mount_path(m_raw)?;
         valid_id(cp_raw)?;
         parsed_mounts.push((mount_path, cp_raw.to_owned()));
@@ -293,10 +303,17 @@ pub fn cmd_namespace_mount(
         base_vector,
     };
     let bytes = serde_json::to_vec_pretty(&manifest)?;
-    ensure!(bytes.len() as u64 <= MAX_MANIFEST, "namespace manifest limit exceeded");
+    ensure!(
+        bytes.len() as u64 <= MAX_MANIFEST,
+        "namespace manifest limit exceeded"
+    );
     write_new(&staging.0.join("namespace.json"), &bytes, 0o600)?;
     let digest = hex::encode(Sha256::digest(&bytes));
-    write_new(&staging.0.join("namespace.sha256"), digest.as_bytes(), 0o600)?;
+    write_new(
+        &staging.0.join("namespace.sha256"),
+        digest.as_bytes(),
+        0o600,
+    )?;
     sync_tree(&staging.0)?;
     publish(&staging.0, &ns_dir)?;
 
@@ -313,7 +330,10 @@ pub fn cmd_verify_namespace(
     let view_root = resolve_view_target(store, view_arg, ns_dir.join("tree"), None)?;
 
     if !view_root.exists() {
-        ensure!(fs::symlink_metadata(&view_root).is_err(), "dangling symlink view path");
+        ensure!(
+            fs::symlink_metadata(&view_root).is_err(),
+            "dangling symlink view path"
+        );
         if let Some(parent) = view_root.parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent)?;
@@ -360,9 +380,15 @@ pub fn cmd_verify_namespace(
             }
             mount_entries += 1;
             let full_rel = mount_rel.join(&rel);
-            expected_map.insert(full_rel, (mount_rel.clone(), rel, cp_repo.clone(), entry.clone()));
+            expected_map.insert(
+                full_rel,
+                (mount_rel.clone(), rel, cp_repo.clone(), entry.clone()),
+            );
         }
-        ensure!(mount_entries == bv.entries_count, "BaseVector entry count mismatch");
+        ensure!(
+            mount_entries == bv.entries_count,
+            "BaseVector entry count mismatch"
+        );
     }
 
     for path in view_files.keys() {
@@ -383,7 +409,10 @@ pub fn cmd_verify_namespace(
         let dp = display_path(path);
 
         if meta.file_type().is_symlink() {
-            ensure!(expected.kind == "symlink", "file kind mismatch in namespace view: {dp}");
+            ensure!(
+                expected.kind == "symlink",
+                "file kind mismatch in namespace view: {dp}"
+            );
             let target = fs::read_link(&full)?;
             validate_symlink(&view_root.join(mount_rel), rel_in_mount, &target)?;
             let bytes = target.into_os_string().into_vec();
@@ -402,8 +431,14 @@ pub fn cmd_verify_namespace(
                 "namespace view shares hardlink inode with checkpoint: {dp}"
             );
             let mode = meta.permissions().mode();
-            ensure!(mode & 0o7000 == 0, "special permission bits in namespace view: {dp}");
-            ensure!(mode & 0o222 == 0, "writable file detected in namespace view: {dp}");
+            ensure!(
+                mode & 0o7000 == 0,
+                "special permission bits in namespace view: {dp}"
+            );
+            ensure!(
+                mode & 0o222 == 0,
+                "writable file detected in namespace view: {dp}"
+            );
             ensure!(mode & 0o444 != 0, "unreadable file in namespace view: {dp}");
             ensure!(
                 (mode & 0o111) == (expected.mode & 0o111),
@@ -506,7 +541,9 @@ pub fn cmd_namespace_git_view(
 
     let staging = store.stage()?;
     let staging_repo = staging.0.join("repo");
-    let repo_str = staging_repo.to_str().context("staging path must be UTF-8")?;
+    let repo_str = staging_repo
+        .to_str()
+        .context("staging path must be UTF-8")?;
     run_git_deterministic(store, &staging.0, &["init", "-q", "-b", "main", repo_str])?;
     for (k, v) in [
         ("user.name", "Rootyard Namespace View"),
@@ -522,7 +559,8 @@ pub fn cmd_namespace_git_view(
         let (cp_dir, cp_manifest) = store.read_checkpoint(&bv.checkpoint_id)?;
         let mount_rel = decode_path(&bv.mount_path_base64)?;
         let dest = staging_repo.join(&mount_rel);
-        projected_files += copy_worktree_entries(&cp_dir.join("repo"), &cp_manifest.entries, &dest, false)?;
+        projected_files +=
+            copy_worktree_entries(&cp_dir.join("repo"), &cp_manifest.entries, &dest, false)?;
     }
 
     let provenance = NamespaceProvenance {

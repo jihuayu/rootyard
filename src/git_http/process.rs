@@ -119,29 +119,49 @@ pub(crate) fn group_quiescent(group: i32) -> io::Result<bool> {
 /// Reap a native Git leader only after every member of its process group is
 /// dead. The unreaped leader reserves the PGID and prevents signaling reuse.
 pub(crate) async fn finish_group_child(child: &mut Child) -> io::Result<std::process::ExitStatus> {
-    let pid = child.id().ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
+    let pid = child
+        .id()
+        .ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
     loop {
         let exited = {
             let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-            let rc = unsafe { libc::waitid(libc::P_PID, pid as u32, info.as_mut_ptr(),
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
-            if rc != 0 { return Err(io::Error::last_os_error()); }
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as u32,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
             unsafe { info.assume_init().si_pid() != 0 }
         };
-        if exited { break; }
+        if exited {
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    unsafe { libc::kill(-pid, libc::SIGKILL); }
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
     wait_group_child_quiescent(pid).await;
     child.wait().await
 }
 
 /// Cancellation and timeout path for a Git leader and all descendants.
 pub(crate) async fn stop_group_child(child: &mut Child) -> io::Result<()> {
-    let pid = child.id().ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
-    unsafe { libc::kill(-pid, libc::SIGTERM); }
+    let pid = child
+        .id()
+        .ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+    }
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    unsafe { libc::kill(-pid, libc::SIGKILL); }
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
     wait_group_child_quiescent(pid).await;
     let _ = child.wait().await?;
     Ok(())
@@ -172,7 +192,9 @@ impl Drop for Process {
             let mut reported = false;
             while !matches!(group_quiescent(self.pid), Ok(true)) {
                 if !reported && started.elapsed() > std::time::Duration::from_secs(5) {
-                    eprintln!("rootyard: cancelled Git process group cleanup blocked; retaining snapshot gate");
+                    eprintln!(
+                        "rootyard: cancelled Git process group cleanup blocked; retaining snapshot gate"
+                    );
                     reported = true;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -340,7 +362,12 @@ mod process_tests {
     async fn maintenance_helpers_wait_for_descendant_quiescence() {
         let (mut finished, finished_child) = orphan_group().await;
         let leader = finished.pid;
-        assert!(finish_group_child(&mut finished.child).await.unwrap().success());
+        assert!(
+            finish_group_child(&mut finished.child)
+                .await
+                .unwrap()
+                .success()
+        );
         finished.pid = 0;
         assert_not_running(finished_child).await;
         assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists());

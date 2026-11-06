@@ -26,16 +26,21 @@ pub struct ActiveGuard {
     _file: File,
 }
 impl ActiveGuard {
-    pub fn operation_is_live(op:&Operation)->Result<bool> {
-        let path=op.path.join("active.lock");
-        if !exists(&path)? {return Ok(false);}
-        let file=OpenOptions::new().read(true).write(true)
-            .custom_flags(libc::O_NOFOLLOW).open(&path)?;
-        ensure!(file.metadata()?.is_file(),"invalid active operation lock");
+    pub fn operation_is_live(op: &Operation) -> Result<bool> {
+        let path = op.path.join("active.lock");
+        if !exists(&path)? {
+            return Ok(false);
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        ensure!(file.metadata()?.is_file(), "invalid active operation lock");
         match file.try_lock_exclusive() {
-            Ok(())=>Ok(false),
-            Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>Ok(true),
-            Err(error)=>Err(error.into()),
+            Ok(()) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err(error.into()),
         }
     }
 }
@@ -201,24 +206,35 @@ pub(super) fn load(path: &Path) -> Result<Operation> {
     );
     op.path = path.to_path_buf();
     if let Some(intent) = &op.ci_pin {
-        ensure!(op.proposal_pin.is_none(),"mixed controller capabilities");
+        ensure!(op.proposal_pin.is_none(), "mixed controller capabilities");
         intent.validate()?;
-        ensure!(intent.repository_id == op.repository_id
-            && intent.storage_generation == op.storage_generation,
-            "maintenance identity mismatch");
+        ensure!(
+            intent.repository_id == op.repository_id
+                && intent.storage_generation == op.storage_generation,
+            "maintenance identity mismatch"
+        );
         if op.service_principal_id.is_some() {
-            ensure!(op.actor_id.is_nil() && op.token_id.is_nil()
-                && op.actor_name == "ci-scheduler", "invalid service principal journal");
+            ensure!(
+                op.actor_id.is_nil() && op.token_id.is_nil() && op.actor_name == "ci-scheduler",
+                "invalid service principal journal"
+            );
         } else {
-            ensure!(intent.owner_id == op.actor_id && !op.token_id.is_nil(),
-                "maintenance human identity mismatch");
+            ensure!(
+                intent.owner_id == op.actor_id && !op.token_id.is_nil(),
+                "maintenance human identity mismatch"
+            );
         }
     } else {
-        ensure!(op.service_principal_id.is_none() && !op.actor_id.is_nil()
-            && !op.token_id.is_nil(), "invalid human journal identity");
-        if let Some(intent)=&op.proposal_pin {
+        ensure!(
+            op.service_principal_id.is_none() && !op.actor_id.is_nil() && !op.token_id.is_nil(),
+            "invalid human journal identity"
+        );
+        if let Some(intent) = &op.proposal_pin {
             intent.validate()?;
-            ensure!(intent.repository_id==op.repository_id,"proposal pin repository mismatch");
+            ensure!(
+                intent.repository_id == op.repository_id,
+                "proposal pin repository mismatch"
+            );
         }
     }
     Ok(op)
@@ -247,18 +263,34 @@ pub fn begin(
         None,
         None,
         false,
-    )?.0)
+    )?
+    .0)
 }
 
 /// Admit a write whose network transfer can overlap independent refs. The
 /// returned guard must outlive the Git child and be dropped only after a
 /// terminal journal marker is durable. Runtime recovery skips live guards.
-pub fn begin_active(data_root:&Path,repository_id:Uuid,actor_id:Uuid,
-    actor_name:String,token_id:Uuid,storage_generation:i64)
-    ->Result<(Operation,ActiveGuard)> {
-    let (op,guard)=begin_inner(data_root,repository_id,actor_id,actor_name,
-        token_id,storage_generation,None,None,None,true)?;
-    Ok((op,guard.context("missing active admission lock")?))
+pub fn begin_active(
+    data_root: &Path,
+    repository_id: Uuid,
+    actor_id: Uuid,
+    actor_name: String,
+    token_id: Uuid,
+    storage_generation: i64,
+) -> Result<(Operation, ActiveGuard)> {
+    let (op, guard) = begin_inner(
+        data_root,
+        repository_id,
+        actor_id,
+        actor_name,
+        token_id,
+        storage_generation,
+        None,
+        None,
+        None,
+        true,
+    )?;
+    Ok((op, guard.context("missing active admission lock")?))
 }
 
 pub(crate) fn begin_ci(
@@ -279,7 +311,8 @@ pub(crate) fn begin_ci(
         None,
         None,
         false,
-    )?.0)
+    )?
+    .0)
 }
 
 /// Admit an exact CI retention ref operation under a non-login principal.
@@ -290,18 +323,48 @@ pub(crate) fn begin_ci_service(
 ) -> Result<Operation> {
     intent.validate()?;
     ensure!(!principal_id.is_nil(), "invalid CI service principal");
-    Ok(begin_inner(data_root, intent.repository_id, Uuid::nil(),
-        "ci-scheduler".into(), Uuid::nil(), intent.storage_generation,
-        Some(intent.clone()), Some(principal_id),None,false)?.0)
+    Ok(begin_inner(
+        data_root,
+        intent.repository_id,
+        Uuid::nil(),
+        "ci-scheduler".into(),
+        Uuid::nil(),
+        intent.storage_generation,
+        Some(intent.clone()),
+        Some(principal_id),
+        None,
+        false,
+    )?
+    .0)
 }
 
-pub(crate) fn begin_proposal(data_root:&Path,repository_id:Uuid,actor_id:Uuid,
-    actor_name:String,token_id:Uuid,storage_generation:i64,
-    intent:crate::namespace_service::ProposalIntent)->Result<Operation>{
+pub(crate) fn begin_proposal(
+    data_root: &Path,
+    repository_id: Uuid,
+    actor_id: Uuid,
+    actor_name: String,
+    token_id: Uuid,
+    storage_generation: i64,
+    intent: crate::namespace_service::ProposalIntent,
+) -> Result<Operation> {
     intent.validate()?;
-    ensure!(intent.repository_id==repository_id,"proposal pin repository mismatch");
-    begin_inner(data_root,repository_id,actor_id,actor_name,token_id,
-        storage_generation,None,None,Some(intent),false).map(|(op,_)|op)
+    ensure!(
+        intent.repository_id == repository_id,
+        "proposal pin repository mismatch"
+    );
+    begin_inner(
+        data_root,
+        repository_id,
+        actor_id,
+        actor_name,
+        token_id,
+        storage_generation,
+        None,
+        None,
+        Some(intent),
+        false,
+    )
+    .map(|(op, _)| op)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -316,7 +379,7 @@ fn begin_inner(
     service_principal_id: Option<Uuid>,
     proposal_pin: Option<crate::namespace_service::ProposalIntent>,
     active: bool,
-) -> Result<(Operation,Option<ActiveGuard>)> {
+) -> Result<(Operation, Option<ActiveGuard>)> {
     safe_path(data_root)?;
     ensure!(
         storage_generation > 0 && !actor_name.is_empty() && actor_name.len() <= 4096,
@@ -329,10 +392,17 @@ fn begin_inner(
     // Admission is short, but multiple independent ref writers may now enter
     // it concurrently. A separate persistent inode is required because the
     // sequence counter itself is atomically replaced after each reservation.
-    let sequence_lock = OpenOptions::new().read(true).write(true).create(true)
-        .mode(0o600).custom_flags(libc::O_NOFOLLOW)
+    let sequence_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(repo.join("sequence.lock"))?;
-    ensure!(sequence_lock.metadata()?.is_file(), "invalid journal admission lock");
+    ensure!(
+        sequence_lock.metadata()?.is_file(),
+        "invalid journal admission lock"
+    );
     sequence_lock.lock_exclusive()?;
     let counter = repo.join("sequence");
     let previous: i64 = if exists(&counter)? {
@@ -371,16 +441,22 @@ fn begin_inner(
         &serde_json::to_vec(&op)?,
         false,
     )?;
-    let active_guard=if active {
-        let file=OpenOptions::new().read(true).write(true).create_new(true)
-            .mode(0o600).custom_flags(libc::O_NOFOLLOW)
+    let active_guard = if active {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(staging.join("active.lock"))?;
         file.lock_exclusive()?;
         Some(ActiveGuard { _file: file })
-    }else{None};
+    } else {
+        None
+    };
     fs::rename(&staging, &op.path)?;
     sync_dir(&repo)?;
-    Ok((op,active_guard))
+    Ok((op, active_guard))
 }
 
 pub fn sequence(data_root: &Path, repository_id: Uuid) -> Result<i64> {
@@ -411,8 +487,11 @@ pub fn pending(data_root: &Path, repository_id: Uuid) -> Result<Vec<Operation>> 
             .file_name()
             .and_then(|s| s.to_str())
             .context("invalid journal filename")?;
-        if name == "sequence" || name == "sequence.lock"
-            || name.starts_with(".tmp-") || name.starts_with(".retired-") {
+        if name == "sequence"
+            || name == "sequence.lock"
+            || name.starts_with(".tmp-")
+            || name.starts_with(".retired-")
+        {
             continue;
         }
         let op = load(&path).context("corrupt pending operation")?;
@@ -434,4 +513,3 @@ pub fn pending(data_root: &Path, repository_id: Uuid) -> Result<Vec<Operation>> 
     );
     Ok(result)
 }
-

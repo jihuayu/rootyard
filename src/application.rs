@@ -1,6 +1,11 @@
 //! Shared application state, bounded error responses and readiness checks.
-use crate::{config,dispatch,metrics,reliability,storage};
-use axum::{Json,extract::State,http::{StatusCode,header},response::{IntoResponse,Response}};
+use crate::{config, dispatch, metrics, reliability, storage};
+use axum::{
+    Json,
+    extract::State,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use deadpool_postgres::Pool;
 use std::sync::Arc;
 use tokio::sync::Semaphore;

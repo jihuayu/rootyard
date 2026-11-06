@@ -10,48 +10,89 @@ pub(super) struct ReceiveCommands {
 /// Read only the bounded command pkt-lines, before Git sees the pack. The
 /// exact bytes are replayed to http-backend after the parent owns every ref
 /// lease. A malformed/unsupported request fails before any native child runs.
-pub(super) async fn receive_commands(reader: &mut (impl tokio::io::AsyncRead + Unpin),
-    oid_len: usize) -> Result<ReceiveCommands, Error> {
-    if !matches!(oid_len, 40 | 64) { return Err(Error::bad_request()); }
+pub(super) async fn receive_commands(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    oid_len: usize,
+) -> Result<ReceiveCommands, Error> {
+    if !matches!(oid_len, 40 | 64) {
+        return Err(Error::bad_request());
+    }
     let mut bytes = Vec::new();
     let mut refs = Vec::new();
     let mut changes = Vec::new();
     loop {
-        if bytes.len() + 4 > 128 * 1024 { return Err(Error::bad_request()); }
-        let mut header = [0u8;4];
-        reader.read_exact(&mut header).await.map_err(Error::internal)?;
+        if bytes.len() + 4 > 128 * 1024 {
+            return Err(Error::bad_request());
+        }
+        let mut header = [0u8; 4];
+        reader
+            .read_exact(&mut header)
+            .await
+            .map_err(Error::internal)?;
         bytes.extend_from_slice(&header);
-        let length = std::str::from_utf8(&header).ok()
+        let length = std::str::from_utf8(&header)
+            .ok()
             .and_then(|h| usize::from_str_radix(h, 16).ok())
             .ok_or_else(Error::bad_request)?;
-        if length == 0 { break; }
-        if !(4..=65520).contains(&length) || bytes.len() + length - 4 > 128 * 1024
-            || refs.len() >= 128 { return Err(Error::bad_request()); }
+        if length == 0 {
+            break;
+        }
+        if !(4..=65520).contains(&length)
+            || bytes.len() + length - 4 > 128 * 1024
+            || refs.len() >= 128
+        {
+            return Err(Error::bad_request());
+        }
         let start = bytes.len();
         bytes.resize(start + length - 4, 0);
-        reader.read_exact(&mut bytes[start..]).await.map_err(Error::internal)?;
+        reader
+            .read_exact(&mut bytes[start..])
+            .await
+            .map_err(Error::internal)?;
         let packet = &bytes[start..];
-        let command = packet.split(|b| *b == 0).next().ok_or_else(Error::bad_request)?;
+        let command = packet
+            .split(|b| *b == 0)
+            .next()
+            .ok_or_else(Error::bad_request)?;
         let command = command.strip_suffix(b"\n").unwrap_or(command);
         let command = std::str::from_utf8(command).map_err(|_| Error::bad_request())?;
         // Shallow lines precede commands, but never confer a publication key.
-        if refs.is_empty() && command.starts_with("shallow ") { continue; }
+        if refs.is_empty() && command.starts_with("shallow ") {
+            continue;
+        }
         let mut fields = command.split(' ');
-        let (Some(old),Some(new),Some(name),None) =
-            (fields.next(),fields.next(),fields.next(),fields.next())
-            else { return Err(Error::bad_request()); };
-        if old.len()!=oid_len || new.len()!=oid_len
-            || !old.bytes().chain(new.bytes()).all(|b| b.is_ascii_hexdigit())
-            || !crate::journal::valid_ref(name) || !name.starts_with("refs/")
-            || refs.iter().any(|prior| prior==name) { return Err(Error::bad_request()); }
+        let (Some(old), Some(new), Some(name), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(Error::bad_request());
+        };
+        if old.len() != oid_len
+            || new.len() != oid_len
+            || !old
+                .bytes()
+                .chain(new.bytes())
+                .all(|b| b.is_ascii_hexdigit())
+            || !crate::journal::valid_ref(name)
+            || !name.starts_with("refs/")
+            || refs.iter().any(|prior| prior == name)
+        {
+            return Err(Error::bad_request());
+        }
         refs.push(name.to_string());
         changes.push(journal::RefChange {
-            ref_name: name.to_string(), old_oid: old.to_ascii_lowercase(),
+            ref_name: name.to_string(),
+            old_oid: old.to_ascii_lowercase(),
             new_oid: new.to_ascii_lowercase(),
         });
     }
-    if refs.is_empty() { return Err(Error::bad_request()); }
-    Ok(ReceiveCommands { bytes, refs, changes })
+    if refs.is_empty() {
+        return Err(Error::bad_request());
+    }
+    Ok(ReceiveCommands {
+        bytes,
+        refs,
+        changes,
+    })
 }
 
 #[cfg(test)]
@@ -59,7 +100,7 @@ mod receive_tests {
     use super::*;
 
     fn packet(command: &[u8]) -> Vec<u8> {
-        let mut bytes = format!("{:04x}",command.len()+4).into_bytes();
+        let mut bytes = format!("{:04x}", command.len() + 4).into_bytes();
         bytes.extend_from_slice(command);
         bytes
     }
@@ -74,18 +115,22 @@ mod receive_tests {
         source.extend(packet(second.as_bytes()));
         source.extend(b"0000PACK");
         let mut reader = source.as_slice();
-        let parsed = receive_commands(&mut reader,40).await.unwrap();
-        assert_eq!(parsed.refs,["refs/heads/a","refs/heads/b"]);
+        let parsed = receive_commands(&mut reader, 40).await.unwrap();
+        assert_eq!(parsed.refs, ["refs/heads/a", "refs/heads/b"]);
         assert_eq!(parsed.changes[0].old_oid, zero);
         assert_eq!(parsed.changes[0].new_oid, oid);
-        assert_eq!(&source[..source.len()-4],parsed.bytes);
-        assert_eq!(reader,b"PACK");
+        assert_eq!(&source[..source.len() - 4], parsed.bytes);
+        assert_eq!(reader, b"PACK");
         let mut duplicate = packet(first.as_bytes());
         duplicate.extend(packet(first.as_bytes()));
         duplicate.extend(b"0000");
-        assert!(receive_commands(&mut duplicate.as_slice(),40).await.is_err());
+        assert!(
+            receive_commands(&mut duplicate.as_slice(), 40)
+                .await
+                .is_err()
+        );
         let mut wrong_format = source.as_slice();
-        assert!(receive_commands(&mut wrong_format,64).await.is_err());
+        assert!(receive_commands(&mut wrong_format, 64).await.is_err());
     }
 }
 
@@ -306,4 +351,3 @@ mod tests {
         );
     }
 }
-

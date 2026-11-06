@@ -1,5 +1,7 @@
 use super::{
-    core::*, ignore::IgnoreMatcher, manifest::entries_equivalent,
+    core::*,
+    ignore::IgnoreMatcher,
+    manifest::entries_equivalent,
     remote::{RemoteCheckpointManifest, RemoteDirtyManifest},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -7,8 +9,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet}, ffi::{OsStr, OsString}, fs::{self, File, OpenOptions}, io::Write,
-    os::unix::{ffi::OsStringExt, fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink}},
+    collections::{BTreeMap, BTreeSet},
+    ffi::{OsStr, OsString},
+    fs::{self, File, OpenOptions},
+    io::Write,
+    os::unix::{
+        ffi::OsStringExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink},
+    },
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
@@ -77,44 +85,75 @@ pub struct VfsEvictReport {
 
 struct TempGuard(PathBuf, bool);
 impl Drop for TempGuard {
-    fn drop(&mut self) { if !self.1 { let _ = fs::remove_file(&self.0); } }
+    fn drop(&mut self) {
+        if !self.1 {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
 }
 
 fn ensure_vfs_root(store: &Store) -> Result<PathBuf> {
     let vfs_root = store.root.join("vfs");
-    if !vfs_root.exists() { private_dir(&vfs_root)?; }
+    if !vfs_root.exists() {
+        private_dir(&vfs_root)?;
+    }
     require_directory(&vfs_root)?;
     Ok(vfs_root)
 }
 
 fn validate_pattern(pat: &str) -> Result<()> {
-    ensure!(!pat.is_empty() && !pat.contains('\0') && !pat.starts_with('/'), "invalid VFS pattern");
-    for seg in pat.split('/') { ensure!(!matches!(seg, "." | ".." | ".git"), "unsafe VFS pattern segment"); }
+    ensure!(
+        !pat.is_empty() && !pat.contains('\0') && !pat.starts_with('/'),
+        "invalid VFS pattern"
+    );
+    for seg in pat.split('/') {
+        ensure!(
+            !matches!(seg, "." | ".." | ".git"),
+            "unsafe VFS pattern segment"
+        );
+    }
     Ok(())
 }
 
 pub(crate) fn matches_query(pattern: &str, rel_path: &str) -> bool {
     let pat = pattern.trim_end_matches('/');
-    if pat == "*" || pat == "**" || pat == rel_path { return true; }
-    if rel_path.strip_prefix(pat).is_some_and(|r| r.starts_with('/')) { return true; }
+    if pat == "*" || pat == "**" || pat == rel_path {
+        return true;
+    }
+    if rel_path
+        .strip_prefix(pat)
+        .is_some_and(|r| r.starts_with('/'))
+    {
+        return true;
+    }
     if !pat.contains('/') {
         let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
-        return glob_seg(pat.as_bytes(), name.as_bytes()) || glob_seg(pat.as_bytes(), rel_path.as_bytes());
+        return glob_seg(pat.as_bytes(), name.as_bytes())
+            || glob_seg(pat.as_bytes(), rel_path.as_bytes());
     }
-    let (p_segs, t_segs): (Vec<_>, Vec<_>) = (pat.split('/').collect(), rel_path.split('/').collect());
+    let (p_segs, t_segs): (Vec<_>, Vec<_>) =
+        (pat.split('/').collect(), rel_path.split('/').collect());
     match_segs(&p_segs, &t_segs)
 }
 
 fn match_segs(pat: &[&str], txt: &[&str]) -> bool {
-    if pat.is_empty() { return txt.is_empty(); }
-    if pat[0] == "**" { return match_segs(&pat[1..], txt) || (!txt.is_empty() && match_segs(pat, &txt[1..])); }
-    !txt.is_empty() && glob_seg(pat[0].as_bytes(), txt[0].as_bytes()) && match_segs(&pat[1..], &txt[1..])
+    if pat.is_empty() {
+        return txt.is_empty();
+    }
+    if pat[0] == "**" {
+        return match_segs(&pat[1..], txt) || (!txt.is_empty() && match_segs(pat, &txt[1..]));
+    }
+    !txt.is_empty()
+        && glob_seg(pat[0].as_bytes(), txt[0].as_bytes())
+        && match_segs(&pat[1..], &txt[1..])
 }
 
 fn glob_seg(pat: &[u8], txt: &[u8]) -> bool {
     match (pat.first(), txt.first()) {
         (None, None) => true,
-        (Some(b'*'), _) => glob_seg(&pat[1..], txt) || (!txt.is_empty() && glob_seg(pat, &txt[1..])),
+        (Some(b'*'), _) => {
+            glob_seg(&pat[1..], txt) || (!txt.is_empty() && glob_seg(pat, &txt[1..]))
+        }
         (Some(b'?'), Some(_)) => glob_seg(&pat[1..], &txt[1..]),
         (Some(a), Some(b)) if a == b => glob_seg(&pat[1..], &txt[1..]),
         _ => false,
@@ -123,12 +162,24 @@ fn glob_seg(pat: &[u8], txt: &[u8]) -> bool {
 
 fn open_remote_cas(store: &Store, cas_arg: &OsStr) -> Result<PathBuf> {
     let req = Path::new(cas_arg);
-    let abs = if req.is_absolute() { req.to_path_buf() } else { std::env::current_dir()?.join(req) };
-    no_symlink_components(&abs)?; require_directory(&abs)?;
+    let abs = if req.is_absolute() {
+        req.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(req)
+    };
+    no_symlink_components(&abs)?;
+    require_directory(&abs)?;
     let cas_root = fs::canonicalize(&abs)?;
-    ensure!(fs::metadata(&cas_root)?.permissions().mode() & 0o077 == 0, "remote CAS must be 0700");
-    ensure!(!cas_root.starts_with(&store.root) && !store.root.starts_with(&cas_root), "CAS overlaps store");
-    require_directory(&cas_root.join("blobs"))?; require_directory(&cas_root.join("checkpoints"))?;
+    ensure!(
+        fs::metadata(&cas_root)?.permissions().mode() & 0o077 == 0,
+        "remote CAS must be 0700"
+    );
+    ensure!(
+        !cas_root.starts_with(&store.root) && !store.root.starts_with(&cas_root),
+        "CAS overlaps store"
+    );
+    require_directory(&cas_root.join("blobs"))?;
+    require_directory(&cas_root.join("checkpoints"))?;
     Ok(cas_root)
 }
 
@@ -156,13 +207,26 @@ fn fetch_blob(store: &Store, cp_id: &str, cas: Option<&Path>, rel: &Path, kind: 
 }
 
 fn write_atomic(dir: &Path, name: &OsStr, bytes: &[u8], mode: u32) -> Result<PathBuf> {
-    if !dir.exists() { private_dir(dir)?; }
+    if !dir.exists() {
+        private_dir(dir)?;
+    }
     require_directory(dir)?;
     let tmp = dir.join(format!(".tmp-{}", Uuid::new_v4()));
     let mut guard = TempGuard(tmp.clone(), false);
-    let mut file = OpenOptions::new().write(true).create_new(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
-    file.write_all(bytes)?; file.set_permissions(fs::Permissions::from_mode(mode))?; file.sync_all()?; drop(file);
-    let dest = dir.join(name); fs::rename(&tmp, &dest)?; File::open(dir)?.sync_all()?; guard.1 = true;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    file.sync_all()?;
+    drop(file);
+    let dest = dir.join(name);
+    fs::rename(&tmp, &dest)?;
+    File::open(dir)?.sync_all()?;
+    guard.1 = true;
     Ok(dest)
 }
 
@@ -192,9 +256,19 @@ fn save_vfs_manifest(vfs_dir: &Path, man: &mut VfsMountManifest, extra_dirty: us
     man.total_entries = man.catalog.len();
     man.hydrated_entries = man.catalog.iter().filter(|e| e.hydrated).count();
     man.dehydrated_entries = man.total_entries - man.hydrated_entries;
-    man.dirty_entries = man.catalog.iter().filter(|e| e.state == "hydrated_dirty").count() + extra_dirty;
+    man.dirty_entries = man
+        .catalog
+        .iter()
+        .filter(|e| e.state == "hydrated_dirty")
+        .count()
+        + extra_dirty;
     man.total_bytes = man.catalog.iter().map(|e| e.size).sum();
-    man.hydrated_bytes = man.catalog.iter().filter(|e| e.hydrated).map(|e| e.size).sum();
+    man.hydrated_bytes = man
+        .catalog
+        .iter()
+        .filter(|e| e.hydrated)
+        .map(|e| e.size)
+        .sum();
     man.unhydrated_bytes = man.total_bytes - man.hydrated_bytes;
     let raw = serde_json::to_vec_pretty(man)?;
     let sha = hex::encode(Sha256::digest(&raw));
@@ -205,15 +279,24 @@ fn save_vfs_manifest(vfs_dir: &Path, man: &mut VfsMountManifest, extra_dirty: us
 
 fn read_vfs_manifest(store: &Store, vfs_arg: &OsStr) -> Result<(PathBuf, VfsMountManifest)> {
     ensure_vfs_root(store)?;
-    let vfs_id = text_arg(vfs_arg)?; valid_id(&vfs_id)?;
+    let vfs_id = text_arg(vfs_arg)?;
+    valid_id(&vfs_id)?;
     let vfs_dir = store.root.join("vfs").join(&vfs_id);
     require_directory(&vfs_dir).with_context(|| format!("unknown VFS mount {vfs_id}"))?;
     let raw = read_regular(&vfs_dir.join("vfs.json"), MAX_MANIFEST)?;
     let exp_sha = String::from_utf8(read_regular(&vfs_dir.join("vfs.sha256"), 256)?)?;
-    ensure!(hex::encode(Sha256::digest(&raw)) == exp_sha.trim(), "VFS manifest checksum mismatch");
+    ensure!(
+        hex::encode(Sha256::digest(&raw)) == exp_sha.trim(),
+        "VFS manifest checksum mismatch"
+    );
     let man: VfsMountManifest = serde_json::from_slice(&raw)?;
-    ensure!(man.schema == SCHEMA && man.vfs_id == vfs_id, "invalid VFS manifest");
-    valid_id(&man.checkpoint_id)?; valid_agent(&man.agent_id)?; require_directory(&vfs_dir.join("mount"))?;
+    ensure!(
+        man.schema == SCHEMA && man.vfs_id == vfs_id,
+        "invalid VFS manifest"
+    );
+    valid_id(&man.checkpoint_id)?;
+    valid_agent(&man.agent_id)?;
+    require_directory(&vfs_dir.join("mount"))?;
     Ok((vfs_dir, man))
 }
 
@@ -227,20 +310,33 @@ fn dirty_item(path: &str, b64: &str, change: &str, actual: Option<Entry>) -> Vfs
 }
 
 fn match_targets(
-    catalog: &[VfsCatalogEntry], added: &BTreeSet<String>, patterns: &[String],
+    catalog: &[VfsCatalogEntry],
+    added: &BTreeSet<String>,
+    patterns: &[String],
 ) -> Result<(BTreeSet<usize>, BTreeSet<String>)> {
     let (mut matched_cat, mut matched_added) = (BTreeSet::new(), BTreeSet::new());
     for pat in patterns {
         let mut found = false;
         for (i, e) in catalog.iter().enumerate() {
-            if matches_query(pat, &e.path) { matched_cat.insert(i); found = true; }
+            if matches_query(pat, &e.path) {
+                matched_cat.insert(i);
+                found = true;
+            }
         }
         for add_p in added {
-            if matches_query(pat, add_p) { matched_added.insert(add_p.clone()); found = true; }
+            if matches_query(pat, add_p) {
+                matched_added.insert(add_p.clone());
+                found = true;
+            }
         }
-        if !pat.contains(['*', '?', '[']) { ensure!(found, "no VFS entry matched path: {pat}"); }
+        if !pat.contains(['*', '?', '[']) {
+            ensure!(found, "no VFS entry matched path: {pat}");
+        }
     }
-    ensure!(!matched_cat.is_empty() || !matched_added.is_empty() || catalog.is_empty(), "no VFS entries matched");
+    ensure!(
+        !matched_cat.is_empty() || !matched_added.is_empty() || catalog.is_empty(),
+        "no VFS entries matched"
+    );
     Ok((matched_cat, matched_added))
 }
 
@@ -459,7 +555,9 @@ pub fn cmd_vfs_hydrate(store: &Store, vfs_arg: &OsStr, rest: &[OsString]) -> Res
 
 pub fn cmd_vfs_status(store: &Store, vfs_arg: &OsStr) -> Result<Json> {
     let (vfs_dir, mut man) = read_vfs_manifest(store, vfs_arg)?;
-    Ok(serde_json::to_value(evaluate_vfs_status(store, &vfs_dir, &mut man)?)?)
+    Ok(serde_json::to_value(evaluate_vfs_status(
+        store, &vfs_dir, &mut man,
+    )?)?)
 }
 
 #[rustfmt::skip]

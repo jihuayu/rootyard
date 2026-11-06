@@ -171,32 +171,65 @@ pub async fn lease(
         return Err(conflict());
     }
     if ws.host_id != state.storage.volume_id {
-        let expired:bool=tx.query_one("SELECT lease_until<=clock_timestamp() FROM workspaces WHERE id=$1", &[&id]).await.map_err(Error::internal)?.get(0);
-        if !expired { return Err(conflict()); }
-        let cp = ws.last_checkpoint_id.ok_or_else(conflict)?;
-        let row = tx.query_opt("SELECT state,captured_revision FROM workspace_checkpoints WHERE id=$1 AND workspace_id=$2", &[&cp,&id]).await.map_err(Error::internal)?.ok_or_else(conflict)?;
-        if row.get::<_,String>(0)!="committed" || ws.revision!=row.get::<_,i64>(1)+1 {
+        let expired: bool = tx
+            .query_one(
+                "SELECT lease_until<=clock_timestamp() FROM workspaces WHERE id=$1",
+                &[&id],
+            )
+            .await
+            .map_err(Error::internal)?
+            .get(0);
+        if !expired {
             return Err(conflict());
         }
-        let tenant: Uuid=tx.query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&ws.repository_id]).await.map_err(Error::internal)?.get(0);
-        super::remote::ensure_local(&state,cp,ws.repository_id,tenant).await?;
-        materialize_takeover(&state,id,cp)?;
-    } else if !super::mounts::lower_path(&state,id).join(".git").is_dir() {
+        let cp = ws.last_checkpoint_id.ok_or_else(conflict)?;
+        let row = tx.query_opt("SELECT state,captured_revision FROM workspace_checkpoints WHERE id=$1 AND workspace_id=$2", &[&cp,&id]).await.map_err(Error::internal)?.ok_or_else(conflict)?;
+        if row.get::<_, String>(0) != "committed" || ws.revision != row.get::<_, i64>(1) + 1 {
+            return Err(conflict());
+        }
+        let tenant: Uuid = tx
+            .query_one(
+                "SELECT owner_id FROM repositories WHERE id=$1",
+                &[&ws.repository_id],
+            )
+            .await
+            .map_err(Error::internal)?
+            .get(0);
+        super::remote::ensure_local(&state, cp, ws.repository_id, tenant).await?;
+        materialize_takeover(&state, id, cp)?;
+    } else if !super::mounts::lower_path(&state, id).join(".git").is_dir() {
         return Err(conflict());
     }
-    let same_host=ws.host_id==state.storage.volume_id;
-    let commit=async {
+    let same_host = ws.host_id == state.storage.volume_id;
+    let commit = async {
         let active: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM sandbox_jobs WHERE workspace_id=$1 AND state IN ('queued','running'))", &[&id]).await.map_err(Error::internal)?.get(0);
-        if active { return Err(conflict()); }
+        if active {
+            return Err(conflict());
+        }
         let changed=tx.execute("UPDATE workspaces SET host_id=$2,lease_epoch=lease_epoch+1,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1 AND lease_epoch=$3 AND (host_id=$2 OR lease_until<=clock_timestamp())", &[&id,&state.storage.volume_id,&input.expected_lease_epoch]).await.map_err(Error::internal)?;
-        if changed != 1 { return Err(conflict()); }
-        let row = tx.query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id]).await.map_err(Error::internal)?;
-        let deadline: i64 = tx.query_one("SELECT EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces WHERE id=$1", &[&id]).await.map_err(Error::internal)?.get(0);
+        if changed != 1 {
+            return Err(conflict());
+        }
+        let row = tx
+            .query_one(
+                &format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"),
+                &[&id],
+            )
+            .await
+            .map_err(Error::internal)?;
+        let deadline: i64 = tx
+            .query_one(
+                "SELECT EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces WHERE id=$1",
+                &[&id],
+            )
+            .await
+            .map_err(Error::internal)?
+            .get(0);
         tx.commit().await.map_err(Error::internal)?;
-        Ok((Workspace::from_row(&row),deadline))
+        Ok((Workspace::from_row(&row), deadline))
     };
-    let (saved,deadline)=if same_host {
-        super::mounts::with_frozen_async(id,commit).await?
+    let (saved, deadline) = if same_host {
+        super::mounts::with_frozen_async(id, commit).await?
     } else {
         commit.await?
     };
@@ -211,21 +244,26 @@ fn materialize_takeover(state: &AppState, id: Uuid, cp: Uuid) -> Result<(), Erro
     let destination = super::mounts::lower_path(state, id);
     if destination.exists() {
         if core::inventory(&destination).map_err(Error::internal)?
-            != core::inventory(&source).map_err(Error::internal)? {
+            != core::inventory(&source).map_err(Error::internal)?
+        {
             return Err(conflict());
         }
         return Ok(());
     }
-    let parent=destination.parent().ok_or_else(Error::bad_request)?;
+    let parent = destination.parent().ok_or_else(Error::bad_request)?;
     fs::create_dir_all(parent).map_err(Error::internal)?;
-    let stage=parent.join(format!(".transfer-{}",Uuid::new_v4()));
-    let copied=(|| {
-        core::copy_all(&source,&stage).map_err(Error::internal)?;
+    let stage = parent.join(format!(".transfer-{}", Uuid::new_v4()));
+    let copied = (|| {
+        core::copy_all(&source, &stage).map_err(Error::internal)?;
         core::sync_tree(&stage).map_err(Error::internal)?;
-        fs::rename(&stage,&destination).map_err(Error::internal)?;
-        fs::File::open(parent).and_then(|f|f.sync_all()).map_err(Error::internal)
+        fs::rename(&stage, &destination).map_err(Error::internal)?;
+        fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(Error::internal)
     })();
-    if copied.is_err() { let _=fs::remove_dir_all(&stage); }
+    if copied.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+    }
     copied
 }
 
@@ -281,21 +319,53 @@ pub async fn create(
         return Ok((StatusCode::OK, Json(saved)));
     }
     let id = Uuid::new_v4();
-    let source_lease=read_leases::shared(&state.pool,repo.repo_id,
-        tokio::time::Instant::now()+state.config.git_timeout).await?;
-    let _local=tokio::time::timeout(state.config.git_timeout,
-        state.storage.read_snapshot_lock(repo.repo_id)).await.map_err(|_|Error::timeout())?;
+    let source_lease = read_leases::shared(
+        &state.pool,
+        repo.repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout,
+    )
+    .await?;
+    let _local = tokio::time::timeout(
+        state.config.git_timeout,
+        state.storage.read_snapshot_lock(repo.repo_id),
+    )
+    .await
+    .map_err(|_| Error::timeout())?;
     source_lease.ensure_active()?;
-    let refreshed=auth::authorize_repo_with_role(&tx,&actor,&input.owner,&input.repository,Role::Write).await?;
-    if refreshed.repo_id!=repo.repo_id { return Err(Error::not_found()); }
-    let source = state.storage.verify_path(repo.repo_id).map_err(Error::internal)?;
+    let refreshed =
+        auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write)
+            .await?;
+    if refreshed.repo_id != repo.repo_id {
+        return Err(Error::not_found());
+    }
+    let source = state
+        .storage
+        .verify_path(repo.repo_id)
+        .map_err(Error::internal)?;
     let dest = super::mounts::lower_path(&state, id);
-    if let Some(parent)=dest.parent(){std::fs::create_dir_all(parent).map_err(Error::internal)?;}
-    let mut clone=state.storage.git(&state.config);
-    clone.args(["-c","core.hooksPath=/dev/null","clone","--no-local","--no-hardlinks","--"])
-        .arg(&source).arg(&dest);
-    source_lease.guard(crate::git_http::collect_git_output(clone,4096,state.config.git_timeout))
-        .await?.map_err(Error::internal)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(Error::internal)?;
+    }
+    let mut clone = state.storage.git(&state.config);
+    clone
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "clone",
+            "--no-local",
+            "--no-hardlinks",
+            "--",
+        ])
+        .arg(&source)
+        .arg(&dest);
+    source_lease
+        .guard(crate::git_http::collect_git_output(
+            clone,
+            4096,
+            state.config.git_timeout,
+        ))
+        .await?
+        .map_err(Error::internal)?;
     source_lease.ensure_active()?;
     drop(_local);
     drop(source_lease);

@@ -2,7 +2,9 @@
 use super::{changesets, views};
 #[path = "reverse_git.rs"]
 mod reverse_git;
-use crate::{AppState, Error, auth, browse::transactions, members::models::Role, storage::read_leases};
+use crate::{
+    AppState, Error, auth, browse::transactions, members::models::Role, storage::read_leases,
+};
 use axum::{
     Json,
     extract::{Path, State},
@@ -18,7 +20,10 @@ use std::{
     os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use uuid::Uuid;
 
@@ -275,12 +280,20 @@ pub async fn create(
         .get(0);
     tx.commit().await.map_err(Error::internal)?;
     drop(client);
-    let source_lease=read_leases::shared(&state.pool,access.repo_id,
-        tokio::time::Instant::now()+state.config.git_timeout).await?;
-    let _local=tokio::time::timeout(state.config.git_timeout,
-        state.storage.read_snapshot_lock(access.repo_id)).await.map_err(|_|Error::timeout())?;
+    let source_lease = read_leases::shared(
+        &state.pool,
+        access.repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout,
+    )
+    .await?;
+    let _local = tokio::time::timeout(
+        state.config.git_timeout,
+        state.storage.read_snapshot_lock(access.repo_id),
+    )
+    .await
+    .map_err(|_| Error::timeout())?;
     source_lease.ensure_active()?;
-    auth::verify_active(&state.pool,&actor,access.repo_id,true).await?;
+    auth::verify_active(&state.pool, &actor, access.repo_id, true).await?;
     let _slot = state
         .git_slots
         .clone()
@@ -327,10 +340,20 @@ pub async fn create(
             }
         });
         let result = tokio::task::block_in_place(move || {
-            reverse_git::with_read_cancel(canceled, volume_lock_fd, || build_source_commit(
-                &source, &projected, &stage, &bundle, &bundle_ref,
-                &view_copy, &source_ref, &actor_name, &message, quota,
-            ))
+            reverse_git::with_read_cancel(canceled, volume_lock_fd, || {
+                build_source_commit(
+                    &source,
+                    &projected,
+                    &stage,
+                    &bundle,
+                    &bundle_ref,
+                    &view_copy,
+                    &source_ref,
+                    &actor_name,
+                    &message,
+                    quota,
+                )
+            })
         });
         finished.store(true, Ordering::Release);
         result

@@ -20,10 +20,13 @@ const MAX_REFS: usize = 4096;
 
 #[path = "journal/core.rs"]
 mod core;
-pub use core::{Operation, RefChange, HookPhase, HookEvent, ActiveGuard,
-    begin, begin_active, sequence, pending};
-pub(crate) use core::{safe_path, mkdir, read, exists, atomic, begin_ci, begin_ci_service, begin_proposal};
-use core::{load, entries, sync_dir, validate, op_name};
+pub use core::{
+    ActiveGuard, HookEvent, HookPhase, Operation, RefChange, begin, begin_active, pending, sequence,
+};
+pub(crate) use core::{
+    atomic, begin_ci, begin_ci_service, begin_proposal, exists, mkdir, read, safe_path,
+};
+use core::{entries, load, op_name, sync_dir, validate};
 
 pub(crate) fn valid_ref(s: &str) -> bool {
     if s.len() > 1024 {
@@ -76,9 +79,12 @@ fn parse(input: &[u8]) -> Result<Vec<RefChange>> {
 }
 fn valid_changes(changes: &[RefChange]) -> bool {
     changes.len() <= MAX_REFS
-        && changes
-            .iter()
-            .all(|c| valid_ref(&c.ref_name) && valid_oid(&c.old_oid) && valid_oid(&c.new_oid) && c.old_oid.len() == c.new_oid.len())
+        && changes.iter().all(|c| {
+            valid_ref(&c.ref_name)
+                && valid_oid(&c.old_oid)
+                && valid_oid(&c.new_oid)
+                && c.old_oid.len() == c.new_oid.len()
+        })
 }
 
 /// Raw diagnostic evidence only. Native transactions can nest and their
@@ -333,7 +339,13 @@ pub fn record_ref_transaction_intent(op: &Operation, changes: &[RefChange]) -> R
     validate_request(changes)?;
     let mut input = Vec::new();
     for change in changes {
-        input.extend_from_slice(format!("{} {} {}\n", change.old_oid, change.new_oid, change.ref_name).as_bytes());
+        input.extend_from_slice(
+            format!(
+                "{} {} {}\n",
+                change.old_oid, change.new_oid, change.ref_name
+            )
+            .as_bytes(),
+        );
     }
     record_request(op, &input)
 }
@@ -343,7 +355,13 @@ pub fn record_ref_transaction_receipt(op: &Operation, changes: &[RefChange]) -> 
     validate_request(changes)?;
     let mut input = Vec::new();
     for change in changes {
-        input.extend_from_slice(format!("{} {} {}\n", change.old_oid, change.new_oid, change.ref_name).as_bytes());
+        input.extend_from_slice(
+            format!(
+                "{} {} {}\n",
+                change.old_oid, change.new_oid, change.ref_name
+            )
+            .as_bytes(),
+        );
     }
     record(op, HookPhase::Committed, &input)?;
     record_receipt(op, &input)
@@ -379,9 +397,12 @@ fn validate_namespace(op: &Operation, changes: &[RefChange]) -> Result<()> {
             crate::ci_pins::load_intent(root, intent.repository_id, intent.job_id)? == *intent,
             "maintenance intent changed"
         );
-    } else if let Some(intent)=&op.proposal_pin {
+    } else if let Some(intent) = &op.proposal_pin {
         intent.validate()?;
-        ensure!(changes==[intent.change()],"proposal transaction differs from exact grant");
+        ensure!(
+            changes == [intent.change()],
+            "proposal transaction differs from exact grant"
+        );
     } else {
         ensure!(
             changes

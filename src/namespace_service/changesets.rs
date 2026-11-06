@@ -1,18 +1,17 @@
 use super::handlers;
 use crate::{
-    auth,
+    AppState, Error, auth,
     browse::{
         models::{RefTransactionRequest, RefUpdateInput},
         transactions,
     },
     members::models::Role,
     storage::read_leases,
-    AppState, Error,
 };
 use axum::{
+    Json,
     extract::{Extension, Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -138,22 +137,48 @@ pub async fn create(
         {
             return Err(Error::bad_request());
         }
-        let source_lease=read_leases::shared(&state.pool,access.repo_id,
-            tokio::time::Instant::now()+state.config.git_timeout).await?;
-        let _local=tokio::time::timeout(state.config.git_timeout,
-            state.storage.read_snapshot_lock(access.repo_id)).await.map_err(|_|Error::timeout())?;
+        let source_lease = read_leases::shared(
+            &state.pool,
+            access.repo_id,
+            tokio::time::Instant::now() + state.config.git_timeout,
+        )
+        .await?;
+        let _local = tokio::time::timeout(
+            state.config.git_timeout,
+            state.storage.read_snapshot_lock(access.repo_id),
+        )
+        .await
+        .map_err(|_| Error::timeout())?;
         source_lease.ensure_active()?;
-        let refreshed=auth::authorize_repo_with_role(&tx,&actor,&mount.owner,&mount.repository,Role::Write).await?;
-        if refreshed.repo_id!=access.repo_id { return Err(Error::not_found()); }
+        let refreshed = auth::authorize_repo_with_role(
+            &tx,
+            &actor,
+            &mount.owner,
+            &mount.repository,
+            Role::Write,
+        )
+        .await?;
+        if refreshed.repo_id != access.repo_id {
+            return Err(Error::not_found());
+        }
         let repo = state
             .storage
             .verify_path(access.repo_id)
             .map_err(Error::internal)?;
-        let mut git=state.storage.git(&state.config);
-        git.arg("--git-dir").arg(&repo)
-            .args(["cat-file","-e",&format!("{}^{{commit}}",step.new_oid)]);
-        source_lease.guard(crate::git_http::collect_git_output(git,128,state.config.git_timeout))
-            .await?.map_err(|_|conflict())?;
+        let mut git = state.storage.git(&state.config);
+        git.arg("--git-dir").arg(&repo).args([
+            "cat-file",
+            "-e",
+            &format!("{}^{{commit}}", step.new_oid),
+        ]);
+        source_lease
+            .guard(crate::git_http::collect_git_output(
+                git,
+                128,
+                state.config.git_timeout,
+            ))
+            .await?
+            .map_err(|_| conflict())?;
         source_lease.ensure_active()?;
         steps.push((ordinal as i32, mount, access.repo_id, step));
     }
@@ -282,22 +307,38 @@ async fn run(
             client.execute("UPDATE workspace_changesets SET state='conflict',updated_at=clock_timestamp() WHERE id=$1", &[&id]).await.map_err(Error::internal)?;
             return Err(conflict());
         }
-        let source_lease=read_leases::shared(&state.pool,step.repository_id,
-            tokio::time::Instant::now()+state.config.git_timeout).await?;
-        let _local=tokio::time::timeout(state.config.git_timeout,
-            state.storage.read_snapshot_lock(step.repository_id)).await.map_err(|_|Error::timeout())?;
+        let source_lease = read_leases::shared(
+            &state.pool,
+            step.repository_id,
+            tokio::time::Instant::now() + state.config.git_timeout,
+        )
+        .await?;
+        let _local = tokio::time::timeout(
+            state.config.git_timeout,
+            state.storage.read_snapshot_lock(step.repository_id),
+        )
+        .await
+        .map_err(|_| Error::timeout())?;
         source_lease.ensure_active()?;
-        auth::verify_active(&state.pool,&actor,step.repository_id,true).await?;
+        auth::verify_active(&state.pool, &actor, step.repository_id, true).await?;
         let repo = state
             .storage
             .verify_path(step.repository_id)
             .map_err(Error::internal)?;
-        let mut git=state.storage.git(&state.config);
-        git.arg("--git-dir").arg(&repo)
-            .args(["rev-parse","--verify",&step.ref_name]);
-        let actual=String::from_utf8(source_lease.guard(
-            crate::git_http::collect_git_output(git,256,state.config.git_timeout))
-            .await?.map_err(|_|conflict())?)
+        let mut git = state.storage.git(&state.config);
+        git.arg("--git-dir")
+            .arg(&repo)
+            .args(["rev-parse", "--verify", &step.ref_name]);
+        let actual = String::from_utf8(
+            source_lease
+                .guard(crate::git_http::collect_git_output(
+                    git,
+                    256,
+                    state.config.git_timeout,
+                ))
+                .await?
+                .map_err(|_| conflict())?,
+        )
         .map_err(Error::internal)?;
         drop(_local);
         if actual.trim() != step.new_oid {

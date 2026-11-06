@@ -7,7 +7,11 @@ use std::{
     os::unix::process::CommandExt,
     path::Path as FsPath,
     process::{Command, Stdio},
-    sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -15,24 +19,41 @@ use std::{
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_PROCESS_FILE: u64 = 256 * 1024 * 1024;
 const MAX_WALL_SECONDS: u64 = 60;
-struct ReadContext { cancel: Arc<AtomicBool>, volume_lock_fd: i32 }
+struct ReadContext {
+    cancel: Arc<AtomicBool>,
+    volume_lock_fd: i32,
+}
 thread_local! {
     static READ_CONTEXT: RefCell<Option<ReadContext>> = const { RefCell::new(None) };
 }
 
-pub(super) fn with_read_cancel<T>(flag: Arc<AtomicBool>, volume_lock_fd: i32,
-    work: impl FnOnce() -> T) -> T {
+pub(super) fn with_read_cancel<T>(
+    flag: Arc<AtomicBool>,
+    volume_lock_fd: i32,
+    work: impl FnOnce() -> T,
+) -> T {
     struct Reset;
     impl Drop for Reset {
-        fn drop(&mut self) { READ_CONTEXT.with(|slot| *slot.borrow_mut() = None); }
+        fn drop(&mut self) {
+            READ_CONTEXT.with(|slot| *slot.borrow_mut() = None);
+        }
     }
-    READ_CONTEXT.with(|slot| *slot.borrow_mut() = Some(ReadContext { cancel: flag, volume_lock_fd }));
+    READ_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(ReadContext {
+            cancel: flag,
+            volume_lock_fd,
+        })
+    });
     let _reset = Reset;
     work()
 }
 
 fn read_cancelled() -> bool {
-    READ_CONTEXT.with(|slot| slot.borrow().as_ref().is_some_and(|ctx| ctx.cancel.load(Ordering::Acquire)))
+    READ_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|ctx| ctx.cancel.load(Ordering::Acquire))
+    })
 }
 
 fn lease_lost() -> Error {
@@ -52,7 +73,8 @@ fn limit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Result<()>
 }
 fn command(repo: &FsPath, args: &[&str]) -> Command {
     let parent_pid = unsafe { libc::getpid() };
-    let volume_lock_fd = READ_CONTEXT.with(|slot| slot.borrow().as_ref().map(|ctx| ctx.volume_lock_fd));
+    let volume_lock_fd =
+        READ_CONTEXT.with(|slot| slot.borrow().as_ref().map(|ctx| ctx.volume_lock_fd));
     let mut cmd = Command::new("git");
     cmd.arg("-c")
         .arg("core.hooksPath=/dev/null")
@@ -88,7 +110,9 @@ fn command(repo: &FsPath, args: &[&str]) -> Command {
     cmd
 }
 fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
-    if read_cancelled() { return Err(lease_lost()); }
+    if read_cancelled() {
+        return Err(lease_lost());
+    }
     let cancel = READ_CONTEXT.with(|slot| slot.borrow().as_ref().map(|ctx| ctx.cancel.clone()));
     cmd.stdin(if input.is_some() {
         Stdio::piped()
@@ -101,12 +125,19 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
     let watchdog = thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(MAX_WALL_SECONDS);
         loop {
-            if cancel.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))
-                || std::time::Instant::now() >= deadline {
-                unsafe { libc::kill(-pid, libc::SIGKILL); }
+            if cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+                || std::time::Instant::now() >= deadline
+            {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
                 break;
             }
-            if stop.recv_timeout(Duration::from_millis(50)).is_ok() { break; }
+            if stop.recv_timeout(Duration::from_millis(50)).is_ok() {
+                break;
+            }
         }
     });
     // The writer must run while stdout is drained. cat-file emits output for
@@ -134,24 +165,36 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
     // Leave the leader unreaped while killing and draining the process group.
     // Otherwise a lease-loss read could outlive its local GC gate.
     loop {
-        let mut info=std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        let rc=unsafe {libc::waitid(libc::P_PID,pid as u32,info.as_mut_ptr(),
-            libc::WEXITED|libc::WNOHANG|libc::WNOWAIT)};
-        if rc!=0 {return Err(Error::internal(std::io::Error::last_os_error()));}
-        if unsafe {info.assume_init().si_pid()!=0} {break;}
-        thread::sleep(Duration::from_millis(10));
-    }
-    unsafe {libc::kill(-pid,libc::SIGKILL);}
-    let started=std::time::Instant::now();
-    let mut reported=false;
-    while !matches!(crate::git_http::group_quiescent(pid),Ok(true)) {
-        if !reported && started.elapsed()>Duration::from_secs(5) {
-            eprintln!("rootyard: reverse Git group cleanup blocked; retaining source gate");
-            reported=true;
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as u32,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::internal(std::io::Error::last_os_error()));
+        }
+        if unsafe { info.assume_init().si_pid() != 0 } {
+            break;
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let status=child.wait().map_err(Error::internal)?;
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let started = std::time::Instant::now();
+    let mut reported = false;
+    while !matches!(crate::git_http::group_quiescent(pid), Ok(true)) {
+        if !reported && started.elapsed() > Duration::from_secs(5) {
+            eprintln!("rootyard: reverse Git group cleanup blocked; retaining source gate");
+            reported = true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = child.wait().map_err(Error::internal)?;
     let _ = done.send(());
     let _ = watchdog.join();
     if let Some(writer) = writer {
@@ -160,7 +203,9 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
             .map_err(|_| Error::internal("Git stdin worker panicked"))?
             .map_err(Error::internal)?;
     }
-    if read_cancelled() { return Err(lease_lost()); }
+    if read_cancelled() {
+        return Err(lease_lost());
+    }
     read_result.map_err(Error::internal)?;
     if oversized {
         return Err(Error(

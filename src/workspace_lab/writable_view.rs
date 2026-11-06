@@ -1,5 +1,6 @@
 use super::{
-    core::*, ignore,
+    core::*,
+    ignore,
     manifest::{Changeset, compute_entries_delta, manifest_worktree_map},
     namespace::{BaseVectorEntry, NamespaceManifest},
 };
@@ -8,9 +9,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap, ffi::{OsStr, OsString}, fs::{self, File, OpenOptions}, io::Write,
-    os::unix::{ffi::OsStrExt, fs::{OpenOptionsExt, PermissionsExt}},
-    path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH},
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+    fs::{self, File, OpenOptions},
+    io::Write,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{OpenOptionsExt, PermissionsExt},
+    },
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -492,4 +500,3 @@ pub fn cmd_namespace_commit_back(store: &Store, ns_arg: &OsStr, agent_arg: &OsSt
 
     Ok(serde_json::to_value(receipt)?)
 }
-

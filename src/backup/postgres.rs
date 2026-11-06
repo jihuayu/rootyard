@@ -97,13 +97,21 @@ pub(super) fn pg_command(config: &Config, exe: &str) -> Result<Command> {
             .context("PostgreSQL TLS backup needs ROOTYARD_PG_CA_PEM")?;
         ensure!(Path::new(&ca).is_file(), "PostgreSQL CA file unavailable");
         cmd.env("PGSSLMODE", "verify-full").env("PGSSLROOTCERT", ca);
-        match (std::env::var("ROOTYARD_PG_CLIENT_CERT_PEM").ok(), std::env::var("ROOTYARD_PG_CLIENT_KEY_PEM").ok()) {
-            (Some(cert), Some(key)) => { cmd.env("PGSSLCERT", cert).env("PGSSLKEY", key); }
+        match (
+            std::env::var("ROOTYARD_PG_CLIENT_CERT_PEM").ok(),
+            std::env::var("ROOTYARD_PG_CLIENT_KEY_PEM").ok(),
+        ) {
+            (Some(cert), Some(key)) => {
+                cmd.env("PGSSLCERT", cert).env("PGSSLKEY", key);
+            }
             (None, None) => {}
             _ => bail!("PostgreSQL client certificate and key must be configured together"),
         }
     } else {
-        ensure!(std::env::var_os("ROOTYARD_PG_CA_PEM").is_none(), "refusing PostgreSQL TLS downgrade");
+        ensure!(
+            std::env::var_os("ROOTYARD_PG_CA_PEM").is_none(),
+            "refusing PostgreSQL TLS downgrade"
+        );
         cmd.env("PGSSLMODE", "disable");
     }
     if let Some(password) = cfg.get_password() {
@@ -123,7 +131,10 @@ pub(super) async fn pg(config: &Config) -> Result<Client> {
     client.batch_execute("SET application_name='rootyard-backup'; SET lock_timeout='5s'; SET statement_timeout='60s'").await?;
     Ok(client)
 }
-pub(super) async fn database_scope(client: &(impl GenericClient + Sync), empty: bool) -> Result<()> {
+pub(super) async fn database_scope(
+    client: &(impl GenericClient + Sync),
+    empty: bool,
+) -> Result<()> {
     let extras: i64 = client.query_one("SELECT (SELECT count(*) FROM pg_namespace WHERE nspname NOT IN ('public','information_schema') AND nspname !~ '^pg_') + (SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public' AND NOT (t.typrelid<>0 AND EXISTS(SELECT 1 FROM pg_class c WHERE c.oid=t.typrelid AND c.relkind='r')) AND NOT (t.typelem<>0 AND t.typtype='b' AND EXISTS(SELECT 1 FROM pg_type e JOIN pg_class c ON c.oid=e.typrelid WHERE e.oid=t.typelem AND e.typarray=t.oid AND c.relkind='r'))) + (SELECT count(*) FROM pg_extension WHERE extname<>'plpgsql') + (SELECT count(*) FROM pg_largeobject_metadata)", &[]).await?.get(0);
     let routines: i64 = client.query_one("SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public'", &[]).await?.get(0);
     let other_objects: i64 = client.query_one("SELECT (SELECT count(*) FROM pg_collation c JOIN pg_namespace n ON n.oid=c.collnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_conversion c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_operator c JOIN pg_namespace n ON n.oid=c.oprnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_opclass c JOIN pg_namespace n ON n.oid=c.opcnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_opfamily c JOIN pg_namespace n ON n.oid=c.opfnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_ts_config c JOIN pg_namespace n ON n.oid=c.cfgnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_ts_dict c JOIN pg_namespace n ON n.oid=c.dictnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_ts_parser c JOIN pg_namespace n ON n.oid=c.prsnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_ts_template c JOIN pg_namespace n ON n.oid=c.tmplnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_statistic_ext c JOIN pg_namespace n ON n.oid=c.stxnamespace WHERE n.nspname='public') + (SELECT count(*) FROM pg_publication) + (SELECT count(oid) FROM pg_subscription WHERE subdbid=(SELECT oid FROM pg_database WHERE datname=current_database()))", &[]).await?.get(0);
@@ -270,4 +281,3 @@ pub(super) async fn git_inventory(
     }
     Ok(())
 }
-

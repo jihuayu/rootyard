@@ -192,7 +192,11 @@ pub async fn reconcile(
             ) {
                 (true, Ok(Some(changes))) => {
                     let outcome = if changes.is_empty() {
-                        if operation.service_principal_id.is_some() { "unknown" } else { "no_ref_changes" }
+                        if operation.service_principal_id.is_some() {
+                            "unknown"
+                        } else {
+                            "no_ref_changes"
+                        }
                     } else {
                         "recorded"
                     };
@@ -372,13 +376,17 @@ pub async fn recover_startup(state: &AppState) -> Result<()> {
             // Replica staging journals are not authority. A partial transfer
             // can leave an empty directory; reading it as a primary journal
             // would poison the shared repository state for its true owner.
-            if !crate::sharding::transport::is_local_primary_for_repo(
-                state,row.get(1),id).await.map_err(|error| anyhow::anyhow!(error.1))? {
+            if !crate::sharding::transport::is_local_primary_for_repo(state, row.get(1), id)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.1))?
+            {
                 continue;
             }
             let _lock = state.storage.write_lock(id).await;
-            if !crate::sharding::transport::is_local_primary_for_repo(
-                state,row.get(1),id).await.map_err(|error| anyhow::anyhow!(error.1))? {
+            if !crate::sharding::transport::is_local_primary_for_repo(state, row.get(1), id)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.1))?
+            {
                 continue;
             }
             if reconcile(state, id, row.get(2), true).await.is_err() {
@@ -417,16 +425,24 @@ pub async fn recover_pending(state: &AppState) -> Result<()> {
             )
             .await?;
         if let Some(row) = row {
-            if !crate::sharding::transport::is_local_primary_for_repo(
-                state,row.get(0),id).await.map_err(|error| anyhow::anyhow!(error.1))? {
+            if !crate::sharding::transport::is_local_primary_for_repo(state, row.get(0), id)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.1))?
+            {
                 continue;
             }
             let Ok(_guard) = tokio::time::timeout(
                 std::time::Duration::from_millis(1),
                 state.storage.write_lock(id),
-            ).await else { continue; };
-            if !crate::sharding::transport::is_local_primary_for_repo(
-                state,row.get(0),id).await.map_err(|error| anyhow::anyhow!(error.1))? {
+            )
+            .await
+            else {
+                continue;
+            };
+            if !crate::sharding::transport::is_local_primary_for_repo(state, row.get(0), id)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.1))?
+            {
                 continue;
             }
             if reconcile(state, id, row.get(1), false).await.is_err() {
