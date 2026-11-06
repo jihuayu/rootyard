@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import signal
 import socket
 import subprocess
@@ -69,11 +70,18 @@ def main():
     h.env["ROOTYARD_CLUSTER_HMAC_KEY"] = base64.b64encode(os.urandom(32)).decode()
     extra = []
     report = {"kind": "native_cluster_client_workload", "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
+              "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+              "source_base_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], text=True).strip(),
               "git_version": subprocess.check_output(["git", "--version"], text=True).strip(),
+              "hardware": {"kernel": platform.release(), "machine": platform.machine(), "logical_cpus": os.cpu_count(),
+                           "mem_total_kb": next((int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()
+                                                 if line.startswith("MemTotal:")), None)},
+              "dataset": "one private repository, 24 sequential one-file commits, eight push/fetch pairs per tier",
               "topology": "distinct Rust processes and storage directories; one PostgreSQL schema; loopback signed forwarding",
               "tiers": [], "failure": {}, "raw": [], "untested": ["automatic takeover", "physical storage fencing", "PostgreSQL HA", "network partition", "disk pressure", "cache eviction"]}
     try:
         h.setup()
+        report["postgres_version"] = h.sql("SHOW server_version")
         h.sql("INSERT INTO cluster_operator_tokens(token_id, granted_by) VALUES ('" + h.alice["token_id"] + "', 'native-workload')")
         node0 = "http://" + h.env["ROOTYARD_BIND"]
         status, _ = request(node0, "/api/shards/nodes", h.alice, "POST", {
@@ -136,6 +144,8 @@ def main():
                                     "processes": [process_sample(h.proc.pid)] + [process_sample(p.pid) for p, _ in extra[:tier - 1]]})
 
         last_tip = report["raw"][-1]["acknowledged_oid"]
+        for index in range(1, 4):
+            assert not (h.root / ("data-node" + str(index)) / "repos" / (h.repo["id"] + ".git")).exists(), "ingress unexpectedly contains owner data"
         stopped_at = time.monotonic_ns()
         h.stop(hard=True)
         status, _ = request(bases[1], repo_path + "/info/refs?service=git-upload-pack", h.reader)
@@ -144,10 +154,24 @@ def main():
         h.start()
         recovered_at = time.monotonic_ns()
         h.git("fetch", bases[1] + repo_path, "refs/heads/main", cwd=h.copy, token=h.reader)
+        read_recovered_at = time.monotonic_ns()
         actual = h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip()
         assert actual == last_tip, "acknowledged write lost after owner restart"
-        report["failure"].update({"injection": "SIGKILL owner process group", "rpo_lost_acknowledged_commits": 0,
-                                  "rto_read_ms": round((time.monotonic_ns() - stopped_at) / 1e6, 3),
+        missing = [sample["acknowledged_oid"] for sample in report["raw"]
+                   if h.git("--git-dir=" + str(h.bare), "cat-file", "-e", sample["acknowledged_oid"] + "^{commit}", check=False).returncode]
+        assert not missing, "acknowledged commits lost after owner restart"
+        (h.work / "hello.txt").write_text("write after owner restart\n")
+        h.git("commit", "-am", "post restart write", cwd=h.work)
+        resumed_tip = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
+        h.git("push", bases[1] + repo_path, "HEAD:main", cwd=h.work, token=h.alice)
+        write_recovered_at = time.monotonic_ns()
+        h.git("fetch", bases[2] + repo_path, "refs/heads/main", cwd=h.copy, token=h.reader)
+        assert h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip() == resumed_tip
+        report["failure"].update({"injection": "SIGKILL owner process group", "rpo_lost_acknowledged_commits": len(missing),
+                                  "acknowledged_commits_checked": len(report["raw"]), "unreachable_owner_failed_closed": True,
+                                  "rto_read_ms": round((read_recovered_at - stopped_at) / 1e6, 3),
+                                  "rto_write_ms": round((write_recovered_at - stopped_at) / 1e6, 3),
+                                  "post_restart_acknowledged_oid": resumed_tip,
                                   "process_restart_ms": round((recovered_at - stopped_at) / 1e6, 3)})
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")

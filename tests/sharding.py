@@ -2936,8 +2936,10 @@ def main() -> int:
         and "sharding::routes()" in lib_src
     )
 
-    runner = ShardingHarness(args) if live_ready else ShardingReferenceRunner(args)
-    mode = "live" if live_ready else "reference"
+    if not args.reference_only and not live_ready:
+        parser.error("native shard test requires ROOTYARD_TEST_DATABASE_URL, psql, a built --binary, and registered Rust sharding routes; use --reference-only for the simulation")
+    runner = ShardingReferenceRunner(args) if args.reference_only else ShardingHarness(args)
+    mode = "reference_simulation" if args.reference_only else "live_metadata_drill"
     success = False
     try:
         if args.case == "all":
@@ -2956,12 +2958,15 @@ def main() -> int:
             success = False
         bin_sha = (
             hashlib.sha256(bin_path.read_bytes()).hexdigest()
-            if bin_path.is_file()
+            if bin_path.is_file() and not args.reference_only
             else "reference-mode"
         )
         report = {
             "passed": success,
             "mode": mode,
+            "production_validation": False,
+            "reference_only": args.reference_only,
+            "data_plane_validation": "run cluster_workload_native.py and cluster_migration_native.py",
             "cases": runner.results,
             "binary_sha256": bin_sha,
         }
