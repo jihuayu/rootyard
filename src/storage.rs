@@ -14,6 +14,8 @@ use std::{
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 
+pub mod remote_objects;
+
 pub struct Storage {
     pub root: PathBuf,
     pub lock_file: File,
