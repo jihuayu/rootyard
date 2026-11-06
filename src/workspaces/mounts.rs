@@ -3,7 +3,7 @@ use super::lazy;
 use crate::{
     AppState, Error,
     members::models::Role,
-    workspace_lab::fuse_mount::{MutationGate, Overlay},
+    workspace_lab::fuse_mount::{LazySource, MutationGate, Overlay},
 };
 use axum::{
     Json,
@@ -130,7 +130,8 @@ pub fn ensure(state: &AppState, id: Uuid, until: i64) -> Result<(), Error> {
     fs::create_dir_all(&mountpoint).map_err(Error::internal)?;
     let gate = MutationGate::new(until);
     let lazy = lazy::Reader::open(state, id)?;
-    let overlay = Overlay::new_with_gate_and_lazy(lower, upper, gate.clone(), lazy.clone()).map_err(Error::internal)?;
+    let source: Option<Arc<dyn LazySource>> = lazy.clone().map(|reader| reader as Arc<dyn LazySource>);
+    let overlay = Overlay::new_with_gate_and_lazy(lower, upper, gate.clone(), source).map_err(Error::internal)?;
     let session = fuser::spawn_mount2(
         overlay,
         &mountpoint,
@@ -170,7 +171,7 @@ pub async fn prewarm(
         .unwrap()
         .get(&id)
         .and_then(|m| m.lazy.clone())
-        .ok_or_else(|| Error(StatusCode::CONFLICT, "workspace has no remote lazy baseline"))?;
+        .ok_or(Error(StatusCode::CONFLICT, "workspace has no remote lazy baseline"))?;
     let paths: Vec<PathBuf> = input
         .paths
         .iter()

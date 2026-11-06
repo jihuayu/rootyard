@@ -74,11 +74,15 @@ class WorkspaceHandoffTest(unittest.TestCase):
                 self.assertEqual(warmed["hydrated_files"],1)
                 self.assertEqual((cache/hashlib.sha256(c_source).hexdigest()).read_bytes(),c_source)
                 endpoint=h.env["ROOTYARD_OBJECT_STORE_ENDPOINT"]
-                h.stop();h.env["ROOTYARD_OBJECT_STORE_ENDPOINT"]="http://127.0.0.1:1";h.start()
+                h.stop();h.env["ROOTYARD_OBJECT_STORE_ENDPOINT"]="http://127.0.0.1:1"
+                h.env["ROOTYARD_WORKSPACE_LAZY_TIMEOUT_MS"]="300";h.start()
                 self.assertEqual(base64.b64decode(json.loads(h.expect(f"/api/workspaces/{wid}/files?path=compile.c",
                     200,token=h.alice))["content_base64"]),c_source)
+                offline_started=time.monotonic()
                 self.assertEqual(h.http(path,token=h.alice)[0],503)
-                h.stop();h.env["ROOTYARD_OBJECT_STORE_ENDPOINT"]=endpoint;h.start()
+                self.assertLess(time.monotonic()-offline_started,5)
+                h.stop();h.env.pop("ROOTYARD_WORKSPACE_LAZY_TIMEOUT_MS",None)
+                h.env["ROOTYARD_OBJECT_STORE_ENDPOINT"]=endpoint;h.start()
                 command="set -e; git grep -q 'durable' -- hello.txt & a=$!; "
                 command+="cat hello.txt & b=$!; wait \"$a\"; wait \"$b\"; gcc compile.c -o app; ./app; "
                 command+="printf 'dirty\\n' > compile.c; mv hello.txt moved.txt; cat moved.txt"
