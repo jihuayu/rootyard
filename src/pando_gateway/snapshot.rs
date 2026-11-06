@@ -19,6 +19,7 @@ pub struct Snapshot {
     pub storage_generation: i64,
     pub ref_generation: i64,
     pub refs: BTreeMap<String, String>,
+    pub source_packs: Vec<Uuid>,
 }
 impl Snapshot {
     pub fn path(&self) -> &Path { &self.path }
@@ -96,7 +97,8 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         let path = root.join(format!(".snapshot-{}", Uuid::new_v4()));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-        let snapshot = Snapshot { path, storage_generation: generation, ref_generation, refs };
+        let snapshot = Snapshot { path, storage_generation: generation, ref_generation, refs,
+            source_packs: pack_ids.clone() };
         let format_arg = format!("--object-format={}", repo.object_format);
         run_git(state, snapshot.path(), &["init", "--bare", &format_arg], lease, deadline).await?;
         let store = PackStore::from_env(state.storage.root.join("pando-pack-work"),

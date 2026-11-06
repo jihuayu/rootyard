@@ -4,7 +4,8 @@ use super::{pack_store::{PackManifest, PackStore}, snapshot::Snapshot};
 use crate::{AppState, Error, db::Repository, git_http, journal::RefChange,
     storage::read_leases::Lease};
 use anyhow::{Result, ensure};
-use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, process::Stdio,
+use std::{collections::{BTreeMap, BTreeSet}, os::unix::fs::DirBuilderExt,
+    path::{Path, PathBuf}, process::Stdio,
     sync::Arc, time::Duration};
 use tokio::{process::Command, time::Instant};
 use uuid::Uuid;
@@ -12,8 +13,40 @@ use uuid::Uuid;
 const MAX_REFS: usize = 4096;
 
 pub struct PreparedPush {
-    pub pack: PackManifest,
+    pub pack: Option<PackManifest>,
     pub changes: Vec<RefChange>,
+}
+
+struct VerifyView(PathBuf);
+impl Drop for VerifyView {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+}
+
+/// Verify the changed targets using only the supplied immutable packs. This
+/// prevents local receive-pack loose objects from making a refs-only push
+/// appear safe when its target is absent from the committed pack set.
+async fn pack_set_covers(state: &AppState, repo: &Repository, snapshot: &Snapshot,
+    packs: &[PathBuf], changes: &[RefChange], lease: &Lease,
+    deadline: Instant) -> Result<bool> {
+    let root = snapshot.path().parent().ok_or_else(|| anyhow::anyhow!("Pando session root missing"))?;
+    let view = VerifyView(root.join(format!(".verify-{}",Uuid::new_v4())));
+    std::fs::DirBuilder::new().mode(0o700).create(&view.0)?;
+    let format_arg = format!("--object-format={}",repo.object_format);
+    git(state,&view.0,&["init","--bare",&format_arg],lease,deadline).await?;
+    let destination = view.0.join("objects/pack");
+    for source in packs {
+        let name = source.file_name().ok_or_else(|| anyhow::anyhow!("invalid Pando pack path"))?;
+        ensure!(source.extension().is_some_and(|ext| ext == "pack"),"invalid Pando pack extension");
+        std::fs::hard_link(source,destination.join(name))?;
+        let index = source.with_extension("idx");
+        std::fs::hard_link(&index,destination.join(index.file_name().unwrap()))?;
+    }
+    for change in changes {
+        if change.new_oid.bytes().all(|byte| byte == b'0') { continue; }
+        if git(state,&view.0,&["update-ref","--no-deref",&change.ref_name,&change.new_oid],
+            lease,deadline).await.is_err() { return Ok(false); }
+    }
+    Ok(git(state,&view.0,&["fsck","--full","--strict"],lease,deadline).await.is_ok())
 }
 
 async fn git(state: &AppState, repo: &Path, args: &[&str],
@@ -83,6 +116,15 @@ pub async fn stage(state: &Arc<AppState>, repo: &Repository, tenant_id: Uuid,
         let changes = observe(state,repo,snapshot,lease,deadline).await
             .map_err(|e| anyhow::anyhow!(e.1))?;
         if changes.is_empty() { return Ok(None); }
+        if changes.iter().all(|change| change.new_oid.bytes().all(|b| b == b'0')) {
+            return Ok(Some(PreparedPush { pack:None, changes }));
+        }
+        let source_dir = snapshot.path().join("objects/pack");
+        let source_packs: Vec<PathBuf> = snapshot.source_packs.iter()
+            .map(|id| source_dir.join(format!("pack-{id}.pack"))).collect();
+        if pack_set_covers(state,repo,snapshot,&source_packs,&changes,lease,deadline).await? {
+            return Ok(Some(PreparedPush { pack:None, changes }));
+        }
         let pack_dir = snapshot.path().join("objects/pack");
         let previous: BTreeSet<PathBuf> = std::fs::read_dir(&pack_dir)?
             .map(|entry| entry.map(|entry| entry.path()))
@@ -98,12 +140,14 @@ pub async fn stage(state: &Arc<AppState>, repo: &Repository, tenant_id: Uuid,
         }
         let pack = pack.ok_or_else(|| anyhow::anyhow!("Pando session has no new pack"))?;
         ensure!(pack.with_extension("idx").is_file(), "Pando repack index missing");
+        ensure!(pack_set_covers(state,repo,snapshot,&[pack.clone()],&changes,
+            lease,deadline).await?, "Pando new pack lacks changed ref closure");
         let store = PackStore::from_env(state.storage.root.join("pando-pack-work"),
             state.config.git.clone())?;
         let manifest = lease.guard(Box::pin(store.publish(&state.pool,repo.id,tenant_id,
             repo.storage_generation,&repo.object_format,&pack,&pack.with_extension("idx"),deadline)))
             .await.map_err(|e| anyhow::anyhow!(e.1))??;
-        Ok(Some(PreparedPush { pack:manifest,changes }))
+        Ok(Some(PreparedPush { pack:Some(manifest),changes }))
     }
     Box::pin(inner(state,repo,tenant_id,snapshot,lease,deadline)).await.map_err(Error::internal)
 }
