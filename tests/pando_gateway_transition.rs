@@ -160,11 +160,9 @@ async fn cutover_rollback_round_trip_and_durable_failure() {
     client.execute("UPDATE repositories SET object_format='sha1' WHERE id=$1", &[&repo]).await.unwrap();
 
     let token = uuid::Uuid::new_v4();
+    let digest = db::digest(&token.to_string());
     client
-        .execute(
-            "INSERT INTO tokens(id,user_id,digest,read_only) VALUES($1,$2,$3,false)",
-            &[&token, &_owner, &vec![0u8; 32]],
-        )
+        .execute("INSERT INTO tokens(id,user_id,digest,read_only) VALUES($1,$2,$3,false)", &[&token, &_owner, &digest])
         .await
         .unwrap();
     let actor = _owner;
