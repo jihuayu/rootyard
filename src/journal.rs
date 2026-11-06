@@ -20,10 +20,12 @@ const MAX_REFS: usize = 4096;
 
 #[path = "journal/core.rs"]
 mod core;
-pub use core::{Operation, RefChange, HookPhase, HookEvent, ActiveGuard,
-    begin, begin_active, sequence, pending};
-pub(crate) use core::{safe_path, mkdir, read, exists, atomic, begin_ci, begin_ci_service};
-use core::{load, entries, sync_dir, validate, op_name};
+pub use core::{
+    ActiveGuard, HookEvent, HookPhase, Operation, RefChange, begin, begin_active,
+    begin_active_with, pending, sequence,
+};
+pub(crate) use core::{atomic, begin_ci, begin_ci_service, exists, mkdir, read, safe_path};
+use core::{entries, load, op_name, sync_dir, validate};
 
 pub(crate) fn valid_ref(s: &str) -> bool {
     if s.len() > 1024 {
@@ -76,9 +78,12 @@ fn parse(input: &[u8]) -> Result<Vec<RefChange>> {
 }
 fn valid_changes(changes: &[RefChange]) -> bool {
     changes.len() <= MAX_REFS
-        && changes
-            .iter()
-            .all(|c| valid_ref(&c.ref_name) && valid_oid(&c.old_oid) && valid_oid(&c.new_oid) && c.old_oid.len() == c.new_oid.len())
+        && changes.iter().all(|c| {
+            valid_ref(&c.ref_name)
+                && valid_oid(&c.old_oid)
+                && valid_oid(&c.new_oid)
+                && c.old_oid.len() == c.new_oid.len()
+        })
 }
 
 /// Raw diagnostic evidence only. Native transactions can nest and their
@@ -105,6 +110,7 @@ fn events_with_size(op: &Operation) -> Result<(Vec<HookEvent>, usize)> {
             || name == "publication.grant"
             || name == "finished"
             || name == "interrupted"
+            || name == "fenced"
             || name == "post-receive.json"
             || name == "pre-receive.json"
             || name.starts_with(".tmp-")
@@ -196,6 +202,22 @@ pub fn is_interrupted(op: &Operation) -> Result<bool> {
     ensure!(read(&path)?.is_empty(), "invalid interrupted marker");
     Ok(true)
 }
+/// The writer lost its PostgreSQL admission before publishing. Local refs may
+/// have advanced inside native Git; reconciliation restores their old OIDs and
+/// retires the journal without creating SQL ref history.
+pub fn mark_fenced_aborted(op: &Operation) -> Result<()> {
+    validate(op)?;
+    atomic(&op.path.join("fenced"), b"", false)
+}
+pub fn is_fenced_aborted(op: &Operation) -> Result<bool> {
+    validate(op)?;
+    let path = op.path.join("fenced");
+    if !exists(&path)? {
+        return Ok(false);
+    }
+    ensure!(read(&path)?.is_empty(), "invalid fenced marker");
+    Ok(true)
+}
 /// Mark verified evidence loss. This is not an inference from Git's exit code.
 pub fn mark_corrupt(op: &Operation) -> Result<()> {
     validate(op)?;
@@ -205,7 +227,7 @@ pub fn mark_corrupt(op: &Operation) -> Result<()> {
 /// Canonical bounded evidence for operator inspection and immutable resolution.
 pub fn evidence(op: &Operation) -> Result<serde_json::Value> {
     Ok(
-        serde_json::json!({"operation":op,"reference_events":events(op)?,"requested":requests(op)?,"post_receive":receipts(op)?,"finished":is_finished(op)?,"interrupted":is_interrupted(op)?}),
+        serde_json::json!({"operation":op,"reference_events":events(op)?,"requested":requests(op)?,"post_receive":receipts(op)?,"finished":is_finished(op)?,"interrupted":is_interrupted(op)?,"fenced_aborted":is_fenced_aborted(op)?}),
     )
 }
 pub fn evidence_digest(op: &Operation) -> Result<String> {
@@ -334,7 +356,13 @@ pub fn record_ref_transaction_intent(op: &Operation, changes: &[RefChange]) -> R
     validate_request(changes)?;
     let mut input = Vec::new();
     for change in changes {
-        input.extend_from_slice(format!("{} {} {}\n", change.old_oid, change.new_oid, change.ref_name).as_bytes());
+        input.extend_from_slice(
+            format!(
+                "{} {} {}\n",
+                change.old_oid, change.new_oid, change.ref_name
+            )
+            .as_bytes(),
+        );
     }
     record_request(op, &input)
 }
@@ -344,7 +372,13 @@ pub fn record_ref_transaction_receipt(op: &Operation, changes: &[RefChange]) -> 
     validate_request(changes)?;
     let mut input = Vec::new();
     for change in changes {
-        input.extend_from_slice(format!("{} {} {}\n", change.old_oid, change.new_oid, change.ref_name).as_bytes());
+        input.extend_from_slice(
+            format!(
+                "{} {} {}\n",
+                change.old_oid, change.new_oid, change.ref_name
+            )
+            .as_bytes(),
+        );
     }
     record(op, HookPhase::Committed, &input)?;
     record_receipt(op, &input)
@@ -416,7 +450,10 @@ pub fn run_hook(state: &str) -> Result<()> {
         _ => bail!("unsupported reference transaction state"),
     };
     let (op, input) = hook_input()?;
-    if phase == HookPhase::Preparing {
+    if matches!(phase, HookPhase::Preparing | HookPhase::Prepared) {
+        // `prepared` runs after Git has locked refs and immediately before it
+        // writes them. Re-check the parent window and durable admission here so
+        // takeover or revocation during the transfer cannot publish refs.
         crate::git_http::publication::verify_grant(&op)?;
         crate::browse::policy::validate_hook_fence(&op)?;
     }

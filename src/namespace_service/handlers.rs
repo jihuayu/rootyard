@@ -1,8 +1,8 @@
-use crate::{auth, db, members::models::Role, storage::read_leases, AppState, Error};
+use crate::{AppState, Error, auth, db, members::models::Role, storage::read_leases};
 use axum::{
+    Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -69,10 +69,18 @@ pub async fn create(
             return Err(Error::bad_request());
         }
         owner_id = Some(access.owner_id);
-        let source_lease=read_leases::shared(&state.pool,access.repo_id,
-            tokio::time::Instant::now()+state.config.git_timeout).await?;
-        let refreshed=auth::authorize_repo_with_role(&tx,&actor,&m.owner,&m.repository,Role::Read).await?;
-        if refreshed.repo_id!=access.repo_id { return Err(Error::not_found()); }
+        let source_lease = read_leases::shared(
+            &state.pool,
+            access.repo_id,
+            tokio::time::Instant::now() + state.config.git_timeout,
+        )
+        .await?;
+        let refreshed =
+            auth::authorize_repo_with_role(&tx, &actor, &m.owner, &m.repository, Role::Read)
+                .await?;
+        if refreshed.repo_id != access.repo_id {
+            return Err(Error::not_found());
+        }
         let repo = state
             .storage
             .verify_path(access.repo_id)

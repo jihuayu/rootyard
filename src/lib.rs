@@ -17,9 +17,9 @@ pub mod events;
 #[rustfmt::skip]
 pub mod forge;
 pub mod git_http;
-pub mod pando_gateway;
 pub mod journal;
 pub mod kafka_wake;
+pub mod pando_gateway;
 #[rustfmt::skip]
 pub mod lfs;
 pub mod maintenance;
@@ -48,9 +48,13 @@ pub mod webhooks;
 
 mod application;
 pub mod repositories;
-pub use application::{AppState,Error};
+pub use application::{AppState, Error};
+use axum::{
+    Router,
+    extract::{DefaultBodyLimit, State},
+    routing::get,
+};
 pub use repositories::recover;
-use axum::{Router,extract::{DefaultBodyLimit,State},routing::get};
 use std::sync::Arc;
 
 pub fn router(state: Arc<AppState>) -> Router {

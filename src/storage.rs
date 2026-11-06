@@ -11,14 +11,17 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
 };
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard,
-    RwLock as AsyncRwLock, OwnedRwLockReadGuard, OwnedRwLockWriteGuard};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    RwLock as AsyncRwLock,
+};
 use uuid::Uuid;
 
-pub mod remote_objects;
 pub mod encrypted_objects;
 pub mod read_leases;
+pub mod ref_admission;
 pub mod ref_publication;
+pub mod remote_objects;
 
 pub struct Storage {
     pub root: PathBuf,
@@ -191,10 +194,14 @@ impl Storage {
         Ok(path)
     }
     pub async fn provision(&self, config: &Config, id: Uuid) -> Result<()> {
-        self.provision_with_format(config, id, crate::browse::object_format::ObjectFormat::Sha1).await
+        self.provision_with_format(config, id, crate::browse::object_format::ObjectFormat::Sha1)
+            .await
     }
     pub async fn provision_with_format(
-        &self, config: &Config, id: Uuid, format: crate::browse::object_format::ObjectFormat,
+        &self,
+        config: &Config,
+        id: Uuid,
+        format: crate::browse::object_format::ObjectFormat,
     ) -> Result<()> {
         let _lock = self.write_lock(id).await;
         let final_path = self.repo_path(id);
@@ -227,7 +234,13 @@ impl Storage {
         let format_arg = format!("--object-format={}", format.as_str());
         checked(
             self.git(config)
-                .args(["init", "--bare", &format_arg, "--initial-branch=main", "--template="])
+                .args([
+                    "init",
+                    "--bare",
+                    &format_arg,
+                    "--initial-branch=main",
+                    "--template=",
+                ])
                 .arg(&staging),
         )
         .await?;

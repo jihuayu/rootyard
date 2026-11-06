@@ -63,10 +63,7 @@ fn read_changeset(store: &Store, id: &str) -> Result<(std::path::PathBuf, Change
     require_directory(&dir)?;
     let bytes = read_regular(&dir.join("changeset.json"), MAX_MANIFEST)?;
     let digest = read_regular(&dir.join("changeset.sha256"), 128)?;
-    let digest_trimmed = std::str::from_utf8(&digest)
-        .unwrap_or("")
-        .trim()
-        .as_bytes();
+    let digest_trimmed = std::str::from_utf8(&digest).unwrap_or("").trim().as_bytes();
     ensure!(
         digest_trimmed == hex::encode(Sha256::digest(&bytes)).as_bytes(),
         "changeset manifest checksum mismatch"
@@ -96,7 +93,10 @@ fn read_changeset(store: &Store, id: &str) -> Result<(std::path::PathBuf, Change
             !rel.starts_with(".git"),
             "changeset may not directly mutate .git paths"
         );
-        ensure!(seen_paths.insert(rel.clone()), "duplicate path in changeset");
+        ensure!(
+            seen_paths.insert(rel.clone()),
+            "duplicate path in changeset"
+        );
         match entry.change.as_str() {
             "added" => ensure!(
                 entry.before.is_none() && entry.after.is_some(),

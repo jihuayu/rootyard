@@ -20,6 +20,7 @@ use axum::{
     response::Response,
 };
 use deadpool_postgres::{Object, Transaction};
+use tokio_postgres::GenericClient;
 use serde_json::{Value, json as sjson};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -30,7 +31,7 @@ pub(super) type SubPath = Path<(String, String, String)>;
 pub(super) type MemberPath = Path<(String, String, String, String)>;
 pub(super) type Res = Result<Response, Error>;
 
-pub async fn rbac_tables_installed(tx: &Transaction<'_>) -> Result<bool, Error> {
+pub async fn rbac_tables_installed<C: GenericClient + Sync>(tx: &C) -> Result<bool, Error> {
     let sql = "SELECT to_regclass('repository_collaborators') IS NOT NULL";
     Ok(tx
         .query_one(sql, &[])
@@ -39,8 +40,8 @@ pub async fn rbac_tables_installed(tx: &Transaction<'_>) -> Result<bool, Error> 
         .get(0))
 }
 
-pub async fn resolve_effective_role(
-    tx: &Transaction<'_>,
+pub async fn resolve_effective_role<C: GenericClient + Sync>(
+    tx: &C,
     repo_id: Uuid,
     owner_id: Uuid,
     user_id: Uuid,
@@ -110,13 +111,13 @@ pub async fn resolve_effective_role_by_id(
     owner_id: Uuid,
     user_id: Uuid,
 ) -> Result<Option<Role>, Error> {
-    Ok(resolve_effective_role(tx, repo_id, owner_id, user_id)
+    Ok(resolve_effective_role(&**tx, repo_id, owner_id, user_id)
         .await?
         .map(|(e, _, _)| e))
 }
 
-pub async fn repo_has_collaborators_or_teams(
-    tx: &Transaction<'_>,
+pub async fn repo_has_collaborators_or_teams<C: GenericClient + Sync>(
+    tx: &C,
     repo_id: Uuid,
 ) -> Result<bool, Error> {
     if !rbac_tables_installed(tx).await? {
@@ -450,7 +451,7 @@ pub async fn get_effective_permission(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;
-    let resolved = resolve_effective_role(&tx, acc.repo_id, acc.owner_id, uid).await?;
+    let resolved = resolve_effective_role(&*tx, acc.repo_id, acc.owner_id, uid).await?;
     let (role, direct_role, team_role) = match resolved {
         Some((eff, d, t)) => (Some(eff), d, t),
         None => (None, None, None),

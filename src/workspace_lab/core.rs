@@ -269,10 +269,7 @@ impl Store {
         require_directory(&checkpoint)?;
         let bytes = read_regular(&checkpoint.join("manifest.json"), MAX_MANIFEST)?;
         let digest = read_regular(&checkpoint.join("manifest.sha256"), 128)?;
-        let digest_trimmed = std::str::from_utf8(&digest)
-            .unwrap_or("")
-            .trim()
-            .as_bytes();
+        let digest_trimmed = std::str::from_utf8(&digest).unwrap_or("").trim().as_bytes();
         ensure!(
             digest_trimmed == hex::encode(Sha256::digest(&bytes)).as_bytes(),
             "checkpoint manifest checksum mismatch"
@@ -298,7 +295,10 @@ impl Store {
 
     pub fn replace_dir_atomic(&self, staging_dir: &Path, target_dir: &Path) -> Result<()> {
         sync_tree(staging_dir)?;
-        let backup = self.root.join("staging").join(format!("backup-{}", new_id()));
+        let backup = self
+            .root
+            .join("staging")
+            .join(format!("backup-{}", new_id()));
         fs::rename(target_dir, &backup)?;
         if let Err(err) = fs::rename(staging_dir, target_dir) {
             let _ = fs::rename(&backup, target_dir);

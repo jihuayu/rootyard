@@ -199,7 +199,11 @@ pub(super) fn inventory(root: &Path) -> Result<BTreeMap<String, Entry>> {
     visit(root, root, &mut entries)?;
     Ok(entries)
 }
-pub(super) fn copy_volume(source: &Path, target: &Path, entries: &BTreeMap<String, Entry>) -> Result<()> {
+pub(super) fn copy_volume(
+    source: &Path,
+    target: &Path,
+    entries: &BTreeMap<String, Entry>,
+) -> Result<()> {
     private_dir(target)?;
     for (name, entry) in entries {
         ensure!(

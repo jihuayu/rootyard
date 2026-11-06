@@ -143,6 +143,14 @@ pub async fn reconcile(
         if !startup && journal::ActiveGuard::operation_is_live(&operation)? {
             continue;
         }
+        // A durable admission that was fenced before SQL settlement must never
+        // publish ref events. Native Git can already have advanced local refs;
+        // restore their old OIDs under the caller's repository write lock and
+        // retire the journal without creating an operation or outbox row.
+        if crate::storage::ref_admission::operation_is_fenced(state, &operation).await? {
+            crate::storage::ref_admission::rollback_fenced(state, &operation).await?;
+            continue;
+        }
         match crate::maintenance::retire_if_resolved(&state.pool, &state.storage, &operation).await
         {
             Ok(true) => continue,
@@ -192,7 +200,11 @@ pub async fn reconcile(
             ) {
                 (true, Ok(Some(changes))) => {
                     let outcome = if changes.is_empty() {
-                        if operation.service_principal_id.is_some() { "unknown" } else { "no_ref_changes" }
+                        if operation.service_principal_id.is_some() {
+                            "unknown"
+                        } else {
+                            "no_ref_changes"
+                        }
                     } else {
                         "recorded"
                     };
@@ -225,7 +237,11 @@ pub async fn reconcile(
                     // managed reference-transaction hook requires that grant.
                     // Every I/O error other than definite NotFound stays unknown.
                     let ungranted_without_hooks = no_parent_publication_possible(
-                        &operation, raw.is_empty(), receipt.is_none(), requested.is_none());
+                        &operation,
+                        raw.is_empty(),
+                        receipt.is_none(),
+                        requested.is_none(),
+                    );
                     let repeated = receipt.as_ref().is_some_and(|items| {
                         let mut seen = std::collections::HashSet::new();
                         items.iter().any(|item| !seen.insert(&item.ref_name))
@@ -235,7 +251,8 @@ pub async fn reconcile(
                     } else if receipt.is_some() {
                         "recorded"
                     } else if (!interrupted || ungranted_without_hooks)
-                        && raw.iter().all(|event| event.changes.is_empty()) {
+                        && raw.iter().all(|event| event.changes.is_empty())
+                    {
                         "no_ref_changes"
                     } else {
                         "unknown"
@@ -280,6 +297,12 @@ pub async fn reconcile(
                 storage_generation: operation.storage_generation,
                 outcome: outcome.into(),
                 evidence,
+                admission: operation.requires_parent_publication.then_some(
+                    events::AdmissionRecord {
+                        writer_id: operation.id,
+                        shard_epoch: operation.shard_epoch,
+                    },
+                ),
             },
             &changes,
         )
@@ -301,9 +324,16 @@ pub async fn reconcile(
     Ok(clear)
 }
 
-fn no_parent_publication_possible(operation: &journal::Operation, no_events: bool,
-    no_receipt: bool, no_request: bool) -> bool {
-    operation.requires_parent_publication && no_events && no_receipt && no_request
+fn no_parent_publication_possible(
+    operation: &journal::Operation,
+    no_events: bool,
+    no_receipt: bool,
+    no_request: bool,
+) -> bool {
+    operation.requires_parent_publication
+        && no_events
+        && no_receipt
+        && no_request
         && matches!(std::fs::symlink_metadata(operation.path.join("publication.grant")),
             Err(ref error) if error.kind() == std::io::ErrorKind::NotFound)
 }
@@ -530,19 +560,36 @@ mod tests {
     #[test]
     fn interrupted_receive_is_certain_only_without_a_parent_grant() {
         let root = tempfile::tempdir().unwrap();
-        let (operation, active) = journal::begin_active(root.path(), Uuid::new_v4(),
-            Uuid::new_v4(), "actor".into(), Uuid::new_v4(), 1).unwrap();
+        let (operation, active) = journal::begin_active(
+            root.path(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "actor".into(),
+            Uuid::new_v4(),
+            1,
+        )
+        .unwrap();
         drop(active);
         assert!(no_parent_publication_possible(&operation, true, true, true));
-        assert!(!no_parent_publication_possible(&operation, false, true, true));
-        assert!(!no_parent_publication_possible(&operation, true, false, true));
-        assert!(!no_parent_publication_possible(&operation, true, true, false));
+        assert!(!no_parent_publication_possible(
+            &operation, false, true, true
+        ));
+        assert!(!no_parent_publication_possible(
+            &operation, true, false, true
+        ));
+        assert!(!no_parent_publication_possible(
+            &operation, true, true, false
+        ));
         let marker = operation.path.join("publication.grant");
         std::fs::write(&marker, b"granted").unwrap();
-        assert!(!no_parent_publication_possible(&operation, true, true, true));
+        assert!(!no_parent_publication_possible(
+            &operation, true, true, true
+        ));
         std::fs::remove_file(&marker).unwrap();
         std::os::unix::fs::symlink("missing", &marker).unwrap();
-        assert!(!no_parent_publication_possible(&operation, true, true, true));
+        assert!(!no_parent_publication_possible(
+            &operation, true, true, true
+        ));
     }
     #[test]
     fn executable_access_checks_capability_not_just_file_presence() {

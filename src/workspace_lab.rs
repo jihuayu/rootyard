@@ -6,11 +6,14 @@ mod core_inner;
 pub mod core { pub use super::core_inner::*; pub(crate) fn private_dir(p: &std::path::Path) -> anyhow::Result<()> { if let Some(d) = p.parent() && !d.as_os_str().is_empty() && !d.exists() { private_dir(d)?; } super::core_inner::private_dir(p) } }
 #[path = "workspace_lab/crash_recovery.rs"]
 pub mod crash_recovery;
+#[path = "workspace_lab/fuse_mount.rs"]
+pub mod fuse_mount;
 #[path = "workspace_lab/ignore.rs"]
 pub mod ignore;
 #[path = "workspace_lab/manifest.rs"]
 pub mod manifest;
 #[path = "workspace_lab/namespace.rs"]
+#[rustfmt::skip]
 pub mod namespace;
 #[path = "workspace_lab/remote.rs"]
 pub mod remote;
@@ -19,12 +22,12 @@ pub mod security;
 #[path = "workspace_lab/sync.rs"]
 pub mod sync;
 #[path = "workspace_lab/vfs.rs"]
+#[rustfmt::skip]
 pub mod vfs;
-#[path = "workspace_lab/fuse_mount.rs"]
-pub mod fuse_mount;
 #[path = "workspace_lab/view.rs"]
 pub mod view;
 #[path = "workspace_lab/writable_view.rs"]
+#[rustfmt::skip]
 pub mod writable_view;
 
 use anyhow::{Context, Result, bail, ensure};

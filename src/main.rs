@@ -155,7 +155,8 @@ async fn run() -> Result<()> {
                 dispatch: rootyard::dispatch::Signals::default(),
             };
             rootyard::reliability::recover_startup(&state).await?;
-            rootyard::sharding::transitions::reconcile_pending(&state).await
+            rootyard::sharding::transitions::reconcile_pending(&state)
+                .await
                 .map_err(|e| anyhow::anyhow!(e.1))?;
             println!(
                 "offline reconciliation finished; inspect repository states for unresolved incidents"
@@ -212,9 +213,12 @@ async fn run() -> Result<()> {
                 let node_id = std::env::var("ROOTYARD_NODE_ID")
                     .context("local process fence requires ROOTYARD_NODE_ID")?;
                 rootyard::sharding::local_fence::register_local_process(&node_id)?
-            } else { false };
+            } else {
+                false
+            };
             rootyard::reliability::recover_startup(&state).await?;
-            rootyard::sharding::transitions::reconcile_pending(&state).await
+            rootyard::sharding::transitions::reconcile_pending(&state)
+                .await
                 .map_err(|e| anyhow::anyhow!(e.1))?;
             rootyard::recover(&state).await?;
             rootyard::sandbox::reconcile_startup(&state)
@@ -225,8 +229,12 @@ async fn run() -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("workspace FUSE mount recovery failed"))?;
             let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
             let controller_task = if local_fence {
-                Some(tokio::spawn(rootyard::sharding::controller::run(state.clone())))
-            } else { None };
+                Some(tokio::spawn(rootyard::sharding::controller::run(
+                    state.clone(),
+                )))
+            } else {
+                None
+            };
             eprintln!(
                 "rootyard listening on {} (GitFS single-node)",
                 listener.local_addr()?
@@ -267,9 +275,12 @@ async fn run() -> Result<()> {
             };
             let webhook_task = if state.config.outbox_worker {
                 Some(tokio::spawn(rootyard::webhooks::background::worker(
-                    state.clone(), dispatch_stop.clone(),
+                    state.clone(),
+                    dispatch_stop.clone(),
                 )))
-            } else { None };
+            } else {
+                None
+            };
             let worker_state = state.clone();
             let workspace_capture_stop = tokio_util::sync::CancellationToken::new();
             let workspace_capture_task = tokio::spawn(rootyard::workspaces::capture::run(
@@ -280,8 +291,13 @@ async fn run() -> Result<()> {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
                     interval.tick().await;
-                    if rootyard::sharding::transitions::reconcile_pending(&worker_state).await.is_err() {
-                        eprintln!("rootyard: shard marker reconciliation unavailable; affected writes remain fenced");
+                    if rootyard::sharding::transitions::reconcile_pending(&worker_state)
+                        .await
+                        .is_err()
+                    {
+                        eprintln!(
+                            "rootyard: shard marker reconciliation unavailable; affected writes remain fenced"
+                        );
                     }
                     if rootyard::reliability::recover_pending(&worker_state)
                         .await
@@ -295,9 +311,12 @@ async fn run() -> Result<()> {
                 }
             });
             let maintenance_stop = tokio_util::sync::CancellationToken::new();
-            let maintenance_task = maintenance_policy.enabled.then(|| tokio::spawn(
-                rootyard::storage_lifecycle::run(state.clone(), maintenance_stop.clone()),
-            ));
+            let maintenance_task = maintenance_policy.enabled.then(|| {
+                tokio::spawn(rootyard::storage_lifecycle::run(
+                    state.clone(),
+                    maintenance_stop.clone(),
+                ))
+            });
             axum::serve(listener, rootyard::router(state))
                 .with_graceful_shutdown(shutdown())
                 .await?;
@@ -305,14 +324,20 @@ async fn run() -> Result<()> {
             maintenance_stop.cancel();
             workspace_capture_stop.cancel();
             let _ = workspace_capture_task.await;
-            if let Some(task) = controller_task { task.abort(); }
-            if let Some(task) = maintenance_task { task.await??; }
+            if let Some(task) = controller_task {
+                task.abort();
+            }
+            if let Some(task) = maintenance_task {
+                task.await??;
+            }
             dispatch_stop.cancel();
             let _ = publish_task.await;
             if let Some(task) = delivery_task {
                 let _ = task.await;
             }
-            if let Some(task) = webhook_task { let _ = task.await; }
+            if let Some(task) = webhook_task {
+                let _ = task.await;
+            }
             if let Some(metrics_worker) = metrics_worker {
                 metrics_worker.abort();
             }

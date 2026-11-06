@@ -6,7 +6,13 @@ use deadpool_postgres::Pool;
 use serde_json::Value;
 use uuid::Uuid;
 
-pub async fn enqueue(pool: &Pool, repo: Uuid, tenant: Uuid, generation: i64, kind: &str) -> Result<bool> {
+pub async fn enqueue(
+    pool: &Pool,
+    repo: Uuid,
+    tenant: Uuid,
+    generation: i64,
+    kind: &str,
+) -> Result<bool> {
     let client = pool.get().await?;
     let n = client.execute(
         "INSERT INTO storage_maintenance_jobs(id,repository_id,tenant_id,kind,repository_generation) \
@@ -26,7 +32,8 @@ pub async fn claim(pool: &Pool, owner: Uuid, policy: &Policy) -> Result<Option<J
          updated_at=clock_timestamp() WHERE state='running' AND lease_until<clock_timestamp() \
          AND attempt >= $1",
         &[&policy.max_attempts],
-    ).await?;
+    )
+    .await?;
     let row = tx.query_opt(
         "WITH candidate AS ( \
            SELECT id FROM storage_maintenance_jobs \
@@ -56,20 +63,40 @@ pub async fn renew(pool: &Pool, job: &Job, policy: &Policy) -> Result<bool> {
 
 pub async fn current(pool: &Pool, job: &Job) -> Result<bool> {
     let client = pool.get().await?;
-    Ok(client.query_opt(
-        "SELECT 1 FROM storage_maintenance_jobs j JOIN repositories r ON r.id=j.repository_id \
+    Ok(client
+        .query_opt(
+            "SELECT 1 FROM storage_maintenance_jobs j JOIN repositories r ON r.id=j.repository_id \
          WHERE j.id=$1 AND j.state='running' AND j.lease_owner=$2 AND \
          j.claim_generation=$3 AND j.attempt=$4 AND j.lease_until>clock_timestamp() \
          AND j.repository_generation=r.storage_generation AND j.tenant_id=r.owner_id \
          AND r.state='ready' AND r.storage_backend='gitfs'",
-        &[&job.id, &job.lease_owner, &job.claim_generation, &job.attempt],
-    ).await?.is_some())
+            &[
+                &job.id,
+                &job.lease_owner,
+                &job.claim_generation,
+                &job.attempt,
+            ],
+        )
+        .await?
+        .is_some())
 }
 
-pub async fn finish(pool: &Pool, job: &Job, result: Value, error: Option<&str>, policy: &Policy) -> Result<bool> {
+pub async fn finish(
+    pool: &Pool,
+    job: &Job,
+    result: Value,
+    error: Option<&str>,
+    policy: &Policy,
+) -> Result<bool> {
     let client = pool.get().await?;
     let retry = error.is_some() && job.attempt < policy.max_attempts;
-    let state = if retry { "queued" } else if error.is_some() { "failed" } else { "succeeded" };
+    let state = if retry {
+        "queued"
+    } else if error.is_some() {
+        "failed"
+    } else {
+        "succeeded"
+    };
     let message = error.map(|e| e.chars().take(1024).collect::<String>());
     let delay = (1_i64 << job.attempt.min(10)).min(900);
     Ok(client.execute(

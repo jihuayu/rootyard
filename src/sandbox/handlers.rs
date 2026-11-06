@@ -61,7 +61,7 @@ async fn authorized_job(state: &AppState, headers: &HeaderMap, id: Uuid) -> Resu
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
-    if row.get::<_,Option<Uuid>>("workspace_id").is_none() {
+    if row.get::<_, Option<Uuid>>("workspace_id").is_none() {
         return Err(Error::not_found());
     }
     let job = job(&row);

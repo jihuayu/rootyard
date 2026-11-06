@@ -1,6 +1,6 @@
 use super::handlers;
 use crate::{
-    auth,
+    AppState, Error, auth,
     browse::{
         models::{RefTransactionRequest, RefUpdateInput},
         transactions,
@@ -8,12 +8,11 @@ use crate::{
     members::models::Role,
     storage::read_leases,
     workspaces::service,
-    AppState, Error,
 };
 use axum::{
+    Json,
     extract::{Extension, Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -139,10 +138,23 @@ pub async fn create(
         {
             return Err(Error::bad_request());
         }
-        let source_lease=read_leases::shared(&state.pool,access.repo_id,
-            tokio::time::Instant::now()+state.config.git_timeout).await?;
-        let refreshed=auth::authorize_repo_with_role(&tx,&actor,&mount.owner,&mount.repository,Role::Write).await?;
-        if refreshed.repo_id!=access.repo_id { return Err(Error::not_found()); }
+        let source_lease = read_leases::shared(
+            &state.pool,
+            access.repo_id,
+            tokio::time::Instant::now() + state.config.git_timeout,
+        )
+        .await?;
+        let refreshed = auth::authorize_repo_with_role(
+            &tx,
+            &actor,
+            &mount.owner,
+            &mount.repository,
+            Role::Write,
+        )
+        .await?;
+        if refreshed.repo_id != access.repo_id {
+            return Err(Error::not_found());
+        }
         let repo = state
             .storage
             .verify_path(access.repo_id)
@@ -279,9 +291,13 @@ async fn run(
             client.execute("UPDATE workspace_changesets SET state='conflict',updated_at=clock_timestamp() WHERE id=$1", &[&id]).await.map_err(Error::internal)?;
             return Err(conflict());
         }
-        let source_lease=read_leases::shared(&state.pool,step.repository_id,
-            tokio::time::Instant::now()+state.config.git_timeout).await?;
-        auth::verify_active(&state.pool,&actor,step.repository_id,true).await?;
+        let source_lease = read_leases::shared(
+            &state.pool,
+            step.repository_id,
+            tokio::time::Instant::now() + state.config.git_timeout,
+        )
+        .await?;
+        auth::verify_active(&state.pool, &actor, step.repository_id, true).await?;
         let repo = state
             .storage
             .verify_path(step.repository_id)

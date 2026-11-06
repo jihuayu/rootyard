@@ -279,7 +279,8 @@ fn read_verified_cas_blob(
     verify_cas_file(&path, expected_sha256, expected_size)?;
     let bytes = read_regular(&path, MAX_BYTES)?;
     ensure!(
-        bytes.len() as u64 == expected_size && hex::encode(Sha256::digest(&bytes)) == expected_sha256,
+        bytes.len() as u64 == expected_size
+            && hex::encode(Sha256::digest(&bytes)) == expected_sha256,
         "CAS blob verification failed on read-back"
     );
     Ok(bytes)
@@ -376,7 +377,12 @@ pub fn cmd_push_remote(
         dirty_sha.as_bytes(),
         0o600,
     )?;
-    let _ = put_cas_blob(&cas_root, &dirty_bytes, &dirty_sha, dirty_bytes.len() as u64)?;
+    let _ = put_cas_blob(
+        &cas_root,
+        &dirty_bytes,
+        &dirty_sha,
+        dirty_bytes.len() as u64,
+    )?;
 
     let remote_manifest = RemoteCheckpointManifest {
         schema: SCHEMA,
@@ -438,12 +444,10 @@ pub fn cmd_pull_remote(
     let remote_cp_dir = cas_root.join("checkpoints").join(&checkpoint_id);
     require_directory(&remote_cp_dir)?;
     let manifest_bytes = read_regular(&remote_cp_dir.join("manifest.json"), MAX_MANIFEST)?;
-    let manifest_sha_expected = String::from_utf8(read_regular(
-        &remote_cp_dir.join("manifest.sha256"),
-        256,
-    )?)?
-    .trim()
-    .to_owned();
+    let manifest_sha_expected =
+        String::from_utf8(read_regular(&remote_cp_dir.join("manifest.sha256"), 256)?)?
+            .trim()
+            .to_owned();
     validate_sha256_hex(&manifest_sha_expected)?;
     let actual_manifest_sha = hex::encode(Sha256::digest(&manifest_bytes));
     ensure!(

@@ -1,6 +1,11 @@
 //! Authorized repository lifecycle and local provisioning recovery.
-use crate::{AppState,Error,auth,browse,db,organizations,sharding};
-use axum::{Json,extract::{Path,State},http::{HeaderMap,StatusCode,header},response::{IntoResponse,Response}};
+use crate::{AppState, Error, auth, browse, db, organizations, sharding};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -26,7 +31,9 @@ pub(super) async fn create_repo(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let owner = input.owner.as_deref().unwrap_or(&identity.username);
     let owner_id = organizations::authorize_namespace_create(&tx, &identity, owner).await?;
-    let format = input.object_format.unwrap_or(browse::object_format::ObjectFormat::Sha1);
+    let format = input
+        .object_format
+        .unwrap_or(browse::object_format::ObjectFormat::Sha1);
     let id = Uuid::new_v4();
     let created=tx.execute("INSERT INTO repositories (id,owner_id,name,object_format) VALUES ($1,$2,$3,$4) ON CONFLICT (owner_id,name) DO NOTHING",&[&id,&owner_id,&input.name,&format.as_str()]).await.map_err(Error::internal)?==1;
     let row = tx
@@ -37,13 +44,20 @@ pub(super) async fn create_repo(
         .await
         .map_err(Error::internal)?;
     let mut repo = db::Repository::from_row(&row);
-    if input.object_format.is_some_and(|requested| requested.as_str() != repo.object_format) {
-        return Err(Error(StatusCode::CONFLICT, "repository object format cannot change"));
+    if input
+        .object_format
+        .is_some_and(|requested| requested.as_str() != repo.object_format)
+    {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "repository object format cannot change",
+        ));
     }
     auth::finish_tx(tx, &identity, true).await?;
     drop(client);
     if repo.state == "provisioning"
-        && sharding::transport::is_local_primary_for_repo(&state, owner_id, repo.id).await? {
+        && sharding::transport::is_local_primary_for_repo(&state, owner_id, repo.id).await?
+    {
         let _slot = state.git_slots.try_acquire().map_err(|_| {
             Error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -52,8 +66,12 @@ pub(super) async fn create_repo(
         })?;
         if state
             .storage
-            .provision_with_format(&state.config, repo.id,
-                browse::object_format::ObjectFormat::from_str_name(&repo.object_format).ok_or_else(Error::bad_request)?)
+            .provision_with_format(
+                &state.config,
+                repo.id,
+                browse::object_format::ObjectFormat::from_str_name(&repo.object_format)
+                    .ok_or_else(Error::bad_request)?,
+            )
             .await
             .is_ok()
         {
@@ -158,15 +176,23 @@ pub async fn recover(state: &AppState) -> anyhow::Result<usize> {
     let mut recovered = 0;
     for row in rows {
         let id: Uuid = row.get(0);
-        if !sharding::transport::is_local_primary_for_repo(state, row.get(2), id).await
-            .map_err(|e| anyhow::anyhow!(e.1))? { continue; }
+        if !sharding::transport::is_local_primary_for_repo(state, row.get(2), id)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.1))?
+        {
+            continue;
+        }
         let format = browse::object_format::ObjectFormat::from_str_name(row.get(1))
             .ok_or_else(|| anyhow::anyhow!("invalid stored object format"))?;
         let Ok(_slot) = state.git_slots.try_acquire() else {
             break;
         };
         state.pool.get().await?.execute("UPDATE repositories SET next_retry_at=clock_timestamp()+interval '30 seconds', provision_attempts=provision_attempts+1 WHERE id=$1 AND state='provisioning'", &[&id]).await?;
-        match state.storage.provision_with_format(&state.config, id, format).await {
+        match state
+            .storage
+            .provision_with_format(&state.config, id, format)
+            .await
+        {
             Ok(()) => {
                 state.pool.get().await?.execute("UPDATE repositories SET state='ready' WHERE id=$1 AND state='provisioning'",&[&id]).await?;
                 recovered += 1;

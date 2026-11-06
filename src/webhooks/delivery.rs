@@ -183,7 +183,7 @@ pub(crate) async fn ensure_pull_ci_pin(
         Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later")
     })?;
     let publication = crate::storage::ref_publication::acquire(&state.pool,repo.id,
-        repo.storage_generation,&[retention_ref.clone()],
+        repo.storage_generation,std::slice::from_ref(&retention_ref),
         tokio::time::Instant::now()+state.config.git_timeout).await?;
     let _write_guard = publication.enter_window(&state.storage,
         tokio::time::Instant::now()+state.config.git_timeout).await?;
@@ -245,6 +245,7 @@ pub(crate) async fn ensure_pull_ci_pin(
             service_principal_id: op.service_principal_id,
             actor_name: op.actor_name.clone(), sequence: op.sequence,
             storage_generation: repo.storage_generation, outcome: "recorded".into(), evidence,
+            admission: None,
         };
         events::publish(&state.pool, &record, &changes).await.map_err(Error::internal)?;
         state.dispatch.committed();

@@ -415,6 +415,7 @@ async fn execute_ref_transaction_inner(
             storage_generation: current_generation,
             outcome: "recorded".into(),
             evidence,
+            admission: None,
         },
         &event_inputs,
     )
@@ -433,6 +434,11 @@ async fn execute_ref_transaction_inner(
     };
     let response_value = serde_json::to_value(&response_body).map_err(Error::internal)?;
     record_creation(&tx, actor.id, repo_id, idem_key.as_deref(), &response_value).await?;
+    // The exact-ref CAS may have waited behind another writer. Re-read the
+    // caller's token and effective role inside this same transaction so a
+    // revocation during the transfer cannot publish refs or outbox events.
+    auth::verify_repo_write_access(&*tx, actor.id, actor.token_id, repo_id,
+        auth::web_scope_enabled()).await?;
     tx.commit().await.map_err(Error::internal)?;
 
     Ok((

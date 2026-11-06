@@ -30,27 +30,50 @@ fn setup() -> (tempfile::TempDir, Operation) {
 }
 #[test]
 fn concurrent_admission_reserves_unique_durable_sequences() {
-    let root=tempfile::tempdir().unwrap();
-    let repo=Uuid::new_v4();
-    let operations=std::thread::scope(|scope| {
-        let handles=(0..48).map(|_|scope.spawn(||begin(root.path(),repo,Uuid::new_v4(),
-            "parallel-actor".into(),Uuid::new_v4(),1).unwrap())).collect::<Vec<_>>();
-        handles.into_iter().map(|h|h.join().unwrap()).collect::<Vec<_>>()
+    let root = tempfile::tempdir().unwrap();
+    let repo = Uuid::new_v4();
+    let operations = std::thread::scope(|scope| {
+        let handles = (0..48)
+            .map(|_| {
+                scope.spawn(|| {
+                    begin(
+                        root.path(),
+                        repo,
+                        Uuid::new_v4(),
+                        "parallel-actor".into(),
+                        Uuid::new_v4(),
+                        1,
+                    )
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
     });
-    let mut sequences=operations.iter().map(|op|op.sequence).collect::<Vec<_>>();
+    let mut sequences = operations.iter().map(|op| op.sequence).collect::<Vec<_>>();
     sequences.sort_unstable();
-    assert_eq!(sequences,(1..=48).collect::<Vec<_>>());
-    assert_eq!(sequence(root.path(),repo).unwrap(),48);
-    assert_eq!(pending(root.path(),repo).unwrap().len(),48);
+    assert_eq!(sequences, (1..=48).collect::<Vec<_>>());
+    assert_eq!(sequence(root.path(), repo).unwrap(), 48);
+    assert_eq!(pending(root.path(), repo).unwrap().len(), 48);
 }
 #[test]
 fn active_admission_is_visible_before_other_recovery_scans() {
-    let root=tempfile::tempdir().unwrap();
-    let repo=Uuid::new_v4();
-    let (op,guard)=begin_active(root.path(),repo,Uuid::new_v4(),
-        "active-actor".into(),Uuid::new_v4(),1).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let repo = Uuid::new_v4();
+    let (op, guard) = begin_active(
+        root.path(),
+        repo,
+        Uuid::new_v4(),
+        "active-actor".into(),
+        Uuid::new_v4(),
+        1,
+    )
+    .unwrap();
     assert!(ActiveGuard::operation_is_live(&op).unwrap());
-    assert_eq!(pending(root.path(),repo).unwrap(),vec![op.clone()]);
+    assert_eq!(pending(root.path(), repo).unwrap(), vec![op.clone()]);
     assert!(events(&op).unwrap().is_empty());
     drop(guard);
     assert!(!ActiveGuard::operation_is_live(&op).unwrap());
@@ -76,7 +99,10 @@ fn ci_service_journal_has_no_human_identity() {
     let op = begin_ci_service(root.path(), &intent, principal).unwrap();
     assert!(op.actor_id.is_nil() && op.token_id.is_nil());
     assert_eq!(op.service_principal_id, Some(principal));
-    assert_eq!(pending(root.path(), intent.repository_id).unwrap(), vec![op]);
+    assert_eq!(
+        pending(root.path(), intent.repository_id).unwrap(),
+        vec![op]
+    );
 }
 fn payload(old: char, new: char) -> Vec<u8> {
     format!(
@@ -177,9 +203,7 @@ fn invalid_inputs_and_truncated_receipt() {
     p.pop();
     assert!(record_receipt(&op, &p).is_err());
     assert!(receipts(&op).unwrap().is_none());
-    assert!(
-        parse(format!("{} ref:refs/heads/main HEAD\n", "0".repeat(40)).as_bytes()).is_err()
-    );
+    assert!(parse(format!("{} ref:refs/heads/main HEAD\n", "0".repeat(40)).as_bytes()).is_err());
     assert!(parse(format!("{} {} HEAD\n", "0".repeat(40), "a".repeat(40)).as_bytes()).is_ok());
     assert!(valid_ref("refs/heads/topic"));
     assert!(!valid_ref("refs/../escape"));

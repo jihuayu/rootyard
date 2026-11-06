@@ -61,19 +61,6 @@ pub(crate) async fn git_output_lease(state: &AppState, args: &[&str], timeout: D
         .map_err(|_| conflict("Git bundle or verification failed"))
 }
 
-pub(crate) async fn refs_digest(state: &AppState, repo: &FsPath) -> Result<String, Error> {
-    let path = repo.to_str().ok_or_else(Error::bad_request)?;
-    let refs = git_output(state, &["--git-dir", path, "for-each-ref", "--format=%(refname) %(objectname)"], state.config.git_timeout).await?;
-    if refs.is_empty() { return Err(conflict("empty repository cannot be replicated as ready")); }
-    let head = git_output(state, &["--git-dir", path, "symbolic-ref", "HEAD"], state.config.git_timeout).await?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"rootyard-shard-refs-v1\0");
-    hasher.update(&refs);
-    hasher.update(b"HEAD\0");
-    hasher.update(&head);
-    Ok(hex::encode(hasher.finalize()))
-}
-
 pub(crate) async fn refs_digest_lease(state: &AppState, repo: &FsPath,
     lease: &crate::storage::read_leases::Lease) -> Result<String, Error> {
     let path = repo.to_str().ok_or_else(Error::bad_request)?;
@@ -170,6 +157,9 @@ pub async fn migrate_repository(
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, true).await?;
     require_operator(&tx, &actor).await?;
+    // Lock repository before route so this order matches events::publish
+    // (repository -> route -> admission) and takeover never deadlocks it.
+    let generation: i64 = tx.query_one("SELECT storage_generation FROM repositories WHERE id = $1 FOR UPDATE", &[&access.repo_id]).await.map_err(Error::internal)?.get(0);
     let route_sql = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id = $1 FOR UPDATE");
     let route = RepoShardRoute::row(&tx.query_one(&route_sql, &[&access.repo_id]).await.map_err(Error::internal)?);
     if route.primary_node_id == input.target_node_id || route.primary_node_id != transport::node_id()?.unwrap_or_default()
@@ -188,11 +178,7 @@ pub async fn migrate_repository(
         return Err(conflict("source volume is fenced or degraded"));
     }
     transitions::reject_pending(&state, access.repo_id).await?;
-    if !journal::pending(&state.storage.root, access.repo_id).map_err(Error::internal)?.is_empty() {
-        return Err(conflict("source has pending Git journal operations; reconcile before migration"));
-    }
     let journal_sequence = journal::sequence(&state.storage.root, access.repo_id).map_err(Error::internal)?;
-    let generation: i64 = tx.query_one("SELECT storage_generation FROM repositories WHERE id = $1 FOR UPDATE", &[&access.repo_id]).await.map_err(Error::internal)?.get(0);
     let operation_id = input.operation_id.unwrap_or_else(Uuid::new_v4);
     let prior = tx.query_opt("SELECT repository_id, source_node_id, target_node_id, source_route_epoch, source_generation, state FROM shard_replication_operations WHERE id = $1", &[&operation_id]).await.map_err(Error::internal)?;
     if let Some(row) = prior {
@@ -211,12 +197,21 @@ pub async fn migrate_repository(
         tx.execute("INSERT INTO shard_replication_operations(id, repository_id, source_node_id, target_node_id, source_route_epoch, source_generation, state) VALUES ($1,$2,$3,$4,$5,$6,'copying')",
             &[&operation_id, &access.repo_id, &route.primary_node_id, &input.target_node_id, &route.route_epoch, &generation]).await.map_err(Error::internal)?;
     }
-    // Stop new admissions durably before releasing the source barriers for the
-    // destination's exclusive install. Any already admitted push completed
-    // before the write mutex above; retry keeps the same operation and drain.
-    tx.execute("UPDATE repository_shard_routes SET draining=true, version=version+1 WHERE repository_id=$1 AND route_epoch=$2",
-        &[&access.repo_id, &route.route_epoch]).await.map_err(Error::internal)?;
+    // Fence the old shard epoch before inspecting admitted writers. The route
+    // row update blocks new admission and settlement transactions; already
+    // ADMITTED writers are either drained by the bounded window or marked
+    // FENCED_ABORTED so their later SQL settlement cannot publish.
+    tx.execute("UPDATE repository_shard_routes SET draining=true, fenced_epoch=GREATEST(fenced_epoch,$3), version=version+1 WHERE repository_id=$1 AND route_epoch=$2",
+        &[&access.repo_id, &route.route_epoch, &route.route_epoch]).await.map_err(Error::internal)?;
+    crate::storage::ref_admission::fence_epoch(&tx, access.repo_id, route.route_epoch,
+        crate::storage::ref_admission::DRAIN_WINDOW).await?;
     tx.commit().await.map_err(Error::internal)?;
+    // The source lock remains held. Restore any refs a fenced, quiescent
+    // writer advanced locally before the bundle/digest is measured.
+    crate::storage::ref_admission::cleanup_fenced(&state, access.repo_id).await.map_err(Error::internal)?;
+    if !journal::pending(&state.storage.root, access.repo_id).map_err(Error::internal)?.is_empty() {
+        return Err(conflict("source has pending Git journal operations; reconcile before migration"));
+    }
     // No database transaction remains open while native Git and network IO run.
     let stage = staging_root(&state)?;
     let bundle = stage.join(format!("{operation_id}.bundle"));
@@ -281,6 +276,17 @@ pub async fn migrate_repository(
         return Err(conflict("route changed during replication"));
     }
     if !route.draining { return Err(conflict("migration drain was released before cutover")); }
+    // Re-fence the old epoch while its route row is locked. A settlement that
+    // committed between the drain and cutover must be visible here before the
+    // target can claim the repository.
+    crate::storage::ref_admission::fence_epoch(&tx, access.repo_id, route.route_epoch,
+        crate::storage::ref_admission::DRAIN_WINDOW).await?;
+    let settled_max: i64 = tx.query_one(
+        "SELECT COALESCE(MAX(sequence),0) FROM git_operations WHERE repository_id=$1",
+        &[&access.repo_id]).await.map_err(Error::internal)?.get(0);
+    if settled_max > journal_sequence {
+        return Err(conflict("source settled a Git operation after the verified snapshot"));
+    }
     cutover.ensure_active()?;
     if input.replicate_only {
         let mut watermarks = route.replica_watermarks.clone();

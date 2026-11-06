@@ -8,6 +8,11 @@ use tokio_postgres::{Row, Transaction};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize)]
+pub struct AdmissionRecord {
+    pub writer_id: Uuid,
+    pub shard_epoch: i64,
+}
+#[derive(Clone, Debug, Serialize)]
 pub struct OperationRecord {
     pub id: Uuid,
     pub repository_id: Uuid,
@@ -19,6 +24,8 @@ pub struct OperationRecord {
     pub storage_generation: i64,
     pub outcome: String,
     pub evidence: serde_json::Value,
+    /// Present for native ref writers admitted through `git_ref_admissions`.
+    pub admission: Option<AdmissionRecord>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct RefEventInput {
@@ -86,13 +93,18 @@ pub async fn publish(
     );
     let service = operation.service_principal_id.is_some();
     if service {
-        ensure!(operation.actor_id.is_nil() && operation.token_id.is_nil()
-            && operation.actor_name == "ci-scheduler"
-            && operation.evidence["kind"] == "observed_immutable_ci_root",
-            "invalid CI service operation");
+        ensure!(
+            operation.actor_id.is_nil()
+                && operation.token_id.is_nil()
+                && operation.actor_name == "ci-scheduler"
+                && operation.evidence["kind"] == "observed_immutable_ci_root",
+            "invalid CI service operation"
+        );
     } else {
-        ensure!(!operation.actor_id.is_nil() && !operation.token_id.is_nil(),
-            "invalid human operation");
+        ensure!(
+            !operation.actor_id.is_nil() && !operation.token_id.is_nil(),
+            "invalid human operation"
+        );
     }
     ensure!(changes.len() <= 100_000, "too many ref events");
     ensure!(
@@ -140,6 +152,17 @@ pub async fn publish(
         .is_none(),
         "resolved operation is immutable"
     );
+    if let Some(admission) = &operation.admission {
+        crate::storage::ref_admission::settle_in_tx(
+            &tx,
+            operation.repository_id,
+            admission,
+            operation.actor_id,
+            operation.token_id,
+            &operation.outcome,
+        )
+        .await?;
+    }
     let human_actor = (!service).then_some(operation.actor_id);
     let human_token = (!service).then_some(operation.token_id);
     let initial_outcome = "unknown";

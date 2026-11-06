@@ -82,10 +82,24 @@ async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
         "SELECT pg_try_advisory_xact_lock(7348291,hashtext($1))", &[&candidate.repo_id.to_string()],
     ).await?.get(0);
     if !elected { return Ok(false); }
+    // Match events::publish lock order: repository -> route -> admission.
+    let locked_generation: i64 = tx.query_one(
+        "SELECT storage_generation FROM repositories WHERE id=$1 FOR UPDATE",
+        &[&candidate.repo_id]).await?.get(0);
     let query = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id=$1 FOR UPDATE");
     let route = RepoShardRoute::row(&tx.query_one(&query, &[&candidate.repo_id]).await?);
     if route.primary_node_id != candidate.old_node || route.route_epoch != candidate.route_epoch
         || route.draining || route.read_only_degraded { return Ok(false); }
+    // Fence the old epoch before inspecting ADMITTED writers. The route row is
+    // already locked, so no settlement can acquire a fresh share lock; any
+    // settlement that began earlier either commits before us or is fenced.
+    tx.execute(
+        "UPDATE repository_shard_routes SET draining=true, fenced_epoch=GREATEST(fenced_epoch,$2), \
+         version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 AND route_epoch=$2",
+        &[&candidate.repo_id, &route.route_epoch]).await?;
+    crate::storage::ref_admission::fence_epoch(
+        &tx, candidate.repo_id, route.route_epoch, crate::storage::ref_admission::DRAIN_WINDOW,
+    ).await.map_err(|error| anyhow::anyhow!(error.1))?;
     let row = tx.query_one(
         "SELECT p.storage_generation,p.owner_id,p.state,old.lease_expires_unix, \
                 o.state,o.source_generation,o.source_route_epoch,o.refs_sha256,o.journal_sequence \
@@ -104,7 +118,8 @@ async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
     let sequence: i64 = row.get(8);
     ensure!(repo_state == "ready" && lease_expiry > 0 && lease_expiry < models::unix_now()
         && op_state == "verified" && source_generation == generation && source_epoch == route.route_epoch
-        && digest == candidate.refs_sha256 && sequence == candidate.journal_sequence,
+        && digest == candidate.refs_sha256 && sequence == candidate.journal_sequence
+        && generation == locked_generation,
         "takeover evidence or expired lease changed");
     let operation_status = tx.query_one(
         "SELECT COALESCE(MAX(sequence),0), COUNT(*) FILTER (WHERE outcome='unknown') FROM git_operations WHERE repository_id=$1",
@@ -163,13 +178,18 @@ pub async fn run(state: Arc<AppState>) {
         if let Err(error) = heartbeat(&state, &node_id).await { eprintln!("rootyard: cluster heartbeat failed: {error:#}"); }
         match candidates(&state, &node_id).await {
             Ok(items) => for candidate in items {
-                let attempt = async {
+                let attempt: anyhow::Result<bool> = async {
                     let mutation = locks::exclusive(&state, candidate.repo_id).await
                         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     verify_target(&state, &candidate, &mutation.lease).await?;
                     let proof = local_fence::fence_local_process(&candidate.old_node).await?;
                     mutation.ensure_active().map_err(|e| anyhow::anyhow!("{e:?}"))?;
-                    promote(&state, &node_id, &candidate, &proof, &mutation.lease).await
+                    let promoted = promote(&state, &node_id, &candidate, &proof, &mutation.lease).await?;
+                    if promoted && let Err(error) = crate::storage::ref_admission::cleanup_fenced(
+                        &state, candidate.repo_id).await {
+                        eprintln!("rootyard: fenced writer cleanup for {} deferred: {error:#}", candidate.repo_id);
+                    }
+                    Ok(promoted)
                 }.await;
                 match attempt {
                     Ok(true) => if let Err(error) = transitions::reconcile_pending(&state).await {

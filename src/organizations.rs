@@ -18,7 +18,10 @@ pub fn routes() -> Router<Arc<crate::AppState>> {
     Router::new()
         .route("/api/orgs", post(handlers::create_organization))
         .route("/api/orgs/{slug}", get(handlers::get_organization))
-        .route("/api/repos/{owner}/{name}/transfer", post(handlers::transfer_ownership))
+        .route(
+            "/api/repos/{owner}/{name}/transfer",
+            post(handlers::transfer_ownership),
+        )
         .route("/api/orgs/{slug}/members", get(handlers::list_members))
         .route(
             "/api/orgs/{slug}/members/{username}",
@@ -61,7 +64,8 @@ pub async fn authorize_namespace_create(
         return Err(Error::not_found());
     }
     tx.query_one("SELECT id FROM organizations WHERE id=$1 FOR SHARE", &[&id])
-        .await.map_err(Error::internal)?;
+        .await
+        .map_err(Error::internal)?;
     let role = tx
         .query_opt(
             "SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",

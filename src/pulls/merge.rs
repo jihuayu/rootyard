@@ -401,6 +401,7 @@ async fn merge_pull_inner(
                 storage_generation: repo.storage_generation,
                 outcome: "no_ref_changes".into(),
                 evidence: no_op_evidence,
+                admission: None,
             },
             &[],
         )
@@ -478,6 +479,7 @@ async fn merge_pull_inner(
             storage_generation: repo.storage_generation,
             outcome: "recorded".into(),
             evidence,
+            admission: None,
         },
         &changes,
     )

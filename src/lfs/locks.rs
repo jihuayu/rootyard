@@ -368,7 +368,7 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
         let count: usize = std::str::from_utf8(&count)
             .ok()
             .and_then(|s| s.trim().parse().ok())
-            .ok_or_else(|| Error(StatusCode::CONFLICT, "invalid LFS lock history count"))?;
+            .ok_or(Error(StatusCode::CONFLICT, "invalid LFS lock history count"))?;
         inspected_commits = inspected_commits.saturating_add(count);
         if inspected_commits > 4096 {
             return Err(Error(

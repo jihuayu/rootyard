@@ -59,14 +59,18 @@ impl Options {
             .set("message.max.bytes", "4096")
             .set("receive.message.max.bytes", "65536");
         if let Some(ca) = &self.ssl_ca_location {
-            config.set("ssl.ca.location", ca)
+            config
+                .set("ssl.ca.location", ca)
                 .set("enable.ssl.certificate.verification", "true")
                 .set("ssl.endpoint.identification.algorithm", "https");
         }
         if let (Some(mechanism), Some(user), Some(password)) = (
-            &self.sasl_mechanism, &self.sasl_username, &self.sasl_password,
+            &self.sasl_mechanism,
+            &self.sasl_username,
+            &self.sasl_password,
         ) {
-            config.set("sasl.mechanism", mechanism)
+            config
+                .set("sasl.mechanism", mechanism)
                 .set("sasl.username", user)
                 .set("sasl.password", password);
         }
@@ -111,27 +115,44 @@ impl KafkaWake {
         );
         let protocol = std::env::var("ROOTYARD_KAFKA_SECURITY_PROTOCOL")
             .unwrap_or_else(|_| "PLAINTEXT".into());
-        ensure!(matches!(protocol.as_str(), "PLAINTEXT" | "SSL" | "SASL_SSL"),
-            "unsupported Kafka security protocol");
+        ensure!(
+            matches!(protocol.as_str(), "PLAINTEXT" | "SSL" | "SASL_SSL"),
+            "unsupported Kafka security protocol"
+        );
         let tls = protocol != "PLAINTEXT";
         let ca = if tls {
             let ca = std::env::var("ROOTYARD_KAFKA_CA_PEM")
                 .context("Kafka TLS requires ROOTYARD_KAFKA_CA_PEM")?;
-            ensure!(std::path::Path::new(&ca).is_file(), "Kafka CA file unavailable");
+            ensure!(
+                std::path::Path::new(&ca).is_file(),
+                "Kafka CA file unavailable"
+            );
             Some(ca)
-        } else { None };
+        } else {
+            None
+        };
         let (mechanism, username, password) = if protocol == "SASL_SSL" {
             let mechanism = std::env::var("ROOTYARD_KAFKA_SASL_MECHANISM")
                 .unwrap_or_else(|_| "SCRAM-SHA-512".into());
-            ensure!(matches!(mechanism.as_str(), "SCRAM-SHA-512" | "SCRAM-SHA-256" | "PLAIN"),
-                "unsupported Kafka SASL mechanism");
+            ensure!(
+                matches!(
+                    mechanism.as_str(),
+                    "SCRAM-SHA-512" | "SCRAM-SHA-256" | "PLAIN"
+                ),
+                "unsupported Kafka SASL mechanism"
+            );
             let username = std::env::var("ROOTYARD_KAFKA_SASL_USERNAME")
                 .context("Kafka SASL username required")?;
             let password = std::env::var("ROOTYARD_KAFKA_SASL_PASSWORD")
                 .context("Kafka SASL password required")?;
-            ensure!(!username.is_empty() && !password.is_empty(), "Kafka SASL credentials cannot be empty");
+            ensure!(
+                !username.is_empty() && !password.is_empty(),
+                "Kafka SASL credentials cannot be empty"
+            );
             (Some(mechanism), Some(username), Some(password))
-        } else { (None, None, None) };
+        } else {
+            (None, None, None)
+        };
         let addresses: Vec<_> = bootstrap.split(',').collect();
         ensure!(
             !addresses.is_empty() && addresses.len() <= 4,
@@ -139,15 +160,29 @@ impl KafkaWake {
         );
         for address in addresses {
             if !tls {
-                let socket: SocketAddr = address.parse()
-                    .context("plaintext Kafka bootstrap must use numeric loopback socket addresses")?;
-                ensure!(socket.ip().is_loopback() && socket.port() != 0,
-                    "plaintext Kafka bootstrap must use nonzero loopback endpoints");
+                let socket: SocketAddr = address.parse().context(
+                    "plaintext Kafka bootstrap must use numeric loopback socket addresses",
+                )?;
+                ensure!(
+                    socket.ip().is_loopback() && socket.port() != 0,
+                    "plaintext Kafka bootstrap must use nonzero loopback endpoints"
+                );
             } else {
-                let (host, port) = address.rsplit_once(':').context("Kafka TLS endpoint must include a port")?;
-                ensure!(!host.is_empty() && host.len() <= 253 && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')),
-                    "invalid Kafka TLS hostname");
-                ensure!(port.parse::<u16>().is_ok_and(|port| port > 0), "invalid Kafka TLS port");
+                let (host, port) = address
+                    .rsplit_once(':')
+                    .context("Kafka TLS endpoint must include a port")?;
+                ensure!(
+                    !host.is_empty()
+                        && host.len() <= 253
+                        && host
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')),
+                    "invalid Kafka TLS hostname"
+                );
+                ensure!(
+                    port.parse::<u16>().is_ok_and(|port| port > 0),
+                    "invalid Kafka TLS port"
+                );
             }
         }
         Ok(Self {

@@ -7,9 +7,9 @@ use fuser::{BackgroundSession, MountOption};
 use std::{
     collections::HashMap,
     fs,
+    future::Future,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
-    future::Future,
 };
 use uuid::Uuid;
 

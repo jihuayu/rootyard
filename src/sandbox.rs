@@ -1,15 +1,15 @@
 //! Bubblewrap process isolation for Agent and CI jobs.
+#[path = "sandbox/ci.rs"]
+pub mod ci;
 #[path = "sandbox/handlers.rs"]
 mod handlers;
 #[path = "sandbox/runner.rs"]
 mod runner;
-#[path = "sandbox/ci.rs"]
-pub mod ci;
 
 use crate::AppState;
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 use std::sync::Arc;
 

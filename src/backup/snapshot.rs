@@ -151,4 +151,3 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     );
     Ok(())
 }
-

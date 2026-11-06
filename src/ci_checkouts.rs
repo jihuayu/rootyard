@@ -26,7 +26,6 @@ pub mod integration;
 #[path = "ci_checkouts/origin.rs"]
 mod origin;
 pub(crate) use origin::origin_job_path;
-pub(crate) use authority::authenticate;
 #[allow(unused_imports)] // consumed by Git HTTP when the CI and transport branches integrate
 pub(crate) use authority::still_authorized;
 

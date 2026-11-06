@@ -73,7 +73,7 @@ pub async fn is_self_approval_disallowed(
             return Ok(true);
         }
     }
-    rbac::repo_has_collaborators_or_teams(tx, repository_id).await
+    rbac::repo_has_collaborators_or_teams(&**tx, repository_id).await
 }
 
 pub async fn upsert_branch_rule(

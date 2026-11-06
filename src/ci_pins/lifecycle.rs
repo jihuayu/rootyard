@@ -335,6 +335,7 @@ pub(super) async fn release_pin_inner(
                     storage_generation: operation.storage_generation,
                     outcome: "recorded".into(),
                     evidence,
+                    admission: None,
                 },
                 &changes,
             )

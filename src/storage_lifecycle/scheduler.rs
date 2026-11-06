@@ -9,27 +9,35 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 async fn local_primary(state: &AppState, repo: Uuid) -> Result<bool> {
-    let client=state.pool.get().await?;
-    let local=std::env::var("ROOTYARD_NODE_ID").ok();
-    if local.as_ref().is_some_and(|id| !crate::sharding::models::valid_node_id(id)) {
+    let client = state.pool.get().await?;
+    let local = std::env::var("ROOTYARD_NODE_ID").ok();
+    if local
+        .as_ref()
+        .is_some_and(|id| !crate::sharding::models::valid_node_id(id))
+    {
         bail!("invalid local node identity");
     }
-    let row=client.query_opt(
-        "SELECT primary_node_id FROM repository_shard_routes WHERE repository_id=$1",
-        &[&repo],
-    ).await?;
-    match (local,row) {
-        (Some(id),Some(row)) => Ok(id==row.get::<_,String>(0)),
-        (Some(id),None) => Ok(id==crate::sharding::models::DEFAULT_NODE_ID),
-        (None,_) => {
-            let count:i64=client.query_one("SELECT count(*) FROM shard_nodes",&[]).await?.get(0);
-            Ok(count<=1)
+    let row = client
+        .query_opt(
+            "SELECT primary_node_id FROM repository_shard_routes WHERE repository_id=$1",
+            &[&repo],
+        )
+        .await?;
+    match (local, row) {
+        (Some(id), Some(row)) => Ok(id == row.get::<_, String>(0)),
+        (Some(id), None) => Ok(id == crate::sharding::models::DEFAULT_NODE_ID),
+        (None, _) => {
+            let count: i64 = client
+                .query_one("SELECT count(*) FROM shard_nodes", &[])
+                .await?
+                .get(0);
+            Ok(count <= 1)
         }
     }
 }
 
 pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
-    let client=state.pool.get().await?;
+    let client = state.pool.get().await?;
     let rows=client.query(
         "SELECT r.id,r.owner_id,r.storage_generation, \
          COALESCE(s.last_repack_loose_count,0) AS base_loose, \
@@ -41,22 +49,28 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
          ORDER BY s.last_scan_at NULLS FIRST,r.id LIMIT 16",
         &[&policy.scan_period_seconds],
     ).await?;
-    let mut scheduled=0;
+    let mut scheduled = 0;
     for row in rows {
-        let repo:Uuid=row.get("id");
-        let tenant:Uuid=row.get("owner_id");
-        let generation:i64=row.get("storage_generation");
-        if !local_primary(state,repo).await? { continue; }
+        let repo: Uuid = row.get("id");
+        let tenant: Uuid = row.get("owner_id");
+        let generation: i64 = row.get("storage_generation");
+        if !local_primary(state, repo).await? {
+            continue;
+        }
         // Count-objects is a native GitFS reader too. Hold the cross-process
         // barrier through child quiescence, including a lost-lease abort.
-        let read=crate::storage::read_leases::shared(
-            &state.pool,repo,Instant::now()+state.config.git_timeout,
-        ).await.map_err(|_| anyhow::anyhow!("repository reader barrier unavailable"))?;
-        let cancel=CancellationToken::new();
-        let count=gitfs::count(state,repo,&cancel);
+        let read = crate::storage::read_leases::shared(
+            &state.pool,
+            repo,
+            Instant::now() + state.config.git_timeout,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("repository reader barrier unavailable"))?;
+        let cancel = CancellationToken::new();
+        let count = gitfs::count(state, repo, &cancel);
         tokio::pin!(count);
-        let mut safety=tokio::time::interval(Duration::from_millis(200));
-        let counts=loop {
+        let mut safety = tokio::time::interval(Duration::from_millis(200));
+        let counts = loop {
             tokio::select! {
                 result=&mut count => break result?,
                 _=safety.tick() => {
@@ -68,9 +82,10 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
                 }
             }
         };
-        read.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+        read.ensure_active()
+            .map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
         drop(read);
-        let client=state.pool.get().await?;
+        let client = state.pool.get().await?;
         let updated=client.execute(
             "INSERT INTO storage_maintenance_repo_state(repository_id,tenant_id,last_scan_at,last_scan_generation,loose_count,pack_count,last_scan) \
              SELECT id,owner_id,clock_timestamp(),storage_generation,$3,$4,$5 FROM repositories \
@@ -81,37 +96,79 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
              WHERE storage_maintenance_repo_state.tenant_id=EXCLUDED.tenant_id",
             &[&repo,&tenant,&counts.loose,&counts.packs,&json!({"source":"git-count-objects-v"}),&generation],
         ).await?;
-        if updated==0 { continue; }
-        if jobs::enqueue(&state.pool,repo,tenant,generation,"gitfs_stage_cleanup").await? { scheduled+=1; }
-        let prior:Option<String>=row.get("last_repack_at");
-        let new_loose=counts.loose-row.get::<_,i64>("base_loose");
-        let new_packs=counts.packs-row.get::<_,i64>("base_packs");
-        let repack=if prior.is_none() {
-            counts.loose>=policy.loose_threshold || counts.packs>=policy.pack_threshold
+        if updated == 0 {
+            continue;
+        }
+        if jobs::enqueue(&state.pool, repo, tenant, generation, "gitfs_stage_cleanup").await? {
+            scheduled += 1;
+        }
+        let prior: Option<String> = row.get("last_repack_at");
+        let new_loose = counts.loose - row.get::<_, i64>("base_loose");
+        let new_packs = counts.packs - row.get::<_, i64>("base_packs");
+        let repack = if prior.is_none() {
+            counts.loose >= policy.loose_threshold || counts.packs >= policy.pack_threshold
         } else {
-            new_loose>=policy.loose_threshold || new_packs>=policy.pack_threshold
+            new_loose >= policy.loose_threshold || new_packs >= policy.pack_threshold
         };
-        if repack && jobs::enqueue(&state.pool,repo,tenant,generation,"gitfs_repack").await? { scheduled+=1; }
-        if repack && jobs::enqueue(&state.pool,repo,tenant,generation,"gitfs_cache_hydrate").await? { scheduled+=1; }
-        if jobs::enqueue(&state.pool,repo,tenant,generation,"gitfs_unreachable_mark").await? { scheduled+=1; }
+        if repack && jobs::enqueue(&state.pool, repo, tenant, generation, "gitfs_repack").await? {
+            scheduled += 1;
+        }
+        if repack
+            && jobs::enqueue(&state.pool, repo, tenant, generation, "gitfs_cache_hydrate").await?
+        {
+            scheduled += 1;
+        }
+        if jobs::enqueue(
+            &state.pool,
+            repo,
+            tenant,
+            generation,
+            "gitfs_unreachable_mark",
+        )
+        .await?
+        {
+            scheduled += 1;
+        }
         if gc::PHYSICAL_DELETE_ENABLED {
-            let graph=state.storage.repo_path(repo).join("objects/info/commit-graph");
-            if let Ok(meta)=std::fs::symlink_metadata(graph)
-                && meta.is_file() && !meta.file_type().is_symlink()
-                && meta.modified()?.elapsed().unwrap_or_default().as_secs()>=policy.cache_max_age_seconds as u64
-                && jobs::enqueue(&state.pool,repo,tenant,generation,"gitfs_cache_evict").await? {
-                scheduled+=1;
+            let graph = state
+                .storage
+                .repo_path(repo)
+                .join("objects/info/commit-graph");
+            if let Ok(meta) = std::fs::symlink_metadata(graph)
+                && meta.is_file()
+                && !meta.file_type().is_symlink()
+                && meta.modified()?.elapsed().unwrap_or_default().as_secs()
+                    >= policy.cache_max_age_seconds as u64
+                && jobs::enqueue(&state.pool, repo, tenant, generation, "gitfs_cache_evict").await?
+            {
+                scheduled += 1;
             }
-            let due:bool=client.query_one(
-                "SELECT EXISTS(SELECT 1 FROM storage_maintenance_tombstones \
+            let due: bool = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM storage_maintenance_tombstones \
                  WHERE repository_id=$1 AND tenant_id=$2 AND repository_generation=$3 \
                  AND state='pending' AND delete_after<=clock_timestamp())",
-                &[&repo,&tenant,&generation],
-            ).await?.get(0);
-            if due && jobs::enqueue(&state.pool,repo,tenant,generation,"gitfs_tombstone_delete").await? { scheduled+=1; }
+                    &[&repo, &tenant, &generation],
+                )
+                .await?
+                .get(0);
+            if due
+                && jobs::enqueue(
+                    &state.pool,
+                    repo,
+                    tenant,
+                    generation,
+                    "gitfs_tombstone_delete",
+                )
+                .await?
+            {
+                scheduled += 1;
+            }
         }
     }
     Ok(scheduled)
 }
 
-pub async fn check_local_primary(state: &AppState, repo: Uuid) -> Result<bool> { local_primary(state,repo).await }
+pub async fn check_local_primary(state: &AppState, repo: Uuid) -> Result<bool> {
+    local_primary(state, repo).await
+}

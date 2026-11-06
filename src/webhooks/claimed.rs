@@ -91,7 +91,7 @@ pub(crate) async fn authorize_claimed_run(
         )
         .await
         .map_err(Error::internal)?
-        .ok_or_else(|| Error(StatusCode::CONFLICT, "CI run claim or checkout changed"))?;
+        .ok_or(Error(StatusCode::CONFLICT, "CI run claim or checkout changed"))?;
     let job_id: Uuid = row.get("job_id");
     let expires_unix: i64 = row.get("expires_unix");
     let plan: Plan = serde_json::from_value(row.get("plan")).map_err(Error::internal)?;

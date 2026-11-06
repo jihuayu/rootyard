@@ -73,6 +73,7 @@ async fn verify_contract(pool: &Pool) -> Result<()> {
         storage_generation: 1,
         outcome: "unknown".into(),
         evidence: serde_json::json!({"state":"prepared"}),
+        admission: None,
     };
     let a = "1".repeat(40);
     let b = "2".repeat(40);

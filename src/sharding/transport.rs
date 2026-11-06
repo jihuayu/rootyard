@@ -73,7 +73,7 @@ fn path_and_query(uri: &Uri) -> &str { uri.path_and_query().map_or(uri.path(), |
 
 fn parse_git<'a>(method: &Method, uri: &'a Uri) -> Option<(&'a str, &'a str, bool)> {
     let parts: Vec<_> = uri.path().split('/').collect();
-    if !(parts.len() == 5 || parts.len() == 6) || parts[0] != "" || parts[1] != "git" { return None; }
+    if !(parts.len() == 5 || parts.len() == 6) || !parts[0].is_empty() || parts[1] != "git" { return None; }
     let owner = parts[2];
     let name = parts[3].strip_suffix(".git")?;
     if !db::valid_name(owner) || !db::valid_name(name) { return None; }

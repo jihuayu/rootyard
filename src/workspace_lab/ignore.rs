@@ -60,10 +60,7 @@ impl IgnoreMatcher {
 
         let mut matcher = Self::default();
         for rel_file in ignore_files {
-            let base_dir = rel_file
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
+            let base_dir = rel_file.parent().map(Path::to_path_buf).unwrap_or_default();
             let raw = read_regular(&repo.join(&rel_file), MAX_MANIFEST)?;
             let content = String::from_utf8_lossy(&raw);
             matcher.add_patterns(&base_dir, &content);
@@ -256,8 +253,8 @@ fn match_bracket(p: &[char], c: char) -> Option<(bool, usize)> {
         (false, 0)
     };
     let mut found_close = None;
-    for i in idx..p.len() {
-        if p[i] == ']' && i > idx {
+    for (i, ch) in p.iter().enumerate().skip(idx) {
+        if *ch == ']' && i > idx {
             found_close = Some(i);
             break;
         }
@@ -344,8 +341,7 @@ pub fn classify_workspace(store: &Store, repo: &Path) -> Result<WorkspaceClassif
         }
     }
 
-    let managed_paths: BTreeSet<PathBuf> =
-        tracked_paths.union(&untracked_paths).cloned().collect();
+    let managed_paths: BTreeSet<PathBuf> = tracked_paths.union(&untracked_paths).cloned().collect();
 
     Ok(WorkspaceClassification {
         head_paths,

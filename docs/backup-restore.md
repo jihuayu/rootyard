@@ -1,6 +1,6 @@
 # ADR 004: an offline backup and isolated restore slice
 
-Status: current integration uses backup format 6 and the exact migration/catalog set embedded in the producing executable (`src/db.rs`, `schema/125_*`). This is a Linux, single-node GitFS maintenance tool, not online replication, failover, PITR, encrypted object storage or a zero-loss guarantee. It does not stop or deploy a service, switch traffic, or automatically repair unknown pushes.
+Status: current integration uses backup format 6 and the exact migration/catalog set embedded in the producing executable (`src/db.rs`, `schema/126_*`). This is a Linux, single-node GitFS maintenance tool, not online replication, failover, PITR, encrypted object storage or a zero-loss guarantee. It does not stop or deploy a service, switch traffic, or automatically repair unknown pushes.
 
 ## Supported boundary
 

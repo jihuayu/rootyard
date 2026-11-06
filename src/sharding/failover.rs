@@ -169,6 +169,8 @@ pub async fn degrade_or_recover_repo(
     ];
     let r_row = tx.query_one(&upd_sql, params).await.map_err(Error::internal)?;
     let updated = RepoShardRoute::row(&r_row);
+    crate::storage::ref_admission::fence_epoch(&tx, access.repo_id, route.route_epoch,
+        std::time::Duration::ZERO).await?;
 
     let eff_gen = repo_gen.max(updated.required_generation);
     let marker = VolumeFenceMarker::from_route(&updated, eff_gen, prev_marker.and_then(|m| m.fenced_node_id), now);
