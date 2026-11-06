@@ -12,12 +12,22 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e import Harness
 
 
 class OrganizationHarness(Harness):
+    def __init__(self, args):
+        super().__init__(args)
+        self.application_name = "rootyard_org_" + self.schema[-12:]
+        parts = urllib.parse.urlsplit(self.db)
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        query.append(("application_name", self.application_name))
+        self.db = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+        self.env["DATABASE_URL"] = self.db
+
     def doc(self, path, code, token=None, **kwargs):
         status, body, _ = self.http(path, token=token or self.alice, **kwargs)
         expected = code if isinstance(code, tuple) else (code,)
@@ -150,7 +160,7 @@ class OrganizationHarness(Harness):
                     deadline = time.monotonic() + 5
                     observed = False
                     while time.monotonic() < deadline and not future.done():
-                        waiting = self.sql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%" + blocked_query + "%' AND pid<>pg_backend_pid()")
+                        waiting = self.sql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND application_name='" + self.application_name + "' AND query LIKE '%" + blocked_query + "%' AND pid<>pg_backend_pid()")
                         if int(waiting) > 0:
                             observed = True
                             break
