@@ -58,30 +58,34 @@ pub async fn mark(state: &AppState, repo: Uuid, tenant: Uuid, generation: i64,
     Ok(json!({"candidates":oids.len(),"new_tombstones":inserted,"deleted":false}))
 }
 
-async fn optional_table(state: &AppState, name: &str) -> Result<bool> {
-    let client=state.pool.get().await?;
-    Ok(client.query_one("SELECT to_regclass($1) IS NOT NULL",&[&name]).await?.get(0))
-}
-
 /// SQL-only roots which Git cannot see. A conservative repository-wide hold
 /// is safer than trying to infer the object closure of an active workspace.
-async fn has_external_roots(state: &AppState, repo: Uuid) -> Result<bool> {
-    let client=state.pool.get().await?;
-    if optional_table(state,"workspaces").await?
-        && client.query_one("SELECT EXISTS(SELECT 1 FROM workspaces WHERE repository_id=$1 AND state<>'deleted')",&[&repo]).await?.get(0) {
-        return Ok(true);
+async fn has_external_roots(tx: &deadpool_postgres::Transaction<'_>, repo: Uuid) -> Result<bool> {
+    // All four tables are required by the current schema. A missing table is
+    // an error, never permission to delete. The caller holds repositories FOR
+    // UPDATE, which blocks new FK-backed roots until this decision commits.
+    Ok(tx.query_one(
+        "SELECT EXISTS(SELECT 1 FROM workspaces WHERE repository_id=$1 AND state<>'deleted') \
+         OR EXISTS(SELECT 1 FROM ci_checkout_jobs WHERE repository_id=$1 AND NOT cancelled AND NOT revoked) \
+         OR EXISTS(SELECT 1 FROM ci_runs WHERE repository_id=$1 AND state IN ('queued','leased')) \
+         OR EXISTS(SELECT 1 FROM forge_pulls WHERE repository_id=$1 AND state='open')",
+        &[&repo],
+    ).await?.get(0))
+}
+
+async fn lock_retention_rows(tx: &deadpool_postgres::Transaction<'_>, repo: Uuid) -> Result<()> {
+    // Parent-row FOR UPDATE blocks new FK-backed roots. Existing rows could
+    // change state without touching that parent, so hold each one stable too.
+    // NOWAIT converts any reverse lock-order into a retry, not a deadlock.
+    for table in ["workspaces", "ci_checkout_jobs", "ci_runs", "forge_pulls"] {
+        let sql=format!(
+            "SELECT 1 FROM {table} WHERE repository_id=$1 LIMIT 10001 FOR SHARE NOWAIT"
+        );
+        if tx.query(&sql,&[&repo]).await?.len()>10_000 {
+            bail!("retention root inspection exceeded limit");
+        }
     }
-    if client.query_one("SELECT EXISTS(SELECT 1 FROM ci_checkout_jobs WHERE repository_id=$1 AND NOT cancelled AND NOT revoked)",&[&repo]).await?.get(0) {
-        return Ok(true);
-    }
-    if optional_table(state,"ci_runs").await?
-        && client.query_one("SELECT EXISTS(SELECT 1 FROM ci_runs WHERE repository_id=$1 AND state IN ('queued','leased'))",&[&repo]).await?.get(0) {
-        return Ok(true);
-    }
-    if client.query_one("SELECT EXISTS(SELECT 1 FROM forge_pulls WHERE repository_id=$1 AND state='open')",&[&repo]).await?.get(0) {
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(())
 }
 
 /// Called only while the global backup barrier, durable exclusive repository
@@ -90,11 +94,22 @@ async fn has_external_roots(state: &AppState, repo: Uuid) -> Result<bool> {
 pub async fn delete_due(state: &AppState, repo: Uuid, tenant: Uuid, generation: i64,
                         lease: &Lease, cancel: &CancellationToken) -> Result<Value> {
     lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
-    if has_external_roots(state,repo).await? {
+    let mut client=state.pool.get().await?;
+    let tx=client.transaction().await?;
+    // A root creator can authorize and lock this row before requesting the
+    // shared PG read lease. NOWAIT avoids waiting on that row while holding
+    // our exclusive PG lease, which would otherwise create a lock cycle.
+    let locked=tx.query_opt(
+        "SELECT id FROM repositories WHERE id=$1 AND owner_id=$2 AND storage_generation=$3 \
+         AND state='ready' AND storage_backend='gitfs' FOR UPDATE NOWAIT",
+        &[&repo,&tenant,&generation],
+    ).await?;
+    if locked.is_none() { bail!("repository changed before collection"); }
+    lock_retention_rows(&tx,repo).await?;
+    if has_external_roots(&tx,repo).await? {
         return Ok(json!({"deleted":0,"retained":"active external roots"}));
     }
-    let client=state.pool.get().await?;
-    let rows=client.query(
+    let rows=tx.query(
         "SELECT oid FROM storage_maintenance_tombstones WHERE repository_id=$1 AND tenant_id=$2 \
          AND repository_generation=$3 AND state='pending' AND delete_after<=clock_timestamp() \
          ORDER BY delete_after,oid LIMIT 100",
@@ -110,10 +125,10 @@ pub async fn delete_due(state: &AppState, repo: Uuid, tenant: Uuid, generation: 
     for row in rows {
         if cancel.is_cancelled() { bail!("maintenance lease lost"); }
         lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
-        if has_external_roots(state,repo).await? { bail!("external retention root appeared during collection"); }
+        if has_external_roots(&tx,repo).await? { bail!("external retention root appeared during collection"); }
         let oid:String=row.get(0);
         if !unreachable.contains(oid.as_str()) {
-            client.execute("UPDATE storage_maintenance_tombstones SET state='retained', \
+            tx.execute("UPDATE storage_maintenance_tombstones SET state='retained', \
                 last_error='native reachability changed' WHERE repository_id=$1 AND tenant_id=$2 \
                 AND oid=$3 AND repository_generation=$4 AND state='pending'",
                 &[&repo,&tenant,&oid,&generation]).await?;
@@ -123,7 +138,7 @@ pub async fn delete_due(state: &AppState, repo: Uuid, tenant: Uuid, generation: 
         let (dir,file)=oid.split_at(2);
         let parent=git_dir.join("objects").join(dir);
         if !parent.exists() {
-            client.execute("UPDATE storage_maintenance_tombstones SET state='retained', \
+            tx.execute("UPDATE storage_maintenance_tombstones SET state='retained', \
                 last_error='object is packed or loose directory absent' WHERE repository_id=$1 AND tenant_id=$2 \
                 AND oid=$3 AND repository_generation=$4 AND state='pending'",
                 &[&repo,&tenant,&oid,&generation]).await?;
@@ -138,7 +153,7 @@ pub async fn delete_due(state: &AppState, repo: Uuid, tenant: Uuid, generation: 
                 fs::remove_file(&path)?;
             }
             Err(error) if error.kind()==std::io::ErrorKind::NotFound => {
-                client.execute("UPDATE storage_maintenance_tombstones SET state='retained', \
+                tx.execute("UPDATE storage_maintenance_tombstones SET state='retained', \
                     last_error='object is packed or loose path absent' WHERE repository_id=$1 AND tenant_id=$2 \
                     AND oid=$3 AND repository_generation=$4 AND state='pending'",
                     &[&repo,&tenant,&oid,&generation]).await?;
@@ -147,13 +162,15 @@ pub async fn delete_due(state: &AppState, repo: Uuid, tenant: Uuid, generation: 
             }
             Err(error) => return Err(error.into()),
         }
-        client.execute("UPDATE storage_maintenance_tombstones SET state='deleted', \
+        tx.execute("UPDATE storage_maintenance_tombstones SET state='deleted', \
             deleted_at=clock_timestamp(),attempts=attempts+1,last_error=NULL \
             WHERE repository_id=$1 AND tenant_id=$2 AND oid=$3 \
             AND repository_generation=$4 AND state='pending'",
             &[&repo,&tenant,&oid,&generation]).await?;
         deleted+=1;
     }
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+    tx.commit().await?;
     Ok(json!({"deleted":deleted,"retained":retained,"remaining_batch":100}))
 }
 

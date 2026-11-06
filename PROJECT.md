@@ -1,5 +1,7 @@
 # Project: Rootyard Tier-1 through Tier-5 Full Architecture Closure
 
+Current integration tracking: [registered-task delivery](docs/registered-task-delivery.md). Historical DONE rows below describe previous lab milestones, not native acceptance of issues #2–#47. Domain routers may take `state: Arc<AppState>` when required to install stateful authentication/routing middleware; their facades and file-size limits remain in force.
+
 ## Architecture
 Rootyard is a high-assurance Git hosting, CI mirror, distributed sharding, and workspace/object-storage system written in Rust (`edition = "2024"`, Axum 0.8, `deadpool-postgres` / `tokio-postgres`).
 To support conflict-free parallel development across Tier-1 (`M1`–`M5`, `DONE`), Tier-2 (`M6`–`M11`, `DONE`), Tier-3 (`M12`–`M17`, `DONE`), Tier-4 (`M18`–`M22`, `DONE`), and Tier-5 (`M23`–`M28`, `DONE`):

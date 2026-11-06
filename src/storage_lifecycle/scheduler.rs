@@ -3,6 +3,8 @@ use super::{gc, gitfs, jobs, models::Policy};
 use crate::AppState;
 use anyhow::{Result, bail};
 use serde_json::json;
+use std::time::Duration;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -45,8 +47,29 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
         let tenant:Uuid=row.get("owner_id");
         let generation:i64=row.get("storage_generation");
         if !local_primary(state,repo).await? { continue; }
+        // Count-objects is a native GitFS reader too. Hold the cross-process
+        // barrier through child quiescence, including a lost-lease abort.
+        let read=crate::storage::read_leases::shared(
+            &state.pool,repo,Instant::now()+state.config.git_timeout,
+        ).await.map_err(|_| anyhow::anyhow!("repository reader barrier unavailable"))?;
         let cancel=CancellationToken::new();
-        let counts=gitfs::count(state,repo,&cancel).await?;
+        let count=gitfs::count(state,repo,&cancel);
+        tokio::pin!(count);
+        let mut safety=tokio::time::interval(Duration::from_millis(200));
+        let counts=loop {
+            tokio::select! {
+                result=&mut count => break result?,
+                _=safety.tick() => {
+                    if read.ensure_active().is_err() {
+                        cancel.cancel();
+                        let _=count.await;
+                        bail!("repository reader barrier lost during maintenance scan");
+                    }
+                }
+            }
+        };
+        read.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+        drop(read);
         let client=state.pool.get().await?;
         let updated=client.execute(
             "INSERT INTO storage_maintenance_repo_state(repository_id,tenant_id,last_scan_at,last_scan_generation,loose_count,pack_count,last_scan) \

@@ -1,0 +1,72 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "format6_checkout_authority_restore",
+      "status": "passed",
+      "seconds": 29.206,
+      "detail": {
+        "format6_current_schema": true,
+        "immutable_grants": true,
+        "permanent_tombstones": true,
+        "backup_then_cancel_then_restore_revokes_grant": true,
+        "raw_credential_not_persisted": true,
+        "live_old_bearer_denied_discovery_and_rpc": true,
+        "ordinary_owner_restored_target_access": true,
+        "genuine_native_pin_and_issuance": true
+      }
+    },
+    {
+      "name": "format4_real_legacy_restore_then_upgrade",
+      "status": "passed",
+      "seconds": 16.3813,
+      "detail": {
+        "real_historical_binary_archive": true,
+        "genuine_archive_manifest_unchanged": true,
+        "explicit_legacy_opt_in_required": true,
+        "schema007_verified_before_upgrade": true,
+        "current_schema_upgrade_empty_authority": true,
+        "mismatched_dump_rejected_guard_retained": true
+      }
+    }
+  ],
+  "binary_sha256": "279beb857d26673aeb7ad3bf6ed18ec54c1665b9da002c9d60f65822b6ea2564",
+  "legacy_binary_sha256": "e9298cd79cf3c4d7c2ad903dcba5f282df059a90a70a747930a7f58a2dbfe273",
+  "limitations": [
+    "Synthetic loopback backup/restore does not establish a production RPO/RTO.",
+    "Restoring permanently revokes all issued checkout credentials; native pins and plans remain."
+  ],
+  "native_build": {
+    "version": 1,
+    "binary_sha256": "279beb857d26673aeb7ad3bf6ed18ec54c1665b9da002c9d60f65822b6ea2564",
+    "source_inputs_sha256": "367eb3d0e9deef34e3296443c32a41bde12426324f6f58a8c9347b94c8b3148d",
+    "workspace_commit": "e4cd74376e147a3c5b534490dc5dde2c022150b4",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard"
+    ],
+    "unstripped_binary_sha256": "983a7b448f7c4896a446f9def81744414bc0e5dc48baeff8d43ed71db9440291",
+    "transformation": "strip --strip-debug"
+  },
+  "legacy_build": {
+    "version": 1,
+    "workspace_commit": "08b10e9976c012343c48e4fd6a5981e0266b8c53",
+    "source_inputs_sha256": "96e67936813c7c2b901e7e6ff96ae3c3d6dd83d608ab762455ffc57834a88f1b",
+    "binary_sha256": "e9298cd79cf3c4d7c2ad903dcba5f282df059a90a70a747930a7f58a2dbfe273",
+    "unstripped_binary_sha256": "5ecfc9aa7ed6732710800e1d5a4f654f71c07b875b59fa569bccad450cf07019",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard"
+    ],
+    "transformation": "strip --strip-debug",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "clean_frozen_checkout": true
+  }
+}

@@ -17,6 +17,7 @@ pub mod events;
 #[rustfmt::skip]
 pub mod forge;
 pub mod git_http;
+pub mod pando_gateway;
 pub mod journal;
 pub mod kafka_wake;
 #[rustfmt::skip]
@@ -57,7 +58,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health/live", get(|| async { "ok" }))
         .route("/health/ready", get(application::ready))
         .merge(repositories::routes())
-        .merge(browse::routes())
+        .merge(browse::routes(state.clone()))
         .merge(ci_pins::routes())
         .merge(ci_checkouts::routes())
         .merge(reliability::routes())

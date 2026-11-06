@@ -3,6 +3,7 @@ import argparse
 import base64
 import json
 import os
+import socket
 import time
 import unittest
 import urllib.parse
@@ -15,7 +16,8 @@ from tests.webhooks import WebhooksHarness
 class CiSandboxTest(unittest.TestCase):
     def test_claimed_origin_checkout_build_and_cancel(self):
         binary=Path(os.environ.get("ROOTYARD_BINARY","target/debug/rootyard")).resolve()
-        h=WebhooksHarness(argparse.Namespace(binary=str(binary),keep=False))
+        h=WebhooksHarness(argparse.Namespace(binary=str(binary),
+            keep=os.environ.get("ROOTYARD_KEEP_TEST")=="1"))
         h.env["ROOTYARD_SANDBOX_MODE"]="dev"
         h.env["ROOTYARD_CI_ORIGIN_FALLBACK_GLOBAL"]="2"
         h.env["ROOTYARD_CI_ORIGIN_FALLBACK_PER_REPO"]="2"
@@ -57,7 +59,7 @@ class CiSandboxTest(unittest.TestCase):
                     status,raw,_=h.http(path(run)+"/"+job+suffix,extra_headers=headers)
                     self.assertEqual(status,200,raw[:300])
                     result=json.loads(raw)
-                    if result["state"] not in ("queued","running"):return result
+                    if result["state"] not in ("queued","preparing","running"):return result
                     time.sleep(.1)
                 self.fail("CI sandbox did not terminate")
 
@@ -65,15 +67,32 @@ class CiSandboxTest(unittest.TestCase):
             self.assertEqual(first["source"],"origin")
             params=tuple_for(first,"native-build")
             command=("git rev-parse HEAD; test -f feature.txt; "
+                "test -z \"$(git show-ref refs/heads/source-nonff)\"; "
+                f"! git cat-file -e {h.diverged_head_oid} 2>/dev/null; "
                 "test ! -e /workspace/shared/rootyard-env.sh; "
                 "printf 'int main(void){return 0;}\\n' > main.c; "
                 "gcc main.c -o app && ./app && echo BUILD_OK")
+            start_body={**params,"argv":["/bin/sh","-c",command],"timeout_seconds":20}
+            encoded=json.dumps(start_body).encode()
+            conn=socket.create_connection(("127.0.0.1",h.port),timeout=3)
+            request=(f"POST {path(runs['ci/build'])} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                f"Authorization: Bearer {secret}\r\nContent-Type: application/json\r\n"
+                f"Content-Length: {len(encoded)}\r\nConnection: close\r\n\r\n").encode()+encoded
+            conn.sendall(request)
+            deadline=time.monotonic()+5
+            queued=""
+            while time.monotonic()<deadline:
+                queued=h.sql(f"SELECT state FROM sandbox_jobs WHERE ci_run_id='{runs['ci/build']}'")
+                if queued in ("queued","preparing"):break
+                time.sleep(.01)
+            self.assertIn(queued,("queued","preparing"),"request did not persist before disconnect")
+            conn.close()
             status,raw,_=h.http(path(runs["ci/build"]),method="POST",
-                body={**params,"argv":["/bin/sh","-c",command],"timeout_seconds":20},
-                extra_headers=headers)
+                body=start_body,extra_headers=headers)
             self.assertEqual(status,201,raw[:300])
             job=json.loads(raw)
             outcome=wait_done(runs["ci/build"],job["id"],params)
+            self.assertEqual(outcome["state"],"succeeded",(outcome,h.root))
             log_path=path(runs["ci/build"])+"/"+job["id"]+"/logs?"+urllib.parse.urlencode(params)
             status,raw,_=h.http(log_path,extra_headers=headers)
             self.assertEqual(status,200,raw[:300])
