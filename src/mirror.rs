@@ -6,9 +6,11 @@ pub mod limiter;
 pub mod observability;
 pub mod sync;
 pub mod views;
+pub mod job_views;
 
 pub(crate) use sync::{ci_route, mirror_git, repository};
-pub(crate) use views::{job_path, pinned_path};
+pub(crate) use views::pinned_path;
+pub(crate) use job_views::job_path;
 
 use crate::{AppState, Error, config::Config, git_http, storage::Storage};
 use anyhow::{Context, Result, bail};

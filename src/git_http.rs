@@ -179,7 +179,12 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         if job {
             crate::ci_checkouts::dependencies::verify_on_mirror(
                 &state, job_plan.as_ref().ok_or_else(Error::unauthorized)?).await?;
-            crate::mirror::job_path(&state, &repo, oid).await?
+            crate::mirror::job_path(
+                &state,
+                &repo,
+                job_plan.as_ref().ok_or_else(Error::unauthorized)?,
+            )
+            .await?
         } else {
             crate::mirror::pinned_path(&state, &repo, oid).await?
         }

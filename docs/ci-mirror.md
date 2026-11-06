@@ -390,16 +390,19 @@ production resource controls for that SQL growth.
 
 An owner-token legacy pin uses alternates into a full snapshot and is **not** a
 privacy boundary. A job token never serves that view. It gets a separate
-`job-views/{storage_generation}-{target_oid}.git` containing only the target
-commit, all its ancestors, their trees and blobs. This grants full reachable
-history, not path-level secrecy; gitlinks do not authorize submodule repositories
-and LFS content is not included or automatically authorized.
+`job-views` Git repository containing only its declared target and tag object
+closures. Full history includes the target's ancestors. Target history writes
+a shallow boundary at the target commit, so an ordinary clone sees only that
+commit's history unless a declared tag independently includes older commits.
+Gitlinks require separate source grants and credentials, and LFS pointers
+require ready, independently authorized bytes.
 
 Preparation writes a fresh non-thin pack without delta/object reuse, checks its
-actual object set against the source target's full reachability set, verifies
+actual object set against the declared target and tag reachability set, verifies
 native `fsck --full --strict`, then fsyncs and atomically publishes. No alternates,
 external delta bases, unrelated objects, extra refs, replacement refs, grafts,
-shallow/promisor metadata, hooks or arbitrary configuration are allowed. Reuse
+promisor metadata, hooks or arbitrary configuration are allowed. Target-history
+views permit only the plan's exact shallow boundary. Reuse
 revalidates the strict on-disk grammar, exact target identity, native integrity
 and physical-object-set equality. Git replacement semantics are disabled.
 
@@ -408,8 +411,8 @@ them on each request. Object enumeration is capped at 64 MiB per command and
 fails closed beyond that bound. Existing Git process, CPU, memory, file-size and
 repository limits apply. The trusted operator controls the mirror filesystem;
 a hostile same-UID process able to race file mutations is outside this boundary.
-No scheduler, automatic fallback/sync, GC, shallow/partial clone promise, or
-production scale claim is added. Validate deployment-specific capacity separately.
+Target-history clones use stock Git shallow fetches; filter-based partial clone
+remains unsupported. Validate deployment-specific capacity separately.
 
 `tests/ci_job_checkouts.py` exercises native protocol v0/v2, exact target clones,
 known unrelated commit/blob wants, physical closure equality, endpoint scoping,
