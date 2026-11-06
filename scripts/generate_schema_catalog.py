@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import urllib.parse
 import uuid
@@ -69,6 +70,13 @@ def main():
                 run([str(args.binary.resolve()), "migrate"], upgraded)
                 capture(upgraded, "upgraded_catalog")
             (args.root / "schema" / f"{latest:03d}_catalog.sql").write_text(query)
+            # The accepted upgraded fixture is specifically a restored schema003
+            # upgrade. An in-place schema060 upgrade has a different PostgreSQL
+            # CHECK-expression parse tree. Exercise both, then regenerate the
+            # canonical fixture from the documented legacy restore paths.
+            subprocess.run([sys.executable, str(args.root / "tests/schema_contract.py"),
+                            "--binary", str(args.binary.resolve()), "--write"],
+                           cwd=args.root, check=True)
     finally:
         for name in reversed(created):
             run(["psql", "-X", "-v", "ON_ERROR_STOP=1", "-c", f'DROP DATABASE "{name}" WITH (FORCE)'])

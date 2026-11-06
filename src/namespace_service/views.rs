@@ -1,5 +1,5 @@
 use super::handlers;
-use crate::{AppState,Error,auth,members::models::Role};
+use crate::{AppState,Error,auth,members::models::Role,storage::read_leases};
 use axum::{Json,extract::{Path,State},http::{HeaderMap,StatusCode,header},response::IntoResponse};
 use serde::{Deserialize,Serialize};
 use std::{fs,path::{Path as FsPath,PathBuf},process::Command,sync::Arc};
@@ -40,11 +40,16 @@ pub async fn create(State(state):State<Arc<AppState>>,headers:HeaderMap,Path(id)
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
     let access=auth::authorize_repo_with_role(&tx,&actor,&mount.owner,&mount.repository,Role::Read).await?;
+    let source_lease=read_leases::shared(&state.pool,access.repo_id,
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let refreshed=auth::authorize_repo_with_role(&tx,&actor,&mount.owner,&mount.repository,Role::Read).await?;
+    if refreshed.repo_id!=access.repo_id { return Err(Error::not_found()); }
     let source=state.storage.verify_path(access.repo_id).map_err(Error::internal)?;
     let vid=Uuid::new_v4();
     let temp=projection_root(&state).join(format!("stage-{vid}"));
     let final_path=projection_root(&state).join(vid.to_string());
     clone(&source,&temp,None)?;
+    source_lease.ensure_active()?;
     git(&temp,&["checkout","--force",&mount.base_oid])?;
     let projected=if input.subdir.is_empty(){mount.base_oid.clone()} else {
         git(&temp,&["filter-branch","--subdirectory-filter",&input.subdir,"--","HEAD"])?;

@@ -1,5 +1,5 @@
 //! Automatic, tenant-scoped job admission based on observed GitFS thresholds.
-use super::{gitfs, jobs, models::Policy};
+use super::{gc, gitfs, jobs, models::Policy};
 use crate::AppState;
 use anyhow::{Result, bail};
 use serde_json::json;
@@ -69,7 +69,24 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
             new_loose>=policy.loose_threshold || new_packs>=policy.pack_threshold
         };
         if repack && jobs::enqueue(&state.pool,repo,tenant,generation,"gitfs_repack").await? { scheduled+=1; }
+        if repack && jobs::enqueue(&state.pool,repo,tenant,generation,"gitfs_cache_hydrate").await? { scheduled+=1; }
         if jobs::enqueue(&state.pool,repo,tenant,generation,"gitfs_unreachable_mark").await? { scheduled+=1; }
+        if gc::PHYSICAL_DELETE_ENABLED {
+            let graph=state.storage.repo_path(repo).join("objects/info/commit-graph");
+            if let Ok(meta)=std::fs::symlink_metadata(graph)
+                && meta.is_file() && !meta.file_type().is_symlink()
+                && meta.modified()?.elapsed().unwrap_or_default().as_secs()>=policy.cache_max_age_seconds as u64
+                && jobs::enqueue(&state.pool,repo,tenant,generation,"gitfs_cache_evict").await? {
+                scheduled+=1;
+            }
+            let due:bool=client.query_one(
+                "SELECT EXISTS(SELECT 1 FROM storage_maintenance_tombstones \
+                 WHERE repository_id=$1 AND tenant_id=$2 AND repository_generation=$3 \
+                 AND state='pending' AND delete_after<=clock_timestamp())",
+                &[&repo,&tenant,&generation],
+            ).await?.get(0);
+            if due && jobs::enqueue(&state.pool,repo,tenant,generation,"gitfs_tombstone_delete").await? { scheduled+=1; }
+        }
     }
     Ok(scheduled)
 }

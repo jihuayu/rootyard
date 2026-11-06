@@ -21,8 +21,8 @@ client failures and packet transcript are in `evidence/client-compatibility.json
 | Annotated tags, stale force-with-lease and atomic multi-ref failure | Passed; failed transaction left refs unchanged | Actual observed native refs |
 | Detached HEAD with staged and untracked files across fetch | Passed; index/worktree status preserved | Stock Git worktree |
 | Stock Git SHA-256 create/push/clone/fsck | Passed with exact 64-hex tip/content | SHA-256 Forge/CI behavior is separately tested under #38 |
-| JGit/libgit2 SHA-256 | Explicitly unsupported; both real clone attempts failed | SHA-1 probes passed; stock Git continued reading the same SHA-256 repository after each failure |
-| Thin push / delta objects | Passed, native repack produced delta objects; receiver clone/fsck/content matched | Transcript records actual receive-pack; no inferred wire-level compression ratio |
+| JGit/libgit2 SHA-256 | Observed incompatible: libgit2 rejects the format; JGit exits with premature EOF | SHA-1 probes passed; stock Git continued reading the same SHA-256 repository after each failure |
+| Thin-requested push / local delta objects | Passed, native repack produced delta objects; receiver clone/fsck/content matched | Transcript records actual receive-pack; wire thin-pack encoding was not independently decoded |
 | Stock git-lfs upload/pull/fsck/lock/unlock | Passed, 1 MiB exact payload | Independent clients' additional LFS extensions are not supported by this matrix |
 | Partial-clone filter | Explicitly unsupported | Capability not advertised; Git warning and full-object fallback verified, not counted as filtered success |
 | SSH | Unsupported | No SSH service endpoint |
@@ -43,5 +43,4 @@ python3 tests/client_compatibility.py --binary target/debug/rootyard --report te
 The JGit download is pinned by SHA-256 and checked before execution. Client
 credentials are passed through child environments, never repository URLs or
 report command arguments. These functional tests are not cluster performance or
-production durability measurements. Issue #45 remains open until independent review, final combined regression and
-merge evidence are complete. A new binary or client version requires a new run.
+production durability measurements. Issue #45 remains open until final combined regression and merge evidence are complete; Luna independently reran all nine cases. A new binary or client version requires a new run.

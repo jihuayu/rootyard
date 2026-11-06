@@ -6,6 +6,7 @@ use crate::{
         transactions,
     },
     members::models::Role,
+    storage::read_leases,
     workspaces::service,
     AppState, Error,
 };
@@ -138,6 +139,10 @@ pub async fn create(
         {
             return Err(Error::bad_request());
         }
+        let source_lease=read_leases::shared(&state.pool,access.repo_id,
+            tokio::time::Instant::now()+state.config.git_timeout).await?;
+        let refreshed=auth::authorize_repo_with_role(&tx,&actor,&mount.owner,&mount.repository,Role::Write).await?;
+        if refreshed.repo_id!=access.repo_id { return Err(Error::not_found()); }
         let repo = state
             .storage
             .verify_path(access.repo_id)
@@ -146,6 +151,7 @@ pub async fn create(
             &repo,
             &["cat-file", "-e", &format!("{}^{{commit}}", step.new_oid)],
         )?;
+        source_lease.ensure_active()?;
         steps.push((ordinal as i32, mount, access.repo_id, step));
     }
     tx.execute("INSERT INTO workspace_changesets(id,namespace_id,state,creator_id) VALUES($1,$2,'proposed',$3)", &[&id,&namespace_id,&actor.id]).await.map_err(Error::internal)?;
@@ -273,6 +279,9 @@ async fn run(
             client.execute("UPDATE workspace_changesets SET state='conflict',updated_at=clock_timestamp() WHERE id=$1", &[&id]).await.map_err(Error::internal)?;
             return Err(conflict());
         }
+        let source_lease=read_leases::shared(&state.pool,step.repository_id,
+            tokio::time::Instant::now()+state.config.git_timeout).await?;
+        auth::verify_active(&state.pool,&actor,step.repository_id,true).await?;
         let repo = state
             .storage
             .verify_path(step.repository_id)
@@ -316,6 +325,7 @@ async fn run(
                 return Err(conflict());
             }
         }
+        source_lease.ensure_active()?;
         let client = state.pool.get().await.map_err(Error::internal)?;
         client.execute("UPDATE workspace_changeset_steps SET applied=true WHERE changeset_id=$1 AND ordinal=$2", &[&id,&step.ordinal]).await.map_err(Error::internal)?;
         client.execute("UPDATE workspace_changesets SET state='partial',updated_at=clock_timestamp() WHERE id=$1", &[&id]).await.map_err(Error::internal)?;

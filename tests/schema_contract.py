@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check exact schema008 catalogs, including an upgrade from restored schema003.
+"""Check current schema catalogs, including upgrades from restored legacy schemas.
 
 Only use disposable PostgreSQL with CREATEDB. --write generates fixtures for
 review; it does not establish their correctness or accept production drift.
@@ -130,8 +130,8 @@ def main():
                             else:
                                 print(f'DIFF in {filename} [{k}]: actual={v_list} expected={e_list}')
                 assert value == expected, 'Canonical schema fixture differs: ' + filename
-        print(json.dumps(dict(canonical_schema008=True, roundtrip_schema008=True,
-                              restored003_upgrade008=True, restored006_upgrade008=True, restored007_upgrade008=True, upgraded008_roundtrip=True,
+        print(json.dumps(dict(schema_version=LATEST_PREFIX, canonical=True, roundtrip=True,
+                              restored003_upgrade=True, restored006_upgrade=True, restored007_upgrade=True, upgraded_roundtrip=True,
                               tables=len(actual['tables']), functions=len(actual['functions']), triggers=len(actual['triggers']))))
     finally:
         for name in reversed(created):

@@ -1,4 +1,4 @@
-use crate::{auth, db, members::models::Role, AppState, Error};
+use crate::{auth, db, members::models::Role, storage::read_leases, AppState, Error};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -69,6 +69,10 @@ pub async fn create(
             return Err(Error::bad_request());
         }
         owner_id = Some(access.owner_id);
+        let source_lease=read_leases::shared(&state.pool,access.repo_id,
+            tokio::time::Instant::now()+state.config.git_timeout).await?;
+        let refreshed=auth::authorize_repo_with_role(&tx,&actor,&m.owner,&m.repository,Role::Read).await?;
+        if refreshed.repo_id!=access.repo_id { return Err(Error::not_found()); }
         let repo = state
             .storage
             .verify_path(access.repo_id)
@@ -82,6 +86,7 @@ pub async fn create(
         if !output.status.success() {
             return Err(Error::bad_request());
         }
+        source_lease.ensure_active()?;
         repo_ids.push(access.repo_id);
     }
     let owner_id = owner_id.ok_or_else(Error::bad_request)?;

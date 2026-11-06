@@ -24,7 +24,17 @@ capture external changes every two seconds; event replay exposes revisions.
 Lease handoff rejects active sandbox jobs, and sandbox admission and execution
 are bound to a persisted lease epoch. A running job is cancelled when its lease
 or database authority disappears. Database lease changes are reflected in the
-FUSE gate on the next scan or at the previous deadline.
+FUSE gate on the next scan or at the previous deadline. An operation admitted
+before expiry may finish on the old host's local upper layer; the old epoch
+cannot publish a checkpoint or remote manifest after lease handoff.
+
+A new host can acquire an expired workspace lease only when its latest revision
+has a committed checkpoint. It verifies and materializes that checkpoint from
+the tenant-scoped remote object store before changing host ownership, then
+mounts the existing workspace ID on its own volume. Edits made after that
+checkpoint on the old host have no durable takeover guarantee. A workspace
+without a committed current checkpoint must be restored as a new workspace or
+recovered from its original volume.
 
 The FUSE overlay currently materializes a complete local Git clone as its lower
 layer. It does not lazily fetch individual files from remote CAS, implement

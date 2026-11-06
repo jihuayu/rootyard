@@ -1427,6 +1427,7 @@ dependencies = [
  "tokio-postgres-rustls",
  "tokio-util",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

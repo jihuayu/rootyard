@@ -5,6 +5,7 @@
 //! `/web/repos/{owner}/{name}...` and `/ui/repos/{owner}/{name}...`.
 pub mod handlers;
 pub mod models;
+pub mod native_reads;
 pub mod sanitize;
 pub mod session;
 pub mod templates;

@@ -117,13 +117,22 @@ pub async fn execute(state: &AppState, repo: Uuid, kind: &str, policy: &Policy, 
             let deleted=tokio::task::spawn_blocking(move || clean_staging(&dir,age,&cancel)).await??;
             Ok(json!({"staging_files_deleted":deleted}))
         }
-        "gitfs_unreachable_mark" => {
-            // A mark is diagnostic only: roots include refs, CI pins, workspace refs,
-            // retained snapshots and backup epochs; no physical deletion is enabled.
-            let report=run_git(state, repo, &["fsck", "--no-reflogs", "--unreachable", "--no-progress"], cancel, 512*1024).await?;
-            Ok(json!({"unreachable_lines":report.lines().take(8192).count(),"deleted":false}))
+        "gitfs_cache_evict" => {
+            let info=state.storage.verify_path(repo)?.join("objects/info");
+            crate::journal::safe_path(&info)?;
+            let graph=info.join("commit-graph");
+            match std::fs::symlink_metadata(&graph) {
+                Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() && meta.nlink()==1 => {
+                    if meta.modified()?.elapsed().unwrap_or_default().as_secs()>=policy.cache_max_age_seconds as u64 {
+                        std::fs::remove_file(graph)?;
+                        Ok(json!({"commit_graph":"evicted"}))
+                    } else { Ok(json!({"commit_graph":"retained_new"})) }
+                }
+                Err(error) if error.kind()==std::io::ErrorKind::NotFound => Ok(json!({"commit_graph":"absent"})),
+                _ => bail!("unsafe commit-graph cache path"),
+            }
         }
-        "gitfs_cache_evict" | "gitfs_tombstone_delete" => bail!("destructive cleanup requires durable cross-process reader leases"),
+        "gitfs_tombstone_delete" => bail!("destructive cleanup requires complete reader lease coverage"),
         _ => bail!("unknown storage maintenance job kind"),
     }
 }

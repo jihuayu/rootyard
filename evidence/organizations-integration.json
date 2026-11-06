@@ -1,0 +1,44 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "inherited_capabilities",
+      "status": "passed",
+      "seconds": 3.9535,
+      "detail": {
+        "namespace_collision_rejected": true,
+        "team_role_inherited": true,
+        "git_lfs_forge_workspace_authorized": true,
+        "revocation_immediate": true,
+        "last_admin_protected": true
+      }
+    },
+    {
+      "name": "role_revocation_barrier",
+      "status": "passed",
+      "seconds": 0.0962,
+      "detail": {
+        "direct_role_waited_then_denied": true,
+        "team_role_waited_then_denied": true,
+        "no_post_revocation_issue": true
+      }
+    }
+  ],
+  "binary_sha256": "ec62504f2c699874fa78a336c9185aba75ade1969a029cabcd786a161a0a31b7",
+  "native_build": {
+    "version": 1,
+    "binary_sha256": "ec62504f2c699874fa78a336c9185aba75ade1969a029cabcd786a161a0a31b7",
+    "source_inputs_sha256": "5bff5d97c98d2537c91a3494ff7b585018d1244527417865af3151a8618e9965",
+    "workspace_commit": "13b28dda0263e3c6993aece7ec2ae620a032ad32",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard"
+    ],
+    "unstripped_binary_sha256": "5977c6e594c01fddc8087976d0a73d4a9d54093ee5eb0c42c63a5d8848ccf511",
+    "transformation": "strip --strip-debug"
+  }
+}

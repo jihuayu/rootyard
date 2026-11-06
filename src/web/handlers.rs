@@ -21,6 +21,7 @@ use crate::{
         rules,
     },
     web::{
+        native_reads,
         models::{
             BlobPreview, COMMENT_FIELDS, CommentViewItem, ISSUE_FIELDS, IssueViewItem,
             OverviewViewData, PullDetailViewData, RepoHeaderCtx, WebBlobQuery, WebCheckPanelQuery,
@@ -120,8 +121,8 @@ async fn resolve_web_commit_or_tree_oid(state: &AppState, repo_id: Uuid, spec_op
     git_read::resolve_commit_oid(state, repo_id, spec).await
 }
 
-pub async fn read_web_blob_preview(state: &AppState, repo_id: Uuid, oid_or_spec: Option<&str>, rel_path: Option<&str>, max_bytes: usize) -> Result<BlobPreview, Error> {
-    let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
+/// Caller must hold a Git slot and `native_reads::Source::protect` through child termination.
+pub(crate) async fn read_web_blob_preview(state: &AppState, repo_id: Uuid, oid_or_spec: Option<&str>, rel_path: Option<&str>, max_bytes: usize) -> Result<BlobPreview, Error> {
     let clean_path = browse_models::normalize_rel_path(rel_path)?;
     let blob_oid = if !clean_path.is_empty() {
         let root_oid = resolve_web_commit_or_tree_oid(state, repo_id, oid_or_spec).await?;
@@ -179,24 +180,27 @@ pub async fn repo_overview(State(state): App, Path((owner, name)): RepoPath, hea
     finish(tx, &actor, false).await?;
     drop(client);
 
-    let (head, refs) = git_read::read_head_and_refs(&state, access.repo_id).await?;
-    let branches: Vec<_> = refs.iter().filter(|r| r.kind == "branch").cloned().collect();
-    let tags: Vec<_> = refs.iter().filter(|r| r.kind == "tag").cloned().collect();
-    let (latest_commit, tree, readme_html) = if let Some(ref oid) = head.oid {
-        let summary = git_read::read_commit_summary(&state, access.repo_id, oid).await.ok();
-        let root_tree = git_read::read_tree(&state, access.repo_id, Some(oid), "", None, 100).await.ok();
-        let mut readme = None;
-        if let Some(ref t) = root_tree {
-            if let Some(entry) = t.items.iter().find(|e| e.kind == "blob" && matches!(e.name.to_ascii_lowercase().as_str(), "readme.md" | "readme.markdown" | "readme.txt" | "readme")) {
-                if let Ok(preview) = read_web_blob_preview(&state, access.repo_id, Some(&entry.oid), None, DEFAULT_WEB_BLOB_PREVIEW_BYTES).await {
-                    readme = preview.text_preview.map(|txt| render_safe_markdown(&txt));
+    let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
+    let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
+    let (head,branches,tags,latest_commit,tree,readme_html)=source.protect(async {
+        let (head, refs) = git_read::read_head_and_refs(&state, access.repo_id).await?;
+        let branches: Vec<_> = refs.iter().filter(|r| r.kind == "branch").cloned().collect();
+        let tags: Vec<_> = refs.iter().filter(|r| r.kind == "tag").cloned().collect();
+        let (latest_commit, tree, readme_html) = if let Some(ref oid) = head.oid {
+            let summary = git_read::read_commit_summary(&state, access.repo_id, oid).await.ok();
+            let root_tree = git_read::read_tree(&state, access.repo_id, Some(oid), "", None, 100).await.ok();
+            let mut readme = None;
+            if let Some(ref t) = root_tree {
+                if let Some(entry) = t.items.iter().find(|e| e.kind == "blob" && matches!(e.name.to_ascii_lowercase().as_str(), "readme.md" | "readme.markdown" | "readme.txt" | "readme")) {
+                    if let Ok(preview) = read_web_blob_preview(&state, access.repo_id, Some(&entry.oid), None, DEFAULT_WEB_BLOB_PREVIEW_BYTES).await {
+                        readme = preview.text_preview.map(|txt| render_safe_markdown(&txt));
+                    }
                 }
             }
-        }
-        (summary, root_tree, readme)
-    } else {
-        (None, None, None)
-    };
+            (summary, root_tree, readme)
+        } else { (None, None, None) };
+        Ok::<_,Error>((head,branches,tags,latest_commit,tree,readme_html))
+    }).await?;
     let data = OverviewViewData { header: header_ctx, head, branches, tags, latest_commit, tree, readme_html, open_issues, open_pulls };
     Ok(html_response(StatusCode::OK, templates::render_repo_overview(&data)))
 }
@@ -205,7 +209,8 @@ pub async fn tree_view(State(state): App, Path((owner, name)): RepoPath, Query(q
     let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
     let (spec, rel_path, after, limit) = query.resolve_spec_and_validate(None)?;
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
-    let tree = git_read::read_tree(&state, access.repo_id, spec, &rel_path, after, limit).await?;
+    let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
+    let tree = source.protect(git_read::read_tree(&state, access.repo_id, spec, &rel_path, after, limit)).await?;
     Ok(html_response(StatusCode::OK, templates::render_tree_view(&header_ctx, &tree)))
 }
 
@@ -213,19 +218,24 @@ pub async fn tree_by_oid_view(State(state): App, Path((owner, name, oid)): OidPa
     let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
     let (spec, rel_path, after, limit) = query.resolve_spec_and_validate(Some(&oid))?;
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
-    let tree = git_read::read_tree(&state, access.repo_id, spec, &rel_path, after, limit).await?;
+    let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
+    let tree = source.protect(git_read::read_tree(&state, access.repo_id, spec, &rel_path, after, limit)).await?;
     Ok(html_response(StatusCode::OK, templates::render_tree_view(&header_ctx, &tree)))
 }
 
 pub async fn blob_view(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<WebBlobQuery>, headers: HeaderMap) -> Res {
     let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
-    let preview = read_web_blob_preview(&state, access.repo_id, query.resolve_spec(None)?, query.path.as_deref(), query.validate_max_bytes()?).await?;
+    let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
+    let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
+    let preview = source.protect(read_web_blob_preview(&state, access.repo_id, query.resolve_spec(None)?, query.path.as_deref(), query.validate_max_bytes()?)).await?;
     Ok(html_response(StatusCode::OK, templates::render_blob_view(&header_ctx, &preview)))
 }
 
 pub async fn blob_by_oid_view(State(state): App, Path((owner, name, oid)): OidPath, Query(query): Query<WebBlobQuery>, headers: HeaderMap) -> Res {
     let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
-    let preview = read_web_blob_preview(&state, access.repo_id, query.resolve_spec(Some(&oid))?, query.path.as_deref(), query.validate_max_bytes()?).await?;
+    let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
+    let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
+    let preview = source.protect(read_web_blob_preview(&state, access.repo_id, query.resolve_spec(Some(&oid))?, query.path.as_deref(), query.validate_max_bytes()?)).await?;
     Ok(html_response(StatusCode::OK, templates::render_blob_view(&header_ctx, &preview)))
 }
 
@@ -233,14 +243,20 @@ pub async fn commits_view(State(state): App, Path((owner, name)): RepoPath, Quer
     let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
     let (spec, after, limit) = query.validate()?;
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
-    let commits = git_read::list_commits(&state, access.repo_id, spec, after, limit).await?;
+    let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
+    let commits = source.protect(git_read::list_commits(&state, access.repo_id, spec, after, limit)).await?;
     Ok(html_response(StatusCode::OK, templates::render_commits_view(&header_ctx, spec, &commits)))
 }
 
 pub async fn commit_detail_view(State(state): App, Path((owner, name, oid)): OidPath, headers: HeaderMap) -> Res {
     let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
-    let detail = git_read::get_commit_detail(&state, access.repo_id, &oid).await?;
-    let diff_raw = git_read::run_git(&state, access.repo_id, &["show", "--format=", "--patch", "--no-color", "--no-ext-diff", &oid], MAX_DIFF_BYTES).await.unwrap_or_default();
+    let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
+    let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
+    let (detail,diff_raw)=source.protect(async {
+        let detail = git_read::get_commit_detail(&state, access.repo_id, &oid).await?;
+        let diff_raw = git_read::run_git(&state, access.repo_id, &["show", "--format=", "--patch", "--no-color", "--no-ext-diff", &oid], MAX_DIFF_BYTES).await.unwrap_or_default();
+        Ok::<_,Error>((detail,diff_raw))
+    }).await?;
     let diff = String::from_utf8_lossy(&diff_raw).into_owned();
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
@@ -266,7 +282,8 @@ pub async fn compare_view(State(state): App, Path((owner, name)): RepoPath, Quer
     let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
     let (base, head) = query.validate()?;
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
-    let cmp = git_read::compare_commits(&state, access.repo_id, base, head).await?;
+    let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
+    let cmp = source.protect(git_read::compare_commits(&state, access.repo_id, base, head)).await?;
     Ok(html_response(StatusCode::OK, templates::render_compare_view(&header_ctx, base, head, &cmp)))
 }
 
@@ -437,9 +454,14 @@ async fn render_pull_detail_for_number(state: &Arc<AppState>, owner: &str, name:
     finish(tx, &actor, false).await?;
     drop(client);
 
-    let merge_base_oid = merge_base(state, access.repo_id, &pull.base_oid, &pull.head_oid).await.ok().flatten();
+    let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
+    let source=native_reads::acquire(state,headers,owner,name,access.repo_id).await?;
+    let (merge_base_oid,diff_raw)=source.protect(async {
+        let merge_base_oid = merge_base(state, access.repo_id, &pull.base_oid, &pull.head_oid).await.ok().flatten();
+        let diff_raw = git_read::run_git(state, access.repo_id, &["diff", "--no-color", "--no-ext-diff", &pull.base_oid, &pull.head_oid], MAX_DIFF_BYTES).await.unwrap_or_default();
+        Ok::<_,Error>((merge_base_oid,diff_raw))
+    }).await?;
     let fast_forward = merge_base_oid.as_deref() == Some(pull.base_oid.as_str());
-    let diff_raw = git_read::run_git(state, access.repo_id, &["diff", "--no-color", "--no-ext-diff", &pull.base_oid, &pull.head_oid], MAX_DIFF_BYTES).await.unwrap_or_default();
     let diff = PullDiffResponse { pull_number: pull.number, base_ref: pull.base_ref.clone(), head_ref: pull.head_ref.clone(), base_oid: pull.base_oid.clone(), head_oid: pull.head_oid.clone(), merge_base_oid, fast_forward, diff: String::from_utf8_lossy(&diff_raw).into_owned() };
     let view_data = PullDetailViewData { pull, author_username, reviews, checks, policy, diff, disallow_self_approval: disallow_self, can_approve, can_merge };
     Ok(html_response(status, templates::render_pull_detail_view(&header_ctx, &view_data)))

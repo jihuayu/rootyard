@@ -32,6 +32,10 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--binary",default="target/debug/rootyard")
     parser.add_argument("--keep",action="store_true")
+    parser.add_argument("--mirror-only",action="store_true",
+        help="Run mirror materialization before the primary scoped Git route is available")
+    parser.add_argument("--user-only",action="store_true",
+        help="Run owner-issued nested checkout without signed integration claim")
     args=parser.parse_args();args.binary=str(Path(args.binary).resolve())
     h=JobCheckoutHarness(args)
     h.env["ROOTYARD_CI_ORIGIN_PUBLIC_URL"]=h.base
@@ -107,6 +111,9 @@ def main():
         h.transition(body["job_id"],"cancel")
         denied,_,_=h.mirror_http(grand_base+"/"+lfs_oid,token=grand_token)
         assert denied in (401,403),denied
+        if args.user_only:
+            print("stock Git owner-issued nested pinned submodules and Git LFS: passed",flush=True)
+            return 0
         hook_secret="nested-integration-secret-123456"
         hook=json.loads(h.expect("/api/repos/alice/demo/webhooks",201,token=h.alice,
             method="POST",body={"url":"http://127.0.0.1:1/hook","secret":hook_secret,
@@ -141,15 +148,36 @@ def main():
         service_clone=h.root/"integration-build"
         h.git("clone",h.mirror_base+h.path(feature_oid),str(service_clone),token=service_token)
         assert h.git("rev-parse","HEAD",cwd=service_clone).stdout.decode().strip()==feature_oid
-        origin_clone=h.root/"integration-origin-build"
-        h.git("clone",h.base+h.path(feature_oid),str(origin_clone),token=service_token)
-        assert h.git("rev-parse","HEAD",cwd=origin_clone).stdout.decode().strip()==feature_oid
-        origin_grand=next(x for x in claim["checkout"]["submodule_credentials"]
-            if x["name"]=="grand")
-        origin_lfs=f"/ci/{grand_oid}/git/alice/grand.git/info/lfs/objects/{lfs_oid}"
-        status,content,_=h.http(origin_lfs,token={"username":"alice",
-            "token":origin_grand["token"]})
-        assert status==200 and content==payload,(status,len(content))
+        if not args.mirror_only:
+            origin_clone=h.root/"integration-origin-build"
+            h.git("clone",h.base+h.path(feature_oid),str(origin_clone),token=service_token)
+            assert h.git("rev-parse","HEAD",cwd=origin_clone).stdout.decode().strip()==feature_oid
+            origin_grand=next(x for x in claim["checkout"]["submodule_credentials"]
+                if x["name"]=="grand")
+            origin_lfs=f"/ci/{grand_oid}/git/alice/grand.git/info/lfs/objects/{lfs_oid}"
+            status,content,_=h.http(origin_lfs,token={"username":"alice",
+                "token":origin_grand["token"]})
+            assert status==200 and content==payload,(status,len(content))
+            h.git("tag","-a","build-input","-m","fixed CI input",root_oid,cwd=h.work)
+            h.git("push","origin","refs/tags/build-input",cwd=h.work,token=h.alice)
+            tag_oid=h.git("rev-parse","refs/tags/build-input",cwd=h.work).stdout.decode().strip()
+            target_job=str(uuid.uuid4())
+            h.pin(h.pin_body(feature_oid,target_job,1))
+            target_grant=h.issue(h.request_body(oid=feature_oid,job=target_job,
+                history="target",tags=["build-input"]))
+            assert target_grant["plan"]["dependencies"]["tags"]==[
+                {"name":"build-input","object_oid":tag_oid}]
+            target_token={"username":"alice","token":target_grant["token"]}
+            target_clone=h.root/"origin-target-tag-build"
+            h.git("clone",h.base+h.path(feature_oid),str(target_clone),token=target_token)
+            assert h.git("rev-parse","HEAD",cwd=target_clone).stdout.decode().strip()==feature_oid
+            assert h.git("rev-list","--count","HEAD",cwd=target_clone).stdout.strip()==b"1"
+            assert h.git("rev-parse","refs/tags/build-input",cwd=target_clone).stdout.decode().strip()==tag_oid
+            h.git("fsck","--full",cwd=target_clone)
+            h.transition(target_job,"cancel")
+            status,_,_=h.http(h.advertise(feature_oid),token=target_token)
+            assert status in (401,403),status
+            print("primary scoped target-history/tag clone and cancellation: passed",flush=True)
         print("fenced integration prepared and cloned nested manifest: passed",flush=True)
         (h.work/".gitmodules").write_text(
             '[submodule "child"]\n\tpath = deps/child\n\turl = https://outside.invalid/child.git\n')

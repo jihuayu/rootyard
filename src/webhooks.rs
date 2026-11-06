@@ -4,6 +4,7 @@ pub mod claims;
 pub mod background;
 pub mod trust;
 pub mod runs;
+pub(crate) mod claimed;
 pub mod mirrors;
 pub mod handlers;
 pub mod models;
