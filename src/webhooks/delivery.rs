@@ -187,6 +187,14 @@ pub(crate) async fn ensure_pull_ci_pin(
         tokio::time::Instant::now()+state.config.git_timeout).await?;
     let _write_guard = publication.enter_window(&state.storage,
         tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let _admission = crate::storage::admission::acquire(
+        &state.pool,
+        repo.id,
+        repo.storage_generation,
+        "ci-pin-webhook",
+        tokio::time::Instant::now() + state.config.git_timeout,
+    )
+    .await?;
     if state.hooks.is_some() {
         reliability::before_push(state, repo).await.map_err(Error::internal)?;
     }

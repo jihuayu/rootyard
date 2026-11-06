@@ -3,7 +3,7 @@
 //! attempt to keep a PostgreSQL transaction alive after they exit.
 use crate::{
     Error,
-    storage::{Storage, read_leases},
+    storage::{Storage, admission, read_leases},
 };
 use axum::http::StatusCode;
 use deadpool_postgres::Pool;
@@ -80,6 +80,7 @@ pub struct PublicationGuard {
     storage_generation: i64,
     refs: Vec<String>,
     data: read_leases::Lease,
+    admission: admission::Admission,
     active: watch::Receiver<Option<Instant>>,
     window_tx: mpsc::Sender<WindowRequest>,
     owner: JoinHandle<()>,
@@ -122,6 +123,7 @@ impl PublicationGuard {
 
     pub fn ensure_active(&self) -> Result<(), Error> {
         self.data.ensure_active()?;
+        self.admission.ensure_active()?;
         if self
             .active
             .borrow()
@@ -266,6 +268,9 @@ pub async fn acquire(
         .map_err(|_| unavailable())?
         .map_err(|_| unavailable())?;
     let data = read_leases::shared(pool, repository_id, deadline).await?;
+    // Durable admission records the writer epoch so a committed GC fence
+    // cannot be crossed even if a future path stops using advisory locks.
+    let admission = admission::acquire(pool, repository_id, generation, "git-push", deadline).await?;
     let owner_pool = pool.clone();
     let owner_names = names.clone();
     let (ready_send, ready_recv) = oneshot::channel::<Result<(), Error>>();
@@ -351,6 +356,7 @@ pub async fn acquire(
             storage_generation: generation,
             refs: names,
             data,
+            admission,
             active,
             window_tx,
             owner: pending.0.take().expect("pending publication task"),
@@ -376,7 +382,7 @@ mod tests {
         let mut url = reqwest::Url::parse(&base_url).unwrap();
         url.query_pairs_mut().append_pair("options", &format!("-csearch_path={schema}"));
         let pool = crate::db::pool(url.as_str()).unwrap();
-        pool.get().await.unwrap().batch_execute("CREATE TABLE repositories(id uuid PRIMARY KEY, storage_generation bigint NOT NULL, state text NOT NULL)").await.unwrap();
+        pool.get().await.unwrap().batch_execute("CREATE TABLE repositories(id uuid PRIMARY KEY, storage_generation bigint NOT NULL, state text NOT NULL, gc_epoch bigint NOT NULL DEFAULT 0, gc_owner uuid, gc_lease_until timestamptz); CREATE TABLE storage_write_admissions(id uuid PRIMARY KEY, repository_id uuid NOT NULL REFERENCES repositories(id), gc_epoch bigint NOT NULL, owner uuid NOT NULL, kind text NOT NULL, state text NOT NULL DEFAULT 'active', admitted_at timestamptz NOT NULL DEFAULT clock_timestamp(), heartbeat_at timestamptz NOT NULL DEFAULT clock_timestamp(), lease_until timestamptz NOT NULL, finished_at timestamptz, detail text)").await.unwrap();
         let repo = Uuid::new_v4();
         pool.get().await.unwrap().execute("INSERT INTO repositories VALUES($1,1,'ready')", &[&repo]).await.unwrap();
         let until = || Instant::now() + Duration::from_secs(2);

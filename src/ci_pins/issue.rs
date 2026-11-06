@@ -58,6 +58,14 @@ pub(super) async fn pin_inner(
         tokio::time::Instant::now()+state.config.git_timeout).await?;
     let _lock = publication.enter_window(&state.storage,
         tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let _admission = crate::storage::admission::acquire(
+        &state.pool,
+        repo.id,
+        repo.storage_generation,
+        "ci-pin",
+        tokio::time::Instant::now() + state.config.git_timeout,
+    )
+    .await?;
     reliability::before_push(&state, &repo)
         .await
         .map_err(Error::internal)?;
