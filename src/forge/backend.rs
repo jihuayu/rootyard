@@ -17,6 +17,7 @@ pub struct BackendPatch {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct StorageBackendMarker {
     pub storage_backend: String,
     pub storage_generation: i64,
@@ -27,6 +28,7 @@ pub struct StorageBackendMarker {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BackendStatusResponse {
     pub repository_id: Uuid,
     pub owner: String,
