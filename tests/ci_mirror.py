@@ -425,6 +425,13 @@ class MirrorHarness(Harness):
         # Active checkout lease blocks source pin release with 409 Conflict.
         repo_id = self.repo["id"]
         owner_id = pin_active["owner_id"]
+        expires_unix = int(
+            self.sql("SELECT extract(epoch FROM clock_timestamp())::bigint + 1800")
+        )
+        token_id = self.sql(
+            f"SELECT id FROM tokens WHERE user_id='{owner_id}' AND NOT revoked AND NOT read_only LIMIT 1"
+        )
+        cred_hex = hashlib.sha256(job_active.encode("utf-8")).hexdigest()
         plan_json = json.dumps(
             dict(
                 version=1,
@@ -436,12 +443,12 @@ class MirrorHarness(Harness):
                 target_oid=self.first,
                 source_receipt_sha256="a" * 64,
                 mirror_audience=str(uuid.uuid4()),
-                expires_unix=int(time.time()) + 1800,
+                expires_unix=expires_unix,
             )
         )
         self.sql(
-            f"INSERT INTO ci_checkout_jobs (repository_id, job_id, owner_id, plan, cancelled, revoked, expires_unix) "
-            f"VALUES ('{repo_id}', '{job_active}', '{owner_id}', '{plan_json}'::jsonb, false, false, extract(epoch FROM clock_timestamp())::bigint + 1800)"
+            f"INSERT INTO ci_checkout_jobs (repository_id, job_id, owner_id, plan, issuer_token_id, credential_digest, cancelled, revoked, expires_unix) "
+            f"VALUES ('{repo_id}', '{job_active}', '{owner_id}', '{plan_json}'::jsonb, '{token_id}', decode('{cred_hex}', 'hex'), false, false, {expires_unix})"
         )
         self.release_pin(job_active, method="DELETE", codes=409)
         self.release_pin(job_active, method="POST", codes=409)
