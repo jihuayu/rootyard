@@ -19,6 +19,7 @@ class CiSandboxTest(unittest.TestCase):
         h=WebhooksHarness(argparse.Namespace(binary=str(binary),
             keep=os.environ.get("ROOTYARD_KEEP_TEST")=="1"))
         h.env["ROOTYARD_SANDBOX_MODE"]="dev"
+        h.env["ROOTYARD_TEST_SANDBOX_GATE_PAUSE_MS"]="750"
         h.env["ROOTYARD_CI_ORIGIN_FALLBACK_GLOBAL"]="2"
         h.env["ROOTYARD_CI_ORIGIN_FALLBACK_PER_REPO"]="2"
         h.env["ROOTYARD_CI_MIRROR_AUDIENCE"]=str(uuid.uuid4())
@@ -114,14 +115,22 @@ class CiSandboxTest(unittest.TestCase):
             second=claim(runs["ci/cancel"],"native-cancel")
             cancel_params=tuple_for(second,"native-cancel")
             status,raw,_=h.http(path(runs["ci/cancel"]),method="POST",
-                body={**cancel_params,"argv":["/bin/sh","-c","sleep 20"],"timeout_seconds":25},
+                body={**cancel_params,"argv":["/bin/sh","-c","touch gate-ran; sleep 20"],"timeout_seconds":25},
                 extra_headers=headers)
             self.assertEqual(status,201,raw[:300])
             other=json.loads(raw)
+            deadline=time.monotonic()+10
+            while time.monotonic()<deadline:
+                if h.sql(f"SELECT state FROM sandbox_jobs WHERE id='{other['id']}'")=="running":break
+                time.sleep(.02)
+            else:self.fail("CI job never reached pre-gate running state")
             suffix="?"+urllib.parse.urlencode(cancel_params)
             self.assertEqual(h.http(path(runs["ci/cancel"])+"/"+other["id"]+suffix,
                 method="DELETE",extra_headers=headers)[0],200)
             self.assertEqual(wait_done(runs["ci/cancel"],other["id"],cancel_params)["state"],"cancelled")
+            time.sleep(1)
+            self.assertFalse((h.root/"data"/"sandbox-jobs"/other["id"]/"workspace"/"gate-ran").exists(),
+                "payload ran after cancellation beat the start gate")
         finally:h.cleanup()
 
 
