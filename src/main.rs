@@ -207,6 +207,7 @@ async fn run() -> Result<()> {
             });
             rootyard::reliability::recover_startup(&state).await?;
             rootyard::recover(&state).await?;
+            rootyard::sandbox::reconcile_startup(&state).await.map_err(|_| anyhow::anyhow!("sandbox startup recovery failed"))?;
             let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
             eprintln!(
                 "rootyard listening on {} (GitFS single-node)",
@@ -247,6 +248,8 @@ async fn run() -> Result<()> {
                 None
             };
             let worker_state = state.clone();
+            let workspace_capture_stop = tokio_util::sync::CancellationToken::new();
+            let workspace_capture_task = tokio::spawn(rootyard::workspaces::capture::run(state.clone(), workspace_capture_stop.clone()));
             let worker = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
@@ -266,6 +269,8 @@ async fn run() -> Result<()> {
                 .with_graceful_shutdown(shutdown())
                 .await?;
             worker.abort();
+            workspace_capture_stop.cancel();
+            let _ = workspace_capture_task.await;
             dispatch_stop.cancel();
             let _ = publish_task.await;
             if let Some(task) = delivery_task {
