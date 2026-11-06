@@ -83,6 +83,22 @@ async fn audit(
     Ok(())
 }
 
+async fn protect_last_admin(
+    tx: &Transaction<'_>, org: Uuid, user: Uuid, current: Role, next: Option<Role>,
+) -> Result<(), Error> {
+    if current != Role::Admin || next == Some(Role::Admin) { return Ok(()); }
+    // Callers lock the organization row before reading memberships, so
+    // concurrent demotions and removals cannot both observe another admin.
+    let remaining: i64 = tx.query_one(
+        "SELECT count(*) FROM organization_memberships WHERE organization_id=$1 AND user_id<>$2 AND role='admin'",
+        &[&org, &user],
+    ).await.map_err(Error::internal)?.get(0);
+    if remaining == 0 {
+        return Err(Error(StatusCode::CONFLICT, "cannot remove last organization administrator"));
+    }
+    Ok(())
+}
+
 pub async fn create_organization(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -220,12 +236,13 @@ pub async fn put_member(
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?
         .get(0);
-    let existing = tx.query_opt("SELECT version FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 FOR UPDATE", &[&org,&user]).await.map_err(Error::internal)?;
+    let existing = tx.query_opt("SELECT version,role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 FOR UPDATE", &[&org,&user]).await.map_err(Error::internal)?;
     let (code, version) = if let Some(row) = existing {
         let version: i64 = row.get(0);
         if input.expected_version.is_some_and(|v| v != version) {
             return Err(Error(StatusCode::CONFLICT, "membership version conflict"));
         }
+        protect_last_admin(&tx, org, user, Role::parse(row.get::<_, &str>("role"))?, Some(input.role)).await?;
         tx.execute("UPDATE organization_memberships SET role=$3,version=version+1,updated_at=clock_timestamp() WHERE organization_id=$1 AND user_id=$2", &[&org,&user,&input.role.as_str()]).await.map_err(Error::internal)?;
         (StatusCode::OK, version + 1)
     } else {
@@ -272,7 +289,9 @@ pub async fn delete_member(
     )
     .await
     .map_err(Error::internal)?;
-    let deleted = tx.execute("DELETE FROM organization_memberships m USING users u WHERE m.organization_id=$1 AND m.user_id=u.id AND u.username=$2", &[&org,&username]).await.map_err(Error::internal)?;
+    let target = tx.query_opt("SELECT m.user_id,m.role FROM organization_memberships m JOIN users u ON u.id=m.user_id WHERE m.organization_id=$1 AND u.username=$2 FOR UPDATE OF m", &[&org,&username]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    protect_last_admin(&tx, org, target.get("user_id"), Role::parse(target.get::<_, &str>("role"))?, None).await?;
+    let deleted = tx.execute("DELETE FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", &[&org,&target.get::<_, Uuid>("user_id")]).await.map_err(Error::internal)?;
     if deleted == 0 {
         return Err(Error::not_found());
     }
