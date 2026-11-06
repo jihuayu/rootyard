@@ -23,11 +23,7 @@ pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
         ],
         _ => bail!("unsupported backup format"),
     };
-    Ok([
-        serde_json::from_str(raw[0])?,
-        serde_json::from_str(raw[1])?,
-        serde_json::from_str(raw[2])?,
-    ])
+    Ok([serde_json::from_str(raw[0])?, serde_json::from_str(raw[1])?, serde_json::from_str(raw[2])?])
 }
 
 pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
@@ -40,25 +36,16 @@ pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
 }
 
 pub(super) fn digest(format: u32) -> Result<String> {
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&catalogs(
-        format,
-    )?)?)))
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&catalogs(format)?)?)))
 }
 
 pub(super) fn relations(format: u32, only_tables: bool) -> Result<Vec<String>> {
     let catalog = catalogs(format)?;
-    let tables = catalog[0]["tables"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("invalid catalog tables"))?;
+    let tables = catalog[0]["tables"].as_array().ok_or_else(|| anyhow::anyhow!("invalid catalog tables"))?;
     let mut names = Vec::new();
     for entry in tables {
         if !only_tables || entry["kind"] == "r" {
-            names.push(
-                entry["name"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("invalid catalog relation"))?
-                    .to_owned(),
-            );
+            names.push(entry["name"].as_str().ok_or_else(|| anyhow::anyhow!("invalid catalog relation"))?.to_owned());
         }
     }
     names.sort();

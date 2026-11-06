@@ -13,14 +13,8 @@ use uuid::Uuid;
 
 #[allow(clippy::large_enum_variant)] // one owned claim per job; indirection would only add an allocation
 pub(super) enum Source {
-    Workspace {
-        id: Uuid,
-        live: bool,
-    },
-    Ci {
-        checkout: PathBuf,
-        claim: crate::webhooks::claimed::ClaimedRun,
-    },
+    Workspace { id: Uuid, live: bool },
+    Ci { checkout: PathBuf, claim: crate::webhooks::claimed::ClaimedRun },
 }
 
 enum Mode {
@@ -34,19 +28,15 @@ fn mode(job: Uuid) -> Result<Mode, Error> {
     if std::env::var("ROOTYARD_SANDBOX_MODE").as_deref() != Ok("cgroup") {
         return Err(Error::internal("sandbox cgroup mode required"));
     }
-    let base =
-        PathBuf::from(std::env::var("ROOTYARD_SANDBOX_CGROUP_ROOT").map_err(Error::internal)?);
+    let base = PathBuf::from(std::env::var("ROOTYARD_SANDBOX_CGROUP_ROOT").map_err(Error::internal)?);
     if !base.starts_with("/sys/fs/cgroup/") || !base.join("cgroup.controllers").exists() {
         return Err(Error::internal("delegated cgroup v2 root required"));
     }
     let group = base.join(job.to_string());
     fs::create_dir(&group).map_err(Error::internal)?;
-    for (name, value) in [
-        ("memory.max", "536870912"),
-        ("memory.swap.max", "0"),
-        ("pids.max", "64"),
-        ("cpu.max", "50000 100000"),
-    ] {
+    for (name, value) in
+        [("memory.max", "536870912"), ("memory.swap.max", "0"), ("pids.max", "64"), ("cpu.max", "50000 100000")]
+    {
         if fs::write(group.join(name), value).is_err() {
             let _ = fs::remove_dir(&group);
             return Err(Error::internal("sandbox cgroup controller unavailable"));
@@ -69,12 +59,7 @@ fn attach_group(group: &Path, pid: i32) -> Result<(), Error> {
         let Some(rest) = stat.rsplit_once(") ").map(|(_, r)| r) else {
             continue;
         };
-        if rest
-            .split_whitespace()
-            .nth(2)
-            .and_then(|v| v.parse::<i32>().ok())
-            == Some(pid)
-        {
+        if rest.split_whitespace().nth(2).and_then(|v| v.parse::<i32>().ok()) == Some(pid) {
             let _ = fs::write(group.join("cgroup.procs"), candidate.to_string());
         }
     }
@@ -86,10 +71,7 @@ pub fn job_root(state: &AppState, id: Uuid) -> PathBuf {
 }
 
 fn limit(resource: libc::__rlimit_resource_t, soft: u64) -> std::io::Result<()> {
-    let lim = libc::rlimit {
-        rlim_cur: soft,
-        rlim_max: soft,
-    };
+    let lim = libc::rlimit { rlim_cur: soft, rlim_max: soft };
     if unsafe { libc::setrlimit(resource, &lim) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -98,24 +80,14 @@ fn limit(resource: libc::__rlimit_resource_t, soft: u64) -> std::io::Result<()> 
 fn leader_exited(pid: i32) -> std::io::Result<bool> {
     let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
     let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as u32,
-            info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
+        libc::waitid(libc::P_PID, pid as u32, info.as_mut_ptr(), libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
     };
     if result != 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { info.assume_init().si_pid() != 0 })
 }
-async fn open_start_gate(
-    state: &AppState,
-    job: Uuid,
-    source: &Source,
-    root: &Path,
-) -> Result<(), Error> {
+async fn open_start_gate(state: &AppState, job: Uuid, source: &Source, root: &Path) -> Result<(), Error> {
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let row = tx
@@ -160,18 +132,7 @@ pub async fn launch(
     live: bool,
     terminal: bool,
 ) -> Result<(), Error> {
-    launch_source(
-        state,
-        job,
-        Source::Workspace {
-            id: workspace,
-            live,
-        },
-        argv,
-        timeout_seconds,
-        terminal,
-    )
-    .await
+    launch_source(state, job, Source::Workspace { id: workspace, live }, argv, timeout_seconds, terminal).await
 }
 
 pub(super) async fn launch_ci(
@@ -183,15 +144,7 @@ pub(super) async fn launch_ci(
     timeout_seconds: u64,
     terminal: bool,
 ) -> Result<(), Error> {
-    launch_source(
-        state,
-        job,
-        Source::Ci { checkout, claim },
-        argv,
-        timeout_seconds,
-        terminal,
-    )
-    .await
+    launch_source(state, job, Source::Ci { checkout, claim }, argv, timeout_seconds, terminal).await
 }
 
 async fn launch_source(
@@ -204,9 +157,7 @@ async fn launch_source(
 ) -> Result<(), Error> {
     let live = matches!(&source, Source::Workspace { live: true, .. });
     if live && std::env::var("ROOTYARD_SANDBOX_MODE").as_deref() != Ok("dev") {
-        return Err(Error::internal(
-            "live FUSE workspace requires dev namespace mode",
-        ));
+        return Err(Error::internal("live FUSE workspace requires dev namespace mode"));
     }
     let isolation = mode(job)?;
     let root = job_root(&state, job);
@@ -232,16 +183,8 @@ async fn launch_source(
         .mode(0o600)
         .open(root.join("stderr.log"))
         .map_err(Error::internal)?;
-    let pty = if terminal {
-        Some(terminal::Pty::open()?)
-    } else {
-        None
-    };
-    let drain_output = if terminal {
-        Some(stdout.try_clone().map_err(Error::internal)?)
-    } else {
-        None
-    };
+    let pty = if terminal { Some(terminal::Pty::open()?) } else { None };
+    let drain_output = if terminal { Some(stdout.try_clone().map_err(Error::internal)?) } else { None };
     let ctl = root.join("control");
     fs::create_dir(&ctl).map_err(Error::internal)?;
     let mut command = Command::new("bwrap");
@@ -321,10 +264,7 @@ async fn launch_source(
             .stdout(Stdio::from(pty.slave.try_clone().map_err(Error::internal)?))
             .stderr(Stdio::from(pty.slave.try_clone().map_err(Error::internal)?));
     } else {
-        command
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .stdin(Stdio::null());
+        command.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr)).stdin(Stdio::null());
     }
     command.kill_on_drop(true);
     unsafe {
@@ -346,9 +286,7 @@ async fn launch_source(
         });
     }
     let mut child = command.spawn().map_err(Error::internal)?;
-    let pid = child
-        .id()
-        .ok_or_else(|| Error::internal("sandbox process missing pid"))? as i32;
+    let pid = child.id().ok_or_else(|| Error::internal("sandbox process missing pid"))? as i32;
     if let Some(pty) = pty {
         pty.drain(job, drain_output.expect("terminal output file"));
     }
@@ -435,10 +373,7 @@ async fn launch_source(
             tokio::time::sleep(Duration::from_millis(200)).await;
         };
         if let Source::Ci { claim, .. } = &source {
-            if !super::ci::still_active(&state, claim, job)
-                .await
-                .unwrap_or(false)
-            {
+            if !super::ci::still_active(&state, claim, job).await.unwrap_or(false) {
                 state_name = "cancelled";
                 code = None;
             }
@@ -466,10 +401,7 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
         .await
         .map_err(Error::internal)?;
     let rows = client
-        .query(
-            "SELECT id,pid FROM sandbox_jobs WHERE host_id=$1 AND state='running'",
-            &[&state.storage.volume_id],
-        )
+        .query("SELECT id,pid FROM sandbox_jobs WHERE host_id=$1 AND state='running'", &[&state.storage.volume_id])
         .await
         .map_err(Error::internal)?;
     for row in rows {

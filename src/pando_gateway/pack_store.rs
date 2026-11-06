@@ -66,36 +66,21 @@ impl PackStore {
             std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_some(),
             "production Pando requires a remote object-store endpoint"
         );
-        ensure!(
-            git.is_absolute(),
-            "production Pando Git path must be absolute"
-        );
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&work_root)?;
+        ensure!(git.is_absolute(), "production Pando Git path must be absolute");
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&work_root)?;
         let meta = std::fs::symlink_metadata(&work_root)?;
         ensure!(
-            meta.is_dir()
-                && !meta.file_type().is_symlink()
-                && meta.uid() == unsafe { libc::geteuid() },
+            meta.is_dir() && !meta.file_type().is_symlink() && meta.uid() == unsafe { libc::geteuid() },
             "Pando scratch root is not a private owned directory"
         );
         std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o700))?;
         let remote = RemoteObjectStore::from_env(work_root.join("unused-local-store"))?;
         let kms = VaultTransit::from_env()?;
-        Ok(Self {
-            remote,
-            kms,
-            work_root,
-            git,
-        })
+        Ok(Self { remote, kms, work_root, git })
     }
 
     fn work_dir(&self) -> Result<WorkDir> {
-        let path = self
-            .work_root
-            .join(format!(".pando-pack-{}", Uuid::new_v4()));
+        let path = self.work_root.join(format!(".pando-pack-{}", Uuid::new_v4()));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(WorkDir(path))
     }
@@ -104,16 +89,8 @@ impl PackStore {
         ObjectKey::new(tenant_id, namespace, sha256)
     }
 
-    async fn verify_git_pack(
-        &self,
-        pack: &Path,
-        object_format: &str,
-        deadline: Instant,
-    ) -> Result<()> {
-        ensure!(
-            matches!(object_format, "sha1" | "sha256"),
-            "invalid Pando object format"
-        );
+    async fn verify_git_pack(&self, pack: &Path, object_format: &str, deadline: Instant) -> Result<()> {
+        ensure!(matches!(object_format, "sha1" | "sha256"), "invalid Pando object format");
         let work = self.work_dir()?;
         let verify_repo = work.0.join("verify.git");
         let format_arg = format!("--object-format={object_format}");
@@ -125,13 +102,8 @@ impl PackStore {
             .args(["init", "--bare", &format_arg])
             .arg(&verify_repo)
             .stdin(Stdio::null());
-        let timeout = deadline
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_secs(120));
-        ensure!(
-            !timeout.is_zero(),
-            "Pando pack verification deadline elapsed"
-        );
+        let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
+        ensure!(!timeout.is_zero(), "Pando pack verification deadline elapsed");
         git_http::collect_git_output(init, 4096, timeout).await?;
         let mut cmd = Command::new(&self.git);
         cmd.env_clear()
@@ -144,13 +116,8 @@ impl PackStore {
             .args(["index-pack", "--verify"])
             .arg(pack)
             .stdin(Stdio::null());
-        let timeout = deadline
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_secs(120));
-        ensure!(
-            !timeout.is_zero(),
-            "Pando pack verification deadline elapsed"
-        );
+        let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
+        ensure!(!timeout.is_zero(), "Pando pack verification deadline elapsed");
         git_http::collect_git_output(cmd, 4096, timeout).await?;
         Ok(())
     }
@@ -165,34 +132,15 @@ impl PackStore {
     ) -> Result<ArtifactReceipt> {
         let ciphertext = work.join(format!("{label}.cipher"));
         let envelopes = work.join(format!("{label}-envelopes"));
-        let envelope =
-            encrypted_objects::encrypt_file(&self.kms, source, &ciphertext, &envelopes, deadline)
-                .await?;
+        let envelope = encrypted_objects::encrypt_file(&self.kms, source, &ciphertext, &envelopes, deadline).await?;
         let envelope_path = envelopes.join(format!("envelope-{:020}.json", envelope.generation));
         let envelope_bytes = fs::read(&envelope_path).await?;
-        ensure!(
-            envelope_bytes.len() <= 64 * 1024,
-            "Pando envelope exceeds limit"
-        );
+        ensure!(envelope_bytes.len() <= 64 * 1024, "Pando envelope exceeds limit");
         let envelope_sha256 = hex::encode(Sha256::digest(&envelope_bytes));
         let cipher_key = Self::key(tenant_id, "pando-cipher", &envelope.ciphertext_sha256)?;
         let envelope_key = Self::key(tenant_id, "pando-envelope", &envelope_sha256)?;
-        self.remote
-            .put_file(
-                &cipher_key,
-                &ciphertext,
-                envelope.ciphertext_bytes,
-                deadline,
-            )
-            .await?;
-        self.remote
-            .put_file(
-                &envelope_key,
-                &envelope_path,
-                envelope_bytes.len() as u64,
-                deadline,
-            )
-            .await?;
+        self.remote.put_file(&cipher_key, &ciphertext, envelope.ciphertext_bytes, deadline).await?;
+        self.remote.put_file(&envelope_key, &envelope_path, envelope_bytes.len() as u64, deadline).await?;
         Ok(ArtifactReceipt {
             plaintext_sha256: envelope.plaintext_sha256.clone(),
             plaintext_bytes: envelope.plaintext_bytes,
@@ -266,10 +214,8 @@ impl PackStore {
         );
         self.verify_git_pack(pack, object_format, deadline).await?;
         let work = self.work_dir()?;
-        let pack_receipt =
-            Box::pin(self.publish_artifact(&work.0, "pack", pack, tenant_id, deadline)).await?;
-        let index_receipt =
-            Box::pin(self.publish_artifact(&work.0, "index", index, tenant_id, deadline)).await?;
+        let pack_receipt = Box::pin(self.publish_artifact(&work.0, "pack", pack, tenant_id, deadline)).await?;
+        let index_receipt = Box::pin(self.publish_artifact(&work.0, "index", index, tenant_id, deadline)).await?;
         let manifest = PackManifest {
             version: 1,
             id: Uuid::new_v4(),
@@ -296,17 +242,8 @@ impl PackStore {
         let envelope_key = Self::key(tenant_id, "pando-envelope", &receipt.envelope_sha256)?;
         let ciphertext = work.join(format!("{label}.cipher"));
         let envelope_file = work.join(format!("{label}.json"));
-        self.remote
-            .get_to_file(&cipher_key, &ciphertext, receipt.ciphertext_bytes, deadline)
-            .await?;
-        self.remote
-            .get_to_file(
-                &envelope_key,
-                &envelope_file,
-                receipt.envelope_bytes,
-                deadline,
-            )
-            .await?;
+        self.remote.get_to_file(&cipher_key, &ciphertext, receipt.ciphertext_bytes, deadline).await?;
+        self.remote.get_to_file(&envelope_key, &envelope_file, receipt.envelope_bytes, deadline).await?;
         let envelope_bytes = fs::read(&envelope_file).await?;
         ensure!(
             hex::encode(Sha256::digest(&envelope_bytes)) == receipt.envelope_sha256,
@@ -323,21 +260,9 @@ impl PackStore {
         );
         let envelopes = work.join(format!("{label}-envelopes"));
         fs::create_dir(&envelopes).await?;
-        fs::copy(
-            &envelope_file,
-            envelopes.join(format!("envelope-{:020}.json", envelope.generation)),
-        )
-        .await?;
-        fs::write(
-            envelopes.join("CURRENT"),
-            format!("{}\n", envelope.generation),
-        )
-        .await?;
-        let output = work.join(if label == "pack" {
-            "output.pack"
-        } else {
-            "output.idx"
-        });
+        fs::copy(&envelope_file, envelopes.join(format!("envelope-{:020}.json", envelope.generation))).await?;
+        fs::write(envelopes.join("CURRENT"), format!("{}\n", envelope.generation)).await?;
+        let output = work.join(if label == "pack" { "output.pack" } else { "output.idx" });
         encrypted_objects::decrypt_file(
             &self.kms,
             &ciphertext,
@@ -381,31 +306,15 @@ impl PackStore {
             "Pando manifest identity mismatch"
         );
         let work = self.work_dir()?;
-        let pack = Box::pin(self.recover_artifact(
-            &work.0,
-            "pack",
-            manifest.tenant_id,
-            &manifest.pack,
-            deadline,
-        ))
-        .await?;
-        let index = Box::pin(self.recover_artifact(
-            &work.0,
-            "index",
-            manifest.tenant_id,
-            &manifest.index,
-            deadline,
-        ))
-        .await?;
-        self.verify_git_pack(&pack, &manifest.object_format, deadline)
-            .await?;
+        let pack =
+            Box::pin(self.recover_artifact(&work.0, "pack", manifest.tenant_id, &manifest.pack, deadline)).await?;
+        let index =
+            Box::pin(self.recover_artifact(&work.0, "index", manifest.tenant_id, &manifest.index, deadline)).await?;
+        self.verify_git_pack(&pack, &manifest.object_format, deadline).await?;
         fs::create_dir_all(destination).await?;
         let target_pack = destination.join(format!("pack-{}.pack", pack_id));
         let target_index = destination.join(format!("pack-{}.idx", pack_id));
-        ensure!(
-            !target_pack.exists() && !target_index.exists(),
-            "Pando cache target already exists"
-        );
+        ensure!(!target_pack.exists() && !target_index.exists(), "Pando cache target already exists");
         fs::rename(&pack, &target_pack).await?;
         if let Err(error) = fs::rename(&index, &target_index).await {
             let _ = fs::remove_file(&target_pack).await;
@@ -430,12 +339,7 @@ mod tests {
         let repo = Uuid::new_v4();
         let username = format!("pando{}", &tenant.simple().to_string()[..12]);
         let seed = pool.get().await.unwrap();
-        seed.execute(
-            "INSERT INTO users(id,username) VALUES($1,$2)",
-            &[&tenant, &username],
-        )
-        .await
-        .unwrap();
+        seed.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&tenant, &username]).await.unwrap();
         seed.execute(
             "INSERT INTO repositories(id,owner_id,name,state) VALUES($1,$2,'fencetest','ready')",
             &[&repo, &tenant],
@@ -478,34 +382,19 @@ mod tests {
         };
         let mut blocker = pool.get().await.unwrap();
         let tx = blocker.transaction().await.unwrap();
-        tx.execute(
-            "UPDATE repositories SET storage_generation=2 WHERE id=$1",
-            &[&repo],
-        )
-        .await
-        .unwrap();
+        tx.execute("UPDATE repositories SET storage_generation=2 WHERE id=$1", &[&repo]).await.unwrap();
         let publishing_pool = pool.clone();
-        let publishing = tokio::spawn(async move {
-            PackStore::insert_ready_manifest(&publishing_pool, &manifest).await
-        });
+        let publishing =
+            tokio::spawn(async move { PackStore::insert_ready_manifest(&publishing_pool, &manifest).await });
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(
-            !publishing.is_finished(),
-            "manifest insert did not wait for generation writer"
-        );
+        assert!(!publishing.is_finished(), "manifest insert did not wait for generation writer");
         tx.commit().await.unwrap();
-        assert!(
-            publishing.await.unwrap().is_err(),
-            "stale generation published a manifest"
-        );
+        assert!(publishing.await.unwrap().is_err(), "stale generation published a manifest");
         let count: i64 = pool
             .get()
             .await
             .unwrap()
-            .query_one(
-                "SELECT count(*) FROM pando_pack_manifests WHERE repository_id=$1",
-                &[&repo],
-            )
+            .query_one("SELECT count(*) FROM pando_pack_manifests WHERE repository_id=$1", &[&repo])
             .await
             .unwrap()
             .get(0);

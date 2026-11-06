@@ -64,13 +64,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/namespaces/{id}/changesets", post(changesets::create))
         .route("/api/changesets/{id}", get(changesets::get))
         .route("/api/changesets/{id}/review", post(changesets::review))
-        .route(
-            "/api/changesets/{id}/integrate",
-            post(changesets::integrate),
-        )
+        .route("/api/changesets/{id}/integrate", post(changesets::integrate))
         .route("/api/changesets/{id}/recover", post(changesets::recover))
-        .route(
-            "/api/views/{id}/changesets",
-            post(reverse::create).layer(DefaultBodyLimit::max(reverse::BODY_LIMIT)),
-        )
+        .route("/api/views/{id}/changesets", post(reverse::create).layer(DefaultBodyLimit::max(reverse::BODY_LIMIT)))
 }

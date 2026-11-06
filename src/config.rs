@@ -20,8 +20,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let data_dir =
-            PathBuf::from(env::var("ROOTYARD_DATA_DIR").unwrap_or_else(|_| "data".into()));
+        let data_dir = PathBuf::from(env::var("ROOTYARD_DATA_DIR").unwrap_or_else(|_| "data".into()));
         let git = if let Ok(path) = env::var("ROOTYARD_GIT") {
             PathBuf::from(path)
         } else {
@@ -30,9 +29,7 @@ impl Config {
                 .find(|path| path.is_file())
                 .context("git executable is required")?
         };
-        let git = git
-            .canonicalize()
-            .context("ROOTYARD_GIT must point to Git")?;
+        let git = git.canonicalize().context("ROOTYARD_GIT must point to Git")?;
         let database_url = env::var("DATABASE_URL").context("DATABASE_URL is required")?;
         let _pg: tokio_postgres::Config = database_url.parse().context("invalid DATABASE_URL")?;
         Ok(Self {
@@ -42,9 +39,7 @@ impl Config {
                 .transpose()?,
             database_url,
             data_dir,
-            bind: env::var("ROOTYARD_BIND")
-                .unwrap_or_else(|_| "127.0.0.1:8080".into())
-                .parse()?,
+            bind: env::var("ROOTYARD_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into()).parse()?,
             git,
             max_request_bytes: number("ROOTYARD_MAX_REQUEST_BYTES", 128 * 1024 * 1024)?,
             max_output_bytes: number("ROOTYARD_MAX_OUTPUT_BYTES", 512 * 1024 * 1024)?,
@@ -52,8 +47,7 @@ impl Config {
             git_timeout: Duration::from_secs(number("ROOTYARD_GIT_TIMEOUT_SECONDS", 120)?),
             git_memory_bytes: number("ROOTYARD_GIT_MEMORY_BYTES", 1024 * 1024 * 1024)?,
             max_repo_bytes: number("ROOTYARD_MAX_REPO_BYTES", 1024 * 1024 * 1024)?,
-            max_pending_deliveries: number("ROOTYARD_MAX_PENDING_DELIVERIES", 100_000)?
-                .try_into()?,
+            max_pending_deliveries: number("ROOTYARD_MAX_PENDING_DELIVERIES", 100_000)?.try_into()?,
             outbox_worker: match env::var("ROOTYARD_OUTBOX_WORKER").as_deref() {
                 Ok("false") => false,
                 Ok("true") | Err(_) => true,

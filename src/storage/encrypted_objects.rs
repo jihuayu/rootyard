@@ -51,13 +51,9 @@ pub struct VaultTransit {
 
 impl VaultTransit {
     pub fn from_env() -> Result<Self> {
-        let base =
-            Url::parse(&std::env::var("ROOTYARD_KMS_VAULT_URL").context("Vault KMS URL missing")?)?;
+        let base = Url::parse(&std::env::var("ROOTYARD_KMS_VAULT_URL").context("Vault KMS URL missing")?)?;
         let loopback = matches!(base.host_str(), Some("127.0.0.1" | "::1" | "localhost"));
-        ensure!(
-            base.scheme() == "https" || base.scheme() == "http" && loopback,
-            "Vault KMS requires TLS"
-        );
+        ensure!(base.scheme() == "https" || base.scheme() == "http" && loopback, "Vault KMS requires TLS");
         ensure!(
             base.path() == "/"
                 && base.query().is_none()
@@ -66,18 +62,14 @@ impl VaultTransit {
                 && base.password().is_none(),
             "Vault KMS URL must be an origin"
         );
-        let token = Zeroizing::new(
-            std::env::var("ROOTYARD_KMS_VAULT_TOKEN").context("Vault KMS token missing")?,
-        );
+        let token = Zeroizing::new(std::env::var("ROOTYARD_KMS_VAULT_TOKEN").context("Vault KMS token missing")?);
         let mount = std::env::var("ROOTYARD_KMS_VAULT_MOUNT").unwrap_or_else(|_| "transit".into());
         let key_name = std::env::var("ROOTYARD_KMS_VAULT_KEY").context("Vault KMS key missing")?;
         for value in [&mount, &key_name] {
             ensure!(
                 !value.is_empty()
                     && value.len() <= 64
-                    && value
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                    && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
                 "invalid Vault KMS path"
             );
         }
@@ -85,25 +77,14 @@ impl VaultTransit {
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Self {
-            client,
-            base,
-            token,
-            mount,
-            key_name,
-        })
+        Ok(Self { client, base, token, mount, key_name })
     }
     fn endpoint(&self, operation: &str) -> Result<Url> {
         let mut url = self.base.clone();
         url.set_path(&format!("/v1/{}/{operation}/{}", self.mount, self.key_name));
         Ok(url)
     }
-    async fn call<T: Serialize>(
-        &self,
-        operation: &str,
-        body: &T,
-        deadline: Instant,
-    ) -> Result<Zeroizing<String>> {
+    async fn call<T: Serialize>(&self, operation: &str, body: &T, deadline: Instant) -> Result<Zeroizing<String>> {
         #[derive(Deserialize)]
         struct TransitData {
             ciphertext: Option<String>,
@@ -131,30 +112,17 @@ impl VaultTransit {
                 .send(),
         )
         .await??;
-        ensure!(
-            response.status().is_success(),
-            "Vault Transit operation failed: {}",
-            response.status()
-        );
+        ensure!(response.status().is_success(), "Vault Transit operation failed: {}", response.status());
         let mut stream = response.bytes_stream();
         let mut bytes = Zeroizing::new(Vec::new());
         while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next()).await? {
             let chunk = chunk?;
-            ensure!(
-                chunk.len() <= 16 * 1024 - bytes.len(),
-                "Vault Transit response exceeds limit"
-            );
+            ensure!(chunk.len() <= 16 * 1024 - bytes.len(), "Vault Transit response exceeds limit");
             bytes.extend_from_slice(&chunk);
         }
         let mut value: TransitResponse = serde_json::from_slice(&bytes)?;
-        let result = if operation == "decrypt" {
-            value.data.plaintext.take()
-        } else {
-            value.data.ciphertext.take()
-        };
-        result
-            .map(Zeroizing::new)
-            .context("Vault Transit response missing data")
+        let result = if operation == "decrypt" { value.data.plaintext.take() } else { value.data.ciphertext.take() };
+        result.map(Zeroizing::new).context("Vault Transit response missing data")
     }
     pub async fn wrap(&self, data_key: &[u8; 32], deadline: Instant) -> Result<String> {
         #[derive(Serialize)]
@@ -162,31 +130,14 @@ impl VaultTransit {
             plaintext: &'a str,
         }
         let encoded = Zeroizing::new(STANDARD.encode(data_key));
-        Ok(self
-            .call(
-                "encrypt",
-                &Request {
-                    plaintext: &encoded,
-                },
-                deadline,
-            )
-            .await?
-            .to_string())
+        Ok(self.call("encrypt", &Request { plaintext: &encoded }, deadline).await?.to_string())
     }
     pub async fn unwrap(&self, wrapped: &str, deadline: Instant) -> Result<Zeroizing<[u8; 32]>> {
         #[derive(Serialize)]
         struct Request<'a> {
             ciphertext: &'a str,
         }
-        let raw = self
-            .call(
-                "decrypt",
-                &Request {
-                    ciphertext: wrapped,
-                },
-                deadline,
-            )
-            .await?;
+        let raw = self.call("decrypt", &Request { ciphertext: wrapped }, deadline).await?;
         let bytes = Zeroizing::new(STANDARD.decode(raw.as_bytes())?);
         ensure!(bytes.len() == 32, "Vault returned an invalid data key");
         let mut key = Zeroizing::new([0u8; 32]);
@@ -198,40 +149,23 @@ impl VaultTransit {
         struct Request<'a> {
             ciphertext: &'a str,
         }
-        Ok(self
-            .call(
-                "rewrap",
-                &Request {
-                    ciphertext: wrapped,
-                },
-                deadline,
-            )
-            .await?
-            .to_string())
+        Ok(self.call("rewrap", &Request { ciphertext: wrapped }, deadline).await?.to_string())
     }
     pub async fn rotate_master(&self, deadline: Instant) -> Result<()> {
         let mut url = self.base.clone();
         url.set_path(&format!("/v1/{}/keys/{}/rotate", self.mount, self.key_name));
         let response = tokio::time::timeout_at(
             deadline,
-            self.client
-                .post(url)
-                .header("X-Vault-Token", self.token.as_str())
-                .send(),
+            self.client.post(url).header("X-Vault-Token", self.token.as_str()).send(),
         )
         .await??;
-        ensure!(
-            response.status().is_success(),
-            "Vault key rotation failed: {}",
-            response.status()
-        );
+        ensure!(response.status().is_success(), "Vault key rotation failed: {}", response.status());
         Ok(())
     }
 }
 
 fn data_cipher(data_key: &[u8; 32]) -> Result<LessSafeKey> {
-    let key = UnboundKey::new(&aead::AES_256_GCM, data_key)
-        .map_err(|_| anyhow::anyhow!("invalid AES-256-GCM key"))?;
+    let key = UnboundKey::new(&aead::AES_256_GCM, data_key).map_err(|_| anyhow::anyhow!("invalid AES-256-GCM key"))?;
     Ok(LessSafeKey::new(key))
 }
 fn aad(envelope: &Envelope, index: u64) -> Vec<u8> {
@@ -245,18 +179,10 @@ fn envelope_path(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("envelope-{generation:020}.json"))
 }
 async fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .await?;
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).await?;
     file.write_all(bytes).await?;
     file.sync_all().await?;
-    File::open(path.parent().context("envelope parent missing")?)
-        .await?
-        .sync_all()
-        .await?;
+    File::open(path.parent().context("envelope parent missing")?).await?.sync_all().await?;
     Ok(())
 }
 async fn read_current(dir: &Path) -> Result<u64> {
@@ -289,10 +215,7 @@ pub async fn encrypt_file(
     envelope_dir: &Path,
     deadline: Instant,
 ) -> Result<Envelope> {
-    ensure!(
-        !ciphertext.exists() && !envelope_dir.exists(),
-        "encrypted pack already exists"
-    );
+    ensure!(!ciphertext.exists() && !envelope_dir.exists(), "encrypted pack already exists");
     let mut source_file = File::open(source).await?;
     let mut digest = Sha256::new();
     let mut plaintext_bytes = 0u64;
@@ -332,12 +255,7 @@ pub async fn encrypt_file(
     let result = async {
         let cipher = data_cipher(&data_key)?;
         let mut input = File::open(source).await?;
-        let mut out = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)
-            .await?;
+        let mut out = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp).await?;
         let mut hash = Sha256::new();
         let mut size = 0u64;
         let mut index = 0u64;
@@ -368,20 +286,13 @@ pub async fn encrypt_file(
             "pack source changed during encryption"
         );
         out.sync_all().await?;
-        ensure!(
-            !ciphertext.exists(),
-            "ciphertext path appeared during encryption"
-        );
+        ensure!(!ciphertext.exists(), "ciphertext path appeared during encryption");
         fs::rename(&temp, ciphertext).await?;
         ciphertext_published = true;
         File::open(parent).await?.sync_all().await?;
         envelope.ciphertext_sha256 = hex::encode(hash.finalize());
         envelope.ciphertext_bytes = size;
-        write_new(
-            &envelope_path(envelope_dir, 1),
-            &serde_json::to_vec(&envelope)?,
-        )
-        .await?;
+        write_new(&envelope_path(envelope_dir, 1), &serde_json::to_vec(&envelope)?).await?;
         write_new(&envelope_dir.join("CURRENT"), b"1\n").await?;
         Ok::<(), anyhow::Error>(())
     }
@@ -406,25 +317,15 @@ pub async fn decrypt_file(
     deadline: Instant,
 ) -> Result<Envelope> {
     let envelope = read_envelope(envelope_dir, generation).await?;
-    ensure!(
-        envelope.key_name == provider.key_name,
-        "wrong Vault key name"
-    );
-    let parent = destination
-        .parent()
-        .context("decrypted pack destination parent missing")?;
+    ensure!(envelope.key_name == provider.key_name, "wrong Vault key name");
+    let parent = destination.parent().context("decrypted pack destination parent missing")?;
     let data_key = provider.unwrap(&envelope.wrapped_key, deadline).await?;
     let temp = parent.join(format!(".decrypted-{}", Uuid::new_v4()));
     let result = async {
         let cipher = data_cipher(&data_key)?;
         fs::create_dir_all(parent).await?;
         let mut input = File::open(ciphertext).await?;
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)
-            .await?;
+        let mut output = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp).await?;
         let mut plaintext_hash = Sha256::new();
         let mut ciphertext_hash = Sha256::new();
         let mut plaintext_bytes = 0u64;
@@ -438,10 +339,7 @@ pub async fn decrypt_file(
             }
             input.read_exact(&mut len_bytes[1..]).await?;
             let len = u32::from_be_bytes(len_bytes) as usize;
-            ensure!(
-                (aead::AES_256_GCM.tag_len()..=MAX_CIPHER_CHUNK).contains(&len),
-                "invalid encrypted chunk length"
-            );
+            ensure!((aead::AES_256_GCM.tag_len()..=MAX_CIPHER_CHUNK).contains(&len), "invalid encrypted chunk length");
             let mut nonce_bytes = [0u8; 12];
             input.read_exact(&mut nonce_bytes).await?;
             let mut chunk = Zeroizing::new(vec![0u8; len]);
@@ -450,26 +348,19 @@ pub async fn decrypt_file(
                 ciphertext_hash.update(part);
                 ciphertext_bytes += part.len() as u64;
             }
-            ensure!(
-                ciphertext_bytes <= envelope.ciphertext_bytes,
-                "ciphertext exceeds envelope size"
-            );
+            ensure!(ciphertext_bytes <= envelope.ciphertext_bytes, "ciphertext exceeds envelope size");
             let nonce = Nonce::assume_unique_for_key(nonce_bytes);
             let plaintext = cipher
                 .open_in_place(nonce, Aad::from(aad(&envelope, index)), &mut chunk)
                 .map_err(|_| anyhow::anyhow!("AES-GCM authentication failed"))?;
             plaintext_bytes += plaintext.len() as u64;
-            ensure!(
-                plaintext_bytes <= envelope.plaintext_bytes,
-                "plaintext exceeds envelope size"
-            );
+            ensure!(plaintext_bytes <= envelope.plaintext_bytes, "plaintext exceeds envelope size");
             plaintext_hash.update(&*plaintext);
             output.write_all(plaintext).await?;
             index += 1;
         }
         ensure!(
-            plaintext_bytes == envelope.plaintext_bytes
-                && ciphertext_bytes == envelope.ciphertext_bytes,
+            plaintext_bytes == envelope.plaintext_bytes && ciphertext_bytes == envelope.ciphertext_bytes,
             "encrypted pack length mismatch"
         );
         ensure!(
@@ -490,16 +381,9 @@ pub async fn decrypt_file(
     Ok(envelope)
 }
 
-pub async fn rotate_envelope(
-    provider: &VaultTransit,
-    envelope_dir: &Path,
-    deadline: Instant,
-) -> Result<Envelope> {
+pub async fn rotate_envelope(provider: &VaultTransit, envelope_dir: &Path, deadline: Instant) -> Result<Envelope> {
     let current = read_envelope(envelope_dir, None).await?;
-    ensure!(
-        current.key_name == provider.key_name,
-        "wrong Vault key name"
-    );
+    ensure!(current.key_name == provider.key_name, "wrong Vault key name");
     let wrapped = provider.rewrap(&current.wrapped_key, deadline).await?;
     // Verify the new wrapper before making it current. Old generations remain
     // readable while Vault permits their key versions.
@@ -509,21 +393,11 @@ pub async fn rotate_envelope(
     ensure!(same_key, "Vault rewrap changed the data key");
     let mut next = current.clone();
     next.wrapped_key = wrapped;
-    next.generation = current
-        .generation
-        .checked_add(1)
-        .context("envelope generation exhausted")?;
+    next.generation = current.generation.checked_add(1).context("envelope generation exhausted")?;
     while envelope_path(envelope_dir, next.generation).exists() {
-        next.generation = next
-            .generation
-            .checked_add(1)
-            .context("envelope generation exhausted")?;
+        next.generation = next.generation.checked_add(1).context("envelope generation exhausted")?;
     }
-    write_new(
-        &envelope_path(envelope_dir, next.generation),
-        &serde_json::to_vec(&next)?,
-    )
-    .await?;
+    write_new(&envelope_path(envelope_dir, next.generation), &serde_json::to_vec(&next)?).await?;
     let pointer = envelope_dir.join(format!(".CURRENT-{}", Uuid::new_v4()));
     write_new(&pointer, format!("{}\n", next.generation).as_bytes()).await?;
     fs::rename(&pointer, envelope_dir.join("CURRENT")).await?;

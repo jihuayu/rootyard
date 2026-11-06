@@ -12,8 +12,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 use tokio::sync::{
-    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
-    RwLock as AsyncRwLock,
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock,
 };
 use uuid::Uuid;
 
@@ -48,9 +47,7 @@ impl Storage {
             .truncate(false)
             .mode(0o600)
             .open(root.join(".rootyard.lock"))?;
-        lock_file
-            .try_lock_exclusive()
-            .context("data directory already in use; do not start another writer")?;
+        lock_file.try_lock_exclusive().context("data directory already in use; do not start another writer")?;
         crate::backup::ensure_not_restoring(&root)?;
         // A read replica must never be accidentally restarted as the writer.
         let marker = root.join(".rootyard-mirror");
@@ -62,13 +59,9 @@ impl Storage {
         if mirror {
             if marker_exists {
                 use std::io::Read;
-                let file = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                    .open(&marker)?;
-                if !file.metadata()?.is_file()
-                    || file.metadata()?.len() != b"rootyard-read-mirror-v1\n".len() as u64
-                {
+                let file =
+                    OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&marker)?;
+                if !file.metadata()?.is_file() || file.metadata()?.len() != b"rootyard-read-mirror-v1\n".len() as u64 {
                     bail!("invalid mirror role marker");
                 }
                 let mut bytes = Vec::new();
@@ -79,9 +72,7 @@ impl Storage {
             } else {
                 for entry in std::fs::read_dir(&root)? {
                     if entry?.file_name() != ".rootyard.lock" {
-                        bail!(
-                            "mirror requires a fresh dedicated volume, not an existing data directory"
-                        );
+                        bail!("mirror requires a fresh dedicated volume, not an existing data directory");
                     }
                 }
                 use std::io::Write;
@@ -137,13 +128,7 @@ impl Storage {
             bail!("repos directory cannot be a symlink");
         }
         std::fs::set_permissions(&repos, std::fs::Permissions::from_mode(0o700))?;
-        Ok(Self {
-            root,
-            lock_file,
-            volume_id,
-            locks: Mutex::new(HashMap::new()),
-            readers: Mutex::new(HashMap::new()),
-        })
+        Ok(Self { root, lock_file, volume_id, locks: Mutex::new(HashMap::new()), readers: Mutex::new(HashMap::new()) })
     }
     pub fn repo_path(&self, id: Uuid) -> PathBuf {
         self.root.join("repos").join(format!("{id}.git"))
@@ -193,8 +178,7 @@ impl Storage {
         Ok(path)
     }
     pub async fn provision(&self, config: &Config, id: Uuid) -> Result<()> {
-        self.provision_with_format(config, id, crate::browse::object_format::ObjectFormat::Sha1)
-            .await
+        self.provision_with_format(config, id, crate::browse::object_format::ObjectFormat::Sha1).await
     }
     pub async fn provision_with_format(
         &self,
@@ -213,9 +197,7 @@ impl Storage {
                 .args(["config", "--get", "rootyard.repositoryId"])
                 .output()
                 .await?;
-            if !out.status.success()
-                || String::from_utf8_lossy(&out.stdout).trim() != id.to_string()
-            {
+            if !out.status.success() || String::from_utf8_lossy(&out.stdout).trim() != id.to_string() {
                 bail!("existing repository identity does not match metadata");
             }
             return Ok(());
@@ -233,13 +215,7 @@ impl Storage {
         let format_arg = format!("--object-format={}", format.as_str());
         checked(
             self.git(config)
-                .args([
-                    "init",
-                    "--bare",
-                    &format_arg,
-                    "--initial-branch=main",
-                    "--template=",
-                ])
+                .args(["init", "--bare", &format_arg, "--initial-branch=main", "--template="])
                 .arg(&staging),
         )
         .await?;
@@ -266,13 +242,7 @@ impl Storage {
             ("pack.deltaCacheSize", "32m".into()),
         ];
         for (key, value) in settings {
-            checked(
-                self.git(config)
-                    .arg("--git-dir")
-                    .arg(&staging)
-                    .args(["config", key, &value]),
-            )
-            .await?;
+            checked(self.git(config).arg("--git-dir").arg(&staging).args(["config", key, &value])).await?;
         }
         // No arbitrary hooks or inherited template. The service OS identity owns this private tree.
         let stage = staging.clone();

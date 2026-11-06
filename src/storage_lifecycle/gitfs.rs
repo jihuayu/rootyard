@@ -121,21 +121,14 @@ fn clean_staging(dir: &Path, age: Duration, cancel: &CancellationToken) -> Resul
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name
-            .strip_prefix(".tmp-")
-            .is_some_and(|tail| Uuid::parse_str(tail).is_ok())
-        {
+        if !name.strip_prefix(".tmp-").is_some_and(|tail| Uuid::parse_str(tail).is_ok()) {
             continue;
         }
         let meta = std::fs::symlink_metadata(entry.path())?;
         if !meta.file_type().is_file() || meta.nlink() != 1 {
             continue;
         }
-        if SystemTime::now()
-            .duration_since(meta.modified()?)
-            .unwrap_or_default()
-            < age
-        {
+        if SystemTime::now().duration_since(meta.modified()?).unwrap_or_default() < age {
             continue;
         }
         std::fs::remove_file(entry.path())?;
@@ -154,33 +147,18 @@ pub async fn execute(
     match kind {
         "gitfs_repack" => {
             // No `-d` or prune: current readers and pinned snapshots retain old packs.
-            run_git(
-                state,
-                repo,
-                &["repack", "-a", "--no-write-bitmap-index"],
-                cancel,
-                1024,
-            )
-            .await?;
+            run_git(state, repo, &["repack", "-a", "--no-write-bitmap-index"], cancel, 1024).await?;
             Ok(json!({"repacked":true,"pruned":false}))
         }
         "gitfs_cache_hydrate" => {
-            run_git(
-                state,
-                repo,
-                &["commit-graph", "write", "--reachable"],
-                cancel,
-                1024,
-            )
-            .await?;
+            run_git(state, repo, &["commit-graph", "write", "--reachable"], cancel, 1024).await?;
             Ok(json!({"commit_graph":"written"}))
         }
         "gitfs_stage_cleanup" => {
             let dir = repo_lfs_dir(&state.storage.root, repo);
             let age = Duration::from_secs(policy.stage_age_seconds as u64);
             let cancel = cancel.clone();
-            let deleted =
-                tokio::task::spawn_blocking(move || clean_staging(&dir, age, &cancel)).await??;
+            let deleted = tokio::task::spawn_blocking(move || clean_staging(&dir, age, &cancel)).await??;
             Ok(json!({"staging_files_deleted":deleted}))
         }
         "gitfs_cache_evict" => {
@@ -188,21 +166,15 @@ pub async fn execute(
             crate::journal::safe_path(&info)?;
             let graph = info.join("commit-graph");
             match std::fs::symlink_metadata(&graph) {
-                Ok(meta)
-                    if meta.is_file() && !meta.file_type().is_symlink() && meta.nlink() == 1 =>
-                {
-                    if meta.modified()?.elapsed().unwrap_or_default().as_secs()
-                        >= policy.cache_max_age_seconds as u64
-                    {
+                Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() && meta.nlink() == 1 => {
+                    if meta.modified()?.elapsed().unwrap_or_default().as_secs() >= policy.cache_max_age_seconds as u64 {
                         std::fs::remove_file(graph)?;
                         Ok(json!({"commit_graph":"evicted"}))
                     } else {
                         Ok(json!({"commit_graph":"retained_new"}))
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok(json!({"commit_graph":"absent"}))
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(json!({"commit_graph":"absent"})),
                 _ => bail!("unsafe commit-graph cache path"),
             }
         }

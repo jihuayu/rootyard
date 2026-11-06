@@ -27,33 +27,20 @@ thread_local! {
     static READ_CONTEXT: RefCell<Option<ReadContext>> = const { RefCell::new(None) };
 }
 
-pub(super) fn with_read_cancel<T>(
-    flag: Arc<AtomicBool>,
-    volume_lock_fd: i32,
-    work: impl FnOnce() -> T,
-) -> T {
+pub(super) fn with_read_cancel<T>(flag: Arc<AtomicBool>, volume_lock_fd: i32, work: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
             READ_CONTEXT.with(|slot| *slot.borrow_mut() = None);
         }
     }
-    READ_CONTEXT.with(|slot| {
-        *slot.borrow_mut() = Some(ReadContext {
-            cancel: flag,
-            volume_lock_fd,
-        })
-    });
+    READ_CONTEXT.with(|slot| *slot.borrow_mut() = Some(ReadContext { cancel: flag, volume_lock_fd }));
     let _reset = Reset;
     work()
 }
 
 fn read_cancelled() -> bool {
-    READ_CONTEXT.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .is_some_and(|ctx| ctx.cancel.load(Ordering::Acquire))
-    })
+    READ_CONTEXT.with(|slot| slot.borrow().as_ref().is_some_and(|ctx| ctx.cancel.load(Ordering::Acquire)))
 }
 
 fn lease_lost() -> Error {
@@ -61,20 +48,12 @@ fn lease_lost() -> Error {
 }
 
 fn limit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Result<()> {
-    let lim = libc::rlimit {
-        rlim_cur: value,
-        rlim_max: value,
-    };
-    if unsafe { libc::setrlimit(resource, &lim) } < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    let lim = libc::rlimit { rlim_cur: value, rlim_max: value };
+    if unsafe { libc::setrlimit(resource, &lim) } < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
 }
 fn command(repo: &FsPath, args: &[&str]) -> Command {
     let parent_pid = unsafe { libc::getpid() };
-    let volume_lock_fd =
-        READ_CONTEXT.with(|slot| slot.borrow().as_ref().map(|ctx| ctx.volume_lock_fd));
+    let volume_lock_fd = READ_CONTEXT.with(|slot| slot.borrow().as_ref().map(|ctx| ctx.volume_lock_fd));
     let mut cmd = Command::new("git");
     cmd.arg("-c")
         .arg("core.hooksPath=/dev/null")
@@ -114,21 +93,14 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
         return Err(lease_lost());
     }
     let cancel = READ_CONTEXT.with(|slot| slot.borrow().as_ref().map(|ctx| ctx.cancel.clone()));
-    cmd.stdin(if input.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
     let mut child = cmd.spawn().map_err(Error::internal)?;
     let pid = child.id() as i32;
     let (done, stop) = mpsc::channel::<()>();
     let watchdog = thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(MAX_WALL_SECONDS);
         loop {
-            if cancel
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Acquire))
-                || std::time::Instant::now() >= deadline
+            if cancel.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) || std::time::Instant::now() >= deadline
             {
                 unsafe {
                     libc::kill(-pid, libc::SIGKILL);
@@ -147,15 +119,9 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
         let mut stdin = child.stdin.take().expect("piped Git stdin");
         thread::spawn(move || stdin.write_all(&bytes))
     });
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::internal("missing Git stdout"))?;
+    let mut stdout = child.stdout.take().ok_or_else(|| Error::internal("missing Git stdout"))?;
     let mut output = Vec::new();
-    let read_result = stdout
-        .by_ref()
-        .take((MAX_OUTPUT + 1) as u64)
-        .read_to_end(&mut output);
+    let read_result = stdout.by_ref().take((MAX_OUTPUT + 1) as u64).read_to_end(&mut output);
     let oversized = output.len() > MAX_OUTPUT;
     if oversized || read_result.is_err() {
         unsafe {
@@ -167,12 +133,7 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
     loop {
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
         let rc = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as u32,
-                info.as_mut_ptr(),
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
+            libc::waitid(libc::P_PID, pid as u32, info.as_mut_ptr(), libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
         };
         if rc != 0 {
             return Err(Error::internal(std::io::Error::last_os_error()));
@@ -198,26 +159,17 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
     let _ = done.send(());
     let _ = watchdog.join();
     if let Some(writer) = writer {
-        writer
-            .join()
-            .map_err(|_| Error::internal("Git stdin worker panicked"))?
-            .map_err(Error::internal)?;
+        writer.join().map_err(|_| Error::internal("Git stdin worker panicked"))?.map_err(Error::internal)?;
     }
     if read_cancelled() {
         return Err(lease_lost());
     }
     read_result.map_err(Error::internal)?;
     if oversized {
-        return Err(Error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Git output exceeds 16 MiB",
-        ));
+        return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "Git output exceeds 16 MiB"));
     }
     if !status.success() {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "Git View reverse mapping conflict",
-        ));
+        return Err(Error(StatusCode::CONFLICT, "Git View reverse mapping conflict"));
     }
     Ok(output)
 }
@@ -226,42 +178,20 @@ pub(super) fn git(repo: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
     run(command(repo, args), None)
 }
 pub(super) fn git_oid(repo: &FsPath, args: &[&str]) -> Result<String, Error> {
-    String::from_utf8(git(repo, args)?)
-        .map(|s| s.trim().to_owned())
-        .map_err(Error::internal)
+    String::from_utf8(git(repo, args)?).map(|s| s.trim().to_owned()).map_err(Error::internal)
 }
-pub(super) fn git_input(
-    repo: &FsPath,
-    args: &[&str],
-    input: &[u8],
-    actor: Option<&str>,
-) -> Result<String, Error> {
+pub(super) fn git_input(repo: &FsPath, args: &[&str], input: &[u8], actor: Option<&str>) -> Result<String, Error> {
     let mut cmd = command(repo, args);
     if let Some(actor) = actor {
         cmd.env("GIT_AUTHOR_NAME", actor)
             .env("GIT_COMMITTER_NAME", actor)
-            .env(
-                "GIT_AUTHOR_EMAIL",
-                format!("{actor}@users.rootyard.invalid"),
-            )
-            .env(
-                "GIT_COMMITTER_EMAIL",
-                format!("{actor}@users.rootyard.invalid"),
-            );
+            .env("GIT_AUTHOR_EMAIL", format!("{actor}@users.rootyard.invalid"))
+            .env("GIT_COMMITTER_EMAIL", format!("{actor}@users.rootyard.invalid"));
     }
-    String::from_utf8(run(cmd, Some(input))?)
-        .map(|s| s.trim().to_owned())
-        .map_err(Error::internal)
+    String::from_utf8(run(cmd, Some(input))?).map(|s| s.trim().to_owned()).map_err(Error::internal)
 }
-pub(super) fn verify_candidate_budget(
-    repo: &FsPath,
-    candidate: &str,
-    base: &str,
-) -> Result<u64, Error> {
-    let raw = git(
-        repo,
-        &["rev-list", "--objects", candidate, &format!("^{base}")],
-    )?;
+pub(super) fn verify_candidate_budget(repo: &FsPath, candidate: &str, base: &str) -> Result<u64, Error> {
+    let raw = git(repo, &["rev-list", "--objects", candidate, &format!("^{base}")])?;
     let mut input = Vec::new();
     let mut count = 0usize;
     for row in raw.split(|b| *b == b'\n').filter(|r| !r.is_empty()) {
@@ -273,28 +203,15 @@ pub(super) fn verify_candidate_budget(
         input.push(b'\n');
         count += 1;
         if count > 100_000 {
-            return Err(Error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "proposal has too many Git objects",
-            ));
+            return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "proposal has too many Git objects"));
         }
     }
-    let sizes = git_input(
-        repo,
-        &["cat-file", "--batch-check=%(objectsize)"],
-        &input,
-        None,
-    )?;
+    let sizes = git_input(repo, &["cat-file", "--batch-check=%(objectsize)"], &input, None)?;
     let mut total = 0u64;
     for size in sizes.lines() {
-        total = total
-            .checked_add(size.parse::<u64>().map_err(Error::internal)?)
-            .ok_or_else(Error::bad_request)?;
+        total = total.checked_add(size.parse::<u64>().map_err(Error::internal)?).ok_or_else(Error::bad_request)?;
         if total > MAX_PROCESS_FILE {
-            return Err(Error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "proposal objects exceed 256 MiB",
-            ));
+            return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "proposal objects exceed 256 MiB"));
         }
     }
     Ok(total)
@@ -305,8 +222,7 @@ mod tests {
     use super::*;
     #[test]
     fn cat_file_drains_more_than_pipe_capacity() {
-        let repo =
-            std::env::temp_dir().join(format!("rootyard-reverse-git-{}", uuid::Uuid::new_v4()));
+        let repo = std::env::temp_dir().join(format!("rootyard-reverse-git-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "--bare"]).unwrap();
         let oid = git_input(&repo, &["hash-object", "-w", "--stdin"], b"x", None).unwrap();
@@ -315,13 +231,7 @@ mod tests {
             input.extend_from_slice(oid.as_bytes());
             input.push(b'\n');
         }
-        let output = git_input(
-            &repo,
-            &["cat-file", "--batch-check=%(objectsize)"],
-            &input,
-            None,
-        )
-        .unwrap();
+        let output = git_input(&repo, &["cat-file", "--batch-check=%(objectsize)"], &input, None).unwrap();
         assert_eq!(output.lines().count(), 60_000);
         std::fs::remove_dir_all(repo).unwrap();
     }

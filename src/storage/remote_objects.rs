@@ -34,29 +34,17 @@ impl ObjectKey {
         ensure!(
             !namespace.is_empty()
                 && namespace.len() <= 48
-                && namespace
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                && namespace.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
             "invalid object namespace"
         );
         ensure!(
-            sha256.len() == 64
-                && sha256
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
             "invalid object digest"
         );
-        Ok(Self {
-            tenant_id,
-            namespace: namespace.into(),
-            sha256: sha256.into(),
-        })
+        Ok(Self { tenant_id, namespace: namespace.into(), sha256: sha256.into() })
     }
     pub fn path(&self) -> String {
-        format!(
-            "tenants/{}/{}/{}",
-            self.tenant_id, self.namespace, self.sha256
-        )
+        format!("tenants/{}/{}/{}", self.tenant_id, self.namespace, self.sha256)
     }
 }
 
@@ -88,8 +76,7 @@ enum Payload {
 
 fn valid_bucket(s: &str) -> bool {
     (3..=63).contains(&s.len())
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
         && !s.starts_with('.')
         && !s.ends_with('.')
         && !s.contains("..")
@@ -102,10 +89,7 @@ impl RemoteObjectStore {
         };
         let endpoint = Url::parse(&endpoint)?;
         let loopback = matches!(endpoint.host_str(), Some("127.0.0.1" | "::1" | "localhost"));
-        ensure!(
-            endpoint.scheme() == "https" || endpoint.scheme() == "http" && loopback,
-            "object store requires TLS"
-        );
+        ensure!(endpoint.scheme() == "https" || endpoint.scheme() == "http" && loopback, "object store requires TLS");
         ensure!(
             endpoint.path() == "/"
                 && endpoint.query().is_none()
@@ -114,41 +98,24 @@ impl RemoteObjectStore {
                 && endpoint.password().is_none(),
             "object store endpoint must be an origin URL"
         );
-        let bucket =
-            std::env::var("ROOTYARD_OBJECT_STORE_BUCKET").context("object store bucket missing")?;
+        let bucket = std::env::var("ROOTYARD_OBJECT_STORE_BUCKET").context("object store bucket missing")?;
         ensure!(valid_bucket(&bucket), "invalid object store bucket");
-        let region =
-            std::env::var("ROOTYARD_OBJECT_STORE_REGION").context("object store region missing")?;
+        let region = std::env::var("ROOTYARD_OBJECT_STORE_REGION").context("object store region missing")?;
         ensure!(
-            !region.is_empty()
-                && region.len() <= 64
-                && region
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            !region.is_empty() && region.len() <= 64 && region.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
             "invalid object store region"
         );
-        let access_key = std::env::var("ROOTYARD_OBJECT_STORE_ACCESS_KEY")
-            .context("object store access key missing")?;
-        let secret_key = std::env::var("ROOTYARD_OBJECT_STORE_SECRET_KEY")
-            .context("object store secret key missing")?;
-        ensure!(
-            !access_key.is_empty() && !secret_key.is_empty(),
-            "object store credentials missing"
-        );
+        let access_key =
+            std::env::var("ROOTYARD_OBJECT_STORE_ACCESS_KEY").context("object store access key missing")?;
+        let secret_key =
+            std::env::var("ROOTYARD_OBJECT_STORE_SECRET_KEY").context("object store secret key missing")?;
+        ensure!(!access_key.is_empty() && !secret_key.is_empty(), "object store credentials missing");
         let session_token = std::env::var("ROOTYARD_OBJECT_STORE_SESSION_TOKEN").ok();
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
-        Ok(Self::S3(S3Store {
-            client,
-            endpoint,
-            bucket,
-            region,
-            access_key,
-            secret_key,
-            session_token,
-        }))
+        Ok(Self::S3(S3Store { client, endpoint, bucket, region, access_key, secret_key, session_token }))
     }
 
     pub async fn put_file(
@@ -159,23 +126,15 @@ impl RemoteObjectStore {
         deadline: Instant,
     ) -> Result<StoredObject> {
         let actual = hash_file(source, deadline).await?;
-        ensure!(
-            actual.size == expected_size && actual.sha256 == key.sha256,
-            "object source digest or size mismatch"
-        );
+        ensure!(actual.size == expected_size && actual.sha256 == key.sha256, "object source digest or size mismatch");
         match self {
             Self::Local(root) => local_put(root, key, source, deadline).await?,
             Self::S3(s3) => s3.put(key, source, expected_size, deadline).await?,
         }
-        let head = self
-            .head(key, deadline)
-            .await?
-            .context("uploaded object is missing")?;
+        let head = self.head(key, deadline).await?.context("uploaded object is missing")?;
         ensure!(head.size == expected_size, "uploaded object is truncated");
         let verification = std::env::temp_dir().join(format!("rootyard-verify-{}", Uuid::new_v4()));
-        let verified = self
-            .get_to_file(key, &verification, expected_size, deadline)
-            .await;
+        let verified = self.get_to_file(key, &verification, expected_size, deadline).await;
         let _ = fs::remove_file(&verification).await;
         verified?;
         Ok(actual)
@@ -186,10 +145,9 @@ impl RemoteObjectStore {
             Self::Local(root) => {
                 let path = root.join(key.path());
                 match fs::metadata(&path).await {
-                    Ok(meta) if meta.is_file() => Ok(Some(StoredObject {
-                        sha256: key.sha256.clone(),
-                        size: meta.len(),
-                    })),
+                    Ok(meta) if meta.is_file() => {
+                        Ok(Some(StoredObject { sha256: key.sha256.clone(), size: meta.len() }))
+                    }
                     Ok(_) => bail!("stored object is not a file"),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                     Err(e) => Err(e.into()),
@@ -206,17 +164,11 @@ impl RemoteObjectStore {
         expected_size: u64,
         deadline: Instant,
     ) -> Result<()> {
-        let parent = destination
-            .parent()
-            .context("object destination parent missing")?;
+        let parent = destination.parent().context("object destination parent missing")?;
         fs::create_dir_all(parent).await?;
         let temp = parent.join(format!(".rootyard-object-{}", Uuid::new_v4()));
         let result = async {
-            let mut out = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)
-                .await?;
+            let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
             let mut hash = Sha256::new();
             let mut size = 0u64;
             match self {
@@ -236,14 +188,9 @@ impl RemoteObjectStore {
                 }
                 Self::S3(s3) => {
                     let response = s3.send(Method::GET, key, "", None, None, deadline).await?;
-                    ensure!(
-                        response.status() == StatusCode::OK,
-                        "object GET failed: {}",
-                        response.status()
-                    );
+                    ensure!(response.status() == StatusCode::OK, "object GET failed: {}", response.status());
                     let mut stream = response.bytes_stream();
-                    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next()).await?
-                    {
+                    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next()).await? {
                         let chunk = chunk?;
                         size += chunk.len() as u64;
                         ensure!(size <= expected_size, "stored object exceeds expected size");
@@ -268,20 +215,9 @@ impl RemoteObjectStore {
         result
     }
 
-    pub async fn get_range(
-        &self,
-        key: &ObjectKey,
-        start: u64,
-        len: u64,
-        deadline: Instant,
-    ) -> Result<Vec<u8>> {
-        ensure!(
-            len <= MAX_RANGE_BYTES && len > 0,
-            "object range exceeds limit"
-        );
-        let end = start
-            .checked_add(len - 1)
-            .context("object range overflow")?;
+    pub async fn get_range(&self, key: &ObjectKey, start: u64, len: u64, deadline: Instant) -> Result<Vec<u8>> {
+        ensure!(len <= MAX_RANGE_BYTES && len > 0, "object range exceeds limit");
+        let end = start.checked_add(len - 1).context("object range overflow")?;
         match self {
             Self::Local(root) => {
                 use tokio::io::AsyncSeekExt;
@@ -293,16 +229,7 @@ impl RemoteObjectStore {
             }
             Self::S3(s3) => {
                 let range = format!("bytes={start}-{end}");
-                let response = s3
-                    .send(
-                        Method::GET,
-                        key,
-                        "",
-                        None,
-                        Some((&header::RANGE, &range)),
-                        deadline,
-                    )
-                    .await?;
+                let response = s3.send(Method::GET, key, "", None, Some((&header::RANGE, &range)), deadline).await?;
                 ensure!(
                     response.status() == StatusCode::PARTIAL_CONTENT,
                     "object range GET failed: {}",
@@ -312,16 +239,10 @@ impl RemoteObjectStore {
                 let mut bytes = Vec::with_capacity(len as usize);
                 while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next()).await? {
                     let chunk = chunk?;
-                    ensure!(
-                        chunk.len() <= len as usize - bytes.len(),
-                        "object range response exceeds limit"
-                    );
+                    ensure!(chunk.len() <= len as usize - bytes.len(), "object range response exceeds limit");
                     bytes.extend_from_slice(&chunk);
                 }
-                ensure!(
-                    bytes.len() == len as usize,
-                    "object range response truncated"
-                );
+                ensure!(bytes.len() == len as usize, "object range response truncated");
                 Ok(bytes)
             }
         }
@@ -335,14 +256,8 @@ impl RemoteObjectStore {
                 Err(e) => Err(e.into()),
             },
             Self::S3(s3) => {
-                let response = s3
-                    .send(Method::DELETE, key, "", None, None, deadline)
-                    .await?;
-                ensure!(
-                    response.status().is_success(),
-                    "object DELETE failed: {}",
-                    response.status()
-                );
+                let response = s3.send(Method::DELETE, key, "", None, None, deadline).await?;
+                ensure!(response.status().is_success(), "object DELETE failed: {}", response.status());
                 Ok(())
             }
         }
@@ -362,10 +277,7 @@ async fn hash_file(path: &Path, deadline: Instant) -> Result<StoredObject> {
         size = size.checked_add(n as u64).context("object size overflow")?;
         hash.update(&buf[..n]);
     }
-    Ok(StoredObject {
-        sha256: hex::encode(hash.finalize()),
-        size,
-    })
+    Ok(StoredObject { sha256: hex::encode(hash.finalize()), size })
 }
 
 async fn local_put(root: &Path, key: &ObjectKey, source: &Path, deadline: Instant) -> Result<()> {
@@ -375,21 +287,14 @@ async fn local_put(root: &Path, key: &ObjectKey, source: &Path, deadline: Instan
     let temp = parent.join(format!(".tmp-{}", Uuid::new_v4()));
     let result = async {
         let mut input = File::open(source).await?;
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .await?;
+        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
         tokio::time::timeout_at(deadline, tokio::io::copy(&mut input, &mut output)).await??;
         output.sync_all().await?;
         match fs::hard_link(&temp, &target).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let existing = hash_file(&target, deadline).await?;
-                ensure!(
-                    existing.sha256 == key.sha256,
-                    "immutable object key collision"
-                );
+                ensure!(existing.sha256 == key.sha256, "immutable object key collision");
             }
             Err(e) => return Err(e.into()),
         }
@@ -414,29 +319,18 @@ fn percent_encode(value: &str) -> String {
 }
 
 fn amz_time() -> Result<(String, String)> {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)?
-        .as_secs() as libc::time_t;
+    let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::gmtime_r(&secs, &mut tm) }.is_null() {
         bail!("UTC clock conversion failed");
     }
-    let date = format!(
-        "{:04}{:02}{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday
-    );
-    let timestamp = format!(
-        "{}T{:02}{:02}{:02}Z",
-        date, tm.tm_hour, tm.tm_min, tm.tm_sec
-    );
+    let date = format!("{:04}{:02}{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+    let timestamp = format!("{}T{:02}{:02}{:02}Z", date, tm.tm_hour, tm.tm_min, tm.tm_sec);
     Ok((date, timestamp))
 }
 
 fn hmac(key: &[u8], bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut mac =
-        HmacSha256::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid signing key"))?;
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| anyhow::anyhow!("invalid signing key"))?;
     mac.update(bytes);
     Ok(mac.finalize().into_bytes().to_vec())
 }
@@ -460,10 +354,7 @@ impl S3Store {
     ) -> Result<reqwest::RequestBuilder> {
         let url = self.url(key, query)?;
         let (date, timestamp) = amz_time()?;
-        let mut host = url
-            .host_str()
-            .context("object store host missing")?
-            .to_owned();
+        let mut host = url.host_str().context("object store host missing")?.to_owned();
         if host.contains(':') {
             host = format!("[{host}]");
         }
@@ -472,10 +363,7 @@ impl S3Store {
         }
         let mut headers = vec![
             ("host".to_owned(), host),
-            (
-                "x-amz-content-sha256".to_owned(),
-                "UNSIGNED-PAYLOAD".to_owned(),
-            ),
+            ("x-amz-content-sha256".to_owned(), "UNSIGNED-PAYLOAD".to_owned()),
             ("x-amz-date".to_owned(), timestamp.clone()),
         ];
         if let Some(token) = &self.session_token {
@@ -485,15 +373,8 @@ impl S3Store {
             headers.push((name.as_str().to_owned(), value.to_owned()));
         }
         headers.sort_by(|a, b| a.0.cmp(&b.0));
-        let canonical_headers = headers
-            .iter()
-            .map(|(k, v)| format!("{k}:{}\n", v.trim()))
-            .collect::<String>();
-        let signed_headers = headers
-            .iter()
-            .map(|(k, _)| k.as_str())
-            .collect::<Vec<_>>()
-            .join(";");
+        let canonical_headers = headers.iter().map(|(k, v)| format!("{k}:{}\n", v.trim())).collect::<String>();
+        let signed_headers = headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
         let canonical = format!(
             "{}\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
             method.as_str(),
@@ -503,14 +384,9 @@ impl S3Store {
             signed_headers
         );
         let scope = format!("{date}/{}/s3/aws4_request", self.region);
-        let to_sign = format!(
-            "AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{}",
-            hex::encode(Sha256::digest(canonical.as_bytes()))
-        );
-        let k_date = hmac(
-            format!("AWS4{}", self.secret_key).as_bytes(),
-            date.as_bytes(),
-        )?;
+        let to_sign =
+            format!("AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{}", hex::encode(Sha256::digest(canonical.as_bytes())));
+        let k_date = hmac(format!("AWS4{}", self.secret_key).as_bytes(), date.as_bytes())?;
         let k_region = hmac(&k_date, self.region.as_bytes())?;
         let k_service = hmac(&k_region, b"s3")?;
         let k_signing = hmac(&k_service, b"aws4_request")?;
@@ -519,10 +395,7 @@ impl S3Store {
             "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
             self.access_key
         );
-        let mut request = self
-            .client
-            .request(method.clone(), url)
-            .header(header::AUTHORIZATION, auth);
+        let mut request = self.client.request(method.clone(), url).header(header::AUTHORIZATION, auth);
         for (name, value) in headers {
             request = request.header(name, value);
         }
@@ -547,9 +420,9 @@ impl S3Store {
                         use tokio::io::AsyncSeekExt;
                         let mut file = File::open(path).await?;
                         file.seek(std::io::SeekFrom::Start(*offset)).await?;
-                        request.header(header::CONTENT_LENGTH, *len).body(
-                            reqwest::Body::wrap_stream(ReaderStream::new(file.take(*len))),
-                        )
+                        request
+                            .header(header::CONTENT_LENGTH, *len)
+                            .body(reqwest::Body::wrap_stream(ReaderStream::new(file.take(*len))))
                     }
                     Payload::Bytes(bytes) => request.body(bytes.clone()),
                 };
@@ -568,36 +441,17 @@ impl S3Store {
     }
 
     async fn head(&self, key: &ObjectKey, deadline: Instant) -> Result<Option<StoredObject>> {
-        let response = self
-            .send(Method::HEAD, key, "", None, None, deadline)
-            .await?;
+        let response = self.send(Method::HEAD, key, "", None, None, deadline).await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        ensure!(
-            response.status().is_success(),
-            "object HEAD failed: {}",
-            response.status()
-        );
-        let size = response
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .context("object HEAD missing length")?
-            .to_str()?
-            .parse()?;
-        Ok(Some(StoredObject {
-            sha256: key.sha256.clone(),
-            size,
-        }))
+        ensure!(response.status().is_success(), "object HEAD failed: {}", response.status());
+        let size =
+            response.headers().get(header::CONTENT_LENGTH).context("object HEAD missing length")?.to_str()?.parse()?;
+        Ok(Some(StoredObject { sha256: key.sha256.clone(), size }))
     }
 
-    async fn put(
-        &self,
-        key: &ObjectKey,
-        source: &Path,
-        size: u64,
-        deadline: Instant,
-    ) -> Result<()> {
+    async fn put(&self, key: &ObjectKey, source: &Path, size: u64, deadline: Instant) -> Result<()> {
         if let Some(existing) = self.head(key, deadline).await? {
             ensure!(existing.size == size, "immutable object key collision");
             return Ok(());
@@ -622,14 +476,8 @@ impl S3Store {
             );
             return Ok(());
         }
-        let initiated = self
-            .send(Method::POST, key, "uploads=", None, None, deadline)
-            .await?;
-        ensure!(
-            initiated.status().is_success(),
-            "multipart initiation failed: {}",
-            initiated.status()
-        );
+        let initiated = self.send(Method::POST, key, "uploads=", None, None, deadline).await?;
+        ensure!(initiated.status().is_success(), "multipart initiation failed: {}", initiated.status());
         let xml = tokio::time::timeout_at(deadline, initiated.text()).await??;
         let upload_id = xml
             .split("<UploadId>")
@@ -637,10 +485,7 @@ impl S3Store {
             .and_then(|s| s.split("</UploadId>").next())
             .context("multipart upload id missing")?
             .to_owned();
-        ensure!(
-            !upload_id.is_empty() && upload_id.len() <= 2048,
-            "invalid multipart upload id"
-        );
+        ensure!(!upload_id.is_empty() && upload_id.len() <= 2048, "invalid multipart upload id");
         let encoded = percent_encode(&upload_id);
         let mut parts = Vec::new();
         let result = async {
@@ -660,60 +505,29 @@ impl S3Store {
                         deadline,
                     )
                     .await?;
-                ensure!(
-                    response.status().is_success(),
-                    "multipart part failed: {}",
-                    response.status()
-                );
-                let etag = response
-                    .headers()
-                    .get(header::ETAG)
-                    .context("multipart ETag missing")?
-                    .to_str()?
-                    .to_owned();
-                ensure!(
-                    etag.starts_with('"') && etag.ends_with('"') && etag.len() < 256,
-                    "invalid multipart ETag"
-                );
+                ensure!(response.status().is_success(), "multipart part failed: {}", response.status());
+                let etag = response.headers().get(header::ETAG).context("multipart ETag missing")?.to_str()?.to_owned();
+                ensure!(etag.starts_with('"') && etag.ends_with('"') && etag.len() < 256, "invalid multipart ETag");
                 parts.push((number, etag));
                 offset += len;
             }
             let mut body = String::from("<CompleteMultipartUpload>");
             for (number, etag) in &parts {
-                body.push_str(&format!(
-                    "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
-                ));
+                body.push_str(&format!("<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"));
             }
             body.push_str("</CompleteMultipartUpload>");
             let query = format!("uploadId={encoded}");
-            let response = self
-                .send(
-                    Method::POST,
-                    key,
-                    &query,
-                    Some(Payload::Bytes(body.into_bytes())),
-                    None,
-                    deadline,
-                )
-                .await?;
-            ensure!(
-                response.status().is_success(),
-                "multipart completion failed: {}",
-                response.status()
-            );
+            let response =
+                self.send(Method::POST, key, &query, Some(Payload::Bytes(body.into_bytes())), None, deadline).await?;
+            ensure!(response.status().is_success(), "multipart completion failed: {}", response.status());
             let text = tokio::time::timeout_at(deadline, response.text()).await??;
-            ensure!(
-                !text.contains("<Error>"),
-                "multipart completion reported an error"
-            );
+            ensure!(!text.contains("<Error>"), "multipart completion reported an error");
             Ok::<(), anyhow::Error>(())
         }
         .await;
         if result.is_err() {
             let query = format!("uploadId={encoded}");
-            let _ = self
-                .send(Method::DELETE, key, &query, None, None, deadline)
-                .await;
+            let _ = self.send(Method::DELETE, key, &query, None, None, deadline).await;
         }
         result
     }

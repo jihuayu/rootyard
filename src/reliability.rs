@@ -24,24 +24,13 @@ pub struct HookInstallation {
 }
 fn hook_identity(meta: &std::fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
     use std::os::unix::fs::MetadataExt;
-    (
-        meta.dev(),
-        meta.ino(),
-        meta.len(),
-        meta.mtime(),
-        meta.mtime_nsec(),
-        meta.ctime(),
-        meta.ctime_nsec(),
-    )
+    (meta.dev(), meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec())
 }
 pub fn install_hooks(root: &FsPath) -> Result<HookInstallation> {
     use std::os::unix::fs::PermissionsExt;
     let dir = root.join("managed-hooks");
     std::fs::create_dir_all(&dir)?;
-    ensure!(
-        !std::fs::symlink_metadata(&dir)?.file_type().is_symlink(),
-        "invalid hooks directory"
-    );
+    ensure!(!std::fs::symlink_metadata(&dir)?.file_type().is_symlink(), "invalid hooks directory");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     // Keep a private durable copy, not a symlink to a deploy path that may be
     // removed while this server still runs. Replacement occurs only at startup
@@ -60,20 +49,15 @@ pub fn install_hooks(root: &FsPath) -> Result<HookInstallation> {
     File::open(&dir)?.sync_all()?;
     File::open(root)?.sync_all()?;
     executable_access(&runner)?;
-    let probe = std::process::Command::new(dir.join("pre-receive"))
-        .arg("--rootyard-hook-self-check")
-        .env_clear()
-        .output()?;
+    let probe =
+        std::process::Command::new(dir.join("pre-receive")).arg("--rootyard-hook-self-check").env_clear().output()?;
     ensure!(
         probe.status.success() && probe.stdout == b"rootyard-hook-v1\n",
         "hook executable self-check failed; the data volume must permit execution"
     );
     let executable = File::open(runner)?;
     let identity = hook_identity(&executable.metadata()?);
-    Ok(HookInstallation {
-        executable,
-        identity,
-    })
+    Ok(HookInstallation { executable, identity })
 }
 fn executable_access(path: &FsPath) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -86,34 +70,22 @@ fn executable_access(path: &FsPath) -> Result<()> {
 }
 pub fn verify_hooks(state: &AppState) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let hooks = state
-        .hooks
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("write hooks not installed"))?;
+    let hooks = state.hooks.as_ref().ok_or_else(|| anyhow::anyhow!("write hooks not installed"))?;
     let dir = state.storage.root.join("managed-hooks");
-    ensure!(
-        !std::fs::symlink_metadata(&dir)?.file_type().is_symlink(),
-        "invalid hooks directory"
-    );
+    ensure!(!std::fs::symlink_metadata(&dir)?.file_type().is_symlink(), "invalid hooks directory");
     let meta = std::fs::symlink_metadata(dir.join(".runner"))?;
     ensure!(
-        meta.is_file()
-            && !meta.file_type().is_symlink()
-            && meta.permissions().mode() & 0o777 == 0o500,
+        meta.is_file() && !meta.file_type().is_symlink() && meta.permissions().mode() & 0o777 == 0o500,
         "invalid hook executable"
     );
     ensure!(
-        hook_identity(&meta) == hooks.identity
-            && hook_identity(&hooks.executable.metadata()?) == hooks.identity,
+        hook_identity(&meta) == hooks.identity && hook_identity(&hooks.executable.metadata()?) == hooks.identity,
         "hook executable changed"
     );
     executable_access(&dir.join(".runner"))?;
     for name in ["pre-receive", "reference-transaction", "post-receive"] {
         executable_access(&dir.join(name))?;
-        ensure!(
-            std::fs::read_link(dir.join(name))? == FsPath::new(".runner"),
-            "mandatory hook missing or changed"
-        );
+        ensure!(std::fs::read_link(dir.join(name))? == FsPath::new(".runner"), "mandatory hook missing or changed");
     }
     Ok(())
 }
@@ -121,12 +93,7 @@ pub fn verify_hooks(state: &AppState) -> Result<()> {
 /// Caller holds the repository write lock and has proved old writers stopped.
 /// Startup alone may finish an interrupted operation: the inherited volume flock
 /// proves no old Git process still owns this volume. Runtime never guesses this.
-pub async fn reconcile(
-    state: &AppState,
-    repo: Uuid,
-    generation: i64,
-    startup: bool,
-) -> Result<bool> {
+pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: bool) -> Result<bool> {
     let pending = match journal::pending(&state.storage.root, repo) {
         Ok(pending) => pending,
         Err(error) => {
@@ -143,8 +110,7 @@ pub async fn reconcile(
         if !startup && journal::ActiveGuard::operation_is_live(&operation)? {
             continue;
         }
-        match crate::maintenance::retire_if_resolved(&state.pool, &state.storage, &operation).await
-        {
+        match crate::maintenance::retire_if_resolved(&state.pool, &state.storage, &operation).await {
             Ok(true) => continue,
             Ok(false) => {}
             Err(error) => {
@@ -159,10 +125,7 @@ pub async fn reconcile(
                 .pool
                 .get()
                 .await?
-                .query_opt(
-                    "SELECT outcome FROM git_operations WHERE id=$1",
-                    &[&operation.id],
-                )
+                .query_opt("SELECT outcome FROM git_operations WHERE id=$1", &[&operation.id])
                 .await?;
             if known.is_some_and(|row| row.get::<_, String>(0) == "unknown") {
                 clear = false;
@@ -176,11 +139,7 @@ pub async fn reconcile(
         }
         let finished = journal::is_finished(&operation)?;
         let interrupted = journal::is_interrupted(&operation)?;
-        let evidence = (
-            journal::events(&operation),
-            journal::receipts(&operation),
-            journal::requests(&operation),
-        );
+        let evidence = (journal::events(&operation), journal::receipts(&operation), journal::requests(&operation));
         let (outcome, changes, evidence) = if operation.ci_pin.is_some() {
             match (
                 finished && operation.storage_generation == generation,
@@ -192,11 +151,7 @@ pub async fn reconcile(
             ) {
                 (true, Ok(Some(changes))) => {
                     let outcome = if changes.is_empty() {
-                        if operation.service_principal_id.is_some() {
-                            "unknown"
-                        } else {
-                            "no_ref_changes"
-                        }
+                        if operation.service_principal_id.is_some() { "unknown" } else { "no_ref_changes" }
                     } else {
                         "recorded"
                     };
@@ -256,11 +211,9 @@ pub async fn reconcile(
                     let evidence = serde_json::json!({"version":1,"finished":finished,"interrupted":interrupted,"reference_events":raw,"requested":requested,"post_receive":receipt,"storage_generation_matches":operation.storage_generation==generation,"repeated_receipt_refs":repeated});
                     (outcome, changes, evidence)
                 }
-                _ => (
-                    "unknown",
-                    Vec::new(),
-                    serde_json::json!({"version":1,"finished":finished,"invalid_journal":true}),
-                ),
+                _ => {
+                    ("unknown", Vec::new(), serde_json::json!({"version":1,"finished":finished,"invalid_journal":true}))
+                }
             }
         };
         events::publish(
@@ -303,21 +256,13 @@ async fn recovering(state: &AppState, repo: Uuid, reason: &str) -> Result<()> {
 
 pub async fn before_push(state: &AppState, repo: &db::Repository) -> Result<()> {
     verify_hooks(state)?;
-    crate::sharding::fencing::check_before_push(state, repo)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.1))?;
-    ensure!(
-        reconcile(state, repo.id, repo.storage_generation, false).await?,
-        "repository recovery required"
-    );
+    crate::sharding::fencing::check_before_push(state, repo).await.map_err(|e| anyhow::anyhow!(e.1))?;
+    ensure!(reconcile(state, repo.id, repo.storage_generation, false).await?, "repository recovery required");
     let row = state
         .pool
         .get()
         .await?
-        .query_one(
-            "SELECT state,storage_generation FROM repositories WHERE id=$1",
-            &[&repo.id],
-        )
+        .query_one("SELECT state,storage_generation FROM repositories WHERE id=$1", &[&repo.id])
         .await?;
     ensure!(
         row.get::<_, String>(0) == "ready" && row.get::<_, i64>(1) == repo.storage_generation,
@@ -327,10 +272,7 @@ pub async fn before_push(state: &AppState, repo: &db::Repository) -> Result<()> 
         .pool
         .get()
         .await?
-        .query_one(
-            "SELECT COALESCE(max(sequence),0) FROM git_operations WHERE repository_id=$1",
-            &[&repo.id],
-        )
+        .query_one("SELECT COALESCE(max(sequence),0) FROM git_operations WHERE repository_id=$1", &[&repo.id])
         .await?
         .get(0);
     if !matches!(journal::sequence(&state.storage.root,repo.id),Ok(value) if value>=maximum) {
@@ -351,13 +293,7 @@ pub async fn complete(state: &AppState, operation: Option<journal::Operation>) -
         journal::finish(&operation)?;
         // Failure keeps the journal, so another push retries ingestion first.
         ensure!(
-            reconcile(
-                state,
-                operation.repository_id,
-                operation.storage_generation,
-                false
-            )
-            .await?,
+            reconcile(state, operation.repository_id, operation.storage_generation, false).await?,
             "push outcome unknown"
         );
     }
@@ -408,11 +344,7 @@ pub async fn recover_pending(state: &AppState) -> Result<()> {
         count += 1;
         ensure!(count <= 100_000, "journal repository listing exceeds limit");
         let entry = entry?;
-        let Some(id) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<Uuid>().ok())
-        else {
+        let Some(id) = entry.file_name().to_str().and_then(|s| s.parse::<Uuid>().ok()) else {
             continue;
         };
         let row = state
@@ -431,11 +363,8 @@ pub async fn recover_pending(state: &AppState) -> Result<()> {
             {
                 continue;
             }
-            let Ok(_guard) = tokio::time::timeout(
-                std::time::Duration::from_millis(1),
-                state.storage.write_lock(id),
-            )
-            .await
+            let Ok(_guard) =
+                tokio::time::timeout(std::time::Duration::from_millis(1), state.storage.write_lock(id)).await
             else {
                 continue;
             };
@@ -460,12 +389,7 @@ pub async fn worker_once(state: &AppState) -> Result<usize> {
     }
     Ok(count)
 }
-async fn authorized_repo(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
-) -> Result<Uuid, Error> {
+async fn authorized_repo(state: &AppState, headers: &HeaderMap, owner: &str, name: &str) -> Result<Uuid, Error> {
     let identity = auth::authenticate(&state.pool, headers).await?;
     if owner != identity.username || !db::valid_name(name) {
         return Err(Error::not_found());
@@ -475,10 +399,7 @@ async fn authorized_repo(
         .get()
         .await
         .map_err(Error::internal)?
-        .query_opt(
-            "SELECT id FROM repositories WHERE owner_id=$1 AND name=$2",
-            &[&identity.id, &name],
-        )
+        .query_opt("SELECT id FROM repositories WHERE owner_id=$1 AND name=$2", &[&identity.id, &name])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?
@@ -494,11 +415,7 @@ pub async fn operations(
     Ok((
         StatusCode::OK,
         [(header::CACHE_CONTROL, "no-store")],
-        Json(
-            rows.iter()
-                .map(|r| r.get::<_, serde_json::Value>(0))
-                .collect::<Vec<_>>(),
-        ),
+        Json(rows.iter().map(|r| r.get::<_, serde_json::Value>(0)).collect::<Vec<_>>()),
     )
         .into_response())
 }
@@ -512,11 +429,7 @@ pub async fn event_list(
     Ok((
         StatusCode::OK,
         [(header::CACHE_CONTROL, "no-store")],
-        Json(
-            rows.iter()
-                .map(|r| r.get::<_, serde_json::Value>(0))
-                .collect::<Vec<_>>(),
-        ),
+        Json(rows.iter().map(|r| r.get::<_, serde_json::Value>(0)).collect::<Vec<_>>()),
     )
         .into_response())
 }
@@ -531,11 +444,7 @@ pub async fn resolutions(
     Ok((
         StatusCode::OK,
         [(header::CACHE_CONTROL, "no-store")],
-        Json(
-            rows.iter()
-                .map(|r| r.get::<_, serde_json::Value>(0))
-                .collect::<Vec<_>>(),
-        ),
+        Json(rows.iter().map(|r| r.get::<_, serde_json::Value>(0)).collect::<Vec<_>>()),
     )
         .into_response())
 }

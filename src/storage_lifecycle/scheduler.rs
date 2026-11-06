@@ -11,26 +11,17 @@ use uuid::Uuid;
 async fn local_primary(state: &AppState, repo: Uuid) -> Result<bool> {
     let client = state.pool.get().await?;
     let local = std::env::var("ROOTYARD_NODE_ID").ok();
-    if local
-        .as_ref()
-        .is_some_and(|id| !crate::sharding::models::valid_node_id(id))
-    {
+    if local.as_ref().is_some_and(|id| !crate::sharding::models::valid_node_id(id)) {
         bail!("invalid local node identity");
     }
     let row = client
-        .query_opt(
-            "SELECT primary_node_id FROM repository_shard_routes WHERE repository_id=$1",
-            &[&repo],
-        )
+        .query_opt("SELECT primary_node_id FROM repository_shard_routes WHERE repository_id=$1", &[&repo])
         .await?;
     match (local, row) {
         (Some(id), Some(row)) => Ok(id == row.get::<_, String>(0)),
         (Some(id), None) => Ok(id == crate::sharding::models::DEFAULT_NODE_ID),
         (None, _) => {
-            let count: i64 = client
-                .query_one("SELECT count(*) FROM shard_nodes", &[])
-                .await?
-                .get(0);
+            let count: i64 = client.query_one("SELECT count(*) FROM shard_nodes", &[]).await?.get(0);
             Ok(count <= 1)
         }
     }
@@ -59,13 +50,9 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
         }
         // Count-objects is a native GitFS reader too. Hold the cross-process
         // barrier through child quiescence, including a lost-lease abort.
-        let read = crate::storage::read_leases::shared(
-            &state.pool,
-            repo,
-            Instant::now() + state.config.git_timeout,
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("repository reader barrier unavailable"))?;
+        let read = crate::storage::read_leases::shared(&state.pool, repo, Instant::now() + state.config.git_timeout)
+            .await
+            .map_err(|_| anyhow::anyhow!("repository reader barrier unavailable"))?;
         let cancel = CancellationToken::new();
         let count = gitfs::count(state, repo, &cancel);
         tokio::pin!(count);
@@ -82,8 +69,7 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
                 }
             }
         };
-        read.ensure_active()
-            .map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+        read.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
         drop(read);
         let client = state.pool.get().await?;
         let updated=client.execute(
@@ -113,32 +99,18 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
         if repack && jobs::enqueue(&state.pool, repo, tenant, generation, "gitfs_repack").await? {
             scheduled += 1;
         }
-        if repack
-            && jobs::enqueue(&state.pool, repo, tenant, generation, "gitfs_cache_hydrate").await?
-        {
+        if repack && jobs::enqueue(&state.pool, repo, tenant, generation, "gitfs_cache_hydrate").await? {
             scheduled += 1;
         }
-        if jobs::enqueue(
-            &state.pool,
-            repo,
-            tenant,
-            generation,
-            "gitfs_unreachable_mark",
-        )
-        .await?
-        {
+        if jobs::enqueue(&state.pool, repo, tenant, generation, "gitfs_unreachable_mark").await? {
             scheduled += 1;
         }
         if gc::PHYSICAL_DELETE_ENABLED {
-            let graph = state
-                .storage
-                .repo_path(repo)
-                .join("objects/info/commit-graph");
+            let graph = state.storage.repo_path(repo).join("objects/info/commit-graph");
             if let Ok(meta) = std::fs::symlink_metadata(graph)
                 && meta.is_file()
                 && !meta.file_type().is_symlink()
-                && meta.modified()?.elapsed().unwrap_or_default().as_secs()
-                    >= policy.cache_max_age_seconds as u64
+                && meta.modified()?.elapsed().unwrap_or_default().as_secs() >= policy.cache_max_age_seconds as u64
                 && jobs::enqueue(&state.pool, repo, tenant, generation, "gitfs_cache_evict").await?
             {
                 scheduled += 1;
@@ -152,16 +124,7 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
                 )
                 .await?
                 .get(0);
-            if due
-                && jobs::enqueue(
-                    &state.pool,
-                    repo,
-                    tenant,
-                    generation,
-                    "gitfs_tombstone_delete",
-                )
-                .await?
-            {
+            if due && jobs::enqueue(&state.pool, repo, tenant, generation, "gitfs_tombstone_delete").await? {
                 scheduled += 1;
             }
         }

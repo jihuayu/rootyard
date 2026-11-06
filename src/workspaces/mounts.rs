@@ -26,18 +26,10 @@ pub fn enabled() -> bool {
     std::env::var("ROOTYARD_WORKSPACE_MOUNT_MODE").as_deref() == Ok("fuse")
 }
 pub fn lower_path(state: &AppState, id: Uuid) -> PathBuf {
-    state
-        .storage
-        .root
-        .join("workspace-service/workspaces")
-        .join(id.to_string())
+    state.storage.root.join("workspace-service/workspaces").join(id.to_string())
 }
 pub fn mount_path(state: &AppState, id: Uuid) -> PathBuf {
-    state
-        .storage
-        .root
-        .join("workspace-service/mounts")
-        .join(id.to_string())
+    state.storage.root.join("workspace-service/mounts").join(id.to_string())
 }
 pub fn mounted(id: Uuid) -> bool {
     !enabled() || registry().lock().unwrap().contains_key(&id)
@@ -83,10 +75,7 @@ pub fn with_frozen<T>(id: Uuid, work: impl FnOnce() -> Result<T, Error>) -> Resu
         .ok_or_else(|| Error::internal("workspace FUSE mount missing"))?;
     gate.freeze(work)
 }
-pub async fn with_frozen_async<T>(
-    id: Uuid,
-    work: impl Future<Output = Result<T, Error>>,
-) -> Result<T, Error> {
+pub async fn with_frozen_async<T>(id: Uuid, work: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
     if !enabled() {
         return work.await;
     }
@@ -125,11 +114,7 @@ pub fn ensure(state: &AppState, id: Uuid, until: i64) -> Result<(), Error> {
     if !lower.join(".git").is_dir() {
         return Err(Error::internal("workspace lower Git state missing"));
     }
-    let upper = state
-        .storage
-        .root
-        .join("workspace-service/uppers")
-        .join(id.to_string());
+    let upper = state.storage.root.join("workspace-service/uppers").join(id.to_string());
     let mountpoint = mount_path(state, id);
     fs::create_dir_all(&upper).map_err(Error::internal)?;
     fs::create_dir_all(&mountpoint).map_err(Error::internal)?;
@@ -138,19 +123,10 @@ pub fn ensure(state: &AppState, id: Uuid, until: i64) -> Result<(), Error> {
     let session = fuser::spawn_mount2(
         overlay,
         &mountpoint,
-        &[
-            MountOption::FSName("rootyard-workspace".into()),
-            MountOption::DefaultPermissions,
-        ],
+        &[MountOption::FSName("rootyard-workspace".into()), MountOption::DefaultPermissions],
     )
     .map_err(Error::internal)?;
-    registry.insert(
-        id,
-        Mounted {
-            _session: session,
-            gate,
-        },
-    );
+    registry.insert(id, Mounted { _session: session, gate });
     Ok(())
 }
 pub async fn ensure_from_database(state: &AppState, id: Uuid) -> Result<(), Error> {

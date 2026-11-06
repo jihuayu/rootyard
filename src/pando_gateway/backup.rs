@@ -30,14 +30,8 @@ pub struct PandoBackupManifest {
     pub packs: Vec<PackManifest>,
 }
 
-async fn inventory<C: GenericClient + Sync>(
-    client: &C,
-    repo_id: Uuid,
-) -> Result<PandoBackupManifest> {
-    let level: String = client
-        .query_one("SHOW transaction_isolation", &[])
-        .await?
-        .get(0);
+async fn inventory<C: GenericClient + Sync>(client: &C, repo_id: Uuid) -> Result<PandoBackupManifest> {
+    let level: String = client.query_one("SHOW transaction_isolation", &[]).await?.get(0);
     ensure!(
         matches!(level.as_str(), "repeatable read" | "serializable"),
         "Pando backup requires a repeatable-read caller transaction"
@@ -45,10 +39,7 @@ async fn inventory<C: GenericClient + Sync>(
     // A bare Client in autocommit mode can report repeatable-read as its
     // default yet use a different snapshot for every query. Force an XID and
     // require the same transaction at the end of enumeration.
-    let transaction_id: String = client
-        .query_one("SELECT txid_current()::text", &[])
-        .await?
-        .get(0);
+    let transaction_id: String = client.query_one("SELECT txid_current()::text", &[]).await?.get(0);
     let row = client
         .query_one(
             "SELECT r.owner_id,r.storage_backend,r.storage_generation,r.object_format, \
@@ -59,16 +50,12 @@ async fn inventory<C: GenericClient + Sync>(
         )
         .await?;
     ensure!(
-        row.get::<_, &str>("storage_backend") == "pando"
-            && row.get::<_, &str>("state") == "serving",
+        row.get::<_, &str>("storage_backend") == "pando" && row.get::<_, &str>("state") == "serving",
         "Pando backup requires a serving PG snapshot"
     );
     let tenant_id: Uuid = row.get("owner_id");
     let pack_ids: Vec<Uuid> = row.get("pack_ids");
-    ensure!(
-        !pack_ids.is_empty() && pack_ids.len() <= MAX_PACKS,
-        "Pando pack closure exceeds bound"
-    );
+    ensure!(!pack_ids.is_empty() && pack_ids.len() <= MAX_PACKS, "Pando pack closure exceeds bound");
     let mut packs = Vec::with_capacity(pack_ids.len());
     for id in pack_ids {
         let record = client
@@ -93,24 +80,15 @@ async fn inventory<C: GenericClient + Sync>(
         packs.push(manifest);
     }
     let records = client
-        .query(
-            "SELECT ref_name,oid FROM pando_refs WHERE repository_id=$1 ORDER BY ref_name",
-            &[&repo_id],
-        )
+        .query("SELECT ref_name,oid FROM pando_refs WHERE repository_id=$1 ORDER BY ref_name", &[&repo_id])
         .await?;
     ensure!(records.len() <= MAX_REFS, "Pando ref closure exceeds bound");
     let mut refs = BTreeMap::new();
     for record in records {
         refs.insert(record.get(0), record.get(1));
     }
-    let after_id: String = client
-        .query_one("SELECT txid_current()::text", &[])
-        .await?
-        .get(0);
-    ensure!(
-        transaction_id == after_id,
-        "Pando backup caller changed PostgreSQL snapshots during enumeration"
-    );
+    let after_id: String = client.query_one("SELECT txid_current()::text", &[]).await?.get(0);
+    ensure!(transaction_id == after_id, "Pando backup caller changed PostgreSQL snapshots during enumeration");
     Ok(PandoBackupManifest {
         version: 1,
         repository_id: repo_id,
@@ -147,16 +125,10 @@ async fn copy_artifact(
     upload: bool,
 ) -> Result<()> {
     let [cipher, envelope] = keys(tenant_id, artifact)?;
-    for (key, size) in [
-        (&cipher, artifact.ciphertext_bytes),
-        (&envelope, artifact.envelope_bytes),
-    ] {
+    for (key, size) in [(&cipher, artifact.ciphertext_bytes), (&envelope, artifact.envelope_bytes)] {
         let path = root.join(key.path());
         if upload {
-            ensure!(
-                fs::symlink_metadata(&path).await?.is_file(),
-                "backup object is not a regular file"
-            );
+            ensure!(fs::symlink_metadata(&path).await?.is_file(), "backup object is not a regular file");
             remote.put_file(key, &path, size, deadline).await?;
         } else {
             remote.get_to_file(key, &path, size, deadline).await?;
@@ -166,8 +138,7 @@ async fn copy_artifact(
     let bytes = fs::read(envelope_path).await?;
     ensure!(
         hex::encode(Sha256::digest(&bytes)) == artifact.envelope_sha256
-            && serde_json::from_slice::<serde_json::Value>(&bytes)?
-                == serde_json::to_value(&artifact.envelope)?,
+            && serde_json::from_slice::<serde_json::Value>(&bytes)? == serde_json::to_value(&artifact.envelope)?,
         "Pando backup envelope differs from PostgreSQL manifest"
     );
     Ok(())
@@ -186,33 +157,12 @@ pub async fn export_closure<C: GenericClient + Sync>(
     std::fs::DirBuilder::new().mode(0o700).create(destination)?;
     let result = async {
         for pack in &manifest.packs {
-            Box::pin(copy_artifact(
-                remote,
-                destination,
-                manifest.tenant_id,
-                &pack.pack,
-                deadline,
-                false,
-            ))
-            .await?;
-            Box::pin(copy_artifact(
-                remote,
-                destination,
-                manifest.tenant_id,
-                &pack.index,
-                deadline,
-                false,
-            ))
-            .await?;
+            Box::pin(copy_artifact(remote, destination, manifest.tenant_id, &pack.pack, deadline, false)).await?;
+            Box::pin(copy_artifact(remote, destination, manifest.tenant_id, &pack.index, deadline, false)).await?;
         }
         let bytes = serde_json::to_vec(&manifest)?;
         let temp = destination.join(".manifest.tmp");
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)
-            .await?;
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp).await?;
         file.write_all(&bytes).await?;
         file.sync_all().await?;
         fs::rename(temp, destination.join("manifest.json")).await?;
@@ -236,32 +186,15 @@ pub async fn import_closure<C: GenericClient + Sync>(
     source: &Path,
     deadline: Instant,
 ) -> Result<PandoBackupManifest> {
-    let expected: PandoBackupManifest =
-        serde_json::from_slice(&fs::read(source.join("manifest.json")).await?)?;
+    let expected: PandoBackupManifest = serde_json::from_slice(&fs::read(source.join("manifest.json")).await?)?;
     let actual = Box::pin(inventory(client, repo_id)).await?;
     ensure!(
         serde_json::to_value(&expected)? == serde_json::to_value(&actual)?,
         "Pando restore manifest differs from restored PostgreSQL snapshot"
     );
     for pack in &actual.packs {
-        Box::pin(copy_artifact(
-            remote,
-            source,
-            actual.tenant_id,
-            &pack.pack,
-            deadline,
-            true,
-        ))
-        .await?;
-        Box::pin(copy_artifact(
-            remote,
-            source,
-            actual.tenant_id,
-            &pack.index,
-            deadline,
-            true,
-        ))
-        .await?;
+        Box::pin(copy_artifact(remote, source, actual.tenant_id, &pack.pack, deadline, true)).await?;
+        Box::pin(copy_artifact(remote, source, actual.tenant_id, &pack.index, deadline, true)).await?;
     }
     Ok(actual)
 }

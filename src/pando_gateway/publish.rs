@@ -17,10 +17,7 @@ use uuid::Uuid;
 
 const MAX_PACKS: usize = 256;
 fn conflict() -> Error {
-    Error(
-        StatusCode::CONFLICT,
-        "Pando refs changed; retry from current refs",
-    )
+    Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs")
 }
 
 /// Caller has completed native receive-pack in a disposable Snapshot and
@@ -47,18 +44,14 @@ pub async fn publish(
     {
         return Err(conflict());
     }
-    let expected: BTreeMap<_, _> = requested
-        .iter()
-        .map(|change| (change.ref_name.as_str(), (&change.old_oid, &change.new_oid)))
-        .collect();
+    let expected: BTreeMap<_, _> =
+        requested.iter().map(|change| (change.ref_name.as_str(), (&change.old_oid, &change.new_oid))).collect();
     if expected.len() != requested.len()
-        || prepared.changes.iter().any(|change| {
-            expected.get(change.ref_name.as_str()) != Some(&(&change.old_oid, &change.new_oid))
-        })
-        || guard
-            .refs()
+        || prepared
+            .changes
             .iter()
-            .any(|name| !expected.contains_key(name.as_str()))
+            .any(|change| expected.get(change.ref_name.as_str()) != Some(&(&change.old_oid, &change.new_oid)))
+        || guard.refs().iter().any(|name| !expected.contains_key(name.as_str()))
     {
         return Err(conflict());
     }
@@ -78,17 +71,20 @@ pub async fn publish(
     crate::sharding::fencing::check_before_push(state, repo).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access =
-        auth::authorize_repo_with_role(&tx, actor, &repo.owner, &repo.name, auth::Role::Write)
-            .await?;
+    let access = auth::authorize_repo_with_role(&tx, actor, &repo.owner, &repo.name, auth::Role::Write).await?;
     if access.repo_id != repo.id || access.owner_id != tenant_id {
         return Err(conflict());
     }
-    let current = tx.query_one("SELECT r.storage_generation,r.storage_backend,r.object_format,
+    let current = tx
+        .query_one(
+            "SELECT r.storage_generation,r.storage_backend,r.object_format,
         s.state,s.storage_generation AS pando_generation,s.ref_generation,s.operation_sequence,
         s.object_format AS pando_format,s.pack_ids FROM repositories r JOIN pando_repository_states s
         ON s.repository_id=r.id WHERE r.id=$1 AND s.tenant_id=$2 FOR UPDATE OF s",
-        &[&repo.id,&tenant_id]).await.map_err(Error::internal)?;
+            &[&repo.id, &tenant_id],
+        )
+        .await
+        .map_err(Error::internal)?;
     if current.get::<_, i64>("storage_generation") != repo.storage_generation
         || current.get::<_, i64>("pando_generation") != repo.storage_generation
         || current.get::<_, &str>("storage_backend") != "pando"
@@ -112,17 +108,12 @@ pub async fn publish(
             .await
             .map_err(Error::internal)?;
         let zero = "0".repeat(change.old_oid.len());
-        let actual = old
-            .as_ref()
-            .map(|row| row.get::<_, String>(0))
-            .unwrap_or(zero);
+        let actual = old.as_ref().map(|row| row.get::<_, String>(0)).unwrap_or(zero);
         if actual != change.old_oid {
             return Err(conflict());
         }
     }
-    let timeout = deadline
-        .saturating_duration_since(Instant::now())
-        .min(Duration::from_secs(120));
+    let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
     if timeout.is_zero() {
         return Err(Error::timeout());
     }
@@ -137,18 +128,16 @@ pub async fn publish(
         )))
         .await??;
     guard
-        .guard(Box::pin(
-            crate::lfs::publication::validate_new_refs_with_client(
-                &*tx,
-                snapshot.path(),
-                &state.storage.root,
-                &state.config.git,
-                timeout,
-                repo.id,
-                tenant_id,
-                &prepared.changes,
-            ),
-        ))
+        .guard(Box::pin(crate::lfs::publication::validate_new_refs_with_client(
+            &*tx,
+            snapshot.path(),
+            &state.storage.root,
+            &state.config.git,
+            timeout,
+            repo.id,
+            tenant_id,
+            &prepared.changes,
+        )))
         .await??;
     guard
         .guard(Box::pin(crate::lfs::locks::validate_new_refs_with_client(
@@ -169,32 +158,21 @@ pub async fn publish(
             .query_opt(
                 "SELECT manifest FROM pando_pack_manifests WHERE id=$1 AND repository_id=$2
             AND tenant_id=$3 AND storage_generation=$4 AND object_format=$5",
-                &[
-                    &pack.id,
-                    &repo.id,
-                    &tenant_id,
-                    &repo.storage_generation,
-                    &repo.object_format,
-                ],
+                &[&pack.id, &repo.id, &tenant_id, &repo.storage_generation, &repo.object_format],
             )
             .await
             .map_err(Error::internal)?
             .ok_or_else(conflict)?;
-        if row.get::<_, serde_json::Value>(0)
-            != serde_json::to_value(pack).map_err(Error::internal)?
-        {
+        if row.get::<_, serde_json::Value>(0) != serde_json::to_value(pack).map_err(Error::internal)? {
             return Err(conflict());
         }
         pack_ids.push(pack.id);
     }
     for change in &prepared.changes {
         if change.new_oid.bytes().all(|byte| byte == b'0') {
-            tx.execute(
-                "DELETE FROM pando_refs WHERE repository_id=$1 AND ref_name=$2",
-                &[&repo.id, &change.ref_name],
-            )
-            .await
-            .map_err(Error::internal)?;
+            tx.execute("DELETE FROM pando_refs WHERE repository_id=$1 AND ref_name=$2", &[&repo.id, &change.ref_name])
+                .await
+                .map_err(Error::internal)?;
         } else {
             tx.execute(
                 "INSERT INTO pando_refs(repository_id,ref_name,oid,updated_generation)
@@ -239,9 +217,7 @@ pub async fn publish(
             new_oid: change.new_oid.clone(),
         })
         .collect();
-    events::publish_in_tx(&tx, &record, &events)
-        .await
-        .map_err(Error::internal)?;
+    events::publish_in_tx(&tx, &record, &events).await.map_err(Error::internal)?;
     window.ensure_active()?;
     auth::finish_tx(tx, actor, true).await?;
     state.dispatch.committed();

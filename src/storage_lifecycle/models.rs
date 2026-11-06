@@ -20,11 +20,7 @@ pub struct Policy {
 }
 
 fn number(name: &str, default: i64, min: i64, max: i64) -> Result<i64> {
-    let n = env::var(name)
-        .ok()
-        .map(|v| v.parse::<i64>())
-        .transpose()?
-        .unwrap_or(default);
+    let n = env::var(name).ok().map(|v| v.parse::<i64>()).transpose()?.unwrap_or(default);
     if n < min || n > max {
         bail!("{name} is outside the supported range");
     }
@@ -39,21 +35,11 @@ impl Policy {
         };
         Ok(Self {
             enabled,
-            poll: Duration::from_secs(number(
-                "ROOTYARD_STORAGE_MAINTENANCE_POLL_SECONDS",
-                5,
-                1,
-                3600,
-            )? as u64),
+            poll: Duration::from_secs(number("ROOTYARD_STORAGE_MAINTENANCE_POLL_SECONDS", 5, 1, 3600)? as u64),
             lease_seconds: number("ROOTYARD_STORAGE_MAINTENANCE_LEASE_SECONDS", 30, 5, 300)?,
             loose_threshold: number("ROOTYARD_STORAGE_REPACK_LOOSE_OBJECTS", 1024, 1, 1_000_000)?,
             pack_threshold: number("ROOTYARD_STORAGE_REPACK_PACKS", 8, 1, 10_000)?,
-            stage_age_seconds: number(
-                "ROOTYARD_STORAGE_STAGE_AGE_SECONDS",
-                3600,
-                1,
-                365 * 24 * 3600,
-            )?,
+            stage_age_seconds: number("ROOTYARD_STORAGE_STAGE_AGE_SECONDS", 3600, 1, 365 * 24 * 3600)?,
             cache_max_age_seconds: number(
                 "ROOTYARD_STORAGE_CACHE_MAX_AGE_SECONDS",
                 7 * 24 * 3600,
@@ -66,12 +52,7 @@ impl Policy {
                 1,
                 365 * 24 * 3600,
             )?,
-            scan_period_seconds: number(
-                "ROOTYARD_STORAGE_SCAN_PERIOD_SECONDS",
-                3600,
-                1,
-                365 * 24 * 3600,
-            )?,
+            scan_period_seconds: number("ROOTYARD_STORAGE_SCAN_PERIOD_SECONDS", 3600, 1, 365 * 24 * 3600)?,
             max_attempts: number("ROOTYARD_STORAGE_MAINTENANCE_MAX_ATTEMPTS", 5, 1, 100)? as i32,
         })
     }

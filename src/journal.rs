@@ -20,12 +20,8 @@ const MAX_REFS: usize = 4096;
 
 #[path = "journal/core.rs"]
 mod core;
-pub use core::{
-    ActiveGuard, HookEvent, HookPhase, Operation, RefChange, begin, begin_active, pending, sequence,
-};
-pub(crate) use core::{
-    atomic, begin_ci, begin_ci_service, begin_proposal, exists, mkdir, read, safe_path,
-};
+pub use core::{ActiveGuard, HookEvent, HookPhase, Operation, RefChange, begin, begin_active, pending, sequence};
+pub(crate) use core::{atomic, begin_ci, begin_ci_service, begin_proposal, exists, mkdir, read, safe_path};
 use core::{entries, load, op_name, sync_dir, validate};
 
 pub(crate) fn valid_ref(s: &str) -> bool {
@@ -39,24 +35,16 @@ pub(crate) fn valid_ref(s: &str) -> bool {
         && !s.ends_with('.')
         && !s.contains("..")
         && !s.contains("@{")
-        && s.split('/')
-            .all(|p| !p.is_empty() && !p.starts_with('.') && !p.ends_with(".lock"))
-        && !s
-            .bytes()
-            .any(|b| b <= 32 || b == 127 || b"~^:?*[\\".contains(&b))
+        && s.split('/').all(|p| !p.is_empty() && !p.starts_with('.') && !p.ends_with(".lock"))
+        && !s.bytes().any(|b| b <= 32 || b == 127 || b"~^:?*[\\".contains(&b))
 }
 fn valid_oid(s: &str) -> bool {
-    matches!(s.len(), 40 | 64)
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 fn parse(input: &[u8]) -> Result<Vec<RefChange>> {
     ensure!(input.len() <= MAX_BYTES, "hook payload exceeds limit");
     let text = std::str::from_utf8(input).context("non UTF-8 ref transaction")?;
-    ensure!(
-        text.is_empty() || text.ends_with('\n'),
-        "truncated hook payload"
-    );
+    ensure!(text.is_empty() || text.ends_with('\n'), "truncated hook payload");
     let mut result = Vec::new();
     for (index, line) in text.lines().enumerate() {
         ensure!(index < MAX_REFS, "too many reference updates");
@@ -69,11 +57,7 @@ fn parse(input: &[u8]) -> Result<Vec<RefChange>> {
                 && valid_ref(fields[2]),
             "unsupported reference transaction payload"
         );
-        result.push(RefChange {
-            old_oid: fields[0].into(),
-            new_oid: fields[1].into(),
-            ref_name: fields[2].into(),
-        });
+        result.push(RefChange { old_oid: fields[0].into(), new_oid: fields[1].into(), ref_name: fields[2].into() });
     }
     Ok(result)
 }
@@ -94,17 +78,11 @@ pub fn events(op: &Operation) -> Result<Vec<HookEvent>> {
 }
 fn events_with_size(op: &Operation) -> Result<(Vec<HookEvent>, usize)> {
     validate(op)?;
-    ensure!(
-        !exists(&op.path.join("corrupt"))?,
-        "journal has incomplete hook evidence"
-    );
+    ensure!(!exists(&op.path.join("corrupt"))?, "journal has incomplete hook evidence");
     let mut result = Vec::new();
     let mut total_bytes = 0usize;
     for path in entries(&op.path)? {
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .context("invalid event filename")?;
+        let name = path.file_name().and_then(|s| s.to_str()).context("invalid event filename")?;
         if name == "operation.json"
             || name == "hook.lock"
             || name == "active.lock"
@@ -116,32 +94,20 @@ fn events_with_size(op: &Operation) -> Result<(Vec<HookEvent>, usize)> {
         {
             continue;
         }
-        let ordinal = name
-            .strip_suffix(".event.json")
-            .context("unexpected journal record")?;
+        let ordinal = name.strip_suffix(".event.json").context("unexpected journal record")?;
         let bytes = read(&path)?;
-        total_bytes = total_bytes
-            .checked_add(bytes.len())
-            .context("event byte count overflow")?;
-        ensure!(
-            total_bytes <= MAX_EVENT_BYTES,
-            "operation event log exceeds byte limit"
-        );
+        total_bytes = total_bytes.checked_add(bytes.len()).context("event byte count overflow")?;
+        ensure!(total_bytes <= MAX_EVENT_BYTES, "operation event log exceeds byte limit");
         let event: HookEvent = serde_json::from_slice(&bytes)?;
         ensure!(
-            event.ordinal > 0
-                && ordinal == format!("{:020}", event.ordinal)
-                && valid_changes(&event.changes),
+            event.ordinal > 0 && ordinal == format!("{:020}", event.ordinal) && valid_changes(&event.changes),
             "invalid hook event"
         );
         result.push(event);
     }
     result.sort_by_key(|e| e.ordinal);
     ensure!(
-        result
-            .iter()
-            .enumerate()
-            .all(|(i, e)| e.ordinal == i as i64 + 1),
+        result.iter().enumerate().all(|(i, e)| e.ordinal == i as i64 + 1),
         "missing or duplicate hook event ordinal"
     );
     Ok((result, total_bytes))
@@ -151,10 +117,7 @@ fn events_with_size(op: &Operation) -> Result<(Vec<HookEvent>, usize)> {
 /// outcome from its presence: the caller must separately verify normal exit.
 pub fn receipts(op: &Operation) -> Result<Option<Vec<RefChange>>> {
     validate(op)?;
-    ensure!(
-        !exists(&op.path.join("corrupt"))?,
-        "journal has incomplete hook evidence"
-    );
+    ensure!(!exists(&op.path.join("corrupt"))?, "journal has incomplete hook evidence");
     let path = op.path.join("post-receive.json");
     if !exists(&path)? {
         return Ok(None);
@@ -179,9 +142,7 @@ fn validate_request(changes: &[RefChange]) -> Result<()> {
     ensure!(valid_changes(changes), "invalid pre-receive request");
     let mut names = HashSet::new();
     ensure!(
-        changes
-            .iter()
-            .all(|c| c.ref_name.starts_with("refs/") && names.insert(&c.ref_name)),
+        changes.iter().all(|c| c.ref_name.starts_with("refs/") && names.insert(&c.ref_name)),
         "duplicate or unsupported pre-receive ref target"
     );
     Ok(())
@@ -215,9 +176,7 @@ pub fn evidence(op: &Operation) -> Result<serde_json::Value> {
 }
 pub fn evidence_digest(op: &Operation) -> Result<String> {
     use sha2::Digest;
-    Ok(hex::encode(sha2::Sha256::digest(serde_json::to_vec(
-        &evidence(op)?,
-    )?)))
+    Ok(hex::encode(sha2::Sha256::digest(serde_json::to_vec(&evidence(op)?)?)))
 }
 pub fn finish(op: &Operation) -> Result<()> {
     validate(op)?;
@@ -256,10 +215,7 @@ fn hook_lock(op: &Operation) -> Result<File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(op.path.join("hook.lock"))?;
-    ensure!(
-        file.metadata()?.is_file(),
-        "hook lock is not a regular file"
-    );
+    ensure!(file.metadata()?.is_file(), "hook lock is not a regular file");
     file.lock_exclusive()?;
     Ok(file)
 }
@@ -270,50 +226,23 @@ fn record(op: &Operation, phase: HookPhase, input: &[u8]) -> Result<()> {
     validate_namespace(op, &changes)?;
     let (previous, total_bytes) = events_with_size(op)?;
     ensure!(previous.len() < MAX_ENTRIES - 7, "too many hook events");
-    let ordinal = previous
-        .last()
-        .map_or(0, |e| e.ordinal)
-        .checked_add(1)
-        .context("hook event ordinal exhausted")?;
-    let event = HookEvent {
-        ordinal,
-        phase,
-        changes,
-    };
+    let ordinal = previous.last().map_or(0, |e| e.ordinal).checked_add(1).context("hook event ordinal exhausted")?;
+    let event = HookEvent { ordinal, phase, changes };
     let bytes = serde_json::to_vec(&event)?;
-    ensure!(
-        bytes.len() <= MAX_RECORD_BYTES,
-        "event record exceeds byte limit"
-    );
-    ensure!(
-        bytes.len() <= MAX_EVENT_BYTES - total_bytes,
-        "operation event log exceeds byte limit"
-    );
-    atomic(
-        &op.path.join(format!("{ordinal:020}.event.json")),
-        &bytes,
-        false,
-    )
+    ensure!(bytes.len() <= MAX_RECORD_BYTES, "event record exceeds byte limit");
+    ensure!(bytes.len() <= MAX_EVENT_BYTES - total_bytes, "operation event log exceeds byte limit");
+    atomic(&op.path.join(format!("{ordinal:020}.event.json")), &bytes, false)
 }
 fn record_receipt(op: &Operation, input: &[u8]) -> Result<()> {
     let _lock = hook_lock(op)?;
     ensure!(!is_finished(op)?, "operation already finished");
     let changes = parse(input)?;
-    ensure!(
-        changes.iter().all(|c| c.ref_name.starts_with("refs/")),
-        "post-receive contains pseudoref"
-    );
+    ensure!(changes.iter().all(|c| c.ref_name.starts_with("refs/")), "post-receive contains pseudoref");
     // Native receive-pack invokes post-receive once. Duplicate callbacks are
     // ambiguous even if identical, so never silently deduplicate them.
-    ensure!(
-        !exists(&op.path.join("post-receive.json"))?,
-        "duplicate post-receive receipt"
-    );
+    ensure!(!exists(&op.path.join("post-receive.json"))?, "duplicate post-receive receipt");
     let bytes = serde_json::to_vec(&changes)?;
-    ensure!(
-        bytes.len() <= MAX_RECORD_BYTES,
-        "receipt record exceeds byte limit"
-    );
+    ensure!(bytes.len() <= MAX_RECORD_BYTES, "receipt record exceeds byte limit");
     atomic(&op.path.join("post-receive.json"), &bytes, false)
 }
 fn record_request(op: &Operation, input: &[u8]) -> Result<()> {
@@ -321,15 +250,9 @@ fn record_request(op: &Operation, input: &[u8]) -> Result<()> {
     ensure!(!is_finished(op)?, "operation already finished");
     let changes = parse(input)?;
     validate_request(&changes)?;
-    ensure!(
-        !exists(&op.path.join("pre-receive.json"))?,
-        "duplicate pre-receive request"
-    );
+    ensure!(!exists(&op.path.join("pre-receive.json"))?, "duplicate pre-receive request");
     let bytes = serde_json::to_vec(&changes)?;
-    ensure!(
-        bytes.len() <= MAX_RECORD_BYTES,
-        "request record exceeds byte limit"
-    );
+    ensure!(bytes.len() <= MAX_RECORD_BYTES, "request record exceeds byte limit");
     atomic(&op.path.join("pre-receive.json"), &bytes, false)
 }
 
@@ -339,13 +262,7 @@ pub fn record_ref_transaction_intent(op: &Operation, changes: &[RefChange]) -> R
     validate_request(changes)?;
     let mut input = Vec::new();
     for change in changes {
-        input.extend_from_slice(
-            format!(
-                "{} {} {}\n",
-                change.old_oid, change.new_oid, change.ref_name
-            )
-            .as_bytes(),
-        );
+        input.extend_from_slice(format!("{} {} {}\n", change.old_oid, change.new_oid, change.ref_name).as_bytes());
     }
     record_request(op, &input)
 }
@@ -355,13 +272,7 @@ pub fn record_ref_transaction_receipt(op: &Operation, changes: &[RefChange]) -> 
     validate_request(changes)?;
     let mut input = Vec::new();
     for change in changes {
-        input.extend_from_slice(
-            format!(
-                "{} {} {}\n",
-                change.old_oid, change.new_oid, change.ref_name
-            )
-            .as_bytes(),
-        );
+        input.extend_from_slice(format!("{} {} {}\n", change.old_oid, change.new_oid, change.ref_name).as_bytes());
     }
     record(op, HookPhase::Committed, &input)?;
     record_receipt(op, &input)
@@ -371,10 +282,7 @@ pub fn record_ref_transaction_receipt(op: &Operation, changes: &[RefChange]) -> 
 pub fn run_pre_receive() -> Result<()> {
     let (op, input) = hook_input()?;
     // No maintenance capability can turn a receive-pack into a privileged writer.
-    ensure!(
-        op.ci_pin.is_none() && op.proposal_pin.is_none(),
-        "maintenance operations cannot receive pushes"
-    );
+    ensure!(op.ci_pin.is_none() && op.proposal_pin.is_none(), "maintenance operations cannot receive pushes");
     let changes = parse(&input)?;
     validate_namespace(&op, &changes)?;
     crate::browse::policy::validate_hook(&op, &changes)?;
@@ -383,32 +291,19 @@ pub fn run_pre_receive() -> Result<()> {
 /// A grant authorizes exactly one absent-to-target update, not an inheritable bypass.
 fn validate_namespace(op: &Operation, changes: &[RefChange]) -> Result<()> {
     if let Some(intent) = &op.ci_pin {
-        ensure!(
-            changes == [intent.change()],
-            "maintenance transaction differs from exact grant"
-        );
-        let root = op
-            .path
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .context("missing volume root")?;
+        ensure!(changes == [intent.change()], "maintenance transaction differs from exact grant");
+        let root = op.path.parent().and_then(Path::parent).and_then(Path::parent).context("missing volume root")?;
         ensure!(
             crate::ci_pins::load_intent(root, intent.repository_id, intent.job_id)? == *intent,
             "maintenance intent changed"
         );
     } else if let Some(intent) = &op.proposal_pin {
         intent.validate()?;
-        ensure!(
-            changes == [intent.change()],
-            "proposal transaction differs from exact grant"
-        );
+        ensure!(changes == [intent.change()], "proposal transaction differs from exact grant");
     } else {
         ensure!(
-            changes
-                .iter()
-                .all(|c| !crate::ci_pins::reserved(&c.ref_name)
-                    && !crate::namespace_service::proposal_ref_reserved(&c.ref_name)),
+            changes.iter().all(|c| !crate::ci_pins::reserved(&c.ref_name)
+                && !crate::namespace_service::proposal_ref_reserved(&c.ref_name)),
             "controller-owned retention namespace cannot be pushed"
         );
     }
@@ -417,14 +312,11 @@ fn validate_namespace(op: &Operation, changes: &[RefChange]) -> Result<()> {
 
 fn hook_input() -> Result<(Operation, Vec<u8>)> {
     let path = PathBuf::from(
-        std::env::var_os("ROOTYARD_JOURNAL_OPERATION")
-            .context("missing controlled operation directory")?,
+        std::env::var_os("ROOTYARD_JOURNAL_OPERATION").context("missing controlled operation directory")?,
     );
     let op = load(&path)?;
     let mut input = Vec::new();
-    std::io::stdin()
-        .take(MAX_BYTES as u64 + 1)
-        .read_to_end(&mut input)?;
+    std::io::stdin().take(MAX_BYTES as u64 + 1).read_to_end(&mut input)?;
     Ok((op, input))
 }
 /// Invoke synchronously before constructing the Tokio runtime. Only controlled

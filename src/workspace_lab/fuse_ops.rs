@@ -34,14 +34,7 @@ impl Filesystem for Overlay {
             Err(e) => reply.error(Self::err(e)),
         }
     }
-    fn readdir(
-        &mut self,
-        _: &Request<'_>,
-        ino: u64,
-        _: u64,
-        offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
+    fn readdir(&mut self, _: &Request<'_>, ino: u64, _: u64, offset: i64, mut reply: ReplyDirectory) {
         let result = (|| -> io::Result<Vec<(u64, FileType, OsString)>> {
             let p = self.rel(ino)?;
             if self.attr(&p, ino)?.kind != FileType::Directory {
@@ -66,9 +59,7 @@ impl Filesystem for Overlay {
         })();
         match result {
             Ok(rows) => {
-                for (idx, (child, kind, name)) in
-                    rows.into_iter().enumerate().skip(offset.max(0) as usize)
-                {
+                for (idx, (child, kind, name)) in rows.into_iter().enumerate().skip(offset.max(0) as usize) {
                     if reply.add(child, (idx + 1) as i64, kind, name) {
                         break;
                     }
@@ -79,10 +70,8 @@ impl Filesystem for Overlay {
         }
     }
     fn readlink(&mut self, _: &Request<'_>, ino: u64, reply: ReplyData) {
-        let result = self
-            .rel(ino)
-            .and_then(|p| self.selected(&p))
-            .and_then(|path| self.host_entry(&path, false)?.read_link());
+        let result =
+            self.rel(ino).and_then(|p| self.selected(&p)).and_then(|path| self.host_entry(&path, false)?.read_link());
         match result {
             Ok(p) => reply.data(p.as_os_str().as_bytes()),
             Err(e) => reply.error(Self::err(e)),
@@ -189,9 +178,7 @@ impl Filesystem for Overlay {
             if mode.is_some() || size.is_some() {
                 let entry = self.prepare(&p)?;
                 if let Some(mode) = mode {
-                    entry
-                        .open(libc::O_RDONLY, 0)?
-                        .set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+                    entry.open(libc::O_RDONLY, 0)?.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
                 }
                 if let Some(size) = size {
                     entry.open(libc::O_WRONLY, 0)?.set_len(size)?;
@@ -204,16 +191,7 @@ impl Filesystem for Overlay {
             Err(e) => reply.error(Self::err(e)),
         }
     }
-    fn create(
-        &mut self,
-        _: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        mode: u32,
-        _: u32,
-        _: i32,
-        reply: ReplyCreate,
-    ) {
+    fn create(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _: u32, _: i32, reply: ReplyCreate) {
         mutation_guard!(self, reply);
         let result = (|| {
             let p = self.child(parent, name)?;
@@ -231,15 +209,7 @@ impl Filesystem for Overlay {
             Err(e) => reply.error(Self::err(e)),
         }
     }
-    fn mkdir(
-        &mut self,
-        _: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        mode: u32,
-        _: u32,
-        reply: ReplyEntry,
-    ) {
+    fn mkdir(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _: u32, reply: ReplyEntry) {
         mutation_guard!(self, reply);
         let result = (|| {
             let p = self.child(parent, name)?;
@@ -334,11 +304,7 @@ impl Filesystem for Overlay {
             for (ino, old) in self.paths.clone() {
                 if old == src || old.starts_with(&src) {
                     let suffix = old.strip_prefix(&src).unwrap();
-                    let new = if suffix.as_os_str().is_empty() {
-                        dst.clone()
-                    } else {
-                        dst.join(suffix)
-                    };
+                    let new = if suffix.as_os_str().is_empty() { dst.clone() } else { dst.join(suffix) };
                     self.ids.remove(&old);
                     self.ids.insert(new.clone(), ino);
                     self.paths.insert(ino, new);

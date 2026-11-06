@@ -21,7 +21,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
-
 #[rustfmt::skip]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -86,7 +85,6 @@ pub struct CrossRepoCommitReceipt {
     pub mount_commits: Vec<CrossRepoMountCommit>, pub previous_base_vector: Vec<BaseVectorEntry>,
     pub base_vector: Vec<BaseVectorEntry>, pub receipt_path: String,
 }
-
 #[rustfmt::skip]
 fn now_secs() -> Result<u64> { Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()) }
 #[rustfmt::skip]
@@ -116,7 +114,6 @@ fn normalize_rel_segments(raw: &str, allow_empty: bool) -> Result<String> {
     ensure!(!segs.is_empty() && segs.join("/") != ".rootyard-namespace.json", "invalid or reserved relative path");
     Ok(segs.join("/"))
 }
-
 #[rustfmt::skip]
 fn prefixes_overlap(a: &str, b: &str) -> bool {
     a.is_empty() || b.is_empty() || a == b || a.strip_prefix(b).is_some_and(|r| r.starts_with('/')) || b.strip_prefix(a).is_some_and(|r| r.starts_with('/'))

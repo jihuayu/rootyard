@@ -30,26 +30,17 @@ pub mod writable_view;
 use anyhow::{Context, Result, bail, ensure};
 use std::{ffi::OsString, path::Path};
 
-pub use self::core::{
-    Entry, MAX_BYTES, MAX_ENTRIES, MAX_MANIFEST, Manifest, SCHEMA, Staging, Store, Workspace,
-};
+pub use self::core::{Entry, MAX_BYTES, MAX_ENTRIES, MAX_MANIFEST, Manifest, SCHEMA, Staging, Store, Workspace};
 pub use crash_recovery::{
-    CrashDrillReport, CrashJournal, CrashJournalEntry, CrashRecoveryReport, OverlayMountManifest,
-    OverlayOpReport, OverlayStatusReport,
+    CrashDrillReport, CrashJournal, CrashJournalEntry, CrashRecoveryReport, OverlayMountManifest, OverlayOpReport,
+    OverlayStatusReport,
 };
 pub use ignore::{IgnoreMatcher, PathClass, WorkspaceClassification};
 pub use manifest::{Changeset, ChangesetEntry, DirtyEntry, WorkspaceStatus};
-pub use namespace::{
-    BaseVectorEntry, NamespaceGitViewReport, NamespaceManifest, NamespaceViewReport,
-};
-pub use remote::{
-    RemoteCheckpointManifest, RemoteDirtyManifest, RemotePullReport, RemotePushReport,
-};
+pub use namespace::{BaseVectorEntry, NamespaceGitViewReport, NamespaceManifest, NamespaceViewReport};
+pub use remote::{RemoteCheckpointManifest, RemoteDirtyManifest, RemotePullReport, RemotePushReport};
 pub use sync::{ApplyReport, SyncDirtyReport};
-pub use vfs::{
-    VfsCatalogEntry, VfsDirtyEntry, VfsEvictReport, VfsHydrateReport, VfsMountManifest,
-    VfsStatusReport,
-};
+pub use vfs::{VfsCatalogEntry, VfsDirtyEntry, VfsEvictReport, VfsHydrateReport, VfsMountManifest, VfsStatusReport};
 pub use view::ReadonlyViewReport;
 pub use writable_view::{AgentLeaseEntry, CrossRepoCommitReceipt, NamespaceWriteReport};
 

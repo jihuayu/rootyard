@@ -27,10 +27,7 @@ impl Error {
     pub fn internal(_error: impl std::fmt::Display) -> Self {
         // Do not print DB URLs, tokens, raw headers, Git stderr or client content.
         eprintln!("rootyard: internal operation failed");
-        Self(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service temporarily unavailable",
-        )
+        Self(StatusCode::SERVICE_UNAVAILABLE, "service temporarily unavailable")
     }
     pub fn unauthorized() -> Self {
         Self(StatusCode::UNAUTHORIZED, "valid credentials required")
@@ -48,35 +45,20 @@ impl Error {
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let mut response = (self.0, Json(serde_json::json!({"error":self.1}))).into_response();
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+        response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
         if self.0 == StatusCode::UNAUTHORIZED {
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                "Basic realm=\"Rootyard\", charset=\"UTF-8\""
-                    .parse()
-                    .unwrap(),
-            );
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, "Basic realm=\"Rootyard\", charset=\"UTF-8\"".parse().unwrap());
         }
         response
     }
 }
 
 pub(crate) async fn ready(State(state): State<Arc<AppState>>) -> Result<&'static str, Error> {
-    state
-        .pool
-        .get()
-        .await
-        .map_err(Error::internal)?
-        .simple_query("SELECT 1")
-        .await
-        .map_err(Error::internal)?;
+    state.pool.get().await.map_err(Error::internal)?.simple_query("SELECT 1").await.map_err(Error::internal)?;
     if !state.storage.root.join("repos").is_dir() {
-        return Err(Error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "storage unavailable",
-        ));
+        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "storage unavailable"));
     }
     reliability::verify_hooks(&state).map_err(Error::internal)?;
     Ok("ready")

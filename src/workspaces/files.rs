@@ -21,9 +21,7 @@ use std::{
 use uuid::Uuid;
 
 fn safe_path(raw: &str) -> Result<PathBuf, Error> {
-    Ok(PathBuf::from(crate::browse::models::normalize_rel_path(
-        Some(raw),
-    )?))
+    Ok(PathBuf::from(crate::browse::models::normalize_rel_path(Some(raw))?))
 }
 fn safe_file(repo: &FsPath, raw: &str) -> Result<PathBuf, Error> {
     let rel = safe_path(raw)?;
@@ -32,11 +30,7 @@ fn safe_file(repo: &FsPath, raw: &str) -> Result<PathBuf, Error> {
     }
     let path = repo.join(rel);
     let mut cur = repo.to_path_buf();
-    for seg in path
-        .strip_prefix(repo)
-        .map_err(Error::internal)?
-        .components()
-    {
+    for seg in path.strip_prefix(repo).map_err(Error::internal)?.components() {
         cur.push(seg);
         if let Ok(meta) = fs::symlink_metadata(&cur) {
             if meta.file_type().is_symlink() {
@@ -61,9 +55,7 @@ fn atomic_put(path: &FsPath, bytes: &[u8]) -> Result<(), Error> {
     file.sync_all().map_err(Error::internal)?;
     drop(file);
     fs::rename(&tmp, path).map_err(Error::internal)?;
-    File::open(parent)
-        .and_then(|d| d.sync_all())
-        .map_err(Error::internal)?;
+    File::open(parent).and_then(|d| d.sync_all()).map_err(Error::internal)?;
     Ok(())
 }
 
@@ -90,10 +82,7 @@ pub async fn get(
     }
     let client = state.pool.get().await.map_err(Error::internal)?;
     let version: i64 = client
-        .query_opt(
-            "SELECT entry_version FROM workspace_entries WHERE workspace_id=$1 AND path=$2",
-            &[&id, &query.path],
-        )
+        .query_opt("SELECT entry_version FROM workspace_entries WHERE workspace_id=$1 AND path=$2", &[&id, &query.path])
         .await
         .map_err(Error::internal)?
         .map(|r| r.get(0))
@@ -113,16 +102,12 @@ pub async fn put(
     if query.view.as_deref().is_some_and(|v| v != "working") {
         return Err(Error::bad_request());
     }
-    let bytes = STANDARD
-        .decode(&input.content_base64)
-        .map_err(|_| Error::bad_request())?;
+    let bytes = STANDARD.decode(&input.content_base64).map_err(|_| Error::bad_request())?;
     if bytes.len() > 4 * 1024 * 1024 {
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "file too large"));
     }
     let actor = auth::authenticate(&state.pool, &headers).await?;
-    let key = auth::idempotency_key(&headers)?
-        .ok_or_else(Error::bad_request)?
-        .to_owned();
+    let key = auth::idempotency_key(&headers)?.ok_or_else(Error::bad_request)?.to_owned();
     let hash = hex::encode(Sha256::digest(
         serde_json::to_vec(&(
             &query.path,
@@ -136,21 +121,36 @@ pub async fn put(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let ws = service::locked(&tx, &actor, id, Role::Write).await?;
-    if let Some(row) = tx.query_opt("SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2", &[&id,&key]).await.map_err(Error::internal)? {
+    if let Some(row) = tx
+        .query_opt(
+            "SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2",
+            &[&id, &key],
+        )
+        .await
+        .map_err(Error::internal)?
+    {
         let old: String = row.get(0);
-        if old != hash { return Err(service::conflict()); }
-        if row.get::<_,String>(1) == "committed" { return Ok(Json(row.get(2))); }
+        if old != hash {
+            return Err(service::conflict());
+        }
+        if row.get::<_, String>(1) == "committed" {
+            return Ok(Json(row.get(2)));
+        }
         return Err(service::conflict());
     }
-    let lease_ok: bool = tx.query_one("SELECT host_id=$2 AND lease_epoch=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1", &[&id,&state.storage.volume_id,&input.lease_epoch]).await.map_err(Error::internal)?.get(0);
+    let lease_ok: bool = tx
+        .query_one(
+            "SELECT host_id=$2 AND lease_epoch=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1",
+            &[&id, &state.storage.volume_id, &input.lease_epoch],
+        )
+        .await
+        .map_err(Error::internal)?
+        .get(0);
     if !lease_ok || ws.revision != input.expected_workspace_revision {
         return Err(service::conflict());
     }
     let prior: i64 = tx
-        .query_opt(
-            "SELECT entry_version FROM workspace_entries WHERE workspace_id=$1 AND path=$2",
-            &[&id, &query.path],
-        )
+        .query_opt("SELECT entry_version FROM workspace_entries WHERE workspace_id=$1 AND path=$2", &[&id, &query.path])
         .await
         .map_err(Error::internal)?
         .map(|r| r.get(0))
@@ -165,8 +165,18 @@ pub async fn put(
     tx.execute("INSERT INTO workspace_entries(workspace_id,path,entry_version,digest) VALUES($1,$2,$3,$4) ON CONFLICT(workspace_id,path) DO UPDATE SET entry_version=$3,digest=$4,deleted=false", &[&id,&query.path,&version,&digest]).await.map_err(Error::internal)?;
     let revision = ws.revision + 1;
     let result = json!({"path":query.path,"entry_version":version,"workspace_revision":revision,"sha256":digest,"lease_epoch":input.lease_epoch});
-    tx.execute("UPDATE workspaces SET revision=$2,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1", &[&id,&revision]).await.map_err(Error::internal)?;
-    tx.execute("INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'file_put',$3)", &[&id,&revision,&result]).await.map_err(Error::internal)?;
+    tx.execute(
+        "UPDATE workspaces SET revision=$2,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1",
+        &[&id, &revision],
+    )
+    .await
+    .map_err(Error::internal)?;
+    tx.execute(
+        "INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'file_put',$3)",
+        &[&id, &revision, &result],
+    )
+    .await
+    .map_err(Error::internal)?;
     tx.execute("INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) VALUES($1,$2,$3,$4,'file_put','committed',$5)", &[&Uuid::new_v4(),&id,&key,&hash,&result]).await.map_err(Error::internal)?;
     super::capture::record_current(&tx, &state, id).await?;
     tx.commit().await.map_err(Error::internal)?;
@@ -180,9 +190,7 @@ pub async fn git(
     Json(input): Json<GitAction>,
 ) -> Result<Json<Value>, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
-    let key = auth::idempotency_key(&headers)?
-        .ok_or_else(Error::bad_request)?
-        .to_owned();
+    let key = auth::idempotency_key(&headers)?.ok_or_else(Error::bad_request)?.to_owned();
     let request_hash = hex::encode(Sha256::digest(
         serde_json::to_vec(&(
             &input.action,
@@ -196,12 +204,30 @@ pub async fn git(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let ws = service::locked(&tx, &actor, id, Role::Write).await?;
-    if let Some(row) = tx.query_opt("SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2", &[&id,&key]).await.map_err(Error::internal)? {
-        if row.get::<_,String>(0) != request_hash { return Err(service::conflict()); }
-        if row.get::<_,String>(1) == "committed" { return Ok(Json(row.get(2))); }
+    if let Some(row) = tx
+        .query_opt(
+            "SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2",
+            &[&id, &key],
+        )
+        .await
+        .map_err(Error::internal)?
+    {
+        if row.get::<_, String>(0) != request_hash {
+            return Err(service::conflict());
+        }
+        if row.get::<_, String>(1) == "committed" {
+            return Ok(Json(row.get(2)));
+        }
         return Err(service::conflict());
     }
-    let lease_ok: bool = tx.query_one("SELECT host_id=$2 AND lease_epoch=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1", &[&id,&state.storage.volume_id,&input.lease_epoch]).await.map_err(Error::internal)?.get(0);
+    let lease_ok: bool = tx
+        .query_one(
+            "SELECT host_id=$2 AND lease_epoch=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1",
+            &[&id, &state.storage.volume_id, &input.lease_epoch],
+        )
+        .await
+        .map_err(Error::internal)?
+        .get(0);
     if !lease_ok
         || ws.revision != input.expected_workspace_revision
         || ws.git_generation != input.expected_git_generation

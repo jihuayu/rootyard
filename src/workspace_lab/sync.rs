@@ -1,13 +1,12 @@
 use super::{
     core::{
-        Entry, MAX_ENTRIES, MAX_MANIFEST, SCHEMA, Store, Workspace, copy_all, copy_single_entry,
-        decode_path, entry_for_path, read_regular, require_directory, text_arg, valid_id,
-        valid_oid, write_new,
+        Entry, MAX_ENTRIES, MAX_MANIFEST, SCHEMA, Store, Workspace, copy_all, copy_single_entry, decode_path,
+        entry_for_path, read_regular, require_directory, text_arg, valid_id, valid_oid, write_new,
     },
     ignore,
     manifest::{
-        Changeset, ChangesetEntry, compute_entries_delta, entries_equivalent,
-        manifest_worktree_map, read_head_tree_entries,
+        Changeset, ChangesetEntry, compute_entries_delta, entries_equivalent, manifest_worktree_map,
+        read_head_tree_entries,
     },
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -64,62 +63,36 @@ fn read_changeset(store: &Store, id: &str) -> Result<(std::path::PathBuf, Change
     let bytes = read_regular(&dir.join("changeset.json"), MAX_MANIFEST)?;
     let digest = read_regular(&dir.join("changeset.sha256"), 128)?;
     let digest_trimmed = std::str::from_utf8(&digest).unwrap_or("").trim().as_bytes();
+    ensure!(digest_trimmed == hex::encode(Sha256::digest(&bytes)).as_bytes(), "changeset manifest checksum mismatch");
+    let changeset: Changeset = serde_json::from_slice(&bytes).context("invalid changeset manifest")?;
     ensure!(
-        digest_trimmed == hex::encode(Sha256::digest(&bytes)).as_bytes(),
-        "changeset manifest checksum mismatch"
-    );
-    let changeset: Changeset =
-        serde_json::from_slice(&bytes).context("invalid changeset manifest")?;
-    ensure!(
-        changeset.schema == SCHEMA
-            && changeset.changeset_id == id
-            && changeset.state == "local_complete",
+        changeset.schema == SCHEMA && changeset.changeset_id == id && changeset.state == "local_complete",
         "unsupported or incomplete changeset"
     );
     valid_oid(&changeset.base_oid)?;
     valid_id(&changeset.base_checkpoint_id)?;
     valid_id(&changeset.source_checkpoint_id)?;
-    ensure!(
-        changeset.entries.len() <= MAX_ENTRIES,
-        "changeset entry limit exceeded"
-    );
+    ensure!(changeset.entries.len() <= MAX_ENTRIES, "changeset entry limit exceeded");
 
     let files_dir = dir.join("files");
     require_directory(&files_dir)?;
     let mut seen_paths = BTreeSet::new();
     for entry in &changeset.entries {
         let rel = decode_path(&entry.path_base64)?;
-        ensure!(
-            !rel.starts_with(".git"),
-            "changeset may not directly mutate .git paths"
-        );
-        ensure!(
-            seen_paths.insert(rel.clone()),
-            "duplicate path in changeset"
-        );
+        ensure!(!rel.starts_with(".git"), "changeset may not directly mutate .git paths");
+        ensure!(seen_paths.insert(rel.clone()), "duplicate path in changeset");
         match entry.change.as_str() {
-            "added" => ensure!(
-                entry.before.is_none() && entry.after.is_some(),
-                "invalid added changeset entry"
-            ),
-            "deleted" => ensure!(
-                entry.before.is_some() && entry.after.is_none(),
-                "invalid deleted changeset entry"
-            ),
-            "modified" | "mode_changed" | "type_changed" => ensure!(
-                entry.before.is_some() && entry.after.is_some(),
-                "invalid modified changeset entry"
-            ),
+            "added" => ensure!(entry.before.is_none() && entry.after.is_some(), "invalid added changeset entry"),
+            "deleted" => ensure!(entry.before.is_some() && entry.after.is_none(), "invalid deleted changeset entry"),
+            "modified" | "mode_changed" | "type_changed" => {
+                ensure!(entry.before.is_some() && entry.after.is_some(), "invalid modified changeset entry")
+            }
             other => bail!("unsupported changeset change type {other}"),
         }
         if let Some(expected_after) = &entry.after {
             let actual = entry_for_path(&files_dir, &rel)?
                 .with_context(|| format!("missing changeset payload file {}", entry.path))?;
-            ensure!(
-                &actual == expected_after,
-                "corrupt changeset payload file {}",
-                entry.path
-            );
+            ensure!(&actual == expected_after, "corrupt changeset payload file {}", entry.path);
         }
     }
     Ok((dir, changeset))
@@ -137,10 +110,7 @@ fn check_target_no_conflicts(
         match &entry.before {
             None => {
                 if fs::symlink_metadata(&full).is_ok() {
-                    bail!(
-                        "conflict in {context_label}: target path {} already exists",
-                        entry.path
-                    );
+                    bail!("conflict in {context_label}: target path {} already exists", entry.path);
                 }
                 let mut parent = target_repo.to_path_buf();
                 if let Some(rel_parent) = rel.parent() {
@@ -158,17 +128,11 @@ fn check_target_no_conflicts(
             }
             Some(expected_before) => {
                 let Some(current) = entry_for_path(target_repo, &rel)? else {
-                    bail!(
-                        "conflict in {context_label}: path {} missing on target",
-                        entry.path
-                    );
+                    bail!("conflict in {context_label}: path {} missing on target", entry.path);
                 };
                 let check_exact = exact_mode || entry.change == "mode_changed";
                 if !entries_equivalent(&current, expected_before, check_exact) {
-                    bail!(
-                        "conflict in {context_label}: path {} modified since base checkpoint",
-                        entry.path
-                    );
+                    bail!("conflict in {context_label}: path {} modified since base checkpoint", entry.path);
                 }
             }
         }
@@ -230,30 +194,18 @@ fn apply_entries_to_workspace(
             copy_single_entry(source_files_root, &staging_repo, &rel, &mut total_copied)?;
             let actual = entry_for_path(&staging_repo, &rel)?
                 .with_context(|| format!("applied file {} missing after copy", entry.path))?;
-            ensure!(
-                &actual == expected_after,
-                "applied file {} checksum or mode mismatch",
-                entry.path
-            );
+            ensure!(&actual == expected_after, "applied file {} checksum or mode mismatch", entry.path);
         }
     }
 
     store.validate_repo(&staging_repo, &target_ws.base_oid)?;
     target_ws.parent_checkpoint_id = Some(new_parent_checkpoint_id);
-    write_new(
-        &staging.0.join("workspace.json"),
-        &serde_json::to_vec_pretty(&target_ws)?,
-        0o600,
-    )?;
+    write_new(&staging.0.join("workspace.json"), &serde_json::to_vec_pretty(&target_ws)?, 0o600)?;
     store.replace_dir_atomic(&staging.0, &target_ws_dir)?;
     Ok(())
 }
 
-pub fn cmd_apply(
-    store: &Store,
-    workspace_arg: &OsStr,
-    changeset_arg: &OsStr,
-) -> Result<serde_json::Value> {
+pub fn cmd_apply(store: &Store, workspace_arg: &OsStr, changeset_arg: &OsStr) -> Result<serde_json::Value> {
     let ws_id = text_arg(workspace_arg)?;
     valid_id(&ws_id)?;
     let cs_id = text_arg(changeset_arg)?;
@@ -264,10 +216,7 @@ pub fn cmd_apply(
     store.validate_repo(&target_repo, &target_ws.base_oid)?;
 
     let (cs_dir, changeset) = read_changeset(store, &cs_id)?;
-    ensure!(
-        changeset.base_oid == target_ws.base_oid,
-        "changeset base_oid does not match workspace base_oid"
-    );
+    ensure!(changeset.base_oid == target_ws.base_oid, "changeset base_oid does not match workspace base_oid");
 
     check_target_no_conflicts(
         &target_repo,
@@ -338,17 +287,11 @@ pub fn cmd_sync_dirty(
     let target_ws_opt = if let Some(t_arg) = target_ws_arg {
         let target_id = text_arg(t_arg)?;
         valid_id(&target_id)?;
-        ensure!(
-            target_id != source_id,
-            "source and target workspaces must be distinct"
-        );
+        ensure!(target_id != source_id, "source and target workspaces must be distinct");
         let target_ws = store.read_workspace(&target_id)?;
         let target_repo = store.root.join("workspaces").join(&target_id).join("repo");
         store.validate_repo(&target_repo, &target_ws.base_oid)?;
-        ensure!(
-            target_ws.base_oid == source_ws.base_oid,
-            "source and target workspaces have different base OIDs"
-        );
+        ensure!(target_ws.base_oid == source_ws.base_oid, "source and target workspaces have different base OIDs");
         check_target_no_conflicts(
             &target_repo,
             &dirty_entries,
@@ -361,41 +304,26 @@ pub fn cmd_sync_dirty(
     };
 
     let cp_value = store.cmd_checkpoint(source_ws_arg)?;
-    let checkpoint_id = cp_value["checkpoint_id"]
-        .as_str()
-        .context("missing checkpoint_id from checkpoint")?
-        .to_owned();
+    let checkpoint_id = cp_value["checkpoint_id"].as_str().context("missing checkpoint_id from checkpoint")?.to_owned();
 
     // Update source workspace parent_checkpoint_id atomically.
     {
         let staging = store.stage()?;
         copy_all(&source_repo, &staging.0.join("repo"))?;
         source_ws.parent_checkpoint_id = Some(checkpoint_id.clone());
-        write_new(
-            &staging.0.join("workspace.json"),
-            &serde_json::to_vec_pretty(&source_ws)?,
-            0o600,
-        )?;
+        write_new(&staging.0.join("workspace.json"), &serde_json::to_vec_pretty(&source_ws)?, 0o600)?;
         store.replace_dir_atomic(&staging.0, &source_ws_dir)?;
     }
 
     let target_workspace_id = if let Some(target_ws) = target_ws_opt {
         let tid = target_ws.workspace_id.clone();
-        apply_entries_to_workspace(
-            store,
-            target_ws,
-            &source_repo,
-            &dirty_entries,
-            checkpoint_id.clone(),
-        )?;
+        apply_entries_to_workspace(store, target_ws, &source_repo, &dirty_entries, checkpoint_id.clone())?;
         Some(tid)
     } else {
         None
     };
 
-    let workspace_id = target_workspace_id
-        .clone()
-        .unwrap_or_else(|| source_id.clone());
+    let workspace_id = target_workspace_id.clone().unwrap_or_else(|| source_id.clone());
     let report = SyncDirtyReport {
         schema: SCHEMA,
         source_workspace_id: source_id,

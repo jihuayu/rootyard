@@ -1,7 +1,7 @@
 //! Transparent Linux FUSE overlay over an immutable snapshot and private CoW layer.
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -31,30 +31,18 @@ pub struct MutationGate {
 }
 impl MutationGate {
     pub fn new(writable_until: i64) -> Arc<Self> {
-        Arc::new(Self {
-            lock: RwLock::new(()),
-            writable_until: AtomicI64::new(writable_until),
-        })
+        Arc::new(Self { lock: RwLock::new(()), writable_until: AtomicI64::new(writable_until) })
     }
     pub fn update(&self, until: i64) {
         self.writable_until.store(until, Ordering::Release);
     }
     pub fn freeze<T>(&self, work: impl FnOnce() -> T) -> T {
-        let _guard = self
-            .lock
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = self.lock.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         work()
     }
     fn mutation(&self) -> io::Result<std::sync::RwLockReadGuard<'_, ()>> {
-        let guard = self
-            .lock
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_secs() as i64;
+        let guard = self.lock.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(io::Error::other)?.as_secs() as i64;
         if now >= self.writable_until.load(Ordering::Acquire) {
             return Err(io::Error::from_raw_os_error(libc::EROFS));
         }
@@ -79,11 +67,7 @@ impl Overlay {
     pub fn new(lower: PathBuf, upper: PathBuf) -> io::Result<Self> {
         Self::new_with_gate(lower, upper, MutationGate::new(i64::MAX))
     }
-    pub fn new_with_gate(
-        lower: PathBuf,
-        upper: PathBuf,
-        gate: Arc<MutationGate>,
-    ) -> io::Result<Self> {
+    pub fn new_with_gate(lower: PathBuf, upper: PathBuf, gate: Arc<MutationGate>) -> io::Result<Self> {
         if !lower.is_dir() {
             return Err(io::Error::from_raw_os_error(libc::ENOENT));
         }
@@ -104,25 +88,15 @@ impl Overlay {
             Err(e) => return Err(e),
         };
         let whiteouts = if whiteout_meta {
-            serde_json::from_slice::<Vec<String>>(&fs::read(
-                upper.join(".rootyard-whiteouts.json"),
-            )?)
-            .map_err(io::Error::other)?
-            .into_iter()
-            .map(PathBuf::from)
-            .collect()
+            serde_json::from_slice::<Vec<String>>(&fs::read(upper.join(".rootyard-whiteouts.json"))?)
+                .map_err(io::Error::other)?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect()
         } else {
             BTreeSet::new()
         };
-        Ok(Self {
-            lower,
-            upper,
-            paths,
-            ids,
-            next: 2,
-            whiteouts,
-            gate,
-        })
+        Ok(Self { lower, upper, paths, ids, next: 2, whiteouts, gate })
     }
     fn ino(&mut self, p: &Path) -> u64 {
         if let Some(n) = self.ids.get(p) {
@@ -135,10 +109,7 @@ impl Overlay {
         n
     }
     fn rel(&self, ino: u64) -> io::Result<PathBuf> {
-        self.paths
-            .get(&ino)
-            .cloned()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
+        self.paths.get(&ino).cloned().ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
     }
     fn child(&self, parent: u64, name: &OsStr) -> io::Result<PathBuf> {
         if name.as_bytes().is_empty()
@@ -228,10 +199,8 @@ impl Overlay {
                 let m = source.lstat()?;
                 if m.is_file() {
                     let mut input = source.open(libc::O_RDONLY, 0)?;
-                    let mut output = to.open(
-                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                        m.permissions().mode() & 0o777,
-                    )?;
+                    let mut output =
+                        to.open(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, m.permissions().mode() & 0o777)?;
                     io::copy(&mut input, &mut output)?;
                     output.sync_all()?;
                 } else if m.file_type().is_symlink() {
@@ -297,11 +266,7 @@ impl Overlay {
         Ok(())
     }
     fn save_whiteouts(&self) -> io::Result<()> {
-        let names: Vec<String> = self
-            .whiteouts
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
+        let names: Vec<String> = self.whiteouts.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         let tmp_name = format!(".rootyard-whiteouts.{}.tmp", uuid::Uuid::new_v4());
         let tmp = Entry::new(&self.upper, Path::new(&tmp_name), false)?;
         let target = Entry::new(&self.upper, Path::new(".rootyard-whiteouts.json"), false)?;
@@ -322,12 +287,5 @@ mod fuse_ops;
 
 pub fn mount(lower: PathBuf, upper: PathBuf, mountpoint: PathBuf) -> io::Result<()> {
     let fs = Overlay::new(lower, upper)?;
-    fuser::mount2(
-        fs,
-        mountpoint,
-        &[
-            MountOption::FSName("rootyard-vfs".into()),
-            MountOption::DefaultPermissions,
-        ],
-    )
+    fuser::mount2(fs, mountpoint, &[MountOption::FSName("rootyard-vfs".into()), MountOption::DefaultPermissions])
 }

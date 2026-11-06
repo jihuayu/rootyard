@@ -8,10 +8,7 @@ fn main() -> Result<()> {
         println!("rootyard-hook-v1");
         return Ok(());
     }
-    let name = std::path::Path::new(&args[0])
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("");
+    let name = std::path::Path::new(&args[0]).file_name().and_then(|v| v.to_str()).unwrap_or("");
     match name {
         "reference-transaction" => {
             return rootyard::journal::run_hook(args.get(1).map(String::as_str).unwrap_or(""));
@@ -20,10 +17,7 @@ fn main() -> Result<()> {
         "pre-receive" => return rootyard::journal::run_pre_receive(),
         _ => {}
     }
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(run())
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
 }
 async fn run() -> Result<()> {
     if !cfg!(target_os = "linux") {
@@ -31,9 +25,8 @@ async fn run() -> Result<()> {
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|s| s == "backup-verify") && args.len() == 2 {
-        return rootyard::backup::check(std::path::Path::new(&args[1])).map_err(|_| {
-            anyhow::anyhow!("backup verification failed; incomplete, unsafe or mismatched files")
-        });
+        return rootyard::backup::check(std::path::Path::new(&args[1]))
+            .map_err(|_| anyhow::anyhow!("backup verification failed; incomplete, unsafe or mismatched files"));
     }
     // Control-plane workers need only PostgreSQL, never Git or a data volume.
     if args.len() == 1 && matches!(args[0].as_str(), "worker" | "worker-once") {
@@ -96,18 +89,11 @@ async fn run() -> Result<()> {
         }
         "create-token" if args.len() == 2 || (args.len() == 3 && args[2] == "--read-only") => {
             db::migrate(&pool).await?;
-            println!(
-                "{}",
-                db::issue_token(&pool, &args[1], false, args.len() == 3).await?
-            );
+            println!("{}", db::issue_token(&pool, &args[1], false, args.len() == 3).await?);
         }
         "revoke-token" if args.len() == 2 => {
             let id: uuid::Uuid = args[1].parse().context("invalid token UUID")?;
-            let changed = pool
-                .get()
-                .await?
-                .execute("UPDATE tokens SET revoked=true WHERE id=$1", &[&id])
-                .await?;
+            let changed = pool.get().await?.execute("UPDATE tokens SET revoked=true WHERE id=$1", &[&id]).await?;
             if changed != 1 {
                 bail!("token not found");
             }
@@ -115,10 +101,7 @@ async fn run() -> Result<()> {
         }
         "inspect-recovery" if args.len() == 2 => {
             db::migrate(&pool).await?;
-            println!(
-                "{}",
-                rootyard::maintenance::inspect(&config, &pool, args[1].parse()?).await?
-            );
+            println!("{}", rootyard::maintenance::inspect(&config, &pool, args[1].parse()?).await?);
         }
         "resolve-unknown"
             if args.len() == 8
@@ -129,15 +112,8 @@ async fn run() -> Result<()> {
             db::migrate(&pool).await?;
             println!(
                 "{}",
-                rootyard::maintenance::resolve(
-                    &config,
-                    &pool,
-                    args[1].parse()?,
-                    args[3].parse()?,
-                    &args[5],
-                    &args[7]
-                )
-                .await?
+                rootyard::maintenance::resolve(&config, &pool, args[1].parse()?, args[3].parse()?, &args[5], &args[7])
+                    .await?
             );
         }
         "reconcile" if args.len() == 1 => {
@@ -155,23 +131,14 @@ async fn run() -> Result<()> {
                 dispatch: rootyard::dispatch::Signals::default(),
             };
             rootyard::reliability::recover_startup(&state).await?;
-            rootyard::sharding::transitions::reconcile_pending(&state)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.1))?;
-            println!(
-                "offline reconciliation finished; inspect repository states for unresolved incidents"
-            );
+            rootyard::sharding::transitions::reconcile_pending(&state).await.map_err(|e| anyhow::anyhow!(e.1))?;
+            println!("offline reconciliation finished; inspect repository states for unresolved incidents");
         }
         "serve-mirror" if args.len() == 1 => {
             let state = rootyard::mirror::open(config, pool).await?;
             let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
-            eprintln!(
-                "rootyard read mirror listening on {}",
-                listener.local_addr()?
-            );
-            axum::serve(listener, rootyard::mirror::router(state))
-                .with_graceful_shutdown(shutdown())
-                .await?;
+            eprintln!("rootyard read mirror listening on {}", listener.local_addr()?);
+            axum::serve(listener, rootyard::mirror::router(state)).with_graceful_shutdown(shutdown()).await?;
         }
         "serve" if args.len() <= 1 => {
             let dispatch_settings = rootyard::dispatch::Settings::from_env()?;
@@ -189,8 +156,7 @@ async fn run() -> Result<()> {
                 .take(2)
                 .map(|n| n.parse::<u32>().unwrap_or(0))
                 .collect();
-            if !version.status.success() || numbers.len() != 2 || (numbers[0], numbers[1]) < (2, 43)
-            {
+            if !version.status.success() || numbers.len() != 2 || (numbers[0], numbers[1]) < (2, 43) {
                 bail!("Git 2.43 or newer is required");
             }
             db::migrate(&pool).await?;
@@ -210,16 +176,14 @@ async fn run() -> Result<()> {
                 git_slots: slots,
             });
             let local_fence = if std::env::var_os("ROOTYARD_LOCAL_FENCE_DIR").is_some() {
-                let node_id = std::env::var("ROOTYARD_NODE_ID")
-                    .context("local process fence requires ROOTYARD_NODE_ID")?;
+                let node_id =
+                    std::env::var("ROOTYARD_NODE_ID").context("local process fence requires ROOTYARD_NODE_ID")?;
                 rootyard::sharding::local_fence::register_local_process(&node_id)?
             } else {
                 false
             };
             rootyard::reliability::recover_startup(&state).await?;
-            rootyard::sharding::transitions::reconcile_pending(&state)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.1))?;
+            rootyard::sharding::transitions::reconcile_pending(&state).await.map_err(|e| anyhow::anyhow!(e.1))?;
             rootyard::recover(&state).await?;
             rootyard::sandbox::reconcile_startup(&state)
                 .await
@@ -228,21 +192,11 @@ async fn run() -> Result<()> {
                 .await
                 .map_err(|_| anyhow::anyhow!("workspace FUSE mount recovery failed"))?;
             let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
-            let controller_task = if local_fence {
-                Some(tokio::spawn(rootyard::sharding::controller::run(
-                    state.clone(),
-                )))
-            } else {
-                None
-            };
-            eprintln!(
-                "rootyard listening on {} (GitFS single-node)",
-                listener.local_addr()?
-            );
+            let controller_task =
+                if local_fence { Some(tokio::spawn(rootyard::sharding::controller::run(state.clone()))) } else { None };
+            eprintln!("rootyard listening on {} (GitFS single-node)", listener.local_addr()?);
             let metrics_worker = if let Some(address) = state.config.metrics_bind {
-                let listener =
-                    tokio::net::TcpListener::bind(rootyard::metrics::validate_bind(address)?)
-                        .await?;
+                let listener = tokio::net::TcpListener::bind(rootyard::metrics::validate_bind(address)?).await?;
                 let router = rootyard::metrics::router(
                     state.pool.clone(),
                     state.git_slots.clone(),
@@ -274,35 +228,22 @@ async fn run() -> Result<()> {
                 None
             };
             let webhook_task = if state.config.outbox_worker {
-                Some(tokio::spawn(rootyard::webhooks::background::worker(
-                    state.clone(),
-                    dispatch_stop.clone(),
-                )))
+                Some(tokio::spawn(rootyard::webhooks::background::worker(state.clone(), dispatch_stop.clone())))
             } else {
                 None
             };
             let worker_state = state.clone();
             let workspace_capture_stop = tokio_util::sync::CancellationToken::new();
-            let workspace_capture_task = tokio::spawn(rootyard::workspaces::capture::run(
-                state.clone(),
-                workspace_capture_stop.clone(),
-            ));
+            let workspace_capture_task =
+                tokio::spawn(rootyard::workspaces::capture::run(state.clone(), workspace_capture_stop.clone()));
             let worker = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
                     interval.tick().await;
-                    if rootyard::sharding::transitions::reconcile_pending(&worker_state)
-                        .await
-                        .is_err()
-                    {
-                        eprintln!(
-                            "rootyard: shard marker reconciliation unavailable; affected writes remain fenced"
-                        );
+                    if rootyard::sharding::transitions::reconcile_pending(&worker_state).await.is_err() {
+                        eprintln!("rootyard: shard marker reconciliation unavailable; affected writes remain fenced");
                     }
-                    if rootyard::reliability::recover_pending(&worker_state)
-                        .await
-                        .is_err()
-                    {
+                    if rootyard::reliability::recover_pending(&worker_state).await.is_err() {
                         eprintln!("rootyard: journal retry unavailable");
                     }
                     if rootyard::recover(&worker_state).await.is_err() {
@@ -311,15 +252,10 @@ async fn run() -> Result<()> {
                 }
             });
             let maintenance_stop = tokio_util::sync::CancellationToken::new();
-            let maintenance_task = maintenance_policy.enabled.then(|| {
-                tokio::spawn(rootyard::storage_lifecycle::run(
-                    state.clone(),
-                    maintenance_stop.clone(),
-                ))
-            });
-            axum::serve(listener, rootyard::router(state))
-                .with_graceful_shutdown(shutdown())
-                .await?;
+            let maintenance_task = maintenance_policy
+                .enabled
+                .then(|| tokio::spawn(rootyard::storage_lifecycle::run(state.clone(), maintenance_stop.clone())));
+            axum::serve(listener, rootyard::router(state)).with_graceful_shutdown(shutdown()).await?;
             worker.abort();
             maintenance_stop.cancel();
             workspace_capture_stop.cancel();
@@ -349,7 +285,7 @@ async fn run() -> Result<()> {
     Ok(())
 }
 async fn shutdown() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("install SIGTERM handler");
+    let mut term =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("install SIGTERM handler");
     tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
 }

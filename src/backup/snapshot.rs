@@ -13,54 +13,32 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     let mut client = pg(config).await?;
     // Acquire this BEFORE beginning REPEATABLE READ: SELECT would otherwise fix
     // the snapshot before waiting for old transactions/migrations to commit.
-    client
-        .query_one("SELECT pg_advisory_lock(738390103)", &[])
-        .await?;
-    let tx = client
-        .build_transaction()
-        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
-        .start()
-        .await?;
+    client.query_one("SELECT pg_advisory_lock(738390103)", &[]).await?;
+    let tx = client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::RepeatableRead).start().await?;
     let list = catalog::relations(FORMAT, true)?
         .iter()
         .map(|t| format!("public.\"{}\"", t.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(",");
-    tx.batch_execute(&format!("LOCK TABLE {list} IN SHARE MODE"))
-        .await?;
+    tx.batch_execute(&format!("LOCK TABLE {list} IN SHARE MODE")).await?;
     // No snapshot-taking SELECT occurs before all DML/DDL table locks are held.
     let versions = schema(&tx, FORMAT).await?;
-    let snapshot: String = tx
-        .query_one("SELECT pg_export_snapshot()", &[])
-        .await?
-        .get(0);
+    let snapshot: String = tx.query_one("SELECT pg_export_snapshot()", &[]).await?.get(0);
     let boundary = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let postgres_version: String = tx.query_one("SHOW server_version", &[]).await?.get(0);
-    ensure!(
-        postgres_version.starts_with("17."),
-        "this format is verified only with PostgreSQL 17"
-    );
+    ensure!(postgres_version.starts_with("17."), "this format is verified only with PostgreSQL 17");
     let mut repos = repositories(&tx).await?;
     let foreign_volumes: i64 = tx
-        .query_one(
-            "SELECT count(*) FROM public.recovery_resolutions WHERE volume_id<>$1",
-            &[&volume_id],
-        )
+        .query_one("SELECT count(*) FROM public.recovery_resolutions WHERE volume_id<>$1", &[&volume_id])
         .await?
         .get(0);
-    ensure!(
-        foreign_volumes == 0,
-        "resolution history belongs to another volume"
-    );
+    ensure!(foreign_volumes == 0, "resolution history belongs to another volume");
     let lfs_objects = lfs_inventory::metadata(&tx).await?;
     lfs_inventory::hydrate(config, &lfs_objects).await?;
     let source_inventory = inventory(&root)?;
     git_inventory(config, &root, &mut repos, false).await?;
     let id = Uuid::new_v4();
-    let staging = destination
-        .parent()
-        .unwrap()
-        .join(format!(".rootyard-backup-{id}.partial"));
+    let staging = destination.parent().unwrap().join(format!(".rootyard-backup-{id}.partial"));
     private_dir(&staging)?;
     let mut dump = pg_command(config, "pg_dump")?;
     dump.args([
@@ -76,16 +54,10 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     ])
     .arg(staging.join("metadata.dump"));
     checked(&mut dump).await?;
-    fs::set_permissions(
-        staging.join("metadata.dump"),
-        fs::Permissions::from_mode(0o600),
-    )?;
+    fs::set_permissions(staging.join("metadata.dump"), fs::Permissions::from_mode(0o600))?;
     File::open(staging.join("metadata.dump"))?.sync_all()?;
     copy_volume(&root, &staging.join("volume"), &source_inventory)?;
-    ensure!(
-        inventory(&root)? == source_inventory,
-        "volume changed during barrier"
-    );
+    ensure!(inventory(&root)? == source_inventory, "volume changed during barrier");
     // Prove the exporting session still owns its transaction before publishing.
     tx.query_one("SELECT 1", &[]).await?;
     let mut files = BTreeMap::new();
@@ -111,12 +83,8 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         rootyard_version: env!("CARGO_PKG_VERSION").into(),
         binary_sha256: hash(&std::env::current_exe()?)?,
         postgres_version,
-        pg_dump_version: String::from_utf8(checked(command("pg_dump").arg("--version")).await?)?
-            .trim()
-            .into(),
-        git_version: String::from_utf8(checked(command(&config.git).arg("--version")).await?)?
-            .trim()
-            .into(),
+        pg_dump_version: String::from_utf8(checked(command("pg_dump").arg("--version")).await?)?.trim().into(),
+        git_version: String::from_utf8(checked(command(&config.git).arg("--version")).await?)?.trim().into(),
         schema_versions: versions,
         consistency: "offline-volume-flock+postgres-share-locks+exported-snapshot".into(),
         journal_record_files: files
@@ -128,17 +96,11 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         files,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-    ensure!(
-        manifest_bytes.len() as u64 <= MAX_MANIFEST,
-        "manifest exceeds format bound"
-    );
+    ensure!(manifest_bytes.len() as u64 <= MAX_MANIFEST, "manifest exceeds format bound");
     write_private(&staging.join("manifest.json"), &manifest_bytes)?;
     File::open(&staging)?.sync_all()?;
     tx.commit().await?;
-    write_private(
-        &staging.join("COMPLETE"),
-        hash(&staging.join("manifest.json"))?.as_bytes(),
-    )?;
+    write_private(&staging.join("COMPLETE"), hash(&staging.join("manifest.json"))?.as_bytes())?;
     File::open(&staging)?.sync_all()?;
     // Drop connection releases session migration lock; never modify source data.
     drop(client);

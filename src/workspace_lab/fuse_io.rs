@@ -58,35 +58,20 @@ pub(super) struct Entry {
 }
 impl Entry {
     pub(super) fn new(root: &Path, path: &Path, create_parent: bool) -> io::Result<Self> {
-        let name = path
-            .file_name()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
-        Ok(Self {
-            dir: walk_dir(root, path.parent().unwrap_or(Path::new("")), create_parent)?,
-            name: c_name(name)?,
-        })
+        let name = path.file_name().ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        Ok(Self { dir: walk_dir(root, path.parent().unwrap_or(Path::new("")), create_parent)?, name: c_name(name)? })
     }
     pub(super) fn lstat(&self) -> io::Result<fs::Metadata> {
         fs::symlink_metadata(self.proc_path())
     }
     fn proc_path(&self) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}", self.dir.as_raw_fd()))
-            .join(OsStr::from_bytes(self.name.as_bytes()))
+        PathBuf::from(format!("/proc/self/fd/{}", self.dir.as_raw_fd())).join(OsStr::from_bytes(self.name.as_bytes()))
     }
     pub(super) fn open(&self, flags: i32, mode: u32) -> io::Result<File> {
         let fd = unsafe {
-            libc::openat(
-                self.dir.as_raw_fd(),
-                self.name.as_ptr(),
-                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                mode,
-            )
+            libc::openat(self.dir.as_raw_fd(), self.name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode)
         };
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(unsafe { File::from_raw_fd(fd) })
-        }
+        if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { File::from_raw_fd(fd) }) }
     }
     pub(super) fn mkdir(&self, mode: u32) -> io::Result<()> {
         if unsafe { libc::mkdirat(self.dir.as_raw_fd(), self.name.as_ptr(), mode) } < 0 {
@@ -104,14 +89,7 @@ impl Entry {
         }
     }
     pub(super) fn rename_to(&self, to: &Entry) -> io::Result<()> {
-        if unsafe {
-            libc::renameat(
-                self.dir.as_raw_fd(),
-                self.name.as_ptr(),
-                to.dir.as_raw_fd(),
-                to.name.as_ptr(),
-            )
-        } < 0
+        if unsafe { libc::renameat(self.dir.as_raw_fd(), self.name.as_ptr(), to.dir.as_raw_fd(), to.name.as_ptr()) } < 0
         {
             Err(io::Error::last_os_error())
         } else {
@@ -120,8 +98,7 @@ impl Entry {
     }
     pub(super) fn symlink(&self, target: &Path) -> io::Result<()> {
         let target = c_name(target.as_os_str())?;
-        if unsafe { libc::symlinkat(target.as_ptr(), self.dir.as_raw_fd(), self.name.as_ptr()) } < 0
-        {
+        if unsafe { libc::symlinkat(target.as_ptr(), self.dir.as_raw_fd(), self.name.as_ptr()) } < 0 {
             Err(io::Error::last_os_error())
         } else {
             Ok(())

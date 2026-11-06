@@ -26,8 +26,7 @@ mod protocol;
 mod receive;
 use process::Process;
 pub(crate) use process::{
-    collect_git_output, collect_git_output_input, finish_group_child, group_quiescent,
-    stop_group_child,
+    collect_git_output, collect_git_output_input, finish_group_child, group_quiescent, stop_group_child,
 };
 use protocol::{job_response_prefix, read_headers, route, validate_headers};
 
@@ -41,23 +40,11 @@ async fn transfer_authorized(
 ) -> io::Result<()> {
     if let Some(plan) = job_plan {
         let digest = match job_principal {
-            Some(crate::ci_checkouts::authority::CheckoutPrincipal::User(user)) => {
-                &user.token_digest
-            }
-            Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration {
-                token_digest,
-                ..
-            }) => token_digest,
+            Some(crate::ci_checkouts::authority::CheckoutPrincipal::User(user)) => &user.token_digest,
+            Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration { token_digest, .. }) => token_digest,
             None => return Err(io::Error::other("missing checkout principal")),
         };
-        match crate::ci_checkouts::still_authorized(
-            state,
-            plan.job_id,
-            digest,
-            repo.id,
-            repo.storage_generation,
-        )
-        .await
+        match crate::ci_checkouts::still_authorized(state, plan.job_id, digest, repo.id, repo.storage_generation).await
         {
             Ok(true) => Ok(()),
             _ => Err(io::Error::other("checkout authority revoked")),
@@ -76,34 +63,23 @@ pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Resp
     }
     // A disconnected caller cannot cancel cleanup between acquiring the write
     // lock and starting the response producer. The owned task retains all guards.
-    tokio::spawn(execute(state, request))
-        .await
-        .map_err(Error::internal)?
+    tokio::spawn(execute(state, request)).await.map_err(Error::internal)?
 }
 async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
     let (parts, body) = request.into_parts();
-    let (pin_oid, route_path) =
-        if state.mirror_primary.is_some() || parts.uri.path().starts_with("/ci/") {
-            let (oid, path) = crate::mirror::ci_route(parts.uri.path())?;
-            (Some(oid), path)
-        } else {
-            (None, parts.uri.path())
-        };
+    let (pin_oid, route_path) = if state.mirror_primary.is_some() || parts.uri.path().starts_with("/ci/") {
+        let (oid, path) = crate::mirror::ci_route(parts.uri.path())?;
+        (Some(oid), path)
+    } else {
+        (None, parts.uri.path())
+    };
     let (owner, name, endpoint, service) = route(&parts.method, route_path, parts.uri.query())?;
     let write = service == "git-receive-pack";
     if write && pin_oid.is_some() {
-        return Err(Error(
-            StatusCode::FORBIDDEN,
-            "read mirror never accepts pushes; use the primary",
-        ));
+        return Err(Error(StatusCode::FORBIDDEN, "read mirror never accepts pushes; use the primary"));
     }
-    let delegation = crate::sharding::transport::authenticate_delegation(
-        &state,
-        &parts.headers,
-        &parts.method,
-        &parts.uri,
-    )
-    .await?;
+    let delegation =
+        crate::sharding::transport::authenticate_delegation(&state, &parts.headers, &parts.method, &parts.uri).await?;
     let job = pin_oid.is_some() && auth::credentials_for(&parts.headers, "ryj_").is_ok();
     if pin_oid.is_some() && state.mirror_primary.is_none() && !job {
         return Err(Error::unauthorized());
@@ -134,67 +110,41 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             .get()
             .await
             .map_err(Error::internal)?
-            .query_opt(
-                &format!("{} WHERE ns.slug=$1 AND r.name=$2", db::REPO_SELECT),
-                &[&owner, &name],
-            )
+            .query_opt(&format!("{} WHERE ns.slug=$1 AND r.name=$2", db::REPO_SELECT), &[&owner, &name])
             .await
             .map_err(Error::internal)?
             .ok_or_else(Error::not_found)?;
         let repo = Repository::from_row(&row);
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        auth::authorize_repo(&tx, &identity, owner, name, write)
-            .await
-            .map_err(|error| {
-                if error.0 == StatusCode::CONFLICT && error.1 == "repository is not ready" {
-                    Error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "repository not ready; recovery may be required",
-                    )
-                } else {
-                    error
-                }
-            })?;
+        auth::authorize_repo(&tx, &identity, owner, name, write).await.map_err(|error| {
+            if error.0 == StatusCode::CONFLICT && error.1 == "repository is not ready" {
+                Error(StatusCode::SERVICE_UNAVAILABLE, "repository not ready; recovery may be required")
+            } else {
+                error
+            }
+        })?;
         auth::finish_tx(tx, &identity, false).await?;
         if repo.state != "ready" {
-            return Err(Error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "repository not ready; recovery may be required",
-            ));
+            return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "repository not ready; recovery may be required"));
         }
         (Some(identity), repo, None, None)
     };
     if repo.storage_backend == "pando" && (write || pin_oid.is_some()) {
-        return Err(Error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Pando publication and pinned checkout are not ready",
-        ));
+        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "Pando publication and pinned checkout are not ready"));
     }
     let remote_user = match &job_principal {
-        Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration {
-            hook_id,
-            job_id,
-            ..
-        }) => format!("ci-job:{job_id}/integration:{hook_id}"),
-        _ => identity
-            .as_ref()
-            .ok_or_else(Error::unauthorized)?
-            .username
-            .clone(),
+        Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration { hook_id, job_id, .. }) => {
+            format!("ci-job:{job_id}/integration:{hook_id}")
+        }
+        _ => identity.as_ref().ok_or_else(Error::unauthorized)?.username.clone(),
     };
-    validate_headers(
-        &parts.headers,
-        &parts.method,
-        service,
-        state.config.max_request_bytes,
-    )?;
-    let permit = state.git_slots.clone().try_acquire_owned().map_err(|_| {
-        Error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Git capacity exhausted; retry later",
-        )
-    })?;
+    validate_headers(&parts.headers, &parts.method, service, state.config.max_request_bytes)?;
+    let permit = state
+        .git_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let deadline = Instant::now() + state.config.git_timeout;
     let max_input = state.config.max_request_bytes;
     let input = receive::prepare(
@@ -203,11 +153,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         max_input,
         state.transfer_metrics.clone(),
         write && parts.method == Method::POST,
-        if repo.object_format == "sha256" {
-            64
-        } else {
-            40
-        },
+        if repo.object_format == "sha256" { 64 } else { 40 },
         deadline,
     )
     .await?;
@@ -216,24 +162,14 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             return Err(Error::bad_request());
         }
         Some(
-            storage::ref_publication::acquire(
-                &state.pool,
-                repo.id,
-                repo.storage_generation,
-                &commands.refs,
-                deadline,
-            )
-            .await?,
+            storage::ref_publication::acquire(&state.pool, repo.id, repo.storage_generation, &commands.refs, deadline)
+                .await?,
         )
     } else {
         None
     };
     let write_guard = if write && parts.method == Method::POST {
-        Some(
-            tokio::time::timeout_at(deadline, state.storage.write_lock(repo.id))
-                .await
-                .map_err(|_| Error::timeout())?,
-        )
+        Some(tokio::time::timeout_at(deadline, state.storage.write_lock(repo.id)).await.map_err(|_| Error::timeout())?)
     } else {
         None
     };
@@ -252,30 +188,16 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         None
     };
     if snapshot_lease.is_some() {
-        transfer_authorized(
-            &state,
-            identity.as_ref(),
-            job_plan.as_ref(),
-            job_principal.as_ref(),
-            &repo,
-            write,
-        )
-        .await
-        .map_err(|_| Error::unauthorized())?;
+        transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(), job_principal.as_ref(), &repo, write)
+            .await
+            .map_err(|_| Error::unauthorized())?;
     }
     if write_guard.is_some() {
-        reliability::before_push(&state, &repo)
-            .await
-            .map_err(Error::internal)?;
+        reliability::before_push(&state, &repo).await.map_err(Error::internal)?;
     }
     let pando_snapshot = if repo.storage_backend == "pando" {
         let lease = snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?;
-        Some(
-            Box::pin(crate::pando_gateway::snapshot::materialize(
-                &state, &repo, lease, deadline,
-            ))
-            .await?,
-        )
+        Some(Box::pin(crate::pando_gateway::snapshot::materialize(&state, &repo, lease, deadline)).await?)
     } else {
         None
     };
@@ -289,27 +211,16 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 crate::mirror::job_path(&state, &repo, plan).await?
             } else {
                 let lease = snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?;
-                lease
-                    .guard(crate::ci_checkouts::origin_job_path(
-                        &state, &repo, plan, lease,
-                    ))
-                    .await??
+                lease.guard(crate::ci_checkouts::origin_job_path(&state, &repo, plan, lease)).await??
             }
         } else {
             crate::mirror::pinned_path(&state, &repo, oid).await?
         }
     } else {
-        state
-            .storage
-            .verify_path(repo.id)
-            .map_err(Error::internal)?
+        state.storage.verify_path(repo.id).map_err(Error::internal)?
     };
     let project_root = path.parent().ok_or_else(Error::bad_request)?.to_path_buf();
-    let repository_dir = path
-        .file_name()
-        .ok_or_else(Error::bad_request)?
-        .to_string_lossy()
-        .into_owned();
+    let repository_dir = path.file_name().ok_or_else(Error::bad_request)?.to_string_lossy().into_owned();
     if write_guard.is_some() {
         let quota = state.config.max_repo_bytes;
         let check_path = path.clone();
@@ -318,10 +229,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             .map_err(Error::internal)?
             .map_err(Error::internal)?;
         if size >= quota {
-            return Err(Error(
-                StatusCode::INSUFFICIENT_STORAGE,
-                "repository quota reached",
-            ));
+            return Err(Error(StatusCode::INSUFFICIENT_STORAGE, "repository quota reached"));
         }
     }
     let mut cmd = state.storage.git(&state.config);
@@ -329,18 +237,12 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
     }
     if write_guard.is_some() {
-        cmd.arg("-c").arg(format!(
-            "core.hooksPath={}",
-            state.storage.root.join("managed-hooks").display()
-        ));
+        cmd.arg("-c").arg(format!("core.hooksPath={}", state.storage.root.join("managed-hooks").display()));
         cmd.env("ROOTYARD_DATABASE_URL", &state.config.database_url)
             .env("ROOTYARD_GIT_PATH", &state.config.git)
             .env("ROOTYARD_GIT_DIR", &path)
             .env("ROOTYARD_DATA_ROOT", &state.storage.root)
-            .env(
-                "ROOTYARD_GIT_TIMEOUT_SECONDS",
-                state.config.git_timeout.as_secs().to_string(),
-            );
+            .env("ROOTYARD_GIT_TIMEOUT_SECONDS", state.config.git_timeout.as_secs().to_string());
         if let Ok(node_id) = std::env::var("ROOTYARD_NODE_ID") {
             cmd.env("ROOTYARD_NODE_ID", node_id);
         }
@@ -376,26 +278,13 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(value) = parts.headers.get(header::CONTENT_TYPE) {
-        cmd.env(
-            "CONTENT_TYPE",
-            value.to_str().map_err(|_| Error::bad_request())?,
-        );
+        cmd.env("CONTENT_TYPE", value.to_str().map_err(|_| Error::bad_request())?);
     }
-    if let Some(value) = parts
-        .headers
-        .get(header::CONTENT_LENGTH)
-        .filter(|_| !input.gzipped)
-    {
-        cmd.env(
-            "CONTENT_LENGTH",
-            value.to_str().map_err(|_| Error::bad_request())?,
-        );
+    if let Some(value) = parts.headers.get(header::CONTENT_LENGTH).filter(|_| !input.gzipped) {
+        cmd.env("CONTENT_LENGTH", value.to_str().map_err(|_| Error::bad_request())?);
     }
     if let Some(value) = parts.headers.get("git-protocol") {
-        cmd.env(
-            "GIT_PROTOCOL",
-            value.to_str().map_err(|_| Error::bad_request())?,
-        );
+        cmd.env("GIT_PROTOCOL", value.to_str().map_err(|_| Error::bad_request())?);
     }
     let memory = state.config.git_memory_bytes;
     let file_size = state.config.max_repo_bytes;
@@ -411,10 +300,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 (libc::RLIMIT_FSIZE, file_size),
                 (libc::RLIMIT_NOFILE, 256),
             ] {
-                let value = libc::rlimit {
-                    rlim_cur: limit,
-                    rlim_max: limit,
-                };
+                let value = libc::rlimit { rlim_cur: limit, rlim_max: limit };
                 if libc::setrlimit(resource, &value) == -1 {
                     return Err(io::Error::last_os_error());
                 }
@@ -469,12 +355,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         let mut buf = [0u8; 4096];
         while matches!(stderr.read(&mut buf).await,Ok(n) if n>0) {}
     });
-    let mut process = Process {
-        child,
-        input: Some(input),
-        stderr,
-        pid,
-    };
+    let mut process = Process { child, input: Some(input), stderr, pid };
     let mut stdout = BufReader::with_capacity(16 * 1024, stdout);
     let headers = match tokio::time::timeout_at(deadline, read_headers(&mut stdout)).await {
         Ok(Ok(headers)) => headers,
@@ -495,12 +376,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     // Inspect just the first bounded packet for job RPCs before committing
     // headers. Never turn a failed/truncated PACK into a successful response.
     let prefix = if job && parts.method == Method::POST && headers.0.is_success() {
-        match tokio::time::timeout_at(
-            deadline,
-            job_response_prefix(&mut stdout, state.config.max_output_bytes),
-        )
-        .await
-        {
+        match tokio::time::timeout_at(deadline, job_response_prefix(&mut stdout, state.config.max_output_bytes)).await {
             Ok(Ok((prefix, false))) => prefix,
             result => {
                 process.stop().await;
@@ -516,15 +392,8 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     } else {
         Vec::new()
     };
-    if let Err(error) = transfer_authorized(
-        &state,
-        identity.as_ref(),
-        job_plan.as_ref(),
-        job_principal.as_ref(),
-        &repo,
-        write,
-    )
-    .await
+    if let Err(error) =
+        transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(), job_principal.as_ref(), &repo, write).await
     {
         process.stop().await;
         let _ = reliability::complete(&state, operation).await;
@@ -545,9 +414,8 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     // Drive pipes independently of response polling. Otherwise a client that stops
     // reading could freeze the deadline, retain its permit and block a repository.
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
-    let failed = Arc::new(std::sync::atomic::AtomicBool::new(
-        headers.0.is_client_error() || headers.0.is_server_error(),
-    ));
+    let failed =
+        Arc::new(std::sync::atomic::AtomicBool::new(headers.0.is_client_error() || headers.0.is_server_error()));
     let producer_failed = failed.clone();
     let admitted_repo = repo.clone();
     tokio::spawn(async move {
@@ -573,14 +441,10 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             )
             .await?;
             if let Some(guard) = &ref_guard {
-                guard
-                    .ensure_active()
-                    .map_err(|_| io::Error::other("ref publication guard lost"))?;
+                guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?;
             }
             if let Some(lease) = &snapshot_lease {
-                lease
-                    .ensure_active()
-                    .map_err(|_| io::Error::other("storage read lease lost"))?;
+                lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?;
             }
             loop {
                 let next = if let Some(input) = process.input.as_mut() {
@@ -628,14 +492,10 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 )
                 .await?;
                 if let Some(guard) = &ref_guard {
-                    guard
-                        .ensure_active()
-                        .map_err(|_| io::Error::other("ref publication guard lost"))?;
+                    guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?;
                 }
                 if let Some(lease) = &snapshot_lease {
-                    lease
-                        .ensure_active()
-                        .map_err(|_| io::Error::other("storage read lease lost"))?;
+                    lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?;
                 }
                 total = total.saturating_add(n as u64);
                 if total > max_output {
@@ -665,9 +525,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             }
             if write {
                 if let Some(guard) = &ref_guard {
-                    guard
-                        .ensure_active()
-                        .map_err(|_| io::Error::other("ref publication guard lost"))?;
+                    guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?;
                 }
                 crate::sharding::fencing::check_before_push(&state, &admitted_repo)
                     .await
@@ -675,10 +533,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             }
             Ok::<(), io::Error>(())
         };
-        if !matches!(
-            tokio::time::timeout_at(deadline, transfer).await,
-            Ok(Ok(()))
-        ) {
+        if !matches!(tokio::time::timeout_at(deadline, transfer).await, Ok(Ok(()))) {
             producer_failed.store(true, std::sync::atomic::Ordering::Release);
         }
         process.stop().await;
@@ -702,10 +557,6 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             Err(io::Error::other("Git transfer failed, timed out, or exceeded limits"))?;
         }
     };
-    let stream: std::pin::Pin<
-        Box<dyn futures_util::Stream<Item = Result<Bytes, io::Error>> + Send>,
-    > = Box::pin(stream);
-    response
-        .body(Body::from_stream(stream))
-        .map_err(Error::internal)
+    let stream: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, io::Error>> + Send>> = Box::pin(stream);
+    response.body(Body::from_stream(stream)).map_err(Error::internal)
 }

@@ -12,15 +12,11 @@ pub fn pool(url: &str) -> Result<Pool> {
     let mut cfg: tokio_postgres::Config = url.parse()?;
     ensure_mode(&cfg)?;
     cfg.connect_timeout(std::time::Duration::from_secs(5));
-    let options = format!(
-        "{} -c statement_timeout=5000 -c lock_timeout=3000 -c timezone=UTC",
-        cfg.get_options().unwrap_or("")
-    );
+    let options =
+        format!("{} -c statement_timeout=5000 -c lock_timeout=3000 -c timezone=UTC", cfg.get_options().unwrap_or(""));
     cfg.options(&options);
     cfg.application_name("rootyard");
-    let options = ManagerConfig {
-        recycling_method: RecyclingMethod::Fast,
-    };
+    let options = ManagerConfig { recycling_method: RecyclingMethod::Fast };
     let manager = if cfg.get_ssl_mode() == tokio_postgres::config::SslMode::Require {
         Manager::from_config(cfg, tls_connector()?, options)
     } else {
@@ -44,16 +40,13 @@ fn ensure_mode(cfg: &tokio_postgres::Config) -> Result<()> {
 }
 
 fn tls_connector() -> Result<MakeRustlsConnect> {
-    let ca_path = std::env::var("ROOTYARD_PG_CA_PEM").context(
-        "sslmode=require needs ROOTYARD_PG_CA_PEM for certificate and hostname validation",
-    )?;
+    let ca_path = std::env::var("ROOTYARD_PG_CA_PEM")
+        .context("sslmode=require needs ROOTYARD_PG_CA_PEM for certificate and hostname validation")?;
     let mut reader = BufReader::new(File::open(ca_path).context("PostgreSQL CA file unavailable")?);
     let mut roots = rustls::RootCertStore::empty();
     let mut count = 0;
     for cert in rustls_pemfile::certs(&mut reader) {
-        roots
-            .add(cert.context("invalid PostgreSQL CA certificate")?)
-            .context("invalid PostgreSQL CA certificate")?;
+        roots.add(cert.context("invalid PostgreSQL CA certificate")?).context("invalid PostgreSQL CA certificate")?;
         count += 1;
     }
     ensure!(count > 0, "PostgreSQL CA file contains no certificates");
@@ -68,15 +61,10 @@ fn tls_connector() -> Result<MakeRustlsConnect> {
         (Some(cert_path), Some(key_path)) => {
             let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path)?))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            ensure!(
-                !certs.is_empty(),
-                "PostgreSQL client certificate file is empty"
-            );
+            ensure!(!certs.is_empty(), "PostgreSQL client certificate file is empty");
             let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(key_path)?))?
                 .context("PostgreSQL client private key missing")?;
-            builder
-                .with_client_auth_cert(certs, key)
-                .context("invalid PostgreSQL client certificate or key")?
+            builder.with_client_auth_cert(certs, key).context("invalid PostgreSQL client certificate or key")?
         }
         (None, None) => builder.with_no_client_auth(),
         _ => bail!("PostgreSQL client certificate and key must be configured together"),
@@ -120,88 +108,37 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (40, include_str!("../migrations/040_webhooks.sql")),
     (50, include_str!("../migrations/050_members_rbac.sql")),
     (60, include_str!("../migrations/060_sharding_fencing.sql")),
-    (
-        70,
-        include_str!("../migrations/070_repository_object_format.sql"),
-    ),
+    (70, include_str!("../migrations/070_repository_object_format.sql")),
     (72, include_str!("../migrations/072_forge_sha256.sql")),
-    (
-        73,
-        include_str!("../migrations/073_pando_pack_manifests.sql"),
-    ),
-    (
-        74,
-        include_str!("../migrations/074_pando_authoritative_refs.sql"),
-    ),
-    (
-        75,
-        include_str!("../migrations/075_pando_operation_sequence.sql"),
-    ),
+    (73, include_str!("../migrations/073_pando_pack_manifests.sql")),
+    (74, include_str!("../migrations/074_pando_authoritative_refs.sql")),
+    (75, include_str!("../migrations/075_pando_operation_sequence.sql")),
     (80, include_str!("../migrations/080_cluster_security.sql")),
-    (
-        81,
-        include_str!("../migrations/081_shard_marker_transitions.sql"),
-    ),
-    (
-        82,
-        include_str!("../migrations/082_cluster_transport_nonces.sql"),
-    ),
+    (81, include_str!("../migrations/081_shard_marker_transitions.sql")),
+    (82, include_str!("../migrations/082_cluster_transport_nonces.sql")),
     (83, include_str!("../migrations/083_shard_replication.sql")),
-    (
-        84,
-        include_str!("../migrations/084_transition_volume_binding.sql"),
-    ),
+    (84, include_str!("../migrations/084_transition_volume_binding.sql")),
     (85, include_str!("../migrations/085_cluster_authority.sql")),
-    (
-        86,
-        include_str!("../migrations/086_replication_sequence.sql"),
-    ),
+    (86, include_str!("../migrations/086_replication_sequence.sql")),
     (90, include_str!("../migrations/090_workspaces.sql")),
     (91, include_str!("../migrations/091_workspace_capture.sql")),
     (92, include_str!("../migrations/092_sandbox_jobs.sql")),
-    (
-        93,
-        include_str!("../migrations/093_workspace_namespaces.sql"),
-    ),
+    (93, include_str!("../migrations/093_workspace_namespaces.sql")),
     (94, include_str!("../migrations/094_workspace_remote.sql")),
-    (
-        95,
-        include_str!("../migrations/095_workspace_remote_staging.sql"),
-    ),
-    (
-        96,
-        include_str!("../migrations/096_workspace_changesets.sql"),
-    ),
-    (
-        97,
-        include_str!("../migrations/097_sandbox_lease_binding.sql"),
-    ),
+    (95, include_str!("../migrations/095_workspace_remote_staging.sql")),
+    (96, include_str!("../migrations/096_workspace_changesets.sql")),
+    (97, include_str!("../migrations/097_sandbox_lease_binding.sql")),
     (98, include_str!("../migrations/098_ci_sandbox.sql")),
     (105, include_str!("../migrations/105_webhook_claims.sql")),
     (106, include_str!("../migrations/106_ci_runs.sql")),
     (107, include_str!("../migrations/107_trusted_checks.sql")),
-    (
-        108,
-        include_str!("../migrations/108_ci_dependency_grants.sql"),
-    ),
-    (
-        109,
-        include_str!("../migrations/109_ci_integration_jobs.sql"),
-    ),
+    (108, include_str!("../migrations/108_ci_dependency_grants.sql")),
+    (109, include_str!("../migrations/109_ci_integration_jobs.sql")),
     (110, include_str!("../migrations/110_audit_sequence.sql")),
     (111, include_str!("../migrations/111_storage_jobs.sql")),
-    (
-        112,
-        include_str!("../migrations/112_pando_storage_jobs.sql"),
-    ),
-    (
-        113,
-        include_str!("../migrations/113_ci_sandbox_run_fkey.sql"),
-    ),
-    (
-        114,
-        include_str!("../migrations/114_ci_sandbox_preparing.sql"),
-    ),
+    (112, include_str!("../migrations/112_pando_storage_jobs.sql")),
+    (113, include_str!("../migrations/113_ci_sandbox_run_fkey.sql")),
+    (114, include_str!("../migrations/114_ci_sandbox_preparing.sql")),
     (116, include_str!("../migrations/116_sandbox_terminal.sql")),
     (120, include_str!("../migrations/120_organizations.sql")),
     (121, include_str!("../migrations/121_lfs_locks.sql")),
@@ -209,27 +146,17 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
 ];
 
 pub const SCHEMA_VERSIONS: &[i32] = &[
-    1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 72, 73, 74, 75, 80, 81, 82, 83, 84, 85, 86, 90,
-    91, 92, 93, 94, 95, 96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 116, 120,
-    121, 125,
+    1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 72, 73, 74, 75, 80, 81, 82, 83, 84, 85, 86, 90, 91, 92, 93, 94, 95,
+    96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 116, 120, 121, 125,
 ];
 
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
-    tx.execute("SELECT pg_advisory_xact_lock(738390103)", &[])
-        .await?;
-    tx.batch_execute(include_str!("../migrations/001_initial.sql"))
-        .await?;
+    tx.execute("SELECT pg_advisory_xact_lock(738390103)", &[]).await?;
+    tx.batch_execute(include_str!("../migrations/001_initial.sql")).await?;
     for &(version, sql) in MIGRATIONS {
-        if tx
-            .query_opt(
-                "SELECT version FROM schema_migrations WHERE version=$1",
-                &[&version],
-            )
-            .await?
-            .is_none()
-        {
+        if tx.query_opt("SELECT version FROM schema_migrations WHERE version=$1", &[&version]).await?.is_none() {
             tx.batch_execute(sql).await?;
         }
     }
@@ -242,21 +169,14 @@ pub fn valid_name(name: &str) -> bool {
     !bytes.is_empty()
         && bytes.len() <= 63
         && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-')
+        && bytes.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'-')
 }
 
 pub fn digest(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
-pub async fn issue_token(
-    pool: &Pool,
-    username: &str,
-    create_user: bool,
-    read_only: bool,
-) -> Result<serde_json::Value> {
+pub async fn issue_token(pool: &Pool, username: &str, create_user: bool, read_only: bool) -> Result<serde_json::Value> {
     if !valid_name(username) {
         bail!(
             "invalid username: use 1-63 lowercase ASCII letters, digits, underscores or hyphens; begin with a letter or digit"
@@ -266,18 +186,12 @@ pub async fn issue_token(
     let tx = client.transaction().await?;
     let user_id = if create_user {
         let id = Uuid::new_v4();
-        tx.execute(
-            "INSERT INTO users (id, username) VALUES ($1, $2)",
-            &[&id, &username],
-        )
-        .await
-        .context("user already exists or cannot be created")?;
+        tx.execute("INSERT INTO users (id, username) VALUES ($1, $2)", &[&id, &username])
+            .await
+            .context("user already exists or cannot be created")?;
         id
     } else {
-        tx.query_opt("SELECT id FROM users WHERE username = $1", &[&username])
-            .await?
-            .context("user not found")?
-            .get(0)
+        tx.query_opt("SELECT id FROM users WHERE username = $1", &[&username]).await?.context("user not found")?.get(0)
     };
     let mut random = [0u8; 32];
     rand::rng().fill_bytes(&mut random);
@@ -342,9 +256,7 @@ mod tests {
         for good in ["a", "0", "repo-one", "a_b"] {
             assert!(valid_name(good));
         }
-        for bad in [
-            "", ".", "..", "a.git", "-a", "A", "a/b", "a%2fb", "a\\b", "a\0", "é",
-        ] {
+        for bad in ["", ".", "..", "a.git", "-a", "A", "a/b", "a%2fb", "a\\b", "a\0", "é"] {
             assert!(!valid_name(bad), "{bad}");
         }
         assert!(!valid_name(&"a".repeat(64)));

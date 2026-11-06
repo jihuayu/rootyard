@@ -48,9 +48,7 @@ impl Process {
         let mut reported = false;
         while !matches!(group_quiescent(self.pid), Ok(true)) {
             if !reported && started.elapsed() > std::time::Duration::from_secs(5) {
-                eprintln!(
-                    "rootyard: process group cleanup blocked; retaining write lock and capacity"
-                );
+                eprintln!("rootyard: process group cleanup blocked; retaining write lock and capacity");
                 reported = true;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -94,10 +92,7 @@ pub(crate) fn group_quiescent(group: i32) -> io::Result<bool> {
         }
         let stat = match std::fs::read_to_string(entry.path().join("stat")) {
             Ok(stat) => stat,
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ESRCH) =>
-            {
+            Err(error) if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) => {
                 continue;
             }
             Err(error) => return Err(error),
@@ -119,19 +114,12 @@ pub(crate) fn group_quiescent(group: i32) -> io::Result<bool> {
 /// Reap a native Git leader only after every member of its process group is
 /// dead. The unreaped leader reserves the PGID and prevents signaling reuse.
 pub(crate) async fn finish_group_child(child: &mut Child) -> io::Result<std::process::ExitStatus> {
-    let pid = child
-        .id()
-        .ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
+    let pid = child.id().ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
     loop {
         let exited = {
             let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
             let rc = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid as u32,
-                    info.as_mut_ptr(),
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
+                libc::waitid(libc::P_PID, pid as u32, info.as_mut_ptr(), libc::WEXITED | libc::WNOHANG | libc::WNOWAIT)
             };
             if rc != 0 {
                 return Err(io::Error::last_os_error());
@@ -152,9 +140,7 @@ pub(crate) async fn finish_group_child(child: &mut Child) -> io::Result<std::pro
 
 /// Cancellation and timeout path for a Git leader and all descendants.
 pub(crate) async fn stop_group_child(child: &mut Child) -> io::Result<()> {
-    let pid = child
-        .id()
-        .ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
+    let pid = child.id().ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
     unsafe {
         libc::kill(-pid, libc::SIGTERM);
     }
@@ -192,9 +178,7 @@ impl Drop for Process {
             let mut reported = false;
             while !matches!(group_quiescent(self.pid), Ok(true)) {
                 if !reported && started.elapsed() > std::time::Duration::from_secs(5) {
-                    eprintln!(
-                        "rootyard: cancelled Git process group cleanup blocked; retaining snapshot gate"
-                    );
+                    eprintln!("rootyard: cancelled Git process group cleanup blocked; retaining snapshot gate");
                     reported = true;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -226,10 +210,7 @@ pub(crate) async fn collect_git_output_input(
     timeout: std::time::Duration,
     input: Stdio,
 ) -> anyhow::Result<Vec<u8>> {
-    command
-        .stdin(input)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdin(input).stdout(Stdio::piped()).stderr(Stdio::piped());
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -239,27 +220,17 @@ pub(crate) async fn collect_git_output_input(
         });
     }
     let mut child = command.spawn()?;
-    let pid = child
-        .id()
-        .ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
+    let pid = child.id().ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
     let drain = tokio::spawn(async move {
         let mut bytes = [0u8; 4096];
         while matches!(stderr.read(&mut bytes).await,Ok(n) if n>0) {}
     });
-    let mut process = Process {
-        child,
-        input: None,
-        stderr: drain,
-        pid,
-    };
+    let mut process = Process { child, input: None, stderr: drain, pid };
     let mut output = Vec::new();
     let result = tokio::time::timeout(timeout, async {
-        (&mut stdout)
-            .take(limit as u64 + 1)
-            .read_to_end(&mut output)
-            .await?;
+        (&mut stdout).take(limit as u64 + 1).read_to_end(&mut output).await?;
         if output.len() > limit {
             return Err(io::Error::other("maintenance output exceeds limit"));
         }
@@ -282,8 +253,15 @@ mod process_tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("child.pid");
         let mut cmd = tokio::process::Command::new("/bin/sh");
-        cmd.args(["-c", "sh -c 'trap \"\" TERM; echo $$ > \"$1\"; while :; do sleep 1; done' child \"$1\" & exit 0", "leader"])
-            .arg(&pid_file).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.args([
+            "-c",
+            "sh -c 'trap \"\" TERM; echo $$ > \"$1\"; while :; do sleep 1; done' child \"$1\" & exit 0",
+            "leader",
+        ])
+        .arg(&pid_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setpgid(0, 0) != 0 {
@@ -294,12 +272,7 @@ mod process_tests {
         }
         let child = cmd.spawn().unwrap();
         let pid = child.id().unwrap() as i32;
-        let process = Process {
-            child,
-            input: None,
-            stderr: tokio::spawn(async {}),
-            pid,
-        };
+        let process = Process { child, input: None, stderr: tokio::spawn(async {}), pid };
         let started = Instant::now();
         let child_pid = loop {
             if let Ok(text) = std::fs::read_to_string(&pid_file) {
@@ -307,10 +280,7 @@ mod process_tests {
                     break pid;
                 }
             }
-            assert!(
-                started.elapsed().as_secs() < 5,
-                "test child failed to start"
-            );
+            assert!(started.elapsed().as_secs() < 5, "test child failed to start");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
         (process, child_pid)
@@ -320,19 +290,12 @@ mod process_tests {
         loop {
             match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
                 Err(_) => return,
-                Ok(text)
-                    if text
-                        .rsplit_once(") ")
-                        .is_some_and(|(_, tail)| tail.starts_with('Z')) =>
-                {
+                Ok(text) if text.rsplit_once(") ").is_some_and(|(_, tail)| tail.starts_with('Z')) => {
                     return;
                 }
                 _ => {}
             }
-            assert!(
-                started.elapsed().as_secs() < 5,
-                "descendant survived group cleanup"
-            );
+            assert!(started.elapsed().as_secs() < 5, "descendant survived group cleanup");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
@@ -342,10 +305,7 @@ mod process_tests {
         let leader = process.pid;
         assert!(process.finish().await.unwrap().success());
         assert_not_running(child_pid).await;
-        assert!(
-            !std::path::Path::new(&format!("/proc/{leader}")).exists(),
-            "leader was not reaped"
-        );
+        assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists(), "leader was not reaped");
     }
     #[tokio::test]
     async fn timeout_cleans_term_ignoring_descendants_before_reaping() {
@@ -353,21 +313,13 @@ mod process_tests {
         let leader = process.pid;
         process.stop().await;
         assert_not_running(child_pid).await;
-        assert!(
-            !std::path::Path::new(&format!("/proc/{leader}")).exists(),
-            "leader was not reaped"
-        );
+        assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists(), "leader was not reaped");
     }
     #[tokio::test]
     async fn maintenance_helpers_wait_for_descendant_quiescence() {
         let (mut finished, finished_child) = orphan_group().await;
         let leader = finished.pid;
-        assert!(
-            finish_group_child(&mut finished.child)
-                .await
-                .unwrap()
-                .success()
-        );
+        assert!(finish_group_child(&mut finished.child).await.unwrap().success());
         finished.pid = 0;
         assert_not_running(finished_child).await;
         assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists());

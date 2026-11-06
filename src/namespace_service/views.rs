@@ -63,24 +63,12 @@ fn git(repo: &FsPath, args: &[&str]) -> Result<String, Error> {
     }
     String::from_utf8(out.stdout).map_err(Error::internal)
 }
-async fn clone(
-    state: &AppState,
-    source: &FsPath,
-    dest: &FsPath,
-    branch: Option<&str>,
-) -> Result<(), Error> {
+async fn clone(state: &AppState, source: &FsPath, dest: &FsPath, branch: Option<&str>) -> Result<(), Error> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(Error::internal)?;
     }
     let mut cmd = state.storage.git(&state.config);
-    cmd.args([
-        "-c",
-        "core.hooksPath=/dev/null",
-        "clone",
-        "--no-local",
-        "--no-hardlinks",
-        "--no-tags",
-    ]);
+    cmd.args(["-c", "core.hooksPath=/dev/null", "clone", "--no-local", "--no-hardlinks", "--no-tags"]);
     if let Some(branch) = branch {
         cmd.args(["--single-branch", "--branch", branch]);
     }
@@ -103,53 +91,31 @@ pub async fn create(
     let ns = handlers::load(&state, &headers, id).await?;
     if !input.subdir.is_empty()
         && (crate::browse::models::normalize_rel_path(Some(&input.subdir))? != input.subdir
-            || !input
-                .subdir
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b)))
+            || !input.subdir.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b)))
     {
         return Err(Error::bad_request());
     }
-    let mount = ns
-        .mounts
-        .iter()
-        .find(|m| m.path == input.mount_path)
-        .ok_or_else(Error::not_found)?;
+    let mount = ns.mounts.iter().find(|m| m.path == input.mount_path).ok_or_else(Error::not_found)?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access =
-        auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Read)
+    let access = auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Read).await?;
+    let source_lease =
+        read_leases::shared(&state.pool, access.repo_id, tokio::time::Instant::now() + state.config.git_timeout)
             .await?;
-    let source_lease = read_leases::shared(
-        &state.pool,
-        access.repo_id,
-        tokio::time::Instant::now() + state.config.git_timeout,
-    )
-    .await?;
-    let _local = tokio::time::timeout(
-        state.config.git_timeout,
-        state.storage.read_snapshot_lock(access.repo_id),
-    )
-    .await
-    .map_err(|_| Error::timeout())?;
+    let _local = tokio::time::timeout(state.config.git_timeout, state.storage.read_snapshot_lock(access.repo_id))
+        .await
+        .map_err(|_| Error::timeout())?;
     source_lease.ensure_active()?;
-    let refreshed =
-        auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Read)
-            .await?;
+    let refreshed = auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Read).await?;
     if refreshed.repo_id != access.repo_id {
         return Err(Error::not_found());
     }
-    let source = state
-        .storage
-        .verify_path(access.repo_id)
-        .map_err(Error::internal)?;
+    let source = state.storage.verify_path(access.repo_id).map_err(Error::internal)?;
     let vid = Uuid::new_v4();
     let temp = projection_root(&state).join(format!("stage-{vid}"));
     let final_path = projection_root(&state).join(vid.to_string());
-    source_lease
-        .guard(clone(&state, &source, &temp, None))
-        .await??;
+    source_lease.guard(clone(&state, &source, &temp, None)).await??;
     // A namespace BaseVector can outlive every source branch that named it.
     // Clone transfers visible refs; fetch the exact pinned commit while the
     // hosted source still has a live cross-process read lease.
@@ -161,18 +127,9 @@ pub async fn create(
         .arg(&source)
         .arg(&mount.base_oid);
     source_lease
-        .guard(crate::git_http::collect_git_output(
-            pinned,
-            4096,
-            state.config.git_timeout,
-        ))
+        .guard(crate::git_http::collect_git_output(pinned, 4096, state.config.git_timeout))
         .await?
-        .map_err(|_| {
-            Error(
-                StatusCode::CONFLICT,
-                "Git View pinned source is unavailable",
-            )
-        })?;
+        .map_err(|_| Error(StatusCode::CONFLICT, "Git View pinned source is unavailable"))?;
     source_lease.ensure_active()?;
     drop(_local);
     drop(source_lease);
@@ -180,16 +137,7 @@ pub async fn create(
     let projected = if input.subdir.is_empty() {
         mount.base_oid.clone()
     } else {
-        git(
-            &temp,
-            &[
-                "filter-branch",
-                "--subdirectory-filter",
-                &input.subdir,
-                "--",
-                "HEAD",
-            ],
-        )?;
+        git(&temp, &["filter-branch", "--subdirectory-filter", &input.subdir, "--", "HEAD"])?;
         git(&temp, &["rev-parse", "HEAD"])?.trim().to_owned()
     };
     git(&temp, &["update-ref", "refs/heads/projected", &projected])?;
@@ -200,7 +148,12 @@ pub async fn create(
         return Err(Error::internal("view head mismatch"));
     }
     tx.execute("INSERT INTO workspace_views(id,namespace_id,repository_id,mount_path,subdir,source_oid,projected_oid,creator_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)", &[&vid,&id,&access.repo_id,&input.mount_path,&input.subdir,&mount.base_oid,&projected,&actor.id]).await.map_err(Error::internal)?;
-    tx.execute("INSERT INTO workspace_view_history(view_id,source_oid,projected_oid,epoch) VALUES($1,$2,$3,1)", &[&vid,&mount.base_oid,&projected]).await.map_err(Error::internal)?;
+    tx.execute(
+        "INSERT INTO workspace_view_history(view_id,source_oid,projected_oid,epoch) VALUES($1,$2,$3,1)",
+        &[&vid, &mount.base_oid, &projected],
+    )
+    .await
+    .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     Ok((
         StatusCode::CREATED,
@@ -238,32 +191,12 @@ pub async fn bundle(
 ) -> Result<impl IntoResponse, Error> {
     load(&state, &headers, id).await?;
     let root = projection_root(&state).join(id.to_string());
-    let path = root
-        .parent()
-        .ok_or_else(Error::not_found)?
-        .join(format!("{id}.bundle"));
-    git(
-        &root,
-        &[
-            "bundle",
-            "create",
-            path.to_str().ok_or_else(Error::bad_request)?,
-            "--all",
-        ],
-    )?;
+    let path = root.parent().ok_or_else(Error::not_found)?.join(format!("{id}.bundle"));
+    git(&root, &["bundle", "create", path.to_str().ok_or_else(Error::bad_request)?, "--all"])?;
     let bytes = fs::read(&path).map_err(Error::internal)?;
     let _ = fs::remove_file(path);
     if bytes.len() > 32 * 1024 * 1024 {
-        return Err(Error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "view bundle too large",
-        ));
+        return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "view bundle too large"));
     }
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/x-git-bundle"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        bytes,
-    ))
+    Ok(([(header::CONTENT_TYPE, "application/x-git-bundle"), (header::CACHE_CONTROL, "no-store")], bytes))
 }

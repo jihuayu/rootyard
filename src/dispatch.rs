@@ -44,49 +44,37 @@ impl Settings {
                 Ok(v) => v.parse().with_context(|| format!("invalid {name}"))?,
                 Err(_) => default,
             };
-            ensure!(
-                (min..=max).contains(&value),
-                "{name} outside supported range"
-            );
+            ensure!((min..=max).contains(&value), "{name} outside supported range");
             Ok(value)
         }
-        let consumers = std::env::var("ROOTYARD_WORKER_CONSUMERS")
-            .unwrap_or_else(|_| crate::events::CONSUMERS.join(","));
+        let consumers =
+            std::env::var("ROOTYARD_WORKER_CONSUMERS").unwrap_or_else(|_| crate::events::CONSUMERS.join(","));
         let consumers: Vec<String> = consumers.split(',').map(str::to_owned).collect();
         ensure!(
             !consumers.is_empty()
                 && consumers.len() <= crate::events::CONSUMERS.len()
-                && consumers
-                    .iter()
-                    .all(|s| crate::events::CONSUMERS.contains(&s.as_str())),
+                && consumers.iter().all(|s| crate::events::CONSUMERS.contains(&s.as_str())),
             "invalid worker consumers"
         );
-        ensure!(
-            consumers.len() == 1 || consumers[0] != consumers[1],
-            "duplicate worker consumer"
-        );
-        let transport: Option<Arc<dyn WakeTransport>> =
-            match std::env::var("ROOTYARD_WAKE_TRANSPORT").as_deref() {
-                Err(_) | Ok("poll") => None,
-                Ok("redis") => {
-                    let address = std::env::var("ROOTYARD_REDIS_ADDRESS")
-                        .context("ROOTYARD_REDIS_ADDRESS is required")?
-                        .parse()
-                        .context("Redis address must be a loopback socket address")?;
-                    let channel = std::env::var("ROOTYARD_WAKE_CHANNEL")
-                        .unwrap_or_else(|_| "rootyard:outbox:v1".into());
-                    Some(Arc::new(RedisWake::new(address, channel)?))
-                }
-                Ok("kafka") => Some(Arc::new(crate::kafka_wake::KafkaWake::new(
-                    std::env::var("ROOTYARD_KAFKA_BOOTSTRAP_SERVERS")
-                        .context("ROOTYARD_KAFKA_BOOTSTRAP_SERVERS is required")?,
-                    std::env::var("ROOTYARD_KAFKA_TOPIC")
-                        .context("ROOTYARD_KAFKA_TOPIC is required")?,
-                    std::env::var("ROOTYARD_KAFKA_GROUP")
-                        .context("ROOTYARD_KAFKA_GROUP is required")?,
-                )?)),
-                _ => bail!("wake transport must be poll, redis or kafka"),
-            };
+        ensure!(consumers.len() == 1 || consumers[0] != consumers[1], "duplicate worker consumer");
+        let transport: Option<Arc<dyn WakeTransport>> = match std::env::var("ROOTYARD_WAKE_TRANSPORT").as_deref() {
+            Err(_) | Ok("poll") => None,
+            Ok("redis") => {
+                let address = std::env::var("ROOTYARD_REDIS_ADDRESS")
+                    .context("ROOTYARD_REDIS_ADDRESS is required")?
+                    .parse()
+                    .context("Redis address must be a loopback socket address")?;
+                let channel = std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
+                Some(Arc::new(RedisWake::new(address, channel)?))
+            }
+            Ok("kafka") => Some(Arc::new(crate::kafka_wake::KafkaWake::new(
+                std::env::var("ROOTYARD_KAFKA_BOOTSTRAP_SERVERS")
+                    .context("ROOTYARD_KAFKA_BOOTSTRAP_SERVERS is required")?,
+                std::env::var("ROOTYARD_KAFKA_TOPIC").context("ROOTYARD_KAFKA_TOPIC is required")?,
+                std::env::var("ROOTYARD_KAFKA_GROUP").context("ROOTYARD_KAFKA_GROUP is required")?,
+            )?)),
+            _ => bail!("wake transport must be poll, redis or kafka"),
+        };
         Ok(Self {
             poll: Duration::from_millis(number("ROOTYARD_WORKER_POLL_MS", 5000, 50, 60_000)?),
             batch: number("ROOTYARD_WORKER_BATCH", 64, 1, 1000)? as i64,
@@ -121,20 +109,19 @@ pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: C
         }
         let scan = async {
             // A poisoned consumer cannot suppress another consumer's scan.
-            let results =
-                futures_util::future::join_all(settings.consumers.iter().map(|consumer| {
-                    tokio::time::timeout(
-                        Duration::from_secs(15),
-                        crate::events::worker_once_with_lease(
-                            &pool,
-                            consumer,
-                            owner,
-                            settings.batch,
-                            settings.lease_seconds,
-                        ),
-                    )
-                }))
-                .await;
+            let results = futures_util::future::join_all(settings.consumers.iter().map(|consumer| {
+                tokio::time::timeout(
+                    Duration::from_secs(15),
+                    crate::events::worker_once_with_lease(
+                        &pool,
+                        consumer,
+                        owner,
+                        settings.batch,
+                        settings.lease_seconds,
+                    ),
+                )
+            }))
+            .await;
             let mut count = 0;
             let mut failed = false;
             for result in results {
@@ -166,11 +153,7 @@ pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: C
     }
 }
 /// Called outside the Git/PG commit path. Any failure loses only a wake hint.
-pub async fn publisher(
-    transport: Option<Arc<dyn WakeTransport>>,
-    signal: Arc<Notify>,
-    stop: CancellationToken,
-) {
+pub async fn publisher(transport: Option<Arc<dyn WakeTransport>>, signal: Arc<Notify>, stop: CancellationToken) {
     let Some(transport) = transport else {
         return;
     };
@@ -208,9 +191,7 @@ impl RedisWake {
         );
         ensure!(
             (1..=128).contains(&channel.len())
-                && channel
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b":_-".contains(&c)),
+                && channel.bytes().all(|c| c.is_ascii_alphanumeric() || b":_-".contains(&c)),
             "invalid wake channel"
         );
         Ok(Self { address, channel })
@@ -225,18 +206,13 @@ impl RedisWake {
         let mut unavailable = false;
         loop {
             let connect = async {
-                let mut stream = self
-                    .connect(&[b"SUBSCRIBE", self.channel.as_bytes()])
-                    .await?;
+                let mut stream = self.connect(&[b"SUBSCRIBE", self.channel.as_bytes()]).await?;
                 let expected = Frame::Array(vec![
                     Frame::Bulk(b"subscribe".to_vec()),
                     Frame::Bulk(self.channel.as_bytes().to_vec()),
                     Frame::Integer(1),
                 ]);
-                ensure!(
-                    read_frame(&mut stream).await? == expected,
-                    "invalid subscription acknowledgment"
-                );
+                ensure!(read_frame(&mut stream).await? == expected, "invalid subscription acknowledgment");
                 Ok::<_, anyhow::Error>(stream)
             };
             let connected = tokio::select! {biased;
@@ -266,9 +242,7 @@ impl RedisWake {
                 }
             }
             if !unavailable {
-                eprintln!(
-                    "rootyard: advisory subscription disconnected; PostgreSQL polling continues"
-                );
+                eprintln!("rootyard: advisory subscription disconnected; PostgreSQL polling continues");
                 unavailable = true;
             }
             tokio::select! { _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
@@ -279,18 +253,14 @@ impl WakeTransport for RedisWake {
     fn publish(&self) -> Task<'_, Result<()>> {
         Box::pin(async move {
             let call = async {
-                let mut stream = self
-                    .connect(&[b"PUBLISH", self.channel.as_bytes(), b"v1"])
-                    .await?;
+                let mut stream = self.connect(&[b"PUBLISH", self.channel.as_bytes(), b"v1"]).await?;
                 ensure!(
                     matches!(read_frame(&mut stream).await?,Frame::Integer(n) if n>=0),
                     "invalid publish acknowledgment"
                 );
                 Ok(())
             };
-            tokio::time::timeout(Duration::from_secs(1), call)
-                .await
-                .context("wake timeout")?
+            tokio::time::timeout(Duration::from_secs(1), call).await.context("wake timeout")?
         })
     }
     fn subscribe(&self, signal: Arc<Notify>, stop: CancellationToken) -> Task<'_, ()> {
@@ -312,10 +282,7 @@ enum Frame {
     Integer(i64),
     Array(Vec<Frame>),
 }
-async fn line<R: tokio::io::AsyncBufRead + Unpin>(
-    stream: &mut R,
-    budget: &mut usize,
-) -> Result<Vec<u8>> {
+async fn line<R: tokio::io::AsyncBufRead + Unpin>(stream: &mut R, budget: &mut usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     loop {
         ensure!(*budget > 0 && out.len() < 256, "RESP line limit");
@@ -411,17 +378,9 @@ mod tests {
             signals.committed();
         }
         signals.local.notified().await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(5), signals.local.notified())
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_millis(5), signals.local.notified()).await.is_err());
         signals.remote.notified().await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(5), signals.remote.notified())
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_millis(5), signals.remote.notified()).await.is_err());
     }
     struct FailedTransport;
     impl WakeTransport for FailedTransport {
@@ -436,17 +395,10 @@ mod tests {
     async fn failed_adapter_is_cancellable() {
         let stop = CancellationToken::new();
         let signal = Arc::new(Notify::new());
-        let task = tokio::spawn(publisher(
-            Some(Arc::new(FailedTransport)),
-            signal.clone(),
-            stop.clone(),
-        ));
+        let task = tokio::spawn(publisher(Some(Arc::new(FailedTransport)), signal.clone(), stop.clone()));
         signal.notify_one();
         tokio::time::sleep(Duration::from_millis(10)).await;
         stop.cancel();
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
     }
 }

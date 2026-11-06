@@ -20,10 +20,7 @@ use uuid::Uuid;
 mod authority;
 mod catalog;
 mod lfs_inventory;
-use catalog::{
-    FORMAT, catalogs as schema_catalogs, digest as schema_contract_digest,
-    versions as schema_versions,
-};
+use catalog::{FORMAT, catalogs as schema_catalogs, digest as schema_contract_digest, versions as schema_versions};
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_MANIFEST: u64 = 256 * 1024 * 1024;
 

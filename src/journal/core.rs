@@ -31,11 +31,7 @@ impl ActiveGuard {
         if !exists(&path)? {
             return Ok(false);
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
+        let file = OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOFOLLOW).open(&path)?;
         ensure!(file.metadata()?.is_file(), "invalid active operation lock");
         match file.try_lock_exclusive() {
             Ok(()) => Ok(false),
@@ -70,10 +66,7 @@ pub(crate) fn safe_path(path: &Path) -> Result<()> {
     ensure!(path.is_absolute(), "journal path must be absolute");
     let mut p = PathBuf::new();
     for c in path.components() {
-        ensure!(
-            matches!(c, Component::RootDir | Component::Normal(_)),
-            "noncanonical journal path"
-        );
+        ensure!(matches!(c, Component::RootDir | Component::Normal(_)), "noncanonical journal path");
         p.push(c);
         let m = fs::symlink_metadata(&p)?;
         ensure!(!m.file_type().is_symlink(), "symlink in journal path");
@@ -94,34 +87,17 @@ pub(crate) fn mkdir(path: &Path) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     safe_path(path)?;
-    ensure!(
-        fs::symlink_metadata(path)?.is_dir(),
-        "journal directory is not a directory"
-    );
+    ensure!(fs::symlink_metadata(path)?.is_dir(), "journal directory is not a directory");
     Ok(())
 }
 pub(crate) fn read(path: &Path) -> Result<Vec<u8>> {
     safe_path(path)?;
-    let mut f = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    ensure!(
-        f.metadata()?.is_file(),
-        "journal record is not a regular file"
-    );
-    ensure!(
-        f.metadata()?.len() <= MAX_RECORD_BYTES as u64,
-        "journal record exceeds limit"
-    );
+    let mut f = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    ensure!(f.metadata()?.is_file(), "journal record is not a regular file");
+    ensure!(f.metadata()?.len() <= MAX_RECORD_BYTES as u64, "journal record exceeds limit");
     let mut bytes = Vec::new();
-    (&mut f)
-        .take(MAX_RECORD_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= MAX_RECORD_BYTES,
-        "journal record exceeds limit"
-    );
+    (&mut f).take(MAX_RECORD_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= MAX_RECORD_BYTES, "journal record exceeds limit");
     Ok(bytes)
 }
 pub(crate) fn exists(path: &Path) -> Result<bool> {
@@ -146,12 +122,8 @@ pub(crate) fn atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
     }
     let temp = parent.join(format!(".tmp-{}", Uuid::new_v4()));
     let result = (|| -> Result<()> {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp)?;
+        let mut f =
+            OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&temp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         fs::rename(&temp, path)?;
@@ -166,10 +138,7 @@ pub(super) fn entries(path: &Path) -> Result<Vec<PathBuf>> {
     safe_path(path)?;
     let mut result = Vec::new();
     for entry in fs::read_dir(path)? {
-        ensure!(
-            result.len() < MAX_ENTRIES,
-            "journal directory exceeds entry limit"
-        );
+        ensure!(result.len() < MAX_ENTRIES, "journal directory exceeds entry limit");
         result.push(entry?.path());
     }
     Ok(result)
@@ -180,14 +149,8 @@ pub(super) fn op_name(op: &Operation) -> String {
 pub(super) fn load(path: &Path) -> Result<Operation> {
     safe_path(path)?;
     let mut op: Operation = serde_json::from_slice(&read(&path.join("operation.json"))?)?;
-    ensure!(
-        op.sequence > 0 && op.storage_generation > 0,
-        "invalid operation sequence or generation"
-    );
-    ensure!(
-        !op.actor_name.is_empty() && op.actor_name.len() <= 4096,
-        "invalid actor name"
-    );
+    ensure!(op.sequence > 0 && op.storage_generation > 0, "invalid operation sequence or generation");
+    ensure!(!op.actor_name.is_empty() && op.actor_name.len() <= 4096, "invalid actor name");
     ensure!(
         path.file_name().and_then(|s| s.to_str()) == Some(op_name(&op).as_str()),
         "operation path identity mismatch"
@@ -198,10 +161,7 @@ pub(super) fn load(path: &Path) -> Result<Operation> {
         "repository identity mismatch"
     );
     ensure!(
-        repo.parent()
-            .and_then(Path::file_name)
-            .and_then(|s| s.to_str())
-            == Some("journal"),
+        repo.parent().and_then(Path::file_name).and_then(|s| s.to_str()) == Some("journal"),
         "unexpected journal layout"
     );
     op.path = path.to_path_buf();
@@ -209,8 +169,7 @@ pub(super) fn load(path: &Path) -> Result<Operation> {
         ensure!(op.proposal_pin.is_none(), "mixed controller capabilities");
         intent.validate()?;
         ensure!(
-            intent.repository_id == op.repository_id
-                && intent.storage_generation == op.storage_generation,
+            intent.repository_id == op.repository_id && intent.storage_generation == op.storage_generation,
             "maintenance identity mismatch"
         );
         if op.service_principal_id.is_some() {
@@ -219,10 +178,7 @@ pub(super) fn load(path: &Path) -> Result<Operation> {
                 "invalid service principal journal"
             );
         } else {
-            ensure!(
-                intent.owner_id == op.actor_id && !op.token_id.is_nil(),
-                "maintenance human identity mismatch"
-            );
+            ensure!(intent.owner_id == op.actor_id && !op.token_id.is_nil(), "maintenance human identity mismatch");
         }
     } else {
         ensure!(
@@ -231,10 +187,7 @@ pub(super) fn load(path: &Path) -> Result<Operation> {
         );
         if let Some(intent) = &op.proposal_pin {
             intent.validate()?;
-            ensure!(
-                intent.repository_id == op.repository_id,
-                "proposal pin repository mismatch"
-            );
+            ensure!(intent.repository_id == op.repository_id, "proposal pin repository mismatch");
         }
     }
     Ok(op)
@@ -348,10 +301,7 @@ pub(crate) fn begin_proposal(
     intent: crate::namespace_service::ProposalIntent,
 ) -> Result<Operation> {
     intent.validate()?;
-    ensure!(
-        intent.repository_id == repository_id,
-        "proposal pin repository mismatch"
-    );
+    ensure!(intent.repository_id == repository_id, "proposal pin repository mismatch");
     begin_inner(
         data_root,
         repository_id,
@@ -381,10 +331,7 @@ fn begin_inner(
     active: bool,
 ) -> Result<(Operation, Option<ActiveGuard>)> {
     safe_path(data_root)?;
-    ensure!(
-        storage_generation > 0 && !actor_name.is_empty() && actor_name.len() <= 4096,
-        "invalid operation metadata"
-    );
+    ensure!(storage_generation > 0 && !actor_name.is_empty() && actor_name.len() <= 4096, "invalid operation metadata");
     let journal = data_root.join("journal");
     mkdir(&journal)?;
     let repo = journal.join(repository_id.to_string());
@@ -399,21 +346,12 @@ fn begin_inner(
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(repo.join("sequence.lock"))?;
-    ensure!(
-        sequence_lock.metadata()?.is_file(),
-        "invalid journal admission lock"
-    );
+    ensure!(sequence_lock.metadata()?.is_file(), "invalid journal admission lock");
     sequence_lock.lock_exclusive()?;
     let counter = repo.join("sequence");
-    let previous: i64 = if exists(&counter)? {
-        std::str::from_utf8(&read(&counter)?)?.parse()?
-    } else {
-        0
-    };
+    let previous: i64 = if exists(&counter)? { std::str::from_utf8(&read(&counter)?)?.parse()? } else { 0 };
     ensure!(previous >= 0, "invalid journal sequence");
-    let sequence = previous
-        .checked_add(1)
-        .context("journal sequence exhausted")?;
+    let sequence = previous.checked_add(1).context("journal sequence exhausted")?;
     // Reserving before publication permits gaps, never reuse.
     atomic(&counter, sequence.to_string().as_bytes(), true)?;
     let mut op = Operation {
@@ -436,11 +374,7 @@ fn begin_inner(
     let staging = repo.join(format!(".tmp-operation-{}", op.id));
     fs::create_dir(&staging)?;
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
-    atomic(
-        &staging.join("operation.json"),
-        &serde_json::to_vec(&op)?,
-        false,
-    )?;
+    atomic(&staging.join("operation.json"), &serde_json::to_vec(&op)?, false)?;
     let active_guard = if active {
         let file = OpenOptions::new()
             .read(true)
@@ -461,10 +395,7 @@ fn begin_inner(
 
 pub fn sequence(data_root: &Path, repository_id: Uuid) -> Result<i64> {
     safe_path(data_root)?;
-    let path = data_root
-        .join("journal")
-        .join(repository_id.to_string())
-        .join("sequence");
+    let path = data_root.join("journal").join(repository_id.to_string()).join("sequence");
     if !exists(&path)? {
         return Ok(0);
     }
@@ -483,15 +414,8 @@ pub fn pending(data_root: &Path, repository_id: Uuid) -> Result<Vec<Operation>> 
     let mut result = Vec::new();
     let counter: i64 = std::str::from_utf8(&read(&repo.join("sequence"))?)?.parse()?;
     for path in entries(&repo)? {
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .context("invalid journal filename")?;
-        if name == "sequence"
-            || name == "sequence.lock"
-            || name.starts_with(".tmp-")
-            || name.starts_with(".retired-")
-        {
+        let name = path.file_name().and_then(|s| s.to_str()).context("invalid journal filename")?;
+        if name == "sequence" || name == "sequence.lock" || name.starts_with(".tmp-") || name.starts_with(".retired-") {
             continue;
         }
         let op = load(&path).context("corrupt pending operation")?;
@@ -502,14 +426,8 @@ pub fn pending(data_root: &Path, repository_id: Uuid) -> Result<Vec<Operation>> 
         result.push(op);
     }
     let mut identities = std::collections::HashSet::new();
-    ensure!(
-        result.iter().all(|o| identities.insert(o.id)),
-        "duplicate journal operation identity"
-    );
+    ensure!(result.iter().all(|o| identities.insert(o.id)), "duplicate journal operation identity");
     result.sort_by_key(|o| o.sequence);
-    ensure!(
-        result.windows(2).all(|w| w[0].sequence != w[1].sequence),
-        "duplicate operation sequence"
-    );
+    ensure!(result.windows(2).all(|w| w[0].sequence != w[1].sequence), "duplicate operation sequence");
     Ok(result)
 }
