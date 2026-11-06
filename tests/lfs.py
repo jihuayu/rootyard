@@ -7,6 +7,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import sys
 import time
@@ -483,7 +484,7 @@ class LfsHarness(Harness):
         assert statuses.count(201) == 1 and statuses.count(409) == 7, statuses
         self.expect("/api/repos/alice/demo/collaborators/bob", 200, token=self.alice, method="DELETE")
 
-    def paired_backup_and_restore(self):
+    def storage_layout_for_backup(self):
         # Verify volume layout invariants required by src/backup.rs::inventory
         lfs_root = self.root / "data" / "lfs"
         assert lfs_root.is_dir() and not lfs_root.is_symlink()
@@ -497,6 +498,33 @@ class LfsHarness(Harness):
             else:
                 assert stat.S_IMODE(st.st_mode) == 0o600, oct(st.st_mode)
                 assert st.st_nlink == 1, st.st_nlink
+
+    def paired_backup_and_restore(self):
+        before = self.git("ls-remote", self.remote, token=self.alice).stdout
+        before_locks = self.git("lfs", "locks", cwd=self.work, token=self.alice).stdout
+        assert b"docs/concurrent.bin" in before_locks
+        before_bytes = self.obj_file.read_bytes()
+        self.stop()
+        dump = self.root / "lfs-metadata.dump"
+        self.run(["pg_dump", "--dbname", self.db, "--format=custom",
+                  "--schema=" + self.schema, "--file", str(dump)])
+        restored = self.root / "restored-data"
+        shutil.copytree(self.env["ROOTYARD_DATA_DIR"], restored, symlinks=True)
+        # This run's random schema is the only database object removed.
+        self.sql('DROP SCHEMA "' + self.schema + '" CASCADE', isolated=False)
+        self.run(["pg_restore", "--dbname", self.base_db, "--exit-on-error", str(dump)])
+        self.env["ROOTYARD_DATA_DIR"] = str(restored)
+        self.start()
+        assert self.git("ls-remote", self.remote, token=self.alice).stdout == before
+        assert self.git("lfs", "locks", cwd=self.work, token=self.alice).stdout == before_locks
+        _, downloaded, _ = self.lfs_get(
+            f"/git/alice/demo.git/info/lfs/objects/{self.oid}/{self.size}",
+            token=self.reader, code=200)
+        assert downloaded == before_bytes
+        self.lfs_get(f"/git/alice/demo.git/info/lfs/objects/{self.oid}/{self.size}",
+                     token=self.bob, code=404)
+        return {"metadata": "pg_dump/pg_restore of isolated schema",
+                "storage": "offline full directory copy", "lfs_bytes_and_locks_preserved": True}
 
 
 def main():
@@ -520,6 +548,7 @@ def main():
             "stalled_body_deadline",
             "stock_lfs_locks",
             "corrupted_on_disk_blob_fails_closed",
+            "storage_layout_for_backup",
             "paired_backup_and_restore",
         ):
             harness.case(name, getattr(harness, name))
