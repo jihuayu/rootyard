@@ -7,7 +7,8 @@ use axum::{Json, body::Body, extract::{OriginalUri, Path, Query, State}, http::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fs::{self, File, OpenOptions}, os::unix::fs::OpenOptionsExt, path::{Path as FsPath, PathBuf}, sync::Arc, time::Duration};
+use std::{fs::{self, File, OpenOptions}, os::unix::fs::OpenOptionsExt,
+    path::{Path as FsPath, PathBuf}, sync::Arc, time::Duration};
 use tokio::{io::AsyncWriteExt, process::Command};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -45,11 +46,19 @@ struct SnapshotReceipt { operation_id: Uuid, refs_sha256: String, state: String 
 pub(crate) async fn git_output(state: &AppState, args: &[&str], timeout: Duration) -> Result<Vec<u8>, Error> {
     let mut command: Command = state.storage.git(&state.config);
     command.args(args);
-    let output = tokio::time::timeout(timeout, command.output()).await.map_err(|_| Error::timeout())?
-        .map_err(Error::internal)?;
-    if !output.status.success() { return Err(conflict("Git bundle or verification failed")); }
-    if output.stdout.len() > 16 * 1024 * 1024 { return Err(conflict("repository ref manifest too large")); }
-    Ok(output.stdout)
+    crate::git_http::collect_git_output(command, 16 * 1024 * 1024, timeout).await
+        .map_err(|_| conflict("Git bundle or verification failed"))
+}
+
+/// The lease is polled while Git runs. The shared process wrapper's Drop
+/// synchronously kills and reaps the native process group on cancellation.
+async fn git_output_lease(state: &AppState, args: &[&str], timeout: Duration,
+    lease: &crate::storage::read_leases::Lease) -> Result<Vec<u8>, Error> {
+    let mut command = state.storage.git(&state.config);
+    command.args(args);
+    lease.guard(crate::git_http::collect_git_output(
+        command, 16 * 1024 * 1024, timeout)).await?
+        .map_err(|_| conflict("Git bundle or verification failed"))
 }
 
 pub(crate) async fn refs_digest(state: &AppState, repo: &FsPath) -> Result<String, Error> {
@@ -57,6 +66,22 @@ pub(crate) async fn refs_digest(state: &AppState, repo: &FsPath) -> Result<Strin
     let refs = git_output(state, &["--git-dir", path, "for-each-ref", "--format=%(refname) %(objectname)"], state.config.git_timeout).await?;
     if refs.is_empty() { return Err(conflict("empty repository cannot be replicated as ready")); }
     let head = git_output(state, &["--git-dir", path, "symbolic-ref", "HEAD"], state.config.git_timeout).await?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"rootyard-shard-refs-v1\0");
+    hasher.update(&refs);
+    hasher.update(b"HEAD\0");
+    hasher.update(&head);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+async fn refs_digest_lease(state: &AppState, repo: &FsPath,
+    lease: &crate::storage::read_leases::Lease) -> Result<String, Error> {
+    let path = repo.to_str().ok_or_else(Error::bad_request)?;
+    let refs = git_output_lease(state, &["--git-dir", path, "for-each-ref",
+        "--format=%(refname) %(objectname)"], state.config.git_timeout, lease).await?;
+    if refs.is_empty() { return Err(conflict("empty repository cannot be replicated as ready")); }
+    let head = git_output_lease(state, &["--git-dir", path, "symbolic-ref", "HEAD"],
+        state.config.git_timeout, lease).await?;
     let mut hasher = Sha256::new();
     hasher.update(b"rootyard-shard-refs-v1\0");
     hasher.update(&refs);
@@ -196,13 +221,13 @@ pub async fn migrate_repository(
     let bundle = stage.join(format!("{operation_id}.bundle"));
     clean_staging(&bundle)?;
     source_lease.ensure_active()?;
-    git_output(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout).await?;
+    git_output_lease(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout, &source_lease).await?;
     source_lease.ensure_active()?;
-    git_output(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "bundle", "create", bundle.to_str().ok_or_else(Error::bad_request)?, "--all"], state.config.git_timeout).await?;
+    git_output_lease(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "bundle", "create", bundle.to_str().ok_or_else(Error::bad_request)?, "--all"], state.config.git_timeout, &source_lease).await?;
     source_lease.ensure_active()?;
     File::open(&bundle).and_then(|f| f.sync_all()).map_err(Error::internal)?;
     sync_parent(&stage)?;
-    let digest = refs_digest(&state, &repo).await?;
+    let digest = refs_digest_lease(&state, &repo, &source_lease).await?;
     source_lease.ensure_active()?;
     let path = format!("/internal/shards/{}/snapshot/{}?refs_sha256={digest}&journal_sequence={journal_sequence}", access.repo_id, operation_id);
     let envelope = Envelope {
@@ -359,11 +384,11 @@ pub async fn receive_snapshot(
     file.sync_all().await.map_err(Error::internal)?;
     drop(file);
     if total == 0 { return Err(conflict("empty snapshot bundle")); }
-    git_output(&state, &["-c", "core.hooksPath=/dev/null", "clone", "--mirror", "--", bundle.to_str().ok_or_else(Error::bad_request)?, staging.to_str().ok_or_else(Error::bad_request)?], state.config.git_timeout).await?;
+    git_output_lease(&state, &["-c", "core.hooksPath=/dev/null", "clone", "--mirror", "--", bundle.to_str().ok_or_else(Error::bad_request)?, staging.to_str().ok_or_else(Error::bad_request)?], state.config.git_timeout, &target_lease).await?;
     target_lease.ensure_active()?;
-    git_output(&state, &["--git-dir", staging.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout).await?;
+    git_output_lease(&state, &["--git-dir", staging.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout, &target_lease).await?;
     target_lease.ensure_active()?;
-    let measured = refs_digest(&state, &staging).await?;
+    let measured = refs_digest_lease(&state, &staging, &target_lease).await?;
     if measured != query.refs_sha256 { return Err(conflict("target refs differ from source snapshot")); }
     configure_target(&state, &staging, repo_id).await?;
     let stage_sync = staging.clone();
