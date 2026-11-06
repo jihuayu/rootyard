@@ -163,6 +163,13 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         Some(tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(repo.id))
             .await.map_err(|_| Error::timeout())?)
     } else { None };
+    let snapshot_lease = if read_guard.is_some() {
+        Some(storage::read_leases::shared(&state.pool, repo.id, deadline).await?)
+    } else { None };
+    if snapshot_lease.is_some() {
+        transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
+            job_principal.as_ref(), &repo, write).await.map_err(|_| Error::unauthorized())?;
+    }
     if write_guard.is_some() {
         reliability::before_push(&state, &repo)
             .await
@@ -222,6 +229,17 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             .env("ROOTYARD_GIT_TIMEOUT_SECONDS", state.config.git_timeout.as_secs().to_string());
         if let Ok(node_id) = std::env::var("ROOTYARD_NODE_ID") {
             cmd.env("ROOTYARD_NODE_ID", node_id);
+        }
+        // Storage::git clears the inherited environment. Forward only the
+        // server's trusted transport inputs required by managed native hooks.
+        for name in [
+            "ROOTYARD_PG_CA_PEM", "ROOTYARD_PG_CLIENT_CERT_PEM", "ROOTYARD_PG_CLIENT_KEY_PEM",
+            "ROOTYARD_OBJECT_STORE_ENDPOINT", "ROOTYARD_OBJECT_STORE_BUCKET",
+            "ROOTYARD_OBJECT_STORE_REGION", "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
+            "ROOTYARD_OBJECT_STORE_SECRET_KEY", "ROOTYARD_OBJECT_STORE_SESSION_TOKEN",
+            "ROOTYARD_LFS_POINTER_VERIFY_BYTES",
+        ] {
+            if let Some(value) = std::env::var_os(name) { cmd.env(name, value); }
         }
     }
     cmd.arg("http-backend")
@@ -443,6 +461,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         let _permit: OwnedSemaphorePermit = permit;
         let _write_guard: Option<OwnedMutexGuard<()>> = write_guard;
         let _read_guard: Option<OwnedRwLockReadGuard<()>> = read_guard;
+        let snapshot_lease = snapshot_lease;
         let state = state;
         let transfer = async {
             let mut total = 0u64;
@@ -451,6 +470,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             recheck_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
                 job_principal.as_ref(), &admitted_repo, write).await?;
+            if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
             loop {
                 let next = if let Some(input) = process.input.as_mut() {
                     tokio::select! {
@@ -462,6 +482,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                         _ = recheck_tick.tick() => {
                             transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
                                 job_principal.as_ref(), &admitted_repo, write).await?;
+                            if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
                             continue;
                         }
                         _ = sender.closed() => return Err(io::Error::other("client disconnected")),
@@ -472,6 +493,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                         _ = recheck_tick.tick() => {
                             transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
                                 job_principal.as_ref(), &admitted_repo, write).await?;
+                            if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
                             continue;
                         }
                         _ = sender.closed() => return Err(io::Error::other("client disconnected")),
@@ -485,6 +507,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 }
                 transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
                     job_principal.as_ref(), &admitted_repo, write).await?;
+                if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
                 total = total.saturating_add(n as u64);
                 if total > max_output {
                     return Err(io::Error::other("Git response size limit exceeded"));
@@ -495,6 +518,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                         _ = recheck_tick.tick() => {
                             transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
                                 job_principal.as_ref(), &admitted_repo, write).await?;
+                            if let Some(lease) = &snapshot_lease { lease.ensure_active().map_err(|_| io::Error::other("storage read lease lost"))?; }
                         }
                     }
                 };
