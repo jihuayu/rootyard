@@ -36,6 +36,14 @@ class PublicationHarness(LfsHarness):
                               token=self.alice, check=False)
             assert pushed.returncode != 0, f"direct Git push accepted {kind} pointer"
             assert not self.git("ls-remote", self.remote, ref, token=self.alice).stdout
+            bad_ref = f"refs/heads/atomic-bad-{kind}"
+            good_ref = f"refs/heads/atomic-good-{kind}"
+            atomic = self.git("push", "--atomic", "origin", f"HEAD:{bad_ref}",
+                              f"{main}:{good_ref}", cwd=self.work,
+                              token=self.alice, check=False)
+            assert atomic.returncode != 0, f"atomic Git push accepted {kind} pointer"
+            assert not self.git("ls-remote", self.remote, bad_ref, token=self.alice).stdout
+            assert not self.git("ls-remote", self.remote, good_ref, token=self.alice).stdout
 
             # Seed an unreachable object via local Git fetch. This bypasses the
             # service publication path while retaining actual Git object bytes.
@@ -66,7 +74,8 @@ class PublicationHarness(LfsHarness):
             assert self.git("ls-remote", self.remote, "refs/heads/main", token=self.alice).stdout.decode().startswith(main)
             self.git("reset", "--hard", main, cwd=self.work)
         return {"pointer_kinds": sorted(pointer_bodies),
-                "publication_paths": ["smart_http_receive", "ref_transaction", "pull_merge"],
+                "publication_paths": ["smart_http_receive", "atomic_smart_http_receive",
+                                      "ref_transaction", "pull_merge"],
                 "rejected_before_ref_move": True}
 
 
