@@ -317,11 +317,15 @@ pub fn body_valid(body: &str, required: bool) -> bool {
             .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
 }
 pub fn valid_oid(oid: &str) -> bool {
-    oid.len() == 40
-        && oid != ZERO_OID
+    matches!(oid.len(), 40 | 64)
+        && oid.bytes().any(|b| b != b'0')
         && oid
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub fn valid_oid_for_format(oid: &str, format: &str) -> bool {
+    valid_oid(oid) && oid.len() == if format == "sha256" { 64 } else { 40 }
 }
 pub fn context_valid(context: &str) -> bool {
     !context.trim().is_empty() && context.len() <= 128 && !context.chars().any(char::is_control)
