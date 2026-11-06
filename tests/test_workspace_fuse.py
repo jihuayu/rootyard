@@ -11,6 +11,43 @@ import unittest
 
 
 class FuseMountTest(unittest.TestCase):
+    def test_moved_symlink_cannot_escape_mount(self):
+        if os.environ.get("ROOTYARD_FUSE_USERNS") != "1":
+            env=dict(os.environ,ROOTYARD_FUSE_USERNS="1")
+            child=subprocess.run(["unshare","-Urnm",sys.executable,"-m","unittest",
+                "tests.test_workspace_fuse.FuseMountTest.test_moved_symlink_cannot_escape_mount"],
+                env=env,capture_output=True,text=True,timeout=30)
+            self.assertEqual(child.returncode,0,child.stdout+child.stderr)
+            return
+        binary=Path("target/debug/rootyard-vfs-mount").resolve()
+        self.assertTrue(binary.is_file())
+        with tempfile.TemporaryDirectory(prefix="rootyard-fuse-escape-") as root:
+            root=Path(root);lower=root/"lower";upper=root/"upper";mount=root/"mount"
+            lower.mkdir();upper.mkdir();mount.mkdir()
+            (lower/"nested").mkdir()
+            (lower/"nested/up").symlink_to("..")
+            (lower/"nested/data.txt").write_text("safe")
+            proc=subprocess.Popen([str(binary),str(lower),str(upper),str(mount)],
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            try:
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline and not os.path.ismount(mount):
+                    if proc.poll() is not None: self.fail(proc.stderr.read().decode())
+                    time.sleep(.05)
+                self.assertTrue(os.path.ismount(mount))
+                self.assertEqual((mount/"nested/up/nested/data.txt").read_text(),"safe")
+                with self.assertRaises(PermissionError):
+                    (mount/"nested/up").rename(mount/"up")
+                self.assertFalse((root/"escaped.txt").exists())
+                self.assertFalse((mount/"up").exists())
+                self.assertEqual(os.readlink(mount/"nested/up"),"..")
+                (mount/"nested").rename(mount/"moved")
+                self.assertEqual((mount/"moved/data.txt").read_text(),"safe")
+                self.assertEqual((lower/"nested/data.txt").read_text(),"safe")
+            finally:
+                if os.path.ismount(mount): subprocess.run(["fusermount3","-u",str(mount)],check=True,timeout=10)
+                proc.wait(timeout=10)
+
     def test_kernel_fuse_transparent_cow(self):
         if os.environ.get("ROOTYARD_FUSE_USERNS") != "1":
             env=dict(os.environ,ROOTYARD_FUSE_USERNS="1")
