@@ -21,6 +21,10 @@ const TABLES: &[&str] = &[
     "audit_events",
     "ci_checkout_jobs",
     "ci_mirror_evictions",
+    "ci_mirror_nodes",
+    "ci_runs",
+    "cluster_operator_tokens",
+    "cluster_transport_nonces",
     "event_deliveries",
     "forge_branch_rules",
     "forge_check_runs",
@@ -31,12 +35,20 @@ const TABLES: &[&str] = &[
     "forge_pull_counters",
     "forge_pull_reviews",
     "forge_pulls",
+    "forge_trusted_check_contexts",
     "forge_webhook_callbacks",
     "forge_webhook_deliveries",
     "forge_webhooks",
     "git_operations",
     "lfs_objects",
+    "namespaces",
     "operation_resolutions",
+    "organization_audit_log",
+    "organization_creation_keys",
+    "organization_memberships",
+    "organization_team_members",
+    "organization_teams",
+    "organizations",
     "outbox_events",
     "recovery_resolutions",
     "repositories",
@@ -49,6 +61,7 @@ const TABLES: &[&str] = &[
     "sandbox_jobs",
     "schema_migrations",
     "shard_failover_operations",
+    "shard_marker_transitions",
     "shard_nodes",
     "shard_virtual_buckets",
     "tokens",
@@ -61,7 +74,8 @@ const TABLES: &[&str] = &[
     "workspace_operations",
     "workspaces",
 ];
-const FORMAT: u32 = 5;
+mod catalog;
+use catalog::{FORMAT, catalogs as schema_catalogs, digest as schema_contract_digest, versions as schema_versions};
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_MANIFEST: u64 = 256 * 1024 * 1024;
 
@@ -206,38 +220,6 @@ fn volume_identity(root: &Path) -> Result<Uuid> {
     let mut value = String::new();
     file.read_to_string(&mut value)?;
     Ok(value.parse()?)
-}
-fn schema_catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
-    let catalogs = match format {
-        4 => [
-            include_str!("../schema/007_catalog.json"),
-            include_str!("../schema/007_restored_catalog.json"),
-            include_str!("../schema/007_upgraded_catalog.json"),
-        ],
-        5 => [
-            include_str!("../schema/060_catalog.json"),
-            include_str!("../schema/060_restored_catalog.json"),
-            include_str!("../schema/060_upgraded_catalog.json"),
-        ],
-        _ => bail!("unsupported backup format"),
-    };
-    Ok([
-        serde_json::from_str(catalogs[0])?,
-        serde_json::from_str(catalogs[1])?,
-        serde_json::from_str(catalogs[2])?,
-    ])
-}
-fn schema_versions(format: u32) -> Result<Vec<i32>> {
-    match format {
-        4 => Ok(vec![1, 2, 3, 6, 7]),
-        5 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
-        _ => bail!("unsupported backup format"),
-    }
-}
-fn schema_contract_digest(format: u32) -> Result<String> {
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
-        &schema_catalogs(format)?,
-    )?)))
 }
 fn volume_lock(root: &Path) -> Result<File> {
     let file = OpenOptions::new()
@@ -543,38 +525,11 @@ async fn database_scope(client: &(impl GenericClient + Sync), empty: bool) -> Re
 }
 async fn schema(client: &(impl GenericClient + Sync), format: u32) -> Result<Vec<i32>> {
     database_scope(client, false).await?;
-    let tables = TABLES
-        .iter()
-        .copied()
-        .filter(|t| {
-            format != 4
-                || !matches!(
-                    *t,
-                    "ci_checkout_jobs"
-                        | "ci_mirror_evictions"
-                        | "forge_branch_rules"
-                        | "forge_check_runs"
-                        | "forge_pull_counters"
-                        | "forge_pull_reviews"
-                        | "forge_pulls"
-                        | "forge_webhook_callbacks"
-                        | "forge_webhook_deliveries"
-                        | "forge_webhooks"
-                        | "lfs_objects"
-                        | "repository_audit_log"
-                        | "repository_collaborators"
-                        | "repository_shard_routes"
-                        | "repository_team_members"
-                        | "repository_teams"
-                        | "shard_failover_operations"
-                        | "shard_nodes"
-                        | "shard_virtual_buckets"
-                )
-        })
-        .collect::<Vec<_>>();
+    let tables = catalog::relations(format, true)?;
+    let expected_relations = catalog::relations(format, false)?;
     let names: Vec<String> = client.query("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S') ORDER BY c.relname", &[]).await?.iter().map(|r| r.get(0)).collect();
     ensure!(
-        names == tables,
+        names == expected_relations,
         "backup supports only the exact Rootyard public schema"
     );
     let regular: i64 = client.query_one("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r' AND c.relpersistence='p'", &[]).await?.get(0);
@@ -873,7 +828,7 @@ fn verify(source: &Path) -> Result<Manifest> {
     );
     let manifest: Manifest = serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
     ensure!(
-        matches!(manifest.format, 4 | 5)
+        matches!(manifest.format, 4 | 5 | 6)
             && manifest.schema_versions == schema_versions(manifest.format)?
             && manifest.schema_contract_sha256 == schema_contract_digest(manifest.format)?,
         "unsupported backup format"
@@ -1039,7 +994,7 @@ pub async fn restore(config: &Config, source: &Path, allow_legacy_schema007: boo
     // A backup can predate cancellation. Never resurrect any previously issued
     // checkout bearer after restoring old authority; plan and native pins remain
     // evidence, not permission to mint a credential for the same job again.
-    if manifest.format == 5 {
+    if manifest.format >= 5 {
         client.execute("UPDATE public.ci_checkout_jobs SET revoked=true WHERE plan IS NOT NULL AND NOT revoked", &[]).await?;
         let unsafe_grants: bool = client.query_one("SELECT EXISTS (SELECT 1 FROM public.ci_checkout_jobs WHERE plan IS NOT NULL AND NOT revoked)", &[]).await?.get(0);
         ensure!(

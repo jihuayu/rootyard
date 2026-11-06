@@ -257,7 +257,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             .await
             .map_err(Error::internal)?
             .query_opt(
-                &format!("{} WHERE u.username=$1 AND r.name=$2", db::REPO_SELECT),
+                &format!("{} WHERE ns.slug=$1 AND r.name=$2", db::REPO_SELECT),
                 &[&owner, &name],
             )
             .await
@@ -266,7 +266,11 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         let repo = Repository::from_row(&row);
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        auth::authorize_repo(&tx, &identity, owner, name, write).await?;
+        auth::authorize_repo(&tx, &identity, owner, name, write).await.map_err(|error| {
+            if error.0 == StatusCode::CONFLICT && error.1 == "repository is not ready" {
+                Error(StatusCode::SERVICE_UNAVAILABLE, "repository not ready; recovery may be required")
+            } else { error }
+        })?;
         auth::finish_tx(tx, &identity, false).await?;
         if repo.state != "ready" {
             return Err(Error(

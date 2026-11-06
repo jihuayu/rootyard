@@ -66,7 +66,7 @@ class CheckoutBackupHarness(BackupCiPinsHarness):
         self.backup_command()
         self.cli('backup-verify', str(self.backup))
         manifest = json.loads((self.backup / 'manifest.json').read_text())
-        assert manifest['format'] == 5 and manifest['schema_versions'] == SCHEMA_VERSIONS
+        assert manifest['format'] == 6 and manifest['schema_versions'] == SCHEMA_VERSIONS
         assert self.raw.encode() not in (self.backup / 'metadata.dump').read_bytes()
         legacy_env = self.env.copy()
         legacy_env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target))
@@ -104,7 +104,7 @@ class CheckoutBackupHarness(BackupCiPinsHarness):
         assert status == 401 and b'PACK' not in body
         self.stop_mirror()
         self.stop()
-        return dict(format5_schema008=True, immutable_grants=True, permanent_tombstones=True,
+        return dict(format6_current_schema=True, immutable_grants=True, permanent_tombstones=True,
                     backup_then_cancel_then_restore_revokes_grant=True, raw_credential_not_persisted=True, live_old_bearer_denied_discovery_and_rpc=True,
                     ordinary_owner_restored_target_access=True, genuine_native_pin_and_issuance=True)
 
@@ -171,7 +171,7 @@ def main():
     h = CheckoutBackupHarness(args)
     success = False
     try:
-        h.case('format5_checkout_authority_restore', h.grants)
+        h.case('format6_checkout_authority_restore', h.grants)
         h.case('format4_real_legacy_restore_then_upgrade', lambda: legacy_restore(args))
         success = True
     except Exception as error:

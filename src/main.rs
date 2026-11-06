@@ -155,6 +155,8 @@ async fn run() -> Result<()> {
                 dispatch: rootyard::dispatch::Signals::default(),
             };
             rootyard::reliability::recover_startup(&state).await?;
+            rootyard::sharding::transitions::reconcile_pending(&state).await
+                .map_err(|e| anyhow::anyhow!(e.1))?;
             println!(
                 "offline reconciliation finished; inspect repository states for unresolved incidents"
             );
@@ -206,6 +208,8 @@ async fn run() -> Result<()> {
                 git_slots: slots,
             });
             rootyard::reliability::recover_startup(&state).await?;
+            rootyard::sharding::transitions::reconcile_pending(&state).await
+                .map_err(|e| anyhow::anyhow!(e.1))?;
             rootyard::recover(&state).await?;
             rootyard::sandbox::reconcile_startup(&state).await.map_err(|_| anyhow::anyhow!("sandbox startup recovery failed"))?;
             let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
@@ -259,6 +263,9 @@ async fn run() -> Result<()> {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
                     interval.tick().await;
+                    if rootyard::sharding::transitions::reconcile_pending(&worker_state).await.is_err() {
+                        eprintln!("rootyard: shard marker reconciliation unavailable; affected writes remain fenced");
+                    }
                     if rootyard::reliability::recover_pending(&worker_state)
                         .await
                         .is_err()

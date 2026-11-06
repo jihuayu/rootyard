@@ -170,7 +170,7 @@ class BackupForgeHarness(RestoredWorkers):
         assert self.git_authority() == self.initial_git_authority
         manifest = json.loads((self.backup / 'manifest.json').read_text())
         assert manifest['schema_versions'] == SCHEMA_VERSIONS
-        assert manifest['format'] == 5
+        assert manifest['format'] == 6
         return dict(forge_tables_uncommitted_writer=True, backup_waited_on_share_barrier=True,
                     pre_boundary_commit_included=True, full_public_table_count=TABLE_COUNT,
                     issue_rows=10, comment_rows=28, issue_counter_after_commit=number + 1,

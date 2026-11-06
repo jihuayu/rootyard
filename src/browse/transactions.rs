@@ -129,7 +129,7 @@ async fn execute_ref_transaction_inner(
         .await
         .map_err(Error::internal)?
         .query_opt(
-            &format!("{} WHERE u.username=$1 AND r.name=$2", db::REPO_SELECT),
+            &format!("{} WHERE ns.slug=$1 AND r.name=$2", db::REPO_SELECT),
             &[&owner, &name],
         )
         .await
