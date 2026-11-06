@@ -47,7 +47,7 @@ def main():
         return urllib.parse.urlunsplit(parts._replace(path="/" + name))
 
     def capture(database_url, suffix):
-        data = json.loads(run(["psql", "-XAt", "-v", "ON_ERROR_STOP=1", "-c", query], database_url))
+        data = json.loads(run(["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-c", "SET search_path=pg_catalog;" + query], database_url))
         path = args.root / "schema" / f"{latest:03d}_{suffix}.json"
         path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
         print(path)

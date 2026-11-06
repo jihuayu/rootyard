@@ -6,6 +6,7 @@
 pub mod handlers;
 pub mod models;
 pub mod sanitize;
+pub mod session;
 pub mod templates;
 
 use crate::AppState;
@@ -15,8 +16,12 @@ use axum::{
 };
 use std::sync::Arc;
 
-pub fn routes() -> Router<Arc<AppState>> {
+pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
+        .route("/web/login", get(session::login_page).post(session::login))
+        .route("/web/app.js", get(session::app_js))
+        .route("/web/logout", post(session::logout))
+        .route("/web/repos", get(session::discover))
         .route("/web/repos/{owner}/{name}", get(handlers::repo_overview))
         .route("/web/repos/{owner}/{name}/tree", get(handlers::tree_view))
         .route("/web/repos/{owner}/{name}/tree/{oid}", get(handlers::tree_by_oid_view))
@@ -55,4 +60,5 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/ui/repos/{owner}/{name}/pulls/{number}/checks", get(handlers::pull_checks_view))
         .route("/ui/repos/{owner}/{name}/pulls/{number}/merge", post(handlers::merge_pull_web))
         .route("/ui/repos/{owner}/{name}/audit", get(handlers::audit_view))
+        .layer(axum::middleware::from_fn_with_state(state, session::middleware))
 }

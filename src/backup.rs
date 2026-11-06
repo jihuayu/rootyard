@@ -14,52 +14,12 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{io::AsyncReadExt, process::Command};
-use tokio_postgres::{Client, GenericClient, NoTls};
+use tokio_postgres::{Client, GenericClient};
 use uuid::Uuid;
 
-const TABLES: &[&str] = &[
-    "audit_events",
-    "ci_checkout_jobs",
-    "ci_mirror_evictions",
-    "event_deliveries",
-    "forge_branch_rules",
-    "forge_check_runs",
-    "forge_creation_requests",
-    "forge_issue_comments",
-    "forge_issue_counters",
-    "forge_issues",
-    "forge_pull_counters",
-    "forge_pull_reviews",
-    "forge_pulls",
-    "forge_webhook_callbacks",
-    "forge_webhook_deliveries",
-    "forge_webhooks",
-    "git_operations",
-    "lfs_objects",
-    "operation_resolutions",
-    "outbox_events",
-    "recovery_resolutions",
-    "repositories",
-    "repository_audit_log",
-    "repository_collaborators",
-    "repository_ref_projection",
-    "repository_shard_routes",
-    "repository_team_members",
-    "repository_teams",
-    "schema_migrations",
-    "shard_failover_operations",
-    "shard_nodes",
-    "shard_virtual_buckets",
-    "tokens",
-    "users",
-    "workspace_checkpoints",
-    "workspace_creations",
-    "workspace_entries",
-    "workspace_events",
-    "workspace_operations",
-    "workspaces",
-];
-const FORMAT: u32 = 5;
+mod catalog;
+mod authority;
+use catalog::{FORMAT, catalogs as schema_catalogs, digest as schema_contract_digest, versions as schema_versions};
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_MANIFEST: u64 = 256 * 1024 * 1024;
 
@@ -204,38 +164,6 @@ fn volume_identity(root: &Path) -> Result<Uuid> {
     let mut value = String::new();
     file.read_to_string(&mut value)?;
     Ok(value.parse()?)
-}
-fn schema_catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
-    let catalogs = match format {
-        4 => [
-            include_str!("../schema/007_catalog.json"),
-            include_str!("../schema/007_restored_catalog.json"),
-            include_str!("../schema/007_upgraded_catalog.json"),
-        ],
-        5 => [
-            include_str!("../schema/060_catalog.json"),
-            include_str!("../schema/060_restored_catalog.json"),
-            include_str!("../schema/060_upgraded_catalog.json"),
-        ],
-        _ => bail!("unsupported backup format"),
-    };
-    Ok([
-        serde_json::from_str(catalogs[0])?,
-        serde_json::from_str(catalogs[1])?,
-        serde_json::from_str(catalogs[2])?,
-    ])
-}
-fn schema_versions(format: u32) -> Result<Vec<i32>> {
-    match format {
-        4 => Ok(vec![1, 2, 3, 6, 7]),
-        5 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
-        _ => bail!("unsupported backup format"),
-    }
-}
-fn schema_contract_digest(format: u32) -> Result<String> {
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
-        &schema_catalogs(format)?,
-    )?)))
 }
 fn volume_lock(root: &Path) -> Result<File> {
     let file = OpenOptions::new()
@@ -498,10 +426,23 @@ fn pg_command(config: &Config, exe: &str) -> Result<Command> {
             cfg.get_user().context("explicit database user required")?,
         )
         .env("PGCONNECT_TIMEOUT", "5")
-        .env("PGSSLMODE", "disable")
         .env("PGPASSFILE", "/dev/null")
         // Detect dead CLI sockets even while PostgreSQL is blocked on a lock.
         .env("PGOPTIONS", "-c client_connection_check_interval=1000");
+    if cfg.get_ssl_mode() == tokio_postgres::config::SslMode::Require {
+        let ca = std::env::var("ROOTYARD_PG_CA_PEM")
+            .context("PostgreSQL TLS backup needs ROOTYARD_PG_CA_PEM")?;
+        ensure!(Path::new(&ca).is_file(), "PostgreSQL CA file unavailable");
+        cmd.env("PGSSLMODE", "verify-full").env("PGSSLROOTCERT", ca);
+        match (std::env::var("ROOTYARD_PG_CLIENT_CERT_PEM").ok(), std::env::var("ROOTYARD_PG_CLIENT_KEY_PEM").ok()) {
+            (Some(cert), Some(key)) => { cmd.env("PGSSLCERT", cert).env("PGSSLKEY", key); }
+            (None, None) => {}
+            _ => bail!("PostgreSQL client certificate and key must be configured together"),
+        }
+    } else {
+        ensure!(std::env::var_os("ROOTYARD_PG_CA_PEM").is_none(), "refusing PostgreSQL TLS downgrade");
+        cmd.env("PGSSLMODE", "disable");
+    }
     if let Some(password) = cfg.get_password() {
         use std::os::unix::ffi::OsStrExt;
         cmd.env("PGPASSWORD", std::ffi::OsStr::from_bytes(password));
@@ -515,10 +456,7 @@ async fn pg(config: &Config) -> Result<Client> {
         parsed.get_options().is_none(),
         "backup requires dedicated database, default public schema, no connection options"
     );
-    let (client, connection) = parsed.connect(NoTls).await?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let client = crate::db::connect_config(parsed).await?;
     client.batch_execute("SET application_name='rootyard-backup'; SET lock_timeout='5s'; SET statement_timeout='60s'").await?;
     Ok(client)
 }
@@ -541,38 +479,11 @@ async fn database_scope(client: &(impl GenericClient + Sync), empty: bool) -> Re
 }
 async fn schema(client: &(impl GenericClient + Sync), format: u32) -> Result<Vec<i32>> {
     database_scope(client, false).await?;
-    let tables = TABLES
-        .iter()
-        .copied()
-        .filter(|t| {
-            format != 4
-                || !matches!(
-                    *t,
-                    "ci_checkout_jobs"
-                        | "ci_mirror_evictions"
-                        | "forge_branch_rules"
-                        | "forge_check_runs"
-                        | "forge_pull_counters"
-                        | "forge_pull_reviews"
-                        | "forge_pulls"
-                        | "forge_webhook_callbacks"
-                        | "forge_webhook_deliveries"
-                        | "forge_webhooks"
-                        | "lfs_objects"
-                        | "repository_audit_log"
-                        | "repository_collaborators"
-                        | "repository_shard_routes"
-                        | "repository_team_members"
-                        | "repository_teams"
-                        | "shard_failover_operations"
-                        | "shard_nodes"
-                        | "shard_virtual_buckets"
-                )
-        })
-        .collect::<Vec<_>>();
+    let tables = catalog::relations(format, true)?;
+    let expected_relations = catalog::relations(format, false)?;
     let names: Vec<String> = client.query("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S') ORDER BY c.relname", &[]).await?.iter().map(|r| r.get(0)).collect();
     ensure!(
-        names == tables,
+        names == expected_relations,
         "backup supports only the exact Rootyard public schema"
     );
     let regular: i64 = client.query_one("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r' AND c.relpersistence='p'", &[]).await?.get(0);
@@ -717,9 +628,9 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .start()
         .await?;
-    let list = TABLES
+    let list = catalog::relations(FORMAT, true)?
         .iter()
-        .map(|t| format!("public.{t}"))
+        .map(|t| format!("public.\"{}\"", t.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(",");
     tx.batch_execute(&format!("LOCK TABLE {list} IN SHARE MODE"))
@@ -871,7 +782,7 @@ fn verify(source: &Path) -> Result<Manifest> {
     );
     let manifest: Manifest = serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
     ensure!(
-        matches!(manifest.format, 4 | 5)
+        matches!(manifest.format, 4 | 5 | 6)
             && manifest.schema_versions == schema_versions(manifest.format)?
             && manifest.schema_contract_sha256 == schema_contract_digest(manifest.format)?,
         "unsupported backup format"
@@ -1037,7 +948,7 @@ pub async fn restore(config: &Config, source: &Path, allow_legacy_schema007: boo
     // A backup can predate cancellation. Never resurrect any previously issued
     // checkout bearer after restoring old authority; plan and native pins remain
     // evidence, not permission to mint a credential for the same job again.
-    if manifest.format == 5 {
+    if manifest.format >= 5 {
         client.execute("UPDATE public.ci_checkout_jobs SET revoked=true WHERE plan IS NOT NULL AND NOT revoked", &[]).await?;
         let unsafe_grants: bool = client.query_one("SELECT EXISTS (SELECT 1 FROM public.ci_checkout_jobs WHERE plan IS NOT NULL AND NOT revoked)", &[]).await?.get(0);
         ensure!(
@@ -1045,6 +956,7 @@ pub async fn restore(config: &Config, source: &Path, allow_legacy_schema007: boo
             "restored checkout credentials were not invalidated"
         );
     }
+    if manifest.format >= 6 { authority::fence(&client).await?; }
     ensure!(!target.exists(), "destination appeared during restore");
     publish(&staging, &target)?;
     File::open(target.parent().unwrap())?.sync_all()?;

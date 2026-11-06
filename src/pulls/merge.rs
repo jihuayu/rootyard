@@ -27,9 +27,12 @@ pub async fn merge_pull(
     headers: HeaderMap,
     Json(input): Json<MergeInput>,
 ) -> Result<Response, Error> {
-    tokio::spawn(async move { merge_pull_inner(state, owner, name, number, headers, input).await })
-        .await
-        .map_err(Error::internal)?
+    let web_scope = auth::web_scope_enabled();
+    tokio::spawn(auth::inherit_web_scope(web_scope, async move {
+        merge_pull_inner(state, owner, name, number, headers, input).await
+    }))
+    .await
+    .map_err(Error::internal)?
 }
 
 async fn merge_pull_inner(
@@ -308,17 +311,28 @@ async fn merge_pull_inner(
         commit_oid
     };
 
-    crate::lfs::publication::validate_new_refs(
+    let ref_change = journal::RefChange {
+        ref_name: pull.base_ref.clone(),
+        old_oid: input.expected_base_oid.clone(),
+        new_oid: merged_oid.clone(),
+    };
+    Box::pin(crate::lfs::publication::validate_new_refs(
         &state,
         &tx,
         repo_id,
         tenant_id,
-        &[journal::RefChange {
-            ref_name: pull.base_ref.clone(),
-            old_oid: input.expected_base_oid.clone(),
-            new_oid: merged_oid.clone(),
-        }],
-    )
+        std::slice::from_ref(&ref_change),
+    ))
+    .await?;
+    Box::pin(crate::lfs::locks::validate_new_refs_with_client(
+        &*tx,
+        &repo_path,
+        &state.config.git,
+        state.config.git_timeout,
+        repo_id,
+        actor.id,
+        &[ref_change],
+    ))
     .await?;
 
     auth::verify_token(&tx, &actor, true).await?;

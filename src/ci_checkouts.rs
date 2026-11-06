@@ -13,6 +13,25 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+#[path = "ci_checkouts/dependencies.rs"]
+pub mod dependencies;
+#[path = "ci_checkouts/mirror_prepare.rs"]
+pub mod mirror_prepare;
+#[path = "ci_checkouts/mirror_lfs.rs"]
+pub mod mirror_lfs;
+#[path = "ci_checkouts/authority.rs"]
+pub mod authority;
+#[path = "ci_checkouts/integration.rs"]
+pub mod integration;
+pub(crate) use authority::{authenticate,still_authorized};
+
+pub fn mirror_routes() -> Router<Arc<AppState>> {
+    Router::new().route("/api/repos/{owner}/{name}/ci-checkouts/{job}/prepare-dependencies",
+        post(mirror_prepare::prepare))
+        .route("/ci/{target}/git/{owner}/{name}/info/lfs/objects/batch", post(mirror_lfs::batch))
+        .route("/ci/{target}/git/{owner}/{name}/info/lfs/objects/{oid}", axum::routing::get(mirror_lfs::download))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/repos/{owner}/{name}/ci-checkouts", post(issue))
@@ -39,6 +58,8 @@ pub struct Plan {
     pub source_receipt_sha256: String,
     pub mirror_audience: Uuid,
     pub expires_unix: i64,
+    #[serde(default)]
+    pub dependencies: dependencies::Manifest,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +69,10 @@ pub struct Issue {
     storage_generation: i64,
     mirror_audience: Uuid,
     expires_unix: i64,
+    #[serde(default)]
+    history: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
 }
 fn audience() -> Result<Uuid, Error> {
     std::env::var("ROOTYARD_CI_MIRROR_AUDIENCE")
@@ -123,7 +148,7 @@ async fn issue_inner(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let repo = repository(&state, &actor, &owner, &name).await?;
     if !ci_pins::valid_oid(&input.target_oid)
-        || input.target_oid == "0".repeat(40)
+        || input.target_oid.bytes().all(|b|b==b'0')
         || input.storage_generation <= 0
     {
         return Err(Error::bad_request());
@@ -149,25 +174,51 @@ async fn issue_inner(
         owner_id: actor.id,
         repository_id: repo.id,
         storage_generation: input.storage_generation,
-        object_format: "sha1".into(),
+        object_format: if input.target_oid.len()==40 {"sha1"} else {"sha256"}.into(),
         target_oid: input.target_oid,
         retention_ref: format!("refs/rootyard-ci/jobs/{}", input.job_id),
     };
     let receipt = ci_pins::verify_receipt(&state, &intent)
         .await
         .map_err(|_| Error(StatusCode::CONFLICT, "verified durable source pin required"))?;
+    drop(_lock);
+    drop(_slot);
+    let deps = dependencies::scan(&state,dependencies::Principal::User(&actor),repo.clone(),input.job_id,&intent.target_oid,
+        input.history.as_deref().unwrap_or("full"),
+        input.tags.as_deref().unwrap_or(&[])).await?;
     let plan = Plan {
         version: 1,
         job_id: intent.job_id,
         owner_id: actor.id,
         repository_id: repo.id,
         storage_generation: intent.storage_generation,
-        object_format: "sha1".into(),
+        object_format: intent.object_format.clone(),
         target_oid: intent.target_oid,
         source_receipt_sha256: receipt,
         mirror_audience: input.mirror_audience,
         expires_unix: input.expires_unix,
+        dependencies: deps,
     };
+    let mut delegated = Vec::new();
+    for sub in &plan.dependencies.submodules {
+        let client=state.pool.get().await.map_err(Error::internal)?;
+        let owner_id:Uuid=client.query_one("SELECT owner_id FROM repositories WHERE id=$1",&[&sub.repository_id])
+            .await.map_err(Error::internal)?.get(0);
+        drop(client);
+        let sub_intent=ci_pins::Intent{version:1,job_id:sub.job_id,owner_id,
+            repository_id:sub.repository_id,storage_generation:sub.storage_generation,
+            object_format:if sub.target_oid.len()==40 {"sha1"} else {"sha256"}.into(),target_oid:sub.target_oid.clone(),
+            retention_ref:format!("refs/rootyard-ci/jobs/{}",sub.job_id)};
+        let sub_receipt=ci_pins::verify_receipt(&state,&sub_intent).await
+            .map_err(|_|Error(StatusCode::CONFLICT,"verified submodule pin required"))?;
+        let sub_plan=Plan{version:1,job_id:sub.job_id,owner_id,repository_id:sub.repository_id,
+            storage_generation:sub.storage_generation,object_format:sub_intent.object_format.clone(),
+            target_oid:sub.target_oid.clone(),source_receipt_sha256:sub_receipt,
+            mirror_audience:input.mirror_audience,expires_unix:input.expires_unix,
+            dependencies:plan.dependencies.for_submodule(sub)};
+        let mut random=[0u8;32];rand::rng().fill_bytes(&mut random);
+        delegated.push((sub.clone(),sub_plan,format!("ryj_{}",hex::encode(random))));
+    }
     let value = serde_json::to_value(&plan).map_err(Error::internal)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
@@ -197,10 +248,21 @@ async fn issue_inner(
     rand::rng().fill_bytes(&mut random);
     let token = format!("ryj_{}", hex::encode(random));
     tx.execute("INSERT INTO ci_checkout_jobs (repository_id,job_id,owner_id,plan,issuer_token_id,credential_digest,expires_unix) VALUES ($1,$2,$3,$4,$5,$6,$7)", &[&repo.id,&plan.job_id,&actor.id,&value,&actor.token_id,&db::digest(&token),&plan.expires_unix]).await.map_err(Error::internal)?;
+    let mut submodule_credentials=Vec::new();
+    for (sub,sub_plan,secret) in delegated {
+        let sub_value=serde_json::to_value(&sub_plan).map_err(Error::internal)?;
+        tx.execute("INSERT INTO ci_checkout_delegations(parent_repository_id,parent_job_id,repository_id,job_id,owner_id,plan,issuer_token_id,credential_digest,expires_unix) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            &[&repo.id,&plan.job_id,&sub.repository_id,&sub.job_id,&sub_plan.owner_id,
+              &sub_value,&actor.token_id,&db::digest(&secret),&plan.expires_unix])
+            .await.map_err(Error::internal)?;
+        submodule_credentials.push(serde_json::json!({"path":sub.path,"owner":sub.owner,
+            "name":sub.name,"job_id":sub.job_id,"target_oid":sub.target_oid,"token":secret}));
+    }
     tx.commit().await.map_err(Error::internal)?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(serde_json::json!({"plan":plan,"token":token})),
+        Json(serde_json::json!({"plan":plan,"token":token,
+            "submodule_credentials":submodule_credentials})),
     )
         .into_response())
 }
@@ -246,59 +308,6 @@ async fn terminal(
         Json(serde_json::json!({"job_id":job,"state":if cancel {"cancelled"} else {"revoked"}})),
     )
         .into_response())
-}
-
-/// No cached authorization: each call queries the authoritative primary database.
-/// This admits a request, not a promise to interrupt an already-admitted stream.
-pub(crate) async fn authenticate(
-    state: &AppState,
-    headers: &HeaderMap,
-    owner: &str,
-    name: &str,
-    oid: &str,
-) -> Result<(db::Identity, db::Repository, Plan), Error> {
-    if state.mirror_primary.is_none() {
-        return Err(Error::unauthorized());
-    }
-    let (user, token) = auth::credentials_for(headers, "ryj_")?;
-    if user.as_ref().is_some_and(|u| u != owner) {
-        return Err(Error::unauthorized());
-    }
-    let audience = audience()?;
-    let row=state.pool.get().await.map_err(Error::internal)?.query_opt(
-        "SELECT j.plan,j.owner_id,j.repository_id,j.issuer_token_id,j.expires_unix,r.storage_generation,u.username,j.job_id FROM ci_checkout_jobs j JOIN repositories r ON r.id=j.repository_id AND r.owner_id=j.owner_id JOIN users u ON u.id=j.owner_id JOIN tokens t ON t.id=j.issuer_token_id AND t.user_id=j.owner_id WHERE j.credential_digest=$1 AND NOT j.cancelled AND NOT j.revoked AND j.expires_unix>extract(epoch FROM clock_timestamp()) AND NOT t.revoked AND NOT t.read_only AND (t.expires_at IS NULL OR t.expires_at>clock_timestamp()) AND r.state='ready' AND r.storage_backend='gitfs' AND r.name=$2 AND u.username=$3",
-        &[&db::digest(&token),&name,&owner]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
-    let plan: Plan = serde_json::from_value(row.get(0)).map_err(Error::internal)?;
-    if plan.job_id != row.get::<_, Uuid>(7)
-        || plan.version != 1
-        || plan.owner_id != row.get::<_, Uuid>(1)
-        || plan.repository_id != row.get::<_, Uuid>(2)
-        || plan.expires_unix != row.get::<_, i64>(4)
-        || plan.storage_generation != row.get::<_, i64>(5)
-        || plan.object_format != "sha1"
-        || plan.target_oid != oid
-        || plan.mirror_audience != audience
-    {
-        return Err(Error::unauthorized());
-    }
-    let identity = db::Identity {
-        id: plan.owner_id,
-        token_id: row.get(3),
-        username: owner.into(),
-        read_only: true,
-        token_digest: db::digest(&token),
-    };
-    let repo = db::Repository {
-        id: plan.repository_id,
-        name: name.into(),
-        owner: owner.into(),
-        state: "ready".into(),
-        clone_path: format!("/git/{owner}/{name}.git"),
-        storage_backend: "gitfs".into(),
-        storage_generation: plan.storage_generation,
-        object_format: plan.object_format.clone(),
-    };
-    Ok((identity, repo, plan))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

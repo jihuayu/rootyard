@@ -1,18 +1,32 @@
+pub use crate::members::models::{RepoAccess, Role};
 use crate::{
     Error,
     db::{self, Identity},
 };
-pub use crate::members::models::{RepoAccess, Role};
 use axum::http::{HeaderMap, StatusCode, header};
 use base64::Engine;
 use deadpool_postgres::{Pool, Transaction};
 use uuid::Uuid;
 
+tokio::task_local! { static WEB_AUTH_SCOPE: bool; }
+pub async fn web_scope<F: std::future::Future>(future: F) -> F::Output {
+    WEB_AUTH_SCOPE.scope(true, future).await
+}
+fn browser_credentials_allowed() -> bool {
+    WEB_AUTH_SCOPE.try_with(|allowed| *allowed).unwrap_or(false)
+}
+pub fn web_scope_enabled() -> bool {
+    browser_credentials_allowed()
+}
+pub async fn inherit_web_scope<F: std::future::Future>(enabled: bool, future: F) -> F::Output {
+    WEB_AUTH_SCOPE.scope(enabled, future).await
+}
+
 pub async fn authenticate(pool: &Pool, headers: &HeaderMap) -> Result<Identity, Error> {
     let (user, token) = credentials(headers)?;
     let client = pool.get().await.map_err(Error::internal)?;
     let row = client.query_opt(
-        "SELECT u.id, u.username, t.read_only, t.id FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.digest=$1 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())", &[&db::digest(&token)])
+        "SELECT u.id, u.username, t.read_only, t.id FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.digest=$1 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) AND (t.kind='api' OR ($2 AND t.kind='browser' AND EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked AND s.expires_at>clock_timestamp())))", &[&db::digest(&token), &browser_credentials_allowed()])
         .await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
     let identity = Identity {
         id: row.get(0),
@@ -57,8 +71,7 @@ pub(crate) fn credentials_for(
         (Some(user.to_owned()), token.to_owned())
     } else {
         return Err(Error::unauthorized());
-    }
-    ;
+    };
     if token.len() != 68
         || !token.starts_with(prefix)
         || !token[4..].bytes().all(|b| b.is_ascii_hexdigit())
@@ -183,8 +196,8 @@ pub async fn verify_token(
 ) -> Result<(), Error> {
     // A separate statement observes the real database clock *after* lock waits.
     let row = tx.query_opt(
-        "SELECT read_only FROM tokens WHERE id=$1 AND user_id=$2 AND digest=$3 AND NOT revoked AND (expires_at IS NULL OR expires_at > clock_timestamp())",
-        &[&actor.token_id, &actor.id, &actor.token_digest],
+        "SELECT t.read_only FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) AND (t.kind='api' OR ($4 AND t.kind='browser' AND EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked AND s.expires_at>clock_timestamp())))",
+        &[&actor.token_id, &actor.id, &actor.token_digest, &browser_credentials_allowed()],
     )
     .await
     .map_err(Error::internal)?

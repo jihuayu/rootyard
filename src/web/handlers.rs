@@ -65,7 +65,7 @@ pub fn normalize_web_headers(headers: &HeaderMap) -> HeaderMap {
     if headers.contains_key(header::AUTHORIZATION) {
         return headers.clone();
     }
-    let token_opt = headers.get("x-rootyard-token").and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).or_else(|| extract_cookie_token(headers));
+    let token_opt = super::session::session_token(headers).or_else(|| headers.get("x-rootyard-token").and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)).or_else(|| extract_cookie_token(headers));
     let mut out = headers.clone();
     if let Some(tok) = token_opt {
         let bearer = if tok.starts_with("Bearer ") || tok.starts_with("Basic ") { tok } else { format!("Bearer {tok}") };
@@ -291,7 +291,7 @@ pub async fn issues_list_view(State(state): App, Path((owner, name)): RepoPath, 
 }
 
 pub async fn create_issue_web(State(state): App, Path((owner, name)): RepoPath, headers: HeaderMap, Json(input): Json<WebNewIssue>) -> Res {
-    tokio::spawn(async move {
+    tokio::spawn(auth::web_scope(async move {
         input.validate()?;
         member_models::ensure_schema(&state.pool).await?;
         let norm_headers = normalize_web_headers(&headers);
@@ -321,7 +321,7 @@ pub async fn create_issue_web(State(state): App, Path((owner, name)): RepoPath, 
         finish(tx, &actor, true).await?;
         let item = IssueViewItem { issue, author_username: actor.username, comment_count: 0 };
         Ok(html_response(StatusCode::CREATED, templates::render_issue_detail_view(&header_ctx, &item, &[])))
-    })
+    }))
     .await
     .map_err(Error::internal)?
 }

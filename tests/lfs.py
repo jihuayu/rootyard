@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Git LFS Batch API, verified streaming object storage, and paired backup/restore tests."""
 import argparse
+import concurrent.futures
 import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import sys
 import time
@@ -362,7 +364,15 @@ class LfsHarness(Harness):
         self._await_staging()
         b = self._partial_put(oid, len(payload), second)
         b.send(payload[:1])
-        time.sleep(.15)  # B has read the pending reservation and queued for the lock.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, body, _ = self.http("/api/repos/alice/demo/lfs/upload-waiters", token=self.alice)
+            assert status == 200
+            if json.loads(body)["waiters"] >= 1:
+                break
+            time.sleep(.02)
+        else:
+            raise AssertionError("second upload did not pass metadata authorization and queue for lock")
         self.sql(f"UPDATE tokens SET revoked=true WHERE id='{second['token_id']}'")
         a.send(payload[1:])
         response_a = a.getresponse()
@@ -439,7 +449,42 @@ class LfsHarness(Harness):
         )
         assert restored_bytes == original
 
-    def paired_backup_and_restore(self):
+    def stock_lfs_locks(self):
+        self.git("lfs", "install", "--local", cwd=self.work)
+        lock = self.git("lfs", "lock", "docs/design.bin", cwd=self.work, token=self.alice)
+        assert b"Locked docs/design.bin" in lock.stdout
+        listed = self.git("lfs", "locks", cwd=self.work, token=self.alice)
+        assert b"docs/design.bin" in listed.stdout
+        self.stop()
+        self.start()
+        listed = self.git("lfs", "locks", cwd=self.work, token=self.alice)
+        assert b"docs/design.bin" in listed.stdout
+        verify = self.http("/git/alice/demo.git/info/lfs/locks/verify", token=self.alice,
+                           method="POST", body={}, content_type=LFS_MIME)
+        assert verify[0] == 200 and len(json.loads(verify[1])["ours"]) == 1
+
+        self.expect("/api/repos/alice/demo/collaborators/bob", 201, token=self.alice,
+                    method="PUT", body={"role": "write"})
+        denied = self.git("lfs", "unlock", "docs/design.bin", cwd=self.work, token=self.bob, check=False)
+        assert denied.returncode != 0
+        denied_force = self.git("lfs", "unlock", "--force", "docs/design.bin", cwd=self.work,
+                                token=self.bob, check=False)
+        assert denied_force.returncode != 0
+        self.expect("/api/repos/alice/demo/collaborators/bob", 200, token=self.alice,
+                    method="PUT", body={"role": "admin"})
+        forced = self.git("lfs", "unlock", "--force", "docs/design.bin", cwd=self.work, token=self.bob)
+        assert b"Unlocked docs/design.bin" in forced.stdout
+
+        def lock_attempt(_):
+            return self.http("/git/alice/demo.git/info/lfs/locks", token=self.alice,
+                             method="POST", body={"path": "docs/concurrent.bin"},
+                             content_type=LFS_MIME)[0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            statuses = list(executor.map(lock_attempt, range(8)))
+        assert statuses.count(201) == 1 and statuses.count(409) == 7, statuses
+        self.expect("/api/repos/alice/demo/collaborators/bob", 200, token=self.alice, method="DELETE")
+
+    def storage_layout_for_backup(self):
         # Verify volume layout invariants required by src/backup.rs::inventory
         lfs_root = self.root / "data" / "lfs"
         assert lfs_root.is_dir() and not lfs_root.is_symlink()
@@ -453,6 +498,33 @@ class LfsHarness(Harness):
             else:
                 assert stat.S_IMODE(st.st_mode) == 0o600, oct(st.st_mode)
                 assert st.st_nlink == 1, st.st_nlink
+
+    def paired_backup_and_restore(self):
+        before = self.git("ls-remote", self.remote, token=self.alice).stdout
+        before_locks = self.git("lfs", "locks", cwd=self.work, token=self.alice).stdout
+        assert b"docs/concurrent.bin" in before_locks
+        before_bytes = self.obj_file.read_bytes()
+        self.stop()
+        dump = self.root / "lfs-metadata.dump"
+        self.run(["pg_dump", "--dbname", self.db, "--format=custom",
+                  "--schema=" + self.schema, "--file", str(dump)])
+        restored = self.root / "restored-data"
+        shutil.copytree(self.env["ROOTYARD_DATA_DIR"], restored, symlinks=True)
+        # This run's random schema is the only database object removed.
+        self.sql('DROP SCHEMA "' + self.schema + '" CASCADE', isolated=False)
+        self.run(["pg_restore", "--dbname", self.base_db, "--exit-on-error", str(dump)])
+        self.env["ROOTYARD_DATA_DIR"] = str(restored)
+        self.start()
+        assert self.git("ls-remote", self.remote, token=self.alice).stdout == before
+        assert self.git("lfs", "locks", cwd=self.work, token=self.alice).stdout == before_locks
+        _, downloaded, _ = self.lfs_get(
+            f"/git/alice/demo.git/info/lfs/objects/{self.oid}/{self.size}",
+            token=self.reader, code=200)
+        assert downloaded == before_bytes
+        self.lfs_get(f"/git/alice/demo.git/info/lfs/objects/{self.oid}/{self.size}",
+                     token=self.bob, code=404)
+        return {"metadata": "pg_dump/pg_restore of isolated schema",
+                "storage": "offline full directory copy", "lfs_bytes_and_locks_preserved": True}
 
 
 def main():
@@ -474,7 +546,9 @@ def main():
             "permissions_and_tenant_isolation",
             "concurrent_upload_revocation",
             "stalled_body_deadline",
+            "stock_lfs_locks",
             "corrupted_on_disk_blob_fails_closed",
+            "storage_layout_for_backup",
             "paired_backup_and_restore",
         ):
             harness.case(name, getattr(harness, name))

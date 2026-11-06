@@ -2,6 +2,7 @@
 import argparse
 import base64
 import json
+import time
 import unittest
 
 from tests.e2e import Harness
@@ -59,6 +60,21 @@ class WorkspaceServiceTest(unittest.TestCase):
             self.assertEqual(base64.b64decode(json.loads(h.expect(f"/api/workspaces/{restored['id']}/files?path=hello.txt",200,token=h.alice))["content_base64"]),b"v2 unstaged\n")
             events = json.loads(h.expect(f"/api/workspaces/{wid}/events?after_revision=0",200,token=h.alice))
             self.assertEqual([e["revision"] for e in events["events"]],[1,2,3,4])
+            live_repo = h.root / "data/workspace-service/workspaces" / wid
+            (live_repo / "hello.txt").write_bytes(b"normal editor save\n")
+            deadline = time.monotonic()+8
+            while time.monotonic()<deadline:
+                replay = json.loads(h.expect(f"/api/workspaces/{wid}/events?after_revision=4",200,token=h.alice))
+                if replay["events"]: break
+                time.sleep(.2)
+            self.assertEqual(replay["events"][0]["kind"],"external_capture")
+            self.assertEqual(replay["events"][0]["revision"],5)
+            lease=json.loads(h.expect(f"/api/workspaces/{wid}/lease",200,token=h.alice,method="POST",
+                body={"expected_lease_epoch":1}))
+            self.assertEqual(lease["lease_epoch"],2)
+            stale={"content_base64":base64.b64encode(b"stale\n").decode(),"expected_entry_version":2,
+                   "expected_workspace_revision":5,"lease_epoch":1}
+            self.assertEqual(h.http(path,token=h.alice,method="PUT",body=stale,extra_headers={"Idempotency-Key":"stale-epoch"})[0],409)
         finally:
             h.cleanup()
 

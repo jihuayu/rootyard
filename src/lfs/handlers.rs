@@ -17,7 +17,55 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex, OnceLock},
+};
+use uuid::Uuid;
+
+static UPLOAD_WAITERS: OnceLock<Mutex<HashMap<Uuid, usize>>> = OnceLock::new();
+fn waiters() -> &'static Mutex<HashMap<Uuid, usize>> {
+    UPLOAD_WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+struct UploadWaiter(Uuid);
+impl UploadWaiter {
+    fn new(id: Uuid) -> Self {
+        *waiters().lock().unwrap().entry(id).or_default() += 1;
+        Self(id)
+    }
+}
+impl Drop for UploadWaiter {
+    fn drop(&mut self) {
+        let mut guard = waiters().lock().unwrap();
+        if let Some(count) = guard.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                guard.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Read-only diagnostic used to prove a request passed metadata authorization
+/// and is queued behind the repository publication lock.
+pub async fn upload_waiters(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo_raw)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let name = models::normalize_repo_name(&repo_raw)?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let access =
+        auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Admin).await?;
+    let count = *waiters().lock().unwrap().get(&access.repo_id).unwrap_or(&0);
+    auth::finish_tx(tx, &actor, false).await?;
+    Ok(lfs_json(
+        StatusCode::OK,
+        serde_json::json!({"waiters":count}),
+    ))
+}
 
 /// Deduplicates multiple byte-for-byte identical `Authorization` headers while leaving
 /// distinct conflicting `Authorization` headers untouched so `auth::authenticate` rejects them.
@@ -209,12 +257,15 @@ pub async fn batch(
                     ));
                     continue;
                 }
-                let on_disk = storage::object_exists_with_size(
+                let on_disk = storage::ensure_readable(
                     &state.storage.root,
                     repo_id,
+                    tenant_id,
                     &spec.oid,
                     spec.size as u64,
+                    tokio::time::Instant::now() + state.config.git_timeout,
                 )
+                .await
                 .map_err(Error::internal)?;
                 if existing_state == "ready" && on_disk {
                     results.push(BatchObjectResult {
@@ -273,12 +324,15 @@ pub async fn batch(
                 let (existing_size, existing_state): (i64, String) = (r.get(0), r.get(1));
                 existing_state == "ready"
                     && existing_size == spec.size
-                    && storage::object_exists_with_size(
+                    && storage::ensure_readable(
                         &state.storage.root,
                         repo_id,
+                        tenant_id,
                         &spec.oid,
                         spec.size as u64,
+                        tokio::time::Instant::now() + state.config.git_timeout,
                     )
+                    .await
                     .map_err(Error::internal)?
             } else {
                 false
@@ -423,10 +477,12 @@ async fn upload_inner(
         (repo_id, tenant_id, expected)
     };
 
+    let waiter = UploadWaiter::new(repo_id);
     let _write_guard =
         tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo_id))
             .await
             .map_err(|_| Error::timeout())?;
+    drop(waiter);
 
     // The reservation snapshot predates the lock. A queued upload may now be
     // superseded by a completed upload or lose authorization while waiting.
@@ -446,8 +502,16 @@ async fn upload_inner(
             ));
         }
         if row.get::<_, &str>("state") == "ready"
-            && storage::verify_object_integrity(&state.storage.root, repo_id, &oid, expected_size)
-                .map_err(Error::internal)?
+            && storage::ensure_readable(
+                &state.storage.root,
+                repo_id,
+                tenant_id,
+                &oid,
+                expected_size,
+                tokio::time::Instant::now() + state.config.git_timeout,
+            )
+            .await
+            .map_err(Error::internal)?
         {
             auth::finish_tx(tx, &actor, true).await?;
             return Ok(lfs_json(
@@ -465,6 +529,7 @@ async fn upload_inner(
     )
     .await
     .map_err(|_| Error::timeout())??;
+    storage::publish_remote(&state, repo_id, tenant_id, &oid, expected_size).await?;
 
     let finalize_res: Result<(), Error> = async {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
@@ -555,14 +620,15 @@ pub async fn verify_object(
         ));
     }
 
-    let root = state.storage.root.clone();
-    let oid_clone = spec.oid.clone();
-    let expected_u64 = spec.size as u64;
-    let verified = tokio::task::spawn_blocking(move || {
-        storage::verify_object_integrity(&root, repo_id, &oid_clone, expected_u64)
-    })
+    let verified = storage::ensure_readable(
+        &state.storage.root,
+        repo_id,
+        tenant_id,
+        &spec.oid,
+        spec.size as u64,
+        tokio::time::Instant::now() + state.config.git_timeout,
+    )
     .await
-    .map_err(Error::internal)?
     .map_err(Error::internal)?;
     if !verified {
         return Ok(lfs_error(
@@ -612,7 +678,7 @@ async fn download_inner(
         return Err(Error::bad_request());
     }
 
-    let (repo_id, expected_size) = {
+    let (repo_id, tenant_id, expected_size) = {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
         let access =
@@ -631,11 +697,12 @@ async fn download_inner(
             return Err(Error::not_found());
         }
         auth::finish_tx(tx, &actor, false).await?;
-        (repo_id, db_size as u64)
+        (repo_id, tenant_id, db_size as u64)
     };
 
     let stream_body =
-        storage::open_verified_download_stream(&state, repo_id, &oid, expected_size).await?;
+        storage::open_verified_download_stream(&state, repo_id, tenant_id, &oid, expected_size)
+            .await?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")

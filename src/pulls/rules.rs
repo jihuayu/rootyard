@@ -31,6 +31,19 @@ pub struct PolicyEvaluation {
     pub reason: Option<&'static str>,
 }
 
+async fn policy_write_lock(state: &AppState, owner: &str, name: &str)
+    -> Result<tokio::sync::OwnedMutexGuard<()>, Error> {
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let row = client.query_opt(
+        "SELECT r.id FROM repositories r JOIN users u ON u.id=r.owner_id WHERE u.username=$1 AND r.name=$2",
+        &[&owner,&name],
+    ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let repo_id: Uuid = row.get(0);
+    drop(client);
+    tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo_id))
+        .await.map_err(|_| Error::timeout())
+}
+
 async fn has_self_approval_col(tx: &Transaction<'_>) -> Result<bool, Error> {
     let sql = "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='forge_branch_rules' AND column_name='prevent_self_approval')";
     Ok(tx.query_one(sql, &[]).await.map_err(Error::internal)?.get(0))
@@ -115,6 +128,7 @@ async fn upsert_branch_rule_inner(
     }
 
     let key = idempotency_key(&headers)?;
+    let _policy_guard = policy_write_lock(&state, &owner, &name).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain).await?;
@@ -305,6 +319,7 @@ pub async fn delete_branch_rule(
 ) -> Result<Response, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let branch_ref = normalize_branch_ref(&branch)?;
+    let _policy_guard = policy_write_lock(&state, &owner, &name).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain).await?;
@@ -345,16 +360,16 @@ pub async fn evaluate_branch_policy(
     base_ref: &str,
     head_oid: &str,
 ) -> Result<PolicyEvaluation, Error> {
-    let (tenant_id, pull_author_id): (Uuid, Uuid) = match tx
+    let (tenant_id, pull_author_id, candidate_base): (Uuid, Uuid, Option<String>) = match tx
         .query_opt(
-            "SELECT tenant_id, author_id FROM forge_pulls WHERE repository_id=$1 AND number=$2",
+            "SELECT tenant_id, author_id, base_oid FROM forge_pulls WHERE repository_id=$1 AND number=$2",
             &[&repository_id, &pull_number],
         )
         .await
         .map_err(Error::internal)?
     {
-        Some(r) => (r.get("tenant_id"), r.get("author_id")),
-        None => (tenant_id, tenant_id),
+        Some(r) => (r.get("tenant_id"), r.get("author_id"),Some(r.get("base_oid"))),
+        None => (tenant_id, tenant_id,None),
     };
 
     let rule_row = tx
@@ -443,21 +458,9 @@ pub async fn evaluate_branch_policy(
 
     let mut missing_or_failed_checks = Vec::new();
     for ctx in &required_checks {
-        let check_row = tx
-            .query_opt(
-                "SELECT status, conclusion FROM forge_check_runs WHERE tenant_id=$1 AND repository_id=$2 AND commit_oid=$3 AND context=$4",
-                &[&tenant_id, &repository_id, &head_oid, ctx],
-            )
-            .await
-            .map_err(Error::internal)?;
-        let passed = match check_row {
-            Some(r) => {
-                let status: String = r.get("status");
-                let conclusion: Option<String> = r.get("conclusion");
-                status == "completed" && conclusion.as_deref() == Some("success")
-            }
-            None => false,
-        };
+        let passed = crate::webhooks::trust::trusted_check_passed(
+            &**tx, repository_id, head_oid, ctx, candidate_base.as_deref(),
+        ).await?;
         if !passed {
             missing_or_failed_checks.push(ctx.clone());
         }

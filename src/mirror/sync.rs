@@ -1,6 +1,7 @@
 //! Snapshot sync, preparation, and filesystem primitives for CI read mirrors.
 use crate::{
-    AppState, Error, auth, db, git_http,
+    AppState, Error, auth, db, git_http, members::models::Role,
+    ci_checkouts::authority::IntegrationScope,
     mirror::{Snapshot, eviction, limiter, observability, views},
 };
 use anyhow::{Context, Result, bail};
@@ -49,22 +50,16 @@ pub(crate) async fn repository(
     name: &str,
 ) -> Result<db::Repository, Error> {
     let identity = auth::authenticate(&state.pool, headers).await?;
-    if identity.username != owner || !db::valid_name(owner) || !db::valid_name(name) {
+    if !db::valid_name(owner) || !db::valid_name(name) {
         return Err(Error::not_found());
     }
-    let row = state
-        .pool
-        .get()
-        .await
-        .map_err(Error::internal)?
-        .query_opt(
-            &format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT),
-            &[&identity.id, &name],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
+    let mut client=state.pool.get().await.map_err(Error::internal)?;
+    let tx=client.transaction().await.map_err(Error::internal)?;
+    let access=auth::authorize_repo_with_role(&tx,&identity,owner,name,Role::Read).await?;
+    let row=tx.query_one(&format!("{} WHERE r.id=$1",db::REPO_SELECT),&[&access.repo_id])
+        .await.map_err(Error::internal)?;
     let repo = db::Repository::from_row(&row);
+    auth::finish_tx(tx,&identity,false).await?;
     if repo.state != "ready" {
         return Err(Error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -174,9 +169,15 @@ pub(crate) async fn sync(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     // Keep cleanup and locks alive even if the HTTP caller disconnects.
-    tokio::spawn(async move { sync_snapshot(state, owner, name, headers).await })
+    tokio::spawn(async move { sync_snapshot(state, owner, name, headers, None).await })
         .await
         .map_err(Error::internal)?
+}
+
+pub(crate) async fn sync_scoped(state:Arc<AppState>,owner:String,name:String,
+    headers:HeaderMap,scope:IntegrationScope)->Result<Response,Error>{
+    tokio::spawn(async move {sync_snapshot(state,owner,name,headers,Some(scope)).await})
+        .await.map_err(Error::internal)?
 }
 
 async fn sync_snapshot(
@@ -184,8 +185,10 @@ async fn sync_snapshot(
     owner: String,
     name: String,
     headers: HeaderMap,
+    scope: Option<IntegrationScope>,
 ) -> Result<Response, Error> {
     let repo = repository(&state, &headers, &owner, &name).await?;
+    if let Some(scope)=&scope {scope.validate_source(&state,repo.id).await?;}
     let mut sync_permit = limiter::for_state(&state).try_acquire_sync(&state, repo.id)?;
     let _permit = state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(
@@ -208,6 +211,8 @@ async fn sync_snapshot(
     let result = async {
         private_directory(&stage)?;
         let bare = stage.join("repository.git");
+        if let Some(scope)=&scope {scope.validate_source(&state,repo.id).await
+            .map_err(|_|anyhow::anyhow!("CI source grant revoked"))?;}
         let url = format!(
             "{}/git/{owner}/{name}.git",
             state.mirror_primary.as_ref().context("not a mirror")?
@@ -276,6 +281,8 @@ async fn sync_snapshot(
         if current.id != repo.id || current.storage_generation != repo.storage_generation {
             bail!("repository generation changed");
         }
+        if let Some(scope)=&scope {scope.validate_source(&state,repo.id).await
+            .map_err(|_|anyhow::anyhow!("CI source grant revoked"))?;}
         std::fs::rename(&stage, &final_path)?;
         File::open(&root)?.sync_all()?;
         atomic_file(&root, "current.json", &serde_json::to_vec(&snapshot)?)?;
