@@ -745,6 +745,9 @@ pub fn run_hook(state: &str) -> Result<()> {
         _ => bail!("unsupported reference transaction state"),
     };
     let (op, input) = hook_input()?;
+    if phase == HookPhase::Preparing {
+        crate::browse::policy::validate_hook_fence(&op)?;
+    }
     let result = record(&op, phase, &input);
     if result.is_err() {
         let _ = atomic(&op.path.join("corrupt"), b"", false);

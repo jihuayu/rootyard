@@ -255,6 +255,9 @@ async fn execute_ref_transaction_inner(
         ref_name: u.ref_name.clone(), old_oid: u.old_oid.clone(), new_oid: u.new_oid.clone(),
     }).collect();
     crate::browse::policy::validate(&*tx, repo_id, &requested, &state.config.git, &repo_path, state.config.git_timeout).await?;
+    let owner_id: Uuid = tx.query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&repo_id])
+        .await.map_err(Error::internal)?.get(0);
+    crate::lfs::publication::validate_new_refs(&state, &tx, repo_id, owner_id, &requested).await?;
 
     auth::verify_token(&tx, &actor, true).await?;
 

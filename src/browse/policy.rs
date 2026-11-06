@@ -43,6 +43,7 @@ pub async fn validate<C: GenericClient + Sync>(
             let mut cmd = tokio::process::Command::new(git_bin);
             cmd.arg("--git-dir").arg(git_dir).args(["merge-base", "--is-ancestor", &change.old_oid, &change.new_oid]);
             cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
+            cmd.kill_on_drop(true).stderr(std::process::Stdio::null());
             let status = tokio::time::timeout(timeout, cmd.status()).await.map_err(|_| Error::timeout())?
                 .map_err(Error::internal)?;
             if !status.success() { return Err(denied()); }
@@ -56,6 +57,7 @@ pub fn validate_hook(op: &crate::journal::Operation, changes: &[RefChange]) -> a
     let url = std::env::var("ROOTYARD_DATABASE_URL").context("missing hook database URL")?;
     let git_bin = std::env::var("ROOTYARD_GIT_PATH").context("missing hook Git path")?;
     let git_dir = std::env::var("ROOTYARD_GIT_DIR").context("missing hook repository path")?;
+    let data_root = std::env::var("ROOTYARD_DATA_ROOT").context("missing hook data root")?;
     let timeout = std::env::var("ROOTYARD_GIT_TIMEOUT_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
@@ -65,10 +67,27 @@ pub fn validate_hook(op: &crate::journal::Operation, changes: &[RefChange]) -> a
         let tenant_id: Uuid = row.get(0);
         let generation: i64 = row.get(1);
         ensure!(generation == op.storage_generation, "repository generation changed");
+        crate::sharding::fencing::check_hook_fence(&client, op.repository_id, Path::new(&git_dir), op.storage_generation)
+            .await.map_err(|e| anyhow::anyhow!(e.1))?;
         validate(&client, op.repository_id, changes, Path::new(&git_bin), Path::new(&git_dir), Duration::from_secs(timeout)).await
             .map_err(|e| anyhow::anyhow!(e.1))?;
-        // Other publication guards use this same pre-receive boundary.
-        let _ = tenant_id;
+        crate::lfs::publication::validate_new_refs_with_client(
+            &client, Path::new(&git_dir), Path::new(&data_root), Path::new(&git_bin),
+            Duration::from_secs(timeout), op.repository_id, tenant_id, changes,
+        ).await.map_err(|e| anyhow::anyhow!(e.1))?;
         Ok::<(), anyhow::Error>(())
+    })
+}
+
+pub fn validate_hook_fence(op: &crate::journal::Operation) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let url = std::env::var("ROOTYARD_DATABASE_URL").context("missing hook database URL")?;
+    let git_dir = std::env::var("ROOTYARD_GIT_DIR").context("missing hook repository path")?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    rt.block_on(async {
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+        tokio::spawn(async move { let _ = connection.await; });
+        crate::sharding::fencing::check_hook_fence(&client, op.repository_id, Path::new(&git_dir), op.storage_generation)
+            .await.map_err(|e| anyhow::anyhow!(e.1))
     })
 }
