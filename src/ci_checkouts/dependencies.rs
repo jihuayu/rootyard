@@ -170,7 +170,8 @@ pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Reposito
             return Err(Error::bad_request());
         }
         let name=format!("refs/tags/{tag}");
-        let out=git(state,root_repo.id,&["rev-parse","--verify",&name],128).await?;
+        let out=tag_lease.as_ref().ok_or_else(unsafe_dependency)?
+            .guard(git(state,root_repo.id,&["rev-parse","--verify",&name],128)).await??;
         let oid=std::str::from_utf8(&out).map_err(|_|unsafe_dependency())?.trim();
         if !ci_pins::valid_oid(oid) {return Err(unsafe_dependency());}
         result.tags.push(TagDependency{name:tag.clone(),object_oid:oid.into()});
@@ -187,16 +188,17 @@ pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Reposito
         // release it before pinning another repository to avoid nested slots.
         let lease=crate::storage::read_leases::shared(&state.pool,source.repo.id,
             tokio::time::Instant::now()+state.config.git_timeout).await?;
-        let entries=parse_tree(&git(state,source.repo.id,&["ls-tree","-rzl","--full-tree",&source.oid],4*1024*1024).await?)?;
+        let entries=parse_tree(&lease.guard(git(state,source.repo.id,
+            &["ls-tree","-rzl","--full-tree",&source.oid],4*1024*1024)).await??)?;
         let module_oid=entries.iter().find(|e|e.4==".gitmodules" && e.1=="blob").map(|e|e.2.clone());
         let gitlinks:Vec<_>=entries.iter().filter(|e|e.0=="160000" && e.1=="commit").collect();
         let modules=if gitlinks.is_empty(){HashMap::new()}else{
             let oid=module_oid.ok_or_else(unsafe_dependency)?;
-            parse_gitmodules(&blob(state,source.repo.id,&oid,64*1024).await?)?
+            parse_gitmodules(&lease.guard(blob(state,source.repo.id,&oid,64*1024)).await??)?
         };
         for (_,kind,oid,size,path) in &entries {
             if kind!="blob" || size.is_none_or(|n|n>1024) {continue;}
-            let bytes=blob(state,source.repo.id,oid,1024).await?;
+            let bytes=lease.guard(blob(state,source.repo.id,oid,1024)).await??;
             if let Some(pointer)=lfs::models::parse_pointer(&bytes){
                 check_lfs(state,&source.repo,&pointer.oid,pointer.size).await?;
                 result.lfs.push(LfsDependency{repository_id:source.repo.id,
