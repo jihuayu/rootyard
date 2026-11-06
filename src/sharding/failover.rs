@@ -9,9 +9,9 @@ use crate::{
         transitions,
         fencing::read_volume_marker_at,
         models::{
-            self, DEFAULT_LEASE_TTL_SECONDS, DegradeDrillInput, DegradeDrillResponse,
+            self, DegradeDrillInput, DegradeDrillResponse,
             FAILOVER_OP_FIELDS, FailoverInput, FailoverOperation, REPO_ROUTE_FIELDS,
-            RepoShardRoute, ShardNode, VolumeFenceMarker, conflict, json, unix_now, valid_node_id,
+            RepoShardRoute, ShardNode, VolumeFenceMarker, conflict, json, unix_now,
         },
         router::{fetch_node, load_or_init_repo_route},
     },
@@ -24,7 +24,6 @@ use axum::{
 };
 use serde_json::json as sjson;
 use std::{path::Path as StdPath, sync::Arc};
-use uuid::Uuid;
 
 pub fn has_git_lock_files(repo_dir: &StdPath) -> bool {
     repo_dir.exists()
@@ -99,137 +98,16 @@ pub async fn execute_failover(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(input): Json<FailoverInput>,
+    Json(_input): Json<FailoverInput>,
 ) -> Result<Response, Error> {
     models::ensure_schema(&state.pool).await?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
-    auth::writable(&actor)?;
-    if !valid_node_id(&input.new_primary_node_id) {
-        return Err(Error::bad_request());
-    }
-    let reason = input.reason.clone().unwrap_or_else(|| "automated primary failover".to_string());
-    if reason.trim().is_empty() || reason.len() > 1024 || reason.chars().any(char::is_control) {
-        return Err(Error::bad_request());
-    }
-    let now = input.now_unix.unwrap_or_else(unix_now);
-
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
     require_operator(&tx, &actor).await?;
-    let _guard = state.storage.write_lock(access.repo_id).await;
-
-    let repo_dir = state
-        .storage
-        .verify_path(access.repo_id)
-        .map_err(|_| conflict("bare Git repository volume verification failed"))?;
-    let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
-    let repo_gen: i64 = tx
-        .query_one("SELECT storage_generation FROM repositories WHERE id = $1 FOR UPDATE", &[&access.repo_id])
-        .await
-        .map_err(Error::internal)?
-        .get(0);
-    let candidate = fetch_node(&tx, &input.new_primary_node_id).await?.ok_or_else(Error::not_found)?;
-
-    let (new_epoch, new_token, new_gen) =
-        validate_failover_candidate(&route, repo_gen, &candidate, &input, has_git_lock_files(&repo_dir))?;
-
-    let old_primary_id = route.primary_node_id.clone();
-    let old_epoch = route.route_epoch;
-
-    tx.execute(
-        "UPDATE shard_nodes SET role = 'fenced', status = 'fenced', \
-         fenced_epoch = GREATEST(fenced_epoch, $2), version = version + 1, updated_at = clock_timestamp() \
-         WHERE node_id = $1",
-        &[&old_primary_id, &old_epoch],
-    )
-    .await
-    .map_err(Error::internal)?;
-
-    let lease_exp = now.saturating_add(DEFAULT_LEASE_TTL_SECONDS);
-    tx.execute(
-        "UPDATE shard_nodes SET role = 'primary', status = 'healthy', \
-         lease_epoch = GREATEST(lease_epoch, $2), lease_expires_unix = $3, \
-         version = version + 1, updated_at = clock_timestamp() WHERE node_id = $1",
-        &[&candidate.node_id, &new_epoch, &lease_exp],
-    )
-    .await
-    .map_err(Error::internal)?;
-
-    if new_gen > repo_gen {
-        tx.execute("UPDATE repositories SET storage_generation = $2 WHERE id = $1", &[&access.repo_id, &new_gen])
-            .await
-            .map_err(Error::internal)?;
-    }
-
-    let remaining: Vec<String> = route
-        .read_replica_nodes
-        .iter()
-        .filter(|n| *n != &candidate.node_id)
-        .cloned()
-        .collect();
-    let rem_json = sjson!(remaining);
-    let upd_route_sql = format!(
-        "UPDATE repository_shard_routes SET \
-         primary_node_id = $3, read_replica_nodes = $4, explicit_override = true, \
-         route_epoch = $5, fencing_token = $6, fenced_epoch = $7, \
-         draining = false, read_only_degraded = false, degraded_reason = '', \
-         in_flight_writes = 0, required_generation = $8, version = version + 1, updated_at = clock_timestamp() \
-         WHERE tenant_id = $1 AND repository_id = $2 RETURNING {REPO_ROUTE_FIELDS}"
-    );
-    let r_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-        &access.owner_id,
-        &access.repo_id,
-        &candidate.node_id,
-        &rem_json,
-        &new_epoch,
-        &new_token,
-        &old_epoch,
-        &new_gen,
-    ];
-    let r_row = tx.query_one(&upd_route_sql, r_params).await.map_err(Error::internal)?;
-    let updated_route = RepoShardRoute::row(&r_row);
-
-    let marker = VolumeFenceMarker::from_route(&updated_route, new_gen, Some(old_primary_id.clone()), now);
-
-    let op_id = Uuid::new_v4();
-    let reason_trimmed = reason.trim();
-    let snapshot = sjson!({
-        "stages": ["draining", "fenced", "verified", "promoted"],
-        "fenced_node_id": old_primary_id,
-        "promoted_node_id": candidate.node_id,
-        "old_route_epoch": old_epoch,
-        "new_route_epoch": new_epoch,
-        "fencing_token": new_token,
-        "storage_generation": new_gen,
-    });
-    let ins_op = format!(
-        "INSERT INTO shard_failover_operations \
-         (id, tenant_id, repository_id, old_primary_node_id, new_primary_node_id, \
-          old_route_epoch, new_route_epoch, fencing_token, storage_generation, state, reason, snapshot) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'promoted', $10, $11) \
-         RETURNING {FAILOVER_OP_FIELDS}"
-    );
-    let op_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
-        &op_id,
-        &access.owner_id,
-        &access.repo_id,
-        &old_primary_id,
-        &candidate.node_id,
-        &old_epoch,
-        &new_epoch,
-        &new_token,
-        &new_gen,
-        &reason_trimmed,
-        &snapshot,
-    ];
-    let op_row = tx.query_one(&ins_op, op_params).await.map_err(Error::internal)?;
-    let failover_op = FailoverOperation::row(&op_row);
-
-    record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.failover_promoted", "shard_failover", &candidate.node_id, snapshot).await?;
-    let transition_id = transitions::stage(&tx, &marker).await?;
-    transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
-    Ok(json(StatusCode::OK, failover_op))
+    finish(tx, &actor, false).await?;
+    Err(conflict("automatic takeover requires verified target data and physical source fencing"))
 }
 
 pub async fn degrade_or_recover_repo(
@@ -297,7 +175,7 @@ pub async fn degrade_or_recover_repo(
 
     let details = sjson!({ "mode": mode, "read_only_degraded": degraded, "route_epoch": updated.route_epoch });
     record_audit_event(&tx, access.owner_id, access.repo_id, &actor, audit_action, "shard_degrade", &updated.primary_node_id, details).await?;
-    let transition_id = transitions::stage(&tx, &marker).await?;
+    let transition_id = transitions::stage(&tx, &state, &marker).await?;
     transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
 
     Ok(json(
@@ -321,6 +199,7 @@ mod tests {
     use super::*;
     use crate::sharding::models::ReplicaWatermark;
     use std::collections::BTreeMap;
+    use uuid::Uuid;
 
     #[test]
     fn failover_candidate_validation_checks_watermark_and_in_flight_writes() {
