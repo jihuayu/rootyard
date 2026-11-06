@@ -246,6 +246,11 @@ async fn run() -> Result<()> {
             } else {
                 None
             };
+            let webhook_task = if state.config.outbox_worker {
+                Some(tokio::spawn(rootyard::webhooks::background::worker(
+                    state.clone(), dispatch_stop.clone(),
+                )))
+            } else { None };
             let worker_state = state.clone();
             let worker = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -271,6 +276,7 @@ async fn run() -> Result<()> {
             if let Some(task) = delivery_task {
                 let _ = task.await;
             }
+            if let Some(task) = webhook_task { let _ = task.await; }
             if let Some(metrics_worker) = metrics_worker {
                 metrics_worker.abort();
             }

@@ -67,6 +67,13 @@ async fn upsert_check_inner(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+    let trusted: bool = tx.query_one(
+        "SELECT EXISTS(SELECT 1 FROM forge_trusted_check_contexts WHERE repository_id=$1 AND context=$2)",
+        &[&repo,&input.context],
+    ).await.map_err(Error::internal)?.get(0);
+    if trusted {
+        return Err(Error(StatusCode::FORBIDDEN, "trusted CI context requires integration evidence"));
+    }
 
     if let Some(key) = key {
         let request = serde_json::json!({

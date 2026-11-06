@@ -413,13 +413,13 @@ pub async fn retry_delivery(
         let row = tx
             .query_opt(
                 &format!(
-                    "UPDATE forge_webhook_deliveries SET state='pending', attempts = CASE WHEN $5 OR state='dead_letter' OR attempts >= max_attempts THEN 0 ELSE attempts END, next_attempt_unix=0, updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND webhook_id=$3 AND id=$4 RETURNING {DELIVERY_FIELDS}"
+                    "UPDATE forge_webhook_deliveries SET state='pending', attempts = CASE WHEN $5 OR state='dead_letter' OR attempts >= max_attempts THEN 0 ELSE attempts END, lease_generation=lease_generation+1, next_attempt_unix=0, updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND webhook_id=$3 AND id=$4 AND (state <> 'leased' OR next_attempt_unix <= extract(epoch FROM clock_timestamp())) RETURNING {DELIVERY_FIELDS}"
                 ),
                 &[&actor.id, &repo, &hook_id, &delivery_id, &reset_attempts],
             )
             .await
             .map_err(Error::internal)?
-            .ok_or_else(Error::not_found)?;
+            .ok_or(Error(StatusCode::CONFLICT, "delivery is being sent or does not exist"))?;
         let pending_delivery = WebhookDelivery::row(&row);
         finish(tx, &actor, true).await?;
         drop(client);
@@ -511,6 +511,32 @@ pub async fn ci_callback(
             return Ok(json(StatusCode::OK, saved_resp));
         }
 
+        let trusted_binding: Option<(Option<Uuid>,bool)> = tx.query_opt(
+            "SELECT webhook_id,active FROM forge_trusted_check_contexts WHERE repository_id=$1 AND context=$2",
+            &[&repo_id,&context],
+        ).await.map_err(Error::internal)?.map(|r| (r.get(0),r.get(1)));
+        if let Some((expected_hook,active)) = trusted_binding {
+            if !active || expected_hook != Some(hook_id) || !hook_row.get::<_, Value>("ci_contexts")
+                .as_array().is_some_and(|a| a.iter().any(|v| v.as_str() == Some(context.as_str()))) {
+                return Err(Error(StatusCode::FORBIDDEN, "integration does not own this CI context"));
+            }
+            let (Some(run_id),Some(job_id),Some(base_oid),Some(generation),Some(pull_number),Some(attempt)) =
+                (input.ci_run_id,input.ci_job_id,input.base_oid.as_ref(),input.lease_generation,input.pull_number,input.attempt)
+                else { return Err(Error::bad_request()); };
+            let valid: bool = tx.query_one(
+                "SELECT EXISTS(SELECT 1 FROM ci_runs c JOIN forge_pulls p \
+                 ON p.repository_id=c.repository_id AND p.number=c.pull_number \
+                 WHERE c.id=$1 AND c.repository_id=$2 AND c.context=$3 AND c.job_id=$4 \
+                   AND c.head_oid=$5 AND c.base_oid=$6 AND c.pull_number=$7 \
+                   AND c.state='leased' AND c.attempt=$8 AND c.lease_generation=$9 \
+                   AND c.lease_expires_unix>extract(epoch FROM clock_timestamp()) \
+                   AND p.state='open' AND p.head_oid=c.head_oid AND p.base_oid=c.base_oid \
+                   AND p.version=c.pull_version)",
+                &[&run_id,&repo_id,&context,&job_id,&input.commit_oid,base_oid,&pull_number,&attempt,&generation],
+            ).await.map_err(Error::internal)?.get(0);
+            if !valid { return Err(Error(StatusCode::CONFLICT, "CI run attempt or candidate changed")); }
+        }
+
         let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
             Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later")
         })?;
@@ -524,6 +550,20 @@ pub async fn ci_callback(
             &tx, tenant_id, repo_id, &input.commit_oid, &context, &input.status,
             input.conclusion.as_ref(), input.attempt, input.sequence, &output,
         ).await?;
+        if trusted_binding.is_some() {
+            tx.execute(
+                "UPDATE forge_check_runs SET issuer_webhook_id=$5,ci_run_id=$6,ci_base_oid=$7,ci_lease_generation=$8 \
+                 WHERE tenant_id=$1 AND repository_id=$2 AND commit_oid=$3 AND context=$4",
+                &[&tenant_id,&repo_id,&input.commit_oid,&context,&hook_id,&input.ci_run_id,
+                  &input.base_oid,&input.lease_generation],
+            ).await.map_err(Error::internal)?;
+            if input.status == "completed" {
+                tx.execute(
+                    "UPDATE ci_runs SET state='completed',conclusion=$2,lease_expires_unix=0,updated_at=clock_timestamp() WHERE id=$1",
+                    &[&input.ci_run_id,&input.conclusion],
+                ).await.map_err(Error::internal)?;
+            }
+        }
 
         let resp_val = serde_json::to_value(&check_run).map_err(Error::internal)?;
         tx.execute(
