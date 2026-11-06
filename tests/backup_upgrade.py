@@ -119,7 +119,7 @@ class BackupUpgradeHarness(BackupRecoveryHarness):
         manifest = json.loads((self.backup / 'manifest.json').read_text())
         assert manifest['schema_versions'] == SCHEMA_VERSIONS
         return {**result, 'restored003_upgraded008_catalog_accepted': True,
-                'all_16_tables_backed_up': True, 'populated_forge_backed_up': True}
+                'all_current_tables_backed_up': True, 'populated_forge_backed_up': True}
 
     def post_boundary_writes(self):
         result = self.write_after_backup()
@@ -137,7 +137,7 @@ class BackupUpgradeHarness(BackupRecoveryHarness):
         result = json.loads(self.restore_command().stdout)
         self.db = self.target_db
         self.env.update(DATABASE_URL=self.db, ROOTYARD_DATA_DIR=str(self.target))
-        assert self.all_rows() == self.source_rows, 'All restored table contents must exactly equal the backup boundary'
+        self.assert_restored_rows()
         assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == SCHEMA_VERSION_CSV
         assert self.sql("SELECT username FROM users WHERE id='" + self.legacy_user + "'") == 'legacy-owner'
         assert self.sql("SELECT owner_id::text || ':' || name FROM repositories WHERE id='" + self.legacy_repo + "'") == self.legacy_user + ':legacy-repo'
@@ -165,7 +165,7 @@ class BackupUpgradeHarness(BackupRecoveryHarness):
         assert changed['version'] == 3
         self.stop()
         return dict(fresh_database_and_volume=True, separate_pg_server=self.admin != self.restore_admin,
-                    full_16_table_rows_exact=True, legacy_identity_and_repository_preserved=True,
+                    durable_rows_exact_with_authority_rotated=True, legacy_identity_and_repository_preserved=True,
                     genuine_authenticated_clone_fsck_content=True, populated_forge_exact=True,
                     owner_read_only_revoked_permissions=True, restored_number_and_cas=True,
                     post_boundary_git_commit_not_recovered=1, post_boundary_forge_changes_not_recovered=2,

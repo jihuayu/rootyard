@@ -61,6 +61,28 @@ class BackupRecoveryHarness(BackupHarness):
         tables = self.rows("SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename")
         return {r['tablename']: self.rows('SELECT * FROM public."' + r['tablename'] + '" t ORDER BY to_jsonb(t)::text') for r in tables}
 
+    def assert_restored_rows(self):
+        """Compare durable state exactly and separately verify authority rotation.
+
+        These legacy fixtures contain no execution grants. Populated grant
+        invalidation is exercised by backup_capabilities/backup_ci_checkouts.
+        Do not discard whole authority tables from the comparison.
+        """
+        restored = self.all_rows()
+        expected = json.loads(json.dumps(self.source_rows))
+        old, new = expected['cluster_authority'], restored['cluster_authority']
+        assert len(old) == len(new) == 1
+        assert new[0]['incarnation'] != old[0]['incarnation']
+        assert uuid.UUID(new[0]['incarnation']).version == 4
+        assert new[0]['rotated_at'] > old[0]['rotated_at']
+        for field in ('incarnation', 'rotated_at'):
+            old[0][field] = new[0][field]
+        different = [table for table in set(expected) | set(restored)
+                     if expected.get(table) != restored.get(table)]
+        assert not different, 'Restored durable rows differ: ' + ', '.join(sorted(different))
+        self.source_rows = restored  # Baseline for subsequent denied-write checks.
+        return restored
+
     def make_resolved(self, name, missing=False):
         self.start()
         repo = json.loads(self.expect('/api/repos', 201, token=self.alice, method='POST', body={'name': name}))
@@ -161,9 +183,8 @@ class BackupRecoveryHarness(BackupHarness):
                 assert (self.target / path.relative_to(self.backup / 'volume')).read_bytes() == path.read_bytes()
         self.db = self.target_db
         self.env.update(DATABASE_URL=self.db, ROOTYARD_DATA_DIR=str(self.target))
-        restored = self.all_rows()
+        restored = self.assert_restored_rows()
         (self.root / 'restored-sql-rows.json').write_text(json.dumps(restored, indent=2) + '\n')
-        assert restored == self.source_rows, 'Full public table contents differ after restore'
         assert self.sql("SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == SCHEMA_VERSION_CSV
         for fixture in (self.resolved, self.missing):
             assert self.sql("SELECT storage_generation FROM repositories WHERE id='" + fixture['repo']['id'] + "'") == '2'
@@ -172,7 +193,7 @@ class BackupRecoveryHarness(BackupHarness):
         effects = self.rows("SELECT state,effect,lease_owner,lease_until FROM event_deliveries WHERE event_id='" + self.candidate + "'")
         assert len(effects) == 2 and all(r == dict(state='delivered',effect='discarded_unknown',lease_owner=None,lease_until=None) for r in effects)
         assert self.sql("SELECT count(*) FROM audit_events WHERE event_id='" + self.candidate + "'") == '0'
-        return dict(all_public_rows_exact=True, volume_id_byte_exact=True, journal_files_byte_exact=True, recovery_snapshot_provenance=True, delivery_effects_preserved=True, separate_pg_server=self.admin != self.restore_admin, restore_seconds=result['elapsed_seconds'])
+        return dict(durable_rows_exact_with_authority_rotated=True, volume_id_byte_exact=True, journal_files_byte_exact=True, recovery_snapshot_provenance=True, delivery_effects_preserved=True, separate_pg_server=self.admin != self.restore_admin, restore_seconds=result['elapsed_seconds'])
 
     def restored_guards(self):
         f = self.resolved
