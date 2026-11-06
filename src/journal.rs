@@ -691,8 +691,9 @@ fn validate_namespace(op: &Operation, changes: &[RefChange]) -> Result<()> {
         ensure!(
             changes
                 .iter()
-                .all(|c| !crate::ci_pins::reserved(&c.ref_name)),
-            "CI retention namespace is controller-only"
+                .all(|c| !crate::ci_pins::reserved(&c.ref_name)
+                    && !crate::namespace_service::proposal_ref_reserved(&c.ref_name)),
+            "controller-owned retention namespace cannot be pushed"
         );
     }
     Ok(())

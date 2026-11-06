@@ -103,9 +103,36 @@ pub async fn execute_ref_transaction(
     headers: HeaderMap,
     Json(input): Json<RefTransactionRequest>,
 ) -> Result<Response, Error> {
-    tokio::spawn(async move { execute_ref_transaction_inner(state, owner, name, headers, input).await })
+    tokio::spawn(async move { execute_ref_transaction_inner(state, owner, name, headers, input, None).await })
         .await
         .map_err(Error::internal)?
+}
+
+/// The only in-process bypass for proposal retention refs is an absent-to-commit pin.
+/// No HTTP route exposes this operation; normal ref transactions reject the prefix.
+pub(crate) async fn create_proposal_pin(
+    state: Arc<AppState>,
+    owner: String,
+    name: String,
+    headers: HeaderMap,
+    proposal_id: Uuid,
+    target_oid: String,
+    storage_generation: i64,
+) -> Result<Response, Error> {
+    let request = RefTransactionRequest {
+        storage_generation: Some(storage_generation),
+        atomic: true,
+        updates: vec![crate::browse::models::RefUpdateInput {
+            ref_name: crate::namespace_service::proposal_pin_ref(proposal_id),
+            old_oid: None,
+            new_oid: Some(target_oid),
+        }],
+    };
+    tokio::spawn(async move {
+        execute_ref_transaction_inner(state, owner, name, headers, request, Some(proposal_id)).await
+    })
+    .await
+    .map_err(Error::internal)?
 }
 
 async fn execute_ref_transaction_inner(
@@ -114,11 +141,12 @@ async fn execute_ref_transaction_inner(
     name: String,
     headers: HeaderMap,
     input: RefTransactionRequest,
+    proposal_pin: Option<Uuid>,
 ) -> Result<Response, Error> {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     auth::writable(&actor)?;
     let idem_key = auth::idempotency_key(&headers)?.map(str::to_owned);
-    let normalized_updates = input.normalize()?;
+    let normalized_updates = input.normalize_with_proposal_pin(proposal_pin)?;
 
     if owner != actor.username || !db::valid_name(&owner) || !db::valid_name(&name) {
         return Err(Error::not_found());

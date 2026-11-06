@@ -344,6 +344,7 @@ pub fn valid_branch_ref(s: &str) -> bool {
         && s.starts_with("refs/heads/")
         && s != "refs/heads/HEAD"
         && !crate::ci_pins::reserved(s)
+        && !crate::namespace_service::proposal_ref_reserved(s)
         && !s.ends_with('/')
         && !s.ends_with('.')
         && !s.contains("..")

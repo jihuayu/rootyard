@@ -10,11 +10,22 @@ mod views;
 
 use crate::AppState;
 use axum::{
+    Router,
     extract::DefaultBodyLimit,
     routing::{get, post},
-    Router,
 };
 use std::sync::Arc;
+use uuid::Uuid;
+
+pub(crate) const PROPOSAL_REFS: &str = "refs/heads/rootyard-proposals";
+
+pub(crate) fn proposal_ref_reserved(name: &str) -> bool {
+    name == PROPOSAL_REFS || name.starts_with("refs/heads/rootyard-proposals/")
+}
+
+pub(crate) fn proposal_pin_ref(id: Uuid) -> String {
+    format!("{PROPOSAL_REFS}/{id}")
+}
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
