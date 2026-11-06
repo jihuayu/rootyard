@@ -17,7 +17,55 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex, OnceLock},
+};
+use uuid::Uuid;
+
+static UPLOAD_WAITERS: OnceLock<Mutex<HashMap<Uuid, usize>>> = OnceLock::new();
+fn waiters() -> &'static Mutex<HashMap<Uuid, usize>> {
+    UPLOAD_WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+struct UploadWaiter(Uuid);
+impl UploadWaiter {
+    fn new(id: Uuid) -> Self {
+        *waiters().lock().unwrap().entry(id).or_default() += 1;
+        Self(id)
+    }
+}
+impl Drop for UploadWaiter {
+    fn drop(&mut self) {
+        let mut guard = waiters().lock().unwrap();
+        if let Some(count) = guard.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                guard.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Read-only diagnostic used to prove a request passed metadata authorization
+/// and is queued behind the repository publication lock.
+pub async fn upload_waiters(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo_raw)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let name = models::normalize_repo_name(&repo_raw)?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let access =
+        auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Admin).await?;
+    let count = *waiters().lock().unwrap().get(&access.repo_id).unwrap_or(&0);
+    auth::finish_tx(tx, &actor, false).await?;
+    Ok(lfs_json(
+        StatusCode::OK,
+        serde_json::json!({"waiters":count}),
+    ))
+}
 
 /// Deduplicates multiple byte-for-byte identical `Authorization` headers while leaving
 /// distinct conflicting `Authorization` headers untouched so `auth::authenticate` rejects them.
@@ -423,10 +471,12 @@ async fn upload_inner(
         (repo_id, tenant_id, expected)
     };
 
+    let waiter = UploadWaiter::new(repo_id);
     let _write_guard =
         tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo_id))
             .await
             .map_err(|_| Error::timeout())?;
+    drop(waiter);
 
     // The reservation snapshot predates the lock. A queued upload may now be
     // superseded by a completed upload or lose authorization while waiting.

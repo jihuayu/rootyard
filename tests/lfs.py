@@ -363,7 +363,15 @@ class LfsHarness(Harness):
         self._await_staging()
         b = self._partial_put(oid, len(payload), second)
         b.send(payload[:1])
-        time.sleep(.15)  # B has read the pending reservation and queued for the lock.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, body, _ = self.http("/api/repos/alice/demo/lfs/upload-waiters", token=self.alice)
+            assert status == 200
+            if json.loads(body)["waiters"] >= 1:
+                break
+            time.sleep(.02)
+        else:
+            raise AssertionError("second upload did not pass metadata authorization and queue for lock")
         self.sql(f"UPDATE tokens SET revoked=true WHERE id='{second['token_id']}'")
         a.send(payload[1:])
         response_a = a.getresponse()
