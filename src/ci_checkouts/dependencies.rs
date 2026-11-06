@@ -161,6 +161,9 @@ pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Reposito
     if !matches!(history,"full"|"target") || tags.len()>32 {return Err(Error::bad_request());}
     let mut result=Manifest{version:1,history:history.into(),tags:Vec::new(),
         lfs:Vec::new(),submodules:Vec::new()};
+    let tag_lease=if tags.is_empty(){None}else{Some(
+        crate::storage::read_leases::shared(&state.pool,root_repo.id,
+            tokio::time::Instant::now()+state.config.git_timeout).await?)};
     for tag in tags {
         if tag.is_empty() || tag.len()>128 || tag.starts_with('-') || tag.contains("..") ||
             tag.contains("@{") || tag.bytes().any(|b|!b.is_ascii_alphanumeric() && !b"/._-".contains(&b)) {
@@ -172,6 +175,7 @@ pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Reposito
         if !ci_pins::valid_oid(oid) {return Err(unsafe_dependency());}
         result.tags.push(TagDependency{name:tag.clone(),object_oid:oid.into()});
     }
+    if let Some(lease)=tag_lease {lease.ensure_active()?;}
     let mut queue=VecDeque::from([Source{repo:root_repo,oid:target.into(),prefix:String::new(),depth:0}]);
     let mut scanned=HashSet::new();
     while let Some(source)=queue.pop_front(){
