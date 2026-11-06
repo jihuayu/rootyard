@@ -19,6 +19,9 @@ The cache eviction age is `ROOTYARD_STORAGE_CACHE_MAX_AGE_SECONDS` (default
 seven days). Physical cleanup stays behind the same fence as every other
 destructive maintenance step.
 
+An authorized `maintain`/`admin` read-only surface for the durable queue is
+defined in [maintenance job observability API](storage-maintenance-jobs-api.md).
+
 Jobs in `storage_maintenance_jobs` carry repository and tenant identities, a
 storage generation, a short lease, an attempt count, and a claim generation.
 Every renewal and completion compares the owner, attempt, and generation;
