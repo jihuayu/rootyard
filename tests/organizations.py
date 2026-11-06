@@ -2,11 +2,15 @@
 """Native organization, team, Git/LFS, Forge, and workspace authorization contract."""
 import argparse
 import base64
+import concurrent.futures
 import hashlib
 import json
 import os
 from pathlib import Path
+import select
+import subprocess
 import sys
+import time
 import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,6 +27,7 @@ class OrganizationHarness(Harness):
     def inherited_capabilities(self):
         self.setup()
         charlie = self.account("create-user", "charlie")
+        self.charlie = charlie
         org = self.doc("/api/orgs", 201, method="POST", body={"slug": "acme"})
         assert org["slug"] == "acme"
         self.doc("/api/orgs", 409, method="POST", body={"slug": "alice"})
@@ -125,6 +130,54 @@ class OrganizationHarness(Harness):
                 "git_lfs_forge_workspace_authorized": True,
                 "revocation_immediate": True, "last_admin_protected": True}
 
+    def role_revocation_barrier(self):
+        issue_path = "/api/repos/acme/project/issues"
+        self.doc("/api/orgs/acme/members/charlie", 201, method="PUT", body={"role": "write"})
+
+        def blocked_write(sql, title, blocked_query):
+            p = subprocess.Popen(["psql", "--dbname", self.db, "-X", "-qAt",
+                                  "-v", "ON_ERROR_STOP=1"], env=self.env,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+            try:
+                p.stdin.write("BEGIN; " + sql + "; SELECT 'locked';\n")
+                p.stdin.flush()
+                assert select.select([p.stdout], [], [], 5)[0], "fixture SQL lock did not start"
+                assert p.stdout.readline().strip() == "locked", "fixture SQL lock failed"
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(self.http, issue_path, token=self.charlie,
+                                             method="POST", body={"title": title})
+                    deadline = time.monotonic() + 5
+                    observed = False
+                    while time.monotonic() < deadline and not future.done():
+                        waiting = self.sql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%" + blocked_query + "%' AND pid<>pg_backend_pid()")
+                        if int(waiting) > 0:
+                            observed = True
+                            break
+                        time.sleep(.05)
+                    p.stdin.write("COMMIT;\n")
+                    p.stdin.flush()
+                    status = future.result(timeout=10)[0]
+                    assert observed, "role authorization did not wait on revocation row lock"
+                    assert status == 403, "write admitted after role revocation"
+                assert self.sql("SELECT count(*) FROM forge_issues WHERE title='" + title + "'") == "0"
+            finally:
+                if p.poll() is None:
+                    p.stdin.write("ROLLBACK;\\q\n")
+                    p.stdin.flush()
+                    p.wait(timeout=5)
+
+        org = self.doc("/api/orgs/acme", 200)
+        blocked_write(
+            f"UPDATE organization_memberships SET role='read' WHERE organization_id='{org['id']}' AND user_id='{self.charlie['user_id']}'",
+            "Denied after direct role wait", "organization_memberships")
+        self.doc("/api/orgs/acme/teams/engineers/members/charlie", 200, method="PUT")
+        blocked_write(
+            f"DELETE FROM organization_team_members WHERE organization_id='{org['id']}' AND user_id='{self.charlie['user_id']}'",
+            "Denied after team role wait", "organization_teams")
+        return {"direct_role_waited_then_denied": True, "team_role_waited_then_denied": True,
+                "no_post_revocation_issue": True}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -139,6 +192,7 @@ def main():
     passed = False
     try:
         h.case("inherited_capabilities", h.inherited_capabilities)
+        h.case("role_revocation_barrier", h.role_revocation_barrier)
         passed = True
     except Exception:
         print(h.redact(traceback.format_exc()), file=sys.stderr)

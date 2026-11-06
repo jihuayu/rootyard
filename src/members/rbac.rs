@@ -51,7 +51,9 @@ pub async fn resolve_effective_role(
     if !rbac_tables_installed(tx).await? {
         return Ok(None);
     }
-    let d_sql = "SELECT role FROM repository_collaborators WHERE repository_id=$1 AND user_id=$2";
+    // Hold the authority rows until the caller commits. A concurrent
+    // revocation must serialize after a write admitted under this role.
+    let d_sql = "SELECT role FROM repository_collaborators WHERE repository_id=$1 AND user_id=$2 FOR SHARE";
     let direct_role = match tx
         .query_opt(d_sql, &[&repo_id, &user_id])
         .await
@@ -62,7 +64,7 @@ pub async fn resolve_effective_role(
     };
     let org_role = tx
         .query_opt(
-            "SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",
+            "SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 FOR SHARE",
             &[&owner_id, &user_id],
         )
         .await
@@ -75,7 +77,7 @@ pub async fn resolve_effective_role(
         (None, Some(o)) => Some(o),
         (None, None) => None,
     };
-    let t_sql = "SELECT t.role FROM repository_teams t JOIN repository_team_members tm ON tm.team_id = t.id WHERE t.repository_id=$1 AND tm.user_id=$2";
+    let t_sql = "SELECT t.role FROM repository_teams t JOIN repository_team_members tm ON tm.team_id = t.id WHERE t.repository_id=$1 AND tm.user_id=$2 FOR SHARE OF t,tm";
     let team_rows = tx
         .query(t_sql, &[&repo_id, &user_id])
         .await
@@ -86,7 +88,7 @@ pub async fn resolve_effective_role(
         max_team_role = Some(max_team_role.map_or(r, |cur| cur.max(r)));
     }
     let org_team_rows = tx.query(
-        "SELECT t.role FROM organization_teams t JOIN organization_team_members tm ON tm.team_id=t.id WHERE t.organization_id=$1 AND tm.user_id=$2",
+        "SELECT t.role FROM organization_teams t JOIN organization_team_members tm ON tm.team_id=t.id WHERE t.organization_id=$1 AND tm.user_id=$2 FOR SHARE OF t,tm",
         &[&owner_id, &user_id],
     ).await.map_err(Error::internal)?;
     for row in org_team_rows {
