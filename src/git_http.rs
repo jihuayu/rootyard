@@ -161,6 +161,9 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         )
     })?;
     let deadline = Instant::now() + state.config.git_timeout;
+    if write && parts.method == Method::POST {
+        crate::sharding::fencing::check_before_push(&state, &repo).await?;
+    }
     let max_input = state.config.max_request_bytes;
     let input = receive::prepare(body, &parts.headers, max_input,
         state.transfer_metrics.clone(), write && parts.method == Method::POST,
@@ -330,6 +333,10 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         });
     }
     let operation = if write_guard.is_some() {
+        // A shard may enter draining while the receive body is decoded or
+        // while policy/recovery checks run. Reject before creating a durable
+        // operation that the native hook would later refuse as stale.
+        crate::sharding::fencing::check_before_push(&state, &repo).await?;
         let identity = identity.as_ref().ok_or_else(Error::unauthorized)?;
         let operation = journal::begin(
             &state.storage.root,
