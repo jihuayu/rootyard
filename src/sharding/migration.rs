@@ -136,9 +136,19 @@ pub async fn migrate_repository(
     if transport::node_id()?.as_deref() != Some(route.primary_node_id.as_str()) {
         return Err(conflict("migration must run on source storage node"));
     }
-    // This lock covers the final snapshot, transfer, and placement commit. A push admitted
-    // before it is acquired completes first; later pushes recheck the new route after release.
-    let _write_lock = state.storage.write_lock(access.repo_id).await;
+    // Cross-process physical GC takes the exclusive PostgreSQL data lease.
+    // Acquire the shared lease before any local gate so there is one global
+    // lock order across readers, migration, and destructive maintenance.
+    let lock_deadline = tokio::time::Instant::now() + state.config.git_timeout;
+    let source_lease = crate::storage::read_leases::shared(
+        &state.pool, access.repo_id, lock_deadline).await?;
+    // This local lock covers the final snapshot, transfer, and placement
+    // commit. A push admitted before it completes first; later pushes recheck
+    // the route after release.
+    let _write_lock = tokio::time::timeout_at(
+        lock_deadline, state.storage.write_lock(access.repo_id))
+        .await.map_err(|_| Error::timeout())?;
+    source_lease.ensure_active()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, true).await?;
@@ -185,11 +195,15 @@ pub async fn migrate_repository(
     let stage = staging_root(&state)?;
     let bundle = stage.join(format!("{operation_id}.bundle"));
     clean_staging(&bundle)?;
+    source_lease.ensure_active()?;
     git_output(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout).await?;
+    source_lease.ensure_active()?;
     git_output(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "bundle", "create", bundle.to_str().ok_or_else(Error::bad_request)?, "--all"], state.config.git_timeout).await?;
+    source_lease.ensure_active()?;
     File::open(&bundle).and_then(|f| f.sync_all()).map_err(Error::internal)?;
     sync_parent(&stage)?;
     let digest = refs_digest(&state, &repo).await?;
+    source_lease.ensure_active()?;
     let path = format!("/internal/shards/{}/snapshot/{}?refs_sha256={digest}&journal_sequence={journal_sequence}", access.repo_id, operation_id);
     let envelope = Envelope {
         version: 1, authority_incarnation, nonce: Uuid::new_v4(), expires_unix: models::unix_now() + ENVELOPE_LIFETIME_SECONDS,
@@ -211,6 +225,7 @@ pub async fn migrate_repository(
     if receipt.operation_id != operation_id || receipt.refs_sha256 != digest || receipt.state != "verified" {
         return Err(conflict("target snapshot verification receipt mismatch"));
     }
+    source_lease.ensure_active()?;
     clean_staging(&bundle)?;
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
@@ -319,7 +334,13 @@ pub async fn receive_snapshot(
     let maximum: i64 = tx.query_one("SELECT COALESCE(MAX(sequence),0) FROM git_operations WHERE repository_id=$1", &[&repo_id]).await.map_err(Error::internal)?.get(0);
     if query.journal_sequence < maximum { return Err(conflict("source journal sequence is behind recorded Git operations")); }
     tx.commit().await.map_err(Error::internal)?;
-    let _lock = state.storage.write_lock(repo_id).await;
+    let lock_deadline = tokio::time::Instant::now() + state.config.git_timeout;
+    let target_lease = crate::storage::read_leases::shared(
+        &state.pool, repo_id, lock_deadline).await?;
+    let _lock = tokio::time::timeout_at(
+        lock_deadline, state.storage.write_lock(repo_id))
+        .await.map_err(|_| Error::timeout())?;
+    target_lease.ensure_active()?;
     let root = staging_root(&state)?;
     let bundle = root.join(format!("{op_id}.incoming.bundle"));
     let staging = root.join(format!("{op_id}.git"));
@@ -339,7 +360,9 @@ pub async fn receive_snapshot(
     drop(file);
     if total == 0 { return Err(conflict("empty snapshot bundle")); }
     git_output(&state, &["-c", "core.hooksPath=/dev/null", "clone", "--mirror", "--", bundle.to_str().ok_or_else(Error::bad_request)?, staging.to_str().ok_or_else(Error::bad_request)?], state.config.git_timeout).await?;
+    target_lease.ensure_active()?;
     git_output(&state, &["--git-dir", staging.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout).await?;
+    target_lease.ensure_active()?;
     let measured = refs_digest(&state, &staging).await?;
     if measured != query.refs_sha256 { return Err(conflict("target refs differ from source snapshot")); }
     configure_target(&state, &staging, repo_id).await?;
@@ -351,11 +374,13 @@ pub async fn receive_snapshot(
     journal::mkdir(&journal_repo).map_err(Error::internal)?;
     let current_sequence = journal::sequence(&state.storage.root, repo_id).map_err(Error::internal)?;
     if current_sequence > query.journal_sequence { return Err(conflict("destination journal sequence is ahead of transferred snapshot")); }
+    target_lease.ensure_active()?;
     journal::atomic(&journal_repo.join("sequence"), query.journal_sequence.to_string().as_bytes(), true).map_err(Error::internal)?;
     let client = state.pool.get().await.map_err(Error::internal)?;
     let updated = client.execute("UPDATE shard_replication_operations SET state='verified', refs_sha256=$2, journal_sequence=$3, updated_at=clock_timestamp() WHERE id=$1 AND state IN ('copying','verified')",
         &[&op_id, &measured, &query.journal_sequence]).await.map_err(Error::internal)?;
     if updated != 1 { return Err(conflict("snapshot operation changed before publication")); }
+    target_lease.ensure_active()?;
     let final_path = state.storage.repo_path(repo_id);
     let backup = root.join(format!("{op_id}.previous-{}.git", Uuid::new_v4()));
     let had_previous = match fs::symlink_metadata(&final_path) {
