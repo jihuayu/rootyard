@@ -64,8 +64,8 @@ pub async fn list_refs(
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
-    let head = git_read::read_head(&state, repo_id).await?;
-    let filtered = git_read::page_refs(&state, repo_id, prefix, after, limit).await?;
+    let head = _lease.guard(git_read::read_head(&state, repo_id)).await??;
+    let filtered = _lease.guard(git_read::page_refs(&state, repo_id, prefix, after, limit)).await??;
     let more = filtered.len() > limit;
     let items: Vec<_> = filtered.into_iter().take(limit).collect();
     let next_after = if more {
@@ -104,7 +104,7 @@ pub async fn list_commits(
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
-    let payload = git_read::list_commits(&state, repo_id, spec, after, limit).await?;
+    let payload = _lease.guard(git_read::list_commits(&state, repo_id, spec, after, limit)).await??;
 
     _lease.ensure_active()?;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
@@ -131,7 +131,7 @@ pub async fn get_commit(
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
-    let detail = git_read::get_commit_detail(&state, repo_id, &oid).await?;
+    let detail = _lease.guard(git_read::get_commit_detail(&state, repo_id, &oid)).await??;
 
     _lease.ensure_active()?;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
@@ -164,15 +164,14 @@ pub async fn get_tree(
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
-    let tree = git_read::read_tree(
+    let tree = _lease.guard(git_read::read_tree(
         &state,
         repo_id,
         query.oid.as_deref(),
         &rel_path,
         after,
         limit,
-    )
-    .await?;
+    )).await??;
 
     _lease.ensure_active()?;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
@@ -203,7 +202,7 @@ pub async fn get_tree_by_oid(
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
-    let tree = git_read::read_tree(&state, repo_id, Some(&oid), &rel_path, after, limit).await?;
+    let tree = _lease.guard(git_read::read_tree(&state, repo_id, Some(&oid), &rel_path, after, limit)).await??;
 
     _lease.ensure_active()?;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
@@ -241,8 +240,8 @@ pub async fn get_blob(
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
-    let blob =
-        git_read::read_blob(&state, repo_id, query.oid.as_deref(), query.path.as_deref()).await?;
+    let blob = _lease.guard(git_read::read_blob(
+        &state, repo_id, query.oid.as_deref(), query.path.as_deref())).await??;
 
     _lease.ensure_active()?;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
@@ -275,7 +274,7 @@ pub async fn get_blob_by_oid(
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
-    let blob = git_read::read_blob(&state, repo_id, Some(&oid), query.path.as_deref()).await?;
+    let blob = _lease.guard(git_read::read_blob(&state, repo_id, Some(&oid), query.path.as_deref())).await??;
 
     _lease.ensure_active()?;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
@@ -303,7 +302,8 @@ pub async fn compare_commits(
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
-    let comparison = git_read::compare_commits(&state, repo_id, &query.base, &query.head).await?;
+    let comparison = _lease.guard(git_read::compare_commits(
+        &state, repo_id, &query.base, &query.head)).await??;
 
     _lease.ensure_active()?;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
