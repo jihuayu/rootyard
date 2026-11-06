@@ -2,7 +2,7 @@
 use super::{changesets, views};
 #[path = "reverse_git.rs"]
 mod reverse_git;
-use crate::{AppState, Error, auth, browse::transactions, members::models::Role};
+use crate::{AppState, Error, auth, browse::transactions, members::models::Role, storage::read_leases};
 use axum::{
     Json,
     extract::{Path, State},
@@ -274,6 +274,9 @@ pub async fn create(
         .get(0);
     tx.commit().await.map_err(Error::internal)?;
     drop(client);
+    let source_lease=read_leases::shared(&state.pool,access.repo_id,
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
+    auth::verify_active(&state.pool,&actor,access.repo_id,true).await?;
     let _slot = state
         .git_slots
         .clone()
@@ -316,6 +319,7 @@ pub async fn create(
     })
     .await
     .map_err(Error::internal)??;
+    source_lease.ensure_active()?;
     drop(_write);
     drop(_slot);
     let mut pin_headers = headers.clone();
@@ -337,6 +341,7 @@ pub async fn create(
     if !pinned.status().is_success() {
         return Err(Error(StatusCode::CONFLICT, "proposal pin was rejected"));
     }
+    source_lease.ensure_active()?;
     changesets::create(
         State(state),
         headers,
