@@ -114,6 +114,10 @@ class OrganizationHarness(Harness):
         self.doc(file_path, 404, token=self.bob)
         assert not self.git("ls-remote", remote, token=self.bob, check=False).returncode == 0
         assert self.sql(f"SELECT count(*) FROM organization_team_members WHERE organization_id='{org['id']}'") == "0"
+        transfer = "/api/repos/acme/project/transfer"
+        self.doc(transfer, 404, token=self.bob, method="POST", body={"new_owner": "alice"})
+        self.doc(transfer, 409, method="POST", body={"new_owner": "alice"})
+        assert self.sql(f"SELECT owner_id FROM repositories WHERE id='{repo['id']}'") == org["id"]
         self.doc("/api/orgs/acme/members/alice", 409, method="DELETE")
         self.doc("/api/repos/acme/project", 200)
         return {"namespace_collision_rejected": True, "team_role_inherited": True,
