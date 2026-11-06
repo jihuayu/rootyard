@@ -13,8 +13,12 @@ use uuid::Uuid;
 const MAX_REFS: usize = 4096;
 
 pub struct PreparedPush {
-    pub pack: Option<PackManifest>,
-    pub changes: Vec<RefChange>,
+    pub(crate) pack: Option<PackManifest>,
+    pub(crate) changes: Vec<RefChange>,
+}
+impl PreparedPush {
+    pub fn pack(&self) -> Option<&PackManifest> { self.pack.as_ref() }
+    pub fn changes(&self) -> &[RefChange] { &self.changes }
 }
 
 struct VerifyView(PathBuf);

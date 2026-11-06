@@ -1,6 +1,7 @@
-use rootyard::{AppState, config::Config, db, dispatch, metrics,
-    pando_gateway::{backup, pack_store::PackStore, prepare, snapshot},
+use rootyard::{AppState, auth, config::Config, db, dispatch, metrics,
+    pando_gateway::{backup, pack_store::PackStore, prepare, publish, snapshot},
     storage::{self, remote_objects::{ObjectKey, RemoteObjectStore}}};
+use axum::http::{HeaderMap,HeaderValue,header};
 use rand::RngCore;
 use std::{path::{Path, PathBuf}, process::Command, sync::Arc, time::Duration};
 use tokio::time::Instant;
@@ -12,6 +13,31 @@ fn run(git: &Path, args: &[&str], cwd: &Path) {
     assert!(status.success(), "Git fixture command failed: {args:?}");
 }
 fn deadline() -> Instant { Instant::now() + Duration::from_secs(300) }
+
+async fn concurrent_views(state: Arc<AppState>, repository: db::Repository) {
+    let gate = Arc::new(Barrier::new(9));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let state = state.clone();
+        let repository = repository.clone();
+        let gate = gate.clone();
+        tasks.spawn(async move {
+            let lease = storage::read_leases::shared(&state.pool, repository.id, deadline()).await.unwrap();
+            gate.wait().await;
+            let _local = state.storage.read_snapshot_lock(repository.id).await;
+            let view = Box::pin(snapshot::materialize(&state,&repository,&lease,deadline())).await.unwrap();
+            assert!(view.path().join("objects/pack").is_dir());
+        });
+    }
+    gate.wait().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        state.pool.get().await.unwrap().query_one("SELECT 1",&[]).await.unwrap();
+    }).await.expect("eight snapshot leases starved authorization query");
+    let completed = tokio::time::timeout(Duration::from_secs(90), async {
+        while let Some(task) = tasks.join_next().await { task.unwrap(); }
+    }).await;
+    if completed.is_err() { tasks.abort_all(); panic!("eight Pando snapshots deadlocked the pool"); }
+}
 
 #[tokio::test]
 async fn remote_encrypted_pack_publish_and_restart_recovery() {
@@ -77,7 +103,7 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
         std::fs::write(root.join("identity.json"), serde_json::to_vec(&serde_json::json!({
             "repository_id":repo,"pack_id":manifest.id,"plaintext_sha256":manifest.pack.plaintext_sha256,
             "pack_bytes":manifest.pack.plaintext_bytes,"commit_oid":oid,"tenant_id":owner,
-            "object_format":format
+            "object_format":format,"owner_slug":user
         })).unwrap()).unwrap();
     } else if phase == "recover" {
         // Deliberately remove all local source and publication cache state.
@@ -108,7 +134,8 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
             git_slots: Arc::new(Semaphore::new(2)) });
         let lease = storage::read_leases::shared(&state.pool, repo, deadline()).await.unwrap();
         let _local = state.storage.read_snapshot_lock(repo).await;
-        let repository = db::Repository { id: repo, name: "packtest".into(), owner: "fixture".into(),
+        let repository = db::Repository { id: repo, name: "packtest".into(),
+            owner: ids["owner_slug"].as_str().unwrap().into(),
             state: "ready".into(), clone_path: "/git/fixture/packtest.git".into(),
             storage_backend: "pando".into(), storage_generation: 1, object_format: format.clone() };
         let snapshot = Box::pin(snapshot::materialize(&state, &repository, &lease, deadline())).await.unwrap();
@@ -157,10 +184,10 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
         run(&git,&["push","origin","HEAD:refs/heads/main"],&client_work);
         let prepared = Box::pin(prepare::stage(&state,&repository,manifest.tenant_id,
             &snapshot,&lease,deadline())).await.unwrap().unwrap();
-        assert_eq!(prepared.changes.len(),1);
-        assert_eq!(prepared.changes[0].old_oid,ids["commit_oid"].as_str().unwrap());
-        assert_ne!(prepared.changes[0].new_oid,prepared.changes[0].old_oid);
-        let staged_pack = prepared.pack.as_ref().expect("new ref target requires a pack");
+        assert_eq!(prepared.changes().len(),1);
+        assert_eq!(prepared.changes()[0].old_oid,ids["commit_oid"].as_str().unwrap());
+        assert_ne!(prepared.changes()[0].new_oid,prepared.changes()[0].old_oid);
+        let staged_pack = prepared.pack().expect("new ref target requires a pack");
         assert_eq!(staged_pack.object_format,format);
         // The newly staged pack must contain the entire reachable closure,
         // not merely the loose objects introduced by the latest receive.
@@ -174,7 +201,7 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
             view_packs.join(format!("pack-{}.pack",staged_pack.id))).unwrap();
         std::fs::copy(staged_dir.join(format!("pack-{}.idx",staged_pack.id)),
             view_packs.join(format!("pack-{}.idx",staged_pack.id))).unwrap();
-        run(&git, &["update-ref","refs/heads/main",&prepared.changes[0].new_oid],&bare_view);
+        run(&git, &["update-ref","refs/heads/main",&prepared.changes()[0].new_oid],&bare_view);
         run(&git, &["fsck","--full","--strict"],&bare_view);
         run(&git, &["update-ref","refs/heads/main",ids["commit_oid"].as_str().unwrap()],
             snapshot.path());
@@ -182,40 +209,45 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
             snapshot.path());
         let copied = Box::pin(prepare::stage(&state,&repository,manifest.tenant_id,
             &snapshot,&lease,deadline())).await.unwrap().unwrap();
-        assert!(copied.pack.is_none(), "refs-only branch copy republished an unchanged pack");
-        assert_eq!(copied.changes.len(),1);
-        assert_eq!(copied.changes[0].ref_name,"refs/heads/copy");
+        assert!(copied.pack().is_none(), "refs-only branch copy republished an unchanged pack");
+        assert_eq!(copied.changes().len(),1);
+        assert_eq!(copied.changes()[0].ref_name,"refs/heads/copy");
         run(&git, &["update-ref","-d","refs/heads/copy"],snapshot.path());
         run(&git, &["update-ref","-d","refs/heads/main"],snapshot.path());
         let deleting = Box::pin(prepare::stage(&state,&repository,manifest.tenant_id,
             &snapshot,&lease,deadline())).await.unwrap().unwrap();
-        assert!(deleting.pack.is_none());
-        assert_eq!(deleting.changes.len(),1);
-        assert!(deleting.changes[0].new_oid.bytes().all(|byte| byte == b'0'));
-        drop(snapshot);
+        assert!(deleting.pack().is_none());
+        assert_eq!(deleting.changes().len(),1);
+        assert!(deleting.changes()[0].new_oid.bytes().all(|byte| byte == b'0'));
+        run(&git, &["update-ref","refs/heads/main",&prepared.changes()[0].new_oid],
+            snapshot.path());
         drop(_local);
+        let issued = db::issue_token(&pool,&repository.owner,false,false).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION,HeaderValue::from_str(&format!(
+            "Bearer {}",issued["token"].as_str().unwrap())).unwrap());
+        let actor = auth::authenticate(&pool,&headers).await.unwrap();
+        let ref_guard = storage::ref_publication::acquire(&pool,repo,1,
+            &["refs/heads/main".to_string()],deadline()).await.unwrap();
+        let committed = Box::pin(publish::publish(&state,&repository,&actor,manifest.tenant_id,
+            &snapshot,&prepared,prepared.changes(),&ref_guard,deadline())).await.unwrap();
+        assert_eq!(committed,2);
+        let row = pool.get().await.unwrap().query_one("SELECT s.ref_generation,s.operation_sequence,
+            s.pack_ids,r.oid FROM pando_repository_states s JOIN pando_refs r
+            ON r.repository_id=s.repository_id WHERE s.repository_id=$1 AND r.ref_name='refs/heads/main'",
+            &[&repo]).await.unwrap();
+        assert_eq!(row.get::<_,i64>(0),2);
+        assert_eq!(row.get::<_,i64>(1),1);
+        assert_eq!(row.get::<_,Vec<Uuid>>(2),vec![pack_id,staged_pack.id]);
+        assert_eq!(row.get::<_,String>(3),prepared.changes()[0].new_oid);
+        assert_eq!(pool.get().await.unwrap().query_one("SELECT count(*) FROM outbox_events
+            WHERE repository_id=$1 AND ref_name='refs/heads/main'", &[&repo]).await.unwrap()
+            .get::<_,i64>(0),1);
+        assert!(Box::pin(publish::publish(&state,&repository,&actor,manifest.tenant_id,
+            &snapshot,&prepared,prepared.changes(),&ref_guard,deadline())).await.is_err());
+        drop(ref_guard);
+        drop(snapshot);
         drop(lease);
-        let gate = Arc::new(Barrier::new(9));
-        let mut tasks = tokio::task::JoinSet::new();
-        for _ in 0..8 {
-            let state = state.clone();
-            let repository = repository.clone();
-            let gate = gate.clone();
-            tasks.spawn(async move {
-                let lease = storage::read_leases::shared(&state.pool, repository.id, deadline()).await.unwrap();
-                gate.wait().await;
-                let _local = state.storage.read_snapshot_lock(repository.id).await;
-                let view = Box::pin(snapshot::materialize(&state,&repository,&lease,deadline())).await.unwrap();
-                assert!(view.path().join("objects/pack").is_dir());
-            });
-        }
-        gate.wait().await;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            state.pool.get().await.unwrap().query_one("SELECT 1",&[]).await.unwrap();
-        }).await.expect("eight snapshot leases starved authorization query");
-        let completed = tokio::time::timeout(Duration::from_secs(45), async {
-            while let Some(task) = tasks.join_next().await { task.unwrap(); }
-        }).await;
-        if completed.is_err() { tasks.abort_all(); panic!("eight Pando snapshots deadlocked the pool"); }
+        concurrent_views(state,repository).await;
     } else { panic!("unknown Pando test phase"); }
 }

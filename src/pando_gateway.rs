@@ -8,3 +8,5 @@ pub mod snapshot;
 pub mod backup;
 #[path = "pando_gateway/prepare.rs"]
 pub mod prepare;
+#[path = "pando_gateway/publish.rs"]
+pub mod publish;

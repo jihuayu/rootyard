@@ -4,6 +4,7 @@ use super::*;
 pub(super) struct ReceiveCommands {
     pub bytes: Vec<u8>,
     pub refs: Vec<String>,
+    pub changes: Vec<journal::RefChange>,
 }
 
 /// Read only the bounded command pkt-lines, before Git sees the pack. The
@@ -14,6 +15,7 @@ pub(super) async fn receive_commands(reader: &mut (impl tokio::io::AsyncRead + U
     if !matches!(oid_len, 40 | 64) { return Err(Error::bad_request()); }
     let mut bytes = Vec::new();
     let mut refs = Vec::new();
+    let mut changes = Vec::new();
     loop {
         if bytes.len() + 4 > 128 * 1024 { return Err(Error::bad_request()); }
         let mut header = [0u8;4];
@@ -43,9 +45,13 @@ pub(super) async fn receive_commands(reader: &mut (impl tokio::io::AsyncRead + U
             || !crate::journal::valid_ref(name) || !name.starts_with("refs/")
             || refs.iter().any(|prior| prior==name) { return Err(Error::bad_request()); }
         refs.push(name.to_string());
+        changes.push(journal::RefChange {
+            ref_name: name.to_string(), old_oid: old.to_ascii_lowercase(),
+            new_oid: new.to_ascii_lowercase(),
+        });
     }
     if refs.is_empty() { return Err(Error::bad_request()); }
-    Ok(ReceiveCommands { bytes, refs })
+    Ok(ReceiveCommands { bytes, refs, changes })
 }
 
 #[cfg(test)]
@@ -70,6 +76,8 @@ mod receive_tests {
         let mut reader = source.as_slice();
         let parsed = receive_commands(&mut reader,40).await.unwrap();
         assert_eq!(parsed.refs,["refs/heads/a","refs/heads/b"]);
+        assert_eq!(parsed.changes[0].old_oid, zero);
+        assert_eq!(parsed.changes[0].new_oid, oid);
         assert_eq!(&source[..source.len()-4],parsed.bytes);
         assert_eq!(reader,b"PACK");
         let mut duplicate = packet(first.as_bytes());
