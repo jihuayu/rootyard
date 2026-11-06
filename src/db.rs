@@ -111,6 +111,7 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (73, include_str!("../migrations/073_pando_pack_manifests.sql")),
     (74, include_str!("../migrations/074_pando_authoritative_refs.sql")),
     (75, include_str!("../migrations/075_pando_operation_sequence.sql")),
+    (76, include_str!("../migrations/076_pando_head_ref.sql")),
     (80, include_str!("../migrations/080_cluster_security.sql")),
     (81, include_str!("../migrations/081_shard_marker_transitions.sql")),
     (82, include_str!("../migrations/082_cluster_transport_nonces.sql")),
