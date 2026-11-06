@@ -48,10 +48,12 @@ async fn fixture(pool: &deadpool_postgres::Pool, name: &str) -> (uuid::Uuid, uui
     let slug = format!("t{}", &owner.simple().to_string()[..12]);
     let client = pool.get().await.unwrap();
     client.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&owner, &slug]).await.unwrap();
-    client
-        .execute("INSERT INTO namespaces(id,slug,kind,user_id) VALUES($1,$2,'user',$1)", &[&owner, &slug])
-        .await
-        .unwrap();
+    let namespace =
+        client.query_one("SELECT id,slug,kind,user_id FROM namespaces WHERE user_id=$1", &[&owner]).await.unwrap();
+    assert_eq!(namespace.get::<_, uuid::Uuid>(0), owner);
+    assert_eq!(namespace.get::<_, String>(1), slug);
+    assert_eq!(namespace.get::<_, String>(2), "user");
+    assert_eq!(namespace.get::<_, Option<uuid::Uuid>>(3), Some(owner));
     client
         .execute("INSERT INTO repositories(id,owner_id,name,state) VALUES($1,$2,$3,'ready')", &[&repo, &owner, &name])
         .await
