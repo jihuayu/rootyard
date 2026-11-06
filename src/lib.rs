@@ -31,6 +31,7 @@ pub mod mirror;
 #[rustfmt::skip]
 pub mod pulls;
 pub mod reliability;
+pub mod sandbox;
 #[rustfmt::skip]
 pub mod sharding;
 pub mod storage;
@@ -127,6 +128,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(web::routes())
         .merge(sharding::routes())
         .merge(workspaces::routes())
+        .merge(sandbox::routes())
         .fallback(|State(state): State<Arc<AppState>>, request| async move {
             git_http::handle(state, request).await
         })
