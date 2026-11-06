@@ -27,6 +27,116 @@
       "default": null,
       "generated": "",
       "identity": "",
+      "name": "parent_repository_id",
+      "not_null": true,
+      "position": 1,
+      "table": "ci_checkout_delegations",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "parent_job_id",
+      "not_null": true,
+      "position": 2,
+      "table": "ci_checkout_delegations",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 3,
+      "table": "ci_checkout_delegations",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "job_id",
+      "not_null": true,
+      "position": 4,
+      "table": "ci_checkout_delegations",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "owner_id",
+      "not_null": true,
+      "position": 5,
+      "table": "ci_checkout_delegations",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "plan",
+      "not_null": true,
+      "position": 6,
+      "table": "ci_checkout_delegations",
+      "type": "jsonb"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "issuer_token_id",
+      "not_null": true,
+      "position": 7,
+      "table": "ci_checkout_delegations",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "credential_digest",
+      "not_null": true,
+      "position": 8,
+      "table": "ci_checkout_delegations",
+      "type": "bytea"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "expires_unix",
+      "not_null": true,
+      "position": 9,
+      "table": "ci_checkout_delegations",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 10,
+      "table": "ci_checkout_delegations",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
       "name": "repository_id",
       "not_null": true,
       "position": 1,
@@ -130,6 +240,171 @@
       "not_null": true,
       "position": 10,
       "table": "ci_checkout_jobs",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "run_id",
+      "not_null": true,
+      "position": 1,
+      "table": "ci_integration_checkout_jobs",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "attempt",
+      "not_null": true,
+      "position": 2,
+      "table": "ci_integration_checkout_jobs",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "lease_generation",
+      "not_null": true,
+      "position": 3,
+      "table": "ci_integration_checkout_jobs",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 4,
+      "table": "ci_integration_checkout_jobs",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "job_id",
+      "not_null": true,
+      "position": 5,
+      "table": "ci_integration_checkout_jobs",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "owner_id",
+      "not_null": true,
+      "position": 6,
+      "table": "ci_integration_checkout_jobs",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "issuer_webhook_id",
+      "not_null": true,
+      "position": 7,
+      "table": "ci_integration_checkout_jobs",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "plan",
+      "not_null": true,
+      "position": 8,
+      "table": "ci_integration_checkout_jobs",
+      "type": "jsonb"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "credential_digest",
+      "not_null": true,
+      "position": 9,
+      "table": "ci_integration_checkout_jobs",
+      "type": "bytea"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "expires_unix",
+      "not_null": true,
+      "position": 10,
+      "table": "ci_integration_checkout_jobs",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 11,
+      "table": "ci_integration_checkout_jobs",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "issuer_webhook_id",
+      "not_null": true,
+      "position": 1,
+      "table": "ci_integration_source_grants",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 2,
+      "table": "ci_integration_source_grants",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": "true",
+      "generated": "",
+      "identity": "",
+      "name": "active",
+      "not_null": true,
+      "position": 3,
+      "table": "ci_integration_source_grants",
+      "type": "boolean"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 4,
+      "table": "ci_integration_source_grants",
       "type": "timestamp with time zone"
     },
     {
@@ -549,6 +824,61 @@
       "position": 21,
       "table": "ci_runs",
       "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "id",
+      "not_null": true,
+      "position": 1,
+      "table": "ci_service_principals",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 2,
+      "table": "ci_service_principals",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "kind",
+      "not_null": true,
+      "position": 3,
+      "table": "ci_service_principals",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "issuer_webhook_id",
+      "not_null": false,
+      "position": 4,
+      "table": "ci_service_principals",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": "true",
+      "generated": "",
+      "identity": "",
+      "name": "active",
+      "not_null": true,
+      "position": 5,
+      "table": "ci_service_principals",
+      "type": "boolean"
     },
     {
       "collation": null,
@@ -2250,7 +2580,7 @@
       "generated": "",
       "identity": "",
       "name": "actor_id",
-      "not_null": true,
+      "not_null": false,
       "position": 3,
       "table": "git_operations",
       "type": "uuid"
@@ -2261,7 +2591,7 @@
       "generated": "",
       "identity": "",
       "name": "token_id",
-      "not_null": true,
+      "not_null": false,
       "position": 4,
       "table": "git_operations",
       "type": "uuid"
@@ -2342,6 +2672,17 @@
       "position": 11,
       "table": "git_operations",
       "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "service_principal_id",
+      "not_null": false,
+      "position": 12,
+      "table": "git_operations",
+      "type": "uuid"
     },
     {
       "collation": null,
@@ -5908,10 +6249,55 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((((plan IS NULL) AND cancelled AND (issuer_token_id IS NULL) AND (credential_digest IS NULL) AND (expires_unix IS NULL)) OR ((plan IS NOT NULL) AND (issuer_token_id IS NOT NULL) AND (credential_digest IS NOT NULL) AND (expires_unix IS NOT NULL) AND (expires_unix > 0))))",
-      "name": "ci_checkout_jobs_check",
-      "table": "ci_checkout_jobs",
+      "definition": "CHECK ((octet_length(credential_digest) = 32))",
+      "name": "ci_checkout_delegations_credential_digest_check",
+      "table": "ci_checkout_delegations",
       "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "UNIQUE (credential_digest)",
+      "name": "ci_checkout_delegations_credential_digest_key",
+      "table": "ci_checkout_delegations",
+      "type": "u",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (issuer_token_id) REFERENCES public.tokens(id)",
+      "name": "ci_checkout_delegations_issuer_token_id_fkey",
+      "table": "ci_checkout_delegations",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (parent_repository_id, parent_job_id) REFERENCES public.ci_checkout_jobs(repository_id, job_id)",
+      "name": "ci_checkout_delegations_parent_repository_id_parent_job_id_fkey",
+      "table": "ci_checkout_delegations",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (repository_id, job_id)",
+      "name": "ci_checkout_delegations_pkey",
+      "table": "ci_checkout_delegations",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id, owner_id) REFERENCES public.repositories(id, owner_id)",
+      "name": "ci_checkout_delegations_repository_id_owner_id_fkey",
+      "table": "ci_checkout_delegations",
+      "type": "f",
       "validated": true
     },
     {
@@ -5971,9 +6357,99 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK (((plan IS NULL) OR ((jsonb_typeof(plan) = 'object'::text) AND (octet_length((plan)::text) <= 8192) AND (plan ?& ARRAY['version'::text, 'job_id'::text, 'owner_id'::text, 'repository_id'::text, 'storage_generation'::text, 'object_format'::text, 'target_oid'::text, 'source_receipt_sha256'::text, 'mirror_audience'::text, 'expires_unix'::text, 'dependencies'::text]) AND ((plan -> 'version'::text) = '1'::jsonb) AND ((plan -> 'job_id'::text) = to_jsonb((job_id)::text)) AND ((plan -> 'owner_id'::text) = to_jsonb((owner_id)::text)) AND ((plan -> 'repository_id'::text) = to_jsonb((repository_id)::text)) AND ((plan -> 'expires_unix'::text) = to_jsonb(expires_unix)) AND ((plan ->> 'object_format'::text) = ANY (ARRAY['sha1'::text, 'sha256'::text])) AND (jsonb_typeof((plan -> 'target_oid'::text)) = 'string'::text) AND (((plan ->> 'target_oid'::text) COLLATE \"C\") ~ '^[0-9a-f]+$'::text) AND (length((plan ->> 'target_oid'::text)) =\nCASE\n    WHEN ((plan ->> 'object_format'::text) = 'sha1'::text) THEN 40\n    ELSE 64\nEND) AND ((plan ->> 'target_oid'::text) <> repeat('0'::text, length((plan ->> 'target_oid'::text)))) AND (((plan ->> 'source_receipt_sha256'::text) COLLATE \"C\") ~ '^[0-9a-f]{64}$'::text) AND (jsonb_typeof((plan -> 'dependencies'::text)) = 'object'::text) AND (((plan -> 'dependencies'::text) -> 'version'::text) = '1'::jsonb))))",
+      "name": "ci_checkout_jobs_plan_format",
+      "table": "ci_checkout_jobs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "FOREIGN KEY (repository_id, owner_id) REFERENCES public.repositories(id, owner_id)",
       "name": "ci_checkout_jobs_repository_id_owner_id_fkey",
       "table": "ci_checkout_jobs",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((octet_length(credential_digest) = 32))",
+      "name": "ci_integration_checkout_jobs_credential_digest_check",
+      "table": "ci_integration_checkout_jobs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "UNIQUE (credential_digest)",
+      "name": "ci_integration_checkout_jobs_credential_digest_key",
+      "table": "ci_integration_checkout_jobs",
+      "type": "u",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (issuer_webhook_id) REFERENCES public.forge_webhooks(id) ON DELETE CASCADE",
+      "name": "ci_integration_checkout_jobs_issuer_webhook_id_fkey",
+      "table": "ci_integration_checkout_jobs",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (run_id, attempt, lease_generation, repository_id, job_id)",
+      "name": "ci_integration_checkout_jobs_pkey",
+      "table": "ci_integration_checkout_jobs",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id, owner_id) REFERENCES public.repositories(id, owner_id)",
+      "name": "ci_integration_checkout_jobs_repository_id_owner_id_fkey",
+      "table": "ci_integration_checkout_jobs",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (run_id) REFERENCES public.ci_runs(id)",
+      "name": "ci_integration_checkout_jobs_run_id_fkey",
+      "table": "ci_integration_checkout_jobs",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (issuer_webhook_id) REFERENCES public.forge_webhooks(id) ON DELETE CASCADE",
+      "name": "ci_integration_source_grants_issuer_webhook_id_fkey",
+      "table": "ci_integration_source_grants",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (issuer_webhook_id, repository_id)",
+      "name": "ci_integration_source_grants_pkey",
+      "table": "ci_integration_source_grants",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES public.repositories(id) ON DELETE CASCADE",
+      "name": "ci_integration_source_grants_repository_id_fkey",
+      "table": "ci_integration_source_grants",
       "type": "f",
       "validated": true
     },
@@ -6070,8 +6546,8 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK (((base_oid COLLATE \"C\") ~ '^[0-9a-f]{40}$'::text))",
-      "name": "ci_runs_base_oid_check",
+      "definition": "CHECK ((((base_oid COLLATE \"C\") ~ '^[0-9a-f]+$'::text) AND (length(base_oid) = length(head_oid))))",
+      "name": "ci_runs_base_oid_format",
       "table": "ci_runs",
       "type": "c",
       "validated": true
@@ -6088,8 +6564,8 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK (((head_oid COLLATE \"C\") ~ '^[0-9a-f]{40}$'::text))",
-      "name": "ci_runs_head_oid_check",
+      "definition": "CHECK ((((head_oid COLLATE \"C\") ~ '^[0-9a-f]+$'::text) AND (length(head_oid) = ANY (ARRAY[40, 64]))))",
+      "name": "ci_runs_head_oid_format",
       "table": "ci_runs",
       "type": "c",
       "validated": true
@@ -6128,6 +6604,60 @@
       "name": "ci_runs_state_check",
       "table": "ci_runs",
       "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "UNIQUE (id, repository_id)",
+      "name": "ci_service_principals_id_repository_id_key",
+      "table": "ci_service_principals",
+      "type": "u",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (issuer_webhook_id) REFERENCES public.forge_webhooks(id) ON DELETE CASCADE",
+      "name": "ci_service_principals_issuer_webhook_id_fkey",
+      "table": "ci_service_principals",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((kind = 'ci-pin'::text))",
+      "name": "ci_service_principals_kind_check",
+      "table": "ci_service_principals",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (id)",
+      "name": "ci_service_principals_pkey",
+      "table": "ci_service_principals",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES public.repositories(id) ON DELETE CASCADE",
+      "name": "ci_service_principals_repository_id_fkey",
+      "table": "ci_service_principals",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "UNIQUE (repository_id, kind)",
+      "name": "ci_service_principals_repository_id_kind_key",
+      "table": "ci_service_principals",
+      "type": "u",
       "validated": true
     },
     {
@@ -6340,7 +6870,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((((commit_oid COLLATE \"C\") ~ '^[0-9a-f]{40}$'::text) AND (commit_oid <> repeat('0'::text, 40))))",
+      "definition": "CHECK ((((commit_oid COLLATE \"C\") ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'::text) AND (commit_oid !~ '^0+$'::text)))",
       "name": "forge_check_runs_commit_oid_check",
       "table": "forge_check_runs",
       "type": "c",
@@ -6673,7 +7203,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((((commit_oid COLLATE \"C\") ~ '^[0-9a-f]{40}$'::text) AND (commit_oid <> repeat('0'::text, 40))))",
+      "definition": "CHECK ((((commit_oid COLLATE \"C\") ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'::text) AND (commit_oid !~ '^0+$'::text)))",
       "name": "forge_pull_reviews_commit_oid_check",
       "table": "forge_pull_reviews",
       "type": "c",
@@ -6736,7 +7266,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((((base_oid COLLATE \"C\") ~ '^[0-9a-f]{40}$'::text) AND (base_oid <> repeat('0'::text, 40))))",
+      "definition": "CHECK ((((base_oid COLLATE \"C\") ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'::text) AND (base_oid !~ '^0+$'::text)))",
       "name": "forge_pulls_base_oid_check",
       "table": "forge_pulls",
       "type": "c",
@@ -6772,7 +7302,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((((head_oid COLLATE \"C\") ~ '^[0-9a-f]{40}$'::text) AND (head_oid <> repeat('0'::text, 40))))",
+      "definition": "CHECK ((((head_oid COLLATE \"C\") ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'::text) AND (head_oid !~ '^0+$'::text)))",
       "name": "forge_pulls_head_oid_check",
       "table": "forge_pulls",
       "type": "c",
@@ -6790,7 +7320,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((((merge_commit_oid COLLATE \"C\") ~ '^[0-9a-f]{40}$'::text) AND (merge_commit_oid <> repeat('0'::text, 40))))",
+      "definition": "CHECK ((((merge_commit_oid COLLATE \"C\") ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'::text) AND (merge_commit_oid !~ '^0+$'::text)))",
       "name": "forge_pulls_merge_commit_oid_check",
       "table": "forge_pulls",
       "type": "c",
@@ -7177,6 +7707,15 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK ((((actor_id IS NOT NULL) AND (token_id IS NOT NULL) AND (service_principal_id IS NULL)) OR ((actor_id IS NULL) AND (token_id IS NULL) AND (service_principal_id IS NOT NULL))))",
+      "name": "git_operations_exactly_one_principal",
+      "table": "git_operations",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "UNIQUE (id, repository_id, storage_generation, sequence)",
       "name": "git_operations_id_repository_id_storage_generation_sequence_key",
       "table": "git_operations",
@@ -7226,6 +7765,15 @@
       "name": "git_operations_sequence_check",
       "table": "git_operations",
       "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (service_principal_id, repository_id) REFERENCES public.ci_service_principals(id, repository_id)",
+      "name": "git_operations_service_principal_fkey",
+      "table": "git_operations",
+      "type": "f",
       "validated": true
     },
     {
@@ -9362,12 +9910,46 @@
       "kind": "f",
       "language": "plpgsql",
       "leakproof": false,
+      "name": "enforce_ci_service_ref",
+      "parallel": "u",
+      "result": "trigger",
+      "rows": 0,
+      "security_definer": false,
+      "source": "\nDECLARE intent JSONB;\nBEGIN\n    SELECT o.evidence->'intent' INTO intent FROM git_operations o\n    WHERE o.id=NEW.operation_id AND o.repository_id=NEW.repository_id\n      AND o.service_principal_id IS NOT NULL;\n    IF FOUND AND (NEW.ref_name IS DISTINCT FROM intent->>'retention_ref' OR\n        NEW.new_oid IS DISTINCT FROM intent->>'target_oid' OR\n        NEW.ref_name IS DISTINCT FROM ('refs/rootyard-ci/jobs/' || (intent->>'job_id')) OR\n        NEW.storage_generation::text IS DISTINCT FROM intent->>'storage_generation') THEN\n        RAISE EXCEPTION 'CI service operation ref differs from exact intent' USING ERRCODE='23514';\n    END IF;\n    RETURN NEW;\nEND ",
+      "strict": false,
+      "volatility": "v"
+    },
+    {
+      "arguments": "",
+      "binary": null,
+      "config": null,
+      "cost": 100,
+      "kind": "f",
+      "language": "plpgsql",
+      "leakproof": false,
       "name": "enforce_repository_actor_membership",
       "parallel": "u",
       "result": "trigger",
       "rows": 0,
       "security_definer": false,
-      "source": "\nDECLARE actor_user_id UUID; repo_owner_id UUID;\nBEGIN\n    IF TG_TABLE_NAME='git_operations' THEN actor_user_id := NEW.actor_id;\n    ELSE actor_user_id := NEW.author_id; END IF;\n    SELECT owner_id INTO repo_owner_id FROM repositories WHERE id=NEW.repository_id;\n    IF repo_owner_id IS NULL THEN\n        RAISE EXCEPTION 'repository does not exist' USING ERRCODE='23503';\n    END IF;\n    IF EXISTS (SELECT 1 FROM namespaces WHERE id=repo_owner_id AND user_id=actor_user_id)\n       OR EXISTS (SELECT 1 FROM organization_memberships\n                  WHERE organization_id=repo_owner_id AND user_id=actor_user_id)\n       OR EXISTS (SELECT 1 FROM repository_collaborators\n                  WHERE repository_id=NEW.repository_id AND user_id=actor_user_id)\n       OR EXISTS (SELECT 1 FROM repository_team_members\n                  WHERE repository_id=NEW.repository_id AND user_id=actor_user_id)\n    THEN RETURN NEW; END IF;\n    RAISE EXCEPTION 'actor is not a member or collaborator of repository' USING ERRCODE='23514';\nEND ",
+      "source": "\nDECLARE actor_user_id UUID; repo_owner_id UUID;\nBEGIN\n    IF TG_TABLE_NAME='git_operations' THEN\n      IF NEW.service_principal_id IS NOT NULL THEN\n        IF NEW.actor_id IS NOT NULL OR NEW.token_id IS NOT NULL OR\n           NEW.actor_name IS DISTINCT FROM 'ci-scheduler' OR\n           NEW.outcome NOT IN ('unknown','recorded') OR\n           NEW.evidence->>'kind' IS DISTINCT FROM 'observed_immutable_ci_root' OR\n           NEW.evidence->'intent'->>'repository_id' IS DISTINCT FROM NEW.repository_id::text OR\n           NEW.evidence->'intent'->>'storage_generation' IS DISTINCT FROM NEW.storage_generation::text OR\n           NOT COALESCE((NEW.evidence->'intent'->>'job_id') COLLATE \"C\" ~\n             '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',false) OR\n           NOT COALESCE((NEW.evidence->'intent'->>'target_oid') COLLATE \"C\" ~\n             '^([0-9a-f]{40}|[0-9a-f]{64})$',false) OR\n           NEW.evidence->'intent'->>'retention_ref' IS DISTINCT FROM\n             ('refs/rootyard-ci/jobs/' || (NEW.evidence->'intent'->>'job_id')) OR\n           NOT EXISTS(SELECT 1 FROM ci_service_principals s\n               JOIN repositories r ON r.id=s.repository_id\n               WHERE s.id=NEW.service_principal_id AND s.repository_id=NEW.repository_id\n               AND s.kind='ci-pin' AND s.active AND r.state='ready'\n               AND r.storage_generation=NEW.storage_generation\n               AND NEW.evidence->'intent'->>'owner_id'=r.owner_id::text\n               AND (s.issuer_webhook_id IS NULL OR EXISTS(\n                   SELECT 1 FROM forge_webhooks w JOIN forge_trusted_check_contexts b\n                     ON b.webhook_id=w.id AND b.repository_id=w.repository_id AND b.active\n                   WHERE w.id=s.issuer_webhook_id AND w.repository_id=s.repository_id AND w.active)))\n        THEN RAISE EXCEPTION 'invalid CI service principal operation' USING ERRCODE='23514';\n        END IF;\n        RETURN NEW;\n      END IF;\n      actor_user_id:=NEW.actor_id;\n    ELSE\n      actor_user_id:=NEW.author_id;\n    END IF;\n    SELECT owner_id INTO repo_owner_id FROM repositories WHERE id=NEW.repository_id;\n    IF repo_owner_id IS NULL THEN\n        RAISE EXCEPTION 'repository does not exist' USING ERRCODE='23503';\n    END IF;\n    IF EXISTS (SELECT 1 FROM namespaces WHERE id=repo_owner_id AND user_id=actor_user_id)\n       OR EXISTS (SELECT 1 FROM organization_memberships\n                  WHERE organization_id=repo_owner_id AND user_id=actor_user_id)\n       OR EXISTS (SELECT 1 FROM repository_collaborators\n                  WHERE repository_id=NEW.repository_id AND user_id=actor_user_id)\n       OR EXISTS (SELECT 1 FROM repository_team_members\n                  WHERE repository_id=NEW.repository_id AND user_id=actor_user_id)\n    THEN RETURN NEW; END IF;\n    RAISE EXCEPTION 'actor is not a member or collaborator of repository' USING ERRCODE='23514';\nEND ",
+      "strict": false,
+      "volatility": "v"
+    },
+    {
+      "arguments": "",
+      "binary": null,
+      "config": null,
+      "cost": 100,
+      "kind": "f",
+      "language": "plpgsql",
+      "leakproof": false,
+      "name": "forge_enforce_repository_object_format",
+      "parallel": "u",
+      "result": "trigger",
+      "rows": 0,
+      "security_definer": false,
+      "source": "\nDECLARE expected_length INTEGER;\nBEGIN\n    SELECT CASE object_format WHEN 'sha256' THEN 64 ELSE 40 END INTO expected_length\n      FROM repositories WHERE id = NEW.repository_id;\n    IF expected_length IS NULL THEN\n        RAISE EXCEPTION 'repository object format missing';\n    END IF;\n    IF TG_TABLE_NAME = 'forge_pulls' THEN\n        IF length(NEW.head_oid) <> expected_length OR length(NEW.base_oid) <> expected_length\n           OR (NEW.merge_commit_oid IS NOT NULL AND length(NEW.merge_commit_oid) <> expected_length) THEN\n            RAISE EXCEPTION 'pull object format differs from repository';\n        END IF;\n    ELSIF length(NEW.commit_oid) <> expected_length THEN\n        RAISE EXCEPTION 'commit object format differs from repository';\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
@@ -9502,6 +10084,33 @@
       "valid": true
     },
     {
+      "definition": "CREATE UNIQUE INDEX ci_checkout_delegations_credential_digest_key ON public.ci_checkout_delegations USING btree (credential_digest)",
+      "live": true,
+      "name": "ci_checkout_delegations_credential_digest_key",
+      "ready": true,
+      "table": "ci_checkout_delegations",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ci_checkout_delegations_parent_idx ON public.ci_checkout_delegations USING btree (parent_repository_id, parent_job_id)",
+      "live": true,
+      "name": "ci_checkout_delegations_parent_idx",
+      "ready": true,
+      "table": "ci_checkout_delegations",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ci_checkout_delegations_pkey ON public.ci_checkout_delegations USING btree (repository_id, job_id)",
+      "live": true,
+      "name": "ci_checkout_delegations_pkey",
+      "ready": true,
+      "table": "ci_checkout_delegations",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX ci_checkout_jobs_credential_digest_key ON public.ci_checkout_jobs USING btree (credential_digest)",
       "live": true,
       "name": "ci_checkout_jobs_credential_digest_key",
@@ -9516,6 +10125,42 @@
       "name": "ci_checkout_jobs_pkey",
       "ready": true,
       "table": "ci_checkout_jobs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ci_integration_checkout_jobs_credential_digest_key ON public.ci_integration_checkout_jobs USING btree (credential_digest)",
+      "live": true,
+      "name": "ci_integration_checkout_jobs_credential_digest_key",
+      "ready": true,
+      "table": "ci_integration_checkout_jobs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX ci_integration_checkout_jobs_job_idx ON public.ci_integration_checkout_jobs USING btree (repository_id, job_id)",
+      "live": true,
+      "name": "ci_integration_checkout_jobs_job_idx",
+      "ready": true,
+      "table": "ci_integration_checkout_jobs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ci_integration_checkout_jobs_pkey ON public.ci_integration_checkout_jobs USING btree (run_id, attempt, lease_generation, repository_id, job_id)",
+      "live": true,
+      "name": "ci_integration_checkout_jobs_pkey",
+      "ready": true,
+      "table": "ci_integration_checkout_jobs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ci_integration_source_grants_pkey ON public.ci_integration_source_grants USING btree (issuer_webhook_id, repository_id)",
+      "live": true,
+      "name": "ci_integration_source_grants_pkey",
+      "ready": true,
+      "table": "ci_integration_source_grants",
       "tablespace": null,
       "valid": true
     },
@@ -9570,6 +10215,33 @@
       "name": "ci_runs_repository_id_pull_number_pull_version_context_key",
       "ready": true,
       "table": "ci_runs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ci_service_principals_id_repository_id_key ON public.ci_service_principals USING btree (id, repository_id)",
+      "live": true,
+      "name": "ci_service_principals_id_repository_id_key",
+      "ready": true,
+      "table": "ci_service_principals",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ci_service_principals_pkey ON public.ci_service_principals USING btree (id)",
+      "live": true,
+      "name": "ci_service_principals_pkey",
+      "ready": true,
+      "table": "ci_service_principals",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX ci_service_principals_repository_id_kind_key ON public.ci_service_principals USING btree (repository_id, kind)",
+      "live": true,
+      "name": "ci_service_principals_repository_id_kind_key",
+      "ready": true,
+      "table": "ci_service_principals",
       "tablespace": null,
       "valid": true
     },
@@ -10617,7 +11289,37 @@
     {
       "force_row_security": false,
       "kind": "r",
+      "name": "ci_checkout_delegations",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
       "name": "ci_checkout_jobs",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "ci_integration_checkout_jobs",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "ci_integration_source_grants",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",
@@ -10648,6 +11350,16 @@
       "force_row_security": false,
       "kind": "r",
       "name": "ci_runs",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "ci_service_principals",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",
@@ -11304,6 +12016,22 @@
       "constraint": false,
       "deferrable": false,
       "deferred": false,
+      "definition": "CREATE TRIGGER forge_check_runs_object_format BEFORE INSERT OR UPDATE ON public.forge_check_runs FOR EACH ROW EXECUTE FUNCTION public.forge_enforce_repository_object_format()",
+      "enabled": "O",
+      "function": "forge_enforce_repository_object_format",
+      "function_schema": "public",
+      "name": "forge_check_runs_object_format",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "forge_check_runs",
+      "type": 23
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
       "definition": "CREATE TRIGGER enforce_forge_issue_comments_actor_membership BEFORE INSERT OR UPDATE ON public.forge_issue_comments FOR EACH ROW EXECUTE FUNCTION public.enforce_repository_actor_membership()",
       "enabled": "O",
       "function": "enforce_repository_actor_membership",
@@ -11352,11 +12080,43 @@
       "constraint": false,
       "deferrable": false,
       "deferred": false,
+      "definition": "CREATE TRIGGER forge_pull_reviews_object_format BEFORE INSERT OR UPDATE ON public.forge_pull_reviews FOR EACH ROW EXECUTE FUNCTION public.forge_enforce_repository_object_format()",
+      "enabled": "O",
+      "function": "forge_enforce_repository_object_format",
+      "function_schema": "public",
+      "name": "forge_pull_reviews_object_format",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "forge_pull_reviews",
+      "type": 23
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
       "definition": "CREATE TRIGGER enforce_forge_pulls_actor_membership BEFORE INSERT OR UPDATE ON public.forge_pulls FOR EACH ROW EXECUTE FUNCTION public.enforce_repository_actor_membership()",
       "enabled": "O",
       "function": "enforce_repository_actor_membership",
       "function_schema": "public",
       "name": "enforce_forge_pulls_actor_membership",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "forge_pulls",
+      "type": 23
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER forge_pulls_object_format BEFORE INSERT OR UPDATE ON public.forge_pulls FOR EACH ROW EXECUTE FUNCTION public.forge_enforce_repository_object_format()",
+      "enabled": "O",
+      "function": "forge_enforce_repository_object_format",
+      "function_schema": "public",
+      "name": "forge_pulls_object_format",
       "new_transition": null,
       "old_transition": null,
       "table": "forge_pulls",
@@ -11425,6 +12185,22 @@
       "old_transition": null,
       "table": "organization_memberships",
       "type": 27
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER enforce_ci_service_ref BEFORE INSERT OR UPDATE ON public.outbox_events FOR EACH ROW EXECUTE FUNCTION public.enforce_ci_service_ref()",
+      "enabled": "O",
+      "function": "enforce_ci_service_ref",
+      "function_schema": "public",
+      "name": "enforce_ci_service_ref",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "outbox_events",
+      "type": 23
     },
     {
       "argument_count": 0,

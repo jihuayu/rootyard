@@ -59,7 +59,7 @@ jobs:
       - run: cargo test --locked --all-targets --features pando-lab
       - name: Verify durable PostgreSQL workers
         run: cargo test --locked --test outbox --test resolution_fences -- --ignored
-      - run: cargo build --locked --features pando-lab --bins
+      - run: python3 scripts/build_native.py --features pando-lab --bins
       - run: cargo build --locked --bin rootyard-view-lab
       - name: Verify design documentation integrity
         run: python3 scripts/check_design_docs.py
