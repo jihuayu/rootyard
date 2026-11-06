@@ -146,6 +146,7 @@ pub async fn login_page() -> Response {
     html_response(StatusCode::OK,"<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Rootyard sign in</title><h1>Sign in</h1><p>Enter your username and API token to open a short browser session.</p><form method=\"post\" action=\"/web/login\"><label>Username <input name=\"username\" autocomplete=\"username\" required></label><label>API token <input name=\"token\" type=\"password\" autocomplete=\"off\" required></label><button>Sign in</button></form></html>".to_owned())
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoginForm {
     username: String,
     token: String,
