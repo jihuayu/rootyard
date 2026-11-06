@@ -69,6 +69,8 @@ python3 tests/cluster_partition_native.py --binary target/debug/rootyard --repor
 python3 tests/cluster_workload_native.py --binary target/debug/rootyard --report evidence/cluster-workload-integration.json
 python3 tests/cluster_tls_native.py --binary target/debug/rootyard --report evidence/cluster-tls.json
 python3 tests/cluster_pg_streaming_native.py --binary target/debug/rootyard --report evidence/cluster-pg-streaming.json
+python3 tests/cluster_pg_pitr_native.py --binary target/debug/rootyard --report evidence/cluster-pg-pitr.json
+python3 tests/cluster_disk_pressure_native.py --binary target/debug/rootyard --report evidence/cluster-disk-pressure.json
 python3 tests/cluster_kafka_tls_native.py --binary target/debug/rootyard --kafka-home /path/to/kafka_2.13-3.9.1 --report evidence/cluster-kafka-tls.json
 ```
 
@@ -77,8 +79,10 @@ native Git, and a built Rust binary. The workload report measures 1/2/4
 processes with distinct volumes, Git push/fetch, acknowledged-commit survival,
 and process restart RTO. The takeover report also exercises a paused admitted
 Git writer, stale replica rejection, a physically stopped source session,
-duplicate node identities, and old-volume write denial. Neither report proves
-cross-host storage fencing, PostgreSQL leader failover/PITR, kernel-level
+duplicate node identities, an unusable trusted fence directory that blocks
+promotion, controller restart without duplicate promotion, and old-volume
+write denial. Neither report proves
+cross-host storage fencing, PostgreSQL leader failover, kernel-level
 network partition recovery, or a production RPO/RTO service-level objective. A multi-host
 deployment must supply an external supported fencing and PostgreSQL HA system
 and must not enable this local process driver across hosts.
@@ -100,6 +104,28 @@ observed outage. It does not elect a database leader, prevent a manually
 restarted old primary from becoming a second writer, archive WAL for PITR, or
 automatically reconfigure applications. Production metadata HA therefore
 requires an external supported solution with DCS, fencing, backup, and PITR.
+
+The separate PostgreSQL PITR drill enables WAL archiving on a disposable
+PostgreSQL 17 primary, takes a physical base backup and a matching offline
+GitFS snapshot, then makes a later acknowledged Git push. It restores the
+database to a named WAL restore point and the matching GitFS snapshot,
+rotates the delegation authority before starting Rootyard, and verifies the
+retained commit, object closure, permissions, token revocation, and a new
+post-restore push. The later acknowledged push is intentionally outside the
+restore point and is absent after recovery; this is measured data loss, not
+zero RPO. The archive and snapshot are local and unencrypted, and recovery
+requires manual traffic coordination. This does not establish a remote
+retention policy, automated leader failover, or a supported multi-host
+deployment.
+
+The disk-pressure drill runs the real Rust service and native Git in a
+rootless Docker container with a private 128 MiB executable tmpfs for its
+repository volume. It fills that volume until the kernel returns ENOSPC,
+checks that the attempted Git push fails without moving the acknowledged
+ref, removes the filler, then fetches, runs native `git fsck`, and retries the
+push. It cannot exhaust the shared workspace disk. The test covers one
+small local repository and does not prove hardware-full, power-loss, or
+multi-host behavior.
 
 The Kafka test uses the Apache Kafka 3.9.1 binary distribution and creates a
 disposable KRaft broker with a TLS listener and SASL/PLAIN authentication.

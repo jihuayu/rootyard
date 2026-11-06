@@ -2,6 +2,19 @@
 use super::*;
 use std::os::unix::fs::FileExt;
 
+macro_rules! mutation_guard {
+    ($self:ident, $reply:ident) => {
+        let gate_owner = $self.gate.clone();
+        let _mutation_guard = match gate_owner.mutation() {
+            Ok(guard) => guard,
+            Err(error) => {
+                $reply.error(Overlay::err(error));
+                return;
+            }
+        };
+    };
+}
+
 impl Filesystem for Overlay {
     fn lookup(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let result = (|| {
@@ -76,6 +89,18 @@ impl Filesystem for Overlay {
         }
     }
     fn open(&mut self, _: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        let gate_owner = self.gate.clone();
+        let _mutation_guard = if flags & (libc::O_WRONLY | libc::O_RDWR) != 0 {
+            Some(match gate_owner.mutation() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    reply.error(Overlay::err(error));
+                    return;
+                }
+            })
+        } else {
+            None
+        };
         let result = (|| {
             let p = self.rel(ino)?;
             if flags & (libc::O_WRONLY | libc::O_RDWR) != 0 {
@@ -127,6 +152,7 @@ impl Filesystem for Overlay {
         _: Option<u64>,
         reply: ReplyWrite,
     ) {
+        mutation_guard!(self, reply);
         let result = (|| {
             let p = self.rel(ino)?;
             let file = self.prepare(&p)?.open(libc::O_WRONLY, 0)?;
@@ -157,6 +183,7 @@ impl Filesystem for Overlay {
         _: Option<u32>,
         reply: ReplyAttr,
     ) {
+        mutation_guard!(self, reply);
         let result = (|| {
             let p = self.rel(ino)?;
             if mode.is_some() || size.is_some() {
@@ -187,6 +214,7 @@ impl Filesystem for Overlay {
         _: i32,
         reply: ReplyCreate,
     ) {
+        mutation_guard!(self, reply);
         let result = (|| {
             let p = self.child(parent, name)?;
             if self.selected(&p).is_ok() {
@@ -212,6 +240,7 @@ impl Filesystem for Overlay {
         _: u32,
         reply: ReplyEntry,
     ) {
+        mutation_guard!(self, reply);
         let result = (|| {
             let p = self.child(parent, name)?;
             if self.selected(&p).is_ok() {
@@ -228,6 +257,7 @@ impl Filesystem for Overlay {
         }
     }
     fn unlink(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        mutation_guard!(self, reply);
         let result = (|| {
             let p = self.child(parent, name)?;
             let selected = self.selected(&p)?;
@@ -249,6 +279,7 @@ impl Filesystem for Overlay {
         }
     }
     fn rmdir(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        mutation_guard!(self, reply);
         let result = (|| {
             let p = self.child(parent, name)?;
             let selected = self.selected(&p)?;
@@ -282,6 +313,7 @@ impl Filesystem for Overlay {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        mutation_guard!(self, reply);
         let result = (|| {
             if flags != 0 {
                 return Err(io::Error::from_raw_os_error(libc::EINVAL));

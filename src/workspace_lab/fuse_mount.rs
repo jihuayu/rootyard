@@ -16,14 +16,55 @@ use std::{
         },
     },
     path::{Path, PathBuf},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicI64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
 const TTL: Duration = Duration::ZERO;
 
+pub struct MutationGate {
+    lock: RwLock<()>,
+    writable_until: AtomicI64,
+}
+impl MutationGate {
+    pub fn new(writable_until: i64) -> Arc<Self> {
+        Arc::new(Self {
+            lock: RwLock::new(()),
+            writable_until: AtomicI64::new(writable_until),
+        })
+    }
+    pub fn update(&self, until: i64) {
+        self.writable_until.store(until, Ordering::Release);
+    }
+    pub fn freeze<T>(&self, work: impl FnOnce() -> T) -> T {
+        let _guard = self
+            .lock
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        work()
+    }
+    fn mutation(&self) -> io::Result<std::sync::RwLockReadGuard<'_, ()>> {
+        let guard = self
+            .lock
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_secs() as i64;
+        if now >= self.writable_until.load(Ordering::Acquire) {
+            return Err(io::Error::from_raw_os_error(libc::EROFS));
+        }
+        Ok(guard)
+    }
+}
+
 #[path = "fuse_io.rs"]
 mod fuse_io;
-use fuse_io::{safe_link_at, walk_dir, Entry};
+use fuse_io::{Entry, safe_link_at, walk_dir};
 
 pub struct Overlay {
     lower: PathBuf,
@@ -32,9 +73,17 @@ pub struct Overlay {
     ids: BTreeMap<PathBuf, u64>,
     next: u64,
     whiteouts: BTreeSet<PathBuf>,
+    gate: Arc<MutationGate>,
 }
 impl Overlay {
     pub fn new(lower: PathBuf, upper: PathBuf) -> io::Result<Self> {
+        Self::new_with_gate(lower, upper, MutationGate::new(i64::MAX))
+    }
+    pub fn new_with_gate(
+        lower: PathBuf,
+        upper: PathBuf,
+        gate: Arc<MutationGate>,
+    ) -> io::Result<Self> {
         if !lower.is_dir() {
             return Err(io::Error::from_raw_os_error(libc::ENOENT));
         }
@@ -72,6 +121,7 @@ impl Overlay {
             ids,
             next: 2,
             whiteouts,
+            gate,
         })
     }
     fn ino(&mut self, p: &Path) -> u64 {

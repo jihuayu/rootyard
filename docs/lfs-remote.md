@@ -11,10 +11,13 @@ credentials or pre-signed URLs. Removing a role or revoking a token blocks new
 downloads, including on another node.
 
 Without the endpoint, LFS remains on the local data volume and belongs in the
-paired database/volume backup. With the endpoint, the object store is an
-additional durability dependency: retain or separately back up its objects
-alongside the database and Git metadata. A restored node can recover missing
-local LFS copies from that store. The local copy is a cache in this mode.
+paired database/volume backup. With the endpoint, the remote store preserves
+objects between backups. A format-6 paired backup inventories every ready LFS
+object and hydrates any missing local copy from the remote store before it
+publishes the backup. Restore verifies those bytes and can serve them without
+an object-store endpoint. The remote store must remain available during backup
+if any ready object's local copy is missing; retain completed paired backups
+for recovery if the store is lost afterward.
 
 The service currently exposes no LFS object-delete or garbage-collection API.
 Aborted and duplicate uploads cannot delete bytes published by another

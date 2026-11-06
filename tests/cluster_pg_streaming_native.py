@@ -163,7 +163,8 @@ def main():
                   "rto_write_ms": round((write_recovered_at - failure_at) / 1e6, 3),
                   "post_promote_oid": new_tip, "standby_promoted": True,
                   "limits": ["manual local-host PostgreSQL promotion and Rootyard restart", "no DCS/elected automatic PG leader",
-                             "no tested PITR/archive restore", "no cross-host storage fencing"]}
+                             "PITR/archive restore tested separately, not integrated with standby promotion",
+                             "no cross-host storage fencing"]}
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"result": "passed", "report": str(args.report), "rto_write_ms": report["rto_write_ms"]}))

@@ -174,6 +174,7 @@ async fn run() -> Result<()> {
         }
         "serve" if args.len() <= 1 => {
             let dispatch_settings = rootyard::dispatch::Settings::from_env()?;
+            let maintenance_policy = rootyard::storage_lifecycle::models::Policy::from_env()?;
             std::fs::read_to_string("/proc/self/stat")
                 .context("readable Linux procfs is required for writer cleanup")?;
             let storage = Storage::open(&config)?;
@@ -216,7 +217,12 @@ async fn run() -> Result<()> {
             rootyard::sharding::transitions::reconcile_pending(&state).await
                 .map_err(|e| anyhow::anyhow!(e.1))?;
             rootyard::recover(&state).await?;
-            rootyard::sandbox::reconcile_startup(&state).await.map_err(|_| anyhow::anyhow!("sandbox startup recovery failed"))?;
+            rootyard::sandbox::reconcile_startup(&state)
+                .await
+                .map_err(|_| anyhow::anyhow!("sandbox startup recovery failed"))?;
+            rootyard::workspaces::mounts::reconcile_startup(&state)
+                .await
+                .map_err(|_| anyhow::anyhow!("workspace FUSE mount recovery failed"))?;
             let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
             let controller_task = if local_fence {
                 Some(tokio::spawn(rootyard::sharding::controller::run(state.clone())))
@@ -266,7 +272,10 @@ async fn run() -> Result<()> {
             } else { None };
             let worker_state = state.clone();
             let workspace_capture_stop = tokio_util::sync::CancellationToken::new();
-            let workspace_capture_task = tokio::spawn(rootyard::workspaces::capture::run(state.clone(), workspace_capture_stop.clone()));
+            let workspace_capture_task = tokio::spawn(rootyard::workspaces::capture::run(
+                state.clone(),
+                workspace_capture_stop.clone(),
+            ));
             let worker = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {
@@ -285,13 +294,19 @@ async fn run() -> Result<()> {
                     }
                 }
             });
+            let maintenance_stop = tokio_util::sync::CancellationToken::new();
+            let maintenance_task = maintenance_policy.enabled.then(|| tokio::spawn(
+                rootyard::storage_lifecycle::run(state.clone(), maintenance_stop.clone()),
+            ));
             axum::serve(listener, rootyard::router(state))
                 .with_graceful_shutdown(shutdown())
                 .await?;
             worker.abort();
+            maintenance_stop.cancel();
             workspace_capture_stop.cancel();
             let _ = workspace_capture_task.await;
             if let Some(task) = controller_task { task.abort(); }
+            if let Some(task) = maintenance_task { task.await??; }
             dispatch_stop.cancel();
             let _ = publish_task.await;
             if let Some(task) = delivery_task {

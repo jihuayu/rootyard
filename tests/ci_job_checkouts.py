@@ -163,6 +163,35 @@ class JobCheckoutHarness(SourcePinHarness):
         assert ordinary.resolve() != view.resolve()
         return dict(native_protocols=[0, 2], full_history=True, exact_physical_object_count=len(actual), ordinary_owner_view_separate=True)
 
+    def declared_tags_and_target_history(self):
+        self.git("tag", "-a", "v1", "-m", "declared tag", self.first, cwd=self.work)
+        self.git("push", "origin", "refs/tags/v1", cwd=self.work, token=self.alice)
+        tag_oid = self.git("rev-parse", "refs/tags/v1", cwd=self.work).stdout.decode().strip()
+        body, grant, token = self.new_grant(self.second, history="target", tags=["v1"])
+        assert grant["plan"]["dependencies"]["history"] == "target"
+        assert grant["plan"]["dependencies"]["tags"] == [{"name": "v1", "object_oid": tag_oid}]
+        self.sync()
+        clone = self.root / "target-history-tag-clone"
+        self.git("clone", self.mirror_base + self.path(self.second), str(clone), token=token)
+        assert self.git("rev-parse", "HEAD", cwd=clone).stdout.decode().strip() == self.second
+        assert self.git("rev-list", "--count", "HEAD", cwd=clone).stdout.strip() == b"1"
+        assert self.git("rev-parse", "refs/tags/v1", cwd=clone).stdout.decode().strip() == tag_oid
+        view = self.root / "mirror-data" / "repos" / self.repo["id"] / "job-views" / (
+            "1-" + self.second + "-" + body["job_id"] + ".git")
+        assert (view / "shallow").read_text() == self.second + "\n"
+        refs = self.git("--git-dir=" + str(view), "for-each-ref", "--format=%(refname) %(objectname)").stdout.decode().splitlines()
+        assert set(refs) == {"refs/heads/main " + self.second, "refs/tags/v1 " + tag_oid}
+        expected = set(self.git("--no-replace-objects", "rev-list", "--objects", "--no-object-names",
+                                "--max-count=1", self.second, "--", cwd=self.work).stdout.decode().splitlines())
+        expected.update(self.git("--no-replace-objects", "rev-list", "--objects", "--no-object-names",
+                                 tag_oid, "--", cwd=self.work).stdout.decode().splitlines())
+        actual = set(self.git("--git-dir=" + str(view), "cat-file", "--batch-all-objects",
+                              "--batch-check=%(objectname)").stdout.decode().splitlines())
+        assert actual == expected, dict(extra=sorted(actual - expected), missing=sorted(expected - actual))
+        self.git("fsck", "--full", cwd=clone)
+        return dict(annotated_tag=True, only_declared_refs=True, target_shallow=True,
+                    exact_physical_object_count=len(actual))
+
     def object_wants_do_not_escape(self):
         for protocol in (0, 2):
             for wanted in (self.second,):
@@ -601,7 +630,7 @@ class JobCheckoutHarness(SourcePinHarness):
                           "import os, pathlib, sys, time\n" +
                           "args = sys.argv[1:]\n" +
                           "if 'http-backend' in args: pathlib.Path(" + repr(str(backend)) + ").touch()\n" +
-                          "if 'pack-objects' in args and '--revs' in args:\n" +
+                          "if 'pack-objects' in args and '--no-reuse-object' in args:\n" +
                           " pathlib.Path(" + repr(str(entered)) + ").touch()\n" +
                           " deadline = time.monotonic() + 15\n" +
                           " while not pathlib.Path(" + repr(str(release)) + ").exists():\n" +
@@ -686,7 +715,8 @@ def main():
     harness = JobCheckoutHarness(args)
     success = False
     try:
-        for name in ("setup_checkout", "native_clones_and_closure", "object_wants_do_not_escape",
+        for name in ("setup_checkout", "native_clones_and_closure", "declared_tags_and_target_history",
+                     "object_wants_do_not_escape",
                      "native_denials_survive_backend_exit", "early_stdin_failure_preserves_denial",
                      "route_and_audience_scope", "immutable_issuance_and_concurrency",
                      "source_evidence_and_input_validation", "cancel_revoke_and_issuer_fences",

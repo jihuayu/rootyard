@@ -136,6 +136,14 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         }
         (Some(identity), repo, None, None)
     };
+    if job && state.mirror_primary.is_none() {
+        let plan = job_plan.as_ref().ok_or_else(Error::unauthorized)?;
+        if !crate::sharding::transport::is_local_primary_for_repo(
+            &state, plan.owner_id, repo.id).await? {
+            return Err(Error(StatusCode::CONFLICT,
+                "CI origin checkout must use the current primary node"));
+        }
+    }
     let remote_user = match &job_principal {
         Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration { hook_id, job_id, .. }) =>
             format!("ci-job:{job_id}/integration:{hook_id}"),
@@ -184,7 +192,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             let plan = job_plan.as_ref().ok_or_else(Error::unauthorized)?;
             if state.mirror_primary.is_some() {
                 crate::ci_checkouts::dependencies::verify_on_mirror(&state, plan).await?;
-                crate::mirror::job_path(&state, &repo, oid).await?
+                crate::mirror::job_path(&state, &repo, plan).await?
             } else {
                 crate::ci_checkouts::origin_job_path(&state, &repo, plan,
                     snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?).await?
