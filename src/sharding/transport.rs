@@ -369,6 +369,16 @@ pub async fn authenticate_delegation(state: &Arc<AppState>, headers: &HeaderMap,
     let access = auth::authorize_repo_with_role(&tx, &actor, owner, name,
         if role_write { Role::Write } else { Role::Read }).await?;
     if access.repo_id != env.repository_id { return Err(Error::unauthorized()); }
+    // A backend recovery/resolve can advance the repository generation without
+    // changing placement or the route epoch. Ingress may have signed this
+    // envelope just before that transaction committed. Re-read the authority
+    // generation here; route watermarks alone cannot invalidate that request.
+    let current_generation: i64 = tx.query_one(
+        "SELECT storage_generation FROM repositories WHERE id = $1", &[&access.repo_id],
+    ).await.map_err(Error::internal)?.get(0);
+    if env.storage_generation != current_generation {
+        return Err(conflict("stale delegated storage generation"));
+    }
     let route_sql = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id = $1");
     let route_row = tx.query_opt(&route_sql, &[&access.repo_id]).await.map_err(Error::internal)?.ok_or_else(|| conflict("repository shard route missing"))?;
     let route = RepoShardRoute::row(&route_row);
