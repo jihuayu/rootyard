@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod models;
 pub mod rbac;
+pub mod teams;
 
 use crate::AppState;
 use axum::{
@@ -28,21 +29,21 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/api/repos/{owner}/{name}/teams",
-            get(rbac::list_teams).post(rbac::create_team),
+            get(teams::list_teams).post(teams::create_team),
         )
         .route(
             "/api/repos/{owner}/{name}/teams/{team_slug}",
-            get(rbac::get_team)
-                .patch(rbac::update_team)
-                .delete(rbac::delete_team),
+            get(teams::get_team)
+                .patch(teams::update_team)
+                .delete(teams::delete_team),
         )
         .route(
             "/api/repos/{owner}/{name}/teams/{team_slug}/members",
-            get(rbac::list_team_members).post(rbac::add_team_member),
+            get(teams::list_team_members).post(teams::add_team_member),
         )
         .route(
             "/api/repos/{owner}/{name}/teams/{team_slug}/members/{username}",
-            put(rbac::put_team_member).delete(rbac::remove_team_member),
+            put(teams::put_team_member).delete(teams::remove_team_member),
         )
         .route(
             "/api/repos/{owner}/{name}/permissions/{username}",
