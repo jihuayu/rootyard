@@ -29,4 +29,4 @@ Earlier Forge/Workspace executor branches were also pushed to preserve their com
 
 Committed native receipts are in `evidence/`; independent reports are in `evidence/reviews/`. Each receipt applies to its named binary, source and topology. Original executor evidence remains under `/workspace/shared/` in this workspace. Important receipts include the offline backup/legacy restore/worker recovery series, the client compatibility matrix, and cluster workload/fault results. Source checkpoints and executor branch commits differ; use the exact receipt rather than inferring acceptance from branch HEAD.
 
-The integration build and real PostgreSQL schema contract are rerun for this handoff. New feature expansion stopped at the user's request.
+The integration build and real PostgreSQL schema contract passed for source checkpoint `ef7e645`. Final targeted native LFS lock cases3/3 and signed CI sandbox1/1 passed against its attested immutable binary; boundary checks9/9 and design documentation checks passed. Receipt: `evidence/push-wrapup.json`. New feature expansion stopped at the user's request.

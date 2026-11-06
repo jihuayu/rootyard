@@ -1,0 +1,52 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "setup_repo",
+      "status": "passed",
+      "seconds": 1.926,
+      "detail": {
+        "stock_lock_created": true
+      }
+    },
+    {
+      "name": "reject_hidden_earlier_commit",
+      "status": "passed",
+      "seconds": 1.564,
+      "detail": {
+        "ancestor": "1cbe2b60ea25815a92e3e291965c11d84836e8d3",
+        "tip": "5cddd33b75c23972cf07bbadba48249b8483d5a9",
+        "new_ref_denied": true,
+        "unlocked_new_ref_allowed": true,
+        "stock_branch_switch_unlock": true
+      }
+    },
+    {
+      "name": "verify_body_cursor",
+      "status": "passed",
+      "seconds": 0.0527,
+      "detail": {
+        "body_limit_pages": 3,
+        "unique_locks": 3,
+        "unknown_field_rejected": true
+      }
+    }
+  ],
+  "binary_sha256": "85b47d7b5fd7e7f672befe55056bdcd81d443e2afa98049bd9f2e3fabe6cddbf",
+  "native_build": {
+    "version": 1,
+    "binary_sha256": "85b47d7b5fd7e7f672befe55056bdcd81d443e2afa98049bd9f2e3fabe6cddbf",
+    "source_inputs_sha256": "341459f0b5fa6f1cbd655726e61f72d54d70bbfc4285f452407443bb29b7848c",
+    "workspace_commit": "ef7e64535c15bb2326a2e59d4c8025bf7b7dd664",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard"
+    ],
+    "unstripped_binary_sha256": "d377b197dbc2d9e696e10ba2e2085510064188679eec5573feb01c110a8877a4",
+    "transformation": "strip --strip-debug"
+  }
+}

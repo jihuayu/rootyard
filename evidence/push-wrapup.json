@@ -1,0 +1,69 @@
+{
+  "source_checkpoint": "ef7e64535c15bb2326a2e59d4c8025bf7b7dd664",
+  "native_build": {
+    "version": 1,
+    "binary_sha256": "85b47d7b5fd7e7f672befe55056bdcd81d443e2afa98049bd9f2e3fabe6cddbf",
+    "source_inputs_sha256": "341459f0b5fa6f1cbd655726e61f72d54d70bbfc4285f452407443bb29b7848c",
+    "workspace_commit": "ef7e64535c15bb2326a2e59d4c8025bf7b7dd664",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard"
+    ],
+    "unstripped_binary_sha256": "d377b197dbc2d9e696e10ba2e2085510064188679eec5573feb01c110a8877a4",
+    "transformation": "strip --strip-debug"
+  },
+  "checks": [
+    {
+      "command": "python3 tests/lfs_lock_policy.py --binary /workspace/shared/rootyard-acceptance-ef7e645",
+      "passed": true,
+      "native_cases": 3,
+      "receipt": "evidence/lfs-lock-policy-wrapup.json"
+    },
+    {
+      "command": "ROOTYARD_BINARY=/workspace/shared/rootyard-acceptance-ef7e645 python3 -m unittest tests.test_ci_sandbox -v",
+      "passed": true,
+      "native_cases": 1,
+      "seconds": 11.849,
+      "observed_stdout": "Ran 1 test in 11.849s; OK",
+      "test_sha256": "ad619a37fb4951a7d450c546e787a2de71f9c6362cacdecbed1fbba699d09159"
+    },
+    {
+      "command": "python3 tests/schema_contract.py --binary /workspace/shared/rootyard-acceptance-ef7e645",
+      "passed": true,
+      "result": {
+        "schema_version": "125",
+        "canonical": true,
+        "roundtrip": true,
+        "restored003_upgrade": true,
+        "restored006_upgrade": true,
+        "restored007_upgrade": true,
+        "upgraded_roundtrip": true,
+        "tables": 79,
+        "functions": 11,
+        "triggers": 19
+      }
+    },
+    {
+      "command": "python3 -m unittest tests.test_parallel_boundaries",
+      "passed": true,
+      "cases": 9
+    },
+    {
+      "command": "python3 scripts/check_design_docs.py",
+      "passed": true,
+      "source_blocks": 823,
+      "chapters": 11,
+      "synchronized_diagrams": 7,
+      "repository_links": 333
+    }
+  ],
+  "limitations": [
+    "Targeted wrap-up checks, not full acceptance of all46 tasks.",
+    "Production physicalGC disabled; long Git transfer mutex retained.",
+    "Executor branches and experimental WIP branches are separate from integrated source."
+  ]
+}
