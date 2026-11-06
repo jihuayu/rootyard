@@ -180,6 +180,16 @@ async fn execute_ref_transaction_inner(
         tokio::time::Instant::now()+state.config.git_timeout).await?;
     let _write_guard = publication.enter_window(&state.storage,
         tokio::time::Instant::now()+state.config.git_timeout).await?;
+    // The durable admission precedes this writer's native ref update. A
+    // committed physical-GC fence rejects the write instead of racing it.
+    let _admission = storage::admission::acquire(
+        &state.pool,
+        repo.id,
+        repo.storage_generation,
+        "ref-transaction",
+        tokio::time::Instant::now() + state.config.git_timeout,
+    )
+    .await?;
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;

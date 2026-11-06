@@ -63,19 +63,27 @@ fn git(repo: &FsPath, args: &[&str]) -> Result<String, Error> {
     }
     String::from_utf8(out.stdout).map_err(Error::internal)
 }
-async fn clone(state: &AppState, source: &FsPath, dest: &FsPath, branch: Option<&str>) -> Result<(), Error> {
+fn clone(source: &FsPath, dest: &FsPath, branch: Option<&str>) -> Result<(), Error> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(Error::internal)?;
     }
-    let mut cmd = state.storage.git(&state.config);
+    let mut cmd = Command::new("git");
     cmd.args(["-c", "core.hooksPath=/dev/null", "clone", "--no-local", "--no-hardlinks", "--no-tags"]);
     if let Some(branch) = branch {
         cmd.args(["--single-branch", "--branch", branch]);
     }
-    cmd.arg("--").arg(source).arg(dest);
-    crate::git_http::collect_git_output(cmd, 4096, state.config.git_timeout)
-        .await
-        .map_err(|_| Error(StatusCode::CONFLICT, "Git view clone failed"))?;
+    let out = cmd
+        .arg("--")
+        .arg(source)
+        .arg(dest)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(Error::internal)?;
+    if !out.status.success() {
+        return Err(Error(StatusCode::CONFLICT, "Git view clone failed"));
+    }
     Ok(())
 }
 fn projection_root(state: &AppState) -> PathBuf {
@@ -103,10 +111,6 @@ pub async fn create(
     let source_lease =
         read_leases::shared(&state.pool, access.repo_id, tokio::time::Instant::now() + state.config.git_timeout)
             .await?;
-    let _local = tokio::time::timeout(state.config.git_timeout, state.storage.read_snapshot_lock(access.repo_id))
-        .await
-        .map_err(|_| Error::timeout())?;
-    source_lease.ensure_active()?;
     let refreshed = auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Read).await?;
     if refreshed.repo_id != access.repo_id {
         return Err(Error::not_found());
@@ -115,24 +119,16 @@ pub async fn create(
     let vid = Uuid::new_v4();
     let temp = projection_root(&state).join(format!("stage-{vid}"));
     let final_path = projection_root(&state).join(vid.to_string());
-    source_lease.guard(clone(&state, &source, &temp, None)).await??;
-    // A namespace BaseVector can outlive every source branch that named it.
-    // Clone transfers visible refs; fetch the exact pinned commit while the
-    // hosted source still has a live cross-process read lease.
-    let mut pinned = state.storage.git(&state.config);
-    pinned
-        .arg("-C")
-        .arg(&temp)
-        .args(["fetch", "--no-tags", "--no-write-fetch-head", "--"])
-        .arg(&source)
-        .arg(&mount.base_oid);
-    source_lease
-        .guard(crate::git_http::collect_git_output(pinned, 4096, state.config.git_timeout))
-        .await?
-        .map_err(|_| Error(StatusCode::CONFLICT, "Git View pinned source is unavailable"))?;
+    clone(&source, &temp, None)?;
     source_lease.ensure_active()?;
-    drop(_local);
-    drop(source_lease);
+    // A durable namespace pin can outlive the branch that advertised it. The
+    // ordinary clone will not fetch an unreachable commit, so fetch the exact
+    // pinned OID from the local source before projecting it.
+    if git(&temp, &["cat-file", "-e", &mount.base_oid]).is_err() {
+        let source = source.to_str().ok_or_else(Error::bad_request)?;
+        git(&temp, &["-c", "uploadpack.allowAnySHA1InWant=true", "fetch", "--no-tags", source, &mount.base_oid])?;
+        git(&temp, &["cat-file", "-e", &mount.base_oid])?;
+    }
     git(&temp, &["checkout", "--force", &mount.base_oid])?;
     let projected = if input.subdir.is_empty() {
         mount.base_oid.clone()
@@ -141,7 +137,7 @@ pub async fn create(
         git(&temp, &["rev-parse", "HEAD"])?.trim().to_owned()
     };
     git(&temp, &["update-ref", "refs/heads/projected", &projected])?;
-    clone(&state, &temp, &final_path, Some("projected")).await?;
+    clone(&temp, &final_path, Some("projected"))?;
     let _ = fs::remove_dir_all(&temp);
     let head = git(&final_path, &["rev-parse", "HEAD"])?;
     if head.trim() != projected {

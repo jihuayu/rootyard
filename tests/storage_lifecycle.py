@@ -52,6 +52,8 @@ class LifecycleHarness(Harness):
         self.git("push", "origin", "HEAD:main", cwd=work, token=self.alice)
         q = "SELECT count(*) FROM storage_maintenance_jobs WHERE repository_id='" + repo["id"] + "' AND kind='gitfs_repack' AND state='succeeded'"
         self.wait_sql(q, "1")
+        assert self.sql("SELECT progress->>'phase' FROM storage_maintenance_jobs WHERE repository_id='"
+            +repo["id"]+"' AND kind='gitfs_repack' AND state='succeeded'")=="succeeded"
         self.wait_sql("SELECT count(*) FROM storage_maintenance_jobs WHERE repository_id='"
                       + repo["id"] + "' AND kind='gitfs_cache_hydrate' AND state='succeeded'", "1")
         bare = self.root / "data" / "repos" / (repo["id"] + ".git")
@@ -111,6 +113,8 @@ class LifecycleHarness(Harness):
         self.start()
         self.wait_sql("SELECT state FROM storage_maintenance_jobs WHERE id='" + fake + "'", "succeeded")
         assert self.sql("SELECT attempt||':'||claim_generation FROM storage_maintenance_jobs WHERE id='" + fake + "'") == "2:2"
+        assert self.sql("SELECT (progress->>'attempt')||':'||(progress->>'claim_generation')||':'||(progress->>'phase') "
+            "FROM storage_maintenance_jobs WHERE id='"+fake+"'")=="2:2:succeeded"
         assert self.sql("SELECT lease_owner IS NULL FROM storage_maintenance_jobs WHERE id='" + fake + "'") == "t"
         return {"expired_attempt_reclaimed": 2, "late_owner_fenced": True,
                 "duplicate_active_kind_rejected": True}

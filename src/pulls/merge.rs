@@ -108,6 +108,14 @@ async fn merge_pull_inner(
     })?;
     let _write_guard = publication.enter_window(&state.storage,
         Instant::now()+state.config.git_timeout).await?;
+    let _admission = storage::admission::acquire(
+        &state.pool,
+        repo.id,
+        repo.storage_generation,
+        "pull-merge",
+        Instant::now() + state.config.git_timeout,
+    )
+    .await?;
     reliability::before_push(&state, &repo)
         .await
         .map_err(Error::internal)?;

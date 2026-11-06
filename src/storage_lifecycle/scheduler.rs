@@ -119,7 +119,7 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM storage_maintenance_tombstones \
                  WHERE repository_id=$1 AND tenant_id=$2 AND repository_generation=$3 \
-                 AND state='pending' AND delete_after<=clock_timestamp())",
+                 AND state IN ('pending','deleting') AND delete_after<=clock_timestamp())",
                     &[&repo, &tenant, &generation],
                 )
                 .await?
