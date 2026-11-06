@@ -38,6 +38,11 @@ pub(super) async fn pin_inner(
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     let repo = db::Repository::from_row(&row);
+    if !valid_format(&repo.object_format)
+        || !nonzero_oid_for_format(&input.target_oid, &repo.object_format)
+    {
+        return Err(Error::bad_request());
+    }
     if repo.storage_generation != input.storage_generation {
         return Err(Error(StatusCode::CONFLICT, "repository generation changed"));
     }
@@ -98,7 +103,7 @@ pub(super) async fn pin_inner(
         owner_id: actor.id,
         repository_id: repo.id,
         storage_generation: input.storage_generation,
-        object_format: if input.target_oid.len()==40 {"sha1"} else {"sha256"}.into(),
+        object_format: repo.object_format.clone(),
         target_oid: input.target_oid,
         retention_ref: format!("{NAMESPACE}/jobs/{}", input.job_id),
     };
@@ -170,11 +175,12 @@ pub(super) async fn pin_inner(
             journal::begin_ci(&state.storage.root, actor.username, actor.token_id, &intent)
                 .map_err(Error::internal)?;
         let mut cmd = git(&state, repo.id).map_err(Error::internal)?;
+        // Server-internal ref writes run with hooks disabled, exactly like the
+        // merge, CI-pin release and webhook pin paths. The managed reference
+        // transaction hook is a client-push contract: it requires the parent
+        // publication environment that only the receive path supplies.
         cmd.arg("-c")
-            .arg(format!(
-                "core.hooksPath={}",
-                state.storage.root.join("managed-hooks").display()
-            ))
+            .arg("core.hooksPath=/dev/null")
             .env("ROOTYARD_JOURNAL_OPERATION", &operation.path)
             .args([
                 "update-ref",

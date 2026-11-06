@@ -18,7 +18,7 @@ pub struct Prepared {
 fn intent(repo:&db::Repository,owner_id:Uuid,job_id:Uuid,oid:&str)->ci_pins::Intent {
     ci_pins::Intent{version:1,job_id,owner_id,repository_id:repo.id,
         storage_generation:repo.storage_generation,
-        object_format:if oid.len()==40 {"sha1"} else {"sha256"}.into(),
+        object_format:repo.object_format.clone(),
         target_oid:oid.into(),retention_ref:format!("refs/rootyard-ci/jobs/{job_id}")}
 }
 
@@ -30,6 +30,11 @@ pub async fn prepare(state:&AppState,hook_id:Uuid,repo_id:Uuid,job_id:Uuid,
     let repo=db::Repository::from_row(&row);
     let owner_id:Uuid=row.get("owner_id");
     drop(client);
+    if !ci_pins::valid_format(&repo.object_format)
+        || !ci_pins::valid_oid_for_format(head,&repo.object_format)
+    {
+        return Err(Error(StatusCode::CONFLICT,"CI checkout target format differs from repository"));
+    }
     let guard=state.storage.write_lock(repo.id).await;
     let receipt=ci_pins::verify_receipt(state,&intent(&repo,owner_id,job_id,head)).await
         .map_err(|_|Error(StatusCode::CONFLICT,"CI source pin missing"))?;
@@ -63,7 +68,7 @@ pub async fn persist(tx:&tokio_postgres::Transaction<'_>,prepared:Prepared,
     let audience=audience()?;
     let root=Plan{version:1,job_id:prepared.job_id,owner_id:prepared.owner_id,
         repository_id:prepared.repo.id,storage_generation:prepared.repo.storage_generation,
-        object_format:if prepared.head.len()==40 {"sha1"} else {"sha256"}.into(),
+        object_format:prepared.repo.object_format.clone(),
         target_oid:prepared.head,source_receipt_sha256:prepared.receipt,
         mirror_audience:audience,expires_unix,dependencies:prepared.manifest.clone()};
     let secret=token();
@@ -77,13 +82,19 @@ pub async fn persist(tx:&tokio_postgres::Transaction<'_>,prepared:Prepared,
     for sub in &prepared.manifest.submodules {
         let receipt=prepared.sub_receipts.iter().find(|(id,_)|id==&sub.job_id)
             .ok_or_else(||Error::internal("missing prepared submodule receipt"))?.1.clone();
-        let row=tx.query_one("SELECT owner_id FROM repositories WHERE id=$1 AND \
+        let row=tx.query_one("SELECT owner_id,object_format FROM repositories WHERE id=$1 AND \
             storage_generation=$2 AND state='ready'",&[&sub.repository_id,&sub.storage_generation])
             .await.map_err(Error::internal)?;
         let owner_id:Uuid=row.get(0);
+        let object_format:String=row.get(1);
+        if !ci_pins::valid_format(&object_format)
+            || !ci_pins::valid_oid_for_format(&sub.target_oid,&object_format)
+        {
+            return Err(Error(StatusCode::CONFLICT,"submodule checkout target format differs"));
+        }
         let plan=Plan{version:1,job_id:sub.job_id,owner_id,
             repository_id:sub.repository_id,storage_generation:sub.storage_generation,
-            object_format:if sub.target_oid.len()==40 {"sha1"} else {"sha256"}.into(),
+            object_format,
             target_oid:sub.target_oid.clone(),source_receipt_sha256:receipt,
             mirror_audience:audience,expires_unix,
             dependencies:prepared.manifest.for_submodule(sub)};

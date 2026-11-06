@@ -32,11 +32,18 @@ pub async fn heartbeat(
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
     let access=auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Maintain).await?;
-    let actual_generation: i64 = tx.query_one(
-        "SELECT storage_generation FROM repositories WHERE id=$1",&[&access.repo_id],
-    ).await.map_err(Error::internal)?.get(0);
+    let repo_row = tx.query_one(
+        "SELECT storage_generation,object_format FROM repositories WHERE id=$1",&[&access.repo_id],
+    ).await.map_err(Error::internal)?;
+    let actual_generation: i64 = repo_row.get(0);
+    let object_format: String = repo_row.get(1);
     if actual_generation!=input.storage_generation {
         return Err(Error(StatusCode::CONFLICT,"repository generation changed"));
+    }
+    if !ci_pins::valid_format(&object_format)
+        || input.ready_oids.iter().any(|oid| !ci_pins::valid_oid_for_format(oid,&object_format))
+    {
+        return Err(Error::bad_request());
     }
     let ready=serde_json::to_value(&input.ready_oids).map_err(Error::internal)?;
     tx.execute(

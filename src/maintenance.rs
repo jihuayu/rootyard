@@ -105,7 +105,10 @@ async fn native_snapshot(storage: &Storage, config: &Config, repo: Uuid) -> Resu
             fields.len() == 3 && fields[0].starts_with("refs/") && fields[0].len() <= 1024 && fields[2].is_empty(),
             "unsupported native reference"
         );
-        ensure!(fields[1].len() == 40 && fields[1].bytes().all(|b| b.is_ascii_hexdigit()), "unsupported object ID");
+        ensure!(
+            matches!(fields[1].len(), 40 | 64) && fields[1].bytes().all(|b| b.is_ascii_hexdigit()),
+            "unsupported object ID"
+        );
         refs.push(NativeRef { name: fields[0].into(), oid: fields[1].into() });
         ensure!(refs.len() <= MAX_REFS, "too many native refs");
     }
@@ -118,7 +121,7 @@ async fn native_snapshot(storage: &Storage, config: &Config, repo: Uuid) -> Resu
         let oid = refs.iter().find(|r| r.name == target).map(|r| r.oid.clone());
         serde_json::json!({"kind":if oid.is_some(){"symbolic"}else{"unborn"},"target":target,"oid":oid})
     } else {
-        ensure!(text.len() == 40 && text.bytes().all(|b| b.is_ascii_hexdigit()), "invalid detached HEAD");
+        ensure!(matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit()), "invalid detached HEAD");
         serde_json::json!({"kind":"detached","oid":text})
     };
     Ok(NativeSnapshot { head, refs })

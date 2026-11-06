@@ -5,7 +5,10 @@ use crate::{
     db, git_http,
     mirror::{
         eviction, limiter,
-        sync::{bare_config, mirror_git, private_directory, read_regular, verify_directory},
+        sync::{
+            bare_config, detect_git_format, init_bare_view, mirror_git, private_directory,
+            read_regular, verify_directory,
+        },
         views::pinned_path,
     },
 };
@@ -24,6 +27,9 @@ pub(crate) async fn job_path(
     let oid = &plan.target_oid;
     if plan.repository_id != repo.id
         || plan.storage_generation != repo.storage_generation
+        || plan.object_format != repo.object_format
+        || !crate::ci_pins::valid_format(&plan.object_format)
+        || !crate::ci_pins::valid_oid_for_format(oid, &plan.object_format)
         || !matches!(plan.dependencies.history.as_str(), "full" | "target")
     {
         return Err(Error::unauthorized());
@@ -68,6 +74,7 @@ pub(crate) async fn job_path(
         .filter(|snapshot| {
             snapshot.repository_id == repo.id
                 && snapshot.storage_generation == repo.storage_generation
+                && snapshot.object_format == plan.object_format
         })
         .map(|snapshot| {
             root.join(snapshot.snapshot.to_string())
@@ -114,8 +121,12 @@ pub(crate) async fn job_path(
             );
         }
         anyhow::ensure!(
-            read_regular(&bare.join("config"), 4096)? == bare_config().as_bytes(),
+            read_regular(&bare.join("config"), 4096)? == bare_config(&plan.object_format).as_bytes(),
             "snapshot configuration changed"
+        );
+        anyhow::ensure!(
+            detect_git_format(state, &bare).await? == plan.object_format,
+            "snapshot object format changed"
         );
         for entry in std::fs::read_dir(bare.join("objects/pack"))? {
             anyhow::ensure!(
@@ -126,6 +137,7 @@ pub(crate) async fn job_path(
         let expected = planned_objects(state, &source, plan).await?;
         private_directory(&stage)?;
         let view = stage.join("view.git");
+        init_bare_view(state, &view, &plan.object_format).await?;
         private_directory(&view)?;
         for dir in [
             "objects",
@@ -147,7 +159,7 @@ pub(crate) async fn job_path(
         if plan.dependencies.history == "target" {
             std::fs::write(view.join("shallow"), format!("{oid}\n"))?;
         }
-        std::fs::write(view.join("config"), bare_config())?;
+        std::fs::write(view.join("config"), bare_config(&plan.object_format))?;
         let input = stage.join("revisions");
         let mut lines = String::new();
         for object in &expected {
@@ -170,7 +182,7 @@ pub(crate) async fn job_path(
         .await?;
         validate_job_view(state, &view, plan).await?;
         anyhow::ensure!(
-            all_objects(state, &view).await? == expected,
+            all_objects(state, &view, plan).await? == expected,
             "materialized target object set differs"
         );
         anyhow::ensure!(
@@ -209,7 +221,7 @@ fn tag_refs(plan: &Plan) -> Result<Vec<(String, String)>> {
                 && !tag.name.starts_with('-')
                 && !tag.name.contains("@{")
                 && seen.insert(tag.name.clone())
-                && crate::ci_pins::valid_oid(&tag.object_oid),
+                && crate::ci_pins::valid_oid_for_format(&tag.object_oid, &plan.object_format),
             "unsafe CI tag"
         );
         result.push((format!("refs/tags/{}", tag.name), tag.object_oid.clone()));
@@ -237,12 +249,13 @@ async fn planned_objects(
                 ],
             )
             .await?,
+            &plan.object_format,
         )?
     } else {
-        closure_objects(state, path, &plan.target_oid).await?
+        closure_objects(state, path, &plan.target_oid, &plan.object_format).await?
     };
     for tag in &plan.dependencies.tags {
-        result.extend(closure_objects(state, path, &tag.object_oid).await?);
+        result.extend(closure_objects(state, path, &tag.object_oid, &plan.object_format).await?);
     }
     Ok(result)
 }
@@ -253,10 +266,13 @@ async fn object_command(state: &AppState, path: &FsPath, args: &[&str]) -> Resul
     git_http::collect_git_output(cmd, 64 * 1024 * 1024, state.config.git_timeout).await
 }
 
-fn object_set(bytes: Vec<u8>) -> Result<std::collections::BTreeSet<String>> {
+fn object_set(bytes: Vec<u8>, object_format: &str) -> Result<std::collections::BTreeSet<String>> {
     let mut result = std::collections::BTreeSet::new();
     for oid in std::str::from_utf8(&bytes)?.lines() {
-        anyhow::ensure!(crate::ci_pins::valid_oid(oid), "invalid object enumeration");
+        anyhow::ensure!(
+            crate::ci_pins::valid_oid_for_format(oid, object_format),
+            "invalid object enumeration"
+        );
         result.insert(oid.to_owned());
     }
     anyhow::ensure!(!result.is_empty(), "empty object closure");
@@ -267,6 +283,7 @@ async fn closure_objects(
     state: &AppState,
     path: &FsPath,
     oid: &str,
+    object_format: &str,
 ) -> Result<std::collections::BTreeSet<String>> {
     object_set(
         object_command(
@@ -275,12 +292,14 @@ async fn closure_objects(
             &["rev-list", "--objects", "--no-object-names", oid, "--"],
         )
         .await?,
+        object_format,
     )
 }
 
 async fn all_objects(
     state: &AppState,
     path: &FsPath,
+    plan: &Plan,
 ) -> Result<std::collections::BTreeSet<String>> {
     object_set(
         object_command(
@@ -293,6 +312,7 @@ async fn all_objects(
             ],
         )
         .await?,
+        &plan.object_format,
     )
 }
 
@@ -360,7 +380,10 @@ async fn validate_job_view(state: &AppState, path: &FsPath, plan: &Plan) -> Resu
                     .strip_prefix("objects/pack/pack-")
                     .context("unexpected job view file")?;
                 let (hash, extension) = suffix.split_once('.').context("invalid job view pack")?;
-                anyhow::ensure!(crate::ci_pins::valid_oid(hash), "invalid job pack identity");
+                anyhow::ensure!(
+                    crate::ci_pins::valid_oid_for_format(hash, &plan.object_format),
+                    "invalid job pack identity"
+                );
                 match extension {
                     "pack" => {
                         packs.insert(hash.to_owned());
@@ -381,14 +404,14 @@ async fn validate_job_view(state: &AppState, path: &FsPath, plan: &Plan) -> Resu
         verify_directory(&path.join(dir))?;
     }
     anyhow::ensure!(
-        read_regular(&path.join("config"), 4096)? == bare_config().as_bytes()
+        read_regular(&path.join("config"), 4096)? == bare_config(&plan.object_format).as_bytes()
             && read_regular(&path.join("HEAD"), 64)? == b"ref: refs/heads/main\n"
-            && read_regular(&path.join("refs/heads/main"), 64)? == format!("{oid}\n").as_bytes(),
+            && read_regular(&path.join("refs/heads/main"), 128)? == format!("{oid}\n").as_bytes(),
         "job identity changed"
     );
     if plan.dependencies.history == "target" {
         anyhow::ensure!(
-            read_regular(&path.join("shallow"), 64)? == format!("{oid}\n").as_bytes(),
+            read_regular(&path.join("shallow"), 128)? == format!("{oid}\n").as_bytes(),
             "job shallow boundary changed"
         );
     }
@@ -425,7 +448,7 @@ async fn validate_job_view(state: &AppState, path: &FsPath, plan: &Plan) -> Resu
     );
     object_command(state, path, &["fsck", "--full", "--strict", "--no-reflogs"]).await?;
     anyhow::ensure!(
-        planned_objects(state, path, plan).await? == all_objects(state, path).await?,
+        planned_objects(state, path, plan).await? == all_objects(state, path, plan).await?,
         "job view contains unrelated objects"
     );
     Ok(())

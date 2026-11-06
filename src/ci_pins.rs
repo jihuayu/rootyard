@@ -51,7 +51,7 @@ mod roots;
 #[cfg(test)]
 mod tests;
 pub use models::Intent;
-pub(crate) use models::{MAX_PINS,reserved,valid_oid};
+pub(crate) use models::{MAX_PINS,reserved,valid_format,valid_oid,valid_oid_for_format};
 use models::*;
 use store::*;
 use native::*;
