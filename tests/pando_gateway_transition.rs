@@ -250,11 +250,16 @@ async fn cutover_rollback_round_trip_and_durable_failure() {
     let pando = repository(repo, &slug, "pando");
     assert!(transition::rollback(&state, &pando, deadline()).await.is_err());
     let failed = client
-        .query_one("SELECT transition_state,transition_error FROM repositories WHERE id=$1", &[&repo])
+        .query_one(
+            "SELECT transition_state,transition_error,backend_transition_epoch FROM repositories WHERE id=$1",
+            &[&repo],
+        )
         .await
         .unwrap();
     assert_eq!(failed.get::<_, String>(0), "failed");
     assert!(failed.get::<_, Option<String>>(1).is_some());
+    let failed_epoch = failed.get::<_, i64>(2);
+    assert_eq!(failed_epoch, 2, "the failed rollback begin minted epoch 2");
 
     // The failed fence is durable but retryable after repairing the snapshot.
     client
@@ -263,7 +268,8 @@ async fn cutover_rollback_round_trip_and_durable_failure() {
         .unwrap();
     let report = transition::rollback(&state, &pando, deadline()).await.unwrap();
     assert_eq!(report.direction, "pando_to_gitfs");
-    assert_eq!(report.transition_epoch, 2);
+    assert_eq!(report.transition_epoch, failed_epoch + 1, "retry begin must mint a new epoch");
+    assert_eq!(report.transition_epoch, 3);
     assert_eq!(report.refs, 1);
     let row = client
         .query_one(
@@ -275,7 +281,7 @@ async fn cutover_rollback_round_trip_and_durable_failure() {
         .unwrap();
     assert_eq!(row.get::<_, String>(0), "gitfs");
     assert_eq!(row.get::<_, String>(1), "stable");
-    assert_eq!(row.get::<_, i64>(2), 2);
+    assert_eq!(row.get::<_, i64>(2), report.transition_epoch);
     assert!(
         journal::sequence(&state.storage.root, repo).unwrap() >= 6,
         "rollback must carry the shared Pando operation sequences back to GitFS"
@@ -336,13 +342,28 @@ async fn gitfs_write_admission_rejects_backend_switch_and_transition_fence() {
         .await
         .unwrap();
     assert_eq!(rootyard::reliability::ensure_gitfs_current(&state, &repo).await.unwrap_err().0, StatusCode::CONFLICT);
+    let transition = uuid::Uuid::new_v4();
     pool.get()
         .await
         .unwrap()
-        .execute("UPDATE repositories SET storage_backend='gitfs',transition_state='draining' WHERE id=$1", &[&repo.id])
+        .execute(
+            "UPDATE repositories SET storage_backend='gitfs',transition_state='draining', \
+             transition_id=$2,transition_started_at=clock_timestamp(), \
+             backend_transition_epoch=backend_transition_epoch+1,transition_error=NULL WHERE id=$1",
+            &[&repo.id, &transition],
+        )
         .await
         .unwrap();
     assert_eq!(rootyard::reliability::ensure_gitfs_current(&state, &repo).await.unwrap_err().0, StatusCode::CONFLICT);
+    let fenced = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT transition_state,transition_id FROM repositories WHERE id=$1", &[&repo.id])
+        .await
+        .unwrap();
+    assert_eq!(fenced.get::<_, String>(0), "draining");
+    assert_eq!(fenced.get::<_, Option<uuid::Uuid>>(1), Some(transition));
     let _ = owner;
 }
 
