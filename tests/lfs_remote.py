@@ -28,18 +28,28 @@ class RemoteLfsHarness(Harness):
         assert self.sql(f"SELECT state FROM lfs_objects WHERE repository_id='{self.repo['id']}' AND oid='{oid}'") == "ready"
         local_lfs = Path(self.env["ROOTYARD_DATA_DIR"]) / "lfs" / self.repo["id"] / oid
         assert local_lfs.is_file()
-        (self.work / "another.dat").write_bytes(payload)
+        new_payload = os.urandom(1024 * 1024)
+        new_oid = hashlib.sha256(new_payload).hexdigest()
+        (self.work / "another.dat").write_bytes(new_payload)
         self.git("add", "another.dat", cwd=self.work)
-        self.git("commit", "-m", "reuse remote-only LFS object", cwd=self.work)
+        # Publish bytes before any Git pointer refers to this new OID.
+        self.git("lfs", "push", "--object-id", "origin", new_oid,
+                 cwd=self.work, token=self.alice)
+        assert self.sql(f"SELECT state FROM lfs_objects WHERE repository_id='{self.repo['id']}' AND oid='{new_oid}'") == "ready"
+        new_local_lfs = Path(self.env["ROOTYARD_DATA_DIR"]) / "lfs" / self.repo["id"] / new_oid
+        assert new_local_lfs.is_file()
+        self.git("commit", "-m", "publish remote-only new LFS pointer", cwd=self.work)
         new_head = self.git("rev-parse", "HEAD", cwd=self.work).stdout.decode().strip()
-        local_lfs.unlink()
-        assert not local_lfs.exists()
+        new_local_lfs.unlink()
+        assert not new_local_lfs.exists()
         # Suppress only the client-side reupload; the server's managed native
         # pre-receive hook must validate this pointer from remote S3 bytes.
         self.git("-c", "core.hooksPath=/dev/null", "push", "origin", "HEAD:main",
                  cwd=self.work, token=self.alice)
         assert self.git("--git-dir=" + str(self.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == new_head
-        assert not local_lfs.exists(), "test lost the remote-only condition"
+        assert (new_local_lfs.is_file() and
+                hashlib.sha256(new_local_lfs.read_bytes()).hexdigest() == new_oid), \
+            "native hook did not verify and hydrate the new remote-only pointer"
         self.stop()
         source=Path(self.env["ROOTYARD_DATA_DIR"])
         replacement=self.root/"second-node"
@@ -52,6 +62,7 @@ class RemoteLfsHarness(Harness):
         self.git("lfs","install","--local",cwd=clone)
         self.git("lfs","pull",cwd=clone,token=self.alice)
         assert (clone/"large.dat").read_bytes()==payload
+        assert (clone/"another.dat").read_bytes()==new_payload
         assert (replacement/"lfs"/self.repo["id"]/oid).is_file()
         self.expect(f"/git/alice/demo.git/info/lfs/objects/{oid}/{len(payload)}",200,token=self.alice)
         self.expect(f"/git/alice/demo.git/info/lfs/objects/{oid}/{len(payload)}",404,token=self.bob)
