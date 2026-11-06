@@ -136,7 +136,7 @@ fn aad(envelope: &Envelope, index: u64) -> Vec<u8> {
 }
 fn envelope_path(dir: &Path, generation: u64) -> PathBuf { dir.join(format!("envelope-{generation:020}.json")) }
 async fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path).await?;
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).await?;
     file.write_all(bytes).await?;
     file.sync_all().await?;
     File::open(path.parent().context("envelope parent missing")?).await?.sync_all().await?;
@@ -185,7 +185,7 @@ pub async fn encrypt_file(provider: &VaultTransit, source: &Path, ciphertext: &P
     let result = async {
         let cipher = data_cipher(&data_key)?;
         let mut input = File::open(source).await?;
-        let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
+        let mut out = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp).await?;
         let mut hash = Sha256::new();
         let mut size = 0u64;
         let mut index = 0u64;
@@ -237,7 +237,7 @@ pub async fn decrypt_file(provider: &VaultTransit, ciphertext: &Path, envelope_d
         let cipher = data_cipher(&data_key)?;
         fs::create_dir_all(parent).await?;
         let mut input = File::open(ciphertext).await?;
-        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
+        let mut output = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp).await?;
         let mut plaintext_hash = Sha256::new();
         let mut ciphertext_hash = Sha256::new();
         let mut plaintext_bytes = 0u64;
