@@ -20,6 +20,7 @@ use axum::{
     response::Response,
 };
 use std::sync::Arc;
+use tokio::time::Instant;
 
 pub async fn merge_pull(
     State(state): State<Arc<AppState>>,
@@ -90,6 +91,12 @@ async fn merge_pull_inner(
         }
     }
 
+    // PostgreSQL lease precedes the local writer lock. A collector takes the
+    // exclusive form in the same order and cannot prune merge inputs mid-read.
+    let source_lease = storage::read_leases::shared(
+        &state.pool, repo.id, Instant::now() + state.config.git_timeout,
+    ).await?;
+
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -103,6 +110,7 @@ async fn merge_pull_inner(
     reliability::before_push(&state, &repo)
         .await
         .map_err(Error::internal)?;
+    source_lease.ensure_active()?;
 
     let repo_path = state
         .storage
@@ -336,6 +344,7 @@ async fn merge_pull_inner(
     .await?;
 
     auth::verify_token(&tx, &actor, true).await?;
+    source_lease.ensure_active()?;
 
     let op = journal::begin(
         &state.storage.root,
@@ -399,6 +408,7 @@ async fn merge_pull_inner(
         return Err(Error(StatusCode::CONFLICT, "atomic ref update rejected"));
     }
     journal::finish(&op).map_err(Error::internal)?;
+    source_lease.ensure_active()?;
 
     let updated_row = tx
         .query_opt(
