@@ -185,7 +185,7 @@ pub async fn reconcile(
             ) {
                 (true, Ok(Some(changes))) => {
                     let outcome = if changes.is_empty() {
-                        "no_ref_changes"
+                        if operation.service_principal_id.is_some() { "unknown" } else { "no_ref_changes" }
                     } else {
                         "recorded"
                     };
@@ -205,7 +205,7 @@ pub async fn reconcile(
                 _ => (
                     "unknown",
                     Vec::new(),
-                    serde_json::json!({"version":1,"kind":"ci_retention_unverified","intent":operation.ci_pin,"finished":finished,"storage_generation_matches":operation.storage_generation==generation}),
+                    serde_json::json!({"version":1,"kind":if operation.service_principal_id.is_some() {"observed_immutable_ci_root"} else {"ci_retention_unverified"},"intent":operation.ci_pin,"finished":finished,"storage_generation_matches":operation.storage_generation==generation}),
                 ),
             }
         } else {
@@ -259,6 +259,7 @@ pub async fn reconcile(
                 repository_id: repo,
                 actor_id: operation.actor_id,
                 token_id: operation.token_id,
+                service_principal_id: operation.service_principal_id,
                 actor_name: operation.actor_name.clone(),
                 sequence: operation.sequence,
                 storage_generation: operation.storage_generation,

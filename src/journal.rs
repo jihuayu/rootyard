@@ -26,6 +26,9 @@ pub struct Operation {
     pub actor_id: Uuid,
     pub actor_name: String,
     pub token_id: Uuid,
+    /// Non-login CI scheduler principal; human IDs are nil only for this variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_principal_id: Option<Uuid>,
     pub sequence: i64,
     pub storage_generation: i64,
     /// Exact maintenance capability, persisted before spawning Git. Never supplied by push clients.
@@ -197,12 +200,19 @@ fn load(path: &Path) -> Result<Operation> {
     op.path = path.to_path_buf();
     if let Some(intent) = &op.ci_pin {
         intent.validate()?;
-        ensure!(
-            intent.repository_id == op.repository_id
-                && intent.owner_id == op.actor_id
-                && intent.storage_generation == op.storage_generation,
-            "maintenance identity mismatch"
-        );
+        ensure!(intent.repository_id == op.repository_id
+            && intent.storage_generation == op.storage_generation,
+            "maintenance identity mismatch");
+        if op.service_principal_id.is_some() {
+            ensure!(op.actor_id.is_nil() && op.token_id.is_nil()
+                && op.actor_name == "ci-scheduler", "invalid service principal journal");
+        } else {
+            ensure!(intent.owner_id == op.actor_id && !op.token_id.is_nil(),
+                "maintenance human identity mismatch");
+        }
+    } else {
+        ensure!(op.service_principal_id.is_none() && !op.actor_id.is_nil()
+            && !op.token_id.is_nil(), "invalid human journal identity");
     }
     Ok(op)
 }
@@ -227,6 +237,7 @@ pub fn begin(
         token_id,
         storage_generation,
         None,
+        None,
     )
 }
 
@@ -245,7 +256,21 @@ pub(crate) fn begin_ci(
         token_id,
         intent.storage_generation,
         Some(intent.clone()),
+        None,
     )
+}
+
+/// Admit an exact CI retention ref operation under a non-login principal.
+pub(crate) fn begin_ci_service(
+    data_root: &Path,
+    intent: &crate::ci_pins::Intent,
+    principal_id: Uuid,
+) -> Result<Operation> {
+    intent.validate()?;
+    ensure!(!principal_id.is_nil(), "invalid CI service principal");
+    begin_inner(data_root, intent.repository_id, Uuid::nil(),
+        "ci-scheduler".into(), Uuid::nil(), intent.storage_generation,
+        Some(intent.clone()), Some(principal_id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -257,6 +282,7 @@ fn begin_inner(
     token_id: Uuid,
     storage_generation: i64,
     ci_pin: Option<crate::ci_pins::Intent>,
+    service_principal_id: Option<Uuid>,
 ) -> Result<Operation> {
     safe_path(data_root)?;
     ensure!(
@@ -285,6 +311,7 @@ fn begin_inner(
         actor_id,
         actor_name,
         token_id,
+        service_principal_id,
         sequence,
         storage_generation,
         ci_pin,
@@ -751,6 +778,26 @@ mod tests {
         )
         .unwrap();
         (root, op)
+    }
+    #[test]
+    fn ci_service_journal_has_no_human_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+        let intent = crate::ci_pins::Intent {
+            version: 1,
+            job_id,
+            owner_id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            storage_generation: 1,
+            object_format: "sha1".into(),
+            target_oid: "a".repeat(40),
+            retention_ref: format!("refs/rootyard-ci/jobs/{job_id}"),
+        };
+        let principal = Uuid::new_v4();
+        let op = begin_ci_service(root.path(), &intent, principal).unwrap();
+        assert!(op.actor_id.is_nil() && op.token_id.is_nil());
+        assert_eq!(op.service_principal_id, Some(principal));
+        assert_eq!(pending(root.path(), intent.repository_id).unwrap(), vec![op]);
     }
     fn payload(old: char, new: char) -> Vec<u8> {
         format!(
