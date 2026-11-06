@@ -120,7 +120,7 @@ pub async fn authorize_repo_with_role(
 
     let row = tx
         .query_opt(
-            "SELECT r.id, r.owner_id, r.state FROM repositories r JOIN users u ON u.id = r.owner_id WHERE u.username = $1 AND r.name = $2 FOR SHARE OF r",
+            "SELECT r.id, r.owner_id, r.state FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id WHERE ns.slug = $1 AND r.name = $2 FOR SHARE OF r",
             &[&owner, &name],
         )
         .await
