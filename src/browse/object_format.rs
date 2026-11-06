@@ -1,13 +1,13 @@
 //! Track 2 (`F46`/`F47`): Git SHA-1 / SHA-256 object-format detection, Smart HTTP v1/v2
 //! capability negotiation, and dual-hash compatibility matrix drills.
 use crate::{
-    AppState, Error, auth,
+    AppState, Error, auth, db::Identity,
     browse::{git_read, handlers, models::{RefTransactionRequest, RefUpdateInput}},
     journal,
     lfs::models::{LFS_HASH_ALGO, verify_lfs_pointer_compatibility},
 };
 use axum::{
-    Json, extract::{Path, State}, http::{HeaderMap, StatusCode, header},
+    Json, extract::{Extension, Path, State}, http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -191,9 +191,8 @@ fn is_capability_admitted(cap: &str, repo_fmt: ObjectFormat) -> bool {
 }
 
 pub async fn get_object_format(
-    State(state): State<Arc<AppState>>, Path((owner, name)): Path<(String, String)>, headers: HeaderMap,
+    State(state): State<Arc<AppState>>, Path((owner, name)): Path<(String, String)>, Extension(actor): Extension<Identity>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
@@ -218,9 +217,8 @@ pub async fn get_object_format(
 
 pub async fn negotiate_object_format(
     State(state): State<Arc<AppState>>, Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap, Json(req): Json<ProtocolNegotiateRequest>,
+    Extension(actor): Extension<Identity>, Json(req): Json<ProtocolNegotiateRequest>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     if !matches!(req.operation.as_str(), "git-upload-pack" | "git-receive-pack" | "browse" | "ref-transaction" | "lfs-batch")
         || req.protocol_version > 2
     {
@@ -358,9 +356,8 @@ async fn execute_single_format_drill(state: &AppState, base: &StdPath, format: O
 
 pub async fn run_object_format_drill(
     State(state): State<Arc<AppState>>, Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap, Json(req): Json<CompatibilityDrillRequest>,
+    Extension(actor): Extension<Identity>, Json(req): Json<CompatibilityDrillRequest>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     auth::writable(&actor)?;
     let target_fmt = match req.target_object_format {
         Some(ref s) => Some(ObjectFormat::from_str_name(s).ok_or_else(Error::bad_request)?),
