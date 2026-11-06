@@ -149,5 +149,208 @@ class CiSandboxTest(unittest.TestCase):
                 "payload ran after cancellation beat the start gate")
         finally:h.cleanup()
 
+    def _hook_with_contexts(self, h, contexts):
+        secret = "ci-sandbox-integration-secret"
+        hook = h.document(h.webhookspath, 201, method="POST", body={"url": h.receiver.url,
+            "secret": secret, "events": ["pull_request"], "ci_contexts": contexts,
+            "auto_ci_pin": True})
+        for context in contexts:
+            h.document(f"/api/repos/alice/forge/integrations/{hook['id']}/trusted-contexts",
+                200, method="PUT", body={"context": context})
+        return hook, secret
+
+    def _claims(self, h, hook, secret, contexts, runners):
+        h.document(h.pullspath, 201, method="POST", body={"title": "CI isolation",
+            "body": "two tasks", "head_ref": "refs/heads/feature", "base_ref": "refs/heads/main"})
+        deadline = time.monotonic() + 10
+        rows = []
+        while time.monotonic() < deadline:
+            rows = h.sql("SELECT id::text||','||context FROM ci_runs ORDER BY context").splitlines()
+            if len(rows) == len(contexts):
+                break
+            time.sleep(.2)
+        self.assertEqual(len(rows), len(contexts))
+        runs = {line.split(',')[1]: line.split(',')[0] for line in rows}
+        headers = {"Authorization": "Bearer " + secret}
+        claims = {}
+        for context, runner in zip(contexts, runners):
+            status, raw, _ = h.http(f"/api/repos/alice/forge/integrations/{hook['id']}/runs/{runs[context]}/claim",
+                method="POST", body={"runner_id": runner}, extra_headers=headers)
+            self.assertEqual(status, 200, raw[:300])
+            claims[context] = (json.loads(raw), runs[context], headers)
+        return claims
+
+    @staticmethod
+    def _tuple(value):
+        return {"runner_id": value["runner_id"], "attempt": value["attempt"],
+            "lease_generation": value["lease_generation"], "head_oid": value["head_oid"],
+            "storage_generation": value["storage_generation"]}
+
+    def test_two_concurrent_claims_isolated_build_and_export(self):
+        binary = Path(os.environ.get("ROOTYARD_BINARY", "target/debug/rootyard")).resolve()
+        h = WebhooksHarness(argparse.Namespace(binary=str(binary), keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
+        h.env["ROOTYARD_SANDBOX_MODE"] = "dev"
+        h.env["ROOTYARD_CI_ORIGIN_FALLBACK_GLOBAL"] = "4"
+        h.env["ROOTYARD_CI_ORIGIN_FALLBACK_PER_REPO"] = "2"
+        h.env["ROOTYARD_CI_MIRROR_AUDIENCE"] = str(uuid.uuid4())
+        try:
+            h.setup()
+            hook, secret = self._hook_with_contexts(h, ["ci/a", "ci/b"])
+            claims = self._claims(h, hook, secret, ["ci/a", "ci/b"], ["isolate-a", "isolate-b"])
+            base = f"/api/repos/alice/forge/integrations/{hook['id']}/runs"
+            jobs = {}
+            for context, mark, other in (("ci/a", "nonce-a", "own-b.txt"), ("ci/b", "nonce-b", "own-a.txt")):
+                value, run, headers = claims[context]
+                command = ("git rev-parse HEAD; test -f feature.txt; "
+                    f"printf %s {mark} > /workspace/{mark}.txt; mkdir -p /artifacts; "
+                    f"printf %s {mark} > /artifacts/who.txt; "
+                    "printf 'int main(void){return 0;}\\n' > main.c; gcc main.c -o app && ./app; "
+                    f"test ! -e /workspace/{other}; ! grep -qs {other} /workspace /tmp /home; "
+                    "env | sort; test ! -e /var/run/docker.sock; test ! -e /root; "
+                    "test -z \"$DATABASE_URL\"; test -z \"$ROOTYARD_SANDBOX_MODE\"; echo BUILD_OK")
+                status, raw, _ = h.http(base + "/" + run + "/sandbox-jobs", method="POST",
+                    body={**self._tuple(value), "argv": ["/bin/sh", "-c", command],
+                        "timeout_seconds": 20}, extra_headers=headers)
+                self.assertEqual(status, 201, raw[:300])
+                jobs[context] = json.loads(raw)
+            import concurrent.futures
+
+            def wait(context):
+                value, run, headers = claims[context]
+                suffix = "?" + urllib.parse.urlencode(self._tuple(value))
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    status, raw, _ = h.http(base + "/" + run + "/sandbox-jobs/" + jobs[context]["id"] + suffix,
+                        extra_headers=headers)
+                    self.assertEqual(status, 200, raw[:300])
+                    result = json.loads(raw)
+                    if result["state"] not in ("queued", "preparing", "running"):
+                        return result
+                    time.sleep(.1)
+                self.fail("CI sandbox did not terminate")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                outcomes = dict(zip(("ci/a", "ci/b"), pool.map(wait, ("ci/a", "ci/b"))))
+            for context, mark in (("ci/a", "nonce-a"), ("ci/b", "nonce-b")):
+                value, run, headers = claims[context]
+                self.assertEqual(outcomes[context]["state"], "succeeded", h.root)
+                suffix = "?" + urllib.parse.urlencode(self._tuple(value))
+                status, raw, _ = h.http(base + "/" + run + "/sandbox-jobs/" + jobs[context]["id"] + "/logs" + suffix,
+                    extra_headers=headers)
+                self.assertEqual(status, 200, raw[:300])
+                stdout = base64.b64decode(json.loads(raw)["stdout_base64"])
+                self.assertIn(value["head_oid"].encode(), stdout)
+                self.assertIn(b"BUILD_OK", stdout)
+                self.assertIn(b"PATH=/usr/bin:/bin", stdout)
+                self.assertIn(b"TMPDIR=/tmp", stdout)
+                self.assertNotIn(b"DATABASE_URL", stdout)
+                self.assertNotIn(b"ROOTYARD_", stdout)
+                artifact_url = (base + "/" + run + "/sandbox-jobs/" + jobs[context]["id"]
+                    + "/artifacts?" + urllib.parse.urlencode({**self._tuple(value), "path": "who.txt"}))
+                status, raw, _ = h.http(artifact_url, extra_headers=headers)
+                self.assertEqual(status, 200, raw[:300])
+                content = base64.b64decode(json.loads(raw)["artifact"]["content_base64"])
+                self.assertEqual(content, mark.encode())
+                job_root = h.root / "data" / "sandbox-jobs" / jobs[context]["id"]
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and (job_root / "checkout").exists():
+                    time.sleep(.05)
+                self.assertFalse((job_root / "checkout").exists(), "CI checkout copy was not reclaimed")
+                self.assertTrue((job_root / "artifacts" / "who.txt").is_file())
+            value_a, run_a, headers_a = claims["ci/a"]
+            value_b, run_b, headers_b = claims["ci/b"]
+            swapped = "?" + urllib.parse.urlencode(self._tuple(value_b))
+            self.assertEqual(h.http(base + "/" + run_a + "/sandbox-jobs/" + jobs["ci/a"]["id"] + swapped,
+                extra_headers=headers_a)[0], 409)
+            suffix = "?" + urllib.parse.urlencode(self._tuple(value_a))
+            status, raw, _ = h.http(base + "/" + run_a + "/sandbox-jobs/" + jobs["ci/a"]["id"] + "/cleanup" + suffix,
+                method="POST", extra_headers=headers_a)
+            self.assertEqual(status, 200, raw[:300])
+            self.assertTrue(json.loads(raw)["removed"])
+            self.assertEqual(h.http(base + "/" + run_a + "/sandbox-jobs/" + jobs["ci/a"]["id"] + "/logs" + suffix,
+                extra_headers=headers_a)[0], 404)
+        finally:
+            h.cleanup()
+
+    def test_fenced_retry_requires_new_attempt(self):
+        binary = Path(os.environ.get("ROOTYARD_BINARY", "target/debug/rootyard")).resolve()
+        h = WebhooksHarness(argparse.Namespace(binary=str(binary), keep=os.environ.get("ROOTYARD_KEEP_TEST") == "1"))
+        h.env["ROOTYARD_SANDBOX_MODE"] = "dev"
+        h.env["ROOTYARD_CI_ORIGIN_FALLBACK_GLOBAL"] = "4"
+        h.env["ROOTYARD_CI_ORIGIN_FALLBACK_PER_REPO"] = "2"
+        h.env["ROOTYARD_CI_MIRROR_AUDIENCE"] = str(uuid.uuid4())
+        try:
+            h.setup()
+            hook, secret = self._hook_with_contexts(h, ["ci/retry"])
+            claims = self._claims(h, hook, secret, ["ci/retry"], ["retry-runner"])
+            first, run, headers = claims["ci/retry"]
+            base = f"/api/repos/alice/forge/integrations/{hook['id']}/runs/{run}/sandbox-jobs"
+            first_tuple = self._tuple(first)
+            status, raw, _ = h.http(base, method="POST",
+                body={**first_tuple, "argv": ["/bin/sh", "-c",
+                    "printf 'first-attempt\\n'; mkdir -p /artifacts; printf first > /artifacts/who.txt"],
+                    "timeout_seconds": 20}, extra_headers=headers)
+            self.assertEqual(status, 201, raw[:300])
+            first_job = json.loads(raw)["id"]
+            suffix = "?" + urllib.parse.urlencode(first_tuple)
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                status, raw, _ = h.http(base + "/" + first_job + suffix, extra_headers=headers)
+                self.assertEqual(status, 200, raw[:300])
+                if json.loads(raw)["state"] not in ("queued", "preparing", "running"):
+                    break
+                time.sleep(.1)
+            self.assertEqual(json.loads(raw)["state"], "succeeded")
+            self.assertEqual(h.sql(f"SELECT attempt||','||lease_generation FROM ci_runs WHERE id='{run}'"), "1,1")
+            h.sql(f"UPDATE ci_runs SET lease_expires_unix=0 WHERE id='{run}'")
+            status, raw, _ = h.http(f"/api/repos/alice/forge/integrations/{hook['id']}/runs/{run}/claim",
+                method="POST", body={"runner_id": "retry-runner"}, extra_headers=headers)
+            self.assertEqual(status, 200, raw[:300])
+            second = json.loads(raw)
+            self.assertGreater(second["attempt"], first["attempt"])
+            self.assertGreater(second["lease_generation"], first["lease_generation"])
+            second_tuple = self._tuple(second)
+            self.assertEqual(h.http(base + "/" + first_job + suffix, extra_headers=headers)[0], 409)
+            new_suffix = "?" + urllib.parse.urlencode(second_tuple)
+            self.assertEqual(h.http(base + "/" + first_job + new_suffix, extra_headers=headers)[0], 404)
+            self.assertEqual(h.http(base + "/" + first_job + "/logs" + new_suffix, extra_headers=headers)[0], 404)
+            self.assertEqual(h.http(base + "/" + first_job + "/cleanup" + new_suffix,
+                method="POST", extra_headers=headers)[0], 404)
+            status, raw, _ = h.http(base, method="POST",
+                body={**second_tuple, "argv": ["/bin/sh", "-c",
+                    "printf 'second-attempt\\n'; mkdir -p /artifacts; printf second > /artifacts/who.txt"],
+                    "timeout_seconds": 20}, extra_headers=headers)
+            self.assertEqual(status, 201, raw[:300])
+            second_job = json.loads(raw)["id"]
+            self.assertNotEqual(first_job, second_job)
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline:
+                status, raw, _ = h.http(base + "/" + second_job + new_suffix, extra_headers=headers)
+                self.assertEqual(status, 200, raw[:300])
+                if json.loads(raw)["state"] not in ("queued", "preparing", "running"):
+                    break
+                time.sleep(.1)
+            self.assertEqual(json.loads(raw)["state"], "succeeded")
+            status, raw, _ = h.http(base + "/" + second_job + "/logs" + new_suffix, extra_headers=headers)
+            self.assertIn(b"second-attempt", base64.b64decode(json.loads(raw)["stdout_base64"]))
+            self.assertEqual(h.sql(f"SELECT attempt||','||lease_generation FROM ci_runs WHERE id='{run}'"), "2,2")
+            self.assertEqual(h.sql(f"SELECT state||','||attempt||','||lease_generation FROM sandbox_jobs WHERE id='{first_job}'"),
+                "succeeded,1,1")
+            self.assertEqual(h.sql(f"SELECT attempt||','||lease_generation FROM sandbox_jobs WHERE id='{second_job}'"),
+                "2,2")
+            h.stop()
+            h.env["ROOTYARD_SANDBOX_RETENTION_SECONDS"] = "0"
+            h.start()
+            for job_id in (first_job, second_job):
+                root = h.root / "data" / "sandbox-jobs" / job_id
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and root.exists():
+                    time.sleep(.05)
+                self.assertFalse(root.exists(), "terminal CI root was not reaped")
+            self.assertEqual(h.http(base + "/" + second_job + "/logs" + new_suffix, extra_headers=headers)[0], 404)
+            self.assertEqual(h.http(base + "/" + second_job + new_suffix, extra_headers=headers)[0], 200)
+        finally:
+            h.cleanup()
+
 
 if __name__=="__main__":unittest.main()

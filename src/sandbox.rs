@@ -1,6 +1,10 @@
 //! Bubblewrap process isolation for Agent and CI jobs.
+#[path = "sandbox/cgroup.rs"]
+mod cgroup;
 #[path = "sandbox/ci.rs"]
 pub mod ci;
+#[path = "sandbox/export.rs"]
+mod export;
 #[path = "sandbox/handlers.rs"]
 mod handlers;
 #[path = "sandbox/runner.rs"]
@@ -27,6 +31,14 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(ci::logs),
         )
         .route(
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/sandbox-jobs/{job_id}/artifacts",
+            get(ci::artifact),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/sandbox-jobs/{job_id}/cleanup",
+            post(ci::cleanup),
+        )
+        .route(
             "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/sandbox-jobs/{job_id}/terminal/input",
             post(ci::terminal_input),
         )
@@ -41,6 +53,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/workspaces/{id}/sandbox-jobs", post(handlers::start))
         .route("/api/sandbox-jobs/{id}", get(handlers::status))
         .route("/api/sandbox-jobs/{id}/stop", post(handlers::stop))
+        .route("/api/sandbox-jobs/{id}/cleanup", post(handlers::cleanup))
         .route("/api/sandbox-jobs/{id}/logs", get(handlers::logs))
         .route("/api/sandbox-jobs/{id}/artifacts", get(handlers::artifact))
         .route("/api/sandbox-jobs/{id}/terminal/input", post(handlers::terminal_input))
