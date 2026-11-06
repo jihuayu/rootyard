@@ -178,6 +178,11 @@ pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Reposito
         if source.depth>5 || !scanned.insert((source.repo.id,source.oid.clone(),source.prefix.clone())) {
             return Err(unsafe_dependency());
         }
+        // Claim and user issuance run outside Git HTTP's transfer lease. Hold
+        // the same durable source barrier while native tree/blob reads run;
+        // release it before pinning another repository to avoid nested slots.
+        let lease=crate::storage::read_leases::shared(&state.pool,source.repo.id,
+            tokio::time::Instant::now()+state.config.git_timeout).await?;
         let entries=parse_tree(&git(state,source.repo.id,&["ls-tree","-rzl","--full-tree",&source.oid],4*1024*1024).await?)?;
         let module_oid=entries.iter().find(|e|e.4==".gitmodules" && e.1=="blob").map(|e|e.2.clone());
         let gitlinks:Vec<_>=entries.iter().filter(|e|e.0=="160000" && e.1=="commit").collect();
@@ -194,16 +199,19 @@ pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Reposito
                     path:format!("{}{}",source.prefix,path),oid:pointer.oid,size:pointer.size});
             }
         }
-        for entry in gitlinks {
-            let url=modules.get(&entry.4).ok_or_else(unsafe_dependency)?;
-            let (owner,name)=relative_source(&source.repo.owner,url)?;
+        let links=gitlinks.into_iter().map(|entry|Ok::<_,Error>((entry.4.clone(),
+            entry.2.clone(),modules.get(&entry.4).ok_or_else(unsafe_dependency)?.clone())))
+            .collect::<Result<Vec<_>,_>>()?;
+        lease.ensure_active()?;
+        drop(lease);
+        for (relative,commit_oid,url) in links {
+            let (owner,name)=relative_source(&source.repo.owner,&url)?;
             let nested=permitted_repo(state,principal,&owner,&name).await?;
             if nested.state!="ready" || nested.storage_backend!="gitfs" {return Err(unsafe_dependency());}
-            git(state,nested.id,&["cat-file","-e",&format!("{}^{{commit}}",entry.2)],1).await?;
-            let path=format!("{}{}",source.prefix,entry.4);
+            let path=format!("{}{}",source.prefix,relative);
             let mut hash=Sha256::new();
             hash.update(b"rootyard-submodule-pin-v1\0");hash.update(root_job_id.as_bytes());
-            hash.update(nested.id.as_bytes());hash.update(entry.2.as_bytes());hash.update(path.as_bytes());
+            hash.update(nested.id.as_bytes());hash.update(commit_oid.as_bytes());hash.update(path.as_bytes());
             let digest=hash.finalize();let mut id=[0u8;16];id.copy_from_slice(&digest[..16]);
             id[6]=(id[6]&0x0f)|0x40;id[8]=(id[8]&0x3f)|0x80;
             let job_id=Uuid::from_bytes(id);
@@ -211,10 +219,10 @@ pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Reposito
             let owner_id:Uuid=client.query_one("SELECT owner_id FROM repositories WHERE id=$1",&[&nested.id])
                 .await.map_err(Error::internal)?.get(0);
             drop(client);
-            ensure_pull_ci_pin(state,&nested,owner_id,job_id,&entry.2).await?;
+            ensure_pull_ci_pin(state,&nested,owner_id,job_id,&commit_oid).await?;
             result.submodules.push(SubmoduleDependency{path:path.clone(),repository_id:nested.id,
-                owner,name,target_oid:entry.2.clone(),storage_generation:nested.storage_generation,job_id});
-            queue.push_back(Source{repo:nested,oid:entry.2.clone(),prefix:format!("{path}/"),depth:source.depth+1});
+                owner,name,target_oid:commit_oid.clone(),storage_generation:nested.storage_generation,job_id});
+            queue.push_back(Source{repo:nested,oid:commit_oid,prefix:format!("{path}/"),depth:source.depth+1});
         }
         if result.lfs.len()+result.submodules.len()>128 {return Err(unsafe_dependency());}
     }
