@@ -40,9 +40,10 @@ pub async fn create(State(state): State<Arc<AppState>>, headers: HeaderMap, Path
     let before = super::capture::fingerprint(&source)?;
     let before_index = fs::read(source.join(".git/index")).unwrap_or_default();
     copy_snapshot(&source,&dest)?;
+    let captured = super::capture::fingerprint(&dest)?;
     let after = super::capture::fingerprint(&source)?;
     let after_index = fs::read(source.join(".git/index")).unwrap_or_default();
-    if before!=after || before_index!=after_index {
+    if before!=after || before!=captured || before_index!=after_index {
         let _ = fs::remove_dir_all(&dest); return Err(service::conflict());
     }
     let revision = ws.revision+1;

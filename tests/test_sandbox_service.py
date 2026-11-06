@@ -12,6 +12,7 @@ class SandboxServiceTest(unittest.TestCase):
     def test_isolated_jobs_logs_cancel_and_timeout(self):
         h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
         try:
+            h.env["ROOTYARD_SANDBOX_MODE"]="dev"
             h.setup(); h.api(); h.roundtrip()
             ws=json.loads(h.expect("/api/workspaces",201,token=h.alice,method="POST",
                 body={"owner":"alice","repository":"demo","agent_id":"sandbox-parent","base_oid":h.second},

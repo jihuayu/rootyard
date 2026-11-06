@@ -69,6 +69,12 @@ class WorkspaceServiceTest(unittest.TestCase):
                 time.sleep(.2)
             self.assertEqual(replay["events"][0]["kind"],"external_capture")
             self.assertEqual(replay["events"][0]["revision"],5)
+            lease=json.loads(h.expect(f"/api/workspaces/{wid}/lease",200,token=h.alice,method="POST",
+                body={"expected_lease_epoch":1}))
+            self.assertEqual(lease["lease_epoch"],2)
+            stale={"content_base64":base64.b64encode(b"stale\n").decode(),"expected_entry_version":2,
+                   "expected_workspace_revision":5,"lease_epoch":1}
+            self.assertEqual(h.http(path,token=h.alice,method="PUT",body=stale,extra_headers={"Idempotency-Key":"stale-epoch"})[0],409)
         finally:
             h.cleanup()
 

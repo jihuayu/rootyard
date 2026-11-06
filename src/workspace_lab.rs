@@ -20,6 +20,8 @@ pub mod security;
 pub mod sync;
 #[path = "workspace_lab/vfs.rs"]
 pub mod vfs;
+#[path = "workspace_lab/fuse_mount.rs"]
+pub mod fuse_mount;
 #[path = "workspace_lab/view.rs"]
 pub mod view;
 #[path = "workspace_lab/writable_view.rs"]
