@@ -1,0 +1,11 @@
+{
+  "kind": "native_postgresql_tls",
+  "postgres_version": "17",
+  "encrypted": true,
+  "scram_sha256_authenticated": true,
+  "wrong_password_rejected": true,
+  "ca_validation_rejected_wrong_root": true,
+  "hostname_validation_rejected_ip_mismatch": true,
+  "explicit_downgrade_rejected": true,
+  "binary": "/workspace/rootyard-cluster/target-cluster/debug/rootyard"
+}

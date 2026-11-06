@@ -20,10 +20,7 @@ use tokio::sync::Semaphore;
 
 /// Validate before binding: wildcard, public and private LAN addresses are forbidden.
 pub fn validate_bind(address: SocketAddr) -> anyhow::Result<SocketAddr> {
-    anyhow::ensure!(
-        address.ip().is_loopback(),
-        "metrics listener must bind a loopback address"
-    );
+    anyhow::ensure!(address.ip().is_loopback(), "metrics listener must bind a loopback address");
     Ok(address)
 }
 
@@ -52,12 +49,8 @@ impl TransferCounters {
 fn increment(value: &AtomicU64, amount: u64) {
     let mut current = value.load(Ordering::Relaxed);
     loop {
-        match value.compare_exchange_weak(
-            current,
-            current.saturating_add(amount),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match value.compare_exchange_weak(current, current.saturating_add(amount), Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => break,
             Err(actual) => current = actual,
         }
@@ -73,20 +66,8 @@ struct MetricsState {
 }
 
 /// Mount only on the separately configured loopback listener, never the app router.
-pub fn router(
-    pool: Pool,
-    git_slots: Arc<Semaphore>,
-    capacity: usize,
-    counters: Arc<TransferCounters>,
-) -> Router {
-    Router::new()
-        .route("/metrics", get(scrape))
-        .with_state(MetricsState {
-            pool,
-            git_slots,
-            capacity,
-            counters,
-        })
+pub fn router(pool: Pool, git_slots: Arc<Semaphore>, capacity: usize, counters: Arc<TransferCounters>) -> Router {
+    Router::new().route("/metrics", get(scrape)).with_state(MetricsState { pool, git_slots, capacity, counters })
 }
 
 // One SQL statement provides one consistent MVCC snapshot, without exposing any
@@ -123,9 +104,7 @@ async fn snapshot(pool: &Pool) -> anyhow::Result<Snapshot> {
     // The server-side timeout prevents a cancelled HTTP scrape from leaving an
     // expensive or lock-blocked query running indefinitely on a pooled session.
     let transaction = client.build_transaction().read_only(true).start().await?;
-    transaction
-        .batch_execute("SET LOCAL statement_timeout = '4000ms'")
-        .await?;
+    transaction.batch_execute("SET LOCAL statement_timeout = '4000ms'").await?;
     let row = transaction.query_one(SNAPSHOT_SQL, &[]).await?;
     transaction.commit().await?;
     Ok(Snapshot {
@@ -140,47 +119,21 @@ async fn snapshot(pool: &Pool) -> anyhow::Result<Snapshot> {
 }
 
 async fn scrape(State(state): State<MetricsState>) -> Response {
-    let snapshot = tokio::time::timeout(Duration::from_secs(5), snapshot(&state.pool))
-        .await
-        .ok()
-        .and_then(Result::ok);
-    let status = if snapshot.is_some() {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    let body = render(
-        state.capacity,
-        state.git_slots.available_permits(),
-        &state.counters,
-        snapshot.as_ref(),
-    );
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), snapshot(&state.pool)).await.ok().and_then(Result::ok);
+    let status = if snapshot.is_some() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let body = render(state.capacity, state.git_slots.available_permits(), &state.counters, snapshot.as_ref());
     (
         status,
-        [
-            (
-                header::CONTENT_TYPE,
-                "text/plain; version=0.0.4; charset=utf-8",
-            ),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (header::CACHE_CONTROL, "no-store")],
         body,
     )
         .into_response()
 }
 
 fn gauge(output: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
-    let _ = writeln!(
-        output,
-        "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
-    );
+    let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}");
 }
-fn render(
-    capacity: usize,
-    available: usize,
-    counters: &TransferCounters,
-    snapshot: Option<&Snapshot>,
-) -> String {
+fn render(capacity: usize, available: usize, counters: &TransferCounters, snapshot: Option<&Snapshot>) -> String {
     let mut output = String::new();
     gauge(
         &mut output,
@@ -188,12 +141,7 @@ fn render(
         "Whether the authoritative database snapshot succeeded.",
         u8::from(snapshot.is_some()),
     );
-    gauge(
-        &mut output,
-        "rootyard_git_capacity",
-        "Configured concurrent native Git capacity.",
-        capacity,
-    );
+    gauge(&mut output, "rootyard_git_capacity", "Configured concurrent native Git capacity.", capacity);
     gauge(
         &mut output,
         "rootyard_git_in_flight",
@@ -217,10 +165,7 @@ fn render(
     // On failure emit no database-derived gauges: zero would falsely imply health.
     if let Some(s) = snapshot {
         output.push_str("# HELP rootyard_repositories Repositories by durable metadata state.\n# TYPE rootyard_repositories gauge\n");
-        for (state, count) in ["provisioning", "ready", "recovering"]
-            .iter()
-            .zip(s.repositories)
-        {
+        for (state, count) in ["provisioning", "ready", "recovering"].iter().zip(s.repositories) {
             let _ = writeln!(output, "rootyard_repositories{{state=\"{state}\"}} {count}");
         }
         gauge(

@@ -2,9 +2,10 @@
 //! orchestration (`on_pull_synchronized`), and SSRF-safe HTTP/1.1 delivery with exponential backoff.
 use crate::{
     AppState, Error, ci_pins, db, events, git_http, journal,
-    pulls::models::{PULL_FIELDS, PullRequest, ZERO_OID, resolve_ref_oid},
+    pulls::models::{PULL_FIELDS, PullRequest, resolve_ref_oid},
     reliability,
     webhooks::{
+        claims,
         models::{DELIVERY_FIELDS, WebhookDelivery, ensure_schema},
         signing::{build_delivery_headers, send_http11_webhook, signature_header},
     },
@@ -129,6 +130,12 @@ pub async fn sync_outbox_events(
             "SELECT e.event_id, e.operation_id, e.storage_generation, e.ref_name, e.old_oid, e.new_oid \
              FROM outbox_events e JOIN git_operations o ON o.id = e.operation_id \
              WHERE e.repository_id=$1 AND o.outcome <> 'unknown' AND e.ref_name NOT LIKE 'refs/rootyard-ci/%' \
+               AND EXISTS ( \
+                 SELECT 1 FROM forge_webhooks w \
+                 WHERE w.repository_id=e.repository_id AND w.active=true AND w.events ? 'push' \
+                   AND NOT EXISTS (SELECT 1 FROM forge_webhook_deliveries d \
+                                   WHERE d.webhook_id=w.id AND d.event_id='outbox:' || e.event_id) \
+               ) \
              ORDER BY e.operation_sequence ASC, e.transaction_sequence ASC LIMIT 200",
             &[&repository_id],
         )
@@ -164,7 +171,7 @@ pub async fn sync_outbox_events(
 }
 
 #[rustfmt::skip]
-async fn ensure_pull_ci_pin(
+pub(crate) async fn ensure_pull_ci_pin(
     state: &AppState,
     repo: &db::Repository,
     owner_id: Uuid,
@@ -184,7 +191,8 @@ async fn ensure_pull_ci_pin(
 
     let intent = ci_pins::Intent {
         version: 1, job_id, owner_id, repository_id: repo.id,
-        storage_generation: repo.storage_generation, object_format: "sha1".into(),
+        storage_generation: repo.storage_generation,
+        object_format: if head_oid.len()==40 {"sha1"} else {"sha256"}.into(),
         target_oid: head_oid.to_owned(), retention_ref: retention_ref.clone(),
     };
     let intent_bytes = serde_json::to_vec(&intent).map_err(Error::internal)?;
@@ -197,18 +205,19 @@ async fn ensure_pull_ci_pin(
     let existing_ref = resolve_ref_oid(state, repo.id, &retention_ref).await?;
     if existing_ref.as_deref() != Some(head_oid) {
         let client = state.pool.get().await.map_err(Error::internal)?;
-        let token_id: Uuid = client
-            .query_opt("SELECT id FROM tokens WHERE user_id=$1 ORDER BY NOT revoked DESC, created_at DESC LIMIT 1", &[&owner_id])
-            .await
-            .map_err(Error::internal)?
-            .map(|r| r.get("id"))
-            .ok_or_else(|| Error::internal("missing owner token for CI pin journal"))?;
+        client.execute("INSERT INTO ci_service_principals(id,repository_id,kind,active) \
+            VALUES($1,$2,'ci-pin',true) ON CONFLICT(repository_id,kind) DO NOTHING",
+            &[&Uuid::new_v4(),&repo.id]).await.map_err(Error::internal)?;
+        let principal_id:Uuid=client.query_opt("SELECT id FROM ci_service_principals \
+            WHERE repository_id=$1 AND kind='ci-pin' AND active=true",&[&repo.id])
+            .await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?.get(0);
         drop(client);
 
         let repo_path = state.storage.verify_path(repo.id).map_err(Error::internal)?;
-        let op = journal::begin(&state.storage.root, repo.id, owner_id, repo.owner.clone(), token_id, repo.storage_generation)
+        let op = journal::begin_ci_service(&state.storage.root,&intent,principal_id)
             .map_err(Error::internal)?;
-        let old_expected = existing_ref.as_deref().unwrap_or(ZERO_OID);
+        let zero="0".repeat(head_oid.len());
+        let old_expected = existing_ref.as_deref().unwrap_or(&zero);
         let mut update_cmd = state.storage.git(&state.config);
         update_cmd
             .args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects", "--git-dir"])
@@ -230,8 +239,9 @@ async fn ensure_pull_ci_pin(
             "finished": true, "interrupted": false, "reference_events": [], "retained": true,
         });
         let record = events::OperationRecord {
-            id: op.id, repository_id: repo.id, actor_id: owner_id, token_id,
-            actor_name: repo.owner.clone(), sequence: op.sequence,
+            id: op.id, repository_id: repo.id, actor_id: op.actor_id, token_id: op.token_id,
+            service_principal_id: op.service_principal_id,
+            actor_name: op.actor_name.clone(), sequence: op.sequence,
             storage_generation: repo.storage_generation, outcome: "recorded".into(), evidence,
         };
         events::publish(&state.pool, &record, &changes).await.map_err(Error::internal)?;
@@ -258,7 +268,7 @@ pub async fn on_pull_synchronized(
     let client = state.pool.get().await.map_err(Error::internal)?;
     let repo_row = client
         .query_opt(
-            &format!("{}, r.owner_id FROM repositories r JOIN users u ON u.id = r.owner_id WHERE r.id=$1", db::REPO_SELECT.split(" FROM ").next().unwrap_or("")),
+            &format!("{} WHERE r.id=$1", db::REPO_SELECT),
             &[&repository_id],
         )
         .await
@@ -316,6 +326,20 @@ pub async fn on_pull_synchronized(
 
     if pull.state == "open" {
         for ctx in &contexts {
+            let config_sha256 = hex::encode(Sha256::digest(format!("rootyard-ci-config-v1\0{ctx}").as_bytes()));
+            client.execute(
+                "UPDATE ci_runs SET state='cancelled',lease_generation=lease_generation+1,updated_at=clock_timestamp() \
+                 WHERE repository_id=$1 AND pull_number=$2 AND context=$3 AND state IN ('queued','leased') \
+                   AND (head_oid<>$4 OR base_oid<>$5 OR storage_generation<>$6)",
+                &[&repository_id,&pull.number,ctx,&pull.head_oid,&pull.base_oid,&repo.storage_generation],
+            ).await.map_err(Error::internal)?;
+            client.execute(
+                "INSERT INTO ci_runs (id,tenant_id,repository_id,pull_number,pull_version,context,job_id,head_oid,base_oid,storage_generation,config_sha256) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+                 ON CONFLICT (repository_id,pull_number,pull_version,context) DO NOTHING",
+                &[&Uuid::new_v4(),&tenant_id,&repository_id,&pull.number,&pull.version,ctx,&job_id,
+                  &pull.head_oid,&pull.base_oid,&repo.storage_generation,&config_sha256],
+            ).await.map_err(Error::internal)?;
             client
                 .execute(
                     "INSERT INTO forge_check_runs (tenant_id,repository_id,commit_oid,context,attempt,sequence,status,conclusion,output) \
@@ -349,6 +373,14 @@ pub async fn on_pull_synchronized(
             enqueued_deliveries += 1;
         }
     }
+
+    client.execute(
+        "INSERT INTO ci_pull_sync_progress(repository_id,pull_number,pull_version,head_oid,base_oid,storage_generation) \
+         VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(repository_id,pull_number,pull_version) \
+         DO UPDATE SET head_oid=excluded.head_oid,base_oid=excluded.base_oid, \
+           storage_generation=excluded.storage_generation,completed_at=clock_timestamp()",
+        &[&repository_id,&pull.number,&pull.version,&pull.head_oid,&pull.base_oid,&repo.storage_generation],
+    ).await.map_err(Error::internal)?;
 
     Ok(PullCiOrchestration {
         pull_number: pull.number, head_oid: pull.head_oid.clone(), base_oid: pull.base_oid.clone(),
@@ -397,25 +429,17 @@ pub async fn deliver_single(
     now_unix: i64,
 ) -> Result<WebhookDelivery, Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
-    let row = client
-        .query_opt(
-            "SELECT d.id, d.webhook_id, d.event_type, d.payload, d.attempts, d.max_attempts, w.url, w.secret, w.timeout_ms \
-             FROM forge_webhook_deliveries d JOIN forge_webhooks w ON w.id = d.webhook_id \
-             WHERE d.tenant_id=$1 AND d.repository_id=$2 AND d.id=$3",
-            &[&tenant_id, &repository_id, &delivery_id],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-
-    let webhook_id: Uuid = row.get("webhook_id");
-    let event_type: String = row.get("event_type");
-    let payload: Value = row.get("payload");
-    let attempt = row.get::<_, i64>("attempts") + 1;
-    let max_attempts: i64 = row.get("max_attempts");
-    let url: String = row.get("url");
-    let secret: String = row.get("secret");
-    let timeout_ms: i64 = row.get("timeout_ms");
+    let Some(claim) = claims::claim(&client, tenant_id, repository_id, delivery_id, now_unix).await? else {
+        return claims::current(&client, tenant_id, repository_id, delivery_id).await;
+    };
+    let webhook_id = claim.webhook_id;
+    let event_type = claim.event_type;
+    let payload = claim.payload;
+    let attempt = claim.attempt;
+    let max_attempts = claim.max_attempts;
+    let url = claim.url;
+    let secret = claim.secret;
+    let timeout_ms = claim.timeout_ms;
 
     let body_bytes = serde_json::to_vec(&payload).map_err(Error::internal)?;
     let sig = signature_header(&secret, &body_bytes);
@@ -442,19 +466,8 @@ pub async fn deliver_single(
         }
     };
 
-    let sql = format!(
-        "UPDATE forge_webhook_deliveries \
-         SET state=$4, attempts=$5, request_headers=$6, signature_256=$7, \
-             response_status=$8, last_error=$9, next_attempt_unix=$10, \
-             delivered_at = CASE WHEN $11 THEN clock_timestamp() ELSE delivered_at END, \
-             updated_at=clock_timestamp() \
-         WHERE tenant_id=$1 AND repository_id=$2 AND id=$3 RETURNING {DELIVERY_FIELDS}"
-    );
-    let updated = client
-        .query_one(&sql, &[&tenant_id, &repository_id, &delivery_id, &next_state, &attempt, &req_headers, &sig, &status_opt, &err_opt, &next_unix, &delivered])
-        .await
-        .map_err(Error::internal)?;
-    Ok(WebhookDelivery::row(&updated))
+    claims::complete(&client, tenant_id, repository_id, delivery_id, claim.generation,
+        next_state, &req_headers, &sig, status_opt, err_opt, next_unix, delivered).await
 }
 
 #[rustfmt::skip]
@@ -470,7 +483,7 @@ pub async fn dispatch_due_deliveries(
         .query(
             "SELECT d.id FROM forge_webhook_deliveries d JOIN forge_webhooks w ON w.id = d.webhook_id \
              WHERE d.tenant_id=$1 AND d.repository_id=$2 AND w.active=true \
-               AND (d.state='pending' OR (d.state='failed' AND d.next_attempt_unix <= $3)) \
+               AND (d.state='pending' OR (d.state IN ('failed','leased') AND d.next_attempt_unix <= $3)) \
              ORDER BY d.sequence ASC LIMIT $4",
             &[&tenant_id, &repository_id, &now_unix, &limit],
         )

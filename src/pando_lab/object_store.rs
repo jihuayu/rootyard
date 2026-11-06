@@ -132,6 +132,7 @@ pub struct ObjectStoreStatusReport {
 pub fn default_bucket() -> String {
     std::env::var("PANDO_OBJECT_STORE_BUCKET").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| DEFAULT_BUCKET.to_owned())
 }
+fn remote_enabled() -> bool { std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_some() }
 
 pub(super) fn store_root(config: &Config) -> PathBuf {
     std::env::var("PANDO_OBJECT_STORE_ROOT").ok().filter(|s| !s.trim().is_empty()).map(PathBuf::from).unwrap_or_else(|| config.root.clone())
@@ -339,7 +340,8 @@ pub fn get_pack_files(
     })
 }
 
-pub(super) fn ensure_local_pack_cached(config: &Config, repo: Uuid, pack: &Pack) -> Result<ObjectStoreGetReport> {
+pub(super) async fn ensure_local_pack_cached(config: &Config, repo: Uuid, pack: &Pack) -> Result<ObjectStoreGetReport> {
+    if remote_enabled() { return super::remote::get(config, repo, pack.id).await; }
     get_pack_files(&store_root(config), &config.root.join("objects"), &default_bucket(), repo, pack.id, Some(&pack.pack_sha256), Some(&pack.idx_sha256))
 }
 
@@ -373,6 +375,7 @@ pub fn verify_repo_files(store_root_dir: &Path, bucket: &str, repo: Uuid) -> Res
 }
 
 pub(super) async fn put_pack(config: &Config, repo: Uuid, pack_id: Uuid, opts: &ObjectStorePutOptions) -> Result<ObjectStorePutReport> {
+    if remote_enabled() { return super::remote::put(config, repo, pack_id, opts).await; }
     let (report, manifest) = put_pack_files(&store_root(config), &config.root.join("objects"), repo, pack_id, opts)?;
     let c = config.db().await?;
     c.execute(
@@ -385,6 +388,7 @@ pub(super) async fn put_pack(config: &Config, repo: Uuid, pack_id: Uuid, opts: &
 }
 
 pub(super) async fn get_pack(config: &Config, repo: Uuid, pack_id: Uuid) -> Result<ObjectStoreGetReport> {
+    if remote_enabled() { return super::remote::get(config, repo, pack_id).await; }
     let c = config.db().await?;
     let row = c.query_opt("SELECT pack_sha256,idx_sha256 FROM pando_lab.manifests WHERE repo=$1 AND pack_id=$2", &[&repo, &pack_id]).await?;
     let (ep, ei) = match row { Some(r) => (Some(r.get::<_, String>(0)), Some(r.get::<_, String>(1))), None => (None, None) };
@@ -392,6 +396,7 @@ pub(super) async fn get_pack(config: &Config, repo: Uuid, pack_id: Uuid) -> Resu
 }
 
 pub(super) async fn verify_repo_store(config: &Config, repo: Uuid) -> Result<ObjectStoreVerifyReport> {
+    if remote_enabled() { return super::remote::verify(config, repo).await; }
     let report = verify_repo_files(&store_root(config), &default_bucket(), repo)?;
     let c = config.db().await?;
     for r in c.query("SELECT pack_id,pack_sha256,idx_sha256 FROM pando_lab.object_store_manifests WHERE repo=$1", &[&repo]).await? {

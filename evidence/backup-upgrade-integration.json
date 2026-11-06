@@ -1,0 +1,137 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "schema003_logical_restore_then_migrate008",
+      "status": "passed",
+      "seconds": 0.5951,
+      "detail": {
+        "real_schema003_dump_and_restore": true,
+        "old_tables": 11,
+        "upgraded_tables": 74,
+        "exact_versions": [
+          1,
+          2,
+          3,
+          6,
+          7,
+          8,
+          9,
+          20,
+          30,
+          40,
+          50,
+          60,
+          70,
+          72,
+          80,
+          81,
+          82,
+          83,
+          84,
+          85,
+          86,
+          90,
+          91,
+          92,
+          93,
+          94,
+          95,
+          96,
+          97,
+          105,
+          106,
+          107,
+          108,
+          109,
+          110,
+          111,
+          120,
+          121,
+          125
+        ],
+        "legacy_identity_and_repository_preserved": true,
+        "repeated_migrate": true,
+        "historical_binary_required": false,
+        "manual_constraint_rewrite": false
+      }
+    },
+    {
+      "name": "upgraded_real_git_and_forge_source",
+      "status": "passed",
+      "seconds": 2.4054,
+      "detail": {
+        "real_git_clone_commit_push_fetch": true,
+        "legacy_repo_provisioned_with_same_identity": true,
+        "forge_issues": 3,
+        "forge_comments": 6,
+        "edited_versions_and_unicode": true
+      }
+    },
+    {
+      "name": "backup_restored003_upgraded008_source",
+      "status": "passed",
+      "seconds": 12.8762,
+      "detail": {
+        "snapshot_includes_commit_after_barrier_wait": true,
+        "inherited_volume_lock_rejected": true,
+        "backup_seconds": 9.593137702,
+        "restored003_upgraded008_catalog_accepted": true,
+        "all_current_tables_backed_up": true,
+        "populated_forge_backed_up": true
+      }
+    },
+    {
+      "name": "post_backup_acknowledged_writes",
+      "status": "passed",
+      "seconds": 1.0155,
+      "detail": {
+        "post_backup_acknowledged_commit": true,
+        "seconds_after_backup_boundary": 13.936,
+        "acknowledged_forge_changes_outside_snapshot": 2,
+        "lossless_restore_claim": false
+      }
+    },
+    {
+      "name": "fresh_database_volume_restore_and_clone",
+      "status": "passed",
+      "seconds": 9.2348,
+      "detail": {
+        "fresh_database_and_volume": true,
+        "separate_pg_server": false,
+        "durable_rows_exact_with_authority_rotated": true,
+        "legacy_identity_and_repository_preserved": true,
+        "genuine_authenticated_clone_fsck_content": true,
+        "populated_forge_exact": true,
+        "owner_read_only_revoked_permissions": true,
+        "restored_number_and_cas": true,
+        "post_boundary_git_commit_not_recovered": 1,
+        "post_boundary_forge_changes_not_recovered": 2,
+        "restore_seconds": 7.505321533
+      }
+    }
+  ],
+  "mode": "required_upgrade_acceptance",
+  "binary_sha256": "884ca118acd0cb5013f09d677d186fe661014e3e59a7ffc607eb0dc9d99b889c",
+  "limitations": [
+    "Real logical restore and migrations in synthetic disposable PostgreSQL only.",
+    "Offline snapshot excludes later acknowledged Git/Forge writes; no production zero-loss promise.",
+    "The regression mode proves known rejection only, not successful backup or restore."
+  ],
+  "native_build": {
+    "version": 1,
+    "binary_sha256": "884ca118acd0cb5013f09d677d186fe661014e3e59a7ffc607eb0dc9d99b889c",
+    "source_inputs_sha256": "ea810844b8f5f4b8f9b7d94336f0ae5cc3a8b8bd0ff4716d75814934615f8c51",
+    "workspace_commit": "495415c097d4996c002d1902b78e392628b9e91c",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard"
+    ],
+    "unstripped_binary_sha256": "fc787bea3ed1de3a4399be532edb00fd2375c1bd6e327f253d537762b93e98c9",
+    "transformation": "strip --strip-debug"
+  }
+}

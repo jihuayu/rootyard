@@ -50,9 +50,7 @@ impl IgnoreMatcher {
             if path.starts_with(".git") || !meta.is_file() {
                 continue;
             }
-            if path.file_name() == Some(OsStr::new(".rootyardignore"))
-                && path != Path::new(".rootyardignore")
-            {
+            if path.file_name() == Some(OsStr::new(".rootyardignore")) && path != Path::new(".rootyardignore") {
                 ignore_files.push(path);
             }
         }
@@ -60,10 +58,7 @@ impl IgnoreMatcher {
 
         let mut matcher = Self::default();
         for rel_file in ignore_files {
-            let base_dir = rel_file
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
+            let base_dir = rel_file.parent().map(Path::to_path_buf).unwrap_or_default();
             let raw = read_regular(&repo.join(&rel_file), MAX_MANIFEST)?;
             let content = String::from_utf8_lossy(&raw);
             matcher.add_patterns(&base_dir, &content);
@@ -93,11 +88,8 @@ impl IgnoreMatcher {
             } else {
                 (false, trimmed)
             };
-            let (dir_only, rest) = if let Some(stripped) = rest.strip_suffix('/') {
-                (true, stripped)
-            } else {
-                (false, rest)
-            };
+            let (dir_only, rest) =
+                if let Some(stripped) = rest.strip_suffix('/') { (true, stripped) } else { (false, rest) };
             if rest.is_empty() {
                 continue;
             }
@@ -109,13 +101,7 @@ impl IgnoreMatcher {
             if pattern.is_empty() {
                 continue;
             }
-            self.rules.push(IgnoreRule {
-                base_dir: base_dir.to_path_buf(),
-                pattern,
-                negated,
-                dir_only,
-                anchored,
-            });
+            self.rules.push(IgnoreRule { base_dir: base_dir.to_path_buf(), pattern, negated, dir_only, anchored });
         }
     }
 
@@ -143,8 +129,7 @@ impl IgnoreMatcher {
                     .file_name()
                     .map(|n| String::from_utf8_lossy(n.as_bytes()).into_owned())
                     .unwrap_or_default();
-                glob_match_segment(&rule.pattern, &file_name)
-                    || glob_match_path(&rule.pattern, &rel_str)
+                glob_match_segment(&rule.pattern, &file_name) || glob_match_path(&rule.pattern, &rel_str)
             };
             if matched {
                 ignored = !rule.negated;
@@ -250,14 +235,10 @@ fn match_bracket(p: &[char], c: char) -> Option<(bool, usize)> {
     if p.is_empty() {
         return None;
     }
-    let (negate, mut idx) = if p[0] == '!' || p[0] == '^' {
-        (true, 1)
-    } else {
-        (false, 0)
-    };
+    let (negate, mut idx) = if p[0] == '!' || p[0] == '^' { (true, 1) } else { (false, 0) };
     let mut found_close = None;
-    for i in idx..p.len() {
-        if p[i] == ']' && i > idx {
+    for (i, character) in p.iter().enumerate().skip(idx) {
+        if *character == ']' && i > idx {
             found_close = Some(i);
             break;
         }
@@ -282,36 +263,18 @@ fn match_bracket(p: &[char], c: char) -> Option<(bool, usize)> {
 
 pub fn classify_workspace(store: &Store, repo: &Path) -> Result<WorkspaceClassification> {
     let mut head_paths = BTreeSet::new();
-    for record in store
-        .git(repo, &["ls-tree", "-rz", "--full-tree", "HEAD"])?
-        .split(|b| *b == 0)
-        .filter(|x| !x.is_empty())
+    for record in
+        store.git(repo, &["ls-tree", "-rz", "--full-tree", "HEAD"])?.split(|b| *b == 0).filter(|x| !x.is_empty())
     {
-        ensure!(
-            !record.starts_with(b"160000 "),
-            "submodules/gitlinks are unsupported"
-        );
-        let split = record
-            .iter()
-            .position(|b| *b == b'\t')
-            .context("invalid Git ls-tree record")?;
+        ensure!(!record.starts_with(b"160000 "), "submodules/gitlinks are unsupported");
+        let split = record.iter().position(|b| *b == b'\t').context("invalid Git ls-tree record")?;
         head_paths.insert(relative_path(&record[split + 1..])?);
     }
 
     let mut index_paths = BTreeSet::new();
-    for record in store
-        .git(repo, &["ls-files", "--stage", "-z"])?
-        .split(|b| *b == 0)
-        .filter(|x| !x.is_empty())
-    {
-        ensure!(
-            !record.starts_with(b"160000 "),
-            "submodules/gitlinks are unsupported"
-        );
-        let split = record
-            .iter()
-            .position(|b| *b == b'\t')
-            .context("invalid Git ls-files record")?;
+    for record in store.git(repo, &["ls-files", "--stage", "-z"])?.split(|b| *b == 0).filter(|x| !x.is_empty()) {
+        ensure!(!record.starts_with(b"160000 "), "submodules/gitlinks are unsupported");
+        let split = record.iter().position(|b| *b == b'\t').context("invalid Git ls-files record")?;
         index_paths.insert(relative_path(&record[split + 1..])?);
     }
 
@@ -344,8 +307,7 @@ pub fn classify_workspace(store: &Store, repo: &Path) -> Result<WorkspaceClassif
         }
     }
 
-    let managed_paths: BTreeSet<PathBuf> =
-        tracked_paths.union(&untracked_paths).cloned().collect();
+    let managed_paths: BTreeSet<PathBuf> = tracked_paths.union(&untracked_paths).cloned().collect();
 
     Ok(WorkspaceClassification {
         head_paths,

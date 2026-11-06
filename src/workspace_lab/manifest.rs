@@ -1,8 +1,7 @@
 use super::{
     core::{
-        Entry, MAX_BYTES, MAX_MANIFEST, SCHEMA, Store, decode_path, display_path, encode_path,
-        entry_for_path, new_id, private_dir, publish, read_regular, relative_path, sync_tree,
-        text_arg, valid_id, write_new,
+        Entry, MAX_BYTES, MAX_MANIFEST, SCHEMA, Store, decode_path, display_path, encode_path, entry_for_path, new_id,
+        private_dir, publish, read_regular, relative_path, sync_tree, text_arg, valid_id, write_new,
     },
     ignore,
 };
@@ -90,28 +89,15 @@ pub(crate) fn entries_equivalent(a: &Entry, b: &Entry, exact_mode: bool) -> bool
     if a.kind != b.kind || a.size != b.size || a.sha256 != b.sha256 {
         return false;
     }
-    if exact_mode {
-        a.mode == b.mode
-    } else {
-        (a.mode & 0o111 != 0) == (b.mode & 0o111 != 0)
-    }
+    if exact_mode { a.mode == b.mode } else { (a.mode & 0o111 != 0) == (b.mode & 0o111 != 0) }
 }
 
-pub(crate) fn read_head_tree_entries(
-    store: &Store,
-    repo: &Path,
-) -> Result<BTreeMap<PathBuf, Entry>> {
+pub(crate) fn read_head_tree_entries(store: &Store, repo: &Path) -> Result<BTreeMap<PathBuf, Entry>> {
     let mut entries = BTreeMap::new();
     let output = store.git(repo, &["ls-tree", "-rz", "--full-tree", "HEAD"])?;
     for record in output.split(|b| *b == 0).filter(|x| !x.is_empty()) {
-        ensure!(
-            !record.starts_with(b"160000 "),
-            "submodules/gitlinks are unsupported"
-        );
-        let tab = record
-            .iter()
-            .position(|b| *b == b'\t')
-            .context("invalid Git ls-tree record")?;
+        ensure!(!record.starts_with(b"160000 "), "submodules/gitlinks are unsupported");
+        let tab = record.iter().position(|b| *b == b'\t').context("invalid Git ls-tree record")?;
         let header = std::str::from_utf8(&record[..tab])?;
         let mut parts = header.split_whitespace();
         let mode_str = parts.next().context("missing tree entry mode")?;
@@ -202,14 +188,7 @@ pub(crate) fn compute_entries_delta(
             after,
         });
     }
-    (
-        entries,
-        added,
-        modified,
-        deleted,
-        mode_changed,
-        type_changed,
-    )
+    (entries, added, modified, deleted, mode_changed, type_changed)
 }
 
 fn parse_nul_paths(bytes: &[u8]) -> Result<BTreeSet<PathBuf>> {
@@ -326,26 +305,16 @@ pub fn cmd_status(store: &Store, workspace_arg: &OsStr) -> Result<serde_json::Va
 
     let classification = ignore::classify_workspace(store, &repo)?;
     let head_oid = store.git_text(&repo, &["rev-parse", "--verify", "HEAD"])?;
-    let detached_head = !store
-        .git_output(&repo, &["symbolic-ref", "-q", "HEAD"])?
-        .status
-        .success();
+    let detached_head = !store.git_output(&repo, &["symbolic-ref", "-q", "HEAD"])?.status.success();
 
     let mut unmerged_set = BTreeSet::new();
-    for record in store
-        .git(&repo, &["ls-files", "--unmerged", "-z"])?
-        .split(|b| *b == 0)
-        .filter(|x| !x.is_empty())
-    {
+    for record in store.git(&repo, &["ls-files", "--unmerged", "-z"])?.split(|b| *b == 0).filter(|x| !x.is_empty()) {
         if let Some(tab) = record.iter().position(|b| *b == b'\t') {
             unmerged_set.insert(relative_path(&record[tab + 1..])?);
         }
     }
 
-    let staged_set = parse_nul_paths(&store.git(
-        &repo,
-        &["diff-index", "--cached", "--name-only", "-z", "HEAD"],
-    )?)?;
+    let staged_set = parse_nul_paths(&store.git(&repo, &["diff-index", "--cached", "--name-only", "-z", "HEAD"])?)?;
     let unstaged_set = compute_unstaged_paths(store, &repo)?;
 
     let head_map = read_head_tree_entries(store, &repo)?;
@@ -441,28 +410,16 @@ pub fn cmd_status(store: &Store, workspace_arg: &OsStr) -> Result<serde_json::Va
         dirty_entries_count: dirty_entries.len(),
         staged_paths: staged_set.iter().map(|p| display_path(p)).collect(),
         unstaged_paths: unstaged_set.iter().map(|p| display_path(p)).collect(),
-        untracked_paths: classification
-            .untracked_paths
-            .iter()
-            .map(|p| display_path(p))
-            .collect(),
+        untracked_paths: classification.untracked_paths.iter().map(|p| display_path(p)).collect(),
         unmerged_paths: unmerged_set.iter().map(|p| display_path(p)).collect(),
         managed_paths: current_map.keys().map(|p| display_path(p)).collect(),
-        ignored_paths: classification
-            .ignored_paths
-            .iter()
-            .map(|p| display_path(p))
-            .collect(),
+        ignored_paths: classification.ignored_paths.iter().map(|p| display_path(p)).collect(),
         dirty_entries,
     };
     Ok(serde_json::to_value(status)?)
 }
 
-pub fn cmd_changeset(
-    store: &Store,
-    base_cp_arg: &OsStr,
-    source_cp_arg: &OsStr,
-) -> Result<serde_json::Value> {
+pub fn cmd_changeset(store: &Store, base_cp_arg: &OsStr, source_cp_arg: &OsStr) -> Result<serde_json::Value> {
     let base_id = text_arg(base_cp_arg)?;
     let source_id = text_arg(source_cp_arg)?;
     let (_, base_manifest) = store.read_checkpoint(&base_id)?;
@@ -505,20 +462,10 @@ pub fn cmd_changeset(
         entries,
     };
     let bytes = serde_json::to_vec_pretty(&changeset)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_MANIFEST,
-        "changeset manifest limit exceeded"
-    );
+    ensure!(bytes.len() as u64 <= MAX_MANIFEST, "changeset manifest limit exceeded");
     write_new(&staging.0.join("changeset.json"), &bytes, 0o600)?;
-    write_new(
-        &staging.0.join("changeset.sha256"),
-        hex::encode(Sha256::digest(&bytes)).as_bytes(),
-        0o600,
-    )?;
+    write_new(&staging.0.join("changeset.sha256"), hex::encode(Sha256::digest(&bytes)).as_bytes(), 0o600)?;
     sync_tree(&staging.0)?;
-    publish(
-        &staging.0,
-        &store.root.join("changesets").join(&changeset_id),
-    )?;
+    publish(&staging.0, &store.root.join("changesets").join(&changeset_id))?;
     Ok(serde_json::to_value(changeset)?)
 }

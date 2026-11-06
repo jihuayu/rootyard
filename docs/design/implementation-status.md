@@ -2,7 +2,9 @@
 
 核对基线：2026-11-04，main [`1fd05a393fe24653687fa3e868f9dca2fb0c9a67`](https://github.com/jihuayu/rootyard/commit/1fd05a393fe24653687fa3e868f9dca2fb0c9a67)。本页说明这份代码具有什么边界，不承诺后续 main 或未合并分支的状态，也不把既有测试报告当作本次重新执行的结果。
 
-## 当前默认实现
+当前未合并集成分支的逐项实现、真实执行和独立审阅状态见 [46 项任务台账](../registered-task-delivery.md)。2026-11-06 已执行真实 PG/Git/Garage/Vault/FUSE/bubblewrap/Chromium 与本机集群故障测试；每份证据仅覆盖其记录的版本和拓扑。下表保留上述历史 main 的边界，不能用作新分支的验收结论。
+
+## 历史 main 基线实现
 
 | 能力 | 已有边界 | 代码与契约 |
 | --- | --- | --- |

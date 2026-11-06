@@ -1,15 +1,15 @@
 # Rootyard
 
-Phase-one, single-node Git hosting in Rust. PostgreSQL holds users, token digests and repository metadata. **Native bare Git repositories on a durable local volume are authoritative for refs and objects.** Clients create commits locally and use Git Smart HTTP to clone, fetch and push.
+Git hosting and collaborative workspaces in Rust. PostgreSQL holds identities, repository metadata, permissions and durable jobs. **Native bare Git repositories on a durable local volume are authoritative for refs and objects.** Clients create commits locally and use Git Smart HTTP to clone, fetch and push.
 
-This is an early implementation, not a production high-availability service. There is no UI, LFS, virtual filesystem, PostgreSQL refs store, online object-store backend, distributed coordinator, complete push audit/outbox, or automated backup system.
+This integration branch adds Forge/browser sessions, organizations, Git LFS and locks, remote object storage, kernel FUSE workspaces, CI orchestration, local-process cluster fencing and paired offline recovery. Production Pando dispatch, remote lazy hydration, independent-ref concurrency and distributed deployment acceptance remain in progress. See the [46-task delivery ledger](docs/registered-task-delivery.md) for executed evidence and remaining gates; this branch is not a production HA qualification.
 
 ## Requirements
 
 - Linux, Rust stable (edition 2024), Git 2.43 or newer, PostgreSQL 17.
 - A durable, private local filesystem for `ROOTYARD_DATA_DIR`; one serving process per directory.
 - TLS termination in front of HTTP outside localhost. The app does not terminate TLS.
-- PostgreSQL on a trusted private connection or through a local TLS proxy. The driver uses `NoTls`, including when the PostgreSQL URL defaults to `sslmode=prefer`; `sslmode=require` is rejected rather than silently downgraded.
+- PostgreSQL 17: use `sslmode=require` plus `ROOTYARD_PG_CA_PEM` for certificate/hostname verification outside local development. Optional client certificate/key variables support mutual TLS. Supplying a CA with a weaker mode is rejected; credentials belong in the trusted runtime environment.
 
 These are baseline requirements, not a claim that every version or storage device has been qualified. See [verification](docs/development.md).
 

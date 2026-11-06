@@ -1,8 +1,8 @@
 use super::{
     core::{
         Entry, MAX_BYTES, MAX_MANIFEST, Manifest, SCHEMA, Store, Workspace, decode_path, inventory,
-        no_symlink_components, private_dir, publish, read_regular, require_directory, sync_tree,
-        text_arg, valid_agent, valid_id, validate_entries, validate_symlink, write_new,
+        no_symlink_components, private_dir, publish, read_regular, require_directory, sync_tree, text_arg, valid_agent,
+        valid_id, validate_entries, validate_symlink, write_new,
     },
     manifest::{self, ChangesetEntry},
 };
@@ -95,10 +95,7 @@ struct StagingFileGuard {
 
 impl StagingFileGuard {
     fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            committed: false,
-        }
+        Self { path, committed: false }
     }
 
     fn disarm(&mut self) {
@@ -116,10 +113,7 @@ impl Drop for StagingFileGuard {
 
 fn validate_sha256_hex(digest: &str) -> Result<()> {
     ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         "invalid SHA-256 hex digest"
     );
     Ok(())
@@ -127,11 +121,8 @@ fn validate_sha256_hex(digest: &str) -> Result<()> {
 
 fn open_remote_cas(store: &Store, cas_arg: &OsStr, create: bool) -> Result<PathBuf> {
     let requested = Path::new(cas_arg);
-    let absolute = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(requested)
-    };
+    let absolute =
+        if requested.is_absolute() { requested.to_path_buf() } else { std::env::current_dir()?.join(requested) };
     no_symlink_components(&absolute)?;
     if !absolute.exists() {
         ensure!(create, "remote CAS directory does not exist");
@@ -139,10 +130,7 @@ fn open_remote_cas(store: &Store, cas_arg: &OsStr, create: bool) -> Result<PathB
     }
     require_directory(&absolute)?;
     let cas_root = fs::canonicalize(&absolute)?;
-    ensure!(
-        fs::metadata(&cas_root)?.permissions().mode() & 0o077 == 0,
-        "remote CAS must be private (mode 0700)"
-    );
+    ensure!(fs::metadata(&cas_root)?.permissions().mode() & 0o077 == 0, "remote CAS must be private (mode 0700)");
     ensure!(
         !cas_root.starts_with(&store.root) && !store.root.starts_with(&cas_root),
         "remote CAS and store must not overlap"
@@ -172,16 +160,8 @@ fn verify_cas_file(path: &Path, expected_sha256: &str, expected_size: u64) -> Re
         .open(path)
         .with_context(|| format!("missing or inaccessible CAS blob {}", path.display()))?;
     let meta = file.metadata()?;
-    ensure!(
-        meta.is_file(),
-        "CAS blob is not a regular file: {}",
-        path.display()
-    );
-    ensure!(
-        meta.permissions().mode() & 0o7000 == 0,
-        "CAS blob has special permission bits: {}",
-        path.display()
-    );
+    ensure!(meta.is_file(), "CAS blob is not a regular file: {}", path.display());
+    ensure!(meta.permissions().mode() & 0o7000 == 0, "CAS blob has special permission bits: {}", path.display());
     ensure!(
         meta.len() == expected_size,
         "CAS blob size mismatch for {}: expected {}, got {}",
@@ -221,12 +201,8 @@ fn write_atomic_file(dir: &Path, filename: &str, bytes: &[u8], mode: u32) -> Res
     let expected_sha = hex::encode(Sha256::digest(bytes));
     let temp_path = dir.join(format!(".tmp-{}", Uuid::new_v4()));
     let mut guard = StagingFileGuard::new(temp_path.clone());
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temp_path)?;
+    let mut file =
+        OpenOptions::new().write(true).create_new(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(&temp_path)?;
     file.write_all(bytes)?;
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     file.sync_all()?;
@@ -239,22 +215,11 @@ fn write_atomic_file(dir: &Path, filename: &str, bytes: &[u8], mode: u32) -> Res
     Ok(expected_sha)
 }
 
-fn put_cas_blob(
-    cas_root: &Path,
-    bytes: &[u8],
-    expected_sha256: &str,
-    expected_size: u64,
-) -> Result<bool> {
+fn put_cas_blob(cas_root: &Path, bytes: &[u8], expected_sha256: &str, expected_size: u64) -> Result<bool> {
     validate_sha256_hex(expected_sha256)?;
-    ensure!(
-        bytes.len() as u64 == expected_size,
-        "entry byte size mismatch before CAS upload"
-    );
+    ensure!(bytes.len() as u64 == expected_size, "entry byte size mismatch before CAS upload");
     let actual_sha = hex::encode(Sha256::digest(bytes));
-    ensure!(
-        actual_sha == expected_sha256,
-        "entry SHA-256 mismatch before CAS upload"
-    );
+    ensure!(actual_sha == expected_sha256, "entry SHA-256 mismatch before CAS upload");
     let shard_dir = cas_root.join("blobs").join(&expected_sha256[0..2]);
     if !shard_dir.exists() {
         private_dir(&shard_dir)?;
@@ -270,11 +235,7 @@ fn put_cas_blob(
     Ok(true)
 }
 
-fn read_verified_cas_blob(
-    cas_root: &Path,
-    expected_sha256: &str,
-    expected_size: u64,
-) -> Result<Vec<u8>> {
+fn read_verified_cas_blob(cas_root: &Path, expected_sha256: &str, expected_size: u64) -> Result<Vec<u8>> {
     let path = cas_blob_path(cas_root, expected_sha256)?;
     verify_cas_file(&path, expected_sha256, expected_size)?;
     let bytes = read_regular(&path, MAX_BYTES)?;
@@ -298,15 +259,9 @@ pub fn cmd_push_remote(
     let checkpoint_id = if store.root.join("checkpoints").join(&id).exists() {
         id
     } else if store.root.join("workspaces").join(&id).exists() {
-        ensure!(
-            quiescent,
-            "stop ALL writers and explicitly pass --quiescent when pushing a live workspace"
-        );
+        ensure!(quiescent, "stop ALL writers and explicitly pass --quiescent when pushing a live workspace");
         let cp_val = store.cmd_checkpoint(target_arg)?;
-        cp_val["checkpoint_id"]
-            .as_str()
-            .context("missing checkpoint_id from local checkpoint")?
-            .to_owned()
+        cp_val["checkpoint_id"].as_str().context("missing checkpoint_id from local checkpoint")?.to_owned()
     } else {
         bail!("unknown workspace or checkpoint id: {id}");
     };
@@ -350,9 +305,7 @@ pub fn cmd_push_remote(
         };
         if put_cas_blob(&cas_root, &bytes, &entry.sha256, entry.size)? {
             blobs_uploaded += 1;
-            bytes_uploaded = bytes_uploaded
-                .checked_add(entry.size)
-                .context("bytes_uploaded overflow")?;
+            bytes_uploaded = bytes_uploaded.checked_add(entry.size).context("bytes_uploaded overflow")?;
         } else {
             blobs_reused += 1;
         }
@@ -365,17 +318,9 @@ pub fn cmd_push_remote(
     require_directory(&remote_cp_dir)?;
 
     let dirty_bytes = serde_json::to_vec_pretty(&dirty_manifest)?;
-    ensure!(
-        dirty_bytes.len() as u64 <= MAX_MANIFEST,
-        "remote dirty manifest limit exceeded"
-    );
+    ensure!(dirty_bytes.len() as u64 <= MAX_MANIFEST, "remote dirty manifest limit exceeded");
     let dirty_sha = write_atomic_file(&remote_cp_dir, "dirty_manifest.json", &dirty_bytes, 0o600)?;
-    write_atomic_file(
-        &remote_cp_dir,
-        "dirty_manifest.sha256",
-        dirty_sha.as_bytes(),
-        0o600,
-    )?;
+    write_atomic_file(&remote_cp_dir, "dirty_manifest.sha256", dirty_sha.as_bytes(), 0o600)?;
     let _ = put_cas_blob(&cas_root, &dirty_bytes, &dirty_sha, dirty_bytes.len() as u64)?;
 
     let remote_manifest = RemoteCheckpointManifest {
@@ -391,18 +336,9 @@ pub fn cmd_push_remote(
         dirty_manifest_sha256: dirty_sha,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&remote_manifest)?;
-    ensure!(
-        manifest_bytes.len() as u64 <= MAX_MANIFEST,
-        "remote checkpoint manifest limit exceeded"
-    );
-    let manifest_sha256 =
-        write_atomic_file(&remote_cp_dir, "manifest.json", &manifest_bytes, 0o600)?;
-    write_atomic_file(
-        &remote_cp_dir,
-        "manifest.sha256",
-        manifest_sha256.as_bytes(),
-        0o600,
-    )?;
+    ensure!(manifest_bytes.len() as u64 <= MAX_MANIFEST, "remote checkpoint manifest limit exceeded");
+    let manifest_sha256 = write_atomic_file(&remote_cp_dir, "manifest.json", &manifest_bytes, 0o600)?;
+    write_atomic_file(&remote_cp_dir, "manifest.sha256", manifest_sha256.as_bytes(), 0o600)?;
 
     let report = RemotePushReport {
         schema: SCHEMA,
@@ -438,48 +374,29 @@ pub fn cmd_pull_remote(
     let remote_cp_dir = cas_root.join("checkpoints").join(&checkpoint_id);
     require_directory(&remote_cp_dir)?;
     let manifest_bytes = read_regular(&remote_cp_dir.join("manifest.json"), MAX_MANIFEST)?;
-    let manifest_sha_expected = String::from_utf8(read_regular(
-        &remote_cp_dir.join("manifest.sha256"),
-        256,
-    )?)?
-    .trim()
-    .to_owned();
+    let manifest_sha_expected =
+        String::from_utf8(read_regular(&remote_cp_dir.join("manifest.sha256"), 256)?)?.trim().to_owned();
     validate_sha256_hex(&manifest_sha_expected)?;
     let actual_manifest_sha = hex::encode(Sha256::digest(&manifest_bytes));
-    ensure!(
-        actual_manifest_sha == manifest_sha_expected,
-        "remote checkpoint manifest checksum mismatch"
-    );
+    ensure!(actual_manifest_sha == manifest_sha_expected, "remote checkpoint manifest checksum mismatch");
 
     let remote_manifest: RemoteCheckpointManifest = serde_json::from_slice(&manifest_bytes)?;
+    ensure!(remote_manifest.schema == SCHEMA, "unsupported remote checkpoint schema");
+    ensure!(remote_manifest.checkpoint_id == checkpoint_id, "remote checkpoint_id mismatch");
     ensure!(
-        remote_manifest.schema == SCHEMA,
-        "unsupported remote checkpoint schema"
-    );
-    ensure!(
-        remote_manifest.checkpoint_id == checkpoint_id,
-        "remote checkpoint_id mismatch"
-    );
-    ensure!(
-        remote_manifest.state == "COMMITTED"
-            && remote_manifest.durability == "remote_cas_committed",
+        remote_manifest.state == "COMMITTED" && remote_manifest.durability == "remote_cas_committed",
         "remote checkpoint is not COMMITTED"
     );
     store.validate_workspace(&remote_manifest.workspace)?;
     validate_entries(&remote_manifest.entries)?;
 
     let dirty_bytes = read_regular(&remote_cp_dir.join("dirty_manifest.json"), MAX_MANIFEST)?;
-    let dirty_sha_expected = String::from_utf8(read_regular(
-        &remote_cp_dir.join("dirty_manifest.sha256"),
-        256,
-    )?)?
-    .trim()
-    .to_owned();
+    let dirty_sha_expected =
+        String::from_utf8(read_regular(&remote_cp_dir.join("dirty_manifest.sha256"), 256)?)?.trim().to_owned();
     validate_sha256_hex(&dirty_sha_expected)?;
     let actual_dirty_sha = hex::encode(Sha256::digest(&dirty_bytes));
     ensure!(
-        actual_dirty_sha == dirty_sha_expected
-            && actual_dirty_sha == remote_manifest.dirty_manifest_sha256,
+        actual_dirty_sha == dirty_sha_expected && actual_dirty_sha == remote_manifest.dirty_manifest_sha256,
         "remote dirty manifest checksum mismatch"
     );
     let dirty_manifest: RemoteDirtyManifest = serde_json::from_slice(&dirty_bytes)?;
@@ -536,10 +453,7 @@ pub fn cmd_pull_remote(
         for (rel, target) in &symlinks_to_validate {
             validate_symlink(&staging_repo, rel, target)?;
         }
-        ensure!(
-            inventory(&staging_repo)? == remote_manifest.entries,
-            "reconstructed checkpoint inventory mismatch"
-        );
+        ensure!(inventory(&staging_repo)? == remote_manifest.entries, "reconstructed checkpoint inventory mismatch");
         store.validate_repo(&staging_repo, &remote_manifest.workspace.base_oid)?;
 
         let local_manifest = Manifest {
@@ -552,24 +466,14 @@ pub fn cmd_pull_remote(
         };
         let local_bytes = serde_json::to_vec_pretty(&local_manifest)?;
         write_new(&staging.0.join("manifest.json"), &local_bytes, 0o600)?;
-        write_new(
-            &staging.0.join("manifest.sha256"),
-            hex::encode(Sha256::digest(&local_bytes)).as_bytes(),
-            0o600,
-        )?;
+        write_new(&staging.0.join("manifest.sha256"), hex::encode(Sha256::digest(&local_bytes)).as_bytes(), 0o600)?;
         sync_tree(&staging.0)?;
         publish(&staging.0, &local_cp_dir)?;
     }
 
     let restored = store.cmd_restore(OsStr::new(&checkpoint_id), OsStr::new(&agent_id))?;
-    let workspace_id = restored["workspace_id"]
-        .as_str()
-        .context("missing restored workspace_id")?
-        .to_owned();
-    let repo_path = restored["repo_path"]
-        .as_str()
-        .context("missing restored repo_path")?
-        .to_owned();
+    let workspace_id = restored["workspace_id"].as_str().context("missing restored workspace_id")?.to_owned();
+    let repo_path = restored["repo_path"].as_str().context("missing restored repo_path")?.to_owned();
 
     let report = RemotePullReport {
         schema: SCHEMA,

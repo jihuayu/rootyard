@@ -120,6 +120,103 @@ class BrowseHarness(Harness):
                 break
         assert collected == ["refs/heads/feature", "refs/heads/main", "refs/tags/v1.0"]
 
+    def bounded_ref_and_commit_pages(self):
+        # Valid packed refs exceed the old 4 MiB output cap. A one-item page
+        # must ask Git for only that page, including when resolving HEAD.
+        self.git("--git-dir=" + str(self.bare), "pack-refs", "--all")
+        packed = self.bare / "packed-refs"
+        existing = [line for line in packed.read_text().splitlines() if line and not line.startswith(("#", "^"))]
+        long_tags = [f"{self.third} refs/tags/perf-{i:05d}-{'x' * 200}" for i in range(20000)]
+        packed.write_text("# pack-refs with: peeled fully-peeled sorted\n" + "\n".join(sorted(existing + long_tags, key=lambda line: line.split(" ", 1)[1])) + "\n")
+        assert packed.stat().st_size > 4 * 1024 * 1024, packed.stat().st_size
+        first = self.document(self.repo_api("/refs?limit=1"))
+        assert first["items"][0]["name"].startswith("refs/heads/"), first
+        heads = self.document(self.repo_api("/refs?limit=1&prefix=refs/heads/"))
+        assert heads["items"][0]["name"] == first["items"][0]["name"], heads
+        second = self.document(self.repo_api("/refs?limit=1&after=refs/heads/feature"))
+        assert second["items"][0]["name"] > "refs/heads/feature", second
+        tail = self.document(self.repo_api("/refs?limit=1&after=refs/tags/perf-19998-" + "x" * 200))
+        assert tail["items"][0]["name"].startswith("refs/tags/perf-19999-"), tail
+        assert self.document(self.repo_api("/commits?limit=1"))["items"][0]["oid"] == self.third
+
+        # A transparent Git wrapper records the actual number of cat-file
+        # processes for a short and a longer page.
+        for _ in range(20):
+            self.git("commit", "--allow-empty", "-m", "batch-page", cwd=self.work)
+        self.git("push", "origin", "HEAD:refs/heads/batch-page", cwd=self.work, token=self.alice)
+        count_path = self.root / "cat-file-count"
+        wrapper = self.root / "git-count-wrapper"
+        wrapper.write_text("#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ]; then echo x >> '" + str(count_path) + "'; fi\ndone\nexec /usr/bin/git \"$@\"\n")
+        wrapper.chmod(0o700)
+        self.stop()
+        self.env["ROOTYARD_GIT"] = str(wrapper)
+        self.start()
+        for size in (1, 20):
+            before = len(count_path.read_text().splitlines()) if count_path.exists() else 0
+            page = self.document(self.repo_api(f"/commits?rev=refs/heads/batch-page&limit={size}"))
+            assert len(page["items"]) == size
+            after = len(count_path.read_text().splitlines())
+            assert after - before == 2, (size, after - before)
+        packed.write_text("# pack-refs with: peeled fully-peeled sorted\n" + "\n".join(existing) + "\n")
+
+    def protected_writes_and_ref_ack_failure(self):
+        self.git("push", "origin", self.third + ":refs/heads/release", cwd=self.work, token=self.alice)
+        rule = {
+            "required_approvals": 2, "required_checks": ["ci/required"],
+            "require_fast_forward": True, "prevent_deletion": True,
+            "prevent_force_push": True,
+        }
+        for branch in ("main", "release"):
+            self.document(self.repo_api("/branch-rules"), 201, method="POST",
+                          body={"branch_ref": "refs/heads/" + branch, **rule})
+        assert self.git("push", "origin", "HEAD:refs/heads/main", cwd=self.work,
+                        token=self.alice, check=False).returncode != 0
+        assert self.git("push", "origin", ":refs/heads/release", cwd=self.work,
+                        token=self.alice, check=False).returncode != 0
+        self.document(self.repo_api("/ref-transactions"), 403, method="POST", body={
+            "updates": [{"ref_name": "refs/heads/main", "old_oid": self.third,
+                         "new_oid": self.second}]})
+        assert self.git("--git-dir=" + str(self.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == self.third
+        assert self.git("--git-dir=" + str(self.bare), "rev-parse", "refs/heads/release").stdout.decode().strip() == self.third
+        self.git("push", "origin", "HEAD:refs/heads/unprotected", cwd=self.work, token=self.alice)
+
+        before_marker = self.root / "fail-before-update"
+        after_marker = self.root / "fail-after-update"
+        wrapper = self.root / "git-fault-wrapper"
+        wrapper.write_text("#!/bin/sh\nupdate=0\nfor a in \"$@\"; do [ \"$a\" = update-ref ] && update=1; done\n"
+                           + "if [ \"$update\" = 1 ] && [ -f '" + str(before_marker) + "' ]; then exit 42; fi\n"
+                           + "/usr/bin/git \"$@\"\nrc=$?\n"
+                           + "if [ \"$update\" = 1 ] && [ \"$rc\" = 0 ] && [ -f '" + str(after_marker) + "' ]; then exit 42; fi\n"
+                           + "exit \"$rc\"\n")
+        wrapper.chmod(0o700)
+        self.stop()
+        self.env["ROOTYARD_GIT"] = str(wrapper)
+        self.start()
+        before_marker.touch()
+        operations_before = int(self.sql("SELECT count(*) FROM git_operations WHERE repository_id='" + self.repo["id"] + "'"))
+        self.document(self.repo_api("/ref-transactions"), 409, method="POST", body={
+            "updates": [{"ref_name": "refs/heads/fault-before", "old_oid": ZERO_OID,
+                         "new_oid": self.feature_oid}]})
+        before_marker.unlink()
+        assert self.git("--git-dir=" + str(self.bare), "show-ref", "--verify", "refs/heads/fault-before", check=False).returncode != 0
+        assert self.sql("SELECT outcome FROM git_operations WHERE repository_id='" + self.repo["id"] + "' ORDER BY sequence DESC LIMIT 1") == "no_ref_changes"
+        assert int(self.sql("SELECT count(*) FROM git_operations WHERE repository_id='" + self.repo["id"] + "'")) == operations_before + 1
+
+        after_marker.touch()
+        events_before = int(self.sql("SELECT count(*) FROM outbox_events WHERE repository_id='" + self.repo["id"] + "'"))
+        payload = {"updates": [{"ref_name": "refs/heads/fault-after", "old_oid": ZERO_OID,
+                                "new_oid": self.feature_oid}]}
+        response = self.document(self.repo_api("/ref-transactions"), 200, method="POST",
+                                 body=payload, extra_headers={"Idempotency-Key": "fault-after"})
+        after_marker.unlink()
+        assert self.git("--git-dir=" + str(self.bare), "rev-parse", "refs/heads/fault-after").stdout.decode().strip() == self.feature_oid
+        assert int(self.sql("SELECT count(*) FROM outbox_events WHERE repository_id='" + self.repo["id"] + "'")) == events_before + 1
+        self.stop()
+        self.start()
+        replay = self.document(self.repo_api("/ref-transactions"), 200, method="POST",
+                               body=payload, extra_headers={"Idempotency-Key": "fault-after"})
+        assert replay == response
+
     def commits_and_pagination(self):
         log_doc = self.document(self.repo_api("/commits"))
         assert [c["oid"] for c in log_doc["items"]] == [
@@ -643,6 +740,8 @@ def main():
             "idempotency_and_concurrency",
             "access_and_fences",
             "object_format_and_negotiation",
+            "bounded_ref_and_commit_pages",
+            "protected_writes_and_ref_ack_failure",
         ):
             harness.case(name, getattr(harness, name))
         success = True
@@ -667,7 +766,6 @@ def main():
             cases=harness.results,
             binary_sha256=binary_sha,
             limitations=[
-                "Personal owner-only tenancy; non-owners receive 404 Not Found.",
                 "Browse blob endpoint enforces a 4 MiB maximum object size cap.",
                 "Ref transactions support up to 128 atomic ref updates per request.",
             ],

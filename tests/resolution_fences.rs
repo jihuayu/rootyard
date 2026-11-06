@@ -12,15 +12,9 @@ async fn resolution_worker_fences() -> Result<()> {
     let url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
     let admin = db::pool(&url)?;
     let schema = format!("resolution_test_{}", Uuid::new_v4().simple());
-    admin
-        .get()
-        .await?
-        .batch_execute(&format!("CREATE SCHEMA {schema}"))
-        .await?;
+    admin.get().await?.batch_execute(&format!("CREATE SCHEMA {schema}")).await?;
     let mut config: tokio_postgres::Config = url.parse()?;
-    config.options(format!(
-        "-c search_path={schema} -c timezone=UTC -c statement_timeout=5000 -c lock_timeout=3000"
-    ));
+    config.options(format!("-c search_path={schema} -c timezone=UTC -c statement_timeout=5000 -c lock_timeout=3000"));
     let pool = Pool::builder(Manager::new(config, tokio_postgres::NoTls))
         .runtime(deadpool_postgres::Runtime::Tokio1)
         .max_size(10)
@@ -31,11 +25,7 @@ async fn resolution_worker_fences() -> Result<()> {
     })
     .await
     .context("fence test panicked");
-    admin
-        .get()
-        .await?
-        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
-        .await?;
+    admin.get().await?.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).await?;
     result??;
     Ok(())
 }
@@ -54,16 +44,14 @@ async fn verify(pool: &Pool) -> Result<()> {
     let repo = Uuid::new_v4();
     pool.get()
         .await?
-        .execute(
-            "INSERT INTO repositories(id,owner_id,name,state) VALUES($1,$2,'fences','ready')",
-            &[&repo, &actor],
-        )
+        .execute("INSERT INTO repositories(id,owner_id,name,state) VALUES($1,$2,'fences','ready')", &[&repo, &actor])
         .await?;
     let mut op = events::OperationRecord {
         id: Uuid::new_v4(),
         repository_id: repo,
         actor_id: actor,
         token_id,
+        service_principal_id: None,
         actor_name: "alice".into(),
         sequence: 1,
         storage_generation: 1,
@@ -71,25 +59,18 @@ async fn verify(pool: &Pool) -> Result<()> {
         evidence: serde_json::json!({"fixture":"known receipt"}),
     };
     events::publish(pool, &op, &[change()]).await?;
-    let first = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 60)
-        .await?
-        .remove(0);
+    let first = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 60).await?.remove(0);
     assert!(events::acknowledge(pool, &first).await?);
     op.id = Uuid::new_v4();
     op.sequence = 2;
     events::publish(pool, &op, &[change()]).await?;
-    let second = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 60)
-        .await?
-        .remove(0);
+    let second = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 60).await?.remove(0);
     // Hold a projection row. The worker must retain its shared repository fence
     // while waiting here, preventing a concurrent resolution from moving epochs.
     let mut blocker = pool.get().await?;
     let lock = blocker.transaction().await?;
-    lock.query_one(
-        "SELECT repository_id FROM repository_ref_projection WHERE repository_id=$1 FOR UPDATE",
-        &[&repo],
-    )
-    .await?;
+    lock.query_one("SELECT repository_id FROM repository_ref_projection WHERE repository_id=$1 FOR UPDATE", &[&repo])
+        .await?;
     let worker_pool = pool.clone();
     let task = tokio::spawn(async move { events::acknowledge(&worker_pool, &second).await });
     let mut observed_block = false;
@@ -98,23 +79,13 @@ async fn verify(pool: &Pool) -> Result<()> {
         let mut resolver = pool.get().await?;
         let tx = resolver.transaction().await?;
         tx.batch_execute("SET LOCAL lock_timeout='100ms'").await?;
-        if tx
-            .query_one(
-                "SELECT id FROM repositories WHERE id=$1 FOR UPDATE",
-                &[&repo],
-            )
-            .await
-            .is_err()
-        {
+        if tx.query_one("SELECT id FROM repositories WHERE id=$1 FOR UPDATE", &[&repo]).await.is_err() {
             observed_block = true;
             break;
         }
         tx.rollback().await?;
     }
-    assert!(
-        observed_block,
-        "in-flight effect did not hold shared repository fence"
-    );
+    assert!(observed_block, "in-flight effect did not hold shared repository fence");
     lock.commit().await?;
     assert!(task.await??);
     // Reverse order: resolution acquires its fence first. A previously claimed
@@ -122,40 +93,23 @@ async fn verify(pool: &Pool) -> Result<()> {
     op.id = Uuid::new_v4();
     op.sequence = 3;
     events::publish(pool, &op, &[change()]).await?;
-    let stale = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 60)
-        .await?
-        .remove(0);
+    let stale = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 60).await?.remove(0);
     let stale_id = stale.event_id.clone();
     let mut resolver = pool.get().await?;
     let tx = resolver.transaction().await?;
-    tx.query_one(
-        "SELECT id FROM repositories WHERE id=$1 FOR UPDATE",
-        &[&repo],
-    )
-    .await?;
+    tx.query_one("SELECT id FROM repositories WHERE id=$1 FOR UPDATE", &[&repo]).await?;
     let worker_pool = pool.clone();
     let task = tokio::spawn(async move { events::acknowledge(&worker_pool, &stale).await });
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(!task.is_finished());
-    tx.execute(
-        "UPDATE repositories SET storage_generation=2 WHERE id=$1",
-        &[&repo],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM repository_ref_projection WHERE repository_id=$1",
-        &[&repo],
-    )
-    .await?;
+    tx.execute("UPDATE repositories SET storage_generation=2 WHERE id=$1", &[&repo]).await?;
+    tx.execute("DELETE FROM repository_ref_projection WHERE repository_id=$1", &[&repo]).await?;
     tx.commit().await?;
     assert!(task.await??);
     assert_eq!(
         pool.get()
             .await?
-            .query_one(
-                "SELECT count(*) FROM repository_ref_projection WHERE repository_id=$1",
-                &[&repo]
-            )
+            .query_one("SELECT count(*) FROM repository_ref_projection WHERE repository_id=$1", &[&repo])
             .await?
             .get::<_, i64>(0),
         0
@@ -163,10 +117,7 @@ async fn verify(pool: &Pool) -> Result<()> {
     assert_eq!(
         pool.get()
             .await?
-            .query_one(
-                "SELECT effect FROM event_deliveries WHERE event_id=$1 AND consumer='ref-index'",
-                &[&stale_id]
-            )
+            .query_one("SELECT effect FROM event_deliveries WHERE event_id=$1 AND consumer='ref-index'", &[&stale_id])
             .await?
             .get::<_, String>(0),
         "superseded_generation"
@@ -177,25 +128,17 @@ async fn verify(pool: &Pool) -> Result<()> {
     op.sequence = 4;
     op.storage_generation = 2;
     events::publish(pool, &op, &[change()]).await?;
-    let expired = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 1)
-        .await?
-        .remove(0);
+    let expired = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 1).await?.remove(0);
     let saved = expired.clone();
     let mut resolver = pool.get().await?;
     let tx = resolver.transaction().await?;
-    tx.query_one(
-        "SELECT id FROM repositories WHERE id=$1 FOR UPDATE",
-        &[&repo],
-    )
-    .await?;
+    tx.query_one("SELECT id FROM repositories WHERE id=$1 FOR UPDATE", &[&repo]).await?;
     let worker_pool = pool.clone();
     let task = tokio::spawn(async move { events::acknowledge(&worker_pool, &expired).await });
     tokio::time::sleep(Duration::from_millis(1200)).await;
     tx.commit().await?;
     assert!(!task.await??);
-    let current = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 60)
-        .await?
-        .remove(0);
+    let current = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 60).await?.remove(0);
     assert!(current.generation > saved.generation);
     assert!(!events::acknowledge(pool, &saved).await?);
     assert!(events::acknowledge(pool, &current).await?);
@@ -204,10 +147,7 @@ async fn verify(pool: &Pool) -> Result<()> {
     let repo2 = Uuid::new_v4();
     pool.get()
         .await?
-        .execute(
-            "INSERT INTO repositories(id,owner_id,name,state) VALUES($1,$2,'barrier','ready')",
-            &[&repo2, &actor],
-        )
+        .execute("INSERT INTO repositories(id,owner_id,name,state) VALUES($1,$2,'barrier','ready')", &[&repo2, &actor])
         .await?;
     op.id = Uuid::new_v4();
     op.repository_id = repo2;
@@ -215,10 +155,7 @@ async fn verify(pool: &Pool) -> Result<()> {
     op.storage_generation = 1;
     events::publish(pool, &op, &[change()]).await?;
     let claims = events::claim(pool, "ref-index", Uuid::new_v4(), 10, 60).await?;
-    let claim = claims
-        .into_iter()
-        .find(|c| c.repository_id == repo2)
-        .unwrap();
+    let claim = claims.into_iter().find(|c| c.repository_id == repo2).unwrap();
     let mut unknown = op.clone();
     unknown.id = Uuid::new_v4();
     unknown.sequence = 1;
@@ -233,27 +170,16 @@ async fn verify(pool: &Pool) -> Result<()> {
     let hash = "a".repeat(64);
     let mut resolver = pool.get().await?;
     let tx = resolver.transaction().await?;
-    tx.query_one(
-        "SELECT id FROM repositories WHERE id=$1 FOR UPDATE",
-        &[&repo2],
-    )
-    .await?;
+    tx.query_one("SELECT id FROM repositories WHERE id=$1 FOR UPDATE", &[&repo2]).await?;
     tx.execute("INSERT INTO recovery_resolutions(id,repository_id,old_generation,new_generation,incident_revision,inspected_fingerprint,volume_id,snapshot,reason) VALUES($1,$2,1,2,0,$3,$4,'{}','test modeled barrier')",&[&id,&repo2,&hash,&volume]).await?;
     tx.execute("INSERT INTO operation_resolutions(operation_id,repository_id,resolution_id,operation_digest) VALUES($1,$2,$3,$4)",&[&unknown.id,&repo2,&id,&hash]).await?;
-    tx.execute(
-        "UPDATE repositories SET storage_generation=2 WHERE id=$1",
-        &[&repo2],
-    )
-    .await?;
+    tx.execute("UPDATE repositories SET storage_generation=2 WHERE id=$1", &[&repo2]).await?;
     tx.commit().await?;
     assert!(events::acknowledge(pool, &claim).await?);
     assert_eq!(
         pool.get()
             .await?
-            .query_one(
-                "SELECT count(*) FROM repository_ref_projection WHERE repository_id=$1",
-                &[&repo2]
-            )
+            .query_one("SELECT count(*) FROM repository_ref_projection WHERE repository_id=$1", &[&repo2])
             .await?
             .get::<_, i64>(0),
         0
@@ -262,40 +188,24 @@ async fn verify(pool: &Pool) -> Result<()> {
     assert!(
         pool.get()
             .await?
-            .execute(
-                "UPDATE git_operations SET outcome='recorded' WHERE id=$1",
-                &[&unknown.id]
-            )
+            .execute("UPDATE git_operations SET outcome='recorded' WHERE id=$1", &[&unknown.id])
             .await
             .is_err()
     );
     assert!(
-        pool.get()
-            .await?
-            .execute(
-                "UPDATE git_operations SET evidence='{}' WHERE id=$1",
-                &[&unknown.id]
-            )
-            .await
-            .is_err()
+        pool.get().await?.execute("UPDATE git_operations SET evidence='{}' WHERE id=$1", &[&unknown.id]).await.is_err()
     );
     assert!(
         pool.get()
             .await?
-            .execute(
-                "DELETE FROM operation_resolutions WHERE operation_id=$1",
-                &[&unknown.id]
-            )
+            .execute("DELETE FROM operation_resolutions WHERE operation_id=$1", &[&unknown.id])
             .await
             .is_err()
     );
     assert_eq!(
         pool.get()
             .await?
-            .query_one(
-                "SELECT outcome FROM git_operations WHERE id=$1",
-                &[&unknown.id]
-            )
+            .query_one("SELECT outcome FROM git_operations WHERE id=$1", &[&unknown.id])
             .await?
             .get::<_, String>(0),
         "unknown"

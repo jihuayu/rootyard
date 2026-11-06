@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for parallel development boundaries, router composition, and schema baseline sync."""
+import json
 import re
 from pathlib import Path
 import sys
@@ -42,16 +43,15 @@ class ParallelBoundariesTest(unittest.TestCase):
         )
 
     def test_backup_tables_match_schema_baseline(self):
-        backup_rs = (ROOT / "src/backup.rs").read_text()
-        tables_match = re.search(
-            r"const TABLES:\s*&\[&str\]\s*=\s*&\[(.*?)\];",
-            backup_rs,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(tables_match, "TABLES constant missing in src/backup.rs")
-        rust_tables = set(re.findall(r'"([^"]+)"', tables_match.group(1)))
-        self.assertEqual(rust_tables, schema_baseline.EXPECTED_TABLES)
-        self.assertEqual(len(rust_tables), schema_baseline.TABLE_COUNT)
+        # The backup now consumes the frozen catalog directly. Native schema
+        # and backup suites check it against PostgreSQL; this is a wiring guard.
+        catalog_rs = (ROOT / "src/backup/catalog.rs").read_text()
+        self.assertIn('schema/' + schema_baseline.CATALOG_JSON_PATH.name, catalog_rs)
+        for name in ('catalog', 'restored_catalog', 'upgraded_catalog'):
+            value = json.loads((ROOT / 'schema' / f'{schema_baseline.LATEST_PREFIX}_{name}.json').read_text())
+            tables = {item['name'] for item in value['tables'] if item['kind'] == 'r'}
+            self.assertEqual(tables, schema_baseline.EXPECTED_TABLES)
+        self.assertIn('catalog::relations(FORMAT, true)', (ROOT / 'src/backup/snapshot.rs').read_text())
 
     def test_catalog_fixtures_exist(self):
         for path in (
@@ -81,14 +81,14 @@ class ParallelBoundariesTest(unittest.TestCase):
             mod_path = ROOT / "src" / f"{mod_name}.rs"
             self.assertTrue(mod_path.is_file(), f"Missing domain module {mod_path}")
             mod_source = mod_path.read_text()
-            self.assertIn(
-                "pub fn routes() -> Router<Arc<AppState>>",
+            self.assertRegex(
                 mod_source,
-                f"{mod_name}.rs must expose pub fn routes() -> Router<Arc<AppState>>",
+                r"pub fn routes\((?:state: Arc<AppState>)?\) -> Router<Arc<AppState>>",
+                f"{mod_name}.rs must expose its domain router",
             )
-            self.assertIn(
-                f".merge({mod_name}::routes())",
+            self.assertRegex(
                 lib_rs,
+                rf"\.merge\({mod_name}::routes\((?:state\.clone\(\))?\)\)",
                 f"src/lib.rs must merge {mod_name}::routes()",
             )
 

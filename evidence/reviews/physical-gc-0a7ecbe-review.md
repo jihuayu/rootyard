@@ -1,0 +1,17 @@
+# Physical GitFS GC review — test-only batch 0a7ecbe
+
+Status: **not approved for activation; two source-safety blockers identified.** The production switch remains `false`.
+
+Reviewed source `/workspace/rootyard-forge-lifecycle` at `0a7ecbef9cf30cd33f1fff6107ea3e955d38e314` and inspected the executor's native report `/workspace/shared/forge-storage-physical-test.json`. That report records 6/6 Rust/PostgreSQL/Git cases passing against test-only binary SHA-256 `d755f09d07d74adeb8a05da837b09a33ecfab4acdf3ecc2da978365fbc1b396a`, with the physical-delete constant temporarily enabled only for that build. I did not independently rerun this 6-case binary: the shared filesystem was at 99% use with 540 MiB free, and independent source review already found blockers that require a new integrated run.
+
+The source has useful safety controls: an exclusive PG advisory lease, backup barrier, local maintenance/read/write gates, five-second remote-reader quiescence delay, repository-row and retention-row locks, complete unreachable-closure grace check, per-object intent before unlink, crash reconciliation, packed-object handling, and test-only ENOSPC/restart injection. The report covers loose and packed deletion, CI ref retention, backup/fetch barriers, crash-after-unlink intent, ENOSPC retry, and a younger unreachable commit sharing an older blob.
+
+Blocking gaps:
+
+1. The acceptance source is not the latest active-reader implementation. Commit `0a7ecbe` does not contain Workspace `1974564` or `b3838d9`; the tested branch still has synchronous source Git calls followed only by `source_lease.ensure_active()`, including workspace clone in `src/workspaces/service.rs` and namespace view clone in `src/namespace_service/views.rs`. A PG session loss releases the advisory lock while such a process can continue. The five-second grace cannot prove that a command lasting longer than five seconds has stopped. Rebuild and rerun the destructive suite against the exact integrated source after those active-cancellation fixes land.
+
+2. `gc::has_external_roots()` omits durable namespace/view source OIDs. Migrations 093/096 persist `workspace_namespace_mounts.base_oid`, `workspace_views.source_oid`, `workspace_view_history.source_oid`, and changeset step OIDs in SQL without native refs pinning every source commit. A namespace can be created against a commit that is not a lasting branch tip; deleting/force-updating its last ref makes the source closure eligible for GC while the namespace still references it. Future view creation then cannot check out the stored base. Add conservative root coverage or native pins, plus a native case that creates a namespace on A, deletes A's last ref, expires tombstones, collects, and creates a view from that namespace.
+
+Additional capacity note: the existing packed-GC preflight reserves current `size-pack`, unreachable-object sizes, and 256 MiB, but not the size of reachable loose objects which repack also needs to write before pruning. This can under-reserve on a repository with a large loose reachable set. Forge acknowledged this and is changing it to include live loose size; the ENOSPC test demonstrates retry safety but does not establish the old estimate as a worst-case bound.
+
+Executor acknowledged both blockers. Keep the production switch disabled until guards and SQL roots are integrated, then rerun physical deletion against an immutable binary matching that integrated source.

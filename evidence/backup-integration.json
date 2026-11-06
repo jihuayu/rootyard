@@ -1,0 +1,101 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "synthetic_source",
+      "status": "passed",
+      "seconds": 2.5029,
+      "detail": {
+        "fresh_databases": 2,
+        "live_server_backup_rejected": true,
+        "unknown_and_unfinished_journal": true
+      }
+    },
+    {
+      "name": "offline_barriers_and_snapshot",
+      "status": "passed",
+      "seconds": 11.1557,
+      "detail": {
+        "snapshot_includes_commit_after_barrier_wait": true,
+        "inherited_volume_lock_rejected": true,
+        "backup_seconds": 8.939319861
+      }
+    },
+    {
+      "name": "unsafe_or_corrupt_inputs",
+      "status": "passed",
+      "seconds": 47.9634,
+      "detail": {
+        "corrupt_missing_extra_traversal_symlink_rejected_before_sql": true,
+        "existing_targets_and_overlap_refused": true,
+        "external_object_dependencies_refused": true
+      }
+    },
+    {
+      "name": "backup_barrier_failures",
+      "status": "passed",
+      "seconds": 9.3926,
+      "detail": {
+        "exporter_connection_loss_no_publication": true,
+        "queued_ddl_bounded_safe_failure": true
+      }
+    },
+    {
+      "name": "interrupted_restore_guard",
+      "status": "passed",
+      "seconds": 7.4012,
+      "detail": {
+        "killed_parent_while_native_pg_restore_blocked": true,
+        "no_orphan_import_or_partial_sql": true,
+        "persistent_guard_blocks_startup": true
+      }
+    },
+    {
+      "name": "post_backup_write_not_in_snapshot",
+      "status": "passed",
+      "seconds": 0.5289,
+      "detail": {
+        "post_backup_acknowledged_commit": true,
+        "seconds_after_backup_boundary": 76.288
+      }
+    },
+    {
+      "name": "new_environment_restore_clone_fsck",
+      "status": "passed",
+      "seconds": 7.1448,
+      "detail": {
+        "fresh_database_and_directory": true,
+        "separate_pg_server": false,
+        "standard_authenticated_clone_fsck_refs_content": true,
+        "revoked_and_read_only_auth_preserved": true,
+        "unknown_stays_blocked": true,
+        "restore_seconds": 6.454353494,
+        "backup_boundary_commits_missing": 0,
+        "post_backup_acknowledged_commits_not_recovered": 1,
+        "observed_backup_age_at_last_ack_seconds": 76.288,
+        "production_rpo_rto_guarantee": false
+      }
+    }
+  ],
+  "binary_sha256": "ec62504f2c699874fa78a336c9185aba75ade1969a029cabcd786a161a0a31b7",
+  "limitations": [
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise.",
+    "Unknown evidence preserved, not automatically resolved."
+  ],
+  "native_build": {
+    "version": 1,
+    "binary_sha256": "ec62504f2c699874fa78a336c9185aba75ade1969a029cabcd786a161a0a31b7",
+    "source_inputs_sha256": "5bff5d97c98d2537c91a3494ff7b585018d1244527417865af3151a8618e9965",
+    "workspace_commit": "13b28dda0263e3c6993aece7ec2ae620a032ad32",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard"
+    ],
+    "unstripped_binary_sha256": "5977c6e594c01fddc8087976d0a73d4a9d54093ee5eb0c42c63a5d8848ccf511",
+    "transformation": "strip --strip-debug"
+  }
+}

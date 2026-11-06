@@ -1,0 +1,11 @@
+# Physical GitFS GC exclusive-lease-loss review — `aaffe8b`
+
+Status: **blocking; physical deletion must remain disabled.** This is a source review of integrated HEAD `aaffe8b`, not a destructive run; the production flag is false and the worker currently fails closed for physical delete jobs.
+
+The exclusive repository barrier is a PostgreSQL transaction advisory lock. If its backend is terminated, PostgreSQL releases that lock immediately. The worker only observes loss on a 200ms poll (`src/storage_lifecycle/worker.rs:60-71`) and then asks the task to cancel. `gc::delete_due` performs synchronous object unlinks between liveness checks (`src/storage_lifecycle/gc.rs:125-173`). The local maintenance gate protects only callers in that process.
+
+The repository `FOR UPDATE` row lock inside `delete_due` does not close this race for all integrated paths. Browse authorization commits before waiting for the shared lease, and after it resumes `auth::verify_active` uses an unlocked repository `SELECT` before starting Git (`src/browse/handlers.rs:54-67`, `src/auth.rs:211-229`). Git receive similarly commits initial authorization before acquiring the publication guard/shared lease, then takes only the local write lock before native receive (`src/git_http.rs:163-195`). If the collector backend dies during deletion, these requests can acquire a new shared advisory lease and enter Git while the collector's separate delete transaction still holds its row lock and continues unlinking.
+
+A native regression must kill the collector's PG backend during paused destructive work and show a second-process reader and writer remain unable to enter Git until the collector's process is quiescent. If there is no cross-process admission fence or durable fail-closed blocker that survives collector connection loss, physical deletion must stay off.
+
+Separate still-open root-coverage gap in this integrated source: `has_external_roots` and `lock_retention_rows` cover workspaces, CI checkout jobs/runs, and open pulls only (`src/storage_lifecycle/gc.rs:61-88`). They omit namespace mounts, views/history, and changeset source OIDs. Forge's `0845f03` fix was not present at this HEAD. Executor test-only reports for later branches are preliminary until these fixes, active workspace Git guards, and pinned-OID view fetch are integrated and rerun together.

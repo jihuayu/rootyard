@@ -5,11 +5,11 @@ use crate::{
         git_read,
         models::{AppliedRefUpdate, RefTransactionRequest, RefTransactionResponse},
     },
-    db, events, journal, reliability, storage,
+    db::{self, Identity}, events, journal, reliability, storage,
 };
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -100,27 +100,57 @@ pub fn build_update_ref_stdin_payload(updates: &[AppliedRefUpdate]) -> Vec<u8> {
 pub async fn execute_ref_transaction(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
+    Extension(actor): Extension<Identity>,
     headers: HeaderMap,
     Json(input): Json<RefTransactionRequest>,
 ) -> Result<Response, Error> {
-    tokio::spawn(async move { execute_ref_transaction_inner(state, owner, name, headers, input).await })
+    tokio::spawn(async move { execute_ref_transaction_inner(state, owner, name, actor, headers, input, None).await })
         .await
         .map_err(Error::internal)?
+}
+
+/// The only in-process bypass for proposal retention refs is an absent-to-commit pin.
+/// No HTTP route exposes this operation; normal ref transactions reject the prefix.
+pub(crate) async fn create_proposal_pin(
+    state: Arc<AppState>,
+    owner: String,
+    name: String,
+    headers: HeaderMap,
+    proposal_id: Uuid,
+    target_oid: String,
+    storage_generation: i64,
+) -> Result<Response, Error> {
+    let request = RefTransactionRequest {
+        storage_generation: Some(storage_generation),
+        atomic: true,
+        updates: vec![crate::browse::models::RefUpdateInput {
+            ref_name: crate::namespace_service::proposal_pin_ref(proposal_id),
+            old_oid: None,
+            new_oid: Some(target_oid),
+        }],
+    };
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    tokio::spawn(async move {
+        execute_ref_transaction_inner(state, owner, name, actor, headers, request, Some(proposal_id)).await
+    })
+    .await
+    .map_err(Error::internal)?
 }
 
 async fn execute_ref_transaction_inner(
     state: Arc<AppState>,
     owner: String,
     name: String,
+    actor: Identity,
     headers: HeaderMap,
     input: RefTransactionRequest,
+    proposal_pin: Option<Uuid>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     auth::writable(&actor)?;
     let idem_key = auth::idempotency_key(&headers)?.map(str::to_owned);
-    let normalized_updates = input.normalize()?;
+    let normalized_updates = input.normalize_with_proposal_pin(proposal_pin)?;
 
-    if owner != actor.username || !db::valid_name(&owner) || !db::valid_name(&name) {
+    if !db::valid_name(&owner) || !db::valid_name(&name) {
         return Err(Error::not_found());
     }
     let repo_row = state
@@ -129,8 +159,8 @@ async fn execute_ref_transaction_inner(
         .await
         .map_err(Error::internal)?
         .query_opt(
-            &format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT),
-            &[&actor.id, &name],
+            &format!("{} WHERE ns.slug=$1 AND r.name=$2", db::REPO_SELECT),
+            &[&owner, &name],
         )
         .await
         .map_err(Error::internal)?
@@ -251,6 +281,16 @@ async fn execute_ref_transaction_inner(
         }
     }
 
+    let requested: Vec<journal::RefChange> = normalized_updates.iter().map(|u| journal::RefChange {
+        ref_name: u.ref_name.clone(), old_oid: u.old_oid.clone(), new_oid: u.new_oid.clone(),
+    }).collect();
+    crate::browse::policy::validate(&*tx, repo_id, &requested, &state.config.git, &repo_path, state.config.git_timeout).await?;
+    let owner_id: Uuid = tx.query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&repo_id])
+        .await.map_err(Error::internal)?.get(0);
+    Box::pin(crate::lfs::publication::validate_new_refs(&state, &tx, repo_id, owner_id, &requested)).await?;
+    Box::pin(crate::lfs::locks::validate_new_refs_with_client(&*tx, &repo_path,
+        &state.config.git, state.config.git_timeout, repo_id, actor.id, &requested)).await?;
+
     auth::verify_token(&tx, &actor, true).await?;
 
     let journal_root = state.storage.root.join("journal");
@@ -273,6 +313,18 @@ async fn execute_ref_transaction_inner(
         .seek(SeekFrom::Start(0))
         .map_err(Error::internal)?;
 
+    let operation = if let Some(proposal_id)=proposal_pin {
+        let intent=crate::namespace_service::ProposalIntent{
+            proposal_id,repository_id:repo_id,target_oid:requested[0].new_oid.clone(),
+        };
+        journal::begin_proposal(&state.storage.root,repo_id,actor.id,
+            actor.username.clone(),actor.token_id,current_generation,intent)
+    } else {
+        journal::begin(&state.storage.root,repo_id,actor.id,
+            actor.username.clone(),actor.token_id,current_generation)
+    }.map_err(Error::internal)?;
+    journal::record_ref_transaction_intent(&operation, &requested).map_err(Error::internal)?;
+
     let mut cmd = git_read::git_cmd(&state, repo_id)?;
     cmd.args(["update-ref", "--stdin", "-z", "--no-deref"]);
     if let Err(err) = crate::git_http::collect_git_output_input(
@@ -283,24 +335,37 @@ async fn execute_ref_transaction_inner(
     )
     .await
     {
-        if err.to_string().contains("timed out") {
-            return Err(Error::timeout());
+        // Git can report a definite CAS conflict or commit all refs and lose
+        // its acknowledgement. Observe the refs after the child is reaped,
+        // while the repository lock still excludes another writer.
+        let mut all_old = true;
+        let mut all_new = true;
+        for change in &requested {
+            let observed = match git_read::run_git(&state, repo_id,
+                &["show-ref", "--verify", "--hash", &change.ref_name], 128).await {
+                Ok(raw) => Some(String::from_utf8_lossy(&raw).trim().to_owned()),
+                Err(e) if e.0 == StatusCode::NOT_FOUND => Some(zero_oid.to_owned()),
+                Err(_) => None,
+            };
+            all_old &= observed.as_deref() == Some(change.old_oid.as_str());
+            all_new &= observed.as_deref() == Some(change.new_oid.as_str());
         }
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "reference transaction conflict",
-        ));
+        if all_old {
+            journal::finish(&operation).map_err(Error::internal)?;
+            tx.rollback().await.map_err(Error::internal)?;
+            reliability::complete(&state, Some(operation)).await.map_err(Error::internal)?;
+            return Err(Error(StatusCode::CONFLICT, "reference transaction conflict"));
+        }
+        if !all_new {
+            journal::mark_interrupted(&operation).map_err(Error::internal)?;
+            journal::finish(&operation).map_err(Error::internal)?;
+            tx.rollback().await.map_err(Error::internal)?;
+            let _ = reliability::reconcile(&state, repo_id, current_generation, false).await;
+            if err.to_string().contains("timed out") { return Err(Error::timeout()); }
+            return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "reference transaction outcome requires recovery"));
+        }
     }
-
-    let operation = journal::begin(
-        &state.storage.root,
-        repo_id,
-        actor.id,
-        actor.username.clone(),
-        actor.token_id,
-        current_generation,
-    )
-    .map_err(Error::internal)?;
+    journal::record_ref_transaction_receipt(&operation, &requested).map_err(Error::internal)?;
     journal::finish(&operation).map_err(Error::internal)?;
 
     let event_inputs: Vec<events::RefEventInput> = normalized_updates
@@ -344,6 +409,7 @@ async fn execute_ref_transaction_inner(
             repository_id: repo_id,
             actor_id: actor.id,
             token_id: actor.token_id,
+            service_principal_id: None,
             actor_name: actor.username.clone(),
             sequence: operation.sequence,
             storage_generation: current_generation,

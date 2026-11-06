@@ -1,13 +1,13 @@
 //! Track 2 (`F46`/`F47`): Git SHA-1 / SHA-256 object-format detection, Smart HTTP v1/v2
 //! capability negotiation, and dual-hash compatibility matrix drills.
 use crate::{
-    AppState, Error, auth,
+    AppState, Error, auth, db::Identity,
     browse::{git_read, handlers, models::{RefTransactionRequest, RefUpdateInput}},
     journal,
     lfs::models::{LFS_HASH_ALGO, verify_lfs_pointer_compatibility},
 };
 use axum::{
-    Json, extract::{Path, State}, http::{HeaderMap, StatusCode, header},
+    Json, extract::{Extension, Path, State}, http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -191,15 +191,21 @@ fn is_capability_admitted(cap: &str, repo_fmt: ObjectFormat) -> bool {
 }
 
 pub async fn get_object_format(
-    State(state): State<Arc<AppState>>, Path((owner, name)): Path<(String, String)>, headers: HeaderMap,
+    State(state): State<Arc<AppState>>, Path((owner, name)): Path<(String, String)>, Extension(actor): Extension<Identity>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
-    let _permit = handlers::acquire_git_slot(&state)?;
-    let object_format = detect_repo_object_format(&state, repo_id).await?;
     auth::finish_tx(tx, &actor, false).await?;
+    drop(client);
+    let _permit = handlers::acquire_git_slot(&state)?;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    let object_format = _lease.guard(detect_repo_object_format(&state, repo_id)).await??;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     Ok(handlers::json_ok(ObjectFormatStatusResponse {
         repository_id: repo_id, object_format, oid_hex_len: object_format.hex_len(),
         raw_oid_bytes: object_format.raw_len(), zero_oid: object_format.zero_oid().to_owned(),
@@ -211,9 +217,8 @@ pub async fn get_object_format(
 
 pub async fn negotiate_object_format(
     State(state): State<Arc<AppState>>, Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap, Json(req): Json<ProtocolNegotiateRequest>,
+    Extension(actor): Extension<Identity>, Json(req): Json<ProtocolNegotiateRequest>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     if !matches!(req.operation.as_str(), "git-upload-pack" | "git-receive-pack" | "browse" | "ref-transaction" | "lfs-batch")
         || req.protocol_version > 2
     {
@@ -225,9 +230,16 @@ pub async fn negotiate_object_format(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, is_write).await?;
+    auth::finish_tx(tx, &actor, is_write).await?;
+    drop(client);
     let _permit = handlers::acquire_git_slot(&state)?;
-    let repo_fmt = detect_repo_object_format(&state, repo_id).await?;
-    auth::finish_tx(tx, &actor, false).await?;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+    auth::verify_active(&state.pool, &actor, repo_id, is_write).await?;
+    let repo_fmt = _lease.guard(detect_repo_object_format(&state, repo_id)).await??;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo_id, is_write).await?;
 
     let proto_ver = if req.protocol_version == 0 { 1 } else { req.protocol_version };
     let server_caps = server_capabilities_for(repo_fmt, &req.operation, proto_ver);
@@ -344,9 +356,8 @@ async fn execute_single_format_drill(state: &AppState, base: &StdPath, format: O
 
 pub async fn run_object_format_drill(
     State(state): State<Arc<AppState>>, Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap, Json(req): Json<CompatibilityDrillRequest>,
+    Extension(actor): Extension<Identity>, Json(req): Json<CompatibilityDrillRequest>,
 ) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
     auth::writable(&actor)?;
     let target_fmt = match req.target_object_format {
         Some(ref s) => Some(ObjectFormat::from_str_name(s).ok_or_else(Error::bad_request)?),
@@ -355,7 +366,13 @@ pub async fn run_object_format_drill(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, true).await?;
+    auth::finish_tx(tx, &actor, true).await?;
+    drop(client);
     let _permit = handlers::acquire_git_slot(&state)?;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+    auth::verify_active(&state.pool, &actor, repo_id, true).await?;
 
     let journal_root = state.storage.root.join("journal");
     journal::mkdir(&journal_root).map_err(Error::internal)?;
@@ -377,13 +394,16 @@ pub async fn run_object_format_drill(
         && !is_capability_admitted("object-format=sha1", ObjectFormat::Sha256);
 
     if let Some(fmt) = target_fmt {
+        _lease.ensure_active()?;
+        auth::verify_active(&state.pool, &actor, repo_id, true).await?;
         let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
         let receipt = ObjectFormatReceipt { object_format: fmt, updated_by: Some(actor.id) };
         let bytes = serde_json::to_vec(&receipt).map_err(Error::internal)?;
         std::fs::write(repo_path.join("rootyard-object-format.json"), bytes).map_err(Error::internal)?;
     }
-    let repo_fmt = detect_repo_object_format(&state, repo_id).await?;
-    auth::finish_tx(tx, &actor, true).await?;
+    let repo_fmt = _lease.guard(detect_repo_object_format(&state, repo_id)).await??;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo_id, true).await?;
 
     let lfs_both = sha1_drill.lfs_verified && sha256_drill.lfs_verified && sha1_drill.lfs_content_sha256_oid == sha256_drill.lfs_content_sha256_oid;
     let passed = sha1_drill.browse_verified && sha256_drill.browse_verified && cross_format_ref_tx_rejected && cross_format_negotiation_rejected && lfs_both;

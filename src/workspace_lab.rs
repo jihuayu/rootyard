@@ -6,6 +6,8 @@ mod core_inner;
 pub mod core { pub use super::core_inner::*; pub(crate) fn private_dir(p: &std::path::Path) -> anyhow::Result<()> { if let Some(d) = p.parent() && !d.as_os_str().is_empty() && !d.exists() { private_dir(d)?; } super::core_inner::private_dir(p) } }
 #[path = "workspace_lab/crash_recovery.rs"]
 pub mod crash_recovery;
+#[path = "workspace_lab/fuse_mount.rs"]
+pub mod fuse_mount;
 #[path = "workspace_lab/ignore.rs"]
 pub mod ignore;
 #[path = "workspace_lab/manifest.rs"]
@@ -14,6 +16,8 @@ pub mod manifest;
 pub mod namespace;
 #[path = "workspace_lab/remote.rs"]
 pub mod remote;
+#[path = "workspace_lab/security.rs"]
+pub mod security;
 #[path = "workspace_lab/sync.rs"]
 pub mod sync;
 #[path = "workspace_lab/vfs.rs"]
@@ -26,26 +30,17 @@ pub mod writable_view;
 use anyhow::{Context, Result, bail, ensure};
 use std::{ffi::OsString, path::Path};
 
-pub use self::core::{
-    Entry, MAX_BYTES, MAX_ENTRIES, MAX_MANIFEST, Manifest, SCHEMA, Staging, Store, Workspace,
-};
+pub use self::core::{Entry, MAX_BYTES, MAX_ENTRIES, MAX_MANIFEST, Manifest, SCHEMA, Staging, Store, Workspace};
 pub use crash_recovery::{
-    CrashDrillReport, CrashJournal, CrashJournalEntry, CrashRecoveryReport, OverlayMountManifest,
-    OverlayOpReport, OverlayStatusReport,
+    CrashDrillReport, CrashJournal, CrashJournalEntry, CrashRecoveryReport, OverlayMountManifest, OverlayOpReport,
+    OverlayStatusReport,
 };
 pub use ignore::{IgnoreMatcher, PathClass, WorkspaceClassification};
 pub use manifest::{Changeset, ChangesetEntry, DirtyEntry, WorkspaceStatus};
-pub use namespace::{
-    BaseVectorEntry, NamespaceGitViewReport, NamespaceManifest, NamespaceViewReport,
-};
-pub use remote::{
-    RemoteCheckpointManifest, RemoteDirtyManifest, RemotePullReport, RemotePushReport,
-};
+pub use namespace::{BaseVectorEntry, NamespaceGitViewReport, NamespaceManifest, NamespaceViewReport};
+pub use remote::{RemoteCheckpointManifest, RemoteDirtyManifest, RemotePullReport, RemotePushReport};
 pub use sync::{ApplyReport, SyncDirtyReport};
-pub use vfs::{
-    VfsCatalogEntry, VfsDirtyEntry, VfsEvictReport, VfsHydrateReport, VfsMountManifest,
-    VfsStatusReport,
-};
+pub use vfs::{VfsCatalogEntry, VfsDirtyEntry, VfsEvictReport, VfsHydrateReport, VfsMountManifest, VfsStatusReport};
 pub use view::ReadonlyViewReport;
 pub use writable_view::{AgentLeaseEntry, CrossRepoCommitReceipt, NamespaceWriteReport};
 

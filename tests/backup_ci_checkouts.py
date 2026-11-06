@@ -66,7 +66,7 @@ class CheckoutBackupHarness(BackupCiPinsHarness):
         self.backup_command()
         self.cli('backup-verify', str(self.backup))
         manifest = json.loads((self.backup / 'manifest.json').read_text())
-        assert manifest['format'] == 5 and manifest['schema_versions'] == SCHEMA_VERSIONS
+        assert manifest['format'] == 6 and manifest['schema_versions'] == SCHEMA_VERSIONS
         assert self.raw.encode() not in (self.backup / 'metadata.dump').read_bytes()
         legacy_env = self.env.copy()
         legacy_env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target))
@@ -104,7 +104,7 @@ class CheckoutBackupHarness(BackupCiPinsHarness):
         assert status == 401 and b'PACK' not in body
         self.stop_mirror()
         self.stop()
-        return dict(format5_schema008=True, immutable_grants=True, permanent_tombstones=True,
+        return dict(format6_current_schema=True, immutable_grants=True, permanent_tombstones=True,
                     backup_then_cancel_then_restore_revokes_grant=True, raw_credential_not_persisted=True, live_old_bearer_denied_discovery_and_rpc=True,
                     ordinary_owner_restored_target_access=True, genuine_native_pin_and_issuance=True)
 
@@ -128,12 +128,13 @@ def legacy_restore(args):
         env.update(DATABASE_URL=h.target_db, ROOTYARD_DATA_DIR=str(h.target))
         h.run([args.binary, 'restore', str(h.backup), '--isolated', '--trust-backup', '--allow-legacy-schema007'], env=env)
         assert h.query(h.target_db, "SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == '1,2,3,6,7'
-        # A correctly checksummed format5 manifest around an actual007 dump is
+        # A correctly checksummed current-format manifest around an actual007 dump is
         # still rejected by the post-restore catalog check, with guard retained.
         hybrid = h.root / 'hybrid-archive'
         shutil.copytree(h.backup, hybrid, symlinks=True)
         changed = copy.deepcopy(manifest)
-        changed['format'] = 5
+        changed['format'] = 6
+        changed['lfs_objects'] = []
         changed['schema_versions'] = SCHEMA_VERSIONS
         changed['binary_sha256'] = hashlib.sha256(Path(args.binary).read_bytes()).hexdigest()
         catalogs = [json.loads(path.read_text()) for path in
@@ -151,9 +152,9 @@ def legacy_restore(args):
         h.run([args.binary, 'migrate'], env=env)
         assert h.query(h.target_db, "SELECT string_agg(version::text,',' ORDER BY version) FROM schema_migrations") == SCHEMA_VERSION_CSV
         assert h.query(h.target_db, 'SELECT count(*) FROM ci_checkout_jobs') == '0'
-        return dict(real_historical_binary_archive=True, no_manifest_rewriting=True,
+        return dict(real_historical_binary_archive=True, genuine_archive_manifest_unchanged=True,
                     explicit_legacy_opt_in_required=True, schema007_verified_before_upgrade=True,
-                    schema008_upgrade_empty_authority=True, mismatched_dump_rejected_guard_retained=True)
+                    current_schema_upgrade_empty_authority=True, mismatched_dump_rejected_guard_retained=True)
     finally:
         h.cleanup()
 
@@ -171,7 +172,7 @@ def main():
     h = CheckoutBackupHarness(args)
     success = False
     try:
-        h.case('format5_checkout_authority_restore', h.grants)
+        h.case('format6_checkout_authority_restore', h.grants)
         h.case('format4_real_legacy_restore_then_upgrade', lambda: legacy_restore(args))
         success = True
     except Exception as error:
@@ -179,6 +180,8 @@ def main():
     finally:
         h.cleanup()
     report = dict(passed=success, cases=h.results,
+                  binary_sha256=hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
+                  legacy_binary_sha256=hashlib.sha256(Path(args.legacy_binary).read_bytes()).hexdigest(),
                   limitations=['Synthetic loopback backup/restore does not establish a production RPO/RTO.',
                                'Restoring permanently revokes all issued checkout credentials; native pins and plans remain.'])
     if args.report:

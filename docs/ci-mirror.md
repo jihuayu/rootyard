@@ -41,7 +41,7 @@ logs. Protect the mirror's own external endpoint with HTTPS as well.
 
 ## Trusted-controller checkout flow
 
-This slice accepts an **exact SHA-1 commit**, not a branch/tag expression. A
+This slice accepts an **exact SHA-1 or SHA-256 commit**, not a branch/tag expression. A
 trusted controller uses its writable owner token only against the primary:
 
 ```http
@@ -49,12 +49,12 @@ POST /api/repos/{owner}/{name}/ci-pins
 Authorization: Bearer <controller-owner-token>
 Content-Type: application/json
 
-{"job_id":"<caller UUID>","target_oid":"<40 lowercase hex>","storage_generation":1}
+{"job_id":"<caller UUID>","target_oid":"<40 or 64 lowercase hex>","storage_generation":1}
 ```
 
 HTTP 200 is a verified durable source-retention receipt. Its fields are
 `version: 1`, `job_id`, `owner_id`, `repository_id`, `storage_generation`,
-`object_format: "sha1"`, `target_oid`,
+`object_format: "sha1"` or `"sha256"`, `target_oid`,
 `retention_ref: "refs/rootyard-ci/jobs/<job UUID>"`, and `state: "pinned"`.
 The writable owner is the controller authority in this release; there is no
 separate controller role. Job-scoped runner credentials are described below; ordinary read-only tokens cannot create
@@ -93,8 +93,54 @@ these two explicit steps. A source root can be pinned while a mirror is still
 unready. An old generation cannot become ready merely because its objects remain
 on disk. `storage_generation` is a storage/recovery fence, not `source_epoch`, a
 publication watermark, authorization policy version, or cross-repository version.
-Those source-publication watermark fields and scheduling are not
-implemented. There is no inferred expiry or automatic release.
+Source-publication watermarks and storage generations remain separate fences.
+There is no inferred expiry or automatic release of the source pin.
+
+## Fenced CI run and dependency checkout
+
+A protected branch can bind a required check context to an active webhook
+integration. Pull synchronization creates a fixed `ci_runs` candidate and a
+durable source pin. The integration calls `POST .../integrations/{hook_id}/runs/{run_id}/claim`
+with its secret and a `runner_id`. A successful claim returns the exact head,
+base, storage generation, attempt, lease generation, selected source, and a
+one-time `checkout` plan with a `ryj_` bearer. The bearer is stored only as a
+SHA-256 digest and is usable for a pinned upload-pack and its declared Git LFS objects. The
+integration calls `.../heartbeat` before each 60-second lease expires and
+`.../report` with the active attempt and lease generation. Candidate changes,
+reclaims, completed runs, disabled webhooks and revoked context bindings end
+checkout authority. A repeated valid result remains idempotent.
+
+Plans include full or target history, requested tags, every required LFS
+object and nested gitlink commit. A source administrator grants an integration
+read access to each separate submodule repository through its
+`PUT /api/repos/{owner}/{name}/ci-source-grants/{hook_id}` endpoint. Unsafe `.gitmodules` URLs, absent Git
+objects, missing or corrupt LFS bytes and unauthorized submodule sources stop
+issuance. The first claim delivers separate one-time tokens for each nested
+repository; a parent token never authorizes those sources. The mirror's
+`POST /api/repos/{owner}/{name}/ci-checkouts/{job}/prepare-dependencies`
+syncs and verifies every declared source and LFS object before declaring the
+checkout ready. Runners use stock Git against each plan's pinned `/ci/{oid}/git/...`
+URL and configure each nested submodule's URL and token from the manifest.
+Git LFS needs a credential helper for the corresponding job token; after a
+clone with `GIT_LFS_SKIP_SMUDGE=1`, run `git lfs install --local`, `git lfs pull`,
+then `git lfs checkout` in that pinned repository.
+
+An integration-triggered mirror preparation requires
+`ROOTYARD_CI_MIRROR_SOURCE_TOKEN=ryt_...` on the mirror, supplied explicitly
+by the operator. This transport token must have read access to each declared
+source repository; it stays on the mirror and is never returned to a runner.
+The mirror also needs the same `ROOTYARD_CI_MIRROR_AUDIENCE` as the primary and
+its own HTTPS `ROOTYARD_CI_MIRROR_PUBLIC_URL` for Git LFS download actions.
+The primary needs `ROOTYARD_CI_ORIGIN_PUBLIC_URL` to advertise its scoped LFS
+download actions when a run uses its bounded origin fallback. Origin job reads
+use the same one-time `ryj_` token and a locally materialized view containing
+only the exact planned Git closure; they do not expose ordinary primary refs.
+Without the configured transport token, preparation fails closed. Before each
+primary Git/LFS fetch and before publishing a mirror snapshot, the mirror
+rechecks the run lease, exact attempt, active binding and source grant.
+Active Git and CI LFS response producers recheck authority each second even
+when the consumer stops reading, and abort a transfer after cancellation,
+revocation, expiry or authority-service failure.
 
 ## Primary retention, recovery and backup
 
@@ -344,16 +390,19 @@ production resource controls for that SQL growth.
 
 An owner-token legacy pin uses alternates into a full snapshot and is **not** a
 privacy boundary. A job token never serves that view. It gets a separate
-`job-views/{storage_generation}-{target_oid}.git` containing only the target
-commit, all its ancestors, their trees and blobs. This grants full reachable
-history, not path-level secrecy; gitlinks do not authorize submodule repositories
-and LFS content is not included or automatically authorized.
+`job-views` Git repository containing only its declared target and tag object
+closures. Full history includes the target's ancestors. Target history writes
+a shallow boundary at the target commit, so an ordinary clone sees only that
+commit's history unless a declared tag independently includes older commits.
+Gitlinks require separate source grants and credentials, and LFS pointers
+require ready, independently authorized bytes.
 
 Preparation writes a fresh non-thin pack without delta/object reuse, checks its
-actual object set against the source target's full reachability set, verifies
+actual object set against the declared target and tag reachability set, verifies
 native `fsck --full --strict`, then fsyncs and atomically publishes. No alternates,
 external delta bases, unrelated objects, extra refs, replacement refs, grafts,
-shallow/promisor metadata, hooks or arbitrary configuration are allowed. Reuse
+promisor metadata, hooks or arbitrary configuration are allowed. Target-history
+views permit only the plan's exact shallow boundary. Reuse
 revalidates the strict on-disk grammar, exact target identity, native integrity
 and physical-object-set equality. Git replacement semantics are disabled.
 
@@ -362,8 +411,8 @@ them on each request. Object enumeration is capped at 64 MiB per command and
 fails closed beyond that bound. Existing Git process, CPU, memory, file-size and
 repository limits apply. The trusted operator controls the mirror filesystem;
 a hostile same-UID process able to race file mutations is outside this boundary.
-No scheduler, automatic fallback/sync, GC, shallow/partial clone promise, or
-production scale claim is added. Validate deployment-specific capacity separately.
+Target-history clones use stock Git shallow fetches; filter-based partial clone
+remains unsupported. Validate deployment-specific capacity separately.
 
 `tests/ci_job_checkouts.py` exercises native protocol v0/v2, exact target clones,
 known unrelated commit/blob wants, physical closure equality, endpoint scoping,

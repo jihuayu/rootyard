@@ -1,0 +1,27 @@
+{
+  "kind": "native_rootyard_git_enospc",
+  "binary_sha256": "e0f475a5b1d7b52d54bf8464abf28ef05de6ba61808842c98ed1978fea283956",
+  "harness_sha256": "bc597d035aa33b0f0a39513113b724ea4ed67e4b0d9f2460fd91bd1e83e7df14",
+  "docker_version": "29.9.2",
+  "container_image_id": "sha256:bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731",
+  "git_version": "git version 2.47.3",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "topology": "one Rust service in rootless Docker; private 128 MiB tmpfs; external PostgreSQL 17",
+  "mount_size_mib": 128,
+  "free_kib_at_push": 0,
+  "fault": "dd writes /data/pressure.bin until kernel returns ENOSPC",
+  "retained_acknowledged_oid": "ab54e47ba4c763846ac5cfaa8df87990b91e1969",
+  "rejected_oid": "ace27f7b85d850da0b51fd6ee486e6612dcbb327",
+  "push_exit_code_during_enospc": 1,
+  "push_stderr_excerpt": "error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503\nsend-pack: unexpected disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly\nEverything up-to-date\n",
+  "git_operation_outcome_counts_during_pressure": [
+    "recorded:2"
+  ],
+  "ref_after_removing_pressure": "ab54e47ba4c763846ac5cfaa8df87990b91e1969",
+  "native_fsck_after_pressure": "passed",
+  "post_pressure_retry_acked": true,
+  "limits": [
+    "local rootless Docker tmpfs rather than hardware disk",
+    "one small repository; no production scale or power-loss assertion"
+  ]
+}

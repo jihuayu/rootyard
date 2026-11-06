@@ -1,10 +1,28 @@
 # Rootyard 4-Tier E2E Test Readiness Report (`TEST_READY.md`)
 
-**Status**: `READY`
+**Status**: `HISTORICAL REFERENCE-MODEL RESULTS — NOT NATIVE ACCEPTANCE`
+**Current delivery**: [Registered issues and evidence gates](docs/registered-task-delivery.md).
+The counts below describe historical Python/reference-model runs. They do not
+prove that a Rust executable was invoked or that production paths passed.
+`tests/e2e_tiers.py` now requires native execution by default; use
+`--reference-only` explicitly to reproduce reference-model results.
 **Test Suite Entrypoint**: `tests/e2e_tiers.py`
 **Infrastructure Design Document**: `TEST_INFRA.md`
 **Total Executable Tests**: `591` (`255` Tier 1 + `255` Tier 2 + `54` Tier 3 + `27` Tier 4)
 **Verification Result**: `591 passed, 0 failed, 0 errors, 0 skipped` (Exit Code `0`)
+
+The count above is the recorded `tests/e2e_tiers.py` result. Its cluster
+fixture runs native Git on local directories but models nodes, leases, and
+failover in Python; it does not start 1/2/4 Rootyard services. The separate
+[native cluster workload](evidence/cluster-workload-integration.json) records
+real Rust processes, PostgreSQL, client push/fetch traffic, GC, retained
+objects, and owner restart. [Takeover](evidence/cluster-takeover-run.json),
+[source-only TCP partition](evidence/cluster-partition.json),
+[PostgreSQL streaming](evidence/cluster-pg-streaming.json),
+[WAL PITR](evidence/cluster-pg-pitr.json), and
+[disk pressure](evidence/cluster-disk-pressure.json) are distinct measured
+drills with the limits stated in each report. No model receipt satisfies a
+native deployment or production RPO/RTO gate.
 
 ---
 
@@ -99,7 +117,7 @@ All fixture classes in `tests/e2e_tiers.py` use real `/usr/bin/git` subprocesses
 13. **`SchemaBoundaryIntegrationFixture`**: Inspects live repository files (`src/db.rs`, `src/backup.rs`, `src/lib.rs`, `src/auth.rs`, `src/events.rs`, `src/dispatch.rs`, `migrations/*.sql`, `schema/*.json`, `tests/schema_baseline.py`, `scripts/check_design_docs.py`, `tests/test_parallel_boundaries.py`), anti-monolith line caps across all domain roots and submodules, Axum 0.8 route-table non-collision, Part 1 `050` closure, Track 5 51-feature / 591-test completeness, and Part 3 `060` convergence.
 14. **`ViewLabHistorySignatureEngine` (`Tier5ViewLabHistoryAndSignatureFixture`)**: Verifies `src/view_lab.rs` (`< 120` lines) and `src/view_lab/{models,namespace,projection,changeset}.rs` (`< 500` lines each), manages bare Git repos with fast-forward and lease-epoch fencing, creates multi-repo namespaces with `.sha256` companion manifests and durable `refs/rootyard/namespace-pins/*`, materializes `project-subdir` and `create-task-view` Git repositories, performs 3-way `git merge-tree --write-tree` changeset integration with failpoints `86`/`87` recovery, projects multi-repo history via `deterministic_history` and `task_snapshot`, and verifies OpenPGP/SSH source commit signatures and RFC 2104 HMAC-SHA256 `Rootyard-View-Signature` provenance trailers.
 15. **`ObjectFormatDualHashEngine` (`Tier5DualHashObjectFormatFixture`)**: Initializes and inspects real SHA-1 (`40`-hex / `20`-byte) and SHA-256 (`64`-hex / `32`-byte) bare Git repositories, verifies canonical empty-tree and zero-OID constants, validates `20`-byte SHA-1 and `32`-byte SHA-256 packv2 stream trailers, browses dual-hash commits/trees/blobs, verifies 64-hex SHA-256 Git LFS content addressing, and executes Smart HTTP v1/v2 `object-format` capability advertisement, negotiation, `409 Conflict` cross-format rejection, and the 4-combination `(sha1, sha256) x (v1, v2)` compatibility matrix drill.
-16. **`ShardingClusterBenchmarkEngine` (`Tier5MultiNodeShardingBenchmarkFixture`)**: Provisions 1-, 2-, and 4-node sharded Git clusters across 1024 deterministic virtual buckets, executes multi-threaded concurrent `push`, `fetch`, `gc`, `cache_evict`, and live primary->replica `failover` workloads with `rootyard-shard-fence.json` split-brain write rejection, audits 100% post-stress reachability of `refs/rootyard-ci/jobs/*` pinned roots, computes monotonic `p50_ms <= p95_ms <= p99_ms` latency percentiles and throughput, collects real Linux `/proc/self/{stat,status,io}` telemetry, and generates JSON and Markdown scaling benchmark reports.
+16. **`ShardingClusterBenchmarkEngine` (`Tier5MultiNodeShardingBenchmarkFixture`)**: Runs native Git operations on local bare repositories while Python models 1-, 2-, and 4-node placement, virtual buckets, fences, failover, and benchmark receipts. Its local object reachability checks exercise Git, but its modeled node state and timings are not evidence of networked Rootyard service behavior. Use the separate native reports linked above for measured service behavior.
 17. **`WorkspaceOverlayCrashRecoveryEngine` (`Tier5WorkspaceOverlayAndCrashRecoveryFixture`)**: Mounts Copy-on-Write (`lower`/`upper`/`work`/`merged`) workspace overlays over immutable `0444`/`0555` lower checkpoints, enforces multi-agent sandbox isolation, tracks upper modifications/additions, `.wh.<name>` whiteout tombstones on cross-layer file/directory renames, `0644`/`0755`/`0600` mode transitions, and `git add -f` overrides, and injects and recovers all 4 mid-write power-loss crash windows (`before_wal_fsync`, `after_wal_before_publish`, `after_publish_before_ack`, `index_update_interrupted`) with `.tmp-*` cleanup, `.git/index.lock` removal, WAL journal SHA-256 verification, and `git fsck --full --strict` validation.
 
 ---

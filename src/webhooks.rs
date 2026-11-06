@@ -1,5 +1,11 @@
 //! Track A: External CI Webhooks, HMAC-SHA256 Delivery & Auto PR CI Pipeline Orchestration.
 pub mod delivery;
+pub mod claims;
+pub mod background;
+pub mod trust;
+pub mod runs;
+pub(crate) mod claimed;
+pub mod mirrors;
 pub mod handlers;
 pub mod models;
 pub mod signing;
@@ -52,5 +58,29 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/repos/{owner}/{name}/integrations/{hook_id}/check-runs",
             post(handlers::ci_callback),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/trusted-contexts",
+            axum::routing::put(trust::bind).delete(trust::revoke),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/ci-source-grants/{hook_id}",
+            axum::routing::put(trust::source_grant).delete(trust::source_revoke),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/claim",
+            post(runs::claim),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/report",
+            post(runs::report),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/heartbeat",
+            post(runs::heartbeat),
+        )
+        .route(
+            "/api/repos/{owner}/{name}/ci-mirrors/{mirror_id}/heartbeat",
+            post(mirrors::heartbeat),
         )
 }

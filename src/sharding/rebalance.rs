@@ -6,9 +6,10 @@ use crate::{
     members::audit::record_audit_event,
     sharding::{
         failover::has_git_lock_files,
-        fencing::write_volume_marker_at,
+        transitions,
+        security::require_operator,
         models::{
-            self, BUCKET_FIELDS, DEFAULT_LEASE_TTL_SECONDS, REPO_ROUTE_FIELDS, RepoShardRoute,
+            self, BUCKET_FIELDS, REPO_ROUTE_FIELDS, RepoShardRoute,
             ShardNode, VIRTUAL_BUCKET_COUNT, VirtualBucket, VolumeFenceMarker, conflict, json,
             open_client, unix_now, valid_node_id,
         },
@@ -26,7 +27,6 @@ use serde_json::json as sjson;
 use std::{
     path::{Path as StdPath, PathBuf},
     sync::Arc,
-    time::Instant,
 };
 use uuid::Uuid;
 
@@ -221,6 +221,10 @@ pub async fn execute_rebalance(
     let (now, dry_run, bucket_id) = (input.now_unix.unwrap_or_else(unix_now), input.dry_run.unwrap_or(false), i32::from(input.bucket_id));
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, !dry_run).await?;
+    if !dry_run { require_operator(&tx, &actor).await?; }
+    if !dry_run {
+        return Err(conflict("rebalance requires measured repository transfer; use shard-migrate"));
+    }
     let _source = fetch_node(&tx, &input.source_node_id).await?.ok_or_else(Error::not_found)?;
     let target = fetch_node(&tx, &input.target_node_id).await?.ok_or_else(Error::not_found)?;
     validate_rebalance_target(&input.source_node_id, &target, now)?;
@@ -239,7 +243,7 @@ pub async fn execute_rebalance(
 
     if let Some(repo_id) = input.repository_id {
         let _guard = state.storage.write_lock(repo_id).await;
-        let meta = tx.query_opt("SELECT u.username, r.name, r.storage_generation FROM repositories r JOIN users u ON u.id = r.owner_id WHERE r.id = $1 FOR UPDATE", &[&repo_id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+        let meta = tx.query_opt("SELECT u.slug, r.name, r.storage_generation FROM repositories r JOIN namespaces u ON u.id = r.owner_id WHERE r.id = $1 FOR UPDATE", &[&repo_id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
         let (owner_name, repo_name, repo_gen): (String, String, i64) = (meta.get(0), meta.get(1), meta.get(2));
         let access = auth::authorize_repo_with_role(&tx, &actor, &owner_name, &repo_name, Role::Admin).await?;
         let repo_dir = state.storage.verify_path(repo_id).map_err(|_| conflict("bare Git repository volume verification failed"))?;
@@ -261,7 +265,6 @@ pub async fn execute_rebalance(
             let updated = RepoShardRoute::row(&r_row);
             (new_ep, token, fenced_ep) = (updated.route_epoch, updated.fencing_token, updated.fenced_epoch);
             let m = VolumeFenceMarker::from_route(&updated, st_gen, Some(input.source_node_id.clone()), now);
-            write_volume_marker_at(&repo_dir, &m)?;
             marker = Some(m);
             let snap = sjson!({ "operation": "rebalance", "bucket_id": input.bucket_id, "phases": REBALANCE_PHASES, "source_node_id": input.source_node_id, "target_node_id": input.target_node_id, "old_route_epoch": old_ep, "new_route_epoch": new_ep, "fencing_token": token, "storage_generation": st_gen });
             tx.execute("INSERT INTO shard_failover_operations (id, tenant_id, repository_id, old_primary_node_id, new_primary_node_id, old_route_epoch, new_route_epoch, fencing_token, storage_generation, state, reason, snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'promoted', $10, $11)", &[&op_id, &access.owner_id, &repo_id, &input.source_node_id, &input.target_node_id, &old_ep, &new_ep, &token, &st_gen, &reason_trimmed, &snap]).await.map_err(Error::internal)?;
@@ -273,7 +276,12 @@ pub async fn execute_rebalance(
         tx.execute("UPDATE repository_shard_routes SET primary_node_id = $2, read_replica_nodes = $3, route_epoch = route_epoch + 1, fencing_token = GREATEST(fencing_token, route_epoch) + 1, fenced_epoch = route_epoch, version = version + 1, updated_at = clock_timestamp() WHERE bucket_id = $1 AND NOT explicit_override", &[&bucket_id, &input.target_node_id, &b_rep_json]).await.map_err(Error::internal)?;
     }
 
-    finish(tx, &actor, !dry_run).await?;
+    if let Some(ref target) = marker {
+        let id = transitions::stage(&tx, &state, target).await?;
+        transitions::commit_and_publish(&state, tx, &actor, target, id).await?;
+    } else {
+        finish(tx, &actor, !dry_run).await?;
+    }
     let receipt = RebalanceReceipt {
         id: op_id, bucket_id: input.bucket_id, source_node_id: input.source_node_id, target_node_id: input.target_node_id,
         repository_id: input.repository_id, dry_run, state: if dry_run { "dry_run".into() } else { "completed".into() },
@@ -310,79 +318,16 @@ pub async fn execute_dr_drill(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
     headers: HeaderMap,
-    Json(input): Json<DrDrillRequest>,
+    Json(_input): Json<DrDrillRequest>,
 ) -> Result<Response, Error> {
-    let started = Instant::now();
     models::ensure_schema(&state.pool).await?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
-    auth::writable(&actor)?;
-    if !valid_node_id(&input.primary_node_id) || !valid_node_id(&input.standby_node_id) || input.target_rpo_secs < 0 || input.target_rto_ms < 1 || input.simulated_lag_secs.is_some_and(|v| v < 0) || input.simulated_takeover_ms.is_some_and(|v| v < 0) {
-        return Err(Error::bad_request());
-    }
-    if input.primary_node_id == input.standby_node_id {
-        return Err(conflict("primary_node_id and standby_node_id must differ"));
-    }
-    let (now, verify_rollback) = (input.now_unix.unwrap_or_else(unix_now), input.verify_rollback.unwrap_or(false));
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
-    let _guard = state.storage.write_lock(access.repo_id).await;
-    let repo_dir = state.storage.verify_path(access.repo_id).map_err(|_| conflict("bare Git repository volume verification failed"))?;
-    let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
-    let repo_gen: i64 = tx.query_one("SELECT storage_generation FROM repositories WHERE id = $1 FOR UPDATE", &[&access.repo_id]).await.map_err(Error::internal)?.get(0);
-
-    let _primary = fetch_node(&tx, &input.primary_node_id).await?.ok_or_else(Error::not_found)?;
-    let standby = fetch_node(&tx, &input.standby_node_id).await?.ok_or_else(Error::not_found)?;
-    if route.primary_node_id != input.primary_node_id {
-        return Err(conflict("repository primary_node_id does not match drill primary_node_id"));
-    }
-    if standby.status != "healthy" || standby.role == "fenced" {
-        return Err(conflict("standby shard node is unhealthy or fenced"));
-    }
-
-    let elapsed_ms = (started.elapsed().as_millis() as i64).max(1);
-    let (measured_rpo_secs, measured_rto_ms, rpo_met, rto_met) = evaluate_dr_drill_metrics(&route, &input, elapsed_ms);
-    let (sla_met, old_epoch, new_epoch) = (rpo_met && rto_met, route.route_epoch, route.route_epoch + 1);
-    let (new_token, lease_exp) = (route.fencing_token.max(new_epoch) + 1, now.saturating_add(DEFAULT_LEASE_TTL_SECONDS));
-    let base_gen = repo_gen.max(route.required_generation);
-
-    let (active_primary, fenced_node, rolled_back, new_gen, status_str, phases, err_msg, http_status) = if !sla_met {
-        (input.primary_node_id.clone(), None, true, base_gen, "sla_breach".into(), vec!["outage_simulated".into(), "fenced".into(), "sla_breach_aborted".into(), "rolled_back".into()], Some("disaster recovery drill RPO/RTO SLA breach".into()), StatusCode::CONFLICT)
-    } else if verify_rollback {
-        (input.primary_node_id.clone(), None, true, base_gen + 1, "passed".into(), vec!["outage_simulated".into(), "fenced".into(), "standby_promoted".into(), "read_write_verified".into(), "rollback_verified".into()], None, StatusCode::OK)
-    } else {
-        (input.standby_node_id.clone(), Some(input.primary_node_id.clone()), false, base_gen + 1, "passed".into(), vec!["outage_simulated".into(), "fenced".into(), "standby_promoted".into(), "read_write_verified".into()], None, StatusCode::OK)
-    };
-
-    if new_gen > repo_gen {
-        tx.execute("UPDATE repositories SET storage_generation = $2 WHERE id = $1", &[&access.repo_id, &new_gen]).await.map_err(Error::internal)?;
-    }
-    if let Some(ref f_node) = fenced_node {
-        tx.execute("UPDATE shard_nodes SET role = 'fenced', status = 'fenced', fenced_epoch = GREATEST(fenced_epoch, $2), version = version + 1, updated_at = clock_timestamp() WHERE node_id = $1", &[f_node, &old_epoch]).await.map_err(Error::internal)?;
-    }
-    tx.execute("UPDATE shard_nodes SET role = 'primary', status = 'healthy', lease_epoch = GREATEST(lease_epoch, $2), lease_expires_unix = GREATEST(lease_expires_unix, $3), version = version + 1, updated_at = clock_timestamp() WHERE node_id = $1", &[&active_primary, &new_epoch, &lease_exp]).await.map_err(Error::internal)?;
-
-    let rem_json = sjson!(route.read_replica_nodes.iter().filter(|n| *n != &active_primary).cloned().collect::<Vec<_>>());
-    let upd = format!("UPDATE repository_shard_routes SET primary_node_id = $3, read_replica_nodes = $4, explicit_override = $5, route_epoch = $6, fencing_token = $7, fenced_epoch = $8, required_generation = $9, draining = false, read_only_degraded = false, degraded_reason = '', in_flight_writes = 0, version = version + 1, updated_at = clock_timestamp() WHERE tenant_id = $1 AND repository_id = $2 RETURNING {REPO_ROUTE_FIELDS}");
-    let exp_ov = route.explicit_override || !rolled_back;
-    let r_row = tx.query_one(&upd, &[&access.owner_id, &access.repo_id, &active_primary, &rem_json, &exp_ov, &new_epoch, &new_token, &old_epoch, &new_gen]).await.map_err(Error::internal)?;
-    let updated_route = RepoShardRoute::row(&r_row);
-    write_volume_marker_at(&repo_dir, &VolumeFenceMarker::from_route(&updated_route, new_gen, fenced_node, now))?;
-
-    let receipt = DrDrillReceipt {
-        drill_id: Uuid::new_v4(), repository_id: access.repo_id, primary_node_id: input.primary_node_id,
-        standby_node_id: input.standby_node_id, active_primary_node_id: active_primary.clone(),
-        target_rpo_secs: input.target_rpo_secs, target_rto_ms: input.target_rto_ms,
-        measured_rpo_secs, measured_rto_ms, rpo_met, rto_met, sla_met, verify_rollback,
-        rolled_back, write_admitted: true, old_route_epoch: old_epoch, new_route_epoch: new_epoch,
-        fencing_token: new_token, storage_generation: new_gen, status: status_str, phases,
-        error: err_msg, updated_unix: now,
-    };
-    write_dr_drill_receipt_at(&repo_dir, &receipt)?;
-    let details = serde_json::to_value(&receipt).map_err(Error::internal)?;
-    record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.dr_drill", "shard_dr_drill", &active_primary, details).await?;
-    finish(tx, &actor, true).await?;
-    Ok(json(http_status, receipt))
+    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    require_operator(&tx, &actor).await?;
+    finish(tx, &actor, false).await?;
+    Err(conflict("simulated DR inputs cannot promote storage; use native cluster recovery workload"))
 }
 
 #[cfg(test)]

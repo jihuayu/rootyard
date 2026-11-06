@@ -130,13 +130,13 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         self.backup_result = json.loads(self.backup_command().stdout)
         self.cli('backup-verify', str(self.backup))
         manifest = json.loads((self.backup / 'manifest.json').read_text())
-        assert manifest['format'] == 5 and manifest['schema_versions'] == SCHEMA_VERSIONS
+        assert manifest['format'] == 6 and manifest['schema_versions'] == SCHEMA_VERSIONS
         assert all((self.backup / 'volume' / 'ci-pins' / name).read_bytes() == data
                    for name, data in self.source_metadata.items())
         return dict(root_created_before_source_delete_and_first_mirror=True,
                     unreachable_from_ordinary_refs_survives_gc=True,
                     exact_intent_and_receipt_backed_up=True, receipt_absence_fixture=True,
-                    generic_unknown_preserved=True, full_public_tables=TABLE_COUNT, backup_format=5)
+                    generic_unknown_preserved=True, full_public_tables=TABLE_COUNT, backup_format=6)
 
     def corrupt_backups_rejected(self):
         relative = Path('volume/ci-pins') / self.repo['id'] / (self.job + '.pinned.json')
@@ -165,7 +165,7 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         self.env.update(DATABASE_URL=self.db, ROOTYARD_DATA_DIR=str(self.target))
         self.mirror_env['DATABASE_URL'] = self.db
         self.bare = self.target / 'repos' / (self.repo['id'] + '.git')
-        assert self.all_rows() == self.source_rows
+        self.assert_restored_rows()
         self.assert_catalog(RESTORED_CATALOG_JSON_PATH)
         assert self.metadata() == self.source_metadata
         assert (self.target / '.volume-id').read_bytes() == self.marker
@@ -194,7 +194,7 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         clone = self.clone_at(self.target_oid, 'restored-first-ever-mirror-clone')
         assert (clone / 'ci-only.txt').read_text() == 'retained before any mirror synchronization\n'
         self.prepare(token=self.bob, code=404)
-        return dict(all_16_tables_exact_before_startup=True, volume_metadata_and_roots_exact=True,
+        return dict(durable_rows_exact_and_authority_rotated_before_startup=True, volume_metadata_and_roots_exact=True,
                     pending_receipt_retry_without_new_operation=True,
                     private_tenant_and_read_only_enforced=True,
                     first_mirror_sync_after_restore_and_source_deletion=True,

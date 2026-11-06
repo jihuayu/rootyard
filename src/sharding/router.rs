@@ -4,7 +4,7 @@ use crate::{
     AppState, Error,
     auth::{self, Role, finish_tx as finish},
     members::audit::record_audit_event,
-    sharding::models::{
+    sharding::{security::require_operator, models::{
         BUCKET_FIELDS, BucketsQuery, ConfigureRouteInput, DEFAULT_CAPACITY_BYTES,
         DEFAULT_LEASE_TTL_SECONDS, DEFAULT_NODE_ENDPOINT, DEFAULT_NODE_ID, NodeLeaseInput,
         NodesQuery, PatchNodeInput, REPO_ROUTE_FIELDS, RepoShardRoute, ResolveRouteQuery,
@@ -12,7 +12,7 @@ use crate::{
         VIRTUAL_BUCKET_COUNT, VirtualBucket, conflict, deterministic_bucket_id, json, open_client,
         unix_now, valid_endpoint, valid_node_id, valid_node_role, valid_node_status,
         valid_replica_list, valid_route_op,
-    },
+    }},
 };
 use axum::{
     Json,
@@ -241,7 +241,7 @@ pub async fn upsert_node(State(state): App, headers: HeaderMap, Json(input): Jso
     };
 
     let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::verify_token(&tx, &actor, true).await?;
+    require_operator(&tx, &actor).await?;
     let code = if fetch_node(&tx, &input.node_id).await?.is_some() { StatusCode::OK } else { StatusCode::CREATED };
     let sql = format!(
         "INSERT INTO shard_nodes (node_id, endpoint, role, status, capacity_bytes, used_bytes, lease_epoch, lease_expires_unix, fenced_epoch, version) \
@@ -278,7 +278,7 @@ pub async fn patch_node(State(state): App, Path(node_id): Path<String>, headers:
         return Err(Error::not_found());
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::verify_token(&tx, &actor, true).await?;
+    require_operator(&tx, &actor).await?;
     let current = fetch_node(&tx, &node_id).await?.ok_or_else(Error::not_found)?;
     if input.expected_version.is_some_and(|v| v != current.version) {
         return Err(conflict("shard node version conflict"));
@@ -314,7 +314,7 @@ pub async fn renew_node_lease(State(state): App, Path(node_id): Path<String>, he
         return Err(Error::bad_request());
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::verify_token(&tx, &actor, true).await?;
+    require_operator(&tx, &actor).await?;
     let current = fetch_node(&tx, &node_id).await?.ok_or_else(Error::not_found)?;
     if current.role == "fenced" || current.status == "fenced" || current.status == "offline" {
         return Err(conflict("cannot renew lease on fenced or offline shard node"));
@@ -370,11 +370,18 @@ pub async fn upsert_bucket(State(state): App, headers: HeaderMap, Json(input): J
         return Err(Error::bad_request());
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::verify_token(&tx, &actor, true).await?;
+    require_operator(&tx, &actor).await?;
     validate_placement_nodes(&tx, &input.primary_node_id, &replicas).await?;
 
     let b_sql = format!("SELECT {BUCKET_FIELDS} FROM shard_virtual_buckets WHERE bucket_id = $1");
     let existing = tx.query_opt(&b_sql, &[&input.bucket_id]).await.map_err(Error::internal)?.map(|r| VirtualBucket::row(&r));
+    let affected: i64 = tx.query_one(
+        "SELECT COUNT(*) FROM repository_shard_routes WHERE bucket_id=$1 AND NOT explicit_override",
+        &[&input.bucket_id],
+    ).await.map_err(Error::internal)?.get(0);
+    if affected > 0 && existing.as_ref().is_none_or(|b| b.primary_node_id != input.primary_node_id || b.read_replica_nodes != replicas) {
+        return Err(conflict("bucket placement has repositories; use verified repository migration"));
+    }
     if input.expected_route_epoch.is_some_and(|e| e != existing.as_ref().map_or(0, |b| b.route_epoch)) {
         return Err(conflict("virtual bucket route_epoch conflict"));
     }
@@ -425,6 +432,13 @@ pub async fn configure_repo_route(State(state): App, Path((owner, name)): RepoPa
 
     let primary_id = input.primary_node_id.unwrap_or_else(|| current.primary_node_id.clone());
     let replicas = input.read_replica_nodes.unwrap_or_else(|| current.read_replica_nodes.clone());
+    if primary_id != current.primary_node_id || replicas != current.read_replica_nodes {
+        require_operator(&tx, &actor).await?;
+        return Err(conflict("placement changes require verified data migration"));
+    }
+    if input.replica_watermarks.as_ref().is_some_and(|w| w != &current.replica_watermarks) {
+        return Err(conflict("replica watermarks require measured data replication"));
+    }
     if !valid_node_id(&primary_id) || !valid_replica_list(&primary_id, &replicas) {
         return Err(Error::bad_request());
     }

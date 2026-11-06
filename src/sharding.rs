@@ -6,6 +6,12 @@ pub mod fencing;
 pub mod models;
 pub mod rebalance;
 pub mod router;
+pub mod security;
+pub mod transitions;
+pub mod transport;
+pub mod migration;
+pub mod local_fence;
+pub mod controller;
 
 use crate::AppState;
 use axum::{
@@ -38,6 +44,8 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/shards/rebalance",
             get(rebalance::list_rebalances).post(rebalance::execute_rebalance),
         )
+        .route("/api/repos/{owner}/{name}/shard-migrate", post(migration::migrate_repository))
+        .route("/internal/shards/{repo_id}/snapshot/{op_id}", post(migration::receive_snapshot))
         .route(
             "/api/shards/benchmark",
             get(benchmark::list_cluster_benchmarks).post(benchmark::run_cluster_benchmark),

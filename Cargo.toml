@@ -15,6 +15,10 @@ name = "rootyard-pando-lab"
 path = "src/bin/rootyard-pando-lab.rs"
 required-features = ["pando-lab"]
 
+[[bin]]
+name = "rootyard-vfs-mount"
+path = "src/bin/rootyard-vfs-mount.rs"
+
 [dependencies]
 anyhow = "1"
 async-stream = "0.3"
@@ -24,18 +28,26 @@ base64 = "0.22"
 bytes = "1"
 deadpool-postgres = "0.14"
 fs2 = "0.4"
+fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
 futures-util = "0.3"
 hex = "0.4"
+hmac = "0.12"
 libc = "0.2"
 rand = "0.9"
-rdkafka = { version = "0.39", default-features = false, features = ["tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "ssl"] }
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-serde_json-1"] }
+tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1.9"
 
 [dev-dependencies]
 tempfile = "3"
