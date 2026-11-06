@@ -1,8 +1,17 @@
 # Rootyard 实现状态
 
-核对基线：2026-11-04，main [`1fd05a393fe24653687fa3e868f9dca2fb0c9a67`](https://github.com/jihuayu/rootyard/commit/1fd05a393fe24653687fa3e868f9dca2fb0c9a67)。本页说明这份代码具有什么边界，不承诺后续 main 或未合并分支的状态，也不把既有测试报告当作本次重新执行的结果。
+历史基线：2026-11-04，main [`1fd05a393fe24653687fa3e868f9dca2fb0c9a67`](https://github.com/jihuayu/rootyard/commit/1fd05a393fe24653687fa3e868f9dca2fb0c9a67)。本页历史快照说明该代码具有什么边界，不承诺后续 main，也不把既有测试报告当作本次重新执行的结果。
 
-当前未合并集成分支的逐项实现、真实执行和独立审阅状态见 [46 项任务台账](../registered-task-delivery.md)。2026-11-06 已执行真实 PG/Git/Garage/Vault/FUSE/bubblewrap/Chromium 与本机集群故障测试；每份证据仅覆盖其记录的版本和拓扑。下表保留上述历史 main 的边界，不能用作新分支的验收结论。
+当前 main 核对基线：2026-11-07，[`6d2f0b845525921339fa045868c2029d6dc42923`](https://github.com/jihuayu/rootyard/commit/6d2f0b845525921339fa045868c2029d6dc42923)。PR #49–#55 已合并；逐条验收证据、met/unproven 分类和未关闭边界见 [主分支验收审计](../acceptance/main-6d2f0b8-audit.md) 与 [46 项任务台账](../registered-task-delivery.md)。2026-11-06 至 2026-11-07 的执行覆盖真实 PG/Git/Garage/Vault/FUSE/bubblewrap/Chromium、本机集群故障与真实客户端流量；每份证据只覆盖其记录的版本和拓扑。下表保留历史 main 的边界，不能用作当前 main 的验收结论。
+
+## 当前 main（6d2f0b8）已合并能力与未验收边界
+
+- Pando 生产网关、双阶段 GitFS↔Pando 迁移/回滚、加密 pack CAS 与 transition 备份已合并（PR #53）；`tests/pando_transition_service.py` 需要真实 Garage/Vault，本次审计未重跑。
+- 独立 ref 写入使用持久 `git_ref_admissions` 与 epoch fence（PR #51，迁移 126）；物理 GitFS GC 使用迁移 127 admission fence、完整 retention roots、quarantine 与幂等删除（PR #52）。
+- SHA-256 已贯通仓库创建、Forge OID admission 与 service 测试（PR #54）；镜像/pin/checkout/restore 的端到端矩阵与 SHA-256 CI checkout 503 修复仍未完成。
+- 本地集群真实 1/2/4-node workload、PG streaming/PITR、磁盘 ENOSPC、迁移和 controller/fence 报告已提交；当前 main 的 controller post-promotion push 409，以及同时具备 HA failover 与新部署恢复的验收仍未完成。
+- Workspace 惰性 VFS 水化已合并（PR #50）；Agent/CI sandbox 已实现 bwrap dev 模式、PTY/artifact 和 cgroup 代码，但聚合 cgroup 资源耗尽、崩溃清理和 cgroup artifact 验收仍未完成。
+- 未验收：跨主机物理 fencing、真实多主机 PostgreSQL/DCS HA、公有云 KMS/HSM、跨数据中心网络分区、生产规模长稳压测，以及 #48 中所有子项的关闭。
 
 ## 历史 main 基线实现
 
