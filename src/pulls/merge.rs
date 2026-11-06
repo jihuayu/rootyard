@@ -57,20 +57,20 @@ async fn merge_pull_inner(
     }
     let key = idempotency_key(&headers)?.map(str::to_owned);
 
-    if owner != actor.username || !db::valid_name(&owner) || !db::valid_name(&name) {
-        return Err(Error::not_found());
-    }
-    auth::writable(&actor)?;
-
+    let (repo_id, tenant_id) = {
+        let mut client = state.pool.get().await.map_err(Error::internal)?;
+        let tx = client.transaction().await.map_err(Error::internal)?;
+        let access =
+            auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
+        finish(tx, &actor, true).await?;
+        (access.repo_id, access.owner_id)
+    };
     let repo_row = state
         .pool
         .get()
         .await
         .map_err(Error::internal)?
-        .query_opt(
-            &format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT),
-            &[&actor.id, &name],
-        )
+        .query_opt(&format!("{} WHERE r.id=$1", db::REPO_SELECT), &[&repo_id])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
@@ -93,17 +93,18 @@ async fn merge_pull_inner(
             "Git capacity exhausted; retry later",
         )
     })?;
-    let _write_guard = tokio::time::timeout(
-        state.config.git_timeout,
-        state.storage.write_lock(repo.id),
-    )
-    .await
-    .map_err(|_| Error::timeout())?;
+    let _write_guard =
+        tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo.id))
+            .await
+            .map_err(|_| Error::timeout())?;
     reliability::before_push(&state, &repo)
         .await
         .map_err(Error::internal)?;
 
-    let repo_path = state.storage.verify_path(repo.id).map_err(Error::internal)?;
+    let repo_path = state
+        .storage
+        .verify_path(repo.id)
+        .map_err(Error::internal)?;
     let quota = state.config.max_repo_bytes;
     let size = tokio::task::spawn_blocking({
         let p = repo_path.clone();
@@ -149,8 +150,7 @@ async fn merge_pull_inner(
             "strategy": strategy_str,
             "commit_message": input.commit_message,
         });
-        if let Some(saved) =
-            creation_replay(&tx, actor.id, repo_id, k, &canonical_request).await?
+        if let Some(saved) = creation_replay(&tx, tenant_id, repo_id, k, &canonical_request).await?
         {
             finish(tx, &actor, true).await?;
             return Ok(json(StatusCode::OK, saved));
@@ -162,7 +162,7 @@ async fn merge_pull_inner(
             &format!(
                 "SELECT {PULL_FIELDS} FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 FOR UPDATE"
             ),
-            &[&actor.id, &repo_id, &number],
+            &[&tenant_id, &repo_id, &number],
         )
         .await
         .map_err(Error::internal)?
@@ -173,10 +173,7 @@ async fn merge_pull_inner(
         return Err(Error(StatusCode::CONFLICT, "pull request is not open"));
     }
     if pull.version != input.expected_version {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "pull request version conflict",
-        ));
+        return Err(Error(StatusCode::CONFLICT, "pull request version conflict"));
     }
     if pull.head_oid != input.expected_head_oid {
         return Err(Error(
@@ -193,7 +190,7 @@ async fn merge_pull_inner(
 
     let policy = rules::evaluate_branch_policy(
         &tx,
-        actor.id,
+        tenant_id,
         repo_id,
         number,
         &pull.base_ref,
@@ -311,6 +308,19 @@ async fn merge_pull_inner(
         commit_oid
     };
 
+    crate::lfs::publication::validate_new_refs(
+        &state,
+        &tx,
+        repo_id,
+        tenant_id,
+        &[journal::RefChange {
+            ref_name: pull.base_ref.clone(),
+            old_oid: input.expected_base_oid.clone(),
+            new_oid: merged_oid.clone(),
+        }],
+    )
+    .await?;
+
     auth::verify_token(&tx, &actor, true).await?;
 
     let op = journal::begin(
@@ -388,7 +398,7 @@ async fn merge_pull_inner(
                  RETURNING {PULL_FIELDS}"
             ),
             &[
-                &actor.id,
+                &tenant_id,
                 &repo_id,
                 &number,
                 &input.expected_version,
@@ -404,7 +414,7 @@ async fn merge_pull_inner(
         ))?;
     let merged_pull = PullRequest::row(&updated_row);
     let response_val = serde_json::to_value(&merged_pull).map_err(Error::internal)?;
-    record_creation(&tx, actor.id, repo_id, key.as_deref(), &response_val).await?;
+    record_creation(&tx, tenant_id, repo_id, key.as_deref(), &response_val).await?;
     finish(tx, &actor, true).await?;
     drop(client);
 

@@ -1,6 +1,7 @@
 //! Track 2B: Git LFS Batch API and verified streaming object transfers.
 pub mod handlers;
 pub mod models;
+pub mod publication;
 pub mod storage;
 
 use crate::AppState;
