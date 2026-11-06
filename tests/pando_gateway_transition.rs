@@ -343,3 +343,45 @@ async fn gitfs_write_admission_rejects_backend_switch_and_transition_fence() {
     assert_eq!(rootyard::reliability::ensure_gitfs_current(&state, &repo).await.unwrap_err().0, StatusCode::CONFLICT);
     let _ = owner;
 }
+
+#[tokio::test]
+async fn worker_generation_function_requires_delivery_privilege_not_ownership() {
+    let Ok(url) = std::env::var("ROOTYARD_TEST_DATABASE_URL") else { return };
+    let pool = db::pool(&url).unwrap();
+    db::migrate(&pool).await.unwrap();
+    let (repo, _owner, _slug) = fixture(&pool, "worker-generation").await;
+    let client = pool.get().await.unwrap();
+    let superuser: bool =
+        client.query_one("SELECT rolsuper FROM pg_roles WHERE rolname=current_user", &[]).await.unwrap().get(0);
+    if !superuser {
+        return;
+    }
+    let positive = format!("rg_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
+    let tx = client.transaction().await.unwrap();
+    tx.batch_execute(&format!(
+        "CREATE ROLE \"{positive}\" NOLOGIN; GRANT USAGE ON SCHEMA public TO \"{positive}\"; \
+         GRANT UPDATE ON event_deliveries TO \"{positive}\"; SET LOCAL SESSION AUTHORIZATION \"{positive}\""
+    ))
+    .await
+    .unwrap();
+    let generation: i64 = tx
+        .query_one("SELECT rootyard_worker_repository_generation($1,current_schema())", &[&repo])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(generation > 0);
+    tx.rollback().await.unwrap();
+
+    let negative = format!("rg_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
+    let tx = client.transaction().await.unwrap();
+    tx.batch_execute(&format!(
+        "CREATE ROLE \"{negative}\" NOLOGIN; GRANT USAGE ON SCHEMA public TO \"{negative}\"; \
+         SET LOCAL SESSION AUTHORIZATION \"{negative}\""
+    ))
+    .await
+    .unwrap();
+    let error =
+        tx.query_one("SELECT rootyard_worker_repository_generation($1,current_schema())", &[&repo]).await.unwrap_err();
+    assert_eq!(error.as_db_error().map(|error| error.code().code()), Some("42501"));
+    tx.rollback().await.unwrap();
+}
