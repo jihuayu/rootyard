@@ -64,6 +64,7 @@ async fn verify(pool: &Pool) -> Result<()> {
         repository_id: repo,
         actor_id: actor,
         token_id,
+        service_principal_id: None,
         actor_name: "alice".into(),
         sequence: 1,
         storage_generation: 1,
