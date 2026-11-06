@@ -79,7 +79,9 @@ native Git, and a built Rust binary. The workload report measures 1/2/4
 processes with distinct volumes, Git push/fetch, acknowledged-commit survival,
 and process restart RTO. The takeover report also exercises a paused admitted
 Git writer, stale replica rejection, a physically stopped source session,
-duplicate node identities, and old-volume write denial. Neither report proves
+duplicate node identities, an unusable trusted fence directory that blocks
+promotion, controller restart without duplicate promotion, and old-volume
+write denial. Neither report proves
 cross-host storage fencing, PostgreSQL leader failover, kernel-level
 network partition recovery, or a production RPO/RTO service-level objective. A multi-host
 deployment must supply an external supported fencing and PostgreSQL HA system
