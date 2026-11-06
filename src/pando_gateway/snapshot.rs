@@ -3,7 +3,7 @@
 use super::pack_store::PackStore;
 use crate::{AppState, Error, db::Repository, git_http, storage::read_leases::Lease};
 use anyhow::{Result, ensure};
-use std::{os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+use std::{collections::BTreeMap, os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf}, process::Stdio, sync::Arc, time::Duration};
 use tokio::{process::Command, time::Instant};
 use uuid::Uuid;
@@ -18,6 +18,7 @@ pub struct Snapshot {
     path: PathBuf,
     pub storage_generation: i64,
     pub ref_generation: i64,
+    pub refs: BTreeMap<String, String>,
 }
 impl Snapshot {
     pub fn path(&self) -> &Path { &self.path }
@@ -71,7 +72,7 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
             WHERE repository_id=$1 ORDER BY ref_name LIMIT $2",
             &[&repo.id,&((MAX_REFS + 1) as i64)]).await?;
         ensure!(rows.len() <= MAX_REFS, "Pando ref snapshot exceeds bounded view");
-        let refs: Vec<(String,String)> = rows.into_iter().map(|r| (r.get(0),r.get(1))).collect();
+        let refs: BTreeMap<String,String> = rows.into_iter().map(|r| (r.get(0),r.get(1))).collect();
         let mut total_declared = 0u64;
         for pack_id in &pack_ids {
             let pack = client.query_one("SELECT manifest FROM pando_pack_manifests \
@@ -95,7 +96,7 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         let path = root.join(format!(".snapshot-{}", Uuid::new_v4()));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-        let snapshot = Snapshot { path, storage_generation: generation, ref_generation };
+        let snapshot = Snapshot { path, storage_generation: generation, ref_generation, refs };
         let format_arg = format!("--object-format={}", repo.object_format);
         run_git(state, snapshot.path(), &["init", "--bare", &format_arg], lease, deadline).await?;
         let store = PackStore::from_env(state.storage.root.join("pando-pack-work"),
@@ -114,7 +115,7 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
             ensure!(total_bytes <= state.config.max_repo_bytes,
                 "Pando snapshot exceeds repository quota");
         }
-        for (name, oid) in &refs {
+        for (name, oid) in &snapshot.refs {
             ensure!(oid.len() == if repo.object_format == "sha256" {64} else {40} &&
                 oid.bytes().all(|b| b.is_ascii_hexdigit()), "Pando ref has wrong object format");
             run_git(state, snapshot.path(), &["update-ref", "--no-deref", name, oid],

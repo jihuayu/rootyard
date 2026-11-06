@@ -6,3 +6,5 @@ pub mod pack_store;
 pub mod snapshot;
 #[path = "pando_gateway/backup.rs"]
 pub mod backup;
+#[path = "pando_gateway/prepare.rs"]
+pub mod prepare;
