@@ -49,8 +49,8 @@ pub async fn insert_audit_event(
         .query_one(
             &format!(
                 "INSERT INTO repository_audit_log \
-                 (id, tenant_id, repository_id, actor_id, actor_name, action, target_type, target_name, details, created_unix) \
-                 VALUES ((SELECT COALESCE(MAX(id), 0) + 1 FROM repository_audit_log), $1, $2, $3, $4, $5, $6, $7, $8, (extract(epoch FROM clock_timestamp()))::bigint) \
+                 (tenant_id, repository_id, actor_id, actor_name, action, target_type, target_name, details, created_unix) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, (extract(epoch FROM clock_timestamp()))::bigint) \
                  RETURNING {AUDIT_FIELDS}"
             ),
             &[
@@ -108,8 +108,7 @@ pub async fn list_audit_events(
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access =
-        auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain).await?;
 
     let rows = tx
         .query(
@@ -145,7 +144,11 @@ pub async fn list_audit_events(
         .take(limit as usize)
         .map(AuditEntry::row)
         .collect();
-    let next_after = if more { items.last().map(|e| e.id) } else { None };
+    let next_after = if more {
+        items.last().map(|e| e.id)
+    } else {
+        None
+    };
 
     finish(tx, &actor, false).await?;
     Ok(json(StatusCode::OK, AuditPage { items, next_after }))
@@ -171,7 +174,12 @@ mod tests {
         ] {
             assert!(valid_audit_token(good));
         }
-        for bad in ["", "spaces not allowed", "slash/not/allowed", &"x".repeat(65)] {
+        for bad in [
+            "",
+            "spaces not allowed",
+            "slash/not/allowed",
+            &"x".repeat(65),
+        ] {
             assert!(!valid_audit_token(bad));
         }
     }

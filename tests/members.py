@@ -1059,6 +1059,7 @@ class MembersHarness(PullsHarness):
         self.carol = self.issue_token("carol", create_user=True)
         self.dave = self.issue_token("dave", create_user=True)
         self.erin = self.issue_token("erin", create_user=True)
+        self.alice_read_only = self.issue_token("alice", read_only=True)
 
     def migration(self):
         assert self.sql("SELECT count(*) FROM schema_migrations WHERE version=50") == "1"
@@ -1125,6 +1126,12 @@ class MembersHarness(PullsHarness):
         # Non-member dave gets 404 Not Found on private repo endpoints
         self.document(self.collabspath, code=404, token=self.dave)
         self.document(self.auditpath, code=404, token=self.dave)
+        before = self.sql("SELECT count(*) FROM repository_collaborators")
+        self.document(self.collabspath, code=403, token=self.alice_read_only,
+                      method="POST", json_body={"username": "erin", "role": "admin"})
+        self.document(self.collabspath, code=404, token=self.dave,
+                      method="POST", json_body={"username": "erin", "role": "admin"})
+        assert self.sql("SELECT count(*) FROM repository_collaborators") == before
 
     def concurrency_and_idempotency(self):
         c1 = self.document(
