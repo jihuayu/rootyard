@@ -38,8 +38,16 @@ class OrganizationHarness(Harness):
         self.setup()
         charlie = self.account("create-user", "charlie")
         self.charlie = charlie
-        org = self.doc("/api/orgs", 201, method="POST", body={"slug": "acme"})
+        key = {"Idempotency-Key": "org-create-acme"}
+        org = self.doc("/api/orgs", 201, method="POST", body={"slug": "acme"},
+                       extra_headers=key)
         assert org["slug"] == "acme"
+        assert self.doc("/api/orgs", 201, method="POST", body={"slug": "acme"},
+                        extra_headers=key)["id"] == org["id"]
+        self.doc("/api/orgs", 409, method="POST", body={"slug": "other-org"},
+                 extra_headers=key)
+        assert self.sql("SELECT count(*) FROM users WHERE username='acme'") == "0"
+        assert self.sql("SELECT kind FROM namespaces WHERE id='" + org["id"] + "'") == "organization"
         self.doc("/api/orgs", 409, method="POST", body={"slug": "alice"})
         assert self.run([self.args.binary, "create-user", "acme"], check=False).returncode != 0
         repo = self.doc("/api/repos", 201, method="POST",
@@ -48,7 +56,11 @@ class OrganizationHarness(Harness):
         remote = self.base + repo["clone_path"]
         self.doc("/api/repos/acme/project", 404, token=self.bob)
         self.doc("/api/repos/acme/project", 404, token=charlie)
-        self.doc("/api/orgs/acme/members/bob", 201, method="PUT", body={"role": "read"})
+        membership = self.doc("/api/orgs/acme/members/bob", 201, method="PUT",
+                              body={"role": "read"})
+        assert membership["version"] == 1
+        self.doc("/api/orgs/acme/members/bob", 409, method="PUT",
+                 body={"role": "admin", "expected_version": 2})
         self.doc("/api/repos/acme/project", 200, token=self.bob)
         assert self.doc("/api/repos/acme/project/backend", 200, token=self.bob)["owner"] == "acme"
 
@@ -135,6 +147,8 @@ class OrganizationHarness(Harness):
         self.doc(transfer, 409, method="POST", body={"new_owner": "alice"})
         assert self.sql(f"SELECT owner_id FROM repositories WHERE id='{repo['id']}'") == org["id"]
         self.doc("/api/orgs/acme/members/alice", 409, method="DELETE")
+        self.doc("/api/orgs/acme/members/alice", 409, method="PUT",
+                 body={"role": "read", "expected_version": 1})
         self.doc("/api/repos/acme/project", 200)
         return {"namespace_collision_rejected": True, "team_role_inherited": True,
                 "git_lfs_forge_workspace_authorized": True,
