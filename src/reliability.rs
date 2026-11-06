@@ -362,15 +362,26 @@ pub async fn complete(state: &AppState, operation: Option<journal::Operation>) -
 pub async fn recover_startup(state: &AppState) -> Result<()> {
     let mut after = Uuid::nil();
     loop {
-        let rows=state.pool.get().await?.query("SELECT id,storage_generation FROM repositories WHERE state<>'provisioning' AND id>$1 ORDER BY id LIMIT 256",&[&after]).await?;
+        let rows=state.pool.get().await?.query("SELECT id,owner_id,storage_generation FROM repositories WHERE state<>'provisioning' AND storage_backend='gitfs' AND id>$1 ORDER BY id LIMIT 256",&[&after]).await?;
         if rows.is_empty() {
             break;
         }
         for row in rows {
             let id: Uuid = row.get(0);
             after = id;
+            // Replica staging journals are not authority. A partial transfer
+            // can leave an empty directory; reading it as a primary journal
+            // would poison the shared repository state for its true owner.
+            if !crate::sharding::transport::is_local_primary_for_repo(
+                state,row.get(1),id).await.map_err(|error| anyhow::anyhow!(error.1))? {
+                continue;
+            }
             let _lock = state.storage.write_lock(id).await;
-            if reconcile(state, id, row.get(1), true).await.is_err() {
+            if !crate::sharding::transport::is_local_primary_for_repo(
+                state,row.get(1),id).await.map_err(|error| anyhow::anyhow!(error.1))? {
+                continue;
+            }
+            if reconcile(state, id, row.get(2), true).await.is_err() {
                 eprintln!("rootyard: repository {id} requires journal recovery");
             }
         }
@@ -396,25 +407,29 @@ pub async fn recover_pending(state: &AppState) -> Result<()> {
         else {
             continue;
         };
-        let Ok(_guard) = tokio::time::timeout(
-            std::time::Duration::from_millis(1),
-            state.storage.write_lock(id),
-        )
-        .await
-        else {
-            continue;
-        };
         let row = state
             .pool
             .get()
             .await?
             .query_opt(
-                "SELECT storage_generation FROM repositories WHERE id=$1 AND (state='ready' OR (state='recovering' AND recovery_reason='push_outcome_unknown'))",
+                "SELECT owner_id,storage_generation FROM repositories WHERE id=$1 AND storage_backend='gitfs' AND (state='ready' OR (state='recovering' AND recovery_reason='push_outcome_unknown'))",
                 &[&id],
             )
             .await?;
         if let Some(row) = row {
-            if reconcile(state, id, row.get(0), false).await.is_err() {
+            if !crate::sharding::transport::is_local_primary_for_repo(
+                state,row.get(0),id).await.map_err(|error| anyhow::anyhow!(error.1))? {
+                continue;
+            }
+            let Ok(_guard) = tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                state.storage.write_lock(id),
+            ).await else { continue; };
+            if !crate::sharding::transport::is_local_primary_for_repo(
+                state,row.get(0),id).await.map_err(|error| anyhow::anyhow!(error.1))? {
+                continue;
+            }
+            if reconcile(state, id, row.get(1), false).await.is_err() {
                 eprintln!("rootyard: journal ingestion retry unavailable");
             }
         }
