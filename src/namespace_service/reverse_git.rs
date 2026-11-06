@@ -2,11 +2,12 @@
 use crate::Error;
 use axum::http::StatusCode;
 use std::{
+    cell::RefCell,
     io::{Read, Write},
     os::unix::process::CommandExt,
     path::Path as FsPath,
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc},
     thread,
     time::Duration,
 };
@@ -14,6 +15,29 @@ use std::{
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_PROCESS_FILE: u64 = 256 * 1024 * 1024;
 const MAX_WALL_SECONDS: u64 = 60;
+struct ReadContext { cancel: Arc<AtomicBool>, volume_lock_fd: i32 }
+thread_local! {
+    static READ_CONTEXT: RefCell<Option<ReadContext>> = const { RefCell::new(None) };
+}
+
+pub(super) fn with_read_cancel<T>(flag: Arc<AtomicBool>, volume_lock_fd: i32,
+    work: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) { READ_CONTEXT.with(|slot| *slot.borrow_mut() = None); }
+    }
+    READ_CONTEXT.with(|slot| *slot.borrow_mut() = Some(ReadContext { cancel: flag, volume_lock_fd }));
+    let _reset = Reset;
+    work()
+}
+
+fn read_cancelled() -> bool {
+    READ_CONTEXT.with(|slot| slot.borrow().as_ref().is_some_and(|ctx| ctx.cancel.load(Ordering::Acquire)))
+}
+
+fn lease_lost() -> Error {
+    Error(StatusCode::SERVICE_UNAVAILABLE, "storage read lease lost")
+}
 
 fn limit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Result<()> {
     let lim = libc::rlimit {
@@ -27,6 +51,8 @@ fn limit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Result<()>
     }
 }
 fn command(repo: &FsPath, args: &[&str]) -> Command {
+    let parent_pid = unsafe { libc::getpid() };
+    let volume_lock_fd = READ_CONTEXT.with(|slot| slot.borrow().as_ref().map(|ctx| ctx.volume_lock_fd));
     let mut cmd = Command::new("git");
     cmd.arg("-c")
         .arg("core.hooksPath=/dev/null")
@@ -41,7 +67,18 @@ fn command(repo: &FsPath, args: &[&str]) -> Command {
         .stderr(Stdio::null())
         .process_group(0);
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if let Some(fd) = volume_lock_fd {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if libc::getppid() != parent_pid {
+                return Err(std::io::Error::other("Git parent exited before exec"));
+            }
             limit(libc::RLIMIT_CPU, MAX_WALL_SECONDS + 2)?;
             limit(libc::RLIMIT_AS, 1024 * 1024 * 1024)?;
             limit(libc::RLIMIT_FSIZE, MAX_PROCESS_FILE)?;
@@ -51,6 +88,8 @@ fn command(repo: &FsPath, args: &[&str]) -> Command {
     cmd
 }
 fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
+    if read_cancelled() { return Err(lease_lost()); }
+    let cancel = READ_CONTEXT.with(|slot| slot.borrow().as_ref().map(|ctx| ctx.cancel.clone()));
     cmd.stdin(if input.is_some() {
         Stdio::piped()
     } else {
@@ -60,13 +99,14 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
     let pid = child.id() as i32;
     let (done, stop) = mpsc::channel::<()>();
     let watchdog = thread::spawn(move || {
-        if stop
-            .recv_timeout(Duration::from_secs(MAX_WALL_SECONDS))
-            .is_err()
-        {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
+        let deadline = std::time::Instant::now() + Duration::from_secs(MAX_WALL_SECONDS);
+        loop {
+            if cancel.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))
+                || std::time::Instant::now() >= deadline {
+                unsafe { libc::kill(-pid, libc::SIGKILL); }
+                break;
             }
+            if stop.recv_timeout(Duration::from_millis(50)).is_ok() { break; }
         }
     });
     // The writer must run while stdout is drained. cat-file emits output for
@@ -120,6 +160,7 @@ fn run(mut cmd: Command, input: Option<&[u8]>) -> Result<Vec<u8>, Error> {
             .map_err(|_| Error::internal("Git stdin worker panicked"))?
             .map_err(Error::internal)?;
     }
+    if read_cancelled() { return Err(lease_lost()); }
     read_result.map_err(Error::internal)?;
     if oversized {
         return Err(Error(
