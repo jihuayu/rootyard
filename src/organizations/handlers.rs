@@ -93,6 +93,13 @@ async fn require_member(
     }
     Ok(())
 }
+async fn lock_org_for_admin(tx: &Transaction<'_>, org: Uuid, actor: Uuid) -> Result<(), Error> {
+    tx.query_one("SELECT id FROM organizations WHERE id=$1 FOR UPDATE", &[&org])
+        .await.map_err(Error::internal)?;
+    // Membership is read after the lock. A concurrently revoked admin cannot
+    // act on the authority they held before waiting for that lock.
+    require_member(tx, org, actor, Role::Admin).await
+}
 async fn audit(
     tx: &Transaction<'_>,
     org: Uuid,
@@ -246,13 +253,7 @@ pub async fn put_member(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
-    require_member(&tx, org, actor.id, Role::Admin).await?;
-    tx.query_one(
-        "SELECT id FROM organizations WHERE id=$1 FOR UPDATE",
-        &[&org],
-    )
-    .await
-    .map_err(Error::internal)?;
+    lock_org_for_admin(&tx, org, actor.id).await?;
     let user: Uuid = tx
         .query_opt("SELECT id FROM users WHERE username=$1", &[&username])
         .await
@@ -305,13 +306,7 @@ pub async fn delete_member(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
-    require_member(&tx, org, actor.id, Role::Admin).await?;
-    tx.query_one(
-        "SELECT id FROM organizations WHERE id=$1 FOR UPDATE",
-        &[&org],
-    )
-    .await
-    .map_err(Error::internal)?;
+    lock_org_for_admin(&tx, org, actor.id).await?;
     let target = tx.query_opt("SELECT m.user_id,m.role FROM organization_memberships m JOIN users u ON u.id=m.user_id WHERE m.organization_id=$1 AND u.username=$2 FOR UPDATE OF m", &[&org,&username]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     protect_last_admin(&tx, org, target.get("user_id"), Role::parse(target.get::<_, &str>("role"))?, None).await?;
     let deleted = tx.execute("DELETE FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", &[&org,&target.get::<_, Uuid>("user_id")]).await.map_err(Error::internal)?;
@@ -366,7 +361,7 @@ pub async fn create_team(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
-    require_member(&tx, org, actor.id, Role::Admin).await?;
+    lock_org_for_admin(&tx, org, actor.id).await?;
     let id = Uuid::new_v4();
     let inserted = tx.execute("INSERT INTO organization_teams(id,organization_id,slug,name,role) VALUES($1,$2,$3,$4,$5) ON CONFLICT(organization_id,slug) DO NOTHING",
         &[&id,&org,&input.slug,&input.name,&input.role.as_str()]).await.map_err(Error::internal)?;
@@ -401,7 +396,7 @@ async fn change_team_member(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
-    require_member(&tx, org, actor.id, Role::Admin).await?;
+    lock_org_for_admin(&tx, org, actor.id).await?;
     let team: Uuid = tx
         .query_opt(
             "SELECT id FROM organization_teams WHERE organization_id=$1 AND slug=$2",
