@@ -1,9 +1,11 @@
-use rootyard::{AppState, config::Config, db, dispatch, metrics, pando_gateway::{pack_store::PackStore, snapshot}, storage};
+use rootyard::{AppState, config::Config, db, dispatch, metrics,
+    pando_gateway::{backup, pack_store::PackStore, snapshot},
+    storage::{self, remote_objects::{ObjectKey, RemoteObjectStore}}};
 use rand::RngCore;
 use std::{path::{Path, PathBuf}, process::Command, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use uuid::Uuid;
-use tokio::sync::Semaphore;
+use tokio::sync::{Barrier, Semaphore};
 
 fn run(git: &Path, args: &[&str], cwd: &Path) {
     let status = Command::new(git).args(args).current_dir(cwd).status().unwrap();
@@ -87,6 +89,7 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
         let pack_id: Uuid = ids["pack_id"].as_str().unwrap().parse().unwrap();
         let destination = root.join("recovered");
         let manifest = Box::pin(store.recover(&pool, repo, pack_id, &destination, deadline())).await.unwrap();
+        eprintln!("pando fixture: remote pack recovered");
         assert_eq!(manifest.pack.plaintext_sha256, ids["plaintext_sha256"].as_str().unwrap());
         assert_eq!(manifest.pack.plaintext_bytes, ids["pack_bytes"].as_u64().unwrap());
         assert_eq!(std::fs::metadata(destination.join(format!("pack-{pack_id}.pack"))).unwrap().len(), manifest.pack.plaintext_bytes);
@@ -109,9 +112,60 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
             state: "ready".into(), clone_path: "/git/fixture/packtest.git".into(),
             storage_backend: "pando".into(), storage_generation: 1, object_format: format.clone() };
         let snapshot = Box::pin(snapshot::materialize(&state, &repository, &lease, deadline())).await.unwrap();
+        eprintln!("pando fixture: authoritative snapshot materialized");
         let actual = Command::new(&git).arg("--git-dir").arg(snapshot.path())
             .args(["rev-parse", "refs/heads/main"]).output().unwrap();
         assert!(actual.status.success());
         assert_eq!(String::from_utf8(actual.stdout).unwrap().trim(), ids["commit_oid"].as_str().unwrap());
+        let remote = RemoteObjectStore::from_env(root.join("unused-local")).unwrap();
+        let mut client = pool.get().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        let backup_dir = root.join(format!("backup-{}", Uuid::new_v4()));
+        eprintln!("pando fixture: exporting encrypted backup closure");
+        let backup_manifest = Box::pin(backup::export_closure(&*tx,&remote,repo,&backup_dir,deadline())).await.unwrap();
+        eprintln!("pando fixture: backup closure exported");
+        assert_eq!(backup_manifest.packs.len(), 1);
+        assert_eq!(backup_manifest.refs["refs/heads/main"], ids["commit_oid"].as_str().unwrap());
+        for artifact in [&manifest.pack,&manifest.index] {
+            for (namespace,digest) in [("pando-cipher",&artifact.ciphertext_sha256),
+                ("pando-envelope",&artifact.envelope_sha256)] {
+                let key = ObjectKey::new(manifest.tenant_id,namespace,digest).unwrap();
+                remote.delete(&key,deadline()).await.unwrap();
+                assert!(remote.head(&key,deadline()).await.unwrap().is_none());
+            }
+        }
+        eprintln!("pando fixture: remote test objects deleted");
+        Box::pin(backup::import_closure(&*tx,&remote,repo,&backup_dir,deadline())).await.unwrap();
+        eprintln!("pando fixture: backup closure imported");
+        tx.commit().await.unwrap();
+        let second = root.join("backup-restored");
+        Box::pin(store.recover(&pool,repo,pack_id,&second,deadline())).await.unwrap();
+        assert_eq!(std::fs::metadata(second.join(format!("pack-{pack_id}.pack"))).unwrap().len(),
+            manifest.pack.plaintext_bytes);
+        drop(snapshot);
+        drop(_local);
+        drop(lease);
+        let gate = Arc::new(Barrier::new(9));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            let repository = repository.clone();
+            let gate = gate.clone();
+            tasks.spawn(async move {
+                let lease = storage::read_leases::shared(&state.pool, repository.id, deadline()).await.unwrap();
+                gate.wait().await;
+                let _local = state.storage.read_snapshot_lock(repository.id).await;
+                let view = Box::pin(snapshot::materialize(&state,&repository,&lease,deadline())).await.unwrap();
+                assert!(view.path().join("objects/pack").is_dir());
+            });
+        }
+        gate.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            state.pool.get().await.unwrap().query_one("SELECT 1",&[]).await.unwrap();
+        }).await.expect("eight snapshot leases starved authorization query");
+        let completed = tokio::time::timeout(Duration::from_secs(45), async {
+            while let Some(task) = tasks.join_next().await { task.unwrap(); }
+        }).await;
+        if completed.is_err() { tasks.abort_all(); panic!("eight Pando snapshots deadlocked the pool"); }
     } else { panic!("unknown Pando test phase"); }
 }
