@@ -176,6 +176,11 @@ def main():
         assert h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip() == acknowledged_tip
         h.git("--git-dir=" + str(target_repo), "fsck", "--full", "--strict")
         stale_volume_tip = h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/heads/main").stdout.decode().strip()
+        (h.work / "hello.txt").write_text("write after fenced takeover\n")
+        h.git("commit", "-am", "post takeover write", cwd=h.work)
+        target_tip = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
+        h.git("push", target_base + h.repo["clone_path"], "HEAD:main", cwd=h.work, token=h.alice)
+        assert h.git("--git-dir=" + str(target_repo), "rev-parse", "refs/heads/main").stdout.decode().strip() == target_tip
         h.stop(hard=True)
         rejected = h.run([args.binary, "serve"], check=False)
         assert rejected.returncode != 0 and b"durable physical fence" in rejected.stderr
@@ -221,6 +226,7 @@ def main():
                           "duplicate_live_node_identity_rejected": True,
                           "retired_source_volume_write_rejected_without_fence_env": True,
                           "old_writer_restart_blocked": True, "acknowledged_tip": acknowledged_tip,
+                          "post_takeover_acknowledged_oid": target_tip,
                           "target_fsck": "passed", "new_epoch": promoted["route_epoch"],
                   "limits": ["single-host isolated process session driver", "no cross-host storage fence or PostgreSQL HA"]}
         if args.report:

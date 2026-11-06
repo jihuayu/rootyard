@@ -65,6 +65,7 @@ The reproducible native checks are:
 python3 tests/cluster_security_native.py --binary target/debug/rootyard
 python3 tests/cluster_migration_native.py --binary target/debug/rootyard
 python3 tests/cluster_takeover_native.py --binary target/debug/rootyard --report evidence/cluster-takeover-run.json
+python3 tests/cluster_partition_native.py --binary target/debug/rootyard --report evidence/cluster-partition.json
 python3 tests/cluster_workload_native.py --binary target/debug/rootyard --report evidence/cluster-workload-integration.json
 python3 tests/cluster_tls_native.py --binary target/debug/rootyard --report evidence/cluster-tls.json
 python3 tests/cluster_pg_streaming_native.py --binary target/debug/rootyard --report evidence/cluster-pg-streaming.json
@@ -77,10 +78,17 @@ processes with distinct volumes, Git push/fetch, acknowledged-commit survival,
 and process restart RTO. The takeover report also exercises a paused admitted
 Git writer, stale replica rejection, a physically stopped source session,
 duplicate node identities, and old-volume write denial. Neither report proves
-cross-host storage fencing, PostgreSQL leader failover/PITR, network-partition
-recovery, or a production RPO/RTO service-level objective. A multi-host
+cross-host storage fencing, PostgreSQL leader failover/PITR, kernel-level
+network partition recovery, or a production RPO/RTO service-level objective. A multi-host
 deployment must supply an external supported fencing and PostgreSQL HA system
 and must not enable this local process driver across hosts.
+
+The TCP isolation test cuts the source process's actual PostgreSQL socket path
+while the target still reaches PostgreSQL. It verifies the isolated source
+returns 503, the measured target takes over only after the source Linux
+session is killed, and a new target Git push succeeds. This exercises a real
+source-only TCP break through a disposable proxy; it is not a kernel network
+namespace partition or a multi-host test.
 
 The PostgreSQL streaming test starts a separate PostgreSQL 17 primary and
 standby using verified TLS, SCRAM authentication, and synchronous
