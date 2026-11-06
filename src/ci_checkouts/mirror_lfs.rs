@@ -24,8 +24,6 @@ pub async fn batch(
     let (_,repo,plan)=ci_checkouts::authority::authenticate_principal(&state,&headers,&owner,&name,&target).await?;
     dependencies::verify_on_mirror(&state,&plan).await?;
     let base=public_url()?;
-    let bearer=headers.get(header::AUTHORIZATION).and_then(|v|v.to_str().ok())
-        .ok_or_else(Error::unauthorized)?;
     let mut objects=Vec::new();
     for spec in request.objects {
         if !models::valid_lfs_oid(&spec.oid) || spec.size<0 ||
@@ -35,8 +33,7 @@ pub async fn batch(
         }
         let href=format!("{base}/ci/{target}/git/{owner}/{name}.git/info/lfs/objects/{}",spec.oid);
         objects.push(serde_json::json!({"oid":spec.oid,"size":spec.size,
-            "authenticated":true,"actions":{"download":{"href":href,
-                "header":{"Authorization":bearer}}}}));
+            "authenticated":true,"actions":{"download":{"href":href}}}));
     }
     Ok((StatusCode::OK,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({
         "transfer":"basic","hash_algo":"sha256","objects":objects,
