@@ -18,6 +18,7 @@ pub fn routes() -> Router<Arc<crate::AppState>> {
     Router::new()
         .route("/api/orgs", post(handlers::create_organization))
         .route("/api/orgs/{slug}", get(handlers::get_organization))
+        .route("/api/repos/{owner}/{name}/transfer", post(handlers::transfer_ownership))
         .route("/api/orgs/{slug}/members", get(handlers::list_members))
         .route(
             "/api/orgs/{slug}/members/{username}",
