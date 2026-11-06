@@ -71,7 +71,11 @@ const TABLES: &[&str] = &[
     "workspace_creations",
     "workspace_entries",
     "workspace_events",
+    "workspace_namespace_mounts",
+    "workspace_namespaces",
     "workspace_operations",
+    "workspace_view_history",
+    "workspace_views",
     "workspaces",
 ];
 mod catalog;

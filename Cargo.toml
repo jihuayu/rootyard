@@ -15,6 +15,10 @@ name = "rootyard-pando-lab"
 path = "src/bin/rootyard-pando-lab.rs"
 required-features = ["pando-lab"]
 
+[[bin]]
+name = "rootyard-vfs-mount"
+path = "src/bin/rootyard-vfs-mount.rs"
+
 [dependencies]
 anyhow = "1"
 async-stream = "0.3"
@@ -24,6 +28,7 @@ base64 = "0.22"
 bytes = "1"
 deadpool-postgres = "0.14"
 fs2 = "0.4"
+fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
 futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
