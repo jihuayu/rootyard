@@ -44,6 +44,7 @@ pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool,Error> {
 }
 
 pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
+    tokio::spawn(super::remote_gc::run(state.clone(), stop.child_token()));
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! { _=stop.cancelled()=>break, _=interval.tick()=>{} }
