@@ -213,6 +213,9 @@ pub(crate) async fn collect_git_output_input(
 }
 
 pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
+    if let Some(plan) = crate::sharding::transport::route_git_request(&state, &request).await? {
+        return crate::sharding::transport::forward_request(&state, plan, request).await;
+    }
     // A disconnected caller cannot cancel cleanup between acquiring the write
     // lock and starting the response producer. The owned task retains all guards.
     tokio::spawn(execute(state, request))
@@ -235,8 +238,13 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             "read mirror never accepts pushes; use the primary",
         ));
     }
+    let delegation = crate::sharding::transport::authenticate_delegation(
+        &state, &parts.headers, &parts.method, &parts.uri,
+    ).await?;
     let job = pin_oid.is_some() && auth::credentials_for(&parts.headers, "ryj_").is_ok();
-    let (identity, repo, job_plan) = if job {
+    let (identity, repo, job_plan) = if let Some((identity, repo)) = delegation {
+        (identity, repo, None)
+    } else if job {
         let (identity, repo, plan) = crate::ci_checkouts::authenticate(
             &state,
             &parts.headers,
