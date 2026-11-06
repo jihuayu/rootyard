@@ -15,6 +15,8 @@ pub mod jobs;
 pub mod models;
 #[path = "storage_lifecycle/observability.rs"]
 pub mod observability;
+#[path = "storage_lifecycle/pando.rs"]
+pub mod pando;
 #[path = "storage_lifecycle/quarantine.rs"]
 pub mod quarantine;
 #[path = "storage_lifecycle/retention.rs"]

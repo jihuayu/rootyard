@@ -3,7 +3,7 @@
 use super::{
     fence, gc, gitfs, jobs,
     models::{JobOutcome, Policy},
-    scheduler,
+    pando, scheduler,
 };
 use crate::{AppState, db};
 use anyhow::{Context, Result, bail};
@@ -127,6 +127,8 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
                     bail!("cache eviction requires complete reader lease coverage");
                 }
                 gitfs::execute(state, job.repository_id, &job.kind, policy, &cancel).await
+            } else if pando::is_pando_kind(&job.kind) {
+                pando::execute(state, &repo, job, &lease, policy, &cancel).await
             } else {
                 gitfs::execute(state, job.repository_id, &job.kind, policy, &cancel).await
             }

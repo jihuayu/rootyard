@@ -60,6 +60,42 @@ impl Drop for WorkDir {
 }
 
 impl PackStore {
+    /// Disposable local cache of verified plaintext packs. It is never an
+    /// authority: every cache hit is copied into a snapshot that is checked by
+    /// `git fsck` against the PostgreSQL manifest and ref closure.
+    pub fn cache_dir(storage_root: &Path, repository_id: Uuid) -> PathBuf {
+        storage_root.join("pando-cache").join(repository_id.to_string())
+    }
+
+    fn prepare_cache_dir(cache_dir: &Path) -> Result<()> {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(cache_dir)?;
+        let meta = std::fs::symlink_metadata(cache_dir)?;
+        ensure!(
+            meta.is_dir() && !meta.file_type().is_symlink() && meta.uid() == unsafe { libc::geteuid() },
+            "Pando cache root is not a private owned directory"
+        );
+        std::fs::set_permissions(cache_dir, std::fs::Permissions::from_mode(0o700))?;
+        Ok(())
+    }
+
+    fn cache_paths(cache_dir: &Path, repository_id: Uuid, pack_id: Uuid) -> (PathBuf, PathBuf) {
+        let _ = repository_id;
+        (
+            cache_dir.join(format!("pack-{pack_id}.pack")),
+            cache_dir.join(format!("pack-{pack_id}.idx")),
+        )
+    }
+
+    fn link_or_copy(source: &Path, target: &Path) -> Result<()> {
+        if target.exists() {
+            std::fs::remove_file(target)?;
+        }
+        match std::fs::hard_link(source, target) {
+            Ok(()) => Ok(()),
+            Err(_) => std::fs::copy(source, target).map(|_| ()).map_err(Into::into),
+        }
+    }
+
     pub fn from_env(work_root: PathBuf, git: PathBuf) -> Result<Self> {
         // Production Pando cannot silently fall back to node-local CAS.
         ensure!(
@@ -275,6 +311,83 @@ impl PackStore {
         Ok(output)
     }
 
+    async fn load_manifest(&self, pool: &Pool, repository_id: Uuid, pack_id: Uuid) -> Result<PackManifest> {
+        let client = pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT tenant_id,storage_generation,object_format,manifest             FROM pando_pack_manifests WHERE repository_id=$1 AND id=$2",
+                &[&repository_id, &pack_id],
+            )
+            .await?;
+        let manifest: PackManifest = serde_json::from_value(row.get("manifest"))?;
+        ensure!(
+            manifest.version == 1
+                && manifest.id == pack_id
+                && manifest.repository_id == repository_id
+                && manifest.tenant_id == row.get::<_, Uuid>("tenant_id")
+                && manifest.storage_generation == row.get::<_, i64>("storage_generation")
+                && manifest.object_format == row.get::<_, String>("object_format"),
+            "Pando manifest identity mismatch"
+        );
+        Ok(manifest)
+    }
+
+    /// Populate the disposable local cache for one committed pack. Cache
+    /// publication is atomic per file; concurrent readers either observe a
+    /// complete pair or fall back to an exact remote recovery.
+    pub async fn recover_to_cache(
+        &self,
+        pool: &Pool,
+        repository_id: Uuid,
+        pack_id: Uuid,
+        cache_dir: &Path,
+        deadline: Instant,
+    ) -> Result<PackManifest> {
+        Self::prepare_cache_dir(cache_dir)?;
+        let manifest = self.load_manifest(pool, repository_id, pack_id).await?;
+        let (target_pack, target_index) = Self::cache_paths(cache_dir, repository_id, pack_id);
+        if target_pack.is_file()
+            && target_index.is_file()
+            && std::fs::metadata(&target_pack)?.len() == manifest.pack.plaintext_bytes
+            && std::fs::metadata(&target_index)?.len() == manifest.index.plaintext_bytes
+        {
+            return Ok(manifest);
+        }
+        let _ = std::fs::remove_file(&target_pack);
+        let _ = std::fs::remove_file(&target_index);
+        let temporary = WorkDir(cache_dir.join(format!(".tmp-{}", Uuid::new_v4())));
+        Box::pin(self.recover(pool, repository_id, pack_id, &temporary.0, deadline)).await?;
+        std::fs::rename(temporary.0.join(format!("pack-{pack_id}.pack")), &target_pack)?;
+        std::fs::rename(temporary.0.join(format!("pack-{pack_id}.idx")), &target_index)?;
+        Ok(manifest)
+    }
+
+    /// Recover a committed pack into a snapshot pack directory, preferring the
+    /// disposable local cache. A cache miss or link failure falls back to an
+    /// exact remote recovery so cache state can never make a valid read fail.
+    pub async fn recover_cached(
+        &self,
+        pool: &Pool,
+        repository_id: Uuid,
+        pack_id: Uuid,
+        destination: &Path,
+        cache_dir: &Path,
+        deadline: Instant,
+    ) -> Result<PackManifest> {
+        let manifest = Box::pin(self.recover_to_cache(pool, repository_id, pack_id, cache_dir, deadline)).await?;
+        let (source_pack, source_index) = Self::cache_paths(cache_dir, repository_id, pack_id);
+        let target_pack = destination.join(format!("pack-{pack_id}.pack"));
+        let target_index = destination.join(format!("pack-{pack_id}.idx"));
+        let linked = Self::link_or_copy(&source_pack, &target_pack)
+            .and_then(|_| Self::link_or_copy(&source_index, &target_index));
+        if linked.is_ok() {
+            return Ok(manifest);
+        }
+        let _ = std::fs::remove_file(&target_pack);
+        let _ = std::fs::remove_file(&target_index);
+        Box::pin(self.recover(pool, repository_id, pack_id, destination, deadline)).await
+    }
+
     /// Recover exclusively from PostgreSQL + remote storage into a fresh
     /// destination. Partial output is removed on failure; no local cache is an
     /// authority for refs or pack existence.
@@ -286,25 +399,7 @@ impl PackStore {
         destination: &Path,
         deadline: Instant,
     ) -> Result<PackManifest> {
-        let client = pool.get().await?;
-        let row = client
-            .query_one(
-                "SELECT tenant_id,storage_generation,object_format,manifest \
-            FROM pando_pack_manifests WHERE repository_id=$1 AND id=$2",
-                &[&repository_id, &pack_id],
-            )
-            .await?;
-        let manifest: PackManifest = serde_json::from_value(row.get("manifest"))?;
-        drop(client);
-        ensure!(
-            manifest.version == 1
-                && manifest.id == pack_id
-                && manifest.repository_id == repository_id
-                && manifest.tenant_id == row.get::<_, Uuid>("tenant_id")
-                && manifest.storage_generation == row.get::<_, i64>("storage_generation")
-                && manifest.object_format == row.get::<_, String>("object_format"),
-            "Pando manifest identity mismatch"
-        );
+        let manifest = self.load_manifest(pool, repository_id, pack_id).await?;
         let work = self.work_dir()?;
         let pack =
             Box::pin(self.recover_artifact(&work.0, "pack", manifest.tenant_id, &manifest.pack, deadline)).await?;

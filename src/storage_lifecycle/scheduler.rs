@@ -1,5 +1,5 @@
 //! Automatic, tenant-scoped job admission based on observed GitFS thresholds.
-use super::{gc, gitfs, jobs, models::Policy};
+use super::{gc, gitfs, jobs, models::Policy, pando};
 use crate::AppState;
 use anyhow::{Result, bail};
 use serde_json::json;
@@ -127,6 +127,60 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
             if due && jobs::enqueue(&state.pool, repo, tenant, generation, "gitfs_tombstone_delete").await? {
                 scheduled += 1;
             }
+        }
+    }
+    scheduled += schedule_pando(state, policy).await?;
+    Ok(scheduled)
+}
+
+/// Pando has no local object counts to sample. Its durable authority is the
+/// PostgreSQL ref generation and committed pack-id list, so fragmentation is
+/// the number of packs in the serving closure. The scheduler never enqueues
+/// remote object marking or deletion until an object-level retention closure
+/// exists.
+async fn schedule_pando(state: &AppState, policy: &Policy) -> Result<usize> {
+    let client = state.pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT r.id,r.owner_id,r.storage_generation,p.pack_ids              FROM repositories r JOIN pando_repository_states p ON p.repository_id=r.id                AND p.tenant_id=r.owner_id AND p.storage_generation=r.storage_generation              LEFT JOIN storage_maintenance_repo_state s ON s.repository_id=r.id              WHERE r.state='ready' AND r.storage_backend='pando' AND r.transition_state='stable'                AND p.state='serving'                AND (s.last_scan_at IS NULL OR s.last_scan_at < clock_timestamp()-make_interval(secs=>($1::bigint)::double precision))              ORDER BY s.last_scan_at NULLS FIRST,r.id LIMIT 16",
+            &[&policy.scan_period_seconds],
+        )
+        .await?;
+    let mut scheduled = 0;
+    for row in rows {
+        let repo: Uuid = row.get("id");
+        let tenant: Uuid = row.get("owner_id");
+        let generation: i64 = row.get("storage_generation");
+        let pack_ids: Vec<Uuid> = row.get("pack_ids");
+        if !local_primary(state, repo).await? {
+            continue;
+        }
+        let updated = client
+            .execute(
+                "INSERT INTO storage_maintenance_repo_state(repository_id,tenant_id,last_scan_at,last_scan_generation,loose_count,pack_count,last_scan)                  SELECT id,owner_id,clock_timestamp(),storage_generation,0,$3,$4 FROM repositories                  WHERE id=$1 AND owner_id=$2 AND storage_generation=$5 AND state='ready'                    AND storage_backend='pando' AND transition_state='stable'                  ON CONFLICT(repository_id) DO UPDATE SET last_scan_at=EXCLUDED.last_scan_at,                  last_scan_generation=EXCLUDED.last_scan_generation,loose_count=0,                  pack_count=EXCLUDED.pack_count,last_scan=EXCLUDED.last_scan                  WHERE storage_maintenance_repo_state.tenant_id=EXCLUDED.tenant_id",
+                &[&repo, &tenant, &(pack_ids.len() as i64), &json!({"source":"pando_pg_pack_set"}), &generation],
+            )
+            .await?;
+        if updated == 0 {
+            continue;
+        }
+        let root = &state.storage.root;
+        // Repack admission is first so a same-poll hydration executes against
+        // the compacted closure rather than spending work on obsolete packs.
+        if pack_ids.len() >= policy.pack_threshold as usize
+            && jobs::enqueue(&state.pool, repo, tenant, generation, "pando_repack").await?
+        {
+            scheduled += 1;
+        }
+        if pando::cache_incomplete(root, repo, &pack_ids)
+            && jobs::enqueue(&state.pool, repo, tenant, generation, "pando_cache_hydrate").await?
+        {
+            scheduled += 1;
+        }
+        if pando::cache_evict_due(root, repo, policy.cache_max_age_seconds)
+            && jobs::enqueue(&state.pool, repo, tenant, generation, "pando_cache_evict").await?
+        {
+            scheduled += 1;
         }
     }
     Ok(scheduled)
