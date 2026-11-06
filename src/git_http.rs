@@ -24,6 +24,8 @@ mod process;
 mod protocol;
 #[path = "git_http/receive.rs"]
 mod receive;
+#[path = "git_http/pando_receive.rs"]
+mod pando_receive;
 use process::Process;
 pub(crate) use process::{collect_git_output, collect_git_output_input,
     finish_group_child, stop_group_child, kill_group_child};
@@ -53,6 +55,19 @@ async fn transfer_authorized(
         auth::verify_active(&state.pool, user, repo.id, write).await
             .map_err(|_| io::Error::other("Git authority revoked"))
     }
+}
+
+async fn backend_current(state: &AppState, repo: &Repository) -> Result<(), Error> {
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let row = client.query_opt("SELECT storage_generation,storage_backend,state FROM repositories WHERE id=$1",
+        &[&repo.id]).await.map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    if row.get::<_,i64>(0) != repo.storage_generation
+        || row.get::<_,&str>(1) != repo.storage_backend
+        || row.get::<_,&str>(2) != "ready" {
+        return Err(Error(StatusCode::CONFLICT,"repository backend changed; retry"));
+    }
+    Ok(())
 }
 
 pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
@@ -139,9 +154,9 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         }
         (Some(identity), repo, None, None)
     };
-    if repo.storage_backend == "pando" && (write || pin_oid.is_some()) {
+    if repo.storage_backend == "pando" && pin_oid.is_some() {
         return Err(Error(StatusCode::SERVICE_UNAVAILABLE,
-            "Pando publication and pinned checkout are not ready"));
+            "Pando pinned checkout is not ready"));
     }
     let remote_user = match &job_principal {
         Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration { hook_id, job_id, .. }) =>
@@ -163,6 +178,10 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     let deadline = Instant::now() + state.config.git_timeout;
     if write && parts.method == Method::POST {
         crate::sharding::fencing::check_before_push(&state, &repo).await?;
+    }
+    if repo.storage_backend == "pando" && write && parts.method == Method::POST {
+        let actor = identity.ok_or_else(Error::unauthorized)?;
+        return pando_receive::execute(state,parts,body,actor,repo,permit,deadline).await;
     }
     let max_input = state.config.max_request_bytes;
     let input = receive::prepare(body, &parts.headers, max_input,
@@ -188,6 +207,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         Some(tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(repo.id))
             .await.map_err(|_| Error::timeout())?)
     } else { None };
+    backend_current(&state,&repo).await?;
     if snapshot_lease.is_some() {
         transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
             job_principal.as_ref(), &repo, write).await.map_err(|_| Error::unauthorized())?;
