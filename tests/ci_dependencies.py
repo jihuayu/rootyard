@@ -158,6 +158,26 @@ def main():
             status,content,_=h.http(origin_lfs,token={"username":"alice",
                 "token":origin_grand["token"]})
             assert status==200 and content==payload,(status,len(content))
+            h.git("tag","-a","build-input","-m","fixed CI input",root_oid,cwd=h.work)
+            h.git("push","origin","refs/tags/build-input",cwd=h.work,token=h.alice)
+            tag_oid=h.git("rev-parse","refs/tags/build-input",cwd=h.work).stdout.decode().strip()
+            target_job=str(uuid.uuid4())
+            h.pin(h.pin_body(feature_oid,target_job,1))
+            target_grant=h.issue(h.request_body(oid=feature_oid,job=target_job,
+                history="target",tags=["build-input"]))
+            assert target_grant["plan"]["dependencies"]["tags"]==[
+                {"name":"build-input","object_oid":tag_oid}]
+            target_token={"username":"alice","token":target_grant["token"]}
+            target_clone=h.root/"origin-target-tag-build"
+            h.git("clone",h.base+h.path(feature_oid),str(target_clone),token=target_token)
+            assert h.git("rev-parse","HEAD",cwd=target_clone).stdout.decode().strip()==feature_oid
+            assert h.git("rev-list","--count","HEAD",cwd=target_clone).stdout.strip()==b"1"
+            assert h.git("rev-parse","refs/tags/build-input",cwd=target_clone).stdout.decode().strip()==tag_oid
+            h.git("fsck","--full",cwd=target_clone)
+            h.transition(target_job,"cancel")
+            status,_,_=h.http(h.advertise(feature_oid),token=target_token)
+            assert status in (401,403),status
+            print("primary scoped target-history/tag clone and cancellation: passed",flush=True)
         print("fenced integration prepared and cloned nested manifest: passed",flush=True)
         (h.work/".gitmodules").write_text(
             '[submodule "child"]\n\tpath = deps/child\n\turl = https://outside.invalid/child.git\n')
