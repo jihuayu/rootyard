@@ -1,6 +1,6 @@
 {
   "kind": "native_local_cluster_profile",
-  "binary_sha256": "27203db5f8f6cac103ef61e06867b205f718b4325a98367c3cc15769e24d6b70",
+  "binary_sha256": "02a4b3d5f78ca05c136e869c0469dfbb0a27f05c58c6f9686db62adc03fb2e25",
   "node_count": 2,
   "postgres_roles": [
     "node0",
@@ -12,13 +12,13 @@
     "node1",
     "worker"
   ],
-  "repository_id": "6799330d-8b69-4062-bdfa-ba5f39d15b68",
-  "acknowledged_oid": "632efad773209f3087bdf6de59d3b994aaeb7f6d",
-  "owner_clone_oid": "632efad773209f3087bdf6de59d3b994aaeb7f6d",
-  "routed_browse_oid": "632efad773209f3087bdf6de59d3b994aaeb7f6d",
+  "repository_id": "c7a52c3d-e8cb-4ddc-b17d-36a1a76338c0",
+  "acknowledged_oid": "ddc635d8282c2e56616d147562e324c9aa39882d",
+  "owner_clone_oid": "ddc635d8282c2e56616d147562e324c9aa39882d",
+  "routed_browse_oid": "ddc635d8282c2e56616d147562e324c9aa39882d",
   "kafka_offset_before": 0,
   "kafka_offset_after": 1,
-  "verified_at_unix": 1793952330,
+  "verified_at_unix": 1793952733,
   "scope": "single trusted Linux host, separate Rust processes/volumes with external TLS/SASL dependencies",
   "kafka_version": "4.4.0",
   "postgres_tls": "verify-full",
@@ -26,5 +26,6 @@
   "kafka_auth": "SASL/PLAIN over TLS",
   "wrong_kafka_role_password_rejected_before_start": true,
   "failed_preflight_secrets_cleaned": true,
-  "launcher_sha256": "3facd3b64c0b1a52d46ec30c44cc15707953bd800d598fd2d2f7bf337c3be0d6"
+  "sigterm_resistant_descendant_killed": true,
+  "launcher_sha256": "1d8096be2c44096da540c4323454d3c9d3e6a29e52e7905ea9b615c9b8d00390"
 }

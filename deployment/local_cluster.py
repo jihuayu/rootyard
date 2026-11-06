@@ -167,7 +167,8 @@ def http(base, path, token, method="GET", body=None):
 def proc_identity(pid):
     raw = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
     boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-    return {"pid": pid, "start_ticks": int(raw[19]), "session": int(raw[3]),
+    return {"pid": pid, "start_ticks": int(raw[19]), "group": int(raw[2]),
+            "session": int(raw[3]), "state": raw[0],
             "boot_id": boot_id}
 
 
@@ -181,22 +182,50 @@ def is_same_process(entry):
         return False
 
 
+def session_members(entry):
+    if Path("/proc/sys/kernel/random/boot_id").read_text().strip() != entry["boot_id"]:
+        raise RuntimeError("recorded process session belongs to another boot")
+    members = []
+    for path in Path("/proc").iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            member = proc_identity(int(path.name))
+        except (OSError, ValueError, IndexError):
+            continue
+        if member["session"] == entry["pid"] and member["state"] != "Z":
+            members.append(member)
+    return members
+
+
 def stop_entries(entries):
+    # Verify the recorded leader before any signal. Once verified, its session
+    # ID remains reserved by descendants even if the leader exits on SIGTERM.
+    # Scan the whole session, not just the leader's original process group:
+    # native Git children can enter their own groups within that session.
+    active = []
     for entry in reversed(entries):
         if is_same_process(entry):
-            try:
-                os.killpg(entry["pid"], signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            active.append(entry)
+        elif session_members(entry):
+            raise RuntimeError("process leader identity lost while descendants survive; manifest retained")
+    def signal_sessions(signum):
+        for entry in active:
+            for group in {member["group"] for member in session_members(entry)}:
+                try:
+                    os.killpg(group, signum)
+                except ProcessLookupError:
+                    pass
+    signal_sessions(signal.SIGTERM)
     deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and any(is_same_process(entry) for entry in entries):
+    while time.monotonic() < deadline and any(session_members(entry) for entry in active):
         time.sleep(.05)
-    for entry in reversed(entries):
-        if is_same_process(entry):
-            try:
-                os.killpg(entry["pid"], signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    signal_sessions(signal.SIGKILL)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and any(session_members(entry) for entry in active):
+        time.sleep(.05)
+    if any(session_members(entry) for entry in active):
+        raise RuntimeError("process session did not quiesce; manifest retained")
 
 
 def start_process(binary, mode, env, log_path):
@@ -240,6 +269,8 @@ def _run_up(args):
     node_envs = [read_env(args.env_dir / f"node{index}.env") for index in range(args.nodes)]
     worker = read_env(args.env_dir / "worker.env")
     roles = [(f"node{index}", item) for index, item in enumerate(node_envs)] + [("worker", worker)]
+    for _, item in roles:
+        validate_env(item)
     db_users = [pg_preflight(item) for _, item in roles]
     kafka_users = [item["ROOTYARD_KAFKA_SASL_USERNAME"] for _, item in roles]
     if len(set(db_users + [migrator_user])) != len(db_users) + 1:

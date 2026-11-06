@@ -8,8 +8,10 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from urllib.parse import quote
@@ -35,6 +37,35 @@ def private(path, content):
     path.chmod(0o600)
 
 
+def prove_descendant_shutdown(launcher):
+    sys.path.insert(0, str(launcher.parent))
+    import local_cluster
+    child_code = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    leader_code = ("import subprocess,sys,time; "
+                   f"subprocess.Popen([sys.executable,'-c',{child_code!r}]); time.sleep(60)")
+    leader = subprocess.Popen([sys.executable, "-c", leader_code],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=True)
+    entry = local_cluster.proc_identity(leader.pid)
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and len(local_cluster.session_members(entry)) < 2:
+            time.sleep(.02)
+        assert len(local_cluster.session_members(entry)) >= 2, "child did not join recorded session"
+        time.sleep(.2)
+        began = time.monotonic()
+        local_cluster.stop_entries([entry])
+        assert time.monotonic() - began >= 4.5, "SIGTERM-resistant child was not exercised"
+        assert not local_cluster.session_members(entry), "descendant survived profile shutdown"
+    finally:
+        if local_cluster.session_members(entry):
+            try:
+                os.killpg(entry["pid"], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -46,6 +77,7 @@ def main():
     kafka_home = args.kafka_home.resolve(strict=True)
     kafka = kafka_home / "bin"
     launcher = Path(__file__).resolve().parents[1] / "deployment/local_cluster.py"
+    prove_descendant_shutdown(launcher)
     root = Path(tempfile.mkdtemp(prefix="rootyard-secure-profile-"))
     config = root / "config"
     config.mkdir(mode=0o700)
@@ -202,6 +234,7 @@ def main():
                       postgres_auth="SCRAM-SHA-256", kafka_auth="SASL/PLAIN over TLS",
                       wrong_kafka_role_password_rejected_before_start=True,
                       failed_preflight_secrets_cleaned=True,
+                      sigterm_resistant_descendant_killed=True,
                       binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                       launcher_sha256=hashlib.sha256(launcher.read_bytes()).hexdigest())
         args.report.parent.mkdir(parents=True, exist_ok=True)
