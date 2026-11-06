@@ -61,6 +61,7 @@ const TABLES: &[&str] = &[
     "workspace_namespace_mounts",
     "workspace_namespaces",
     "workspace_operations",
+    "workspace_remote_staging_objects",
     "workspace_view_history",
     "workspace_views",
     "workspaces",
