@@ -168,6 +168,15 @@ pub async fn report(
     let (repo,tenant) = integration(&state,&owner,&name,hook_id,&headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    crate::webhooks::trust::lock_policy_tx(&tx,repo).await?;
+    let current_hook=tx.query_opt("SELECT secret,active FROM forge_webhooks WHERE id=$1 AND repository_id=$2 FOR SHARE",
+        &[&hook_id,&repo]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
+    let bearer=headers.get("authorization").and_then(|h|h.to_str().ok())
+        .and_then(|h|h.strip_prefix("Bearer ")).ok_or_else(Error::unauthorized)?;
+    if !current_hook.get::<_,bool>("active") ||
+        !constant_time_eq(current_hook.get::<_,String>("secret").as_bytes(),bearer.as_bytes()) {
+        return Err(Error::unauthorized());
+    }
     let row = tx.query_opt(
         "SELECT c.context,c.head_oid,c.base_oid,c.state,c.attempt,c.lease_generation,c.result_sha256, \
           p.head_oid AS live_head,p.base_oid AS live_base,p.version AS live_version,c.pull_version \
