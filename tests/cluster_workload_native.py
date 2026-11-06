@@ -332,11 +332,28 @@ def main():
         assert request(bases[0], git_discovery, None,
                        extra_headers={"x-rootyard-cluster-delegation":
                                       signed_delegation(git_discovery, after_generation)})[0] == 200
+        status, raw = request(bases[0], browse_path + "/shard-route", h.alice, "PUT",
+                              {"required_generation": after_generation + 1,
+                               "expected_route_epoch": after_route["route_epoch"],
+                               "expected_version": after_route["version"]})
+        assert status == 200, (status, raw[:300])
+        ahead_route = json.loads(raw)
+        assert ahead_route["route_epoch"] == after_route["route_epoch"]
+        # The route's future-generation floor cannot authorize a request
+        # before the repository has actually reached that generation.
+        assert request(bases[1], browse_path + "/refs", h.reader)[0] == 409
+        status, raw = request(bases[0], browse_path + "/shard-route", h.alice, "PUT",
+                              {"required_generation": after_generation,
+                               "expected_route_epoch": ahead_route["route_epoch"],
+                               "expected_version": ahead_route["version"]})
+        assert status == 200, (status, raw[:300])
+        assert request(bases[1], browse_path + "/refs", h.reader)[0] == 200
         report["stale_delegation"] = {"mutation": "native Forge backend PATCH gitfs generation increment",
                                       "route_epoch_unchanged": True,
                                       "old_generation": before_generation, "new_generation": after_generation,
                                       "unused_old_browse_and_git_delegations_status": 409,
-                                      "fresh_browse_and_git_delegations_status": 200}
+                                      "fresh_browse_and_git_delegations_status": 200,
+                                      "future_required_generation_ingress_status": 409}
         report["untested"] = [item for item in report["untested"] if item != "cache eviction"] + ["CI mirror cache eviction"]
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
