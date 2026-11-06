@@ -14,7 +14,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{io::AsyncReadExt, process::Command};
-use tokio_postgres::{Client, GenericClient, NoTls};
+use tokio_postgres::{Client, GenericClient};
 use uuid::Uuid;
 
 const TABLES: &[&str] = &[
@@ -492,10 +492,23 @@ fn pg_command(config: &Config, exe: &str) -> Result<Command> {
             cfg.get_user().context("explicit database user required")?,
         )
         .env("PGCONNECT_TIMEOUT", "5")
-        .env("PGSSLMODE", "disable")
         .env("PGPASSFILE", "/dev/null")
         // Detect dead CLI sockets even while PostgreSQL is blocked on a lock.
         .env("PGOPTIONS", "-c client_connection_check_interval=1000");
+    if cfg.get_ssl_mode() == tokio_postgres::config::SslMode::Require {
+        let ca = std::env::var("ROOTYARD_PG_CA_PEM")
+            .context("PostgreSQL TLS backup needs ROOTYARD_PG_CA_PEM")?;
+        ensure!(Path::new(&ca).is_file(), "PostgreSQL CA file unavailable");
+        cmd.env("PGSSLMODE", "verify-full").env("PGSSLROOTCERT", ca);
+        match (std::env::var("ROOTYARD_PG_CLIENT_CERT_PEM").ok(), std::env::var("ROOTYARD_PG_CLIENT_KEY_PEM").ok()) {
+            (Some(cert), Some(key)) => { cmd.env("PGSSLCERT", cert).env("PGSSLKEY", key); }
+            (None, None) => {}
+            _ => bail!("PostgreSQL client certificate and key must be configured together"),
+        }
+    } else {
+        ensure!(std::env::var_os("ROOTYARD_PG_CA_PEM").is_none(), "refusing PostgreSQL TLS downgrade");
+        cmd.env("PGSSLMODE", "disable");
+    }
     if let Some(password) = cfg.get_password() {
         use std::os::unix::ffi::OsStrExt;
         cmd.env("PGPASSWORD", std::ffi::OsStr::from_bytes(password));
@@ -509,10 +522,7 @@ async fn pg(config: &Config) -> Result<Client> {
         parsed.get_options().is_none(),
         "backup requires dedicated database, default public schema, no connection options"
     );
-    let (client, connection) = parsed.connect(NoTls).await?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let client = crate::db::connect_config(parsed).await?;
     client.batch_execute("SET application_name='rootyard-backup'; SET lock_timeout='5s'; SET statement_timeout='60s'").await?;
     Ok(client)
 }

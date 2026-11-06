@@ -30,13 +30,16 @@ hmac = "0.12"
 libc = "0.2"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-rdkafka = { version = "0.39", default-features = false, features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "ssl"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-serde_json-1"] }
+tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
