@@ -39,6 +39,30 @@ def main():
             pr["repository_id"]+"' AND service_principal_id IS NOT NULL AND actor_id IS NULL "+
             "AND token_id IS NULL AND evidence->>'kind'='observed_immutable_ci_root'")
         assert service=="1",service
+        human=h.sql("SELECT count(*) FROM outbox_events e JOIN git_operations o "+
+            "ON o.id=e.operation_id WHERE e.repository_id='"+pr["repository_id"]+
+            "' AND o.actor_id IS NOT NULL")
+        assert int(human)>0,human
+        import hashlib
+        forged_event=hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+        bad_ref=("INSERT INTO outbox_events(event_id,operation_id,repository_id,"
+            "storage_generation,operation_sequence,transaction_sequence,ref_name,old_oid,new_oid) "
+            f"SELECT '{forged_event}',id,repository_id,storage_generation,sequence,2,"
+            f"'refs/heads/forged',repeat('0',40),'{h.feat1_oid}' FROM git_operations "
+            f"WHERE repository_id='{pr['repository_id']}' AND service_principal_id IS NOT NULL")
+        try:h.sql(bad_ref)
+        except AssertionError:pass
+        else:raise AssertionError("CI service journal accepted an unrelated ref")
+        principal=h.sql("SELECT service_principal_id FROM git_operations WHERE repository_id='"+
+            pr["repository_id"]+"' AND service_principal_id IS NOT NULL")
+        bad_operation=("INSERT INTO git_operations(id,repository_id,service_principal_id,actor_name,"
+            "sequence,storage_generation,outcome,evidence) VALUES("+
+            f"'{uuid.uuid4()}','{pr['repository_id']}','{principal}','ci-scheduler',"
+            "(SELECT coalesce(max(sequence),0)+1 FROM git_operations WHERE repository_id='"+
+            pr["repository_id"]+"'),1,'unknown','{\"kind\":\"observed_immutable_ci_root\"}'::jsonb)")
+        try:h.sql(bad_operation)
+        except AssertionError:pass
+        else:raise AssertionError("CI service journal accepted missing intent")
         run_rows=h.sql("SELECT id::text||','||context FROM ci_runs ORDER BY context").splitlines()
         assert len(run_rows)==2,run_rows
         runs={line.split(',')[1]:line.split(',')[0] for line in run_rows}
@@ -61,7 +85,6 @@ def main():
         assert first["checkout"]["token"].startswith("ryj_")
         digest=h.sql("SELECT encode(credential_digest,'hex') FROM ci_integration_checkout_jobs "+
             "WHERE run_id='"+runs["ci/test"]+"' AND attempt=1")
-        import hashlib
         assert digest==hashlib.sha256(first["checkout"]["token"].encode()).hexdigest()
         runner(prefix+runs["ci/test"]+"/heartbeat",{"attempt":first["attempt"],
             "lease_generation":first["lease_generation"],"runner_id":"runner-a"})
