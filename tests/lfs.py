@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Git LFS Batch API, verified streaming object storage, and paired backup/restore tests."""
 import argparse
+import concurrent.futures
 import hashlib
 import http.client
 import json
@@ -439,6 +440,41 @@ class LfsHarness(Harness):
         )
         assert restored_bytes == original
 
+    def stock_lfs_locks(self):
+        self.git("lfs", "install", "--local", cwd=self.work)
+        lock = self.git("lfs", "lock", "docs/design.bin", cwd=self.work, token=self.alice)
+        assert b"Locked docs/design.bin" in lock.stdout
+        listed = self.git("lfs", "locks", cwd=self.work, token=self.alice)
+        assert b"docs/design.bin" in listed.stdout
+        self.stop()
+        self.start()
+        listed = self.git("lfs", "locks", cwd=self.work, token=self.alice)
+        assert b"docs/design.bin" in listed.stdout
+        verify = self.http("/git/alice/demo.git/info/lfs/locks/verify", token=self.alice,
+                           method="POST", body={}, content_type=LFS_MIME)
+        assert verify[0] == 200 and len(json.loads(verify[1])["ours"]) == 1
+
+        self.expect("/api/repos/alice/demo/collaborators/bob", 201, token=self.alice,
+                    method="PUT", body={"role": "write"})
+        denied = self.git("lfs", "unlock", "docs/design.bin", cwd=self.work, token=self.bob, check=False)
+        assert denied.returncode != 0
+        denied_force = self.git("lfs", "unlock", "--force", "docs/design.bin", cwd=self.work,
+                                token=self.bob, check=False)
+        assert denied_force.returncode != 0
+        self.expect("/api/repos/alice/demo/collaborators/bob", 200, token=self.alice,
+                    method="PUT", body={"role": "admin"})
+        forced = self.git("lfs", "unlock", "--force", "docs/design.bin", cwd=self.work, token=self.bob)
+        assert b"Unlocked docs/design.bin" in forced.stdout
+
+        def lock_attempt(_):
+            return self.http("/git/alice/demo.git/info/lfs/locks", token=self.alice,
+                             method="POST", body={"path": "docs/concurrent.bin"},
+                             content_type=LFS_MIME)[0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            statuses = list(executor.map(lock_attempt, range(8)))
+        assert statuses.count(201) == 1 and statuses.count(409) == 7, statuses
+        self.expect("/api/repos/alice/demo/collaborators/bob", 200, token=self.alice, method="DELETE")
+
     def paired_backup_and_restore(self):
         # Verify volume layout invariants required by src/backup.rs::inventory
         lfs_root = self.root / "data" / "lfs"
@@ -474,6 +510,7 @@ def main():
             "permissions_and_tenant_isolation",
             "concurrent_upload_revocation",
             "stalled_body_deadline",
+            "stock_lfs_locks",
             "corrupted_on_disk_blob_fails_closed",
             "paired_backup_and_restore",
         ):

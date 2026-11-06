@@ -308,16 +308,27 @@ async fn merge_pull_inner(
         commit_oid
     };
 
+    let ref_change = journal::RefChange {
+        ref_name: pull.base_ref.clone(),
+        old_oid: input.expected_base_oid.clone(),
+        new_oid: merged_oid.clone(),
+    };
     crate::lfs::publication::validate_new_refs(
         &state,
         &tx,
         repo_id,
         tenant_id,
-        &[journal::RefChange {
-            ref_name: pull.base_ref.clone(),
-            old_oid: input.expected_base_oid.clone(),
-            new_oid: merged_oid.clone(),
-        }],
+        std::slice::from_ref(&ref_change),
+    )
+    .await?;
+    crate::lfs::locks::validate_new_refs_with_client(
+        &*tx,
+        &repo_path,
+        &state.config.git,
+        state.config.git_timeout,
+        repo_id,
+        actor.id,
+        &[ref_change],
     )
     .await?;
 

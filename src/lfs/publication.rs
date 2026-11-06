@@ -17,7 +17,7 @@ const MAX_SMALL_BLOBS: usize = 4_096;
 const MAX_LIST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_POINTER_BYTES: usize = 1024;
 
-async fn git_input(
+pub(crate) async fn git_input(
     git_dir: &Path,
     git_bin: &Path,
     timeout: Duration,
@@ -31,6 +31,14 @@ async fn git_input(
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("LC_ALL", "C")
         .env("GIT_TERMINAL_PROMPT", "0");
+    // Git receive-pack places incoming objects in a quarantine directory
+    // until the pre-receive hook accepts the update. Forward only these two
+    // Git-managed paths; the rest of the hook environment remains cleared.
+    for name in ["GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"] {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
     cmd.arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("--no-replace-objects")

@@ -61,7 +61,7 @@ CREATE TABLE organization_teams (
     id UUID PRIMARY KEY,
     organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     slug TEXT NOT NULL CHECK (slug ~ '^[a-z0-9][a-z0-9_-]{0,62}$'),
-    name TEXT NOT NULL CHECK (octet_length(btrim(name)) BETWEEN 1 AND 128),
+    name TEXT NOT NULL CHECK (octet_length(btrim(name)) >= 1 AND octet_length(btrim(name)) <= 128),
     role TEXT NOT NULL CHECK (role IN ('read','triage','write','maintain','admin')),
     version BIGINT NOT NULL DEFAULT 1 CHECK (version > 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
