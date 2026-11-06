@@ -35,7 +35,7 @@ pub async fn claim(pool: &Pool, owner: Uuid, policy: &Policy) -> Result<Option<J
            ORDER BY not_before,created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED \
          ) UPDATE storage_maintenance_jobs j SET state='running', \
              attempt=j.attempt+1, claim_generation=j.claim_generation+1, \
-             lease_owner=$1, lease_until=clock_timestamp()+make_interval(secs=>$2), \
+             lease_owner=$1, lease_until=clock_timestamp()+make_interval(secs=>($2::bigint)::double precision), \
              updated_at=clock_timestamp() \
          FROM candidate WHERE j.id=candidate.id RETURNING j.*",
         &[&owner, &policy.lease_seconds, &policy.max_attempts],
@@ -47,7 +47,7 @@ pub async fn claim(pool: &Pool, owner: Uuid, policy: &Policy) -> Result<Option<J
 pub async fn renew(pool: &Pool, job: &Job, policy: &Policy) -> Result<bool> {
     let client = pool.get().await?;
     Ok(client.execute(
-        "UPDATE storage_maintenance_jobs SET lease_until=clock_timestamp()+make_interval(secs=>$5), \
+        "UPDATE storage_maintenance_jobs SET lease_until=clock_timestamp()+make_interval(secs=>($5::bigint)::double precision), \
          updated_at=clock_timestamp() WHERE id=$1 AND state='running' AND lease_owner=$2 \
          AND claim_generation=$3 AND attempt=$4 AND lease_until > clock_timestamp()",
         &[&job.id, &job.lease_owner, &job.claim_generation, &job.attempt, &policy.lease_seconds],
@@ -74,7 +74,7 @@ pub async fn finish(pool: &Pool, job: &Job, result: Value, error: Option<&str>, 
     let delay = (1_i64 << job.attempt.min(10)).min(900);
     Ok(client.execute(
         "UPDATE storage_maintenance_jobs SET state=$5, lease_owner=NULL,lease_until=NULL, \
-         result=$6,last_error=$7,not_before=clock_timestamp()+make_interval(secs=>$8), \
+         result=$6,last_error=$7,not_before=clock_timestamp()+make_interval(secs=>($8::bigint)::double precision), \
          completed_at=CASE WHEN $5='queued' THEN NULL ELSE clock_timestamp() END, \
          updated_at=clock_timestamp() WHERE id=$1 AND state='running' AND lease_owner=$2 \
          AND claim_generation=$3 AND attempt=$4 AND lease_until>clock_timestamp()",

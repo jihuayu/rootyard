@@ -35,7 +35,7 @@ pub async fn schedule_once(state: &AppState, policy: &Policy) -> Result<usize> {
          s.last_repack_at::text AS last_repack_at \
          FROM repositories r LEFT JOIN storage_maintenance_repo_state s ON s.repository_id=r.id \
          WHERE r.state='ready' AND r.storage_backend='gitfs' AND \
-           (s.last_scan_at IS NULL OR s.last_scan_at < clock_timestamp()-make_interval(secs=>$1)) \
+           (s.last_scan_at IS NULL OR s.last_scan_at < clock_timestamp()-make_interval(secs=>($1::bigint)::double precision)) \
          ORDER BY s.last_scan_at NULLS FIRST,r.id LIMIT 16",
         &[&policy.scan_period_seconds],
     ).await?;
