@@ -135,6 +135,7 @@ def transition_flow(h, object_format):
     assert status["storage_backend"] == "gitfs" and status["transition_state"] == "stable", status
 
     h.start()
+    clone_verify(h, remote, second, object_format, object_format + "-rollback")
     third = commit(h, work, "three.txt", "gitfs third " + object_format)
     push(h, work)
     assert sequences(h, repo) == (3, 3, 1, 3), sequences(h, repo)

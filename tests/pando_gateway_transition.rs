@@ -350,7 +350,7 @@ async fn worker_generation_function_requires_delivery_privilege_not_ownership() 
     let pool = db::pool(&url).unwrap();
     db::migrate(&pool).await.unwrap();
     let (repo, _owner, _slug) = fixture(&pool, "worker-generation").await;
-    let client = pool.get().await.unwrap();
+    let mut client = pool.get().await.unwrap();
     let superuser: bool =
         client.query_one("SELECT rolsuper FROM pg_roles WHERE rolname=current_user", &[]).await.unwrap().get(0);
     if !superuser {
