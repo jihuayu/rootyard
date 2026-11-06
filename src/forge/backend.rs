@@ -1,5 +1,5 @@
 //! Repository storage backend status and administrative switch.
-use super::{json, positive};
+use super::handlers::{json, positive};
 use crate::{AppState, Error, auth::{self, Role, authorize_repo_with_role as authorize, finish_tx as finish}};
 use axum::{Json, extract::{Path, State}, http::{HeaderMap, StatusCode}, response::Response};
 use serde::{Deserialize, Serialize};
