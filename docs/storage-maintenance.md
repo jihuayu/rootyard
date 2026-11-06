@@ -32,3 +32,10 @@ Repacking currently retains old packs. Physical tombstone deletion and pack prun
 complete durable lease coverage across all source readers, including CI and
 workspace paths. An unavailable lease, backup barrier, shard route, or job
 generation fails closed and retries within the configured attempt limit.
+
+Migration 112 reserves `pando_*` job kinds in the same durable queue. The
+GitFS scheduler does not enqueue them and its worker rejects them until the
+production Pando gateway can resolve pack manifests from PostgreSQL and
+verify ref, CI, workspace, migration, and backup retention before remote
+deletion. S3 listing and synthetic Pando lab commands are not retention
+authorities.
