@@ -17,6 +17,37 @@ pub struct PublicationWindow<'a> {
     guard: &'a PublicationGuard,
     _local: OwnedMutexGuard<()>,
 }
+
+/// Repo-only exclusive publication fence for placement/policy transitions.
+/// Callers must already hold their data maintenance lease and local exclusive
+/// gate, then take the local writer mutex only after this fence is granted.
+pub struct RepositoryFence {
+    active: watch::Receiver<Option<Instant>>,
+    owner: JoinHandle<()>,
+    _slot: OwnedSemaphorePermit,
+}
+impl RepositoryFence {
+    pub fn ensure_active(&self) -> Result<(),Error> {
+        if self.active.borrow().as_ref().is_some_and(|seen|
+            Instant::now().duration_since(*seen)<Duration::from_secs(3))
+            && !self.owner.is_finished() { Ok(()) }
+        else { Err(unavailable()) }
+    }
+    pub async fn guard<F: Future>(&self, future:F)->Result<F::Output,Error> {
+        tokio::pin!(future);
+        let mut tick=tokio::time::interval(Duration::from_millis(500));
+        loop {
+            self.ensure_active()?;
+            tokio::select! {
+                result=&mut future=>{self.ensure_active()?;return Ok(result);}
+                _=tick.tick()=>{}
+            }
+        }
+    }
+}
+impl Drop for RepositoryFence {
+    fn drop(&mut self) { self.owner.abort(); }
+}
 impl PublicationWindow<'_> {
     pub fn ensure_active(&self) -> Result<(), Error> { self.guard.ensure_active() }
 }
@@ -92,6 +123,54 @@ fn unavailable() -> Error {
 
 fn valid_ref(name: &str) -> bool {
     name.starts_with("refs/") && crate::journal::valid_ref(name)
+}
+
+/// The exact key used by `PublicationGuard::enter_window`, without acquiring
+/// a ref lock or an extra data lease. This is for migrations and other
+/// repository-wide transitions, never normal ref writers.
+pub async fn acquire_repository_fence(pool:&Pool, repository_id:Uuid,
+    deadline:Instant)->Result<RepositoryFence,Error> {
+    if repository_id.is_nil() {return Err(Error::bad_request());}
+    static SLOTS:OnceLock<Arc<Semaphore>>=OnceLock::new();
+    let slots=SLOTS.get_or_init(||Arc::new(Semaphore::new(2))).clone();
+    let slot=tokio::time::timeout_at(deadline,slots.acquire_owned()).await
+        .map_err(|_|unavailable())?.map_err(|_|unavailable())?;
+    let owner_pool=pool.clone();
+    let (ready_send,ready_recv)=oneshot::channel::<Result<(),Error>>();
+    let (active_send,active)=watch::channel(None);
+    let mut pending=Pending(Some(tokio::spawn(async move {
+        let mut ready_send=Some(ready_send);
+        let result:Result<(),Error>=async {
+            let mut client=owner_pool.get().await.map_err(Error::internal)?;
+            let tx=client.transaction().await.map_err(Error::internal)?;
+            tx.batch_execute("SET LOCAL idle_in_transaction_session_timeout='5s'; SET LOCAL statement_timeout='3s'")
+                .await.map_err(Error::internal)?;
+            loop {
+                let granted:bool=tx.query_one(LOCK_REPOSITORY,&[&repository_id])
+                    .await.map_err(Error::internal)?.get(0);
+                if granted {break;}
+                if Instant::now()>=deadline {return Err(unavailable());}
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            active_send.send_replace(Some(Instant::now()));
+            if let Some(send)=ready_send.take(){let _=send.send(Ok(()));}
+            let mut tick=tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                tokio::time::timeout(Duration::from_millis(1500),tx.simple_query("SELECT 1"))
+                    .await.map_err(|_|unavailable())?.map_err(Error::internal)?;
+                active_send.send_replace(Some(Instant::now()));
+            }
+        }.await;
+        if let Some(send)=ready_send.take(){let _=send.send(result);}
+        active_send.send_replace(None);
+    })));
+    match tokio::time::timeout_at(deadline,ready_recv).await {
+        Ok(Ok(Ok(())))=>Ok(RepositoryFence {active,owner:pending.0.take().unwrap(),_slot:slot}),
+        Ok(Ok(Err(error)))=>Err(error),
+        _=>Err(unavailable()),
+    }
 }
 
 /// Acquire sorted exact-ref locks and the repository's shared maintenance
@@ -239,7 +318,12 @@ mod tests {
         let free_a = acquire(&pool, repo, 1, &a, until()).await.unwrap();
         free_a.ensure_active().unwrap();
         drop(free_a);
+        assert!(acquire_repository_fence(&pool,repo,Instant::now()+Duration::from_millis(150))
+            .await.is_err(),"migration fence overlapped a native publication window");
         drop(independent);
+        let maintenance=acquire_repository_fence(&pool,repo,until()).await.unwrap();
+        maintenance.ensure_active().unwrap();
+        drop(maintenance);
         let all = acquire(&pool, repo, 1, &group, until()).await.unwrap();
         assert_eq!(all.refs(), &["refs/heads/a", "refs/heads/b"]);
         drop(all);
