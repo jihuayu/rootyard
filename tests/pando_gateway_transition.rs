@@ -8,7 +8,7 @@ use rootyard::{
     AppState,
     config::Config,
     db, dispatch, journal, metrics,
-    pando_gateway::transition,
+    pando_gateway::transition::{self, operator},
     storage::{self, read_leases, ref_publication},
 };
 use std::{path::Path, process::Command, sync::Arc, time::Duration};
@@ -384,4 +384,78 @@ async fn worker_generation_function_requires_delivery_privilege_not_ownership() 
         tx.query_one("SELECT rootyard_worker_repository_generation($1,current_schema())", &[&repo]).await.unwrap_err();
     assert_eq!(error.as_db_error().map(|error| error.code().code()), Some("42501"));
     tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn abandoned_draining_recovery_requires_exact_identity_and_no_publisher() {
+    let Ok(url) = std::env::var("ROOTYARD_TEST_DATABASE_URL") else { return };
+    let pool = db::pool(&url).unwrap();
+    db::migrate(&pool).await.unwrap();
+    let (repo, _owner, _slug) = fixture(&pool, "abandoned-drain").await;
+    let client = pool.get().await.unwrap();
+    let transition = uuid::Uuid::new_v4();
+    client
+        .execute(
+            "UPDATE repositories SET transition_state='draining',transition_id=$2, \
+             transition_started_at=clock_timestamp(),backend_transition_epoch=9 WHERE id=$1",
+            &[&repo, &transition],
+        )
+        .await
+        .unwrap();
+    let generation: i64 =
+        client.query_one("SELECT storage_generation FROM repositories WHERE id=$1", &[&repo]).await.unwrap().get(0);
+    let root = std::env::temp_dir().join(format!("rootyard-abandoned-{}", uuid::Uuid::new_v4()));
+    let cfg = config(&root, std::path::Path::new("/usr/bin/git"));
+
+    // The offline command must prove exclusive volume ownership before it can
+    // mutate the fence, so a live writer on the same data directory rejects.
+    let held = storage::Storage::open(&cfg).unwrap();
+    assert!(operator::recover_abandoned_draining(&cfg, &pool, repo, transition, 9, "gitfs", generation).await.is_err());
+    drop(held);
+
+    // A stale transition ID, epoch or source backend must never clear the drain.
+    assert!(
+        operator::recover_abandoned_draining(&cfg, &pool, repo, uuid::Uuid::new_v4(), 9, "gitfs", generation)
+            .await
+            .is_err()
+    );
+    assert!(operator::recover_abandoned_draining(&cfg, &pool, repo, transition, 8, "gitfs", generation).await.is_err());
+    assert!(operator::recover_abandoned_draining(&cfg, &pool, repo, transition, 9, "pando", generation).await.is_err());
+
+    // An active publisher holds the same repository publication key and must
+    // make recovery reject rather than unfence live work.
+    let publisher = ref_publication::acquire_repository_fence(&pool, repo, deadline()).await.unwrap();
+    assert!(operator::recover_abandoned_draining(&cfg, &pool, repo, transition, 9, "gitfs", generation).await.is_err());
+    drop(publisher);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let status_args = vec!["status".to_owned(), "--repository".to_owned(), repo.to_string()];
+    operator::cli(&cfg, &pool, &status_args).await.unwrap();
+    let args: Vec<String> = [
+        "recover-abandoned-draining",
+        "--repository",
+        &repo.to_string(),
+        "--expected-transition",
+        &transition.to_string(),
+        "--expected-epoch",
+        "9",
+        "--expected-backend",
+        "gitfs",
+        "--expected-generation",
+        &generation.to_string(),
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    operator::cli(&cfg, &pool, &args).await.unwrap();
+    let status = operator::status(&pool, repo).await.unwrap();
+    assert_eq!(status["transition_state"], "failed");
+    let transition_text = transition.to_string();
+    assert_eq!(status["transition_id"].as_str(), Some(transition_text.as_str()));
+    assert_eq!(status["transition_epoch"].as_i64(), Some(9));
+    assert!(status["transition_error"].as_str().unwrap().contains("abandoned draining"));
+
+    // Recovery closes the fence to failed, never to stable; ordinary writes
+    // remain rejected until a same-direction retry completes.
+    assert!(transition::admit_write(&pool, repo, "gitfs").await.is_err());
 }

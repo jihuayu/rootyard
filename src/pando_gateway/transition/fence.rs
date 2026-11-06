@@ -97,7 +97,7 @@ async fn ensure_fence(tx: &tokio_postgres::Transaction<'_>, repo_id: Uuid, fence
     Ok(())
 }
 
-pub(super) async fn acquire_publication_lock(pool: &Pool, repo_id: Uuid, deadline: Instant) -> Result<Client, Error> {
+pub(crate) async fn acquire_publication_lock(pool: &Pool, repo_id: Uuid, deadline: Instant) -> Result<Client, Error> {
     let client = pool.get().await.map_err(Error::internal)?;
     loop {
         let granted: bool = client
@@ -118,7 +118,7 @@ pub(super) async fn acquire_publication_lock(pool: &Pool, repo_id: Uuid, deadlin
     }
 }
 
-pub(super) async fn release_publication_lock(client: &Client, repo_id: Uuid) {
+pub(crate) async fn release_publication_lock(client: &Client, repo_id: Uuid) {
     let _ = client
         .query_one(
             "SELECT pg_advisory_unlock(hashtextextended('rootyard-publication-v1:' || $1::uuid::text, 0))",

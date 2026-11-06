@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 mod fence;
 mod gitfs;
+pub mod operator;
 #[cfg(test)]
 mod tests;
 
