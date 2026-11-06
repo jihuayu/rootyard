@@ -4,6 +4,7 @@ pub mod locks;
 pub mod models;
 pub mod publication;
 pub mod storage;
+mod upload;
 
 use crate::AppState;
 use axum::{
@@ -19,42 +20,42 @@ pub fn routes() -> Router<Arc<AppState>> {
     let upload_routes = Router::new()
         .route(
             "/git/{owner}/{name}/info/lfs/objects/{oid}",
-            put(handlers::upload_object),
+            put(upload::upload_object),
         )
         .route(
             "/git/{owner}/{name}/info/lfs/objects/{oid}/{size}",
-            put(handlers::upload_object_with_size),
+            put(upload::upload_object_with_size),
         )
         .route(
             "/{owner}/{name}/info/lfs/objects/{oid}",
-            put(handlers::upload_object),
+            put(upload::upload_object),
         )
         .route(
             "/{owner}/{name}/info/lfs/objects/{oid}/{size}",
-            put(handlers::upload_object_with_size),
+            put(upload::upload_object_with_size),
         )
         .route(
             "/api/repos/{owner}/{name}/lfs/objects/{oid}",
-            put(handlers::upload_object),
+            put(upload::upload_object),
         )
         .route(
             "/api/repos/{owner}/{name}/lfs/objects/{oid}/{size}",
-            put(handlers::upload_object_with_size),
+            put(upload::upload_object_with_size),
         )
         .route(
             "/api/repos/{owner}/{name}/info/lfs/objects/{oid}",
-            put(handlers::upload_object),
+            put(upload::upload_object),
         )
         .route(
             "/api/repos/{owner}/{name}/info/lfs/objects/{oid}/{size}",
-            put(handlers::upload_object_with_size),
+            put(upload::upload_object_with_size),
         )
         .layer(DefaultBodyLimit::disable());
 
     Router::new()
         .route(
             "/api/repos/{owner}/{name}/lfs/upload-waiters",
-            get(handlers::upload_waiters),
+            get(upload::upload_waiters),
         )
         .route(
             "/git/{owner}/{name}/info/lfs/locks",
