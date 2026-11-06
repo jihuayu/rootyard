@@ -2,7 +2,7 @@
 
 Git hosting and collaborative workspaces in Rust. PostgreSQL holds identities, repository metadata, permissions and durable jobs. **Native bare Git repositories on a durable local volume are authoritative for refs and objects.** Clients create commits locally and use Git Smart HTTP to clone, fetch and push.
 
-This integration branch adds Forge/browser sessions, organizations, Git LFS and locks, remote object storage, kernel FUSE workspaces, CI orchestration, local-process cluster fencing and paired offline recovery. Production Pando dispatch, remote lazy hydration, independent-ref concurrency and distributed deployment acceptance remain in progress. See the [46-task delivery ledger](docs/registered-task-delivery.md) for executed evidence and remaining gates; this branch is not a production HA qualification.
+This main (`6d2f0b8`) includes the merged #49–#55 work: Forge/browser sessions, organizations, Git LFS and locks, the authenticated Pando gateway and transition operator, remote lazy Workspace hydration, durable independent-ref admission, physical GitFS GC fencing, SHA-256 Forge admission, CI orchestration, local-process cluster fencing and paired offline recovery. Current round-2 fixes for SHA-256 CI checkout, controller post-promotion push and sandbox cgroup acceptance are still in progress. See the [46-task delivery ledger](docs/registered-task-delivery.md) and the [`6d2f0b8` acceptance audit](docs/acceptance/main-6d2f0b8-audit.md) for executed evidence and remaining gates; this main is not a production HA qualification.
 
 ## Requirements
 
