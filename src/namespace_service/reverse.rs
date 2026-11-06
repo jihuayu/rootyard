@@ -1,5 +1,7 @@
 //! Import a projected Git bundle and map its tree back into a pinned source subdir.
 use super::{changesets, views};
+#[path = "reverse_git.rs"]
+mod reverse_git;
 use crate::{
     auth,
     browse::{
@@ -15,6 +17,7 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use reverse_git::{git, git_input, git_oid, verify_candidate_budget};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -22,7 +25,6 @@ use std::{
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
-    process::{Command, Stdio},
     sync::Arc,
 };
 use uuid::Uuid;
@@ -43,82 +45,6 @@ impl Drop for Stage {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
-}
-
-fn git(repo: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
-    let output = Command::new("git")
-        .arg("-c")
-        .arg("core.hooksPath=/dev/null")
-        .arg("--no-replace-objects")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(Error::internal)?;
-    if !output.status.success() {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "Git View reverse mapping conflict",
-        ));
-    }
-    Ok(output.stdout)
-}
-fn git_oid(repo: &FsPath, args: &[&str]) -> Result<String, Error> {
-    String::from_utf8(git(repo, args)?)
-        .map(|s| s.trim().to_owned())
-        .map_err(Error::internal)
-}
-fn git_input(
-    repo: &FsPath,
-    args: &[&str],
-    input: &[u8],
-    actor: Option<&str>,
-) -> Result<String, Error> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-c")
-        .arg("core.hooksPath=/dev/null")
-        .arg("--no-replace-objects")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    if let Some(actor) = actor {
-        cmd.env("GIT_AUTHOR_NAME", actor)
-            .env("GIT_COMMITTER_NAME", actor)
-            .env(
-                "GIT_AUTHOR_EMAIL",
-                format!("{actor}@users.rootyard.invalid"),
-            )
-            .env(
-                "GIT_COMMITTER_EMAIL",
-                format!("{actor}@users.rootyard.invalid"),
-            );
-    }
-    let mut child = cmd.spawn().map_err(Error::internal)?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| Error::internal("missing Git stdin"))?
-        .write_all(input)
-        .map_err(Error::internal)?;
-    let output = child.wait_with_output().map_err(Error::internal)?;
-    if !output.status.success() {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "Git View reverse mapping conflict",
-        ));
-    }
-    String::from_utf8(output.stdout)
-        .map(|s| s.trim().to_owned())
-        .map_err(Error::internal)
 }
 
 fn replace_tree(
@@ -162,49 +88,6 @@ fn replace_tree(
     git_input(repo, &["mktree", "-z"], &out, None)
 }
 
-fn verify_candidate_budget(repo: &FsPath, candidate: &str, base: &str) -> Result<(), Error> {
-    let raw = git(
-        repo,
-        &["rev-list", "--objects", candidate, &format!("^{base}")],
-    )?;
-    let mut input = Vec::new();
-    let mut count = 0usize;
-    for row in raw.split(|b| *b == b'\n').filter(|r| !r.is_empty()) {
-        let oid = row.split(|b| *b == b' ').next().unwrap_or_default();
-        if oid.len() != 40 && oid.len() != 64 {
-            return Err(Error::bad_request());
-        }
-        input.extend_from_slice(oid);
-        input.push(b'\n');
-        count += 1;
-        if count > 100_000 {
-            return Err(Error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "proposal has too many Git objects",
-            ));
-        }
-    }
-    let sizes = git_input(
-        repo,
-        &["cat-file", "--batch-check=%(objectsize)"],
-        &input,
-        None,
-    )?;
-    let mut total = 0u64;
-    for size in sizes.lines() {
-        total = total
-            .checked_add(size.parse::<u64>().map_err(Error::internal)?)
-            .ok_or_else(Error::bad_request)?;
-        if total > 256 * 1024 * 1024 {
-            return Err(Error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "proposal objects exceed 256 MiB",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn build_source_commit(
     source: &FsPath,
     projected_repo: &FsPath,
@@ -215,6 +98,7 @@ fn build_source_commit(
     source_ref: &str,
     actor: &str,
     message: &str,
+    max_repo_bytes: u64,
 ) -> Result<String, Error> {
     fs::create_dir_all(root).map_err(Error::internal)?;
     fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(Error::internal)?;
@@ -231,6 +115,15 @@ fn build_source_commit(
     output.sync_all().map_err(Error::internal)?;
     drop(output);
     let checkout = root.join("projected");
+    let source_view_bytes =
+        crate::storage::disk_bytes(&projected_repo.join(".git"), 256 * 1024 * 1024)
+            .map_err(Error::internal)?;
+    if source_view_bytes > 256 * 1024 * 1024 {
+        return Err(Error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "View Git store exceeds import budget",
+        ));
+    }
     git(
         root,
         &[
@@ -268,7 +161,15 @@ fn build_source_commit(
             &candidate,
         ],
     )?;
-    verify_candidate_budget(&checkout, &candidate, &view.projected_oid)?;
+    let candidate_bytes = verify_candidate_budget(&checkout, &candidate, &view.projected_oid)?;
+    let staged_bytes = crate::storage::disk_bytes(&checkout.join(".git"), 512 * 1024 * 1024)
+        .map_err(Error::internal)?;
+    if staged_bytes > 512 * 1024 * 1024 {
+        return Err(Error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "proposal staging exceeds 512 MiB",
+        ));
+    }
     git(&checkout, &["fsck", "--strict", "--no-reflogs", &candidate])?;
     let projected_tree = git_oid(&checkout, &["rev-parse", &format!("{candidate}^{{tree}}")])?;
     let old_projected_tree = git_oid(
@@ -281,6 +182,14 @@ fn build_source_commit(
     let current = git_oid(source, &["rev-parse", "--verify", source_ref])?;
     if current != view.source_oid {
         return Err(Error(StatusCode::CONFLICT, "source ref advanced"));
+    }
+    let source_bytes =
+        crate::storage::disk_bytes(source, max_repo_bytes).map_err(Error::internal)?;
+    if source_bytes.saturating_add(candidate_bytes) > max_repo_bytes {
+        return Err(Error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "repository quota reached",
+        ));
     }
     git(
         &checkout,
@@ -296,6 +205,13 @@ fn build_source_commit(
             "refs/heads/reverse-import",
         ],
     )?;
+    if crate::storage::disk_bytes(source, max_repo_bytes).map_err(Error::internal)? > max_repo_bytes
+    {
+        return Err(Error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "repository quota reached",
+        ));
+    }
     let old_tree = git_oid(
         source,
         &["rev-parse", &format!("{}^{{tree}}", view.source_oid)],
@@ -391,6 +307,7 @@ pub async fn create(
     let source_ref = input.source_ref.clone();
     let bundle_ref = input.bundle_ref.clone();
     let message = input.message.clone();
+    let quota = state.config.max_repo_bytes;
     let new_oid = tokio::task::spawn_blocking(move || {
         build_source_commit(
             &source,
@@ -402,6 +319,7 @@ pub async fn create(
             &source_ref,
             &actor_name,
             &message,
+            quota,
         )
     })
     .await
