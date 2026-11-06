@@ -48,22 +48,36 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
     let task=async {
         if job.kind=="gitfs_unreachable_mark" {
             gc::mark(state,job.repository_id,job.tenant_id,job.repository_generation,policy,&cancel).await
+        } else if job.kind=="gitfs_tombstone_delete" && gc::PHYSICAL_DELETE_ENABLED {
+            gc::delete_due(state,job.repository_id,job.tenant_id,job.repository_generation,&lease,&cancel).await
+        } else if job.kind=="gitfs_cache_evict" && !gc::PHYSICAL_DELETE_ENABLED {
+            bail!("cache eviction requires complete reader lease coverage")
         } else {
             gitfs::execute(state,job.repository_id,&job.kind,policy,&cancel).await
         }
     };
     tokio::pin!(task);
-    let mut tick=tokio::time::interval(Duration::from_secs((policy.lease_seconds/3).max(1) as u64));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut safety=tokio::time::interval(Duration::from_millis(200));
+    safety.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut renew=tokio::time::interval(Duration::from_secs((policy.lease_seconds/3).max(1) as u64));
+    renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result=loop {
         tokio::select! {
             done=&mut task => break done,
-            _=tick.tick() => {
-                if lease.ensure_active().is_err()
-                    || !jobs::renew(&state.pool,job,policy).await.unwrap_or(false)
-                    || tx.query_one("SELECT 1",&[]).await.is_err() {
+            _=safety.tick() => {
+                if lease.ensure_active().is_err() {
                     cancel.cancel();
-                    break task.await;
+                    let _=task.await;
+                    bail!("repository reader barrier lost during maintenance");
+                }
+            }
+            _=renew.tick() => {
+                let renewed=tokio::time::timeout(Duration::from_millis(750),jobs::renew(&state.pool,job,policy)).await;
+                let backup_ping=tokio::time::timeout(Duration::from_millis(750),tx.query_one("SELECT 1",&[])).await;
+                if !matches!(renewed,Ok(Ok(true))) || !matches!(backup_ping,Ok(Ok(_))) {
+                    cancel.cancel();
+                    let _=task.await;
+                    bail!("maintenance lease or backup barrier lost");
                 }
             }
         }
