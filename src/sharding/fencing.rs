@@ -168,6 +168,8 @@ pub async fn check_before_push(state: &AppState, repo: &RepoState) -> Result<(),
 
     let r_sql = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id = $1");
     let Some(r_row) = client.query_opt(&r_sql, &[&repo.id]).await.map_err(Error::internal)? else {
+        let count: i64 = client.query_one("SELECT COUNT(*) FROM shard_nodes", &[]).await.map_err(Error::internal)?.get(0);
+        if count > 1 { return Err(conflict("cluster writer requires a durable repository route")); }
         return Ok(());
     };
     let route = RepoShardRoute::row(&r_row);
@@ -215,6 +217,8 @@ pub async fn check_hook_fence(
     let r_sql = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id=$1");
     let Some(row) = client.query_opt(&r_sql, &[&repo_id]).await.map_err(Error::internal)? else {
         if marker.is_some() { return Err(conflict("shard marker exists without route")); }
+        let count: i64 = client.query_one("SELECT COUNT(*) FROM shard_nodes", &[]).await.map_err(Error::internal)?.get(0);
+        if count > 1 { return Err(conflict("native Git cluster writer lacks durable repository route")); }
         return Ok(());
     };
     let route = RepoShardRoute::row(&row);
