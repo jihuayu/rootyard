@@ -458,9 +458,9 @@ pub async fn ensure_schema(pool: &Pool) -> Result<(), Error> {
     let mut client = pool.get().await.map_err(Error::internal)?;
     let exists: bool = client
         .query_one(
-            "SELECT to_regclass('public.forge_webhooks') IS NOT NULL \
-             AND to_regclass('public.forge_webhook_deliveries') IS NOT NULL \
-             AND to_regclass('public.forge_webhook_callbacks') IS NOT NULL",
+            "SELECT to_regclass('forge_webhooks') IS NOT NULL \
+             AND to_regclass('forge_webhook_deliveries') IS NOT NULL \
+             AND to_regclass('forge_webhook_callbacks') IS NOT NULL",
             &[],
         )
         .await

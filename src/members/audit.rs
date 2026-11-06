@@ -20,7 +20,7 @@ use uuid::Uuid;
 pub async fn audit_table_installed(tx: &Transaction<'_>) -> Result<bool, Error> {
     let row = tx
         .query_one(
-            "SELECT to_regclass('public.repository_audit_log') IS NOT NULL",
+            "SELECT to_regclass('repository_audit_log') IS NOT NULL",
             &[],
         )
         .await

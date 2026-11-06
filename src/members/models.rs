@@ -340,7 +340,7 @@ pub async fn ensure_schema(pool: &Pool) -> Result<(), Error> {
         .map_err(Error::internal)?;
     let installed: bool = tx
         .query_one(
-            "SELECT to_regclass('public.repository_collaborators') IS NOT NULL",
+            "SELECT to_regclass('repository_collaborators') IS NOT NULL",
             &[],
         )
         .await

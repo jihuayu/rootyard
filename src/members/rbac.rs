@@ -33,7 +33,7 @@ type MemberPath = Path<(String, String, String, String)>;
 type Res = Result<Response, Error>;
 
 pub async fn rbac_tables_installed(tx: &Transaction<'_>) -> Result<bool, Error> {
-    let sql = "SELECT to_regclass('public.repository_collaborators') IS NOT NULL";
+    let sql = "SELECT to_regclass('repository_collaborators') IS NOT NULL";
     Ok(tx.query_one(sql, &[]).await.map_err(Error::internal)?.get(0))
 }
 

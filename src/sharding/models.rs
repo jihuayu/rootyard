@@ -495,7 +495,7 @@ pub struct DegradeDrillResponse {
 /// Idempotently initializes the Track 4 sharding & fencing tables under an advisory lock.
 pub async fn ensure_schema(pool: &Pool) -> Result<(), Error> {
     let mut client = pool.get().await.map_err(Error::internal)?;
-    let sql = "SELECT to_regclass('public.shard_nodes') IS NOT NULL AND to_regclass('public.shard_virtual_buckets') IS NOT NULL AND to_regclass('public.repository_shard_routes') IS NOT NULL AND to_regclass('public.shard_failover_operations') IS NOT NULL";
+    let sql = "SELECT to_regclass('shard_nodes') IS NOT NULL AND to_regclass('shard_virtual_buckets') IS NOT NULL AND to_regclass('repository_shard_routes') IS NOT NULL AND to_regclass('shard_failover_operations') IS NOT NULL";
     if client.query_one(sql, &[]).await.map_err(Error::internal)?.get::<_, bool>(0) {
         return Ok(());
     }

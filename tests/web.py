@@ -1529,10 +1529,11 @@ class WebHarness(PullsHarness):
     """Dual-mode E2E & loopback verification harness for Track 1 Web UI & Security Rendering (F33 & F34)."""
 
     def __init__(self, args: Optional[argparse.Namespace] = None) -> None:
+        args = args or argparse.Namespace(binary="target/debug/rootyard", report=None, keep=False, case="all")
         self._standalone = not bool(os.environ.get("ROOTYARD_TEST_DATABASE_URL"))
         self.local_server: Optional[LocalWebUiServer] = None
         if self._standalone:
-            self.args = args or argparse.Namespace(binary="target/debug/rootyard", report=None, keep=False, case="all")
+            self.args = args
             self.results: list[dict[str, Any]] = []
             self.root = Path(tempfile.mkdtemp(prefix="rootyard-web-e2e-"))
         else:

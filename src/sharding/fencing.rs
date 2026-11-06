@@ -152,7 +152,7 @@ pub async fn check_before_push(state: &AppState, repo: &RepoState) -> Result<(),
 
     let client = state.pool.get().await.map_err(Error::internal)?;
     let installed: bool = client
-        .query_one("SELECT to_regclass('public.repository_shard_routes') IS NOT NULL", &[])
+        .query_one("SELECT to_regclass('repository_shard_routes') IS NOT NULL", &[])
         .await
         .map_err(Error::internal)?
         .get(0);

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -1148,28 +1150,68 @@ class MembersHarness(PullsHarness):
         assert perm["role"] == "maintain"
 
     def run_all(self):
-        self.setup()
-        self.migration()
-        self.collaborators_and_5_role_hierarchy()
-        self.teams_and_max_role_inheritance()
-        self.multi_reviewer_self_approval_and_distinct_approvers()
-        self.audit_log_filters_and_cursor_pagination()
-        self.access_and_boundaries()
-        self.concurrency_and_idempotency()
-        self.restart()
+        for name in (
+            "setup",
+            "migration",
+            "collaborators_and_5_role_hierarchy",
+            "teams_and_max_role_inheritance",
+            "multi_reviewer_self_approval_and_distinct_approvers",
+            "audit_log_filters_and_cursor_pagination",
+            "access_and_boundaries",
+            "concurrency_and_idempotency",
+            "restart",
+        ):
+            self.case(name, getattr(self, name))
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", default="target/debug/rootyard")
+    parser.add_argument("--report", type=Path)
+    parser.add_argument("--keep", action="store_true")
     parser.add_argument("--case", default="all")
     args = parser.parse_args()
-    with MembersHarness() as h:
+    bin_path = Path(args.binary).resolve()
+    args.binary = str(bin_path)
+
+    if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
+        parser.error("ROOTYARD_TEST_DATABASE_URL is required")
+    harness = MembersHarness(args)
+    success = False
+    try:
         if args.case == "all":
-            h.run_all()
+            harness.run_all()
         else:
-            h.setup()
-            getattr(h, args.case)()
+            harness.case("setup", harness.setup)
+            harness.case(args.case, getattr(harness, args.case))
+        success = True
+    except Exception as error:
+        print(harness.redact(error), file=sys.stderr)
+    finally:
+        try:
+            harness.cleanup()
+        except Exception as error:
+            harness.results.append(
+                dict(name="cleanup", status="failed", error=harness.redact(error))
+            )
+            success = False
+        report = dict(
+            passed=success,
+            cases=harness.results,
+            binary_sha256=(
+                hashlib.sha256(bin_path.read_bytes()).hexdigest()
+                if bin_path.is_file()
+                else "missing-binary"
+            ),
+        )
+        if args.keep:
+            report["retained_directory"] = str(harness.root)
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report, indent=2))
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -25,12 +25,28 @@ def migration_009_path() -> Path:
 
 
 class PullsHarness(ForgeHarness):
-    def document(self, path, code=200, token=None, **kwargs):
-        status, body, headers = self.http(path, token=token or self.alice, **kwargs)
+    def issue_token(
+        self, username: str, create_user: bool = False, read_only: bool = False
+    ) -> dict:
+        cmd = ["issue-token", "--username", username]
+        if create_user:
+            cmd.append("--create-user")
+        if read_only:
+            cmd.append("--read-only")
+        return self.account(*cmd)
+
+    def document(
+        self, path, code=200, token=None, json_body=None, headers=None, **kwargs
+    ):
+        if json_body is not None:
+            kwargs["body"] = json_body
+        if headers is not None:
+            kwargs["extra_headers"] = headers
+        status, body, resp_headers = self.http(path, token=token or self.alice, **kwargs)
         expected = code if isinstance(code, tuple) else (code,)
         assert status in expected, f"{path}: expected {code}, got {status}: {body[:200]!r}"
-        assert headers.get("cache-control") == "no-store", headers
-        assert "application/json" in headers.get("content-type", "")
+        assert resp_headers.get("cache-control") == "no-store", resp_headers
+        assert "application/json" in resp_headers.get("content-type", "")
         return json.loads(body)
 
     def ensure_migration_009(self):
