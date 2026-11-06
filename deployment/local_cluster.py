@@ -209,6 +209,14 @@ def start_process(binary, mode, env, log_path):
     return process
 
 
+def clean_preflight_files(state, node_count):
+    for role in [*(f"node{index}" for index in range(node_count)), "worker"]:
+        for suffix in (".truststore.p12", ".kafka.properties"):
+            path = state / (role + suffix)
+            if path.exists():
+                private_file(path).unlink()
+
+
 def service_env(values):
     env = {key: value for key, value in os.environ.items()
            if key != "DATABASE_URL" and not key.startswith(("ROOTYARD_", "PG"))}
@@ -216,10 +224,13 @@ def service_env(values):
     return env
 
 
-def run_up(args):
+def _run_up(args):
     state = private_dir(args.state_dir)
     if (state / "manifest.json").exists():
         raise ValueError("cluster already has a manifest; run down before up")
+    # A failed credential or broker preflight must not make a corrected retry
+    # fail on O_EXCL, nor leave old credential files in the private state dir.
+    clean_preflight_files(state, args.nodes)
     fence = private_dir(state / "fences")
     kafka_bin = Path(args.kafka_home).resolve(strict=True) / "bin"
     binary = Path(args.binary).resolve(strict=True)
@@ -318,10 +329,20 @@ def run_up(args):
         raise
 
 
+def run_up(args):
+    try:
+        _run_up(args)
+    except Exception:
+        if Path(args.state_dir).is_dir() and not (Path(args.state_dir) / "manifest.json").exists():
+            clean_preflight_files(Path(args.state_dir), args.nodes)
+        raise
+
+
 def run_down(args):
     manifest_path = private_file(Path(args.state_dir) / "manifest.json")
     manifest = json.loads(manifest_path.read_text())
     stop_entries(manifest["processes"])
+    clean_preflight_files(Path(args.state_dir), manifest["node_count"])
     manifest_path.unlink()
     print(json.dumps({"result": "stopped", "volumes_retained": True}))
 
