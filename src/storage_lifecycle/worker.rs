@@ -1,12 +1,12 @@
 //! Native-volume worker. The global backup barrier precedes repository locks;
 //! a claimed job is revalidated only after all local admission barriers are held.
 use super::{
-    gc, gitfs, jobs,
+    fence, gc, gitfs, jobs,
     models::{JobOutcome, Policy},
     scheduler,
 };
 use crate::{AppState, db};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
@@ -56,6 +56,30 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
     .await
     .map_err(|_| anyhow::anyhow!("repository reader barrier unavailable"))?;
     lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+    if matches!(job.kind.as_str(), "gitfs_tombstone_delete" | "gitfs_cache_evict") {
+        // A remote reader may lose its PostgreSQL session just before its
+        // watcher notices and reaps the native Git child. The exclusive lock
+        // excludes new readers; allow the old ones to quiesce before unlink.
+        let grace = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(grace);
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _=&mut grace => break,
+                _=tick.tick() => {
+                    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+                    let renewed=tokio::time::timeout(Duration::from_millis(750),
+                        jobs::renew(&state.pool,job,policy)).await;
+                    let backup_ping=tokio::time::timeout(Duration::from_millis(750),
+                        tx.query_one("SELECT 1",&[])).await;
+                    if !matches!(renewed,Ok(Ok(true))) || !matches!(backup_ping,Ok(Ok(_))) {
+                        bail!("maintenance lease or backup barrier lost during reader grace");
+                    }
+                }
+            }
+        }
+        lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+    }
     let _readers = state.storage.maintenance_exclusive(job.repository_id).await;
     // A push may hold a shared transfer gate while waiting for the writer
     // mutex at final CAS. Taking this exclusive gate first lets it finish.
@@ -73,45 +97,73 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
     crate::sharding::fencing::check_before_push(state, &repo)
         .await
         .map_err(|_| anyhow::anyhow!("repository storage fence denies maintenance"))?;
+    if !matches!(
+        tokio::time::timeout(Duration::from_millis(750), jobs::progress(&state.pool, job, "executing")).await,
+        Ok(Ok(true))
+    ) {
+        bail!("maintenance progress claim was superseded");
+    }
 
     let cancel = CancellationToken::new();
-    let task = async {
-        if job.kind == "gitfs_unreachable_mark" {
-            gc::mark(state, job.repository_id, job.tenant_id, job.repository_generation, policy, &cancel).await
-        } else if matches!(job.kind.as_str(), "gitfs_tombstone_delete" | "gitfs_cache_evict") {
-            bail!("physical deletion requires complete reader lease coverage")
-        } else {
-            gitfs::execute(state, job.repository_id, &job.kind, policy, &cancel).await
+    let mut fence = if job.kind == "gitfs_tombstone_delete" {
+        if !gc::PHYSICAL_DELETE_ENABLED {
+            bail!("physical deletion requires complete reader lease coverage");
         }
+        Some(fence::acquire(state, job, &lease, policy, &cancel).await?)
+    } else {
+        None
     };
-    tokio::pin!(task);
-    let mut safety = tokio::time::interval(Duration::from_millis(200));
-    safety.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut renew = tokio::time::interval(Duration::from_secs((policy.lease_seconds / 3).max(1) as u64));
-    renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let result = loop {
-        tokio::select! {
-            done=&mut task => break done,
-            _=safety.tick() => {
-                if lease.ensure_active().is_err() {
-                    cancel.cancel();
-                    let _=task.await;
-                    bail!("repository reader barrier lost during maintenance");
+    let result = {
+        let task = async {
+            if job.kind == "gitfs_unreachable_mark" {
+                gc::mark(state, job.repository_id, job.tenant_id, job.repository_generation, policy, &cancel).await
+            } else if job.kind == "gitfs_tombstone_delete" {
+                if !gc::PHYSICAL_DELETE_ENABLED {
+                    bail!("physical deletion requires complete reader lease coverage");
                 }
+                gc::delete_due(state, job, &lease, fence.as_ref().context("physical GC fence missing")?, &cancel).await
+            } else if job.kind == "gitfs_cache_evict" {
+                if !gc::PHYSICAL_DELETE_ENABLED {
+                    bail!("cache eviction requires complete reader lease coverage");
+                }
+                gitfs::execute(state, job.repository_id, &job.kind, policy, &cancel).await
+            } else {
+                gitfs::execute(state, job.repository_id, &job.kind, policy, &cancel).await
             }
-            _=renew.tick() => {
-                let renewed=tokio::time::timeout(Duration::from_millis(750),jobs::renew(&state.pool,job,policy)).await;
-                let backup_ping=tokio::time::timeout(Duration::from_millis(750),tx.query_one("SELECT 1",&[])).await;
-                if !matches!(renewed,Ok(Ok(true))) || !matches!(backup_ping,Ok(Ok(_))) {
-                    cancel.cancel();
-                    let _=task.await;
-                    bail!("maintenance lease or backup barrier lost");
+        };
+        tokio::pin!(task);
+        let mut safety = tokio::time::interval(Duration::from_millis(200));
+        safety.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut renew = tokio::time::interval(Duration::from_secs((policy.lease_seconds / 3).max(1) as u64));
+        renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                done=&mut task => break done,
+                _=safety.tick() => {
+                    if lease.ensure_active().is_err()
+                        || fence.as_ref().is_some_and(|fence| fence.ensure_active().is_err()) {
+                        cancel.cancel();
+                        let _=task.await;
+                        bail!("repository reader barrier or physical GC fence lost during maintenance");
+                    }
+                }
+                _=renew.tick() => {
+                    let renewed=tokio::time::timeout(Duration::from_millis(750),jobs::renew(&state.pool,job,policy)).await;
+                    let backup_ping=tokio::time::timeout(Duration::from_millis(750),tx.query_one("SELECT 1",&[])).await;
+                    if !matches!(renewed,Ok(Ok(true))) || !matches!(backup_ping,Ok(Ok(_))) {
+                        cancel.cancel();
+                        let _=task.await;
+                        bail!("maintenance lease or backup barrier lost");
+                    }
                 }
             }
         }
     };
     let result = result?;
     lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+    if let Some(fence) = &fence {
+        fence.verify(job, &lease, &cancel).await?;
+    }
     if !jobs::current(&state.pool, job).await? {
         bail!("maintenance lease expired before result publication");
     }
@@ -128,6 +180,9 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
             .await?;
     }
     let accepted = jobs::finish(&state.pool, job, result, None, policy).await?;
+    if let Some(fence) = fence.take() {
+        fence.release().await;
+    }
     lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     tx.commit().await?;
     Ok(JobOutcome {

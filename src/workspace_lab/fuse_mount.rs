@@ -4,7 +4,7 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::{OsStr, OsString},
     fs::{self, File},
     io,
@@ -17,13 +17,123 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock,
-        atomic::{AtomicI64, Ordering},
+        Arc, Condvar, Mutex, OnceLock, RwLock,
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::{Duration, SystemTime},
 };
 
 const TTL: Duration = Duration::ZERO;
+
+/// Verified local bytes for a lazily hydrated lower-layer file. Keeping this
+/// boundary in `workspace_lab` lets the standalone lab binary compile without
+/// the service-side workspace modules.
+///
+/// `Ok(None)` means the path is eagerly materialized metadata (`.git`). Lazy
+/// worktree paths must return bytes or an error; the caller fails closed rather
+/// than serving the zero-filled sparse placeholder.
+pub trait LazySource: Send + Sync {
+    fn file(&self, relative: &Path) -> io::Result<Option<File>>;
+}
+
+const READ_WORKERS: usize = 4;
+const READ_QUEUE_BYTES: usize = 256;
+type ReadJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// FUSE request dispatch is a single session thread. Hydration and pread for
+/// lazy lower files run on this bounded pool so one unreachable blob cannot
+/// block every other operation, and so distinct blobs hydrate concurrently.
+struct ReadPool {
+    queue: Mutex<VecDeque<ReadJob>>,
+    ready: Condvar,
+    capacity: usize,
+    closed: AtomicBool,
+}
+
+impl ReadPool {
+    fn new(workers: usize, capacity: usize) -> io::Result<Arc<Self>> {
+        let pool = Arc::new(Self {
+            queue: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
+            capacity,
+            closed: AtomicBool::new(false),
+        });
+        for index in 0..workers {
+            let worker = pool.clone();
+            let result =
+                std::thread::Builder::new().name(format!("rootyard-fuse-read-{index}")).spawn(move || worker.run());
+            if let Err(error) = result {
+                pool.close();
+                return Err(error);
+            }
+        }
+        Ok(pool)
+    }
+
+    fn execute(&self, job: ReadJob) -> Result<(), ReadJob> {
+        let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) || queue.len() >= self.capacity {
+            return Err(job);
+        }
+        queue.push_back(job);
+        drop(queue);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    fn run(&self) {
+        loop {
+            let job = {
+                let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                while queue.is_empty() && !self.closed.load(Ordering::Acquire) {
+                    queue = self.ready.wait(queue).unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                queue.pop_front()
+            };
+            match job {
+                Some(job) => job(),
+                None => return,
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.ready.notify_all();
+    }
+}
+
+fn read_pool() -> io::Result<&'static ReadPool> {
+    static POOL: OnceLock<Result<Arc<ReadPool>, String>> = OnceLock::new();
+    POOL.get_or_init(|| ReadPool::new(READ_WORKERS, READ_QUEUE_BYTES).map_err(|e| e.to_string()))
+        .as_ref()
+        .map(|pool| pool.as_ref())
+        .map_err(|error| io::Error::other(error.clone()))
+}
+
+fn submit_read(job: ReadJob) {
+    match read_pool() {
+        Ok(pool) => {
+            if let Err(job) = pool.execute(job) {
+                // The bounded queue is saturated: preserve correctness by
+                // doing this one bounded read on the FUSE thread.
+                job();
+            }
+        }
+        Err(_) => job(),
+    }
+}
+
+fn open_lower(lazy: Option<&dyn LazySource>, relative: &Path, source: &Entry) -> io::Result<File> {
+    if let Some(lazy) = lazy {
+        match lazy.file(relative)? {
+            Some(file) => return Ok(file),
+            None if relative.starts_with(".git") => {}
+            None => return Err(io::Error::from_raw_os_error(libc::EIO)),
+        }
+    }
+    source.open(libc::O_RDONLY, 0)
+}
 
 pub struct MutationGate {
     lock: RwLock<()>,
@@ -62,12 +172,21 @@ pub struct Overlay {
     next: u64,
     whiteouts: BTreeSet<PathBuf>,
     gate: Arc<MutationGate>,
+    lazy: Option<Arc<dyn LazySource>>,
 }
 impl Overlay {
     pub fn new(lower: PathBuf, upper: PathBuf) -> io::Result<Self> {
         Self::new_with_gate(lower, upper, MutationGate::new(i64::MAX))
     }
     pub fn new_with_gate(lower: PathBuf, upper: PathBuf, gate: Arc<MutationGate>) -> io::Result<Self> {
+        Self::new_with_gate_and_lazy(lower, upper, gate, None)
+    }
+    pub(crate) fn new_with_gate_and_lazy(
+        lower: PathBuf,
+        upper: PathBuf,
+        gate: Arc<MutationGate>,
+        lazy: Option<Arc<dyn LazySource>>,
+    ) -> io::Result<Self> {
         if !lower.is_dir() {
             return Err(io::Error::from_raw_os_error(libc::ENOENT));
         }
@@ -96,7 +215,7 @@ impl Overlay {
         } else {
             BTreeSet::new()
         };
-        Ok(Self { lower, upper, paths, ids, next: 2, whiteouts, gate })
+        Ok(Self { lower, upper, paths, ids, next: 2, whiteouts, gate, lazy })
     }
     fn ino(&mut self, p: &Path) -> u64 {
         if let Some(n) = self.ids.get(p) {
@@ -198,7 +317,11 @@ impl Overlay {
                 let source = self.host_entry(&from, false)?;
                 let m = source.lstat()?;
                 if m.is_file() {
-                    let mut input = source.open(libc::O_RDONLY, 0)?;
+                    let mut input = if from.starts_with(&self.lower) {
+                        open_lower(self.lazy.as_deref(), p, &source)?
+                    } else {
+                        source.open(libc::O_RDONLY, 0)?
+                    };
                     let mut output =
                         to.open(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, m.permissions().mode() & 0o777)?;
                     io::copy(&mut input, &mut output)?;
@@ -288,4 +411,56 @@ mod fuse_ops;
 pub fn mount(lower: PathBuf, upper: PathBuf, mountpoint: PathBuf) -> io::Result<()> {
     let fs = Overlay::new(lower, upper)?;
     fuser::mount2(fs, mountpoint, &[MountOption::FSName("rootyard-vfs".into()), MountOption::DefaultPermissions])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NotManaged;
+
+    impl LazySource for NotManaged {
+        fn file(&self, _: &Path) -> io::Result<Option<File>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn unknown_lazy_path_fails_closed_but_git_is_eager() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("worktree.txt"), b"remote placeholder").unwrap();
+        let entry = Entry::new(root.path(), Path::new("worktree.txt"), false).unwrap();
+        let error = open_lower(Some(&NotManaged), Path::new("worktree.txt"), &entry).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::write(root.path().join(".git/config"), b"[core]").unwrap();
+        let entry = Entry::new(root.path(), Path::new(".git/config"), false).unwrap();
+        let file = open_lower(Some(&NotManaged), Path::new(".git/config"), &entry).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn read_pool_executes_distinct_jobs_concurrently() {
+        let pool = ReadPool::new(2, 8).unwrap();
+        let state = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let state = state.clone();
+            let sender = sender.clone();
+            pool.execute(Box::new(move || {
+                let (lock, ready) = &*state;
+                let mut count = lock.lock().unwrap();
+                *count += 1;
+                ready.notify_all();
+                let (count, timed_out) =
+                    ready.wait_timeout_while(count, Duration::from_millis(500), |count| *count < 2).unwrap();
+                sender.send(*count == 2 && !timed_out.timed_out()).unwrap();
+            }))
+            .ok()
+            .expect("read pool rejected a test job");
+        }
+        let results: Vec<bool> = (0..2).map(|_| receiver.recv_timeout(Duration::from_secs(2)).unwrap()).collect();
+        assert!(results.iter().all(|result| *result), "read pool serialized independent jobs");
+    }
 }

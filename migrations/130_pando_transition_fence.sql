@@ -29,4 +29,4 @@ CREATE INDEX IF NOT EXISTS repositories_transition_inflight
     ON repositories(transition_started_at)
     WHERE transition_state <> 'stable';
 
-INSERT INTO schema_migrations (version) VALUES (128) ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations (version) VALUES (130) ON CONFLICT DO NOTHING;

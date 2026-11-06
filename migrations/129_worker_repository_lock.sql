@@ -17,7 +17,11 @@ BEGIN
     RETURN generation;
 END;
 $$;
-REVOKE ALL ON FUNCTION rootyard_worker_repository_generation(uuid, name) FROM PUBLIC;
+-- Executable by any login, but the SECURITY DEFINER body rejects callers
+-- without UPDATE on the application event_deliveries table. This keeps the
+-- split worker role usable without granting it UPDATE on repository metadata;
+-- a non-delivery login still gets SQLSTATE 42501 from the function itself.
+GRANT EXECUTE ON FUNCTION rootyard_worker_repository_generation(uuid, name) TO PUBLIC;
 -- The projection trigger also checks the generation under FOR SHARE. Reuse
 -- the same narrowly authorized lock rather than requiring worker UPDATE on
 -- repositories through that trigger's invoker privileges.
@@ -33,4 +37,4 @@ BEGIN
     RETURN NEW;
 END;
 $$;
-INSERT INTO schema_migrations (version) VALUES (127) ON CONFLICT DO NOTHING;
+INSERT INTO schema_migrations (version) VALUES (129) ON CONFLICT DO NOTHING;

@@ -107,6 +107,7 @@ pub async fn materialize(
             .await?;
         ensure!(rows.len() <= MAX_REFS, "Pando ref snapshot exceeds bounded view");
         let refs: BTreeMap<String, String> = rows.into_iter().map(|r| (r.get(0), r.get(1))).collect();
+        ensure!(refs.contains_key(&head_ref), "Pando advertised HEAD is not an authoritative ref");
         let mut total_declared = 0u64;
         for pack_id in &pack_ids {
             let pack = client

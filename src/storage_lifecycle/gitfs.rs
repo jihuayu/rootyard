@@ -9,7 +9,10 @@ use std::{
     process::Stdio,
     time::{Duration, SystemTime},
 };
-use tokio::{io::AsyncReadExt, process::Command};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -64,21 +67,21 @@ pub async fn run_git(
     tokio::pin!(read);
     let result = tokio::select! {
         result = &mut read => result.map(|_| ()),
-        _ = cancel.cancelled() => { crate::git_http::stop_group_child(&mut child).await?; bail!("maintenance lease lost"); },
-        _ = &mut timeout => { crate::git_http::stop_group_child(&mut child).await?; bail!("Git maintenance timed out"); },
+        _ = cancel.cancelled() => { crate::git_http::kill_group_child(&mut child).await?; bail!("maintenance lease lost"); },
+        _ = &mut timeout => { crate::git_http::kill_group_child(&mut child).await?; bail!("Git maintenance timed out"); },
     };
     if let Err(error) = result {
-        crate::git_http::stop_group_child(&mut child).await?;
+        crate::git_http::kill_group_child(&mut child).await?;
         return Err(error.into());
     }
     if bytes.len() > limit {
-        crate::git_http::stop_group_child(&mut child).await?;
+        crate::git_http::kill_group_child(&mut child).await?;
         bail!("Git maintenance output exceeded limit");
     }
     let status = tokio::select! {
         result = crate::git_http::finish_group_child(&mut child) => result?,
-        _ = cancel.cancelled() => { crate::git_http::stop_group_child(&mut child).await?; bail!("maintenance lease lost"); },
-        _ = &mut timeout => { crate::git_http::stop_group_child(&mut child).await?; bail!("Git maintenance timed out"); },
+        _ = cancel.cancelled() => { crate::git_http::kill_group_child(&mut child).await?; bail!("maintenance lease lost"); },
+        _ = &mut timeout => { crate::git_http::kill_group_child(&mut child).await?; bail!("Git maintenance timed out"); },
     };
     if !status.success() {
         bail!("Git maintenance exited unsuccessfully");
@@ -86,14 +89,120 @@ pub async fn run_git(
     Ok(String::from_utf8(bytes)?)
 }
 
+/// Run a native Git command with a bounded stdin payload. The child owns a new
+/// process group and is SIGKILLed as a group on cancellation or timeout.
+pub async fn run_git_with_input(
+    state: &AppState,
+    repo: Uuid,
+    args: &[&str],
+    input: &[u8],
+    cancel: &CancellationToken,
+    limit: usize,
+) -> Result<String> {
+    let mut cmd = command(state, repo, args)?;
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = cmd.spawn().context("spawn Git maintenance input")?;
+    let mut stdin = child.stdin.take().context("Git stdin unavailable")?;
+    let stdout = child.stdout.take().context("Git stdout unavailable")?;
+    let timeout = tokio::time::sleep(state.config.git_timeout);
+    tokio::pin!(timeout);
+    let io = async {
+        stdin.write_all(input).await?;
+        stdin.shutdown().await?;
+        drop(stdin);
+        let mut bytes = Vec::new();
+        let mut limited = stdout.take((limit + 1) as u64);
+        limited.read_to_end(&mut bytes).await?;
+        Ok::<Vec<u8>, std::io::Error>(bytes)
+    };
+    tokio::pin!(io);
+    let bytes = tokio::select! {
+        result = &mut io => result?,
+        _ = cancel.cancelled() => {
+            crate::git_http::kill_group_child(&mut child).await?;
+            bail!("maintenance lease lost");
+        },
+        _ = &mut timeout => {
+            crate::git_http::kill_group_child(&mut child).await?;
+            bail!("Git maintenance timed out");
+        },
+    };
+    if bytes.len() > limit {
+        crate::git_http::kill_group_child(&mut child).await?;
+        bail!("Git maintenance output exceeded limit");
+    }
+    let status = tokio::select! {
+        result = crate::git_http::finish_group_child(&mut child) => result?,
+        _ = cancel.cancelled() => {
+            crate::git_http::kill_group_child(&mut child).await?;
+            bail!("maintenance lease lost");
+        },
+        _ = &mut timeout => {
+            crate::git_http::kill_group_child(&mut child).await?;
+            bail!("Git maintenance timed out");
+        },
+    };
+    if !status.success() {
+        bail!("Git maintenance exited unsuccessfully");
+    }
+    Ok(String::from_utf8(bytes)?)
+}
+
+/// Batch object existence. Missing OIDs are reported as absent; a malformed
+/// response fails closed so it can never be mistaken for successful deletion.
+pub async fn existing_oids(
+    state: &AppState,
+    repo: Uuid,
+    oids: &[String],
+    cancel: &CancellationToken,
+) -> Result<std::collections::BTreeSet<String>> {
+    if oids.is_empty() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let mut input = String::new();
+    for oid in oids {
+        if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            bail!("invalid object ID for existence check");
+        }
+        input.push_str(oid);
+        input.push('\n');
+    }
+    let raw = run_git_with_input(
+        state,
+        repo,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        input.as_bytes(),
+        cancel,
+        8 * 1024 * 1024,
+    )
+    .await?;
+    let mut existing = std::collections::BTreeSet::new();
+    for line in raw.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let oid = fields.next().context("missing object check identity")?;
+        let kind = fields.next().context("missing object check type")?;
+        if fields.next().is_some() {
+            bail!("invalid object existence response");
+        }
+        if kind != "missing" {
+            existing.insert(oid.to_owned());
+        }
+    }
+    Ok(existing)
+}
+
 #[derive(Default, Debug)]
 pub struct Counts {
     pub loose: i64,
     pub packs: i64,
+    pub loose_kib: u64,
+    pub pack_kib: u64,
 }
 pub async fn count(state: &AppState, repo: Uuid, cancel: &CancellationToken) -> Result<Counts> {
     let output = run_git(state, repo, &["count-objects", "-v"], cancel, 4096).await?;
     let mut counts = Counts::default();
+    let mut size_loose_seen = false;
+    let mut size_pack_seen = false;
     for line in output.lines() {
         if let Some(v) = line.strip_prefix("count: ") {
             counts.loose = v.parse()?;
@@ -101,8 +210,47 @@ pub async fn count(state: &AppState, repo: Uuid, cancel: &CancellationToken) -> 
         if let Some(v) = line.strip_prefix("packs: ") {
             counts.packs = v.parse()?;
         }
+        if let Some(v) = line.strip_prefix("size: ") {
+            counts.loose_kib = v.parse()?;
+            size_loose_seen = true;
+        }
+        if let Some(v) = line.strip_prefix("size-pack: ") {
+            counts.pack_kib = v.parse()?;
+            size_pack_seen = true;
+        }
+    }
+    if !size_pack_seen || !size_loose_seen {
+        bail!("Git object size unavailable for maintenance preflight");
     }
     Ok(counts)
+}
+
+/// Distinguish a missing object (Git exit 1) from a failed inspection. The
+/// latter must never be interpreted as successful collection after a crash.
+pub async fn object_exists(state: &AppState, repo: Uuid, oid: &str, cancel: &CancellationToken) -> Result<bool> {
+    let mut cmd = command(state, repo, &["cat-file", "-e", oid])?;
+    cmd.stdout(Stdio::null());
+    let mut child = cmd.spawn().context("spawn Git object existence check")?;
+    let timeout = tokio::time::sleep(state.config.git_timeout);
+    tokio::pin!(timeout);
+    let status = tokio::select! {
+        result=crate::git_http::finish_group_child(&mut child) => result?,
+        _=cancel.cancelled() => {
+            crate::git_http::kill_group_child(&mut child).await?;
+            bail!("maintenance lease lost during object check");
+        },
+        _=&mut timeout => {
+            crate::git_http::kill_group_child(&mut child).await?;
+            bail!("Git object check timed out");
+        },
+    };
+    if status.success() {
+        Ok(true)
+    } else if status.code() == Some(1) {
+        Ok(false)
+    } else {
+        bail!("Git object check failed")
+    }
 }
 
 fn clean_staging(dir: &Path, age: Duration, cancel: &CancellationToken) -> Result<u64> {

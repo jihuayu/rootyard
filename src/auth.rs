@@ -6,6 +6,7 @@ use crate::{
 use axum::http::{HeaderMap, StatusCode, header};
 use base64::Engine;
 use deadpool_postgres::{Pool, Transaction};
+use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
 tokio::task_local! { static WEB_AUTH_SCOPE: bool; }
@@ -144,7 +145,7 @@ pub async fn authorize_repo_with_role(
     let state: String = row.get("state");
 
     let Some((effective_role, _, _)) =
-        crate::members::rbac::resolve_effective_role(tx, repo_id, owner_id, actor.id).await?
+        crate::members::rbac::resolve_effective_role(&**tx, repo_id, owner_id, actor.id).await?
     else {
         return Err(Error::not_found());
     };
@@ -232,7 +233,7 @@ pub async fn verify_active(
     }
     let min_role = if write { Role::Write } else { Role::Read };
     let Some((eff, _, _)) =
-        crate::members::rbac::resolve_effective_role(&tx, repo_id, owner_id, actor.id).await?
+        crate::members::rbac::resolve_effective_role(&*tx, repo_id, owner_id, actor.id).await?
     else {
         return Err(Error::not_found());
     };
@@ -246,6 +247,56 @@ pub async fn finish_tx(tx: Transaction<'_>, actor: &Identity, write: bool) -> Re
     // Allocation/row waits must not turn an expired token into a successful write.
     verify_token(&tx, actor, write).await?;
     tx.commit().await.map_err(Error::internal)
+}
+
+
+/// Re-verify the exact token, repository generation/state and effective write
+/// role for an already authenticated identity. Native receive hooks and the
+/// server-side exact-ref CAS transaction call this immediately before their SQL
+/// commit so a revocation during a long transfer cannot publish refs.
+pub async fn verify_repo_write_access<C: GenericClient + Sync>(
+    client: &C,
+    actor_id: Uuid,
+    token_id: Uuid,
+    repo_id: Uuid,
+    browser: bool,
+) -> Result<(), Error> {
+    let token = client
+        .query_opt(
+            "SELECT t.read_only FROM tokens t WHERE t.id=$1 AND t.user_id=$2 \
+             AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
+             AND (t.kind='api' OR ($3 AND t.kind='browser' AND EXISTS \
+                 (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked \
+                  AND s.expires_at>clock_timestamp()))) FOR SHARE OF t",
+            &[&token_id, &actor_id, &browser],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::unauthorized)?;
+    if token.get::<_, bool>(0) {
+        return Err(Error(StatusCode::FORBIDDEN, "write permission required"));
+    }
+    let repo = client
+        .query_opt(
+            "SELECT owner_id,state FROM repositories WHERE id=$1",
+            &[&repo_id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    let owner_id: Uuid = repo.get(0);
+    if repo.get::<_, String>(1) != "ready" {
+        return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
+    }
+    let Some((effective, _, _)) =
+        crate::members::rbac::resolve_effective_role(client, repo_id, owner_id, actor_id).await?
+    else {
+        return Err(Error::not_found());
+    };
+    if effective < Role::Write {
+        return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

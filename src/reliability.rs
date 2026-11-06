@@ -110,6 +110,14 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
         if !startup && journal::ActiveGuard::operation_is_live(&operation)? {
             continue;
         }
+        // A durable admission that was fenced before SQL settlement must never
+        // publish ref events. Native Git can already have advanced local refs;
+        // restore their old OIDs under the caller's repository write lock and
+        // retire the journal without creating an operation or outbox row.
+        if crate::storage::ref_admission::operation_is_fenced(state, &operation).await? {
+            crate::storage::ref_admission::rollback_fenced(state, &operation).await?;
+            continue;
+        }
         match crate::maintenance::retire_if_resolved(&state.pool, &state.storage, &operation).await {
             Ok(true) => continue,
             Ok(false) => {}
@@ -178,6 +186,17 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
             match evidence {
                 (Ok(raw), Ok(receipt), Ok(requested)) => {
                     let valid = finished && operation.storage_generation == generation;
+                    // An active receive can be interrupted before its hook ever
+                    // requests a parent publication window. With no grant and
+                    // no hook evidence, its native ref CAS was impossible: the
+                    // managed reference-transaction hook requires that grant.
+                    // Every I/O error other than definite NotFound stays unknown.
+                    let ungranted_without_hooks = no_parent_publication_possible(
+                        &operation,
+                        raw.is_empty(),
+                        receipt.is_none(),
+                        requested.is_none(),
+                    );
                     let repeated = receipt.as_ref().is_some_and(|items| {
                         let mut seen = std::collections::HashSet::new();
                         items.iter().any(|item| !seen.insert(&item.ref_name))
@@ -186,7 +205,9 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
                         "unknown"
                     } else if receipt.is_some() {
                         "recorded"
-                    } else if !interrupted && raw.iter().all(|event| event.changes.is_empty()) {
+                    } else if (!interrupted || ungranted_without_hooks)
+                        && raw.iter().all(|event| event.changes.is_empty())
+                    {
                         "no_ref_changes"
                     } else {
                         "unknown"
@@ -208,7 +229,7 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
-                    let evidence = serde_json::json!({"version":1,"finished":finished,"interrupted":interrupted,"reference_events":raw,"requested":requested,"post_receive":receipt,"storage_generation_matches":operation.storage_generation==generation,"repeated_receipt_refs":repeated});
+                    let evidence = serde_json::json!({"version":1,"finished":finished,"interrupted":interrupted,"reference_events":raw,"requested":requested,"post_receive":receipt,"storage_generation_matches":operation.storage_generation==generation,"repeated_receipt_refs":repeated,"ungranted_without_hooks":ungranted_without_hooks});
                     (outcome, changes, evidence)
                 }
                 _ => {
@@ -229,6 +250,9 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
                 storage_generation: operation.storage_generation,
                 outcome: outcome.into(),
                 evidence,
+                admission: operation
+                    .requires_parent_publication
+                    .then_some(events::AdmissionRecord { writer_id: operation.id, shard_epoch: operation.shard_epoch }),
             },
             &changes,
         )
@@ -249,9 +273,55 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
     }
     Ok(clear)
 }
+
+fn no_parent_publication_possible(
+    operation: &journal::Operation,
+    no_events: bool,
+    no_receipt: bool,
+    no_request: bool,
+) -> bool {
+    operation.requires_parent_publication
+        && no_events
+        && no_receipt
+        && no_request
+        && matches!(std::fs::symlink_metadata(operation.path.join("publication.grant")),
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound)
+}
 async fn recovering(state: &AppState, repo: Uuid, reason: &str) -> Result<()> {
     state.pool.get().await?.execute("UPDATE repositories SET state='recovering',recovery_reason=CASE WHEN state<>'recovering' OR recovery_reason IS NULL OR recovery_reason='push_outcome_unknown' THEN $2 ELSE recovery_reason END WHERE id=$1 AND state<>'provisioning'",&[&repo,&reason]).await?;
     Ok(())
+}
+
+/// A mutating GitFS path must not touch the bare repository after a cutover
+/// began or committed. Callers hold the repository write/publication lock, so
+/// this check observes the authoritative backend and fence after the wait.
+pub async fn ensure_gitfs_current(state: &AppState, repo: &db::Repository) -> std::result::Result<(), Error> {
+    let row = state
+        .pool
+        .get()
+        .await
+        .map_err(Error::internal)?
+        .query_opt(
+            "SELECT state,storage_generation,storage_backend,transition_state FROM repositories WHERE id=$1",
+            &[&repo.id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    if row.get::<_, String>(0) != "ready"
+        || row.get::<_, i64>(1) != repo.storage_generation
+        || row.get::<_, String>(2) != "gitfs"
+        || row.get::<_, String>(3) != "stable"
+    {
+        return Err(Error(StatusCode::CONFLICT, "repository backend or storage transition changed; retry"));
+    }
+    Ok(())
+}
+
+/// GitFS mutation admission with a caller-visible CONFLICT status.
+pub async fn before_gitfs_push(state: &AppState, repo: &db::Repository) -> std::result::Result<(), Error> {
+    ensure_gitfs_current(state, repo).await?;
+    before_push(state, repo).await.map_err(Error::internal)
 }
 
 pub async fn before_push(state: &AppState, repo: &db::Repository) -> Result<()> {
@@ -262,11 +332,17 @@ pub async fn before_push(state: &AppState, repo: &db::Repository) -> Result<()> 
         .pool
         .get()
         .await?
-        .query_one("SELECT state,storage_generation FROM repositories WHERE id=$1", &[&repo.id])
+        .query_one(
+            "SELECT state,storage_generation,storage_backend,transition_state FROM repositories WHERE id=$1",
+            &[&repo.id],
+        )
         .await?;
     ensure!(
-        row.get::<_, String>(0) == "ready" && row.get::<_, i64>(1) == repo.storage_generation,
-        "repository changed or recovery required"
+        row.get::<_, String>(0) == "ready"
+            && row.get::<_, i64>(1) == repo.storage_generation
+            && row.get::<_, String>(2) == "gitfs"
+            && row.get::<_, String>(3) == "stable",
+        "repository backend or storage transition changed; retry"
     );
     let maximum: i64 = state
         .pool
@@ -452,6 +528,24 @@ pub async fn resolutions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interrupted_receive_is_certain_only_without_a_parent_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let (operation, active) =
+            journal::begin_active(root.path(), Uuid::new_v4(), Uuid::new_v4(), "actor".into(), Uuid::new_v4(), 1)
+                .unwrap();
+        drop(active);
+        assert!(no_parent_publication_possible(&operation, true, true, true));
+        assert!(!no_parent_publication_possible(&operation, false, true, true));
+        assert!(!no_parent_publication_possible(&operation, true, false, true));
+        assert!(!no_parent_publication_possible(&operation, true, true, false));
+        let marker = operation.path.join("publication.grant");
+        std::fs::write(&marker, b"granted").unwrap();
+        assert!(!no_parent_publication_possible(&operation, true, true, true));
+        std::fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink("missing", &marker).unwrap();
+        assert!(!no_parent_publication_possible(&operation, true, true, true));
+    }
     #[test]
     fn executable_access_checks_capability_not_just_file_presence() {
         use std::os::unix::fs::PermissionsExt;

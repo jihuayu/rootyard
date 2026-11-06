@@ -2766,6 +2766,116 @@
       "default": null,
       "generated": "",
       "identity": "",
+      "name": "writer_id",
+      "not_null": true,
+      "position": 1,
+      "table": "git_ref_admissions",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 2,
+      "table": "git_ref_admissions",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "shard_epoch",
+      "not_null": true,
+      "position": 3,
+      "table": "git_ref_admissions",
+      "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "node_id",
+      "not_null": false,
+      "position": 4,
+      "table": "git_ref_admissions",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "actor_id",
+      "not_null": true,
+      "position": 5,
+      "table": "git_ref_admissions",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "token_id",
+      "not_null": true,
+      "position": 6,
+      "table": "git_ref_admissions",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "ref_names",
+      "not_null": true,
+      "position": 7,
+      "table": "git_ref_admissions",
+      "type": "text[]"
+    },
+    {
+      "collation": "default",
+      "default": "'ADMITTED'::text",
+      "generated": "",
+      "identity": "",
+      "name": "state",
+      "not_null": true,
+      "position": 8,
+      "table": "git_ref_admissions",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 9,
+      "table": "git_ref_admissions",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "settled_at",
+      "not_null": false,
+      "position": 10,
+      "table": "git_ref_admissions",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
       "name": "id",
       "not_null": true,
       "position": 1,
@@ -3763,17 +3873,6 @@
       "type": "bigint"
     },
     {
-      "collation": "default",
-      "default": "'refs/heads/main'::text",
-      "generated": "",
-      "identity": "",
-      "name": "head_ref",
-      "not_null": true,
-      "position": 11,
-      "table": "pando_repository_states",
-      "type": "text"
-    },
-    {
       "collation": null,
       "default": null,
       "generated": "",
@@ -4023,61 +4122,6 @@
       "name": "object_format",
       "not_null": true,
       "position": 12,
-      "table": "repositories",
-      "type": "text"
-    },
-    {
-      "collation": null,
-      "default": "0",
-      "generated": "",
-      "identity": "",
-      "name": "backend_transition_epoch",
-      "not_null": true,
-      "position": 13,
-      "table": "repositories",
-      "type": "bigint"
-    },
-    {
-      "collation": "default",
-      "default": "'stable'::text",
-      "generated": "",
-      "identity": "",
-      "name": "transition_state",
-      "not_null": true,
-      "position": 14,
-      "table": "repositories",
-      "type": "text"
-    },
-    {
-      "collation": null,
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "name": "transition_id",
-      "not_null": false,
-      "position": 15,
-      "table": "repositories",
-      "type": "uuid"
-    },
-    {
-      "collation": null,
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "name": "transition_started_at",
-      "not_null": false,
-      "position": 16,
-      "table": "repositories",
-      "type": "timestamp with time zone"
-    },
-    {
-      "collation": "default",
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "name": "transition_error",
-      "not_null": false,
-      "position": 17,
       "table": "repositories",
       "type": "text"
     },
@@ -8902,6 +8946,87 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "FOREIGN KEY (actor_id) REFERENCES public.users(id)",
+      "name": "git_ref_admissions_actor_id_fkey",
+      "table": "git_ref_admissions",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((((state = 'ADMITTED'::text) AND (settled_at IS NULL)) OR ((state <> 'ADMITTED'::text) AND (settled_at IS NOT NULL))))",
+      "name": "git_ref_admissions_check",
+      "table": "git_ref_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((node_id IS NULL) OR ((octet_length(node_id) >= 1) AND (octet_length(node_id) <= 63) AND (node_id !~ '[[:cntrl:]]'::text))))",
+      "name": "git_ref_admissions_node_id_check",
+      "table": "git_ref_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (writer_id)",
+      "name": "git_ref_admissions_pkey",
+      "table": "git_ref_admissions",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((cardinality(ref_names) >= 1) AND (cardinality(ref_names) <= 128)))",
+      "name": "git_ref_admissions_ref_names_check",
+      "table": "git_ref_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES public.repositories(id) ON DELETE CASCADE",
+      "name": "git_ref_admissions_repository_id_fkey",
+      "table": "git_ref_admissions",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((shard_epoch > 0))",
+      "name": "git_ref_admissions_shard_epoch_check",
+      "table": "git_ref_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((state = ANY (ARRAY['ADMITTED'::text, 'COMMITTED'::text, 'ABORTED'::text, 'FENCED_ABORTED'::text])))",
+      "name": "git_ref_admissions_state_check",
+      "table": "git_ref_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (token_id, actor_id) REFERENCES public.tokens(id, user_id)",
+      "name": "git_ref_admissions_token_id_actor_id_fkey",
+      "table": "git_ref_admissions",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "FOREIGN KEY (owner_user_id) REFERENCES public.users(id)",
       "name": "lfs_locks_owner_user_id_fkey",
       "table": "lfs_locks",
@@ -9415,7 +9540,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((((length(ref_name) >= 6) AND (length(ref_name) <= 1024)) AND (ref_name ~~ 'refs/%'::text)))",
+      "definition": "CHECK (((length(ref_name) >= 6) AND (length(ref_name) <= 1024) AND (ref_name ~~ 'refs/%'::text)))",
       "name": "outbox_events_ref_name_check",
       "table": "outbox_events",
       "type": "c",
@@ -9526,15 +9651,6 @@
       "definition": "CHECK ((updated_generation > 0))",
       "name": "pando_refs_updated_generation_check",
       "table": "pando_refs",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK (((octet_length(head_ref) >= 12) AND (octet_length(head_ref) <= 1024) AND (head_ref ~~ 'refs/heads/%'::text) AND (head_ref !~ '[[:cntrl:]]'::text)))",
-      "name": "pando_repository_states_head_ref_check",
-      "table": "pando_repository_states",
       "type": "c",
       "validated": true
     },
@@ -9759,33 +9875,6 @@
       "deferred": false,
       "definition": "CHECK ((storage_generation > 0))",
       "name": "repositories_storage_generation_check",
-      "table": "repositories",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK ((backend_transition_epoch >= 0))",
-      "name": "repositories_transition_epoch_check",
-      "table": "repositories",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK ((((transition_state = 'stable'::text) = (transition_id IS NULL)) AND ((transition_state = 'stable'::text) = (transition_started_at IS NULL)) AND ((transition_state <> 'failed'::text) OR (transition_error IS NOT NULL))))",
-      "name": "repositories_transition_fence_check",
-      "table": "repositories",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK ((transition_state = ANY (ARRAY['stable'::text, 'draining'::text, 'failed'::text])))",
-      "name": "repositories_transition_state_check",
       "table": "repositories",
       "type": "c",
       "validated": true
@@ -11730,9 +11819,7 @@
     {
       "arguments": "",
       "binary": null,
-      "config": [
-        "search_path=pg_catalog"
-      ],
+      "config": null,
       "cost": 100,
       "kind": "f",
       "language": "plpgsql",
@@ -11741,27 +11828,8 @@
       "parallel": "u",
       "result": "trigger",
       "rows": 0,
-      "security_definer": true,
-      "source": "\nDECLARE current_generation bigint;\nBEGIN\n    EXECUTE format('SELECT storage_generation FROM %I.repositories WHERE id=$1 FOR SHARE', TG_TABLE_SCHEMA)\n        INTO STRICT current_generation USING NEW.repository_id;\n    IF NEW.storage_generation IS DISTINCT FROM current_generation THEN\n        RAISE EXCEPTION 'stale projection storage generation';\n    END IF;\n    RETURN NEW;\nEND;\n",
-      "strict": false,
-      "volatility": "v"
-    },
-    {
-      "arguments": "repo_uuid uuid, app_schema name",
-      "binary": null,
-      "config": [
-        "search_path=pg_catalog"
-      ],
-      "cost": 100,
-      "kind": "f",
-      "language": "plpgsql",
-      "leakproof": false,
-      "name": "rootyard_worker_repository_generation",
-      "parallel": "u",
-      "result": "bigint",
-      "rows": 0,
-      "security_definer": true,
-      "source": "\nDECLARE generation bigint;\nBEGIN\n    IF NOT has_table_privilege(session_user, format('%I.event_deliveries', app_schema), 'UPDATE') THEN\n        RAISE EXCEPTION 'repository delivery lock requires event delivery role'\n            USING ERRCODE = '42501';\n    END IF;\n    EXECUTE format('SELECT storage_generation FROM %I.repositories WHERE id=$1 FOR SHARE', app_schema)\n        INTO STRICT generation USING repo_uuid;\n    RETURN generation;\nEND;\n",
+      "security_definer": false,
+      "source": "\nDECLARE current_generation BIGINT;\nBEGIN\n SELECT storage_generation INTO current_generation FROM repositories WHERE id=NEW.repository_id FOR SHARE;\n IF NEW.storage_generation IS DISTINCT FROM current_generation THEN RAISE EXCEPTION 'stale projection storage generation'; END IF;\n RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     }
@@ -12218,6 +12286,33 @@
       "valid": true
     },
     {
+      "definition": "CREATE INDEX git_ref_admissions_open_epoch_idx ON public.git_ref_admissions USING btree (repository_id, shard_epoch, state) WHERE (state = 'ADMITTED'::text)",
+      "live": true,
+      "name": "git_ref_admissions_open_epoch_idx",
+      "ready": true,
+      "table": "git_ref_admissions",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX git_ref_admissions_pkey ON public.git_ref_admissions USING btree (writer_id)",
+      "live": true,
+      "name": "git_ref_admissions_pkey",
+      "ready": true,
+      "table": "git_ref_admissions",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX git_ref_admissions_repository_idx ON public.git_ref_admissions USING btree (repository_id, writer_id)",
+      "live": true,
+      "name": "git_ref_admissions_repository_idx",
+      "ready": true,
+      "table": "git_ref_admissions",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX lfs_locks_pkey ON public.lfs_locks USING btree (id)",
       "live": true,
       "name": "lfs_locks_pkey",
@@ -12536,15 +12631,6 @@
       "definition": "CREATE UNIQUE INDEX repositories_pkey ON public.repositories USING btree (id)",
       "live": true,
       "name": "repositories_pkey",
-      "ready": true,
-      "table": "repositories",
-      "tablespace": null,
-      "valid": true
-    },
-    {
-      "definition": "CREATE INDEX repositories_transition_inflight ON public.repositories USING btree (transition_started_at) WHERE (transition_state <> 'stable'::text)",
-      "live": true,
-      "name": "repositories_transition_inflight",
       "ready": true,
       "table": "repositories",
       "tablespace": null,
@@ -13414,6 +13500,16 @@
       "force_row_security": false,
       "kind": "r",
       "name": "git_operations",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "git_ref_admissions",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",

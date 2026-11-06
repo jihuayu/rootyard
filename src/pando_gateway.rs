@@ -10,5 +10,4 @@ pub mod prepare;
 pub mod publish;
 #[path = "pando_gateway/snapshot.rs"]
 pub mod snapshot;
-#[path = "pando_gateway/transition.rs"]
 pub mod transition;

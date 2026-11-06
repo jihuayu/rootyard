@@ -1,6 +1,8 @@
 //! Durable GitFS storage maintenance. The server owns this worker because it
 //! holds the exclusive local data volume lock; a control-plane-only worker
 //! must never open or mutate a repository volume.
+#[path = "storage_lifecycle/fence.rs"]
+pub mod fence;
 #[path = "storage_lifecycle/gc.rs"]
 pub mod gc;
 #[path = "storage_lifecycle/gitfs.rs"]
@@ -9,6 +11,10 @@ pub mod gitfs;
 pub mod jobs;
 #[path = "storage_lifecycle/models.rs"]
 pub mod models;
+#[path = "storage_lifecycle/quarantine.rs"]
+pub mod quarantine;
+#[path = "storage_lifecycle/retention.rs"]
+pub mod retention;
 #[path = "storage_lifecycle/scheduler.rs"]
 pub mod scheduler;
 #[path = "storage_lifecycle/worker.rs"]

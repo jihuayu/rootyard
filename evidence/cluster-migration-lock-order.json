@@ -1,0 +1,23 @@
+{
+  "kind": "native_cluster_staged_migration",
+  "result": "passed",
+  "binary_sha256": "5031928229726503335b0b55209d1c02f4232abced58bc6532a915e8eb705543",
+  "harness_sha256": "1721ac662b175c2e25007d03d1a52ce91ec09dea03c52e7b65872b7ba0369984",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "operation_id": "3a9ac0f3-a515-450a-a745-c0499a9230ca",
+  "transfer_ms": 5675.991,
+  "partial_copy_rejected_before_cutover": true,
+  "same_operation_resumed_after_target_restart": true,
+  "ahead_journal_rejected_without_replacing_target": true,
+  "failed_transfer_drained_source_writes": true,
+  "target_exclusive_barrier_waited_for_native_reader": true,
+  "browse_read_from_retired_ingress_reached_new_owner": true,
+  "source_oid": "2adfdb373cf698e9c3e06631c4a110c9242b90c3",
+  "destination_oid_after_push": "18b0b9209a1053a21d6fdfa9b7b8445556e89a63",
+  "source_volume": "/tmp/rootyard-e2e-gk8xlxcj/data/repos/35fa66e9-d20c-4747-addb-70bf9ba327cc.git",
+  "destination_volume": "/tmp/rootyard-e2e-gk8xlxcj/data-node1/repos/35fa66e9-d20c-4747-addb-70bf9ba327cc.git",
+  "limits": [
+    "one PostgreSQL authority, two Rust processes on one Linux host",
+    "physical cross-host fencing remains external"
+  ]
+}

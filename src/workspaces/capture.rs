@@ -8,6 +8,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub(super) fn fingerprint(repo: &Path) -> Result<String, Error> {
+    if let Some(fingerprint) = super::lazy::fingerprint(repo)? {
+        return Ok(fingerprint);
+    }
     let entries = core::inventory(repo).map_err(Error::internal)?;
     let raw = serde_json::to_vec(&entries).map_err(Error::internal)?;
     Ok(hex::encode(Sha256::digest(&raw)))

@@ -129,7 +129,7 @@ pub async fn degrade_or_recover_repo(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
-    let _guard = state.storage.write_lock(access.repo_id).await;
+    let mutation = super::locks::exclusive(&state, access.repo_id).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     let repo_gen: i64 = tx
         .query_one("SELECT storage_generation FROM repositories WHERE id = $1", &[&access.repo_id])
@@ -169,6 +169,8 @@ pub async fn degrade_or_recover_repo(
     ];
     let r_row = tx.query_one(&upd_sql, params).await.map_err(Error::internal)?;
     let updated = RepoShardRoute::row(&r_row);
+    crate::storage::ref_admission::fence_epoch(&tx, access.repo_id, route.route_epoch,
+        std::time::Duration::ZERO).await?;
 
     let eff_gen = repo_gen.max(updated.required_generation);
     let marker = VolumeFenceMarker::from_route(&updated, eff_gen, prev_marker.and_then(|m| m.fenced_node_id), now);
@@ -176,6 +178,7 @@ pub async fn degrade_or_recover_repo(
     let details = sjson!({ "mode": mode, "read_only_degraded": degraded, "route_epoch": updated.route_epoch });
     record_audit_event(&tx, access.owner_id, access.repo_id, &actor, audit_action, "shard_degrade", &updated.primary_node_id, details).await?;
     let transition_id = transitions::stage(&tx, &state, &marker).await?;
+    mutation.ensure_active()?;
     transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
 
     Ok(json(

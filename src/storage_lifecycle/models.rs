@@ -16,6 +16,7 @@ pub struct Policy {
     pub cache_max_age_seconds: i64,
     pub tombstone_grace_seconds: i64,
     pub scan_period_seconds: i64,
+    pub quiescence_seconds: i64,
     pub max_attempts: i32,
 }
 
@@ -53,6 +54,7 @@ impl Policy {
                 365 * 24 * 3600,
             )?,
             scan_period_seconds: number("ROOTYARD_STORAGE_SCAN_PERIOD_SECONDS", 3600, 1, 365 * 24 * 3600)?,
+            quiescence_seconds: number("ROOTYARD_STORAGE_MAINTENANCE_QUIESCENCE_SECONDS", 15, 1, 300)?,
             max_attempts: number("ROOTYARD_STORAGE_MAINTENANCE_MAX_ATTEMPTS", 5, 1, 100)? as i32,
         })
     }

@@ -69,9 +69,6 @@ pub(super) async fn receive_commands(
             new_oid: new.to_ascii_lowercase(),
         });
     }
-    if refs.is_empty() {
-        return Err(Error::bad_request());
-    }
     Ok(ReceiveCommands { bytes, refs, changes })
 }
 

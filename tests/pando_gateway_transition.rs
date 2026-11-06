@@ -3,10 +3,11 @@
 //! The full round-trip needs PostgreSQL, the remote object store and Vault
 //! Transit, exactly like the production Pando pack tests. The fence-admission
 //! test only needs PostgreSQL. Both skip when their environment is absent.
+use axum::http::StatusCode;
 use rootyard::{
     AppState,
     config::Config,
-    db, dispatch, metrics,
+    db, dispatch, journal, metrics,
     pando_gateway::transition,
     storage::{self, read_leases, ref_publication},
 };
@@ -156,8 +157,31 @@ async fn cutover_rollback_round_trip_and_durable_failure() {
     let client = pool.get().await.unwrap();
     client.execute("UPDATE repositories SET object_format='sha1' WHERE id=$1", &[&repo]).await.unwrap();
 
+    let token = uuid::Uuid::new_v4();
+    client
+        .execute(
+            "INSERT INTO tokens(id,user_id,digest,read_only) VALUES($1,$2,$3,false)",
+            &[&token, &_owner, &vec![0u8; 32]],
+        )
+        .await
+        .unwrap();
+    let actor = _owner;
+    client
+        .execute(
+            "INSERT INTO git_operations(id,repository_id,actor_id,token_id,actor_name,sequence,storage_generation,evidence,outcome)             VALUES($1,$2,$3,$4,$5,5,1,'{}','recorded')",
+            &[&uuid::Uuid::new_v4(), &repo, &actor, &token, &slug],
+        )
+        .await
+        .unwrap();
     let gitfs = repository(repo, &slug, "gitfs");
     let report = transition::cutover(&state, &gitfs, deadline()).await.unwrap();
+    let pando_sequence: i64 = client
+        .query_one("SELECT operation_sequence FROM pando_repository_states WHERE repository_id=$1", &[&repo])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(pando_sequence, 5, "cutover must carry the durable operation high-water mark");
+    assert!(journal::sequence(&state.storage.root, repo).unwrap() >= 5, "local journal must not lag shared sequences");
     assert_eq!(report.direction, "gitfs_to_pando");
     assert_eq!(report.transition_epoch, 1);
     assert_eq!(report.refs, 1);
@@ -205,6 +229,16 @@ async fn cutover_rollback_round_trip_and_durable_failure() {
         .await
         .unwrap();
 
+    // A Pando-era operation advances the shared namespace without touching the
+    // local journal counter; rollback must reseed it before restoring GitFS.
+    client
+        .execute(
+            "INSERT INTO git_operations(id,repository_id,actor_id,token_id,actor_name,sequence,storage_generation,evidence,outcome)             VALUES($1,$2,$3,$4,$5,6,1,'{}','recorded')",
+            &[&uuid::Uuid::new_v4(), &repo, &actor, &token, &slug],
+        )
+        .await
+        .unwrap();
+
     // A stale advertised HEAD is a parity failure: the durable fence records it
     // and leaves GitFS authority unchanged.
     client
@@ -240,6 +274,10 @@ async fn cutover_rollback_round_trip_and_durable_failure() {
     assert_eq!(row.get::<_, String>(0), "gitfs");
     assert_eq!(row.get::<_, String>(1), "stable");
     assert_eq!(row.get::<_, i64>(2), 2);
+    assert!(
+        journal::sequence(&state.storage.root, repo).unwrap() >= 6,
+        "rollback must carry the shared Pando operation sequences back to GitFS"
+    );
     let pando = client
         .query_one("SELECT state,head_ref FROM pando_repository_states WHERE repository_id=$1", &[&repo])
         .await
@@ -254,4 +292,54 @@ async fn cutover_rollback_round_trip_and_durable_failure() {
     assert_eq!(String::from_utf8(observed.stdout).unwrap().trim(), format!("refs/heads/main {oid}"));
     let head = Command::new(&git).args(["--git-dir", bare.to_str().unwrap(), "symbolic-ref", "HEAD"]).output().unwrap();
     assert_eq!(String::from_utf8(head.stdout).unwrap().trim(), "refs/heads/main");
+}
+
+#[tokio::test]
+async fn gitfs_write_admission_rejects_backend_switch_and_transition_fence() {
+    let Ok(url) = std::env::var("ROOTYARD_TEST_DATABASE_URL") else { return };
+    let pool = db::pool(&url).unwrap();
+    db::migrate(&pool).await.unwrap();
+    let (repo, owner, _slug) = fixture(&pool, "gitfs-admission").await;
+    let config = Config {
+        database_url: url,
+        data_dir: std::env::temp_dir().join(format!("rootyard-gitfs-admission-{}", uuid::Uuid::new_v4())),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        git: std::path::PathBuf::from("/usr/bin/git"),
+        max_request_bytes: 1024,
+        max_output_bytes: 1024,
+        max_concurrent_git: 1,
+        git_timeout: Duration::from_secs(5),
+        git_memory_bytes: 1024 * 1024,
+        max_repo_bytes: 1024 * 1024,
+        max_pending_deliveries: 10,
+        outbox_worker: false,
+        metrics_bind: None,
+    };
+    let state = AppState {
+        mirror_primary: None,
+        dispatch: dispatch::Signals::default(),
+        storage: storage::Storage::open(&config).unwrap(),
+        config,
+        pool: pool.clone(),
+        hooks: None,
+        transfer_metrics: Arc::new(metrics::TransferCounters::default()),
+        git_slots: Arc::new(Semaphore::new(1)),
+    };
+    let repo = repository(repo, &_slug, "gitfs");
+    rootyard::reliability::ensure_gitfs_current(&state, &repo).await.unwrap();
+    pool.get()
+        .await
+        .unwrap()
+        .execute("UPDATE repositories SET storage_backend='pando' WHERE id=$1", &[&repo.id])
+        .await
+        .unwrap();
+    assert_eq!(rootyard::reliability::ensure_gitfs_current(&state, &repo).await.unwrap_err().0, StatusCode::CONFLICT);
+    pool.get()
+        .await
+        .unwrap()
+        .execute("UPDATE repositories SET storage_backend='gitfs',transition_state='draining' WHERE id=$1", &[&repo.id])
+        .await
+        .unwrap();
+    assert_eq!(rootyard::reliability::ensure_gitfs_current(&state, &repo).await.unwrap_err().0, StatusCode::CONFLICT);
+    let _ = owner;
 }

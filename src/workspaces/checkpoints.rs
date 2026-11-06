@@ -86,7 +86,12 @@ pub async fn create(
     }
     let revision = ws.revision + 1;
     let result = json!({"checkpoint_id":cp,"workspace_id":id,"captured_revision":ws.revision,"workspace_revision":revision,"state":"local_complete","durability":"local_filesystem_only","excluded_native_state":"none"});
-    tx.execute("INSERT INTO workspace_checkpoints(id,workspace_id,repository_id,captured_revision,lease_epoch,state,excluded_summary) VALUES($1,$2,$3,$4,$5,'local_complete',$6)", &[&cp,&id,&ws.repository_id,&ws.revision,&ws.lease_epoch,&json!({"native_entries":"included"})]).await.map_err(Error::internal)?;
+    let base_oid: Option<String> = tx
+        .query_opt("SELECT base_oid FROM workspaces WHERE id=$1", &[&id])
+        .await
+        .map_err(Error::internal)?
+        .and_then(|row| row.get(0));
+    tx.execute("INSERT INTO workspace_checkpoints(id,workspace_id,repository_id,captured_revision,lease_epoch,state,excluded_summary,base_oid) VALUES($1,$2,$3,$4,$5,'local_complete',$6,$7)", &[&cp,&id,&ws.repository_id,&ws.revision,&ws.lease_epoch,&json!({"native_entries":"included"}),&base_oid]).await.map_err(Error::internal)?;
     tx.execute("UPDATE workspaces SET revision=$2,last_checkpoint_id=$3,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1", &[&id,&revision,&cp]).await.map_err(Error::internal)?;
     tx.execute(
         "INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'checkpoint',$3)",
@@ -112,7 +117,7 @@ async fn restore_inner(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let row = tx.query_opt("SELECT w.id,w.repository_id,w.owner_slug,w.repository_name,w.agent_id,w.creator_id,w.state,w.host_id,w.lease_epoch,w.revision,w.git_generation,w.last_checkpoint_id FROM workspace_checkpoints c JOIN workspaces w ON w.id=c.workspace_id WHERE c.id=$1 AND c.state IN ('local_complete','committed')", &[&cp]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let row = tx.query_opt("SELECT w.id,w.repository_id,w.owner_slug,w.repository_name,w.agent_id,w.creator_id,w.state,w.host_id,w.lease_epoch,w.revision,w.git_generation,w.last_checkpoint_id,c.state AS checkpoint_state FROM workspace_checkpoints c JOIN workspaces w ON w.id=c.workspace_id WHERE c.id=$1 AND c.state IN ('local_complete','committed')", &[&cp]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let parent = Workspace::from_row(&row);
     let access = auth::authorize_repo_with_role(&tx, &actor, &parent.owner, &parent.repository, Role::Write).await?;
     if parent.creator_id != actor.id || access.repo_id != parent.repository_id {
@@ -133,9 +138,18 @@ async fn restore_inner(
         }
     }
     let id = Uuid::new_v4();
-    super::remote::ensure_local(&state, cp, parent.repository_id, access.owner_id).await?;
-    copy_snapshot(&service::checkpoint_repo(&state, cp), &super::mounts::lower_path(&state, id))?;
-    tx.execute("INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,parent_checkpoint_id,state,host_id,lease_until) VALUES($1,$2,$3,$4,$5,$6,$7,'ready',$8,clock_timestamp()+interval '5 minutes')", &[&id,&parent.repository_id,&parent.owner,&parent.repository,&agent,&actor.id,&cp,&state.storage.volume_id]).await.map_err(Error::internal)?;
+    if super::mounts::enabled() && row.get::<_, String>("checkpoint_state") == "committed" {
+        super::lazy::prepare(&state, id, cp, parent.repository_id, access.owner_id).await?;
+    } else {
+        super::remote::ensure_local(&state, cp, parent.repository_id, access.owner_id).await?;
+        copy_snapshot(&service::checkpoint_repo(&state, cp), &super::mounts::lower_path(&state, id))?;
+    }
+    let base_oid: Option<String> = tx
+        .query_opt("SELECT base_oid FROM workspace_checkpoints WHERE id=$1", &[&cp])
+        .await
+        .map_err(Error::internal)?
+        .and_then(|row| row.get(0));
+    tx.execute("INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,parent_checkpoint_id,state,host_id,lease_until,base_oid) VALUES($1,$2,$3,$4,$5,$6,$7,'ready',$8,clock_timestamp()+interval '5 minutes',$9)", &[&id,&parent.repository_id,&parent.owner,&parent.repository,&agent,&actor.id,&cp,&state.storage.volume_id,&base_oid]).await.map_err(Error::internal)?;
     if let Some(key) = &key {
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&(kind, cp, &agent)).map_err(Error::internal)?));
         tx.execute(

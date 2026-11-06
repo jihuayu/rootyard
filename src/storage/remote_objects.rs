@@ -74,6 +74,17 @@ enum Payload {
     Bytes(Vec<u8>),
 }
 
+/// Removes a partially written object temp when the async future is dropped.
+struct TempObject {
+    path: PathBuf,
+}
+
+impl Drop for TempObject {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 fn valid_bucket(s: &str) -> bool {
     (3..=63).contains(&s.len())
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
@@ -167,6 +178,7 @@ impl RemoteObjectStore {
         let parent = destination.parent().context("object destination parent missing")?;
         fs::create_dir_all(parent).await?;
         let temp = parent.join(format!(".rootyard-object-{}", Uuid::new_v4()));
+        let _temp_guard = TempObject { path: temp.clone() };
         let result = async {
             let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
             let mut hash = Sha256::new();

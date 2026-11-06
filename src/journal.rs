@@ -20,8 +20,12 @@ const MAX_REFS: usize = 4096;
 
 #[path = "journal/core.rs"]
 mod core;
-pub use core::{ActiveGuard, HookEvent, HookPhase, Operation, RefChange, begin, begin_active, pending, sequence};
-pub(crate) use core::{atomic, begin_ci, begin_ci_service, begin_proposal, exists, mkdir, read, safe_path};
+pub use core::{
+    ActiveGuard, HookEvent, HookPhase, Operation, RefChange, begin, begin_active, begin_active_with, pending, sequence,
+};
+pub(crate) use core::{
+    atomic, begin_ci, begin_ci_service, begin_proposal, ensure_sequence_at_least, exists, mkdir, read, safe_path,
+};
 use core::{entries, load, op_name, sync_dir, validate};
 
 pub(crate) fn valid_ref(s: &str) -> bool {
@@ -86,8 +90,10 @@ fn events_with_size(op: &Operation) -> Result<(Vec<HookEvent>, usize)> {
         if name == "operation.json"
             || name == "hook.lock"
             || name == "active.lock"
+            || name == "publication.grant"
             || name == "finished"
             || name == "interrupted"
+            || name == "fenced"
             || name == "post-receive.json"
             || name == "pre-receive.json"
             || name.starts_with(".tmp-")
@@ -162,6 +168,22 @@ pub fn is_interrupted(op: &Operation) -> Result<bool> {
     ensure!(read(&path)?.is_empty(), "invalid interrupted marker");
     Ok(true)
 }
+/// The writer lost its PostgreSQL admission before publishing. Local refs may
+/// have advanced inside native Git; reconciliation restores their old OIDs and
+/// retires the journal without creating SQL ref history.
+pub fn mark_fenced_aborted(op: &Operation) -> Result<()> {
+    validate(op)?;
+    atomic(&op.path.join("fenced"), b"", false)
+}
+pub fn is_fenced_aborted(op: &Operation) -> Result<bool> {
+    validate(op)?;
+    let path = op.path.join("fenced");
+    if !exists(&path)? {
+        return Ok(false);
+    }
+    ensure!(read(&path)?.is_empty(), "invalid fenced marker");
+    Ok(true)
+}
 /// Mark verified evidence loss. This is not an inference from Git's exit code.
 pub fn mark_corrupt(op: &Operation) -> Result<()> {
     validate(op)?;
@@ -171,7 +193,7 @@ pub fn mark_corrupt(op: &Operation) -> Result<()> {
 /// Canonical bounded evidence for operator inspection and immutable resolution.
 pub fn evidence(op: &Operation) -> Result<serde_json::Value> {
     Ok(
-        serde_json::json!({"operation":op,"reference_events":events(op)?,"requested":requests(op)?,"post_receive":receipts(op)?,"finished":is_finished(op)?,"interrupted":is_interrupted(op)?}),
+        serde_json::json!({"operation":op,"reference_events":events(op)?,"requested":requests(op)?,"post_receive":receipts(op)?,"finished":is_finished(op)?,"interrupted":is_interrupted(op)?,"fenced_aborted":is_fenced_aborted(op)?}),
     )
 }
 pub fn evidence_digest(op: &Operation) -> Result<String> {
@@ -285,6 +307,7 @@ pub fn run_pre_receive() -> Result<()> {
     ensure!(op.ci_pin.is_none() && op.proposal_pin.is_none(), "maintenance operations cannot receive pushes");
     let changes = parse(&input)?;
     validate_namespace(&op, &changes)?;
+    crate::git_http::publication::await_grant(&op)?;
     crate::browse::policy::validate_hook(&op, &changes)?;
     record_request(&op, &input)
 }
@@ -330,7 +353,11 @@ pub fn run_hook(state: &str) -> Result<()> {
         _ => bail!("unsupported reference transaction state"),
     };
     let (op, input) = hook_input()?;
-    if phase == HookPhase::Preparing {
+    if matches!(phase, HookPhase::Preparing | HookPhase::Prepared) {
+        // `prepared` runs after Git has locked refs and immediately before it
+        // writes them. Re-check the parent window and durable admission here so
+        // takeover or revocation during the transfer cannot publish refs.
+        crate::git_http::publication::verify_grant(&op)?;
         crate::browse::policy::validate_hook_fence(&op)?;
     }
     let result = record(&op, phase, &input);

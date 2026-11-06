@@ -13,6 +13,11 @@ pub struct Operation {
     pub service_principal_id: Option<Uuid>,
     pub sequence: i64,
     pub storage_generation: i64,
+    #[serde(default)]
+    pub requires_parent_publication: bool,
+    /// Admitted shard route epoch. Zero denotes a pre-admission legacy journal.
+    #[serde(default)]
+    pub shard_epoch: i64,
     /// Exact maintenance capability, persisted before spawning Git. Never supplied by push clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_pin: Option<crate::ci_pins::Intent>,
@@ -149,7 +154,10 @@ pub(super) fn op_name(op: &Operation) -> String {
 pub(super) fn load(path: &Path) -> Result<Operation> {
     safe_path(path)?;
     let mut op: Operation = serde_json::from_slice(&read(&path.join("operation.json"))?)?;
-    ensure!(op.sequence > 0 && op.storage_generation > 0, "invalid operation sequence or generation");
+    ensure!(
+        op.sequence > 0 && op.storage_generation > 0 && op.shard_epoch >= 0,
+        "invalid operation sequence, generation or shard epoch"
+    );
     ensure!(!op.actor_name.is_empty() && op.actor_name.len() <= 4096, "invalid actor name");
     ensure!(
         path.file_name().and_then(|s| s.to_str()) == Some(op_name(&op).as_str()),
@@ -216,6 +224,8 @@ pub fn begin(
         None,
         None,
         false,
+        Uuid::new_v4(),
+        0,
     )?
     .0)
 }
@@ -231,6 +241,22 @@ pub fn begin_active(
     token_id: Uuid,
     storage_generation: i64,
 ) -> Result<(Operation, ActiveGuard)> {
+    begin_active_with(data_root, repository_id, actor_id, actor_name, token_id, storage_generation, Uuid::new_v4(), 0)
+}
+
+/// Admit an active write with the exact PostgreSQL admission identity and
+/// shard epoch already recorded by `storage::ref_admission::admit`.
+pub fn begin_active_with(
+    data_root: &Path,
+    repository_id: Uuid,
+    actor_id: Uuid,
+    actor_name: String,
+    token_id: Uuid,
+    storage_generation: i64,
+    writer_id: Uuid,
+    shard_epoch: i64,
+) -> Result<(Operation, ActiveGuard)> {
+    ensure!(!writer_id.is_nil(), "invalid admission writer identity");
     let (op, guard) = begin_inner(
         data_root,
         repository_id,
@@ -242,6 +268,8 @@ pub fn begin_active(
         None,
         None,
         true,
+        writer_id,
+        shard_epoch,
     )?;
     Ok((op, guard.context("missing active admission lock")?))
 }
@@ -264,6 +292,8 @@ pub(crate) fn begin_ci(
         None,
         None,
         false,
+        Uuid::new_v4(),
+        0,
     )?
     .0)
 }
@@ -287,6 +317,8 @@ pub(crate) fn begin_ci_service(
         Some(principal_id),
         None,
         false,
+        Uuid::new_v4(),
+        0,
     )?
     .0)
 }
@@ -313,6 +345,8 @@ pub(crate) fn begin_proposal(
         None,
         Some(intent),
         false,
+        Uuid::new_v4(),
+        0,
     )
     .map(|(op, _)| op)
 }
@@ -329,6 +363,8 @@ fn begin_inner(
     service_principal_id: Option<Uuid>,
     proposal_pin: Option<crate::namespace_service::ProposalIntent>,
     active: bool,
+    writer_id: Uuid,
+    shard_epoch: i64,
 ) -> Result<(Operation, Option<ActiveGuard>)> {
     safe_path(data_root)?;
     ensure!(storage_generation > 0 && !actor_name.is_empty() && actor_name.len() <= 4096, "invalid operation metadata");
@@ -355,7 +391,7 @@ fn begin_inner(
     // Reserving before publication permits gaps, never reuse.
     atomic(&counter, sequence.to_string().as_bytes(), true)?;
     let mut op = Operation {
-        id: Uuid::new_v4(),
+        id: writer_id,
         repository_id,
         actor_id,
         actor_name,
@@ -363,6 +399,8 @@ fn begin_inner(
         service_principal_id,
         sequence,
         storage_generation,
+        requires_parent_publication: active,
+        shard_epoch,
         ci_pin,
         proposal_pin,
         path: PathBuf::new(),
@@ -404,6 +442,35 @@ pub fn sequence(data_root: &Path, repository_id: Uuid) -> Result<i64> {
     let value = std::str::from_utf8(&bytes)?.parse::<i64>()?;
     ensure!(value >= 0, "negative journal counter");
     Ok(value)
+}
+
+/// Advance the durable local sequence counter to at least `floor` while holding
+/// the same admission lock used by `begin_inner`. Storage transitions use this
+/// to carry both backends across one shared `git_operations` uniqueness
+/// namespace without ever lowering or reusing a published sequence.
+pub(crate) fn ensure_sequence_at_least(data_root: &Path, repository_id: Uuid, floor: i64) -> Result<i64> {
+    ensure!(floor >= 0, "invalid journal sequence floor");
+    safe_path(data_root)?;
+    let journal = data_root.join("journal");
+    mkdir(&journal)?;
+    let repo = journal.join(repository_id.to_string());
+    mkdir(&repo)?;
+    let sequence_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(repo.join("sequence.lock"))?;
+    ensure!(sequence_lock.metadata()?.is_file(), "invalid journal admission lock");
+    sequence_lock.lock_exclusive()?;
+    let counter = repo.join("sequence");
+    let previous: i64 = if exists(&counter)? { std::str::from_utf8(&read(&counter)?)?.parse()? } else { 0 };
+    ensure!(previous >= 0, "invalid journal sequence");
+    if previous < floor {
+        atomic(&counter, floor.to_string().as_bytes(), true)?;
+    }
+    Ok(previous.max(floor))
 }
 pub fn pending(data_root: &Path, repository_id: Uuid) -> Result<Vec<Operation>> {
     safe_path(data_root)?;

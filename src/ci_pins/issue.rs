@@ -53,12 +53,20 @@ pub(super) async fn pin_inner(
             "Git capacity exhausted; retry later",
         )
     })?;
-    let _lock = tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo.id))
-        .await
-        .map_err(|_| Error::timeout())?;
-    reliability::before_push(&state, &repo)
-        .await
-        .map_err(Error::internal)?;
+    let publication = storage::ref_publication::acquire(&state.pool,repo.id,
+        repo.storage_generation,&[format!("{NAMESPACE}/jobs/{}",input.job_id)],
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let _lock = publication.enter_window(&state.storage,
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let _admission = crate::storage::admission::acquire(
+        &state.pool,
+        repo.id,
+        repo.storage_generation,
+        "ci-pin",
+        tokio::time::Instant::now() + state.config.git_timeout,
+    )
+    .await?;
+    reliability::before_gitfs_push(&state, &repo).await?;
     // Hold current token/owner/repository authority through ref publication. The
     // durable journal is reconciled after releasing SQL locks; it is not rolled
     // back by a database disconnect and never pretends to be a SQL transaction.

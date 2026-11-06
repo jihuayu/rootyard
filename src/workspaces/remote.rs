@@ -32,23 +32,23 @@ use uuid::Uuid;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RemoteEntry {
-    path_base64: String,
-    kind: String,
-    mode: u32,
-    size: u64,
-    sha256: String,
-    target_base64: Option<String>,
+pub(super) struct RemoteEntry {
+    pub path_base64: String,
+    pub kind: String,
+    pub mode: u32,
+    pub size: u64,
+    pub sha256: String,
+    pub target_base64: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RemoteManifest {
-    schema: u32,
-    checkpoint_id: Uuid,
-    repository_id: Uuid,
-    tenant_id: Uuid,
-    captured_revision: i64,
-    entries: Vec<RemoteEntry>,
+pub(super) struct RemoteManifest {
+    pub schema: u32,
+    pub checkpoint_id: Uuid,
+    pub repository_id: Uuid,
+    pub tenant_id: Uuid,
+    pub captured_revision: i64,
+    pub entries: Vec<RemoteEntry>,
 }
 
 pub(super) fn remote_store(state: &AppState) -> Result<RemoteObjectStore, Error> {
@@ -73,6 +73,50 @@ fn bounded_manifest(raw: &[u8]) -> Result<RemoteManifest, Error> {
 }
 fn report(cp: Uuid, manifest: &str, size: i64, revision: i64) -> Value {
     json!({"checkpoint_id":cp,"state":"COMMITTED","durability":"remote_verified","manifest_sha256":manifest,"manifest_size":size,"captured_revision":revision})
+}
+pub(super) async fn load_manifest(
+    state: &AppState,
+    cp: Uuid,
+    repo: Uuid,
+    tenant: Uuid,
+) -> Result<RemoteManifest, Error> {
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let row = client
+        .query_opt(
+            "SELECT state,manifest_digest,manifest_size FROM workspace_checkpoints WHERE id=$1 AND repository_id=$2",
+            &[&cp, &repo],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    if row.get::<_, String>(0) != "committed" {
+        return Err(service::conflict());
+    }
+    let digest: String = row.get::<_, Option<String>>(1).ok_or_else(|| Error::internal("missing remote metadata"))?;
+    let size: i64 = row.get::<_, Option<i64>>(2).ok_or_else(|| Error::internal("missing remote metadata"))?;
+    if !(1..=16 * 1024 * 1024).contains(&size) {
+        return Err(Error::internal("invalid remote manifest size"));
+    }
+    let store = remote_store(state)?;
+    let stage = state.storage.root.join("workspace-service/staging");
+    fs::create_dir_all(&stage).map_err(Error::internal)?;
+    let path = stage.join(format!("lazy-manifest-{cp}-{}", Uuid::new_v4()));
+    let result = store.get_to_file(&key(tenant, &digest)?, &path, size as u64, deadline()).await;
+    if let Err(error) = result {
+        let _ = fs::remove_file(&path);
+        return Err(Error::internal(error));
+    }
+    let raw = fs::read(&path).map_err(Error::internal)?;
+    let _ = fs::remove_file(&path);
+    let manifest = bounded_manifest(&raw)?;
+    if manifest.schema != 1
+        || manifest.checkpoint_id != cp
+        || manifest.repository_id != repo
+        || manifest.tenant_id != tenant
+    {
+        return Err(Error::bad_request());
+    }
+    Ok(manifest)
 }
 async fn stage_key(state: &AppState, cp: Uuid, tenant: Uuid, digest: &str, size: u64, kind: &str) -> Result<(), Error> {
     let mut client = state.pool.get().await.map_err(Error::internal)?;

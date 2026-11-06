@@ -153,6 +153,18 @@ pub(crate) async fn stop_group_child(child: &mut Child) -> io::Result<()> {
     Ok(())
 }
 
+/// Lease-loss path: SIGKILL immediately, then retain the unreaped leader until
+/// every descendant stops. The caller keeps its local data guard throughout.
+pub(crate) async fn kill_group_child(child: &mut Child) -> io::Result<()> {
+    let pid = child.id().ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    wait_group_child_quiescent(pid).await;
+    let _ = child.wait().await?;
+    Ok(())
+}
+
 async fn wait_group_child_quiescent(pid: i32) {
     let started = Instant::now();
     let mut reported = false;

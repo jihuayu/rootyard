@@ -93,6 +93,7 @@ async fn inventory<C: GenericClient + Sync>(client: &C, repo_id: Uuid) -> Result
     for record in records {
         refs.insert(record.get(0), record.get(1));
     }
+    ensure!(refs.contains_key(&head_ref), "Pando backup HEAD is not an authoritative ref");
     let after_id: String = client.query_one("SELECT txid_current()::text", &[]).await?.get(0);
     ensure!(transaction_id == after_id, "Pando backup caller changed PostgreSQL snapshots during enumeration");
     Ok(PandoBackupManifest {

@@ -54,6 +54,14 @@ topic. Restrict broker ACLs to topic produce/consume and group access; the
 profile does not provision ACLs or a broker. The wake is advisory: PostgreSQL
 outbox rows remain durable and the worker polls if Kafka is unavailable.
 
+The delivery role needs `UPDATE` on `event_deliveries` and ordinary `SELECT`
+on repositories/outbox tables. Migration 129 makes
+`rootyard_worker_repository_generation(uuid,name)` executable by any login, but
+the SECURITY DEFINER body raises SQLSTATE 42501 unless `session_user` holds
+that `event_deliveries` UPDATE privilege. No `UPDATE` on `repositories` is
+needed; grant it only if you also grant the delivery table, and never make the
+worker a schema owner.
+
 ```bash
 python3 deployment/local_cluster.py up \
   --binary /absolute/path/rootyard --env-dir /absolute/private/config \
@@ -73,6 +81,12 @@ uses `rootyard worker`, has no Git volume, and processes the shared PostgreSQL
 outbox. A control operator uses the authenticated shard APIs and the separate
 `migrator.env` identity. The current binary does not provide a standalone
 control HTTP role: these routes run on the data/API nodes.
+
+A migration that fails after the source begins draining deliberately keeps the
+source write-blocked. Retry `/shard-migrate` with the **same operation ID**
+after repairing the destination. The source snapshot, destination install,
+and source cutover use ordered PostgreSQL and local barriers; do not clear the
+drain by editing SQL directly or by registering a new target volume as current.
 
 For workspace execution, add `ROOTYARD_WORKSPACE_MOUNT_MODE=fuse` to the
 corresponding node environment and provide `/dev/fuse` and a functioning user

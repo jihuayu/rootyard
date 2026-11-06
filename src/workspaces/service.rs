@@ -171,8 +171,12 @@ pub async fn lease(
             .await
             .map_err(Error::internal)?
             .get(0);
-        super::remote::ensure_local(&state, cp, ws.repository_id, tenant).await?;
-        materialize_takeover(&state, id, cp)?;
+        if super::mounts::enabled() {
+            super::lazy::prepare(&state, id, cp, ws.repository_id, tenant).await?;
+        } else {
+            super::remote::ensure_local(&state, cp, ws.repository_id, tenant).await?;
+            materialize_takeover(&state, id, cp)?;
+        }
     } else if !super::mounts::lower_path(&state, id).join(".git").is_dir() {
         return Err(conflict());
     }
@@ -243,7 +247,7 @@ pub async fn fence_restored(pool: &deadpool_postgres::Pool) -> Result<(), Error>
     let mut client = pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     tx.execute("UPDATE workspaces SET lease_epoch=lease_epoch+1,lease_until=clock_timestamp()-interval '1 second' WHERE state='ready'", &[]).await.map_err(Error::internal)?;
-    tx.execute("UPDATE sandbox_jobs SET state='cancelled',pid=NULL,finished_at=clock_timestamp() WHERE state IN ('queued','running')", &[]).await.map_err(Error::internal)?;
+    tx.execute("UPDATE sandbox_jobs SET state='cancelled',pid=NULL,finished_at=clock_timestamp() WHERE state IN ('queued','preparing','running')", &[]).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)
 }
 
@@ -306,17 +310,21 @@ pub async fn create(
     source_lease.ensure_active()?;
     drop(_local);
     drop(source_lease);
+    let head = String::from_utf8(git(&dest, &["rev-parse", "HEAD"]).unwrap_or_default())
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| crate::browse::models::valid_non_zero_oid(value));
     if let Some(base) = &input.base_oid {
         if !crate::browse::models::valid_non_zero_oid(base) {
             return Err(Error::bad_request());
         }
-        let head = String::from_utf8(git(&dest, &["rev-parse", "HEAD"])?).map_err(Error::internal)?;
-        if head.trim() != base {
+        if head.as_deref() != Some(base.as_str()) {
             return Err(conflict());
         }
     }
+    let base_oid = input.base_oid.clone().or(head);
     let host_id = state.storage.volume_id;
-    tx.execute("INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,state,host_id,lease_until) VALUES($1,$2,$3,$4,$5,$6,'ready',$7,clock_timestamp()+interval '5 minutes')", &[&id,&repo.repo_id,&input.owner,&input.repository,&input.agent_id,&actor.id,&host_id]).await.map_err(Error::internal)?;
+    tx.execute("INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,state,host_id,lease_until,base_oid) VALUES($1,$2,$3,$4,$5,$6,'ready',$7,clock_timestamp()+interval '5 minutes',$8)", &[&id,&repo.repo_id,&input.owner,&input.repository,&input.agent_id,&actor.id,&host_id,&base_oid]).await.map_err(Error::internal)?;
     tx.execute(
         "INSERT INTO workspace_creations(actor_id,idempotency_key,request_sha256,workspace_id) VALUES($1,$2,$3,$4)",
         &[&actor.id, &key, &digest, &id],

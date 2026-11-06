@@ -2766,6 +2766,116 @@
       "default": null,
       "generated": "",
       "identity": "",
+      "name": "writer_id",
+      "not_null": true,
+      "position": 1,
+      "table": "git_ref_admissions",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 2,
+      "table": "git_ref_admissions",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "shard_epoch",
+      "not_null": true,
+      "position": 3,
+      "table": "git_ref_admissions",
+      "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "node_id",
+      "not_null": false,
+      "position": 4,
+      "table": "git_ref_admissions",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "actor_id",
+      "not_null": true,
+      "position": 5,
+      "table": "git_ref_admissions",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "token_id",
+      "not_null": true,
+      "position": 6,
+      "table": "git_ref_admissions",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "ref_names",
+      "not_null": true,
+      "position": 7,
+      "table": "git_ref_admissions",
+      "type": "text[]"
+    },
+    {
+      "collation": "default",
+      "default": "'ADMITTED'::text",
+      "generated": "",
+      "identity": "",
+      "name": "state",
+      "not_null": true,
+      "position": 8,
+      "table": "git_ref_admissions",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 9,
+      "table": "git_ref_admissions",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "settled_at",
+      "not_null": false,
+      "position": 10,
+      "table": "git_ref_admissions",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
       "name": "id",
       "not_null": true,
       "position": 1,
@@ -3763,17 +3873,6 @@
       "type": "bigint"
     },
     {
-      "collation": "default",
-      "default": "'refs/heads/main'::text",
-      "generated": "",
-      "identity": "",
-      "name": "head_ref",
-      "not_null": true,
-      "position": 11,
-      "table": "pando_repository_states",
-      "type": "text"
-    },
-    {
       "collation": null,
       "default": null,
       "generated": "",
@@ -4031,29 +4130,29 @@
       "default": "0",
       "generated": "",
       "identity": "",
-      "name": "backend_transition_epoch",
+      "name": "gc_epoch",
       "not_null": true,
       "position": 13,
       "table": "repositories",
       "type": "bigint"
     },
     {
-      "collation": "default",
-      "default": "'stable'::text",
+      "collation": null,
+      "default": null,
       "generated": "",
       "identity": "",
-      "name": "transition_state",
-      "not_null": true,
+      "name": "gc_owner",
+      "not_null": false,
       "position": 14,
       "table": "repositories",
-      "type": "text"
+      "type": "uuid"
     },
     {
       "collation": null,
       "default": null,
       "generated": "",
       "identity": "",
-      "name": "transition_id",
+      "name": "gc_job_id",
       "not_null": false,
       "position": 15,
       "table": "repositories",
@@ -4064,22 +4163,33 @@
       "default": null,
       "generated": "",
       "identity": "",
-      "name": "transition_started_at",
+      "name": "gc_lease_until",
       "not_null": false,
       "position": 16,
       "table": "repositories",
       "type": "timestamp with time zone"
     },
     {
-      "collation": "default",
+      "collation": null,
       "default": null,
       "generated": "",
       "identity": "",
-      "name": "transition_error",
+      "name": "gc_fence_started_at",
       "not_null": false,
       "position": 17,
       "table": "repositories",
-      "type": "text"
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "gc_quiesced_at",
+      "not_null": false,
+      "position": 18,
+      "table": "repositories",
+      "type": "timestamp with time zone"
     },
     {
       "collation": null,
@@ -6025,6 +6135,127 @@
       "name": "id",
       "not_null": true,
       "position": 1,
+      "table": "storage_write_admissions",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 2,
+      "table": "storage_write_admissions",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "gc_epoch",
+      "not_null": true,
+      "position": 3,
+      "table": "storage_write_admissions",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "owner",
+      "not_null": true,
+      "position": 4,
+      "table": "storage_write_admissions",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "kind",
+      "not_null": true,
+      "position": 5,
+      "table": "storage_write_admissions",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": "'active'::text",
+      "generated": "",
+      "identity": "",
+      "name": "state",
+      "not_null": true,
+      "position": 6,
+      "table": "storage_write_admissions",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "admitted_at",
+      "not_null": true,
+      "position": 7,
+      "table": "storage_write_admissions",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "heartbeat_at",
+      "not_null": true,
+      "position": 8,
+      "table": "storage_write_admissions",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "lease_until",
+      "not_null": true,
+      "position": 9,
+      "table": "storage_write_admissions",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "finished_at",
+      "not_null": false,
+      "position": 10,
+      "table": "storage_write_admissions",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "detail",
+      "not_null": false,
+      "position": 11,
+      "table": "storage_write_admissions",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "id",
+      "not_null": true,
+      "position": 1,
       "table": "tokens",
       "type": "uuid"
     },
@@ -6544,6 +6775,17 @@
       "position": 11,
       "table": "workspace_checkpoints",
       "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "base_oid",
+      "not_null": false,
+      "position": 12,
+      "table": "workspace_checkpoints",
+      "type": "text"
     },
     {
       "collation": null,
@@ -7303,6 +7545,17 @@
       "position": 15,
       "table": "workspaces",
       "type": "timestamp with time zone"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "base_oid",
+      "not_null": false,
+      "position": 16,
+      "table": "workspaces",
+      "type": "text"
     }
   ],
   "constraints": [
@@ -8902,6 +9155,87 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "FOREIGN KEY (actor_id) REFERENCES public.users(id)",
+      "name": "git_ref_admissions_actor_id_fkey",
+      "table": "git_ref_admissions",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((((state = 'ADMITTED'::text) AND (settled_at IS NULL)) OR ((state <> 'ADMITTED'::text) AND (settled_at IS NOT NULL))))",
+      "name": "git_ref_admissions_check",
+      "table": "git_ref_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((node_id IS NULL) OR ((octet_length(node_id) >= 1) AND (octet_length(node_id) <= 63) AND (node_id !~ '[[:cntrl:]]'::text))))",
+      "name": "git_ref_admissions_node_id_check",
+      "table": "git_ref_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (writer_id)",
+      "name": "git_ref_admissions_pkey",
+      "table": "git_ref_admissions",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((cardinality(ref_names) >= 1) AND (cardinality(ref_names) <= 128)))",
+      "name": "git_ref_admissions_ref_names_check",
+      "table": "git_ref_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES public.repositories(id) ON DELETE CASCADE",
+      "name": "git_ref_admissions_repository_id_fkey",
+      "table": "git_ref_admissions",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((shard_epoch > 0))",
+      "name": "git_ref_admissions_shard_epoch_check",
+      "table": "git_ref_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((state = ANY (ARRAY['ADMITTED'::text, 'COMMITTED'::text, 'ABORTED'::text, 'FENCED_ABORTED'::text])))",
+      "name": "git_ref_admissions_state_check",
+      "table": "git_ref_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (token_id, actor_id) REFERENCES public.tokens(id, user_id)",
+      "name": "git_ref_admissions_token_id_actor_id_fkey",
+      "table": "git_ref_admissions",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "FOREIGN KEY (owner_user_id) REFERENCES public.users(id)",
       "name": "lfs_locks_owner_user_id_fkey",
       "table": "lfs_locks",
@@ -9532,15 +9866,6 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK (((octet_length(head_ref) >= 12) AND (octet_length(head_ref) <= 1024) AND (head_ref ~~ 'refs/heads/%'::text) AND (head_ref !~ '[[:cntrl:]]'::text)))",
-      "name": "pando_repository_states_head_ref_check",
-      "table": "pando_repository_states",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
       "definition": "CHECK ((object_format = ANY (ARRAY['sha1'::text, 'sha256'::text])))",
       "name": "pando_repository_states_object_format_check",
       "table": "pando_repository_states",
@@ -9685,6 +10010,33 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK ((gc_epoch >= 0))",
+      "name": "repositories_gc_epoch_check",
+      "table": "repositories",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((((gc_owner IS NULL) AND (gc_job_id IS NULL) AND (gc_lease_until IS NULL) AND (gc_fence_started_at IS NULL) AND (gc_quiesced_at IS NULL)) OR ((gc_owner IS NOT NULL) AND (gc_job_id IS NOT NULL) AND (gc_lease_until IS NOT NULL) AND (gc_fence_started_at IS NOT NULL))))",
+      "name": "repositories_gc_fence_consistency",
+      "table": "repositories",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (gc_job_id) REFERENCES public.storage_maintenance_jobs(id) ON DELETE SET NULL",
+      "name": "repositories_gc_job_id_fkey",
+      "table": "repositories",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "CHECK ((incident_revision >= 0))",
       "name": "repositories_incident_revision_check",
       "table": "repositories",
@@ -9759,33 +10111,6 @@
       "deferred": false,
       "definition": "CHECK ((storage_generation > 0))",
       "name": "repositories_storage_generation_check",
-      "table": "repositories",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK ((backend_transition_epoch >= 0))",
-      "name": "repositories_transition_epoch_check",
-      "table": "repositories",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK ((((transition_state = 'stable'::text) = (transition_id IS NULL)) AND ((transition_state = 'stable'::text) = (transition_started_at IS NULL)) AND ((transition_state <> 'failed'::text) OR (transition_error IS NOT NULL))))",
-      "name": "repositories_transition_fence_check",
-      "table": "repositories",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK ((transition_state = ANY (ARRAY['stable'::text, 'draining'::text, 'failed'::text])))",
-      "name": "repositories_transition_state_check",
       "table": "repositories",
       "type": "c",
       "validated": true
@@ -10963,7 +11288,7 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK ((state = ANY (ARRAY['pending'::text, 'retained'::text, 'deleted'::text])))",
+      "definition": "CHECK ((state = ANY (ARRAY['pending'::text, 'deleting'::text, 'retained'::text, 'deleted'::text])))",
       "name": "storage_maintenance_tombstones_state_check",
       "table": "storage_maintenance_tombstones",
       "type": "c",
@@ -10976,6 +11301,69 @@
       "name": "storage_maintenance_tombstones_tenant_id_fkey",
       "table": "storage_maintenance_tombstones",
       "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((state = 'active'::text) = (finished_at IS NULL)))",
+      "name": "storage_write_admissions_check",
+      "table": "storage_write_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((detail IS NULL) OR (octet_length(detail) <= 512)))",
+      "name": "storage_write_admissions_detail_check",
+      "table": "storage_write_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((gc_epoch >= 0))",
+      "name": "storage_write_admissions_gc_epoch_check",
+      "table": "storage_write_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((kind ~ '^[a-z0-9][a-z0-9._-]{0,63}$'::text))",
+      "name": "storage_write_admissions_kind_check",
+      "table": "storage_write_admissions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (id)",
+      "name": "storage_write_admissions_pkey",
+      "table": "storage_write_admissions",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES public.repositories(id) ON DELETE CASCADE",
+      "name": "storage_write_admissions_repository_id_fkey",
+      "table": "storage_write_admissions",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((state = ANY (ARRAY['active'::text, 'finished'::text, 'aborted'::text, 'fenced'::text])))",
+      "name": "storage_write_admissions_state_check",
+      "table": "storage_write_admissions",
+      "type": "c",
       "validated": true
     },
     {
@@ -11173,6 +11561,15 @@
       "definition": "CHECK ((state = ANY (ARRAY['proposed'::text, 'reviewed'::text, 'integrating'::text, 'partial'::text, 'complete'::text, 'conflict'::text])))",
       "name": "workspace_changesets_state_check",
       "table": "workspace_changesets",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((base_oid IS NULL) OR (((base_oid COLLATE \"C\") ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'::text) AND (base_oid <> repeat('0'::text, length(base_oid))))))",
+      "name": "workspace_checkpoints_base_oid_check",
+      "table": "workspace_checkpoints",
       "type": "c",
       "validated": true
     },
@@ -11476,6 +11873,15 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK (((base_oid IS NULL) OR (((base_oid COLLATE \"C\") ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'::text) AND (base_oid <> repeat('0'::text, length(base_oid))))))",
+      "name": "workspaces_base_oid_check",
+      "table": "workspaces",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "FOREIGN KEY (creator_id) REFERENCES public.users(id)",
       "name": "workspaces_creator_id_fkey",
       "table": "workspaces",
@@ -11730,9 +12136,7 @@
     {
       "arguments": "",
       "binary": null,
-      "config": [
-        "search_path=pg_catalog"
-      ],
+      "config": null,
       "cost": 100,
       "kind": "f",
       "language": "plpgsql",
@@ -11741,27 +12145,25 @@
       "parallel": "u",
       "result": "trigger",
       "rows": 0,
-      "security_definer": true,
-      "source": "\nDECLARE current_generation bigint;\nBEGIN\n    EXECUTE format('SELECT storage_generation FROM %I.repositories WHERE id=$1 FOR SHARE', TG_TABLE_SCHEMA)\n        INTO STRICT current_generation USING NEW.repository_id;\n    IF NEW.storage_generation IS DISTINCT FROM current_generation THEN\n        RAISE EXCEPTION 'stale projection storage generation';\n    END IF;\n    RETURN NEW;\nEND;\n",
+      "security_definer": false,
+      "source": "\nDECLARE current_generation BIGINT;\nBEGIN\n SELECT storage_generation INTO current_generation FROM repositories WHERE id=NEW.repository_id FOR SHARE;\n IF NEW.storage_generation IS DISTINCT FROM current_generation THEN RAISE EXCEPTION 'stale projection storage generation'; END IF;\n RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     },
     {
-      "arguments": "repo_uuid uuid, app_schema name",
+      "arguments": "",
       "binary": null,
-      "config": [
-        "search_path=pg_catalog"
-      ],
+      "config": null,
       "cost": 100,
       "kind": "f",
       "language": "plpgsql",
       "leakproof": false,
-      "name": "rootyard_worker_repository_generation",
+      "name": "rootyard_reject_gc_root_change",
       "parallel": "u",
-      "result": "bigint",
+      "result": "trigger",
       "rows": 0,
-      "security_definer": true,
-      "source": "\nDECLARE generation bigint;\nBEGIN\n    IF NOT has_table_privilege(session_user, format('%I.event_deliveries', app_schema), 'UPDATE') THEN\n        RAISE EXCEPTION 'repository delivery lock requires event delivery role'\n            USING ERRCODE = '42501';\n    END IF;\n    EXECUTE format('SELECT storage_generation FROM %I.repositories WHERE id=$1 FOR SHARE', app_schema)\n        INTO STRICT generation USING repo_uuid;\n    RETURN generation;\nEND;\n",
+      "security_definer": false,
+      "source": "\nDECLARE repo_id UUID;\nBEGIN\n    IF TG_TABLE_NAME = 'workspace_view_history' THEN\n        IF TG_OP = 'DELETE' THEN\n            SELECT v.repository_id INTO repo_id\n            FROM workspace_views v WHERE v.id = OLD.view_id;\n        ELSE\n            SELECT v.repository_id INTO repo_id\n            FROM workspace_views v WHERE v.id = NEW.view_id;\n        END IF;\n    ELSIF TG_TABLE_NAME = 'sandbox_jobs' THEN\n        -- A sandbox job reaches its repository through either a workspace or a\n        -- CI run; the table itself has no repository_id column.\n        IF TG_OP = 'DELETE' THEN\n            SELECT COALESCE(\n                (SELECT repository_id FROM workspaces WHERE id = OLD.workspace_id),\n                (SELECT repository_id FROM ci_runs WHERE id = OLD.ci_run_id)\n            ) INTO repo_id;\n        ELSE\n            SELECT COALESCE(\n                (SELECT repository_id FROM workspaces WHERE id = NEW.workspace_id),\n                (SELECT repository_id FROM ci_runs WHERE id = NEW.ci_run_id)\n            ) INTO repo_id;\n        END IF;\n    ELSIF TG_OP = 'DELETE' THEN\n        repo_id := OLD.repository_id;\n    ELSE\n        repo_id := NEW.repository_id;\n    END IF;\n    IF repo_id IS NOT NULL AND EXISTS (\n        SELECT 1 FROM repositories r\n        WHERE r.id = repo_id AND r.gc_owner IS NOT NULL\n          AND r.gc_lease_until > clock_timestamp()\n    ) THEN\n        RAISE EXCEPTION 'repository retention roots are fenced by physical GC'\n            USING ERRCODE = '55006';\n    END IF;\n    IF TG_OP = 'DELETE' THEN\n        RETURN OLD;\n    END IF;\n    RETURN NEW;\nEND ",
       "strict": false,
       "volatility": "v"
     }
@@ -12218,6 +12620,33 @@
       "valid": true
     },
     {
+      "definition": "CREATE INDEX git_ref_admissions_open_epoch_idx ON public.git_ref_admissions USING btree (repository_id, shard_epoch, state) WHERE (state = 'ADMITTED'::text)",
+      "live": true,
+      "name": "git_ref_admissions_open_epoch_idx",
+      "ready": true,
+      "table": "git_ref_admissions",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX git_ref_admissions_pkey ON public.git_ref_admissions USING btree (writer_id)",
+      "live": true,
+      "name": "git_ref_admissions_pkey",
+      "ready": true,
+      "table": "git_ref_admissions",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX git_ref_admissions_repository_idx ON public.git_ref_admissions USING btree (repository_id, writer_id)",
+      "live": true,
+      "name": "git_ref_admissions_repository_idx",
+      "ready": true,
+      "table": "git_ref_admissions",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX lfs_locks_pkey ON public.lfs_locks USING btree (id)",
       "live": true,
       "name": "lfs_locks_pkey",
@@ -12506,6 +12935,15 @@
       "valid": true
     },
     {
+      "definition": "CREATE INDEX repositories_gc_fence_active ON public.repositories USING btree (gc_lease_until) WHERE (gc_owner IS NOT NULL)",
+      "live": true,
+      "name": "repositories_gc_fence_active",
+      "ready": true,
+      "table": "repositories",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX repositories_owner_id_name_key ON public.repositories USING btree (owner_id, name)",
       "live": true,
       "name": "repositories_owner_id_name_key",
@@ -12536,15 +12974,6 @@
       "definition": "CREATE UNIQUE INDEX repositories_pkey ON public.repositories USING btree (id)",
       "live": true,
       "name": "repositories_pkey",
-      "ready": true,
-      "table": "repositories",
-      "tablespace": null,
-      "valid": true
-    },
-    {
-      "definition": "CREATE INDEX repositories_transition_inflight ON public.repositories USING btree (transition_started_at) WHERE (transition_state <> 'stable'::text)",
-      "live": true,
-      "name": "repositories_transition_inflight",
       "ready": true,
       "table": "repositories",
       "tablespace": null,
@@ -12893,7 +13322,7 @@
       "valid": true
     },
     {
-      "definition": "CREATE INDEX storage_maintenance_tombstones_due ON public.storage_maintenance_tombstones USING btree (delete_after, repository_id) WHERE (state = 'pending'::text)",
+      "definition": "CREATE INDEX storage_maintenance_tombstones_due ON public.storage_maintenance_tombstones USING btree (delete_after, repository_id) WHERE (state = ANY (ARRAY['pending'::text, 'deleting'::text]))",
       "live": true,
       "name": "storage_maintenance_tombstones_due",
       "ready": true,
@@ -12907,6 +13336,33 @@
       "name": "storage_maintenance_tombstones_pkey",
       "ready": true,
       "table": "storage_maintenance_tombstones",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX storage_write_admissions_active ON public.storage_write_admissions USING btree (repository_id, lease_until) WHERE (state = 'active'::text)",
+      "live": true,
+      "name": "storage_write_admissions_active",
+      "ready": true,
+      "table": "storage_write_admissions",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX storage_write_admissions_history ON public.storage_write_admissions USING btree (repository_id, admitted_at DESC)",
+      "live": true,
+      "name": "storage_write_admissions_history",
+      "ready": true,
+      "table": "storage_write_admissions",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX storage_write_admissions_pkey ON public.storage_write_admissions USING btree (id)",
+      "live": true,
+      "name": "storage_write_admissions_pkey",
+      "ready": true,
+      "table": "storage_write_admissions",
       "tablespace": null,
       "valid": true
     },
@@ -13423,6 +13879,16 @@
     {
       "force_row_security": false,
       "kind": "r",
+      "name": "git_ref_admissions",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
       "name": "lfs_locks",
       "options": null,
       "persistence": "p",
@@ -13763,6 +14229,16 @@
     {
       "force_row_security": false,
       "kind": "r",
+      "name": "storage_write_admissions",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
       "name": "tokens",
       "options": null,
       "persistence": "p",
@@ -13938,6 +14414,22 @@
       "constraint": false,
       "deferrable": false,
       "deferred": false,
+      "definition": "CREATE TRIGGER ci_checkout_jobs_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.ci_checkout_jobs FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "ci_checkout_jobs_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "ci_checkout_jobs",
+      "type": 31
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
       "definition": "CREATE TRIGGER ci_checkout_jobs_immutable BEFORE DELETE OR UPDATE ON public.ci_checkout_jobs FOR EACH ROW EXECUTE FUNCTION public.protect_ci_checkout_job()",
       "enabled": "O",
       "function": "protect_ci_checkout_job",
@@ -13963,6 +14455,70 @@
       "old_transition": null,
       "table": "ci_checkout_jobs",
       "type": 34
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER ci_integration_checkout_jobs_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.ci_integration_checkout_jobs FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "ci_integration_checkout_jobs_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "ci_integration_checkout_jobs",
+      "type": 31
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER ci_pull_sync_progress_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.ci_pull_sync_progress FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "ci_pull_sync_progress_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "ci_pull_sync_progress",
+      "type": 31
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER ci_runs_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.ci_runs FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "ci_runs_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "ci_runs",
+      "type": 31
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER forge_check_runs_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.forge_check_runs FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "forge_check_runs_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "forge_check_runs",
+      "type": 31
     },
     {
       "argument_count": 0,
@@ -14034,6 +14590,22 @@
       "constraint": false,
       "deferrable": false,
       "deferred": false,
+      "definition": "CREATE TRIGGER forge_pull_reviews_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.forge_pull_reviews FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "forge_pull_reviews_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "forge_pull_reviews",
+      "type": 31
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
       "definition": "CREATE TRIGGER forge_pull_reviews_object_format BEFORE INSERT OR UPDATE ON public.forge_pull_reviews FOR EACH ROW EXECUTE FUNCTION public.forge_enforce_repository_object_format()",
       "enabled": "O",
       "function": "forge_enforce_repository_object_format",
@@ -14059,6 +14631,22 @@
       "old_transition": null,
       "table": "forge_pulls",
       "type": 23
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER forge_pulls_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.forge_pulls FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "forge_pulls_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "forge_pulls",
+      "type": 31
     },
     {
       "argument_count": 0,
@@ -14226,6 +14814,22 @@
       "constraint": false,
       "deferrable": false,
       "deferred": false,
+      "definition": "CREATE TRIGGER sandbox_jobs_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.sandbox_jobs FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "sandbox_jobs_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "sandbox_jobs",
+      "type": 31
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
       "definition": "CREATE TRIGGER users_personal_namespace AFTER INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION public.create_personal_namespace()",
       "enabled": "O",
       "function": "create_personal_namespace",
@@ -14235,6 +14839,102 @@
       "old_transition": null,
       "table": "users",
       "type": 5
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER workspace_changeset_steps_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.workspace_changeset_steps FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "workspace_changeset_steps_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "workspace_changeset_steps",
+      "type": 31
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER workspace_checkpoints_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.workspace_checkpoints FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "workspace_checkpoints_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "workspace_checkpoints",
+      "type": 31
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER workspace_namespace_mounts_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.workspace_namespace_mounts FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "workspace_namespace_mounts_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "workspace_namespace_mounts",
+      "type": 31
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER workspace_view_history_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.workspace_view_history FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "workspace_view_history_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "workspace_view_history",
+      "type": 31
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER workspace_views_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.workspace_views FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "workspace_views_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "workspace_views",
+      "type": 31
+    },
+    {
+      "argument_count": 0,
+      "arguments": "",
+      "constraint": false,
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CREATE TRIGGER workspaces_gc_root_fence BEFORE INSERT OR DELETE OR UPDATE ON public.workspaces FOR EACH ROW EXECUTE FUNCTION public.rootyard_reject_gc_root_change()",
+      "enabled": "O",
+      "function": "rootyard_reject_gc_root_change",
+      "function_schema": "public",
+      "name": "workspaces_gc_root_fence",
+      "new_transition": null,
+      "old_transition": null,
+      "table": "workspaces",
+      "type": 31
     }
   ]
 }

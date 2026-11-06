@@ -164,9 +164,12 @@ pub async fn update_webhook(
         if let Some(v) = patch.expected_version {
             positive(v)?;
         }
+        let policy_repo=crate::webhooks::trust::policy_repo_id(&state,&owner,&name).await?;
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
+        crate::webhooks::trust::lock_policy_tx(&tx,policy_repo).await?;
         let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+        if repo!=policy_repo{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
 
         let existing = tx
             .query_opt(&format!("SELECT {WEBHOOK_FIELDS}, secret FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3 FOR UPDATE"), &[&actor.id, &repo, &hook_id])
@@ -225,9 +228,12 @@ pub async fn delete_webhook(
     tokio::spawn(async move {
         ensure_schema(&state.pool).await?;
         let actor = auth::authenticate(&state.pool, &headers).await?;
+        let policy_repo=crate::webhooks::trust::policy_repo_id(&state,&owner,&name).await?;
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
+        crate::webhooks::trust::lock_policy_tx(&tx,policy_repo).await?;
         let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+        if repo!=policy_repo{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
         let deleted = tx
             .execute("DELETE FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3", &[&actor.id, &repo, &hook_id])
             .await
@@ -498,6 +504,16 @@ pub async fn ci_callback(
 
         let (event_id, req_sha256) = resolve_callback_identity(&headers, hook_id, &input, &context, &output)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
+        crate::webhooks::trust::lock_policy_tx(&tx,repo_id).await?;
+        let current_hook=tx.query_opt(
+            "SELECT secret,active,ci_contexts FROM forge_webhooks WHERE id=$1 AND repository_id=$2 FOR SHARE",
+            &[&hook_id,&repo_id]).await.map_err(Error::internal)?
+            .ok_or_else(Error::unauthorized)?;
+        if !current_hook.get::<_,bool>("active") ||
+            current_hook.get::<_,String>("secret")!=secret ||
+            current_hook.get::<_,Value>("ci_contexts")!=hook_row.get::<_,Value>("ci_contexts") {
+            return Err(Error::unauthorized());
+        }
         if let Some(cb_row) = tx
             .query_opt("SELECT request_sha256, response FROM forge_webhook_callbacks WHERE repository_id=$1 AND event_id=$2 FOR UPDATE", &[&repo_id, &event_id])
             .await

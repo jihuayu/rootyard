@@ -13,7 +13,7 @@ use std::{io, process::Stdio, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::Child,
-    sync::{OwnedMutexGuard, OwnedRwLockReadGuard, OwnedSemaphorePermit},
+    sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit},
     task::JoinHandle,
     time::Instant,
 };
@@ -24,11 +24,14 @@ mod pando_receive;
 mod process;
 #[path = "git_http/protocol.rs"]
 mod protocol;
+#[path = "git_http/publication.rs"]
+pub(crate) mod publication;
 #[path = "git_http/receive.rs"]
 mod receive;
 use process::Process;
 pub(crate) use process::{
-    collect_git_output, collect_git_output_input, finish_group_child, group_quiescent, stop_group_child,
+    collect_git_output, collect_git_output_input, finish_group_child, group_quiescent, kill_group_child,
+    stop_group_child,
 };
 use protocol::{job_response_prefix, read_headers, route, validate_headers};
 
@@ -186,33 +189,33 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         deadline,
     )
     .await?;
-    let ref_guard = if let Some(commands) = &input.commands {
+    let ref_guard = if let Some(commands) = input.commands.as_ref().filter(|c| !c.refs.is_empty()) {
         if commands.changes.len() != commands.refs.len() {
             return Err(Error::bad_request());
         }
-        Some(
+        Some(Arc::new(
             storage::ref_publication::acquire(&state.pool, repo.id, repo.storage_generation, &commands.refs, deadline)
                 .await?,
-        )
+        ))
     } else {
         None
     };
-    let write_guard = if write && parts.method == Method::POST {
-        Some(tokio::time::timeout_at(deadline, state.storage.write_lock(repo.id)).await.map_err(|_| Error::timeout())?)
-    } else {
-        None
-    };
-    let snapshot_lease = if write_guard.is_none() {
+    let snapshot_lease = if ref_guard.is_none() {
         Some(storage::read_leases::shared(&state.pool, repo.id, deadline).await?)
     } else {
         None
     };
-    let read_guard = if snapshot_lease.is_some() {
+    let read_guard = if ref_guard.is_some() || snapshot_lease.is_some() {
         Some(
             tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(repo.id))
                 .await
                 .map_err(|_| Error::timeout())?,
         )
+    } else {
+        None
+    };
+    let write_guard = if ref_guard.is_some() {
+        Some(tokio::time::timeout_at(deadline, state.storage.write_lock(repo.id)).await.map_err(|_| Error::timeout())?)
     } else {
         None
     };
@@ -223,7 +226,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             .map_err(|_| Error::unauthorized())?;
     }
     if write_guard.is_some() {
-        reliability::before_push(&state, &repo).await.map_err(Error::internal)?;
+        reliability::before_gitfs_push(&state, &repo).await?;
     }
     let pando_snapshot = if repo.storage_backend == "pando" {
         let lease = snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?;
@@ -338,21 +341,54 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             Ok(())
         });
     }
-    let operation = if write_guard.is_some() {
+    // Durable PostgreSQL admission precedes every journal/object write. It
+    // carries the writer identity and shard epoch that takeover fences.
+    let admission = if write_guard.is_some() {
         let identity = identity.as_ref().ok_or_else(Error::unauthorized)?;
-        let operation = journal::begin(
+        let commands = input.commands.as_ref().ok_or_else(Error::bad_request)?;
+        Some(
+            storage::ref_admission::admit(
+                &state.pool,
+                repo.id,
+                repo.storage_generation,
+                identity,
+                &commands.refs,
+                deadline,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let (operation, active_guard, coordinator) = if let Some(admission) = &admission {
+        let identity = identity.as_ref().ok_or_else(Error::unauthorized)?;
+        let (operation, active) = journal::begin_active_with(
             &state.storage.root,
             repo.id,
             identity.id,
             identity.username.clone(),
             identity.token_id,
             repo.storage_generation,
+            admission.writer_id,
+            admission.shard_epoch,
         )
         .map_err(Error::internal)?;
+        let coordinator = match publication::Coordinator::bind(&operation, identity) {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                drop(active);
+                if let Ok(()) = journal::finish(&operation) {
+                    let _ = reliability::complete(&state, Some(operation)).await;
+                }
+                return Err(Error::internal(error));
+            }
+        };
         cmd.env("ROOTYARD_JOURNAL_OPERATION", &operation.path);
-        Some(operation)
+        cmd.env("ROOTYARD_PUBLICATION_ENDPOINT", coordinator.endpoint().to_string())
+            .env("ROOTYARD_PUBLICATION_NONCE", coordinator.nonce_hex());
+        (Some(operation), Some(active), Some(coordinator))
     } else {
-        None
+        (None, None, None)
     };
     if let Some(plan) = &job_plan {
         let (_, _, current) = crate::ci_checkouts::authority::authenticate_principal(
@@ -370,10 +406,19 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
+            if let Some(op) = &operation {
+                let _ = journal::finish(op);
+            }
+            drop(active_guard);
             let _ = reliability::complete(&state, operation).await;
             return Err(Error::internal(error));
         }
     };
+    let coordinator = coordinator
+        .map(|coord| coord.start(ref_guard.as_ref().expect("write has exact refs").clone(), state.clone(), deadline));
+    // Uploads may now overlap. The pre-receive hook cannot proceed until its
+    // parent coordinator acquires the short repo publication window.
+    drop(write_guard);
     let pid = child.id().ok_or_else(Error::bad_request)? as i32;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
@@ -383,7 +428,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         // Drain continuously, bounded memory. Do not forward untrusted Git diagnostics
         // into logs where paths, commit data or secrets could be disclosed.
         let mut buf = [0u8; 4096];
-        while matches!(stderr.read(&mut buf).await,Ok(n) if n>0) {}
+        while matches!(stderr.read(&mut buf).await, Ok(n) if n > 0) {}
     });
     let mut process = Process { child, input: Some(input), stderr, pid };
     let mut stdout = BufReader::with_capacity(16 * 1024, stdout);
@@ -392,7 +437,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         result => {
             process.stop().await;
             state.transfer_metrics.record_failure();
-            let _ = reliability::complete(&state, operation).await;
+            let _ = publication::settle(&state, operation, active_guard, coordinator).await;
             return Err(match result {
                 Err(_) => Error::timeout(),
                 Ok(Err(error)) => Error::internal(error),
@@ -426,7 +471,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(), job_principal.as_ref(), &repo, write).await
     {
         process.stop().await;
-        let _ = reliability::complete(&state, operation).await;
+        let _ = publication::settle(&state, operation, active_guard, coordinator).await;
         return Err(Error::internal(error));
     }
     // Reinsert the inspected bytes unchanged. Existing transfer accounting,
@@ -450,7 +495,6 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     let admitted_repo = repo.clone();
     tokio::spawn(async move {
         let _permit: OwnedSemaphorePermit = permit;
-        let _write_guard: Option<OwnedMutexGuard<()>> = write_guard;
         let ref_guard = ref_guard;
         let _read_guard: Option<OwnedRwLockReadGuard<()>> = read_guard;
         let snapshot_lease = snapshot_lease;
@@ -553,7 +597,9 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             if !status.success() {
                 return Err(io::Error::other("Git subprocess failed"));
             }
-            if write {
+            if ref_guard.is_some() {
+                // Git may reject a malformed pack before any hook executes. A
+                // ref mutation still requires the hook's parent grant.
                 if let Some(guard) = &ref_guard {
                     guard.ensure_active().map_err(|_| io::Error::other("ref publication guard lost"))?;
                 }
@@ -570,7 +616,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         // Drop is also a last-resort guard if this task itself is cancelled.
         drop(process);
         drop(pando_snapshot);
-        if let Err(error) = reliability::complete(&state, operation).await {
+        if let Err(error) = publication::settle(&state, operation, active_guard, coordinator).await {
             producer_failed.store(true, std::sync::atomic::Ordering::Release);
             eprintln!("rootyard: push evidence requires recovery: {error:#}");
         }
