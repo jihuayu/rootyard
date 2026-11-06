@@ -40,6 +40,7 @@ pub async fn scan_once(state: &AppState) -> Result<(), Error> {
         let tenant: Uuid = row.get(0);
         let repo: Uuid = row.get(1);
         reconcile_pull_refs(state, tenant, repo).await?;
+        repair_pull_orchestration(state, tenant, repo).await?;
         sync_pull_events(state, tenant, repo).await?;
         // Missing-delivery selection makes each batch advance, including new hooks.
         loop {
@@ -47,6 +48,27 @@ pub async fn scan_once(state: &AppState) -> Result<(), Error> {
         }
         let now = current_unix_seconds();
         dispatch_due_deliveries(state, tenant, repo, 200, now).await?;
+    }
+    Ok(())
+}
+
+/// Recover a PR whose row advanced but whose pin, runs, or deliveries did not
+/// finish. The marker is written last, after every idempotent side effect.
+async fn repair_pull_orchestration(state:&AppState,tenant:Uuid,repo:Uuid)->Result<(),Error>{
+    let client=state.pool.get().await.map_err(Error::internal)?;
+    let rows=client.query(&format!("SELECT {PULL_FIELDS} FROM forge_pulls p \
+        WHERE p.tenant_id=$1 AND p.repository_id=$2 AND p.state='open' AND NOT EXISTS( \
+          SELECT 1 FROM ci_pull_sync_progress s WHERE s.repository_id=p.repository_id \
+            AND s.pull_number=p.number AND s.pull_version=p.version \
+            AND s.head_oid=p.head_oid AND s.base_oid=p.base_oid \
+            AND s.storage_generation=(SELECT storage_generation FROM repositories \
+              WHERE id=p.repository_id)) ORDER BY p.number LIMIT 100"),
+        &[&tenant,&repo]).await.map_err(Error::internal)?;
+    drop(client);
+    for row in rows {
+        let pull=PullRequest::row(&row);
+        let action=if pull.version==1 {"opened"} else {"synchronize"};
+        on_pull_synchronized(state,repo,&pull,action).await?;
     }
     Ok(())
 }

@@ -91,11 +91,23 @@ def main():
         until=time.monotonic()+15
         while time.monotonic()<until:
             new_pr=h.document(f"{h.pullspath}/{pr['number']}")
-            if new_pr["head_oid"]==new_oid:break
+            new_runs=h.sql(f"SELECT count(*) FROM ci_runs WHERE repository_id='{pr['repository_id']}' AND head_oid='{new_oid}'")
+            if new_pr["head_oid"]==new_oid and new_runs=="2":break
             time.sleep(.2)
         assert new_pr["head_oid"]==new_oid,new_pr
-        new_runs=h.sql(f"SELECT count(*) FROM ci_runs WHERE repository_id='{pr['repository_id']}' AND head_oid='{new_oid}'")
         assert new_runs=="2",new_runs
+        h.sql(f"DELETE FROM ci_runs WHERE repository_id='{pr['repository_id']}' AND "
+              f"pull_number={pr['number']} AND pull_version={new_pr['version']} "
+              "AND context='ci/lint'")
+        h.sql(f"DELETE FROM ci_pull_sync_progress WHERE repository_id='{pr['repository_id']}' "
+              f"AND pull_number={pr['number']} AND pull_version={new_pr['version']}")
+        until=time.monotonic()+15
+        while time.monotonic()<until:
+            repaired=h.sql(f"SELECT count(*) FROM ci_runs WHERE repository_id='{pr['repository_id']}' "
+                f"AND pull_number={pr['number']} AND pull_version={new_pr['version']}")
+            if repaired=="2":break
+            time.sleep(.2)
+        assert repaired=="2",repaired
         print("push reconciles PR candidate and creates new runs: passed",flush=True)
         return 0
     finally:
