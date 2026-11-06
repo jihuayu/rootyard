@@ -185,9 +185,9 @@ class BackupHarness(Harness):
         try:
             deadline=time.monotonic()+20
             # The last metadata query precedes frozen-volume hashing/copying.
-            # Match schema003's volume-history check, not the older repo query.
+            # Format 6 inventories ready LFS rows after the volume-history check.
             while True:
-                pids=self.query(self.source_db,"SELECT pid FROM pg_stat_activity WHERE application_name='rootyard-backup' AND state='idle in transaction' AND query LIKE 'SELECT count(*) FROM public.recovery_resolutions WHERE volume_id%'")
+                pids=self.query(self.source_db,"SELECT pid FROM pg_stat_activity WHERE application_name='rootyard-backup' AND state='idle in transaction' AND query LIKE 'SELECT tenant_id,repository_id,oid,size FROM public.lfs_objects%'")
                 if pids:
                     assert self.query(self.source_db,"SELECT pg_terminate_backend("+str(int(pids.splitlines()[0]))+")")=="t"
                     break

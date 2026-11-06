@@ -4666,6 +4666,28 @@
     },
     {
       "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "name": "lease_epoch",
+      "not_null": true,
+      "position": 16,
+      "table": "sandbox_jobs",
+      "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": "'private'::text",
+      "generated": "",
+      "identity": "",
+      "name": "workspace_access",
+      "not_null": true,
+      "position": 17,
+      "table": "sandbox_jobs",
+      "type": "text"
+    },
+    {
+      "collation": null,
       "default": null,
       "generated": "",
       "identity": "",
@@ -5223,6 +5245,424 @@
       "not_null": true,
       "position": 5,
       "table": "shard_virtual_buckets",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "id",
+      "not_null": true,
+      "position": 1,
+      "table": "storage_maintenance_jobs",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 2,
+      "table": "storage_maintenance_jobs",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "tenant_id",
+      "not_null": true,
+      "position": 3,
+      "table": "storage_maintenance_jobs",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "kind",
+      "not_null": true,
+      "position": 4,
+      "table": "storage_maintenance_jobs",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": "'queued'::text",
+      "generated": "",
+      "identity": "",
+      "name": "state",
+      "not_null": true,
+      "position": 5,
+      "table": "storage_maintenance_jobs",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_generation",
+      "not_null": true,
+      "position": 6,
+      "table": "storage_maintenance_jobs",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "name": "attempt",
+      "not_null": true,
+      "position": 7,
+      "table": "storage_maintenance_jobs",
+      "type": "integer"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "name": "claim_generation",
+      "not_null": true,
+      "position": 8,
+      "table": "storage_maintenance_jobs",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "lease_owner",
+      "not_null": false,
+      "position": 9,
+      "table": "storage_maintenance_jobs",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "lease_until",
+      "not_null": false,
+      "position": 10,
+      "table": "storage_maintenance_jobs",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "not_before",
+      "not_null": true,
+      "position": 11,
+      "table": "storage_maintenance_jobs",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "'{}'::jsonb",
+      "generated": "",
+      "identity": "",
+      "name": "progress",
+      "not_null": true,
+      "position": 12,
+      "table": "storage_maintenance_jobs",
+      "type": "jsonb"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "result",
+      "not_null": false,
+      "position": 13,
+      "table": "storage_maintenance_jobs",
+      "type": "jsonb"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "last_error",
+      "not_null": false,
+      "position": 14,
+      "table": "storage_maintenance_jobs",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 15,
+      "table": "storage_maintenance_jobs",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "updated_at",
+      "not_null": true,
+      "position": 16,
+      "table": "storage_maintenance_jobs",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "completed_at",
+      "not_null": false,
+      "position": 17,
+      "table": "storage_maintenance_jobs",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 1,
+      "table": "storage_maintenance_repo_state",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "tenant_id",
+      "not_null": true,
+      "position": 2,
+      "table": "storage_maintenance_repo_state",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "last_scan_at",
+      "not_null": false,
+      "position": 3,
+      "table": "storage_maintenance_repo_state",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "last_scan_generation",
+      "not_null": false,
+      "position": 4,
+      "table": "storage_maintenance_repo_state",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "last_repack_at",
+      "not_null": false,
+      "position": 5,
+      "table": "storage_maintenance_repo_state",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "name": "last_repack_loose_count",
+      "not_null": true,
+      "position": 6,
+      "table": "storage_maintenance_repo_state",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "name": "last_repack_pack_count",
+      "not_null": true,
+      "position": 7,
+      "table": "storage_maintenance_repo_state",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "name": "loose_count",
+      "not_null": true,
+      "position": 8,
+      "table": "storage_maintenance_repo_state",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "name": "pack_count",
+      "not_null": true,
+      "position": 9,
+      "table": "storage_maintenance_repo_state",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "'{}'::jsonb",
+      "generated": "",
+      "identity": "",
+      "name": "last_scan",
+      "not_null": true,
+      "position": 10,
+      "table": "storage_maintenance_repo_state",
+      "type": "jsonb"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 1,
+      "table": "storage_maintenance_tombstones",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "tenant_id",
+      "not_null": true,
+      "position": 2,
+      "table": "storage_maintenance_tombstones",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "oid",
+      "not_null": true,
+      "position": 3,
+      "table": "storage_maintenance_tombstones",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "object_kind",
+      "not_null": true,
+      "position": 4,
+      "table": "storage_maintenance_tombstones",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "repository_generation",
+      "not_null": true,
+      "position": 5,
+      "table": "storage_maintenance_tombstones",
+      "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": "'pending'::text",
+      "generated": "",
+      "identity": "",
+      "name": "state",
+      "not_null": true,
+      "position": 6,
+      "table": "storage_maintenance_tombstones",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "marked_at",
+      "not_null": true,
+      "position": 7,
+      "table": "storage_maintenance_tombstones",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "delete_after",
+      "not_null": true,
+      "position": 8,
+      "table": "storage_maintenance_tombstones",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "name": "attempts",
+      "not_null": true,
+      "position": 9,
+      "table": "storage_maintenance_tombstones",
+      "type": "integer"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "last_error",
+      "not_null": false,
+      "position": 10,
+      "table": "storage_maintenance_tombstones",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "deleted_at",
+      "not_null": false,
+      "position": 11,
+      "table": "storage_maintenance_tombstones",
       "type": "timestamp with time zone"
     },
     {
@@ -9289,6 +9729,15 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK ((workspace_access = ANY (ARRAY['private'::text, 'live'::text])))",
+      "name": "sandbox_jobs_workspace_access_check",
+      "table": "sandbox_jobs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "FOREIGN KEY (workspace_id) REFERENCES public.workspaces(id)",
       "name": "sandbox_jobs_workspace_id_fkey",
       "table": "sandbox_jobs",
@@ -9707,6 +10156,240 @@
       "name": "shard_virtual_buckets_route_epoch_check",
       "table": "shard_virtual_buckets",
       "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((attempt >= 0))",
+      "name": "storage_maintenance_jobs_attempt_check",
+      "table": "storage_maintenance_jobs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((state = 'running'::text) = ((lease_owner IS NOT NULL) AND (lease_until IS NOT NULL))))",
+      "name": "storage_maintenance_jobs_check",
+      "table": "storage_maintenance_jobs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((claim_generation >= 0))",
+      "name": "storage_maintenance_jobs_claim_generation_check",
+      "table": "storage_maintenance_jobs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((kind = ANY (ARRAY['gitfs_stage_cleanup'::text, 'gitfs_repack'::text, 'gitfs_cache_hydrate'::text, 'gitfs_cache_evict'::text, 'gitfs_unreachable_mark'::text, 'gitfs_tombstone_delete'::text])))",
+      "name": "storage_maintenance_jobs_kind_check",
+      "table": "storage_maintenance_jobs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((last_error IS NULL) OR (octet_length(last_error) <= 2048)))",
+      "name": "storage_maintenance_jobs_last_error_check",
+      "table": "storage_maintenance_jobs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (id)",
+      "name": "storage_maintenance_jobs_pkey",
+      "table": "storage_maintenance_jobs",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((repository_generation > 0))",
+      "name": "storage_maintenance_jobs_repository_generation_check",
+      "table": "storage_maintenance_jobs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES public.repositories(id) ON DELETE CASCADE",
+      "name": "storage_maintenance_jobs_repository_id_fkey",
+      "table": "storage_maintenance_jobs",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((state = ANY (ARRAY['queued'::text, 'running'::text, 'succeeded'::text, 'failed'::text])))",
+      "name": "storage_maintenance_jobs_state_check",
+      "table": "storage_maintenance_jobs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (tenant_id) REFERENCES public.namespaces(id)",
+      "name": "storage_maintenance_jobs_tenant_id_fkey",
+      "table": "storage_maintenance_jobs",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((last_repack_loose_count >= 0))",
+      "name": "storage_maintenance_repo_state_last_repack_loose_count_check",
+      "table": "storage_maintenance_repo_state",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((last_repack_pack_count >= 0))",
+      "name": "storage_maintenance_repo_state_last_repack_pack_count_check",
+      "table": "storage_maintenance_repo_state",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((loose_count >= 0))",
+      "name": "storage_maintenance_repo_state_loose_count_check",
+      "table": "storage_maintenance_repo_state",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((pack_count >= 0))",
+      "name": "storage_maintenance_repo_state_pack_count_check",
+      "table": "storage_maintenance_repo_state",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (repository_id)",
+      "name": "storage_maintenance_repo_state_pkey",
+      "table": "storage_maintenance_repo_state",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES public.repositories(id) ON DELETE CASCADE",
+      "name": "storage_maintenance_repo_state_repository_id_fkey",
+      "table": "storage_maintenance_repo_state",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (tenant_id) REFERENCES public.namespaces(id)",
+      "name": "storage_maintenance_repo_state_tenant_id_fkey",
+      "table": "storage_maintenance_repo_state",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((attempts >= 0))",
+      "name": "storage_maintenance_tombstones_attempts_check",
+      "table": "storage_maintenance_tombstones",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((last_error IS NULL) OR (octet_length(last_error) <= 2048)))",
+      "name": "storage_maintenance_tombstones_last_error_check",
+      "table": "storage_maintenance_tombstones",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((object_kind = ANY (ARRAY['blob'::text, 'tree'::text, 'commit'::text, 'tag'::text])))",
+      "name": "storage_maintenance_tombstones_object_kind_check",
+      "table": "storage_maintenance_tombstones",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((oid ~ '^[0-9a-f]{40}$'::text) OR (oid ~ '^[0-9a-f]{64}$'::text)))",
+      "name": "storage_maintenance_tombstones_oid_check",
+      "table": "storage_maintenance_tombstones",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (repository_id, oid)",
+      "name": "storage_maintenance_tombstones_pkey",
+      "table": "storage_maintenance_tombstones",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((repository_generation > 0))",
+      "name": "storage_maintenance_tombstones_repository_generation_check",
+      "table": "storage_maintenance_tombstones",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES public.repositories(id) ON DELETE CASCADE",
+      "name": "storage_maintenance_tombstones_repository_id_fkey",
+      "table": "storage_maintenance_tombstones",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((state = ANY (ARRAY['pending'::text, 'retained'::text, 'deleted'::text])))",
+      "name": "storage_maintenance_tombstones_state_check",
+      "table": "storage_maintenance_tombstones",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (tenant_id) REFERENCES public.namespaces(id)",
+      "name": "storage_maintenance_tombstones_tenant_id_fkey",
+      "table": "storage_maintenance_tombstones",
+      "type": "f",
       "validated": true
     },
     {
@@ -11351,6 +12034,15 @@
       "valid": true
     },
     {
+      "definition": "CREATE INDEX sandbox_jobs_active_workspace_idx ON public.sandbox_jobs USING btree (workspace_id, lease_epoch) WHERE (state = ANY (ARRAY['queued'::text, 'running'::text]))",
+      "live": true,
+      "name": "sandbox_jobs_active_workspace_idx",
+      "ready": true,
+      "table": "sandbox_jobs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX sandbox_jobs_pkey ON public.sandbox_jobs USING btree (id)",
       "live": true,
       "name": "sandbox_jobs_pkey",
@@ -11473,6 +12165,69 @@
       "name": "shard_virtual_buckets_primary_idx",
       "ready": true,
       "table": "shard_virtual_buckets",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX storage_maintenance_claimable ON public.storage_maintenance_jobs USING btree (state, not_before, lease_until, created_at) WHERE (state = ANY (ARRAY['queued'::text, 'running'::text]))",
+      "live": true,
+      "name": "storage_maintenance_claimable",
+      "ready": true,
+      "table": "storage_maintenance_jobs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX storage_maintenance_history ON public.storage_maintenance_jobs USING btree (repository_id, kind, completed_at DESC)",
+      "live": true,
+      "name": "storage_maintenance_history",
+      "ready": true,
+      "table": "storage_maintenance_jobs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX storage_maintenance_jobs_pkey ON public.storage_maintenance_jobs USING btree (id)",
+      "live": true,
+      "name": "storage_maintenance_jobs_pkey",
+      "ready": true,
+      "table": "storage_maintenance_jobs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX storage_maintenance_one_active_kind ON public.storage_maintenance_jobs USING btree (repository_id, kind) WHERE (state = ANY (ARRAY['queued'::text, 'running'::text]))",
+      "live": true,
+      "name": "storage_maintenance_one_active_kind",
+      "ready": true,
+      "table": "storage_maintenance_jobs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX storage_maintenance_repo_state_pkey ON public.storage_maintenance_repo_state USING btree (repository_id)",
+      "live": true,
+      "name": "storage_maintenance_repo_state_pkey",
+      "ready": true,
+      "table": "storage_maintenance_repo_state",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE INDEX storage_maintenance_tombstones_due ON public.storage_maintenance_tombstones USING btree (delete_after, repository_id) WHERE (state = 'pending'::text)",
+      "live": true,
+      "name": "storage_maintenance_tombstones_due",
+      "ready": true,
+      "table": "storage_maintenance_tombstones",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX storage_maintenance_tombstones_pkey ON public.storage_maintenance_tombstones USING btree (repository_id, oid)",
+      "live": true,
+      "name": "storage_maintenance_tombstones_pkey",
+      "ready": true,
+      "table": "storage_maintenance_tombstones",
       "tablespace": null,
       "valid": true
     },
@@ -12260,6 +13015,36 @@
       "force_row_security": false,
       "kind": "r",
       "name": "shard_virtual_buckets",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "storage_maintenance_jobs",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "storage_maintenance_repo_state",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "storage_maintenance_tombstones",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",
