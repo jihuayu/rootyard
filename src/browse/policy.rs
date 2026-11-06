@@ -60,11 +60,12 @@ pub fn validate_hook(op: &crate::journal::Operation, changes: &[RefChange]) -> a
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
         let client = crate::db::connect_url(&url).await?;
+        crate::storage::ref_admission::ensure_hook_admitted(&client, op).await?;
         let row = client.query_one("SELECT owner_id,storage_generation FROM repositories WHERE id=$1", &[&op.repository_id]).await?;
         let tenant_id: Uuid = row.get(0);
         let generation: i64 = row.get(1);
         ensure!(generation == op.storage_generation, "repository generation changed");
-        crate::sharding::fencing::check_hook_fence(&client, op.repository_id, Path::new(&git_dir), op.storage_generation)
+        crate::sharding::fencing::check_hook_fence(&client, op.repository_id, Path::new(&git_dir), op.storage_generation, op.shard_epoch)
             .await.map_err(|e| anyhow::anyhow!(e.1))?;
         validate(&client, op.repository_id, changes, Path::new(&git_bin), Path::new(&git_dir), Duration::from_secs(timeout)).await
             .map_err(|e| anyhow::anyhow!(e.1))?;
@@ -87,7 +88,8 @@ pub fn validate_hook_fence(op: &crate::journal::Operation) -> anyhow::Result<()>
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
         let client = crate::db::connect_url(&url).await?;
-        crate::sharding::fencing::check_hook_fence(&client, op.repository_id, Path::new(&git_dir), op.storage_generation)
+        crate::storage::ref_admission::ensure_hook_admitted(&client, op).await?;
+        crate::sharding::fencing::check_hook_fence(&client, op.repository_id, Path::new(&git_dir), op.storage_generation, op.shard_epoch)
             .await.map_err(|e| anyhow::anyhow!(e.1))
     })
 }

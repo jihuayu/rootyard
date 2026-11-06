@@ -13,6 +13,7 @@ pub mod ignore;
 #[path = "workspace_lab/manifest.rs"]
 pub mod manifest;
 #[path = "workspace_lab/namespace.rs"]
+#[rustfmt::skip]
 pub mod namespace;
 #[path = "workspace_lab/remote.rs"]
 pub mod remote;
@@ -21,10 +22,12 @@ pub mod security;
 #[path = "workspace_lab/sync.rs"]
 pub mod sync;
 #[path = "workspace_lab/vfs.rs"]
+#[rustfmt::skip]
 pub mod vfs;
 #[path = "workspace_lab/view.rs"]
 pub mod view;
 #[path = "workspace_lab/writable_view.rs"]
+#[rustfmt::skip]
 pub mod writable_view;
 
 use anyhow::{Context, Result, bail, ensure};

@@ -16,8 +16,10 @@ use tokio::sync::{
 };
 use uuid::Uuid;
 
+pub mod admission;
 pub mod encrypted_objects;
 pub mod read_leases;
+pub mod ref_admission;
 pub mod ref_publication;
 pub mod remote_objects;
 

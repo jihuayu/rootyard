@@ -462,7 +462,10 @@ class Harness:
             for pid, starttime in children.items():
                 try:
                     stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-                    if stat[19] == starttime:
+                    # The server can terminate native grandchildren but cannot
+                    # reap a zombie adopted by container PID 1. Its process
+                    # cleanup uses the same live-process boundary.
+                    if stat[19] == starttime and stat[0] not in ("Z", "X"):
                         remaining.append({"pid": pid, "state": stat[0], "parent": int(stat[1]),
                                           "group": int(stat[2]), "starttime": stat[19]})
                 except (FileNotFoundError, ProcessLookupError):
@@ -538,7 +541,7 @@ class Harness:
                     self.env[key] = value
             self.start()
         return {"timeout_seconds": 2, "git_slots": 1, "slow_reader_releases_slot": True,
-                "incomplete_upload_releases_slot_and_writer_lock": True, "observed_git_descendants_reaped": True, "payload_bytes": 12 * 1024 * 1024}
+                "incomplete_upload_releases_slot_and_writer_lock": True, "observed_git_descendants_quiescent": True, "payload_bytes": 12 * 1024 * 1024}
 
     def bounded_payloads(self):
         self.stop()

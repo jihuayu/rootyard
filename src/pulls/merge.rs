@@ -96,11 +96,14 @@ async fn merge_pull_inner(
         return Err(Error::bad_request());
     }
 
-    // PostgreSQL lease precedes the local writer lock. A collector takes the
-    // exclusive form in the same order and cannot prune merge inputs mid-read.
-    let source_lease = storage::read_leases::shared(
-        &state.pool, repo.id, Instant::now() + state.config.git_timeout,
-    ).await?;
+    // The immutable PR base ref chooses the exact publication key before any
+    // local mutex. Its row and candidate are checked again under the window.
+    let base_ref: String = state.pool.get().await.map_err(Error::internal)?
+        .query_opt("SELECT base_ref FROM forge_pulls WHERE repository_id=$1 AND number=$2",
+            &[&repo.id,&number]).await.map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?.get(0);
+    let publication = storage::ref_publication::acquire(&state.pool,repo.id,
+        repo.storage_generation,&[base_ref],Instant::now()+state.config.git_timeout).await?;
 
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(
@@ -108,14 +111,20 @@ async fn merge_pull_inner(
             "Git capacity exhausted; retry later",
         )
     })?;
-    let _write_guard =
-        tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo.id))
-            .await
-            .map_err(|_| Error::timeout())?;
+    let _write_guard = publication.enter_window(&state.storage,
+        Instant::now()+state.config.git_timeout).await?;
+    let _admission = storage::admission::acquire(
+        &state.pool,
+        repo.id,
+        repo.storage_generation,
+        "pull-merge",
+        Instant::now() + state.config.git_timeout,
+    )
+    .await?;
     reliability::before_push(&state, &repo)
         .await
         .map_err(Error::internal)?;
-    source_lease.ensure_active()?;
+    publication.ensure_active()?;
 
     let repo_path = state
         .storage
@@ -355,7 +364,7 @@ async fn merge_pull_inner(
     .await?;
 
     auth::verify_token(&tx, &actor, true).await?;
-    source_lease.ensure_active()?;
+    publication.ensure_active()?;
 
     let op = journal::begin(
         &state.storage.root,
@@ -411,6 +420,7 @@ async fn merge_pull_inner(
                 storage_generation: repo.storage_generation,
                 outcome: "no_ref_changes".into(),
                 evidence: no_op_evidence,
+                admission: None,
             },
             &[],
         )
@@ -419,7 +429,7 @@ async fn merge_pull_inner(
         return Err(Error(StatusCode::CONFLICT, "atomic ref update rejected"));
     }
     journal::finish(&op).map_err(Error::internal)?;
-    source_lease.ensure_active()?;
+    publication.ensure_active()?;
 
     let updated_row = tx
         .query_opt(
@@ -488,6 +498,7 @@ async fn merge_pull_inner(
             storage_generation: repo.storage_generation,
             outcome: "recorded".into(),
             evidence,
+            admission: None,
         },
         &changes,
     )

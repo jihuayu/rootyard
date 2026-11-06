@@ -100,6 +100,7 @@ async fn upsert_check_inner(
     let (expected_repo,lease)=authorized_read_lease(&state,&actor,&owner,&name,true).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    crate::webhooks::trust::lock_policy_tx(&tx,expected_repo).await?;
     let repo = authorize(&tx, &actor, &owner, &name, true).await?;
     same_repository(expected_repo,repo)?;
     lease.guard(require_repo_oid_format(&state,repo,&commit_oid)).await??;

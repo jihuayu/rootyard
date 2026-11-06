@@ -5,6 +5,24 @@ use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub(crate) async fn policy_repo_id(state:&AppState,owner:&str,name:&str)
+    ->Result<Uuid,Error>{
+    let client=state.pool.get().await.map_err(Error::internal)?;
+    let repo:Uuid=client.query_opt(
+        "SELECT r.id FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id WHERE ns.slug=$1 AND r.name=$2",
+        &[&owner,&name]).await.map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?.get(0);
+    Ok(repo)
+}
+pub(crate) async fn lock_policy_tx(tx:&deadpool_postgres::Transaction<'_>,repo:Uuid)
+    ->Result<(),Error>{
+    // The advisory lock and metadata write share one PostgreSQL transaction,
+    // so a lost session cannot publish a policy change after dropping the gate.
+    tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended('rootyard-publication-v1:' || $1::uuid::text, 0))",
+        &[&repo]).await.map_err(Error::internal)?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextInput { pub context: String }
@@ -60,9 +78,12 @@ pub async fn bind(
 ) -> Result<Response,Error> {
     if !context_valid(&input.context) { return Err(Error::bad_request()); }
     let actor = auth::authenticate(&state.pool,&headers).await?;
+    let repo_id=policy_repo_id(&state,&owner,&name).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    lock_policy_tx(&tx,repo_id).await?;
     let access = auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Maintain).await?;
+    if access.repo_id!=repo_id{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
     let hook = tx.query_opt(
         "SELECT active,ci_contexts FROM forge_webhooks WHERE id=$1 AND repository_id=$2",
         &[&hook_id,&access.repo_id],
@@ -87,9 +108,12 @@ pub async fn revoke(
 ) -> Result<Response,Error> {
     if !context_valid(&input.context) { return Err(Error::bad_request()); }
     let actor = auth::authenticate(&state.pool,&headers).await?;
+    let repo_id=policy_repo_id(&state,&owner,&name).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    lock_policy_tx(&tx,repo_id).await?;
     let access = auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Maintain).await?;
+    if access.repo_id!=repo_id{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
     let changed = tx.execute(
         "UPDATE forge_trusted_check_contexts SET active=false WHERE repository_id=$1 AND context=$2 AND webhook_id=$3",
         &[&access.repo_id,&input.context,&hook_id],

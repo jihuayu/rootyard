@@ -175,6 +175,14 @@ pub(super) async fn release_pin_inner(
     let _lock = tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo.id))
         .await
         .map_err(|_| Error::timeout())?;
+    let _admission = crate::storage::admission::acquire(
+        &state.pool,
+        repo.id,
+        repo.storage_generation,
+        "ci-pin-release",
+        tokio::time::Instant::now() + state.config.git_timeout,
+    )
+    .await?;
     reliability::before_push(&state, &repo)
         .await
         .map_err(Error::internal)?;
@@ -335,6 +343,7 @@ pub(super) async fn release_pin_inner(
                     storage_generation: operation.storage_generation,
                     outcome: "recorded".into(),
                     evidence,
+                    admission: None,
                 },
                 &changes,
             )

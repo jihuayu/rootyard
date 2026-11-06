@@ -205,6 +205,7 @@ pub async fn publish(
             "snapshot_ref_generation":snapshot.ref_generation,
             "committed_ref_generation":next_ref,"pack_id":prepared.pack.as_ref().map(|pack|pack.id),
             "changes":prepared.changes}),
+        admission: None,
     };
     let events: Vec<_> = prepared
         .changes
