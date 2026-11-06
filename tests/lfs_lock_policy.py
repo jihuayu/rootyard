@@ -50,7 +50,9 @@ class LockPolicyHarness(Harness):
         self.git("add","unlocked.txt",cwd=self.bob_work)
         self.git("commit","-m","B edits only unlocked path",cwd=self.bob_work)
         tip=self.git("rev-parse","HEAD",cwd=self.bob_work).stdout.decode().strip()
-        denied=self.git("push","origin","HEAD:refs/heads/blocked",cwd=self.bob_work,
+        # Disable only the local pre-push hook: the server must reject this
+        # malicious Git ref update itself, after native receive-pack starts.
+        denied=self.git("-c","core.hooksPath=/dev/null","push","origin","HEAD:refs/heads/blocked",cwd=self.bob_work,
                         token=self.alice,check=False)
         assert denied.returncode!=0, "new branch exposed an ancestor edit to locked path"
         remote_refs=self.git("ls-remote",self.remote,"refs/heads/blocked",token=self.alice).stdout
