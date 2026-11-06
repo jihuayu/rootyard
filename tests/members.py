@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -1149,6 +1150,19 @@ class MembersHarness(PullsHarness):
             json_body={"username": "carol", "role": "maintain"},
         )
         assert c1 == c2
+
+        # Independent mutations in two repositories must never allocate the
+        # same global audit ID or roll back because another audit insert won.
+        before = int(self.sql("SELECT count(*) FROM repository_audit_log WHERE action='branch_rule.upserted'"))
+        def create_rule(index):
+            repo = "forge" if index % 2 == 0 else "other"
+            return self.http(f"/api/repos/alice/{repo}/branch-rules", token=self.alice,
+                             method="POST", body={"branch_ref": f"refs/heads/audit-race-{index}"})[0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            statuses = list(executor.map(create_rule, range(32)))
+        assert statuses == [201] * 32, statuses
+        assert int(self.sql("SELECT count(*) FROM repository_audit_log WHERE action='branch_rule.upserted'")) == before + 32
+        assert self.sql("SELECT count(*)=count(DISTINCT id) FROM repository_audit_log") == "t"
 
     def restart(self):
         self.stop()
