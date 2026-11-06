@@ -112,7 +112,7 @@ async fn restore_inner(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let row = tx.query_opt("SELECT w.id,w.repository_id,w.owner_slug,w.repository_name,w.agent_id,w.creator_id,w.state,w.host_id,w.lease_epoch,w.revision,w.git_generation,w.last_checkpoint_id FROM workspace_checkpoints c JOIN workspaces w ON w.id=c.workspace_id WHERE c.id=$1 AND c.state IN ('local_complete','committed')", &[&cp]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let row = tx.query_opt("SELECT w.id,w.repository_id,w.owner_slug,w.repository_name,w.agent_id,w.creator_id,w.state,w.host_id,w.lease_epoch,w.revision,w.git_generation,w.last_checkpoint_id,c.state AS checkpoint_state FROM workspace_checkpoints c JOIN workspaces w ON w.id=c.workspace_id WHERE c.id=$1 AND c.state IN ('local_complete','committed')", &[&cp]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let parent = Workspace::from_row(&row);
     let access = auth::authorize_repo_with_role(&tx, &actor, &parent.owner, &parent.repository, Role::Write).await?;
     if parent.creator_id != actor.id || access.repo_id != parent.repository_id {
@@ -133,8 +133,12 @@ async fn restore_inner(
         }
     }
     let id = Uuid::new_v4();
-    super::remote::ensure_local(&state, cp, parent.repository_id, access.owner_id).await?;
-    copy_snapshot(&service::checkpoint_repo(&state, cp), &super::mounts::lower_path(&state, id))?;
+    if super::mounts::enabled() && row.get::<_, String>("checkpoint_state") == "committed" {
+        super::lazy::prepare(&state, id, cp, parent.repository_id, access.owner_id).await?;
+    } else {
+        super::remote::ensure_local(&state, cp, parent.repository_id, access.owner_id).await?;
+        copy_snapshot(&service::checkpoint_repo(&state, cp), &super::mounts::lower_path(&state, id))?;
+    }
     tx.execute("INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,parent_checkpoint_id,state,host_id,lease_until) VALUES($1,$2,$3,$4,$5,$6,$7,'ready',$8,clock_timestamp()+interval '5 minutes')", &[&id,&parent.repository_id,&parent.owner,&parent.repository,&agent,&actor.id,&cp,&state.storage.volume_id]).await.map_err(Error::internal)?;
     if let Some(key) = &key {
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&(kind, cp, &agent)).map_err(Error::internal)?));

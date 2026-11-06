@@ -62,12 +62,21 @@ pub struct Overlay {
     next: u64,
     whiteouts: BTreeSet<PathBuf>,
     gate: Arc<MutationGate>,
+    lazy: Option<Arc<crate::workspaces::lazy::Reader>>,
 }
 impl Overlay {
     pub fn new(lower: PathBuf, upper: PathBuf) -> io::Result<Self> {
         Self::new_with_gate(lower, upper, MutationGate::new(i64::MAX))
     }
     pub fn new_with_gate(lower: PathBuf, upper: PathBuf, gate: Arc<MutationGate>) -> io::Result<Self> {
+        Self::new_with_gate_and_lazy(lower, upper, gate, None)
+    }
+    pub(crate) fn new_with_gate_and_lazy(
+        lower: PathBuf,
+        upper: PathBuf,
+        gate: Arc<MutationGate>,
+        lazy: Option<Arc<crate::workspaces::lazy::Reader>>,
+    ) -> io::Result<Self> {
         if !lower.is_dir() {
             return Err(io::Error::from_raw_os_error(libc::ENOENT));
         }
@@ -96,7 +105,7 @@ impl Overlay {
         } else {
             BTreeSet::new()
         };
-        Ok(Self { lower, upper, paths, ids, next: 2, whiteouts, gate })
+        Ok(Self { lower, upper, paths, ids, next: 2, whiteouts, gate, lazy })
     }
     fn ino(&mut self, p: &Path) -> u64 {
         if let Some(n) = self.ids.get(p) {
@@ -198,7 +207,14 @@ impl Overlay {
                 let source = self.host_entry(&from, false)?;
                 let m = source.lstat()?;
                 if m.is_file() {
-                    let mut input = source.open(libc::O_RDONLY, 0)?;
+                    let mut input = if from.starts_with(&self.lower) {
+                        match self.lazy.as_ref().map(|lazy| lazy.file(p)).transpose()? {
+                            Some(Some(file)) => file,
+                            _ => source.open(libc::O_RDONLY, 0)?,
+                        }
+                    } else {
+                        source.open(libc::O_RDONLY, 0)?
+                    };
                     let mut output =
                         to.open(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, m.permissions().mode() & 0o777)?;
                     io::copy(&mut input, &mut output)?;

@@ -71,7 +71,9 @@ pub async fn get(
     let raw = match query.view.as_deref().unwrap_or("working") {
         "working" => {
             let path = safe_file(&repo, &query.path)?;
-            fs::read(path).map_err(|_| Error::not_found())?
+            fs::read(path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound { Error::not_found() } else { Error::internal(error) }
+            })?
         }
         "head" => service::git(&repo, &["show", &format!("HEAD:{}", rel.display())])?,
         "index" => service::git(&repo, &["show", &format!(":{}", rel.display())])?,

@@ -118,7 +118,14 @@ impl Filesystem for Overlay {
         let result = (|| {
             let p = self.rel(ino)?;
             let path = self.selected(&p)?;
-            let file = self.host_entry(&path, false)?.open(libc::O_RDONLY, 0)?;
+            let file = if path.starts_with(&self.lower) {
+                match self.lazy.as_ref().map(|lazy| lazy.file(&p)).transpose()? {
+                    Some(Some(file)) => file,
+                    _ => self.host_entry(&path, false)?.open(libc::O_RDONLY, 0)?,
+                }
+            } else {
+                self.host_entry(&path, false)?.open(libc::O_RDONLY, 0)?
+            };
             let mut buf = vec![0; size.min(1024 * 1024) as usize];
             let count = file.read_at(&mut buf, offset.max(0) as u64)?;
             buf.truncate(count);
