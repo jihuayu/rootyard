@@ -44,6 +44,21 @@ fn concurrent_admission_reserves_unique_durable_sequences() {
     assert_eq!(pending(root.path(),repo).unwrap().len(),48);
 }
 #[test]
+fn active_admission_is_visible_before_other_recovery_scans() {
+    let root=tempfile::tempdir().unwrap();
+    let repo=Uuid::new_v4();
+    let (op,guard)=begin_active(root.path(),repo,Uuid::new_v4(),
+        "active-actor".into(),Uuid::new_v4(),1).unwrap();
+    assert!(ActiveGuard::operation_is_live(&op).unwrap());
+    assert_eq!(pending(root.path(),repo).unwrap(),vec![op.clone()]);
+    assert!(events(&op).unwrap().is_empty());
+    drop(guard);
+    assert!(!ActiveGuard::operation_is_live(&op).unwrap());
+    mark_interrupted(&op).unwrap();
+    finish(&op).unwrap();
+    assert!(is_interrupted(&op).unwrap());
+}
+#[test]
 fn ci_service_journal_has_no_human_identity() {
     let root = tempfile::tempdir().unwrap();
     let job_id = Uuid::new_v4();
