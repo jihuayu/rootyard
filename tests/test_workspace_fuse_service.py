@@ -4,6 +4,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import time
 import unittest
@@ -35,7 +36,10 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 self.assertEqual(base64.b64decode(before["content_base64"]),b"second\n")
                 job=json.loads(h.expect(f"/api/workspaces/{wid}/sandbox-jobs",201,token=h.alice,
                     method="POST",body={"argv":["/bin/sh","-c",
-                        "printf 'normal editor save\n' > hello.tmp; mv hello.tmp hello.txt; git add hello.txt"],
+                        "printf 'normal editor save\n' > hello.tmp; mv hello.tmp hello.txt; "
+                        "chmod 755 hello.txt; printf '*.tmp\n' > .gitignore; "
+                        "printf ignored > ignored.tmp; git check-ignore ignored.tmp; "
+                        "git add hello.txt .gitignore"],
                         "timeout_seconds":15,"lease_epoch":1,"workspace_access":"live"}))
                 deadline=time.monotonic()+20
                 while time.monotonic()<deadline:
@@ -45,8 +49,12 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 self.assertEqual(result["state"],"succeeded")
                 self.assertEqual((lower/"hello.txt").read_bytes(),b"second\n")
                 self.assertEqual((upper/"hello.txt").read_bytes(),b"normal editor save\n")
+                self.assertEqual(stat.S_IMODE((upper/"hello.txt").stat().st_mode),0o755)
+                self.assertEqual((upper/".gitignore").read_bytes(),b"*.tmp\n")
                 visible=json.loads(h.expect(f"/api/workspaces/{wid}/files?path=hello.txt",200,token=h.alice))
                 self.assertEqual(base64.b64decode(visible["content_base64"]),b"normal editor save\n")
+                staged=json.loads(h.expect(f"/api/workspaces/{wid}/files?path=hello.txt&view=index",200,token=h.alice))
+                self.assertEqual(base64.b64decode(staged["content_base64"]),b"normal editor save\n")
                 deadline=time.monotonic()+10
                 while time.monotonic()<deadline:
                     current=json.loads(h.expect(f"/api/workspaces/{wid}",200,token=h.alice))
@@ -62,6 +70,7 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
                 cid=checkpoint["checkpoint_id"]
                 self.assertEqual((h.root/"data/workspace-service/checkpoints"/cid/"hello.txt").read_bytes(),
                     b"normal editor save\n")
+                self.assertEqual(stat.S_IMODE((h.root/"data/workspace-service/checkpoints"/cid/"hello.txt").stat().st_mode),0o755)
                 late=json.loads(h.expect(f"/api/workspaces/{wid}/sandbox-jobs",201,token=h.alice,
                     method="POST",body={"argv":["/bin/sh","-c","sleep 4; printf stale > blocked.txt"],
                         "timeout_seconds":10,"lease_epoch":1,"workspace_access":"live"}))

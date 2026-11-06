@@ -3,6 +3,7 @@ import mmap
 import os
 import sys
 import concurrent.futures
+import fcntl
 from pathlib import Path
 import subprocess
 import tempfile
@@ -97,17 +98,27 @@ class FuseMountTest(unittest.TestCase):
                     self.assertTrue(all(data==original for data in workers.map(lambda _:path.read_bytes(),range(16))))
                 with path.open("rb") as stream, mmap.mmap(stream.fileno(),0,access=mmap.ACCESS_READ) as mapped:
                     self.assertEqual(mapped[:],original)
+                with path.open("rb") as first, path.open("rb") as second:
+                    fcntl.flock(first,fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(second,fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(first,fcntl.LOCK_UN)
                 path.write_bytes(b"agent edit\n")
                 self.assertEqual(path.read_bytes(),b"agent edit\n")
                 self.assertEqual((lower/"nested/data.txt").read_bytes(),original)
                 self.assertEqual((upper/"nested/data.txt").read_bytes(),b"agent edit\n")
+                with path.open("r+b") as stream, mmap.mmap(stream.fileno(),0,access=mmap.ACCESS_WRITE) as mapped:
+                    mapped[:5]=b"other"
+                    mapped.flush()
+                self.assertEqual(path.read_bytes(),b"other edit\n")
+                self.assertEqual((lower/"nested/data.txt").read_bytes(),original)
                 path.rename(mount/"renamed.txt")
                 try: os.stat(mount/"renamed.txt")
                 except OSError as error:
                     upper_list=list(upper.rglob('*')); mount_list=list(mount.iterdir())
                     proc.terminate(); proc.wait(timeout=5)
                     self.fail(f"stat={error} upper={upper_list} mount={mount_list} server={proc.stderr.read().decode()}")
-                self.assertEqual((mount/"renamed.txt").read_bytes(),b"agent edit\n")
+                self.assertEqual((mount/"renamed.txt").read_bytes(),b"other edit\n")
                 self.assertFalse(path.exists())
                 self.assertEqual((lower/"nested/data.txt").read_bytes(),original)
             finally:
@@ -119,7 +130,7 @@ class FuseMountTest(unittest.TestCase):
                 while time.monotonic()<deadline and not os.path.ismount(mount):
                     if proc.poll() is not None: self.fail(proc.stderr.read().decode())
                     time.sleep(.05)
-                self.assertEqual((mount/"renamed.txt").read_bytes(),b"agent edit\n")
+                self.assertEqual((mount/"renamed.txt").read_bytes(),b"other edit\n")
                 self.assertFalse((mount/"nested/data.txt").exists())
             finally:
                 if os.path.ismount(mount): subprocess.run(["fusermount3","-u",str(mount)],check=True,timeout=10)
