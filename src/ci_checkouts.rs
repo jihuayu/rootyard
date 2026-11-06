@@ -23,7 +23,9 @@ pub mod mirror_lfs;
 pub mod authority;
 #[path = "ci_checkouts/integration.rs"]
 pub mod integration;
-pub(crate) use authority::{authenticate,still_authorized};
+pub(crate) use authority::authenticate;
+#[allow(unused_imports)] // consumed by Git HTTP when the CI and transport branches integrate
+pub(crate) use authority::still_authorized;
 
 pub fn mirror_routes() -> Router<Arc<AppState>> {
     Router::new().route("/api/repos/{owner}/{name}/ci-checkouts/{job}/prepare-dependencies",

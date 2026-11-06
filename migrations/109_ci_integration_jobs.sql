@@ -80,21 +80,21 @@ BEGIN
         IF NEW.actor_id IS NOT NULL OR NEW.token_id IS NOT NULL OR
            NEW.actor_name IS DISTINCT FROM 'ci-scheduler' OR
            NEW.outcome NOT IN ('unknown','recorded') OR
-           NEW.evidence->>'kind' IS DISTINCT FROM 'observed_immutable_ci_root' OR
-           NEW.evidence->'intent'->>'repository_id' IS DISTINCT FROM NEW.repository_id::text OR
-           NEW.evidence->'intent'->>'storage_generation' IS DISTINCT FROM NEW.storage_generation::text OR
+           (NEW.evidence->>'kind') IS DISTINCT FROM 'observed_immutable_ci_root' OR
+           (NEW.evidence->'intent'->>'repository_id') IS DISTINCT FROM NEW.repository_id::text OR
+           (NEW.evidence->'intent'->>'storage_generation') IS DISTINCT FROM NEW.storage_generation::text OR
            NOT COALESCE((NEW.evidence->'intent'->>'job_id') COLLATE "C" ~
              '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',false) OR
            NOT COALESCE((NEW.evidence->'intent'->>'target_oid') COLLATE "C" ~
              '^([0-9a-f]{40}|[0-9a-f]{64})$',false) OR
-           NEW.evidence->'intent'->>'retention_ref' IS DISTINCT FROM
+           (NEW.evidence->'intent'->>'retention_ref') IS DISTINCT FROM
              ('refs/rootyard-ci/jobs/' || (NEW.evidence->'intent'->>'job_id')) OR
            NOT EXISTS(SELECT 1 FROM ci_service_principals s
                JOIN repositories r ON r.id=s.repository_id
                WHERE s.id=NEW.service_principal_id AND s.repository_id=NEW.repository_id
                AND s.kind='ci-pin' AND s.active AND r.state='ready'
                AND r.storage_generation=NEW.storage_generation
-               AND NEW.evidence->'intent'->>'owner_id'=r.owner_id::text
+               AND (NEW.evidence->'intent'->>'owner_id')=r.owner_id::text
                AND (s.issuer_webhook_id IS NULL OR EXISTS(
                    SELECT 1 FROM forge_webhooks w JOIN forge_trusted_check_contexts b
                      ON b.webhook_id=w.id AND b.repository_id=w.repository_id AND b.active
@@ -126,11 +126,13 @@ BEGIN
     SELECT o.evidence->'intent' INTO intent FROM git_operations o
     WHERE o.id=NEW.operation_id AND o.repository_id=NEW.repository_id
       AND o.service_principal_id IS NOT NULL;
-    IF FOUND AND (NEW.ref_name IS DISTINCT FROM intent->>'retention_ref' OR
-        NEW.new_oid IS DISTINCT FROM intent->>'target_oid' OR
-        NEW.ref_name IS DISTINCT FROM ('refs/rootyard-ci/jobs/' || (intent->>'job_id')) OR
-        NEW.storage_generation::text IS DISTINCT FROM intent->>'storage_generation') THEN
-        RAISE EXCEPTION 'CI service operation ref differs from exact intent' USING ERRCODE='23514';
+    IF FOUND THEN
+        IF NEW.ref_name IS DISTINCT FROM (intent->>'retention_ref') OR
+           NEW.new_oid IS DISTINCT FROM (intent->>'target_oid') OR
+           NEW.ref_name IS DISTINCT FROM ('refs/rootyard-ci/jobs/' || (intent->>'job_id')) OR
+           NEW.storage_generation::text IS DISTINCT FROM (intent->>'storage_generation') THEN
+            RAISE EXCEPTION 'CI service operation ref differs from exact intent' USING ERRCODE='23514';
+        END IF;
     END IF;
     RETURN NEW;
 END $$;

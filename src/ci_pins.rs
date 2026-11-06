@@ -48,6 +48,7 @@ mod lifecycle;
 #[path = "ci_pins/roots.rs"]
 mod roots;
 #[path = "ci_pins/tests.rs"]
+#[cfg(test)]
 mod tests;
 pub use models::Intent;
 pub(crate) use models::{MAX_PINS,reserved,valid_oid};
