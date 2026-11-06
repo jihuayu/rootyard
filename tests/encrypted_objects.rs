@@ -22,6 +22,14 @@ async fn vault_pack_encryption_rotation() {
         file.sync_all().unwrap();
         let first = encrypt_file(&provider, &source, &ciphertext, &envelopes, deadline()).await.unwrap();
         assert_eq!(first.generation, 1);
+        let missing_parent = root.join("missing-parent").join("envelopes");
+        let retry_cipher = root.join("retry.cipher");
+        assert!(encrypt_file(&provider, &source, &retry_cipher, &missing_parent, deadline()).await.is_err());
+        assert!(!retry_cipher.exists());
+        std::fs::create_dir(root.join("missing-parent")).unwrap();
+        encrypt_file(&provider, &source, &retry_cipher, &missing_parent, deadline()).await.unwrap();
+        decrypt_file(&provider, &retry_cipher, &missing_parent, None, &root.join("retry.out"), deadline()).await.unwrap();
+        assert_eq!(std::fs::read(root.join("retry.out")).unwrap(), std::fs::read(&source).unwrap());
         let mut raw = Vec::new();
         File::open(&ciphertext).unwrap().take(4096).read_to_end(&mut raw).unwrap();
         assert!(!raw.windows(32).any(|w| w == [0x4c; 32]));
