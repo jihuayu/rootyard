@@ -294,13 +294,19 @@ pub(crate) async fn origin_job_path(
     {
         return Err(Error::unauthorized());
     }
-    super::dependencies::verify_on_origin(state, plan).await?;
     let root = state.storage.root.join("ci-origin-views");
     let directory = root.join(repo.id.to_string());
     let destination = directory.join(format!("{}-{}.git", repo.storage_generation, plan.job_id));
     let _lock = tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo.id))
         .await
         .map_err(|_| Error::timeout())?;
+    let lease = crate::storage::read_leases::shared(
+        &state.pool,
+        repo.id,
+        tokio::time::Instant::now() + state.config.git_timeout,
+    )
+    .await?;
+    super::dependencies::verify_on_origin(state, plan).await?;
     let source = state
         .storage
         .verify_path(repo.id)
@@ -325,6 +331,7 @@ pub(crate) async fn origin_job_path(
         validate(state, &destination, plan, &source)
             .await
             .map_err(Error::internal)?;
+        lease.ensure_active()?;
         return Ok(destination);
     }
     private_directory(&root).map_err(Error::internal)?;
@@ -404,5 +411,6 @@ pub(crate) async fn origin_job_path(
         let _ = std::fs::remove_dir_all(&stage);
     }
     result.map_err(Error::internal)?;
+    lease.ensure_active()?;
     Ok(destination)
 }
