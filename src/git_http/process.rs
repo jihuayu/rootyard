@@ -121,11 +121,14 @@ fn group_quiescent(group: i32) -> io::Result<bool> {
 pub(crate) async fn finish_group_child(child: &mut Child) -> io::Result<std::process::ExitStatus> {
     let pid = child.id().ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
     loop {
-        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        let rc = unsafe { libc::waitid(libc::P_PID, pid as u32, info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
-        if rc != 0 { return Err(io::Error::last_os_error()); }
-        if unsafe { info.assume_init().si_pid() } != 0 { break; }
+        let exited = {
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            let rc = unsafe { libc::waitid(libc::P_PID, pid as u32, info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+            if rc != 0 { return Err(io::Error::last_os_error()); }
+            unsafe { info.assume_init().si_pid() != 0 }
+        };
+        if exited { break; }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     unsafe { libc::kill(-pid, libc::SIGKILL); }
@@ -158,13 +161,27 @@ async fn wait_group_child_quiescent(pid: i32) {
 impl Drop for Process {
     fn drop(&mut self) {
         // The process group covers http-backend, receive/upload-pack and their workers.
-        // kill_on_drop only covers the immediate child, which is insufficient here.
+        // A cancelled read future drops this Process before its caller releases
+        // the local snapshot gate. Wait here, even on a Tokio worker thread:
+        // SIGKILL delivery alone does not stop descendants before physical GC.
         if self.pid > 0 {
             unsafe {
                 libc::kill(-self.pid, libc::SIGKILL);
             }
+            let started = Instant::now();
+            let mut reported = false;
+            while !matches!(group_quiescent(self.pid), Ok(true)) {
+                if !reported && started.elapsed() > std::time::Duration::from_secs(5) {
+                    eprintln!("rootyard: cancelled Git process group cleanup blocked; retaining snapshot gate");
+                    reported = true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // The unreaped leader reserved the process-group ID throughout the
+            // wait. Reaping is safe only after the group is quiescent.
+            let _ = self.child.try_wait();
+            self.pid = 0;
         }
-        let _ = self.child.start_kill();
         if let Some(input) = &self.input {
             input.abort();
         }
@@ -333,6 +350,14 @@ mod process_tests {
         stop_group_child(&mut cancelled.child).await.unwrap();
         cancelled.pid = 0;
         assert_not_running(cancelled_child).await;
+        assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists());
+    }
+    #[tokio::test]
+    async fn cancellation_drop_waits_for_all_descendants() {
+        let (process, descendant) = orphan_group().await;
+        let leader = process.pid;
+        drop(process);
+        assert_not_running(descendant).await;
         assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists());
     }
 }
