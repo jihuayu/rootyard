@@ -60,6 +60,8 @@ pub async fn authorize_namespace_create(
         }
         return Err(Error::not_found());
     }
+    tx.query_one("SELECT id FROM organizations WHERE id=$1 FOR SHARE", &[&id])
+        .await.map_err(Error::internal)?;
     let role = tx
         .query_opt(
             "SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",
