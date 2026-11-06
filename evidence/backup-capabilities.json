@@ -1,0 +1,25 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "populated_capability_restore",
+      "status": "passed",
+      "seconds": 65.7738,
+      "detail": {
+        "fresh_database_and_volume": true,
+        "organization_inherited_access": true,
+        "lfs_lock_identity_preserved": true,
+        "workspace_bytes_preserved": true,
+        "old_workspace_lease_rejected": true,
+        "renewed_lease_accepted": true,
+        "browser_session_revoked": true,
+        "cluster_authority_rotated": true,
+        "stock_git_clone_fsck": true
+      }
+    }
+  ],
+  "binary_sha256": "b3cf2ff6b628fb9614af8ab233b4b90c762405deda78cbb44b5deb6fc1c2ee53",
+  "limitations": [
+    "Loopback service and PostgreSQL; no hardware failure guarantee."
+  ]
+}

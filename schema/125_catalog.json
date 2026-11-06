@@ -552,6 +552,39 @@
     },
     {
       "collation": null,
+      "default": "true",
+      "generated": "",
+      "identity": "",
+      "name": "singleton",
+      "not_null": true,
+      "position": 1,
+      "table": "cluster_authority",
+      "type": "boolean"
+    },
+    {
+      "collation": null,
+      "default": "gen_random_uuid()",
+      "generated": "",
+      "identity": "",
+      "name": "incarnation",
+      "not_null": true,
+      "position": 2,
+      "table": "cluster_authority",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "rotated_at",
+      "not_null": true,
+      "position": 3,
+      "table": "cluster_authority",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
       "default": null,
       "generated": "",
       "identity": "",
@@ -5087,6 +5120,17 @@
       "default": null,
       "generated": "",
       "identity": "",
+      "name": "manifest_size",
+      "not_null": false,
+      "position": 11,
+      "table": "workspace_checkpoints",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
       "name": "actor_id",
       "not_null": true,
       "position": 1,
@@ -5454,6 +5498,72 @@
       "not_null": true,
       "position": 8,
       "table": "workspace_operations",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "checkpoint_id",
+      "not_null": true,
+      "position": 1,
+      "table": "workspace_remote_staging_objects",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "tenant_id",
+      "not_null": true,
+      "position": 2,
+      "table": "workspace_remote_staging_objects",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "digest",
+      "not_null": true,
+      "position": 3,
+      "table": "workspace_remote_staging_objects",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "size",
+      "not_null": true,
+      "position": 4,
+      "table": "workspace_remote_staging_objects",
+      "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "kind",
+      "not_null": true,
+      "position": 5,
+      "table": "workspace_remote_staging_objects",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 6,
+      "table": "workspace_remote_staging_objects",
       "type": "timestamp with time zone"
     },
     {
@@ -6017,6 +6127,24 @@
       "definition": "CHECK ((state = ANY (ARRAY['queued'::text, 'leased'::text, 'completed'::text, 'cancelled'::text])))",
       "name": "ci_runs_state_check",
       "table": "ci_runs",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (singleton)",
+      "name": "cluster_authority_pkey",
+      "table": "cluster_authority",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (singleton)",
+      "name": "cluster_authority_singleton_check",
+      "table": "cluster_authority",
       "type": "c",
       "validated": true
     },
@@ -8867,6 +8995,15 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK (((manifest_size IS NULL) OR ((manifest_size >= 1) AND (manifest_size <= 16777216))))",
+      "name": "workspace_manifest_size_valid",
+      "table": "workspace_checkpoints",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "FOREIGN KEY (actor_id) REFERENCES public.users(id)",
       "name": "workspace_creations_actor_id_fkey",
       "table": "workspace_creations",
@@ -9024,6 +9161,42 @@
       "name": "workspace_operations_workspace_id_idempotency_key_key",
       "table": "workspace_operations",
       "type": "u",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (checkpoint_id) REFERENCES public.workspace_checkpoints(id)",
+      "name": "workspace_remote_staging_objects_checkpoint_id_fkey",
+      "table": "workspace_remote_staging_objects",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((kind = ANY (ARRAY['file'::text, 'manifest'::text])))",
+      "name": "workspace_remote_staging_objects_kind_check",
+      "table": "workspace_remote_staging_objects",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (checkpoint_id, digest)",
+      "name": "workspace_remote_staging_objects_pkey",
+      "table": "workspace_remote_staging_objects",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((size >= 0))",
+      "name": "workspace_remote_staging_objects_size_check",
+      "table": "workspace_remote_staging_objects",
+      "type": "c",
       "validated": true
     },
     {
@@ -9397,6 +9570,15 @@
       "name": "ci_runs_repository_id_pull_number_pull_version_context_key",
       "ready": true,
       "table": "ci_runs",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX cluster_authority_pkey ON public.cluster_authority USING btree (singleton)",
+      "live": true,
+      "name": "cluster_authority_pkey",
+      "ready": true,
+      "table": "cluster_authority",
       "tablespace": null,
       "valid": true
     },
@@ -10364,6 +10546,24 @@
       "valid": true
     },
     {
+      "definition": "CREATE INDEX workspace_remote_staging_age_idx ON public.workspace_remote_staging_objects USING btree (created_at)",
+      "live": true,
+      "name": "workspace_remote_staging_age_idx",
+      "ready": true,
+      "table": "workspace_remote_staging_objects",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX workspace_remote_staging_objects_pkey ON public.workspace_remote_staging_objects USING btree (checkpoint_id, digest)",
+      "live": true,
+      "name": "workspace_remote_staging_objects_pkey",
+      "ready": true,
+      "table": "workspace_remote_staging_objects",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX workspace_view_history_pkey ON public.workspace_view_history USING btree (view_id, source_oid)",
       "live": true,
       "name": "workspace_view_history_pkey",
@@ -10448,6 +10648,16 @@
       "force_row_security": false,
       "kind": "r",
       "name": "ci_runs",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "cluster_authority",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",
@@ -11008,6 +11218,16 @@
       "force_row_security": false,
       "kind": "r",
       "name": "workspace_operations",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "workspace_remote_staging_objects",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",

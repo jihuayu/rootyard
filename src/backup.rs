@@ -17,71 +17,6 @@ use tokio::{io::AsyncReadExt, process::Command};
 use tokio_postgres::{Client, GenericClient};
 use uuid::Uuid;
 
-const TABLES: &[&str] = &[
-    "audit_events",
-    "ci_checkout_jobs",
-    "ci_mirror_evictions",
-    "ci_mirror_nodes",
-    "ci_runs",
-    "cluster_operator_tokens",
-    "cluster_transport_nonces",
-    "event_deliveries",
-    "forge_branch_rules",
-    "forge_check_runs",
-    "forge_creation_requests",
-    "forge_issue_comments",
-    "forge_issue_counters",
-    "forge_issues",
-    "forge_pull_counters",
-    "forge_pull_reviews",
-    "forge_pulls",
-    "forge_trusted_check_contexts",
-    "forge_webhook_callbacks",
-    "forge_webhook_deliveries",
-    "forge_webhooks",
-    "git_operations",
-    "lfs_locks",
-    "lfs_objects",
-    "namespaces",
-    "operation_resolutions",
-    "organization_audit_log",
-    "organization_creation_keys",
-    "organization_memberships",
-    "organization_team_members",
-    "organization_teams",
-    "organizations",
-    "outbox_events",
-    "recovery_resolutions",
-    "repositories",
-    "repository_audit_log",
-    "repository_collaborators",
-    "repository_ref_projection",
-    "repository_shard_routes",
-    "repository_team_members",
-    "repository_teams",
-    "sandbox_jobs",
-    "schema_migrations",
-    "shard_failover_operations",
-    "shard_marker_transitions",
-    "shard_nodes",
-    "shard_replication_operations",
-    "shard_virtual_buckets",
-    "tokens",
-    "users",
-    "web_sessions",
-    "workspace_capture_state",
-    "workspace_checkpoints",
-    "workspace_creations",
-    "workspace_entries",
-    "workspace_events",
-    "workspace_namespace_mounts",
-    "workspace_namespaces",
-    "workspace_operations",
-    "workspace_remote_staging_objects",
-    "workspace_view_history",
-    "workspace_views",
-    "workspaces",
-];
 mod catalog;
 mod authority;
 use catalog::{FORMAT, catalogs as schema_catalogs, digest as schema_contract_digest, versions as schema_versions};
@@ -693,9 +628,9 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .start()
         .await?;
-    let list = TABLES
+    let list = catalog::relations(FORMAT, true)?
         .iter()
-        .map(|t| format!("public.{t}"))
+        .map(|t| format!("public.\"{}\"", t.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(",");
     tx.batch_execute(&format!("LOCK TABLE {list} IN SHARE MODE"))
