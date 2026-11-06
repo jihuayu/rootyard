@@ -1,6 +1,6 @@
 //! Durable transition fence transitions and publication-window arbitration.
-use super::{MAX_ERROR, pack_store::PackManifest};
-use crate::{AppState, Error, db::Repository, journal};
+use super::MAX_ERROR;
+use crate::{AppState, Error, db::Repository, journal, pando_gateway::pack_store::PackManifest};
 use anyhow::{Result, ensure};
 use axum::http::StatusCode;
 use deadpool_postgres::{Client, Pool};

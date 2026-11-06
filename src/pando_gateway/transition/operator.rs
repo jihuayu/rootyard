@@ -123,7 +123,7 @@ pub async fn recover_abandoned_draining(
                     &repository_id,
                     &expected_transition,
                     &expected_epoch,
-                    expected_backend,
+                    &expected_backend,
                     &expected_generation,
                     &message,
                 ],

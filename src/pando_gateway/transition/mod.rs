@@ -21,9 +21,7 @@ pub mod operator;
 mod tests;
 
 pub use fence::admit_write;
-use fence::{
-    Fence, acquire_publication_lock, begin, complete_cutover, complete_rollback, fail, release_publication_lock,
-};
+use fence::{acquire_publication_lock, begin, complete_cutover, complete_rollback, fail, release_publication_lock};
 use gitfs::{WorkDir, git, index_pack, parse_refs, plan_ref_mutations, valid_head, verify_closure, work_dir};
 
 pub(super) const MAX_REFS: usize = 4096;
