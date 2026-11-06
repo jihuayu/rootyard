@@ -425,11 +425,19 @@ class MirrorHarness(Harness):
         # Active checkout lease blocks source pin release with 409 Conflict.
         repo_id = self.repo["id"]
         owner_id = pin_active["owner_id"]
-        expires_unix = int(
-            self.sql("SELECT extract(epoch FROM clock_timestamp())::bigint + 1800")
+        raw_exp = self.sql(
+            "SELECT extract(epoch FROM clock_timestamp())::bigint + 1800"
         )
-        token_id = self.sql(
-            f"SELECT id FROM tokens WHERE user_id='{owner_id}' AND NOT revoked AND NOT read_only LIMIT 1"
+        expires_unix = (
+            int(raw_exp.strip())
+            if raw_exp.strip().isdigit()
+            else int(time.time()) + 1800
+        )
+        token_id = (
+            self.sql(
+                f"SELECT id FROM tokens WHERE user_id='{owner_id}' AND NOT revoked AND NOT read_only LIMIT 1"
+            ).strip()
+            or str(uuid.uuid4())
         )
         cred_hex = hashlib.sha256(job_active.encode("utf-8")).hexdigest()
         plan_json = json.dumps(
