@@ -25,9 +25,7 @@ fn candidate(line: &str) -> Option<(&str, &str)> {
     let oid = fields.next()?;
     if fields.next().is_some()
         || !matches!(oid.len(), 40 | 64)
-        || !oid
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        || !oid.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     {
         return None;
     }
@@ -44,18 +42,16 @@ pub async fn mark(
 ) -> Result<Value> {
     // Include reflogs as roots. CI retention refs are native refs and therefore
     // roots too. Rows alone never authorize a physical delete.
-    let report = gitfs::run_git(
-        state,
-        repo,
-        &["fsck", "--unreachable", "--no-progress"],
-        cancel,
-        8 * 1024 * 1024,
-    )
-    .await?;
+    let report =
+        gitfs::run_git(state, repo, &["fsck", "--unreachable", "--no-progress"], cancel, 8 * 1024 * 1024).await?;
     let mut oids = Vec::<String>::new();
     let mut kinds = Vec::<String>::new();
+    let mut seen = HashSet::new();
     for line in report.lines() {
         if let Some((oid, kind)) = candidate(line) {
+            if !seen.insert(oid.to_owned()) {
+                continue;
+            }
             oids.push(oid.to_owned());
             kinds.push(kind.to_owned());
             if oids.len() > 100_000 {
@@ -89,13 +85,16 @@ async fn has_external_roots(tx: &deadpool_postgres::Transaction<'_>, repo: Uuid)
     // All four tables are required by the current schema. A missing table is
     // an error, never permission to delete. The caller holds repositories FOR
     // UPDATE, which blocks new FK-backed roots until this decision commits.
-    Ok(tx.query_one(
-        "SELECT EXISTS(SELECT 1 FROM workspaces WHERE repository_id=$1 AND state<>'deleted') \
+    Ok(tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM workspaces WHERE repository_id=$1 AND state<>'deleted') \
          OR EXISTS(SELECT 1 FROM ci_checkout_jobs WHERE repository_id=$1 AND NOT cancelled AND NOT revoked) \
          OR EXISTS(SELECT 1 FROM ci_runs WHERE repository_id=$1 AND state IN ('queued','leased')) \
          OR EXISTS(SELECT 1 FROM forge_pulls WHERE repository_id=$1 AND state='open')",
-        &[&repo],
-    ).await?.get(0))
+            &[&repo],
+        )
+        .await?
+        .get(0))
 }
 
 async fn lock_retention_rows(tx: &deadpool_postgres::Transaction<'_>, repo: Uuid) -> Result<()> {
@@ -103,8 +102,7 @@ async fn lock_retention_rows(tx: &deadpool_postgres::Transaction<'_>, repo: Uuid
     // change state without touching that parent, so hold each one stable too.
     // NOWAIT converts any reverse lock-order into a retry, not a deadlock.
     for table in ["workspaces", "ci_checkout_jobs", "ci_runs", "forge_pulls"] {
-        let sql =
-            format!("SELECT 1 FROM {table} WHERE repository_id=$1 LIMIT 10001 FOR SHARE NOWAIT");
+        let sql = format!("SELECT 1 FROM {table} WHERE repository_id=$1 LIMIT 10001 FOR SHARE NOWAIT");
         if tx.query(&sql, &[&repo]).await?.len() > 10_000 {
             bail!("retention root inspection exceeded limit");
         }
@@ -123,9 +121,7 @@ pub async fn delete_due(
     lease: &Lease,
     cancel: &CancellationToken,
 ) -> Result<Value> {
-    lease
-        .ensure_active()
-        .map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     let mut client = state.pool.get().await?;
     let tx = client.transaction().await?;
     // A root creator can authorize and lock this row before requesting the
@@ -145,28 +141,20 @@ pub async fn delete_due(
     if has_external_roots(&tx, repo).await? {
         return Ok(json!({"deleted":0,"retained":"active external roots"}));
     }
-    let rows=tx.query(
-        "SELECT oid FROM storage_maintenance_tombstones WHERE repository_id=$1 AND tenant_id=$2 \
+    let rows = tx
+        .query(
+            "SELECT oid FROM storage_maintenance_tombstones WHERE repository_id=$1 AND tenant_id=$2 \
          AND repository_generation=$3 AND state='pending' AND delete_after<=clock_timestamp() \
          ORDER BY delete_after,oid LIMIT 100",
-        &[&repo,&tenant,&generation],
-    ).await?;
+            &[&repo, &tenant, &generation],
+        )
+        .await?;
     if rows.is_empty() {
         return Ok(json!({"deleted":0}));
     }
-    let report = gitfs::run_git(
-        state,
-        repo,
-        &["fsck", "--unreachable", "--no-progress"],
-        cancel,
-        8 * 1024 * 1024,
-    )
-    .await?;
-    let unreachable = report
-        .lines()
-        .filter_map(candidate)
-        .map(|(oid, _)| oid)
-        .collect::<HashSet<_>>();
+    let report =
+        gitfs::run_git(state, repo, &["fsck", "--unreachable", "--no-progress"], cancel, 8 * 1024 * 1024).await?;
+    let unreachable = report.lines().filter_map(candidate).map(|(oid, _)| oid).collect::<HashSet<_>>();
     let git_dir = state.storage.verify_path(repo)?;
     crate::journal::safe_path(&git_dir.join("objects"))?;
     let mut deleted = 0_u64;
@@ -175,9 +163,7 @@ pub async fn delete_due(
         if cancel.is_cancelled() {
             bail!("maintenance lease lost");
         }
-        lease
-            .ensure_active()
-            .map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+        lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
         if has_external_roots(&tx, repo).await? {
             bail!("external retention root appeared during collection");
         }
@@ -196,10 +182,13 @@ pub async fn delete_due(
         let (dir, file) = oid.split_at(2);
         let parent = git_dir.join("objects").join(dir);
         if !parent.exists() {
-            tx.execute("UPDATE storage_maintenance_tombstones SET state='retained', \
+            tx.execute(
+                "UPDATE storage_maintenance_tombstones SET state='retained', \
                 last_error='object is packed or loose directory absent' WHERE repository_id=$1 AND tenant_id=$2 \
                 AND oid=$3 AND repository_generation=$4 AND state='pending'",
-                &[&repo,&tenant,&oid,&generation]).await?;
+                &[&repo, &tenant, &oid, &generation],
+            )
+            .await?;
             retained += 1;
             continue;
         }
@@ -213,10 +202,13 @@ pub async fn delete_due(
                 fs::remove_file(&path)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                tx.execute("UPDATE storage_maintenance_tombstones SET state='retained', \
+                tx.execute(
+                    "UPDATE storage_maintenance_tombstones SET state='retained', \
                     last_error='object is packed or loose path absent' WHERE repository_id=$1 AND tenant_id=$2 \
                     AND oid=$3 AND repository_generation=$4 AND state='pending'",
-                    &[&repo,&tenant,&oid,&generation]).await?;
+                    &[&repo, &tenant, &oid, &generation],
+                )
+                .await?;
                 retained += 1;
                 continue;
             }
@@ -232,9 +224,7 @@ pub async fn delete_due(
         .await?;
         deleted += 1;
     }
-    lease
-        .ensure_active()
-        .map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     tx.commit().await?;
     Ok(json!({"deleted":deleted,"retained":retained,"remaining_batch":100}))
 }
@@ -245,14 +235,8 @@ mod tests {
     #[test]
     fn only_native_unreachable_objects_become_tombstones() {
         let oid = "a".repeat(40);
-        assert_eq!(
-            candidate(&format!("unreachable blob {oid}")),
-            Some((oid.as_str(), "blob"))
-        );
-        assert_eq!(
-            candidate(&format!("dangling commit {oid}")),
-            Some((oid.as_str(), "commit"))
-        );
+        assert_eq!(candidate(&format!("unreachable blob {oid}")), Some((oid.as_str(), "blob")));
+        assert_eq!(candidate(&format!("dangling commit {oid}")), Some((oid.as_str(), "commit")));
         assert!(candidate(&format!("reachable blob {oid}")).is_none());
         assert!(candidate("unreachable blob ../../escape").is_none());
         assert!(candidate(&format!("unreachable blob {}", "A".repeat(40))).is_none());
