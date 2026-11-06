@@ -13,11 +13,11 @@
     503,
     503
   ],
-  "acknowledged_oid_before_failure": "d02ed831b2fbb93f3880dd50329d0093fffd1809",
+  "acknowledged_oid_before_failure": "449a1128895d936168dba44df4316520e052fffe",
   "rpo_lost_acknowledged_commits": 0,
-  "rto_read_ms": 566.653,
-  "rto_write_ms": 738.705,
-  "post_promote_oid": "f4d7ada3b279ea7f2a116a95aab3f050a3dbd1fd",
+  "rto_read_ms": 544.67,
+  "rto_write_ms": 686.657,
+  "post_promote_oid": "19212a5cb349e6a0d1d44f4536d35e749e983385",
   "standby_promoted": true,
   "limits": [
     "manual local-host PostgreSQL promotion and Rootyard restart",

@@ -68,6 +68,7 @@ python3 tests/cluster_takeover_native.py --binary target/debug/rootyard --report
 python3 tests/cluster_workload_native.py --binary target/debug/rootyard --report evidence/cluster-workload-integration.json
 python3 tests/cluster_tls_native.py --binary target/debug/rootyard --report evidence/cluster-tls.json
 python3 tests/cluster_pg_streaming_native.py --binary target/debug/rootyard --report evidence/cluster-pg-streaming.json
+python3 tests/cluster_kafka_tls_native.py --binary target/debug/rootyard --kafka-home /path/to/kafka_2.13-3.9.1 --report evidence/cluster-kafka-tls.json
 ```
 
 These tests require the PostgreSQL 17 binaries, `ROOTYARD_TEST_DATABASE_URL`,
@@ -91,3 +92,13 @@ observed outage. It does not elect a database leader, prevent a manually
 restarted old primary from becoming a second writer, archive WAL for PITR, or
 automatically reconfigure applications. Production metadata HA therefore
 requires an external supported solution with DCS, fencing, backup, and PITR.
+
+The Kafka test uses the Apache Kafka 3.9.1 binary distribution and creates a
+disposable KRaft broker with a TLS listener and SASL/PLAIN authentication.
+Its client checks reject the wrong CA, hostname, and password. Rootyard then
+publishes real wake messages after Git pushes, continues to acknowledge Git
+operations while the broker is stopped (PostgreSQL remains authoritative),
+and publishes another wake after the broker restarts. This verifies the local
+encrypted dependency and reconnect path, but not a multi-broker Kafka cluster
+or a remote Kafka failover. The test distribution can be obtained from
+`https://archive.apache.org/dist/kafka/3.9.1/kafka_2.13-3.9.1.tgz`.
