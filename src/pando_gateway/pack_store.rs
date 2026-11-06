@@ -5,7 +5,8 @@ use anyhow::{Context, Result, ensure};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{path::{Path, PathBuf}, process::Stdio, time::Duration};
+use std::{os::unix::{fs::{DirBuilderExt, MetadataExt, PermissionsExt}},
+    path::{Path, PathBuf}, process::Stdio, time::Duration};
 use tokio::{fs, process::Command, time::Instant};
 use uuid::Uuid;
 
@@ -52,7 +53,12 @@ impl PackStore {
         ensure!(std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_some(),
             "production Pando requires a remote object-store endpoint");
         ensure!(git.is_absolute(), "production Pando Git path must be absolute");
-        std::fs::create_dir_all(&work_root)?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&work_root)?;
+        let meta = std::fs::symlink_metadata(&work_root)?;
+        ensure!(meta.is_dir() && !meta.file_type().is_symlink() &&
+            meta.uid() == unsafe { libc::geteuid() },
+            "Pando scratch root is not a private owned directory");
+        std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o700))?;
         let remote = RemoteObjectStore::from_env(work_root.join("unused-local-store"))?;
         let kms = VaultTransit::from_env()?;
         Ok(Self { remote, kms, work_root, git })
@@ -60,7 +66,7 @@ impl PackStore {
 
     fn work_dir(&self) -> Result<WorkDir> {
         let path = self.work_root.join(format!(".pando-pack-{}", Uuid::new_v4()));
-        std::fs::create_dir(&path)?;
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(WorkDir(path))
     }
 
@@ -68,11 +74,24 @@ impl PackStore {
         ObjectKey::new(tenant_id, namespace, sha256)
     }
 
-    async fn verify_git_pack(&self, pack: &Path, deadline: Instant) -> Result<()> {
+    async fn verify_git_pack(&self, pack: &Path, object_format: &str, deadline: Instant) -> Result<()> {
+        ensure!(matches!(object_format, "sha1" | "sha256"), "invalid Pando object format");
+        let work = self.work_dir()?;
+        let verify_repo = work.0.join("verify.git");
+        let format_arg = format!("--object-format={object_format}");
+        let mut init = Command::new(&self.git);
+        init.env_clear().env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init", "--bare", &format_arg]).arg(&verify_repo)
+            .stdin(Stdio::null());
+        let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
+        ensure!(!timeout.is_zero(), "Pando pack verification deadline elapsed");
+        git_http::collect_git_output(init, 4096, timeout).await?;
         let mut cmd = Command::new(&self.git);
         cmd.env_clear().env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .arg("--git-dir").arg(&verify_repo)
             .args(["index-pack", "--verify"]).arg(pack)
             .stdin(Stdio::null());
         let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
@@ -113,7 +132,7 @@ impl PackStore {
             "invalid Pando repository identity");
         ensure!(pack.extension().is_some_and(|v| v == "pack") &&
             index == pack.with_extension("idx"), "Pando pack and index paths differ");
-        self.verify_git_pack(pack, deadline).await?;
+        self.verify_git_pack(pack, object_format, deadline).await?;
         let work = self.work_dir()?;
         let pack_receipt = self.publish_artifact(&work.0, "pack", pack, tenant_id, deadline).await?;
         let index_receipt = self.publish_artifact(&work.0, "index", index, tenant_id, deadline).await?;
@@ -178,7 +197,7 @@ impl PackStore {
         let work = self.work_dir()?;
         let pack = self.recover_artifact(&work.0, "pack", manifest.tenant_id, &manifest.pack, deadline).await?;
         let index = self.recover_artifact(&work.0, "index", manifest.tenant_id, &manifest.index, deadline).await?;
-        self.verify_git_pack(&pack, deadline).await?;
+        self.verify_git_pack(&pack, &manifest.object_format, deadline).await?;
         fs::create_dir_all(destination).await?;
         let target_pack = destination.join(format!("pack-{}.pack", pack_id));
         let target_index = destination.join(format!("pack-{}.idx", pack_id));
