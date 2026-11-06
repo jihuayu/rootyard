@@ -296,6 +296,7 @@ pub(crate) async fn authenticate(
         clone_path: format!("/git/{owner}/{name}.git"),
         storage_backend: "gitfs".into(),
         storage_generation: plan.storage_generation,
+        object_format: plan.object_format.clone(),
     };
     Ok((identity, repo, plan))
 }

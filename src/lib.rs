@@ -155,6 +155,8 @@ async fn ready(State(state): State<Arc<AppState>>) -> Result<&'static str, Error
 #[serde(deny_unknown_fields)]
 struct CreateRepo {
     name: String,
+    owner: Option<String>,
+    object_format: Option<browse::object_format::ObjectFormat>,
 }
 async fn create_repo(
     State(state): State<Arc<AppState>>,
@@ -166,17 +168,25 @@ async fn create_repo(
     if !db::valid_name(&input.name) {
         return Err(Error(StatusCode::BAD_REQUEST, "invalid repository name"));
     }
-    let client = state.pool.get().await.map_err(Error::internal)?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let owner = input.owner.as_deref().unwrap_or(&identity.username);
+    let owner_id = organizations::authorize_namespace_create(&tx, &identity, owner).await?;
+    let format = input.object_format.unwrap_or(browse::object_format::ObjectFormat::Sha1);
     let id = Uuid::new_v4();
-    let created=client.execute("INSERT INTO repositories (id,owner_id,name) VALUES ($1,$2,$3) ON CONFLICT (owner_id,name) DO NOTHING",&[&id,&identity.id,&input.name]).await.map_err(Error::internal)?==1;
-    let row = client
+    let created=tx.execute("INSERT INTO repositories (id,owner_id,name,object_format) VALUES ($1,$2,$3,$4) ON CONFLICT (owner_id,name) DO NOTHING",&[&id,&owner_id,&input.name,&format.as_str()]).await.map_err(Error::internal)?==1;
+    let row = tx
         .query_one(
             &format!("{} WHERE r.owner_id=$1 AND r.name=$2", db::REPO_SELECT),
-            &[&identity.id, &input.name],
+            &[&owner_id, &input.name],
         )
         .await
         .map_err(Error::internal)?;
     let mut repo = db::Repository::from_row(&row);
+    if input.object_format.is_some_and(|requested| requested.as_str() != repo.object_format) {
+        return Err(Error(StatusCode::CONFLICT, "repository object format cannot change"));
+    }
+    auth::finish_tx(tx, &identity, true).await?;
     drop(client);
     if repo.state == "provisioning" {
         let _slot = state.git_slots.try_acquire().map_err(|_| {
@@ -187,7 +197,8 @@ async fn create_repo(
         })?;
         if state
             .storage
-            .provision(&state.config, repo.id)
+            .provision_with_format(&state.config, repo.id,
+                browse::object_format::ObjectFormat::from_str_name(&repo.object_format).ok_or_else(Error::bad_request)?)
             .await
             .is_ok()
         {
@@ -228,7 +239,7 @@ async fn list_repos(
         .map_err(Error::internal)?
         .query(
             &format!(
-                "{} WHERE r.owner_id=$1 ORDER BY r.name LIMIT 1000",
+                "{} WHERE r.owner_id=$1 OR EXISTS (SELECT 1 FROM repository_collaborators c WHERE c.repository_id=r.id AND c.user_id=$1) OR EXISTS (SELECT 1 FROM repository_teams t JOIN repository_team_members m ON m.team_id=t.id WHERE t.repository_id=r.id AND m.user_id=$1) OR EXISTS (SELECT 1 FROM organization_memberships m WHERE m.organization_id=r.owner_id AND m.user_id=$1) ORDER BY ns.slug,r.name LIMIT 1000",
                 db::REPO_SELECT
             ),
             &[&identity.id],
@@ -285,18 +296,20 @@ pub async fn recover(state: &AppState) -> anyhow::Result<usize> {
         .get()
         .await?
         .query(
-            "SELECT id FROM repositories WHERE state='provisioning' AND next_retry_at <= clock_timestamp() ORDER BY next_retry_at, created_at LIMIT 64",
+            "SELECT id, object_format FROM repositories WHERE state='provisioning' AND next_retry_at <= clock_timestamp() ORDER BY next_retry_at, created_at LIMIT 64",
             &[],
         )
         .await?;
     let mut recovered = 0;
     for row in rows {
         let id: Uuid = row.get(0);
+        let format = browse::object_format::ObjectFormat::from_str_name(row.get(1))
+            .ok_or_else(|| anyhow::anyhow!("invalid stored object format"))?;
         let Ok(_slot) = state.git_slots.try_acquire() else {
             break;
         };
         state.pool.get().await?.execute("UPDATE repositories SET next_retry_at=clock_timestamp()+interval '30 seconds', provision_attempts=provision_attempts+1 WHERE id=$1 AND state='provisioning'", &[&id]).await?;
-        match state.storage.provision(&state.config, id).await {
+        match state.storage.provision_with_format(&state.config, id, format).await {
             Ok(()) => {
                 state.pool.get().await?.execute("UPDATE repositories SET state='ready' WHERE id=$1 AND state='provisioning'",&[&id]).await?;
                 recovered += 1;
