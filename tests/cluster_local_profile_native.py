@@ -178,6 +178,17 @@ def main():
              "-X", "-v", "ON_ERROR_STOP=1", "-c", "INSERT INTO cluster_operator_tokens(token_id,granted_by) VALUES ('"
              + account["token_id"] + "','native secure profile')"], env=grant_env)
         profile_cmd = ["python3", str(launcher)]
+        good_node1 = (config / "node1.env").read_text()
+        private(config / "node1.env", good_node1.replace(
+            "ROOTYARD_KAFKA_SASL_PASSWORD=" + kafka_pass["node1"],
+            "ROOTYARD_KAFKA_SASL_PASSWORD=wrong-password"))
+        invalid = run([*profile_cmd, "up", "--binary", str(binary), "--env-dir", str(config),
+                       "--state-dir", str(state), "--kafka-home", str(kafka_home),
+                       "--operator-account", str(config / "operator.json"), "--base-port", str(bind_port),
+                       "--nodes", "2"], timeout=180, check=False)
+        assert invalid.returncode != 0 and not (state / "manifest.json").exists(), "wrong Kafka login accepted"
+        assert not list(state.glob("*.kafka.properties")), "failed preflight retained client secrets"
+        private(config / "node1.env", good_node1)
         run([*profile_cmd, "up", "--binary", str(binary), "--env-dir", str(config),
              "--state-dir", str(state), "--kafka-home", str(kafka_home),
              "--operator-account", str(config / "operator.json"), "--base-port", str(bind_port),
@@ -189,6 +200,8 @@ def main():
         report = json.loads(native_report.read_text())
         report.update(kafka_version="4.4.0", postgres_tls="verify-full",
                       postgres_auth="SCRAM-SHA-256", kafka_auth="SASL/PLAIN over TLS",
+                      wrong_kafka_role_password_rejected_before_start=True,
+                      failed_preflight_secrets_cleaned=True,
                       binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                       launcher_sha256=hashlib.sha256(launcher.read_bytes()).hexdigest())
         args.report.parent.mkdir(parents=True, exist_ok=True)
