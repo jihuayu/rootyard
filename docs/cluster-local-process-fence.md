@@ -67,6 +67,7 @@ python3 tests/cluster_migration_native.py --binary target/debug/rootyard
 python3 tests/cluster_takeover_native.py --binary target/debug/rootyard --report evidence/cluster-takeover-run.json
 python3 tests/cluster_workload_native.py --binary target/debug/rootyard --report evidence/cluster-workload-integration.json
 python3 tests/cluster_tls_native.py --binary target/debug/rootyard --report evidence/cluster-tls.json
+python3 tests/cluster_pg_streaming_native.py --binary target/debug/rootyard --report evidence/cluster-pg-streaming.json
 ```
 
 These tests require the PostgreSQL 17 binaries, `ROOTYARD_TEST_DATABASE_URL`,
@@ -79,3 +80,14 @@ cross-host storage fencing, PostgreSQL leader failover/PITR, network-partition
 recovery, or a production RPO/RTO service-level objective. A multi-host
 deployment must supply an external supported fencing and PostgreSQL HA system
 and must not enable this local process driver across hosts.
+
+The PostgreSQL streaming test starts a separate PostgreSQL 17 primary and
+standby using verified TLS, SCRAM authentication, and synchronous
+`remote_apply` commits. It writes and reads real Git data through Rootyard,
+stops the primary during client reads, manually promotes the standby, restarts
+Rootyard against the new endpoint, and checks acknowledged Git history before
+and after a new push. This demonstrates a local functional failover path and
+observed outage. It does not elect a database leader, prevent a manually
+restarted old primary from becoming a second writer, archive WAL for PITR, or
+automatically reconfigure applications. Production metadata HA therefore
+requires an external supported solution with DCS, fencing, backup, and PITR.
