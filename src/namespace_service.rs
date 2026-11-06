@@ -3,11 +3,14 @@
 mod changesets;
 #[path = "namespace_service/handlers.rs"]
 mod handlers;
+#[path = "namespace_service/reverse.rs"]
+mod reverse;
 #[path = "namespace_service/views.rs"]
 mod views;
 
 use crate::AppState;
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
@@ -28,4 +31,8 @@ pub fn routes() -> Router<Arc<AppState>> {
             post(changesets::integrate),
         )
         .route("/api/changesets/{id}/recover", post(changesets::recover))
+        .route(
+            "/api/views/{id}/changesets",
+            post(reverse::create).layer(DefaultBodyLimit::max(reverse::BODY_LIMIT)),
+        )
 }

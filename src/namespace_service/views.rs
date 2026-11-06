@@ -61,7 +61,7 @@ pub async fn create(State(state):State<Arc<AppState>>,headers:HeaderMap,Path(id)
     Ok((StatusCode::CREATED,Json(View{id:vid,namespace_id:id,repository_id:access.repo_id,mount_path:input.mount_path,subdir:input.subdir,source_oid:mount.base_oid.clone(),projected_oid:projected,epoch:1})))
 }
 
-async fn load(state:&AppState,headers:&HeaderMap,id:Uuid)->Result<View,Error>{
+pub(super) async fn load(state:&AppState,headers:&HeaderMap,id:Uuid)->Result<View,Error>{
     let client=state.pool.get().await.map_err(Error::internal)?;
     let row=client.query_opt("SELECT id,namespace_id,repository_id,mount_path,subdir,source_oid,projected_oid,epoch FROM workspace_views WHERE id=$1", &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let result=view(&row);
