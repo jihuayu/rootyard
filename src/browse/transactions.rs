@@ -376,6 +376,7 @@ async fn execute_ref_transaction_inner(
             repository_id: repo_id,
             actor_id: actor.id,
             token_id: actor.token_id,
+            service_principal_id: None,
             actor_name: actor.username.clone(),
             sequence: operation.sequence,
             storage_generation: current_generation,

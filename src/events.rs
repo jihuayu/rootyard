@@ -13,6 +13,7 @@ pub struct OperationRecord {
     pub repository_id: Uuid,
     pub actor_id: Uuid,
     pub token_id: Uuid,
+    pub service_principal_id: Option<Uuid>,
     pub actor_name: String,
     pub sequence: i64,
     pub storage_generation: i64,
@@ -83,6 +84,16 @@ pub async fn publish(
         crate::db::valid_name(&operation.actor_name),
         "invalid actor name"
     );
+    let service = operation.service_principal_id.is_some();
+    if service {
+        ensure!(operation.actor_id.is_nil() && operation.token_id.is_nil()
+            && operation.actor_name == "ci-scheduler"
+            && operation.evidence["kind"] == "observed_immutable_ci_root",
+            "invalid CI service operation");
+    } else {
+        ensure!(!operation.actor_id.is_nil() && !operation.token_id.is_nil(),
+            "invalid human operation");
+    }
     ensure!(changes.len() <= 100_000, "too many ref events");
     ensure!(
         operation.outcome != "no_ref_changes" || changes.is_empty(),
@@ -129,7 +140,10 @@ pub async fn publish(
         .is_none(),
         "resolved operation is immutable"
     );
-    tx.execute("INSERT INTO git_operations(id,repository_id,actor_id,token_id,actor_name,sequence,storage_generation,outcome,evidence) VALUES($1,$2,$3,$4,$5,$6,$7,'unknown',$8) ON CONFLICT(id) DO NOTHING", &[&operation.id,&operation.repository_id,&operation.actor_id,&operation.token_id,&operation.actor_name,&operation.sequence,&operation.storage_generation,&operation.evidence]).await?;
+    let human_actor = (!service).then_some(operation.actor_id);
+    let human_token = (!service).then_some(operation.token_id);
+    let initial_outcome = "unknown";
+    tx.execute("INSERT INTO git_operations(id,repository_id,actor_id,token_id,service_principal_id,actor_name,sequence,storage_generation,outcome,evidence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(id) DO NOTHING", &[&operation.id,&operation.repository_id,&human_actor,&human_token,&operation.service_principal_id,&operation.actor_name,&operation.sequence,&operation.storage_generation,&initial_outcome,&operation.evidence]).await?;
     let row = tx
         .query_one(
             "SELECT * FROM git_operations WHERE id=$1 FOR UPDATE",
@@ -138,8 +152,9 @@ pub async fn publish(
         .await?;
     ensure!(
         row.get::<_, Uuid>("repository_id") == operation.repository_id
-            && row.get::<_, Uuid>("actor_id") == operation.actor_id
-            && row.get::<_, Uuid>("token_id") == operation.token_id
+            && row.get::<_, Option<Uuid>>("actor_id") == human_actor
+            && row.get::<_, Option<Uuid>>("token_id") == human_token
+            && row.get::<_, Option<Uuid>>("service_principal_id") == operation.service_principal_id
             && row.get::<_, String>("actor_name") == operation.actor_name
             && row.get::<_, i64>("sequence") == operation.sequence
             && row.get::<_, i64>("storage_generation") == operation.storage_generation,

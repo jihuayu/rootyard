@@ -240,6 +240,7 @@ pub(crate) async fn ensure_pull_ci_pin(
         });
         let record = events::OperationRecord {
             id: op.id, repository_id: repo.id, actor_id: owner_id, token_id,
+            service_principal_id: None,
             actor_name: repo.owner.clone(), sequence: op.sequence,
             storage_generation: repo.storage_generation, outcome: "recorded".into(), evidence,
         };

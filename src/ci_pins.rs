@@ -900,6 +900,7 @@ async fn release_pin_inner(
                     repository_id: repo.id,
                     actor_id: operation.actor_id,
                     token_id: operation.token_id,
+                    service_principal_id: operation.service_principal_id,
                     actor_name: operation.actor_name.clone(),
                     sequence: operation.sequence,
                     storage_generation: operation.storage_generation,
