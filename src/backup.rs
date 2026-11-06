@@ -54,6 +54,8 @@ const TABLES: &[&str] = &[
     "tokens",
     "users",
     "workspace_capture_state",
+    "workspace_changeset_steps",
+    "workspace_changesets",
     "workspace_checkpoints",
     "workspace_creations",
     "workspace_entries",

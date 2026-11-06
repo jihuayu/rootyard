@@ -52,9 +52,10 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (93, include_str!("../migrations/093_workspace_namespaces.sql")),
     (94, include_str!("../migrations/094_workspace_remote.sql")),
     (95, include_str!("../migrations/095_workspace_remote_staging.sql")),
+    (96, include_str!("../migrations/096_workspace_changesets.sql")),
 ];
 
-pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 90, 91, 92, 93, 94, 95];
+pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 90, 91, 92, 93, 94, 95, 96];
 
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;
