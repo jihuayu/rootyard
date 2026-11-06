@@ -26,6 +26,7 @@ class FuseMountTest(unittest.TestCase):
             lower.mkdir();upper.mkdir();mount.mkdir()
             (lower/"nested").mkdir()
             (lower/"nested/up").symlink_to("..")
+            (lower/"nested/special").symlink_to(".rootyard-whiteouts.json")
             (lower/"nested/data.txt").write_text("safe")
             proc=subprocess.Popen([str(binary),str(lower),str(upper),str(mount)],
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE)
@@ -41,9 +42,27 @@ class FuseMountTest(unittest.TestCase):
                 self.assertFalse((root/"escaped.txt").exists())
                 self.assertFalse((mount/"up").exists())
                 self.assertEqual(os.readlink(mount/"nested/up"),"..")
+                with self.assertRaises(OSError):
+                    (mount/"nested/special").rename(mount/".rootyard-whiteouts.tmp")
+                self.assertFalse((upper/".rootyard-whiteouts.tmp").exists())
                 (mount/"nested").rename(mount/"moved")
                 self.assertEqual((mount/"moved/data.txt").read_text(),"safe")
                 self.assertEqual((lower/"nested/data.txt").read_text(),"safe")
+                self.assertTrue((upper/".rootyard-whiteouts.json").is_file())
+                self.assertFalse((upper/".rootyard-whiteouts.json").is_symlink())
+            finally:
+                if os.path.ismount(mount): subprocess.run(["fusermount3","-u",str(mount)],check=True,timeout=10)
+                proc.wait(timeout=10)
+            proc=subprocess.Popen([str(binary),str(lower),str(upper),str(mount)],
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            try:
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline and not os.path.ismount(mount):
+                    if proc.poll() is not None: self.fail(proc.stderr.read().decode())
+                    time.sleep(.05)
+                self.assertEqual((mount/"moved/data.txt").read_text(),"safe")
+                self.assertFalse((mount/"nested").exists())
+                self.assertFalse((upper/".rootyard-whiteouts.json").is_symlink())
             finally:
                 if os.path.ismount(mount): subprocess.run(["fusermount3","-u",str(mount)],check=True,timeout=10)
                 proc.wait(timeout=10)
