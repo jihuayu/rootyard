@@ -12,22 +12,12 @@ import subprocess
 import sys
 import time
 import traceback
-import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e import Harness
 
 
 class OrganizationHarness(Harness):
-    def __init__(self, args):
-        super().__init__(args)
-        self.application_name = "rootyard_org_" + self.schema[-12:]
-        parts = urllib.parse.urlsplit(self.db)
-        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
-        query.append(("application_name", self.application_name))
-        self.db = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
-        self.env["DATABASE_URL"] = self.db
-
     def doc(self, path, code, token=None, **kwargs):
         status, body, _ = self.http(path, token=token or self.alice, **kwargs)
         expected = code if isinstance(code, tuple) else (code,)
@@ -164,17 +154,17 @@ class OrganizationHarness(Harness):
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
             try:
-                p.stdin.write("BEGIN; " + sql + "; SELECT 'locked';\n")
+                p.stdin.write("BEGIN; " + sql + "; SELECT pg_backend_pid();\n")
                 p.stdin.flush()
                 assert select.select([p.stdout], [], [], 5)[0], "fixture SQL lock did not start"
-                assert p.stdout.readline().strip() == "locked", "fixture SQL lock failed"
+                blocker_pid = int(p.stdout.readline().strip())
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(self.http, issue_path, token=self.charlie,
                                              method="POST", body={"title": title})
                     deadline = time.monotonic() + 5
                     observed = False
                     while time.monotonic() < deadline and not future.done():
-                        waiting = self.sql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND application_name='" + self.application_name + "' AND query LIKE '%" + blocked_query + "%' AND pid<>pg_backend_pid()")
+                        waiting = self.sql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND " + str(blocker_pid) + " = ANY(pg_blocking_pids(pid)) AND query LIKE '%" + blocked_query + "%'")
                         if int(waiting) > 0:
                             observed = True
                             break
@@ -182,7 +172,7 @@ class OrganizationHarness(Harness):
                     p.stdin.write("COMMIT;\n")
                     p.stdin.flush()
                     status = future.result(timeout=10)[0]
-                    assert observed, "role authorization did not wait on revocation row lock"
+                    assert observed, f"role authorization did not wait on revocation row lock: status={status}"
                     assert status == 403, "write admitted after role revocation"
                 assert self.sql("SELECT count(*) FROM forge_issues WHERE title='" + title + "'") == "0"
             finally:
