@@ -175,11 +175,12 @@ pub(super) async fn pin_inner(
             journal::begin_ci(&state.storage.root, actor.username, actor.token_id, &intent)
                 .map_err(Error::internal)?;
         let mut cmd = git(&state, repo.id).map_err(Error::internal)?;
+        // Server-internal ref writes run with hooks disabled, exactly like the
+        // merge, CI-pin release and webhook pin paths. The managed reference
+        // transaction hook is a client-push contract: it requires the parent
+        // publication environment that only the receive path supplies.
         cmd.arg("-c")
-            .arg(format!(
-                "core.hooksPath={}",
-                state.storage.root.join("managed-hooks").display()
-            ))
+            .arg("core.hooksPath=/dev/null")
             .env("ROOTYARD_JOURNAL_OPERATION", &operation.path)
             .args([
                 "update-ref",
