@@ -128,6 +128,16 @@ pub async fn locked(
     id: Uuid,
     role: Role,
 ) -> Result<Workspace, Error> {
+    locked_inner(tx, actor, id, role, true).await
+}
+
+async fn locked_inner(
+    tx: &deadpool_postgres::Transaction<'_>,
+    actor: &crate::db::Identity,
+    id: Uuid,
+    role: Role,
+    require_mount: bool,
+) -> Result<Workspace, Error> {
     let sql = format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1");
     let row = tx
         .query_opt(&sql, &[&id])
@@ -158,7 +168,7 @@ pub async fn locked(
     {
         return Err(Error::not_found());
     }
-    if !super::mounts::mounted(id) {
+    if require_mount && !super::mounts::mounted(id) {
         return Err(Error::internal("workspace FUSE mount missing"));
     }
     Ok(ws)
@@ -181,38 +191,67 @@ pub async fn lease(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = locked(&tx, &actor, id, Role::Write).await?;
-    if ws.lease_epoch != input.expected_lease_epoch
-        || !workspace_repo(&state, id).join(".git").is_dir()
-    {
+    let ws = locked_inner(&tx, &actor, id, Role::Write, false).await?;
+    if ws.lease_epoch != input.expected_lease_epoch {
         return Err(conflict());
     }
-    let active: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM sandbox_jobs WHERE workspace_id=$1 AND state IN ('queued','running'))", &[&id]).await.map_err(Error::internal)?.get(0);
-    if active {
+    if ws.host_id != state.storage.volume_id {
+        let expired:bool=tx.query_one("SELECT lease_until<=clock_timestamp() FROM workspaces WHERE id=$1", &[&id]).await.map_err(Error::internal)?.get(0);
+        if !expired { return Err(conflict()); }
+        let cp = ws.last_checkpoint_id.ok_or_else(conflict)?;
+        let row = tx.query_opt("SELECT state,captured_revision FROM workspace_checkpoints WHERE id=$1 AND workspace_id=$2", &[&cp,&id]).await.map_err(Error::internal)?.ok_or_else(conflict)?;
+        if row.get::<_,String>(0)!="committed" || ws.revision!=row.get::<_,i64>(1)+1 {
+            return Err(conflict());
+        }
+        let tenant: Uuid=tx.query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&ws.repository_id]).await.map_err(Error::internal)?.get(0);
+        super::remote::ensure_local(&state,cp,ws.repository_id,tenant).await?;
+        materialize_takeover(&state,id,cp)?;
+    } else if !super::mounts::lower_path(&state,id).join(".git").is_dir() {
         return Err(conflict());
     }
-    let changed=tx.execute("UPDATE workspaces SET host_id=$2,lease_epoch=lease_epoch+1,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1 AND lease_epoch=$3 AND (host_id=$2 OR lease_until<=clock_timestamp())", &[&id,&state.storage.volume_id,&input.expected_lease_epoch]).await.map_err(Error::internal)?;
-    if changed != 1 {
-        return Err(conflict());
+    let same_host=ws.host_id==state.storage.volume_id;
+    let commit=async {
+        let active: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM sandbox_jobs WHERE workspace_id=$1 AND state IN ('queued','running'))", &[&id]).await.map_err(Error::internal)?.get(0);
+        if active { return Err(conflict()); }
+        let changed=tx.execute("UPDATE workspaces SET host_id=$2,lease_epoch=lease_epoch+1,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1 AND lease_epoch=$3 AND (host_id=$2 OR lease_until<=clock_timestamp())", &[&id,&state.storage.volume_id,&input.expected_lease_epoch]).await.map_err(Error::internal)?;
+        if changed != 1 { return Err(conflict()); }
+        let row = tx.query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id]).await.map_err(Error::internal)?;
+        let deadline: i64 = tx.query_one("SELECT EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces WHERE id=$1", &[&id]).await.map_err(Error::internal)?.get(0);
+        tx.commit().await.map_err(Error::internal)?;
+        Ok((Workspace::from_row(&row),deadline))
+    };
+    let (saved,deadline)=if same_host {
+        super::mounts::with_frozen_async(id,commit).await?
+    } else {
+        commit.await?
+    };
+    super::mounts::ensure(&state, id, deadline)?;
+    Ok(Json(saved))
+}
+
+fn materialize_takeover(state: &AppState, id: Uuid, cp: Uuid) -> Result<(), Error> {
+    use crate::workspace_lab::core;
+    use std::fs;
+    let source = checkpoint_repo(state, cp);
+    let destination = super::mounts::lower_path(state, id);
+    if destination.exists() {
+        if core::inventory(&destination).map_err(Error::internal)?
+            != core::inventory(&source).map_err(Error::internal)? {
+            return Err(conflict());
+        }
+        return Ok(());
     }
-    let row = tx
-        .query_one(
-            &format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"),
-            &[&id],
-        )
-        .await
-        .map_err(Error::internal)?;
-    let deadline: i64 = tx
-        .query_one(
-            "SELECT EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces WHERE id=$1",
-            &[&id],
-        )
-        .await
-        .map_err(Error::internal)?
-        .get(0);
-    tx.commit().await.map_err(Error::internal)?;
-    super::mounts::update_lease(id, deadline);
-    Ok(Json(Workspace::from_row(&row)))
+    let parent=destination.parent().ok_or_else(Error::bad_request)?;
+    fs::create_dir_all(parent).map_err(Error::internal)?;
+    let stage=parent.join(format!(".transfer-{}",Uuid::new_v4()));
+    let copied=(|| {
+        core::copy_all(&source,&stage).map_err(Error::internal)?;
+        core::sync_tree(&stage).map_err(Error::internal)?;
+        fs::rename(&stage,&destination).map_err(Error::internal)?;
+        fs::File::open(parent).and_then(|f|f.sync_all()).map_err(Error::internal)
+    })();
+    if copied.is_err() { let _=fs::remove_dir_all(&stage); }
+    copied
 }
 
 pub async fn fence_restored(pool: &deadpool_postgres::Pool) -> Result<(), Error> {

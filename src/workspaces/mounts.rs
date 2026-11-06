@@ -9,6 +9,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
+    future::Future,
 };
 use uuid::Uuid;
 
@@ -81,6 +82,35 @@ pub fn with_frozen<T>(id: Uuid, work: impl FnOnce() -> Result<T, Error>) -> Resu
         .map(|m| m.gate.clone())
         .ok_or_else(|| Error::internal("workspace FUSE mount missing"))?;
     gate.freeze(work)
+}
+pub async fn with_frozen_async<T>(
+    id: Uuid,
+    work: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    if !enabled() {
+        return work.await;
+    }
+    let gate = registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|m| m.gate.clone())
+        .ok_or_else(|| Error::internal("workspace FUSE mount missing"))?;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let guard = tokio::task::spawn_blocking(move || {
+        // Hold the exclusive gate until the database transaction finishes or
+        // its future is cancelled; then outstanding callbacks have drained.
+        gate.freeze(|| {
+            let _ = ready_tx.send(());
+            let _ = release_rx.blocking_recv();
+        });
+    });
+    ready_rx.await.map_err(Error::internal)?;
+    let outcome = work.await;
+    drop(release_tx);
+    guard.await.map_err(Error::internal)?;
+    outcome
 }
 pub fn ensure(state: &AppState, id: Uuid, until: i64) -> Result<(), Error> {
     if !enabled() {
