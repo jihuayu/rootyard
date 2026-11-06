@@ -94,6 +94,25 @@ fn leader_exited(pid:i32)->std::io::Result<bool>{
     if result!=0 {return Err(std::io::Error::last_os_error());}
     Ok(unsafe {info.assume_init().si_pid()!=0})
 }
+async fn open_start_gate(state:&AppState,job:Uuid,source:&Source,root:&PathBuf)->Result<(),Error>{
+    let mut client=state.pool.get().await.map_err(Error::internal)?;
+    let tx=client.transaction().await.map_err(Error::internal)?;
+    let row=tx.query_opt("SELECT state FROM sandbox_jobs WHERE id=$1 AND host_id=$2 FOR UPDATE",
+        &[&job,&state.storage.volume_id]).await.map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    if row.get::<_,String>(0)!="running" {return Err(Error::internal("sandbox cancelled before start"));}
+    let authorized=match source {
+        Source::Ci{claim,..}=>super::ci::gate_authorized(&tx,claim).await?,
+        Source::Workspace{..}=>tx.query_opt("SELECT 1 FROM workspaces w JOIN sandbox_jobs j \
+            ON j.workspace_id=w.id WHERE j.id=$1 AND j.lease_epoch=w.lease_epoch \
+            AND j.host_id=w.host_id AND w.lease_until>clock_timestamp()+interval '2 seconds' \
+            FOR SHARE OF w",&[&job]).await.map_err(Error::internal)?.is_some(),
+    };
+    if !authorized {return Err(Error::internal("sandbox authority expired before start"));}
+    fs::write(root.join("control/start"),b"start").map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(())
+}
 
 pub async fn launch(
     state: Arc<AppState>,
@@ -263,13 +282,22 @@ async fn launch_source(
         }
         return Err(error);
     }
-    if let Err(error) = fs::write(root.join("control/start"), b"start") {
+    if let Ok(delay)=std::env::var("ROOTYARD_TEST_SANDBOX_GATE_PAUSE_MS") {
+        if let Ok(delay)=delay.parse::<u64>() {
+            tokio::time::sleep(Duration::from_millis(delay.min(2000))).await;
+        }
+    }
+    if let Err(error) = open_start_gate(&state,job,&source,&root).await {
         let _=crate::git_http::stop_group_child(&mut child).await;
         if let Mode::Cgroup(group)=&isolation {
             let _=fs::write(group.join("cgroup.kill"),"1");
             let _=fs::remove_dir(group);
         }
-        return Err(Error::internal(error));
+        if let Ok(client)=state.pool.get().await {
+            let _=client.execute("UPDATE sandbox_jobs SET state='failed',pid=NULL,finished_at=clock_timestamp() \
+                WHERE id=$1 AND state='running'",&[&job]).await;
+        }
+        return Err(error);
     }
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);

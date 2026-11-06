@@ -128,11 +128,16 @@ fn spawn_preparation(state:Arc<AppState>,claim:ClaimedRun,id:Uuid,
         if let Err(error)=prepare_and_launch(state.clone(),claim,id,argv,timeout_seconds).await {
             // A database outage leaves the queued row retryable. Once preparation
             // was claimed, record a terminal result; cancellation remains final.
-            if let Ok(client)=state.pool.get().await {
-                let _=client.execute("UPDATE sandbox_jobs SET state='failed',finished_at=clock_timestamp(),pid=NULL \
-                    WHERE id=$1 AND state IN ('preparing','running')",&[&id]).await;
-            }
             eprintln!("rootyard: CI sandbox preparation failed ({})",error.0);
+            // Keep the owned task until PostgreSQL acknowledges a terminal
+            // update. A short DB outage must not strand a preparing row.
+            loop {
+                if let Ok(client)=state.pool.get().await {
+                    if client.execute("UPDATE sandbox_jobs SET state='failed',finished_at=clock_timestamp(),pid=NULL \
+                        WHERE id=$1 AND state IN ('preparing','running')",&[&id]).await.is_ok() {break;}
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         }
     });
 }
@@ -251,6 +256,16 @@ pub(super) async fn still_active(state:&AppState,claim:&ClaimedRun,job:Uuid)->Re
         &claim.attempt,&claim.lease_generation,&claim.head_oid,&claim.storage_generation,
         &claim.tenant_id,&claim.job_id,&plan,&job])
         .await.map_err(Error::internal)?.is_some())
+}
+pub(super) async fn gate_authorized(tx:&deadpool_postgres::Transaction<'_>,
+    claim:&ClaimedRun)->Result<bool,Error>{
+    let sql=format!("SELECT 1 {AUTHORITY} \
+        AND c.lease_expires_unix>extract(epoch FROM clock_timestamp())+2 \
+        FOR SHARE OF c,w,b,p,r,i");
+    let plan=serde_json::to_value(&claim.plan).map_err(Error::internal)?;
+    Ok(tx.query_opt(&sql,&[&claim.run_id,&claim.hook_id,&claim.repository_id,&claim.runner_id,
+        &claim.attempt,&claim.lease_generation,&claim.head_oid,&claim.storage_generation,
+        &claim.tenant_id,&claim.job_id,&plan]).await.map_err(Error::internal)?.is_some())
 }
 async fn load_job(state:&AppState,claim:&ClaimedRun,id:Uuid)->Result<CiJob,Error>{
     let client=state.pool.get().await.map_err(Error::internal)?;
