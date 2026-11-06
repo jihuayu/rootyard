@@ -1,4 +1,4 @@
-use super::{core::*, ignore};
+use super::{core::*, ignore, security::check_overlay_parent};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 #[rustfmt::skip]
 use std::{collections::BTreeSet, ffi::{OsStr, OsString}, fs::{self, File, OpenOptions}, io::Write, os::unix::{ffi::OsStringExt, fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink}}, path::{Path, PathBuf}};
 use uuid::Uuid;
-
 #[rustfmt::skip]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -57,16 +56,16 @@ pub struct CrashRecoveryReport {
 }
 #[rustfmt::skip]
 fn write_atomic_file(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> Result<PathBuf> {
+    no_symlink_components(dir)?;
     if !dir.exists() { fs::create_dir_all(dir)?; fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?; }
-    require_directory(dir)?;
+    no_symlink_components(dir)?; require_directory(dir)?;
     let tmp = dir.join(format!(".tmp-{}", Uuid::new_v4()));
     let res = (|| -> Result<PathBuf> {
         let mut f = OpenOptions::new().write(true).create_new(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
         f.write_all(bytes)?; f.set_permissions(fs::Permissions::from_mode(mode))?; f.sync_all()?; drop(f);
         let dest = dir.join(name); fs::rename(&tmp, &dest)?; File::open(dir)?.sync_all()?; Ok(dest)
     })();
-    if res.is_err() { let _ = fs::remove_file(&tmp); }
-    res
+    if res.is_err() { let _ = fs::remove_file(&tmp); } res
 }
 #[rustfmt::skip]
 fn norm_overlay_rel(raw: &str) -> Result<PathBuf> {
@@ -102,6 +101,8 @@ fn read_overlay_manifest(store: &Store, ov_arg: &OsStr) -> Result<(PathBuf, Over
 }
 #[rustfmt::skip]
 fn copy_entry_cow(root: &Path, rel: &Path, src_full: &Path, force_mode: Option<u32>) -> Result<(u32, u64, String)> {
+    check_overlay_parent(root, rel)?;
+    no_symlink_components(src_full.parent().context("missing source parent")?)?;
     let dest = root.join(rel);
     let parent = dest.parent().context("missing parent")?;
     if !parent.exists() { fs::create_dir_all(parent)?; fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?; }
@@ -231,6 +232,7 @@ pub fn cmd_overlay_op(store: &Store, ov_arg: &OsStr, op_arg: &OsStr, rest: &[OsS
         "write" => {
             ensure!(rest.len() == 2, "overlay-write requires REL_PATH and CONTENT_OR_FILE");
             let (rel, val) = (norm_overlay_rel(&text_arg(&rest[0])?)?, text_arg(&rest[1])?);
+            for root in [&upper_dir, &merged_dir, &lower_dir] { check_overlay_parent(root, &rel)?; }
             let (p_str, cand) = (display_path(&rel), Path::new(&val));
             let bytes = if cand.is_file() && !fs::symlink_metadata(cand)?.file_type().is_symlink() && !fs::canonicalize(cand)?.starts_with(&store.root) { read_regular(cand, MAX_BYTES)? } else { val.as_bytes().to_vec() };
             let mode = fs::symlink_metadata(merged_dir.join(&rel)).ok().or_else(|| fs::symlink_metadata(lower_dir.join(&rel)).ok()).map_or(0o644, |m| if m.permissions().mode() & 0o111 != 0 { 0o755 } else { 0o644 });
@@ -243,6 +245,7 @@ pub fn cmd_overlay_op(store: &Store, ov_arg: &OsStr, op_arg: &OsStr, rest: &[OsS
         "delete" => {
             ensure!(rest.len() == 1, "overlay-delete requires REL_PATH");
             let rel = norm_overlay_rel(&text_arg(&rest[0])?)?; let p_str = display_path(&rel);
+            for root in [&upper_dir, &merged_dir, &lower_dir] { check_overlay_parent(root, &rel)?; }
             let (m_full, u_full, l_full) = (merged_dir.join(&rel), upper_dir.join(&rel), lower_dir.join(&rel));
             ensure!(fs::symlink_metadata(&m_full).is_ok() || fs::symlink_metadata(&u_full).is_ok() || fs::symlink_metadata(&l_full).is_ok(), "cannot delete non-existent path: {p_str}");
             if m_full.is_dir() || l_full.is_dir() {
@@ -258,6 +261,7 @@ pub fn cmd_overlay_op(store: &Store, ov_arg: &OsStr, op_arg: &OsStr, rest: &[OsS
         "rename" => {
             ensure!(rest.len() == 2, "overlay-rename requires SRC_REL_PATH and DST_REL_PATH");
             let (src_rel, dst_rel) = (norm_overlay_rel(&text_arg(&rest[0])?)?, norm_overlay_rel(&text_arg(&rest[1])?)?);
+            for root in [&upper_dir, &merged_dir, &lower_dir] { check_overlay_parent(root, &src_rel)?; check_overlay_parent(root, &dst_rel)?; }
             ensure!(src_rel != dst_rel && !dst_rel.starts_with(&src_rel), "invalid overlay rename target");
             let (src_str, dst_str, src_m) = (display_path(&src_rel), display_path(&dst_rel), merged_dir.join(&src_rel));
             let src_meta = fs::symlink_metadata(&src_m).with_context(|| format!("missing rename source {src_str}"))?;
@@ -282,6 +286,7 @@ pub fn cmd_overlay_op(store: &Store, ov_arg: &OsStr, op_arg: &OsStr, rest: &[OsS
         "chmod" => {
             ensure!(rest.len() == 2, "overlay-chmod requires REL_PATH and MODE_OCTAL");
             let (rel, raw_m) = (norm_overlay_rel(&text_arg(&rest[0])?)?, text_arg(&rest[1])?); let p_str = display_path(&rel);
+            for root in [&upper_dir, &merged_dir, &lower_dir] { check_overlay_parent(root, &rel)?; }
             let mode = u32::from_str_radix(raw_m.trim_start_matches("0o").trim_start_matches("0O"), 8).context("invalid octal mode")?;
             ensure!(mode & 0o7000 == 0 && mode & 0o400 != 0, "invalid chmod mode");
             let (m, sz, sha) = copy_entry_cow(&upper_dir, &rel, &merged_dir.join(&rel), Some(mode))?;
@@ -292,6 +297,7 @@ pub fn cmd_overlay_op(store: &Store, ov_arg: &OsStr, op_arg: &OsStr, rest: &[OsS
         "git-add-f" => {
             ensure!(rest.len() == 1, "overlay-git-add-f requires REL_PATH");
             let rel = norm_overlay_rel(&text_arg(&rest[0])?)?; let p_str = display_path(&rel);
+            for root in [&upper_dir, &merged_dir, &lower_dir] { check_overlay_parent(root, &rel)?; }
             let (m, sz, sha) = copy_entry_cow(&upper_dir, &rel, &merged_dir.join(&rel), None)?;
             copy_entry_cow(&merged_dir, &rel, &upper_dir.join(&rel), Some(m))?;
             store.git(&merged_dir, &["add", "-f", "--", &p_str])?; man.forced_managed_paths.push(p_str.clone());
