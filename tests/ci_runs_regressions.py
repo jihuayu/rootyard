@@ -35,6 +35,10 @@ def main():
         pr=h.document(h.pullspath,201,method="POST",body={"title":"CI candidate",
             "body":"fenced run","head_ref":"refs/heads/feature","base_ref":"refs/heads/main"})
         assert pr["head_oid"]==h.feat1_oid
+        service=h.sql("SELECT count(*) FROM git_operations WHERE repository_id='"+
+            pr["repository_id"]+"' AND service_principal_id IS NOT NULL AND actor_id IS NULL "+
+            "AND token_id IS NULL AND evidence->>'kind'='observed_immutable_ci_root'")
+        assert service=="1",service
         run_rows=h.sql("SELECT id::text||','||context FROM ci_runs ORDER BY context").splitlines()
         assert len(run_rows)==2,run_rows
         runs={line.split(',')[1]:line.split(',')[0] for line in run_rows}
@@ -53,6 +57,16 @@ def main():
         prefix=f"/api/repos/alice/forge/integrations/{hook['id']}/runs/"
         first=runner(prefix+runs["ci/test"]+"/claim",{"runner_id":"runner-a"})
         assert first["head_oid"]==h.feat1_oid and first["source"]=="origin",first
+        assert first["checkout"]["plan"]["target_oid"]==h.feat1_oid
+        assert first["checkout"]["token"].startswith("ryj_")
+        digest=h.sql("SELECT encode(credential_digest,'hex') FROM ci_integration_checkout_jobs "+
+            "WHERE run_id='"+runs["ci/test"]+"' AND attempt=1")
+        import hashlib
+        assert digest==hashlib.sha256(first["checkout"]["token"].encode()).hexdigest()
+        runner(prefix+runs["ci/test"]+"/heartbeat",{"attempt":first["attempt"],
+            "lease_generation":first["lease_generation"],"runner_id":"runner-a"})
+        runner(prefix+runs["ci/test"]+"/heartbeat",{"attempt":first["attempt"],
+            "lease_generation":first["lease_generation"],"runner_id":"wrong"},409)
         runner(prefix+runs["ci/lint"]+"/claim",{"runner_id":"runner-b"},429)
         stale=runner(prefix+runs["ci/test"]+"/report",{"attempt":first["attempt"],
             "lease_generation":first["lease_generation"]+1,"conclusion":"success","output":"ok"},409)
