@@ -24,9 +24,9 @@ pub mod lfs;
 pub mod maintenance;
 #[rustfmt::skip]
 pub mod members;
-pub mod organizations;
 pub mod metrics;
 pub mod namespace_service;
+pub mod organizations;
 #[rustfmt::skip]
 pub mod mirror;
 #[rustfmt::skip]
@@ -126,7 +126,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(webhooks::routes())
         .merge(members::routes())
         .merge(organizations::routes())
-        .merge(web::routes())
+        .merge(web::routes(state.clone()))
         .merge(sharding::routes())
         .merge(workspaces::routes())
         .merge(sandbox::routes())
