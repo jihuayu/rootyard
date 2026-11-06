@@ -10,8 +10,13 @@ To propose an edit, clone the View bundle, commit on its projected branch, and
 create a bundle containing that branch. Submit it to
 `POST /api/views/{view_id}/changesets` with `bundle_base64`,
 `bundle_ref`, `source_ref`, and `message`. The service verifies that the
-candidate descends from the pinned projected commit, checks Git objects and
-resource limits, and replaces only the mapped source subtree. It records a
+candidate descends from the pinned projected commit, checks Git objects, and
+replaces only the mapped source subtree. Requests are limited to a 16 MiB
+bundle, 100,000 new objects, 256 MiB summed new-object size, 16 MiB Git
+command output, and 60 seconds per Git process group. Each process has memory,
+CPU, and file-size limits; staged Git storage is checked at 512 MiB after
+bundle import. These checks do not provide a strict aggregate temporary-disk
+quota during import. The service records a
 new source commit without advancing the source branch. A protected
 `refs/heads/rootyard-proposals/*` branch pins the source commit for review.
 If the source branch has advanced past the View's pinned source commit, the
