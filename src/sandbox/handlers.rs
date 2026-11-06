@@ -1,4 +1,4 @@
-use super::runner;
+use super::{runner, terminal};
 use crate::{AppState, Error, members::models::Role, workspaces::service};
 use axum::{
     Json,
@@ -32,6 +32,8 @@ pub struct Start {
     pub ci_run_id: Option<Uuid>,
     pub ci_attempt: Option<i64>,
     pub ci_lease_generation: Option<i64>,
+    #[serde(default)]
+    pub terminal: bool,
 }
 #[derive(Serialize)]
 pub struct Job {
@@ -40,6 +42,7 @@ pub struct Job {
     pub state: String,
     pub exit_code: Option<i32>,
     pub timeout_seconds: i32,
+    pub terminal: bool,
 }
 
 fn job(row: &tokio_postgres::Row) -> Job {
@@ -49,13 +52,14 @@ fn job(row: &tokio_postgres::Row) -> Job {
         state: row.get("state"),
         exit_code: row.get("exit_code"),
         timeout_seconds: row.get("timeout_seconds"),
+        terminal: row.get("terminal"),
     }
 }
 async fn authorized_job(state: &AppState, headers: &HeaderMap, id: Uuid) -> Result<Job, Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client
         .query_opt(
-            "SELECT id,workspace_id,state,exit_code,timeout_seconds FROM sandbox_jobs WHERE id=$1",
+            "SELECT id,workspace_id,state,exit_code,timeout_seconds,terminal FROM sandbox_jobs WHERE id=$1",
             &[&id],
         )
         .await
@@ -124,10 +128,10 @@ pub async fn start(
     let job_id = Uuid::new_v4();
     let argv = json!(input.argv);
     let access = if live_workspace { "live" } else { "private" };
-    tx.execute("INSERT INTO sandbox_jobs(id,workspace_id,actor_id,host_id,state,argv,timeout_seconds,lease_epoch,workspace_access) VALUES($1,$2,$3,$4,'queued',$5,$6,$7,$8)", &[&job_id,&id,&ws.creator_id,&state.storage.volume_id,&argv,&(timeout as i32),&input.lease_epoch,&access]).await.map_err(Error::internal)?;
+    tx.execute("INSERT INTO sandbox_jobs(id,workspace_id,actor_id,host_id,state,argv,timeout_seconds,lease_epoch,workspace_access,terminal) VALUES($1,$2,$3,$4,'queued',$5,$6,$7,$8,$9)", &[&job_id,&id,&ws.creator_id,&state.storage.volume_id,&argv,&(timeout as i32),&input.lease_epoch,&access,&input.terminal]).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     let args: Vec<String> = serde_json::from_value(argv).map_err(Error::internal)?;
-    if runner::launch(state.clone(), job_id, id, args, timeout, live_workspace)
+    if runner::launch(state.clone(), job_id, id, args, timeout, live_workspace, input.terminal)
         .await
         .is_err()
     {
@@ -142,7 +146,7 @@ pub async fn start(
     }
     let row = client
         .query_one(
-            "SELECT id,workspace_id,state,exit_code,timeout_seconds FROM sandbox_jobs WHERE id=$1",
+            "SELECT id,workspace_id,state,exit_code,timeout_seconds,terminal FROM sandbox_jobs WHERE id=$1",
             &[&job_id],
         )
         .await
@@ -168,7 +172,7 @@ pub async fn stop(
     client.execute("UPDATE sandbox_jobs SET state='cancelled',finished_at=clock_timestamp() WHERE id=$1 AND state IN ('queued','running')", &[&id]).await.map_err(Error::internal)?;
     let row = client
         .query_one(
-            "SELECT id,workspace_id,state,exit_code,timeout_seconds FROM sandbox_jobs WHERE id=$1",
+            "SELECT id,workspace_id,state,exit_code,timeout_seconds,terminal FROM sandbox_jobs WHERE id=$1",
             &[&id],
         )
         .await
@@ -190,6 +194,32 @@ pub async fn logs(
     Ok(Json(
         json!({"stdout_base64":STANDARD.encode(stdout),"stderr_base64":STANDARD.encode(stderr)}),
     ))
+}
+
+async fn terminal_job(state:&AppState,headers:&HeaderMap,id:Uuid,write:bool)->Result<Job,Error>{
+    let job=authorized_job(state,headers,id).await?;
+    if !job.terminal {return Err(Error::not_found());}
+    if write {
+        service::authorized(state,headers,job.workspace_id,Role::Write).await?;
+        if job.state!="running" {return Err(Error(StatusCode::CONFLICT,"terminal is not running"));}
+    }
+    Ok(job)
+}
+pub async fn terminal_input(State(state):State<Arc<AppState>>,headers:HeaderMap,
+    Path(id):Path<Uuid>,Json(input):Json<terminal::Input>)->Result<Json<Value>,Error>{
+    terminal_job(&state,&headers,id,true).await?;
+    Ok(Json(terminal::write_input(id,input)?))
+}
+pub async fn terminal_output(State(state):State<Arc<AppState>>,headers:HeaderMap,
+    Path(id):Path<Uuid>,Query(query):Query<terminal::OutputQuery>)->Result<Json<Value>,Error>{
+    terminal_job(&state,&headers,id,false).await?;
+    Ok(Json(terminal::read_output(&runner::job_root(&state,id).join("stdout.log"),query)?))
+}
+pub async fn terminal_resize(State(state):State<Arc<AppState>>,headers:HeaderMap,
+    Path(id):Path<Uuid>,Json(size):Json<terminal::Resize>)->Result<Json<Value>,Error>{
+    terminal_job(&state,&headers,id,true).await?;
+    terminal::resize(id,size.rows,size.columns)?;
+    Ok(Json(json!({"rows":size.rows,"columns":size.columns})))
 }
 
 #[derive(Deserialize)]
