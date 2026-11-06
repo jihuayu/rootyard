@@ -1,0 +1,28 @@
+{
+  "kind": "native_local_cluster_profile",
+  "binary_sha256": "27203db5f8f6cac103ef61e06867b205f718b4325a98367c3cc15769e24d6b70",
+  "node_count": 2,
+  "postgres_roles": [
+    "node0",
+    "node1",
+    "worker"
+  ],
+  "kafka_roles": [
+    "node0",
+    "node1",
+    "worker"
+  ],
+  "repository_id": "b40c0316-b1b0-440e-bf07-0bb616856b14",
+  "acknowledged_oid": "d308aa7d698f17ea6210aeab4427e09a053d8120",
+  "owner_clone_oid": "d308aa7d698f17ea6210aeab4427e09a053d8120",
+  "routed_browse_oid": "d308aa7d698f17ea6210aeab4427e09a053d8120",
+  "kafka_offset_before": 0,
+  "kafka_offset_after": 1,
+  "verified_at_unix": 1793952181,
+  "scope": "single trusted Linux host, separate Rust processes/volumes with external TLS/SASL dependencies",
+  "kafka_version": "4.4.0",
+  "postgres_tls": "verify-full",
+  "postgres_auth": "SCRAM-SHA-256",
+  "kafka_auth": "SASL/PLAIN over TLS",
+  "launcher_sha256": "9598fd26b055e0da65232cc8d52622dc29df6eef03dae93cacab75d42a55fc31"
+}
