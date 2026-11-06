@@ -289,6 +289,54 @@ def main():
         report["removed_object_negative_control"] = {"fixture": "copy of owner repository",
                                                        "removed_pinned_blob_oid": blob,
                                                        "cat_file_detected_missing": True, "native_fsck_failed": True}
+        # Forge backend resolution advances the authoritative repository
+        # generation without changing the shard route epoch. A previously
+        # signed, unused delegation must fail at the destination itself.
+        before_generation = int(h.sql("SELECT storage_generation FROM repositories WHERE id='" + h.repo["id"] + "'"))
+        status, route_raw = request(bases[0], browse_path + "/shard-route", h.alice)
+        assert status == 200
+        before_route = json.loads(route_raw)
+        def signed_delegation(path, generation):
+            envelope = {"version": 1,
+                        "authority_incarnation": h.sql("SELECT incarnation::text FROM cluster_authority WHERE singleton=true"),
+                        "nonce": str(uuid.uuid4()), "expires_unix": int(time.time()) + 30,
+                        "actor_id": h.sql("SELECT id::text FROM users WHERE username='alice'"),
+                        "token_id": h.reader["token_id"], "repository_id": h.repo["id"],
+                        "target_node_id": "shard-primary-0",
+                        "route_epoch": before_route["route_epoch"],
+                        "fencing_token": before_route["fencing_token"],
+                        "storage_generation": generation, "method": "GET", "path_and_query": path}
+            payload = json.dumps(envelope, separators=(",", ":")).encode()
+            return b64(payload) + "." + b64(hmac.new(signing_key, payload, hashlib.sha256).digest())
+        stale_browse = signed_delegation(browse_path + "/refs", before_generation)
+        git_discovery = repo_path + "/info/refs?service=git-upload-pack"
+        stale_git = signed_delegation(git_discovery, before_generation)
+        status, raw = request(bases[0], browse_path + "/backend", h.alice, "PATCH",
+                              {"storage_backend": "gitfs", "expected_storage_generation": before_generation,
+                               "write_paused": False})
+        assert status == 200, (status, raw[:300])
+        after_generation = int(h.sql("SELECT storage_generation FROM repositories WHERE id='" + h.repo["id"] + "'"))
+        assert after_generation == before_generation + 1
+        status, route_raw = request(bases[0], browse_path + "/shard-route", h.alice)
+        assert status == 200
+        after_route = json.loads(route_raw)
+        assert (before_route["route_epoch"], before_route["fencing_token"]) == (
+            after_route["route_epoch"], after_route["fencing_token"])
+        assert request(bases[0], browse_path + "/refs", None,
+                       extra_headers={"x-rootyard-cluster-delegation": stale_browse})[0] == 409
+        assert request(bases[0], git_discovery, None,
+                       extra_headers={"x-rootyard-cluster-delegation": stale_git})[0] == 409
+        assert request(bases[0], browse_path + "/refs", None,
+                       extra_headers={"x-rootyard-cluster-delegation":
+                                      signed_delegation(browse_path + "/refs", after_generation)})[0] == 200
+        assert request(bases[0], git_discovery, None,
+                       extra_headers={"x-rootyard-cluster-delegation":
+                                      signed_delegation(git_discovery, after_generation)})[0] == 200
+        report["stale_delegation"] = {"mutation": "native Forge backend PATCH gitfs generation increment",
+                                      "route_epoch_unchanged": True,
+                                      "old_generation": before_generation, "new_generation": after_generation,
+                                      "unused_old_browse_and_git_delegations_status": 409,
+                                      "fresh_browse_and_git_delegations_status": 200}
         report["untested"] = [item for item in report["untested"] if item != "cache eviction"] + ["CI mirror cache eviction"]
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
