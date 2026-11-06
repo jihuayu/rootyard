@@ -52,14 +52,31 @@ class LifecycleHarness(Harness):
         self.git("push", "origin", "HEAD:main", cwd=work, token=self.alice)
         q = "SELECT count(*) FROM storage_maintenance_jobs WHERE repository_id='" + repo["id"] + "' AND kind='gitfs_repack' AND state='succeeded'"
         self.wait_sql(q, "1")
+        self.wait_sql("SELECT count(*) FROM storage_maintenance_jobs WHERE repository_id='"
+                      + repo["id"] + "' AND kind='gitfs_cache_hydrate' AND state='succeeded'", "1")
         bare = self.root / "data" / "repos" / (repo["id"] + ".git")
+        assert (bare / "objects" / "info" / "commit-graph").is_file()
         self.git("--git-dir", str(bare), "cat-file", "-e", oid)
         self.git("fetch", "origin", cwd=work, token=self.alice)
+        time.sleep(2)
+        assert self.sql(q) == "1", "unchanged Git object counts caused repeated repacking"
         orphan = self.run(["git", "--git-dir", str(bare), "hash-object", "-w", "--stdin"],
                           data=b"unreferenced maintenance candidate\n").stdout.decode().strip()
         self.wait_sql("SELECT state FROM storage_maintenance_tombstones WHERE repository_id='"
                       + repo["id"] + "' AND oid='" + orphan + "'", "pending")
         assert (bare / "objects" / orphan[:2] / orphan[2:]).is_file()
+        tree = self.git("--git-dir", str(bare), "rev-parse", "main^{tree}").stdout.decode().strip()
+        pinned = self.git("-c", "user.name=Alice", "-c", "user.email=alice@rootyard.local",
+                          "--git-dir", str(bare), "commit-tree", tree, "-p", oid,
+                          "-m", "CI retained source").stdout.decode().strip()
+        pin_job = str(uuid.uuid4())
+        self.expect("/api/repos/alice/maint/ci-pins", (200, 201), token=self.alice,
+                    method="POST", body={"job_id": pin_job, "target_oid": pinned,
+                                         "storage_generation": 1})
+        assert self.git("--git-dir", str(bare), "rev-parse",
+                        "refs/rootyard-ci/jobs/" + pin_job).stdout.decode().strip() == pinned
+        assert pinned not in self.git("--git-dir", str(bare), "fsck", "--unreachable",
+                                      "--no-progress").stdout.decode()
 
         # A stale LFS transfer temporary file is independent of Git objects.
         staging = self.root / "data" / "lfs" / repo["id"]
@@ -71,9 +88,13 @@ class LifecycleHarness(Harness):
         while stale.exists() and time.monotonic() < until:
             time.sleep(.2)
         assert not stale.exists(), "stale upload was not reclaimed"
+        self.wait_sql("SELECT count(*) FROM storage_maintenance_jobs WHERE repository_id='"
+                      + repo["id"] + "' AND kind='gitfs_cache_hydrate' AND state IN ('queued','running')", "0")
         assert self.sql("SELECT count(*) FROM storage_maintenance_tombstones WHERE repository_id='" + repo["id"] + "' AND state='deleted'") == "0"
-        return {"repack_succeeded": True, "stale_stage_reclaimed": True,
-                "retained_commit": oid, "unreachable_oid_tombstoned_without_delete": orphan}
+        return {"repack_succeeded": True, "commit_graph_hydrated": True,
+                "stale_stage_reclaimed": True,
+                "retained_commit": oid, "ci_pin_root": pinned,
+                "unreachable_oid_tombstoned_without_delete": orphan}
 
     def expired_claim_reclaim(self):
         self.stop()
@@ -82,11 +103,17 @@ class LifecycleHarness(Harness):
         owner = str(uuid.uuid4())
         self.sql("INSERT INTO storage_maintenance_jobs(id,repository_id,tenant_id,kind,repository_generation,state,attempt,claim_generation,lease_owner,lease_until) "
                  "VALUES('" + fake + "','" + repo + "','" + self.alice["user_id"] + "','gitfs_cache_hydrate',1,'running',1,1,'" + owner + "',clock_timestamp()-interval '1 second')")
+        duplicate = self.run(["psql", "--dbname", self.db, "-X", "-v", "ON_ERROR_STOP=1", "-c",
+                              "INSERT INTO storage_maintenance_jobs(id,repository_id,tenant_id,kind,repository_generation) VALUES('"
+                              + str(uuid.uuid4()) + "','" + repo + "','" + self.alice["user_id"]
+                              + "','gitfs_cache_hydrate',1)"], check=False)
+        assert duplicate.returncode != 0, "duplicate queued wakeup bypassed unique active-kind index"
         self.start()
         self.wait_sql("SELECT state FROM storage_maintenance_jobs WHERE id='" + fake + "'", "succeeded")
         assert self.sql("SELECT attempt||':'||claim_generation FROM storage_maintenance_jobs WHERE id='" + fake + "'") == "2:2"
         assert self.sql("SELECT lease_owner IS NULL FROM storage_maintenance_jobs WHERE id='" + fake + "'") == "t"
-        return {"expired_attempt_reclaimed": 2, "late_owner_fenced": True}
+        return {"expired_attempt_reclaimed": 2, "late_owner_fenced": True,
+                "duplicate_active_kind_rejected": True}
 
     def killed_worker_volume_barrier(self):
         self.stop()
