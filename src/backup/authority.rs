@@ -5,6 +5,8 @@ use tokio_postgres::Client;
 pub(super) async fn fence(client: &Client) -> Result<()> {
     client.batch_execute(
         "BEGIN;
+         UPDATE public.cluster_authority SET incarnation=gen_random_uuid(),rotated_at=clock_timestamp() WHERE singleton=true;
+         DELETE FROM public.cluster_transport_nonces;
          UPDATE public.ci_runs SET state='cancelled',lease_generation=lease_generation+1,
              lease_expires_unix=0,runner_id=NULL,updated_at=clock_timestamp()
              WHERE state IN ('queued','leased');
