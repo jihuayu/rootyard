@@ -23,6 +23,9 @@ pub mod mirror_lfs;
 pub mod authority;
 #[path = "ci_checkouts/integration.rs"]
 pub mod integration;
+#[path = "ci_checkouts/origin.rs"]
+mod origin;
+pub(crate) use origin::origin_job_path;
 pub(crate) use authority::authenticate;
 #[allow(unused_imports)] // consumed by Git HTTP when the CI and transport branches integrate
 pub(crate) use authority::still_authorized;
@@ -30,12 +33,17 @@ pub(crate) use authority::still_authorized;
 pub fn mirror_routes() -> Router<Arc<AppState>> {
     Router::new().route("/api/repos/{owner}/{name}/ci-checkouts/{job}/prepare-dependencies",
         post(mirror_prepare::prepare))
+        .merge(lfs_routes())
+}
+
+fn lfs_routes()->Router<Arc<AppState>> {
+    Router::new()
         .route("/ci/{target}/git/{owner}/{name}/info/lfs/objects/batch", post(mirror_lfs::batch))
         .route("/ci/{target}/git/{owner}/{name}/info/lfs/objects/{oid}", axum::routing::get(mirror_lfs::download))
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
-    Router::new()
+    Router::new().merge(lfs_routes())
         .route("/api/repos/{owner}/{name}/ci-checkouts", post(issue))
         .route(
             "/api/repos/{owner}/{name}/ci-checkouts/{job}/cancel",
