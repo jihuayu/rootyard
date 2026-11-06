@@ -22,7 +22,7 @@ const MAX_REFS: usize = 4096;
 mod core;
 pub use core::{Operation, RefChange, HookPhase, HookEvent, ActiveGuard,
     begin, begin_active, sequence, pending};
-pub(crate) use core::{safe_path, mkdir, read, exists, atomic, begin_ci, begin_ci_service};
+pub(crate) use core::{safe_path, mkdir, read, exists, atomic, begin_ci, begin_ci_service, begin_proposal};
 use core::{load, entries, sync_dir, validate, op_name};
 
 pub(crate) fn valid_ref(s: &str) -> bool {
@@ -354,7 +354,7 @@ pub fn run_pre_receive() -> Result<()> {
     let (op, input) = hook_input()?;
     // No maintenance capability can turn a receive-pack into a privileged writer.
     ensure!(
-        op.ci_pin.is_none(),
+        op.ci_pin.is_none() && op.proposal_pin.is_none(),
         "maintenance operations cannot receive pushes"
     );
     let changes = parse(&input)?;
@@ -379,6 +379,9 @@ fn validate_namespace(op: &Operation, changes: &[RefChange]) -> Result<()> {
             crate::ci_pins::load_intent(root, intent.repository_id, intent.job_id)? == *intent,
             "maintenance intent changed"
         );
+    } else if let Some(intent)=&op.proposal_pin {
+        intent.validate()?;
+        ensure!(changes==[intent.change()],"proposal transaction differs from exact grant");
     } else {
         ensure!(
             changes
