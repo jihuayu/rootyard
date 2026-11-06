@@ -166,6 +166,7 @@ async fn execute_ref_transaction_inner(
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     let mut repo = db::Repository::from_row(&repo_row);
+    crate::pando_gateway::transition::admit_write(&state.pool, repo.id, &repo.storage_backend).await?;
 
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(

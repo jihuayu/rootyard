@@ -174,10 +174,13 @@ pub async fn acquire(
                 let tx = client.transaction().await.map_err(Error::internal)?;
                 tx.batch_execute("SET LOCAL idle_in_transaction_session_timeout='5s'; SET LOCAL statement_timeout='3s'")
                     .await.map_err(Error::internal)?;
-                let row = tx.query_opt("SELECT storage_generation,state FROM repositories WHERE id=$1",
+                let row = tx.query_opt("SELECT storage_generation,state,transition_state FROM repositories WHERE id=$1",
                     &[&repository_id]).await.map_err(Error::internal)?
                     .ok_or_else(Error::not_found)?;
-                if row.get::<_, i64>(0) != generation || row.get::<_, String>(1) != "ready" {
+                if row.get::<_, i64>(0) != generation
+                    || row.get::<_, String>(1) != "ready"
+                    || row.get::<_, String>(2) != "stable"
+                {
                     return Err(Error(StatusCode::CONFLICT, "repository generation or state changed"));
                 }
                 let mut all = true;
@@ -207,10 +210,13 @@ pub async fn acquire(
                                     if request.is_closed() { break; }
                                     let granted: bool = tx.query_one(LOCK_REPOSITORY, &[&repository_id])
                                         .await.map_err(Error::internal)?.get(0);
-                                    let row = tx.query_opt("SELECT storage_generation,state FROM repositories WHERE id=$1",
+                                    let row = tx.query_opt("SELECT storage_generation,state,transition_state FROM repositories WHERE id=$1",
                                         &[&repository_id]).await.map_err(Error::internal)?
                                         .ok_or_else(Error::not_found)?;
-                                    if row.get::<_, i64>(0) != generation || row.get::<_, String>(1) != "ready" {
+                                    if row.get::<_, i64>(0) != generation
+                                        || row.get::<_, String>(1) != "ready"
+                                        || row.get::<_, String>(2) != "stable"
+                                    {
                                         return Err(Error(StatusCode::CONFLICT, "repository generation or state changed"));
                                     }
                                     active_send.send_replace(Some(Instant::now()));
@@ -222,10 +228,13 @@ pub async fn acquire(
                         }
                     }
                     let row = tokio::time::timeout(Duration::from_millis(1500),
-                        tx.query_opt("SELECT storage_generation,state FROM repositories WHERE id=$1",
+                        tx.query_opt("SELECT storage_generation,state,transition_state FROM repositories WHERE id=$1",
                             &[&repository_id])).await.map_err(|_| unavailable())?
                         .map_err(Error::internal)?.ok_or_else(Error::not_found)?;
-                    if row.get::<_, i64>(0) != generation || row.get::<_, String>(1) != "ready" {
+                    if row.get::<_, i64>(0) != generation
+                        || row.get::<_, String>(1) != "ready"
+                        || row.get::<_, String>(2) != "stable"
+                    {
                         return Err(Error(StatusCode::CONFLICT, "repository generation or state changed"));
                     }
                     active_send.send_replace(Some(Instant::now()));
@@ -269,7 +278,7 @@ mod tests {
         let mut url = reqwest::Url::parse(&base_url).unwrap();
         url.query_pairs_mut().append_pair("options", &format!("-csearch_path={schema}"));
         let pool = crate::db::pool(url.as_str()).unwrap();
-        pool.get().await.unwrap().batch_execute("CREATE TABLE repositories(id uuid PRIMARY KEY, storage_generation bigint NOT NULL, state text NOT NULL)").await.unwrap();
+        pool.get().await.unwrap().batch_execute("CREATE TABLE repositories(id uuid PRIMARY KEY, storage_generation bigint NOT NULL, state text NOT NULL, transition_state text NOT NULL DEFAULT 'stable')").await.unwrap();
         let repo = Uuid::new_v4();
         pool.get().await.unwrap().execute("INSERT INTO repositories VALUES($1,1,'ready')", &[&repo]).await.unwrap();
         let until = || Instant::now() + Duration::from_secs(2);

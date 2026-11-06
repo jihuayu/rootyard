@@ -26,6 +26,7 @@ pub struct PandoBackupManifest {
     pub storage_generation: i64,
     pub ref_generation: i64,
     pub object_format: String,
+    pub head_ref: String,
     pub refs: BTreeMap<String, String>,
     pub packs: Vec<PackManifest>,
 }
@@ -43,7 +44,7 @@ async fn inventory<C: GenericClient + Sync>(client: &C, repo_id: Uuid) -> Result
     let row = client
         .query_one(
             "SELECT r.owner_id,r.storage_backend,r.storage_generation,r.object_format, \
-        s.state,s.ref_generation,s.pack_ids FROM repositories r \
+        s.state,s.ref_generation,s.head_ref,s.pack_ids FROM repositories r \
         JOIN pando_repository_states s ON s.repository_id=r.id AND s.tenant_id=r.owner_id \
         WHERE r.id=$1 AND s.storage_generation=r.storage_generation",
             &[&repo_id],
@@ -54,6 +55,11 @@ async fn inventory<C: GenericClient + Sync>(client: &C, repo_id: Uuid) -> Result
         "Pando backup requires a serving PG snapshot"
     );
     let tenant_id: Uuid = row.get("owner_id");
+    let head_ref: String = row.get("head_ref");
+    ensure!(
+        head_ref.starts_with("refs/heads/") && crate::journal::valid_ref(&head_ref),
+        "Pando backup HEAD is invalid"
+    );
     let pack_ids: Vec<Uuid> = row.get("pack_ids");
     ensure!(!pack_ids.is_empty() && pack_ids.len() <= MAX_PACKS, "Pando pack closure exceeds bound");
     let mut packs = Vec::with_capacity(pack_ids.len());
@@ -96,6 +102,7 @@ async fn inventory<C: GenericClient + Sync>(client: &C, repo_id: Uuid) -> Result
         storage_generation: row.get("storage_generation"),
         ref_generation: row.get("ref_generation"),
         object_format: row.get("object_format"),
+        head_ref,
         refs,
         packs,
     })

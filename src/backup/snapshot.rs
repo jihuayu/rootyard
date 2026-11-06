@@ -23,6 +23,12 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     tx.batch_execute(&format!("LOCK TABLE {list} IN SHARE MODE")).await?;
     // No snapshot-taking SELECT occurs before all DML/DDL table locks are held.
     let versions = schema(&tx, FORMAT).await?;
+    tx.batch_execute("SET LOCAL search_path=public").await?;
+    // A durable cutover/rollback fence means the backend authority is in
+    // motion. Never capture a paired backup from a repository under transition.
+    let transitioning: i64 =
+        tx.query_one("SELECT count(*) FROM public.repositories WHERE transition_state <> 'stable'", &[]).await?.get(0);
+    ensure!(transitioning == 0, "backup requires a stable storage transition fence");
     let snapshot: String = tx.query_one("SELECT pg_export_snapshot()", &[]).await?.get(0);
     let boundary = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let postgres_version: String = tx.query_one("SHOW server_version", &[]).await?.get(0);
@@ -57,6 +63,25 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     fs::set_permissions(staging.join("metadata.dump"), fs::Permissions::from_mode(0o600))?;
     File::open(staging.join("metadata.dump"))?.sync_all()?;
     copy_volume(&root, &staging.join("volume"), &source_inventory)?;
+    // Pando authority lives in remote encrypted packs, not the volume. Export
+    // the exact committed closure under the same repeatable-read transaction so
+    // the archive carries both pando_refs/HEAD and every encrypted artifact.
+    let pando_root = staging.join("pando");
+    private_dir(&pando_root)?;
+    let pando_repos: Vec<Uuid> = tx
+        .query("SELECT id FROM public.repositories WHERE storage_backend='pando' ORDER BY id", &[])
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    if !pando_repos.is_empty() {
+        let remote = crate::storage::remote_objects::RemoteObjectStore::from_env(root.join("pando-pack-work"))?;
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+        for repo in pando_repos {
+            crate::pando_gateway::backup::export_closure(&tx, &remote, repo, &pando_root.join(repo.to_string()), until)
+                .await?;
+        }
+    }
     ensure!(inventory(&root)? == source_inventory, "volume changed during barrier");
     // Prove the exporting session still owns its transaction before publishing.
     tx.query_one("SELECT 1", &[]).await?;
@@ -73,6 +98,9 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     );
     for (name, entry) in source_inventory {
         files.insert(format!("volume/{name}"), entry);
+    }
+    for (name, entry) in inventory(&pando_root)? {
+        files.insert(format!("pando/{name}"), entry);
     }
     let manifest = Manifest {
         format: FORMAT,

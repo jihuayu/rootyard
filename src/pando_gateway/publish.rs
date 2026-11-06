@@ -77,7 +77,7 @@ pub async fn publish(
     }
     let current = tx
         .query_one(
-            "SELECT r.storage_generation,r.storage_backend,r.object_format,
+            "SELECT r.storage_generation,r.storage_backend,r.object_format,r.transition_state,
         s.state,s.storage_generation AS pando_generation,s.ref_generation,s.operation_sequence,
         s.object_format AS pando_format,s.pack_ids FROM repositories r JOIN pando_repository_states s
         ON s.repository_id=r.id WHERE r.id=$1 AND s.tenant_id=$2 FOR UPDATE OF s",
@@ -88,6 +88,7 @@ pub async fn publish(
     if current.get::<_, i64>("storage_generation") != repo.storage_generation
         || current.get::<_, i64>("pando_generation") != repo.storage_generation
         || current.get::<_, &str>("storage_backend") != "pando"
+        || current.get::<_, &str>("transition_state") != "stable"
         || current.get::<_, &str>("state") != "serving"
         || current.get::<_, &str>("object_format") != repo.object_format
         || current.get::<_, &str>("pando_format") != repo.object_format

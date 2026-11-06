@@ -24,6 +24,7 @@ pub struct Snapshot {
     path: PathBuf,
     pub storage_generation: i64,
     pub ref_generation: i64,
+    pub head_ref: String,
     pub refs: BTreeMap<String, String>,
     pub source_packs: Vec<Uuid>,
 }
@@ -73,7 +74,7 @@ pub async fn materialize(
         let row = client
             .query_one(
                 "SELECT r.owner_id,r.storage_backend,r.storage_generation,r.object_format, \
-             s.state,s.ref_generation,s.pack_ids FROM repositories r \
+             s.state,s.ref_generation,s.head_ref,s.pack_ids FROM repositories r \
              JOIN pando_repository_states s ON s.repository_id=r.id \
              WHERE r.id=$1 AND s.tenant_id=r.owner_id AND \
              s.storage_generation=r.storage_generation AND s.object_format=r.object_format",
@@ -83,6 +84,7 @@ pub async fn materialize(
         let tenant: Uuid = row.get("owner_id");
         let generation: i64 = row.get("storage_generation");
         let ref_generation: i64 = row.get("ref_generation");
+        let head_ref: String = row.get("head_ref");
         let pack_ids: Vec<Uuid> = row.get("pack_ids");
         ensure!(
             row.get::<_, &str>("storage_backend") == "pando"
@@ -92,6 +94,10 @@ pub async fn materialize(
             "Pando repository has no serving authoritative snapshot"
         );
         ensure!(!pack_ids.is_empty() && pack_ids.len() <= MAX_PACKS, "Pando pack snapshot exceeds bounded view");
+        ensure!(
+            head_ref.starts_with("refs/heads/") && crate::journal::valid_ref(&head_ref),
+            "Pando advertised HEAD is invalid"
+        );
         let rows = client
             .query(
                 "SELECT ref_name,oid FROM pando_refs \
@@ -135,8 +141,14 @@ pub async fn materialize(
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         let path = root.join(format!(".snapshot-{}", Uuid::new_v4()));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-        let snapshot =
-            Snapshot { path, storage_generation: generation, ref_generation, refs, source_packs: pack_ids.clone() };
+        let snapshot = Snapshot {
+            path,
+            storage_generation: generation,
+            ref_generation,
+            head_ref,
+            refs,
+            source_packs: pack_ids.clone(),
+        };
         let format_arg = format!("--object-format={}", repo.object_format);
         run_git(state, snapshot.path(), &["init", "--bare", &format_arg], lease, deadline).await?;
         let store = PackStore::from_env(state.storage.root.join("pando-pack-work"), state.config.git.clone())?;
@@ -166,19 +178,9 @@ pub async fn materialize(
             );
             run_git(state, snapshot.path(), &["update-ref", "--no-deref", name, oid], lease, deadline).await?;
         }
-        // A disposable bare repository would otherwise advertise an invented
-        // default branch. Point HEAD at an authoritative branch that exists.
-        let head_ref = if snapshot.refs.contains_key("refs/heads/main") {
-            "refs/heads/main".to_owned()
-        } else {
-            snapshot
-                .refs
-                .keys()
-                .find(|name| name.starts_with("refs/heads/"))
-                .cloned()
-                .unwrap_or_else(|| "refs/heads/main".to_owned())
-        };
-        run_git(state, snapshot.path(), &["symbolic-ref", "HEAD", &head_ref], lease, deadline).await?;
+        // The advertised HEAD is part of the authoritative snapshot. A disposable
+        // bare repository must not invent a default branch from git init.
+        run_git(state, snapshot.path(), &["symbolic-ref", "HEAD", &snapshot.head_ref], lease, deadline).await?;
         run_git(state, snapshot.path(), &["fsck", "--full", "--strict"], lease, deadline).await?;
         active(lease)?;
         let client = state.pool.get().await?;

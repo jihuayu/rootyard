@@ -17,9 +17,9 @@ pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
             include_str!("../../schema/060_upgraded_catalog.json"),
         ],
         6 => [
-            include_str!("../../schema/125_catalog.json"),
-            include_str!("../../schema/125_restored_catalog.json"),
-            include_str!("../../schema/125_upgraded_catalog.json"),
+            include_str!("../../schema/128_catalog.json"),
+            include_str!("../../schema/128_restored_catalog.json"),
+            include_str!("../../schema/128_upgraded_catalog.json"),
         ],
         _ => bail!("unsupported backup format"),
     };
