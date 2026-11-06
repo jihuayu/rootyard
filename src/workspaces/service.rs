@@ -1,5 +1,5 @@
 use super::models::{CreateWorkspace, LeaseRequest, WS_COLUMNS, Workspace};
-use crate::{AppState, Error, auth, members::models::Role};
+use crate::{AppState, Error, auth, members::models::Role, storage::read_leases};
 use axum::{
     Json,
     extract::{Path, State},
@@ -306,12 +306,14 @@ pub async fn create(
         return Ok((StatusCode::OK, Json(saved)));
     }
     let id = Uuid::new_v4();
-    let source = state
-        .storage
-        .verify_path(repo.repo_id)
-        .map_err(Error::internal)?;
+    let source_lease=read_leases::shared(&state.pool,repo.repo_id,
+        tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let refreshed=auth::authorize_repo_with_role(&tx,&actor,&input.owner,&input.repository,Role::Write).await?;
+    if refreshed.repo_id!=repo.repo_id { return Err(Error::not_found()); }
+    let source = state.storage.verify_path(repo.repo_id).map_err(Error::internal)?;
     let dest = super::mounts::lower_path(&state, id);
     clone_repo(&source, &dest)?;
+    source_lease.ensure_active()?;
     if let Some(base) = &input.base_oid {
         if !crate::browse::models::valid_non_zero_oid(base) {
             return Err(Error::bad_request());
