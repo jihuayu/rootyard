@@ -373,6 +373,9 @@ pub async fn authenticate_delegation(state: &Arc<AppState>, headers: &HeaderMap,
     // changing placement or the route epoch. Ingress may have signed this
     // envelope just before that transaction committed. Re-read the authority
     // generation here; route watermarks alone cannot invalidate that request.
+    // A configured required_generation ahead of the repository is a readiness
+    // floor, not authority to process a future-generation request. It remains
+    // closed until the repository itself advances to that generation.
     let current_generation: i64 = tx.query_one(
         "SELECT storage_generation FROM repositories WHERE id = $1", &[&access.repo_id],
     ).await.map_err(Error::internal)?.get(0);
