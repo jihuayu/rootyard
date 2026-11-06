@@ -1,0 +1,373 @@
+{
+  "kind": "native_cluster_client_workload",
+  "binary_sha256": "179d98f6689bc7f97509271a5bed8e24fb8b7bd36870cf53997e0f1ec75cd27b",
+  "harness_sha256": "f48d767585388bbb30faf07ea1980eb2ebc33575d20ae7b56c91d4922a0ac21c",
+  "source_base_commit": "21dfe047f07fa2473f66ef2cdaca3175fafc0416",
+  "git_version": "git version 2.52.0",
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "mem_total_kb": 18440100
+  },
+  "dataset": "one private repository, 24 sequential one-file commits, eight push/fetch pairs per tier",
+  "topology": "distinct Rust processes and storage directories; one PostgreSQL schema; loopback signed forwarding",
+  "tiers": [
+    {
+      "node_count": 1,
+      "duration_ms": 4156.273,
+      "push": {
+        "count": 8,
+        "p50_ms": 238.694,
+        "p95_ms": 269.102,
+        "p99_ms": 269.102
+      },
+      "fetch": {
+        "count": 8,
+        "p50_ms": 266.863,
+        "p95_ms": 293.311,
+        "p99_ms": 293.311
+      },
+      "host_loopback_rx_delta_bytes": 2602952,
+      "host_loopback_tx_delta_bytes": 2602952,
+      "git_operation_rows": 11,
+      "processes": [
+        {
+          "pid": 479491,
+          "rss_kb": 25184,
+          "read_bytes": 0,
+          "write_bytes": 50311168
+        }
+      ]
+    },
+    {
+      "node_count": 2,
+      "duration_ms": 4237.028,
+      "push": {
+        "count": 8,
+        "p50_ms": 239.472,
+        "p95_ms": 301.421,
+        "p99_ms": 301.421
+      },
+      "fetch": {
+        "count": 8,
+        "p50_ms": 257.702,
+        "p95_ms": 321.54,
+        "p99_ms": 321.54
+      },
+      "host_loopback_rx_delta_bytes": 1077468,
+      "host_loopback_tx_delta_bytes": 1077468,
+      "git_operation_rows": 19,
+      "processes": [
+        {
+          "pid": 479491,
+          "rss_kb": 25252,
+          "read_bytes": 0,
+          "write_bytes": 50675712
+        },
+        {
+          "pid": 479641,
+          "rss_kb": 22828,
+          "read_bytes": 0,
+          "write_bytes": 48861184
+        }
+      ]
+    },
+    {
+      "node_count": 4,
+      "duration_ms": 4420.917,
+      "push": {
+        "count": 8,
+        "p50_ms": 237.516,
+        "p95_ms": 289.401,
+        "p99_ms": 289.401
+      },
+      "fetch": {
+        "count": 8,
+        "p50_ms": 280.502,
+        "p95_ms": 346.162,
+        "p99_ms": 346.162
+      },
+      "host_loopback_rx_delta_bytes": 1484848,
+      "host_loopback_tx_delta_bytes": 1484848,
+      "git_operation_rows": 27,
+      "processes": [
+        {
+          "pid": 479491,
+          "rss_kb": 25264,
+          "read_bytes": 0,
+          "write_bytes": 51249152
+        },
+        {
+          "pid": 479641,
+          "rss_kb": 22852,
+          "read_bytes": 0,
+          "write_bytes": 48861184
+        },
+        {
+          "pid": 479649,
+          "rss_kb": 22564,
+          "read_bytes": 0,
+          "write_bytes": 48865280
+        },
+        {
+          "pid": 479657,
+          "rss_kb": 22728,
+          "read_bytes": 0,
+          "write_bytes": 48877568
+        }
+      ]
+    }
+  ],
+  "failure": {
+    "read_while_owner_stopped_status": 502,
+    "browse_while_owner_stopped_status": 502,
+    "injection": "SIGKILL owner process group",
+    "rpo_lost_acknowledged_commits": 0,
+    "acknowledged_commits_checked": 24,
+    "unreachable_owner_failed_closed": true,
+    "rto_read_ms": 330.544,
+    "rto_write_ms": 680.136,
+    "post_restart_acknowledged_oid": "b919d53b6d1302b7ce16cb8969f81caf74eeb61e",
+    "process_restart_ms": 123.876
+  },
+  "raw": [
+    {
+      "tier": 1,
+      "sequence": 0,
+      "ingress_node": 0,
+      "acknowledged_oid": "641fc93cc8ba834d57e111ba923f8ff48ccf2cf0",
+      "push_ms": 207.822,
+      "fetch_ms": 258.715
+    },
+    {
+      "tier": 1,
+      "sequence": 1,
+      "ingress_node": 0,
+      "acknowledged_oid": "e7f4d4e8386ffeb79994a8fd58490edf6331a13d",
+      "push_ms": 269.102,
+      "fetch_ms": 293.02
+    },
+    {
+      "tier": 1,
+      "sequence": 2,
+      "ingress_node": 0,
+      "acknowledged_oid": "6db54eeebd086372f8024a826f29e15569577eee",
+      "push_ms": 259.323,
+      "fetch_ms": 277.054
+    },
+    {
+      "tier": 1,
+      "sequence": 3,
+      "ingress_node": 0,
+      "acknowledged_oid": "9ba7e98fdca7dc20dd6c564f394980f497a40748",
+      "push_ms": 244.605,
+      "fetch_ms": 251.313
+    },
+    {
+      "tier": 1,
+      "sequence": 4,
+      "ingress_node": 0,
+      "acknowledged_oid": "d72d92892efe5edad25f55e385d27a703f3f02eb",
+      "push_ms": 238.694,
+      "fetch_ms": 293.311
+    },
+    {
+      "tier": 1,
+      "sequence": 5,
+      "ingress_node": 0,
+      "acknowledged_oid": "c84613268a3c2319947f56fd4f7638c4eaa30fb3",
+      "push_ms": 222.444,
+      "fetch_ms": 266.863
+    },
+    {
+      "tier": 1,
+      "sequence": 6,
+      "ingress_node": 0,
+      "acknowledged_oid": "8d1b8f59c8ffee668d3e306e2c8136e7d5535e41",
+      "push_ms": 237.352,
+      "fetch_ms": 271.219
+    },
+    {
+      "tier": 1,
+      "sequence": 7,
+      "ingress_node": 0,
+      "acknowledged_oid": "2a830ab408d44eceda361c240cbab1f5eda891da",
+      "push_ms": 249.861,
+      "fetch_ms": 245.968
+    },
+    {
+      "tier": 2,
+      "sequence": 0,
+      "ingress_node": 0,
+      "acknowledged_oid": "f04bcf7bb8dec3eae88996a3b44a30ad3c6bdfeb",
+      "push_ms": 216.254,
+      "fetch_ms": 262.974
+    },
+    {
+      "tier": 2,
+      "sequence": 1,
+      "ingress_node": 1,
+      "acknowledged_oid": "0bef18fb6b709fb1b0a165d05116b2287ab5a6b2",
+      "push_ms": 227.498,
+      "fetch_ms": 249.671
+    },
+    {
+      "tier": 2,
+      "sequence": 2,
+      "ingress_node": 0,
+      "acknowledged_oid": "c24eaa6a52ae7608e4004e39978f276001b961b7",
+      "push_ms": 230.081,
+      "fetch_ms": 257.702
+    },
+    {
+      "tier": 2,
+      "sequence": 3,
+      "ingress_node": 1,
+      "acknowledged_oid": "f14878596902f5b9b8d530f9739c8dea485845f1",
+      "push_ms": 301.421,
+      "fetch_ms": 321.54
+    },
+    {
+      "tier": 2,
+      "sequence": 4,
+      "ingress_node": 0,
+      "acknowledged_oid": "70727d3f31c1e38cac2b269b4aad0154015a79f3",
+      "push_ms": 282.938,
+      "fetch_ms": 252.821
+    },
+    {
+      "tier": 2,
+      "sequence": 5,
+      "ingress_node": 1,
+      "acknowledged_oid": "632eab1734a64573dd655dc76bf79ee05dfc24b0",
+      "push_ms": 244.767,
+      "fetch_ms": 262.311
+    },
+    {
+      "tier": 2,
+      "sequence": 6,
+      "ingress_node": 0,
+      "acknowledged_oid": "8b8cc874bf54d24b437245a15d36e52dbccbd7a2",
+      "push_ms": 239.472,
+      "fetch_ms": 248.958
+    },
+    {
+      "tier": 2,
+      "sequence": 7,
+      "ingress_node": 1,
+      "acknowledged_oid": "109e5f7cf2c73c7057beca7a454f6055603f87cb",
+      "push_ms": 248.797,
+      "fetch_ms": 312.022
+    },
+    {
+      "tier": 4,
+      "sequence": 0,
+      "ingress_node": 0,
+      "acknowledged_oid": "736f854e754238bc820165284fe7727da25ecb68",
+      "push_ms": 239.587,
+      "fetch_ms": 270.871
+    },
+    {
+      "tier": 4,
+      "sequence": 1,
+      "ingress_node": 1,
+      "acknowledged_oid": "579504d418842eda7df6be87ce34f194eb92cbf9",
+      "push_ms": 282.22,
+      "fetch_ms": 346.162
+    },
+    {
+      "tier": 4,
+      "sequence": 2,
+      "ingress_node": 2,
+      "acknowledged_oid": "f0eb2879f87ca91535077c5da28cc256b81ada07",
+      "push_ms": 289.401,
+      "fetch_ms": 323.237
+    },
+    {
+      "tier": 4,
+      "sequence": 3,
+      "ingress_node": 3,
+      "acknowledged_oid": "8c564757419aa7954b50ae68f11b429500ca3e51",
+      "push_ms": 237.516,
+      "fetch_ms": 280.502
+    },
+    {
+      "tier": 4,
+      "sequence": 4,
+      "ingress_node": 0,
+      "acknowledged_oid": "fa6f6f41841e170c3bd31f01b0039c25e39436e6",
+      "push_ms": 221.098,
+      "fetch_ms": 256.502
+    },
+    {
+      "tier": 4,
+      "sequence": 5,
+      "ingress_node": 1,
+      "acknowledged_oid": "5b435383328446673d3b0a1de36a953d3d47b5e4",
+      "push_ms": 229.707,
+      "fetch_ms": 289.973
+    },
+    {
+      "tier": 4,
+      "sequence": 6,
+      "ingress_node": 2,
+      "acknowledged_oid": "06e64630ed9615045ef777c734c4c29fee2ad723",
+      "push_ms": 235.308,
+      "fetch_ms": 263.66
+    },
+    {
+      "tier": 4,
+      "sequence": 7,
+      "ingress_node": 3,
+      "acknowledged_oid": "a88d0fd2afe21e6c561811c134676a58029ed293",
+      "push_ms": 259.06,
+      "fetch_ms": 329.009
+    }
+  ],
+  "untested": [
+    "automatic takeover",
+    "physical storage fencing",
+    "PostgreSQL HA",
+    "network partition",
+    "disk pressure",
+    "CI mirror cache eviction"
+  ],
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "browse_routing": {
+    "read_ingress_nodes": [
+      1,
+      2,
+      3
+    ],
+    "owner_only_ref_transaction_idempotent_across_ingress": true,
+    "unrelated_tenant_denied": true,
+    "delegation_replay_cross_path_and_tamper_rejected": true,
+    "ref_transaction_operation_id": "aa63731b-fe63-4647-8e03-0344e9099df0"
+  },
+  "retained_root": {
+    "ref": "refs/rootyard-ci/jobs/bench",
+    "reachable_oids_after_gc": 79,
+    "native_fsck": "passed",
+    "gc_overlapped_client_fetches": true
+  },
+  "client_cache_eviction": {
+    "removed_local_clone_and_refetched_from_node4": true,
+    "acknowledged_oid": "b919d53b6d1302b7ce16cb8969f81caf74eeb61e"
+  },
+  "removed_object_negative_control": {
+    "fixture": "copy of owner repository",
+    "removed_pinned_blob_oid": "2409227e1ab2c45dc68c848178aafbb50fd95413",
+    "cat_file_detected_missing": true,
+    "native_fsck_failed": true
+  },
+  "stale_delegation": {
+    "mutation": "native Forge backend PATCH gitfs generation increment",
+    "route_epoch_unchanged": true,
+    "old_generation": 1,
+    "new_generation": 2,
+    "unused_old_browse_and_git_delegations_status": 409,
+    "fresh_browse_and_git_delegations_status": 200,
+    "future_required_generation_ingress_status": 409
+  }
+}
