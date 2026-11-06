@@ -45,7 +45,12 @@ pub const fn forbidden(msg: &'static str) -> Error {
 
 pub fn json(status: StatusCode, value: impl Serialize) -> Response {
     match serde_json::to_vec(&value) {
-        Ok(bytes) => (status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
+        Ok(bytes) => (
+            status,
+            [(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-store")],
+            bytes,
+        )
+            .into_response(),
         Err(err) => Error::internal(err).into_response(),
     }
 }
