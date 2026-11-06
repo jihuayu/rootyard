@@ -41,3 +41,17 @@ layer. It does not lazily fetch individual files from remote CAS, implement
 dirty-safe cache eviction, or prewarm an offline sparse tree. Checkpoints become
 remote-durable only after the separate authenticated publish step reports
 `committed`; local capture reports `local_complete`.
+
+Signed CI integrations can start an origin-backed sandbox at
+`/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/sandbox-jobs`.
+The request supplies the claimed runner ID, attempt, lease generation, head OID,
+storage generation, command and timeout. The service rechecks the signed
+integration, active trusted context and open PR candidate, exact root checkout
+plan, and run lease before preparing a local checkout at that OID. It stores the
+CI run tuple without a user identity, executes the command in bubblewrap, and
+rechecks authority until completion. The same signed tuple authorizes status,
+cancellation and bounded logs. Ordinary user sandbox routes cannot access CI
+jobs. In-service execution currently accepts `source=origin`; mirror-scheduled
+claims use the external runner because a trusted in-service mirror materializer
+is not present. The native CI test uses development namespace mode; production
+aggregate resource limits require a delegated cgroup v2 root.
