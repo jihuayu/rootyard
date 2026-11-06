@@ -29,6 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import native_evidence
 
 
 class Harness:
@@ -108,9 +109,14 @@ class Harness:
                     if not allow_incomplete:
                         raise
                     data = error.partial
+                native_evidence.record(self, "http_response", method=method,
+                                       path=path.split("?", 1)[0], status=r.status, response_bytes=len(data))
                 return r.status, data, dict(r.headers)
         except urllib.error.HTTPError as e:
-            return e.code, e.read(), dict(e.headers)
+            data = e.read()
+            native_evidence.record(self, "http_response", method=method,
+                                   path=path.split("?", 1)[0], status=e.code, response_bytes=len(data))
+            return e.code, data, dict(e.headers)
 
     def git(self, *args, cwd=None, token=None, check=True, env=None):
         prefix = ["git"]
@@ -129,6 +135,7 @@ class Harness:
                 raise RuntimeError("Server exited during startup; inspect retained server.log")
             try:
                 if self.http("/health/ready")[0] == 200:
+                    native_evidence.started(self)
                     return
             except (OSError, urllib.error.URLError):
                 pass

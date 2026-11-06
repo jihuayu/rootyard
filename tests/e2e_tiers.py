@@ -21499,9 +21499,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--tier", choices=("1", "2", "3", "4", "all"), default="all", help="Test tier to execute")
     parser.add_argument("--feature", default=None, help="Filter by feature ID (F1..F51)")
     parser.add_argument("--report", default=None, help="Optional path to write JSON test report")
-    parser.add_argument("--binary", default="target/debug/rootyard", help="Optional compiled binary path")
+    parser.add_argument("--binary", default="target/debug/rootyard", help="Required native service binary")
+    parser.add_argument("--reference-only", action="store_true", help="Run Python reference models; not native acceptance evidence")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose test output")
     args = parser.parse_args(argv)
+
+    if not args.reference_only:
+        from native_tiers import run
+        return run(args)
 
     suite = build_suite(tier=args.tier, feature=args.feature)
     total_scheduled = suite.countTestCases()
@@ -21514,6 +21519,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     passed = result.testsRun - len(result.failures) - len(result.errors) - len(result.skipped)
     summary = {
+        "backend": "reference_model",
+        "production_acceptance": False,
         "tier": args.tier,
         "feature": args.feature,
         "total": result.testsRun,
