@@ -158,6 +158,15 @@ def main():
         third = json.loads(h.expect(path, 200, token=h.alice, method="POST", body=request_body))
         assert third["state"] == "verified"
         assert h.git("--git-dir=" + str(target_repo), "rev-parse", "refs/heads/main").stdout.decode().strip() == acknowledged_tip
+        # A controller that cannot verify its trusted fence directory must
+        # leave the old route in place, even after the old lease expires.
+        fence_dir.chmod(0o755)
+        os.killpg(old_pid, signal.SIGSTOP)
+        time.sleep(7)
+        status, raw = request(target_base, route_path, h.alice)
+        assert status == 200 and json.loads(raw)["primary_node_id"] == "shard-primary-0"
+        assert h.proc.poll() is None and not (fence_dir / "shard-primary-0.blocked").exists()
+        fence_dir.chmod(0o700)
         os.killpg(old_pid, signal.SIGSTOP)
         started = time.monotonic_ns()
         until = time.monotonic() + 20
@@ -181,6 +190,20 @@ def main():
         target_tip = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
         h.git("push", target_base + h.repo["clone_path"], "HEAD:main", cwd=h.work, token=h.alice)
         assert h.git("--git-dir=" + str(target_repo), "rev-parse", "refs/heads/main").stdout.decode().strip() == target_tip
+        failover_rows = int(h.sql("SELECT COUNT(*) FROM shard_failover_operations WHERE repository_id='" + h.repo["id"] + "' AND state='promoted'"))
+        assert failover_rows == 1, "takeover created duplicate promotion records"
+        os.killpg(target.pid, signal.SIGKILL)
+        target.wait(timeout=10)
+        target = subprocess.Popen([args.binary, "serve"], env=env, stdout=log,
+                                  stderr=log, start_new_session=True)
+        wait_ready(target_base, h.alice, target)
+        status, raw = request(target_base, route_path, h.alice)
+        assert status == 200 and json.loads(raw)["primary_node_id"] == "node1"
+        assert int(h.sql("SELECT COUNT(*) FROM shard_failover_operations WHERE repository_id='"
+                         + h.repo["id"] + "' AND state='promoted'")) == failover_rows
+        h.git("fetch", target_base + h.repo["clone_path"], "refs/heads/main",
+              cwd=h.copy, token=h.reader)
+        assert h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip() == target_tip
         h.stop(hard=True)
         rejected = h.run([args.binary, "serve"], check=False)
         assert rejected.returncode != 0 and b"durable physical fence" in rejected.stderr
@@ -224,6 +247,8 @@ def main():
                   "stale_replica_rejected": True, "old_writer_sigstop_then_killed": True,
                           "admitted_native_writer_paused_and_promotion_rejected": True,
                           "duplicate_live_node_identity_rejected": True,
+                          "unavailable_fence_directory_blocks_promotion": True,
+                          "controller_restart_preserved_single_promotion": True,
                           "retired_source_volume_write_rejected_without_fence_env": True,
                           "old_writer_restart_blocked": True, "acknowledged_tip": acknowledged_tip,
                           "post_takeover_acknowledged_oid": target_tip,
