@@ -8,7 +8,7 @@ use crate::{
 use axum::http::StatusCode;
 use deadpool_postgres::Transaction;
 use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
@@ -50,20 +50,61 @@ pub(crate) async fn git_input(
         .stderr(Stdio::null())
         .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(Error::internal)?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input).await.map_err(Error::internal)?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::internal("Git stdin missing"))?;
+    let input = input.to_vec();
+    let mut writer = tokio::spawn(async move { stdin.write_all(&input).await });
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::internal("Git stdout missing"))?;
+    let result = tokio::time::timeout(timeout, async {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = stdout.read(&mut buf).await.map_err(Error::internal)?;
+            if n == 0 {
+                break;
+            }
+            if out.len().saturating_add(n) > MAX_LIST_BYTES {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "LFS pointer inspection exceeded output limit",
+                ));
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        (&mut writer)
+            .await
+            .map_err(Error::internal)?
+            .map_err(Error::internal)?;
+        let status = child.wait().await.map_err(Error::internal)?;
+        if !status.success() {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "LFS pointer Git command failed",
+            ));
+        }
+        Ok(out)
+    })
+    .await;
+    match result {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(err)) => {
+            writer.abort();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(err)
+        }
+        Err(_) => {
+            writer.abort();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(Error::timeout())
+        }
     }
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| Error::timeout())?
-        .map_err(Error::internal)?;
-    if !output.status.success() || output.stdout.len() > MAX_LIST_BYTES {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "LFS pointer inspection failed or exceeded limit",
-        ));
-    }
-    Ok(output.stdout)
 }
 
 pub async fn validate_new_refs(
@@ -101,8 +142,41 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
     tenant_id: Uuid,
     changes: &[RefChange],
 ) -> Result<(), Error> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let remaining = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let max_lfs_bytes = std::env::var("ROOTYARD_LFS_POINTER_VERIFY_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(512 * 1024 * 1024)
+        .min(8 * 1024 * 1024 * 1024);
+    let mut inspected_lfs_bytes = 0u64;
+    let mut inspected_lfs_oids = std::collections::BTreeSet::new();
+    let format = git_input(
+        git_dir,
+        git_bin,
+        remaining(),
+        &["rev-parse", "--show-object-format"],
+        &[],
+    )
+    .await?;
+    let oid_len = if format.starts_with(b"sha256") {
+        64
+    } else if format.starts_with(b"sha1") {
+        40
+    } else {
+        return Err(Error(StatusCode::CONFLICT, "unsupported Git object format"));
+    };
+    let valid_git_oid = |oid: &str| {
+        oid.len() == oid_len
+            && oid
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
     let mut objects = std::collections::BTreeSet::new();
     for change in changes {
+        if !valid_git_oid(&change.old_oid) || !valid_git_oid(&change.new_oid) {
+            return Err(Error(StatusCode::CONFLICT, "Git object ID format mismatch"));
+        }
         if change.new_oid.bytes().all(|b| b == b'0') {
             continue;
         }
@@ -113,11 +187,11 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
         } else {
             args.extend(["--not", "--all"]);
         }
-        let raw = git_input(git_dir, git_bin, timeout, &args, &[]).await?;
+        let raw = git_input(git_dir, git_bin, remaining(), &args, &[]).await?;
         let list = std::str::from_utf8(&raw).map_err(Error::internal)?;
         for line in list.lines() {
             let oid = line.split_once(' ').map_or(line, |(oid, _)| oid);
-            if !crate::pulls::models::valid_oid(oid) {
+            if !valid_git_oid(oid) {
                 return Err(Error(
                     StatusCode::CONFLICT,
                     "invalid Git object during LFS inspection",
@@ -144,7 +218,7 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
     let meta = git_input(
         git_dir,
         git_bin,
-        timeout,
+        remaining(),
         &[
             "cat-file",
             "--batch-check=%(objectname) %(objecttype) %(objectsize)",
@@ -179,7 +253,7 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
     let payload = git_input(
         git_dir,
         git_bin,
-        timeout,
+        remaining(),
         &["cat-file", "--batch"],
         input.as_bytes(),
     )
@@ -214,13 +288,36 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
         }
         let spec = models::parse_pointer(bytes)
             .ok_or(Error(StatusCode::CONFLICT, "invalid LFS pointer"))?;
-        let row = client.query_opt("SELECT size FROM lfs_objects WHERE tenant_id=$1 AND repository_id=$2 AND oid=$3 AND state='ready'",
-            &[&tenant_id, &repo_id, &spec.oid]).await.map_err(Error::internal)?
+        if !inspected_lfs_oids.insert(spec.oid.clone()) {
+            continue;
+        }
+        inspected_lfs_bytes = inspected_lfs_bytes
+            .checked_add(spec.size as u64)
+            .ok_or(Error(
+                StatusCode::CONFLICT,
+                "LFS pointer inspection byte limit exceeded",
+            ))?;
+        if inspected_lfs_bytes > max_lfs_bytes {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "LFS pointer inspection byte limit exceeded",
+            ));
+        }
+        let row = tokio::time::timeout_at(deadline,client.query_opt("SELECT size FROM lfs_objects WHERE tenant_id=$1 AND repository_id=$2 AND oid=$3 AND state='ready'",
+            &[&tenant_id, &repo_id, &spec.oid])).await.map_err(|_|Error::timeout())?.map_err(Error::internal)?
             .ok_or(Error(StatusCode::CONFLICT, "LFS pointer references an unavailable object"))?;
         let size: i64 = row.get(0);
         if size != spec.size
-            || !storage::verify_object_integrity(data_root, repo_id, &spec.oid, size as u64)
-                .map_err(Error::internal)?
+            || !storage::ensure_readable(
+                data_root,
+                repo_id,
+                tenant_id,
+                &spec.oid,
+                size as u64,
+                deadline,
+            )
+            .await
+            .map_err(Error::internal)?
         {
             return Err(Error(
                 StatusCode::CONFLICT,
