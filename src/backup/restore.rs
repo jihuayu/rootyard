@@ -36,6 +36,7 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
         volume_identity(&source.join("volume"))? == manifest.volume_id,
         "backup volume identity mismatch"
     );
+    if manifest.format >= 6 { lfs_inventory::verify(&source.join("volume"), &manifest.lfs_objects)?; }
     let mut actual = inventory(&source.join("volume"))?
         .into_iter()
         .map(|(n, e)| (format!("volume/{n}"), e))
@@ -179,6 +180,9 @@ pub async fn restore(config: &Config, source: &Path, allow_legacy_schema007: boo
         restored_foreign_volumes == 0,
         "restored resolutions belong to another volume"
     );
+    if manifest.format >= 6 {
+        ensure!(lfs_inventory::metadata(&client).await? == manifest.lfs_objects, "restored LFS metadata differs from backup closure");
+    }
     let mut metadata_repos = repositories(&client).await?;
     for repo in &mut metadata_repos {
         if let Some(old) = manifest.repositories.iter().find(|old| old.id == repo.id) {

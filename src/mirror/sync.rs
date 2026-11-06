@@ -55,7 +55,10 @@ pub(crate) async fn repository(
     }
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
-    let access=auth::authorize_repo_with_role(&tx,&identity,owner,name,Role::Read).await?;
+    let access=auth::authorize_repo_with_role(&tx,&identity,owner,name,Role::Read).await
+        .map_err(|error| if error.0 == StatusCode::CONFLICT && error.1 == "repository is not ready" {
+            Error(StatusCode::SERVICE_UNAVAILABLE, "repository not ready")
+        } else { error })?;
     let row=tx.query_one(&format!("{} WHERE r.id=$1",db::REPO_SELECT),&[&access.repo_id])
         .await.map_err(Error::internal)?;
     let repo = db::Repository::from_row(&row);

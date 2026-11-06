@@ -52,6 +52,8 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         foreign_volumes == 0,
         "resolution history belongs to another volume"
     );
+    let lfs_objects = lfs_inventory::metadata(&tx).await?;
+    lfs_inventory::hydrate(config, &lfs_objects).await?;
     let source_inventory = inventory(&root)?;
     git_inventory(config, &root, &mut repos, false).await?;
     let id = Uuid::new_v4();
@@ -122,6 +124,7 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
             .filter(|p| p.starts_with("volume/journal/") && p.ends_with("/operation.json"))
             .count(),
         repositories: repos,
+        lfs_objects,
         files,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;

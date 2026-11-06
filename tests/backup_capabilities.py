@@ -31,6 +31,11 @@ class CapabilityBackupHarness(BackupHarness):
         lock = json.loads(self.expect(lock_path, 201, token=self.alice, method='POST',
                           body={'path': 'docs/preserved.bin'},
                           content_type='application/vnd.git-lfs+json'))['lock']
+        lfs_bytes = b'paired restore LFS payload\n' * 4096
+        lfs_oid = hashlib.sha256(lfs_bytes).hexdigest()
+        lfs_path = f'/git/alice/demo.git/info/lfs/objects/{lfs_oid}/{len(lfs_bytes)}'
+        self.expect(lfs_path, 200, token=self.alice, method='PUT', body=lfs_bytes,
+                    content_type='application/octet-stream')
         workspace = json.loads(self.expect('/api/workspaces', 201, token=self.alice, method='POST',
                                body={'owner': 'alice', 'repository': 'demo',
                                      'agent_id': 'restore-agent', 'base_oid': self.second},
@@ -47,7 +52,19 @@ class CapabilityBackupHarness(BackupHarness):
         assert self.request('/web/repos', headers=headers)[0] == 200
         before_authority = self.query(self.db, 'SELECT incarnation FROM cluster_authority')
         self.stop()
+        remote_lfs = getattr(self.args, 'remote_lfs', False)
+        if remote_lfs:
+            assert self.env.get('ROOTYARD_OBJECT_STORE_ENDPOINT'), 'real remote object store required'
+            cached = self.root / 'data/lfs' / self.repo['id'] / lfs_oid
+            cached.unlink()
+            assert not cached.exists()
         self.backup_command()
+        manifest = json.loads((self.backup / 'manifest.json').read_text())
+        assert any(obj['oid'] == lfs_oid and obj['size'] == len(lfs_bytes)
+                   for obj in manifest['lfs_objects'])
+        if remote_lfs:
+            assert cached.read_bytes() == lfs_bytes
+            self.env.pop('ROOTYARD_OBJECT_STORE_ENDPOINT')
         self.cli('backup-verify', str(self.backup))
         self.restore_command()
         assert self.query(self.target_db, 'SELECT incarnation FROM cluster_authority') != before_authority
@@ -61,6 +78,8 @@ class CapabilityBackupHarness(BackupHarness):
         self.expect('/api/repos/restore-team/shared', 200, token=self.bob)
         locks = json.loads(self.expect(lock_path, 200, token=self.alice))['locks']
         assert any(item['id'] == lock['id'] and item['path'] == 'docs/preserved.bin' for item in locks)
+        assert self.expect(lfs_path, 200, token=self.alice) == lfs_bytes
+        self.expect(lfs_path, 404, token=self.bob)
         restored = json.loads(self.expect(file_path, 200, token=self.alice))
         assert base64.b64decode(restored['content_base64']) == b'preserved workspace\n'
         payload.update(expected_entry_version=1, expected_workspace_revision=1)
@@ -76,10 +95,10 @@ class CapabilityBackupHarness(BackupHarness):
         self.git('fsck', '--full', '--strict', cwd=clone)
         assert (clone / 'hello.txt').read_text() == 'second\n'
         return {'fresh_database_and_volume': True, 'organization_inherited_access': True,
-                'lfs_lock_identity_preserved': True, 'workspace_bytes_preserved': True,
+                'lfs_lock_identity_preserved': True, 'lfs_bytes_preserved': True, 'workspace_bytes_preserved': True,
                 'old_workspace_lease_rejected': True, 'renewed_lease_accepted': True,
                 'browser_session_revoked': True, 'cluster_authority_rotated': True,
-                'stock_git_clone_fsck': True}
+                'stock_git_clone_fsck': True, 'remote_lfs_hydrated_without_target_endpoint': remote_lfs}
 
 
 def main():
@@ -87,6 +106,7 @@ def main():
     parser.add_argument('--binary', default='target/debug/rootyard')
     parser.add_argument('--report', type=Path)
     parser.add_argument('--keep', action='store_true')
+    parser.add_argument('--remote-lfs', action='store_true')
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
     if not os.environ.get('ROOTYARD_TEST_DATABASE_URL'):

@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 mod catalog;
 mod authority;
+mod lfs_inventory;
 use catalog::{FORMAT, catalogs as schema_catalogs, digest as schema_contract_digest, versions as schema_versions};
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_MANIFEST: u64 = 256 * 1024 * 1024;
@@ -62,6 +63,8 @@ struct Manifest {
     consistency: String,
     journal_record_files: usize,
     repositories: Vec<Repository>,
+    #[serde(default)]
+    lfs_objects: Vec<lfs_inventory::Object>,
     files: BTreeMap<String, Entry>,
 }
 
