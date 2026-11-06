@@ -67,10 +67,26 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
             "Pando repository has no serving authoritative snapshot");
         ensure!(!pack_ids.is_empty() && pack_ids.len() <= MAX_PACKS,
             "Pando pack snapshot exceeds bounded view");
-        let rows = client.query("SELECT ref_name,oid FROM pando_refs WHERE repository_id=$1 ORDER BY ref_name",
-            &[&repo.id]).await?;
+        let rows = client.query("SELECT ref_name,oid FROM pando_refs \
+            WHERE repository_id=$1 ORDER BY ref_name LIMIT $2",
+            &[&repo.id,&((MAX_REFS + 1) as i64)]).await?;
         ensure!(rows.len() <= MAX_REFS, "Pando ref snapshot exceeds bounded view");
         let refs: Vec<(String,String)> = rows.into_iter().map(|r| (r.get(0),r.get(1))).collect();
+        let mut total_declared = 0u64;
+        for pack_id in &pack_ids {
+            let pack = client.query_one("SELECT manifest FROM pando_pack_manifests \
+                WHERE repository_id=$1 AND id=$2", &[&repo.id,pack_id]).await?;
+            let manifest: super::pack_store::PackManifest = serde_json::from_value(pack.get(0))?;
+            ensure!(manifest.id == *pack_id && manifest.repository_id == repo.id &&
+                manifest.tenant_id == tenant && manifest.object_format == repo.object_format,
+                "Pando declared pack identity mismatch");
+            total_declared = total_declared.checked_add(manifest.pack.plaintext_bytes)
+                .and_then(|v| v.checked_add(manifest.index.plaintext_bytes))
+                .ok_or_else(|| anyhow::anyhow!("Pando declared snapshot size overflow"))?;
+            ensure!(total_declared <= state.config.max_repo_bytes,
+                "Pando declared snapshot exceeds repository quota");
+        }
+        drop(client);
         let root = state.storage.root.join("pando-sessions");
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&root)?;
         let meta = std::fs::symlink_metadata(&root)?;
@@ -88,8 +104,8 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
         let mut total_bytes = 0u64;
         for pack_id in pack_ids {
             active(lease)?;
-            let manifest = lease.guard(store.recover(&state.pool, repo.id, pack_id,
-                &pack_dir, deadline)).await.map_err(|error| anyhow::anyhow!(error.1))??;
+            let manifest = lease.guard(Box::pin(store.recover(&state.pool, repo.id, pack_id,
+                &pack_dir, deadline))).await.map_err(|error| anyhow::anyhow!(error.1))??;
             ensure!(manifest.tenant_id == tenant && manifest.object_format == repo.object_format,
                 "Pando snapshot pack identity mismatch");
             total_bytes = total_bytes.checked_add(manifest.pack.plaintext_bytes)
@@ -106,6 +122,7 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
         }
         run_git(state, snapshot.path(), &["fsck", "--full", "--strict"], lease, deadline).await?;
         active(lease)?;
+        let client = state.pool.get().await?;
         let current = client.query_one("SELECT r.storage_generation,s.ref_generation,s.state \
             FROM repositories r JOIN pando_repository_states s ON s.repository_id=r.id WHERE r.id=$1",
             &[&repo.id]).await?;
@@ -114,5 +131,5 @@ pub async fn materialize(state: &Arc<AppState>, repo: &Repository, lease: &Lease
             current.get::<_,&str>(2) == "serving", "Pando snapshot changed during reconstruction");
         Ok(snapshot)
     }
-    inner(state,repo,lease,deadline).await.map_err(Error::internal)
+    Box::pin(inner(state,repo,lease,deadline)).await.map_err(Error::internal)
 }

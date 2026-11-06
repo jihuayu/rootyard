@@ -123,6 +123,29 @@ impl PackStore {
         })
     }
 
+    async fn insert_ready_manifest(pool: &Pool, manifest: &PackManifest) -> Result<()> {
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        // FOR SHARE conflicts with generation-changing UPDATE's NO KEY UPDATE
+        // lock. A concurrent cutover cannot commit between this recheck and
+        // the ready manifest INSERT.
+        let current = tx.query_one("SELECT owner_id,storage_generation,object_format,state \
+            FROM repositories WHERE id=$1 FOR SHARE", &[&manifest.repository_id]).await?;
+        ensure!(current.get::<_, Uuid>("owner_id") == manifest.tenant_id &&
+            current.get::<_, i64>("storage_generation") == manifest.storage_generation &&
+            current.get::<_, &str>("object_format") == manifest.object_format &&
+            current.get::<_, &str>("state") == "ready",
+            "Pando pack publication lost repository generation or ownership");
+        let value = serde_json::to_value(manifest)?;
+        tx.execute("INSERT INTO pando_pack_manifests \
+            (id,repository_id,tenant_id,storage_generation,object_format,manifest) \
+            VALUES($1,$2,$3,$4,$5,$6)",
+            &[&manifest.id,&manifest.repository_id,&manifest.tenant_id,
+                &manifest.storage_generation,&manifest.object_format,&value]).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Publish a verified pack/index pair. The database INSERT occurs only
     /// after both remote ciphertexts and envelopes pass read-back verification.
     pub async fn publish(&self, pool: &Pool, repository_id: Uuid, tenant_id: Uuid,
@@ -134,20 +157,12 @@ impl PackStore {
             index == pack.with_extension("idx"), "Pando pack and index paths differ");
         self.verify_git_pack(pack, object_format, deadline).await?;
         let work = self.work_dir()?;
-        let pack_receipt = self.publish_artifact(&work.0, "pack", pack, tenant_id, deadline).await?;
-        let index_receipt = self.publish_artifact(&work.0, "index", index, tenant_id, deadline).await?;
+        let pack_receipt = Box::pin(self.publish_artifact(&work.0, "pack", pack, tenant_id, deadline)).await?;
+        let index_receipt = Box::pin(self.publish_artifact(&work.0, "index", index, tenant_id, deadline)).await?;
         let manifest = PackManifest { version: 1, id: Uuid::new_v4(), repository_id,
             tenant_id, storage_generation, object_format: object_format.into(),
             pack: pack_receipt, index: index_receipt };
-        let client = pool.get().await?;
-        let value = serde_json::to_value(&manifest)?;
-        let rows = client.execute(
-            "INSERT INTO pando_pack_manifests(id,repository_id,tenant_id,storage_generation,object_format,manifest) \
-             SELECT $1,r.id,r.owner_id,r.storage_generation,r.object_format,$2 \
-             FROM repositories r WHERE r.id=$3 AND r.owner_id=$4 \
-             AND r.storage_generation=$5 AND r.object_format=$6 AND r.state='ready'",
-            &[&manifest.id, &value, &repository_id, &tenant_id, &storage_generation, &object_format]).await?;
-        ensure!(rows == 1, "Pando pack publication lost repository generation or ownership");
+        Self::insert_ready_manifest(pool, &manifest).await?;
         Ok(manifest)
     }
 
@@ -189,14 +204,15 @@ impl PackStore {
             FROM pando_pack_manifests WHERE repository_id=$1 AND id=$2",
             &[&repository_id, &pack_id]).await?;
         let manifest: PackManifest = serde_json::from_value(row.get("manifest"))?;
+        drop(client);
         ensure!(manifest.version == 1 && manifest.id == pack_id &&
             manifest.repository_id == repository_id && manifest.tenant_id == row.get::<_, Uuid>("tenant_id") &&
             manifest.storage_generation == row.get::<_, i64>("storage_generation") &&
             manifest.object_format == row.get::<_, String>("object_format"),
             "Pando manifest identity mismatch");
         let work = self.work_dir()?;
-        let pack = self.recover_artifact(&work.0, "pack", manifest.tenant_id, &manifest.pack, deadline).await?;
-        let index = self.recover_artifact(&work.0, "index", manifest.tenant_id, &manifest.index, deadline).await?;
+        let pack = Box::pin(self.recover_artifact(&work.0, "pack", manifest.tenant_id, &manifest.pack, deadline)).await?;
+        let index = Box::pin(self.recover_artifact(&work.0, "index", manifest.tenant_id, &manifest.index, deadline)).await?;
         self.verify_git_pack(&pack, &manifest.object_format, deadline).await?;
         fs::create_dir_all(destination).await?;
         let target_pack = destination.join(format!("pack-{}.pack", pack_id));
@@ -208,5 +224,52 @@ impl PackStore {
             return Err(error).context("Pando index cache publication failed");
         }
         Ok(manifest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn generation_update_fences_ready_manifest_insert() {
+        let Ok(url) = std::env::var("ROOTYARD_TEST_DATABASE_URL") else { return; };
+        let pool = crate::db::pool(&url).unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        let tenant = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        let username = format!("pando{}", &tenant.simple().to_string()[..12]);
+        let seed = pool.get().await.unwrap();
+        seed.execute("INSERT INTO users(id,username) VALUES($1,$2)", &[&tenant,&username]).await.unwrap();
+        seed.execute("INSERT INTO repositories(id,owner_id,name,state) VALUES($1,$2,'fencetest','ready')",
+            &[&repo,&tenant]).await.unwrap();
+        drop(seed);
+        let envelope = Envelope { version: 1, generation: 1, object_id: Uuid::new_v4(),
+            cipher: "AES-256-GCM-CHUNKED".into(), provider: "vault-transit".into(),
+            key_name: "test".into(), wrapped_key: "test".into(),
+            plaintext_sha256: "0".repeat(64), plaintext_bytes: 1,
+            ciphertext_sha256: "1".repeat(64), ciphertext_bytes: 64, chunk_bytes: 65536 };
+        let artifact = ArtifactReceipt { plaintext_sha256: envelope.plaintext_sha256.clone(),
+            plaintext_bytes: 1, ciphertext_sha256: envelope.ciphertext_sha256.clone(),
+            ciphertext_bytes: 64, envelope_sha256: "2".repeat(64), envelope_bytes: 128,
+            envelope };
+        let manifest = PackManifest { version: 1, id: Uuid::new_v4(), repository_id: repo,
+            tenant_id: tenant, storage_generation: 1, object_format: "sha1".into(),
+            pack: artifact.clone(), index: artifact };
+        let mut blocker = pool.get().await.unwrap();
+        let tx = blocker.transaction().await.unwrap();
+        tx.execute("UPDATE repositories SET storage_generation=2 WHERE id=$1", &[&repo]).await.unwrap();
+        let publishing_pool = pool.clone();
+        let publishing = tokio::spawn(async move {
+            PackStore::insert_ready_manifest(&publishing_pool,&manifest).await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!publishing.is_finished(), "manifest insert did not wait for generation writer");
+        tx.commit().await.unwrap();
+        assert!(publishing.await.unwrap().is_err(), "stale generation published a manifest");
+        let count: i64 = pool.get().await.unwrap().query_one(
+            "SELECT count(*) FROM pando_pack_manifests WHERE repository_id=$1", &[&repo])
+            .await.unwrap().get(0);
+        assert_eq!(count,0);
     }
 }
