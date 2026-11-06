@@ -7,6 +7,8 @@ pub(crate) mod service;
 mod files;
 #[path = "workspaces/checkpoints.rs"]
 mod checkpoints;
+#[path = "workspaces/remote.rs"]
+mod remote;
 #[path = "workspaces/events.rs"]
 mod events;
 #[path = "workspaces/capture.rs"]
@@ -29,4 +31,5 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/workspaces/{id}/events", get(events::list))
         .route("/api/workspaces/{id}/events/stream", get(events::stream))
         .route("/api/checkpoints/{id}/restore", post(checkpoints::restore))
+        .route("/api/checkpoints/{id}/publish", post(remote::publish))
 }

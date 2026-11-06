@@ -37,9 +37,22 @@ pub async fn authorized(state: &AppState, headers: &HeaderMap, id: Uuid, role: R
     let sql = format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1");
     let row = tx.query_opt(&sql, &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let ws = Workspace::from_row(&row);
-    auth::authorize_repo_with_role(&tx, &actor, &ws.owner, &ws.repository, role).await?;
+    let access=auth::authorize_repo_with_role(&tx, &actor, &ws.owner, &ws.repository, role).await?;
+    if access.repo_id!=ws.repository_id{return Err(Error::not_found());}
     if ws.creator_id != actor.id || ws.state != "ready" { return Err(Error::not_found()); }
     tx.commit().await.map_err(Error::internal)?;
+    Ok(ws)
+}
+
+pub async fn locked(tx:&deadpool_postgres::Transaction<'_>,actor:&crate::db::Identity,id:Uuid,role:Role)->Result<Workspace,Error>{
+    let sql=format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1");
+    let row=tx.query_opt(&sql,&[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let initial=Workspace::from_row(&row);
+    let access=auth::authorize_repo_with_role(tx,actor,&initial.owner,&initial.repository,role).await?;
+    if access.repo_id!=initial.repository_id{return Err(Error::not_found());}
+    let row=tx.query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1 FOR UPDATE"),&[&id]).await.map_err(Error::internal)?;
+    let ws=Workspace::from_row(&row);
+    if ws.repository_id!=initial.repository_id || ws.creator_id!=initial.creator_id || ws.owner!=initial.owner || ws.repository!=initial.repository || ws.creator_id!=actor.id || ws.state!="ready" {return Err(Error::not_found());}
     Ok(ws)
 }
 
@@ -51,10 +64,7 @@ pub async fn lease(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(
     let actor=auth::authenticate(&state.pool,&headers).await?;
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
-    let row=tx.query_opt(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1 FOR UPDATE"), &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
-    let ws=Workspace::from_row(&row);
-    auth::authorize_repo_with_role(&tx,&actor,&ws.owner,&ws.repository,Role::Write).await?;
-    if ws.creator_id!=actor.id || ws.state!="ready" {return Err(Error::not_found());}
+    let ws=locked(&tx,&actor,id,Role::Write).await?;
     if ws.lease_epoch!=input.expected_lease_epoch || !workspace_repo(&state,id).join(".git").is_dir(){return Err(conflict());}
     let changed=tx.execute("UPDATE workspaces SET host_id=$2,lease_epoch=lease_epoch+1,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1 AND lease_epoch=$3 AND (host_id=$2 OR lease_until<=clock_timestamp())", &[&id,&state.storage.volume_id,&input.expected_lease_epoch]).await.map_err(Error::internal)?;
     if changed!=1{return Err(conflict());}
