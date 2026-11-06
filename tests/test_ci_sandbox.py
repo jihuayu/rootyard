@@ -15,7 +15,8 @@ from tests.webhooks import WebhooksHarness
 class CiSandboxTest(unittest.TestCase):
     def test_claimed_origin_checkout_build_and_cancel(self):
         binary=Path(os.environ.get("ROOTYARD_BINARY","target/debug/rootyard")).resolve()
-        h=WebhooksHarness(argparse.Namespace(binary=str(binary),keep=False))
+        h=WebhooksHarness(argparse.Namespace(binary=str(binary),
+            keep=os.environ.get("ROOTYARD_KEEP_TEST")=="1"))
         h.env["ROOTYARD_SANDBOX_MODE"]="dev"
         h.env["ROOTYARD_CI_ORIGIN_FALLBACK_GLOBAL"]="2"
         h.env["ROOTYARD_CI_ORIGIN_FALLBACK_PER_REPO"]="2"
@@ -65,6 +66,8 @@ class CiSandboxTest(unittest.TestCase):
             self.assertEqual(first["source"],"origin")
             params=tuple_for(first,"native-build")
             command=("git rev-parse HEAD; test -f feature.txt; "
+                "test -z \"$(git show-ref refs/heads/source-nonff)\"; "
+                f"! git cat-file -e {h.diverged_head_oid} 2>/dev/null; "
                 "test ! -e /workspace/shared/rootyard-env.sh; "
                 "printf 'int main(void){return 0;}\\n' > main.c; "
                 "gcc main.c -o app && ./app && echo BUILD_OK")

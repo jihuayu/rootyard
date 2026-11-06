@@ -1,6 +1,6 @@
 //! Signed CI-run sandbox execution bound to one claimed candidate and checkout plan.
 use super::runner;
-use crate::{AppState, Error, storage::read_leases, webhooks::claimed::{ClaimedRun, authorize_claimed_run}};
+use crate::{AppState, Error, ci_checkouts, db, storage::read_leases, webhooks::claimed::{ClaimedRun, authorize_claimed_run}};
 use axum::{Json, extract::{Path, Query, State}, http::{HeaderMap, StatusCode}};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -130,22 +130,35 @@ async fn prepare_checkout(state:&AppState,claim:&ClaimedRun,dest:&PathBuf)->Resu
     let lease=read_leases::shared(&state.pool,claim.repository_id,
         tokio::time::Instant::now()+state.config.git_timeout).await?;
     if !still_claimed(state,claim).await? {return Err(Error(StatusCode::CONFLICT,"CI claim changed"));}
-    let source=state.storage.verify_path(claim.repository_id).map_err(Error::internal)?;
+    let client=state.pool.get().await.map_err(Error::internal)?;
+    let row=client.query_one(&format!("{} WHERE r.id=$1",db::REPO_SELECT),
+        &[&claim.repository_id]).await.map_err(Error::internal)?;
+    let repo=db::Repository::from_row(&row);
+    let owner_id:Uuid=row.get("owner_id");
+    if repo.storage_generation!=claim.storage_generation || repo.id!=claim.repository_id ||
+        owner_id!=claim.tenant_id || claim.plan.owner_id!=claim.tenant_id ||
+        claim.plan.repository_id!=repo.id {
+        return Err(Error(StatusCode::CONFLICT,"CI checkout source changed"));
+    }
+    let source=ci_checkouts::origin_job_path(state,&repo,&claim.plan,&lease).await?;
     if let Some(parent)=dest.parent(){std::fs::create_dir_all(parent).map_err(Error::internal)?;}
     let mut clone=state.storage.git(&state.config);
     clone.args(["-c","core.hooksPath=/dev/null","clone","--no-local","--no-hardlinks","--no-checkout","--"])
         .arg(&source).arg(dest);
-    crate::git_http::collect_git_output(clone,4096,state.config.git_timeout).await.map_err(Error::internal)?;
+    lease.guard(crate::git_http::collect_git_output(clone,4096,state.config.git_timeout))
+        .await?.map_err(Error::internal)?;
     lease.ensure_active()?;
     let mut checkout=state.storage.git(&state.config);
     checkout.args(["-c","core.hooksPath=/dev/null","-C"]).arg(dest)
         .args(["checkout","--detach","--force",&claim.head_oid]);
-    crate::git_http::collect_git_output(checkout,4096,state.config.git_timeout).await.map_err(Error::internal)?;
+    lease.guard(crate::git_http::collect_git_output(checkout,4096,state.config.git_timeout))
+        .await?.map_err(Error::internal)?;
     lease.ensure_active()?;
     if !still_claimed(state,claim).await? {return Err(Error(StatusCode::CONFLICT,"CI claim changed"));}
     let mut verify=state.storage.git(&state.config);
     verify.arg("-C").arg(dest).args(["rev-parse","HEAD"]);
-    let actual=crate::git_http::collect_git_output(verify,256,state.config.git_timeout).await.map_err(Error::internal)?;
+    let actual=lease.guard(crate::git_http::collect_git_output(verify,256,state.config.git_timeout))
+        .await?.map_err(Error::internal)?;
     if actual!=format!("{}\n",claim.head_oid).as_bytes(){return Err(Error(StatusCode::CONFLICT,"CI checkout target changed"));}
     Ok(())
 }
