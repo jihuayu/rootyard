@@ -12,6 +12,7 @@ fn command(state: &AppState, repo: Uuid, args: &[&str]) -> Result<Command> {
     let path = state.storage.verify_path(repo)?;
     let mut cmd = state.storage.git(&state.config);
     cmd.arg("--git-dir").arg(path).args(args)
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_CONFIG_COUNT", "2")
