@@ -7,10 +7,14 @@ pub mod fence;
 pub mod gc;
 #[path = "storage_lifecycle/gitfs.rs"]
 pub mod gitfs;
+#[path = "storage_lifecycle/job_view.rs"]
+pub mod job_view;
 #[path = "storage_lifecycle/jobs.rs"]
 pub mod jobs;
 #[path = "storage_lifecycle/models.rs"]
 pub mod models;
+#[path = "storage_lifecycle/observability.rs"]
+pub mod observability;
 #[path = "storage_lifecycle/quarantine.rs"]
 pub mod quarantine;
 #[path = "storage_lifecycle/retention.rs"]
@@ -22,9 +26,17 @@ pub mod worker;
 
 use crate::AppState;
 use anyhow::Result;
+use axum::{Router, routing::get};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Read-only maintenance observability. Mutating maintenance remains server-owned.
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/repos/{owner}/{name}/maintenance-jobs", get(observability::list))
+        .route("/api/repos/{owner}/{name}/maintenance-jobs/{job_id}", get(observability::get))
+}
 
 /// One loop per running native-volume server. Job claims are durable, so a
 /// replacement process resumes expired work without trusting in-memory state.

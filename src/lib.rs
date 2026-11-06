@@ -66,6 +66,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(ci_pins::routes())
         .merge(ci_checkouts::routes())
         .merge(reliability::routes())
+        .merge(storage_lifecycle::routes())
         .merge(forge::routes())
         .merge(pulls::routes())
         .merge(lfs::routes())
