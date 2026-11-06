@@ -1,5 +1,5 @@
 use rootyard::{AppState, config::Config, db, dispatch, metrics,
-    pando_gateway::{backup, pack_store::PackStore, snapshot},
+    pando_gateway::{backup, pack_store::PackStore, prepare, snapshot},
     storage::{self, remote_objects::{ObjectKey, RemoteObjectStore}}};
 use rand::RngCore;
 use std::{path::{Path, PathBuf}, process::Command, sync::Arc, time::Duration};
@@ -147,6 +147,34 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
         Box::pin(store.recover(&pool,repo,pack_id,&second,deadline())).await.unwrap();
         assert_eq!(std::fs::metadata(second.join(format!("pack-{pack_id}.pack"))).unwrap().len(),
             manifest.pack.plaintext_bytes);
+        let client_work = root.join(format!("push-client-{}",Uuid::new_v4()));
+        run(&git,["clone","--branch","main",snapshot.path().to_str().unwrap(),
+            client_work.to_str().unwrap()].as_slice(),&root);
+        std::fs::write(client_work.join("after.txt"),b"commit after Pando materialization\n").unwrap();
+        run(&git,&["add","after.txt"],&client_work);
+        run(&git,&["-c","user.name=Pack Test","-c","user.email=pack@test.invalid",
+            "commit","-m","post-cutover-style"],&client_work);
+        run(&git,&["push","origin","HEAD:refs/heads/main"],&client_work);
+        let prepared = Box::pin(prepare::stage(&state,&repository,manifest.tenant_id,
+            &snapshot,&lease,deadline())).await.unwrap().unwrap();
+        assert_eq!(prepared.changes.len(),1);
+        assert_eq!(prepared.changes[0].old_oid,ids["commit_oid"].as_str().unwrap());
+        assert_ne!(prepared.changes[0].new_oid,prepared.changes[0].old_oid);
+        assert_eq!(prepared.pack.object_format,format);
+        // The newly staged pack must contain the entire reachable closure,
+        // not merely the loose objects introduced by the latest receive.
+        let staged_dir = root.join(format!("staged-pack-{}", Uuid::new_v4()));
+        let bare_view = root.join(format!("staged-view-{}", Uuid::new_v4()));
+        std::fs::create_dir(&bare_view).unwrap();
+        run(&git, &["init", "--bare", &format_arg, "."], &bare_view);
+        Box::pin(store.recover(&pool,repo,prepared.pack.id,&staged_dir,deadline())).await.unwrap();
+        let view_packs = bare_view.join("objects/pack");
+        std::fs::copy(staged_dir.join(format!("pack-{}.pack",prepared.pack.id)),
+            view_packs.join(format!("pack-{}.pack",prepared.pack.id))).unwrap();
+        std::fs::copy(staged_dir.join(format!("pack-{}.idx",prepared.pack.id)),
+            view_packs.join(format!("pack-{}.idx",prepared.pack.id))).unwrap();
+        run(&git, &["update-ref","refs/heads/main",&prepared.changes[0].new_oid],&bare_view);
+        run(&git, &["fsck","--full","--strict"],&bare_view);
         drop(snapshot);
         drop(_local);
         drop(lease);
