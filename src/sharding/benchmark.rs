@@ -6,10 +6,11 @@ use crate::{
     members::audit::record_audit_event,
     sharding::{
         models::{
-            self, DEFAULT_CAPACITY_BYTES, DEFAULT_LEASE_TTL_SECONDS, VIRTUAL_BUCKET_COUNT,
+            self, VIRTUAL_BUCKET_COUNT,
             conflict, deterministic_bucket_id, json, open_client, unix_now,
         },
         router::load_or_init_repo_route,
+        security::require_operator,
     },
 };
 use axum::{Json, extract::{Path, State}, http::{HeaderMap, StatusCode}, response::Response};
@@ -267,7 +268,7 @@ pub fn write_repo_benchmark_receipt_at(repo_dir: &StdPath, receipt: &BenchmarkSu
     crate::journal::atomic(&repo_dir.join(REPO_BENCHMARK_RECEIPT_FILE), &bytes, true).map_err(Error::internal)
 }
 
-async fn execute_suite(tx: &Transaction<'_>, storage_root: &StdPath, repo_id: Option<Uuid>, input: &BenchmarkRunRequest) -> Result<BenchmarkSuiteReceipt, Error> {
+async fn execute_suite(_tx: &Transaction<'_>, storage_root: &StdPath, repo_id: Option<Uuid>, input: &BenchmarkRunRequest) -> Result<BenchmarkSuiteReceipt, Error> {
     let (node_counts, concurrency, ops_per_tier, pinned_roots) = validate_benchmark_request(input)?;
     let now = input.now_unix.unwrap_or_else(unix_now);
     let (inject_failover, inject_eviction, inject_gc) = (
@@ -278,20 +279,11 @@ async fn execute_suite(tx: &Transaction<'_>, storage_root: &StdPath, repo_id: Op
     if input.simulate_missing_pinned_objects.unwrap_or(0) > 0 {
         return Err(conflict("pinned root reachability check failed"));
     }
-    let lease_exp = now.saturating_add(DEFAULT_LEASE_TTL_SECONDS * 5);
     let (mut base_throughput, mut tiers) = (0.0_f64, Vec::with_capacity(node_counts.len()));
 
     for &node_count in &node_counts {
-        let (tier_start, db_start) = (Instant::now(), Instant::now());
-        for idx in 0..node_count {
-            let (node_id, role) = (format!("shard-bench-n{node_count}-{idx}"), if idx == 0 { "primary" } else { "replica" });
-            let endpoint = format!("http://127.0.0.1:{}", 19080 + u16::from(node_count) * 10 + u16::from(idx));
-            tx.execute(
-                "INSERT INTO shard_nodes (node_id, endpoint, role, status, capacity_bytes, used_bytes, lease_epoch, lease_expires_unix, fenced_epoch, version) VALUES ($1, $2, $3, 'healthy', $4, 0, 1, $5, 0, 1) ON CONFLICT (node_id) DO UPDATE SET status = 'healthy', lease_expires_unix = GREATEST(shard_nodes.lease_expires_unix, $5), updated_at = clock_timestamp()",
-                &[&node_id, &endpoint, &role, &DEFAULT_CAPACITY_BYTES, &lease_exp],
-            ).await.map_err(Error::internal)?;
-        }
-        let db_wait_ms = (db_start.elapsed().as_millis() as u64).max(1);
+        let tier_start = Instant::now();
+        let db_wait_ms = 0;
         let (mut push_samples, mut fetch_samples, mut gc_samples, mut all_samples) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut cache_hits, mut bytes_processed) = (0_usize, 0_u64);
 
@@ -356,10 +348,10 @@ async fn execute_suite(tx: &Transaction<'_>, storage_root: &StdPath, repo_id: Op
         });
     }
 
-    let markdown_report = render_benchmark_markdown(&tiers, true);
+    let markdown_report = format!("# Simulation only — not measured Git or cluster readiness\n\n{}", render_benchmark_markdown(&tiers, false));
     Ok(BenchmarkSuiteReceipt {
-        benchmark_id: Uuid::new_v4(), repository_id: repo_id, status: "passed".to_string(),
-        node_tiers: tiers, pinned_roots_verified: true, failover_verified: inject_failover,
+        benchmark_id: Uuid::new_v4(), repository_id: repo_id, status: "simulation_only".to_string(),
+        node_tiers: tiers, pinned_roots_verified: false, failover_verified: false,
         markdown_report, updated_unix: now,
     })
 }
@@ -378,7 +370,7 @@ pub async fn run_cluster_benchmark(State(state): State<Arc<AppState>>, headers: 
     let (actor, mut client) = open_client(&state, &headers).await?;
     auth::writable(&actor)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::verify_token(&tx, &actor, true).await?;
+    require_operator(&tx, &actor).await?;
     let storage_root = state.storage.repo_path(Uuid::nil());
     let parent = storage_root.parent().unwrap_or(&storage_root);
     let receipt = execute_suite(&tx, parent, None, &input).await?;
@@ -393,6 +385,7 @@ pub async fn list_repo_benchmarks(State(state): State<Arc<AppState>>, Path((owne
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    require_operator(&tx, &actor).await?;
     let latest = read_repo_benchmark_receipt_at(&state.storage.repo_path(access.repo_id))?;
     let rows = tx.query("SELECT details FROM repository_audit_log WHERE tenant_id = $1 AND repository_id = $2 AND action = 'shard.benchmark' ORDER BY id DESC LIMIT 50", &[&access.owner_id, &access.repo_id]).await.map_err(Error::internal)?;
     let mut items: Vec<BenchmarkSuiteReceipt> = rows.iter().filter_map(|r| serde_json::from_value(r.get::<_, serde_json::Value>(0)).ok()).collect();

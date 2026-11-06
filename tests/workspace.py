@@ -3416,14 +3416,12 @@ def _run_reference_cli(argv):
 
 
 class WorkspaceHarness:
-    def __init__(self, binary_path="target/debug/rootyard-workspace-lab"):
+    def __init__(self, binary_path="target/debug/rootyard-workspace-lab", reference_only=False):
         self.root = Path(tempfile.mkdtemp(prefix="rootyard-workspace-inc-"))
         self.requested_binary = Path(binary_path).expanduser().resolve()
-        if self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK):
-            self.binary_cmd = [str(self.requested_binary)]
-            self.binary_sha256 = hashlib.sha256(self.requested_binary.read_bytes()).hexdigest()
-        else:
-            wrapper = self.root / "rootyard-workspace-lab-fallback"
+        self.runtime = "reference_model" if reference_only else "native_rust"
+        if reference_only:
+            wrapper = self.root / "rootyard-workspace-lab-reference"
             wrapper.write_text(
                 "#!/bin/sh\n"
                 f"exec {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} --reference-cli \"$@\"\n"
@@ -3431,6 +3429,14 @@ class WorkspaceHarness:
             wrapper.chmod(0o700)
             self.binary_cmd = [str(wrapper)]
             self.binary_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        else:
+            require(self.requested_binary.is_file() and os.access(self.requested_binary, os.X_OK),
+                    f"native Rust workspace binary missing or not executable: {self.requested_binary}")
+            with self.requested_binary.open("rb") as stream:
+                require(stream.read(4) == b"\x7fELF",
+                        "workspace binary is not a native ELF executable")
+            self.binary_cmd = [str(self.requested_binary)]
+            self.binary_sha256 = hashlib.sha256(self.requested_binary.read_bytes()).hexdigest()
 
         found_git = shutil.which(os.environ.get("ROOTYARD_WORKSPACE_GIT", "git"))
         require(found_git is not None, "Git executable unavailable")
@@ -3471,6 +3477,11 @@ class WorkspaceHarness:
         })
         (self.root / "home").mkdir()
         (self.root / "xdg").mkdir()
+        if not reference_only:
+            probe = subprocess.run(self.binary_cmd, env=self.env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=10)
+            require(probe.returncode != 0 and b"rootyard-workspace-lab" in probe.stderr,
+                    "executable does not identify as the native workspace CLI")
         self.sequence = 0
         self.checks = []
         self.git_version = self.git("--version").stdout.decode().strip()
@@ -4201,6 +4212,7 @@ class WorkspaceHarness:
             "suite": "workspace-incremental-sync-and-readonly-view",
             "binary": str(self.requested_binary),
             "binary_sha256": self.binary_sha256,
+            "runtime": self.runtime,
             "git_version": self.git_version,
             "checks": self.checks,
             "ok": bool(self.checks) and all(item["ok"] for item in self.checks),
@@ -4261,10 +4273,11 @@ def main():
         return _run_reference_cli(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/rootyard-workspace-lab")
+    parser.add_argument("--reference-only", action="store_true", help="run the labeled Python reference model")
     parser.add_argument("--report", default=None)
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
-    harness = WorkspaceHarness(args.binary)
+    harness = WorkspaceHarness(args.binary, reference_only=args.reference_only)
     try:
         harness.run_all()
         rep = harness.report()

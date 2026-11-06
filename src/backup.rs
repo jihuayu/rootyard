@@ -52,6 +52,12 @@ const TABLES: &[&str] = &[
     "shard_virtual_buckets",
     "tokens",
     "users",
+    "workspace_checkpoints",
+    "workspace_creations",
+    "workspace_entries",
+    "workspace_events",
+    "workspace_operations",
+    "workspaces",
 ];
 const FORMAT: u32 = 5;
 const MAX_ENTRIES: usize = 2_000_000;

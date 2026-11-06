@@ -12,14 +12,12 @@ use serde_json::Value;
 use tokio_postgres::Row;
 use uuid::Uuid;
 
-pub const COLLABORATOR_FIELDS: &str =
-    "c.repository_id, c.user_id, u.username, c.role, c.version, c.created_at::text, c.updated_at::text";
+pub const COLLABORATOR_FIELDS: &str = "c.repository_id, c.user_id, u.username, c.role, c.version, c.created_at::text, c.updated_at::text";
 pub const TEAM_FIELDS: &str =
     "id, repository_id, slug, name, description, role, version, created_at::text, updated_at::text";
 pub const TEAM_MEMBER_FIELDS: &str =
     "tm.team_id, tm.repository_id, tm.user_id, u.username, tm.created_at::text";
-pub const AUDIT_FIELDS: &str =
-    "id, repository_id, actor_id, actor_name, action, target_type, target_name, details, created_unix, created_at::text";
+pub const AUDIT_FIELDS: &str = "id, repository_id, actor_id, actor_name, action, target_type, target_name, details, created_unix, created_at::text";
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -333,25 +331,18 @@ pub fn valid_audit_token(token: &str) -> bool {
 }
 
 pub async fn ensure_schema(pool: &Pool) -> Result<(), Error> {
-    let mut client = pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    tx.execute("SELECT pg_advisory_xact_lock(738390103)", &[])
-        .await
-        .map_err(Error::internal)?;
-    let installed: bool = tx
+    let client = pool.get().await.map_err(Error::internal)?;
+    let installed: bool = client
         .query_one(
-            "SELECT to_regclass('repository_collaborators') IS NOT NULL",
+            "SELECT to_regclass('repository_collaborators') IS NOT NULL AND to_regclass('repository_audit_log') IS NOT NULL",
             &[],
         )
         .await
         .map_err(Error::internal)?
         .get(0);
     if !installed {
-        tx.batch_execute(super::MIGRATION_050_SQL)
-            .await
-            .map_err(Error::internal)?;
+        return Err(Error::internal("members schema is not migrated"));
     }
-    tx.commit().await.map_err(Error::internal)?;
     Ok(())
 }
 
@@ -401,13 +392,16 @@ mod tests {
         assert!(!valid_team_name("   "));
         assert!(!valid_team_name("bad\nname"));
         assert!(!valid_team_name(&"x".repeat(129)));
-        assert!(valid_team_description("Handles core reviews\nand security."));
+        assert!(valid_team_description(
+            "Handles core reviews\nand security."
+        ));
         assert!(!valid_team_description("bad\0desc"));
         assert!(!valid_team_description(&"x".repeat(1025)));
 
-        let uri = "/audit?actor=alice&action=collaborator.upsert&since=100&until=200&after=5&limit=25"
-            .parse()
-            .unwrap();
+        let uri =
+            "/audit?actor=alice&action=collaborator.upsert&since=100&until=200&after=5&limit=25"
+                .parse()
+                .unwrap();
         let Query(q) = Query::<AuditQuery>::try_from_uri(&uri).unwrap();
         assert_eq!(q.validate().unwrap(), (5, 25));
 

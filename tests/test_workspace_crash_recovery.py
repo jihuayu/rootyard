@@ -4,6 +4,7 @@
 import json
 import os
 from pathlib import Path
+import stat
 import unittest
 
 from tests.workspace import WorkspaceHarness
@@ -12,6 +13,42 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class WorkspaceCrashRecoveryTestSuite(unittest.TestCase):
+    def test_overlay_write_rejects_parent_symlinks_in_native_cli(self):
+        harness = WorkspaceHarness()
+        try:
+            self.assertTrue(harness.requested_binary.is_file(), "native Rust CLI required")
+            root, source, store, base = harness.fixture(
+                "overlay-parent-symlink", {"sub/data.txt": b"checkpoint original\n"}
+            )
+            workspace, _ = harness.init(store, source, base)
+            checkpoint = harness.checkpoint(store, workspace)
+            overlay = harness.data("overlay-mount", store, checkpoint["checkpoint_id"], "agent-one")
+            lower = Path(overlay["lower_path"])
+            upper = Path(overlay["upper_path"])
+            merged = Path(overlay["merged_path"])
+            external = root / "external"
+            external.mkdir()
+            (external / "sub").mkdir()
+            outside_file = external / "sub/data.txt"
+            outside_file.write_bytes(b"outside original\n")
+            outside_file.chmod(0o640)
+            lower_file = lower / "sub/data.txt"
+            original = [(p.read_bytes(), stat.S_IMODE(p.lstat().st_mode)) for p in (lower_file, outside_file)]
+
+            (merged / "alias").symlink_to("../lower")
+            (merged / "outside").symlink_to(external)
+            for alias in ("alias", "outside"):
+                result = harness.lab("overlay-write", store, overlay["overlay_id"],
+                                     f"{alias}/sub/data.txt", "attacker bytes", check=False)
+                self.assertNotEqual(result.returncode, 0, result.stdout.decode())
+                self.assertFalse((upper / alias).exists())
+            self.assertEqual(
+                [(p.read_bytes(), stat.S_IMODE(p.lstat().st_mode)) for p in (lower_file, outside_file)],
+                original,
+            )
+        finally:
+            harness.cleanup()
+
     def test_source_tree_line_caps_and_serde_deny_unknown_fields(self):
         facade = REPO_ROOT / "src/workspace_lab.rs"
         mod_rs = REPO_ROOT / "src/workspace_lab/mod.rs"

@@ -24,6 +24,7 @@ pub mod lfs;
 pub mod maintenance;
 #[rustfmt::skip]
 pub mod members;
+pub mod organizations;
 pub mod metrics;
 #[rustfmt::skip]
 pub mod mirror;
@@ -34,6 +35,8 @@ pub mod reliability;
 pub mod sharding;
 pub mod storage;
 pub mod view_lab;
+pub mod workspace_lab;
+pub mod workspaces;
 #[rustfmt::skip]
 pub mod web;
 #[rustfmt::skip]
@@ -120,8 +123,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(lfs::routes())
         .merge(webhooks::routes())
         .merge(members::routes())
+        .merge(organizations::routes())
         .merge(web::routes())
         .merge(sharding::routes())
+        .merge(workspaces::routes())
         .fallback(|State(state): State<Arc<AppState>>, request| async move {
             git_http::handle(state, request).await
         })

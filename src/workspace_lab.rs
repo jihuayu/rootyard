@@ -14,6 +14,8 @@ pub mod manifest;
 pub mod namespace;
 #[path = "workspace_lab/remote.rs"]
 pub mod remote;
+#[path = "workspace_lab/security.rs"]
+pub mod security;
 #[path = "workspace_lab/sync.rs"]
 pub mod sync;
 #[path = "workspace_lab/vfs.rs"]

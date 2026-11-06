@@ -32,7 +32,7 @@ jobs:
           rustup default stable
       - name: Install matching PostgreSQL client and test tools
         run: |
-          apt-get update && apt-get install -y --no-install-recommends git python3 postgresql-17 postgresql-client-17 redis-server gcc g++ make pkg-config openjdk-21-jre-headless curl ca-certificates
+          apt-get update && apt-get install -y --no-install-recommends git python3 python3-venv postgresql-17 postgresql-client-17 redis-server gcc g++ make pkg-config openjdk-21-jre-headless curl ca-certificates
           echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
           echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
       - name: Test bounded Kafka download helper
@@ -67,6 +67,16 @@ jobs:
         run: python3 tests/schema_contract.py --binary target/debug/rootyard
       - name: Verify end-to-end harness synchronization
         run: python3 -m unittest discover -s tests -p 'test_e2e_sync.py'
+      - name: Reject missing executables and non-server stubs
+        run: python3 -m unittest discover -s tests -p 'test_native_entrypoint.py'
+      - name: Prepare pinned independent Git clients
+        run: |
+          python3 scripts/prepare_git_clients.py test-results/ci-tools/clients
+          python3 -m venv test-results/ci-tools/client-venv
+          test-results/ci-tools/client-venv/bin/pip install pygit2==1.19.0 cffi==2.1.1 pycparser==3.12
+      - name: Exercise stock Git, JGit and libgit2 against the Rust service
+        run: |
+          ROOTYARD_JGIT_CLASSPATH="$PWD/test-results/ci-tools/clients/jgit-libs/*" ROOTYARD_PYGIT2_PYTHON="$PWD/test-results/ci-tools/client-venv/bin/python" python3 tests/client_compatibility.py --binary target/debug/rootyard --report test-results/client-compatibility.json
       - name: Verify parallel track and schema baseline boundaries
         run: python3 -m unittest discover -s tests -p 'test_parallel_boundaries.py'
       - name: Run all Python unit and Tier-5 adversarial contract suites
@@ -166,8 +176,8 @@ jobs:
         run: python3 tests/sharding.py --binary target/debug/rootyard --report test-results/sharding.json
       - name: Exercise multi-node 1/2/4-node concurrency and P95/P99 sharding benchmark suite
         run: python3 tests/benchmark_tiers.py --binary target/debug/rootyard --report test-results/benchmark-tiers.json
-      - name: Exercise 4-tier requirement-driven E2E test suite
-        run: ROOTYARD_E2E_REQUIRE_M5=1 ROOTYARD_E2E_REQUIRE_P2=1 ROOTYARD_E2E_REQUIRE_P3=1 python3 tests/e2e_tiers.py --tier all --binary target/debug/rootyard --report test-results/e2e-tiers.json
+      - name: Exercise explicitly labeled 4-tier reference models
+        run: ROOTYARD_E2E_REQUIRE_M5=1 ROOTYARD_E2E_REQUIRE_P2=1 ROOTYARD_E2E_REQUIRE_P3=1 python3 tests/e2e_tiers.py --reference-only --tier all --report test-results/reference-tiers.json
       - name: Upload end-to-end report
         if: always()
         uses: actions/upload-artifact@v4

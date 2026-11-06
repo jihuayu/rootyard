@@ -6,7 +6,8 @@ use crate::{
     members::audit::record_audit_event,
     sharding::{
         failover::has_git_lock_files,
-        fencing::write_volume_marker_at,
+        transitions,
+        security::require_operator,
         models::{
             self, BUCKET_FIELDS, DEFAULT_LEASE_TTL_SECONDS, REPO_ROUTE_FIELDS, RepoShardRoute,
             ShardNode, VIRTUAL_BUCKET_COUNT, VirtualBucket, VolumeFenceMarker, conflict, json,
@@ -221,6 +222,7 @@ pub async fn execute_rebalance(
     let (now, dry_run, bucket_id) = (input.now_unix.unwrap_or_else(unix_now), input.dry_run.unwrap_or(false), i32::from(input.bucket_id));
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, !dry_run).await?;
+    if !dry_run { require_operator(&tx, &actor).await?; }
     let _source = fetch_node(&tx, &input.source_node_id).await?.ok_or_else(Error::not_found)?;
     let target = fetch_node(&tx, &input.target_node_id).await?.ok_or_else(Error::not_found)?;
     validate_rebalance_target(&input.source_node_id, &target, now)?;
@@ -261,7 +263,6 @@ pub async fn execute_rebalance(
             let updated = RepoShardRoute::row(&r_row);
             (new_ep, token, fenced_ep) = (updated.route_epoch, updated.fencing_token, updated.fenced_epoch);
             let m = VolumeFenceMarker::from_route(&updated, st_gen, Some(input.source_node_id.clone()), now);
-            write_volume_marker_at(&repo_dir, &m)?;
             marker = Some(m);
             let snap = sjson!({ "operation": "rebalance", "bucket_id": input.bucket_id, "phases": REBALANCE_PHASES, "source_node_id": input.source_node_id, "target_node_id": input.target_node_id, "old_route_epoch": old_ep, "new_route_epoch": new_ep, "fencing_token": token, "storage_generation": st_gen });
             tx.execute("INSERT INTO shard_failover_operations (id, tenant_id, repository_id, old_primary_node_id, new_primary_node_id, old_route_epoch, new_route_epoch, fencing_token, storage_generation, state, reason, snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'promoted', $10, $11)", &[&op_id, &access.owner_id, &repo_id, &input.source_node_id, &input.target_node_id, &old_ep, &new_ep, &token, &st_gen, &reason_trimmed, &snap]).await.map_err(Error::internal)?;
@@ -273,7 +274,12 @@ pub async fn execute_rebalance(
         tx.execute("UPDATE repository_shard_routes SET primary_node_id = $2, read_replica_nodes = $3, route_epoch = route_epoch + 1, fencing_token = GREATEST(fencing_token, route_epoch) + 1, fenced_epoch = route_epoch, version = version + 1, updated_at = clock_timestamp() WHERE bucket_id = $1 AND NOT explicit_override", &[&bucket_id, &input.target_node_id, &b_rep_json]).await.map_err(Error::internal)?;
     }
 
-    finish(tx, &actor, !dry_run).await?;
+    if let Some(ref target) = marker {
+        let id = transitions::stage(&tx, target).await?;
+        transitions::commit_and_publish(&state, tx, &actor, target, id).await?;
+    } else {
+        finish(tx, &actor, !dry_run).await?;
+    }
     let receipt = RebalanceReceipt {
         id: op_id, bucket_id: input.bucket_id, source_node_id: input.source_node_id, target_node_id: input.target_node_id,
         repository_id: input.repository_id, dry_run, state: if dry_run { "dry_run".into() } else { "completed".into() },
@@ -367,7 +373,7 @@ pub async fn execute_dr_drill(
     let exp_ov = route.explicit_override || !rolled_back;
     let r_row = tx.query_one(&upd, &[&access.owner_id, &access.repo_id, &active_primary, &rem_json, &exp_ov, &new_epoch, &new_token, &old_epoch, &new_gen]).await.map_err(Error::internal)?;
     let updated_route = RepoShardRoute::row(&r_row);
-    write_volume_marker_at(&repo_dir, &VolumeFenceMarker::from_route(&updated_route, new_gen, fenced_node, now))?;
+    let marker = VolumeFenceMarker::from_route(&updated_route, new_gen, fenced_node, now);
 
     let receipt = DrDrillReceipt {
         drill_id: Uuid::new_v4(), repository_id: access.repo_id, primary_node_id: input.primary_node_id,
@@ -378,10 +384,11 @@ pub async fn execute_dr_drill(
         fencing_token: new_token, storage_generation: new_gen, status: status_str, phases,
         error: err_msg, updated_unix: now,
     };
-    write_dr_drill_receipt_at(&repo_dir, &receipt)?;
     let details = serde_json::to_value(&receipt).map_err(Error::internal)?;
     record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.dr_drill", "shard_dr_drill", &active_primary, details).await?;
-    finish(tx, &actor, true).await?;
+    let id = transitions::stage(&tx, &marker).await?;
+    transitions::commit_and_publish(&state, tx, &actor, &marker, id).await?;
+    write_dr_drill_receipt_at(&repo_dir, &receipt)?;
     Ok(json(http_status, receipt))
 }
 

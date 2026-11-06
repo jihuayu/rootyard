@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -1059,6 +1060,7 @@ class MembersHarness(PullsHarness):
         self.carol = self.issue_token("carol", create_user=True)
         self.dave = self.issue_token("dave", create_user=True)
         self.erin = self.issue_token("erin", create_user=True)
+        self.alice_read_only = self.issue_token("alice", read_only=True)
 
     def migration(self):
         assert self.sql("SELECT count(*) FROM schema_migrations WHERE version=50") == "1"
@@ -1125,6 +1127,12 @@ class MembersHarness(PullsHarness):
         # Non-member dave gets 404 Not Found on private repo endpoints
         self.document(self.collabspath, code=404, token=self.dave)
         self.document(self.auditpath, code=404, token=self.dave)
+        before = self.sql("SELECT count(*) FROM repository_collaborators")
+        self.document(self.collabspath, code=403, token=self.alice_read_only,
+                      method="POST", json_body={"username": "erin", "role": "admin"})
+        self.document(self.collabspath, code=404, token=self.dave,
+                      method="POST", json_body={"username": "erin", "role": "admin"})
+        assert self.sql("SELECT count(*) FROM repository_collaborators") == before
 
     def concurrency_and_idempotency(self):
         c1 = self.document(
@@ -1142,6 +1150,19 @@ class MembersHarness(PullsHarness):
             json_body={"username": "carol", "role": "maintain"},
         )
         assert c1 == c2
+
+        # Independent mutations in two repositories must never allocate the
+        # same global audit ID or roll back because another audit insert won.
+        before = int(self.sql("SELECT count(*) FROM repository_audit_log WHERE action='branch_rule.upserted'"))
+        def create_rule(index):
+            repo = "forge" if index % 2 == 0 else "other"
+            return self.http(f"/api/repos/alice/{repo}/branch-rules", token=self.alice,
+                             method="POST", body={"branch_ref": f"refs/heads/audit-race-{index}"})[0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+            statuses = list(executor.map(create_rule, range(32)))
+        assert statuses == [201] * 32, statuses
+        assert int(self.sql("SELECT count(*) FROM repository_audit_log WHERE action='branch_rule.upserted'")) == before + 32
+        assert self.sql("SELECT count(*)=count(DISTINCT id) FROM repository_audit_log") == "t"
 
     def restart(self):
         self.stop()
