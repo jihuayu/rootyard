@@ -1,10 +1,11 @@
 //! Native-volume worker. The global backup barrier precedes repository locks;
 //! a claimed job is revalidated only after all local admission barriers are held.
-use super::{gitfs, jobs, models::{JobOutcome,Policy}, scheduler};
+use super::{gc, gitfs, jobs, models::{JobOutcome,Policy}, scheduler};
 use crate::{AppState, db};
 use anyhow::{Result, bail};
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -28,11 +29,13 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
     let tx=barrier.transaction().await?;
     let granted:bool=tx.query_one("SELECT pg_try_advisory_xact_lock_shared(738390103)",&[]).await?.get(0);
     if !granted { bail!("backup or migration barrier is active"); }
-    // The durable per-repository reader lease will be acquired here before
-    // the local locks once storage::read_leases lands. Until then, this worker
-    // permits only nonpruning operations.
+    let lease=crate::storage::read_leases::exclusive(
+        &state.pool,job.repository_id,Instant::now()+state.config.git_timeout,
+    ).await.map_err(|_| anyhow::anyhow!("repository reader barrier unavailable"))?;
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     let _write=state.storage.write_lock(job.repository_id).await;
     let _readers=state.storage.maintenance_exclusive(job.repository_id).await;
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     if !jobs::current(&state.pool,job).await? { bail!("maintenance claim or repository generation changed"); }
     if !scheduler::check_local_primary(state,job.repository_id).await? { bail!("repository is not assigned to this primary"); }
     let client=state.pool.get().await?;
@@ -42,7 +45,13 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
         .map_err(|_| anyhow::anyhow!("repository storage fence denies maintenance"))?;
 
     let cancel=CancellationToken::new();
-    let task=gitfs::execute(state,job.repository_id,&job.kind,policy,&cancel);
+    let task=async {
+        if job.kind=="gitfs_unreachable_mark" {
+            gc::mark(state,job.repository_id,job.tenant_id,job.repository_generation,policy,&cancel).await
+        } else {
+            gitfs::execute(state,job.repository_id,&job.kind,policy,&cancel).await
+        }
+    };
     tokio::pin!(task);
     let mut tick=tokio::time::interval(Duration::from_secs((policy.lease_seconds/3).max(1) as u64));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -50,7 +59,8 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
         tokio::select! {
             done=&mut task => break done,
             _=tick.tick() => {
-                if !jobs::renew(&state.pool,job,policy).await.unwrap_or(false)
+                if lease.ensure_active().is_err()
+                    || !jobs::renew(&state.pool,job,policy).await.unwrap_or(false)
                     || tx.query_one("SELECT 1",&[]).await.is_err() {
                     cancel.cancel();
                     break task.await;
@@ -59,6 +69,7 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
         }
     };
     let result=result?;
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     if !jobs::current(&state.pool,job).await? { bail!("maintenance lease expired before result publication"); }
     if job.kind=="gitfs_repack" {
         let counts=gitfs::count(state,job.repository_id,&CancellationToken::new()).await?;
@@ -71,6 +82,7 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
         ).await?;
     }
     let accepted=jobs::finish(&state.pool,job,result,None,policy).await?;
+    lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     tx.commit().await?;
     Ok(JobOutcome {job_id:job.id,kind:job.kind.clone(),repository_id:job.repository_id,
         attempt:job.attempt,state:if accepted {"succeeded"} else {"superseded"}.into()})
