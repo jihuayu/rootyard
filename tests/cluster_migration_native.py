@@ -2,6 +2,8 @@
 """Exercise verified Git bundle migration between disjoint Rust storage processes."""
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ import signal
 import subprocess
 import time
 import urllib.error
+from urllib.parse import unquote, urlsplit
 import uuid
 
 from e2e import Harness
@@ -18,6 +21,7 @@ from cluster_workload_native import free_port, request
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--report", type=Path)
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
     args.binary = str(args.binary.resolve())
@@ -26,6 +30,7 @@ def main():
     h.env["ROOTYARD_CLUSTER_HMAC_KEY"] = base64.b64encode(os.urandom(32)).decode()
     target = None
     target_log = None
+    held_reader = None
     try:
         h.setup()
         h.sql("INSERT INTO cluster_operator_tokens(token_id, granted_by) VALUES ('" + h.alice["token_id"] + "', 'native-migration')")
@@ -35,6 +40,8 @@ def main():
         assert status in (200, 201), status
         h.api()
         h.roundtrip()
+        source_sequence_file = h.root / "data" / "journal" / h.repo["id"] / "sequence"
+        initial_sequence = int(source_sequence_file.read_text())
         port = free_port()
         node1 = "http://127.0.0.1:" + str(port)
         node1_data = h.root / "data-node1"
@@ -65,6 +72,7 @@ def main():
         operation_id = str(uuid.uuid4())
         h.expect("/api/repos/alice/demo/shard-migrate", 409, token=h.alice, method="POST",
                  body={"target_node_id": "node1", "expected_route_epoch": route["route_epoch"], "operation_id": operation_id})
+        assert int(source_sequence_file.read_text()) == initial_sequence, "partial transfer wrote source journal"
         unchanged = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
         assert unchanged["primary_node_id"] == "shard-primary-0" and unchanged["route_epoch"] == route["route_epoch"]
         assert not (node1_data / "repos" / (h.repo["id"] + ".git")).exists()
@@ -94,14 +102,75 @@ def main():
         sequence.write_text("999999")
         h.expect("/api/repos/alice/demo/shard-migrate", 409, token=h.alice, method="POST",
                  body={"target_node_id": "node1", "expected_route_epoch": route["route_epoch"], "operation_id": operation_id})
+        assert int(source_sequence_file.read_text()) == initial_sequence, "ahead target transfer wrote source journal"
         assert sentinel.read_bytes() == b"preserve old target on rejected transfer\n"
         unchanged = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
         assert unchanged["primary_node_id"] == "shard-primary-0"
         sequence.unlink()
+        journal_dir.rmdir()
+        assert unchanged["draining"] is True, "failed transfer released its durable write drain"
+        advert_status, advert_body = request(node0, h.repo["clone_path"] +
+                                              "/info/refs?service=git-receive-pack", h.alice)
+        assert advert_status == 409, ("drained source advertised receive-pack", advert_status, advert_body[:150])
+        journal_before = int((h.root / "data" / "journal" / h.repo["id"] / "sequence").read_text())
+        (h.work / "hello.txt").write_text("commit held until safe cutover\n")
+        h.git("commit", "-am", "blocked by migration drain", cwd=h.work)
+        blocked_push = h.git("push", "origin", "HEAD:main", cwd=h.work, token=h.alice, check=False)
+        assert blocked_push.returncode != 0, "source accepted a write during failed migration drain"
+        journal_after = int((h.root / "data" / "journal" / h.repo["id"] / "sequence").read_text())
+        assert journal_after == journal_before, ("drained push allocated journal operation", journal_before,
+                                                 journal_after, blocked_push.stderr.decode(errors="replace")[-250:])
+        repo_state = h.sql("SELECT state || ':' || COALESCE(recovery_reason,'') FROM repositories WHERE id='" + h.repo["id"] + "'")
+        assert repo_state == "ready:", "failed drained push poisoned repository state: " + repo_state
+        assert h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == h.second
+        # A real PostgreSQL shared object lease holds target replacement back.
+        # Source must release its shared lease before target takes exclusive,
+        # and a paused reader must retain the old target path until release.
+        hold_env = h.env.copy()
+        db_url = urlsplit(h.db)
+        hold_env.update(PGHOST=db_url.hostname, PGPORT=str(db_url.port or 5432),
+                        PGUSER=unquote(db_url.username or "agent"),
+                        PGDATABASE=db_url.path.lstrip("/") or "postgres",
+                        PGAPPNAME="rootyard-migration-held-reader")
+        if db_url.password:
+            hold_env["PGPASSWORD"] = unquote(db_url.password)
+        lock_sql = ("BEGIN; SELECT pg_advisory_xact_lock_shared(hashtextextended("
+                    "'rootyard-data-v1:' || '" + h.repo["id"] + "'::uuid::text,0)); "
+                    "SELECT pg_sleep(4); COMMIT;")
+        held_reader = subprocess.Popen(["psql", "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c", lock_sql],
+                                       env=hold_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if held_reader.poll() is not None:
+                _, error = held_reader.communicate()
+                raise AssertionError("native PG shared lock command failed: " + error.decode(errors="replace")[-300:])
+            acquired = h.sql("SELECT COUNT(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid "
+                             "WHERE a.application_name='rootyard-migration-held-reader' AND l.locktype='advisory' "
+                             "AND l.mode='ShareLock' AND l.granted")
+            if acquired == "1":
+                break
+            time.sleep(.02)
+        else:
+            raise AssertionError("native reader failed to acquire PostgreSQL shared object lease")
         started = time.monotonic_ns()
-        receipt = json.loads(h.expect("/api/repos/alice/demo/shard-migrate", 200, token=h.alice,
-                                      method="POST", body={"target_node_id": "node1", "expected_route_epoch": route["route_epoch"], "operation_id": operation_id}))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(h.http, "/api/repos/alice/demo/shard-migrate", token=h.alice,
+                                  method="POST", body={"target_node_id": "node1", "expected_route_epoch": route["route_epoch"], "operation_id": operation_id})
+            time.sleep(.6)
+            assert not pending.done(), "migration bypassed held PostgreSQL reader"
+            assert sentinel.is_file(), "target path replaced before exclusive data barrier"
+            held_output, held_error = held_reader.communicate(timeout=10)
+            assert held_reader.returncode == 0, held_error.decode(errors="replace")[-300:]
+            held_reader = None
+            status, raw, _ = pending.result(timeout=20)
+        assert status == 200, (status, raw[:300],
+                               str(h.root), initial_sequence,
+                               sorted(path.name for path in source_sequence_file.parent.iterdir()),
+                               h.sql("SELECT state || ':' || COALESCE(recovery_reason,'') FROM repositories WHERE id='" + h.repo["id"] + "'"),
+                               h.sql("SELECT outcome || ':' || COUNT(*) FROM git_operations WHERE repository_id='" + h.repo["id"] + "' GROUP BY outcome"))
+        receipt = json.loads(raw)
         duration_ms = round((time.monotonic_ns() - started) / 1e6, 3)
+        assert duration_ms >= 1000, "migration did not wait on native PostgreSQL reader"
         assert receipt["state"] == "completed" and receipt["target_node_id"] == "node1" and receipt["operation_id"] == operation_id
         new_route = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
         assert new_route["primary_node_id"] == "node1" and new_route["route_epoch"] > route["route_epoch"]
@@ -126,13 +195,28 @@ def main():
         retired = json.loads((h.bare / "rootyard-shard-fence.json").read_text())
         assert retired["primary_node_id"] == "shard-primary-0" and retired["read_only_degraded"] is True
         assert retired["route_epoch"] == new_route["route_epoch"]
-        print(json.dumps({"result": "passed", "operation_id": receipt["operation_id"], "transfer_ms": duration_ms,
+        report = {"kind": "native_cluster_staged_migration", "result": "passed",
+                          "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
+                          "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                          "postgres_version": h.sql("SHOW server_version"),
+                          "operation_id": receipt["operation_id"], "transfer_ms": duration_ms,
                           "partial_copy_rejected_before_cutover": True, "same_operation_resumed_after_target_restart": True,
                           "ahead_journal_rejected_without_replacing_target": True,
+                          "failed_transfer_drained_source_writes": True,
+                          "target_exclusive_barrier_waited_for_native_reader": True,
                           "browse_read_from_retired_ingress_reached_new_owner": True,
                           "source_oid": initial, "destination_oid_after_push": final_tip,
-                          "source_volume": str(h.bare), "destination_volume": str(dest_repo)}))
+                          "source_volume": str(h.bare), "destination_volume": str(dest_repo),
+                          "limits": ["one PostgreSQL authority, two Rust processes on one Linux host",
+                                     "physical cross-host fencing remains external"]}
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report))
     finally:
+        if held_reader and held_reader.poll() is None:
+            held_reader.kill()
+            held_reader.communicate(timeout=5)
         if target and target.poll() is None:
             os.killpg(target.pid, signal.SIGKILL)
             target.wait(timeout=10)

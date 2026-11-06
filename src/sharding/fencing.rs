@@ -303,7 +303,7 @@ pub async fn apply_or_verify_fence(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
-    let _guard = state.storage.write_lock(access.repo_id).await;
+    let mutation = super::locks::exclusive(&state, access.repo_id).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     let repo_gen: i64 = tx
         .query_one("SELECT storage_generation FROM repositories WHERE id = $1 FOR UPDATE", &[&access.repo_id])
@@ -354,6 +354,7 @@ pub async fn apply_or_verify_fence(
         let details = sjson!({ "fenced_epoch": f_epoch, "fencing_token": new_token, "storage_generation": new_gen });
         record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.fenced", "shard_fence", &target_node, details).await?;
         let transition_id = transitions::stage(&tx, &state, &marker).await?;
+        mutation.ensure_active()?;
         transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
         return Ok(json(StatusCode::OK, FenceStatusResponse::from_route(&updated, new_gen, false, Some(marker))));
     }
@@ -378,6 +379,7 @@ pub async fn apply_or_verify_fence(
     let details = sjson!({ "route_epoch": new_route_epoch, "fencing_token": new_token, "storage_generation": new_gen });
     record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.unfenced", "shard_fence", &updated.primary_node_id, details).await?;
     let transition_id = transitions::stage(&tx, &state, &marker).await?;
+    mutation.ensure_active()?;
     transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
     let admitted = !updated.read_only_degraded;
     Ok(json(StatusCode::OK, FenceStatusResponse::from_route(&updated, new_gen, admitted, Some(marker))))

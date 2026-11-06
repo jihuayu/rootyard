@@ -100,7 +100,8 @@ pub async fn reconcile_pending(state: &AppState) -> Result<(), Error> {
         let id: Uuid = row.get(0);
         let target: serde_json::Value = row.get(1);
         let marker: VolumeFenceMarker = serde_json::from_value(target).map_err(Error::internal)?;
-        let _lock = state.storage.write_lock(marker.repository_id).await;
+        let mutation = super::locks::exclusive(state, marker.repository_id).await?;
+        mutation.ensure_active()?;
         publish(state, &marker, id).await?;
     }
     Ok(())
