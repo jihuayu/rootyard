@@ -55,13 +55,17 @@ pub(crate) fn node_id() -> Result<Option<String>, Error> {
 
 /// Provisioning and startup recovery must touch only the assigned data volume.
 pub async fn is_local_primary_for_repo(state: &AppState, owner_id: Uuid, repo_id: Uuid) -> Result<bool, Error> {
-    let Some(local) = node_id()? else { return Ok(true); };
+    let local = node_id()?;
     models::ensure_schema(&state.pool).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    if local.is_none() {
+        let count: i64 = tx.query_one("SELECT COUNT(*) FROM shard_nodes", &[]).await.map_err(Error::internal)?.get(0);
+        if count > 1 { return Err(conflict("cluster provisioning requires a local node identity")); }
+    }
     let route = load_or_init_repo_route(&tx, owner_id, repo_id).await?;
     tx.commit().await.map_err(Error::internal)?;
-    Ok(route.primary_node_id == local)
+    Ok(local.as_deref().is_none_or(|node| route.primary_node_id == node))
 }
 
 fn path_and_query(uri: &Uri) -> &str { uri.path_and_query().map_or(uri.path(), |v| v.as_str()) }
@@ -116,8 +120,13 @@ pub fn route_git_request<'a>(state: &'a Arc<AppState>, request: &Request<Body>)
     let headers = request.headers().clone();
     async move {
     if state.mirror_primary.is_some() || headers.contains_key(DELEGATION_HEADER) { return Ok(None); }
-    let Some(local_node) = node_id()? else { return Ok(None); };
     let Some((owner, name, write)) = parse_git(&method, &uri) else { return Ok(None); };
+    let Some(local_node) = node_id()? else {
+        let client = state.pool.get().await.map_err(Error::internal)?;
+        let count: i64 = client.query_one("SELECT COUNT(*) FROM shard_nodes", &[]).await.map_err(Error::internal)?.get(0);
+        if count > 1 { return Err(conflict("cluster Git ingress requires a local node identity")); }
+        return Ok(None);
+    };
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;

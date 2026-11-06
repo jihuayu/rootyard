@@ -53,9 +53,17 @@ async fn publish(state: &AppState, marker: &VolumeFenceMarker, id: Uuid) -> Resu
     let degraded: bool = row.get(4);
     let required_gen: i64 = row.get(5);
     let repo_gen: i64 = row.get(6);
-    if primary != marker.primary_node_id || epoch != marker.route_epoch
+    let current = primary == marker.primary_node_id && degraded == marker.read_only_degraded;
+    let retired_source = if !current && marker.read_only_degraded && marker.primary_node_id != primary
+        && marker.fenced_node_id.as_deref() == Some(marker.primary_node_id.as_str()) {
+        client.query_opt(
+            "SELECT id FROM shard_replication_operations WHERE repository_id=$1 AND source_node_id=$2 \
+             AND target_node_id=$3 AND source_route_epoch=$4 AND state='completed' LIMIT 1",
+            &[&marker.repository_id, &marker.primary_node_id, &primary, &(epoch - 1)],
+        ).await.map_err(Error::internal)?.is_some()
+    } else { false };
+    if !(current || retired_source) || epoch != marker.route_epoch
         || token != marker.fencing_token || fenced != marker.fenced_epoch
-        || degraded != marker.read_only_degraded
         || repo_gen.max(required_gen) != marker.storage_generation {
         return Err(conflict("shard marker transition differs from committed route; writes blocked"));
     }

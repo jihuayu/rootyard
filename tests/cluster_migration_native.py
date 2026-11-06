@@ -117,6 +117,9 @@ def main():
         assert h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip() == final_tip
         assert h.git("--git-dir=" + str(dest_repo), "rev-parse", "refs/heads/main").stdout.decode().strip() == final_tip
         assert h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == initial
+        retired = json.loads((h.bare / "rootyard-shard-fence.json").read_text())
+        assert retired["primary_node_id"] == "shard-primary-0" and retired["read_only_degraded"] is True
+        assert retired["route_epoch"] == new_route["route_epoch"]
         print(json.dumps({"result": "passed", "operation_id": receipt["operation_id"], "transfer_ms": duration_ms,
                           "partial_copy_rejected_before_cutover": True, "same_operation_resumed_after_target_restart": True,
                           "ahead_journal_rejected_without_replacing_target": True,
