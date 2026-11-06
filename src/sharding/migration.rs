@@ -52,7 +52,7 @@ pub(crate) async fn git_output(state: &AppState, args: &[&str], timeout: Duratio
 
 /// The lease is polled while Git runs. The shared process wrapper's Drop
 /// synchronously kills and reaps the native process group on cancellation.
-async fn git_output_lease(state: &AppState, args: &[&str], timeout: Duration,
+pub(crate) async fn git_output_lease(state: &AppState, args: &[&str], timeout: Duration,
     lease: &crate::storage::read_leases::Lease) -> Result<Vec<u8>, Error> {
     let mut command = state.storage.git(&state.config);
     command.args(args);
@@ -74,7 +74,7 @@ pub(crate) async fn refs_digest(state: &AppState, repo: &FsPath) -> Result<Strin
     Ok(hex::encode(hasher.finalize()))
 }
 
-async fn refs_digest_lease(state: &AppState, repo: &FsPath,
+pub(crate) async fn refs_digest_lease(state: &AppState, repo: &FsPath,
     lease: &crate::storage::read_leases::Lease) -> Result<String, Error> {
     let path = repo.to_str().ok_or_else(Error::bad_request)?;
     let refs = git_output_lease(state, &["--git-dir", path, "for-each-ref",
@@ -167,9 +167,11 @@ pub async fn migrate_repository(
     let lock_deadline = tokio::time::Instant::now() + state.config.git_timeout;
     let source_lease = crate::storage::read_leases::shared(
         &state.pool, access.repo_id, lock_deadline).await?;
-    // This local lock covers the final snapshot, transfer, and placement
-    // commit. A push admitted before it completes first; later pushes recheck
-    // the route after release.
+    let source_gate = tokio::time::timeout_at(
+        lock_deadline, state.storage.maintenance_exclusive(access.repo_id))
+        .await.map_err(|_| Error::timeout())?;
+    // This local lock waits for admitted writers and covers the source bundle
+    // snapshot. The durable drain below keeps later pushes out after release.
     let _write_lock = tokio::time::timeout_at(
         lock_deadline, state.storage.write_lock(access.repo_id))
         .await.map_err(|_| Error::timeout())?;
@@ -181,7 +183,7 @@ pub async fn migrate_repository(
     let route_sql = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id = $1 FOR UPDATE");
     let route = RepoShardRoute::row(&tx.query_one(&route_sql, &[&access.repo_id]).await.map_err(Error::internal)?);
     if route.primary_node_id == input.target_node_id || route.primary_node_id != transport::node_id()?.unwrap_or_default()
-        || input.expected_route_epoch.is_some_and(|e| e != route.route_epoch) || route.draining || route.read_only_degraded {
+        || input.expected_route_epoch.is_some_and(|e| e != route.route_epoch) || route.read_only_degraded {
         return Err(conflict("migration source or route epoch changed"));
     }
     if route.read_replica_nodes.contains(&input.target_node_id) && route.replica_watermarks.get(&input.target_node_id).is_some_and(|w| w.verified) {
@@ -202,19 +204,27 @@ pub async fn migrate_repository(
     let journal_sequence = journal::sequence(&state.storage.root, access.repo_id).map_err(Error::internal)?;
     let generation: i64 = tx.query_one("SELECT storage_generation FROM repositories WHERE id = $1 FOR UPDATE", &[&access.repo_id]).await.map_err(Error::internal)?.get(0);
     let operation_id = input.operation_id.unwrap_or_else(Uuid::new_v4);
-    let prior = tx.query_opt("SELECT source_node_id, target_node_id, source_route_epoch, state FROM shard_replication_operations WHERE id = $1", &[&operation_id]).await.map_err(Error::internal)?;
+    let prior = tx.query_opt("SELECT source_node_id, target_node_id, source_route_epoch, source_generation, state FROM shard_replication_operations WHERE id = $1", &[&operation_id]).await.map_err(Error::internal)?;
     if let Some(row) = prior {
         let source: String = row.get(0);
         let destination: String = row.get(1);
         let epoch: i64 = row.get(2);
-        let state: String = row.get(3);
-        if source != route.primary_node_id || destination != input.target_node_id || epoch != route.route_epoch || state == "completed" || state == "aborted" {
+        let prior_generation: i64 = row.get(3);
+        let state: String = row.get(4);
+        if source != route.primary_node_id || destination != input.target_node_id || epoch != route.route_epoch
+            || prior_generation != generation || state == "completed" || state == "aborted" {
             return Err(conflict("replication operation cannot resume against changed placement"));
         }
     } else {
+        if route.draining { return Err(conflict("repository is drained by another migration")); }
         tx.execute("INSERT INTO shard_replication_operations(id, repository_id, source_node_id, target_node_id, source_route_epoch, source_generation, state) VALUES ($1,$2,$3,$4,$5,$6,'copying')",
             &[&operation_id, &access.repo_id, &route.primary_node_id, &input.target_node_id, &route.route_epoch, &generation]).await.map_err(Error::internal)?;
     }
+    // Stop new admissions durably before releasing the source barriers for the
+    // destination's exclusive install. Any already admitted push completed
+    // before the write mutex above; retry keeps the same operation and drain.
+    tx.execute("UPDATE repository_shard_routes SET draining=true, version=version+1 WHERE repository_id=$1 AND route_epoch=$2",
+        &[&access.repo_id, &route.route_epoch]).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     // No database transaction remains open while native Git and network IO run.
     let stage = staging_root(&state)?;
@@ -229,6 +239,12 @@ pub async fn migrate_repository(
     sync_parent(&stage)?;
     let digest = refs_digest_lease(&state, &repo, &source_lease).await?;
     source_lease.ensure_active()?;
+    // The bundle is now immutable in private staging. The target must acquire
+    // the exclusive PG data barrier before replacing its native repository;
+    // holding the source's shared barrier across HTTP would deadlock it.
+    drop(_write_lock);
+    drop(source_gate);
+    drop(source_lease);
     let path = format!("/internal/shards/{}/snapshot/{}?refs_sha256={digest}&journal_sequence={journal_sequence}", access.repo_id, operation_id);
     let envelope = Envelope {
         version: 1, authority_incarnation, nonce: Uuid::new_v4(), expires_unix: models::unix_now() + ENVELOPE_LIFETIME_SECONDS,
@@ -250,8 +266,13 @@ pub async fn migrate_repository(
     if receipt.operation_id != operation_id || receipt.refs_sha256 != digest || receipt.state != "verified" {
         return Err(conflict("target snapshot verification receipt mismatch"));
     }
-    source_lease.ensure_active()?;
     clean_staging(&bundle)?;
+
+    let cutover = super::locks::exclusive(&state, access.repo_id).await?;
+    cutover.ensure_active()?;
+    if journal::sequence(&state.storage.root, access.repo_id).map_err(Error::internal)? != journal_sequence {
+        return Err(conflict("source journal advanced after migration drain"));
+    }
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
@@ -270,16 +291,19 @@ pub async fn migrate_repository(
     if route.route_epoch != envelope.route_epoch || route.fencing_token != envelope.fencing_token {
         return Err(conflict("route changed during replication"));
     }
+    if !route.draining { return Err(conflict("migration drain was released before cutover")); }
+    cutover.ensure_active()?;
     if input.replicate_only {
         let mut watermarks = route.replica_watermarks.clone();
         watermarks.insert(input.target_node_id.clone(), models::ReplicaWatermark {
             storage_generation: generation, op_sequence: journal_sequence, verified: true,
             updated_unix: models::unix_now(),
         });
-        tx.execute("UPDATE repository_shard_routes SET replica_watermarks=$2, required_op_sequence=GREATEST(required_op_sequence,$3), version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 AND route_epoch=$4",
+        tx.execute("UPDATE repository_shard_routes SET replica_watermarks=$2, required_op_sequence=GREATEST(required_op_sequence,$3), draining=false, version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 AND route_epoch=$4",
             &[&access.repo_id, &serde_json::json!(watermarks), &journal_sequence, &route.route_epoch]).await.map_err(Error::internal)?;
         record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.replica_verified", "shard_replication", &input.target_node_id,
             serde_json::json!({"operation_id":operation_id,"refs_sha256":digest,"journal_sequence":journal_sequence})).await?;
+        cutover.ensure_active()?;
         auth::finish_tx(tx, &actor, true).await?;
         return Ok(json(StatusCode::OK, MigrationReceipt { operation_id, repository_id: access.repo_id,
             source_node_id: route.primary_node_id, target_node_id: input.target_node_id,
@@ -292,7 +316,7 @@ pub async fn migrate_repository(
     let updated = tx.execute("UPDATE repositories SET storage_generation = $2 WHERE id = $1 AND storage_generation = $3", &[&access.repo_id, &new_generation, &generation]).await.map_err(Error::internal)?;
     if updated != 1 { return Err(conflict("repository generation changed during transfer")); }
     tx.execute("UPDATE shard_nodes SET role='primary', lease_epoch=GREATEST(lease_epoch,$2), version=version+1 WHERE node_id=$1", &[&input.target_node_id, &new_epoch]).await.map_err(Error::internal)?;
-    let upd = format!("UPDATE repository_shard_routes SET primary_node_id=$2, route_epoch=$3, fencing_token=$4, fenced_epoch=$5, required_generation=$6, explicit_override=true, read_replica_nodes='[]'::jsonb, replica_watermarks='{{}}'::jsonb, version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 RETURNING {REPO_ROUTE_FIELDS}");
+    let upd = format!("UPDATE repository_shard_routes SET primary_node_id=$2, route_epoch=$3, fencing_token=$4, fenced_epoch=$5, required_generation=$6, draining=false, explicit_override=true, read_replica_nodes='[]'::jsonb, replica_watermarks='{{}}'::jsonb, version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 RETURNING {REPO_ROUTE_FIELDS}");
     let moved = RepoShardRoute::row(&tx.query_one(&upd, &[&access.repo_id, &input.target_node_id, &new_epoch, &new_token, &route.route_epoch, &new_generation]).await.map_err(Error::internal)?);
     tx.execute("UPDATE shard_replication_operations SET state='completed', updated_at=clock_timestamp() WHERE id=$1 AND state='verified'", &[&operation_id]).await.map_err(Error::internal)?;
     // Publish a retired marker on the *source* volume. The target process may
@@ -304,6 +328,7 @@ pub async fn migrate_repository(
     record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.migrated", "shard_replication", &input.target_node_id,
         serde_json::json!({"operation_id": operation_id, "refs_sha256": digest, "source": route.primary_node_id, "target": input.target_node_id})).await?;
     let transition_id = transitions::stage(&tx, &state, &marker).await?;
+    cutover.ensure_active()?;
     transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
     Ok(json(StatusCode::OK, MigrationReceipt { operation_id, repository_id: access.repo_id, source_node_id: route.primary_node_id,
         target_node_id: input.target_node_id, refs_sha256: digest, old_route_epoch: route.route_epoch, new_route_epoch: new_epoch, state: "completed" }))
@@ -359,13 +384,8 @@ pub async fn receive_snapshot(
     let maximum: i64 = tx.query_one("SELECT COALESCE(MAX(sequence),0) FROM git_operations WHERE repository_id=$1", &[&repo_id]).await.map_err(Error::internal)?.get(0);
     if query.journal_sequence < maximum { return Err(conflict("source journal sequence is behind recorded Git operations")); }
     tx.commit().await.map_err(Error::internal)?;
-    let lock_deadline = tokio::time::Instant::now() + state.config.git_timeout;
-    let target_lease = crate::storage::read_leases::shared(
-        &state.pool, repo_id, lock_deadline).await?;
-    let _lock = tokio::time::timeout_at(
-        lock_deadline, state.storage.write_lock(repo_id))
-        .await.map_err(|_| Error::timeout())?;
-    target_lease.ensure_active()?;
+    let target = super::locks::exclusive(&state, repo_id).await?;
+    target.ensure_active()?;
     let root = staging_root(&state)?;
     let bundle = root.join(format!("{op_id}.incoming.bundle"));
     let staging = root.join(format!("{op_id}.git"));
@@ -384,11 +404,11 @@ pub async fn receive_snapshot(
     file.sync_all().await.map_err(Error::internal)?;
     drop(file);
     if total == 0 { return Err(conflict("empty snapshot bundle")); }
-    git_output_lease(&state, &["-c", "core.hooksPath=/dev/null", "clone", "--mirror", "--", bundle.to_str().ok_or_else(Error::bad_request)?, staging.to_str().ok_or_else(Error::bad_request)?], state.config.git_timeout, &target_lease).await?;
-    target_lease.ensure_active()?;
-    git_output_lease(&state, &["--git-dir", staging.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout, &target_lease).await?;
-    target_lease.ensure_active()?;
-    let measured = refs_digest_lease(&state, &staging, &target_lease).await?;
+    git_output_lease(&state, &["-c", "core.hooksPath=/dev/null", "clone", "--mirror", "--", bundle.to_str().ok_or_else(Error::bad_request)?, staging.to_str().ok_or_else(Error::bad_request)?], state.config.git_timeout, &target.lease).await?;
+    target.ensure_active()?;
+    git_output_lease(&state, &["--git-dir", staging.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout, &target.lease).await?;
+    target.ensure_active()?;
+    let measured = refs_digest_lease(&state, &staging, &target.lease).await?;
     if measured != query.refs_sha256 { return Err(conflict("target refs differ from source snapshot")); }
     configure_target(&state, &staging, repo_id).await?;
     let stage_sync = staging.clone();
@@ -399,13 +419,13 @@ pub async fn receive_snapshot(
     journal::mkdir(&journal_repo).map_err(Error::internal)?;
     let current_sequence = journal::sequence(&state.storage.root, repo_id).map_err(Error::internal)?;
     if current_sequence > query.journal_sequence { return Err(conflict("destination journal sequence is ahead of transferred snapshot")); }
-    target_lease.ensure_active()?;
+    target.ensure_active()?;
     journal::atomic(&journal_repo.join("sequence"), query.journal_sequence.to_string().as_bytes(), true).map_err(Error::internal)?;
     let client = state.pool.get().await.map_err(Error::internal)?;
     let updated = client.execute("UPDATE shard_replication_operations SET state='verified', refs_sha256=$2, journal_sequence=$3, updated_at=clock_timestamp() WHERE id=$1 AND state IN ('copying','verified')",
         &[&op_id, &measured, &query.journal_sequence]).await.map_err(Error::internal)?;
     if updated != 1 { return Err(conflict("snapshot operation changed before publication")); }
-    target_lease.ensure_active()?;
+    target.ensure_active()?;
     let final_path = state.storage.repo_path(repo_id);
     let backup = root.join(format!("{op_id}.previous-{}.git", Uuid::new_v4()));
     let had_previous = match fs::symlink_metadata(&final_path) {
@@ -419,7 +439,8 @@ pub async fn receive_snapshot(
         if had_previous { fs::rename(&backup, &final_path).map_err(Error::internal)?; }
         return Err(Error::internal(error));
     }
-    if let Err(error) = sync_parent(final_path.parent().ok_or_else(Error::bad_request)?) {
+    if let Err(error) = sync_parent(final_path.parent().ok_or_else(Error::bad_request)?)
+        .and_then(|_| target.ensure_active()) {
         let failed = root.join(format!("{op_id}.failed-{}.git", Uuid::new_v4()));
         fs::rename(&final_path, &failed).map_err(Error::internal)?;
         if had_previous { fs::rename(&backup, &final_path).map_err(Error::internal)?; }

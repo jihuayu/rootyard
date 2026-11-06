@@ -242,7 +242,11 @@ pub async fn execute_rebalance(
         (old_b_epoch, new_b_epoch, new_b_epoch, old_b_epoch, 1_i64, None);
 
     if let Some(repo_id) = input.repository_id {
-        let _guard = state.storage.write_lock(repo_id).await;
+        let deadline = tokio::time::Instant::now() + state.config.git_timeout;
+        let lease = crate::storage::read_leases::shared(&state.pool, repo_id, deadline).await?;
+        let _gate = tokio::time::timeout_at(deadline, state.storage.read_snapshot_lock(repo_id))
+            .await.map_err(|_| Error::timeout())?;
+        lease.ensure_active()?;
         let meta = tx.query_opt("SELECT u.username, r.name, r.storage_generation FROM repositories r JOIN users u ON u.id = r.owner_id WHERE r.id = $1 FOR UPDATE", &[&repo_id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
         let (owner_name, repo_name, repo_gen): (String, String, i64) = (meta.get(0), meta.get(1), meta.get(2));
         let access = auth::authorize_repo_with_role(&tx, &actor, &owner_name, &repo_name, Role::Admin).await?;
@@ -254,6 +258,7 @@ pub async fn execute_rebalance(
         if route.in_flight_writes > 0 || has_git_lock_files(&repo_dir) {
             return Err(conflict("cannot drain repository with active in-flight writes or Git lock files"));
         }
+        lease.ensure_active()?;
         (old_ep, new_ep, token, fenced_ep, st_gen) = (route.route_epoch, route.route_epoch + 1, route.fencing_token.max(route.route_epoch) + 1, route.route_epoch, repo_gen + 1);
         if !dry_run {
             tx.execute("INSERT INTO shard_virtual_buckets (bucket_id, primary_node_id, read_replica_nodes, route_epoch) VALUES ($1, $2, $3, $4) ON CONFLICT (bucket_id) DO UPDATE SET primary_node_id = $2, read_replica_nodes = $3, route_epoch = shard_virtual_buckets.route_epoch + 1, updated_at = clock_timestamp()", &[&bucket_id, &input.target_node_id, &b_rep_json, &new_b_epoch]).await.map_err(Error::internal)?;

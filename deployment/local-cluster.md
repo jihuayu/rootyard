@@ -74,6 +74,12 @@ outbox. A control operator uses the authenticated shard APIs and the separate
 `migrator.env` identity. The current binary does not provide a standalone
 control HTTP role: these routes run on the data/API nodes.
 
+A migration that fails after the source begins draining deliberately keeps the
+source write-blocked. Retry `/shard-migrate` with the **same operation ID**
+after repairing the destination. The source snapshot, destination install,
+and source cutover use ordered PostgreSQL and local barriers; do not clear the
+drain by editing SQL directly or by registering a new target volume as current.
+
 For workspace execution, add `ROOTYARD_WORKSPACE_MOUNT_MODE=fuse` to the
 corresponding node environment and provide `/dev/fuse` and a functioning user
 mount namespace. A workspace mount is local to that process's namespace;
