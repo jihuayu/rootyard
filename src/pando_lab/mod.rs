@@ -9,6 +9,7 @@ pub mod migration;
 pub mod object_format;
 pub mod object_store;
 pub mod repack;
+mod remote;
 pub mod rollback;
 mod store;
 
@@ -290,7 +291,7 @@ pub async fn run() -> Result<()> {
             let snap = store::snapshot(&config, repo).await?;
             let mut obj_store = graph::ObjectStore::default();
             for pack in &snap.packs {
-                object_store::ensure_local_pack_cached(&config, repo, pack)?;
+                object_store::ensure_local_pack_cached(&config, repo, pack).await?;
                 let prefix = config
                     .root
                     .join("objects")

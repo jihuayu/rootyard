@@ -180,7 +180,7 @@ pub(super) async fn repack_repo(config: &Config, repo: Uuid, opts: &RepackOption
     let mut input_packs = Vec::with_capacity(m_rows.len());
     for r in &m_rows {
         let pack = Pack { id: r.get(0), pack_sha256: r.get(1), idx_sha256: r.get(2) };
-        object_store::ensure_local_pack_cached(config, repo, &pack)?;
+        object_store::ensure_local_pack_cached(config, repo, &pack).await?;
         let pfx = config.root.join("objects").join(repo.to_string()).join(pack.id.to_string());
         let (pb, ib) = (std::fs::read(pfx.with_extension("pack"))?, std::fs::read(pfx.with_extension("idx"))?);
         ensure!(delta::sha256_hex(&pb) == pack.pack_sha256 && delta::sha256_hex(&ib) == pack.idx_sha256, "pack checksum mismatch before repack");

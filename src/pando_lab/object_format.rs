@@ -330,7 +330,7 @@ pub(super) async fn verify_repo_format(config: &Config, repo: Uuid, expected: Op
     let snap = store::snapshot(config, repo).await?;
     let (mut obj_store, mut objects_verified) = (ObjectStore::default(), 0usize);
     for pack in &snap.packs {
-        object_store::ensure_local_pack_cached(config, repo, pack)?;
+        object_store::ensure_local_pack_cached(config, repo, pack).await?;
         let prefix = config.root.join("objects").join(repo.to_string()).join(pack.id.to_string());
         let pack_bytes = std::fs::read(prefix.with_extension("pack"))?;
         let rep = verify_pack_dual_format(&pack_bytes, format, &Limits::default())?;

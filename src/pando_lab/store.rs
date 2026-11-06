@@ -105,7 +105,7 @@ pub(super) async fn materialize(
     let staging = base.join("staging.git");
     init_repo(config, &staging).await?;
     for pack in &snapshot.packs {
-        object_store::ensure_local_pack_cached(config, snapshot.repo, pack)?;
+        object_store::ensure_local_pack_cached(config, snapshot.repo, pack).await?;
         let prefix = config
             .root
             .join("objects")
@@ -191,7 +191,7 @@ pub(super) async fn publish_pack(
 
     let mut existing_store = graph::ObjectStore::default();
     for pack in &existing_snap.packs {
-        object_store::ensure_local_pack_cached(config, repo, pack)?;
+        object_store::ensure_local_pack_cached(config, repo, pack).await?;
         let prefix = config
             .root
             .join("objects")
