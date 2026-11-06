@@ -90,7 +90,7 @@ pub async fn authenticate_principal(state:&AppState,headers:&HeaderMap,owner:&st
     }
     let repo=db::Repository{id:repo_id,name:name.into(),owner:owner.into(),state:"ready".into(),
         clone_path:format!("/git/{owner}/{name}.git"),storage_backend:"gitfs".into(),
-        storage_generation:plan.storage_generation};
+        storage_generation:plan.storage_generation,object_format:plan.object_format.clone()};
     Ok((CheckoutPrincipal::Integration{hook_id:row.get(4),run_id:row.get(5),
         job_id:plan.job_id,token_digest:digest},repo,plan))
 }
@@ -144,7 +144,7 @@ pub(crate) async fn authenticate(
         read_only:true,token_digest:digest};
     let repo=db::Repository{id:repo_id,name:name.into(),owner:owner.into(),state:"ready".into(),
         clone_path:format!("/git/{owner}/{name}.git"),storage_backend:"gitfs".into(),
-        storage_generation:plan.storage_generation};
+        storage_generation:plan.storage_generation,object_format:plan.object_format.clone()};
     Ok((identity,repo,plan))
 }
 

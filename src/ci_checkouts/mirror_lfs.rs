@@ -52,7 +52,7 @@ pub async fn download(
     dependencies::verify_on_mirror(&state,&plan).await?;
     let dep=plan.dependencies.lfs.iter().find(|dep|dep.repository_id==repo.id && dep.oid==oid)
         .ok_or_else(Error::not_found)?;
-    let body=storage::open_verified_download_stream(&state,repo.id,&oid,dep.size as u64).await?;
+    let body=storage::open_verified_download_stream(&state,repo.id,plan.owner_id,&oid,dep.size as u64).await?;
     Ok((StatusCode::OK,[(header::CONTENT_TYPE,"application/octet-stream"),
         (header::CACHE_CONTROL,"no-store")],body).into_response())
 }
