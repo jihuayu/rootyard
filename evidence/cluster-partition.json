@@ -1,15 +1,15 @@
 {
   "kind": "native_tcp_partition_takeover",
-  "binary_sha256": "32446ef5011eb23e14704ab04543d2998f1caf490eb40b5faa41f31a6f5fdb17",
+  "binary_sha256": "e0f475a5b1d7b52d54bf8464abf28ef05de6ba61808842c98ed1978fea283956",
   "fault": "closed source-only PostgreSQL TCP proxy and all its live sockets",
   "source_metadata_status_after_partition": 503,
   "old_source_session_killed": true,
   "durable_restart_block": true,
-  "acknowledged_oid_before_partition": "c3ae22f9fda086ba877987fde7574b7a29273c12",
+  "acknowledged_oid_before_partition": "c24df4e93dd5f871e8bf5dad366caaea1103ebda",
   "rpo_lost_acknowledged_commits": 0,
-  "takeover_ms": 5599.629,
+  "takeover_ms": 6773.544,
   "new_route_epoch": 2,
-  "post_takeover_oid": "d2814de3fa1eab537cc670820bdfbb7e17c94ee3",
+  "post_takeover_oid": "9dbf0680233d9ca3e7fe444c60f0efa651e32f35",
   "limits": [
     "single-host TCP isolation; no kernel network namespace partition",
     "local process-session fence only"
