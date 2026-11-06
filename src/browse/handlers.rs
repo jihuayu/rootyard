@@ -60,9 +60,9 @@ pub async fn list_refs(
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = acquire_git_slot(&state)?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let head = git_read::read_head(&state, repo_id).await?;
     let filtered = git_read::page_refs(&state, repo_id, prefix, after, limit).await?;
@@ -100,9 +100,9 @@ pub async fn list_commits(
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = acquire_git_slot(&state)?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let payload = git_read::list_commits(&state, repo_id, spec, after, limit).await?;
 
@@ -127,9 +127,9 @@ pub async fn get_commit(
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = acquire_git_slot(&state)?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let detail = git_read::get_commit_detail(&state, repo_id, &oid).await?;
 
@@ -160,9 +160,9 @@ pub async fn get_tree(
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = acquire_git_slot(&state)?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let tree = git_read::read_tree(
         &state,
@@ -199,9 +199,9 @@ pub async fn get_tree_by_oid(
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = acquire_git_slot(&state)?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let tree = git_read::read_tree(&state, repo_id, Some(&oid), &rel_path, after, limit).await?;
 
@@ -237,9 +237,9 @@ pub async fn get_blob(
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = acquire_git_slot(&state)?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let blob =
         git_read::read_blob(&state, repo_id, query.oid.as_deref(), query.path.as_deref()).await?;
@@ -271,9 +271,9 @@ pub async fn get_blob_by_oid(
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = acquire_git_slot(&state)?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let blob = git_read::read_blob(&state, repo_id, Some(&oid), query.path.as_deref()).await?;
 
@@ -299,9 +299,9 @@ pub async fn compare_commits(
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
     let _permit = acquire_git_slot(&state)?;
-    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let comparison = git_read::compare_commits(&state, repo_id, &query.base, &query.head).await?;
 

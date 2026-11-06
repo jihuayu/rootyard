@@ -88,7 +88,7 @@ async fn validate(state:&AppState,path:&Path,plan:&Plan,
 /// Called only after a job token has passed live, exact-target authority.
 /// The view contains solely the declared commit ancestry and tag closures.
 pub(crate) async fn origin_job_path(state:&AppState,repo:&db::Repository,
-    plan:&Plan)->Result<PathBuf,Error>{
+    plan:&Plan, lease:&crate::storage::read_leases::Lease)->Result<PathBuf,Error>{
     if state.mirror_primary.is_some() || repo.id!=plan.repository_id ||
         repo.storage_generation!=plan.storage_generation ||
         plan.target_oid.len()!=if plan.object_format=="sha1" {40} else {64} {
@@ -100,6 +100,7 @@ pub(crate) async fn origin_job_path(state:&AppState,repo:&db::Repository,
     let destination=directory.join(format!("{}-{}.git",repo.storage_generation,plan.job_id));
     let _lock=tokio::time::timeout(state.config.git_timeout,state.storage.write_lock(repo.id))
         .await.map_err(|_|Error::timeout())?;
+    lease.ensure_active()?;
     let source=state.storage.verify_path(repo.id).map_err(Error::internal)?;
     let intent=ci_pins::Intent{version:1,job_id:plan.job_id,owner_id:plan.owner_id,
         repository_id:repo.id,storage_generation:repo.storage_generation,
@@ -109,6 +110,7 @@ pub(crate) async fn origin_job_path(state:&AppState,repo:&db::Repository,
     if receipt!=plan.source_receipt_sha256 {return Err(unavailable());}
     if destination.exists(){
         validate(state,&destination,plan,&source).await.map_err(Error::internal)?;
+        lease.ensure_active()?;
         return Ok(destination);
     }
     private_directory(&root).map_err(Error::internal)?;
@@ -150,5 +152,6 @@ pub(crate) async fn origin_job_path(state:&AppState,repo:&db::Repository,
     }.await;
     if stage.exists(){let _=std::fs::remove_dir_all(&stage);}
     result.map_err(Error::internal)?;
+    lease.ensure_active()?;
     Ok(destination)
 }
