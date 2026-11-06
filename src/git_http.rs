@@ -23,7 +23,8 @@ mod process;
 #[path = "git_http/protocol.rs"]
 mod protocol;
 use process::Process;
-pub(crate) use process::{collect_git_output, collect_git_output_input};
+pub(crate) use process::{collect_git_output, collect_git_output_input,
+    finish_group_child, stop_group_child};
 use protocol::{job_response_prefix, route, validate_headers, read_headers};
 
 async fn transfer_authorized(

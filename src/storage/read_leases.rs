@@ -3,7 +3,7 @@
 use crate::Error;
 use axum::http::StatusCode;
 use deadpool_postgres::Pool;
-use std::sync::{Arc, OnceLock};
+use std::{future::Future, sync::{Arc, OnceLock}};
 use tokio::{sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore}, task::JoinHandle, time::{Duration, Instant}};
 use uuid::Uuid;
 
@@ -33,6 +33,20 @@ impl Lease {
             Instant::now().duration_since(*last) < Duration::from_secs(3));
         if fresh && !self.task.is_finished() { Ok(()) }
         else { Err(Error(StatusCode::SERVICE_UNAVAILABLE, "storage read lease lost")) }
+    }
+
+    /// Abort a native read future promptly if its fencing lease is lost.
+    /// Git subprocess wrappers use kill-on-drop, so cancellation stops them.
+    pub async fn guard<F: Future>(&self, future: F) -> Result<F::Output, Error> {
+        tokio::pin!(future);
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            self.ensure_active()?;
+            tokio::select! {
+                result = &mut future => { self.ensure_active()?; return Ok(result); }
+                _ = tick.tick() => {}
+            }
+        }
     }
 }
 
@@ -186,9 +200,11 @@ mod tests {
             Instant::now() + Duration::from_secs(3)).await.unwrap();
         lease.ensure_active().unwrap();
         pause_send.send(true).unwrap();
-        tokio::time::sleep(Duration::from_millis(2800)).await;
-        assert!(lease.ensure_active().is_err(),
-            "blackholed heartbeat left a readable snapshot lease");
+        let result = tokio::time::timeout(Duration::from_secs(4), lease.guard(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        })).await.unwrap();
+        assert!(result.is_err(), "blackholed heartbeat left a native read running");
+        assert!(lease.ensure_active().is_err(), "blackholed lease remained active");
         drop(lease);
         proxy.abort();
     }

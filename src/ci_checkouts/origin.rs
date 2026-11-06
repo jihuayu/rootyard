@@ -287,6 +287,17 @@ pub(crate) async fn origin_job_path(
     plan: &Plan,
     lease: &crate::storage::read_leases::Lease,
 ) -> Result<PathBuf, Error> {
+    // The lease owner lives in Git HTTP for the entire response. Guard every
+    // native source read, including receipt verification and pack construction;
+    // a stalled PostgreSQL heartbeat cancels the Git future before GC proceeds.
+    lease.guard(origin_job_path_inner(state,repo,plan)).await?
+}
+
+async fn origin_job_path_inner(
+    state: &AppState,
+    repo: &db::Repository,
+    plan: &Plan,
+) -> Result<PathBuf, Error> {
     if state.mirror_primary.is_some()
         || repo.id != plan.repository_id
         || repo.storage_generation != plan.storage_generation
@@ -301,7 +312,6 @@ pub(crate) async fn origin_job_path(
     let _lock = tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo.id))
         .await
         .map_err(|_| Error::timeout())?;
-    lease.ensure_active()?;
     super::dependencies::verify_on_origin(state, plan).await?;
     let source = state
         .storage
@@ -327,7 +337,6 @@ pub(crate) async fn origin_job_path(
         validate(state, &destination, plan, &source)
             .await
             .map_err(Error::internal)?;
-        lease.ensure_active()?;
         return Ok(destination);
     }
     private_directory(&root).map_err(Error::internal)?;
@@ -407,6 +416,5 @@ pub(crate) async fn origin_job_path(
         let _ = std::fs::remove_dir_all(&stage);
     }
     result.map_err(Error::internal)?;
-    lease.ensure_active()?;
     Ok(destination)
 }
