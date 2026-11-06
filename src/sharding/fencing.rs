@@ -5,6 +5,7 @@ use crate::{
     auth::{self, Role, finish_tx as finish},
     members::audit::record_audit_event,
     sharding::{
+        transitions,
         models::{
             self, FenceActionInput, FenceStatusResponse, REPO_ROUTE_FIELDS, RepoShardRoute,
             RepoState, SHARD_NODE_FIELDS, ShardNode, VOLUME_FENCE_MARKER_FILE, VolumeFenceMarker,
@@ -139,6 +140,7 @@ pub fn evaluate_write_barrier(
 
 /// Pre-push storage fencing hook ready to be wired into `src/reliability.rs::before_push` in M17.
 pub async fn check_before_push(state: &AppState, repo: &RepoState) -> Result<(), Error> {
+    transitions::reject_pending(state, repo.id).await?;
     let repo_dir = state.storage.repo_path(repo.id);
     let marker = read_volume_marker_at(&repo_dir)?;
     if let Some(ref m) = marker
@@ -165,6 +167,10 @@ pub async fn check_before_push(state: &AppState, repo: &RepoState) -> Result<(),
         return Ok(());
     };
     let route = RepoShardRoute::row(&r_row);
+    if let Ok(local_node) = std::env::var("ROOTYARD_NODE_ID")
+        && local_node != route.primary_node_id {
+        return Err(conflict("local storage node is not repository primary"));
+    }
 
     let n_sql = format!("SELECT {SHARD_NODE_FIELDS} FROM shard_nodes WHERE node_id = $1");
     let primary = client
@@ -199,7 +205,8 @@ pub async fn get_fence_status(
         .ok_or_else(|| conflict("primary shard node missing"))?;
     let repo_dir = state.storage.repo_path(access.repo_id);
     let marker = read_volume_marker_at(&repo_dir)?;
-    let admitted = evaluate_write_barrier(&route, &primary, repo_gen, marker.as_ref(), None, unix_now()).is_ok();
+    let admitted = transitions::reject_pending(&state, access.repo_id).await.is_ok()
+        && evaluate_write_barrier(&route, &primary, repo_gen, marker.as_ref(), None, unix_now()).is_ok();
     finish(tx, &actor, false).await?;
     let eff_gen = repo_gen.max(route.required_generation);
     Ok(json(StatusCode::OK, FenceStatusResponse::from_route(&route, eff_gen, admitted, marker)))
@@ -251,7 +258,6 @@ pub async fn apply_or_verify_fence(
         .await
         .map_err(Error::internal)?
         .get(0);
-    let repo_dir = state.storage.repo_path(access.repo_id);
     let new_gen = input.storage_generation.unwrap_or(repo_gen.max(route.required_generation));
     if new_gen < repo_gen {
         return Err(conflict("storage_generation cannot move backward"));
@@ -267,22 +273,15 @@ pub async fn apply_or_verify_fence(
         if !valid_node_id(&target_node) {
             return Err(Error::bad_request());
         }
+        if target_node != route.primary_node_id {
+            return Err(conflict("repository fence can target only its current primary"));
+        }
         let f_epoch = input.fenced_epoch.unwrap_or(route.route_epoch);
         if f_epoch <= 0 || f_epoch < route.fenced_epoch {
             return Err(conflict("fenced_epoch cannot move backward"));
         }
         let new_route_epoch = route.route_epoch.max(f_epoch);
         let new_token = route.fencing_token.max(new_route_epoch) + 1;
-
-        tx.execute(
-            "UPDATE shard_nodes SET fenced_epoch = GREATEST(fenced_epoch, $2), \
-             role = CASE WHEN node_id = $1 THEN 'fenced' ELSE role END, \
-             status = CASE WHEN node_id = $1 THEN 'fenced' ELSE status END, \
-             version = version + 1, updated_at = clock_timestamp() WHERE node_id = $1",
-            &[&target_node, &f_epoch],
-        )
-        .await
-        .map_err(Error::internal)?;
 
         let upd_sql = format!(
             "UPDATE repository_shard_routes SET route_epoch = $3, fencing_token = $4, \
@@ -300,24 +299,15 @@ pub async fn apply_or_verify_fence(
         let row = tx.query_one(&upd_sql, params).await.map_err(Error::internal)?;
         let updated = RepoShardRoute::row(&row);
         let marker = VolumeFenceMarker::from_route(&updated, new_gen, Some(target_node.clone()), now);
-        write_volume_marker_at(&repo_dir, &marker)?;
         let details = sjson!({ "fenced_epoch": f_epoch, "fencing_token": new_token, "storage_generation": new_gen });
         record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.fenced", "shard_fence", &target_node, details).await?;
-        finish(tx, &actor, true).await?;
+        let transition_id = transitions::stage(&tx, &marker).await?;
+        transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
         return Ok(json(StatusCode::OK, FenceStatusResponse::from_route(&updated, new_gen, false, Some(marker))));
     }
 
     let new_route_epoch = route.route_epoch.max(route.fenced_epoch) + 1;
     let new_token = route.fencing_token.max(new_route_epoch) + 1;
-    tx.execute(
-        "UPDATE shard_nodes SET role = 'primary', status = 'healthy', \
-         lease_epoch = GREATEST(lease_epoch, $2), version = version + 1, updated_at = clock_timestamp() \
-         WHERE node_id = $1",
-        &[&route.primary_node_id, &new_route_epoch],
-    )
-    .await
-    .map_err(Error::internal)?;
-
     let upd_sql = format!(
         "UPDATE repository_shard_routes SET route_epoch = $3, fencing_token = $4, \
          required_generation = $5, draining = false, version = version + 1, updated_at = clock_timestamp() \
@@ -333,10 +323,10 @@ pub async fn apply_or_verify_fence(
     let row = tx.query_one(&upd_sql, params).await.map_err(Error::internal)?;
     let updated = RepoShardRoute::row(&row);
     let marker = VolumeFenceMarker::from_route(&updated, new_gen, None, now);
-    write_volume_marker_at(&repo_dir, &marker)?;
     let details = sjson!({ "route_epoch": new_route_epoch, "fencing_token": new_token, "storage_generation": new_gen });
     record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.unfenced", "shard_fence", &updated.primary_node_id, details).await?;
-    finish(tx, &actor, true).await?;
+    let transition_id = transitions::stage(&tx, &marker).await?;
+    transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
     let admitted = !updated.read_only_degraded;
     Ok(json(StatusCode::OK, FenceStatusResponse::from_route(&updated, new_gen, admitted, Some(marker))))
 }

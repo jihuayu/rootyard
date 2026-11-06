@@ -5,7 +5,9 @@ use crate::{
     auth::{self, Role, finish_tx as finish},
     members::audit::record_audit_event,
     sharding::{
-        fencing::{read_volume_marker_at, write_volume_marker_at},
+        security::require_operator,
+        transitions,
+        fencing::read_volume_marker_at,
         models::{
             self, DEFAULT_LEASE_TTL_SECONDS, DegradeDrillInput, DegradeDrillResponse,
             FAILOVER_OP_FIELDS, FailoverInput, FailoverOperation, REPO_ROUTE_FIELDS,
@@ -114,6 +116,7 @@ pub async fn execute_failover(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    require_operator(&tx, &actor).await?;
     let _guard = state.storage.write_lock(access.repo_id).await;
 
     let repo_dir = state
@@ -188,7 +191,6 @@ pub async fn execute_failover(
     let updated_route = RepoShardRoute::row(&r_row);
 
     let marker = VolumeFenceMarker::from_route(&updated_route, new_gen, Some(old_primary_id.clone()), now);
-    write_volume_marker_at(&repo_dir, &marker)?;
 
     let op_id = Uuid::new_v4();
     let reason_trimmed = reason.trim();
@@ -225,7 +227,8 @@ pub async fn execute_failover(
     let failover_op = FailoverOperation::row(&op_row);
 
     record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.failover_promoted", "shard_failover", &candidate.node_id, snapshot).await?;
-    finish(tx, &actor, true).await?;
+    let transition_id = transitions::stage(&tx, &marker).await?;
+    transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
     Ok(json(StatusCode::OK, failover_op))
 }
 
@@ -291,11 +294,11 @@ pub async fn degrade_or_recover_repo(
 
     let eff_gen = repo_gen.max(updated.required_generation);
     let marker = VolumeFenceMarker::from_route(&updated, eff_gen, prev_marker.and_then(|m| m.fenced_node_id), now);
-    write_volume_marker_at(&repo_dir, &marker)?;
 
     let details = sjson!({ "mode": mode, "read_only_degraded": degraded, "route_epoch": updated.route_epoch });
     record_audit_event(&tx, access.owner_id, access.repo_id, &actor, audit_action, "shard_degrade", &updated.primary_node_id, details).await?;
-    finish(tx, &actor, true).await?;
+    let transition_id = transitions::stage(&tx, &marker).await?;
+    transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
 
     Ok(json(
         StatusCode::OK,
