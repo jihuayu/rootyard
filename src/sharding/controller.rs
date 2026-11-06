@@ -147,7 +147,6 @@ async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
         Some(candidate.old_node.clone()), models::unix_now());
     transitions::stage(&tx, state, &marker).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
     tx.commit().await?;
-    transitions::reconcile_pending(state).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
     Ok(true)
 }
 
@@ -164,11 +163,16 @@ pub async fn run(state: Arc<AppState>) {
                 let attempt = async {
                     verify_target(&state, &candidate).await?;
                     let proof = local_fence::fence_local_process(&candidate.old_node).await?;
-                    promote(&state, &node_id, &candidate, &proof).await?;
-                    Ok::<(), anyhow::Error>(())
+                    promote(&state, &node_id, &candidate, &proof).await
                 }.await;
                 drop(lock);
-                if let Err(error) = attempt { eprintln!("rootyard: takeover of {} remains blocked: {error:#}", candidate.repo_id); }
+                match attempt {
+                    Ok(true) => if let Err(error) = transitions::reconcile_pending(&state).await {
+                        eprintln!("rootyard: takeover of {} awaits marker reconciliation: {error:?}", candidate.repo_id);
+                    },
+                    Ok(false) => {},
+                    Err(error) => eprintln!("rootyard: takeover of {} remains blocked: {error:#}", candidate.repo_id),
+                }
             },
             Err(error) => eprintln!("rootyard: cluster controller scan failed: {error:#}"),
         }
