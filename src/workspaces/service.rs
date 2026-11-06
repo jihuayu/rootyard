@@ -171,8 +171,12 @@ pub async fn lease(
             .await
             .map_err(Error::internal)?
             .get(0);
-        super::remote::ensure_local(&state, cp, ws.repository_id, tenant).await?;
-        materialize_takeover(&state, id, cp)?;
+        if super::mounts::enabled() {
+            super::lazy::prepare(&state, id, cp, ws.repository_id, tenant).await?;
+        } else {
+            super::remote::ensure_local(&state, cp, ws.repository_id, tenant).await?;
+            materialize_takeover(&state, id, cp)?;
+        }
     } else if !super::mounts::lower_path(&state, id).join(".git").is_dir() {
         return Err(conflict());
     }
@@ -243,7 +247,7 @@ pub async fn fence_restored(pool: &deadpool_postgres::Pool) -> Result<(), Error>
     let mut client = pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     tx.execute("UPDATE workspaces SET lease_epoch=lease_epoch+1,lease_until=clock_timestamp()-interval '1 second' WHERE state='ready'", &[]).await.map_err(Error::internal)?;
-    tx.execute("UPDATE sandbox_jobs SET state='cancelled',pid=NULL,finished_at=clock_timestamp() WHERE state IN ('queued','running')", &[]).await.map_err(Error::internal)?;
+    tx.execute("UPDATE sandbox_jobs SET state='cancelled',pid=NULL,finished_at=clock_timestamp() WHERE state IN ('queued','preparing','running')", &[]).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)
 }
 

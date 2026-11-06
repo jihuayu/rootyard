@@ -115,9 +115,49 @@ impl Filesystem for Overlay {
         _: Option<u64>,
         reply: ReplyData,
     ) {
+        let p = match self.rel(ino) {
+            Ok(path) => path,
+            Err(error) => {
+                reply.error(Self::err(error));
+                return;
+            }
+        };
+        let path = match self.selected(&p) {
+            Ok(path) => path,
+            Err(error) => {
+                reply.error(Self::err(error));
+                return;
+            }
+        };
+        if path.starts_with(&self.lower) && !p.starts_with(".git") {
+            if let Some(lazy) = self.lazy.clone() {
+                let source = match self.host_entry(&path, false) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        reply.error(Self::err(error));
+                        return;
+                    }
+                };
+                let offset = offset.max(0) as u64;
+                let size = size.min(1024 * 1024) as usize;
+                let job: ReadJob = Box::new(move || {
+                    let result = (|| {
+                        let file = open_lower(Some(lazy.as_ref()), &p, &source)?;
+                        let mut buf = vec![0; size];
+                        let count = file.read_at(&mut buf, offset)?;
+                        buf.truncate(count);
+                        Ok::<_, io::Error>(buf)
+                    })();
+                    match result {
+                        Ok(data) => reply.data(&data),
+                        Err(error) => reply.error(Overlay::err(error)),
+                    }
+                });
+                submit_read(job);
+                return;
+            }
+        }
         let result = (|| {
-            let p = self.rel(ino)?;
-            let path = self.selected(&p)?;
             let file = self.host_entry(&path, false)?.open(libc::O_RDONLY, 0)?;
             let mut buf = vec![0; size.min(1024 * 1024) as usize];
             let count = file.read_at(&mut buf, offset.max(0) as u64)?;
