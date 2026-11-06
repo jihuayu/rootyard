@@ -19,15 +19,14 @@ fn git(repo:&FsPath,args:&[&str])->Result<String,Error>{
     if !out.status.success(){return Err(Error(StatusCode::CONFLICT,"Git view projection failed"));}
     String::from_utf8(out.stdout).map_err(Error::internal)
 }
-fn clone(source:&FsPath,dest:&FsPath,branch:Option<&str>)->Result<(),Error>{
+async fn clone(state:&AppState,source:&FsPath,dest:&FsPath,branch:Option<&str>)->Result<(),Error>{
     if let Some(parent)=dest.parent(){fs::create_dir_all(parent).map_err(Error::internal)?;}
-    let mut cmd=Command::new("git");
+    let mut cmd=state.storage.git(&state.config);
     cmd.args(["-c","core.hooksPath=/dev/null","clone","--no-local","--no-hardlinks","--no-tags"]);
     if let Some(branch)=branch { cmd.args(["--single-branch","--branch",branch]); }
-    let out=cmd.arg("--").arg(source).arg(dest).env("GIT_CONFIG_NOSYSTEM","1")
-        .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_TERMINAL_PROMPT","0")
-        .output().map_err(Error::internal)?;
-    if !out.status.success(){return Err(Error(StatusCode::CONFLICT,"Git view clone failed"));}
+    cmd.arg("--").arg(source).arg(dest);
+    crate::git_http::collect_git_output(cmd,4096,state.config.git_timeout)
+        .await.map_err(|_|Error(StatusCode::CONFLICT,"Git view clone failed"))?;
     Ok(())
 }
 fn projection_root(state:&AppState)->PathBuf { state.storage.root.join("workspace-service/views") }
@@ -42,21 +41,26 @@ pub async fn create(State(state):State<Arc<AppState>>,headers:HeaderMap,Path(id)
     let access=auth::authorize_repo_with_role(&tx,&actor,&mount.owner,&mount.repository,Role::Read).await?;
     let source_lease=read_leases::shared(&state.pool,access.repo_id,
         tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let _local=tokio::time::timeout(state.config.git_timeout,
+        state.storage.read_snapshot_lock(access.repo_id)).await.map_err(|_|Error::timeout())?;
+    source_lease.ensure_active()?;
     let refreshed=auth::authorize_repo_with_role(&tx,&actor,&mount.owner,&mount.repository,Role::Read).await?;
     if refreshed.repo_id!=access.repo_id { return Err(Error::not_found()); }
     let source=state.storage.verify_path(access.repo_id).map_err(Error::internal)?;
     let vid=Uuid::new_v4();
     let temp=projection_root(&state).join(format!("stage-{vid}"));
     let final_path=projection_root(&state).join(vid.to_string());
-    clone(&source,&temp,None)?;
+    source_lease.guard(clone(&state,&source,&temp,None)).await??;
     source_lease.ensure_active()?;
+    drop(_local);
+    drop(source_lease);
     git(&temp,&["checkout","--force",&mount.base_oid])?;
     let projected=if input.subdir.is_empty(){mount.base_oid.clone()} else {
         git(&temp,&["filter-branch","--subdirectory-filter",&input.subdir,"--","HEAD"])?;
         git(&temp,&["rev-parse","HEAD"])?.trim().to_owned()
     };
     git(&temp,&["update-ref","refs/heads/projected",&projected])?;
-    clone(&temp,&final_path,Some("projected"))?;
+    clone(&state,&temp,&final_path,Some("projected")).await?;
     let _=fs::remove_dir_all(&temp);
     let head=git(&final_path,&["rev-parse","HEAD"])?;
     if head.trim()!=projected { return Err(Error::internal("view head mismatch")); }

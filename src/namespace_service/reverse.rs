@@ -276,6 +276,9 @@ pub async fn create(
     drop(client);
     let source_lease=read_leases::shared(&state.pool,access.repo_id,
         tokio::time::Instant::now()+state.config.git_timeout).await?;
+    let _local=tokio::time::timeout(state.config.git_timeout,
+        state.storage.read_snapshot_lock(access.repo_id)).await.map_err(|_|Error::timeout())?;
+    source_lease.ensure_active()?;
     auth::verify_active(&state.pool,&actor,access.repo_id,true).await?;
     let _slot = state
         .git_slots
@@ -303,7 +306,9 @@ pub async fn create(
     let bundle_ref = input.bundle_ref.clone();
     let message = input.message.clone();
     let quota = state.config.max_repo_bytes;
-    let new_oid = tokio::task::spawn_blocking(move || {
+    // block_in_place keeps the local source gate alive until every bounded
+    // native Git subprocess has exited, even if the HTTP request disconnects.
+    let new_oid = tokio::task::block_in_place(move || {
         build_source_commit(
             &source,
             &projected,
@@ -316,10 +321,9 @@ pub async fn create(
             &message,
             quota,
         )
-    })
-    .await
-    .map_err(Error::internal)??;
+    })?;
     source_lease.ensure_active()?;
+    drop(_local);
     drop(_write);
     drop(_slot);
     let mut pin_headers = headers.clone();
