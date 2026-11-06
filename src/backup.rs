@@ -40,6 +40,7 @@ const TABLES: &[&str] = &[
     "forge_webhook_deliveries",
     "forge_webhooks",
     "git_operations",
+    "lfs_locks",
     "lfs_objects",
     "namespaces",
     "operation_resolutions",
@@ -63,9 +64,11 @@ const TABLES: &[&str] = &[
     "shard_failover_operations",
     "shard_marker_transitions",
     "shard_nodes",
+    "shard_replication_operations",
     "shard_virtual_buckets",
     "tokens",
     "users",
+    "web_sessions",
     "workspace_capture_state",
     "workspace_checkpoints",
     "workspace_creations",
@@ -79,6 +82,7 @@ const TABLES: &[&str] = &[
     "workspaces",
 ];
 mod catalog;
+mod authority;
 use catalog::{FORMAT, catalogs as schema_catalogs, digest as schema_contract_digest, versions as schema_versions};
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_MANIFEST: u64 = 256 * 1024 * 1024;
@@ -1006,6 +1010,7 @@ pub async fn restore(config: &Config, source: &Path, allow_legacy_schema007: boo
             "restored checkout credentials were not invalidated"
         );
     }
+    if manifest.format >= 6 { authority::fence(&client).await?; }
     ensure!(!target.exists(), "destination appeared during restore");
     publish(&staging, &target)?;
     File::open(target.parent().unwrap())?.sync_all()?;
