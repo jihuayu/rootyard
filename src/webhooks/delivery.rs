@@ -374,6 +374,14 @@ pub async fn on_pull_synchronized(
         }
     }
 
+    client.execute(
+        "INSERT INTO ci_pull_sync_progress(repository_id,pull_number,pull_version,head_oid,base_oid,storage_generation) \
+         VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(repository_id,pull_number,pull_version) \
+         DO UPDATE SET head_oid=excluded.head_oid,base_oid=excluded.base_oid, \
+           storage_generation=excluded.storage_generation,completed_at=clock_timestamp()",
+        &[&repository_id,&pull.number,&pull.version,&pull.head_oid,&pull.base_oid,&repo.storage_generation],
+    ).await.map_err(Error::internal)?;
+
     Ok(PullCiOrchestration {
         pull_number: pull.number, head_oid: pull.head_oid.clone(), base_oid: pull.base_oid.clone(),
         job_id, retention_ref, queued_contexts: contexts, enqueued_deliveries,

@@ -599,6 +599,83 @@
       "default": null,
       "generated": "",
       "identity": "",
+      "name": "repository_id",
+      "not_null": true,
+      "position": 1,
+      "table": "ci_pull_sync_progress",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "pull_number",
+      "not_null": true,
+      "position": 2,
+      "table": "ci_pull_sync_progress",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "pull_version",
+      "not_null": true,
+      "position": 3,
+      "table": "ci_pull_sync_progress",
+      "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "head_oid",
+      "not_null": true,
+      "position": 4,
+      "table": "ci_pull_sync_progress",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "base_oid",
+      "not_null": true,
+      "position": 5,
+      "table": "ci_pull_sync_progress",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "storage_generation",
+      "not_null": true,
+      "position": 6,
+      "table": "ci_pull_sync_progress",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "completed_at",
+      "not_null": true,
+      "position": 7,
+      "table": "ci_pull_sync_progress",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
       "name": "id",
       "not_null": true,
       "position": 1,
@@ -4566,6 +4643,33 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK (((length(head_oid) = ANY (ARRAY[40, 64])) AND (length(base_oid) = length(head_oid))))",
+      "name": "ci_pull_sync_progress_check",
+      "table": "ci_pull_sync_progress",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (repository_id, pull_number, pull_version)",
+      "name": "ci_pull_sync_progress_pkey",
+      "table": "ci_pull_sync_progress",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE",
+      "name": "ci_pull_sync_progress_repository_id_fkey",
+      "table": "ci_pull_sync_progress",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "CHECK ((((base_oid COLLATE \"C\") ~ '^[0-9a-f]+$'::text) AND (length(base_oid) = length(head_oid))))",
       "name": "ci_runs_base_oid_format",
       "table": "ci_runs",
@@ -7144,6 +7248,15 @@
       "valid": true
     },
     {
+      "definition": "CREATE UNIQUE INDEX ci_pull_sync_progress_pkey ON public.ci_pull_sync_progress USING btree (repository_id, pull_number, pull_version)",
+      "live": true,
+      "name": "ci_pull_sync_progress_pkey",
+      "ready": true,
+      "table": "ci_pull_sync_progress",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE INDEX ci_runs_claim_idx ON public.ci_runs USING btree (state, lease_expires_unix, created_at)",
       "live": true,
       "name": "ci_runs_claim_idx",
@@ -7869,6 +7982,16 @@
       "force_row_security": false,
       "kind": "r",
       "name": "ci_mirror_nodes",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "ci_pull_sync_progress",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",

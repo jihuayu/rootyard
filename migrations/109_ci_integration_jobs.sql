@@ -138,4 +138,17 @@ BEGIN
 END $$;
 CREATE TRIGGER enforce_ci_service_ref BEFORE INSERT OR UPDATE ON outbox_events
 FOR EACH ROW EXECUTE FUNCTION enforce_ci_service_ref();
+-- Complete orchestration marker. A PR head update is not proof that its pin,
+-- check runs, and webhook deliveries were all durably created.
+CREATE TABLE ci_pull_sync_progress (
+    repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    pull_number BIGINT NOT NULL,
+    pull_version BIGINT NOT NULL,
+    head_oid TEXT NOT NULL,
+    base_oid TEXT NOT NULL,
+    storage_generation BIGINT NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY(repository_id,pull_number,pull_version),
+    CHECK(length(head_oid) IN (40,64) AND length(base_oid)=length(head_oid))
+);
 INSERT INTO schema_migrations(version) VALUES(109) ON CONFLICT DO NOTHING;
