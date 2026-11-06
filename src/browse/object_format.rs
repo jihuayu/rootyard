@@ -204,7 +204,7 @@ pub async fn get_object_format(
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
-    let object_format = detect_repo_object_format(&state, repo_id).await?;
+    let object_format = _lease.guard(detect_repo_object_format(&state, repo_id)).await??;
     _lease.ensure_active()?;
     auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     Ok(handlers::json_ok(ObjectFormatStatusResponse {
@@ -239,7 +239,7 @@ pub async fn negotiate_object_format(
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
     auth::verify_active(&state.pool, &actor, repo_id, is_write).await?;
-    let repo_fmt = detect_repo_object_format(&state, repo_id).await?;
+    let repo_fmt = _lease.guard(detect_repo_object_format(&state, repo_id)).await??;
     _lease.ensure_active()?;
     auth::verify_active(&state.pool, &actor, repo_id, is_write).await?;
 
@@ -404,7 +404,7 @@ pub async fn run_object_format_drill(
         let bytes = serde_json::to_vec(&receipt).map_err(Error::internal)?;
         std::fs::write(repo_path.join("rootyard-object-format.json"), bytes).map_err(Error::internal)?;
     }
-    let repo_fmt = detect_repo_object_format(&state, repo_id).await?;
+    let repo_fmt = _lease.guard(detect_repo_object_format(&state, repo_id)).await??;
     _lease.ensure_active()?;
     auth::verify_active(&state.pool, &actor, repo_id, true).await?;
 

@@ -25,6 +25,23 @@ use serde_json::json as sjson;
 use std::sync::Arc;
 use uuid::Uuid;
 
+async fn source_lease(
+    state: &AppState, actor: &crate::db::Identity, owner: &str, name: &str, write: bool,
+) -> Result<(Uuid, crate::storage::read_leases::Lease), Error> {
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let row = client.query_opt(
+        "SELECT r.id FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id \
+         WHERE ns.slug=$1 AND r.name=$2", &[&owner, &name],
+    ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let repo: Uuid = row.get(0);
+    drop(client);
+    auth::verify_active(&state.pool, actor, repo, write).await?;
+    let lease = crate::storage::read_leases::shared(&state.pool, repo,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    auth::verify_active(&state.pool, actor, repo, write).await?;
+    Ok((repo, lease))
+}
+
 async fn has_active_webhooks(
     tx: &deadpool_postgres::Transaction<'_>,
     repo_id: Uuid,
@@ -66,10 +83,12 @@ pub async fn create_pull(
     {
         return Err(Error::bad_request());
     }
+    let (lease_repo, source_lease) = source_lease(&state, &actor, &owner, &name, true).await?;
     let key = idempotency_key(&headers)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+    if repo != lease_repo { return Err(Error(StatusCode::CONFLICT, "repository route changed")); }
     let tenant_id = repo_tenant_id(&tx, repo).await?;
     if let Some(key) = key {
         let request = sjson!({
@@ -89,12 +108,13 @@ pub async fn create_pull(
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later")
     })?;
-    let live_head_oid = resolve_ref_oid(&state, repo, &head_ref)
-        .await?
+    let live_head_oid = source_lease.guard(resolve_ref_oid(&state, repo, &head_ref))
+        .await??
         .ok_or(Error(StatusCode::CONFLICT, "head branch ref does not exist"))?;
-    let live_base_oid = resolve_ref_oid(&state, repo, &base_ref)
-        .await?
+    let live_base_oid = source_lease.guard(resolve_ref_oid(&state, repo, &base_ref))
+        .await??
         .ok_or(Error(StatusCode::CONFLICT, "base branch ref does not exist"))?;
+    source_lease.ensure_active()?;
     drop(_slot);
 
     if input.head_oid.as_ref().is_some_and(|expected| expected != &live_head_oid) {
@@ -192,9 +212,15 @@ pub async fn update_pull(
     {
         return Err(Error::bad_request());
     }
+    let source_lease = if input.head_oid.is_some() || input.base_oid.is_some() {
+        Some(source_lease(&state, &actor, &owner, &name, true).await?)
+    } else { None };
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+    if source_lease.as_ref().is_some_and(|(id, _)| *id != repo) {
+        return Err(Error(StatusCode::CONFLICT, "repository route changed"));
+    }
     let tenant_id = repo_tenant_id(&tx, repo).await?;
     let lock_q = "SELECT state, version, head_ref, base_ref FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 FOR UPDATE";
     let existing = tx.query_opt(lock_q, &[&tenant_id, &repo, &number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
@@ -217,22 +243,24 @@ pub async fn update_pull(
         let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
             Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later")
         })?;
+        let lease = &source_lease.as_ref().ok_or_else(Error::unauthorized)?.1;
         if let Some(ref new_head) = input.head_oid {
-            let live_head = resolve_ref_oid(&state, repo, &head_ref)
-                .await?
+            let live_head = lease.guard(resolve_ref_oid(&state, repo, &head_ref))
+                .await??
                 .ok_or(Error(StatusCode::CONFLICT, "head branch ref does not exist"))?;
             if &live_head != new_head {
                 return Err(Error(StatusCode::CONFLICT, "head_oid does not match live branch ref"));
             }
         }
         if let Some(ref new_base) = input.base_oid {
-            let live_base = resolve_ref_oid(&state, repo, &base_ref)
-                .await?
+            let live_base = lease.guard(resolve_ref_oid(&state, repo, &base_ref))
+                .await??
                 .ok_or(Error(StatusCode::CONFLICT, "base branch ref does not exist"))?;
             if &live_base != new_base {
                 return Err(Error(StatusCode::CONFLICT, "base_oid does not match live branch ref"));
             }
         }
+        if let Some((_, lease)) = &source_lease { lease.ensure_active()?; }
     }
 
     let upd = format!("UPDATE forge_pulls SET title=COALESCE($5,title),body=COALESCE($6,body),state=COALESCE($7,state),head_oid=COALESCE($8,head_oid),base_oid=COALESCE($9,base_oid),version=version+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 AND version=$4 RETURNING {PULL_FIELDS}");
@@ -291,13 +319,18 @@ pub async fn get_pull_diff(
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later")
     })?;
-    let merge_base_oid = merge_base(&state, repo, &pull.base_oid, &pull.head_oid).await?;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    auth::verify_active(&state.pool, &actor, repo, false).await?;
+    let merge_base_oid = _lease.guard(merge_base(&state, repo, &pull.base_oid, &pull.head_oid)).await??;
     let fast_forward = merge_base_oid.as_deref() == Some(pull.base_oid.as_str());
     let mut cmd = git_cmd(&state, repo)?;
     cmd.args(["diff", "--no-color", "--no-ext-diff", &pull.base_oid, &pull.head_oid]);
-    let diff_bytes = git_http::collect_git_output(cmd, 4 * 1024 * 1024, state.config.git_timeout)
-        .await
+    let diff_bytes = _lease.guard(git_http::collect_git_output(
+        cmd, 4 * 1024 * 1024, state.config.git_timeout)).await?
         .map_err(Error::internal)?;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo, false).await?;
     let diff = String::from_utf8_lossy(&diff_bytes).into_owned();
     Ok(json(
         StatusCode::OK,

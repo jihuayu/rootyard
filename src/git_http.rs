@@ -23,7 +23,8 @@ mod process;
 #[path = "git_http/protocol.rs"]
 mod protocol;
 use process::Process;
-pub(crate) use process::{collect_git_output, collect_git_output_input};
+pub(crate) use process::{collect_git_output, collect_git_output_input,
+    finish_group_child, stop_group_child};
 use protocol::{job_response_prefix, route, validate_headers, read_headers};
 
 async fn transfer_authorized(
@@ -194,8 +195,9 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 crate::ci_checkouts::dependencies::verify_on_mirror(&state, plan).await?;
                 crate::mirror::job_path(&state, &repo, plan).await?
             } else {
-                crate::ci_checkouts::origin_job_path(&state, &repo, plan,
-                    snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?).await?
+                let lease = snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?;
+                lease.guard(crate::ci_checkouts::origin_job_path(
+                    &state, &repo, plan, lease)).await??
             }
         } else {
             crate::mirror::pinned_path(&state, &repo, oid).await?
