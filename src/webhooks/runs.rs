@@ -178,7 +178,10 @@ pub async fn report(
         &[&run_id,&repo,&hook_id],
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let digest = sha256_hex(format!("{}\0{}",input.conclusion,input.output).as_bytes());
-    if row.get::<_,String>("state")=="completed" && row.get::<_,Option<String>>("result_sha256").as_deref()==Some(&digest) {
+    if row.get::<_,String>("state")=="completed" &&
+        row.get::<_,i64>("attempt")==input.attempt &&
+        row.get::<_,i64>("lease_generation")==input.lease_generation &&
+        row.get::<_,Option<String>>("result_sha256").as_deref()==Some(&digest) {
         tx.commit().await.map_err(Error::internal)?;
         return Ok((StatusCode::OK,[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"run_id":run_id,"replay":true}))).into_response());
     }
