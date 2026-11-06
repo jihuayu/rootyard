@@ -1,6 +1,6 @@
 {
   "kind": "native_postgresql_streaming_promote",
-  "binary_sha256": "fa8e256063ea049d9c9caea90ac16983c6d460b15acc7a3cfd17fdefe9fa9e3d",
+  "binary_sha256": "e0f475a5b1d7b52d54bf8464abf28ef05de6ba61808842c98ed1978fea283956",
   "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
   "synchronous_commit": "remote_apply",
   "standby_sync_state_before_failure": "sync",
@@ -9,20 +9,18 @@
     200,
     200,
     200,
-    200,
-    503,
     503
   ],
-  "acknowledged_oid_before_failure": "449a1128895d936168dba44df4316520e052fffe",
+  "acknowledged_oid_before_failure": "3991cc1bdff7b186252c2d54196a103ebb6d2b8f",
   "rpo_lost_acknowledged_commits": 0,
-  "rto_read_ms": 544.67,
-  "rto_write_ms": 686.657,
-  "post_promote_oid": "19212a5cb349e6a0d1d44f4536d35e749e983385",
+  "rto_read_ms": 704.544,
+  "rto_write_ms": 1052.843,
+  "post_promote_oid": "f652a55f1de6a0e30f4ee2231d344f811169b458",
   "standby_promoted": true,
   "limits": [
     "manual local-host PostgreSQL promotion and Rootyard restart",
     "no DCS/elected automatic PG leader",
-    "no tested PITR/archive restore",
+    "PITR/archive restore tested separately, not integrated with standby promotion",
     "no cross-host storage fencing"
   ]
 }

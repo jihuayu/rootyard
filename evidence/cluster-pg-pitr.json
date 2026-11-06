@@ -1,0 +1,25 @@
+{
+  "kind": "native_postgresql_wal_archive_pitr_and_gitfs_snapshot",
+  "binary_sha256": "e0f475a5b1d7b52d54bf8464abf28ef05de6ba61808842c98ed1978fea283956",
+  "harness_sha256": "e12a5c327d4e403c019d58f02920378274655db3a255279d0e5385600fa672f6",
+  "pg_basebackup_version": "pg_basebackup (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "archive_mode": "on",
+  "restore_point_lsn": "0/3000090",
+  "archived_segment_after_later_ack": "000000010000000000000003",
+  "archive_segment_count": 5,
+  "retained_acknowledged_oid": "b7a01d209c3420162a8f2599294d8af5fb5998a1",
+  "later_acknowledged_oid_outside_recovery_point": "0d1b3d00c7965aa919182faac41c3c3ce2088242",
+  "post_restore_acknowledged_oid": "dfc36fee8c97194ca0367311b49f4c240f8c157b",
+  "restored_git_operation_rows": 2,
+  "retained_ref_and_objects_fsck": "passed",
+  "reader_access_unrelated_tenant_denial_and_token_revocation": "passed",
+  "delegation_authority_rotated_before_reopening": true,
+  "later_write_intentionally_lost_at_point_in_time": true,
+  "limits": [
+    "single-host local archive and offline matching GitFS snapshot",
+    "manual recovery and traffic restart",
+    "not a remote-retained encrypted backup",
+    "not zero-RPO failover or a supported multi-host PostgreSQL HA deployment"
+  ]
+}
