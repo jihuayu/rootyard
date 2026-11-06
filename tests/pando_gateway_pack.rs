@@ -160,21 +160,38 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
         assert_eq!(prepared.changes.len(),1);
         assert_eq!(prepared.changes[0].old_oid,ids["commit_oid"].as_str().unwrap());
         assert_ne!(prepared.changes[0].new_oid,prepared.changes[0].old_oid);
-        assert_eq!(prepared.pack.object_format,format);
+        let staged_pack = prepared.pack.as_ref().expect("new ref target requires a pack");
+        assert_eq!(staged_pack.object_format,format);
         // The newly staged pack must contain the entire reachable closure,
         // not merely the loose objects introduced by the latest receive.
         let staged_dir = root.join(format!("staged-pack-{}", Uuid::new_v4()));
         let bare_view = root.join(format!("staged-view-{}", Uuid::new_v4()));
         std::fs::create_dir(&bare_view).unwrap();
         run(&git, &["init", "--bare", &format_arg, "."], &bare_view);
-        Box::pin(store.recover(&pool,repo,prepared.pack.id,&staged_dir,deadline())).await.unwrap();
+        Box::pin(store.recover(&pool,repo,staged_pack.id,&staged_dir,deadline())).await.unwrap();
         let view_packs = bare_view.join("objects/pack");
-        std::fs::copy(staged_dir.join(format!("pack-{}.pack",prepared.pack.id)),
-            view_packs.join(format!("pack-{}.pack",prepared.pack.id))).unwrap();
-        std::fs::copy(staged_dir.join(format!("pack-{}.idx",prepared.pack.id)),
-            view_packs.join(format!("pack-{}.idx",prepared.pack.id))).unwrap();
+        std::fs::copy(staged_dir.join(format!("pack-{}.pack",staged_pack.id)),
+            view_packs.join(format!("pack-{}.pack",staged_pack.id))).unwrap();
+        std::fs::copy(staged_dir.join(format!("pack-{}.idx",staged_pack.id)),
+            view_packs.join(format!("pack-{}.idx",staged_pack.id))).unwrap();
         run(&git, &["update-ref","refs/heads/main",&prepared.changes[0].new_oid],&bare_view);
         run(&git, &["fsck","--full","--strict"],&bare_view);
+        run(&git, &["update-ref","refs/heads/main",ids["commit_oid"].as_str().unwrap()],
+            snapshot.path());
+        run(&git, &["update-ref","refs/heads/copy",ids["commit_oid"].as_str().unwrap()],
+            snapshot.path());
+        let copied = Box::pin(prepare::stage(&state,&repository,manifest.tenant_id,
+            &snapshot,&lease,deadline())).await.unwrap().unwrap();
+        assert!(copied.pack.is_none(), "refs-only branch copy republished an unchanged pack");
+        assert_eq!(copied.changes.len(),1);
+        assert_eq!(copied.changes[0].ref_name,"refs/heads/copy");
+        run(&git, &["update-ref","-d","refs/heads/copy"],snapshot.path());
+        run(&git, &["update-ref","-d","refs/heads/main"],snapshot.path());
+        let deleting = Box::pin(prepare::stage(&state,&repository,manifest.tenant_id,
+            &snapshot,&lease,deadline())).await.unwrap().unwrap();
+        assert!(deleting.pack.is_none());
+        assert_eq!(deleting.changes.len(),1);
+        assert!(deleting.changes[0].new_oid.bytes().all(|byte| byte == b'0'));
         drop(snapshot);
         drop(_local);
         drop(lease);
