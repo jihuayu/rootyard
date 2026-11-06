@@ -131,9 +131,16 @@ by the operator. This transport token must have read access to each declared
 source repository; it stays on the mirror and is never returned to a runner.
 The mirror also needs the same `ROOTYARD_CI_MIRROR_AUDIENCE` as the primary and
 its own HTTPS `ROOTYARD_CI_MIRROR_PUBLIC_URL` for Git LFS download actions.
+The primary needs `ROOTYARD_CI_ORIGIN_PUBLIC_URL` to advertise its scoped LFS
+download actions when a run uses its bounded origin fallback. Origin job reads
+use the same one-time `ryj_` token and a locally materialized view containing
+only the exact planned Git closure; they do not expose ordinary primary refs.
 Without the configured transport token, preparation fails closed. Before each
 primary Git/LFS fetch and before publishing a mirror snapshot, the mirror
 rechecks the run lease, exact attempt, active binding and source grant.
+Active Git and CI LFS response producers recheck authority each second even
+when the consumer stops reading, and abort a transfer after cancellation,
+revocation, expiry or authority-service failure.
 
 ## Primary retention, recovery and backup
 

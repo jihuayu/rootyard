@@ -67,7 +67,6 @@ pub async fn authenticate_principal(state:&AppState,headers:&HeaderMap,owner:&st
     if let Ok((identity,repo,plan))=authenticate(state,headers,owner,name,oid).await {
         return Ok((CheckoutPrincipal::User(identity),repo,plan));
     }
-    if state.mirror_primary.is_none(){return Err(Error::unauthorized());}
     let (user,token)=auth::credentials_for(headers,"ryj_")?;
     if user.as_ref().is_some_and(|u|u!=owner){return Err(Error::unauthorized());}
     let digest=db::digest(&token);
@@ -110,7 +109,6 @@ const GRANTS: &str = "WITH grants AS ( \
 pub(crate) async fn authenticate(
     state:&AppState,headers:&HeaderMap,owner:&str,name:&str,oid:&str,
 ) -> Result<(db::Identity,db::Repository,Plan),Error>{
-    if state.mirror_primary.is_none(){return Err(Error::unauthorized());}
     let (user,token)=auth::credentials_for(headers,"ryj_")?;
     if user.as_ref().is_some_and(|u|u!=owner){return Err(Error::unauthorized());}
     let digest=db::digest(&token);

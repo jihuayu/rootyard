@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--keep",action="store_true")
     args=parser.parse_args();args.binary=str(Path(args.binary).resolve())
     h=JobCheckoutHarness(args)
+    h.env["ROOTYARD_CI_ORIGIN_PUBLIC_URL"]=h.base
     h.mirror_env["ROOTYARD_CI_MIRROR_PUBLIC_URL"]=h.mirror_base
     try:
         h.setup();h.api();h.roundtrip()
@@ -140,6 +141,15 @@ def main():
         service_clone=h.root/"integration-build"
         h.git("clone",h.mirror_base+h.path(feature_oid),str(service_clone),token=service_token)
         assert h.git("rev-parse","HEAD",cwd=service_clone).stdout.decode().strip()==feature_oid
+        origin_clone=h.root/"integration-origin-build"
+        h.git("clone",h.base+h.path(feature_oid),str(origin_clone),token=service_token)
+        assert h.git("rev-parse","HEAD",cwd=origin_clone).stdout.decode().strip()==feature_oid
+        origin_grand=next(x for x in claim["checkout"]["submodule_credentials"]
+            if x["name"]=="grand")
+        origin_lfs=f"/ci/{grand_oid}/git/alice/grand.git/info/lfs/objects/{lfs_oid}"
+        status,content,_=h.http(origin_lfs,token={"username":"alice",
+            "token":origin_grand["token"]})
+        assert status==200 and content==payload,(status,len(content))
         print("fenced integration prepared and cloned nested manifest: passed",flush=True)
         (h.work/".gitmodules").write_text(
             '[submodule "child"]\n\tpath = deps/child\n\turl = https://outside.invalid/child.git\n')
