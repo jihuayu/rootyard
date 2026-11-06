@@ -107,18 +107,21 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (50, include_str!("../migrations/050_members_rbac.sql")),
     (60, include_str!("../migrations/060_sharding_fencing.sql")),
     (70, include_str!("../migrations/070_repository_object_format.sql")),
+    (72, include_str!("../migrations/072_forge_sha256.sql")),
     (80, include_str!("../migrations/080_cluster_security.sql")),
     (81, include_str!("../migrations/081_shard_marker_transitions.sql")),
     (82, include_str!("../migrations/082_cluster_transport_nonces.sql")),
     (83, include_str!("../migrations/083_shard_replication.sql")),
     (84, include_str!("../migrations/084_transition_volume_binding.sql")),
     (85, include_str!("../migrations/085_cluster_authority.sql")),
+    (86, include_str!("../migrations/086_replication_sequence.sql")),
     (90, include_str!("../migrations/090_workspaces.sql")),
     (91, include_str!("../migrations/091_workspace_capture.sql")),
     (92, include_str!("../migrations/092_sandbox_jobs.sql")),
     (93, include_str!("../migrations/093_workspace_namespaces.sql")),
     (94, include_str!("../migrations/094_workspace_remote.sql")),
     (95, include_str!("../migrations/095_workspace_remote_staging.sql")),
+    (96, include_str!("../migrations/096_workspace_changesets.sql")),
     (105, include_str!("../migrations/105_webhook_claims.sql")),
     (106, include_str!("../migrations/106_ci_runs.sql")),
     (107, include_str!("../migrations/107_trusted_checks.sql")),
@@ -130,7 +133,7 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (125, include_str!("../migrations/125_web_sessions.sql")),
 ];
 
-pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 80, 81, 82, 83, 84, 85, 90, 91, 92, 93, 94, 95, 105, 106, 107, 108, 109, 110, 120, 121, 125];
+pub const SCHEMA_VERSIONS: &[i32] = &[1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 72, 80, 81, 82, 83, 84, 85, 86, 90, 91, 92, 93, 94, 95, 96, 105, 106, 107, 108, 109, 110, 120, 121, 125];
 
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;

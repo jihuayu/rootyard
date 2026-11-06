@@ -51,7 +51,9 @@ pub async fn resolve_effective_role(
     if !rbac_tables_installed(tx).await? {
         return Ok(None);
     }
-    let d_sql = "SELECT role FROM repository_collaborators WHERE repository_id=$1 AND user_id=$2";
+    // Hold the authority rows until the caller commits. A concurrent
+    // revocation must serialize after a write admitted under this role.
+    let d_sql = "SELECT role FROM repository_collaborators WHERE repository_id=$1 AND user_id=$2 FOR SHARE";
     let direct_role = match tx
         .query_opt(d_sql, &[&repo_id, &user_id])
         .await
@@ -62,7 +64,7 @@ pub async fn resolve_effective_role(
     };
     let org_role = tx
         .query_opt(
-            "SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",
+            "SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 FOR SHARE",
             &[&owner_id, &user_id],
         )
         .await
@@ -75,7 +77,7 @@ pub async fn resolve_effective_role(
         (None, Some(o)) => Some(o),
         (None, None) => None,
     };
-    let t_sql = "SELECT t.role FROM repository_teams t JOIN repository_team_members tm ON tm.team_id = t.id WHERE t.repository_id=$1 AND tm.user_id=$2";
+    let t_sql = "SELECT t.role FROM repository_teams t JOIN repository_team_members tm ON tm.team_id = t.id WHERE t.repository_id=$1 AND tm.user_id=$2 FOR SHARE OF t,tm";
     let team_rows = tx
         .query(t_sql, &[&repo_id, &user_id])
         .await
@@ -86,7 +88,7 @@ pub async fn resolve_effective_role(
         max_team_role = Some(max_team_role.map_or(r, |cur| cur.max(r)));
     }
     let org_team_rows = tx.query(
-        "SELECT t.role FROM organization_teams t JOIN organization_team_members tm ON tm.team_id=t.id WHERE t.organization_id=$1 AND tm.user_id=$2",
+        "SELECT t.role FROM organization_teams t JOIN organization_team_members tm ON tm.team_id=t.id WHERE t.organization_id=$1 AND tm.user_id=$2 FOR SHARE OF t,tm",
         &[&owner_id, &user_id],
     ).await.map_err(Error::internal)?;
     for row in org_team_rows {
@@ -162,6 +164,27 @@ pub(super) async fn open_client(
     let actor = auth::authenticate(&state.pool, headers).await?;
     let client = state.pool.get().await.map_err(Error::internal)?;
     Ok((actor, client))
+}
+
+/// Serialize member-policy mutations before acquiring role row locks. This
+/// prevents two administrators changing each other's roles from taking
+/// reciprocal SHARE→UPDATE upgrades and deadlocking.
+pub(super) async fn serialize_member_mutation(
+    tx: &Transaction<'_>, actor: &Identity, owner: &str, name: &str,
+) -> Result<(), Error> {
+    if !db::valid_name(owner) || !db::valid_name(name) {
+        return Err(Error::not_found());
+    }
+    tx.query_opt(
+        "SELECT t.id FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND u.username=$3 FOR SHARE OF t,u",
+        &[&actor.token_id, &actor.id, &actor.username],
+    ).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
+    auth::verify_token(tx, actor, true).await?;
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1 || '/' || $2, 7329))",
+        &[&owner, &name],
+    ).await.map_err(Error::internal)?;
+    Ok(())
 }
 
 pub(super) async fn finish_audit(
@@ -286,6 +309,7 @@ async fn upsert_collaborator_inner(
     }
     let key = idempotency_key(&h)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    serialize_member_mutation(&tx, &actor, &o, &n).await?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;
     if uid == acc.owner_id {
@@ -376,6 +400,7 @@ pub async fn remove_collaborator(State(s): App, Path((o, n, u)): SubPath, h: Hea
         return Err(Error::bad_request());
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
+    serialize_member_mutation(&tx, &actor, &o, &n).await?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     if u == o {
         return Err(Error(

@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Native organization, team, Git/LFS, Forge, and workspace authorization contract."""
+import argparse
+import base64
+import concurrent.futures
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import subprocess
+import sys
+import time
+import traceback
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from e2e import Harness
+
+
+class OrganizationHarness(Harness):
+    def doc(self, path, code, token=None, **kwargs):
+        status, body, _ = self.http(path, token=token or self.alice, **kwargs)
+        expected = code if isinstance(code, tuple) else (code,)
+        assert status in expected, f"{path}: expected {code}, got {status}: {body[:300]!r}"
+        return json.loads(body) if body and status < 300 else None
+
+    def inherited_capabilities(self):
+        self.setup()
+        charlie = self.account("create-user", "charlie")
+        self.charlie = charlie
+        key = {"Idempotency-Key": "org-create-acme"}
+        org = self.doc("/api/orgs", 201, method="POST", body={"slug": "acme"},
+                       extra_headers=key)
+        assert org["slug"] == "acme"
+        assert self.doc("/api/orgs", 201, method="POST", body={"slug": "acme"},
+                        extra_headers=key)["id"] == org["id"]
+        self.doc("/api/orgs", 409, method="POST", body={"slug": "other-org"},
+                 extra_headers=key)
+        assert self.sql("SELECT count(*) FROM users WHERE username='acme'") == "0"
+        assert self.sql("SELECT kind FROM namespaces WHERE id='" + org["id"] + "'") == "organization"
+        self.doc("/api/orgs", 409, method="POST", body={"slug": "alice"})
+        assert self.run([self.args.binary, "create-user", "acme"], check=False).returncode != 0
+        repo = self.doc("/api/repos", 201, method="POST",
+                        body={"owner": "acme", "name": "project"})
+        assert repo["owner"] == "acme" and repo["clone_path"] == "/git/acme/project.git"
+        remote = self.base + repo["clone_path"]
+        self.doc("/api/repos/acme/project", 404, token=self.bob)
+        self.doc("/api/repos/acme/project", 404, token=charlie)
+        membership = self.doc("/api/orgs/acme/members/bob", 201, method="PUT",
+                              body={"role": "read"})
+        assert membership["version"] == 1
+        self.doc("/api/orgs/acme/members/bob", 409, method="PUT",
+                 body={"role": "admin", "expected_version": 2})
+        self.doc("/api/repos/acme/project", 200, token=self.bob)
+        assert self.doc("/api/repos/acme/project/backend", 200, token=self.bob)["owner"] == "acme"
+
+        alice_work = self.root / "org-alice"
+        self.git("clone", remote, str(alice_work), token=self.alice)
+        self.git("config", "user.name", "Alice", cwd=alice_work)
+        self.git("config", "user.email", "alice@rootyard.local", cwd=alice_work)
+        (alice_work / "README.md").write_text("organization repository\n")
+        self.git("add", "README.md", cwd=alice_work)
+        self.git("commit", "-m", "main", cwd=alice_work)
+        self.git("push", "origin", "HEAD:main", cwd=alice_work, token=self.alice)
+        bob_work = self.root / "org-bob"
+        self.git("clone", remote, str(bob_work), token=self.bob)
+        denied = self.git("push", "origin", "HEAD:refs/heads/read-only", cwd=bob_work,
+                          token=self.bob, check=False)
+        assert denied.returncode != 0
+
+        self.doc("/api/orgs/acme/teams", 201, method="POST",
+                 body={"slug": "engineers", "name": "Engineers", "role": "write"})
+        self.doc("/api/orgs/acme/teams/engineers/members/bob", 200, method="PUT")
+        assert self.doc("/api/repos/acme/project/permissions/bob", 200, token=self.bob)["role"] == "write"
+        self.git("config", "user.name", "Bob", cwd=bob_work)
+        self.git("config", "user.email", "bob@rootyard.local", cwd=bob_work)
+        self.git("lfs", "install", "--local", cwd=bob_work)
+        self.git("lfs", "track", "*.dat", cwd=bob_work)
+        payload = os.urandom(64 * 1024)
+        oid = hashlib.sha256(payload).hexdigest()
+        (bob_work / "asset.dat").write_bytes(payload)
+        self.git("add", ".gitattributes", "asset.dat", cwd=bob_work)
+        self.git("commit", "-m", "team LFS upload", cwd=bob_work)
+        self.git("push", "origin", "HEAD:main", cwd=bob_work, token=self.bob)
+        assert self.sql(f"SELECT state FROM lfs_objects WHERE repository_id='{repo['id']}' AND oid='{oid}'") == "ready"
+        path = f"/git/acme/project.git/info/lfs/objects/{oid}/{len(payload)}"
+        assert self.expect(path, 200, token=self.alice) == payload
+        self.expect(path, 404, token=charlie)
+
+        issue_path = "/api/repos/acme/project/issues"
+        issue = self.doc(issue_path, 201, token=self.bob, method="POST",
+                         body={"title": "Team issue"})
+        assert issue["author_id"] == self.bob["user_id"]
+        self.doc(issue_path + "/1", 200, token=self.alice)
+        self.git("checkout", "-b", "feature", cwd=bob_work)
+        (bob_work / "feature.txt").write_text("team feature\n")
+        self.git("add", "feature.txt", cwd=bob_work)
+        self.git("commit", "-m", "team feature", cwd=bob_work)
+        feature_oid = self.git("rev-parse", "HEAD", cwd=bob_work).stdout.decode().strip()
+        self.git("push", "origin", "HEAD:feature", cwd=bob_work, token=self.bob)
+        base_oid = self.git("rev-parse", "HEAD~1", cwd=bob_work).stdout.decode().strip()
+        pulls = "/api/repos/acme/project/pulls"
+        pr = self.doc(pulls, 201, token=self.bob, method="POST",
+                      body={"title": "Team PR", "head_ref": "refs/heads/feature",
+                            "base_ref": "refs/heads/main"})
+        merged = self.doc(f"{pulls}/{pr['number']}/merge", 200, method="POST",
+                          body={"expected_version": pr["version"],
+                                "expected_head_oid": feature_oid,
+                                "expected_base_oid": base_oid,
+                                "storage_generation": 1, "strategy": "fast_forward"})
+        assert merged["state"] == "merged"
+
+        workspace = self.doc("/api/workspaces", 201, token=self.bob, method="POST",
+                             body={"owner": "acme", "repository": "project",
+                                   "agent_id": "team-agent", "base_oid": feature_oid},
+                             extra_headers={"Idempotency-Key": "org-workspace"})
+        file_path = f"/api/workspaces/{workspace['id']}/files?path=team.txt"
+        self.doc(file_path, 200, token=self.bob, method="PUT",
+                 body={"content_base64": base64.b64encode(b"team workspace\n").decode(),
+                       "expected_entry_version": 0, "expected_workspace_revision": 0,
+                       "lease_epoch": workspace["lease_epoch"]},
+                 extra_headers={"Idempotency-Key": "team-edit"})
+        self.doc(file_path, 200, token=self.bob)
+        self.doc(file_path, 404, token=self.alice)
+
+        # Membership removal cascades team membership and revokes inherited
+        # access across every surface even while the token remains valid.
+        self.doc("/api/orgs/acme/members/bob", 200, method="DELETE")
+        self.doc("/api/repos/acme/project", 404, token=self.bob)
+        self.expect(path, 404, token=self.bob)
+        self.doc(issue_path + "/1", 404, token=self.bob)
+        self.doc(file_path, 404, token=self.bob)
+        assert not self.git("ls-remote", remote, token=self.bob, check=False).returncode == 0
+        assert self.sql(f"SELECT count(*) FROM organization_team_members WHERE organization_id='{org['id']}'") == "0"
+        transfer = "/api/repos/acme/project/transfer"
+        self.doc(transfer, 404, token=self.bob, method="POST", body={"new_owner": "alice"})
+        self.doc(transfer, 409, method="POST", body={"new_owner": "alice"})
+        assert self.sql(f"SELECT owner_id FROM repositories WHERE id='{repo['id']}'") == org["id"]
+        self.doc("/api/orgs/acme/members/alice", 409, method="DELETE")
+        self.doc("/api/orgs/acme/members/alice", 409, method="PUT",
+                 body={"role": "read", "expected_version": 1})
+        self.doc("/api/repos/acme/project", 200)
+        return {"namespace_collision_rejected": True, "team_role_inherited": True,
+                "git_lfs_forge_workspace_authorized": True,
+                "revocation_immediate": True, "last_admin_protected": True}
+
+    def role_revocation_barrier(self):
+        issue_path = "/api/repos/acme/project/issues"
+        self.doc("/api/orgs/acme/members/charlie", 201, method="PUT", body={"role": "write"})
+
+        def blocked_write(sql, title, blocked_query):
+            p = subprocess.Popen(["psql", "--dbname", self.db, "-X", "-qAt",
+                                  "-v", "ON_ERROR_STOP=1"], env=self.env,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+            try:
+                p.stdin.write("BEGIN; " + sql + "; SELECT pg_backend_pid();\n")
+                p.stdin.flush()
+                assert select.select([p.stdout], [], [], 5)[0], "fixture SQL lock did not start"
+                blocker_pid = int(p.stdout.readline().strip())
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(self.http, issue_path, token=self.charlie,
+                                             method="POST", body={"title": title})
+                    deadline = time.monotonic() + 5
+                    observed = False
+                    while time.monotonic() < deadline and not future.done():
+                        waiting = self.sql("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND " + str(blocker_pid) + " = ANY(pg_blocking_pids(pid)) AND query LIKE '%" + blocked_query + "%'")
+                        if int(waiting) > 0:
+                            observed = True
+                            break
+                        time.sleep(.05)
+                    p.stdin.write("COMMIT;\n")
+                    p.stdin.flush()
+                    status = future.result(timeout=10)[0]
+                    assert observed, f"role authorization did not wait on revocation row lock: status={status}"
+                    assert status == 403, "write admitted after role revocation"
+                assert self.sql("SELECT count(*) FROM forge_issues WHERE title='" + title + "'") == "0"
+            finally:
+                if p.poll() is None:
+                    p.stdin.write("ROLLBACK;\\q\n")
+                    p.stdin.flush()
+                    p.wait(timeout=5)
+
+        org = self.doc("/api/orgs/acme", 200)
+        blocked_write(
+            f"UPDATE organization_memberships SET role='read' WHERE organization_id='{org['id']}' AND user_id='{self.charlie['user_id']}'",
+            "Denied after direct role wait", "organization_memberships")
+        self.doc("/api/orgs/acme/teams/engineers/members/charlie", 200, method="PUT")
+        blocked_write(
+            f"DELETE FROM organization_team_members WHERE organization_id='{org['id']}' AND user_id='{self.charlie['user_id']}'",
+            "Denied after team role wait", "organization_teams")
+        return {"direct_role_waited_then_denied": True, "team_role_waited_then_denied": True,
+                "no_post_revocation_issue": True}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", default="target/debug/rootyard")
+    parser.add_argument("--report", type=Path)
+    parser.add_argument("--keep", action="store_true")
+    args = parser.parse_args()
+    args.binary = str(Path(args.binary).resolve())
+    if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
+        parser.error("ROOTYARD_TEST_DATABASE_URL is required")
+    h = OrganizationHarness(args)
+    passed = False
+    try:
+        h.case("inherited_capabilities", h.inherited_capabilities)
+        h.case("role_revocation_barrier", h.role_revocation_barrier)
+        passed = True
+    except Exception:
+        print(h.redact(traceback.format_exc()), file=sys.stderr)
+    finally:
+        h.cleanup()
+        report = {"passed": passed, "cases": h.results,
+                  "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest()}
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report, indent=2))
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

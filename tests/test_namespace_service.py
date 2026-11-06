@@ -1,5 +1,6 @@
 """Native authorized namespace projection and stock-Git bundle regression."""
 import argparse
+import base64
 import json
 import unittest
 
@@ -32,6 +33,41 @@ class NamespaceServiceTest(unittest.TestCase):
             self.assertFalse((clone/"hello.txt").exists())
             self.assertEqual(h.git("rev-parse","HEAD",cwd=clone).stdout.decode().strip(),view["projected_oid"])
             self.assertNotEqual(h.git("cat-file","-e",base+"^{commit}",cwd=clone,check=False).returncode,0)
+            h.git("config","user.name","View author",cwd=clone)
+            h.git("config","user.email","view@example.invalid",cwd=clone)
+            (clone/"lib.rs").write_text("pub fn value() -> u32 { 11 }\n")
+            h.git("commit","-am","change projected package",cwd=clone)
+            proposal=h.root/"proposal.bundle"
+            h.git("bundle","create",str(proposal),"--all",cwd=clone)
+            h.expect("/api/repos/alice/demo/collaborators",201,token=h.alice,
+                method="POST",body={"username":"bob","role":"maintain"})
+            cs=json.loads(h.expect(f"/api/views/{view['id']}/changesets",201,token=h.alice,
+                method="POST",body={"bundle_base64":base64.b64encode(proposal.read_bytes()).decode(),
+                    "bundle_ref":"refs/heads/projected","source_ref":"refs/heads/main",
+                    "message":"Update package value"}))
+            self.assertEqual(cs["state"],"proposed")
+            pins=h.git("--git-dir="+str(h.bare),"for-each-ref","--format=%(refname) %(objectname)",
+                "refs/heads/rootyard-proposals").stdout.decode().strip().splitlines()
+            self.assertEqual(len(pins),1)
+            pin, pinned_oid=pins[0].split()
+            self.assertEqual(pinned_oid,cs["steps"][0]["new_oid"])
+            self.assertNotEqual(h.git("push","origin",":"+pin,cwd=h.work,token=h.alice,check=False).returncode,0)
+            self.assertNotEqual(h.git("push","--force","origin","HEAD:"+pin,
+                cwd=h.work,token=h.alice,check=False).returncode,0)
+            for old_oid,new_oid in ((pinned_oid,"0"*40),(pinned_oid,base)):
+                status,_,_=h.http("/api/repos/alice/demo/ref-transactions",token=h.alice,method="POST",
+                    body={"atomic":True,"updates":[{"ref_name":pin,"old_oid":old_oid,"new_oid":new_oid}]})
+                self.assertEqual(status,400)
+            self.assertEqual(h.git("--git-dir="+str(h.bare),"rev-parse",pin).stdout.decode().strip(),pinned_oid)
+            self.assertEqual(h.git("--git-dir="+str(h.bare),"rev-parse","refs/heads/main").stdout.decode().strip(),base)
+            h.expect(f"/api/changesets/{cs['id']}/review",200,token=h.bob,method="POST")
+            done=json.loads(h.expect(f"/api/changesets/{cs['id']}/integrate",200,token=h.alice,method="POST"))
+            self.assertEqual(done["state"],"complete")
+            new_source=done["steps"][0]["new_oid"]
+            self.assertEqual(h.git("--git-dir="+str(h.bare),"rev-parse","refs/heads/main").stdout.decode().strip(),new_source)
+            self.assertEqual(h.git("--git-dir="+str(h.bare),"show",new_source+":pkg/lib.rs").stdout.decode(),
+                "pub fn value() -> u32 { 11 }\n")
+            self.assertEqual(h.git("--git-dir="+str(h.bare),"show",new_source+":hello.txt").stdout.decode(),"second\n")
         finally: h.cleanup()
 
 

@@ -455,9 +455,9 @@ pub async fn ci_callback(
         let hook_row = client
             .query_opt(
                 "SELECT r.id AS repo_id, r.owner_id AS tenant_id, r.state AS repo_state, w.secret, w.active, w.ci_contexts \
-                 FROM repositories r JOIN users u ON u.id = r.owner_id \
+                 FROM repositories r JOIN namespaces u ON u.id = r.owner_id \
                  JOIN forge_webhooks w ON w.repository_id = r.id AND w.tenant_id = r.owner_id \
-                 WHERE u.username=$1 AND r.name=$2 AND w.id=$3",
+                 WHERE u.slug=$1 AND r.name=$2 AND w.id=$3",
                 &[&owner, &name, &hook_id],
             )
             .await

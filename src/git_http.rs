@@ -548,9 +548,9 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         process.stop().await;
         // Drop is also a last-resort guard if this task itself is cancelled.
         drop(process);
-        if reliability::complete(&state, operation).await.is_err() {
+        if let Err(error) = reliability::complete(&state, operation).await {
             producer_failed.store(true, std::sync::atomic::Ordering::Release);
-            eprintln!("rootyard: push evidence requires recovery");
+            eprintln!("rootyard: push evidence requires recovery: {error:#}");
         }
         if producer_failed.load(std::sync::atomic::Ordering::Acquire) {
             state.transfer_metrics.record_failure();

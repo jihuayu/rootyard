@@ -1,6 +1,6 @@
 //! Repository-scoped team management handlers.
 use super::rbac::{
-    App, MemberPath, RepoPath, Res, SubPath, finish_audit, lookup_team_id, lookup_user, open_client,
+    App, MemberPath, RepoPath, Res, SubPath, finish_audit, lookup_team_id, lookup_user, open_client, serialize_member_mutation,
 };
 use crate::{
     AppState, Error,
@@ -63,6 +63,7 @@ pub async fn create_team(
     }
     let key = idempotency_key(&h)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    serialize_member_mutation(&tx, &actor, &o, &n).await?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let r_str = inp.role.as_str();
     if let Some(key) = key {
@@ -139,6 +140,7 @@ pub async fn update_team(
         return Err(Error::bad_request());
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
+    serialize_member_mutation(&tx, &actor, &o, &n).await?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let _ = lookup_team_id(&tx, acc.repo_id, &slug).await?;
     let r_opt = inp.role.map(|r| r.as_str().to_owned());
@@ -173,6 +175,7 @@ pub async fn delete_team(State(s): App, Path((o, n, slug)): SubPath, h: HeaderMa
         return Err(Error::bad_request());
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
+    serialize_member_mutation(&tx, &actor, &o, &n).await?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let del = "DELETE FROM repository_teams WHERE tenant_id=$1 AND repository_id=$2 AND slug=$3";
     if tx
@@ -251,6 +254,7 @@ async fn put_team_member_inner(
 ) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    serialize_member_mutation(&tx, &actor, &o, &n).await?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let tid = lookup_team_id(&tx, acc.repo_id, &slug).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;
@@ -300,6 +304,7 @@ pub async fn remove_team_member(
 ) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     let tx = client.transaction().await.map_err(Error::internal)?;
+    serialize_member_mutation(&tx, &actor, &o, &n).await?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let tid = lookup_team_id(&tx, acc.repo_id, &slug).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;

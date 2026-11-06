@@ -67,14 +67,13 @@ pub async fn authenticate_principal(state:&AppState,headers:&HeaderMap,owner:&st
     if let Ok((identity,repo,plan))=authenticate(state,headers,owner,name,oid).await {
         return Ok((CheckoutPrincipal::User(identity),repo,plan));
     }
-    if state.mirror_primary.is_none(){return Err(Error::unauthorized());}
     let (user,token)=auth::credentials_for(headers,"ryj_")?;
     if user.as_ref().is_some_and(|u|u!=owner){return Err(Error::unauthorized());}
     let digest=db::digest(&token);
     let sql=format!("SELECT i.plan,i.job_id,i.owner_id,i.repository_id,i.issuer_webhook_id, \
       i.run_id,i.expires_unix,r.storage_generation {INTEGRATION_GRANT} \
-      AND i.credential_digest=$1 AND r.name=$2 AND EXISTS(SELECT 1 FROM users u \
-      WHERE u.id=r.owner_id AND u.username=$3)");
+      AND i.credential_digest=$1 AND r.name=$2 AND EXISTS(SELECT 1 FROM namespaces u \
+      WHERE u.id=r.owner_id AND u.slug=$3)");
     let client=state.pool.get().await.map_err(Error::internal)?;
     let row=client.query_opt(&sql,&[&digest,&name,&owner]).await.map_err(Error::internal)?
         .ok_or_else(Error::unauthorized)?;
@@ -110,22 +109,21 @@ const GRANTS: &str = "WITH grants AS ( \
 pub(crate) async fn authenticate(
     state:&AppState,headers:&HeaderMap,owner:&str,name:&str,oid:&str,
 ) -> Result<(db::Identity,db::Repository,Plan),Error>{
-    if state.mirror_primary.is_none(){return Err(Error::unauthorized());}
     let (user,token)=auth::credentials_for(headers,"ryj_")?;
     if user.as_ref().is_some_and(|u|u!=owner){return Err(Error::unauthorized());}
     let digest=db::digest(&token);
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
     let sql=format!("{GRANTS} SELECT g.plan,g.owner_id,g.repository_id,g.issuer_token_id, \
-        g.expires_unix,r.storage_generation,u.username,g.job_id,t.user_id,ua.username AS actor_name \
+        g.expires_unix,r.storage_generation,u.slug AS username,g.job_id,t.user_id,ua.username AS actor_name \
         FROM grants g JOIN repositories r ON r.id=g.repository_id AND r.owner_id=g.owner_id \
-        JOIN users u ON u.id=g.owner_id JOIN tokens t ON t.id=g.issuer_token_id \
+        JOIN namespaces u ON u.id=g.owner_id JOIN tokens t ON t.id=g.issuer_token_id \
         JOIN users ua ON ua.id=t.user_id \
         WHERE g.credential_digest=$1 AND NOT g.cancelled AND NOT g.revoked \
           AND g.expires_unix>extract(epoch FROM clock_timestamp()) \
           AND NOT t.revoked AND NOT t.read_only \
           AND (t.expires_at IS NULL OR t.expires_at>clock_timestamp()) \
-          AND r.state='ready' AND r.storage_backend='gitfs' AND r.name=$2 AND u.username=$3");
+          AND r.state='ready' AND r.storage_backend='gitfs' AND r.name=$2 AND u.slug=$3");
     let row=tx.query_opt(&sql,&[&digest,&name,&owner]).await.map_err(Error::internal)?
         .ok_or_else(Error::unauthorized)?;
     let repo_id:Uuid=row.get(2);let owner_id:Uuid=row.get(1);let actor_id:Uuid=row.get(8);

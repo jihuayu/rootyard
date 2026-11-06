@@ -17,12 +17,12 @@ struct RemoteEntry { path_base64:String,kind:String,mode:u32,size:u64,sha256:Str
 #[serde(deny_unknown_fields)]
 struct RemoteManifest { schema:u32,checkpoint_id:Uuid,repository_id:Uuid,tenant_id:Uuid,captured_revision:i64,entries:Vec<RemoteEntry> }
 
-fn remote_store(state:&AppState)->Result<RemoteObjectStore,Error>{
+pub(super) fn remote_store(state:&AppState)->Result<RemoteObjectStore,Error>{
     let store=RemoteObjectStore::from_env(state.storage.root.join("workspace-service/local-object-cache")).map_err(Error::internal)?;
     if matches!(store,RemoteObjectStore::Local(_)){return Err(Error(StatusCode::SERVICE_UNAVAILABLE,"remote object store is not configured"));}
     Ok(store)
 }
-fn key(tenant:Uuid,digest:&str)->Result<ObjectKey,Error>{ObjectKey::new(tenant,"workspace",digest).map_err(|_|Error::bad_request())}
+pub(super) fn key(tenant:Uuid,digest:&str)->Result<ObjectKey,Error>{ObjectKey::new(tenant,"workspace",digest).map_err(|_|Error::bad_request())}
 fn deadline()->Instant{Instant::now()+Duration::from_secs(120)}
 fn bounded_manifest(raw:&[u8])->Result<RemoteManifest,Error>{
     if raw.len()>16*1024*1024{return Err(Error::bad_request());}
@@ -30,8 +30,11 @@ fn bounded_manifest(raw:&[u8])->Result<RemoteManifest,Error>{
 }
 fn report(cp:Uuid,manifest:&str,size:i64,revision:i64)->Value{json!({"checkpoint_id":cp,"state":"COMMITTED","durability":"remote_verified","manifest_sha256":manifest,"manifest_size":size,"captured_revision":revision})}
 async fn stage_key(state:&AppState,cp:Uuid,tenant:Uuid,digest:&str,size:u64,kind:&str)->Result<(),Error>{
-    let client=state.pool.get().await.map_err(Error::internal)?;
-    client.execute("INSERT INTO workspace_remote_staging_objects(checkpoint_id,tenant_id,digest,size,kind) VALUES($1,$2,$3,$4,$5) ON CONFLICT(checkpoint_id,digest) DO NOTHING", &[&cp,&tenant,&digest,&(size as i64),&kind]).await.map_err(Error::internal)?;
+    let mut client=state.pool.get().await.map_err(Error::internal)?;
+    let tx=client.transaction().await.map_err(Error::internal)?;
+    super::remote_gc::lock_key(&tx,tenant,digest).await?;
+    tx.execute("INSERT INTO workspace_remote_staging_objects(checkpoint_id,tenant_id,digest,size,kind) VALUES($1,$2,$3,$4,$5) ON CONFLICT(checkpoint_id,digest) DO NOTHING", &[&cp,&tenant,&digest,&(size as i64),&kind]).await.map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(())
 }
 
@@ -87,6 +90,9 @@ pub async fn publish(State(state):State<Arc<AppState>>,headers:HeaderMap,Path(cp
         if row.get::<_,String>(0)!="committed" || row.get::<_,Option<String>>(1).as_deref()!=Some(&digest) {return Err(service::conflict());}
     }
     tx.commit().await.map_err(Error::internal)?;
+    if std::env::var("ROOTYARD_WORKSPACE_REMOTE_KILL_AFTER_COMMIT").as_deref()==Ok("1") {
+        std::process::exit(78);
+    }
     Ok((StatusCode::OK,Json(report(cp,&digest,raw.len() as i64,captured))))
 }
 

@@ -4,11 +4,12 @@
     {
       "name": "populated_capability_restore",
       "status": "passed",
-      "seconds": 65.7738,
+      "seconds": 24.7296,
       "detail": {
         "fresh_database_and_volume": true,
         "organization_inherited_access": true,
         "lfs_lock_identity_preserved": true,
+        "lfs_bytes_preserved": true,
         "workspace_bytes_preserved": true,
         "old_workspace_lease_rejected": true,
         "renewed_lease_accepted": true,
@@ -18,7 +19,7 @@
       }
     }
   ],
-  "binary_sha256": "b3cf2ff6b628fb9614af8ab233b4b90c762405deda78cbb44b5deb6fc1c2ee53",
+  "binary_sha256": "96d76361ac34af39a9abaa550e2dccb5bc5474c327b6b7fdb97bd0bced4e3916",
   "limitations": [
     "Loopback service and PostgreSQL; no hardware failure guarantee."
   ]

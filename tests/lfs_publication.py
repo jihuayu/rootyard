@@ -22,9 +22,17 @@ class PublicationHarness(LfsHarness):
             "missing": f"version https://git-lfs.github.com/spec/v1\noid sha256:{missing}\nsize 13\n",
             "wrong_size": f"version https://git-lfs.github.com/spec/v1\noid sha256:{self.oid}\nsize {self.size+1}\n",
             "invalid": "version https://git-lfs.github.com/spec/v1\noid sha256:not-hex\nsize 13\n",
+            "ready_missing_bytes": f"version https://git-lfs.github.com/spec/v1\noid sha256:{self.oid}\nsize {self.size}\next-test missing\n",
+            "ready_corrupt_bytes": f"version https://git-lfs.github.com/spec/v1\noid sha256:{self.oid}\nsize {self.size}\next-test corrupt\n",
         }
         zero = "0" * 40
         for kind, pointer in pointer_bodies.items():
+            held = self.obj_file.with_name(".held-" + self.oid)
+            if kind == "ready_missing_bytes":
+                self.obj_file.rename(held)
+            elif kind == "ready_corrupt_bytes":
+                original = self.obj_file.read_bytes()
+                self.obj_file.write_bytes(bytes([original[0] ^ 1]) + original[1:])
             (self.work / "pointer.dat").write_text(pointer)
             self.git("add", "pointer.dat", cwd=self.work)
             self.git("commit", "-m", f"{kind} pointer", cwd=self.work)
@@ -36,6 +44,14 @@ class PublicationHarness(LfsHarness):
                               token=self.alice, check=False)
             assert pushed.returncode != 0, f"direct Git push accepted {kind} pointer"
             assert not self.git("ls-remote", self.remote, ref, token=self.alice).stdout
+            bad_ref = f"refs/heads/atomic-bad-{kind}"
+            good_ref = f"refs/heads/atomic-good-{kind}"
+            atomic = self.git("push", "--atomic", "origin", f"HEAD:{bad_ref}",
+                              f"{main}:{good_ref}", cwd=self.work,
+                              token=self.alice, check=False)
+            assert atomic.returncode != 0, f"atomic Git push accepted {kind} pointer"
+            assert not self.git("ls-remote", self.remote, bad_ref, token=self.alice).stdout
+            assert not self.git("ls-remote", self.remote, good_ref, token=self.alice).stdout
 
             # Seed an unreachable object via local Git fetch. This bypasses the
             # service publication path while retaining actual Git object bytes.
@@ -65,8 +81,13 @@ class PublicationHarness(LfsHarness):
             assert merged[0] == 409, f"merge accepted {kind}: {merged[0]} {merged[1][:200]!r}"
             assert self.git("ls-remote", self.remote, "refs/heads/main", token=self.alice).stdout.decode().startswith(main)
             self.git("reset", "--hard", main, cwd=self.work)
+            if kind == "ready_missing_bytes":
+                held.rename(self.obj_file)
+            elif kind == "ready_corrupt_bytes":
+                self.obj_file.write_bytes(original)
         return {"pointer_kinds": sorted(pointer_bodies),
-                "publication_paths": ["smart_http_receive", "ref_transaction", "pull_merge"],
+                "publication_paths": ["smart_http_receive", "atomic_smart_http_receive",
+                                      "ref_transaction", "pull_merge"],
                 "rejected_before_ref_move": True}
 
 

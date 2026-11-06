@@ -53,7 +53,7 @@ pub async fn create(State(state): State<Arc<AppState>>, headers: HeaderMap, Path
     Ok((StatusCode::CREATED,Json(result)))
 }
 
-async fn restore_inner(state: Arc<AppState>, headers: HeaderMap, cp: Uuid, agent: String) -> Result<(StatusCode,Json<Workspace>),Error> {
+async fn restore_inner(state: Arc<AppState>, headers: HeaderMap, cp: Uuid, agent: String, kind:&str) -> Result<(StatusCode,Json<Workspace>),Error> {
     if !valid_agent(&agent) { return Err(Error::bad_request()); }
     let actor = auth::authenticate(&state.pool,&headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
@@ -61,11 +61,26 @@ async fn restore_inner(state: Arc<AppState>, headers: HeaderMap, cp: Uuid, agent
     let row = tx.query_opt("SELECT w.id,w.repository_id,w.owner_slug,w.repository_name,w.agent_id,w.creator_id,w.state,w.host_id,w.lease_epoch,w.revision,w.git_generation,w.last_checkpoint_id FROM workspace_checkpoints c JOIN workspaces w ON w.id=c.workspace_id WHERE c.id=$1 AND c.state IN ('local_complete','committed')", &[&cp]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let parent = Workspace::from_row(&row);
     let access=auth::authorize_repo_with_role(&tx,&actor,&parent.owner,&parent.repository,Role::Write).await?;
-    if parent.creator_id != actor.id { return Err(Error::not_found()); }
+    if parent.creator_id != actor.id || access.repo_id!=parent.repository_id { return Err(Error::not_found()); }
+    let key=auth::idempotency_key(&headers)?.map(str::to_owned);
+    if let Some(key)=&key {
+        service::creation_lock(&tx,actor.id,key).await?;
+        let digest=hex::encode(Sha256::digest(serde_json::to_vec(&(kind,cp,&agent)).map_err(Error::internal)?));
+        if let Some(old)=tx.query_opt("SELECT request_sha256,workspace_id FROM workspace_creations WHERE actor_id=$1 AND idempotency_key=$2 FOR UPDATE",&[&actor.id,&key]).await.map_err(Error::internal)? {
+            if old.get::<_,String>(0)!=digest{return Err(service::conflict());}
+            let existing:Uuid=old.get(1);
+            let row=tx.query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"),&[&existing]).await.map_err(Error::internal)?;
+            return Ok((StatusCode::OK,Json(Workspace::from_row(&row))));
+        }
+    }
     let id = Uuid::new_v4();
     super::remote::ensure_local(&state,cp,parent.repository_id,access.owner_id).await?;
     copy_snapshot(&service::checkpoint_repo(&state,cp),&service::workspace_repo(&state,id))?;
     tx.execute("INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,parent_checkpoint_id,state,host_id,lease_until) VALUES($1,$2,$3,$4,$5,$6,$7,'ready',$8,clock_timestamp()+interval '5 minutes')", &[&id,&parent.repository_id,&parent.owner,&parent.repository,&agent,&actor.id,&cp,&state.storage.volume_id]).await.map_err(Error::internal)?;
+    if let Some(key)=&key {
+        let digest=hex::encode(Sha256::digest(serde_json::to_vec(&(kind,cp,&agent)).map_err(Error::internal)?));
+        tx.execute("INSERT INTO workspace_creations(actor_id,idempotency_key,request_sha256,workspace_id) VALUES($1,$2,$3,$4)",&[&actor.id,key,&digest,&id]).await.map_err(Error::internal)?;
+    }
     super::capture::record_current(&tx,&state,id).await?;
     let row = tx.query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id]).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
@@ -73,12 +88,12 @@ async fn restore_inner(state: Arc<AppState>, headers: HeaderMap, cp: Uuid, agent
 }
 
 pub async fn restore(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<Uuid>, Json(input): Json<RestoreRequest>) -> Result<(StatusCode,Json<Workspace>),Error> {
-    restore_inner(state,headers,id,input.agent_id).await
+    restore_inner(state,headers,id,input.agent_id,"restore").await
 }
 pub async fn fork(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<Uuid>, Json(input): Json<ForkRequest>) -> Result<(StatusCode,Json<Workspace>),Error> {
     let ws = service::authorized(&state,&headers,id,Role::Write).await?;
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client.query_opt("SELECT workspace_id FROM workspace_checkpoints WHERE id=$1", &[&input.checkpoint_id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     if row.get::<_,Uuid>(0)!=ws.id { return Err(Error::not_found()); }
-    restore_inner(state,headers,input.checkpoint_id,input.new_agent_id).await
+    restore_inner(state,headers,input.checkpoint_id,input.new_agent_id,"fork").await
 }

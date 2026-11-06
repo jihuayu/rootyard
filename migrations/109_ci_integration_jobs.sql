@@ -126,14 +126,29 @@ BEGIN
     SELECT o.evidence->'intent' INTO intent FROM git_operations o
     WHERE o.id=NEW.operation_id AND o.repository_id=NEW.repository_id
       AND o.service_principal_id IS NOT NULL;
-    IF FOUND AND (NEW.ref_name IS DISTINCT FROM (intent->>'retention_ref') OR
-        NEW.new_oid IS DISTINCT FROM (intent->>'target_oid') OR
-        NEW.ref_name IS DISTINCT FROM ('refs/rootyard-ci/jobs/' || (intent->>'job_id')) OR
-        NEW.storage_generation::text IS DISTINCT FROM (intent->>'storage_generation')) THEN
-        RAISE EXCEPTION 'CI service operation ref differs from exact intent' USING ERRCODE='23514';
+    IF FOUND THEN
+        IF NEW.ref_name IS DISTINCT FROM (intent->>'retention_ref') OR
+           NEW.new_oid IS DISTINCT FROM (intent->>'target_oid') OR
+           NEW.ref_name IS DISTINCT FROM ('refs/rootyard-ci/jobs/' || (intent->>'job_id')) OR
+           NEW.storage_generation::text IS DISTINCT FROM (intent->>'storage_generation') THEN
+            RAISE EXCEPTION 'CI service operation ref differs from exact intent' USING ERRCODE='23514';
+        END IF;
     END IF;
     RETURN NEW;
 END $$;
 CREATE TRIGGER enforce_ci_service_ref BEFORE INSERT OR UPDATE ON outbox_events
 FOR EACH ROW EXECUTE FUNCTION enforce_ci_service_ref();
+-- Complete orchestration marker. A PR head update is not proof that its pin,
+-- check runs, and webhook deliveries were all durably created.
+CREATE TABLE ci_pull_sync_progress (
+    repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    pull_number BIGINT NOT NULL,
+    pull_version BIGINT NOT NULL,
+    head_oid TEXT NOT NULL,
+    base_oid TEXT NOT NULL,
+    storage_generation BIGINT NOT NULL,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY(repository_id,pull_number,pull_version),
+    CHECK(length(head_oid) IN (40,64) AND length(base_oid)=length(head_oid))
+);
 INSERT INTO schema_migrations(version) VALUES(109) ON CONFLICT DO NOTHING;

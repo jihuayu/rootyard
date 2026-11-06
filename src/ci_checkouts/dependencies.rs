@@ -124,9 +124,9 @@ async fn permitted_repo(state:&AppState,principal:Principal<'_>,owner:&str,name:
     let repo_id=match principal {
         Principal::User(actor)=>auth::authorize_repo_with_role(&tx,actor,owner,name,Role::Read).await?.repo_id,
         Principal::Integration(hook_id)=>tx.query_opt(
-            "SELECT r.id FROM repositories r JOIN users u ON u.id=r.owner_id \
+            "SELECT r.id FROM repositories r JOIN namespaces u ON u.id=r.owner_id \
              JOIN ci_integration_source_grants g ON g.repository_id=r.id \
-             WHERE u.username=$1 AND r.name=$2 AND g.issuer_webhook_id=$3 AND g.active=true \
+             WHERE u.slug=$1 AND r.name=$2 AND g.issuer_webhook_id=$3 AND g.active=true \
                AND r.state='ready'",
             &[&owner,&name,&hook_id],
         ).await.map_err(Error::internal)?.ok_or_else(unsafe_dependency)?.get(0),
@@ -225,7 +225,15 @@ pub async fn scan(state:&AppState,principal:Principal<'_>,root_repo:db::Reposito
 /// A job is ready on a mirror only if every declared dependency is present and
 /// the original issuer still has independent read authority on each source.
 pub async fn verify_on_mirror(state:&AppState,plan:&super::Plan)->Result<(),Error>{
-    if state.mirror_primary.is_none() || plan.dependencies.version!=1 {
+    verify_dependencies(state,plan,true).await
+}
+
+pub async fn verify_on_origin(state:&AppState,plan:&super::Plan)->Result<(),Error>{
+    verify_dependencies(state,plan,false).await
+}
+
+async fn verify_dependencies(state:&AppState,plan:&super::Plan,mirror:bool)->Result<(),Error>{
+    if state.mirror_primary.is_some()!=mirror || plan.dependencies.version!=1 {
         return Err(unsafe_dependency());
     }
     let mut client=state.pool.get().await.map_err(Error::internal)?;
@@ -273,13 +281,26 @@ pub async fn verify_on_mirror(state:&AppState,plan:&super::Plan)->Result<(),Erro
         if row.is_none(){return Err(unsafe_dependency());}
     }
     tx.commit().await.map_err(Error::internal)?;
-    // Native pin views verify the exact Gitlink commit, never a moving branch.
+    // Native pin views or source receipts verify the exact Gitlink commit,
+    // never a moving branch.
     for sub in &plan.dependencies.submodules {
         let client=state.pool.get().await.map_err(Error::internal)?;
         let row=client.query_one(&format!("{} WHERE r.id=$1",db::REPO_SELECT),&[&sub.repository_id])
             .await.map_err(Error::internal)?;
         let repo=db::Repository::from_row(&row);
-        crate::mirror::pinned_path(state,&repo,&sub.target_oid).await?;
+        if mirror {
+            crate::mirror::pinned_path(state,&repo,&sub.target_oid).await?;
+        } else {
+            let owner_id:Uuid=row.get("owner_id");
+            let intent=ci_pins::Intent{version:1,job_id:sub.job_id,owner_id,
+                repository_id:repo.id,storage_generation:repo.storage_generation,
+                object_format:if sub.target_oid.len()==40 {"sha1"} else {"sha256"}.into(),
+                target_oid:sub.target_oid.clone(),
+                retention_ref:format!("refs/rootyard-ci/jobs/{}",sub.job_id)};
+            let lock=state.storage.write_lock(repo.id).await;
+            ci_pins::verify_receipt(state,&intent).await.map_err(|_|unsafe_dependency())?;
+            drop(lock);
+        }
     }
     for lfs in &plan.dependencies.lfs {
         let root=state.storage.root.clone();let repo=lfs.repository_id;

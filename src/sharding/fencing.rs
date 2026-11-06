@@ -119,6 +119,10 @@ pub fn evaluate_write_barrier(
         if m.repository_id != route.repository_id {
             return Err(conflict("volume fence marker repository_id mismatch"));
         }
+        if m.primary_node_id != route.primary_node_id || m.route_epoch != route.route_epoch
+            || m.fencing_token != route.fencing_token || m.storage_generation != req_gen {
+            return Err(conflict("volume fence marker does not match current storage placement"));
+        }
         if m.read_only_degraded {
             return Err(conflict("volume fence marker enforces read-only degradation"));
         }
@@ -164,12 +168,18 @@ pub async fn check_before_push(state: &AppState, repo: &RepoState) -> Result<(),
 
     let r_sql = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id = $1");
     let Some(r_row) = client.query_opt(&r_sql, &[&repo.id]).await.map_err(Error::internal)? else {
+        let count: i64 = client.query_one("SELECT COUNT(*) FROM shard_nodes", &[]).await.map_err(Error::internal)?.get(0);
+        if count > 1 { return Err(conflict("cluster writer requires a durable repository route")); }
         return Ok(());
     };
     let route = RepoShardRoute::row(&r_row);
-    if let Ok(local_node) = std::env::var("ROOTYARD_NODE_ID")
-        && local_node != route.primary_node_id {
+    let local_node = crate::sharding::transport::node_id()?;
+    if local_node.as_deref().is_some_and(|node| node != route.primary_node_id) {
         return Err(conflict("local storage node is not repository primary"));
+    }
+    if local_node.is_none() {
+        let count: i64 = client.query_one("SELECT COUNT(*) FROM shard_nodes", &[]).await.map_err(Error::internal)?.get(0);
+        if count > 1 { return Err(conflict("cluster writer requires a local node identity")); }
     }
 
     let n_sql = format!("SELECT {SHARD_NODE_FIELDS} FROM shard_nodes WHERE node_id = $1");
@@ -207,12 +217,18 @@ pub async fn check_hook_fence(
     let r_sql = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id=$1");
     let Some(row) = client.query_opt(&r_sql, &[&repo_id]).await.map_err(Error::internal)? else {
         if marker.is_some() { return Err(conflict("shard marker exists without route")); }
+        let count: i64 = client.query_one("SELECT COUNT(*) FROM shard_nodes", &[]).await.map_err(Error::internal)?.get(0);
+        if count > 1 { return Err(conflict("native Git cluster writer lacks durable repository route")); }
         return Ok(());
     };
     let route = RepoShardRoute::row(&row);
-    if let Ok(local_node) = std::env::var("ROOTYARD_NODE_ID")
-        && local_node != route.primary_node_id {
+    let local_node = crate::sharding::transport::node_id()?;
+    if local_node.as_deref().is_some_and(|node| node != route.primary_node_id) {
         return Err(conflict("native Git writer is not current storage primary"));
+    }
+    if local_node.is_none() {
+        let count: i64 = client.query_one("SELECT COUNT(*) FROM shard_nodes", &[]).await.map_err(Error::internal)?.get(0);
+        if count > 1 { return Err(conflict("native Git cluster writer lacks node identity")); }
     }
     let n_sql = format!("SELECT {SHARD_NODE_FIELDS} FROM shard_nodes WHERE node_id=$1");
     let primary = client.query_opt(&n_sql, &[&route.primary_node_id]).await.map_err(Error::internal)?
