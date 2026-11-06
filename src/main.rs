@@ -217,7 +217,12 @@ async fn run() -> Result<()> {
             rootyard::sharding::transitions::reconcile_pending(&state).await
                 .map_err(|e| anyhow::anyhow!(e.1))?;
             rootyard::recover(&state).await?;
-            rootyard::sandbox::reconcile_startup(&state).await.map_err(|_| anyhow::anyhow!("sandbox startup recovery failed"))?;
+            rootyard::sandbox::reconcile_startup(&state)
+                .await
+                .map_err(|_| anyhow::anyhow!("sandbox startup recovery failed"))?;
+            rootyard::workspaces::mounts::reconcile_startup(&state)
+                .await
+                .map_err(|_| anyhow::anyhow!("workspace FUSE mount recovery failed"))?;
             let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
             let controller_task = if local_fence {
                 Some(tokio::spawn(rootyard::sharding::controller::run(state.clone())))
@@ -267,7 +272,10 @@ async fn run() -> Result<()> {
             } else { None };
             let worker_state = state.clone();
             let workspace_capture_stop = tokio_util::sync::CancellationToken::new();
-            let workspace_capture_task = tokio::spawn(rootyard::workspaces::capture::run(state.clone(), workspace_capture_stop.clone()));
+            let workspace_capture_task = tokio::spawn(rootyard::workspaces::capture::run(
+                state.clone(),
+                workspace_capture_stop.clone(),
+            ));
             let worker = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
                 loop {

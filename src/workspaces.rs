@@ -9,6 +9,8 @@ mod events;
 mod files;
 #[path = "workspaces/models.rs"]
 mod models;
+#[path = "workspaces/mounts.rs"]
+pub mod mounts;
 #[path = "workspaces/remote.rs"]
 mod remote;
 #[path = "workspaces/remote_gc.rs"]
@@ -18,8 +20,8 @@ pub(crate) mod service;
 
 use crate::AppState;
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 pub use service::fence_restored;
 use std::sync::Arc;
