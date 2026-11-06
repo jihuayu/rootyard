@@ -146,7 +146,10 @@ pub async fn encrypt_file(provider: &VaultTransit, source: &Path, ciphertext: &P
     }
     let mut data_key = [0u8; 32];
     rand::rng().fill_bytes(&mut data_key);
-    let wrapped_key = provider.wrap(&data_key, deadline).await?;
+    let wrapped_key = match provider.wrap(&data_key, deadline).await {
+        Ok(wrapped) => wrapped,
+        Err(error) => { data_key.fill(0); return Err(error); }
+    };
     let mut envelope = Envelope {
         version: 1, generation: 1, object_id: Uuid::new_v4(), cipher: "AES-256-GCM-CHUNKED".into(),
         provider: "vault-transit".into(), key_name: provider.key_name.clone(), wrapped_key,
@@ -154,8 +157,18 @@ pub async fn encrypt_file(provider: &VaultTransit, source: &Path, ciphertext: &P
         ciphertext_sha256: String::new(), ciphertext_bytes: 0, chunk_bytes: CHUNK_BYTES,
     };
     let parent = ciphertext.parent().context("ciphertext parent missing")?;
-    fs::create_dir_all(parent).await?;
+    if let Err(error) = fs::create_dir_all(parent).await {
+        data_key.fill(0);
+        return Err(error.into());
+    }
+    // Allocate metadata first: a missing or unwritable envelope parent cannot
+    // leave a published ciphertext that permanently poisons a retry.
+    if let Err(error) = fs::create_dir(envelope_dir).await {
+        data_key.fill(0);
+        return Err(error.into());
+    }
     let temp = parent.join(format!(".cipher-{}", Uuid::new_v4()));
+    let mut ciphertext_published = false;
     let result = async {
         let cipher = data_cipher(&data_key)?;
         let mut input = File::open(source).await?;
@@ -184,15 +197,19 @@ pub async fn encrypt_file(provider: &VaultTransit, source: &Path, ciphertext: &P
         out.sync_all().await?;
         ensure!(!ciphertext.exists(), "ciphertext path appeared during encryption");
         fs::rename(&temp, ciphertext).await?;
+        ciphertext_published = true;
         File::open(parent).await?.sync_all().await?;
         envelope.ciphertext_sha256 = hex::encode(hash.finalize());
         envelope.ciphertext_bytes = size;
-        fs::create_dir(envelope_dir).await?;
         write_new(&envelope_path(envelope_dir, 1), &serde_json::to_vec(&envelope)?).await?;
         write_new(&envelope_dir.join("CURRENT"), b"1\n").await?;
         Ok::<(), anyhow::Error>(())
     }.await;
-    if result.is_err() { let _ = fs::remove_file(&temp).await; }
+    if result.is_err() {
+        let _ = fs::remove_file(&temp).await;
+        if ciphertext_published { let _ = fs::remove_file(ciphertext).await; }
+        let _ = fs::remove_dir_all(envelope_dir).await;
+    }
     data_key.fill(0);
     result?;
     Ok(envelope)
@@ -201,12 +218,12 @@ pub async fn encrypt_file(provider: &VaultTransit, source: &Path, ciphertext: &P
 pub async fn decrypt_file(provider: &VaultTransit, ciphertext: &Path, envelope_dir: &Path, generation: Option<u64>, destination: &Path, deadline: Instant) -> Result<Envelope> {
     let envelope = read_envelope(envelope_dir, generation).await?;
     ensure!(envelope.key_name == provider.key_name, "wrong Vault key name");
-    let mut data_key = provider.unwrap(&envelope.wrapped_key, deadline).await?;
-    let cipher = data_cipher(&data_key)?;
     let parent = destination.parent().context("decrypted pack destination parent missing")?;
-    fs::create_dir_all(parent).await?;
+    let mut data_key = provider.unwrap(&envelope.wrapped_key, deadline).await?;
     let temp = parent.join(format!(".decrypted-{}", Uuid::new_v4()));
     let result = async {
+        let cipher = data_cipher(&data_key)?;
+        fs::create_dir_all(parent).await?;
         let mut input = File::open(ciphertext).await?;
         let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
         let mut plaintext_hash = Sha256::new();
@@ -258,7 +275,10 @@ pub async fn rotate_envelope(provider: &VaultTransit, envelope_dir: &Path, deadl
     // Verify the new wrapper before making it current. Old generations remain
     // readable while Vault permits their key versions.
     let mut old_key = provider.unwrap(&current.wrapped_key, deadline).await?;
-    let mut new_key = provider.unwrap(&wrapped, deadline).await?;
+    let mut new_key = match provider.unwrap(&wrapped, deadline).await {
+        Ok(key) => key,
+        Err(error) => { old_key.fill(0); return Err(error); }
+    };
     let same_key = old_key == new_key;
     old_key.fill(0);
     new_key.fill(0);
