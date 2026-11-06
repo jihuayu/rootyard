@@ -54,6 +54,14 @@ topic. Restrict broker ACLs to topic produce/consume and group access; the
 profile does not provision ACLs or a broker. The wake is advisory: PostgreSQL
 outbox rows remain durable and the worker polls if Kafka is unavailable.
 
+The delivery role needs `UPDATE` on `event_deliveries` and ordinary `SELECT`
+on repositories/outbox tables. Migration 129 makes
+`rootyard_worker_repository_generation(uuid,name)` executable by any login, but
+the SECURITY DEFINER body raises SQLSTATE 42501 unless `session_user` holds
+that `event_deliveries` UPDATE privilege. No `UPDATE` on `repositories` is
+needed; grant it only if you also grant the delivery table, and never make the
+worker a schema owner.
+
 ```bash
 python3 deployment/local_cluster.py up \
   --binary /absolute/path/rootyard --env-dir /absolute/private/config \
@@ -79,6 +87,34 @@ source write-blocked. Retry `/shard-migrate` with the **same operation ID**
 after repairing the destination. The source snapshot, destination install,
 and source cutover use ordered PostgreSQL and local barriers; do not clear the
 drain by editing SQL directly or by registering a new target volume as current.
+
+### Pando backend transition recovery
+
+`cutover`, `rollback` and abandoned-drain recovery are offline commands. They
+open the data directory exclusively, so stop the server that owns that volume
+first; a live server or another offline operator makes the command fail with
+`data volume is in use`. `status` is PostgreSQL-only, read-only and safe while
+the server runs, so it is the command to identify the exact fence to recover.
+
+```bash
+rootyard pando-transition status --repository <repo-uuid>
+rootyard pando-transition cutover --repository <repo-uuid>
+rootyard pando-transition rollback --repository <repo-uuid>
+rootyard pando-transition recover-abandoned-draining   --repository <repo-uuid> --expected-transition <uuid> --expected-epoch <n>   --expected-backend <gitfs|pando> --expected-generation <n>
+```
+
+A crashed process can leave `transition_state=draining` with no live worker.
+Inspect `status` and record its exact `transition_id`, `transition_epoch`,
+`storage_backend` and `storage_generation`. Stop the server, then run the
+recovery command while holding exclusive volume ownership. It also takes the
+repository publication advisory lock, so an active publisher or transition
+rejects it. It then requires every expected value to still match under
+`FOR UPDATE` and moves the fence to `failed` with an operator error. It never
+moves directly to `stable`. Ordinary writes remain blocked. After repairing the
+original cause (object store, capacity, Git parity or HEAD), rerun the same
+direction with `cutover`/`rollback`; `begin` accepts `failed`, mints a new
+transition ID and epoch, and only a successful completion restores `stable`.
+Do not edit `transition_state` directly.
 
 For workspace execution, add `ROOTYARD_WORKSPACE_MOUNT_MODE=fuse` to the
 corresponding node environment and provide `/dev/fuse` and a functioning user

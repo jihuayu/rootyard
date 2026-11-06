@@ -443,6 +443,35 @@ pub fn sequence(data_root: &Path, repository_id: Uuid) -> Result<i64> {
     ensure!(value >= 0, "negative journal counter");
     Ok(value)
 }
+
+/// Advance the durable local sequence counter to at least `floor` while holding
+/// the same admission lock used by `begin_inner`. Storage transitions use this
+/// to carry both backends across one shared `git_operations` uniqueness
+/// namespace without ever lowering or reusing a published sequence.
+pub(crate) fn ensure_sequence_at_least(data_root: &Path, repository_id: Uuid, floor: i64) -> Result<i64> {
+    ensure!(floor >= 0, "invalid journal sequence floor");
+    safe_path(data_root)?;
+    let journal = data_root.join("journal");
+    mkdir(&journal)?;
+    let repo = journal.join(repository_id.to_string());
+    mkdir(&repo)?;
+    let sequence_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(repo.join("sequence.lock"))?;
+    ensure!(sequence_lock.metadata()?.is_file(), "invalid journal admission lock");
+    sequence_lock.lock_exclusive()?;
+    let counter = repo.join("sequence");
+    let previous: i64 = if exists(&counter)? { std::str::from_utf8(&read(&counter)?)?.parse()? } else { 0 };
+    ensure!(previous >= 0, "invalid journal sequence");
+    if previous < floor {
+        atomic(&counter, floor.to_string().as_bytes(), true)?;
+    }
+    Ok(previous.max(floor))
+}
 pub fn pending(data_root: &Path, repository_id: Uuid) -> Result<Vec<Operation>> {
     safe_path(data_root)?;
     let repo = data_root.join("journal").join(repository_id.to_string());

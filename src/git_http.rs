@@ -18,6 +18,8 @@ use tokio::{
     time::Instant,
 };
 
+#[path = "git_http/pando_receive.rs"]
+mod pando_receive;
 #[path = "git_http/process.rs"]
 mod process;
 #[path = "git_http/protocol.rs"]
@@ -58,6 +60,26 @@ async fn transfer_authorized(
             .await
             .map_err(|_| io::Error::other("Git authority revoked"))
     }
+}
+
+async fn backend_current(state: &AppState, repo: &Repository) -> Result<(), Error> {
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let row = client
+        .query_opt(
+            "SELECT storage_generation,storage_backend,state,transition_state FROM repositories WHERE id=$1",
+            &[&repo.id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    if row.get::<_, i64>(0) != repo.storage_generation
+        || row.get::<_, &str>(1) != repo.storage_backend
+        || row.get::<_, &str>(2) != "ready"
+        || row.get::<_, &str>(3) != "stable"
+    {
+        return Err(Error(StatusCode::CONFLICT, "repository backend changed; retry"));
+    }
+    Ok(())
 }
 
 pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
@@ -133,8 +155,8 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         }
         (Some(identity), repo, None, None)
     };
-    if repo.storage_backend == "pando" && (write || pin_oid.is_some()) {
-        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "Pando publication and pinned checkout are not ready"));
+    if repo.storage_backend == "pando" && pin_oid.is_some() {
+        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "Pando pinned checkout is not ready"));
     }
     let remote_user = match &job_principal {
         Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration { hook_id, job_id, .. }) => {
@@ -143,12 +165,19 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         _ => identity.as_ref().ok_or_else(Error::unauthorized)?.username.clone(),
     };
     validate_headers(&parts.headers, &parts.method, service, state.config.max_request_bytes)?;
+    if write {
+        crate::pando_gateway::transition::admit_write(&state.pool, repo.id, &repo.storage_backend).await?;
+    }
     let permit = state
         .git_slots
         .clone()
         .try_acquire_owned()
         .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let deadline = Instant::now() + state.config.git_timeout;
+    if repo.storage_backend == "pando" && write && parts.method == Method::POST {
+        let actor = identity.ok_or_else(Error::unauthorized)?;
+        return pando_receive::execute(state, parts, body, actor, repo, permit, deadline).await;
+    }
     let max_input = state.config.max_request_bytes;
     let input = receive::prepare(
         body,
@@ -190,13 +219,14 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     } else {
         None
     };
+    backend_current(&state, &repo).await?;
     if snapshot_lease.is_some() {
         transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(), job_principal.as_ref(), &repo, write)
             .await
             .map_err(|_| Error::unauthorized())?;
     }
     if write_guard.is_some() {
-        reliability::before_push(&state, &repo).await.map_err(Error::internal)?;
+        reliability::before_gitfs_push(&state, &repo).await?;
     }
     let pando_snapshot = if repo.storage_backend == "pando" {
         let lease = snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?;

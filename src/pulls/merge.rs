@@ -121,9 +121,7 @@ async fn merge_pull_inner(
         Instant::now() + state.config.git_timeout,
     )
     .await?;
-    reliability::before_push(&state, &repo)
-        .await
-        .map_err(Error::internal)?;
+    reliability::before_gitfs_push(&state, &repo).await?;
     publication.ensure_active()?;
 
     let repo_path = state

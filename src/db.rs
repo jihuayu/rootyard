@@ -146,12 +146,36 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (125, include_str!("../migrations/125_web_sessions.sql")),
     (126, include_str!("../migrations/126_ref_admissions.sql")),
     (127, include_str!("../migrations/127_gc_admission_fence.sql")),
+    (128, include_str!("../migrations/128_pando_head_ref.sql")),
+    (129, include_str!("../migrations/129_worker_repository_lock.sql")),
+    (130, include_str!("../migrations/130_pando_transition_fence.sql")),
 ];
 
 pub const SCHEMA_VERSIONS: &[i32] = &[
     1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 72, 73, 74, 75, 80, 81, 82, 83, 84, 85, 86, 90, 91, 92, 93, 94, 95,
-    96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 121, 125, 126, 127,
+    96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 121, 125, 126, 127, 128, 129, 130,
 ];
+
+/// Runtime roles use a read-only schema check. Migration/backup ownership is
+/// intentionally separate from API and outbox worker database credentials.
+pub async fn verify_schema(pool: &Pool) -> Result<()> {
+    let client = pool.get().await?;
+    let rows = client.query("SELECT version FROM schema_migrations ORDER BY version", &[]).await?;
+    let installed: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
+    ensure!(
+        installed.as_slice() == SCHEMA_VERSIONS,
+        "database schema differs from this binary; run the migrator before runtime startup"
+    );
+    Ok(())
+}
+
+pub async fn prepare_runtime_schema(pool: &Pool) -> Result<()> {
+    match std::env::var("ROOTYARD_SCHEMA_MODE").as_deref() {
+        Ok("external") => verify_schema(pool).await,
+        Ok("auto") | Err(_) => migrate(pool).await,
+        _ => bail!("ROOTYARD_SCHEMA_MODE must be external or auto"),
+    }
+}
 
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;

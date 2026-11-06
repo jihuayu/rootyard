@@ -71,9 +71,7 @@ pub(super) async fn pin_inner(
         tokio::time::Instant::now() + state.config.git_timeout,
     )
     .await?;
-    reliability::before_push(&state, &repo)
-        .await
-        .map_err(Error::internal)?;
+    reliability::before_gitfs_push(&state, &repo).await?;
     // Hold current token/owner/repository authority through ref publication. The
     // durable journal is reconciled after releasing SQL locks; it is not rolled
     // back by a database disconnect and never pretends to be a SQL transaction.

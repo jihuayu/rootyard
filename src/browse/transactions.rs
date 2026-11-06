@@ -166,6 +166,7 @@ async fn execute_ref_transaction_inner(
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     let mut repo = db::Repository::from_row(&repo_row);
+    crate::pando_gateway::transition::admit_write(&state.pool, repo.id, &repo.storage_backend).await?;
 
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(
@@ -229,9 +230,7 @@ async fn execute_ref_transaction_inner(
         }
     }
     repo.storage_generation = current_generation;
-    reliability::before_push(&state, &repo)
-        .await
-        .map_err(Error::internal)?;
+    reliability::before_gitfs_push(&state, &repo).await?;
 
     let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
     let quota = state.config.max_repo_bytes;

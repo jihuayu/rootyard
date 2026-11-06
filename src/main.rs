@@ -32,7 +32,7 @@ async fn run() -> Result<()> {
     if args.len() == 1 && matches!(args[0].as_str(), "worker" | "worker-once") {
         let url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
         let pool = db::pool(&url)?;
-        db::migrate(&pool).await?;
+        db::prepare_runtime_schema(&pool).await?;
         let settings = rootyard::dispatch::Settings::from_env()?;
         if args[0] == "worker-once" {
             let owner = uuid::Uuid::new_v4();
@@ -116,6 +116,9 @@ async fn run() -> Result<()> {
                     .await?
             );
         }
+        "pando-transition" if args.len() >= 2 => {
+            rootyard::pando_gateway::transition::operator::cli(&config, &pool, &args[1..]).await?;
+        }
         "reconcile" if args.len() == 1 => {
             db::migrate(&pool).await?;
             let storage = Storage::open(&config)?;
@@ -159,7 +162,7 @@ async fn run() -> Result<()> {
             if !version.status.success() || numbers.len() != 2 || (numbers[0], numbers[1]) < (2, 43) {
                 bail!("Git 2.43 or newer is required");
             }
-            db::migrate(&pool).await?;
+            db::prepare_runtime_schema(&pool).await?;
             // A restore can install its guard while this server waits for the
             // migration advisory lock; recheck before any recovery or serving.
             rootyard::backup::ensure_not_restoring(&storage.root)?;
@@ -279,7 +282,7 @@ async fn run() -> Result<()> {
             }
         }
         _ => bail!(
-            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007]]"
+            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007]]"
         ),
     }
     Ok(())

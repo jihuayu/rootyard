@@ -23,7 +23,9 @@ mod core;
 pub use core::{
     ActiveGuard, HookEvent, HookPhase, Operation, RefChange, begin, begin_active, begin_active_with, pending, sequence,
 };
-pub(crate) use core::{atomic, begin_ci, begin_ci_service, begin_proposal, exists, mkdir, read, safe_path};
+pub(crate) use core::{
+    atomic, begin_ci, begin_ci_service, begin_proposal, ensure_sequence_at_least, exists, mkdir, read, safe_path,
+};
 use core::{entries, load, op_name, sync_dir, validate};
 
 pub(crate) fn valid_ref(s: &str) -> bool {

@@ -242,7 +242,7 @@ pub async fn acknowledge(pool: &Pool, claim: &Claim) -> Result<bool> {
     let Some(event)=tx.query_opt("SELECT repository_id,storage_generation,operation_sequence,transaction_sequence,ref_name,operation_id FROM outbox_events WHERE event_id=$1",&[&claim.event_id]).await? else {return Ok(false);};
     let repository_id: Uuid = event.get(0);
     let current: i64 = tx
-        .query_one("SELECT storage_generation FROM repositories WHERE id=$1 FOR SHARE", &[&repository_id])
+        .query_one("SELECT rootyard_worker_repository_generation($1, current_schema())", &[&repository_id])
         .await?
         .get(0);
     if !lock_valid_lease(&tx, claim).await? {

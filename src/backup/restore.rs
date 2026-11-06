@@ -32,6 +32,18 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
         .into_iter()
         .map(|(n, e)| (format!("volume/{n}"), e))
         .collect::<BTreeMap<_, _>>();
+    let pando_root = source.join("pando");
+    let has_pando = match fs::symlink_metadata(&pando_root) {
+        Ok(meta) => {
+            ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "invalid Pando closure directory");
+            for (name, entry) in inventory(&pando_root)? {
+                actual.insert(format!("pando/{name}"), entry);
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
     let dump = source.join("metadata.dump");
     let metadata = fs::symlink_metadata(&dump)?;
     ensure!(metadata.is_file() && metadata.nlink() == 1, "invalid dump file");
@@ -53,10 +65,12 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
     );
     let mut names = fs::read_dir(source)?.map(|e| e.map(|v| v.file_name())).collect::<std::io::Result<Vec<_>>>()?;
     names.sort();
-    ensure!(
-        names == ["COMPLETE", "manifest.json", "metadata.dump", "volume"].map(std::ffi::OsString::from),
-        "unexpected backup files"
-    );
+    let mut allowed = ["COMPLETE", "manifest.json", "metadata.dump", "volume"].map(std::ffi::OsString::from).to_vec();
+    if has_pando {
+        allowed.push("pando".into());
+    }
+    allowed.sort();
+    ensure!(names == allowed, "unexpected backup files");
     Ok(manifest)
 }
 
@@ -81,7 +95,7 @@ pub async fn restore(config: &Config, source: &Path, allow_legacy_schema007: boo
         (allow_legacy_schema007 && manifest.format == 4) || manifest.binary_sha256 == hash(&std::env::current_exe()?)?,
         "restore requires the exact backup binary; upgrade separately"
     );
-    let client = pg(config).await?;
+    let mut client = pg(config).await?;
     client.query_one("SELECT pg_advisory_lock(738390103)", &[]).await?;
     database_scope(&client, true).await?;
     let object_count: i64 = client.query_one("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'", &[]).await?.get(0);
@@ -166,6 +180,36 @@ pub async fn restore(config: &Config, source: &Path, allow_legacy_schema007: boo
     }
     if manifest.format >= 6 {
         authority::fence(&client).await?;
+        // Restored pando_refs/HEAD rows are only complete once the encrypted
+        // pack closure is back in remote object storage. Import before the
+        // volume is published so a failure leaves the isolated restore intact.
+        let pando: Vec<Uuid> = client
+            .query(
+                "SELECT r.id FROM public.repositories r JOIN public.pando_repository_states s \
+            ON s.repository_id=r.id WHERE r.storage_backend='pando' ORDER BY r.id",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        if !pando.is_empty() {
+            let remote =
+                crate::storage::remote_objects::RemoteObjectStore::from_env(config.data_dir.join("pando-pack-work"))?;
+            let until = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+            for repo in pando {
+                let closure = source.join("pando").join(repo.to_string());
+                ensure!(closure.is_dir(), "backup is missing a Pando pack closure");
+                let tx = client
+                    .build_transaction()
+                    .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+                    .start()
+                    .await?;
+                tx.batch_execute("SET LOCAL search_path=public").await?;
+                crate::pando_gateway::backup::import_closure(&tx, &remote, repo, &closure, until).await?;
+                tx.commit().await?;
+            }
+        }
     }
     ensure!(!target.exists(), "destination appeared during restore");
     publish(&staging, &target)?;

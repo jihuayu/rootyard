@@ -195,8 +195,9 @@ pub(crate) async fn ensure_pull_ci_pin(
         tokio::time::Instant::now() + state.config.git_timeout,
     )
     .await?;
+    reliability::ensure_gitfs_current(state, repo).await?;
     if state.hooks.is_some() {
-        reliability::before_push(state, repo).await.map_err(Error::internal)?;
+        reliability::before_gitfs_push(state, repo).await?;
     }
 
     if !ci_pins::valid_format(&repo.object_format)

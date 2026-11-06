@@ -20,6 +20,10 @@ fn conflict() -> Error {
     Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs")
 }
 
+fn deletes_head(head_ref: &str, changes: &[RefChange]) -> bool {
+    changes.iter().any(|change| change.ref_name == head_ref && change.new_oid.bytes().all(|byte| byte == b'0'))
+}
+
 /// Caller has completed native receive-pack in a disposable Snapshot and
 /// staged any new closure. It must retain the exact-ref guard, but release the
 /// local snapshot read lock before this method enters the publication window.
@@ -77,9 +81,9 @@ pub async fn publish(
     }
     let current = tx
         .query_one(
-            "SELECT r.storage_generation,r.storage_backend,r.object_format,
+            "SELECT r.storage_generation,r.storage_backend,r.object_format,r.transition_state,
         s.state,s.storage_generation AS pando_generation,s.ref_generation,s.operation_sequence,
-        s.object_format AS pando_format,s.pack_ids FROM repositories r JOIN pando_repository_states s
+        s.object_format AS pando_format,s.pack_ids,s.head_ref FROM repositories r JOIN pando_repository_states s
         ON s.repository_id=r.id WHERE r.id=$1 AND s.tenant_id=$2 FOR UPDATE OF s",
             &[&repo.id, &tenant_id],
         )
@@ -88,6 +92,7 @@ pub async fn publish(
     if current.get::<_, i64>("storage_generation") != repo.storage_generation
         || current.get::<_, i64>("pando_generation") != repo.storage_generation
         || current.get::<_, &str>("storage_backend") != "pando"
+        || current.get::<_, &str>("transition_state") != "stable"
         || current.get::<_, &str>("state") != "serving"
         || current.get::<_, &str>("object_format") != repo.object_format
         || current.get::<_, &str>("pando_format") != repo.object_format
@@ -96,6 +101,13 @@ pub async fn publish(
     }
     let ref_generation: i64 = current.get("ref_generation");
     let operation_sequence: i64 = current.get("operation_sequence");
+    let head_ref: String = current.get("head_ref");
+    if !head_ref.starts_with("refs/heads/") || !crate::journal::valid_ref(&head_ref) {
+        return Err(conflict());
+    }
+    if deletes_head(&head_ref, &prepared.changes) {
+        return Err(Error(StatusCode::CONFLICT, "cannot delete the advertised HEAD ref; retarget HEAD first"));
+    }
     let mut pack_ids: Vec<Uuid> = current.get("pack_ids");
     let next_ref = ref_generation.checked_add(1).ok_or_else(conflict)?;
     let next_operation = operation_sequence.checked_add(1).ok_or_else(conflict)?;
@@ -224,4 +236,20 @@ pub async fn publish(
     state.dispatch.committed();
     window.ensure_active()?;
     Ok(next_ref)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change(name: &str, oid: char) -> RefChange {
+        RefChange { old_oid: "a".repeat(40), new_oid: oid.to_string().repeat(40), ref_name: name.into() }
+    }
+
+    #[test]
+    fn advertised_head_cannot_be_deleted_but_other_branches_can() {
+        assert!(deletes_head("refs/heads/main", &[change("refs/heads/main", '0')]));
+        assert!(!deletes_head("refs/heads/main", &[change("refs/heads/main", 'b')]));
+        assert!(!deletes_head("refs/heads/main", &[change("refs/heads/old", '0')]));
+    }
 }

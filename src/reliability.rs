@@ -292,6 +292,38 @@ async fn recovering(state: &AppState, repo: Uuid, reason: &str) -> Result<()> {
     Ok(())
 }
 
+/// A mutating GitFS path must not touch the bare repository after a cutover
+/// began or committed. Callers hold the repository write/publication lock, so
+/// this check observes the authoritative backend and fence after the wait.
+pub async fn ensure_gitfs_current(state: &AppState, repo: &db::Repository) -> std::result::Result<(), Error> {
+    let row = state
+        .pool
+        .get()
+        .await
+        .map_err(Error::internal)?
+        .query_opt(
+            "SELECT state,storage_generation,storage_backend,transition_state FROM repositories WHERE id=$1",
+            &[&repo.id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    if row.get::<_, String>(0) != "ready"
+        || row.get::<_, i64>(1) != repo.storage_generation
+        || row.get::<_, String>(2) != "gitfs"
+        || row.get::<_, String>(3) != "stable"
+    {
+        return Err(Error(StatusCode::CONFLICT, "repository backend or storage transition changed; retry"));
+    }
+    Ok(())
+}
+
+/// GitFS mutation admission with a caller-visible CONFLICT status.
+pub async fn before_gitfs_push(state: &AppState, repo: &db::Repository) -> std::result::Result<(), Error> {
+    ensure_gitfs_current(state, repo).await?;
+    before_push(state, repo).await.map_err(Error::internal)
+}
+
 pub async fn before_push(state: &AppState, repo: &db::Repository) -> Result<()> {
     verify_hooks(state)?;
     crate::sharding::fencing::check_before_push(state, repo).await.map_err(|e| anyhow::anyhow!(e.1))?;
@@ -300,11 +332,17 @@ pub async fn before_push(state: &AppState, repo: &db::Repository) -> Result<()> 
         .pool
         .get()
         .await?
-        .query_one("SELECT state,storage_generation FROM repositories WHERE id=$1", &[&repo.id])
+        .query_one(
+            "SELECT state,storage_generation,storage_backend,transition_state FROM repositories WHERE id=$1",
+            &[&repo.id],
+        )
         .await?;
     ensure!(
-        row.get::<_, String>(0) == "ready" && row.get::<_, i64>(1) == repo.storage_generation,
-        "repository changed or recovery required"
+        row.get::<_, String>(0) == "ready"
+            && row.get::<_, i64>(1) == repo.storage_generation
+            && row.get::<_, String>(2) == "gitfs"
+            && row.get::<_, String>(3) == "stable",
+        "repository backend or storage transition changed; retry"
     );
     let maximum: i64 = state
         .pool
