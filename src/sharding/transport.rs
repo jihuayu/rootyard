@@ -221,7 +221,7 @@ pub async fn authenticate_delegation(state: &Arc<AppState>, headers: &HeaderMap,
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let inserted = tx.execute(
-        "INSERT INTO cluster_transport_nonces(nonce, expires_at) VALUES ($1, to_timestamp($2)) ON CONFLICT DO NOTHING",
+        "INSERT INTO cluster_transport_nonces(nonce, expires_at) VALUES ($1, to_timestamp($2::bigint::double precision)) ON CONFLICT DO NOTHING",
         &[&env.nonce, &env.expires_unix],
     ).await.map_err(Error::internal)?;
     if inserted != 1 { return Err(Error::unauthorized()); }
