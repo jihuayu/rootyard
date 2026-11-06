@@ -99,6 +99,10 @@ def main():
         runner(prefix+runs["ci/test"]+"/report",body)
         replay=runner(prefix+runs["ci/test"]+"/report",body)
         assert replay["replay"] is True
+        runner(prefix+runs["ci/test"]+"/report",{**body,
+            "lease_generation":body["lease_generation"]+1},409)
+        runner(prefix+runs["ci/test"]+"/report",{**body,
+            "attempt":body["attempt"]+1},409)
         second=runner(prefix+runs["ci/lint"]+"/claim",{"runner_id":"runner-b"})
         runner(prefix+runs["ci/lint"]+"/report",{"attempt":second["attempt"],
             "lease_generation":second["lease_generation"],"conclusion":"success","output":"ok"})
