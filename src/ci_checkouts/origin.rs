@@ -285,6 +285,7 @@ pub(crate) async fn origin_job_path(
     state: &AppState,
     repo: &db::Repository,
     plan: &Plan,
+    lease: &crate::storage::read_leases::Lease,
 ) -> Result<PathBuf, Error> {
     if state.mirror_primary.is_some()
         || repo.id != plan.repository_id
@@ -300,12 +301,7 @@ pub(crate) async fn origin_job_path(
     let _lock = tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo.id))
         .await
         .map_err(|_| Error::timeout())?;
-    let lease = crate::storage::read_leases::shared(
-        &state.pool,
-        repo.id,
-        tokio::time::Instant::now() + state.config.git_timeout,
-    )
-    .await?;
+    lease.ensure_active()?;
     super::dependencies::verify_on_origin(state, plan).await?;
     let source = state
         .storage
