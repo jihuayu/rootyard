@@ -15,9 +15,10 @@ use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
+    os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
 };
 use uuid::Uuid;
 
@@ -306,21 +307,33 @@ pub async fn create(
     let bundle_ref = input.bundle_ref.clone();
     let message = input.message.clone();
     let quota = state.config.max_repo_bytes;
-    // block_in_place keeps the local source gate alive until every bounded
-    // native Git subprocess has exited, even if the HTTP request disconnects.
-    let new_oid = tokio::task::block_in_place(move || {
-        build_source_commit(
-            &source,
-            &projected,
-            &stage,
-            &bundle,
-            &bundle_ref,
-            &view_copy,
-            &source_ref,
-            &actor_name,
-            &message,
-            quota,
-        )
+    let volume_lock_fd = state.storage.lock_file.as_raw_fd();
+    // The local gate survives HTTP cancellation. A separate watcher also
+    // fences a lost cross-process PG lease while synchronous Git is active:
+    // reverse_git kills and reaps its whole process group before this returns.
+    let canceled = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let new_oid = std::thread::scope(|scope| {
+        let watcher_cancel = canceled.clone();
+        let watcher_finished = finished.clone();
+        let lease = &source_lease;
+        scope.spawn(move || {
+            while !watcher_finished.load(Ordering::Acquire) {
+                if lease.ensure_active().is_err() {
+                    watcher_cancel.store(true, Ordering::Release);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        let result = tokio::task::block_in_place(move || {
+            reverse_git::with_read_cancel(canceled, volume_lock_fd, || build_source_commit(
+                &source, &projected, &stage, &bundle, &bundle_ref,
+                &view_copy, &source_ref, &actor_name, &message, quota,
+            ))
+        });
+        finished.store(true, Ordering::Release);
+        result
     })?;
     source_lease.ensure_active()?;
     drop(_local);
