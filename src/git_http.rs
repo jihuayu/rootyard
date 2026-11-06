@@ -213,6 +213,9 @@ pub(crate) async fn collect_git_output_input(
 }
 
 pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
+    if let Some(plan) = crate::sharding::transport::route_git_request(&state, &request).await? {
+        return crate::sharding::transport::forward_request(&state, plan, request).await;
+    }
     // A disconnected caller cannot cancel cleanup between acquiring the write
     // lock and starting the response producer. The owned task retains all guards.
     tokio::spawn(execute(state, request))
@@ -235,8 +238,13 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             "read mirror never accepts pushes; use the primary",
         ));
     }
+    let delegation = crate::sharding::transport::authenticate_delegation(
+        &state, &parts.headers, &parts.method, &parts.uri,
+    ).await?;
     let job = pin_oid.is_some() && auth::credentials_for(&parts.headers, "ryj_").is_ok();
-    let (identity, repo, job_plan) = if job {
+    let (identity, repo, job_plan) = if let Some((identity, repo)) = delegation {
+        (identity, repo, None)
+    } else if job {
         let (identity, repo, plan) = crate::ci_checkouts::authenticate(
             &state,
             &parts.headers,
@@ -257,7 +265,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             .await
             .map_err(Error::internal)?
             .query_opt(
-                &format!("{} WHERE u.username=$1 AND r.name=$2", db::REPO_SELECT),
+                &format!("{} WHERE ns.slug=$1 AND r.name=$2", db::REPO_SELECT),
                 &[&owner, &name],
             )
             .await
@@ -351,7 +359,11 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         cmd.env("ROOTYARD_DATABASE_URL", &state.config.database_url)
             .env("ROOTYARD_GIT_PATH", &state.config.git)
             .env("ROOTYARD_GIT_DIR", &path)
+            .env("ROOTYARD_DATA_ROOT", &state.storage.root)
             .env("ROOTYARD_GIT_TIMEOUT_SECONDS", state.config.git_timeout.as_secs().to_string());
+        if let Ok(node_id) = std::env::var("ROOTYARD_NODE_ID") {
+            cmd.env("ROOTYARD_NODE_ID", node_id);
+        }
     }
     cmd.arg("http-backend")
         .env("GIT_PROJECT_ROOT", project_root)
@@ -560,6 +572,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         headers.0.is_client_error() || headers.0.is_server_error(),
     ));
     let producer_failed = failed.clone();
+    let admitted_repo = repo.clone();
     tokio::spawn(async move {
         let _permit: OwnedSemaphorePermit = permit;
         let _write_guard: Option<OwnedMutexGuard<()>> = write_guard;
@@ -606,6 +619,10 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             let status = process.finish().await?;
             if !status.success() {
                 return Err(io::Error::other("Git subprocess failed"));
+            }
+            if write {
+                crate::sharding::fencing::check_before_push(&state, &admitted_repo).await
+                    .map_err(|_| io::Error::other("storage fence changed during Git write"))?;
             }
             Ok::<(), io::Error>(())
         };

@@ -184,6 +184,39 @@ pub async fn check_before_push(state: &AppState, repo: &RepoState) -> Result<(),
     evaluate_write_barrier(&route, &primary, repo.storage_generation, marker.as_ref(), None, unix_now())
 }
 
+/// Repeat the storage barrier inside Git immediately before refs publish.
+pub async fn check_hook_fence(
+    client: &tokio_postgres::Client,
+    repo_id: Uuid,
+    repo_dir: &StdPath,
+    admitted_generation: i64,
+) -> Result<(), Error> {
+    let marker = read_volume_marker_at(repo_dir)?;
+    let pending = client.query_opt(
+        "SELECT id FROM shard_marker_transitions WHERE repository_id=$1 AND state='pending' LIMIT 1",
+        &[&repo_id],
+    ).await.map_err(Error::internal)?.is_some();
+    if pending { return Err(conflict("shard marker transition pending")); }
+    let repo_generation: i64 = client.query_one(
+        "SELECT storage_generation FROM repositories WHERE id=$1", &[&repo_id],
+    ).await.map_err(Error::internal)?.get(0);
+    if admitted_generation != repo_generation { return Err(conflict("admitted writer storage generation is stale")); }
+    let r_sql = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id=$1");
+    let Some(row) = client.query_opt(&r_sql, &[&repo_id]).await.map_err(Error::internal)? else {
+        if marker.is_some() { return Err(conflict("shard marker exists without route")); }
+        return Ok(());
+    };
+    let route = RepoShardRoute::row(&row);
+    if let Ok(local_node) = std::env::var("ROOTYARD_NODE_ID")
+        && local_node != route.primary_node_id {
+        return Err(conflict("native Git writer is not current storage primary"));
+    }
+    let n_sql = format!("SELECT {SHARD_NODE_FIELDS} FROM shard_nodes WHERE node_id=$1");
+    let primary = client.query_opt(&n_sql, &[&route.primary_node_id]).await.map_err(Error::internal)?
+        .as_ref().map(ShardNode::row).ok_or_else(|| conflict("shard primary missing"))?;
+    evaluate_write_barrier(&route, &primary, repo_generation, marker.as_ref(), None, unix_now())
+}
+
 pub async fn get_fence_status(
     State(state): State<Arc<AppState>>,
     Path((owner, name)): Path<(String, String)>,
