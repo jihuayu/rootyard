@@ -46,7 +46,15 @@ class WorkspaceServiceTest(unittest.TestCase):
             h.stop(hard=True)
             h.start()
             fork = json.loads(h.expect(f"/api/workspaces/{wid}/fork",201,token=h.alice,method="POST",
-                body={"checkpoint_id":cid,"new_agent_id":"agent-two"}))
+                body={"checkpoint_id":cid,"new_agent_id":"agent-two"},
+                extra_headers={"Idempotency-Key":"fork-one"}))
+            fork_replay=json.loads(h.expect(f"/api/workspaces/{wid}/fork",200,token=h.alice,method="POST",
+                body={"checkpoint_id":cid,"new_agent_id":"agent-two"},
+                extra_headers={"Idempotency-Key":"fork-one"}))
+            self.assertEqual(fork_replay["id"],fork["id"])
+            self.assertEqual(h.http(f"/api/workspaces/{wid}/fork",token=h.alice,method="POST",
+                body={"checkpoint_id":cid,"new_agent_id":"different"},
+                extra_headers={"Idempotency-Key":"fork-one"})[0],409)
             fork_path=f"/api/workspaces/{fork['id']}/files?path=hello.txt"
             self.assertEqual(base64.b64decode(json.loads(h.expect(fork_path,200,token=h.alice))["content_base64"]),b"v2 unstaged\n")
             self.assertEqual(base64.b64decode(json.loads(h.expect(fork_path+"&view=index",200,token=h.alice))["content_base64"]),b"v1\n")
@@ -55,7 +63,10 @@ class WorkspaceServiceTest(unittest.TestCase):
                        "expected_workspace_revision":0,"lease_epoch":fork["lease_epoch"]}
             h.expect(fork_path,200,token=h.alice,method="PUT",body=changed,extra_headers={"Idempotency-Key":"fork-put"})
             self.assertEqual(base64.b64decode(json.loads(h.expect(path,200,token=h.alice))["content_base64"]),b"v2 unstaged\n")
-            restored = json.loads(h.expect(f"/api/checkpoints/{cid}/restore",201,token=h.alice,method="POST",body={"agent_id":"restored"}))
+            restored = json.loads(h.expect(f"/api/checkpoints/{cid}/restore",201,token=h.alice,method="POST",
+                body={"agent_id":"restored"},extra_headers={"Idempotency-Key":"restore-one"}))
+            self.assertEqual(json.loads(h.expect(f"/api/checkpoints/{cid}/restore",200,token=h.alice,method="POST",
+                body={"agent_id":"restored"},extra_headers={"Idempotency-Key":"restore-one"}))["id"],restored["id"])
             self.assertNotEqual(restored["id"],wid)
             self.assertEqual(base64.b64decode(json.loads(h.expect(f"/api/workspaces/{restored['id']}/files?path=hello.txt",200,token=h.alice))["content_base64"]),b"v2 unstaged\n")
             events = json.loads(h.expect(f"/api/workspaces/{wid}/events?after_revision=0",200,token=h.alice))
