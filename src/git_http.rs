@@ -1,6 +1,6 @@
 use crate::{
     AppState, Error, auth,
-    db::{self, Repository},
+    db::{self, Identity, Repository},
     journal, reliability, storage,
 };
 use axum::{
@@ -212,6 +212,32 @@ pub(crate) async fn collect_git_output_input(
     Ok(output)
 }
 
+async fn transfer_authorized(
+    state: &AppState,
+    identity: Option<&Identity>,
+    job_plan: Option<&crate::ci_checkouts::Plan>,
+    job_principal: Option<&crate::ci_checkouts::authority::CheckoutPrincipal>,
+    repo: &Repository,
+    write: bool,
+) -> io::Result<()> {
+    if let Some(plan) = job_plan {
+        let digest = match job_principal {
+            Some(crate::ci_checkouts::authority::CheckoutPrincipal::User(user)) => &user.token_digest,
+            Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration { token_digest, .. }) => token_digest,
+            None => return Err(io::Error::other("missing checkout principal")),
+        };
+        match crate::ci_checkouts::still_authorized(state, plan.job_id, digest,
+            repo.id, repo.storage_generation).await {
+            Ok(true) => Ok(()),
+            _ => Err(io::Error::other("checkout authority revoked")),
+        }
+    } else {
+        let user = identity.ok_or_else(|| io::Error::other("missing Git actor"))?;
+        auth::verify_active(&state.pool, user, repo.id, write).await
+            .map_err(|_| io::Error::other("Git authority revoked"))
+    }
+}
+
 pub async fn handle(state: Arc<AppState>, request: Request<Body>) -> Result<Response<Body>, Error> {
     if let Some(plan) = crate::sharding::transport::route_git_request(&state, &request).await? {
         return crate::sharding::transport::forward_request(&state, plan, request).await;
@@ -242,10 +268,10 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         &state, &parts.headers, &parts.method, &parts.uri,
     ).await?;
     let job = pin_oid.is_some() && auth::credentials_for(&parts.headers, "ryj_").is_ok();
-    let (identity, repo, job_plan) = if let Some((identity, repo)) = delegation {
-        (identity, repo, None)
+    let (identity, repo, job_plan, job_principal) = if let Some((identity, repo)) = delegation {
+        (Some(identity), repo, None, None)
     } else if job {
-        let (identity, repo, plan) = crate::ci_checkouts::authenticate(
+        let (principal, repo, plan) = crate::ci_checkouts::authority::authenticate_principal(
             &state,
             &parts.headers,
             owner,
@@ -253,7 +279,11 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             pin_oid.unwrap(),
         )
         .await?;
-        (identity, repo, Some(plan))
+        let identity = match &principal {
+            crate::ci_checkouts::authority::CheckoutPrincipal::User(user) => Some(user.clone()),
+            crate::ci_checkouts::authority::CheckoutPrincipal::Integration { .. } => None,
+        };
+        (identity, repo, Some(plan), Some(principal))
     } else {
         let identity = auth::authenticate(&state.pool, &parts.headers).await?;
         if write {
@@ -286,7 +316,12 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 "repository not ready; recovery may be required",
             ));
         }
-        (identity, repo, None)
+        (Some(identity), repo, None, None)
+    };
+    let remote_user = match &job_principal {
+        Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration { hook_id, job_id, .. }) =>
+            format!("ci-job:{job_id}/integration:{hook_id}"),
+        _ => identity.as_ref().ok_or_else(Error::unauthorized)?.username.clone(),
     };
     validate_headers(
         &parts.headers,
@@ -317,6 +352,8 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     }
     let path = if let Some(oid) = pin_oid {
         if job {
+            crate::ci_checkouts::dependencies::verify_on_mirror(
+                &state, job_plan.as_ref().ok_or_else(Error::unauthorized)?).await?;
             crate::mirror::job_path(&state, &repo, oid).await?
         } else {
             crate::mirror::pinned_path(&state, &repo, oid).await?
@@ -375,7 +412,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         .env("GIT_HTTP_EXPORT_ALL", "1")
         .env("REQUEST_METHOD", parts.method.as_str())
         .env("QUERY_STRING", parts.uri.query().unwrap_or(""))
-        .env("REMOTE_USER", &identity.username)
+        .env("REMOTE_USER", &remote_user)
         .env("REMOTE_ADDR", "127.0.0.1")
         .env("GIT_HTTP_MAX_REQUEST_BUFFER", "10485760")
         .stdin(Stdio::piped())
@@ -429,6 +466,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         });
     }
     let operation = if write_guard.is_some() {
+        let identity = identity.as_ref().ok_or_else(Error::unauthorized)?;
         let operation = journal::begin(
             &state.storage.root,
             repo.id,
@@ -444,7 +482,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         None
     };
     if let Some(plan) = &job_plan {
-        let (_, _, current) = crate::ci_checkouts::authenticate(
+        let (_, _, current) = crate::ci_checkouts::authority::authenticate_principal(
             &state,
             &parts.headers,
             owner,
@@ -557,6 +595,12 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
     } else {
         Vec::new()
     };
+    if let Err(error) = transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
+        job_principal.as_ref(), &repo, write).await {
+        process.stop().await;
+        let _ = reliability::complete(&state, operation).await;
+        return Err(Error::internal(error));
+    }
     // Reinsert the inspected bytes unchanged. Existing transfer accounting,
     // process-exit checks, input errors and deadlines still cover every byte.
     let mut stdout = std::io::Cursor::new(prefix).chain(stdout);
@@ -584,6 +628,10 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         let transfer = async {
             let mut total = 0u64;
             let mut buf = vec![0u8; 32 * 1024];
+            let mut recheck_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            recheck_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
+                job_principal.as_ref(), &admitted_repo, write).await?;
             loop {
                 let next = if let Some(input) = process.input.as_mut() {
                     tokio::select! {
@@ -592,11 +640,21 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                             process.input = None;
                             value.map_err(io::Error::other).and_then(|v|v).map(|_|None)
                         }
+                        _ = recheck_tick.tick() => {
+                            transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
+                                job_principal.as_ref(), &admitted_repo, write).await?;
+                            continue;
+                        }
                         _ = sender.closed() => return Err(io::Error::other("client disconnected")),
                     }
                 } else {
                     tokio::select! {
                         value = stdout.read(&mut buf) => value.map(Some),
+                        _ = recheck_tick.tick() => {
+                            transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
+                                job_principal.as_ref(), &admitted_repo, write).await?;
+                            continue;
+                        }
                         _ = sender.closed() => return Err(io::Error::other("client disconnected")),
                     }
                 };
@@ -606,14 +664,22 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
                 if n == 0 {
                     break;
                 }
+                transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
+                    job_principal.as_ref(), &admitted_repo, write).await?;
                 total = total.saturating_add(n as u64);
                 if total > max_output {
                     return Err(io::Error::other("Git response size limit exceeded"));
                 }
-                sender
-                    .send(Bytes::copy_from_slice(&buf[..n]))
-                    .await
-                    .map_err(|_| io::Error::other("client disconnected"))?;
+                let slot = loop {
+                    tokio::select! {
+                        slot = sender.reserve() => break slot.map_err(|_| io::Error::other("client disconnected"))?,
+                        _ = recheck_tick.tick() => {
+                            transfer_authorized(&state, identity.as_ref(), job_plan.as_ref(),
+                                job_principal.as_ref(), &admitted_repo, write).await?;
+                        }
+                    }
+                };
+                slot.send(Bytes::copy_from_slice(&buf[..n]));
                 state.transfer_metrics.add_sent_bytes(n as u64);
             }
             if let Some(input) = process.input.as_mut() {

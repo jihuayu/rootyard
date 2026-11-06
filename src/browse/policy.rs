@@ -33,10 +33,8 @@ pub async fn validate<C: GenericClient + Sync>(
         if row.get::<_, i64>("required_approvals") > 0 { return Err(denied()); }
         let checks: Vec<String> = serde_json::from_value(row.get("required_checks")).map_err(Error::internal)?;
         for context in checks {
-            let passed: bool = client.query_one(
-                "SELECT EXISTS(SELECT 1 FROM forge_check_runs WHERE repository_id=$1 AND commit_oid=$2 AND context=$3 AND status='completed' AND conclusion='success')",
-                &[&repo, &change.new_oid, &context],
-            ).await.map_err(Error::internal)?.get(0);
+            let passed = crate::webhooks::trust::trusted_check_passed(client, repo,
+                &change.new_oid, &context, if creating { None } else { Some(change.old_oid.as_str()) }).await?;
             if !passed { return Err(denied()); }
         }
         if !creating && (row.get::<_, bool>("require_fast_forward") || row.get::<_, bool>("prevent_force_push")) {
@@ -70,10 +68,14 @@ pub fn validate_hook(op: &crate::journal::Operation, changes: &[RefChange]) -> a
             .await.map_err(|e| anyhow::anyhow!(e.1))?;
         validate(&client, op.repository_id, changes, Path::new(&git_bin), Path::new(&git_dir), Duration::from_secs(timeout)).await
             .map_err(|e| anyhow::anyhow!(e.1))?;
-        crate::lfs::publication::validate_new_refs_with_client(
+        Box::pin(crate::lfs::publication::validate_new_refs_with_client(
             &client, Path::new(&git_dir), Path::new(&data_root), Path::new(&git_bin),
             Duration::from_secs(timeout), op.repository_id, tenant_id, changes,
-        ).await.map_err(|e| anyhow::anyhow!(e.1))?;
+        )).await.map_err(|e| anyhow::anyhow!(e.1))?;
+        Box::pin(crate::lfs::locks::validate_new_refs_with_client(
+            &client, Path::new(&git_dir), Path::new(&git_bin),
+            Duration::from_secs(timeout), op.repository_id, op.actor_id, changes,
+        )).await.map_err(|e| anyhow::anyhow!(e.1))?;
         Ok::<(), anyhow::Error>(())
     })
 }
