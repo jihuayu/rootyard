@@ -2,6 +2,7 @@
 import argparse
 import base64
 import json
+import time
 import unittest
 
 from tests.e2e import Harness
@@ -59,6 +60,15 @@ class WorkspaceServiceTest(unittest.TestCase):
             self.assertEqual(base64.b64decode(json.loads(h.expect(f"/api/workspaces/{restored['id']}/files?path=hello.txt",200,token=h.alice))["content_base64"]),b"v2 unstaged\n")
             events = json.loads(h.expect(f"/api/workspaces/{wid}/events?after_revision=0",200,token=h.alice))
             self.assertEqual([e["revision"] for e in events["events"]],[1,2,3,4])
+            live_repo = h.root / "data/workspace-service/workspaces" / wid
+            (live_repo / "hello.txt").write_bytes(b"normal editor save\n")
+            deadline = time.monotonic()+8
+            while time.monotonic()<deadline:
+                replay = json.loads(h.expect(f"/api/workspaces/{wid}/events?after_revision=4",200,token=h.alice))
+                if replay["events"]: break
+                time.sleep(.2)
+            self.assertEqual(replay["events"][0]["kind"],"external_capture")
+            self.assertEqual(replay["events"][0]["revision"],5)
         finally:
             h.cleanup()
 

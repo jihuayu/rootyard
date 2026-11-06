@@ -74,6 +74,7 @@ pub async fn create(State(state): State<Arc<AppState>>, headers: HeaderMap, Json
     let host_id = state.storage.volume_id;
     tx.execute("INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,state,host_id,lease_until) VALUES($1,$2,$3,$4,$5,$6,'ready',$7,clock_timestamp()+interval '5 minutes')", &[&id,&repo.repo_id,&input.owner,&input.repository,&input.agent_id,&actor.id,&host_id]).await.map_err(Error::internal)?;
     tx.execute("INSERT INTO workspace_creations(actor_id,idempotency_key,request_sha256,workspace_id) VALUES($1,$2,$3,$4)", &[&actor.id,&key,&digest,&id]).await.map_err(Error::internal)?;
+    super::capture::record_current(&tx,&state,id).await?;
     let row = tx.query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id]).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     Ok((StatusCode::CREATED, Json(Workspace::from_row(&row))))

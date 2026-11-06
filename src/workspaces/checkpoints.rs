@@ -14,6 +14,8 @@ fn copy_snapshot(source: &FsPath, dest: &FsPath) -> Result<(), Error> {
 fn valid_agent(value: &str) -> bool { !value.is_empty() && value.len()<=128 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) }
 
 pub async fn create(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id): Path<Uuid>, Json(input): Json<CheckpointRequest>) -> Result<(StatusCode,Json<Value>), Error> {
+    service::authorized(&state,&headers,id,Role::Write).await?;
+    super::capture::reconcile_one(&state,id).await?;
     let actor = auth::authenticate(&state.pool,&headers).await?;
     let key = auth::idempotency_key(&headers)?.ok_or_else(Error::bad_request)?.to_owned();
     let hash = hex::encode(Sha256::digest(format!("checkpoint:{}:{}",input.expected_workspace_revision,input.lease_epoch)));
@@ -35,10 +37,10 @@ pub async fn create(State(state): State<Arc<AppState>>, headers: HeaderMap, Path
     let dest = service::checkpoint_repo(&state,cp);
     // Check the native index and worktree around the immutable copy. A changed
     // source is rejected; external editors are not fenced by this DB lock.
-    let before = service::git(&source,&["status","--porcelain=v1","-z","--untracked-files=all"])?;
+    let before = super::capture::fingerprint(&source)?;
     let before_index = fs::read(source.join(".git/index")).unwrap_or_default();
     copy_snapshot(&source,&dest)?;
-    let after = service::git(&source,&["status","--porcelain=v1","-z","--untracked-files=all"])?;
+    let after = super::capture::fingerprint(&source)?;
     let after_index = fs::read(source.join(".git/index")).unwrap_or_default();
     if before!=after || before_index!=after_index {
         let _ = fs::remove_dir_all(&dest); return Err(service::conflict());
@@ -65,6 +67,7 @@ async fn restore_inner(state: Arc<AppState>, headers: HeaderMap, cp: Uuid, agent
     let id = Uuid::new_v4();
     copy_snapshot(&service::checkpoint_repo(&state,cp),&service::workspace_repo(&state,id))?;
     tx.execute("INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,parent_checkpoint_id,state,host_id,lease_until) VALUES($1,$2,$3,$4,$5,$6,$7,'ready',$8,clock_timestamp()+interval '5 minutes')", &[&id,&parent.repository_id,&parent.owner,&parent.repository,&agent,&actor.id,&cp,&state.storage.volume_id]).await.map_err(Error::internal)?;
+    super::capture::record_current(&tx,&state,id).await?;
     let row = tx.query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id]).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     Ok((StatusCode::CREATED,Json(Workspace::from_row(&row))))

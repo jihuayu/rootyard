@@ -2,13 +2,15 @@
 #[path = "workspaces/models.rs"]
 mod models;
 #[path = "workspaces/service.rs"]
-mod service;
+pub(crate) mod service;
 #[path = "workspaces/files.rs"]
 mod files;
 #[path = "workspaces/checkpoints.rs"]
 mod checkpoints;
 #[path = "workspaces/events.rs"]
 mod events;
+#[path = "workspaces/capture.rs"]
+pub mod capture;
 
 use crate::AppState;
 use axum::{Router, routing::{get, post}};
