@@ -61,8 +61,7 @@ fn unavailable() -> Error {
 }
 
 fn valid_ref(name: &str) -> bool {
-    name.starts_with("refs/") && name.len() <= 1024 && !name.contains(['\0', '\n', '\r'])
-        && !name.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+    name.starts_with("refs/") && crate::journal::valid_ref(name)
 }
 
 /// Acquire sorted exact-ref locks and the repository's shared maintenance
@@ -182,6 +181,29 @@ mod tests {
         let all = acquire(&pool, repo, 1, &group, until()).await.unwrap();
         assert_eq!(all.refs(), &["refs/heads/a", "refs/heads/b"]);
         drop(all);
+        let (ready_send, mut ready_recv) = tokio::sync::mpsc::channel(8);
+        let mut writers = Vec::new();
+        for index in 0..8 {
+            let writer_pool = pool.clone();
+            let writer_ready = ready_send.clone();
+            writers.push(tokio::spawn(async move {
+                let name = vec![format!("refs/heads/parallel-{index}")];
+                let guard = acquire(&writer_pool, repo, 1, &name,
+                    Instant::now()+Duration::from_secs(5)).await.unwrap();
+                writer_ready.send(()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                guard.ensure_active().unwrap();
+            }));
+        }
+        for _ in 0..4 {
+            tokio::time::timeout(Duration::from_secs(3),ready_recv.recv()).await.unwrap().unwrap();
+        }
+        // Four writers use at most four of the eight data lease slots plus
+        // four ref-owner sessions. Authorization still obtains a pool session.
+        tokio::time::timeout(Duration::from_millis(500), async {
+            pool.get().await.unwrap().query_one("SELECT count(*) FROM repositories WHERE id=$1", &[&repo]).await.unwrap()
+        }).await.expect("writer guard pool starvation");
+        for writer in writers { writer.await.unwrap(); }
         pool.get().await.unwrap().execute("UPDATE repositories SET storage_generation=2 WHERE id=$1", &[&repo]).await.unwrap();
         assert!(acquire(&pool, repo, 1, &a, until()).await.is_err());
         drop(pool);

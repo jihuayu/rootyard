@@ -25,7 +25,7 @@ pub use core::{Operation, RefChange, HookPhase, HookEvent, ActiveGuard,
 pub(crate) use core::{safe_path, mkdir, read, exists, atomic, begin_ci, begin_ci_service};
 use core::{load, entries, sync_dir, validate, op_name};
 
-fn valid_ref(s: &str) -> bool {
+pub(crate) fn valid_ref(s: &str) -> bool {
     if s.len() > 1024 {
         return false;
     }
