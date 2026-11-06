@@ -21,10 +21,7 @@ pub async fn create(State(state): State<Arc<AppState>>, headers: HeaderMap, Path
     let hash = hex::encode(Sha256::digest(format!("checkpoint:{}:{}",input.expected_workspace_revision,input.lease_epoch)));
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let row = tx.query_opt(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1 FOR UPDATE"), &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
-    let ws = Workspace::from_row(&row);
-    auth::authorize_repo_with_role(&tx,&actor,&ws.owner,&ws.repository,Role::Write).await?;
-    if ws.creator_id != actor.id || ws.state != "ready" { return Err(Error::not_found()); }
+    let ws=service::locked(&tx,&actor,id,Role::Write).await?;
     if let Some(row) = tx.query_opt("SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2", &[&id,&key]).await.map_err(Error::internal)? {
         if row.get::<_,String>(0)!=hash { return Err(service::conflict()); }
         if row.get::<_,String>(1)=="committed" { return Ok((StatusCode::OK,Json(row.get(2)))); }
@@ -63,9 +60,10 @@ async fn restore_inner(state: Arc<AppState>, headers: HeaderMap, cp: Uuid, agent
     let tx = client.transaction().await.map_err(Error::internal)?;
     let row = tx.query_opt("SELECT w.id,w.repository_id,w.owner_slug,w.repository_name,w.agent_id,w.creator_id,w.state,w.host_id,w.lease_epoch,w.revision,w.git_generation,w.last_checkpoint_id FROM workspace_checkpoints c JOIN workspaces w ON w.id=c.workspace_id WHERE c.id=$1 AND c.state IN ('local_complete','committed')", &[&cp]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let parent = Workspace::from_row(&row);
-    auth::authorize_repo_with_role(&tx,&actor,&parent.owner,&parent.repository,Role::Write).await?;
+    let access=auth::authorize_repo_with_role(&tx,&actor,&parent.owner,&parent.repository,Role::Write).await?;
     if parent.creator_id != actor.id { return Err(Error::not_found()); }
     let id = Uuid::new_v4();
+    super::remote::ensure_local(&state,cp,parent.repository_id,access.owner_id).await?;
     copy_snapshot(&service::checkpoint_repo(&state,cp),&service::workspace_repo(&state,id))?;
     tx.execute("INSERT INTO workspaces(id,repository_id,owner_slug,repository_name,agent_id,creator_id,parent_checkpoint_id,state,host_id,lease_until) VALUES($1,$2,$3,$4,$5,$6,$7,'ready',$8,clock_timestamp()+interval '5 minutes')", &[&id,&parent.repository_id,&parent.owner,&parent.repository,&agent,&actor.id,&cp,&state.storage.volume_id]).await.map_err(Error::internal)?;
     super::capture::record_current(&tx,&state,id).await?;

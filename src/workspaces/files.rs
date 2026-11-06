@@ -1,4 +1,4 @@
-use super::{models::{FilePut, FileQuery, GitAction, WS_COLUMNS, Workspace}, service};
+use super::{models::{FilePut, FileQuery, GitAction}, service};
 use crate::{AppState, Error, auth, members::models::Role};
 use axum::{Json, extract::{Path, Query, State}, http::{HeaderMap, StatusCode}};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -65,10 +65,7 @@ pub async fn put(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id
     let hash = hex::encode(Sha256::digest(serde_json::to_vec(&(&query.path,&input.content_base64,input.expected_entry_version,input.expected_workspace_revision,input.lease_epoch)).map_err(Error::internal)?));
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let row = tx.query_opt(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1 FOR UPDATE"), &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
-    let ws = Workspace::from_row(&row);
-    auth::authorize_repo_with_role(&tx, &actor, &ws.owner, &ws.repository, Role::Write).await?;
-    if ws.creator_id != actor.id || ws.state != "ready" { return Err(Error::not_found()); }
+    let ws=service::locked(&tx,&actor,id,Role::Write).await?;
     if let Some(row) = tx.query_opt("SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2", &[&id,&key]).await.map_err(Error::internal)? {
         let old: String = row.get(0);
         if old != hash { return Err(service::conflict()); }
@@ -100,10 +97,7 @@ pub async fn git(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(id
     let request_hash = hex::encode(Sha256::digest(serde_json::to_vec(&(&input.action,&input.paths,input.expected_git_generation,input.expected_workspace_revision,input.lease_epoch)).map_err(Error::internal)?));
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let row = tx.query_opt(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1 FOR UPDATE"), &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
-    let ws = Workspace::from_row(&row);
-    auth::authorize_repo_with_role(&tx,&actor,&ws.owner,&ws.repository,Role::Write).await?;
-    if ws.creator_id != actor.id || ws.state != "ready" { return Err(Error::not_found()); }
+    let ws=service::locked(&tx,&actor,id,Role::Write).await?;
     if let Some(row) = tx.query_opt("SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2", &[&id,&key]).await.map_err(Error::internal)? {
         if row.get::<_,String>(0) != request_hash { return Err(service::conflict()); }
         if row.get::<_,String>(1) == "committed" { return Ok(Json(row.get(2))); }
