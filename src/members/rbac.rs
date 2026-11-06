@@ -34,7 +34,11 @@ type Res = Result<Response, Error>;
 
 pub async fn rbac_tables_installed(tx: &Transaction<'_>) -> Result<bool, Error> {
     let sql = "SELECT to_regclass('repository_collaborators') IS NOT NULL";
-    Ok(tx.query_one(sql, &[]).await.map_err(Error::internal)?.get(0))
+    Ok(tx
+        .query_one(sql, &[])
+        .await
+        .map_err(Error::internal)?
+        .get(0))
 }
 
 pub async fn resolve_effective_role(
@@ -50,14 +54,44 @@ pub async fn resolve_effective_role(
         return Ok(None);
     }
     let d_sql = "SELECT role FROM repository_collaborators WHERE repository_id=$1 AND user_id=$2";
-    let direct_role = match tx.query_opt(d_sql, &[&repo_id, &user_id]).await.map_err(Error::internal)? {
+    let direct_role = match tx
+        .query_opt(d_sql, &[&repo_id, &user_id])
+        .await
+        .map_err(Error::internal)?
+    {
         Some(r) => Some(Role::parse(r.get::<_, &str>(0))?),
         None => None,
     };
+    let org_role = tx
+        .query_opt(
+            "SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",
+            &[&owner_id, &user_id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .map(|r| Role::parse(r.get::<_, &str>(0)))
+        .transpose()?;
+    let direct_role = match (direct_role, org_role) {
+        (Some(d), Some(o)) => Some(d.max(o)),
+        (Some(d), None) => Some(d),
+        (None, Some(o)) => Some(o),
+        (None, None) => None,
+    };
     let t_sql = "SELECT t.role FROM repository_teams t JOIN repository_team_members tm ON tm.team_id = t.id WHERE t.repository_id=$1 AND tm.user_id=$2";
-    let team_rows = tx.query(t_sql, &[&repo_id, &user_id]).await.map_err(Error::internal)?;
+    let team_rows = tx
+        .query(t_sql, &[&repo_id, &user_id])
+        .await
+        .map_err(Error::internal)?;
     let mut max_team_role: Option<Role> = None;
     for row in team_rows {
+        let r = Role::parse(row.get::<_, &str>(0))?;
+        max_team_role = Some(max_team_role.map_or(r, |cur| cur.max(r)));
+    }
+    let org_team_rows = tx.query(
+        "SELECT t.role FROM organization_teams t JOIN organization_team_members tm ON tm.team_id=t.id WHERE t.organization_id=$1 AND tm.user_id=$2",
+        &[&owner_id, &user_id],
+    ).await.map_err(Error::internal)?;
+    for row in org_team_rows {
         let r = Role::parse(row.get::<_, &str>(0))?;
         max_team_role = Some(max_team_role.map_or(r, |cur| cur.max(r)));
     }
@@ -76,15 +110,24 @@ pub async fn resolve_effective_role_by_id(
     owner_id: Uuid,
     user_id: Uuid,
 ) -> Result<Option<Role>, Error> {
-    Ok(resolve_effective_role(tx, repo_id, owner_id, user_id).await?.map(|(e, _, _)| e))
+    Ok(resolve_effective_role(tx, repo_id, owner_id, user_id)
+        .await?
+        .map(|(e, _, _)| e))
 }
 
-pub async fn repo_has_collaborators_or_teams(tx: &Transaction<'_>, repo_id: Uuid) -> Result<bool, Error> {
+pub async fn repo_has_collaborators_or_teams(
+    tx: &Transaction<'_>,
+    repo_id: Uuid,
+) -> Result<bool, Error> {
     if !rbac_tables_installed(tx).await? {
         return Ok(false);
     }
     let sql = "SELECT EXISTS(SELECT 1 FROM repository_collaborators WHERE repository_id=$1) OR EXISTS(SELECT 1 FROM repository_teams WHERE repository_id=$1)";
-    Ok(tx.query_one(sql, &[&repo_id]).await.map_err(Error::internal)?.get(0))
+    Ok(tx
+        .query_one(sql, &[&repo_id])
+        .await
+        .map_err(Error::internal)?
+        .get(0))
 }
 
 pub async fn check_review_permission(
@@ -96,12 +139,19 @@ pub async fn check_review_permission(
     review_state: &str,
     disallow_self_approval: bool,
 ) -> Result<(), Error> {
-    let min_role = if review_state == "commented" { Role::Triage } else { Role::Write };
+    let min_role = if review_state == "commented" {
+        Role::Triage
+    } else {
+        Role::Write
+    };
     if access.role < min_role {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
     }
     if review_state == "approved" && actor_id == pull_author_id && disallow_self_approval {
-        return Err(Error(StatusCode::FORBIDDEN, "pull request author cannot approve their own pull request"));
+        return Err(Error(
+            StatusCode::FORBIDDEN,
+            "pull request author cannot approve their own pull request",
+        ));
     }
     Ok(())
 }
@@ -122,7 +172,17 @@ async fn finish_audit(
     target: &str,
     details: Value,
 ) -> Result<(), Error> {
-    audit::insert_audit_event(&tx, acc.owner_id, acc.repo_id, actor, act, kind, target, details).await?;
+    audit::insert_audit_event(
+        &tx,
+        acc.owner_id,
+        acc.repo_id,
+        actor,
+        act,
+        kind,
+        target,
+        details,
+    )
+    .await?;
     finish(tx, actor, true).await
 }
 
@@ -131,7 +191,11 @@ async fn lookup_user(tx: &Transaction<'_>, username: &str) -> Result<(Uuid, Stri
         return Err(Error::bad_request());
     }
     let sql = "SELECT id, username FROM users WHERE username=$1";
-    let r = tx.query_opt(sql, &[&username]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let r = tx
+        .query_opt(sql, &[&username])
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
     Ok((r.get(0), r.get(1)))
 }
 
@@ -140,16 +204,31 @@ async fn lookup_team_id(tx: &Transaction<'_>, repo_id: Uuid, slug: &str) -> Resu
         return Err(Error::bad_request());
     }
     let sql = "SELECT id FROM repository_teams WHERE repository_id=$1 AND slug=$2";
-    Ok(tx.query_opt(sql, &[&repo_id, &slug]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?.get(0))
+    Ok(tx
+        .query_opt(sql, &[&repo_id, &slug])
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?
+        .get(0))
 }
 
-pub async fn list_collaborators(State(s): App, Path((o, n)): RepoPath, Query(p): Query<Page>, h: HeaderMap) -> Res {
+pub async fn list_collaborators(
+    State(s): App,
+    Path((o, n)): RepoPath,
+    Query(p): Query<Page>,
+    h: HeaderMap,
+) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     let (after, limit) = p.bounds()?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
-    let q = format!("SELECT {COLLABORATOR_FIELDS} FROM repository_collaborators c JOIN users u ON u.id = c.user_id WHERE c.tenant_id=$1 AND c.repository_id=$2 ORDER BY u.username ASC OFFSET $3 LIMIT $4");
-    let rows = tx.query(&q, &[&acc.owner_id, &acc.repo_id, &after, &(limit + 1)]).await.map_err(Error::internal)?;
+    let q = format!(
+        "SELECT {COLLABORATOR_FIELDS} FROM repository_collaborators c JOIN users u ON u.id = c.user_id WHERE c.tenant_id=$1 AND c.repository_id=$2 ORDER BY u.username ASC OFFSET $3 LIMIT $4"
+    );
+    let rows = tx
+        .query(&q, &[&acc.owner_id, &acc.repo_id, &after, &(limit + 1)])
+        .await
+        .map_err(Error::internal)?;
     let more = rows.len() > limit as usize;
     let mut items = Vec::with_capacity(rows.len().min(limit as usize));
     for r in rows.iter().take(limit as usize) {
@@ -157,22 +236,42 @@ pub async fn list_collaborators(State(s): App, Path((o, n)): RepoPath, Query(p):
     }
     let next_after = if more { Some(after + limit) } else { None };
     finish(tx, &actor, false).await?;
-    Ok(json(StatusCode::OK, sjson!({ "items": items, "next_after": next_after })))
+    Ok(json(
+        StatusCode::OK,
+        sjson!({ "items": items, "next_after": next_after }),
+    ))
 }
 
-pub async fn upsert_collaborator(State(s): App, Path((o, n)): RepoPath, h: HeaderMap, Json(inp): Json<CollaboratorInput>) -> Res {
+pub async fn upsert_collaborator(
+    State(s): App,
+    Path((o, n)): RepoPath,
+    h: HeaderMap,
+    Json(inp): Json<CollaboratorInput>,
+) -> Res {
     let u = inp.username.clone().ok_or_else(Error::bad_request)?;
     upsert_collaborator_inner(s, o, n, u, h, inp).await
 }
 
-pub async fn put_collaborator(State(s): App, Path((o, n, u)): SubPath, h: HeaderMap, Json(inp): Json<CollaboratorInput>) -> Res {
+pub async fn put_collaborator(
+    State(s): App,
+    Path((o, n, u)): SubPath,
+    h: HeaderMap,
+    Json(inp): Json<CollaboratorInput>,
+) -> Res {
     if inp.username.as_ref().is_some_and(|body_u| body_u != &u) {
         return Err(Error::bad_request());
     }
     upsert_collaborator_inner(s, o, n, u, h, inp).await
 }
 
-async fn upsert_collaborator_inner(s: Arc<AppState>, o: String, n: String, u: String, h: HeaderMap, inp: CollaboratorInput) -> Res {
+async fn upsert_collaborator_inner(
+    s: Arc<AppState>,
+    o: String,
+    n: String,
+    u: String,
+    h: HeaderMap,
+    inp: CollaboratorInput,
+) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     if inp.expected_version.is_some_and(|v| v <= 0) {
         return Err(Error::bad_request());
@@ -182,26 +281,38 @@ async fn upsert_collaborator_inner(s: Arc<AppState>, o: String, n: String, u: St
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;
     if uid == acc.owner_id {
-        return Err(Error(StatusCode::CONFLICT, "cannot modify or remove repository owner"));
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "cannot modify or remove repository owner",
+        ));
     }
     let r_str = inp.role.as_str();
     if let Some(key) = key {
         let req = sjson!({"operation":"collaborator_upsert","username":uname,"role":r_str,"expected_version":inp.expected_version});
         if let Some(resp) = creation_replay(&tx, acc.owner_id, acc.repo_id, key, &req).await? {
             finish(tx, &actor, true).await?;
-            let code = if inp.expected_version.is_none() { StatusCode::CREATED } else { StatusCode::OK };
+            let code = if inp.expected_version.is_none() {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
             return Ok(json(code, resp));
         }
     }
     let lock_q = "SELECT version FROM repository_collaborators WHERE repository_id=$1 AND user_id=$2 FOR UPDATE";
-    let existing = tx.query_opt(lock_q, &[&acc.repo_id, &uid]).await.map_err(Error::internal)?;
+    let existing = tx
+        .query_opt(lock_q, &[&acc.repo_id, &uid])
+        .await
+        .map_err(Error::internal)?;
     let (code, act) = match existing {
         None => {
             if inp.expected_version.is_some() {
                 return Err(Error(StatusCode::CONFLICT, "collaborator version conflict"));
             }
             let ins = "INSERT INTO repository_collaborators (repository_id, tenant_id, user_id, role) VALUES ($1, $2, $3, $4)";
-            tx.execute(ins, &[&acc.repo_id, &acc.owner_id, &uid, &r_str]).await.map_err(Error::internal)?;
+            tx.execute(ins, &[&acc.repo_id, &acc.owner_id, &uid, &r_str])
+                .await
+                .map_err(Error::internal)?;
             (StatusCode::CREATED, "collaborator.added")
         }
         Some(cur) => {
@@ -210,12 +321,19 @@ async fn upsert_collaborator_inner(s: Arc<AppState>, o: String, n: String, u: St
                 return Err(Error(StatusCode::CONFLICT, "collaborator version conflict"));
             }
             let upd = "UPDATE repository_collaborators SET role=$3, version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 AND user_id=$2";
-            tx.execute(upd, &[&acc.repo_id, &uid, &r_str]).await.map_err(Error::internal)?;
+            tx.execute(upd, &[&acc.repo_id, &uid, &r_str])
+                .await
+                .map_err(Error::internal)?;
             (StatusCode::OK, "collaborator.updated")
         }
     };
-    let sel = format!("SELECT {COLLABORATOR_FIELDS} FROM repository_collaborators c JOIN users u ON u.id = c.user_id WHERE c.repository_id=$1 AND c.user_id=$2");
-    let row = tx.query_one(&sel, &[&acc.repo_id, &uid]).await.map_err(Error::internal)?;
+    let sel = format!(
+        "SELECT {COLLABORATOR_FIELDS} FROM repository_collaborators c JOIN users u ON u.id = c.user_id WHERE c.repository_id=$1 AND c.user_id=$2"
+    );
+    let row = tx
+        .query_one(&sel, &[&acc.repo_id, &uid])
+        .await
+        .map_err(Error::internal)?;
     let collab = Collaborator::row(&row)?;
     let val = serde_json::to_value(&collab).map_err(Error::internal)?;
     record_creation(&tx, acc.owner_id, acc.repo_id, key, &val).await?;
@@ -231,8 +349,14 @@ pub async fn get_collaborator(State(s): App, Path((o, n, u)): SubPath, h: Header
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
-    let q = format!("SELECT {COLLABORATOR_FIELDS} FROM repository_collaborators c JOIN users u ON u.id = c.user_id WHERE c.repository_id=$1 AND u.username=$2");
-    let row = tx.query_opt(&q, &[&acc.repo_id, &u]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let q = format!(
+        "SELECT {COLLABORATOR_FIELDS} FROM repository_collaborators c JOIN users u ON u.id = c.user_id WHERE c.repository_id=$1 AND u.username=$2"
+    );
+    let row = tx
+        .query_opt(&q, &[&acc.repo_id, &u])
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
     let collab = Collaborator::row(&row)?;
     finish(tx, &actor, false).await?;
     Ok(json(StatusCode::OK, collab))
@@ -246,28 +370,61 @@ pub async fn remove_collaborator(State(s): App, Path((o, n, u)): SubPath, h: Hea
     let tx = client.transaction().await.map_err(Error::internal)?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     if u == o {
-        return Err(Error(StatusCode::CONFLICT, "cannot modify or remove repository owner"));
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "cannot modify or remove repository owner",
+        ));
     }
     let (uid, uname) = lookup_user(&tx, &u).await?;
     if uid == acc.owner_id {
-        return Err(Error(StatusCode::CONFLICT, "cannot modify or remove repository owner"));
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "cannot modify or remove repository owner",
+        ));
     }
     let del = "DELETE FROM repository_collaborators WHERE repository_id=$1 AND user_id=$2";
-    if tx.execute(del, &[&acc.repo_id, &uid]).await.map_err(Error::internal)? == 0 {
+    if tx
+        .execute(del, &[&acc.repo_id, &uid])
+        .await
+        .map_err(Error::internal)?
+        == 0
+    {
         return Err(Error::not_found());
     }
     let det = sjson!({ "user_id": uid });
-    finish_audit(tx, acc, &actor, "collaborator.removed", "collaborator", &uname, det).await?;
-    Ok(json(StatusCode::OK, sjson!({ "removed": true, "username": uname })))
+    finish_audit(
+        tx,
+        acc,
+        &actor,
+        "collaborator.removed",
+        "collaborator",
+        &uname,
+        det,
+    )
+    .await?;
+    Ok(json(
+        StatusCode::OK,
+        sjson!({ "removed": true, "username": uname }),
+    ))
 }
 
-pub async fn list_teams(State(s): App, Path((o, n)): RepoPath, Query(p): Query<Page>, h: HeaderMap) -> Res {
+pub async fn list_teams(
+    State(s): App,
+    Path((o, n)): RepoPath,
+    Query(p): Query<Page>,
+    h: HeaderMap,
+) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     let (after, limit) = p.bounds()?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
-    let q = format!("SELECT {TEAM_FIELDS} FROM repository_teams WHERE tenant_id=$1 AND repository_id=$2 ORDER BY slug ASC OFFSET $3 LIMIT $4");
-    let rows = tx.query(&q, &[&acc.owner_id, &acc.repo_id, &after, &(limit + 1)]).await.map_err(Error::internal)?;
+    let q = format!(
+        "SELECT {TEAM_FIELDS} FROM repository_teams WHERE tenant_id=$1 AND repository_id=$2 ORDER BY slug ASC OFFSET $3 LIMIT $4"
+    );
+    let rows = tx
+        .query(&q, &[&acc.owner_id, &acc.repo_id, &after, &(limit + 1)])
+        .await
+        .map_err(Error::internal)?;
     let more = rows.len() > limit as usize;
     let mut items = Vec::with_capacity(rows.len().min(limit as usize));
     for r in rows.iter().take(limit as usize) {
@@ -275,10 +432,18 @@ pub async fn list_teams(State(s): App, Path((o, n)): RepoPath, Query(p): Query<P
     }
     let next_after = if more { Some(after + limit) } else { None };
     finish(tx, &actor, false).await?;
-    Ok(json(StatusCode::OK, sjson!({ "items": items, "next_after": next_after })))
+    Ok(json(
+        StatusCode::OK,
+        sjson!({ "items": items, "next_after": next_after }),
+    ))
 }
 
-pub async fn create_team(State(s): App, Path((o, n)): RepoPath, h: HeaderMap, Json(inp): Json<NewTeam>) -> Res {
+pub async fn create_team(
+    State(s): App,
+    Path((o, n)): RepoPath,
+    h: HeaderMap,
+    Json(inp): Json<NewTeam>,
+) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     let desc = inp.description.as_deref().unwrap_or("");
     if !valid_team_slug(&inp.slug) || !valid_team_name(&inp.name) || !valid_team_description(desc) {
@@ -296,9 +461,22 @@ pub async fn create_team(State(s): App, Path((o, n)): RepoPath, h: HeaderMap, Js
         }
     }
     let tid = Uuid::new_v4();
-    let ins = format!("INSERT INTO repository_teams (id, tenant_id, repository_id, slug, name, description, role) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (repository_id, slug) DO NOTHING RETURNING {TEAM_FIELDS}");
+    let ins = format!(
+        "INSERT INTO repository_teams (id, tenant_id, repository_id, slug, name, description, role) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (repository_id, slug) DO NOTHING RETURNING {TEAM_FIELDS}"
+    );
     let row = tx
-        .query_opt(&ins, &[&tid, &acc.owner_id, &acc.repo_id, &inp.slug, &inp.name, &desc, &r_str])
+        .query_opt(
+            &ins,
+            &[
+                &tid,
+                &acc.owner_id,
+                &acc.repo_id,
+                &inp.slug,
+                &inp.name,
+                &desc,
+                &r_str,
+            ],
+        )
         .await
         .map_err(Error::internal)?
         .ok_or(Error(StatusCode::CONFLICT, "team slug already exists"))?;
@@ -317,19 +495,33 @@ pub async fn get_team(State(s): App, Path((o, n, slug)): SubPath, h: HeaderMap) 
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
-    let q = format!("SELECT {TEAM_FIELDS} FROM repository_teams WHERE tenant_id=$1 AND repository_id=$2 AND slug=$3");
-    let row = tx.query_opt(&q, &[&acc.owner_id, &acc.repo_id, &slug]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+    let q = format!(
+        "SELECT {TEAM_FIELDS} FROM repository_teams WHERE tenant_id=$1 AND repository_id=$2 AND slug=$3"
+    );
+    let row = tx
+        .query_opt(&q, &[&acc.owner_id, &acc.repo_id, &slug])
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
     let team = Team::row(&row)?;
     finish(tx, &actor, false).await?;
     Ok(json(StatusCode::OK, team))
 }
 
-pub async fn update_team(State(s): App, Path((o, n, slug)): SubPath, h: HeaderMap, Json(inp): Json<TeamPatch>) -> Res {
+pub async fn update_team(
+    State(s): App,
+    Path((o, n, slug)): SubPath,
+    h: HeaderMap,
+    Json(inp): Json<TeamPatch>,
+) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     positive(inp.expected_version)?;
     if !valid_team_slug(&slug)
         || inp.name.as_ref().is_some_and(|v| !valid_team_name(v))
-        || inp.description.as_ref().is_some_and(|v| !valid_team_description(v))
+        || inp
+            .description
+            .as_ref()
+            .is_some_and(|v| !valid_team_description(v))
         || (inp.name.is_none() && inp.description.is_none() && inp.role.is_none())
     {
         return Err(Error::bad_request());
@@ -338,9 +530,22 @@ pub async fn update_team(State(s): App, Path((o, n, slug)): SubPath, h: HeaderMa
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let _ = lookup_team_id(&tx, acc.repo_id, &slug).await?;
     let r_opt = inp.role.map(|r| r.as_str().to_owned());
-    let upd = format!("UPDATE repository_teams SET name=COALESCE($5,name), description=COALESCE($6,description), role=COALESCE($7,role), version=version+1, updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND slug=$3 AND version=$4 RETURNING {TEAM_FIELDS}");
+    let upd = format!(
+        "UPDATE repository_teams SET name=COALESCE($5,name), description=COALESCE($6,description), role=COALESCE($7,role), version=version+1, updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND slug=$3 AND version=$4 RETURNING {TEAM_FIELDS}"
+    );
     let row = tx
-        .query_opt(&upd, &[&acc.owner_id, &acc.repo_id, &slug, &inp.expected_version, &inp.name, &inp.description, &r_opt])
+        .query_opt(
+            &upd,
+            &[
+                &acc.owner_id,
+                &acc.repo_id,
+                &slug,
+                &inp.expected_version,
+                &inp.name,
+                &inp.description,
+                &r_opt,
+            ],
+        )
         .await
         .map_err(Error::internal)?
         .ok_or(Error(StatusCode::CONFLICT, "team version conflict"))?;
@@ -358,56 +563,117 @@ pub async fn delete_team(State(s): App, Path((o, n, slug)): SubPath, h: HeaderMa
     let tx = client.transaction().await.map_err(Error::internal)?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let del = "DELETE FROM repository_teams WHERE tenant_id=$1 AND repository_id=$2 AND slug=$3";
-    if tx.execute(del, &[&acc.owner_id, &acc.repo_id, &slug]).await.map_err(Error::internal)? == 0 {
+    if tx
+        .execute(del, &[&acc.owner_id, &acc.repo_id, &slug])
+        .await
+        .map_err(Error::internal)?
+        == 0
+    {
         return Err(Error::not_found());
     }
     let det = sjson!({ "slug": slug });
     finish_audit(tx, acc, &actor, "team.deleted", "team", &slug, det).await?;
-    Ok(json(StatusCode::OK, sjson!({ "deleted": true, "slug": slug })))
+    Ok(json(
+        StatusCode::OK,
+        sjson!({ "deleted": true, "slug": slug }),
+    ))
 }
 
-pub async fn list_team_members(State(s): App, Path((o, n, slug)): SubPath, Query(p): Query<Page>, h: HeaderMap) -> Res {
+pub async fn list_team_members(
+    State(s): App,
+    Path((o, n, slug)): SubPath,
+    Query(p): Query<Page>,
+    h: HeaderMap,
+) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     let (after, limit) = p.bounds()?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
     let tid = lookup_team_id(&tx, acc.repo_id, &slug).await?;
-    let q = format!("SELECT {TEAM_MEMBER_FIELDS} FROM repository_team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.team_id=$1 ORDER BY u.username ASC OFFSET $2 LIMIT $3");
-    let rows = tx.query(&q, &[&tid, &after, &(limit + 1)]).await.map_err(Error::internal)?;
+    let q = format!(
+        "SELECT {TEAM_MEMBER_FIELDS} FROM repository_team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.team_id=$1 ORDER BY u.username ASC OFFSET $2 LIMIT $3"
+    );
+    let rows = tx
+        .query(&q, &[&tid, &after, &(limit + 1)])
+        .await
+        .map_err(Error::internal)?;
     let more = rows.len() > limit as usize;
-    let items: Vec<TeamMember> = rows.iter().take(limit as usize).map(TeamMember::row).collect();
+    let items: Vec<TeamMember> = rows
+        .iter()
+        .take(limit as usize)
+        .map(TeamMember::row)
+        .collect();
     let next_after = if more { Some(after + limit) } else { None };
     finish(tx, &actor, false).await?;
-    Ok(json(StatusCode::OK, sjson!({ "items": items, "next_after": next_after })))
+    Ok(json(
+        StatusCode::OK,
+        sjson!({ "items": items, "next_after": next_after }),
+    ))
 }
 
-pub async fn add_team_member(State(s): App, Path((o, n, slug)): SubPath, h: HeaderMap, Json(inp): Json<TeamMemberInput>) -> Res {
+pub async fn add_team_member(
+    State(s): App,
+    Path((o, n, slug)): SubPath,
+    h: HeaderMap,
+    Json(inp): Json<TeamMemberInput>,
+) -> Res {
     let u = inp.username.ok_or_else(Error::bad_request)?;
     put_team_member_inner(s, o, n, slug, u, h).await
 }
 
-pub async fn put_team_member(State(s): App, Path((o, n, slug, u)): MemberPath, h: HeaderMap) -> Res {
+pub async fn put_team_member(
+    State(s): App,
+    Path((o, n, slug, u)): MemberPath,
+    h: HeaderMap,
+) -> Res {
     put_team_member_inner(s, o, n, slug, u, h).await
 }
 
-async fn put_team_member_inner(s: Arc<AppState>, o: String, n: String, slug: String, u: String, h: HeaderMap) -> Res {
+async fn put_team_member_inner(
+    s: Arc<AppState>,
+    o: String,
+    n: String,
+    slug: String,
+    u: String,
+    h: HeaderMap,
+) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let tid = lookup_team_id(&tx, acc.repo_id, &slug).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;
     if uid == acc.owner_id {
-        return Err(Error(StatusCode::CONFLICT, "cannot modify or remove repository owner"));
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "cannot modify or remove repository owner",
+        ));
     }
     let ins = "INSERT INTO repository_team_members (team_id, repository_id, user_id) VALUES ($1, $2, $3) ON CONFLICT (team_id, user_id) DO NOTHING";
-    let inserted = tx.execute(ins, &[&tid, &acc.repo_id, &uid]).await.map_err(Error::internal)?;
-    let q = format!("SELECT {TEAM_MEMBER_FIELDS} FROM repository_team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.team_id=$1 AND tm.user_id=$2");
-    let row = tx.query_one(&q, &[&tid, &uid]).await.map_err(Error::internal)?;
+    let inserted = tx
+        .execute(ins, &[&tid, &acc.repo_id, &uid])
+        .await
+        .map_err(Error::internal)?;
+    let q = format!(
+        "SELECT {TEAM_MEMBER_FIELDS} FROM repository_team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.team_id=$1 AND tm.user_id=$2"
+    );
+    let row = tx
+        .query_one(&q, &[&tid, &uid])
+        .await
+        .map_err(Error::internal)?;
     let member = TeamMember::row(&row);
     if inserted == 1 {
         let det = sjson!({ "team_slug": slug, "username": uname });
         let target = format!("{slug}:{uname}");
-        finish_audit(tx, acc, &actor, "team_member.added", "team_member", &target, det).await?;
+        finish_audit(
+            tx,
+            acc,
+            &actor,
+            "team_member.added",
+            "team_member",
+            &target,
+            det,
+        )
+        .await?;
         Ok(json(StatusCode::CREATED, member))
     } else {
         finish(tx, &actor, true).await?;
@@ -415,23 +681,48 @@ async fn put_team_member_inner(s: Arc<AppState>, o: String, n: String, slug: Str
     }
 }
 
-pub async fn remove_team_member(State(s): App, Path((o, n, slug, u)): MemberPath, h: HeaderMap) -> Res {
+pub async fn remove_team_member(
+    State(s): App,
+    Path((o, n, slug, u)): MemberPath,
+    h: HeaderMap,
+) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
     let tid = lookup_team_id(&tx, acc.repo_id, &slug).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;
     let del = "DELETE FROM repository_team_members WHERE team_id=$1 AND user_id=$2";
-    if tx.execute(del, &[&tid, &uid]).await.map_err(Error::internal)? == 0 {
+    if tx
+        .execute(del, &[&tid, &uid])
+        .await
+        .map_err(Error::internal)?
+        == 0
+    {
         return Err(Error::not_found());
     }
     let det = sjson!({ "team_slug": slug, "username": uname });
     let target = format!("{slug}:{uname}");
-    finish_audit(tx, acc, &actor, "team_member.removed", "team_member", &target, det).await?;
-    Ok(json(StatusCode::OK, sjson!({ "removed": true, "team_slug": slug, "username": uname })))
+    finish_audit(
+        tx,
+        acc,
+        &actor,
+        "team_member.removed",
+        "team_member",
+        &target,
+        det,
+    )
+    .await?;
+    Ok(json(
+        StatusCode::OK,
+        sjson!({ "removed": true, "team_slug": slug, "username": uname }),
+    ))
 }
 
-pub async fn get_effective_permission(State(s): App, Path((o, n, u)): SubPath, h: HeaderMap) -> Res {
+pub async fn get_effective_permission(
+    State(s): App,
+    Path((o, n, u)): SubPath,
+    h: HeaderMap,
+) -> Res {
     let (actor, mut client) = open_client(&s, &h).await?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
