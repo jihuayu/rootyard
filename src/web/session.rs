@@ -46,8 +46,13 @@ fn browser_origin(headers: &HeaderMap) -> bool {
         "http"
     };
     let expected = format!("{proto}://{host}");
-    headers.get_all(header::ORIGIN).iter().count() == 1
-        && headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) == Some(expected.as_str())
+    if headers.get_all(header::ORIGIN).iter().count() != 1 {
+        return false;
+    }
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    origin == Some(expected.as_str())
+        || (origin == Some("null")
+            && headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("same-origin"))
 }
 fn secure_cookie(headers: &HeaderMap) -> Result<bool, Error> {
     if headers

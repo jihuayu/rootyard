@@ -283,10 +283,13 @@ pub fn render_issues_list_view(
     let mut rows = String::new();
     for item in items {
         rows.push_str(&format!(
-            "<li class=\"issue-row\" data-issue-number=\"{}\" data-issue-state=\"{}\" data-issue-author=\"{}\"><span class=\"issue-num\">#{}</span> <strong class=\"issue-title\">{}</strong> <span class=\"issue-comments\" data-comment-count=\"{}\">({} comments)</span></li>\n",
+            "<li class=\"issue-row\" data-issue-number=\"{}\" data-issue-state=\"{}\" data-issue-author=\"{}\"><a href=\"/web/repos/{}/{}/issues/{}\"><span class=\"issue-num\">#{}</span> <strong class=\"issue-title\">{}</strong></a> <span class=\"issue-comments\" data-comment-count=\"{}\">({} comments)</span></li>\n",
             item.issue.number,
             escape_html(&item.issue.state),
             escape_html(&item.author_username),
+            escape_html(&header.owner),
+            escape_html(&header.name),
+            item.issue.number,
             item.issue.number,
             escape_html(&item.issue.title),
             item.comment_count,
@@ -358,12 +361,15 @@ pub fn render_pulls_list_view(
     let mut rows = String::new();
     for pr in items {
         rows.push_str(&format!(
-            "<li class=\"pull-row\" data-pull-number=\"{}\" data-pull-state=\"{}\" data-head-ref=\"{}\" data-base-ref=\"{}\" data-head-oid=\"{}\"><span class=\"pull-num\">#{}</span> <strong class=\"pull-title\">{}</strong></li>\n",
+            "<li class=\"pull-row\" data-pull-number=\"{}\" data-pull-state=\"{}\" data-head-ref=\"{}\" data-base-ref=\"{}\" data-head-oid=\"{}\"><a href=\"/web/repos/{}/{}/pulls/{}\"><span class=\"pull-num\">#{}</span> <strong class=\"pull-title\">{}</strong></a></li>\n",
             pr.number,
             escape_html(&pr.state),
             escape_html(&pr.head_ref),
             escape_html(&pr.base_ref),
             escape_html(&pr.head_oid),
+            escape_html(&header.owner),
+            escape_html(&header.name),
+            pr.number,
             pr.number,
             escape_html(&pr.title),
         ));
