@@ -49,7 +49,10 @@ class SandboxServiceTest(unittest.TestCase):
             self.assertEqual(json.loads(h.expect(f"/api/sandbox-jobs/{slow['id']}/stop",200,token=h.alice,method="POST"))["state"],"cancelled")
             timed=start(["/bin/sh","-c","sleep 20"],timeout=1)
             self.assertEqual(done(timed)["state"],"timed_out")
-            interactive=start(["/bin/sh","-c","printf 'ready\\n'; read line; stty size; printf 'got:%s\\n' \"$line\""],terminal=True)
+            interactive=start(["/bin/sh","-c", "for fd in /proc/self/fd/*; do "
+                "case \"$fd\" in /proc/self/fd/[012]) ;; *) "
+                "test \"$(readlink \"$fd\")\" != /dev/ptmx || exit 88 ;; esac; done; "
+                "printf 'ready\\n'; read line; stty size; printf 'got:%s\\n' \"$line\""],terminal=True)
             self.assertTrue(interactive["terminal"])
             url=f"/api/sandbox-jobs/{interactive['id']}/terminal"
             self.assertEqual(h.http(url+"/output",token=h.bob)[0],404)

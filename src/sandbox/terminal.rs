@@ -49,6 +49,14 @@ impl Pty {
         }
         let master = unsafe { File::from_raw_fd(master) };
         let slave = unsafe { File::from_raw_fd(slave) };
+        // Only the slave's duplicated stdio descriptors may enter bwrap. The
+        // master must stay in the service so sandbox code cannot drive its own
+        // terminal or retain a service-side descriptor after exit.
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(Error::internal(std::io::Error::last_os_error()));
+            }
+        }
         let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
         if flags < 0 || unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(Error::internal(std::io::Error::last_os_error()));
