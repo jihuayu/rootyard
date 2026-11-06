@@ -85,15 +85,18 @@ pub(crate) fn build_backend_status(
     let repo_path = state.storage.repo_path(repository_id);
     let gitfs_ready = repo_state == "ready" && state.storage.verify_path(repository_id).is_ok();
     let marker = read_repo_backend_marker(&repo_path);
-    let (cfg_backend, cfg_paused) = read_repo_git_config_backend(&repo_path);
-    let is_pando = db_backend == "pando" || marker.as_ref().is_some_and(|m| m.storage_backend == "pando") || cfg_backend.as_deref() == Some("pando");
-    let storage_backend = if is_pando { "pando".to_owned() } else { "gitfs".to_owned() };
+    let (_, cfg_paused) = read_repo_git_config_backend(&repo_path);
+    // Marker/config hints never promote a backend: only a verified migration
+    // can commit the authoritative database backend and enable its dispatcher.
+    let storage_backend = db_backend.to_owned();
     let write_paused = marker.as_ref().map(|m| m.write_paused).unwrap_or(cfg_paused);
-    let gateway_route = if is_pando { "pando_gateway".to_owned() } else { "gitfs_local".to_owned() };
-    let pando_ready = repo_state == "ready" && (is_pando || marker.as_ref().is_some_and(|m| m.pando_ready) || state.storage.root.join("pando").join("objects").join(repository_id.to_string()).is_dir());
+    let serving = if db_backend == "gitfs" { "gitfs" } else { "unavailable" };
+    let gateway_route = if db_backend == "gitfs" { "gitfs_local" } else { "unavailable" }.to_owned();
+    let pando_ready = false;
     BackendStatusResponse {
-        repository_id, owner, name, read_backend: storage_backend.clone(), write_backend: storage_backend.clone(),
-        storage_backend, storage_generation, state: repo_state, gateway_route, write_paused, pando_ready, gitfs_ready,
+        repository_id, owner, name, read_backend: serving.into(), write_backend: serving.into(),
+        storage_backend, storage_generation, state: repo_state, gateway_route, write_paused,
+        pando_ready, gitfs_ready: gitfs_ready && db_backend == "gitfs",
     }
 }
 
@@ -120,8 +123,16 @@ pub async fn set_backend(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = authorize(&tx, &actor, &owner, &name, Role::Admin).await?;
     let repo_id = access.repo_id;
+    if input.storage_backend == "pando" {
+        return Err(Error(StatusCode::CONFLICT,
+            "Pando cutover requires a verified production migration"));
+    }
     let _write_guard = state.storage.write_lock(repo_id).await;
     let row = tx.query_one("SELECT r.name, r.state, r.storage_backend, r.storage_generation, ns.slug FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id WHERE r.id = $1 FOR UPDATE OF r", &[&repo_id]).await.map_err(Error::internal)?;
+    if row.get::<_, &str>("storage_backend") != "gitfs" {
+        return Err(Error(StatusCode::CONFLICT,
+            "backend changes require a verified migration"));
+    }
     let current_gen: i64 = row.get("storage_generation");
     if input.expected_storage_generation.is_some_and(|exp| exp != current_gen) {
         return Err(Error(StatusCode::CONFLICT, "storage generation conflict"));
@@ -129,7 +140,7 @@ pub async fn set_backend(
     let updated = tx.query_one("UPDATE repositories SET storage_generation = storage_generation + 1 WHERE id = $1 RETURNING state, storage_generation", &[&repo_id]).await.map_err(Error::internal)?;
     let (new_gen, repo_state): (i64, String) = (updated.get("storage_generation"), updated.get("state"));
     let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
-    let marker = StorageBackendMarker { storage_backend: input.storage_backend.clone(), storage_generation: new_gen, write_paused: input.write_paused, pando_ready: input.pando_ready.unwrap_or(input.storage_backend == "pando") };
+    let marker = StorageBackendMarker { storage_backend: input.storage_backend.clone(), storage_generation: new_gen, write_paused: input.write_paused, pando_ready: false };
     write_repo_backend_marker(&repo_path, &marker).map_err(Error::internal)?;
     let (gen_str, paused_str) = (new_gen.to_string(), if input.write_paused { "true" } else { "false" });
     let receive_pack = if !input.write_paused && input.storage_backend == "gitfs" { "true" } else { "false" };

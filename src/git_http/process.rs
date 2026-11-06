@@ -121,11 +121,14 @@ fn group_quiescent(group: i32) -> io::Result<bool> {
 pub(crate) async fn finish_group_child(child: &mut Child) -> io::Result<std::process::ExitStatus> {
     let pid = child.id().ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
     loop {
-        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        let rc = unsafe { libc::waitid(libc::P_PID, pid as u32, info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
-        if rc != 0 { return Err(io::Error::last_os_error()); }
-        if unsafe { info.assume_init().si_pid() } != 0 { break; }
+        let exited = {
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            let rc = unsafe { libc::waitid(libc::P_PID, pid as u32, info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+            if rc != 0 { return Err(io::Error::last_os_error()); }
+            unsafe { info.assume_init().si_pid() != 0 }
+        };
+        if exited { break; }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     unsafe { libc::kill(-pid, libc::SIGKILL); }
