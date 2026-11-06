@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import signal
 import socket
 import subprocess
@@ -56,6 +57,14 @@ def process_sample(pid):
                 "write_bytes": next(int(line.split()[1]) for line in io.splitlines() if line.startswith("write_bytes:"))}
     except (OSError, StopIteration, ValueError):
         return {"pid": pid, "sample_error": True}
+
+
+def loopback_bytes():
+    for line in Path("/proc/net/dev").read_text().splitlines():
+        if line.lstrip().startswith("lo:"):
+            fields = line.split(":", 1)[1].split()
+            return int(fields[0]), int(fields[8])
+    raise AssertionError("loopback interface missing")
 
 
 def main():
@@ -122,6 +131,7 @@ def main():
         for tier in (1, 2, 4):
             push_ms, fetch_ms = [], []
             started = time.monotonic()
+            rx_before, tx_before = loopback_bytes()
             for sequence in range(8):
                 base = bases[sequence % tier]
                 (h.work / "hello.txt").write_text(f"tier={tier} sequence={sequence}\n")
@@ -139,8 +149,12 @@ def main():
                 fetch_ms.append(fetch_latency)
                 report["raw"].append({"tier": tier, "sequence": sequence, "ingress_node": sequence % tier,
                                       "acknowledged_oid": tip, "push_ms": push_latency, "fetch_ms": fetch_latency})
+            rx_after, tx_after = loopback_bytes()
             report["tiers"].append({"node_count": tier, "duration_ms": round((time.monotonic() - started) * 1000, 3),
                                     "push": percentiles(push_ms), "fetch": percentiles(fetch_ms),
+                                    "host_loopback_rx_delta_bytes": rx_after - rx_before,
+                                    "host_loopback_tx_delta_bytes": tx_after - tx_before,
+                                    "git_operation_rows": int(h.sql("SELECT COUNT(*) FROM git_operations WHERE repository_id='" + h.repo["id"] + "'")),
                                     "processes": [process_sample(h.proc.pid)] + [process_sample(p.pid) for p, _ in extra[:tier - 1]]})
 
         last_tip = report["raw"][-1]["acknowledged_oid"]
@@ -173,6 +187,46 @@ def main():
                                   "rto_write_ms": round((write_recovered_at - stopped_at) / 1e6, 3),
                                   "post_restart_acknowledged_oid": resumed_tip,
                                   "process_restart_ms": round((recovered_at - stopped_at) / 1e6, 3)})
+        # Exercise real Git reachability and GC while clients fetch through all
+        # ingress processes. Keep a CI-style pin across the collection.
+        h.git("--git-dir=" + str(h.bare), "update-ref", "refs/rootyard-ci/jobs/bench", last_tip)
+        gc = subprocess.Popen(["git", "--git-dir=" + str(h.bare), "gc", "--prune=2.weeks.ago"],
+                              env=h.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        gc_overlap = False
+        for base in bases:
+            gc_overlap |= gc.poll() is None
+            h.git("fetch", base + repo_path, "refs/heads/main", cwd=h.copy, token=h.reader)
+            assert h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip() == resumed_tip
+        _, gc_error = gc.communicate(timeout=60)
+        assert gc.returncode == 0, gc_error.decode(errors="replace")[-300:]
+        pinned = h.git("--git-dir=" + str(h.bare), "rev-list", "--objects", "refs/rootyard-ci/jobs/bench").stdout.decode().splitlines()
+        pinned_oids = [line.split()[0] for line in pinned]
+        assert pinned_oids and all(h.git("--git-dir=" + str(h.bare), "cat-file", "-e", oid, check=False).returncode == 0
+                                   for oid in pinned_oids)
+        h.git("--git-dir=" + str(h.bare), "fsck", "--full", "--strict")
+        report["retained_root"] = {"ref": "refs/rootyard-ci/jobs/bench", "reachable_oids_after_gc": len(pinned_oids),
+                                   "native_fsck": "passed", "gc_overlapped_client_fetches": gc_overlap}
+        shutil.rmtree(h.copy)
+        h.git("clone", bases[3] + repo_path, str(h.copy), token=h.reader)
+        assert h.git("rev-parse", "refs/heads/main", cwd=h.copy).stdout.decode().strip() == resumed_tip
+        report["client_cache_eviction"] = {"removed_local_clone_and_refetched_from_node4": True,
+                                           "acknowledged_oid": resumed_tip}
+        # A negative control uses a copy of the real owner repository so the
+        # live service remains valid for the RPO evidence above.
+        damaged = h.root / "damaged-reachability-fixture.git"
+        shutil.copytree(h.bare, damaged)
+        blob = h.run(["git", "--git-dir=" + str(damaged), "hash-object", "-w", "--stdin"],
+                     data=b"retained object removed by negative control\n").stdout.decode().strip()
+        h.git("--git-dir=" + str(damaged), "update-ref", "refs/rootyard-ci/jobs/removal-check", blob)
+        loose = damaged / "objects" / blob[:2] / blob[2:]
+        assert loose.is_file()
+        loose.unlink()
+        assert h.git("--git-dir=" + str(damaged), "cat-file", "-e", blob, check=False).returncode != 0
+        assert h.git("--git-dir=" + str(damaged), "fsck", "--full", "--strict", check=False).returncode != 0
+        report["removed_object_negative_control"] = {"fixture": "copy of owner repository",
+                                                       "removed_pinned_blob_oid": blob,
+                                                       "cat_file_detected_missing": True, "native_fsck_failed": True}
+        report["untested"] = [item for item in report["untested"] if item != "cache eviction"] + ["CI mirror cache eviction"]
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"result": "passed", "report": str(args.report), "tiers": [1, 2, 4]}))
