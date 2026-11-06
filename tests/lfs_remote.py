@@ -26,6 +26,20 @@ class RemoteLfsHarness(Harness):
         self.git("commit","-m","stock LFS upload",cwd=self.work)
         self.git("push","origin","HEAD:main",cwd=self.work,token=self.alice)
         assert self.sql(f"SELECT state FROM lfs_objects WHERE repository_id='{self.repo['id']}' AND oid='{oid}'") == "ready"
+        local_lfs = Path(self.env["ROOTYARD_DATA_DIR"]) / "lfs" / self.repo["id"] / oid
+        assert local_lfs.is_file()
+        (self.work / "another.dat").write_bytes(payload)
+        self.git("add", "another.dat", cwd=self.work)
+        self.git("commit", "-m", "reuse remote-only LFS object", cwd=self.work)
+        new_head = self.git("rev-parse", "HEAD", cwd=self.work).stdout.decode().strip()
+        local_lfs.unlink()
+        assert not local_lfs.exists()
+        # Suppress only the client-side reupload; the server's managed native
+        # pre-receive hook must validate this pointer from remote S3 bytes.
+        self.git("-c", "core.hooksPath=/dev/null", "push", "origin", "HEAD:main",
+                 cwd=self.work, token=self.alice)
+        assert self.git("--git-dir=" + str(self.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == new_head
+        assert not local_lfs.exists(), "test lost the remote-only condition"
         self.stop()
         source=Path(self.env["ROOTYARD_DATA_DIR"])
         replacement=self.root/"second-node"
@@ -41,7 +55,8 @@ class RemoteLfsHarness(Harness):
         assert (replacement/"lfs"/self.repo["id"]/oid).is_file()
         self.expect(f"/git/alice/demo.git/info/lfs/objects/{oid}/{len(payload)}",200,token=self.alice)
         self.expect(f"/git/alice/demo.git/info/lfs/objects/{oid}/{len(payload)}",404,token=self.bob)
-        return {"bytes":len(payload),"recovered_after_source_volume_loss":True}
+        return {"bytes":len(payload),"recovered_after_source_volume_loss":True,
+                "remote_only_pointer_push":True}
 
 
 def main():
