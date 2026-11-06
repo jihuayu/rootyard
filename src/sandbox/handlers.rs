@@ -1,13 +1,13 @@
 use super::runner;
-use crate::{members::models::Role, workspaces::service, AppState, Error};
+use crate::{AppState, Error, members::models::Role, workspaces::service};
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    Json,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::CString,
@@ -28,6 +28,7 @@ pub struct Start {
     pub argv: Vec<String>,
     pub timeout_seconds: Option<u64>,
     pub lease_epoch: i64,
+    pub workspace_access: Option<String>,
     pub ci_run_id: Option<Uuid>,
     pub ci_attempt: Option<i64>,
     pub ci_lease_generation: Option<i64>,
@@ -99,16 +100,31 @@ pub async fn start(
             "CI runner capability required",
         ));
     }
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let live: bool=client.query_one("SELECT lease_epoch=$2 AND host_id=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1", &[&id,&input.lease_epoch,&state.storage.volume_id]).await.map_err(Error::internal)?.get(0);
-    if !live {
+    let live_workspace = match input.workspace_access.as_deref().unwrap_or("private") {
+        "private" => false,
+        "live"
+            if crate::workspaces::mounts::enabled()
+                && crate::workspaces::mounts::mounted(id)
+                && std::env::var("ROOTYARD_SANDBOX_MODE").as_deref() == Ok("dev") =>
+        {
+            true
+        }
+        _ => return Err(Error::bad_request()),
+    };
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    // A shared workspace-row lock serializes admission with lease-epoch handoff.
+    let lease_live: bool=tx.query_one("SELECT lease_epoch=$2 AND host_id=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1 FOR SHARE", &[&id,&input.lease_epoch,&state.storage.volume_id]).await.map_err(Error::internal)?.get(0);
+    if !lease_live {
         return Err(service::conflict());
     }
     let job_id = Uuid::new_v4();
     let argv = json!(input.argv);
-    client.execute("INSERT INTO sandbox_jobs(id,workspace_id,actor_id,host_id,state,argv,timeout_seconds) VALUES($1,$2,$3,$4,'queued',$5,$6)", &[&job_id,&id,&ws.creator_id,&state.storage.volume_id,&argv,&(timeout as i32)]).await.map_err(Error::internal)?;
+    let access = if live_workspace { "live" } else { "private" };
+    tx.execute("INSERT INTO sandbox_jobs(id,workspace_id,actor_id,host_id,state,argv,timeout_seconds,lease_epoch,workspace_access) VALUES($1,$2,$3,$4,'queued',$5,$6,$7,$8)", &[&job_id,&id,&ws.creator_id,&state.storage.volume_id,&argv,&(timeout as i32),&input.lease_epoch,&access]).await.map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     let args: Vec<String> = serde_json::from_value(argv).map_err(Error::internal)?;
-    if runner::launch(state.clone(), job_id, id, args, timeout)
+    if runner::launch(state.clone(), job_id, id, args, timeout, live_workspace)
         .await
         .is_err()
     {
