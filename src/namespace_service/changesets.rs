@@ -11,7 +11,7 @@ use crate::{
     AppState, Error,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     Json,
 };
@@ -315,6 +315,7 @@ async fn run(
             let response = transactions::execute_ref_transaction(
                 State(state.clone()),
                 Path((step.owner.clone(), step.repository.clone())),
+                Extension(actor.clone()),
                 step_headers,
                 Json(request),
             )
