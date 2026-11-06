@@ -250,11 +250,7 @@ impl Repository {
     }
 }
 
-<<<<<<< HEAD
-pub const REPO_SELECT: &str = "SELECT r.id, r.name, r.state, r.storage_backend, r.storage_generation, r.object_format, ns.slug AS username FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id";
-=======
-pub const REPO_SELECT: &str = "SELECT r.id, r.owner_id, r.name, r.state, r.storage_backend, r.storage_generation, u.username FROM repositories r JOIN users u ON u.id = r.owner_id";
->>>>>>> 7eb56f2 (feat(ci): bind run checkouts to dependency and service authority)
+pub const REPO_SELECT: &str = "SELECT r.id, r.owner_id, r.name, r.state, r.storage_backend, r.storage_generation, r.object_format, ns.slug AS username FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id";
 
 #[cfg(test)]
 mod tests {
