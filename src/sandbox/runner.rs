@@ -72,7 +72,9 @@ pub async fn launch(state: Arc<AppState>, job: Uuid, workspace: Uuid, argv: Vec<
         limit(libc::RLIMIT_AS,512*1024*1024)?;
         limit(libc::RLIMIT_FSIZE,16*1024*1024)?;
         limit(libc::RLIMIT_NOFILE,128)?;
-        limit(libc::RLIMIT_NPROC,1024)?;
+        // Production process accounting is the job cgroup's pids.max=64.
+        // RLIMIT_NPROC counts unrelated same-UID host processes (including
+        // unreaped zombies) and can prevent bubblewrap from starting at all.
         Ok(())
     }); }
     let mut child=command.spawn().map_err(Error::internal)?;

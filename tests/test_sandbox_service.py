@@ -20,7 +20,7 @@ class SandboxServiceTest(unittest.TestCase):
             def start(argv,timeout=10):
                 return json.loads(h.expect(f"/api/workspaces/{ws['id']}/sandbox-jobs",201,token=h.alice,method="POST",
                     body={"argv":argv,"timeout_seconds":timeout,"lease_epoch":1}))
-            jobs=[start(["/bin/sh","-c",f"printf {mark} > task.txt; cat hello.txt; test ! -e /root; test ! -e /workspace/shared/rootyard-env.sh"])
+            jobs=[start(["/bin/sh","-c",f"printf {mark} > task.txt; mkdir artifacts; cp task.txt artifacts/result.txt; ln -s ../task.txt artifacts/escape; cat hello.txt; test ! -e /root; test ! -e /workspace/shared/rootyard-env.sh"])
                   for mark in ("one","two")]
             def done(job):
                 deadline=time.monotonic()+15
@@ -34,6 +34,10 @@ class SandboxServiceTest(unittest.TestCase):
                 self.assertEqual(done(job)["state"],"succeeded",base64.b64decode(logs["stderr_base64"]))
                 self.assertIn(b"second",base64.b64decode(logs["stdout_base64"]))
                 self.assertEqual(h.http(f"/api/sandbox-jobs/{job['id']}/logs",token=h.bob)[0],404)
+                artifact=json.loads(h.expect(f"/api/sandbox-jobs/{job['id']}/artifacts?path=result.txt",200,token=h.alice))
+                self.assertIn(base64.b64decode(artifact["content_base64"]),(b"one",b"two"))
+                self.assertEqual(h.http(f"/api/sandbox-jobs/{job['id']}/artifacts?path=result.txt",token=h.bob)[0],404)
+                self.assertEqual(h.http(f"/api/sandbox-jobs/{job['id']}/artifacts?path=escape",token=h.alice)[0],404)
             roots=[h.root/"data/sandbox-jobs"/j["id"]/"workspace" for j in jobs]
             self.assertEqual([(p/"task.txt").read_text() for p in roots],["one","two"])
             self.assertFalse((h.root/"data/workspace-service/workspaces"/ws["id"]/"task.txt").exists())

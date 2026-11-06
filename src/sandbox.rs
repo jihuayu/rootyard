@@ -5,14 +5,18 @@ mod handlers;
 mod runner;
 
 use crate::AppState;
-use axum::{Router,routing::{get,post}};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/workspaces/{id}/sandbox-jobs",post(handlers::start))
-        .route("/api/sandbox-jobs/{id}",get(handlers::status))
-        .route("/api/sandbox-jobs/{id}/stop",post(handlers::stop))
-        .route("/api/sandbox-jobs/{id}/logs",get(handlers::logs))
+        .route("/api/workspaces/{id}/sandbox-jobs", post(handlers::start))
+        .route("/api/sandbox-jobs/{id}", get(handlers::status))
+        .route("/api/sandbox-jobs/{id}/stop", post(handlers::stop))
+        .route("/api/sandbox-jobs/{id}/logs", get(handlers::logs))
+        .route("/api/sandbox-jobs/{id}/artifacts", get(handlers::artifact))
 }
 pub use runner::reconcile_startup;
