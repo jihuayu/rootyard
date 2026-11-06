@@ -192,7 +192,8 @@ async fn create_repo(
     }
     auth::finish_tx(tx, &identity, true).await?;
     drop(client);
-    if repo.state == "provisioning" {
+    if repo.state == "provisioning"
+        && sharding::transport::is_local_primary_for_repo(&state, owner_id, repo.id).await? {
         let _slot = state.git_slots.try_acquire().map_err(|_| {
             Error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -300,13 +301,15 @@ pub async fn recover(state: &AppState) -> anyhow::Result<usize> {
         .get()
         .await?
         .query(
-            "SELECT id, object_format FROM repositories WHERE state='provisioning' AND next_retry_at <= clock_timestamp() ORDER BY next_retry_at, created_at LIMIT 64",
+            "SELECT id, object_format, owner_id FROM repositories WHERE state='provisioning' AND next_retry_at <= clock_timestamp() ORDER BY next_retry_at, created_at LIMIT 64",
             &[],
         )
         .await?;
     let mut recovered = 0;
     for row in rows {
         let id: Uuid = row.get(0);
+        if !sharding::transport::is_local_primary_for_repo(state, row.get(2), id).await
+            .map_err(|e| anyhow::anyhow!(e.1))? { continue; }
         let format = browse::object_format::ObjectFormat::from_str_name(row.get(1))
             .ok_or_else(|| anyhow::anyhow!("invalid stored object format"))?;
         let Ok(_slot) = state.git_slots.try_acquire() else {
