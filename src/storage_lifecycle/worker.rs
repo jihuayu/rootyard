@@ -33,8 +33,10 @@ async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models
         &state.pool,job.repository_id,Instant::now()+state.config.git_timeout,
     ).await.map_err(|_| anyhow::anyhow!("repository reader barrier unavailable"))?;
     lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
-    let _write=state.storage.write_lock(job.repository_id).await;
     let _readers=state.storage.maintenance_exclusive(job.repository_id).await;
+    // A push may hold a shared transfer gate while waiting for the writer
+    // mutex at final CAS. Taking this exclusive gate first lets it finish.
+    let _write=state.storage.write_lock(job.repository_id).await;
     lease.ensure_active().map_err(|_| anyhow::anyhow!("repository reader barrier lost"))?;
     if !jobs::current(&state.pool,job).await? { bail!("maintenance claim or repository generation changed"); }
     if !scheduler::check_local_primary(state,job.repository_id).await? { bail!("repository is not assigned to this primary"); }
