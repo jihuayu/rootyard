@@ -57,15 +57,15 @@ pub async fn list_refs(
         .map_err(Error::internal)?
         .get(0);
 
+    auth::finish_tx(tx, &actor, false).await?;
+    drop(client);
     let _permit = acquire_git_slot(&state)?;
-    let (head, all_refs) = git_read::read_head_and_refs(&state, repo_id).await?;
-
-    let filtered: Vec<_> = all_refs
-        .into_iter()
-        .filter(|r| prefix.is_none_or(|p| r.name.starts_with(p)))
-        .filter(|r| after.is_none_or(|cursor| r.name.as_str() > cursor))
-        .take(limit + 1)
-        .collect();
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    let head = git_read::read_head(&state, repo_id).await?;
+    let filtered = git_read::page_refs(&state, repo_id, prefix, after, limit).await?;
     let more = filtered.len() > limit;
     let items: Vec<_> = filtered.into_iter().take(limit).collect();
     let next_after = if more {
@@ -74,7 +74,8 @@ pub async fn list_refs(
         None
     };
 
-    auth::finish_tx(tx, &actor, false).await?;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     Ok(json_ok(RefsResponse {
         repository_id: repo_id,
         storage_generation,
@@ -96,10 +97,17 @@ pub async fn list_commits(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
 
+    auth::finish_tx(tx, &actor, false).await?;
+    drop(client);
     let _permit = acquire_git_slot(&state)?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let payload = git_read::list_commits(&state, repo_id, spec, after, limit).await?;
 
-    auth::finish_tx(tx, &actor, false).await?;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     Ok(json_ok(payload))
 }
 
@@ -116,10 +124,17 @@ pub async fn get_commit(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
 
+    auth::finish_tx(tx, &actor, false).await?;
+    drop(client);
     let _permit = acquire_git_slot(&state)?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let detail = git_read::get_commit_detail(&state, repo_id, &oid).await?;
 
-    auth::finish_tx(tx, &actor, false).await?;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     Ok(json_ok(detail))
 }
 
@@ -142,7 +157,13 @@ pub async fn get_tree(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
 
+    auth::finish_tx(tx, &actor, false).await?;
+    drop(client);
     let _permit = acquire_git_slot(&state)?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let tree = git_read::read_tree(
         &state,
         repo_id,
@@ -153,7 +174,8 @@ pub async fn get_tree(
     )
     .await?;
 
-    auth::finish_tx(tx, &actor, false).await?;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     Ok(json_ok(tree))
 }
 
@@ -174,10 +196,17 @@ pub async fn get_tree_by_oid(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
 
+    auth::finish_tx(tx, &actor, false).await?;
+    drop(client);
     let _permit = acquire_git_slot(&state)?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let tree = git_read::read_tree(&state, repo_id, Some(&oid), &rel_path, after, limit).await?;
 
-    auth::finish_tx(tx, &actor, false).await?;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     Ok(json_ok(tree))
 }
 
@@ -205,11 +234,18 @@ pub async fn get_blob(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
 
+    auth::finish_tx(tx, &actor, false).await?;
+    drop(client);
     let _permit = acquire_git_slot(&state)?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let blob =
         git_read::read_blob(&state, repo_id, query.oid.as_deref(), query.path.as_deref()).await?;
 
-    auth::finish_tx(tx, &actor, false).await?;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     Ok(json_ok(blob))
 }
 
@@ -232,10 +268,17 @@ pub async fn get_blob_by_oid(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
 
+    auth::finish_tx(tx, &actor, false).await?;
+    drop(client);
     let _permit = acquire_git_slot(&state)?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let blob = git_read::read_blob(&state, repo_id, Some(&oid), query.path.as_deref()).await?;
 
-    auth::finish_tx(tx, &actor, false).await?;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     Ok(json_ok(blob))
 }
 
@@ -253,10 +296,17 @@ pub async fn compare_commits(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
 
+    auth::finish_tx(tx, &actor, false).await?;
+    drop(client);
     let _permit = acquire_git_slot(&state)?;
+    let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
+    let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
+        tokio::time::Instant::now() + state.config.git_timeout).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     let comparison = git_read::compare_commits(&state, repo_id, &query.base, &query.head).await?;
 
-    auth::finish_tx(tx, &actor, false).await?;
+    _lease.ensure_active()?;
+    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
     Ok(json_ok(comparison))
 }
 
@@ -273,8 +323,8 @@ pub async fn get_storage_route(
     let repo_id: Uuid = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
     let row = tx
         .query_one(
-            "SELECT r.name, r.state, r.storage_backend, r.storage_generation, u.username \
-             FROM repositories r JOIN users u ON u.id = r.owner_id WHERE r.id = $1",
+            "SELECT r.name, r.state, r.storage_backend, r.storage_generation, ns.slug AS username \
+             FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id WHERE r.id = $1",
             &[&repo_id],
         )
         .await
