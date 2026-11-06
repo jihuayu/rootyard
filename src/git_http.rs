@@ -139,6 +139,10 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         }
         (Some(identity), repo, None, None)
     };
+    if repo.storage_backend == "pando" && (write || pin_oid.is_some()) {
+        return Err(Error(StatusCode::SERVICE_UNAVAILABLE,
+            "Pando publication and pinned checkout are not ready"));
+    }
     let remote_user = match &job_principal {
         Some(crate::ci_checkouts::authority::CheckoutPrincipal::Integration { hook_id, job_id, .. }) =>
             format!("ci-job:{job_id}/integration:{hook_id}"),
@@ -190,7 +194,14 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             .await
             .map_err(Error::internal)?;
     }
-    let path = if let Some(oid) = pin_oid {
+    let pando_snapshot = if repo.storage_backend == "pando" {
+        let lease = snapshot_lease.as_ref().ok_or_else(Error::unauthorized)?;
+        Some(Box::pin(crate::pando_gateway::snapshot::materialize(
+            &state, &repo, lease, deadline)).await?)
+    } else { None };
+    let path = if let Some(snapshot) = &pando_snapshot {
+        snapshot.path().to_owned()
+    } else if let Some(oid) = pin_oid {
         if job {
             let plan = job_plan.as_ref().ok_or_else(Error::unauthorized)?;
             if state.mirror_primary.is_some() {
@@ -444,6 +455,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         let ref_guard = ref_guard;
         let _read_guard: Option<OwnedRwLockReadGuard<()>> = read_guard;
         let snapshot_lease = snapshot_lease;
+        let pando_snapshot = pando_snapshot;
         let state = state;
         let transfer = async {
             let mut total = 0u64;
@@ -536,6 +548,7 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         process.stop().await;
         // Drop is also a last-resort guard if this task itself is cancelled.
         drop(process);
+        drop(pando_snapshot);
         if let Err(error) = reliability::complete(&state, operation).await {
             producer_failed.store(true, std::sync::atomic::Ordering::Release);
             eprintln!("rootyard: push evidence requires recovery: {error:#}");
