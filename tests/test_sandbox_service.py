@@ -15,7 +15,7 @@ class SandboxServiceTest(unittest.TestCase):
             h.env["ROOTYARD_SANDBOX_MODE"]="dev"
             h.setup(); h.api(); h.roundtrip()
             h.stop()
-            h.sql("ALTER TABLE sandbox_jobs DROP COLUMN terminal; DELETE FROM schema_migrations WHERE version=115")
+            h.sql("ALTER TABLE sandbox_jobs DROP COLUMN terminal; DELETE FROM schema_migrations WHERE version=116")
             h.start()
             self.assertEqual(h.sql("SELECT count(*) FROM information_schema.columns WHERE table_name='sandbox_jobs' AND column_name='terminal'"),"1")
             ws=json.loads(h.expect("/api/workspaces",201,token=h.alice,method="POST",
