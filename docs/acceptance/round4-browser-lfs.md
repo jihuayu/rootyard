@@ -19,7 +19,8 @@ backup manifest format **8**.
 
 **Actual runs** (`evidence/round4/browser-lfs-4c5bcfe` bundle,
 `state=passed`, `stage=complete`, all 11 disposable databases dropped): 11 job
-groups, 10 with JSON reports plus one stdout-only regression job. Counts are
+groups, 9 with JSON reports plus two stdout-only jobs (`webhook-regressions` and
+`rust-lib`). Counts are
 kept apart — **145** Rust unit tests (`cargo test --locked --lib`) and **25**
 cases across the **9** JSON reports; the "170" total is their sum, not 170
 end-to-end scenarios.
@@ -59,7 +60,9 @@ either order. Bounds are unchanged: ≤1024 raw bytes per candidate blob, 4096
 small blobs, 20000 newly reachable objects, 512 MiB default verification budget
 (8 GiB maximum), failing closed when the budget or Git deadline is exhausted.
 The native backend holds the data `ShareLock` for the whole publication, so
-concurrent staging cleanup cannot delete referenced bytes until it releases.
+concurrent staging cleanup waits for native publication and then deletes only
+stale staging files; committed object bytes are never deleted (no
+object-delete/GC API exists, so accepted objects are retained indefinitely).
 
 Supported boundary: binary or non-UTF-8 blobs are **not** valid stock-client
 pointers (`git lfs pointer --check` exits 1 for every probe fixture), and a

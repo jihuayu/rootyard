@@ -30,8 +30,8 @@ marker scan.
 
 Counts are **not** additive across kinds and are deliberately kept apart:
 **145** Rust unit tests (`rust-lib`), **25** cases across the **9** JSON reports,
-plus 4 named stdout checks in the one job that emits no JSON report
-(`webhook-regressions`). The mixed "170" figure in the review is
+plus 4 named stdout checks in `webhook-regressions` and the `rust-lib` log,
+the two jobs that emit no JSON report. The mixed "170" figure in the review is
 `145 + 25` and is not a claim of 170 end-to-end scenarios.
 
 | Job | Exit | Result | Artifact |
@@ -186,4 +186,13 @@ physical #26/#43/#44 qualification, and no mass closure of other issues.
 - Every payload digest equals its `manifest.json` entry.
 - Marker scan for private keys, tokens and password material across the
   payloads: no matches.
-- `git diff --check` clean; header and in-document links checked.
+- `git diff --check 4c5bcfe..HEAD` reports only whitespace diagnostics in
+  evidence payloads, listed here for completeness: intentional Markdown
+  two-space hard breaks in `acceptance-review.md:3` (byte-exact copy of the
+  independent acceptance review) and `reviews/native-lease-review.md:3-5`,
+  plus emitted extra final blank lines in `native/rust-lib.log:203` and
+  `reviews/native-lease-review.md:84`. Raw reports are preserved byte-for-byte
+  and are deliberately **not** normalized; this is not a code or acceptance
+  defect. Human-authored documentation in this publication adds no whitespace
+  errors.
+- Header and in-document relative links checked (all resolve).

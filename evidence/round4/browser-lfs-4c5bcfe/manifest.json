@@ -15,8 +15,8 @@
   "evidence_role": "round-4 browser #47 and LFS #39/#40: 11 native coordinator jobs plus independent final acceptance (docs/evidence only, no compile)",
   "files": {
     "README.md": {
-      "bytes": 11678,
-      "sha256": "bbcee4b1af7c8436fdd377096f360fe2b888952bf771934d0ce241e223e854d2"
+      "bytes": 12309,
+      "sha256": "1da16c91a2fbed099c9bd00067709d05be2a85b0a9d50f82d5ab8e2854537994"
     },
     "acceptance-review.json": {
       "bytes": 13011,
