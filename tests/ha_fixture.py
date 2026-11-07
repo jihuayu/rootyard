@@ -520,7 +520,9 @@ class HAFixture:
     def wait_endpoint_primary(self, timeout=30, stable_samples=3):
         """Require the stable endpoint to reach the leader for consecutive samples.
 
-        Require the authenticated Patroni /primary role check, HAProxy server
+        Require the Patroni /primary role-health answer (health GETs are
+        unauthenticated by design; the Basic header is sent, loopback binding
+        is the access boundary), HAProxy server
         states and the SQL answer to agree for several consecutive samples.
         This closes HAProxy's startup window (3.0 has no init-state keyword,
         so a server is assumed UP until its first checks fail) before any

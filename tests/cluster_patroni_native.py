@@ -17,6 +17,7 @@ only as a configuration gate, never certified here.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -30,6 +31,30 @@ import ha_fixture
 import ops_provenance
 
 TABLE_COUNTS = ("repositories", "git_operations", "tokens", "outbox_events", "event_deliveries")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def readme_json_examples():
+    """Parse every fenced JSON block in the HA README (bounded doc check)."""
+    text = (REPO_ROOT / "deployment" / "ha" / "README.md").read_text()
+    blocks, current = [], None
+    sep = chr(10)
+    for line in text.splitlines():
+        if line.strip().startswith("```json"):
+            current = []
+        elif current is not None and line.strip() == "```":
+            blocks.append(sep.join(current))
+            current = None
+        elif current is not None:
+            current.append(line)
+    parsed = []
+    for index, block in enumerate(blocks):
+        try:
+            parsed.append(json.loads(block))
+        except ValueError as error:
+            raise AssertionError(f"README fenced JSON block {index} is invalid: {error}") from error
+    return parsed
+
 
 
 def redact(text, secrets):
@@ -123,6 +148,9 @@ def main():
         assert "sslmode=require" in env_file and "ROOTYARD_PG_CA_PEM=" in env_file
         assert oct((fx.render_dir / "rootyard.env").stat().st_mode & 0o777) == "0o600"
         negative = {}
+        readme_examples = readme_json_examples()
+        assert readme_examples, "deployment/ha/README.md has no fenced JSON example"
+        negative["readme_json_examples_valid"] = len(readme_examples)
         prod = json.loads(fx.spec_path.read_text())
         prod["environment"] = "production"
         (root / "prod-spec.json").write_text(json.dumps(prod))
@@ -408,17 +436,35 @@ def main():
         }
         assert not missing
 
-        # ---- DCS quorum loss: no unsafe promotion, old PG read-only ------
+        # ---- DCS quorum loss: measured role history and write rejection ----
         dcs_leader = fx.leader()
+        alice_user_id = h.sql("SELECT id::text FROM users WHERE username='alice'")
+        assert re.fullmatch(r"[0-9a-f-]{36}", alice_user_id), f"unexpected alice id: {alice_user_id!r}"
+
+        def durable_write_probe():
+            """No-op real write with the app identity on the fixture application DB."""
+            try:
+                out = fx.endpoint_sql("UPDATE users SET username=username WHERE id='"
+                                      + alice_user_id + "'", db="rootyard_ha")
+                return True, out[:200]
+            except AssertionError as error:
+                return False, str(error)[:300]
+
         stopped = [node["name"] for node in fx.spec["etcd"]["nodes"][:2]]
         dcs_loss_at = time.monotonic_ns()
         fx.stop_etcd(stopped)
-        nodes_during_loss = {}
-        loss_rest_views = []
-        endpoint_write_rejected = False
+        role_history = []
+        demotion_detected_at = None
+        verification_deadline = None
+        valid_lease_writes = 0
+        post_demotion_probes = 0
+        post_demotion_rejected = 0
+        last_probe = None
         api_during_quorum_loss = "unknown"
-        deadline = time.monotonic() + 75
-        while time.monotonic() < deadline:
+        while True:
+            now = time.monotonic_ns()
+            elapsed = (now - dcs_loss_at) / 1e9
+            node_roles = {}
             for node in fx.spec["nodes"]:
                 name = node["name"]
                 try:
@@ -427,35 +473,69 @@ def main():
                 except AssertionError:
                     role = "unavailable"
                 status, _ = fx.rest(name)
-                nodes_during_loss[name] = {"pg": role, "patroni_rest_status": status}
-            rest_view = fx.cluster_state()
-            if rest_view:
-                loss_rest_views.append({"leader": rest_view.get("leader"),
-                                        "members": [(m.get("name"), m.get("role"), m.get("state"))
-                                                    for m in rest_view.get("members", [])]})
-            try:
-                fx.endpoint_sql("CREATE TEMP TABLE ha43_no_quorum_probe(x int)")
-            except AssertionError:
-                endpoint_write_rejected = True
-            try:
-                h.http("/api/repos/alice/demo", token=h.reader)
-                api_during_quorum_loss = "200"
-            except (OSError, urllib.error.URLError):
-                api_during_quorum_loss = "unreachable"
-            old_role = nodes_during_loss.get(dcs_leader, {}).get("pg")
-            if old_role in ("standby", "unavailable") and endpoint_write_rejected:
-                break
+                node_roles[name] = {"pg": role, "patroni_rest_status": status}
+            role_history.append({"elapsed_s": round(elapsed, 2), "nodes": node_roles})
+            unsafe = sorted(name for name, observation in node_roles.items()
+                            if name != dcs_leader and observation["pg"] == "primary")
+            if unsafe:
+                raise AssertionError(
+                    f"standby promoted while the DCS quorum was absent: {unsafe}; "
+                    f"recent history={role_history[-5:]}")
+            old_role = node_roles[dcs_leader]["pg"]
+            accepted, detail = durable_write_probe()
+            last_probe = {"accepted": accepted, "detail": detail,
+                          "old_primary_pg": old_role, "elapsed_s": round(elapsed, 2)}
+            if demotion_detected_at is None:
+                if old_role in ("standby", "unavailable"):
+                    demotion_detected_at = now
+                    verification_deadline = now + 5_000_000_000
+                elif accepted:
+                    # The old leader may legitimately accept writes while its
+                    # still-valid lease has not expired. Record, do not judge.
+                    valid_lease_writes += 1
+            else:
+                post_demotion_probes += 1
+                if accepted:
+                    raise AssertionError(
+                        "stable endpoint accepted a durable write after the old primary was "
+                        f"read-only/stopped while the DCS quorum was absent: probe={last_probe}; "
+                        f"roles={node_roles}")
+                post_demotion_rejected += 1
+                if now >= verification_deadline and post_demotion_probes >= 3:
+                    break
+            if elapsed > 75 and demotion_detected_at is None:
+                raise AssertionError(
+                    f"old primary was not demoted within 75s of quorum loss: {role_history[-5:]}")
             time.sleep(0.5)
-        old_primary_pg = nodes_during_loss.get(dcs_leader, {}).get("pg", "unknown")
-        readonly_observed = old_primary_pg in ("standby", "unavailable")
-        unsafe_promotions = sorted(name for name, observation in nodes_during_loss.items()
-                                   if name != dcs_leader and observation["pg"] == "primary")
-        assert readonly_observed, (
-            f"old primary stayed writable while the DCS quorum was lost: "
-            f"{nodes_during_loss.get(dcs_leader)}")
-        assert not unsafe_promotions, f"standby promoted without a DCS quorum: {unsafe_promotions}"
-        assert endpoint_write_rejected, "stable endpoint accepted writes without a DCS quorum"
+        assert demotion_detected_at is not None
+        assert post_demotion_probes >= 3 and post_demotion_rejected == post_demotion_probes, (
+            f"post-demotion write probes: {post_demotion_probes} total, "
+            f"{post_demotion_rejected} rejected; last={last_probe}")
+        promoted_without_quorum = sorted({name for sample in role_history
+                                          for name, observation in sample["nodes"].items()
+                                          if name != dcs_leader and observation["pg"] == "primary"})
+        assert not promoted_without_quorum, (
+            f"promotion observed without quorum: {promoted_without_quorum}")
+        demotion_index = next(index for index, sample in enumerate(role_history)
+                              if sample["nodes"][dcs_leader]["pg"] in ("standby", "unavailable"))
+        old_primary_states_after_demotion = [sample["nodes"][dcs_leader]["pg"]
+                                             for sample in role_history[demotion_index:]]
+        assert all(state in ("standby", "unavailable") for state in old_primary_states_after_demotion), (
+            f"old primary returned to primary while quorum was absent: {old_primary_states_after_demotion}")
+        old_primary_readonly_or_stopped = role_history[-1]["nodes"][dcs_leader]["pg"] in (
+            "standby", "unavailable")
+        try:
+            h.http("/api/repos/alice/demo", token=h.reader)
+            api_during_quorum_loss = "200"
+        except (OSError, urllib.error.URLError):
+            api_during_quorum_loss = "unreachable"
         no_quorum_seconds = (time.monotonic_ns() - dcs_loss_at) / 1e9
+        demotion_detection_seconds = (demotion_detected_at - dcs_loss_at) / 1e9
+        post_demotion_window_seconds = (time.monotonic_ns() - demotion_detected_at) / 1e9
+        role_transitions = []
+        for sample in role_history:
+            if not role_transitions or role_transitions[-1]["nodes"] != sample["nodes"]:
+                role_transitions.append(sample)
         fx.start_etcd_members(stopped)
         dcs_recovered_at = None
         try:
@@ -464,7 +544,7 @@ def main():
         except AssertionError as error:
             raise AssertionError(
                 "cluster did not regain a writable primary after the DCS quorum returned: "
-                f"nodes_during_loss={nodes_during_loss} detail='{error}'")
+                f"role_history={role_history[-5:]} detail='{error}'")
         nodes_after_recovery = {}
         for node in fx.spec["nodes"]:
             try:
@@ -477,21 +557,33 @@ def main():
                                      if role == "primary")
         assert len(recovered_primaries) == 1, (
             f"unexpected PostgreSQL primary set after quorum recovery: {nodes_after_recovery}")
+        recovered_primary = recovered_primaries[0]
         dcs_oid, _ = push_commit("write after DCS quorum recovery", "post-quorum.txt")
         dcs = {"stopped_etcd_members": stopped, "old_primary_during_loss": dcs_leader,
-               "old_primary_pg_during_loss": old_primary_pg,
-               "nodes_during_loss": nodes_during_loss,
-               "patroni_rest_during_loss": {"samples": loss_rest_views[-3:],
-                                            "note": "Patroni may serve a cached DCS view; recorded, not trusted"},
-               "standby_nodes_promoted_without_quorum": unsafe_promotions,
-               "promotion_without_quorum": bool(unsafe_promotions),
-               "old_primary_readonly_or_stopped": readonly_observed,
-               "endpoint_writes_rejected": endpoint_write_rejected,
+               "old_primary_pg_during_loss": role_history[-1]["nodes"][dcs_leader]["pg"],
+               "nodes_during_loss": role_history[-1]["nodes"],
+               "role_history_samples": len(role_history),
+               "role_transitions": role_transitions[-10:],
+               "standby_nodes_promoted_without_quorum": promoted_without_quorum,
+               "promotion_without_quorum": bool(promoted_without_quorum),
+               "old_primary_readonly_or_stopped": old_primary_readonly_or_stopped,
+               "old_primary_states_after_demotion": old_primary_states_after_demotion[-5:],
+               "endpoint_writes_rejected": post_demotion_rejected == post_demotion_probes,
                "api_during_quorum_loss": api_during_quorum_loss,
+               "demotion_detection_seconds": round(demotion_detection_seconds, 2),
+               "post_demotion_verification_window_seconds_target": 5.0,
+               "post_demotion_verification_window_seconds_observed": round(post_demotion_window_seconds, 2),
+               "post_demotion_write_probes": post_demotion_probes,
+               "post_demotion_write_rejections": post_demotion_rejected,
+               "valid_lease_write_probes_accepted": valid_lease_writes,
+               "last_write_probe": {"accepted": last_probe["accepted"] if last_probe else None,
+                                    "old_primary_pg": last_probe["old_primary_pg"] if last_probe else None,
+                                    "result": (last_probe["detail"][:120] if last_probe else None)},
                "quorum_loss_detection_seconds": round(no_quorum_seconds, 2),
                "quorum_restored_writable_ms": round((dcs_recovered_at - dcs_loss_at) / 1e6, 1),
                "nodes_after_recovery": nodes_after_recovery,
-               "recovered_primary": recovered_primaries[0],
+               "recovered_primary": recovered_primary,
+               "old_primary_recovered_as_primary": recovered_primary == dcs_leader,
                "endpoint_after_quorum": endpoint_after_quorum,
                "post_quorum_recovery_oid": dcs_oid}
 
@@ -513,9 +605,20 @@ def main():
         started_backup = time.monotonic()
         subprocess.run([args.binary, "backup", str(backup_dir), "--offline"], env=backup_env,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1200, check=True)
-        subprocess.run([args.binary, "backup-verify", str(backup_dir)], env=backup_env,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600, check=True)
+        verify_result = subprocess.run([args.binary, "backup-verify", str(backup_dir)], env=backup_env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600,
+                                       check=True)
         backup_seconds = time.monotonic() - started_backup
+        backup_verify = json.loads(verify_result.stdout.decode())
+        manifest = json.loads((backup_dir / "manifest.json").read_text())
+        backup_manifest = {"format": manifest.get("format"),
+                           "schema_versions": manifest.get("schema_versions"),
+                           "backup_id": manifest.get("backup_id"),
+                           "rootyard_version": manifest.get("rootyard_version")}
+        assert isinstance(backup_manifest["format"], int), backup_manifest
+        assert isinstance(backup_manifest["schema_versions"], list) and backup_manifest["schema_versions"]
+        assert backup_verify.get("checksums_verified") is True, backup_verify
+        assert backup_verify.get("authenticity_verified") is False, backup_verify
         # An acknowledged write after the backup boundary must be absent from a
         # fresh-authority restore; it is measured disaster RPO, not zero.
         h.start()
@@ -667,6 +770,7 @@ def main():
             "backup_closure_seconds": round(backup_seconds, 2),
             "restore_seconds": round(restore_seconds, 2),
             "source_counts": pre_backup_counts, "restored_counts": restored_counts,
+            "backup_manifest": backup_manifest, "backup_verify": backup_verify,
             "source_refs": pre_backup_refs, "restored_refs": ref_count(str(restored_repo)),
             "source_ref_map": pre_backup_refs_map, "restored_ref_map": restored_refs_map,
             "restored_ref_map_equals_source": restored_refs_map == pre_backup_refs_map,
@@ -695,7 +799,9 @@ def main():
                       "with TLS/SCRAM and strict synchronous_mode, 1 HAProxy stable primary endpoint, "
                       "1 Rootyard server on the stable endpoint; no second physical host and no hardware watchdog"),
             dataset=("one private repository with acknowledged Git pushes before the crash, a post-failover "
-                     "push, a DCS-quorum-loss probe and a real format-7 backup/restore closure"),
+                     "push, an observed DCS-quorum-loss probe and a real "
+                     f"format-{backup_manifest["format"]} (schema {backup_manifest["schema_versions"]}) "
+                     "backup/restore closure derived from the verified manifest"),
             workload=("native Git clone/push/fetch/fsck and HTTP browse through the stable primary endpoint; "
                       "complete old primary node (Patroni + unmanaged postmaster session) hard-killed; automatic "
                       "Patroni promotion without pg_ctl promote; two-of-three etcd quorum loss; offline backup and "

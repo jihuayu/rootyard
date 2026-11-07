@@ -7,7 +7,7 @@ PostgreSQL nodes (TLS + SCRAM, strict synchronous mode) and an HAProxy stable
 endpoint that routes on the Patroni REST role health check.
 
 The renderer is deliberately strict: it refuses plaintext DCS, PostgreSQL TLS
-downgrades, unauthenticated role health checks, weak/reused passwords and
+downgrades, role health checks whose HTTP authentication cannot be trusted (loopback binding is the boundary), weak/reused passwords and
 (production mode) a configuration without a real watchdog device.  Rendered
 files are private (0600) because they contain credentials.
 

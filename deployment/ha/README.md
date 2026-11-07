@@ -32,7 +32,7 @@ certification.
   "etcd": {
     "cluster_token": "rootyard-ha",
     "server_cert": "/etc/rootyard/pki/server.crt",
-    "server_key": "/etc/rootyard/pki/server.key",  // 0600, validated like all TLS keys
+    "server_key": "/etc/rootyard/pki/server.key",
     "client_ca": "/etc/rootyard/pki/ca.crt",
     "client_cert": "/etc/rootyard/pki/client.crt",
     "client_key": "/etc/rootyard/pki/client.key",
@@ -70,6 +70,8 @@ certification.
 }
 ```
 
+All TLS keys listed above must be private files (`0600`, owned by the service account): the renderer validates CA, server, DCS client/peer and etcd server cert/key inputs and rejects missing, group/other-accessible keys.
+
 `secrets.json` (mode `0600`, never committed):
 
 ```json
@@ -97,11 +99,14 @@ watchdog subsystem registered:
 
 The validator reads only metadata: the path must be a character device whose
 major/minor appears under `/sys/class/watchdog/*/dev` with a non-empty
-`identity`. `/dev/null`, `/dev/urandom` and other software character devices
-are rejected. The device is never opened and no watchdog ioctl is issued, so a
-configuration check cannot arm a machine reset. Software watchdogs (for
-example the `softdog` module) are emulated timers and do not replace a hardware
-watchdog that resets a wedged host. Rendering is refused when the gate is not
+`identity`. `/dev/null`, `/dev/urandom` and any device not registered by the
+kernel watchdog subsystem are rejected. The device is never opened and no watchdog ioctl is issued, so a
+configuration check cannot arm a machine reset. A kernel-registered software
+watchdog (for example the `softdog` module) passes this configuration gate;
+the gate is not hardware qualification. Software watchdogs are emulated timers
+and do not replace a hardware watchdog that resets a wedged host, so hardware
+positive qualification remains separately required and is unavailable in the
+local acceptance environment. Rendering is refused when the gate is not
 satisfied; do not certify automatic failover on a host without working
 fencing.
 
@@ -121,9 +126,13 @@ Artifacts:
 | --- | --- |
 | `patroni-<node>.yml` | Patroni configuration for one node |
 | `etcd-<node>.args` | etcd argv, one argument per line (server/peer TLS files are validated as private inputs) |
-| `haproxy.cfg` | stable primary/replica endpoints with authenticated role checks |
+| `haproxy.cfg` | stable primary/replica endpoints with Patroni role-health checks |
 | `rootyard.env` | service environment (`DATABASE_URL`, CA, data dir, bind) |
 | `bootstrap-app.sh` | Patroni `post_bootstrap` hook creating the service role/database |
+
+## Backup format and schema
+
+Backup/restore acceptance derives the archive format and migration schema from the verified `manifest.json` of the backup set; it does not hardcode format 7 or schema 131. The certified local binary currently produces format 7/schema 131. A composed binary that produces a newer format/schema (for example Pando schema 132 / backup format 8) must be recorded from its own verified manifest, and is only accepted after the same `backup-verify`, ref/OID-map, RPO and restored-authority checks pass. Backup and restore must use the same trusted binary, and these gates are never weakened to accept a newer format.
 
 ## Operate
 

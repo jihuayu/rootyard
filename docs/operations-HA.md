@@ -15,7 +15,7 @@ the acceptance run (no hardware watchdog, one physical host).
 | Stable application endpoint | HAProxy 3.x routing on Patroni REST role health | Rootyard stays connected to one host:port across a failover |
 | Metadata | PostgreSQL 17, TLS `verify-full` + SCRAM-SHA-256 | `deployment/ha/render.py` output and native checks |
 | Application data | Rootyard GitFS volume | retained per node; this profile does not replicate the Git volume |
-| Backup / new-deployment restore | `rootyard backup --offline` + `rootyard restore --isolated` | real format-7 closure restored into a fresh database and data directory |
+| Backup / new-deployment restore | `rootyard backup --offline` + `rootyard restore --isolated` | real verified closure restored into a fresh database and data directory; format/schema read from the manifest |
 
 The renderer is `deployment/ha/render.py`; it consumes a cluster spec and a
 private secrets file and emits `patroni-<node>.yml`, `etcd-<node>.args`,
@@ -48,8 +48,10 @@ deployment:
   read-only health/GET endpoints are unauthenticated by design, so
   loopback-only binding is the security boundary for those; HAProxy sends the
   basic credential on its role checks anyway.
-- HAProxy routes only on authenticated `GET /primary` / `GET /replica`
-  health checks; a node that is not the elected primary is never used for the
+- HAProxy routes only on Patroni role-health `GET /primary` / `GET /replica`
+  checks. The proxy sends Basic credentials, but Patroni health GETs are
+  unauthenticated by design, so the loopback-only binding is the actual access
+  boundary. A node that is not the elected primary is never used for the
   write endpoint, and stale client sessions to a failed node are closed
   (`on-marked-down shutdown-sessions`) so the application pool reconnects to
   the promoted node on the same address. HAProxy 3.0 has no `init-state`
@@ -81,10 +83,12 @@ it never opens the device or issues watchdog ioctls, because opening/arming a
 watchdog during a mere configuration check can reset the machine. This is a
 configuration gate, not physical hardware qualification.
 
-Software watchdogs such as the kernel `softdog` module are emulated timers.
-They can trigger a reboot only while the kernel and scheduler are healthy; they
-are not a substitute for a hardware watchdog that resets a wedged host. Use a
-real hardware/BMC watchdog for production fencing. The acceptance host has no
+Any kernel-registered watchdog identity, including a kernel software watchdog
+such as `softdog`, passes this configuration gate. That is not hardware
+qualification: software watchdogs are emulated timers, can trigger a reboot
+only while the kernel and scheduler are healthy, and are not a substitute for a
+hardware watchdog that resets a wedged host. Use a real hardware/BMC watchdog
+for production fencing; the hardware positive remains unqualified here. The acceptance host has no
 registered watchdog, so this run validates the gate but does **not** certify
 production fencing. For real production use also supply:
 
@@ -122,14 +126,19 @@ would delay the first standby by up to `checkpoint_timeout`. Rootyard serves Git
    the report are measured from those timestamps.
 5. Token revocation, tenant isolation and the durable outbox worker backlog
    are rechecked on the promoted cluster.
-6. DCS quorum loss: two of three etcd members are stopped. The test records
-   each node's actual PostgreSQL role and Patroni REST status during the loss
-   window. The old primary must become a read-only standby (or stop), no other
-   node may appear as a primary, and the stable endpoint must reject writes.
-   Patroni's cached REST view during the loss is recorded but not trusted.
-   When the quorum returns Patroni automatically re-acquires its session lock
-   and re-promotes the old primary; the test waits for stable endpoint routing
-   and records the actual PostgreSQL primary before accepting a new write.
+6. DCS quorum loss: two of three etcd members are stopped. The test keeps a
+   per-sample history of every node's actual PostgreSQL role and Patroni REST
+   status for the whole loss window, and fails immediately if any standby
+   becomes a primary. During the old leader's still-valid lease, real writes
+   may legitimately continue; that interval is measured and reported, not
+   labelled unsafe. Once the old primary is observed read-only/stopped, the
+   test keeps the quorum absent for a bounded five-second verification window
+   and requires every real durable no-op write probe against the fixture
+   application database to be rejected, failing immediately on any accepted
+   write. Patroni's cached REST view is recorded but not trusted. When the
+   quorum returns, Patroni automatically re-acquires its session lock; the test
+   waits for stable endpoint routing and records the actual recovered primary
+   (which need not be the previous old primary) before accepting a new write.
    No manual promotion is performed.
 
 The same-host process scope is reported explicitly. Killing processes on one
@@ -139,8 +148,11 @@ cross-host fencing.
 ## Backup and new-deployment restore
 
 After the failover and quorum-loss drills the test stops the application
-writer, takes a real `rootyard backup --offline` closure (format 7, schema
-131) through the stable endpoint, verifies it with `backup-verify`, and
+writer, takes a real `rootyard backup --offline` closure through the stable
+endpoint, verifies it with `backup-verify`, and records the archive format and
+schema from the verified `manifest.json` (the certified local binary currently
+produces format 7/schema 131; newer composed binaries must report their own
+observed values). It then
 restores it with `rootyard restore --isolated --trust-backup` into a *fresh*
 PostgreSQL 17 cluster and a *new* private data directory. No Rootyard ingress
 exists for the restored authority until these offline checks pass:
@@ -155,6 +167,18 @@ exists for the restored authority until these offline checks pass:
   authority;
 - permissions, read-only tokens, revocation and a new Git push are exercised
   on the restored deployment.
+
+### Backup format/schema compatibility (including Pando)
+
+The acceptance derives format and schema from the verified manifest instead of
+hardcoding them. The certified local binary produces format 7/schema 131 today.
+A composed binary that produces Pando schema132/backup format8 must be recorded
+honestly from its own verified manifest and must pass the same gates: untouched
+`backup-verify`, exact ref/OID-map equality, pre-boundary ACK survival, absence
+of the post-boundary OID, retained delegation/revocation/worker checks, and the
+same trusted binary for backup and restore. These gates are never weakened to
+admit a newer format, and this worker does not claim a schema132/format8 pass
+until the composed binary is actually exercised.
 
 Cutover is a deliberate operator action: the reference profile never starts
 the restored deployment beside the old writer automatically.
