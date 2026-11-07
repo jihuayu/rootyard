@@ -157,7 +157,7 @@ impl PublicationGuard {
     ) -> Result<PublicationWindow<'a>, Error> {
         self.ensure_active()?;
         let (send, recv) = oneshot::channel();
-        tokio::time::timeout_at(deadline, self.window_tx.send(send))
+        tokio::time::timeout_at(deadline, self.window_tx.send(WindowRequest::Enter(send)))
             .await
             .map_err(|_| unavailable())?
             .map_err(|_| unavailable())?;
