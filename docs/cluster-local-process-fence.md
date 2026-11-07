@@ -205,7 +205,12 @@ retained CI root is not in the measured manifest is omitted instead of being
 resurrected, and a receipt without its root fails closed. The old-generation
 intent and receipt are preserved verbatim on the new primary only as retention
 evidence and cannot authorize a checkout under the new generation: a fresh
-job/attempt must issue a fresh pin, and cancelled or released jobs stay denied. Startup reconciliation enumerates every operation
+job/attempt must issue a fresh pin, and cancelled or released jobs stay denied. Retained historical generations share the existing
+fixed admission and sidecar caps (at most 1024 pin intents and 2 MiB of sidecar
+bytes per repository, including all generations). That is a deliberate
+fail-closed operational limit, not a multi-hop capacity or scalability claim;
+reaching it blocks new pins or migration rather than discarding evidence.
+Startup reconciliation enumerates every operation
 for the target node instead of a small completion window; it retains staged
 bundles for copying, verified and completed operations, resolves an exact
 operation row before cleanup, and deletes only staging proven aborted or

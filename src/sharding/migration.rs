@@ -61,6 +61,31 @@ pub struct MigrationReceipt {
     state: &'static str,
 }
 
+const MAX_RECEIPT_BYTES: usize = 2048;
+
+/// Collect a peer receipt with a hard byte cap. The body may have unknown
+/// length; only this bounded buffer is allocated and an oversized single chunk
+/// is rejected before being appended. Error text is never logged or returned.
+async fn collect_bounded<S, E>(mut stream: S, cap: usize) -> Result<Vec<u8>, Error>
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    let mut body = Vec::with_capacity(cap.min(512));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| Error(StatusCode::BAD_GATEWAY, "replica receipt interrupted"))?;
+        if chunk.len() > cap.saturating_sub(body.len()) {
+            return Err(Error(StatusCode::BAD_GATEWAY, "replica receipt too large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn read_receipt<T: serde::de::DeserializeOwned>(upstream: reqwest::Response) -> Result<T, Error> {
+    let body = collect_bounded(upstream.bytes_stream(), MAX_RECEIPT_BYTES).await?;
+    serde_json::from_slice(&body).map_err(Error::internal)
+}
+
 async fn send_transfer(
     state: &AppState,
     target_url: &str,
@@ -83,42 +108,18 @@ async fn send_transfer(
     };
     let body = reqwest::Body::wrap_stream(prefix.chain(ReaderStream::new(reader)));
     let http = transport::cluster_client(state.config.git_timeout)?;
-    let delegation = transport::sign(envelope)?;
     let upstream = http
         .post(url)
-        .header(DELEGATION_HEADER, delegation.clone())
+        .header(DELEGATION_HEADER, transport::sign(envelope)?)
         .body(body)
         .send()
         .await
         .map_err(|_| Error(StatusCode::BAD_GATEWAY, "replica transfer interrupted"))?;
     let status = upstream.status();
     if status != StatusCode::OK {
-        // Read a small fixed prefix, then stop. The stream is dropped rather
-        // than draining an arbitrarily large or streaming error body. Only a
-        // known static JSON `error` field is logged; raw response bytes are
-        // never emitted. The exact signed delegation header is retained only
-        // to redact it if a broken upstream echoes it.
-        let mut stream = upstream.bytes_stream();
-        let mut bounded = Vec::with_capacity(512);
-        while bounded.len() < 512 {
-            match stream.next().await {
-                Some(Ok(chunk)) => {
-                    let take = (512 - bounded.len()).min(chunk.len());
-                    bounded.extend_from_slice(&chunk[..take]);
-                    if take < chunk.len() {
-                        break;
-                    }
-                }
-                Some(Err(_)) | None => break,
-            }
-        }
-        let target_error = serde_json::from_slice::<serde_json::Value>(&bounded)
-            .ok()
-            .and_then(|value| value.get("error").and_then(|error| error.as_str()).map(str::to_owned))
-            .map(|message| message.chars().filter(|character| !character.is_control()).take(256).collect::<String>())
-            .map(|message| message.replace(&delegation, "[redacted]"))
-            .unwrap_or_else(|| "unavailable".to_owned());
-        eprintln!("rootyard: replica transfer rejected target_status={status} target_error={target_error}");
+        // Never log or return untrusted peer error text. Only the HTTP status
+        // and a fixed source-facing class cross the trust boundary.
+        eprintln!("rootyard: replica transfer rejected target_status={status}");
         return match status {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 Err(conflict("replica rejected snapshot transfer: unauthorized"))
@@ -133,7 +134,7 @@ async fn send_transfer(
             _ => Err(conflict("replica rejected snapshot transfer")),
         };
     }
-    upstream.json::<SnapshotReceipt>().await.map_err(Error::internal)
+    read_receipt::<SnapshotReceipt>(upstream).await
 }
 
 async fn send_sidecar_finalize(
@@ -156,7 +157,7 @@ async fn send_sidecar_finalize(
     if upstream.status() != StatusCode::OK {
         return Err(conflict("cutover committed but target CI sidecar publication is pending recovery"));
     }
-    let receipt = upstream.json::<replication_target::FinalizeReceipt>().await.map_err(Error::internal)?;
+    let receipt = read_receipt::<replication_target::FinalizeReceipt>(upstream).await?;
     if receipt.operation_id != operation_id || receipt.state != "published" {
         return Err(conflict("target CI sidecar finalization receipt mismatch"));
     }
@@ -902,4 +903,34 @@ pub async fn list_migrations(
         .collect();
     finish(tx, &actor, false).await?;
     Ok(json(StatusCode::OK, sjson!({"items": items})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_bounded;
+    use bytes::Bytes;
+
+    fn chunks(parts: &[&'static [u8]]) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Unpin {
+        futures_util::stream::iter(parts.iter().map(|part| Ok(Bytes::from_static(part))).collect::<Vec<_>>())
+    }
+
+    #[tokio::test]
+    async fn receipt_reader_accepts_unknown_length_within_cap() {
+        let body = collect_bounded(chunks(&[br#"{"error":"x","#, br#""#]), 64).await.unwrap();
+        assert_eq!(body, br#"{"error":"x","#);
+        let exact = collect_bounded(chunks(&[b"1234", b"5678"]), 8).await.unwrap();
+        assert_eq!(exact, b"12345678");
+    }
+
+    #[tokio::test]
+    async fn receipt_reader_rejects_chunked_overflow_before_appending_it() {
+        let error = collect_bounded(chunks(&[b"1234", b"56789"]), 8).await.unwrap_err();
+        assert_eq!(error.1, "replica receipt too large");
+    }
+
+    #[tokio::test]
+    async fn receipt_reader_rejects_oversized_single_chunk() {
+        let error = collect_bounded(chunks(&[b"0123456789"]), 4).await.unwrap_err();
+        assert_eq!(error.1, "replica receipt too large");
+    }
 }
