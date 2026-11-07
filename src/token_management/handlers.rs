@@ -6,10 +6,10 @@
 
 use crate::{AppState, Error, auth};
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::Response,
-    Json,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -72,11 +72,7 @@ pub async fn list_sessions(State(state): State<App>, headers: HeaderMap, Query(q
     Ok(json_response(StatusCode::OK, page))
 }
 
-pub async fn revoke_session(
-    State(state): State<App>,
-    headers: HeaderMap,
-    Path(session_token_id): Path<Uuid>,
-) -> Res {
+pub async fn revoke_session(State(state): State<App>, headers: HeaderMap, Path(session_token_id): Path<Uuid>) -> Res {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     service::revoke_session(&state.pool, &actor, session_token_id).await?;
     Ok(empty_response(StatusCode::NO_CONTENT))

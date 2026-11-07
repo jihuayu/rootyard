@@ -224,8 +224,8 @@ pub fn normalize_repository_grants(
         }
         let actions = out.entry(grant.repository_id).or_default();
         for action in grant.actions {
-            let parsed = RepoAction::parse(&action)
-                .ok_or(Error(StatusCode::BAD_REQUEST, "unknown repository action"))?;
+            let parsed =
+                RepoAction::parse(&action).ok_or(Error(StatusCode::BAD_REQUEST, "unknown repository action"))?;
             actions.insert(parsed);
         }
     }
@@ -243,8 +243,8 @@ pub fn normalize_namespace_grants(
         }
         let actions = out.entry(grant.organization_id).or_default();
         for action in grant.actions {
-            let parsed = NamespaceAction::parse(&action)
-                .ok_or(Error(StatusCode::BAD_REQUEST, "unknown organisation action"))?;
+            let parsed =
+                NamespaceAction::parse(&action).ok_or(Error(StatusCode::BAD_REQUEST, "unknown organisation action"))?;
             actions.insert(parsed);
         }
     }
@@ -274,9 +274,9 @@ pub fn is_repository_subset(
     requested: &BTreeMap<Uuid, BTreeSet<RepoAction>>,
     current: &BTreeMap<Uuid, BTreeSet<RepoAction>>,
 ) -> bool {
-    requested.iter().all(|(repository, actions)| {
-        current.get(repository).is_some_and(|existing| actions.is_subset(existing))
-    })
+    requested
+        .iter()
+        .all(|(repository, actions)| current.get(repository).is_some_and(|existing| actions.is_subset(existing)))
 }
 
 /// True when every requested namespace action already exists in `current`.
@@ -284,9 +284,9 @@ pub fn is_namespace_subset(
     requested: &BTreeMap<Uuid, BTreeSet<NamespaceAction>>,
     current: &BTreeMap<Uuid, BTreeSet<NamespaceAction>>,
 ) -> bool {
-    requested.iter().all(|(organization, actions)| {
-        current.get(organization).is_some_and(|existing| actions.is_subset(existing))
-    })
+    requested
+        .iter()
+        .all(|(organization, actions)| current.get(organization).is_some_and(|existing| actions.is_subset(existing)))
 }
 
 /// Derive the live browser parent id from a session secret.
@@ -350,7 +350,7 @@ mod tests {
         let mut wider = narrower.clone();
         wider.entry(Uuid::nil()).or_default().insert(RepoAction::ContentsWrite);
         assert!(!is_repository_subset(&wider, &current));
-        let mut foreign = BTreeMap::new();
+        let mut foreign: BTreeMap<Uuid, BTreeSet<RepoAction>> = BTreeMap::new();
         foreign.entry(Uuid::from_u128(1)).or_default().insert(RepoAction::ContentsRead);
         assert!(!is_repository_subset(&foreign, &current));
     }

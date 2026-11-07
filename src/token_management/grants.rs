@@ -24,10 +24,7 @@ fn conflict(message: &'static str) -> Error {
     Error(StatusCode::CONFLICT, message)
 }
 
-pub async fn load_grants(
-    tx: &Transaction<'_>,
-    token_id: Uuid,
-) -> Result<(RepositoryGrants, NamespaceGrants), Error> {
+pub async fn load_grants(tx: &Transaction<'_>, token_id: Uuid) -> Result<(RepositoryGrants, NamespaceGrants), Error> {
     let mut repositories: RepositoryGrants = BTreeMap::new();
     let rows = tx
         .query("SELECT repository_id, action FROM token_repository_scopes WHERE token_id = $1", &[&token_id])
@@ -35,8 +32,8 @@ pub async fn load_grants(
         .map_err(Error::internal)?;
     for row in rows {
         let repository_id: Uuid = row.get(0);
-        let action = RepoAction::parse(row.get::<_, &str>(1))
-            .ok_or_else(|| Error::internal("token scope store unavailable"))?;
+        let action =
+            RepoAction::parse(row.get::<_, &str>(1)).ok_or_else(|| Error::internal("token scope store unavailable"))?;
         repositories.entry(repository_id).or_default().insert(action);
     }
     let mut namespaces: NamespaceGrants = BTreeMap::new();
@@ -122,10 +119,7 @@ pub async fn validate_repository_grant(
     };
     for action in actions {
         if role < models::repository_min_role(*action) {
-            return Err(Error(
-                StatusCode::FORBIDDEN,
-                "current repository role is insufficient for a granted action",
-            ));
+            return Err(Error(StatusCode::FORBIDDEN, "current repository role is insufficient for a granted action"));
         }
     }
     if state != "ready" {
@@ -158,10 +152,7 @@ pub async fn validate_namespace_grant(
     let role = Role::parse(row.get::<_, &str>(0))?;
     for action in actions {
         if role < models::namespace_min_role(*action) {
-            return Err(Error(
-                StatusCode::FORBIDDEN,
-                "current organisation role is insufficient for a granted action",
-            ));
+            return Err(Error(StatusCode::FORBIDDEN, "current organisation role is insufficient for a granted action"));
         }
     }
     Ok(())

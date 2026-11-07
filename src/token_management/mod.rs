@@ -26,10 +26,10 @@ pub mod service;
 
 use crate::AppState;
 use axum::{
+    Json, Router,
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    Json, Router,
 };
 use std::sync::Arc;
 
@@ -48,19 +48,11 @@ pub fn routes() -> Router<Arc<AppState>> {
 /// JSON response that is never cacheable and never content-sniffed. Secret
 /// material appears only in a create/rotate response body, never in a header.
 pub fn json_response<T: serde::Serialize>(status: StatusCode, body: T) -> Response {
-    (
-        status,
-        [(header::CACHE_CONTROL, "no-store"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")],
-        Json(body),
-    )
+    (status, [(header::CACHE_CONTROL, "no-store"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], Json(body))
         .into_response()
 }
 
 /// Empty response with the same no-store/nosniff policy.
 pub fn empty_response(status: StatusCode) -> Response {
-    (
-        status,
-        [(header::CACHE_CONTROL, "no-store"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")],
-    )
-        .into_response()
+    (status, [(header::CACHE_CONTROL, "no-store"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")]).into_response()
 }

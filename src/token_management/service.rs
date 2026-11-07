@@ -35,15 +35,11 @@
 //!   audit/GC references.
 
 use crate::{
-    Error,
-    auth,
+    Error, auth,
     db::{self, Identity},
     pagination,
     token_management::{
-        grants::{
-            insert_grants, load_grants, replace_grants, validate_namespace_grant,
-            validate_repository_grant,
-        },
+        grants::{insert_grants, load_grants, replace_grants, validate_namespace_grant, validate_repository_grant},
         models::{self, *},
     },
 };
@@ -114,11 +110,7 @@ async fn verify_issuer(tx: &Transaction<'_>, actor: &Identity, mutation: bool) -
     Ok(())
 }
 
-async fn begin(
-    tx: &Transaction<'_>,
-    actor: &Identity,
-    mutation: bool,
-) -> Result<(), Error> {
+async fn begin(tx: &Transaction<'_>, actor: &Identity, mutation: bool) -> Result<(), Error> {
     lock_user(tx, actor).await?;
     verify_issuer(tx, actor, mutation).await
 }
@@ -198,11 +190,7 @@ async fn token_views(tx: &Transaction<'_>, rows: &[Row]) -> Result<Vec<TokenView
         }
         let mut namespace_grants = Vec::new();
         for (organization_id, (slug, actions)) in namespaces.remove(&id).unwrap_or_default() {
-            namespace_grants.push(NamespaceGrantView {
-                organization_id,
-                slug,
-                actions: actions.into_iter().collect(),
-            });
+            namespace_grants.push(NamespaceGrantView { organization_id, slug, actions: actions.into_iter().collect() });
         }
         views.push(TokenView {
             id,
@@ -249,12 +237,7 @@ fn decode_cursor(after: Option<&String>, scope: &str) -> Result<(Option<String>,
 
 /// List the actor's own API tokens. Keyset-bounded by actor and kind; revoked
 /// tokens are excluded.
-pub async fn list_tokens(
-    pool: &Pool,
-    actor: &Identity,
-    after: Option<String>,
-    limit: i64,
-) -> Result<TokenPage, Error> {
+pub async fn list_tokens(pool: &Pool, actor: &Identity, after: Option<String>, limit: i64) -> Result<TokenPage, Error> {
     let scope = format!("tokens:api:{}", actor.id);
     let (after_ts, after_id) = decode_cursor(after.as_ref(), &scope)?;
     let mut client = pool.get().await.map_err(Error::internal)?;
@@ -314,11 +297,7 @@ pub async fn get_token(pool: &Pool, actor: &Identity, token_id: Uuid) -> Result<
 }
 
 /// Create an explicitly restricted token. The secret is returned once.
-pub async fn create_token(
-    pool: &Pool,
-    actor: &Identity,
-    input: CreateTokenInput,
-) -> Result<IssuedToken, Error> {
+pub async fn create_token(pool: &Pool, actor: &Identity, input: CreateTokenInput) -> Result<IssuedToken, Error> {
     let display_name = models::validate_display_name(&input.display_name)?;
     let days = models::validate_expiry_days(input.expires_in_days)?;
     let repositories = models::normalize_repository_grants(input.repository_grants)?;
@@ -462,12 +441,9 @@ pub async fn rotate_token(pool: &Pool, actor: &Identity, token_id: Uuid) -> Resu
     .await
     .map_err(Error::internal)?;
     insert_grants(&tx, new_id, &kept_repositories, &kept_namespaces).await?;
-    tx.execute(
-        "UPDATE tokens SET revoked = true, scope_version = scope_version + 1 WHERE id = $1",
-        &[&token_id],
-    )
-    .await
-    .map_err(Error::internal)?;
+    tx.execute("UPDATE tokens SET revoked = true, scope_version = scope_version + 1 WHERE id = $1", &[&token_id])
+        .await
+        .map_err(Error::internal)?;
     let view = load_token_view(&tx, new_id).await?;
     auth::finish_tx(tx, actor, true).await?;
     Ok(IssuedToken { token: view, secret })
@@ -488,12 +464,9 @@ pub async fn revoke_token(pool: &Pool, actor: &Identity, token_id: Uuid) -> Resu
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
     if !row.get::<_, bool>(0) {
-        tx.execute(
-            "UPDATE tokens SET revoked = true, scope_version = scope_version + 1 WHERE id = $1",
-            &[&token_id],
-        )
-        .await
-        .map_err(Error::internal)?;
+        tx.execute("UPDATE tokens SET revoked = true, scope_version = scope_version + 1 WHERE id = $1", &[&token_id])
+            .await
+            .map_err(Error::internal)?;
     }
     auth::finish_tx(tx, actor, true).await
 }
@@ -543,7 +516,11 @@ pub async fn list_sessions(
     });
     let items = rows
         .iter()
-        .map(|row| SessionView { token_id: row.get("id"), created_at: row.get("created_at"), expires_at: row.get("expires_at") })
+        .map(|row| SessionView {
+            token_id: row.get("id"),
+            created_at: row.get("created_at"),
+            expires_at: row.get("expires_at"),
+        })
         .collect();
     auth::finish_tx(tx, actor, false).await?;
     Ok(SessionPage { items, next_after })
