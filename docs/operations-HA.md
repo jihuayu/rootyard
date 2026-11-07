@@ -42,9 +42,12 @@ deployment:
   (`--client-cert-auth`, `--peer-client-cert-auth`); Patroni is configured with
   DCS `https`, CA and client certificate/key. A client without a certificate
   is rejected (checked natively).
-- The Patroni REST API is bound to loopback and requires basic
-  authentication; the same credential is used by HAProxy's health check.
-  Unauthenticated REST requests are rejected (checked natively).
+- The Patroni REST API is bound to loopback (network access control) and
+  management endpoints require basic authentication; an unauthenticated
+  management request is rejected with 401 (checked natively). Patroni's
+  read-only health/GET endpoints are unauthenticated by design, so
+  loopback-only binding is the security boundary for those; HAProxy sends the
+  basic credential on its role checks anyway.
 - HAProxy routes only on authenticated `GET /primary` / `GET /replica`
   health checks; a node that is not the elected primary is never used for the
   write endpoint, and stale client sessions to a failed node are closed

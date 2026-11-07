@@ -135,12 +135,23 @@ def main():
         endpoint_role = fx.wait_endpoint_primary()
         assert endpoint_role == "f:" + str(fx.pg_port(leader))
         assert fx.sql(leader, "SELECT pg_is_in_recovery()") == "f"
-        rest_unauth = fx.rest(leader, auth=False)
-        assert rest_unauth[0] == 401, "Patroni REST health endpoint accepted unauthenticated access"
-        rest_auth = fx.rest(leader)
-        assert rest_auth[0] == 200
-        negative["patroni_rest_authentication"] = {"unauthenticated": rest_unauth[0],
-                                                   "authenticated": rest_auth[0]}
+        # Patroni protects management endpoints with basic auth; its health and
+        # read-only GET endpoints are unauthenticated by design, so network
+        # access control is the loopback-only bind (checked below).
+        rest_unauth = fx.rest(leader, path="/restart", auth=False, method="DELETE")
+        assert rest_unauth[0] == 401, "Patroni REST management endpoint accepted unauthenticated access"
+        rest_auth = fx.rest(leader, path="/restart", auth=True, method="DELETE")
+        assert rest_auth[0] == 404, "Patroni REST management endpoint rejected authenticated access"
+        rest_health = fx.rest(leader, auth=False)
+        assert rest_health[0] == 200
+        rest_listeners = {node["name"]: sorted(fx.listener_addresses(node["rest_port"]))
+                          for node in fx.spec["nodes"]}
+        for name, addresses in rest_listeners.items():
+            assert "127.0.0.1" in addresses and "0.0.0.0" not in addresses                 and fx.host_ip not in addresses, f"Patroni REST not loopback-only on {name}: {addresses}"
+        negative["patroni_rest_authentication"] = {
+            "unauthenticated_management": rest_unauth[0], "authenticated_management": rest_auth[0],
+            "read_only_health_http": rest_health[0], "loopback_only": rest_listeners,
+            "note": "Patroni health/GET endpoints are unauthenticated by design; management endpoints need basic auth; REST binds loopback only"}
         role_attrs = fx.sql(leader, "SELECT rolname||'|'||rolsuper||'|'||rolcreatedb||'|'||rolreplication "
                                     "FROM pg_roles WHERE rolname IN ('repl','rootyard') ORDER BY rolname")
         assert "repl|false|false|true" in role_attrs, role_attrs
@@ -180,7 +191,9 @@ def main():
         h.base_db = verify_dsn
         h.db = verify_dsn
         h.env.update({"DATABASE_URL": require_dsn, "ROOTYARD_PG_CA_PEM": str(fx.pki / "ca.crt"),
-                      "PGSSLMODE": "verify-full", "PGSSLROOTCERT": str(fx.pki / "ca.crt")})
+                      "PGSSLMODE": "verify-full", "PGSSLROOTCERT": str(fx.pki / "ca.crt"),
+                      "ROOTYARD_OUTBOX_WORKER": "false"})
+        fx.wait_endpoint_primary()
         h.cli("migrate")
         h.alice = h.account("create-user", "alice")
         h.bob = h.account("create-user", "bob")
@@ -223,7 +236,7 @@ def main():
         # ---- hard crash of the complete old primary node -----------------
         old_primary = fx.leader()
         old_port = fx.pg_port(old_primary)
-        assert fx.endpoint_sql("SELECT pg_is_in_recovery() || ':' || inet_server_port()") == "f:" + str(old_port)
+        assert fx.endpoint_role() == "f:" + str(old_port)
         crash_at = time.monotonic_ns()
         fx.kill_node(old_primary)
         crashed = time.monotonic_ns()
@@ -240,7 +253,7 @@ def main():
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 try:
-                    if fx.endpoint_sql("SELECT pg_is_in_recovery()", timeout=6).strip() == "f":
+                    if fx.endpoint_sql("SELECT pg_is_in_recovery()", timeout=6) == "f":
                         return time.monotonic_ns()
                 except AssertionError:
                     pass
@@ -275,8 +288,7 @@ def main():
                                                    "post-promotion.txt")
         h.git("fetch", "origin", cwd=post_failover_clone, token=h.reader)
         assert h.git("rev-parse", "FETCH_HEAD", cwd=post_failover_clone).stdout.decode().strip() == post_oid
-        assert fx.endpoint_sql("SELECT pg_is_in_recovery() || ':' || inet_server_port()") == (
-            "f:" + str(fx.pg_port(successor)))
+        assert fx.endpoint_role() == "f:" + str(fx.pg_port(successor))
         assert h.http("/api/repos/alice/demo", token=revoked)[0] == 401
         assert h.http("/api/repos/alice/demo", token=h.bob)[0] in (403, 404)
         worker_processed = int(h.cli("worker-once"))
@@ -348,7 +360,7 @@ def main():
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             try:
-                if fx.endpoint_sql("SELECT pg_is_in_recovery()", timeout=6).strip() == "f":
+                if fx.endpoint_sql("SELECT pg_is_in_recovery()", timeout=6) == "f":
                     dcs_recovered_at = time.monotonic_ns()
                     break
             except AssertionError:

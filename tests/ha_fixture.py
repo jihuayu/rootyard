@@ -297,9 +297,9 @@ class HAFixture:
             time.sleep(0.5)
         raise AssertionError(f"Patroni cluster did not elect a leader with three members: {observed}")
 
-    def rest(self, node_name, path="/cluster", auth=True, timeout=5):
+    def rest(self, node_name, path="/cluster", auth=True, timeout=5, method="GET"):
         port = next(n["rest_port"] for n in self.spec["nodes"] if n["name"] == node_name)
-        request = urllib.request.Request(f"http://127.0.0.1:{port}{path}")
+        request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
         if auth:
             basic = base64.b64encode((self.secrets["patroni_rest_user"] + ":"
                                       + self.secrets["patroni_rest_password"]).encode()).decode()
@@ -311,6 +311,37 @@ class HAFixture:
             return error.code, error.read()
         except (OSError, urllib.error.URLError):
             return 0, b""
+
+    def listener_addresses(self, port):
+        """Return IPv4/IPv6 addresses listening on *port* from /proc/net/tcp*."""
+        found = set()
+        for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                lines = Path(name).read_text().splitlines()[1:]
+            except OSError:
+                continue
+            for line in lines:
+                fields = line.split()
+                if len(fields) < 4 or fields[3] != "0A":
+                    continue
+                address, _, port_hex = fields[1].partition(":")
+                try:
+                    if int(port_hex, 16) != port:
+                        continue
+                except ValueError:
+                    continue
+                if name.endswith("tcp6"):
+                    if address == "00000000000000000000000001000000":
+                        found.add("::1")
+                    elif address == "00000000000000000000000000000000":
+                        found.add("::")
+                else:
+                    try:
+                        octets = [int(address[i:i + 2], 16) for i in (6, 4, 2, 0)]
+                    except ValueError:
+                        continue
+                    found.add(".".join(str(octet) for octet in octets))
+        return found
 
     def cluster_state(self):
         """Return the Patroni cluster view with a normalized leader name.
@@ -383,11 +414,24 @@ class HAFixture:
         return result.stdout.decode().strip()
 
     def endpoint_sql(self, query, db="postgres", user="rootyard", timeout=20):
+        """Run one query through the HAProxy primary endpoint and return its last line.
+
+        The statement timeout is passed through PGOPTIONS so psql does not print a
+        SET command tag before the result; callers compare exact role values.
+        """
         env = self.env({"PGPASSWORD": self.secrets["rootyard_password"], "PGSSLMODE": "verify-full",
-                        "PGSSLROOTCERT": str(self.pki / "ca.crt")})
-        return run(["psql", "-h", "127.0.0.1", "-p", str(self.ports["haproxy_primary"]),
-                    "-U", user, "-d", db, "-X", "-At", "-v", "ON_ERROR_STOP=1",
-                    "-c", f"SET statement_timeout='5s'; {query}"], env=env, timeout=timeout)
+                        "PGSSLROOTCERT": str(self.pki / "ca.crt"),
+                        "PGOPTIONS": "-c statement_timeout=5000 -c lock_timeout=3000"})
+        result = run(["psql", "-h", "127.0.0.1", "-p", str(self.ports["haproxy_primary"]),
+                     "-U", user, "-d", db, "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c", query],
+                     env=env, timeout=timeout)
+        lines = [line.strip() for line in result.stdout.decode().splitlines() if line.strip()]
+        return lines[-1] if lines else ""
+
+    def endpoint_role(self, timeout=20):
+        """Return '<f|t>:<server_port>' observed through the stable endpoint."""
+        return self.endpoint_sql("SELECT CASE WHEN pg_is_in_recovery() THEN 't' ELSE 'f' END"
+                                 " || ':' || inet_server_port()", timeout=timeout)
 
     def start_haproxy(self):
         cfg = self.render_dir / "haproxy.cfg"
@@ -409,17 +453,70 @@ class HAFixture:
             time.sleep(0.1)
         raise AssertionError("HAProxy did not create its stats socket")
 
-    def wait_endpoint_primary(self, timeout=30):
+    def haproxy_stats(self):
+        """Return sanitized server states from the HAProxy stats socket."""
+        rows = []
+        try:
+            with socket.socket(socket.AF_UNIX) as sock:
+                sock.settimeout(2)
+                sock.connect(self.spec["haproxy"]["stats_socket"])
+                sock.sendall(b"show stat\n")
+                data = b""
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+        except OSError as error:
+            return [{"error": type(error).__name__}]
+        for line in data.decode(errors="replace").splitlines():
+            if line.startswith("#") or not line:
+                continue
+            fields = line.split(",")
+            if len(fields) > 17 and fields[0] in ("postgres_primary_nodes", "postgres_replica_nodes"):
+                rows.append({"backend": fields[0], "server": fields[1], "status": fields[17],
+                             "check": fields[18] if len(fields) > 18 else ""})
+        return rows
+
+    def wait_endpoint_primary(self, timeout=30, stable_samples=3):
+        """Require the stable endpoint to reach the leader for consecutive samples.
+
+        Require the authenticated Patroni /primary role check, HAProxy server
+        states and the SQL answer to agree for several consecutive samples.
+        This closes HAProxy's startup window (3.0 has no init-state keyword,
+        so a server is assumed UP until its first checks fail) before any
+        application write connection or migration is attempted.
+        """
         deadline = time.monotonic() + timeout
+        observed = {"endpoint_values": [], "endpoint_errors": [], "leaders": [],
+                    "haproxy_stats": [], "haproxy_log": []}
+        good = 0
         while time.monotonic() < deadline:
+            leader = self.leader()
+            observed["leaders"].append(leader)
             try:
-                value = self.endpoint_sql("SELECT pg_is_in_recovery() || ':' || inet_server_port()")
-            except AssertionError:
+                value = self.endpoint_role(timeout=8)
+                observed["endpoint_values"].append(value)
+            except AssertionError as error:
                 value = ""
-            if value == "f:" + str(self.pg_port(self.leader() or "")):
+                observed["endpoint_errors"].append(str(error)[:300])
+            stats = self.haproxy_stats()
+            primary = {row["server"]: row["status"] for row in stats
+                       if row.get("backend") == "postgres_primary_nodes"}
+            expected = "f:" + str(self.pg_port(leader)) if leader else None
+            routed_ok = bool(expected) and value == expected and primary.get(leader) == "UP"                 and all(status != "UP" for name, status in primary.items()
+                        if name not in (leader, "BACKEND"))
+            good = good + 1 if routed_ok else 0
+            if good >= stable_samples:
                 return value
-            time.sleep(0.2)
-        raise AssertionError("HAProxy primary endpoint did not route to the elected leader")
+            time.sleep(0.25)
+        observed["haproxy_stats"] = self.haproxy_stats()
+        log_path = self.workdir / "haproxy.log"
+        if log_path.exists():
+            observed["haproxy_log"] = log_path.read_text(errors="replace").splitlines()[-15:]
+        observed = {key: (value[-5:] if isinstance(value, list) else value)
+                    for key, value in observed.items()}
+        raise AssertionError(f"HAProxy primary endpoint did not route to the elected leader: {observed}")
 
     def node_processes(self, name):
         data_dir = next(n["data_dir"] for n in self.spec["nodes"] if n["name"] == name)

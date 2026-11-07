@@ -25,6 +25,8 @@ backend postgres_primary_nodes
     option httpchk GET /primary
     http-check send hdr Authorization "Basic $health_auth"
     http-check expect status 200
+    # Start DOWN: before the first authenticated role check a node must never
+    # be presumed primary-capable (a standby would reject writes as read-only).
     default-server check inter 1000ms fall 2 rise 1 on-marked-down shutdown-sessions
 $servers
 
@@ -36,5 +38,7 @@ backend postgres_replica_nodes
     option httpchk GET /replica
     http-check send hdr Authorization "Basic $health_auth"
     http-check expect status 200
+    # Start DOWN: before the first authenticated role check a node must never
+    # be presumed primary-capable (a standby would reject writes as read-only).
     default-server check inter 1000ms fall 2 rise 1 on-marked-down shutdown-sessions
 $servers

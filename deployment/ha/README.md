@@ -132,7 +132,9 @@ Artifacts:
 5. Start Rootyard with `rootyard.env`. It should connect to the HAProxy primary
    port, never to a node port.
 6. Use `GET /primary` (200 only on the leader) and `GET /replica` for health
-   checks; both require the Patroni REST basic-auth credential.
+   checks. Patroni health GETs are unauthenticated by design and are protected
+   by the loopback-only bind; HAProxy nevertheless sends the basic-auth
+   credential. Patroni management endpoints require that credential.
 
 Upgrade/rollback and restore ordering are covered in
 [`docs/operations-HA.md`](../../docs/operations-HA.md).
