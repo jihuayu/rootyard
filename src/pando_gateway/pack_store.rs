@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    io::Read,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -332,6 +333,50 @@ impl PackStore {
         Ok(manifest)
     }
 
+    fn file_sha256(path: &Path) -> Result<String> {
+        let meta = std::fs::symlink_metadata(path)?;
+        ensure!(meta.is_file() && !meta.file_type().is_symlink(), "Pando cache entry is not a regular file");
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    fn cache_pair_valid(
+        pack: &Path,
+        index: &Path,
+        manifest: &PackManifest,
+    ) -> Result<bool> {
+        let pack_meta = match std::fs::symlink_metadata(pack) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let index_meta = match std::fs::symlink_metadata(index) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if !pack_meta.is_file()
+            || pack_meta.file_type().is_symlink()
+            || !index_meta.is_file()
+            || index_meta.file_type().is_symlink()
+            || pack_meta.len() != manifest.pack.plaintext_bytes
+            || index_meta.len() != manifest.index.plaintext_bytes
+        {
+            return Ok(false);
+        }
+        Ok(Self::file_sha256(pack)? == manifest.pack.plaintext_sha256
+            && Self::file_sha256(index)? == manifest.index.plaintext_sha256)
+    }
+
     /// Populate the disposable local cache for one committed pack. Cache
     /// publication is atomic per file; concurrent readers either observe a
     /// complete pair or fall back to an exact remote recovery.
@@ -346,11 +391,7 @@ impl PackStore {
         Self::prepare_cache_dir(cache_dir)?;
         let manifest = self.load_manifest(pool, repository_id, pack_id).await?;
         let (target_pack, target_index) = Self::cache_paths(cache_dir, repository_id, pack_id);
-        if target_pack.is_file()
-            && target_index.is_file()
-            && std::fs::metadata(&target_pack)?.len() == manifest.pack.plaintext_bytes
-            && std::fs::metadata(&target_index)?.len() == manifest.index.plaintext_bytes
-        {
+        if Self::cache_pair_valid(&target_pack, &target_index, &manifest)? {
             return Ok(manifest);
         }
         let _ = std::fs::remove_file(&target_pack);
@@ -359,6 +400,10 @@ impl PackStore {
         Box::pin(self.recover(pool, repository_id, pack_id, &temporary.0, deadline)).await?;
         std::fs::rename(temporary.0.join(format!("pack-{pack_id}.pack")), &target_pack)?;
         std::fs::rename(temporary.0.join(format!("pack-{pack_id}.idx")), &target_index)?;
+        ensure!(
+            Self::cache_pair_valid(&target_pack, &target_index, &manifest)?,
+            "Pando cache publication did not match the committed manifest"
+        );
         Ok(manifest)
     }
 
@@ -380,7 +425,7 @@ impl PackStore {
         let target_index = destination.join(format!("pack-{pack_id}.idx"));
         let linked = Self::link_or_copy(&source_pack, &target_pack)
             .and_then(|_| Self::link_or_copy(&source_index, &target_index));
-        if linked.is_ok() {
+        if linked.is_ok() && Self::cache_pair_valid(&target_pack, &target_index, &manifest)? {
             return Ok(manifest);
         }
         let _ = std::fs::remove_file(&target_pack);

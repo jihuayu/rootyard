@@ -16,8 +16,9 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
-    path::Path,
+    collections::{BTreeMap, HashSet},
+    os::unix::fs::DirBuilderExt,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, SystemTime},
 };
@@ -37,6 +38,13 @@ pub fn is_pando_kind(kind: &str) -> bool {
             | "pando_unreachable_mark"
             | "pando_tombstone_delete"
     )
+}
+
+struct VerifyDir(PathBuf);
+impl Drop for VerifyDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -113,9 +121,169 @@ async fn pando_git(
     let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
     ensure!(!timeout.is_zero(), "Pando maintenance deadline elapsed");
     lease
-        .guard(git_http::collect_git_output(command, 8 * 1024 * 1024, timeout))
+        .guard(git_http::collect_git_output(command, 64 * 1024 * 1024, timeout))
         .await
         .map_err(|error| anyhow::anyhow!(error.1))?
+}
+
+async fn pando_git_input(
+    state: &AppState,
+    path: &Path,
+    args: &[&str],
+    input: &Path,
+    lease: &Lease,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    lease.ensure_active().map_err(|error| anyhow::anyhow!(error.1))?;
+    let mut command = Command::new(&state.config.git);
+    command
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .arg("--git-dir")
+        .arg(path)
+        .args(args);
+    let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
+    ensure!(!timeout.is_zero(), "Pando maintenance deadline elapsed");
+    let file = std::fs::File::open(input)?;
+    lease
+        .guard(git_http::collect_git_output_input(
+            command,
+            64 * 1024 * 1024,
+            timeout,
+            Stdio::from(file),
+        ))
+        .await
+        .map_err(|error| anyhow::anyhow!(error.1))?
+}
+
+fn valid_oid(oid: &str) -> bool {
+    matches!(oid.len(), 40 | 64)
+        && oid.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && oid.bytes().any(|byte| byte != b'0')
+}
+
+async fn all_objects(
+    state: &AppState,
+    path: &Path,
+    lease: &Lease,
+    deadline: Instant,
+) -> Result<BTreeMap<String, String>> {
+    let raw = pando_git(
+        state,
+        path,
+        &["cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"],
+        lease,
+        deadline,
+    )
+    .await?;
+    let text = String::from_utf8(raw)?;
+    let mut objects = BTreeMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let oid = fields.next().context("missing Pando object identity")?;
+        let kind = fields.next().context("missing Pando object type")?;
+        ensure!(
+            fields.next().is_none()
+                && valid_oid(oid)
+                && matches!(kind, "commit" | "tree" | "blob" | "tag"),
+            "invalid Pando native object listing"
+        );
+        ensure!(objects.insert(oid.to_owned(), kind.to_owned()).is_none(), "duplicate Pando object identity");
+    }
+    ensure!(!objects.is_empty(), "Pando compaction requires a non-empty object set");
+    Ok(objects)
+}
+
+async fn packed_objects(
+    state: &AppState,
+    pack: &Path,
+    lease: &Lease,
+    deadline: Instant,
+) -> Result<BTreeMap<String, String>> {
+    lease.ensure_active().map_err(|error| anyhow::anyhow!(error.1))?;
+    let mut command = Command::new(&state.config.git);
+    command
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["verify-pack", "-v"])
+        .arg(pack)
+        .stdin(Stdio::null());
+    let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
+    ensure!(!timeout.is_zero(), "Pando maintenance deadline elapsed");
+    let raw = lease
+        .guard(git_http::collect_git_output(command, 64 * 1024 * 1024, timeout))
+        .await
+        .map_err(|error| anyhow::anyhow!(error.1))??;
+    let text = String::from_utf8(raw)?;
+    let mut objects = BTreeMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let Some(oid) = fields.next() else { continue };
+        if !valid_oid(oid) {
+            continue;
+        }
+        let kind = fields.next().context("missing packed Pando object type")?;
+        ensure!(matches!(kind, "commit" | "tree" | "blob" | "tag"), "invalid packed Pando object type");
+        ensure!(objects.insert(oid.to_owned(), kind.to_owned()).is_none(), "duplicate packed Pando object");
+    }
+    Ok(objects)
+}
+
+async fn verify_candidate(
+    state: &AppState,
+    snapshot: &snapshot::Snapshot,
+    repo: &Repository,
+    pack: &Path,
+    index: &Path,
+    lease: &Lease,
+    deadline: Instant,
+) -> Result<()> {
+    let parent = snapshot.path().parent().context("Pando session root missing")?;
+    let verify = VerifyDir(parent.join(format!(".verify-{}", Uuid::new_v4())));
+    std::fs::DirBuilder::new().mode(0o700).create(&verify.0)?;
+    let format = format!("--object-format={}", repo.object_format);
+    pando_git(state, &verify.0, &["init", "--bare", &format], lease, deadline).await?;
+    // Git matches pack/index by basename. Link exactly the candidate pair
+    // into an otherwise empty disposable repository.
+    let pack_dir = verify.0.join("objects/pack");
+    std::fs::create_dir_all(&pack_dir)?;
+    let base = format!("pack-{}", Uuid::new_v4());
+    let target_pack = pack_dir.join(format!("{base}.pack"));
+    let target_index = pack_dir.join(format!("{base}.idx"));
+    if std::fs::hard_link(pack, &target_pack).is_err() {
+        std::fs::copy(pack, &target_pack)?;
+    }
+    if std::fs::hard_link(index, &target_index).is_err() {
+        std::fs::copy(index, &target_index)?;
+    }
+    for (name, oid) in &snapshot.refs {
+        pando_git(
+            state,
+            &verify.0,
+            &["update-ref", "--no-deref", name, oid],
+            lease,
+            deadline,
+        )
+        .await?;
+    }
+    pando_git(state, &verify.0, &["symbolic-ref", "HEAD", &snapshot.head_ref], lease, deadline).await?;
+    pando_git(state, &verify.0, &["fsck", "--full", "--strict"], lease, deadline).await?;
+    let raw = pando_git(state, &verify.0, &["for-each-ref", "--format=%(refname) %(objectname)"], lease, deadline)
+        .await?;
+    let text = String::from_utf8(raw)?;
+    let mut actual = BTreeMap::new();
+    for line in text.lines() {
+        let (name, oid) = line.split_once(' ').context("invalid compacted Pando ref")?;
+        ensure!(valid_oid(oid) && name.starts_with("refs/"), "invalid compacted Pando ref");
+        ensure!(actual.insert(name.to_owned(), oid.to_owned()).is_none(), "duplicate compacted Pando ref");
+    }
+    ensure!(actual == snapshot.refs, "compaction changed the authoritative Pando refs");
+    Ok(())
 }
 
 fn write_allowed(kind: &str) -> bool {
@@ -146,7 +314,9 @@ pub async fn execute(
         "pando_repack" => repack(state, repo, job, lease, cancel).await,
         "pando_cache_hydrate" => cache_hydrate(state, repo, lease, cancel).await,
         "pando_cache_evict" => {
-            let removed = evict_expired(&state.storage.root, repo.id, policy.cache_max_age_seconds)?;
+            lease.ensure_active().map_err(|error| anyhow::anyhow!(error.1))?;
+            let removed = evict_expired(&state.storage.root, repo.id, policy.cache_max_age_seconds, cancel)?;
+            lease.ensure_active().map_err(|error| anyhow::anyhow!(error.1))?;
             Ok(json!({"cache_files_removed":removed,"remote_deleted":false}))
         }
         _ => bail!("unsupported Pando maintenance job kind"),
@@ -173,10 +343,29 @@ async fn repack(
             && snapshot.source_packs == before.pack_ids,
         "Pando serving snapshot changed before repack"
     );
-    pando_git(state, snapshot.path(), &["repack", "-a", "-d"], lease, deadline).await?;
-    let pack_dir = snapshot.path().join("objects/pack");
+    let all = all_objects(state, snapshot.path(), lease, deadline).await?;
+    ensure!(all.len() <= 1_000_000, "Pando compaction object count exceeds bound");
+    let output = snapshot.path().join(".compact-output");
+    std::fs::DirBuilder::new().mode(0o700).create(&output)?;
+    let list = snapshot.path().join(".compact-objects");
+    let mut input = String::with_capacity(all.len().saturating_mul(41));
+    for oid in all.keys() {
+        input.push_str(oid);
+        input.push('\n');
+    }
+    std::fs::write(&list, input.as_bytes())?;
+    let prefix = output.join("pack");
+    pando_git_input(
+        state,
+        snapshot.path(),
+        &["pack-objects", "-q", prefix.to_str().context("Pando pack prefix path")?],
+        &list,
+        lease,
+        deadline,
+    )
+    .await?;
     let mut packs = Vec::new();
-    for entry in std::fs::read_dir(&pack_dir)? {
+    for entry in std::fs::read_dir(&output)? {
         let path = entry?.path();
         if path.extension().is_some_and(|extension| extension == "pack") {
             packs.push(path);
@@ -186,6 +375,9 @@ async fn repack(
     let pack = packs.pop().expect("single compacted pack");
     let index = pack.with_extension("idx");
     ensure!(index.is_file(), "Pando compaction pack index missing");
+    let packed = packed_objects(state, &pack, lease, deadline).await?;
+    ensure!(packed == all, "Pando compaction did not preserve the complete object set");
+    verify_candidate(state, &snapshot, repo, &pack, &index, lease, deadline).await?;
     let store = PackStore::from_env(state.storage.root.join("pando-pack-work"), state.config.git.clone())?;
     let manifest = lease
         .guard(Box::pin(store.publish(
@@ -210,22 +402,27 @@ async fn repack(
     let tx = client.transaction().await?;
     let row = tx
         .query_one(
-            "SELECT tenant_id,storage_generation,ref_generation,object_format,state,head_ref,pack_ids \
-             FROM pando_repository_states WHERE repository_id=$1 FOR UPDATE",
+            "SELECT r.owner_id,r.storage_backend,r.storage_generation,r.state,r.transition_state,s.tenant_id,s.storage_generation AS pando_generation,s.ref_generation,s.object_format AS pando_format,s.state AS pando_state,s.head_ref,s.pack_ids FROM repositories r JOIN pando_repository_states s ON s.repository_id=r.id WHERE r.id=$1 FOR UPDATE OF r,s",
             &[&repo.id],
         )
         .await?;
     let current_packs: Vec<Uuid> = row.get("pack_ids");
     ensure!(
-        row.get::<_, Uuid>("tenant_id") == before.tenant_id
+        row.get::<_, Uuid>("owner_id") == before.tenant_id
+            && row.get::<_, String>("storage_backend") == "pando"
+            && row.get::<_, String>("state") == "ready"
+            && row.get::<_, String>("transition_state") == "stable"
             && row.get::<_, i64>("storage_generation") == before.storage_generation
+            && row.get::<_, i64>("pando_generation") == before.storage_generation
+            && row.get::<_, Uuid>("tenant_id") == before.tenant_id
             && row.get::<_, i64>("ref_generation") == before.ref_generation
-            && row.get::<_, String>("object_format") == before.object_format
-            && row.get::<_, String>("state") == "serving"
+            && row.get::<_, String>("pando_format") == before.object_format
+            && row.get::<_, String>("pando_state") == "serving"
             && row.get::<_, String>("head_ref") == before.head_ref
             && current_packs == before.pack_ids,
         "Pando pack-set authority changed during compaction"
     );
+    ensure!(!cancel.is_cancelled(), "maintenance lease lost before Pando pack-set CAS");
     let new_packs = vec![manifest.id];
     let changed = tx
         .execute(
@@ -243,6 +440,7 @@ async fn repack(
         )
         .await?;
     ensure!(changed == 1, "Pando pack-set CAS was superseded");
+    ensure!(!cancel.is_cancelled(), "maintenance lease lost before Pando pack-set commit");
     let state_updated = tx
         .execute(
             "UPDATE storage_maintenance_repo_state SET last_repack_at=clock_timestamp(), \
@@ -324,7 +522,7 @@ pub fn cache_incomplete(storage_root: &Path, repo: Uuid, pack_ids: &[Uuid]) -> b
     })
 }
 
-fn expired_ids(cache_dir: &Path, max_age_seconds: i64) -> Result<Vec<Uuid>> {
+fn expired_ids(cache_dir: &Path, max_age_seconds: i64, cancel: Option<&CancellationToken>) -> Result<Vec<Uuid>> {
     if cache_dir_missing(cache_dir) {
         return Ok(Vec::new());
     }
@@ -332,6 +530,9 @@ fn expired_ids(cache_dir: &Path, max_age_seconds: i64) -> Result<Vec<Uuid>> {
     let cutoff = SystemTime::now().checked_sub(Duration::from_secs(max_age_seconds.max(1) as u64));
     let mut expired = HashSet::new();
     for entry in std::fs::read_dir(cache_dir)?.take(10_000) {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            bail!("maintenance lease lost during Pando cache eviction");
+        }
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
         let Some(rest) = name.strip_prefix("pack-") else { continue };
@@ -356,16 +557,22 @@ fn expired_ids(cache_dir: &Path, max_age_seconds: i64) -> Result<Vec<Uuid>> {
 /// Scheduler probe for the configured cache-retention age.
 pub fn cache_evict_due(storage_root: &Path, repo: Uuid, max_age_seconds: i64) -> bool {
     let cache_dir = PackStore::cache_dir(storage_root, repo);
-    expired_ids(&cache_dir, max_age_seconds).is_ok_and(|ids| !ids.is_empty())
+    expired_ids(&cache_dir, max_age_seconds, None).is_ok_and(|ids| !ids.is_empty())
 }
 
 /// Delete only expired local cache pairs. Remote pack bytes and PostgreSQL
 /// manifests are untouched; active snapshots hold hard links to the same
 /// inode, so unlinking a cache name cannot remove bytes from a live reader.
-pub fn evict_expired(storage_root: &Path, repo: Uuid, max_age_seconds: i64) -> Result<u64> {
+pub fn evict_expired(
+    storage_root: &Path,
+    repo: Uuid,
+    max_age_seconds: i64,
+    cancel: &CancellationToken,
+) -> Result<u64> {
     let cache_dir = PackStore::cache_dir(storage_root, repo);
     let mut removed = 0u64;
-    for id in expired_ids(&cache_dir, max_age_seconds)? {
+    for id in expired_ids(&cache_dir, max_age_seconds, Some(cancel))? {
+        ensure!(!cancel.is_cancelled(), "maintenance lease lost during Pando cache eviction");
         for path in [
             cache_dir.join(format!("pack-{id}.pack")),
             cache_dir.join(format!("pack-{id}.idx")),

@@ -89,9 +89,34 @@ conservative admission estimate; an actual ENOSPC remains retryable without
 discarding retained objects. An oversized or malformed object listing
 fails closed.
 
-Migration 112 reserves `pando_*` job kinds in the same durable queue. The
-GitFS scheduler does not enqueue them and its worker rejects them until the
-production Pando gateway can resolve pack manifests from PostgreSQL and
-verify ref, CI, workspace, migration, and backup retention before remote
-deletion. S3 listing and synthetic Pando lab commands are not retention
-authorities.
+Pando repositories use the PostgreSQL ref set and committed `pack_ids` as
+authority. The scheduler enqueues `pando_repack` when that serving pack count
+reaches `ROOTYARD_STORAGE_REPACK_PACKS`. Compaction materializes the exact
+serving closure, enumerates every object in the old pack set with
+`git cat-file --batch-all-objects`, and feeds that exact OID list to
+`git pack-objects`; it does not use reachability pruning. The candidate pack
+must contain the complete old object set (including objects no ref names),
+must pass `git fsck --full --strict`, and must reproduce every authoritative
+ref before its manifest is published. The serving `pack_ids` replacement is a
+row-locked CAS that also revalidates repository backend, state, tenant,
+storage generation, transition state, ref generation and the exact old pack
+list. Old pack manifests and remote ciphertext are retained, so compaction is
+non-pruning by construction.
+
+`pando_cache_hydrate` recovers each committed pack into a disposable local
+cache and reconstructs the full serving snapshot. `pando_cache_evict` removes
+only cache pairs older than `ROOTYARD_STORAGE_CACHE_MAX_AGE_SECONDS`. Every
+cache hit is checked against both manifest plaintext SHA-256 digests and byte
+lengths before use; a same-size corrupt or substituted pair is discarded and
+exactly recovered from PostgreSQL plus remote storage. Cache state is never an
+authority: fallback uses an isolated snapshot directory, so concurrent cache
+replacement or eviction cannot turn a valid read into a failed one.
+
+`pando_unreachable_mark` and `pando_tombstone_delete` remain disabled. Remote
+ciphertext keys are tenant-wide content addresses, and no object-level pack
+index, global content-reference closure (including backups and SQL pins), or
+remote-deletion fence currently proves an artifact is unreferenced. S3 listing
+and synthetic Pando lab commands are not retention authorities. Enabling those
+kinds requires a durable object-to-pack index, a reference-count or retention
+registry covering every backup generation, and a remote delete intent/fence
+that is audited before the first destructive call.
