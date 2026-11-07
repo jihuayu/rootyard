@@ -21,6 +21,7 @@ use crate::{
         rules,
     },
     web::{
+        detail_pagination::{self, DetailPageQuery, DetailPager, Kind},
         native_reads,
         models::{
             BlobPreview, COMMENT_FIELDS, CommentViewItem, ISSUE_FIELDS, IssueViewItem,
@@ -328,31 +329,47 @@ pub async fn create_issue_web(State(state): App, Path((owner, name)): RepoPath, 
     .map_err(Error::internal)?
 }
 
-async fn load_issue_and_comments(tx: &Transaction<'_>, tenant_id: Uuid, repo_id: Uuid, number: i64) -> Result<(IssueViewItem, Vec<CommentViewItem>), Error> {
+/// One bounded comment page: `number > after ORDER BY number ASC LIMIT 101`
+/// renders 100 rows plus the probe row that only reports `next_after`.
+async fn load_issue_and_comments_after(tx: &Transaction<'_>, tenant_id: Uuid, repo_id: Uuid, number: i64, after: i64) -> Result<(IssueViewItem, Vec<CommentViewItem>, Option<i64>), Error> {
     let q = format!("SELECT {ISSUE_FIELDS} FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND number=$3");
     let row = tx.query_opt(&q, &[&tenant_id, &repo_id, &number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let issue = WebIssue::from_row(&row);
     let author_username = lookup_username(tx, issue.author_id).await?;
-    let cq = format!("SELECT {COMMENT_FIELDS} FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 ORDER BY number ASC LIMIT 100");
-    let c_rows = tx.query(&cq, &[&tenant_id, &repo_id, &number]).await.map_err(Error::internal)?;
-    let mut comments = Vec::with_capacity(c_rows.len());
-    for cr in &c_rows {
+    let comment_count: i64 = tx.query_one("SELECT count(*) FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3", &[&tenant_id, &repo_id, &number]).await.map_err(Error::internal)?.get(0);
+    let cq = format!("SELECT {COMMENT_FIELDS} FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number>$4 ORDER BY number ASC LIMIT $5");
+    let c_rows = tx.query(&cq, &[&tenant_id, &repo_id, &number, &after, &detail_pagination::FETCH_LIMIT]).await.map_err(Error::internal)?;
+    let page_len = detail_pagination::PAGE_SIZE as usize;
+    let mut comments = Vec::with_capacity(c_rows.len().min(page_len));
+    for cr in c_rows.iter().take(page_len) {
         let comment = WebComment::from_row(cr);
         let c_author = lookup_username(tx, comment.author_id).await?;
         comments.push(CommentViewItem { comment, author_username: c_author });
     }
-    let item = IssueViewItem { issue, author_username, comment_count: comments.len() as i64 };
+    let next_after = if c_rows.len() > page_len { comments.last().map(|c| c.comment.number) } else { None };
+    let item = IssueViewItem { issue, author_username, comment_count };
+    Ok((item, comments, next_after))
+}
+
+/// Mutation responses always re-render the first page; the GET detail view is
+/// the only caller that can resume from a cursor.
+async fn load_issue_and_comments(tx: &Transaction<'_>, tenant_id: Uuid, repo_id: Uuid, number: i64) -> Result<(IssueViewItem, Vec<CommentViewItem>), Error> {
+    let (item, comments, _) = load_issue_and_comments_after(tx, tenant_id, repo_id, number, 0).await?;
     Ok((item, comments))
 }
 
-pub async fn issue_detail_view(State(state): App, Path((owner, name, number)): NumPath, headers: HeaderMap) -> Res {
+pub async fn issue_detail_view(State(state): App, Path((owner, name, number)): NumPath, Query(page): Query<DetailPageQuery>, headers: HeaderMap) -> Res {
     positive(number)?;
     let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let pager = DetailPager::new(actor.id, access.repo_id, number, Kind::IssueComments);
+    let after = pager.resume_after(page.cursor.as_deref())?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let (item, comments) = load_issue_and_comments(&tx, access.owner_id, access.repo_id, number).await?;
+    let (item, comments, next_after) = load_issue_and_comments_after(&tx, access.owner_id, access.repo_id, number, after).await?;
     finish(tx, &actor, false).await?;
-    Ok(html_response(StatusCode::OK, templates::render_issue_detail_view(&header_ctx, &item, &comments)))
+    let html = templates::render_issue_detail_view(&header_ctx, &item, &comments);
+    let body = templates::attach_next_page_nav(html, pager.next_cursor(next_after).as_deref(), "Older comments");
+    Ok(html_response(StatusCode::OK, body))
 }
 
 pub async fn update_issue_web(State(state): App, Path((owner, name, number)): NumPath, headers: HeaderMap, Json(input): Json<WebIssuePatch>) -> Res {
@@ -419,7 +436,7 @@ pub async fn pulls_list_view(State(state): App, Path((owner, name)): RepoPath, Q
     Ok(html_response(StatusCode::OK, templates::render_pulls_list_view(&header_ctx, &items, filter_str, next_after)))
 }
 
-async fn render_pull_detail_for_number(state: &Arc<AppState>, owner: &str, name: &str, number: i64, headers: &HeaderMap, status: StatusCode) -> Res {
+async fn render_pull_detail_for_number(state: &Arc<AppState>, owner: &str, name: &str, number: i64, headers: &HeaderMap, status: StatusCode, page: Option<&DetailPageQuery>) -> Res {
     positive(number)?;
     let (actor, access, header_ctx) = authorize_web_repo(state, headers, owner, name, Role::Read).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
@@ -428,9 +445,16 @@ async fn render_pull_detail_for_number(state: &Arc<AppState>, owner: &str, name:
     let row = tx.query_opt(&q, &[&access.owner_id, &access.repo_id, &number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let pull = PullRequest::row(&row);
     let author_username = lookup_username(&tx, pull.author_id).await?;
-    let rq = format!("SELECT {REVIEW_FIELDS} FROM forge_pull_reviews WHERE tenant_id=$1 AND repository_id=$2 AND pull_number=$3 ORDER BY number ASC LIMIT 100");
-    let r_rows = tx.query(&rq, &[&access.owner_id, &access.repo_id, &number]).await.map_err(Error::internal)?;
-    let reviews: Vec<_> = r_rows.iter().map(PullReview::row).collect();
+    let pager = DetailPager::new(actor.id, access.repo_id, number, Kind::PullReviews);
+    let review_after = match page {
+        Some(page) => pager.resume_after(page.cursor.as_deref())?,
+        None => 0,
+    };
+    let rq = format!("SELECT {REVIEW_FIELDS} FROM forge_pull_reviews WHERE tenant_id=$1 AND repository_id=$2 AND pull_number=$3 AND number>$4 ORDER BY number ASC LIMIT $5");
+    let r_rows = tx.query(&rq, &[&access.owner_id, &access.repo_id, &number, &review_after, &detail_pagination::FETCH_LIMIT]).await.map_err(Error::internal)?;
+    let page_len = detail_pagination::PAGE_SIZE as usize;
+    let reviews: Vec<_> = r_rows.iter().take(page_len).map(PullReview::row).collect();
+    let next_reviews = if r_rows.len() > page_len { reviews.last().map(|r| r.number) } else { None };
     let checks = query_commit_checks(&tx, access.owner_id, access.repo_id, &pull.head_oid, 0, 50).await?;
     let policy = rules::evaluate_branch_policy(&tx, access.owner_id, access.repo_id, pull.number, &pull.base_ref, &pull.head_oid).await?;
     let disallow_self = rules::is_self_approval_disallowed(&tx, access.owner_id, access.repo_id, &pull.base_ref, pull.author_id).await?;
@@ -449,7 +473,9 @@ async fn render_pull_detail_for_number(state: &Arc<AppState>, owner: &str, name:
     let fast_forward = merge_base_oid.as_deref() == Some(pull.base_oid.as_str());
     let diff = PullDiffResponse { pull_number: pull.number, base_ref: pull.base_ref.clone(), head_ref: pull.head_ref.clone(), base_oid: pull.base_oid.clone(), head_oid: pull.head_oid.clone(), merge_base_oid, fast_forward, diff: String::from_utf8_lossy(&diff_raw).into_owned() };
     let view_data = PullDetailViewData { pull, author_username, reviews, checks, policy, diff, disallow_self_approval: disallow_self, can_approve, can_merge };
-    Ok(html_response(status, templates::render_pull_detail_view(&header_ctx, &view_data)))
+    let html = templates::render_pull_detail_view(&header_ctx, &view_data);
+    let body = templates::attach_next_page_nav(html, pager.next_cursor(next_reviews).as_deref(), "Older reviews");
+    Ok(html_response(status, body))
 }
 
 pub async fn create_pull_web(State(state): App, Path((owner, name)): RepoPath, headers: HeaderMap, Json(input): Json<NewPull>) -> Res {
@@ -459,33 +485,33 @@ pub async fn create_pull_web(State(state): App, Path((owner, name)): RepoPath, h
     let status = api_resp.status();
     let body_bytes = axum::body::to_bytes(api_resp.into_body(), 256 * 1024).await.map_err(Error::internal)?;
     let pr: PullRequest = serde_json::from_slice(&body_bytes).map_err(Error::internal)?;
-    render_pull_detail_for_number(&state, &owner, &name, pr.number, &norm, status).await
+    render_pull_detail_for_number(&state, &owner, &name, pr.number, &norm, status, None).await
 }
 
-pub async fn pull_detail_view(State(state): App, Path((owner, name, number)): NumPath, headers: HeaderMap) -> Res {
-    render_pull_detail_for_number(&state, &owner, &name, number, &headers, StatusCode::OK).await
+pub async fn pull_detail_view(State(state): App, Path((owner, name, number)): NumPath, Query(page): Query<DetailPageQuery>, headers: HeaderMap) -> Res {
+    render_pull_detail_for_number(&state, &owner, &name, number, &headers, StatusCode::OK, Some(&page)).await
 }
 
 pub async fn update_pull_web(State(state): App, Path((owner, name, number)): NumPath, headers: HeaderMap, Json(input): Json<PullPatch>) -> Res {
     member_models::ensure_schema(&state.pool).await?;
     let norm = normalize_web_headers(&headers);
     let api_resp = pull_handlers::update_pull(State(state.clone()), Path((owner.clone(), name.clone(), number)), norm.clone(), Json(input)).await?;
-    render_pull_detail_for_number(&state, &owner, &name, number, &norm, api_resp.status()).await
+    render_pull_detail_for_number(&state, &owner, &name, number, &norm, api_resp.status(), None).await
 }
 
-pub async fn pull_diff_view(State(state): App, Path((owner, name, number)): NumPath, headers: HeaderMap) -> Res {
-    render_pull_detail_for_number(&state, &owner, &name, number, &headers, StatusCode::OK).await
+pub async fn pull_diff_view(State(state): App, Path((owner, name, number)): NumPath, Query(page): Query<DetailPageQuery>, headers: HeaderMap) -> Res {
+    render_pull_detail_for_number(&state, &owner, &name, number, &headers, StatusCode::OK, Some(&page)).await
 }
 
-pub async fn pull_reviews_view(State(state): App, Path((owner, name, number)): NumPath, headers: HeaderMap) -> Res {
-    render_pull_detail_for_number(&state, &owner, &name, number, &headers, StatusCode::OK).await
+pub async fn pull_reviews_view(State(state): App, Path((owner, name, number)): NumPath, Query(page): Query<DetailPageQuery>, headers: HeaderMap) -> Res {
+    render_pull_detail_for_number(&state, &owner, &name, number, &headers, StatusCode::OK, Some(&page)).await
 }
 
 pub async fn create_review_web(State(state): App, Path((owner, name, number)): NumPath, headers: HeaderMap, Json(input): Json<NewReview>) -> Res {
     member_models::ensure_schema(&state.pool).await?;
     let norm = normalize_web_headers(&headers);
     let api_resp = pull_handlers::create_review(State(state.clone()), Path((owner.clone(), name.clone(), number)), norm.clone(), Json(input)).await?;
-    render_pull_detail_for_number(&state, &owner, &name, number, &norm, api_resp.status()).await
+    render_pull_detail_for_number(&state, &owner, &name, number, &norm, api_resp.status(), None).await
 }
 
 pub async fn pull_checks_view(State(state): App, Path((owner, name, number)): NumPath, Query(query): Query<WebCheckPanelQuery>, headers: HeaderMap) -> Res {
@@ -505,7 +531,7 @@ pub async fn merge_pull_web(State(state): App, Path((owner, name, number)): NumP
     member_models::ensure_schema(&state.pool).await?;
     let norm = normalize_web_headers(&headers);
     let api_resp = pull_merge::merge_pull(State(state.clone()), Path((owner.clone(), name.clone(), number)), norm.clone(), Json(input)).await?;
-    render_pull_detail_for_number(&state, &owner, &name, number, &norm, api_resp.status()).await
+    render_pull_detail_for_number(&state, &owner, &name, number, &norm, api_resp.status(), None).await
 }
 
 pub async fn audit_view(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<AuditQuery>, headers: HeaderMap) -> Res {

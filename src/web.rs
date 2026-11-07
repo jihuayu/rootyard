@@ -3,6 +3,7 @@
 //! commit history, commit diffs, branch comparison, Issues, Pull Requests, Reviews,
 //! Check Run status panels, atomic Pull Request merge, and RBAC audit logs under
 //! `/web/repos/{owner}/{name}...` and `/ui/repos/{owner}/{name}...`.
+pub mod detail_pagination;
 pub mod handlers;
 pub mod models;
 pub mod native_reads;
