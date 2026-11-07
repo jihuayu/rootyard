@@ -16,8 +16,7 @@ fn main() -> Result<()> {
         if !cfg!(target_os = "linux") {
             bail!("workspace FUSE helper requires Linux");
         }
-        return rootyard::workspace_lab::fuse_helper::run_child()
-            .context("workspace FUSE helper stopped");
+        return rootyard::workspace_lab::fuse_helper::run_child().context("workspace FUSE helper stopped");
     }
     let name = std::path::Path::new(&args[0]).file_name().and_then(|v| v.to_str()).unwrap_or("");
     match name {

@@ -18,9 +18,7 @@
 //! different FUSE inode per path. It exercises same-host-offset ordering without
 //! the VFS serializing the two aliases on one inode lock. It does not claim that
 //! production hardlink semantics are complete.
-use rootyard::workspace_lab::fuse_mount::{
-    DispatchQueueUsage, MountHandle, MutationGate, Overlay, spawn,
-};
+use rootyard::workspace_lab::fuse_mount::{DispatchQueueUsage, MountHandle, MutationGate, Overlay, spawn};
 use std::{
     fs::{self, OpenOptions},
     os::unix::fs::{FileExt, MetadataExt},
@@ -40,10 +38,7 @@ fn native() -> bool {
 }
 
 fn enter_native() -> std::sync::MutexGuard<'static, ()> {
-    assert!(
-        native(),
-        "set ROOTYARD_FUSE_NATIVE=1 to run this ignored native FUSE test"
-    );
+    assert!(native(), "set ROOTYARD_FUSE_NATIVE=1 to run this ignored native FUSE test");
     NATIVE_TESTS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -61,11 +56,7 @@ fn wait_until(mut predicate: impl FnMut() -> bool, label: &str) {
 /// Per-mount work only. The process-wide helper counters may still be charged by
 /// another deliberately frozen mount in the same test.
 fn mount_drained(usage: DispatchQueueUsage) -> bool {
-    usage.mount_ops == 0
-        && usage.mount_bytes == 0
-        && usage.ready == 0
-        && usage.frozen == 0
-        && usage.pending_reads == 0
+    usage.mount_ops == 0 && usage.mount_bytes == 0 && usage.ready == 0 && usage.frozen == 0 && usage.pending_reads == 0
 }
 
 /// Every queue/budget counter, but not the cumulative diagnostics: an observed
@@ -161,10 +152,7 @@ fn frozen_readwrite_aliases_drain_in_fifo_order_and_other_mount_stays_live() {
             second_tx.send(second.write_at(b"second", 0)).unwrap();
         });
         wait_until(|| handle.queue_usage().frozen >= 2, "second frozen write to park");
-        assert!(
-            second_rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "the second frozen write must also block"
-        );
+        assert!(second_rx.recv_timeout(Duration::from_millis(300)).is_err(), "the second frozen write must also block");
 
         // A second real mount owns a different gate, actor and queue. It must
         // create/write/read while the first mount is frozen.
@@ -185,11 +173,7 @@ fn frozen_readwrite_aliases_drain_in_fifo_order_and_other_mount_stays_live() {
 
         thaw_tx.send(()).unwrap();
         freezer.join().unwrap();
-        assert_eq!(
-            first_rx.recv_timeout(WAIT).unwrap().unwrap(),
-            6,
-            "the first alias write must complete after thaw"
-        );
+        assert_eq!(first_rx.recv_timeout(WAIT).unwrap().unwrap(), 6, "the first alias write must complete after thaw");
         assert_eq!(
             second_rx.recv_timeout(WAIT).unwrap().unwrap(),
             6,
@@ -256,11 +240,7 @@ fn rapid_freeze_fence_handoff_cannot_replay_the_old_epoch_when_fenced_is_missed(
         fs::write(&path, b"origin").unwrap();
         // Open the write description while this epoch is healthy, so only the
         // Write request itself can be parked by the freeze.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(mount.join(&name))
-            .expect("pre-freeze write-open");
+        let file = OpenOptions::new().read(true).write(true).open(mount.join(&name)).expect("pre-freeze write-open");
         wait_until_queue_drained(&handle, "pre-freeze open to drain");
         let before = handle.queue_usage();
         let next = epoch + 1;
@@ -294,11 +274,9 @@ fn rapid_freeze_fence_handoff_cannot_replay_the_old_epoch_when_fenced_is_missed(
                 .expect("handoff must authorize the next epoch");
             match write_rx.recv_timeout(WAIT).expect("writer result") {
                 Ok(count) => panic!("the old parked write executed {count} bytes after handoff"),
-                Err(error) => assert_eq!(
-                    error.raw_os_error(),
-                    Some(libc::EROFS),
-                    "the old parked write must fail EROFS"
-                ),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EROFS), "the old parked write must fail EROFS")
+                }
             }
         });
 
@@ -314,17 +292,11 @@ fn rapid_freeze_fence_handoff_cannot_replay_the_old_epoch_when_fenced_is_missed(
         if fenced == 0 {
             // The actor never saw Fenced. The only acceptable reason the write
             // failed is the enqueue-era epoch stamp rejecting it after handoff.
-            assert!(
-                rejected > 0,
-                "a zero fence-observation round must be explained by an epoch-mismatch rejection"
-            );
+            assert!(rejected > 0, "a zero fence-observation round must be explained by an epoch-mismatch rejection");
             covered_missed_fence = true;
             // The new epoch must accept a normal write.
-            let current = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(mount.join(&name))
-                .expect("new-epoch write-open");
+            let current =
+                OpenOptions::new().read(true).write(true).open(mount.join(&name)).expect("new-epoch write-open");
             assert_eq!(current.write_at(b"fresh!", 0).unwrap(), 6);
             assert_eq!(fs::read(mount.join(&name)).unwrap(), b"fresh!");
             assert_eq!(fs::read(&path).unwrap(), b"fresh!");

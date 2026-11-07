@@ -59,8 +59,8 @@ pub(super) fn remote_store(state: &AppState) -> Result<RemoteObjectStore, Error>
 /// The independent FUSE helper uses this instead of an `AppState`, so the child
 /// never needs PostgreSQL or the service configuration.
 pub(super) fn store_at(root: &std::path::Path) -> Result<RemoteObjectStore, Error> {
-    let store = RemoteObjectStore::from_env(root.join("workspace-service/local-object-cache"))
-        .map_err(Error::internal)?;
+    let store =
+        RemoteObjectStore::from_env(root.join("workspace-service/local-object-cache")).map_err(Error::internal)?;
     if matches!(store, RemoteObjectStore::Local(_)) {
         return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "remote object store is not configured"));
     }

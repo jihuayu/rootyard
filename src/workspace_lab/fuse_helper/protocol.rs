@@ -244,9 +244,8 @@ pub enum Body {
 }
 
 fn decode_args<T: serde::de::DeserializeOwned>(op: &str, args: Value) -> io::Result<T> {
-    serde_json::from_value(args).map_err(|error| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("invalid helper frame `{op}`: {error}"))
-    })
+    serde_json::from_value(args)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("invalid helper frame `{op}`: {error}")))
 }
 
 impl Body {
@@ -322,10 +321,7 @@ impl Body {
             "shutting_down" => Body::ShuttingDown,
             "error" => Body::Error(decode_args(op, args)?),
             other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown helper operation `{other}`"),
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown helper operation `{other}`")));
             }
         })
     }
@@ -404,10 +400,7 @@ mod tests {
             }
             other => panic!("unexpected body {other:?}"),
         }
-        assert!(matches!(
-            roundtrip(Body::Observe(Observe { epoch: 2, until: 30 })),
-            Body::Observe(_)
-        ));
+        assert!(matches!(roundtrip(Body::Observe(Observe { epoch: 2, until: 30 })), Body::Observe(_)));
         assert!(matches!(roundtrip(Body::Unmount), Body::Unmount));
     }
 

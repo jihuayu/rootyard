@@ -525,7 +525,11 @@ fn a_higher_observation_advances_the_marker_even_while_fenced() {
     assert_eq!(gate.handoff(3, deadline()).unwrap_err().raw_os_error(), Some(libc::ESTALE));
     assert_eq!(gate.epoch(), 1);
     assert_eq!(gate.phase(), GatePhase::Fenced);
-    assert_eq!(gate.observe_lease(3, deadline()), LeaseObservation::Stale, "an observation below the highest is ignored");
+    assert_eq!(
+        gate.observe_lease(3, deadline()),
+        LeaseObservation::Stale,
+        "an observation below the highest is ignored"
+    );
     assert!(gate.is_fenced());
     gate.handoff(4, deadline()).expect("the highest observed epoch restores writes");
     assert_eq!(gate.epoch(), 4);

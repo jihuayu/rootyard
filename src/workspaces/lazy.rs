@@ -316,11 +316,7 @@ impl Reader {
     /// remaining budget, and each single-blob hydration is bounded by the
     /// smaller of that remaining time and the configured per-blob timeout, so
     /// four paths cannot turn one 60s admission into 240s of work.
-    pub(crate) fn prewarm_until(
-        &self,
-        paths: &[PathBuf],
-        deadline: std::time::Instant,
-    ) -> io::Result<(usize, u64)> {
+    pub(crate) fn prewarm_until(&self, paths: &[PathBuf], deadline: std::time::Instant) -> io::Result<(usize, u64)> {
         let mut count = 0;
         let mut bytes = 0;
         for path in paths {
@@ -378,11 +374,8 @@ impl Flight {
     /// the existing `EIO`. Neither case cancels the shared leader, which stays
     /// owned by the original caller that created the flight.
     fn wait_until(&self, caller_deadline: std::time::Instant) -> io::Result<()> {
-        let (limit, timeout_error): (std::time::Instant, fn() -> io::Error) = if caller_deadline < self.deadline {
-            (caller_deadline, etimedout)
-        } else {
-            (self.deadline, eio)
-        };
+        let (limit, timeout_error): (std::time::Instant, fn() -> io::Error) =
+            if caller_deadline < self.deadline { (caller_deadline, etimedout) } else { (self.deadline, eio) };
         #[cfg(test)]
         self.waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let result = self.wait_bounded(limit, timeout_error);

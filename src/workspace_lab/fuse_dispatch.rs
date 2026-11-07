@@ -40,8 +40,8 @@
 use super::inner_ops::{ReadPlan, read_at};
 use super::owned_ops::OwnedOp;
 use super::*;
-use fuser::ReplyData;
 use budget::{Budget, Permit, global_budget};
+use fuser::ReplyData;
 use read_pool::{ReadJob, ReadPool, global as global_read_pool};
 use std::collections::VecDeque;
 use std::sync::{
@@ -198,10 +198,7 @@ impl Shared {
     }
 
     fn diagnostics(&self) -> (usize, usize) {
-        (
-            self.fence_observations.load(Ordering::Relaxed),
-            self.epoch_mismatch_rejections.load(Ordering::Relaxed),
-        )
+        (self.fence_observations.load(Ordering::Relaxed), self.epoch_mismatch_rejections.load(Ordering::Relaxed))
     }
 
     fn push_ready(&self, queued: Queued) -> Option<Queued> {

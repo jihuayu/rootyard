@@ -99,10 +99,7 @@ pub fn helper_env<F>(lookup: F) -> Vec<(String, OsString)>
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    INHERITED_ENV
-        .iter()
-        .filter_map(|name| lookup(name).map(|value| ((*name).to_owned(), value)))
-        .collect()
+    INHERITED_ENV.iter().filter_map(|name| lookup(name).map(|value| ((*name).to_owned(), value))).collect()
 }
 
 /// Validate the parent-supplied storage root inside the child.
@@ -136,9 +133,7 @@ mod tests {
         let names = ["PATH", "DATABASE_URL", "ROOTYARD_API_TOKEN", "VAULT_TOKEN", "AWS_SECRET_ACCESS_KEY"];
         let env = helper_env(|name| names.contains(&name).then(|| OsString::from(format!("value-{name}"))));
         assert_eq!(env, vec![("PATH".to_owned(), OsString::from("value-PATH"))]);
-        let env = helper_env(|name| {
-            (name == "ROOTYARD_OBJECT_STORE_SECRET_KEY").then(|| OsString::from("s3-secret"))
-        });
+        let env = helper_env(|name| (name == "ROOTYARD_OBJECT_STORE_SECRET_KEY").then(|| OsString::from("s3-secret")));
         assert_eq!(env.len(), 1);
         assert!(helper_env(|name| (name == "DATABASE_URL").then(|| OsString::from("postgres://x"))).is_empty());
     }

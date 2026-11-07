@@ -30,7 +30,6 @@ impl Reservation {
     fn new(helper_generation: u64) -> Self {
         Self { token: Uuid::new_v4(), helper_generation }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,12 +116,7 @@ impl<C: Clone, I> Registry<C, I> {
     /// Exactly one caller can receive `Reserved` for a workspace while no
     /// confirmed/in-process mount exists. Losers see `Pending` and must not
     /// send a mount RPC or cancel anything on the shared workspace.
-    pub(crate) fn admit(
-        shared: &Arc<Mutex<Self>>,
-        id: Uuid,
-        client: C,
-        helper_generation: u64,
-    ) -> Admission<C, I> {
+    pub(crate) fn admit(shared: &Arc<Mutex<Self>>, id: Uuid, client: C, helper_generation: u64) -> Admission<C, I> {
         let mut registry = lock(shared);
         match registry.entries.get(&id) {
             Some(MountEntry::InProcess(_)) => Admission::InProcess,
@@ -134,16 +128,10 @@ impl<C: Clone, I> Registry<C, I> {
             },
             None => {
                 let reservation = Reservation::new(helper_generation);
-                registry.entries.insert(
-                    id,
-                    MountEntry::Helper(HelperSlot { client, state: HelperState::Pending(reservation) }),
-                );
-                Admission::Reserved(ReservationGuard {
-                    registry: shared.clone(),
-                    id,
-                    reservation,
-                    armed: true,
-                })
+                registry
+                    .entries
+                    .insert(id, MountEntry::Helper(HelperSlot { client, state: HelperState::Pending(reservation) }));
+                Admission::Reserved(ReservationGuard { registry: shared.clone(), id, reservation, armed: true })
             }
         }
     }
@@ -206,9 +194,7 @@ impl<C, I> ReservationGuard<C, I> {
     pub(crate) fn promote(&mut self, client: C) -> Result<(), PromoteConflict> {
         let mut registry = lock(&self.registry);
         let matched = match registry.entries.get_mut(&self.id) {
-            Some(MountEntry::Helper(slot))
-                if slot.state == HelperState::Pending(self.reservation) =>
-            {
+            Some(MountEntry::Helper(slot)) if slot.state == HelperState::Pending(self.reservation) => {
                 slot.client = client;
                 slot.state = HelperState::Confirmed { helper_generation: self.reservation.helper_generation };
                 true
@@ -289,11 +275,7 @@ mod tests {
                 won
             }));
         }
-        let winners = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .filter(|won| *won)
-            .count();
+        let winners = handles.into_iter().map(|handle| handle.join().unwrap()).filter(|won| *won).count();
         assert_eq!(winners, 1, "two concurrent ensures must not both own the mount RPC");
     }
 
@@ -338,10 +320,7 @@ mod tests {
         registry.lock().unwrap().insert_in_process(id, ());
 
         assert!(matches!(TestRegistry::admit(&registry, id, TestClient(1), 7), Admission::InProcess));
-        assert!(matches!(
-            registry.lock().unwrap().get(&id),
-            Some(MountEntry::InProcess(()))
-        ));
+        assert!(matches!(registry.lock().unwrap().get(&id), Some(MountEntry::InProcess(()))));
     }
 
     #[test]

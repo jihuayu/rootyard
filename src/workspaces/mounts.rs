@@ -18,6 +18,7 @@
 //! after the lease transaction committed a new `lease_epoch`, `prepare` ran with
 //! database authorization, and `with_frozen*` still classifies a proven
 //! pre-COMMIT rollback as the only case that may thaw the old epoch.
+#[path = "mounts/registry.rs"]
 mod registry;
 
 use self::registry::{Admission, MountEntry, Registry};
@@ -172,9 +173,7 @@ pub async fn refresh_leases(state: &AppState) -> Result<(), Error> {
         let mut helpers = Vec::new();
         for (id, mount) in mounts.iter() {
             match mount {
-                MountEntry::InProcess(slot) => {
-                    in_process.push((*id, slot.gate.clone(), slot.gate.lease_marker()))
-                }
+                MountEntry::InProcess(slot) => in_process.push((*id, slot.gate.clone(), slot.gate.lease_marker())),
                 MountEntry::Helper(slot) if !slot.is_pending() => helpers.push((*id, slot.client.clone())),
                 // An unconfirmed mount has no published gate to refresh.
                 MountEntry::Helper(_) => {}
@@ -352,7 +351,10 @@ pub async fn with_frozen_async<T>(
         Release::KnownRollback => FreezeDecision::Thaw,
         Release::Fence => FreezeDecision::Fence,
     };
-    tokio::task::spawn_blocking(move || token.finish(decision)).await.map_err(Error::internal)?.map_err(helper_error)?;
+    tokio::task::spawn_blocking(move || token.finish(decision))
+        .await
+        .map_err(Error::internal)?
+        .map_err(helper_error)?;
     outcome
 }
 
@@ -403,10 +405,9 @@ fn ensure_helper(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Resul
     // sends the mount RPC; a concurrent ensure sees Pending and returns before
     // touching the shared helper mount.
     match MountRegistry::admit(registry(), id, client.clone(), generation) {
-        Admission::InProcess => Err(Error(
-            StatusCode::CONFLICT,
-            "workspace is already mounted by the in-process backend",
-        )),
+        Admission::InProcess => {
+            Err(Error(StatusCode::CONFLICT, "workspace is already mounted by the in-process backend"))
+        }
         Admission::Pending => Err(Error(
             StatusCode::CONFLICT,
             "workspace mount is still being confirmed by the FUSE helper; retry on the same epoch",
@@ -418,16 +419,11 @@ fn ensure_helper(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Resul
                 return client.handoff(id, db_epoch, until).map_err(helper_error);
             }
             if registry().lock().unwrap().remove_confirmed(id, helper_generation) {
-                return Err(Error::internal(
-                    "workspace FUSE helper is unavailable after a control failure",
-                ));
+                return Err(Error::internal("workspace FUSE helper is unavailable after a control failure"));
             }
             // A newer generation replaced this registration while the failure
             // was observed. Never delete it; the caller retries against it.
-            Err(Error(
-                StatusCode::CONFLICT,
-                "workspace mount changed while the FUSE helper was unavailable; retry",
-            ))
+            Err(Error(StatusCode::CONFLICT, "workspace mount changed while the FUSE helper was unavailable; retry"))
         }
         Admission::Reserved(mut guard) => {
             // The lower tree was prepared by `prepare` under database

@@ -10,10 +10,9 @@
 //! `ECONNRESET` and `alive()` turns false. Nothing here pretends a crashed
 //! child kept serving reads.
 use super::protocol::{
-    ABORT_DEADLINE, AbortFreeze, AbortMount, Body, ErrorReply, FenceIfUnchanged, Frame, FREEZE_DEADLINE,
-    FreezeBegin, FreezeFinish, Handoff, HEARTBEAT_INTERVAL, Heartbeat, Hello, MAX_INFLIGHT, MOUNT_DEADLINE,
-    MountRequest, Observe, PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, PrewarmReply, REQUEST_DEADLINE,
-    StateReply, read_frame, write_frame,
+    ABORT_DEADLINE, AbortFreeze, AbortMount, Body, ErrorReply, FREEZE_DEADLINE, FenceIfUnchanged, Frame, FreezeBegin,
+    FreezeFinish, HEARTBEAT_INTERVAL, Handoff, Heartbeat, Hello, MAX_INFLIGHT, MOUNT_DEADLINE, MountRequest, Observe,
+    PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, PrewarmReply, REQUEST_DEADLINE, StateReply, read_frame, write_frame,
 };
 use crate::workspace_lab::fuse_mount::FreezeDecision;
 use std::{
@@ -133,9 +132,9 @@ impl Inner {
                 // They are decoded before the success-frame epoch check, which
                 // stays strict for every non-error body.
                 Ok(Body::Error(ErrorReply { code, message })) => Err(HelperError::new(code, message)),
-                Ok(body) if expected.db_epoch != 0 && frame.db_epoch != expected.db_epoch => Err(
-                    HelperError::protocol("helper reply does not match the request epoch"),
-                ),
+                Ok(_body) if expected.db_epoch != 0 && frame.db_epoch != expected.db_epoch => {
+                    Err(HelperError::protocol("helper reply does not match the request epoch"))
+                }
                 Ok(body) => Ok(body),
                 Err(error) => Err(HelperError::protocol(error.to_string())),
             }
@@ -206,16 +205,19 @@ impl Inner {
             Ok(result) => (request_id, result),
             Err(RecvTimeoutError::Timeout) => {
                 lock(&self.pending).remove(&request_id);
-                (
-                    request_id,
-                    Err(HelperError::new(libc::ETIMEDOUT, "workspace FUSE helper request deadline expired")),
-                )
+                (request_id, Err(HelperError::new(libc::ETIMEDOUT, "workspace FUSE helper request deadline expired")))
             }
             Err(RecvTimeoutError::Disconnected) => (request_id, Err(HelperError::disconnected())),
         }
     }
 
-    fn call(&self, workspace: Option<Uuid>, db_epoch: i64, body: Body, deadline: Duration) -> Result<Body, HelperError> {
+    fn call(
+        &self,
+        workspace: Option<Uuid>,
+        db_epoch: i64,
+        body: Body,
+        deadline: Duration,
+    ) -> Result<Body, HelperError> {
         self.call_full(workspace, db_epoch, body, deadline).1
     }
 
@@ -232,10 +234,7 @@ impl Inner {
             match status {
                 Ok(Some(status)) if status.success() => return Ok(()),
                 Ok(Some(status)) => {
-                    return Err(HelperError::new(
-                        libc::ECHILD,
-                        format!("workspace FUSE helper exited with {status}"),
-                    ));
+                    return Err(HelperError::new(libc::ECHILD, format!("workspace FUSE helper exited with {status}")));
                 }
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                 Ok(None) => {
@@ -379,7 +378,13 @@ impl HelperClient {
     }
 
     /// Send one request and wait for the matching reply with a deadline.
-    pub fn call(&self, workspace: Option<Uuid>, db_epoch: i64, body: Body, deadline: Duration) -> Result<Body, HelperError> {
+    pub fn call(
+        &self,
+        workspace: Option<Uuid>,
+        db_epoch: i64,
+        body: Body,
+        deadline: Duration,
+    ) -> Result<Body, HelperError> {
         self.inner.call(workspace, db_epoch, body, deadline)
     }
 
@@ -392,10 +397,8 @@ impl HelperClient {
         lease_until: i64,
         lazy: bool,
     ) -> Result<(), HelperError> {
-        let root = root
-            .to_str()
-            .ok_or_else(|| HelperError::new(libc::EINVAL, "storage root is not valid UTF-8"))?
-            .to_owned();
+        let root =
+            root.to_str().ok_or_else(|| HelperError::new(libc::EINVAL, "storage root is not valid UTF-8"))?.to_owned();
         let (request_id, reply) = self.inner.call_full(
             Some(workspace),
             db_epoch,
@@ -450,13 +453,7 @@ impl HelperClient {
     /// task or a panic always has a cancel to send. The returned attempt is
     /// RAII: dropping it without [`FreezeAttempt::begin`] success aborts the op.
     pub fn freeze_attempt(&self, workspace: Uuid, epoch: i64) -> FreezeAttempt {
-        FreezeAttempt {
-            client: self.clone(),
-            workspace,
-            epoch,
-            op_id: self.inner.next_request(),
-            armed: true,
-        }
+        FreezeAttempt { client: self.clone(), workspace, epoch, op_id: self.inner.next_request(), armed: true }
     }
 
     /// Run the child-side blocking prewarm job.
@@ -489,10 +486,7 @@ impl HelperClient {
                 self.inner.join_threads();
                 match request {
                     Ok(Body::ShuttingDown) | Err(HelperError { code: libc::ECONNRESET, .. }) => Ok(()),
-                    Ok(other) => Err(HelperError::protocol(format!(
-                        "unexpected shutdown reply `{}`",
-                        other.op()
-                    ))),
+                    Ok(other) => Err(HelperError::protocol(format!("unexpected shutdown reply `{}`", other.op()))),
                     Err(error) => Err(error),
                 }
             }
@@ -564,11 +558,9 @@ fn abort_worker(inner: Arc<Inner>, jobs: mpsc::Receiver<AbortJob>) {
             Err(RecvTimeoutError::Disconnected) => return,
         };
         let (workspace, epoch, body) = match job {
-            AbortJob::Freeze { workspace, epoch, op_id } => (
-                workspace,
-                epoch,
-                Body::AbortFreeze(AbortFreeze { op_id }),
-            ),
+            AbortJob::Freeze { workspace, epoch, op_id } => {
+                (workspace, epoch, Body::AbortFreeze(AbortFreeze { op_id }))
+            }
             AbortJob::Mount { workspace, request } => (workspace, 0, Body::AbortMount(AbortMount { request })),
         };
         let _ = inner.call(Some(workspace), epoch, body, ABORT_DEADLINE);

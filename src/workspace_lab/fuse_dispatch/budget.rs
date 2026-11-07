@@ -76,4 +76,3 @@ impl Drop for Permit {
         self.mount.release(self.bytes);
     }
 }
-

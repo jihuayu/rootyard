@@ -5,12 +5,10 @@
 //! never across a filesystem walk, a session join or an RPC write, and every
 //! operation has an independent deadline so a caller that disappeared cannot
 //! park a gate or a per-workspace slot forever.
-use super::super::protocol::{
-    Body, FREEZE_OP_DEADLINE, MountRequest, MountedReply, OkReply, PrewarmReply,
-};
+use super::super::protocol::{Body, FREEZE_OP_DEADLINE, MountRequest, MountedReply, OkReply, PrewarmReply};
 use super::{
-    FreezeOp, MOUNT_QUEUE_CAPACITY, Mounted, PendingMount, State, TOMBSTONES, gate_for, lock, reply, reply_error,
-    reply_errno,
+    FreezeOp, MOUNT_QUEUE_CAPACITY, Mounted, PendingMount, State, TOMBSTONES, gate_for, lock, reply, reply_errno,
+    reply_error,
 };
 use crate::workspace_lab::fuse_helper::{validate_root, workspace_paths};
 use crate::workspace_lab::fuse_mount::{FreezeDecision, LazySource, MutationGate, Overlay, spawn as spawn_mount};
@@ -129,9 +127,7 @@ pub(super) fn mount(
     // Idempotent retry: a mount whose reply was lost may already be published
     // at exactly this epoch and root. Reuse it instead of failing with EEXIST
     // forever; anything else must be reconciled explicitly.
-    let existing = lock(&state.mounts)
-        .get(&body.workspace)
-        .map(|mount| (mount.gate.epoch(), mount.root.clone()));
+    let existing = lock(&state.mounts).get(&body.workspace).map(|mount| (mount.gate.epoch(), mount.root.clone()));
     if let Some((epoch, root)) = existing {
         let same_root = root == Path::new(&body.root)
             || validate_root(&body.root).map(|candidate| candidate == root).unwrap_or(false);
@@ -162,7 +158,9 @@ pub(super) fn mount(
         return reply_error(state, request, workspace, code, message);
     }
     match build(state, &body, db_epoch, &cancel, deadline) {
-        Ok((handle, gate, reader, root)) => publish(state, request, workspace, body.workspace, handle, gate, reader, root),
+        Ok((handle, gate, reader, root)) => {
+            publish(state, request, workspace, body.workspace, handle, gate, reader, root)
+        }
         Err((code, message)) => {
             remove_pending(state, body.workspace, request);
             reply_error(state, request, workspace, code, message);
@@ -179,9 +177,8 @@ fn build(
     cancel: &AtomicBool,
     deadline: Instant,
 ) -> Result<Built, (i32, String)> {
-    let root = validate_root(&body.root).map_err(|error| {
-        (error.raw_os_error().unwrap_or(libc::EINVAL), format!("helper root rejected: {error}"))
-    })?;
+    let root = validate_root(&body.root)
+        .map_err(|error| (error.raw_os_error().unwrap_or(libc::EINVAL), format!("helper root rejected: {error}")))?;
     let paths = workspace_paths(&root, body.workspace);
     if !paths.lower.join(".git").is_dir() {
         return Err((libc::ENOENT, "workspace lower Git state missing".into()));
@@ -199,7 +196,7 @@ fn build(
     checkpoint(cancel, deadline)?;
     let reader = if body.lazy {
         match Reader::open_root(&root, body.workspace) {
-            Ok(reader) => Some(reader),
+            Ok(reader) => reader,
             Err(_) => return Err((libc::EIO, "workspace lazy baseline is unavailable".into())),
         }
     } else {
@@ -312,12 +309,7 @@ pub(super) fn cancel_mount(state: &Arc<State>, workspace: Option<Uuid>, mount_re
     }
 }
 
-pub(super) fn abort_mount_reply(
-    state: &Arc<State>,
-    request: u64,
-    workspace: Option<Uuid>,
-    removed: Option<Mounted>,
-) {
+pub(super) fn abort_mount_reply(state: &Arc<State>, request: u64, workspace: Option<Uuid>, removed: Option<Mounted>) {
     if let Some(mount) = removed {
         mount.handle.shutdown();
         drop(mount.handle);
@@ -383,9 +375,9 @@ pub(super) fn freeze_begin(state: &Arc<State>, request: u64, workspace: Option<U
         },
     );
     let thread_state = state.clone();
-    let spawned = thread::Builder::new().name(format!("fuse-helper-freeze-{op_id}")).spawn(move || {
-        freeze_thread(thread_state, ws, op_id, db_epoch, gate, request, deadline, waiter, done)
-    });
+    let spawned = thread::Builder::new()
+        .name(format!("fuse-helper-freeze-{op_id}"))
+        .spawn(move || freeze_thread(thread_state, ws, op_id, db_epoch, gate, request, deadline, waiter, done));
     if let Err(error) = spawned {
         take_freeze_op(state, op_id, request);
         reply_error(state, request, workspace, libc::EAGAIN, format!("cannot start freeze thread: {error}"));
@@ -401,7 +393,7 @@ fn freeze_thread(
     begin_request: u64,
     deadline: Instant,
     waiter: Receiver<bool>,
-    done: Arc<Mutex<Option<u64>>>,
+    _done: Arc<Mutex<Option<u64>>>,
 ) {
     // The acknowledgement is sent once the gate really drained; the control
     // loop keeps serving other mounts while this thread waits. The wait has an
@@ -508,7 +500,10 @@ pub(super) fn freeze_release(
         // The decision could not be delivered (the thread is gone or the
         // watchdog already queued a fence). Drop our acknowledgement claim so
         // no stale `finished` reply can claim the decision was applied.
-        let mut done = { let freezes = lock(&state.freezes); freezes.get(&op_id).map(|op| op.done.clone()) };
+        let mut done = {
+            let freezes = lock(&state.freezes);
+            freezes.get(&op_id).map(|op| op.done.clone())
+        };
         if let Some(slot) = done.as_mut() {
             let mut slot = lock(&**slot);
             if *slot == Some(request) {
@@ -542,20 +537,16 @@ pub(super) fn prewarm(
     let reader = match lock(&state.mounts).get(&ws).and_then(|mount| mount.reader.clone()) {
         Some(reader) => reader,
         None => {
-            return reply_error(state, request, workspace, libc::ENOENT, "workspace has no lazily hydrated baseline")
+            return reply_error(state, request, workspace, libc::ENOENT, "workspace has no lazily hydrated baseline");
         }
     };
     if Instant::now() >= deadline {
         return reply_error(state, request, workspace, libc::ETIMEDOUT, "prewarm deadline expired before it started");
     }
     match reader.prewarm_until(&relative, deadline) {
-        Ok((files, bytes)) => reply(
-            state,
-            request,
-            workspace,
-            0,
-            Body::Prewarmed(PrewarmReply { files: files as u64, bytes }),
-        ),
+        Ok((files, bytes)) => {
+            reply(state, request, workspace, 0, Body::Prewarmed(PrewarmReply { files: files as u64, bytes }))
+        }
         Err(error) => {
             let code = error.raw_os_error().unwrap_or(libc::EIO);
             reply_error(state, request, workspace, code, error.to_string());
@@ -603,7 +594,10 @@ mod tests {
 
     #[test]
     fn cancelled_or_expired_work_is_never_completed() {
-        assert_eq!(checkpoint(&AtomicBool::new(true), Instant::now() + Duration::from_secs(30)).unwrap_err().0, libc::ECANCELED);
+        assert_eq!(
+            checkpoint(&AtomicBool::new(true), Instant::now() + Duration::from_secs(30)).unwrap_err().0,
+            libc::ECANCELED
+        );
         assert_eq!(checkpoint(&AtomicBool::new(false), Instant::now()).unwrap_err().0, libc::ETIMEDOUT);
         assert!(checkpoint(&AtomicBool::new(false), Instant::now() + Duration::from_secs(30)).is_ok());
     }

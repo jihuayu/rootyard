@@ -31,8 +31,8 @@
 //! never a thaw), unmounts every workspace and exits non-zero. An explicit
 //! `shutdown` is the only exit that reports success.
 use super::protocol::{
-    Body, ErrorReply, FenceIfUnchanged, Frame, FreezeBegin, FreezeFinish, Handoff, HEARTBEAT_DEADLINE, Heartbeat, Hello,
-    MOUNT_OP_DEADLINE, Observe, OkReply, PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, StateReply, read_frame,
+    Body, ErrorReply, FenceIfUnchanged, Frame, FreezeBegin, FreezeFinish, HEARTBEAT_DEADLINE, Handoff, Heartbeat,
+    Hello, MOUNT_OP_DEADLINE, Observe, OkReply, PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, StateReply, read_frame,
     write_frame,
 };
 use crate::workspace_lab::fuse_mount::{MountHandle, MutationGate};
@@ -118,7 +118,7 @@ pub(super) struct FreezeOp {
     pub expired: AtomicBool,
     pub decision: SyncSender<bool>,
     /// Request id that receives the `finished` reply once the gate is free.
-    pub done: Mutex<Option<u64>>,
+    pub done: Arc<Mutex<Option<u64>>>,
     pub released: AtomicBool,
 }
 
@@ -325,13 +325,15 @@ fn spawn_pool(state: Arc<State>, name: &str, workers: usize, jobs: Receiver<Job>
     for index in 0..workers {
         let state = state.clone();
         let jobs = jobs.clone();
-        thread::Builder::new().name(format!("{name}-{index}")).spawn(move || loop {
-            let job = match lock(&jobs).recv() {
-                Ok(job) => job,
-                Err(_) => return,
-            };
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
-                state.failstop("operation worker panicked", 1);
+        thread::Builder::new().name(format!("{name}-{index}")).spawn(move || {
+            loop {
+                let job = match lock(&jobs).recv() {
+                    Ok(job) => job,
+                    Err(_) => return,
+                };
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                    state.failstop("operation worker panicked", 1);
+                }
             }
         })?;
     }
