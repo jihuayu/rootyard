@@ -308,8 +308,11 @@ jobs:
             esac
             rm -f -- "$OBJECT_STORE_ENV_FILE"
           fi
+          # stop is idempotent when the fixture directory is absent (a start
+          # that failed early), so a nonzero exit here means the owned fixture
+          # could not be verified or removed and must fail the job.
           scripts/owned_garage_fixture.sh stop \
-            --directory "$RUNNER_TEMP/owned-garage/fixture" || true
+            --directory "$RUNNER_TEMP/owned-garage/fixture"
       - name: Upload object-store candidate evidence
         if: always()
         uses: actions/upload-artifact@v4

@@ -9,6 +9,10 @@
 set -euo pipefail
 
 image="dxflrs/garage:v2.1.0@sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a"
+# The only reference this helper is ever allowed to pull. A fresh GitHub runner
+# starts with an empty image cache, but a mutable tag can be re-pointed between
+# runs, so the cache is warmed from the digest reference and nothing else.
+pinned_image="$image"
 expected_digest="sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a"
 directory=""
 output=""
@@ -35,12 +39,71 @@ fail() {
 rootyard_fixture_owned=0
 
 on_start_exit() {
-  local status=$?
+  local status=$? cleanup_status=0
   trap - EXIT
   if [ "$status" -ne 0 ] && [ "${rootyard_fixture_owned:-0}" = "1" ]; then
-    stop >/dev/null 2>&1 || true
+    # stop() runs in a subshell because its fail() exits: a cleanup failure must
+    # never overwrite the start status that is propagated to the caller. The
+    # report stays generic (statuses plus the owned directory path); the private
+    # env file, the pull log and the sentinel contents are never echoed.
+    ( stop ) >/dev/null 2>&1 || cleanup_status=$?
+    if [ "$cleanup_status" -ne 0 ]; then
+      echo "owned garage fixture: start failed with status $status and cleanup of the owned fixture also failed with status $cleanup_status; inspect $directory before retrying" >&2
+    fi
   fi
   exit "$status"
+}
+
+# Whole-number setting with a hard bound; bad input fails closed.
+bounded_integer() {
+  local name=$1 value=$2 minimum=$3 maximum=$4
+  case "$value" in
+    '' | *[!0-9]*) fail "$name must be a whole number" ;;
+  esac
+  [ "$value" -ge "$minimum" ] && [ "$value" -le "$maximum" ] \
+    || fail "$name must be between $minimum and $maximum"
+  printf '%s' "$value"
+}
+
+# A cold runner has no cached image, so `docker image inspect` would fail before
+# the digest check ever runs. Warm the cache first, but only with the pinned
+# digest reference: an explicit --image that is absent locally is refused rather
+# than pulled as a mutable tag. Timeouts/attempts are bounded, every failure
+# propagates, and the caller's EXIT trap then removes exactly the fixture this
+# start created. Pull output is logged inside the owned directory and never
+# echoed, so registry/credential chatter cannot reach the job log.
+ensure_image() {
+  if docker image inspect --format '{{.Id}}' "$image" >/dev/null 2>&1; then
+    return 0
+  fi
+  [ "$image" = "$pinned_image" ] \
+    || fail "image $image is absent locally and only the pinned digest reference may be pulled"
+  local timeout_seconds attempts attempt=1 status=0
+  timeout_seconds=$(bounded_integer ROOTYARD_FIXTURE_PULL_TIMEOUT \
+    "${ROOTYARD_FIXTURE_PULL_TIMEOUT:-300}" 1 1800)
+  attempts=$(bounded_integer ROOTYARD_FIXTURE_PULL_ATTEMPTS \
+    "${ROOTYARD_FIXTURE_PULL_ATTEMPTS:-2}" 1 5)
+  command -v timeout >/dev/null 2>&1 \
+    || fail "timeout(1) is required to bound the cold-cache image pull"
+  local pull_log="$directory/docker-pull.log"
+  : >"$pull_log"
+  chmod 600 "$pull_log"
+  while :; do
+    status=0
+    timeout --signal=TERM --kill-after=10 "$timeout_seconds" docker pull "$image" \
+      >"$pull_log" 2>&1 || status=$?
+    if [ "$status" -eq 0 ]; then
+      break
+    fi
+    if [ "$attempt" -ge "$attempts" ]; then
+      break
+    fi
+    echo "owned garage fixture: docker pull attempt $attempt failed with status $status; retrying" >&2
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+  [ "$status" -eq 0 ] \
+    || fail "docker pull $image failed with status $status after $attempt attempt(s) within ${timeout_seconds}s each"
 }
 
 # Extract one "Label: value" field from Garage's aligned key table. Every
@@ -228,6 +291,7 @@ start() {
   rootyard_fixture_owned=1
   trap on_start_exit EXIT
   local image_id repo_digests version_line
+  ensure_image
   image_id=$(docker image inspect --format '{{.Id}}' "$image") \
     || fail "cannot inspect $image"
   repo_digests=$(docker image inspect --format '{{join .RepoDigests "\n"}}' "$image")
