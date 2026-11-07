@@ -5,27 +5,154 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lfs import LfsHarness
 
+VERSION_LINE = "version https://git-lfs.github.com/spec/v1"
+LEGACY_HAWSER_LINE = "version https://hawser.github.com/spec/v1"
+LEGACY_MEDIA_LINE = "version http://git-media.io/v/2"
+
+# Installed git-lfs 3.6.1 `pointer --check` exits recorded by the primary:
+# canonical/LF, CRLF, leading ASCII whitespace (space, tab, newline, CRLF, VT),
+# leading Unicode NBSP, and the two legacy headers are accepted; a trailing
+# space/tab on the version line, reordered fields, and scheme-swapped legacy
+# headers are not pointer-shaped.
+CLIENT_POINTER_EXPECTED = {
+    "canonical": True,
+    "crlf": True,
+    "leading-newline": True,
+    "leading-space": True,
+    "leading-tab": True,
+    "leading-crlf": True,
+    "leading-vtab": True,
+    "leading-nbsp": True,
+    "legacy-hawser": True,
+    "legacy-media-http": True,
+    "header-no-newline": True,
+    "trailing-space": True,
+    "header-trailing-space": False,
+    "header-tab": False,
+    "reordered": False,
+    "legacy-http": False,
+    "legacy-media-https": False,
+    "legacy-hawser-http": False,
+}
+
+
+def pointer_body(version, oid, size, newline="\n"):
+    return newline.join([version, f"oid sha256:{oid}", f"size {size}", ""])
+
+
+def git_blob_oid(body):
+    """Git SHA-1 object id for a blob body, matching the repository's BTreeSet order."""
+    digest = hashlib.sha1()
+    digest.update(b"blob " + str(len(body)).encode("ascii") + b"\0")
+    digest.update(body)
+    return digest.hexdigest()
+
+
+def pointer_variants(oid, size):
+    canonical = pointer_body(VERSION_LINE, oid, size)
+    return {
+        "canonical": canonical,
+        "crlf": pointer_body(VERSION_LINE, oid, size, "\r\n"),
+        "leading-newline": "\n" + canonical,
+        "leading-space": " " + canonical,
+        "leading-tab": "\t" + canonical,
+        "leading-crlf": "\r\n" + canonical,
+        "leading-vtab": "\v" + canonical,
+        "leading-nbsp": "\u00a0" + canonical,
+        "legacy-hawser": pointer_body(LEGACY_HAWSER_LINE, oid, size),
+        "legacy-media-http": pointer_body(LEGACY_MEDIA_LINE, oid, size),
+        "header-no-newline": canonical.rstrip("\n"),
+        "trailing-space": canonical + " ",
+        "header-trailing-space": pointer_body(VERSION_LINE + " ", oid, size),
+        "header-tab": pointer_body(VERSION_LINE + "\t", oid, size),
+        "reordered": f"{VERSION_LINE}\nsize {size}\noid sha256:{oid}\n",
+        "legacy-http": pointer_body("version http://git-lfs.github.com/spec/v1", oid, size),
+        "legacy-media-https": pointer_body("version https://git-media.io/v/2", oid, size),
+        "legacy-hawser-http": pointer_body("version http://hawser.github.com/spec/v1", oid, size),
+    }
+
 
 class PublicationHarness(LfsHarness):
+    def probe_pointer_variants(self):
+        """Record the installed client's pointer recognition for every variant."""
+        version = subprocess.run(["git", "lfs", "version"], capture_output=True)
+        if version.returncode != 0:
+            return {"client_available": False, "variants": {}}
+        oid = hashlib.sha256(b"pointer-variant-probe").hexdigest()
+        probes = {}
+        with tempfile.TemporaryDirectory(prefix="rootyard-pointer-variants-") as raw:
+            fixtures = Path(raw)
+            for name, body in sorted(pointer_variants(oid, 7).items()):
+                fixture = fixtures / f"pointer-variant-{name}.txt"
+                fixture.write_bytes(body.encode())
+                checked = subprocess.run(
+                    ["git", "lfs", "pointer", "--check", "--file", str(fixture)],
+                    capture_output=True)
+                probes[name] = {
+                    "exit": checked.returncode,
+                    "accepted": checked.returncode == 0,
+                    "expected_accept": CLIENT_POINTER_EXPECTED[name],
+                }
+        mismatched = [name for name, probe in probes.items()
+                      if probe["accepted"] != probe["expected_accept"]]
+        assert not mismatched, (
+            "installed git-lfs pointer recognition differs from the recorded "
+            f"client probes: {mismatched}")
+        return {
+            "client_available": True,
+            "client_version": version.stdout.decode().strip(),
+            "variants": probes,
+        }
+
     def reject_pointer_publication(self):
         self.setup_lfs()
         self.batch_upload_stream_verify_and_download()
         main = self.second
         missing = hashlib.sha256(b"absent-object").hexdigest()
+        missing_size = 13
+        wrong_size = self.size + 1
+        # A batch can promise the same LFS oid at two sizes. The good canonical
+        # pointer blob must sort before the wrong-size pointer blob so the old
+        # oid-only de-duplication validated the good promise first and then
+        # skipped the wrong-size promise deterministically.
+        good_same_oid = pointer_body(VERSION_LINE, self.oid, self.size).encode()
+        good_same_oid_blob = git_blob_oid(good_same_oid)
+        for bump in range(1, 100_000):
+            bad_same_size = self.size + bump
+            bad_same_oid = pointer_body(VERSION_LINE, self.oid, bad_same_size).encode()
+            bad_same_oid_blob = git_blob_oid(bad_same_oid)
+            if bad_same_oid_blob > good_same_oid_blob:
+                break
+        else:  # pragma: no cover - astronomically unlikely
+            raise AssertionError("could not construct an ordered same-oid pointer pair")
         pointer_bodies = {
-            "missing": f"version https://git-lfs.github.com/spec/v1\noid sha256:{missing}\nsize 13\n",
-            "wrong_size": f"version https://git-lfs.github.com/spec/v1\noid sha256:{self.oid}\nsize {self.size+1}\n",
-            "invalid": "version https://git-lfs.github.com/spec/v1\noid sha256:not-hex\nsize 13\n",
-            "crlf_missing": f"version https://git-lfs.github.com/spec/v1\r\noid sha256:{missing}\r\nsize 13\r\n",
-            "crlf_wrong_size": f"version https://git-lfs.github.com/spec/v1\r\noid sha256:{self.oid}\r\nsize {self.size+1}\r\n",
-            "ready_missing_bytes": f"version https://git-lfs.github.com/spec/v1\noid sha256:{self.oid}\nsize {self.size}\next-test missing\n",
-            "ready_corrupt_bytes": f"version https://git-lfs.github.com/spec/v1\noid sha256:{self.oid}\nsize {self.size}\next-test corrupt\n",
+            "missing": pointer_body(VERSION_LINE, missing, missing_size),
+            "wrong_size": pointer_body(VERSION_LINE, self.oid, wrong_size),
+            "invalid": f"{VERSION_LINE}\noid sha256:not-hex\nsize 13\n",
+            "crlf_missing": pointer_body(VERSION_LINE, missing, missing_size, "\r\n"),
+            "crlf_wrong_size": pointer_body(VERSION_LINE, self.oid, wrong_size, "\r\n"),
+            # Client-accepted shapes the old prefix-only gate treated as
+            # ordinary content; each must still fail closed when the promised
+            # bytes are missing or the wrong size.
+            "nbsp_missing": "\u00a0" + pointer_body(VERSION_LINE, missing, missing_size),
+            "nbsp_wrong_size": "\u00a0" + pointer_body(VERSION_LINE, self.oid, wrong_size),
+            "legacy_hawser_missing": pointer_body(LEGACY_HAWSER_LINE, missing, missing_size),
+            "legacy_media_wrong_size": pointer_body(LEGACY_MEDIA_LINE, self.oid, wrong_size),
+            # Same oid, good canonical promise plus a wrong-size promise whose
+            # blob sorts after the good one (the oid-only dedup regression).
+            "same_oid_good_and_wrong_size": bad_same_oid.decode(),
+            "ready_missing_bytes": pointer_body(VERSION_LINE, self.oid, self.size)
+                                    + "ext-test missing\n",
+            "ready_corrupt_bytes": pointer_body(VERSION_LINE, self.oid, self.size)
+                                    + "ext-test corrupt\n",
         }
         # The installed client accepts a CRLF pointer (non-strict check) while
         # --strict rejects only its canonical encoding. Record both exits so the
@@ -51,7 +178,14 @@ class PublicationHarness(LfsHarness):
                 original = self.obj_file.read_bytes()
                 self.obj_file.write_bytes(bytes([original[0] ^ 1]) + original[1:])
             (self.work / "pointer.dat").write_text(pointer)
-            self.git("add", "pointer.dat", cwd=self.work)
+            add_paths = ["pointer.dat"]
+            if kind == "same_oid_good_and_wrong_size":
+                # This extra good pointer exists only for the ordering case and
+                # is removed by the reset to main after this iteration.
+                good_name = "pointer-good-canonical.dat"
+                (self.work / good_name).write_bytes(good_same_oid)
+                add_paths.append(good_name)
+            self.git("add", *add_paths, cwd=self.work)
             self.git("commit", "-m", f"{kind} pointer", cwd=self.work)
             oid = self.git("rev-parse", "HEAD", cwd=self.work).stdout.decode().strip()
 
@@ -102,31 +236,43 @@ class PublicationHarness(LfsHarness):
                 held.rename(self.obj_file)
             elif kind == "ready_corrupt_bytes":
                 self.obj_file.write_bytes(original)
-        # A CRLF pointer to this repository's ready, digest-verified object must
-        # still publish; line-ending normalization must not become over-rejection.
-        crlf_valid = (f"version https://git-lfs.github.com/spec/v1\r\n"
-                      f"oid sha256:{self.oid}\r\nsize {self.size}\r\n")
-        self.git("reset", "--hard", main, cwd=self.work)
-        (self.work / "pointer.dat").write_bytes(crlf_valid.encode())
-        self.git("add", "pointer.dat", cwd=self.work)
-        self.git("commit", "-m", "valid crlf pointer", cwd=self.work)
-        crlf_head = self.git("rev-parse", "HEAD", cwd=self.work).stdout.decode().strip()
-        crlf_ref = "refs/heads/crlf-valid"
-        crlf_push = self.git("push", "origin", f"HEAD:{crlf_ref}", cwd=self.work,
-                             token=self.alice, check=False)
-        assert crlf_push.returncode == 0, self.redact(
-            "valid CRLF pointer push rejected: "
-            + crlf_push.stderr.decode(errors="replace")[-1000:])
-        remote_head = self.git("ls-remote", self.remote, crlf_ref,
-                               token=self.alice).stdout.decode().split()
-        assert remote_head and remote_head[0] == crlf_head, remote_head
+        # Client-recognized non-canonical pointers to this repository's ready,
+        # digest-verified object must still publish; normalization must not
+        # become over-rejection.
+        valid_variants = {
+            "crlf_valid": pointer_body(VERSION_LINE, self.oid, self.size, "\r\n"),
+            "nbsp_valid": "\u00a0" + pointer_body(VERSION_LINE, self.oid, self.size),
+            "legacy_hawser_valid": pointer_body(LEGACY_HAWSER_LINE, self.oid, self.size),
+            "legacy_media_valid": pointer_body(LEGACY_MEDIA_LINE, self.oid, self.size),
+        }
+        published = {}
+        for name, pointer in valid_variants.items():
+            self.git("reset", "--hard", main, cwd=self.work)
+            (self.work / "pointer.dat").write_bytes(pointer.encode())
+            self.git("add", "pointer.dat", cwd=self.work)
+            self.git("commit", "-m", f"valid {name} pointer", cwd=self.work)
+            head = self.git("rev-parse", "HEAD", cwd=self.work).stdout.decode().strip()
+            ref = f"refs/heads/{name}"
+            push = self.git("push", "origin", f"HEAD:{ref}", cwd=self.work,
+                            token=self.alice, check=False)
+            assert push.returncode == 0, self.redact(
+                f"valid {name} pointer push rejected: "
+                + push.stderr.decode(errors="replace")[-1000:])
+            remote_head = self.git("ls-remote", self.remote, ref,
+                                   token=self.alice).stdout.decode().split()
+            assert remote_head and remote_head[0] == head, remote_head
+            published[name] = ref
         return {"pointer_kinds": sorted(pointer_bodies),
                 "publication_paths": ["smart_http_receive", "atomic_smart_http_receive",
                                       "ref_transaction", "pull_merge"],
                 "rejected_before_ref_move": True,
                 "crlf_client_pointer_check": client_check,
-                "crlf_valid_pointer_published": True,
-                "crlf_valid_ref": crlf_ref}
+                "valid_pointers_published": published,
+                "same_oid_wrong_size_order": {
+                    "good_blob_oid": good_same_oid_blob,
+                    "wrong_size": bad_same_size,
+                    "wrong_blob_oid": bad_same_oid_blob,
+                }}
 
 
 def main():
@@ -141,6 +287,7 @@ def main():
     h = PublicationHarness(args)
     passed = False
     try:
+        h.case("probe_pointer_variants", h.probe_pointer_variants)
         h.case("reject_pointer_publication", h.reject_pointer_publication)
         passed = True
     except Exception:
