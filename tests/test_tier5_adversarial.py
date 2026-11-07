@@ -414,7 +414,17 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             )
         ]
         for cat in catalogs:
-            self.assertEqual(len(cat["tables"]), schema_baseline.TABLE_COUNT)
+            # The catalog lists every relation; TABLE_COUNT covers ordinary
+            # tables only (kind == "r"), views are validated separately below.
+            ordinary = [t for t in cat["tables"] if t["kind"] == "r"]
+            self.assertEqual(len(ordinary), schema_baseline.TABLE_COUNT)
+            # Non-table relations are sequences and must stay explicit.
+            non_tables = [t for t in cat["tables"] if t["kind"] != "r"]
+            self.assertEqual(
+                sorted(t["kind"] for t in non_tables),
+                ["S"] * len(non_tables),
+            )
+            self.assertEqual(len(ordinary) + len(non_tables), len(cat["tables"]))
             self.assertGreaterEqual(len(cat["columns"]), 314)
             self.assertGreaterEqual(len(cat["constraints"]), 254)
             self.assertGreaterEqual(len(cat["indexes"]), 70)
@@ -453,7 +463,15 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         c2 = [c for c in catalogs[2]["constraints"] if c["table"] in new_tables]
         self.assertEqual(c0, c1)
         self.assertEqual(c1, c2)
-        self.assertEqual(len(c0), 158)
+        # Anchor on the frozen 060 fixture; the live catalog may only grow
+        # because later migrations add constraints to these tables.
+        frozen = json.loads((ROOT / "schema/060_catalog.json").read_text(encoding="utf-8"))
+        frozen_new = [c for c in frozen["constraints"] if c["table"] in new_tables]
+        self.assertEqual(len(frozen_new), 158)
+        self.assertGreaterEqual(len(c0), len(frozen_new))
+        live_keys = {(c["table"], c["name"]) for c in c0}
+        for con in frozen_new:
+            self.assertIn((con["table"], con["name"]), live_keys)
 
     def test_sqlite_relational_constraint_adversarial_rejection_on_009_020_030_tables(self) -> None:
         with tempfile.TemporaryDirectory(prefix="rootyard-tier5-sql-") as tmp:
