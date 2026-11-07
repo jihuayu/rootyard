@@ -549,7 +549,7 @@ class HydrationHarness(LfsHarness):
         assert not proxy.errors, proxy.errors
         assert proxy.snapshot() == (heads_before + 1, gets_before + 1), (
             "a body-boundary failure must not restart the S3 request", proxy.snapshot())
-        stimuli = [event for event in proxy.events if event.get("event") == "target_get_truncated"]
+        stimuli = [event for event in proxy.events if event.get("kind") == "target_get_truncated"]
         assert len(stimuli) == 1, stimuli
         assert (stimuli[0]["status"], stimuli[0]["declared"], stimuli[0]["forwarded"]) == (
             200, size, TRUNCATED_BODY_BYTES), stimuli[0]
