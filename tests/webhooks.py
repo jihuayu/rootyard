@@ -570,13 +570,13 @@ class WebhooksHarness(PullsHarness):
             # A row persisted while loopback was allowed must not deliver once the
             # policy is the default: the send path re-validates the target.
             legacy_id = deny.sql(
-                "INSERT INTO forge_webhooks (id,tenant_id,repository_id,url,secret,secret_sha256) "
+                "WITH inserted AS (INSERT INTO forge_webhooks (id,tenant_id,repository_id,url,secret,secret_sha256) "
                 "SELECT gen_random_uuid(), r.owner_id, r.id, '"
                 + receiver.url
                 + "', 'whsec_deny_loopback_secret_0123456789', "
-                "encode(digest('whsec_deny_loopback_secret_0123456789','sha256'),'hex') "
+                "'" + hashlib.sha256(b"whsec_deny_loopback_secret_0123456789").hexdigest() + "' "
                 "FROM repositories r JOIN namespaces n ON n.id=r.owner_id "
-                "WHERE n.slug='alice' AND r.name='deny' RETURNING id"
+                "WHERE n.slug='alice' AND r.name='deny' RETURNING id) SELECT id FROM inserted"
             )
             denial = deny.document(
                 hooks_path + "/" + legacy_id + "/ping",

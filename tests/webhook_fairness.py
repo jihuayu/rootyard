@@ -444,8 +444,9 @@ def main():
         marker = "valid-12s-receiver"
         receiver.delay(marker, 12.0)
         pending = ping("forge", slow_hook["id"], marker, "valid-12s-1")
-        worker(True)
+        # Delivery may start before readiness returns from worker(True).
         started = time.monotonic()
+        worker(True)
         done = wait_for("12 second valid receiver to complete", lambda: (
             lambda d: d if d["state"] == "delivered" else None
         )(delivery("forge", slow_hook["id"], pending["id"])), timeout=25)
