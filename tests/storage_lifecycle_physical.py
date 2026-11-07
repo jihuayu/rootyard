@@ -38,6 +38,18 @@ class PhysicalHarness(LifecycleHarness):
         bare=self.root/"data"/"repos"/(repo["id"]+".git")
         return repo,work,bare,base
 
+    def namespace_view(self, namespace_id, token):
+        """Retry only the supported API's transient maintenance/backup 503."""
+        until = time.monotonic() + 20
+        while True:
+            status, body, _ = self.http(f"/api/namespaces/{namespace_id}/views", token=token,
+                                        method="POST", body={"mount_path":"project","subdir":"pkg"})
+            if status == 201:
+                return json.loads(body)
+            if status != 503 or time.monotonic() >= until:
+                raise AssertionError(f"/api/namespaces/{namespace_id}/views: expected 201, got {status}: {body[:300]!r}")
+            time.sleep(.2)
+
     def physical_loose_packed_and_pin(self):
         self.setup()
         repo,work,bare,base=self.new_repo("physical")
@@ -225,6 +237,16 @@ class PhysicalHarness(LifecycleHarness):
         self.git("commit","-m","packed object",cwd=work)
         packed=self.git("rev-parse","HEAD",cwd=work).stdout.decode().strip()
         self.git("push","origin","HEAD:refs/heads/temporary",cwd=work,token=self.alice)
+        # The event consumer's outbox lease survives a server restart. Wait for
+        # the live create projection and its delivered ref-index event before
+        # stopping, or the later delete event is correctly serialized behind an
+        # undelivered create and the projection can remain absent past a short
+        # test timeout. Production retention rules stay unchanged.
+        self.wait_sql("SELECT COALESCE((SELECT deleted::text FROM repository_ref_projection WHERE repository_id='"
+                      +repo["id"]+"' AND ref_name='refs/heads/temporary'),'missing')","false",seconds=20)
+        self.wait_sql("SELECT count(*) FROM outbox_events e JOIN event_deliveries d USING(event_id) "
+                      "WHERE e.repository_id='"+repo["id"]+"' AND e.ref_name='refs/heads/temporary' "
+                      "AND d.consumer='ref-index' AND d.state<>'delivered'","0",seconds=20)
         self.stop()
         # Pack the temporary commit while its ref still exists, then remove the
         # ref through the supported Smart-HTTP path. An offline update-ref would
@@ -371,8 +393,7 @@ ssize_t write(int fd,const void *buf,size_t count) {
         ns=json.loads(self.expect("/api/namespaces",201,token=self.alice,method="POST",
             body={"name":"gc-retention","mounts":[{"path":"project","owner":"alice",
                 "repository":"namespace-root","base_oid":historical}]}))
-        first=json.loads(self.expect(f"/api/namespaces/{ns['id']}/views",201,
-            token=self.alice,method="POST",body={"mount_path":"project","subdir":"pkg"}))
+        first=self.namespace_view(ns["id"], self.alice)
         assert first["source_oid"]==historical
         self.git("push","origin",":refs/heads/historical",cwd=work,token=self.alice)
         self.stop()
@@ -388,8 +409,7 @@ ssize_t write(int fd,const void *buf,size_t count) {
             +repo["id"]+"' AND kind='gitfs_tombstone_delete' AND state='succeeded' "
             +"AND result->>'retained'='active external roots'","t",seconds=20)
         self.git("--git-dir",str(bare),"cat-file","-e",historical)
-        second=json.loads(self.expect(f"/api/namespaces/{ns['id']}/views",201,
-            token=self.alice,method="POST",body={"mount_path":"project","subdir":"pkg"}))
+        second=self.namespace_view(ns["id"], self.alice)
         assert second["source_oid"]==historical and second["id"]!=first["id"]
         self.git("--git-dir",str(bare),"fsck","--full","--strict")
         return {"deleted_branch_source_retained":historical,
