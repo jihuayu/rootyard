@@ -30,6 +30,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import native_evidence
+import owned_fuse_cleanup
 
 
 class Harness:
@@ -150,8 +151,20 @@ class Harness:
                 try:
                     self.proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
-                    self.proc.wait()
+                    if not hard:
+                        os.killpg(self.proc.pid, signal.SIGKILL)
+                    # SIGKILL is already delivered. A FUSE daemon that is also
+                    # its own blocked client never releases the mount, so the
+                    # kernel waiter must be aborted with a forced unmount of
+                    # this fixture's own namespaced mounts before waiting again.
+                    owned_fuse_cleanup.release_owned_fuse_mounts(self)
+                    try:
+                        self.proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired as error:
+                        raise RuntimeError(
+                            "Owned test service did not exit after SIGKILL; "
+                            "kernel I/O may remain blocked. Preserve the fixture for diagnosis."
+                        ) from error
             self.proc = None
         if self.log:
             self.log.close()

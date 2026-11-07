@@ -221,8 +221,8 @@ the token pass fails, then checks that `rootyard_session_gc_failures_total` and
 gone while the token row remains. After dropping the trigger it waits for a
 committed token pass and the real deletion, then renames `event_deliveries` to
 force HTTP 503 and checks that every SQL-derived gauge is omitted while all four
-GC counters remain. That script has not been executed against a built binary as
-part of this change; native acceptance is pending.
+GC counters remain. The [recorded three-case native drill](acceptance/round5-security-maintenance-evidence/security134-gc-metrics.json)
+passed against the attested schema134 candidate. Its trigger and table-rename faults do not simulate a database outage.
 
 `tests/worker_metrics.py` covers the worker/capture/repair series with real
 HTTP-created repositories and workspace baselines plus controlled SQL fixtures

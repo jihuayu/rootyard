@@ -42,6 +42,8 @@ class NativeKernelEntrypointTests(unittest.TestCase):
             self.assertTrue(receipt.is_file(), result.stderr)
             report = json.loads(receipt.read_text())
             self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["detail"], "native acceptance refuses ROOTYARD_SANDBOX_MODE=dev")
+            self.assertEqual(report["preflight"], {})
 
 
 if __name__ == "__main__":
