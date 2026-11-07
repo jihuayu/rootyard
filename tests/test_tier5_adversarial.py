@@ -99,15 +99,23 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
         "src/reliability.rs",
         "src/forge.rs",
         "src/pulls.rs",
-        "src/lfs.rs",
+        "src/lfs/routes.rs",
         "src/members.rs",
         "src/web.rs",
-        "src/sharding.rs",
+        "src/sharding/routes.rs",
     )
     ALL_PRIMARY_ROUTER_FILES = (
         *PRIMARY_ROUTER_FILES,
         "src/webhooks.rs",
     )
+    # Roots that only declare `mod routes;` and delegate must not hide an empty
+    # route table: the connected delegated file is checked instead of the root.
+    DELEGATED_ROUTE_FILES = {
+        "lfs": "src/lfs/routes.rs",
+        "sharding": "src/sharding/routes.rs",
+    }
+    # The single optional `state: Arc<AppState>` parameter is allowed here only.
+    STATE_ROUTE_DOMAINS = ("browse", "web")
 
     def test_all_seven_domain_routers_and_lib_rs_have_zero_method_path_collisions(self) -> None:
         lib_text = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
@@ -124,7 +132,54 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
             "web",
             "sharding",
         ):
-            self.assertIn(f".merge({domain}::routes())", lib_text)
+            root_rs = ROOT / "src" / f"{domain}.rs"
+            self.assertTrue(root_rs.is_file(), f"Missing domain root src/{domain}.rs")
+            root_src = root_rs.read_text(encoding="utf-8")
+            if domain in self.STATE_ROUTE_DOMAINS:
+                self.assertIn(
+                    "pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>>",
+                    root_src,
+                    f"src/{domain}.rs must take exactly the optional state parameter",
+                )
+                self.assertNotIn(
+                    "pub fn routes() -> Router<Arc<AppState>>",
+                    root_src,
+                    f"src/{domain}.rs must not keep a zero-argument routes() that the mount cannot call",
+                )
+                mount = f".merge({domain}::routes(state.clone()))"
+            else:
+                self.assertIn(
+                    "pub fn routes() -> Router<Arc<AppState>>",
+                    root_src,
+                    f"src/{domain}.rs missing pub fn routes() -> Router<Arc<AppState>>",
+                )
+                mount = f".merge({domain}::routes())"
+            self.assertIn(mount, lib_text, f"src/lib.rs does not mount {domain} routes via {mount}")
+            delegated = self.DELEGATED_ROUTE_FILES.get(domain)
+            if delegated is None:
+                self.assertNotIn(
+                    "routes::routes()",
+                    root_src,
+                    f"src/{domain}.rs has no declared delegation; keep its route table inline",
+                )
+            else:
+                self.assertIn("mod routes;", root_src, f"src/{domain}.rs must declare `mod routes;`")
+                self.assertIn(
+                    "routes::routes()",
+                    root_src,
+                    f"src/{domain}.rs must delegate to routes::routes()",
+                )
+                delegated_src = (ROOT / delegated).read_text(encoding="utf-8")
+                self.assertIn(
+                    "fn routes() -> Router<Arc<AppState>>",
+                    delegated_src,
+                    f"{delegated} must own the connected route table",
+                )
+                self.assertGreater(
+                    len(_extract_route_registrations(ROOT / delegated)),
+                    0,
+                    f"Delegated route file {delegated} registers no routes",
+                )
 
         seen_bindings: dict[tuple[str, str], tuple[str, str]] = {}
         total_bindings = 0
@@ -208,7 +263,10 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
         self.assertEqual(wildcard_routes, [("src/pulls.rs", "/api/repos/{owner}/{name}/branch-rules/{*branch}")])
 
     def test_lfs_upload_routes_disable_default_body_limit_while_api_router_caps_at_16kib(self) -> None:
-        lfs_src = (ROOT / "src/lfs.rs").read_text(encoding="utf-8")
+        lfs_root = (ROOT / "src/lfs.rs").read_text(encoding="utf-8")
+        self.assertIn("mod routes;", lfs_root, "src/lfs.rs must declare `mod routes;`")
+        self.assertIn("routes::routes()", lfs_root, "src/lfs.rs must delegate to routes::routes()")
+        lfs_src = (ROOT / "src/lfs/routes.rs").read_text(encoding="utf-8")
         lib_src = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
         mirror_src = (ROOT / "src/mirror.rs").read_text(encoding="utf-8")
 
@@ -219,8 +277,17 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
 
         # Ensure only PUT object routes are inside upload_routes before .layer(DefaultBodyLimit::disable())
         upload_block = lfs_src.split("DefaultBodyLimit::disable()", 1)[0]
-        self.assertEqual(upload_block.count("put(handlers::upload_object"), 8)
+        self.assertEqual(upload_block.count("put(upload::upload_object"), 8)
+        self.assertEqual(upload_block.count("put(upload::upload_object)"), 4)
+        self.assertEqual(upload_block.count("put(upload::upload_object_with_size)"), 4)
         self.assertNotIn("post(handlers::batch)", upload_block)
+        for other_method in ("get(", "post(", "patch(", "delete("):
+            self.assertNotIn(
+                other_method,
+                upload_block,
+                f"Only PUT LFS object uploads may bypass DefaultBodyLimit ({other_method})",
+            )
+        self.assertEqual(upload_block.count("objects/{oid}"), 8)
 
     def test_mirror_router_isolation_and_route_table_completeness(self) -> None:
         mirror_regs = _extract_route_registrations(ROOT / "src/mirror.rs")
@@ -743,7 +810,9 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
         # Verify shared auth::authenticate, authorize_repo, finish_tx, and tokio::spawn disconnect safety
         merge_src = (ROOT / "src/pulls/merge.rs").read_text(encoding="utf-8")
         tx_src = (ROOT / "src/browse/transactions.rs").read_text(encoding="utf-8")
-        lfs_src = (ROOT / "src/lfs/handlers.rs").read_text(encoding="utf-8")
+        lfs_root = (ROOT / "src/lfs.rs").read_text(encoding="utf-8")
+        self.assertIn("mod upload;", lfs_root, "src/lfs.rs must declare the upload submodule")
+        lfs_src = (ROOT / "src/lfs/upload.rs").read_text(encoding="utf-8")
         wh_src = (ROOT / "src/webhooks/handlers.rs").read_text(encoding="utf-8")
         self.assertIn("tokio::spawn", merge_src)
         self.assertIn("finish_tx", merge_src)
@@ -751,6 +820,15 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
         self.assertIn("finish_tx", tx_src)
         self.assertIn("tokio::spawn", lfs_src)
         self.assertIn("auth::authenticate", lfs_src)
+        self.assertIn("sanitize_headers", lfs_src)
+        self.assertEqual(lfs_src.count("tokio::spawn(async move { upload_inner("), 2)
+        upload_inner = lfs_src.split("async fn upload_inner(", 1)[1]
+        self.assertLess(
+            upload_inner.index("sanitize_headers(&headers)"),
+            upload_inner.index("auth::authenticate"),
+            "LFS upload must strip conflicting auth headers before authenticating",
+        )
+        self.assertIn("auth::writable(&actor)", upload_inner)
         self.assertIn("tokio::spawn", wh_src)
 
 
