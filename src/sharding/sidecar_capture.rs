@@ -15,9 +15,9 @@ use std::{
 };
 use uuid::Uuid;
 
-struct Scanned {
-    intents: BTreeMap<Uuid, (crate::ci_pins::Intent, Vec<u8>)>,
-    receipts: BTreeMap<Uuid, Vec<u8>>,
+pub(super) struct Scanned {
+    pub(super) intents: BTreeMap<Uuid, (crate::ci_pins::Intent, Vec<u8>)>,
+    pub(super) receipts: BTreeMap<Uuid, Vec<u8>>,
 }
 
 pub(super) fn read_sidecar_directory(
