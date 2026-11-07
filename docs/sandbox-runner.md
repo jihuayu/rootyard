@@ -210,6 +210,32 @@ runs when an operator dispatches it.
   acceptance runs as the ordinary runner account with no `sudo`/`runuser`
   wrapper, so that `PATH` reaches the test and its service unchanged, and the
   build step asserts `pg_dump --version` is 17.
+- Runtime capability: the sandbox runtime bounds `/tmp` and `/workspace` with
+  `--size BYTES --tmpfs DEST`. Ubuntu 22.04 ships bubblewrap 0.6.1, which
+  predates `--size`; the first hosted run therefore failed every job before the
+  start gate. The workflow builds the source Ubuntu 24.04 ships from the signed
+  Ubuntu archive source index (`deb-src ... noble`, verified by the archive key
+  already trusted on the runner), installs it to `/usr/local/bin` ahead of
+  `/usr/bin`, and requires the capability functionally with
+  `bwrap --unshare-all --die-with-parent --size 1048576 --tmpfs /tmp --
+  /bin/true`. AppArmor and the rest of the runner policy are untouched. The
+  service probes the same capability once (`bwrap_supports_size`) and fails
+  closed with a static, secret-free `rootyard: bubblewrap does not support
+  --size` diagnostic instead of starting an unbounded job; the native preflight
+  probes it too and reports BLOCKED with the observed version and probe stderr,
+  and the receipt records `bubblewrap` version/support as the
+  `bubblewrap_capabilities` assertion.
+- Failure diagnostics: on any assertion failure the native script records a
+  bounded (`<= 4096` bytes per field, 10 most recent jobs) sanitized report
+  outside the checkout at `${RUNNER_TEMP}/native-kernel/evidence/
+  failure-<test>.json`. It contains the structured terminal state, exit code and
+  PID, job stderr/stdout tails, cgroup membership of the job and of the test
+  process, the service log tail, and tool versions (`bwrap`, `gcc`, `pg_dump`,
+  kernel, Python). DSNs, `Authorization`/`Bearer` headers, tokens, passwords and
+  API-key style assignments are redacted; the process environment, request
+  headers and credentials are never recorded. The report is uploaded with the
+  receipt artifact, so a failing hosted run is diagnosable without a second
+  guess.
 - Source equivalence: the checkout step uses `persist-credentials: false`, the
   build step requires `git rev-parse HEAD == GITHUB_SHA` with a clean tree,
   builds with `cargo build --locked --bin rootyard`, and the receipt records
@@ -285,6 +311,12 @@ and the root `cgroup.subtree_control` enable that cgroup v2 requires.
 On the current managed development host there is no delegated cgroup v2
 subtree (rootless Docker cgroup driver `none`, cgroupfs writes denied), so
 positive local acceptance remains BLOCKED until the coordinator dispatches this
-workflow on the supported VM. Local verification of this change is limited to
-shell syntax, YAML parsing, Python byte-compilation and the existing target
-Rust unit tests; it is not a substitute for the hosted run.
+workflow on the supported VM. Local verification of this change is limited to shell syntax, `actionlint` YAML
+parsing and Python byte-compilation; this implementation host has no Rust
+toolchain, so the `src/sandbox/runner.rs` capability change is compiled and
+unit-tested by the hosted workflow step (`cargo test --locked --lib sandbox`)
+and is not claimed as locally verified. None of this is a substitute for the
+hosted run. The runtime capability check was added after the
+first hosted run failed with opaque job failures; until a hosted run passes with
+the capability present and sanitized diagnostics recorded, positive native
+acceptance remains unproven and this host stays BLOCKED.

@@ -92,12 +92,48 @@ jobs:
           bwrap --version
           gcc --version | head -1
 
+      - name: Install a bubblewrap that implements --size
+        timeout-minutes: 12
+        run: |
+          # The production runtime bounds /tmp and /workspace with
+          # `--size BYTES --tmpfs DEST`. Ubuntu 22.04 ships bubblewrap 0.6.1,
+          # which predates --size, so every job failed before the start gate on
+          # the first hosted run. Build the same source Ubuntu 24.04 ships from
+          # the signed Ubuntu archive source index (verified by the archive key
+          # already trusted on this runner), install it to /usr/local/bin so it
+          # precedes /usr/bin, and require the capability functionally. AppArmor
+          # and the rest of the runner policy are left untouched.
+          sudo apt-get install -y --no-install-recommends dpkg-dev libcap-dev meson ninja-build pkg-config
+          echo "deb-src [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://archive.ubuntu.com/ubuntu noble main universe" \
+            | sudo tee /etc/apt/sources.list.d/ubuntu-noble-src.list >/dev/null
+          sudo apt-get update
+          work=$(mktemp -d)
+          (cd "$work" && apt-get source bubblewrap)
+          src=$(find "$work" -maxdepth 1 -mindepth 1 -type d -name 'bubblewrap-*' | head -1)
+          test -n "$src"
+          version=$(dpkg-parsechangelog -l "$src/debian/changelog" -SVersion)
+          echo "bubblewrap source version: $version"
+          # Pin the minimum upstream version that implements --size. The signed
+          # Ubuntu archive provides provenance for the source; the functional
+          # probe below proves the built binary really has the capability.
+          dpkg --compare-versions "${version%%-*}" ge 0.9.0
+          (cd "$src" && meson setup _build --prefix=/usr/local && ninja -C _build && sudo ninja -C _build install)
+          hash -r
+          command -v bwrap
+          bwrap --version
+          # Functional capability probe: no version parsing, the mount path is
+          # the only thing that matters.
+          bwrap --unshare-all --die-with-parent --size 1048576 --tmpfs /tmp -- /bin/true
+          echo "bubblewrap with --size support: $(bwrap --version)"
+          sha256sum "$(command -v bwrap)"
+
       - name: Build actual production binary from the dispatched commit
         timeout-minutes: 20
         run: |
           mkdir -p "$RECEIPT_DIR" "$EVIDENCE_DIR"
           command -v python3
           python3 --version
+          bwrap --version
           python3 --version | grep -Eq '^Python 3\.12\.'
           command -v pg_dump
           pg_dump --version
@@ -113,9 +149,9 @@ jobs:
           test "$("$ROOTYARD_BINARY" --rootyard-hook-self-check)" = rootyard-hook-v1
           sha256sum "$ROOTYARD_BINARY" | tee "$RECEIPT_DIR/binary.sha256"
 
-      - name: Run production cgroup validator unit tests
+      - name: Run production sandbox unit tests
         timeout-minutes: 10
-        run: cargo test --locked --lib sandbox::cgroup
+        run: cargo test --locked --lib sandbox
 
       - name: Delegate run-specific cgroup and mount bounded tmpfs
         id: native_setup

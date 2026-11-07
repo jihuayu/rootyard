@@ -27,7 +27,42 @@ enum Mode {
     Cgroup(PathBuf),
 }
 
+/// Bubblewrap capability the sandbox runtime depends on.
+///
+/// Every profile bounds `/tmp` and the cgroup profile bounds `/workspace` with
+/// `--size BYTES --tmpfs DEST`. Ubuntu 22.04 ships bubblewrap 0.6.1, which
+/// predates `--size`: Bubblewrap exits with a usage error before the start gate
+/// and the job fails with an opaque 503/failed state. Probe the real binary
+/// once (functional probe, not a version string) so an incapable runtime fails
+/// closed with a precise reason instead of executing an unbounded job.
+fn bwrap_supports_size(binary: &str) -> bool {
+    match std::process::Command::new(binary).arg("--version").output() {
+        Ok(output) if output.status.success() => {}
+        _ => return false,
+    }
+    std::process::Command::new(binary)
+        .args(["--unshare-all", "--die-with-parent", "--size", "1048576", "--tmpfs", "/tmp", "--", "/bin/true"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn bubblewrap_ready() -> bool {
+    static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *READY.get_or_init(|| bwrap_supports_size("bwrap"))
+}
+
+fn require_bubblewrap() -> Result<(), Error> {
+    if bubblewrap_ready() {
+        return Ok(());
+    }
+    // Static, secret-free diagnostic: the API body stays generic on purpose.
+    eprintln!("rootyard: bubblewrap does not support --size; the sandbox runtime requires a bubblewrap that implements --size");
+    Err(Error::internal("sandbox runtime requires bubblewrap --size support"))
+}
+
 fn isolation_mode(job: Uuid, limits: &cgroup::Limits) -> Result<Mode, Error> {
+    require_bubblewrap()?;
     match std::env::var("ROOTYARD_SANDBOX_MODE").as_deref() {
         Ok("dev") => Ok(Mode::Dev),
         Ok("cgroup") => {
@@ -797,4 +832,17 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
         cleanup_job(state, id)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bwrap_supports_size;
+
+    /// The capability probe must fail closed for a binary that is missing or
+    /// unusable instead of reporting a usable runtime.
+    #[test]
+    fn bubblewrap_probe_rejects_unusable_binaries() {
+        assert!(!bwrap_supports_size("rootyard-no-such-bubblewrap-binary"));
+        assert!(!bwrap_supports_size("/bin/false"));
+    }
 }
