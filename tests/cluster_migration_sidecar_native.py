@@ -97,6 +97,27 @@ def marker(data, phase):
     raise AssertionError("fault marker did not persist: " + phase)
 
 
+def wait_marker_or_response(data, phase, pending, h, timeout=20):
+    path = data / ".native-test-faults" / (phase + ".json")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.is_file():
+            return json.loads(path.read_text())
+        if pending.done():
+            try:
+                result = pending.result()
+            except Exception as error:  # noqa: BLE001 - sanitized diagnostic
+                raise AssertionError(
+                    "migration request failed before fault phase " + phase + ": "
+                    + h.redact(repr(error))) from error
+            status, raw = result[0], result[1]
+            raise AssertionError(
+                "migration request completed before fault phase " + phase
+                + ": status=" + str(status) + " body=" + h.redact(raw[:500].decode(errors="replace")))
+        time.sleep(.02)
+    raise AssertionError("fault marker did not persist (request still pending): " + phase)
+
+
 def create_repository(h, name):
     status, raw, _ = h.http("/api/repos", token=h.alice, method="POST",
                             body={"name": name})
@@ -252,6 +273,23 @@ def main():
                      "refs/rootyard-backup/snapshot-1"):
             h.git("--git-dir=" + str(h.bare), "update-ref", root, h.second)
 
+        # Create freshrace while node0 is still the only primary so its route
+        # defaults to the source. It has zero pre-existing CI roots.
+        freshrace, freshrace_work, _, freshrace_tip = create_repo(h, "freshrace")
+        freshrace_route = json.loads(h.expect(
+            "/api/repos/alice/freshrace/shard-route", 200, token=h.alice))
+        assert freshrace_route["primary_node_id"] == "shard-primary-0", freshrace_route
+        freshrace_generation = int(h.sql(
+            "SELECT storage_generation FROM repositories WHERE id='" + freshrace["id"] + "'"))
+        chaos, chaos_work, chaos_remote, chaos_tip = create_repo(h, "chaosharness")
+        chaos_route = json.loads(h.expect("/api/repos/alice/chaosharness/shard-route",
+                                          200, token=h.alice))
+        assert chaos_route["primary_node_id"] == "shard-primary-0", chaos_route
+        recover, recover_work, _, recover_tip = create_repo(h, "recoverharness")
+        recover_route = json.loads(h.expect("/api/repos/alice/recoverharness/shard-route",
+                                            200, token=h.alice))
+        assert recover_route["primary_node_id"] == "shard-primary-0", recover_route
+
         port = free_port()
         node1 = "http://127.0.0.1:" + str(port)
         node1_data = h.root / "data-node1"
@@ -259,7 +297,7 @@ def main():
         target_log = open(node1_data.parent / "node1.log", "ab")
         status, _ = request(node0, "/api/shards/nodes", h.alice, "POST", {
             "node_id": "node1", "endpoint": node1, "role": "replica",
-            "status": "healthy"})
+            "status": "healthy", "lease_ttl_seconds": 120})
         assert status in (200, 201), status
         route = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200,
                                     token=h.alice))
@@ -306,7 +344,7 @@ def main():
                                   body={"target_node_id": "node1",
                                         "expected_route_epoch": route["route_epoch"],
                                         "operation_id": op})
-            marker(node1_data, "target-copy-after-receive")
+            wait_marker_or_response(node1_data, "target-copy-after-receive", pending, h)
             target.wait(timeout=20)
             assert target.returncode == -signal.SIGKILL
             try:
@@ -329,7 +367,7 @@ def main():
                                   body={"target_node_id": "node1",
                                         "expected_route_epoch": route["route_epoch"],
                                         "operation_id": op})
-            marker(node1_data, "target-verify-before-publish")
+            wait_marker_or_response(node1_data, "target-verify-before-publish", pending, h)
             target.wait(timeout=20)
             assert target.returncode == -signal.SIGKILL
             try:
@@ -371,14 +409,15 @@ def main():
                                   body={"target_node_id": "node1",
                                         "expected_route_epoch": route["route_epoch"],
                                         "operation_id": op})
-            marker(h.root / "data", "cutover-before-sidecar-finalize")
+            wait_marker_or_response(h.root / "data", "cutover-before-sidecar-finalize",
+                                    pending, h)
             merged_job = str(uuid.uuid4())
             merged_status, merged_raw = request(
                 node1, "/api/repos/alice/demo/ci-pins", h.alice, "POST",
                 {"job_id": merged_job, "target_oid": concurrent_oid,
                  "storage_generation": demo_generation + 1})
             assert merged_status == 503, (merged_status, merged_raw[:300])
-            marker(node1_data, "target-sidecar-before-publish")
+            wait_marker_or_response(node1_data, "target-sidecar-before-publish", pending, h)
             pin_status, pin_raw = request(
                 node1, "/api/repos/alice/demo/ci-pins", h.alice, "POST",
                 {"job_id": concurrent_job, "target_oid": concurrent_oid,
@@ -493,11 +532,6 @@ def main():
         # the committed cutover is paused before the first finalize RPC. The
         # empty source image has nothing to hand off, and finalize must merge
         # the accepted fresh pin instead of replacing the live directory.
-        freshrace, freshrace_work, _, freshrace_tip = create_repo(h, "freshrace")
-        freshrace_route = json.loads(h.expect(
-            "/api/repos/alice/freshrace/shard-route", 200, token=h.alice))
-        freshrace_generation = int(h.sql(
-            "SELECT storage_generation FROM repositories WHERE id='" + freshrace["id"] + "'"))
         pause_marker = h.root / "data" / ".native-test-faults" / "cutover-before-sidecar-finalize.json"
         if pause_marker.exists():
             pause_marker.unlink()
@@ -515,7 +549,8 @@ def main():
                 body={"target_node_id": "node1",
                       "expected_route_epoch": freshrace_route["route_epoch"],
                       "operation_id": freshrace_op})
-            marker(h.root / "data", "cutover-before-sidecar-finalize")
+            wait_marker_or_response(h.root / "data", "cutover-before-sidecar-finalize",
+                                    pending, h)
             fresh_status, fresh_raw = request(
                 node1, "/api/repos/alice/freshrace/ci-pins", h.alice, "POST",
                 {"job_id": freshrace_job, "target_oid": freshrace_tip,
@@ -540,11 +575,8 @@ def main():
         # Second repository: source SIGKILL at final drain, before cutover
         # commit, and immediately after the cutover commit. The old source is
         # non-writer from the true drain onwards; abort cannot reopen it.
-        chaos, chaos_work, chaos_remote, chaos_tip = create_repo(h, "chaosharness")
         chaos_gen = int(h.sql("SELECT storage_generation FROM repositories WHERE id='"
                               + chaos["id"] + "'"))
-        chaos_route = json.loads(h.expect("/api/repos/alice/chaosharness/shard-route",
-                                          200, token=h.alice))
         chaos_op = str(uuid.uuid4())
         chaos_dest = node1_data / "repos" / (chaos["id"] + ".git")
         acknowledged = [chaos_tip]
@@ -557,7 +589,7 @@ def main():
             with ThreadPoolExecutor(max_workers=1) as pool:
                 pending = pool.submit(h.http, "/api/repos/alice/chaosharness/shard-migrate",
                                       token=h.alice, method="POST", body=body)
-                marker(h.root / "data", phase)
+                wait_marker_or_response(h.root / "data", phase, pending, h)
                 h.proc.wait(timeout=20)
                 assert h.proc.returncode == -signal.SIGKILL
                 try:
@@ -612,9 +644,6 @@ def main():
         # A second migration back is not needed: exercise the committed-cutover
         # recovery boundary on a third repository so the post-commit source
         # SIGKILL and target startup sidecar reconciliation are independent.
-        recover, recover_work, _, recover_tip = create_repo(h, "recoverharness")
-        recover_route = json.loads(h.expect("/api/repos/alice/recoverharness/shard-route",
-                                            200, token=h.alice))
         recover_op = str(uuid.uuid4())
         recover_body = {"target_node_id": "node1",
                         "expected_route_epoch": recover_route["route_epoch"],
