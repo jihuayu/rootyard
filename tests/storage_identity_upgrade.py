@@ -198,7 +198,7 @@ class UpgradeHarness(Harness):
         for name, (columns, target) in composite.items():
             assert name in definitions, name
             info = definitions[name]
-            assert info["validated"] == "t", (name, info)
+            assert info["validated"] == "true", (name, info)
             assert info["type"] == "f", (name, info)
             assert info["delete_action"] == "c", (name, info)
             assert columns in info["definition"], (name, info)
@@ -206,7 +206,7 @@ class UpgradeHarness(Harness):
             assert "ON DELETE CASCADE" in info["definition"], (name, info)
             observed[name] = "validated composite cascade"
         unique = definitions[SCHEMA134_UNIQUE]
-        assert unique["validated"] == "t", unique
+        assert unique["validated"] == "true", unique
         assert unique["type"] == "u", unique
         assert "UNIQUE (id, repository_id, tenant_id)" in unique["definition"], unique
         assert self.constraint_count((REMOVED_FK,)) == "0"
