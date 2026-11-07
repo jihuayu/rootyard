@@ -5,6 +5,41 @@ specialised cgroup VM gate in `.github/workflows/native-kernel-acceptance.yml`.
 
 ## Layer 1 — every push and pull request (`.github/workflows/ci.yml`)
 
+The verify job runs on a plain `ubuntu-22.04` host, not in the former
+`rust:1-trixie` container. That is the same host profile on which the manual
+native-kernel-acceptance workflow passed its 17 assertions (run 42410286276):
+an unprivileged runner, host PID 1 adopting and reaping orphaned Git
+grandchildren, a usable `/dev/fuse`, and unprivileged `unshare -Urnm`. The
+PostgreSQL 17 service is published on the host at the fixed loopback address
+`127.0.0.1:55432`; it keeps an ephemeral CI-only password and is never a
+repository secret.
+
+`scripts/install_ci_native_tools.sh` prepares the profile and then proves it
+functionally before any test runs:
+
+* PostgreSQL 17 client and server from the same signed PGDG repository (with
+  the expected key fingerprint pinned) that the manual native workflow trusts.
+* Git from the newest audited 2.43.x security revision offered by the signed
+  Ubuntu Noble source index (deb-src only: `noble`, `noble-updates`,
+  `noble-security`). Ubuntu 22.04 ships 2.34, which workspace_lab rejects.
+  The downloaded `.dsc` `Checksums-Sha256` entries are re-verified, and the
+  exact source package version and every source-file SHA-256 are recorded in
+  `test-results/ci-native-tools/provenance.json`. Git is compiled into an
+  owned `RUNNER_TEMP` prefix with `NO_TCLTK=1 NO_GETTEXT=1`; `/usr/bin/git`
+  and global Git configuration are untouched.
+* bubblewrap `0.9.0-1build1` from the same signed Noble archive, built into the
+  same prefix. The capability is proved by actually running `bwrap --size`,
+  not by parsing a version string.
+* `git-lfs`, `fuse3` (`fusermount3`), `util-linux` (`unshare`, `nsenter`),
+  `redis-server`, Java 21, `gcc`/`g++`/`make`/`pkg-config` and the real kernel
+  FUSE test prerequisites.
+
+Preflight fails the job if Git is below 2.43, if the prefix tool is shadowed,
+if `bwrap --size` cannot start a sandbox, if `/dev/fuse` is missing or not
+readable/writable, or if `unshare -Urnm` cannot create private mount and
+network namespaces with a mounted tmpfs. Nothing is skipped and no global
+subreaper, sysctl or AppArmor policy is changed.
+
 Cheap but real native security, tenancy and concurrency regressions run against
 the binary built once by `scripts/build_native.py --features pando-lab --bins`:
 
@@ -20,9 +55,10 @@ unless every report was produced by the exact binary whose SHA-256 appears in
 `ci_webhook_regressions` log is non-empty and contains each expected phase
 marker, and the receipt's commit and compiled source-input digest were recorded.
 The manifest (`test-results/native-pr-gate.json`) also stores harness SHA-256
-digests, `postgres=postgres:17` and the exact `rustc -V` string. Injecting any of
-those defects turns the pull request red instead of leaving the regression to
-manual re-verification.
+digests, `postgres=postgres:17`, the exact `rustc -V` string, `git --version`,
+`git lfs version`, `bwrap --version`, the `/dev/fuse` stat and the SHA-256 of
+the native tool provenance file. Injecting any of those defects turns the pull
+request red instead of leaving the regression to manual re-verification.
 
 ## Layer 2 — candidate release gate (`.github/workflows/candidate-release-acceptance.yml`)
 
@@ -95,7 +131,16 @@ generated keys; an actions-step environment is not inherited across steps.
 
 ## Reproduction and current status
 
-Run the per-pull-request regressions exactly as CI does after building once:
+On a plain Ubuntu 22.04 host, first bootstrap and prove the native tool
+profile (the helper uses `sudo` for apt and builds into `$RUNNER_TEMP`; it does
+not run in this repository's local checks):
+
+```sh
+scripts/install_ci_native_tools.sh install --prefix "$RUNNER_TEMP/rootyard-ci-native" --provenance test-results/ci-native-tools/provenance.json
+scripts/install_ci_native_tools.sh preflight --prefix "$RUNNER_TEMP/rootyard-ci-native"
+```
+
+Then run the per-pull-request regressions exactly as CI does after building once:
 
 ```sh
 python3 scripts/build_native.py --features pando-lab --bins
@@ -103,6 +148,16 @@ python3 tests/web_sessions.py --binary target/debug/rootyard --report test-resul
 python3 tests/ci_webhook_regressions.py --binary target/debug/rootyard | tee test-results/ci-webhook-regressions.log
 python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
 ```
+
+The native host profile in this change was validated locally only: workflow
+YAML parses, every helper passes `bash -n`,
+`tests/test_install_ci_native_tools.py` and the Phase-1 CI wiring tests pass,
+and no local `sudo`, apt, mount, sysctl or AppArmor change was made. The
+coordinator must run the pushed branch on GitHub Actions before any green
+ordinary-CI result is claimed. The Git source revision is selected from the
+signed Noble index at run time; the actual version and source-file SHA-256
+digests are recorded in the provenance artifact rather than fabricated in
+advance.
 
 Candidate jobs require Docker with the pinned Garage image, `/usr/bin/chromium`
 and a Playwright client. The coordinator verifies them against an owned fixture;
@@ -129,3 +184,8 @@ no GitHub Actions run was executed.
 * Kernel sandbox/cgroup acceptance remains in
   `.github/workflows/native-kernel-acceptance.yml`; Docker-backed Garage tests do
   not exercise it. No Vault dependency is introduced.
+* Ordinary CI's Git 2.43 client is selected from the signed Ubuntu Noble source
+  index (latest audited 2.43.x security revision) and built per run; its exact
+  source package version and source-file SHA-256 digests are recorded at run
+  time. The profile therefore records provenance instead of asserting a
+  hard-coded digest that could not be verified in this environment.
