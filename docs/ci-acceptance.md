@@ -54,7 +54,9 @@ and every job asserts `git rev-parse HEAD` equals it before building.
 * `release-gate` downloads both job manifests and runs
   `scripts/native_report_manifest.py --mode release`. It requires the two jobs to
   share the dispatched commit and one compiled source-input digest, re-verifies
-  every harness SHA-256 against the dispatched checkout, requires the
+  every harness SHA-256 against the dispatched checkout, re-hashes every
+  downloaded report and log against the SHA-256 in its job manifest (missing,
+  symlinked or traversing artifact names fail closed), requires the
   `browser_ui`, `lfs_hydration`, `lfs_remote` and `lfs_retention` reports, and
   requires the exact `garage_version=2.1.0`, the exact Garage image digest,
   `git_lfs_version=3.6.1`, `playwright_version=1.49.0` and a Chromium version in
@@ -64,7 +66,9 @@ and every job asserts `git rev-parse HEAD` equals it before building.
   `garage node id` (64 hex `@address`), never by grepping 16-hex `status` ids. Its output is `candidate-release-gate.json`.
 
 Reports, stdout logs, build receipts, evidence JSONL and the manifests are
-uploaded. A missing report, empty log, failed case, digest mismatch, foreign
+uploaded; download-artifact flattens them under `artifacts/<job>/`, and the
+release step passes each job's directory with `--artifact-dir` so the gate
+re-hashes the downloaded bytes rather than trusting the manifest alone. A missing report, empty log, failed case, digest mismatch, foreign
 commit, stale harness, missing fixture version, absent service or a credential
 reaching an artifact fails the gate closed — there is no "success skip".
 

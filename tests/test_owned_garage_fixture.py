@@ -27,15 +27,27 @@ class FixtureGuardTest(unittest.TestCase):
         docker = self.bin / "docker"
         docker.write_text(
             """#!/usr/bin/env bash
-printf '%s\\n' "$*" >>"$STUB_DOCKER_LOG"
+printf '%s\n' "$*" >>"$STUB_DOCKER_LOG"
+sentinel_field() { sed -n "s/^$1=//p" "${STUB_SENTINEL:?}" 2>/dev/null | head -n 1; }
 case "$*" in
-  *'{{.Id}}'*) printf '%s\\n' "${STUB_CONTAINER_ID:?}" ;;
-  *'rootyard.fixture.kind'*) printf '%s\\n' "${STUB_KIND:-owned-garage}" ;;
-  *'rootyard.fixture.nonce'*) printf '%s\\n' "${STUB_NONCE:-}" ;;
-  *'rootyard.fixture.directory'*) printf '%s\\n' "${STUB_PATH:-}" ;;
-  *'rootyard.fixture.uid'*) printf '%s\\n' "${STUB_UID:-$(id -u)}" ;;
-  *'rootyard.fixture.name'*) printf '%s\\n' "${STUB_NAME:-}" ;;
+  *'image inspect'*'{{.Id}}'*) printf '%s\n' 'sha256:fake-image-id' ;;
+  *'image inspect'*RepoDigests*) printf '%s\n' 'dxflrs/garage@sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a' ;;
+  *'run --rm'*'--version'*) printf '%s\n' 'garage v2.1.0 [features: bundled-libs]' ;;
+  *'create --rm'*) printf '%s\n' "${STUB_CONTAINER_ID:?}" ;;
+  exec*)
+    case "$*" in
+      *'node id'*) printf '%s\n' "$(printf 'b%.0s' {1..64})@127.0.0.1:3901" ;;
+      *'key create'*) printf 'Key ID:         %s\nSecret key:     %s\nCreated:        2026-11-07\n' "${STUB_ACCESS_KEY:-GK0123456789abcdef01234567}" "${STUB_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}" ;;
+      *) exit 0 ;;
+    esac ;;
+  *'{{.Id}}'*) printf '%s\n' "${STUB_CONTAINER_ID:?}" ;;
+  *'rootyard.fixture.kind'*) printf '%s\n' "${STUB_KIND:-owned-garage}" ;;
+  *'rootyard.fixture.nonce'*) printf '%s\n' "${STUB_NONCE:-$(sentinel_field nonce)}" ;;
+  *'rootyard.fixture.directory'*) printf '%s\n' "${STUB_PATH:-$(sentinel_field directory)}" ;;
+  *'rootyard.fixture.uid'*) printf '%s\n' "${STUB_UID:-$(sentinel_field uid)}" ;;
+  *'rootyard.fixture.name'*) printf '%s\n' "${STUB_NAME:-$(sentinel_field container_name)}" ;;
   rm*) exit 0 ;;
+  start*) exit "${STUB_START_EXIT:-0}" ;;
   *) exit 1 ;;
 esac
 """
@@ -85,6 +97,7 @@ esac
     def run_script(self, action, directory, expect, env=None):
         environment = self.env.copy()
         environment.update(self.stub_container(directory))
+        environment["STUB_SENTINEL"] = str(directory / ".rootyard-owned-fixture")
         environment.update(env or {})
         process = subprocess.run(
             [str(SCRIPT), action, "--directory", str(directory)],
@@ -101,6 +114,8 @@ esac
 
     def start(self, directory, expect, *extra, env=None):
         environment = self.env.copy()
+        environment["STUB_CONTAINER_ID"] = self.cid
+        environment["STUB_SENTINEL"] = str(directory / ".rootyard-owned-fixture")
         environment.update(env or {})
         process = subprocess.run(
             [str(SCRIPT), "start", "--directory", str(directory),
@@ -184,6 +199,39 @@ esac
         process = self.start(link, 1)
         self.assertIn("symlink", process.stderr)
         self.assertEqual("", self.docker_calls())
+
+    def test_start_parses_padded_key_and_cleans_up_after_probe_failure(self):
+        directory = self.root / "owned"
+        access = "GK00112233445566778899aabb"
+        secret = "cd" * 32
+        process = self.start(
+            directory, 1, "--port", "55982",
+            env={
+                "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
+                "STUB_ACCESS_KEY": access,
+                "STUB_SECRET_KEY": secret,
+            },
+        )
+        combined = process.stdout + process.stderr
+        self.assertNotIn("unbound variable", combined)
+        self.assertNotIn("no access key", combined)
+        self.assertNotIn("no secret key", combined)
+        self.assertNotIn(secret, combined)
+        allow = [line for line in self.docker_calls().splitlines() if "bucket allow" in line]
+        self.assertEqual(1, len(allow), self.docker_calls())
+        self.assertIn(f"--key {access} ", allow[0])
+        self.assertIn(f"rm -f -- {self.cid}", self.docker_calls())
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
+
+    def test_start_failure_after_container_create_cleans_only_minted_resources(self):
+        directory = self.root / "owned"
+        process = self.start(directory, 1, env={"STUB_START_EXIT": "1"})
+        combined = process.stdout + process.stderr
+        self.assertNotIn("unbound variable", combined)
+        self.assertIn(f"rm -f -- {self.cid}", self.docker_calls())
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
 
 
 if __name__ == "__main__":

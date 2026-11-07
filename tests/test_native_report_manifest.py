@@ -68,6 +68,20 @@ class ManifestFixture:
         path.write_text(text)
         return path
 
+    def artifact_directory(self, job_name, manifest):
+        """Mirror download-artifact: flatten a job's reports and logs by name."""
+        data = json.loads(Path(manifest).read_text())
+        directory = self.root / f"artifacts/{job_name}"
+        directory.mkdir(parents=True, exist_ok=True)
+        for records in (data.get("reports") or {}, data.get("logs") or {}):
+            for record in records.values():
+                source = Path(record["file"])
+                target = directory / source.name
+                if target.exists() or target.is_symlink():
+                    target.unlink()
+                target.write_bytes(source.read_bytes())
+        return directory
+
     def run(self, *arguments, expect=0, env=None):
         environment = os.environ.copy()
         environment.pop("GITHUB_SHA", None)
@@ -203,6 +217,10 @@ class TestReleaseGate(unittest.TestCase):
             },
             extra=("--fixture", "garage=garage 2.1.0", "--fixture", "git_lfs=git-lfs/3.6.1"),
         )
+        self.staged = {
+            "browser": self.fixture.artifact_directory("browser", self.browser),
+            "object-store": self.fixture.artifact_directory("object-store", self.store),
+        }
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -210,6 +228,11 @@ class TestReleaseGate(unittest.TestCase):
     def release(self, *arguments, fixtures=None, expect=0):
         fixtures = fixtures if fixtures is not None else {"garage": "2.1", "git_lfs": "3.6.1"}
         output = self.fixture.root / "candidate-release-gate.json"
+        for index, value in enumerate(arguments):
+            if value == "--job-manifest" and index + 1 < len(arguments):
+                name, _, path = str(arguments[index + 1]).partition("=")
+                if name not in self.staged:
+                    self.staged[name] = self.fixture.artifact_directory(name, path)
         command = [
             "--mode", "release",
             "--manifest-out", output,
@@ -219,6 +242,8 @@ class TestReleaseGate(unittest.TestCase):
             "--require-report", "browser_ui",
             "--require-report", "lfs_hydration",
         ]
+        for name, directory in self.staged.items():
+            command += ["--artifact-dir", f"{name}={directory}"]
         for name, substring in fixtures.items():
             command += ["--require-fixture", f"{name}={substring}"]
         process = self.fixture.run(*command, *arguments, expect=expect)
@@ -234,6 +259,10 @@ class TestReleaseGate(unittest.TestCase):
         self.assertEqual(sorted(gate["jobs"]), ["browser", "object-store"])
         self.assertEqual(gate["fixtures"]["garage"], "garage 2.1.0")
         self.assertEqual(gate["reports"], ["browser_ui", "lfs_hydration", "lfs_retention"])
+        self.assertEqual(
+            sorted(gate["jobs"]["browser"]["artifacts"]),
+            ["log:webhook_regressions", "report:browser_ui"],
+        )
 
     def test_rejects_missing_required_report_and_wrong_fixture_pin(self):
         process, _ = self.release("--require-report", "lfs_remote", expect=1)
@@ -255,6 +284,33 @@ class TestReleaseGate(unittest.TestCase):
         self.fixture.harness.write_text("# harness changed\n")
         process, _ = self.release(expect=1)
         self.assertIn("changed after the job ran", process.stderr)
+
+    def test_rejects_report_tampered_after_manifest_generation(self):
+        report = self.staged["browser"] / "browser_ui.json"
+        report.write_text(report.read_text().replace('"passed": true', '"passed": false'))
+        process, _ = self.release(expect=1)
+        self.assertIn("does not match the manifest sha256", process.stderr)
+
+    def test_rejects_missing_downloaded_report(self):
+        (self.staged["object-store"] / "lfs_hydration.json").unlink()
+        process, _ = self.release(expect=1)
+        self.assertIn("is missing", process.stderr)
+
+    def test_rejects_traversing_artifact_path(self):
+        manifest = json.loads(self.store.read_text())
+        manifest["reports"]["lfs_hydration"]["file"] = "../../lfs_hydration.json"
+        self.store.write_text(json.dumps(manifest))
+        process, _ = self.release(expect=1)
+        self.assertIn("traverses out of its artifact", process.stderr)
+
+    def test_rejects_symlinked_downloaded_artifact(self):
+        staged = self.staged["browser"] / "browser_ui.json"
+        outside = self.fixture.root / "elsewhere.json"
+        outside.write_bytes(staged.read_bytes())
+        staged.unlink()
+        staged.symlink_to(outside)
+        process, _ = self.release(expect=1)
+        self.assertIn("is a symlink", process.stderr)
 
 
 if __name__ == "__main__":

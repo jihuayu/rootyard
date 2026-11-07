@@ -347,6 +347,8 @@ jobs:
           python3 scripts/native_report_manifest.py --mode release \
             --manifest-out candidate-release-gate.json \
             --expect-commit "$GITHUB_SHA" \
+            --artifact-dir browser=artifacts/candidate-browser \
+            --artifact-dir object-store=artifacts/candidate-object-store \
             --job-manifest browser=artifacts/candidate-browser/native-job-manifest.json \
             --job-manifest object-store=artifacts/candidate-object-store/native-job-manifest.json \
             --require-report browser_ui \

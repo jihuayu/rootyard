@@ -30,6 +30,46 @@ fail() {
   exit 1
 }
 
+# Start-failure state is script-scoped, never `local`: the EXIT trap can run
+# after start()'s frame has unwound, where function-local values are gone.
+rootyard_fixture_owned=0
+
+on_start_exit() {
+  local status=$?
+  trap - EXIT
+  if [ "$status" -ne 0 ] && [ "${rootyard_fixture_owned:-0}" = "1" ]; then
+    stop >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+
+# Extract one "Label: value" field from Garage's aligned key table. Every
+# leading and trailing blank is stripped; a blank left inside the value makes
+# the character check reject it instead of silently gluing the fragments.
+key_table_field() {
+  local label=$1 text=$2 line
+  while IFS= read -r line; do
+    if [[ "$line" == "$label:"* ]]; then
+      line=${line#"$label:"}
+      line=${line#"${line%%[![:space:]]*}"}
+      line=${line%"${line##*[![:space:]]}"}
+      printf '%s' "$line"
+      return 0
+    fi
+  done <<<"$text"
+}
+
+# Validate a parsed credential without ever echoing it.
+check_credential() {
+  local label=$1 value=$2 minimum=$3 maximum=$4 length
+  [ -n "$value" ] || fail "Garage key creation returned no $label"
+  [[ "$value" =~ ^[A-Za-z0-9+/=_.-]+$ ]] \
+    || fail "Garage key creation returned a $label with unexpected characters"
+  length=${#value}
+  [ "$length" -ge "$minimum" ] && [ "$length" -le "$maximum" ] \
+    || fail "Garage key creation returned a $label of unexpected length $length"
+}
+
 # Print a canonical absolute path, rejecting root/ancestor/symlink paths. The
 # canonical form is what gets written into the sentinel and container labels.
 canonical_fixture_path() {
@@ -165,6 +205,9 @@ start() {
   [ -n "$output" ] || fail "--output-env is required"
   directory=$(canonical_fixture_path "$directory")
   output=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$output")
+  [ -n "$output" ] || fail "--output-env resolved to an empty path"
+  [ ! -e "$output" ] && [ ! -L "$output" ] \
+    || fail "refusing to overwrite an existing file at $output"
   case "$output/" in
     "$directory/"*) fail "credential env file must live outside the owned fixture directory" ;;
   esac
@@ -182,16 +225,8 @@ start() {
   uid=$(id -u)
   name="rootyard-owned-garage-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-${nonce:0:12}"
   write_sentinel "" "$name" "$nonce"
-  local owned=0 cleanup_status=0
-  cleanup_start_failure() {
-    cleanup_status=$?
-    if [ "$cleanup_status" -ne 0 ] && [ "$owned" = 1 ]; then
-      stop >/dev/null 2>&1 || true
-    fi
-    exit "$cleanup_status"
-  }
-  trap cleanup_start_failure EXIT
-  owned=1
+  rootyard_fixture_owned=1
+  trap on_start_exit EXIT
   local image_id repo_digests version_line
   image_id=$(docker image inspect --format '{{.Id}}' "$image") \
     || fail "cannot inspect $image"
@@ -267,19 +302,23 @@ TOML
   local key_name="rootyard-ci-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-${nonce:0:12}"
   local bucket="${bucket_prefix}-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-${nonce:0:8}"
   local created access secret
-  if "${garage[@]}" key --help 2>&1 | grep -q 'create'; then
-    created=$("${garage[@]}" key create "$key_name")
-  else
-    created=$("${garage[@]}" key new --name "$key_name")
-  fi
-  access=$(printf '%s\n' "$created" | sed -n 's/^Key ID: //p' | head -n 1)
-  secret=$(printf '%s\n' "$created" | sed -n 's/^Secret key: //p' | head -n 1)
-  [ -n "$access" ] || fail "Garage key creation returned no key id"
-  [ -n "$secret" ] || fail "Garage key creation returned no secret key"
+  # Garage 2.1.0 `key create NAME` prints an aligned table, so a naive prefix
+  # strip keeps the column padding and the S3 client then signs with a padded
+  # key id (the 400 "0 matching keys" failure). The raw output is never shown.
+  created=$("${garage[@]}" key create "$key_name")
+  access=$(key_table_field "Key ID" "$created")
+  secret=$(key_table_field "Secret key" "$created")
+  check_credential "access key id" "$access" 16 128
+  check_credential "secret key" "$secret" 32 256
+  [ "$access" != "$secret" ] || fail "Garage key creation returned one value for both credentials"
 
   "${garage[@]}" bucket create "$bucket" >/dev/null
   "${garage[@]}" bucket allow --read --write --owner --key "$access" "$bucket" >/dev/null
 
+  local probe_timeout="${ROOTYARD_FIXTURE_PROBE_TIMEOUT:-60}"
+  case "$probe_timeout" in
+    '' | *[!0-9]*) fail "ROOTYARD_FIXTURE_PROBE_TIMEOUT must be a whole number of seconds" ;;
+  esac
   ROOTYARD_FIXTURE_ACCESS_KEY="$access" ROOTYARD_FIXTURE_SECRET_KEY="$secret" \
     python3 "$(dirname "$0")/owned_object_store_env.py" \
       --output "$output" \
@@ -287,7 +326,7 @@ TOML
       --bucket "$bucket" \
       --region "$region" \
       --require-bucket-prefix "${bucket_prefix}-" \
-      --probe-timeout 60 \
+      --probe-timeout "$probe_timeout" \
       --summary "$directory/fixture-summary.json" >/dev/null
 
   python3 - "$directory/garage-image.json" "$image" "$image_id" "$expected_digest" "$version_line" <<'PY'
@@ -300,6 +339,7 @@ with open(path, "w", encoding="utf-8") as stream:
     stream.write("\n")
 PY
 
+  rootyard_fixture_owned=0
   trap - EXIT
   echo "owned garage fixture image: $image"
   echo "owned garage fixture image id: $image_id"

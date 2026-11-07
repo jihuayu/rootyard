@@ -60,6 +60,36 @@ def digest(path):
     return hasher.hexdigest()
 
 
+def artifact_file(directory, record, label):
+    """Resolve a downloaded artifact by its flattened name inside one job's dir.
+
+    The job manifest records the path the file had inside the job workspace;
+    upload/download-artifact flattens every job file under one artifact
+    directory, so only the final name is bound. Missing files, symlinks, names
+    that traverse and paths resolving outside the artifact directory fail
+    closed, so the release gate can never re-hash a file of its own choosing.
+    """
+    require(isinstance(record, dict), f"{label}: malformed manifest record")
+    recorded = record.get("file")
+    expected = record.get("sha256")
+    require(isinstance(recorded, str) and recorded, f"{label}: no recorded file name")
+    require(isinstance(expected, str) and len(expected) == 64, f"{label}: no recorded sha256")
+    require(".." not in Path(recorded).parts, f"{label}: recorded path {recorded!r} traverses out of its artifact")
+    name = Path(recorded).name
+    require(name not in ("", ".", ".."), f"{label}: recorded path {recorded!r} has no file name")
+    root = Path(directory)
+    require(root.is_dir() and not root.is_symlink(), f"{label}: artifact directory {root} is missing or a symlink")
+    candidate = root / name
+    require(not candidate.is_symlink(), f"{label}: downloaded artifact {candidate} is a symlink")
+    require(candidate.is_file(), f"{label}: downloaded artifact {candidate} is missing")
+    resolved = candidate.resolve()
+    require(
+        resolved.parent == root.resolve(),
+        f"{label}: downloaded artifact {candidate} resolves outside its artifact directory",
+    )
+    return resolved
+
+
 def pairs(values, flag):
     result = {}
     for value in values or []:
@@ -202,6 +232,7 @@ def release_manifest(args):
     required_reports = set(args.require_report or [])
     required_fixtures = pairs(args.require_fixture, "--require-fixture")
     exact_fixtures = pairs(args.require_fixture_exact, "--require-fixture-exact")
+    artifact_dirs = pairs(args.artifact_dir, "--artifact-dir")
 
     job_records, all_reports, all_fixtures, all_harnesses = {}, {}, {}, {}
     source_digests, commits = set(), set()
@@ -218,12 +249,28 @@ def release_manifest(args):
         require(data.get("source_inputs_sha256"), f"job manifest {name}: no source input digest")
         source_digests.add(data["source_inputs_sha256"])
         require(data.get("binary_sha256"), f"job manifest {name}: no binary digest")
+        artifact_dir = artifact_dirs.get(name)
+        require(
+            artifact_dir is not None,
+            f"job manifest {name}: no --artifact-dir supplied for its downloaded artifacts",
+        )
 
         reports = data.get("reports") or {}
         require(reports, f"job manifest {name}: no reports")
+        verified = {}
+        for kind, records in (("report", reports), ("log", data.get("logs") or {})):
+            for record_name, record in records.items():
+                label = f"job manifest {name}: {kind} {record_name}"
+                downloaded = artifact_file(artifact_dir, record, label)
+                actual = digest(downloaded)
+                require(
+                    actual == record["sha256"],
+                    f"{label}: downloaded file does not match the manifest sha256",
+                )
+                verified[f"{kind}:{record_name}"] = {"file": downloaded.name, "sha256": actual}
         for report_name, record in reports.items():
             require(report_name not in all_reports, f"report {report_name!r} is claimed by two jobs")
-            all_reports[report_name] = {**record, "job": name}
+            all_reports[report_name] = {**record, "job": name, "downloaded_sha256": verified[f"report:{report_name}"]["sha256"]}
 
         fixtures = data.get("fixtures") or {}
         for fixture_name, value in fixtures.items():
@@ -253,6 +300,7 @@ def release_manifest(args):
             "binary_sha256": data["binary_sha256"],
             "reports": sorted(reports),
             "fixtures": fixtures,
+            "artifacts": verified,
         }
 
     require(commits == {args.expect_commit}, "job manifests do not share the dispatched commit")
@@ -310,6 +358,7 @@ def main():
     parser.add_argument("--harness", action="append", default=[])
     parser.add_argument("--fixture", action="append", default=[])
     parser.add_argument("--job-manifest", action="append", default=[])
+    parser.add_argument("--artifact-dir", action="append", default=[])
     parser.add_argument("--require-report", action="append", default=[])
     parser.add_argument("--require-fixture", action="append", default=[])
     parser.add_argument("--require-fixture-exact", action="append", default=[])
