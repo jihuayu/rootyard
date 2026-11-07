@@ -118,12 +118,12 @@ impl<C: Clone, I> Registry<C, I> {
     /// confirmed/in-process mount exists. Losers see `Pending` and must not
     /// send a mount RPC or cancel anything on the shared workspace.
     pub(crate) fn admit(
-        self: &Arc<Mutex<Self>>,
+        shared: &Arc<Mutex<Self>>,
         id: Uuid,
         client: C,
         helper_generation: u64,
     ) -> Admission<C, I> {
-        let mut registry = lock(self);
+        let mut registry = lock(shared);
         match registry.entries.get(&id) {
             Some(MountEntry::InProcess(_)) => Admission::InProcess,
             Some(MountEntry::Helper(slot)) => match slot.state {
@@ -139,7 +139,7 @@ impl<C: Clone, I> Registry<C, I> {
                     MountEntry::Helper(HelperSlot { client, state: HelperState::Pending(reservation) }),
                 );
                 Admission::Reserved(ReservationGuard {
-                    registry: self.clone(),
+                    registry: shared.clone(),
                     id,
                     reservation,
                     armed: true,
@@ -263,7 +263,7 @@ mod tests {
         client: TestClient,
         generation: u64,
     ) -> ReservationGuard<TestClient, ()> {
-        match registry.admit(id, client, generation) {
+        match TestRegistry::admit(registry, id, client, generation) {
             Admission::Reserved(guard) => guard,
             _ => panic!("expected this caller to win the reservation"),
         }
@@ -281,12 +281,18 @@ mod tests {
             handles.push(thread::spawn(move || {
                 barrier.wait();
                 // Only `Reserved` is allowed to issue the mount RPC.
-                matches!(registry.admit(id, TestClient(n), 7), Admission::Reserved(_))
+                let admission = TestRegistry::admit(&registry, id, TestClient(n), 7);
+                let won = matches!(&admission, Admission::Reserved(_));
+                // Keep the winner's reservation until both admissions finish.
+                barrier.wait();
+                drop(admission);
+                won
             }));
         }
         let winners = handles
             .into_iter()
-            .filter(|handle| handle.join().unwrap())
+            .map(|handle| handle.join().unwrap())
+            .filter(|won| *won)
             .count();
         assert_eq!(winners, 1, "two concurrent ensures must not both own the mount RPC");
     }
@@ -331,7 +337,7 @@ mod tests {
         let id = Uuid::new_v4();
         registry.lock().unwrap().insert_in_process(id, ());
 
-        assert!(matches!(registry.admit(id, TestClient(1), 7), Admission::InProcess));
+        assert!(matches!(TestRegistry::admit(&registry, id, TestClient(1), 7), Admission::InProcess));
         assert!(matches!(
             registry.lock().unwrap().get(&id),
             Some(MountEntry::InProcess(()))

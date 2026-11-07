@@ -402,7 +402,7 @@ fn ensure_helper(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Resul
     // Check and reserve under one registry lock. Only the winner of `admit`
     // sends the mount RPC; a concurrent ensure sees Pending and returns before
     // touching the shared helper mount.
-    match registry().admit(id, client.clone(), generation) {
+    match MountRegistry::admit(registry(), id, client.clone(), generation) {
         Admission::InProcess => Err(Error(
             StatusCode::CONFLICT,
             "workspace is already mounted by the in-process backend",
@@ -443,7 +443,12 @@ fn ensure_helper(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Resul
                 // (shutdown or helper-generation replacement). Tear down the
                 // mount this winner created; no other caller shares this
                 // reservation, so this cannot cancel a later owner's mount.
-                let _ = client.unmount(id);
+                if client.unmount(id).is_err() {
+                    // A successful mount with lost registration is uncertain.
+                    // Fail this helper generation closed if compensation fails.
+                    let _ = client.shutdown(Duration::from_secs(10));
+                    return Err(Error::internal("workspace helper cleanup failed after lost reservation"));
+                }
                 return Err(Error(
                     StatusCode::CONFLICT,
                     "workspace mount reservation changed before confirmation; retry",
@@ -554,7 +559,13 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
 /// exit is killed by the client and reported, never silently ignored.
 pub async fn shutdown_helper() -> Result<(), Error> {
     let client = helper_slot().lock().unwrap().take();
-    registry().lock().unwrap().clear();
+    let entries = {
+        let mut registry = registry().lock().unwrap();
+        std::mem::take(&mut *registry)
+    };
+    // In-process handles can unmount/join on drop. Never hold the global
+    // registry while dropping them.
+    drop(entries);
     let Some(client) = client else { return Ok(()) };
     tokio::task::spawn_blocking(move || client.shutdown(Duration::from_secs(10)))
         .await
