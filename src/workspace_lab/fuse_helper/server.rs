@@ -525,7 +525,7 @@ fn prewarm(state: &Arc<State>, request: u64, workspace: Option<Uuid>, paths: Vec
                 request,
                 Some(ws),
                 0,
-                Body::Prewarmed(PrewarmReply { files, bytes }),
+                Body::Prewarmed(PrewarmReply { files: files as u64, bytes }),
             ),
             Err(error) => {
                 let code = error.raw_os_error().unwrap_or(libc::EIO);

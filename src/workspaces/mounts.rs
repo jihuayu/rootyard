@@ -334,7 +334,11 @@ pub async fn with_frozen_async<T>(
     // token is dropped and the child receives an explicit fence, never a thaw.
     let outcome = work.await;
     let release = release_after(&outcome, commit_started.load(Ordering::Acquire));
-    tokio::task::spawn_blocking(move || token.finish(release)).await.map_err(Error::internal)?.map_err(helper_error)?;
+    let decision = match release {
+        Release::KnownRollback => FreezeDecision::Thaw,
+        Release::Fence => FreezeDecision::Fence,
+    };
+    tokio::task::spawn_blocking(move || token.finish(decision)).await.map_err(Error::internal)?.map_err(helper_error)?;
     outcome
 }
 

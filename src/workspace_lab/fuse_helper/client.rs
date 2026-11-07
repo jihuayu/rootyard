@@ -19,7 +19,6 @@ use super::protocol::{
 use crate::workspace_lab::fuse_mount::FreezeDecision;
 use std::{
     collections::HashMap,
-    ffi::OsString,
     io,
     os::{
         fd::OwnedFd,
