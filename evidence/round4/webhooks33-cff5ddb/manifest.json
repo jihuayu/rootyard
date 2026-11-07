@@ -1,0 +1,95 @@
+{
+  "base_main": "53e77762a80a2fc28d4d3dcd8ca8c271eb687d47",
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "candidate_head": "cff5ddb0e15558c1300d5d8f239df5653f20411a",
+  "compiled_source": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "coordinator_exit_codes": {
+    "regressions": 0,
+    "worker-recovery": 0
+  },
+  "coordinator_stage": "complete",
+  "coordinator_state": "passed",
+  "database_cleanup": {
+    "regressions": "dropped_after_success",
+    "worker-recovery": "dropped_after_success"
+  },
+  "evidence_role": "round-4 webhooks: issue 33 automatic durable delivery, bugs 3/16/19 regression plus untrusted-CA TLS negative (docs/evidence only, no compile)",
+  "files": {
+    "README.md": {
+      "bytes": 7669,
+      "sha256": "29ebe9b3ea9cb638133a214e54d7fd95a487f80112859e590322af4e45ad1d0d"
+    },
+    "certificate.json": {
+      "bytes": 643,
+      "sha256": "78a6113be2b3a9be6b3f29165a00bed94c182224483e3613a1f6a1fec6b0033c"
+    },
+    "production-inputs.json": {
+      "bytes": 32569,
+      "sha256": "1468d0f93ce3d1732881eca82f5d212d2f1dcce10d3c12b5f0a5dc2440bb165c"
+    },
+    "regressions.log": {
+      "bytes": 225,
+      "sha256": "62b8998214902e1e280accac709155d6aeb5d79ee8ba8b8f2bce78139b074180"
+    },
+    "source-review.json": {
+      "bytes": 13351,
+      "sha256": "12e0a6e128e8a106deb22f140751defb0fb862a0ff78502d365deb4d1d52720f"
+    },
+    "source-review.md": {
+      "bytes": 5874,
+      "sha256": "79cff7fed0a4867cbf00bc24de2078bac13d77882364a64a92449fd367ea6128"
+    },
+    "status.json": {
+      "bytes": 3085,
+      "sha256": "907d484f002b8a15ac489e4310ded9546671381285acce27469da4b10e69636e"
+    },
+    "worker-recovery-report.json": {
+      "bytes": 3484,
+      "sha256": "75ddfcc95475f313830b1adaf44a9f2fe5c541533b35c649e9c31646df9e7452"
+    },
+    "worker-recovery.log": {
+      "bytes": 3742,
+      "sha256": "39bba5a1f06b53acd466f158752a4cbe37d2845434c1e193022fa0a878770a3b"
+    }
+  },
+  "harness_sha256": {
+    "tests/ci_webhook_regressions.py": "ec86c09f5e70c8e40d2d6cbda9fe3144cdf3b46aa919987dca2c175d25f332cd",
+    "tests/webhook_worker_recovery.py": "f3f2cffae85d63660ee285037a1a7a324aa7f9a592260650b29297b63be99bd2"
+  },
+  "harness_source_commit": "cff5ddb0e15558c1300d5d8f239df5653f20411a",
+  "log_normalization_applied": false,
+  "manifest_excludes_self": true,
+  "manual_dispatch_calls_in_worker_report": 0,
+  "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+  "publication_checks": {
+    "binary_rehashed_at_recorded_path": true,
+    "production_digest_recomputed": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+    "production_file_count_recomputed": 331,
+    "production_inputs_map_equal_stored": true,
+    "raw_fixtures_or_tls_keys_published": false,
+    "secret_marker_scan": "no matches"
+  },
+  "retry_timing_note": "backoff due field is integer unix now+2; measured wall interval ~1.897 s is an observation, not a guaranteed 2 s minimum",
+  "review_verdicts": {
+    "closable": [
+      33,
+      3,
+      16,
+      19
+    ],
+    "native_status": "passed",
+    "p1_count": 0,
+    "p2_count": 5,
+    "source_approval": "approved"
+  },
+  "source_input_file_count": 331,
+  "worker_report_cases": {
+    "automatic_backoff_retry_and_dead_letter": "passed",
+    "enqueue_boundary_lost_wakeup_recovers": "passed",
+    "kill_after_receiver_2xx_before_ack_recovers_at_least_once": "passed",
+    "retry_cannot_steal_a_live_worker_lease": "passed",
+    "stock_push_updates_open_pull_automatically": "passed"
+  },
+  "worker_report_matches_reported_sha": true,
+  "worker_report_sha256": "75ddfcc95475f313830b1adaf44a9f2fe5c541533b35c649e9c31646df9e7452"
+}

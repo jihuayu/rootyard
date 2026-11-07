@@ -1,0 +1,11 @@
+{
+  "main": "53e77762a80a2fc28d4d3dcd8ca8c271eb687d47",
+  "compiled_source": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "binary": "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+  "source_equivalence": "all production file paths/digests equal the certified baseline",
+  "harness_source_commit": "cff5ddb0e15558c1300d5d8f239df5653f20411a",
+  "valid": true,
+  "reused_baseline": true
+}
