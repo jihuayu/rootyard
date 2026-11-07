@@ -56,8 +56,14 @@ async fn transfer_authorized(
         }
     } else {
         let user = identity.ok_or_else(|| io::Error::other("missing Git actor"))?;
-        auth::verify_active(&state.pool, user, repo.id, write)
-            .await
+        auth::verify_active(
+            &state.pool,
+            user,
+            repo.id,
+            if write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead },
+            if write { auth::Role::Write } else { auth::Role::Read },
+        )
+        .await
             .map_err(|_| io::Error::other("Git authority revoked"))
     }
 }
@@ -142,7 +148,16 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         let repo = Repository::from_row(&row);
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        auth::authorize_repo(&tx, &identity, owner, name, write).await.map_err(|error| {
+        auth::authorize_repo_with_role(
+            &tx,
+            &identity,
+            owner,
+            name,
+            if write { auth::Role::Write } else { auth::Role::Read },
+            if write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead },
+        )
+        .await
+        .map_err(|error| {
             if error.0 == StatusCode::CONFLICT && error.1 == "repository is not ready" {
                 Error(StatusCode::SERVICE_UNAVAILABLE, "repository not ready; recovery may be required")
             } else {

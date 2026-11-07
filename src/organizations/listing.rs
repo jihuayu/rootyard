@@ -8,7 +8,7 @@
 //! is read. Each cursor is bound to `(actor, organization, list kind)` by the
 //! codec scope, so replaying it as another actor, organization or list is a
 //! 400 rather than an authorization shortcut.
-use crate::{AppState, Error, auth, db, members::models::Role, pagination};
+use crate::{AppState, Error, auth, db, members::models::Role, pagination, token_scopes::NamespaceAction};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -121,6 +121,7 @@ pub async fn list_members(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgRead).await?;
     // Authorization precedes cursor decoding: an unauthorized caller keeps the
     // historical 404/403 even when the supplied cursor is malformed.
     require_member(&tx, org, actor.id, Role::Read).await?;
@@ -190,6 +191,7 @@ pub async fn list_teams(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgRead).await?;
     require_member(&tx, org, actor.id, Role::Read).await?;
     let cursor = match query.cursor.as_deref() {
         Some(raw) => Some(decode_team_cursor(raw, actor.id, org)?),

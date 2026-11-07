@@ -34,7 +34,7 @@ pub async fn abort_migration(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     require_operator(&tx, &actor).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     finish(tx, &actor, false).await?;
@@ -180,7 +180,7 @@ pub async fn list_migrations(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read, crate::token_scopes::RepoAction::RepoRead).await?;
     require_operator(&tx, &actor).await?;
     let rows = tx
         .query(

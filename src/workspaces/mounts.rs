@@ -153,7 +153,7 @@ pub async fn prewarm(
     Path(id): Path<Uuid>,
     Json(input): Json<Prewarm>,
 ) -> Result<Json<Value>, Error> {
-    let ws = super::service::authorized(&state, &headers, id, Role::Write).await?;
+    let ws = super::service::authorized(&state, &headers, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     if ws.host_id != state.storage.volume_id || input.paths.is_empty() || input.paths.len() > 4 {
         return Err(Error(StatusCode::CONFLICT, "workspace prewarm requires local lease and up to four paths"));
     }

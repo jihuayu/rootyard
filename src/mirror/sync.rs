@@ -55,7 +55,7 @@ pub(crate) async fn repository(
     }
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
-    let access=auth::authorize_repo_with_role(&tx,&identity,owner,name,Role::Read).await
+    let access=auth::authorize_repo_with_role(&tx,&identity,owner,name,Role::Read,crate::token_scopes::RepoAction::ContentsRead).await
         .map_err(|error| if error.0 == StatusCode::CONFLICT && error.1 == "repository is not ready" {
             Error(StatusCode::SERVICE_UNAVAILABLE, "repository not ready")
         } else { error })?;

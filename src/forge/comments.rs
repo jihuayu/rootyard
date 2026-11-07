@@ -1,6 +1,6 @@
 //! Tenant-scoped Issue comment handlers.
 use super::handlers::{Comment, CommentPatch, NewComment, Page, COMMENT_FIELDS, body_valid, creation_replay, issue_exists, json, positive, record_creation};
-use crate::{AppState, Error, auth::{self, Role, authorize_repo_with_role as authorize, finish_tx as finish, idempotency_key}};
+use crate::{AppState, Error, auth::{self, finish_tx as finish, idempotency_key}};
 use axum::{Json, extract::{Path, Query, State}, http::{HeaderMap, StatusCode}, response::Response};
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ pub async fn create_comment(
     let key = idempotency_key(&headers)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize(&tx, &actor, &owner, &name, Role::Triage).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Triage, crate::token_scopes::RepoAction::IssuesWrite).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     if let Some(key) = key {
         let request =
@@ -47,7 +47,7 @@ pub async fn list_comments(
     let (after, limit) = page.bounds()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize(&tx, &actor, &owner, &name, Role::Read).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::IssuesRead).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     issue_exists(&tx, tenant_id, repo, number).await?;
     let rows = tx.query(&format!("SELECT {COMMENT_FIELDS} FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number>$4 ORDER BY number LIMIT $5"), &[&tenant_id,&repo,&number,&after,&(limit+1)]).await.map_err(Error::internal)?;
@@ -75,7 +75,7 @@ pub async fn get_comment(
     positive(comment_number)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize(&tx, &actor, &owner, &name, Role::Read).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::IssuesRead).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     let row = tx.query_opt(&format!("SELECT {COMMENT_FIELDS} FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4"), &[&tenant_id,&repo,&number,&comment_number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let comment = Comment::row(&row);
@@ -98,7 +98,7 @@ pub async fn update_comment(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize(&tx, &actor, &owner, &name, Role::Triage).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Triage, crate::token_scopes::RepoAction::IssuesWrite).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     tx.query_opt("SELECT number FROM forge_issue_comments WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4", &[&tenant_id,&repo,&number,&comment_number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let row = tx.query_opt(&format!("UPDATE forge_issue_comments SET body=$6,version=version+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND issue_number=$3 AND number=$4 AND version=$5 RETURNING {COMMENT_FIELDS}"), &[&tenant_id,&repo,&number,&comment_number,&input.expected_version,&input.body]).await.map_err(Error::internal)?.ok_or(Error(StatusCode::CONFLICT,"comment version conflict"))?;

@@ -1,5 +1,5 @@
 //! Issue models, validation, and transactional handlers.
-use crate::{AppState, Error, auth::{self, Role, authorize_repo_with_role as authorize, finish_tx as finish, idempotency_key}};
+use crate::{AppState, Error, auth::{self, finish_tx as finish, idempotency_key}};
 use axum::{Json, extract::{Path, Query, State}, http::{HeaderMap, StatusCode, header}, response::{IntoResponse, Response}};
 use deadpool_postgres::Transaction;
 use serde::{Deserialize, Serialize};
@@ -238,7 +238,7 @@ pub async fn create_issue(
     let key = idempotency_key(&headers)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize(&tx, &actor, &owner, &name, Role::Triage).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Triage, crate::token_scopes::RepoAction::IssuesWrite).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     if let Some(key) = key {
         let request =
@@ -268,7 +268,7 @@ pub async fn list_issues(
     let filter = page.state.as_ref().map(IssueState::as_str);
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize(&tx, &actor, &owner, &name, Role::Read).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::IssuesRead).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     let rows = tx.query(&format!("SELECT {ISSUE_FIELDS} FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND number>$3 AND ($5::text IS NULL OR state=$5) ORDER BY number LIMIT $4"), &[&tenant_id, &repo, &after, &(limit+1), &filter]).await.map_err(Error::internal)?;
     let more = rows.len() > limit as usize;
@@ -294,7 +294,7 @@ pub async fn get_issue(
     positive(number)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize(&tx, &actor, &owner, &name, Role::Read).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::IssuesRead).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     let row = tx.query_opt(&format!("SELECT {ISSUE_FIELDS} FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND number=$3"), &[&tenant_id,&repo,&number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let issue = Issue::row(&row);
@@ -323,7 +323,7 @@ pub async fn update_issue(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize(&tx, &actor, &owner, &name, Role::Triage).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Triage, crate::token_scopes::RepoAction::IssuesWrite).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     issue_exists(&tx, tenant_id, repo, number).await?;
     let row = tx.query_opt(&format!("UPDATE forge_issues SET title=COALESCE($5,title),body=COALESCE($6,body),state=COALESCE($7,state),version=version+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 AND version=$4 RETURNING {ISSUE_FIELDS}"), &[&tenant_id,&repo,&number,&input.expected_version,&input.title,&input.body,&input.state]).await.map_err(Error::internal)?.ok_or(Error(StatusCode::CONFLICT,"issue version conflict"))?;

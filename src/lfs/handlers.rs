@@ -114,6 +114,7 @@ pub async fn batch(
         &owner,
         name,
         if write { auth::Role::Write } else { auth::Role::Read },
+        if write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead },
     )
     .await?;
     let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
@@ -287,7 +288,7 @@ pub async fn verify_object(
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
     let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
 
     let row = tx
@@ -361,7 +362,7 @@ async fn download_inner(
     let (repo_id, tenant_id, expected_size) = {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Read).await?;
+        let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
         let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
         let row = tx
             .query_opt(

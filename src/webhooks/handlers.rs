@@ -46,7 +46,7 @@ pub async fn list_webhooks(
     let tx = client.transaction().await.map_err(Error::internal)?;
     // The tenant column is the repository owner, never the acting user, so
     // collaborators and organization administrators read the owner's rows.
-    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read).await?;
+    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::HooksRead).await?;
     let sql = format!(
         "SELECT {WEBHOOK_FIELDS} FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND ($3::bool IS NULL OR active=$3) ORDER BY created_at ASC, id ASC OFFSET $4 LIMIT $5"
     );
@@ -92,7 +92,7 @@ pub async fn create_webhook(
         let key = idempotency_key(&headers)?.map(str::to_owned);
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::HooksAdmin).await?;
 
         if let Some(ref k) = key {
             let req_val = sjson!({
@@ -136,7 +136,7 @@ pub async fn get_webhook(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read).await?;
+    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::HooksRead).await?;
     let row = tx
         .query_opt(
             &format!("SELECT {WEBHOOK_FIELDS} FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3"),
@@ -166,7 +166,7 @@ pub async fn update_webhook(
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
         crate::webhooks::trust::lock_policy_tx(&tx,policy_repo).await?;
-        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::HooksAdmin).await?;
         if access.repo_id!=policy_repo{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
 
         let existing = tx
@@ -230,7 +230,7 @@ pub async fn delete_webhook(
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
         crate::webhooks::trust::lock_policy_tx(&tx, policy_repo).await?;
-        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::HooksAdmin).await?;
         if access.repo_id != policy_repo {
             return Err(Error(StatusCode::CONFLICT, "repository changed"));
         }
@@ -263,7 +263,7 @@ pub async fn ping_webhook(
         let input: PingInput = parse_opt_body(&body)?;
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::HooksAdmin).await?;
         let row = tx
             .query_opt(
                 "SELECT secret, max_attempts FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3",
@@ -341,7 +341,7 @@ pub async fn dispatch_webhooks(
 
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::HooksAdmin).await?;
         finish(tx, &actor, true).await?;
         drop(client);
 
@@ -389,7 +389,7 @@ pub async fn list_deliveries(
     let cursor = query.cursor(hook_id)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read).await?;
+    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::HooksRead).await?;
 
     tx.query_opt(
         "SELECT id FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3",
@@ -453,7 +453,7 @@ pub async fn get_delivery(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read).await?;
+    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::HooksRead).await?;
     let row = tx
         .query_opt(&format!("SELECT {DELIVERY_FIELDS} FROM forge_webhook_deliveries WHERE tenant_id=$1 AND repository_id=$2 AND webhook_id=$3 AND id=$4"), &[&access.owner_id, &access.repo_id, &hook_id, &delivery_id])
         .await
@@ -478,7 +478,7 @@ pub async fn retry_delivery(
 
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::HooksAdmin).await?;
         let row = tx
             .query_opt(
                 &format!(

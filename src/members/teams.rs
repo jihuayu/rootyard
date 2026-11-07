@@ -29,7 +29,7 @@ pub async fn list_teams(
     let (actor, mut client) = open_client(&s, &h).await?;
     let (after, limit) = p.bounds()?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read, crate::token_scopes::RepoAction::MembersRead).await?;
     let q = format!(
         "SELECT {TEAM_FIELDS} FROM repository_teams WHERE tenant_id=$1 AND repository_id=$2 ORDER BY slug ASC OFFSET $3 LIMIT $4"
     );
@@ -64,7 +64,7 @@ pub async fn create_team(
     let key = idempotency_key(&h)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     serialize_member_mutation(&tx, &actor, &o, &n).await?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin, crate::token_scopes::RepoAction::MembersAdmin).await?;
     let r_str = inp.role.as_str();
     if let Some(key) = key {
         let req = sjson!({"operation":"team_create","slug":inp.slug,"name":inp.name,"description":desc,"role":r_str});
@@ -107,7 +107,7 @@ pub async fn get_team(State(s): App, Path((o, n, slug)): SubPath, h: HeaderMap) 
         return Err(Error::bad_request());
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read, crate::token_scopes::RepoAction::MembersRead).await?;
     let q = format!(
         "SELECT {TEAM_FIELDS} FROM repository_teams WHERE tenant_id=$1 AND repository_id=$2 AND slug=$3"
     );
@@ -141,7 +141,7 @@ pub async fn update_team(
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
     serialize_member_mutation(&tx, &actor, &o, &n).await?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin, crate::token_scopes::RepoAction::MembersAdmin).await?;
     let _ = lookup_team_id(&tx, acc.repo_id, &slug).await?;
     let r_opt = inp.role.map(|r| r.as_str().to_owned());
     let upd = format!(
@@ -176,7 +176,7 @@ pub async fn delete_team(State(s): App, Path((o, n, slug)): SubPath, h: HeaderMa
     }
     let tx = client.transaction().await.map_err(Error::internal)?;
     serialize_member_mutation(&tx, &actor, &o, &n).await?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin, crate::token_scopes::RepoAction::MembersAdmin).await?;
     let del = "DELETE FROM repository_teams WHERE tenant_id=$1 AND repository_id=$2 AND slug=$3";
     if tx
         .execute(del, &[&acc.owner_id, &acc.repo_id, &slug])
@@ -203,7 +203,7 @@ pub async fn list_team_members(
     let (actor, mut client) = open_client(&s, &h).await?;
     let (after, limit) = p.bounds()?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Read, crate::token_scopes::RepoAction::MembersRead).await?;
     let tid = lookup_team_id(&tx, acc.repo_id, &slug).await?;
     let q = format!(
         "SELECT {TEAM_MEMBER_FIELDS} FROM repository_team_members tm JOIN users u ON u.id = tm.user_id WHERE tm.team_id=$1 ORDER BY u.username ASC OFFSET $2 LIMIT $3"
@@ -255,7 +255,7 @@ async fn put_team_member_inner(
     let (actor, mut client) = open_client(&s, &h).await?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     serialize_member_mutation(&tx, &actor, &o, &n).await?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin, crate::token_scopes::RepoAction::MembersAdmin).await?;
     let tid = lookup_team_id(&tx, acc.repo_id, &slug).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;
     if uid == acc.owner_id {
@@ -305,7 +305,7 @@ pub async fn remove_team_member(
     let (actor, mut client) = open_client(&s, &h).await?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     serialize_member_mutation(&tx, &actor, &o, &n).await?;
-    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin).await?;
+    let acc = auth::authorize_repo_with_role(&tx, &actor, &o, &n, Role::Admin, crate::token_scopes::RepoAction::MembersAdmin).await?;
     let tid = lookup_team_id(&tx, acc.repo_id, &slug).await?;
     let (uid, uname) = lookup_user(&tx, &u).await?;
     let del = "DELETE FROM repository_team_members WHERE team_id=$1 AND user_id=$2";

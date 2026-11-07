@@ -92,8 +92,8 @@
 
 新增 HTTP JSON API（如 `src/pulls.rs`、`src/browse.rs`、`src/lfs.rs`、`src/webhooks.rs`、`src/members.rs`、`src/web.rs`、`src/sharding.rs`）应直接复用 `crate::auth` 导出的公共函数，避免重复编写 SQL 锁顺序：
 
-- `auth::authorize_repo_with_role(&tx, &actor, &owner_name, &repo_name, min_role)`：在单个 `READ COMMITTED` 事务内校验仓库 5 级角色权限（`Role::Read`、`Role::Triage`、`Role::Write`、`Role::Maintain`、`Role::Admin`），返回 `RepoAccess`。
-- `auth::authorize_repo(&tx, &actor, &owner_name, &repo_name, write)`：兼容读写布尔鉴权辅助函数（底层委托 `Role::Write` / `Role::Read`）。
+- `auth::authorize_repo_with_role(&tx, &actor, &owner_name, &repo_name, min_role, action)`：在单个 `READ COMMITTED` 事务内校验仓库 5 级角色权限（`Role::Read`、`Role::Triage`、`Role::Write`、`Role::Maintain`、`Role::Admin`），再用显式 `token_scopes::RepoAction` 收窄 PAT 作用域，返回 `RepoAccess`。`action` 决定 `read_only` 判定（读取动作不被只读令牌误拒）。
+- `auth::verify_active(&pool, &actor, repo_id, action, min_role)` / `auth::verify_repo_write_access(..., browser, action)`：事务外查询已解析仓库时使用，二者同样叠加 `RepoAction` 作用域检查。`verify_repo_write_access` 只接受裸 `GenericClient`，其 `FOR SHARE` 仅在本语句内有效，Git CAS 期间的父令牌锁仍未实现。
 - `auth::verify_token(&mut tx, &headers, write)`：只校验令牌而不锁定特定仓库行。
 - `auth::finish_tx(tx, &actor, write)`：显式提交事务后返回响应，保证读/写事务不会隐式回滚。
 - `auth::idempotency_key(&headers)`：校验并提取 `Idempotency-Key` 请求头（拒绝空值、首尾空白、控制字符或超 128 字节的值）。

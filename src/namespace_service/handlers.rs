@@ -57,7 +57,7 @@ pub async fn create(
     let mut owner_id = None;
     let mut repo_ids = Vec::new();
     for m in &input.mounts {
-        let access = auth::authorize_repo_with_role(&tx, &actor, &m.owner, &m.repository, Role::Read).await?;
+        let access = auth::authorize_repo_with_role(&tx, &actor, &m.owner, &m.repository, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
         if owner_id.is_some_and(|id| id != access.owner_id) {
             return Err(Error::bad_request());
         }
@@ -69,7 +69,7 @@ pub async fn create(
             .await
             .map_err(|_| Error::timeout())?;
         source_lease.ensure_active()?;
-        let refreshed = auth::authorize_repo_with_role(&tx, &actor, &m.owner, &m.repository, Role::Read).await?;
+        let refreshed = auth::authorize_repo_with_role(&tx, &actor, &m.owner, &m.repository, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
         if refreshed.repo_id != access.repo_id {
             return Err(Error::not_found());
         }
@@ -111,7 +111,7 @@ pub async fn load(state: &AppState, headers: &HeaderMap, id: Uuid) -> Result<Nam
     let mut mounts = Vec::new();
     for r in rows {
         let m = Mount { path: r.get(0), owner: r.get(2), repository: r.get(3), base_oid: r.get(4) };
-        let access = auth::authorize_repo_with_role(&tx, &actor, &m.owner, &m.repository, Role::Read).await?;
+        let access = auth::authorize_repo_with_role(&tx, &actor, &m.owner, &m.repository, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
         if access.repo_id != r.get::<_, Uuid>(1) {
             return Err(Error::not_found());
         }

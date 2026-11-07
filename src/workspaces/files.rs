@@ -66,7 +66,7 @@ pub async fn get(
     Path(id): Path<Uuid>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<Value>, Error> {
-    let ws = service::authorized(&state, &headers, id, Role::Read).await?;
+    let ws = service::authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?;
     let repo = service::workspace_repo(&state, id);
     let rel = safe_path(&query.path)?;
     let raw = match query.view.as_deref().unwrap_or("working") {
@@ -123,7 +123,7 @@ pub async fn put(
     ));
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = service::locked(&tx, &actor, id, Role::Write).await?;
+    let ws = service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     if let Some(row) = tx
         .query_opt(
             "SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2",
@@ -236,7 +236,7 @@ async fn git_mutation(
     ));
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = service::locked(&tx, &actor, id, Role::Write).await?;
+    let ws = service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     if let Some(row) = tx
         .query_opt(
             "SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2",

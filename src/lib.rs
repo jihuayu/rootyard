@@ -41,6 +41,8 @@ pub mod sandbox;
 pub mod sharding;
 pub mod storage;
 pub mod storage_lifecycle;
+#[rustfmt::skip]
+pub mod token_scopes;
 pub mod view_lab;
 pub mod workspace_lab;
 pub mod workspaces;

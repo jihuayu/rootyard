@@ -83,14 +83,14 @@ async fn load_header_ctx(tx: &Transaction<'_>, owner: &str, name: &str, actor: &
     })
 }
 
-pub async fn authorize_web_repo(state: &AppState, headers: &HeaderMap, owner: &str, name: &str, min_role: Role) -> Result<(Identity, RepoAccess, RepoHeaderCtx), Error> {
+pub async fn authorize_web_repo(state: &AppState, headers: &HeaderMap, owner: &str, name: &str, min_role: Role, action: crate::token_scopes::RepoAction) -> Result<(Identity, RepoAccess, RepoHeaderCtx), Error> {
     member_models::ensure_schema(&state.pool).await?;
     let actor = authenticate_web(&state.pool, headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, owner, name, min_role).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, owner, name, min_role, action).await?;
     let header_ctx = load_header_ctx(&tx, owner, name, &actor, access).await?;
-    finish(tx, &actor, min_role >= Role::Triage).await?;
+    finish(tx, &actor, action.is_mutating()).await?;
     Ok((actor, access, header_ctx))
 }
 
@@ -159,7 +159,7 @@ async fn lookup_username(tx: &Transaction<'_>, user_id: Uuid) -> Result<String, 
 }
 
 pub async fn repo_overview(State(state): App, Path((owner, name)): RepoPath, headers: HeaderMap) -> Res {
-    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::RepoRead).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let open_issues: i64 = tx.query_one("SELECT count(*) FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND state='open'", &[&access.owner_id, &access.repo_id]).await.map_err(Error::internal)?.get(0);
@@ -191,7 +191,7 @@ pub async fn repo_overview(State(state): App, Path((owner, name)): RepoPath, hea
 }
 
 pub async fn tree_view(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<WebTreeQuery>, headers: HeaderMap) -> Res {
-    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
     let (spec, rel_path, after, limit) = query.resolve_spec_and_validate(None)?;
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
@@ -200,7 +200,7 @@ pub async fn tree_view(State(state): App, Path((owner, name)): RepoPath, Query(q
 }
 
 pub async fn tree_by_oid_view(State(state): App, Path((owner, name, oid)): OidPath, Query(query): Query<WebTreeQuery>, headers: HeaderMap) -> Res {
-    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
     let (spec, rel_path, after, limit) = query.resolve_spec_and_validate(Some(&oid))?;
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
@@ -209,7 +209,7 @@ pub async fn tree_by_oid_view(State(state): App, Path((owner, name, oid)): OidPa
 }
 
 pub async fn blob_view(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<WebBlobQuery>, headers: HeaderMap) -> Res {
-    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
     let preview = source.protect(read_web_blob_preview(&state, access.repo_id, query.resolve_spec(None)?, query.path.as_deref(), query.validate_max_bytes()?)).await?;
@@ -217,7 +217,7 @@ pub async fn blob_view(State(state): App, Path((owner, name)): RepoPath, Query(q
 }
 
 pub async fn blob_by_oid_view(State(state): App, Path((owner, name, oid)): OidPath, Query(query): Query<WebBlobQuery>, headers: HeaderMap) -> Res {
-    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
     let preview = source.protect(read_web_blob_preview(&state, access.repo_id, query.resolve_spec(Some(&oid))?, query.path.as_deref(), query.validate_max_bytes()?)).await?;
@@ -225,7 +225,7 @@ pub async fn blob_by_oid_view(State(state): App, Path((owner, name, oid)): OidPa
 }
 
 pub async fn commits_view(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<WebCommitsQuery>, headers: HeaderMap) -> Res {
-    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
     let (spec, after, limit) = query.validate()?;
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
@@ -234,7 +234,7 @@ pub async fn commits_view(State(state): App, Path((owner, name)): RepoPath, Quer
 }
 
 pub async fn commit_detail_view(State(state): App, Path((owner, name, oid)): OidPath, headers: HeaderMap) -> Res {
-    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
     let (detail,diff_raw)=source.protect(async {
@@ -255,7 +255,7 @@ pub async fn commit_checks_view(State(state): App, Path((owner, name, oid)): Oid
         return Err(Error::bad_request());
     }
     let (after, limit) = query.validate()?;
-    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::ChecksRead).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let checks = query_commit_checks(&tx, access.owner_id, access.repo_id, &oid, after, limit).await?;
@@ -264,7 +264,7 @@ pub async fn commit_checks_view(State(state): App, Path((owner, name, oid)): Oid
 }
 
 pub async fn compare_view(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<WebCompareQuery>, headers: HeaderMap) -> Res {
-    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (_, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
     let (base, head) = query.validate()?;
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later"))?;
     let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
@@ -274,7 +274,7 @@ pub async fn compare_view(State(state): App, Path((owner, name)): RepoPath, Quer
 
 pub async fn issues_list_view(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<WebIssueFilterQuery>, headers: HeaderMap) -> Res {
     let (filter_state, after, limit) = query.validate()?;
-    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::IssuesRead).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let q = format!("SELECT {ISSUE_FIELDS} FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND number>$3 AND ($5::text IS NULL OR state=$5) ORDER BY number ASC LIMIT $4");
@@ -301,7 +301,7 @@ pub async fn create_issue_web(State(state): App, Path((owner, name)): RepoPath, 
         let key = idempotency_key(&norm_headers)?;
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Triage).await?;
+        let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Triage, crate::token_scopes::RepoAction::IssuesWrite).await?;
         let header_ctx = load_header_ctx(&tx, &owner, &name, &actor, access).await?;
         let (repo, tenant_id) = (access.repo_id, access.owner_id);
         if let Some(key) = key {
@@ -347,7 +347,7 @@ async fn load_issue_and_comments(tx: &Transaction<'_>, tenant_id: Uuid, repo_id:
 
 pub async fn issue_detail_view(State(state): App, Path((owner, name, number)): NumPath, headers: HeaderMap) -> Res {
     positive(number)?;
-    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::IssuesRead).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let (item, comments) = load_issue_and_comments(&tx, access.owner_id, access.repo_id, number).await?;
@@ -363,7 +363,7 @@ pub async fn update_issue_web(State(state): App, Path((owner, name, number)): Nu
     let actor = auth::authenticate(&state.pool, &norm_headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Triage).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Triage, crate::token_scopes::RepoAction::IssuesWrite).await?;
     let header_ctx = load_header_ctx(&tx, &owner, &name, &actor, access).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     tx.query_opt("SELECT number FROM forge_issues WHERE tenant_id=$1 AND repository_id=$2 AND number=$3 FOR UPDATE", &[&tenant_id, &repo, &number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
@@ -383,7 +383,7 @@ pub async fn create_issue_comment_web(State(state): App, Path((owner, name, numb
     let key = idempotency_key(&norm_headers)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Triage).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Triage, crate::token_scopes::RepoAction::IssuesWrite).await?;
     let header_ctx = load_header_ctx(&tx, &owner, &name, &actor, access).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     if let Some(key) = key {
@@ -407,7 +407,7 @@ pub async fn create_issue_comment_web(State(state): App, Path((owner, name, numb
 pub async fn pulls_list_view(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<WebPullFilterQuery>, headers: HeaderMap) -> Res {
     let (filter_enum, after, limit) = query.validate()?;
     let filter_str = filter_enum.as_ref().map(PullStateFilter::as_str);
-    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::PullsRead).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let q = format!("SELECT {PULL_FIELDS} FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number>$3 AND ($5::text IS NULL OR state=$5) ORDER BY number ASC LIMIT $4");
@@ -421,7 +421,7 @@ pub async fn pulls_list_view(State(state): App, Path((owner, name)): RepoPath, Q
 
 async fn render_pull_detail_for_number(state: &Arc<AppState>, owner: &str, name: &str, number: i64, headers: &HeaderMap, status: StatusCode) -> Res {
     positive(number)?;
-    let (actor, access, header_ctx) = authorize_web_repo(state, headers, owner, name, Role::Read).await?;
+    let (actor, access, header_ctx) = authorize_web_repo(state, headers, owner, name, Role::Read, crate::token_scopes::RepoAction::PullsRead).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let q = format!("SELECT {PULL_FIELDS} FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number=$3");
@@ -491,7 +491,7 @@ pub async fn create_review_web(State(state): App, Path((owner, name, number)): N
 pub async fn pull_checks_view(State(state): App, Path((owner, name, number)): NumPath, Query(query): Query<WebCheckPanelQuery>, headers: HeaderMap) -> Res {
     positive(number)?;
     let (after, limit) = query.validate()?;
-    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read).await?;
+    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Read, crate::token_scopes::RepoAction::ChecksRead).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let row = tx.query_opt("SELECT head_oid FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number=$3", &[&access.owner_id, &access.repo_id, &number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
@@ -510,7 +510,7 @@ pub async fn merge_pull_web(State(state): App, Path((owner, name, number)): NumP
 
 pub async fn audit_view(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<AuditQuery>, headers: HeaderMap) -> Res {
     let (after, limit) = query.validate()?;
-    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Maintain).await?;
+    let (actor, access, header_ctx) = authorize_web_repo(&state, &headers, &owner, &name, Role::Maintain, crate::token_scopes::RepoAction::MembersRead).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let rows = tx.query(&format!("SELECT {AUDIT_FIELDS} FROM repository_audit_log WHERE tenant_id=$1 AND repository_id=$2 AND id>$3 AND ($4::text IS NULL OR actor_name=$4) AND ($5::text IS NULL OR action=$5) AND ($6::bigint IS NULL OR created_unix>=$6) AND ($7::bigint IS NULL OR created_unix<=$7) ORDER BY id ASC LIMIT $8"), &[&access.owner_id, &access.repo_id, &after, &query.actor, &query.action, &query.since, &query.until, &(limit + 1)]).await.map_err(Error::internal)?;

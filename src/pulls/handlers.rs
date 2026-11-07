@@ -1,7 +1,7 @@
 //! HTTP handlers for Pull Request CRUD, native Git diff inspection, and Pull Request Reviews.
 use crate::{
     AppState, Error,
-    auth::{self, authorize_repo as authorize, finish_tx as finish, idempotency_key},
+    auth::{self, finish_tx as finish, idempotency_key},
     git_http,
     members::{audit, models::Role, rbac},
     pulls::{
@@ -35,10 +35,18 @@ async fn source_lease(
     ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let repo: Uuid = row.get(0);
     drop(client);
-    auth::verify_active(&state.pool, actor, repo, write).await?;
+    auth::verify_active(
+        &state.pool, actor, repo,
+        if write { crate::token_scopes::RepoAction::PullsWrite } else { crate::token_scopes::RepoAction::PullsRead },
+        if write { auth::Role::Write } else { auth::Role::Read },
+    ).await?;
     let lease = crate::storage::read_leases::shared(&state.pool, repo,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
-    auth::verify_active(&state.pool, actor, repo, write).await?;
+    auth::verify_active(
+        &state.pool, actor, repo,
+        if write { crate::token_scopes::RepoAction::PullsWrite } else { crate::token_scopes::RepoAction::PullsRead },
+        if write { auth::Role::Write } else { auth::Role::Read },
+    ).await?;
     Ok((repo, lease))
 }
 
@@ -87,7 +95,7 @@ pub async fn create_pull(
     let key = idempotency_key(&headers)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::PullsWrite).await?.repo_id;
     if repo != lease_repo { return Err(Error(StatusCode::CONFLICT, "repository route changed")); }
     let tenant_id = repo_tenant_id(&tx, repo).await?;
     let object_format = repository_object_format(&tx, repo).await?;
@@ -172,7 +180,7 @@ pub async fn list_pulls(
     let filter = page.state.as_ref().map(PullStateFilter::as_str);
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::PullsRead).await?.repo_id;
     let tenant_id = repo_tenant_id(&tx, repo).await?;
     let q = format!("SELECT {PULL_FIELDS} FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number>$3 AND ($5::text IS NULL OR state=$5) ORDER BY number LIMIT $4");
     let rows = tx.query(&q, &[&tenant_id, &repo, &after, &(limit + 1), &filter]).await.map_err(Error::internal)?;
@@ -192,7 +200,7 @@ pub async fn get_pull(
     positive(number)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::PullsRead).await?.repo_id;
     let tenant_id = repo_tenant_id(&tx, repo).await?;
     let q = format!("SELECT {PULL_FIELDS} FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number=$3");
     let row = tx.query_opt(&q, &[&tenant_id, &repo, &number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
@@ -228,7 +236,7 @@ pub async fn update_pull(
     } else { None };
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::PullsWrite).await?.repo_id;
     if source_lease.as_ref().is_some_and(|(id, _)| *id != repo) {
         return Err(Error(StatusCode::CONFLICT, "repository route changed"));
     }
@@ -331,7 +339,7 @@ pub async fn get_pull_diff(
     positive(number)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::PullsRead).await?.repo_id;
     let tenant_id = repo_tenant_id(&tx, repo).await?;
     let q = format!("SELECT {PULL_FIELDS} FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number=$3");
     let row = tx.query_opt(&q, &[&tenant_id, &repo, &number]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
@@ -344,7 +352,7 @@ pub async fn get_pull_diff(
     })?;
     let _lease = crate::storage::read_leases::shared(&state.pool, repo,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
-    auth::verify_active(&state.pool, &actor, repo, false).await?;
+    auth::verify_active(&state.pool, &actor, repo, crate::token_scopes::RepoAction::PullsRead, auth::Role::Read).await?;
     let merge_base_oid = _lease.guard(merge_base(&state, repo, &pull.base_oid, &pull.head_oid)).await??;
     let fast_forward = merge_base_oid.as_deref() == Some(pull.base_oid.as_str());
     let mut cmd = git_cmd(&state, repo)?;
@@ -353,7 +361,7 @@ pub async fn get_pull_diff(
         cmd, 4 * 1024 * 1024, state.config.git_timeout)).await?
         .map_err(Error::internal)?;
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo, false).await?;
+    auth::verify_active(&state.pool, &actor, repo, crate::token_scopes::RepoAction::PullsRead, auth::Role::Read).await?;
     let diff = String::from_utf8_lossy(&diff_bytes).into_owned();
     Ok(json(
         StatusCode::OK,
@@ -388,7 +396,7 @@ pub async fn create_review(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let min_role = if input.state == "commented" { Role::Triage } else { Role::Write };
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, min_role).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, min_role, crate::token_scopes::RepoAction::PullsWrite).await?;
     let (repo, tenant_id) = (access.repo_id, access.owner_id);
     let object_format = repository_object_format(&tx, repo).await?;
     if !valid_oid_for_format(&input.commit_oid, &object_format) {
@@ -449,7 +457,7 @@ pub async fn list_reviews(
     let (after, limit) = page.bounds()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::PullsRead).await?.repo_id;
     let tenant_id = repo_tenant_id(&tx, repo).await?;
     pull_exists(&tx, tenant_id, repo, number).await?;
     let q = format!("SELECT {REVIEW_FIELDS} FROM forge_pull_reviews WHERE tenant_id=$1 AND repository_id=$2 AND pull_number=$3 AND number>$4 ORDER BY number LIMIT $5");

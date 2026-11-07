@@ -412,7 +412,7 @@ pub async fn upsert_bucket(State(state): App, headers: HeaderMap, Json(input): J
 pub async fn get_repo_route(State(state): App, Path((owner, name)): RepoPath, headers: HeaderMap) -> Res {
     let (actor, mut client) = open_client(&state, &headers).await?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read, crate::token_scopes::RepoAction::RepoRead).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     finish(tx, &actor, false).await?;
     Ok(json(StatusCode::OK, route))
@@ -422,7 +422,7 @@ pub async fn configure_repo_route(State(state): App, Path((owner, name)): RepoPa
     let (actor, mut client) = open_client(&state, &headers).await?;
     auth::writable(&actor)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     let current = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     if input.expected_route_epoch.is_some_and(|e| e != current.route_epoch)
         || input.expected_version.is_some_and(|v| v != current.version)
@@ -481,7 +481,7 @@ pub async fn configure_repo_route(State(state): App, Path((owner, name)): RepoPa
 pub async fn resolve_repo_route(State(state): App, Path((owner, name)): RepoPath, Query(query): Query<ResolveRouteQuery>, headers: HeaderMap) -> Res {
     let (actor, mut client) = open_client(&state, &headers).await?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read, crate::token_scopes::RepoAction::RepoRead).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     let repo_gen: i64 = tx
         .query_one("SELECT storage_generation FROM repositories WHERE id = $1", &[&access.repo_id])

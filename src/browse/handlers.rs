@@ -46,7 +46,7 @@ pub async fn list_refs(
     let (prefix, after, limit) = query.validate()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id: Uuid = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let repo_id: Uuid = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?.repo_id;
     let storage_generation: i64 = tx
         .query_one(
             "SELECT storage_generation FROM repositories WHERE id=$1",
@@ -62,7 +62,7 @@ pub async fn list_refs(
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     let head = _lease.guard(git_read::read_head(&state, repo_id)).await??;
     let filtered = _lease.guard(git_read::page_refs(&state, repo_id, prefix, after, limit)).await??;
     let more = filtered.len() > limit;
@@ -74,7 +74,7 @@ pub async fn list_refs(
     };
 
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     Ok(json_ok(RefsResponse {
         repository_id: repo_id,
         storage_generation,
@@ -93,7 +93,7 @@ pub async fn list_commits(
     let (spec, after, limit) = query.validate()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?.repo_id;
 
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
@@ -101,11 +101,11 @@ pub async fn list_commits(
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     let payload = _lease.guard(git_read::list_commits(&state, repo_id, spec, after, limit)).await??;
 
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     Ok(json_ok(payload))
 }
 
@@ -119,7 +119,7 @@ pub async fn get_commit(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?.repo_id;
 
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
@@ -127,11 +127,11 @@ pub async fn get_commit(
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     let detail = _lease.guard(git_read::get_commit_detail(&state, repo_id, &oid)).await??;
 
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     Ok(json_ok(detail))
 }
 
@@ -150,7 +150,7 @@ pub async fn get_tree(
         }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?.repo_id;
 
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
@@ -158,7 +158,7 @@ pub async fn get_tree(
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     let tree = _lease.guard(git_read::read_tree(
         &state,
         repo_id,
@@ -169,7 +169,7 @@ pub async fn get_tree(
     )).await??;
 
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     Ok(json_ok(tree))
 }
 
@@ -187,7 +187,7 @@ pub async fn get_tree_by_oid(
     let rel_path = models::normalize_rel_path(query.path.as_deref())?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?.repo_id;
 
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
@@ -195,11 +195,11 @@ pub async fn get_tree_by_oid(
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     let tree = _lease.guard(git_read::read_tree(&state, repo_id, Some(&oid), &rel_path, after, limit)).await??;
 
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     Ok(json_ok(tree))
 }
 
@@ -223,7 +223,7 @@ pub async fn get_blob(
         }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?.repo_id;
 
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
@@ -231,12 +231,12 @@ pub async fn get_blob(
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     let blob = _lease.guard(git_read::read_blob(
         &state, repo_id, query.oid.as_deref(), query.path.as_deref())).await??;
 
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     Ok(json_ok(blob))
 }
 
@@ -256,7 +256,7 @@ pub async fn get_blob_by_oid(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?.repo_id;
 
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
@@ -264,11 +264,11 @@ pub async fn get_blob_by_oid(
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     let blob = _lease.guard(git_read::read_blob(&state, repo_id, Some(&oid), query.path.as_deref())).await??;
 
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     Ok(json_ok(blob))
 }
 
@@ -283,7 +283,7 @@ pub async fn compare_commits(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?.repo_id;
 
     auth::finish_tx(tx, &actor, false).await?;
     drop(client);
@@ -291,12 +291,12 @@ pub async fn compare_commits(
     let _lease = crate::storage::read_leases::shared(&state.pool, repo_id,
         tokio::time::Instant::now() + state.config.git_timeout).await?;
     let _snapshot = state.storage.read_snapshot_lock(repo_id).await;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     let comparison = _lease.guard(git_read::compare_commits(
         &state, repo_id, &query.base, &query.head)).await??;
 
     _lease.ensure_active()?;
-    auth::verify_active(&state.pool, &actor, repo_id, false).await?;
+    auth::verify_active(&state.pool, &actor, repo_id, crate::token_scopes::RepoAction::ContentsRead, auth::Role::Read).await?;
     Ok(json_ok(comparison))
 }
 
@@ -309,7 +309,7 @@ pub async fn get_storage_route(
     let requested_operation = query.validate()?.to_owned();
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id: Uuid = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let repo_id: Uuid = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?.repo_id;
     let row = tx
         .query_one(
             "SELECT r.name, r.state, r.storage_backend, r.storage_generation, ns.slug AS username \

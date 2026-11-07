@@ -74,7 +74,7 @@ pub async fn publish(
     crate::sharding::fencing::check_before_push(state, repo).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, actor, &repo.owner, &repo.name, auth::Role::Write).await?;
+    let access = auth::authorize_repo_with_role(&tx, actor, &repo.owner, &repo.name, auth::Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
     if access.repo_id != repo.id || access.owner_id != tenant_id {
         return Err(conflict());
     }

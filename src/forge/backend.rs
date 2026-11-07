@@ -103,7 +103,7 @@ pub async fn get_backend(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read, crate::token_scopes::RepoAction::RepoRead).await.map(|access| access.repo_id)?;
     let row = tx.query_one("SELECT r.name, r.state, r.storage_backend, r.storage_generation, ns.slug FROM repositories r JOIN namespaces ns ON ns.id = r.owner_id WHERE r.id = $1", &[&repo_id]).await.map_err(Error::internal)?;
     let status = build_backend_status(&state, repo_id, row.get("slug"), row.get("name"), row.get("state"), row.get::<_, &str>("storage_backend"), row.get("storage_generation"));
     finish(tx, &actor, false).await?;
@@ -118,7 +118,7 @@ pub async fn set_backend(
     if let Some(expected) = input.expected_storage_generation { positive(expected)?; }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = authorize(&tx, &actor, &owner, &name, Role::Admin).await?;
+    let access = authorize(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     let repo_id = access.repo_id;
     if input.storage_backend == "pando" {
         return Err(Error(StatusCode::CONFLICT,

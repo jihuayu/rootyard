@@ -194,7 +194,7 @@ async fn execute_ref_transaction_inner(
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, true).await?;
+    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?.repo_id;
     let current_generation: i64 = tx
         .query_one(
             "SELECT storage_generation FROM repositories WHERE id=$1 FOR SHARE",
@@ -446,7 +446,7 @@ async fn execute_ref_transaction_inner(
     // caller's token and effective role inside this same transaction so a
     // revocation during the transfer cannot publish refs or outbox events.
     auth::verify_repo_write_access(&*tx, actor.id, actor.token_id, repo_id,
-        auth::web_scope_enabled()).await?;
+        auth::web_scope_enabled(), crate::token_scopes::RepoAction::ContentsWrite).await?;
     tx.commit().await.map_err(Error::internal)?;
 
     Ok((

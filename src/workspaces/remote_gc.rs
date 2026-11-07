@@ -46,7 +46,7 @@ pub async fn abandon(
         .ok_or_else(Error::not_found)?;
     let workspace_id: Uuid = row.get(0);
     let status: String = row.get(1);
-    service::authorized(&state, &headers, workspace_id, Role::Write).await?;
+    service::authorized(&state, &headers, workspace_id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     if status == "committed" {
         return Err(Error(StatusCode::CONFLICT, "committed checkpoint is a retention root"));
     }

@@ -97,7 +97,7 @@ pub async fn migrate_repository(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     require_operator(&tx, &actor).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
     let authority_incarnation: Uuid = tx
@@ -476,7 +476,7 @@ pub async fn migrate_repository(
         sjson!({"repository_id": access.repo_id, "operation_id": operation_id,
                 "new_route_epoch": new_epoch, "new_generation": new_generation}),
     );
-    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     let updated = tx
         .execute(
             "UPDATE repositories SET storage_generation=$2 WHERE id=$1 AND storage_generation=$3",

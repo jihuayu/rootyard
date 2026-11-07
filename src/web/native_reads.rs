@@ -42,7 +42,7 @@ pub async fn acquire(state: &AppState, headers: &HeaderMap, owner: &str,
     // The first authorization ended before waiting for either barrier. A
     // revoked session or role must not read source objects after admission.
     let (_,fresh,_) = handlers::authorize_web_repo(
-        state,headers,owner,name,crate::members::models::Role::Read,
+        state,headers,owner,name,crate::members::models::Role::Read,crate::token_scopes::RepoAction::ContentsRead,
     ).await?;
     if fresh.repo_id!=repo_id { return Err(Error(StatusCode::NOT_FOUND,"not found")); }
     lease.ensure_active()?;

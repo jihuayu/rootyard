@@ -138,7 +138,7 @@ async fn authorize_transfer(
     let generation: i64 = repo.get(2);
     let owner_id: Uuid = repo.get(3);
     let object_format: String = repo.get(4);
-    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Admin).await?;
+    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     let op = tx
         .query_opt(
             "SELECT source_node_id,target_node_id,source_route_epoch,source_generation,state,refs_sha256 \
@@ -544,7 +544,7 @@ async fn authorize_finalize(
     let name: String = repo.get(1);
     let generation: i64 = repo.get(2);
     let owner_id: Uuid = repo.get(3);
-    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Admin).await?;
+    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     let op = tx
         .query_opt(
             "SELECT target_node_id,source_route_epoch,source_generation,state \

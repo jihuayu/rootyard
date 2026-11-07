@@ -83,7 +83,7 @@ impl Coordinator {
                     }
                     let window =
                         guard.enter_window(&state.storage, deadline).await.map_err(|e| anyhow::anyhow!(e.1))?;
-                    auth::verify_active(&state.pool, &self.actor, self.op.repository_id, true)
+                    auth::verify_active(&state.pool, &self.actor, self.op.repository_id, crate::token_scopes::RepoAction::ContentsWrite, auth::Role::Write)
                         .await
                         .map_err(|e| anyhow::anyhow!(e.1))?;
                     let repo_path = state.storage.verify_path(self.op.repository_id)?;

@@ -1,6 +1,7 @@
 use crate::{
     AppState, Error, auth, db,
     members::models::{Role, json},
+    token_scopes::NamespaceAction,
 };
 use axum::{
     Json,
@@ -62,7 +63,7 @@ pub async fn transfer_ownership(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     auth::finish_tx(tx, &actor, true).await?;
     Err(Error(StatusCode::CONFLICT, "repository ownership transfer is unsupported"))
 }
@@ -151,6 +152,7 @@ pub async fn create_organization(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, true).await?;
+    auth::reject_restricted_create(&tx, &actor).await?;
     let org = Uuid::new_v4();
     if let Some(key) = key {
         let inserted = tx.query_opt("INSERT INTO organization_creation_keys(actor_id,key,slug,organization_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING organization_id",
@@ -195,6 +197,7 @@ pub async fn get_organization(State(state): State<Arc<AppState>>, Path(slug): Pa
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgRead).await?;
     require_member(&tx, org, actor.id, Role::Read).await?;
     let row = tx
         .query_one("SELECT version,created_by,created_at::text FROM organizations WHERE id=$1", &[&org])
@@ -220,6 +223,7 @@ pub async fn put_member(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgMembersWrite).await?;
     lock_org_for_admin(&tx, org, actor.id).await?;
     let user: Uuid = tx
         .query_opt("SELECT id FROM users WHERE username=$1", &[&username])
@@ -276,6 +280,7 @@ pub async fn delete_member(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgMembersWrite).await?;
     lock_org_for_admin(&tx, org, actor.id).await?;
     let target = tx.query_opt("SELECT m.user_id,m.role FROM organization_memberships m JOIN users u ON u.id=m.user_id WHERE m.organization_id=$1 AND u.username=$2 FOR UPDATE OF m", &[&org,&username]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     protect_last_admin(&tx, org, target.get("user_id"), Role::parse(target.get::<_, &str>("role"))?, None).await?;
@@ -307,6 +312,7 @@ pub async fn create_team(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgTeamsWrite).await?;
     lock_org_for_admin(&tx, org, actor.id).await?;
     let id = Uuid::new_v4();
     let inserted = tx.execute("INSERT INTO organization_teams(id,organization_id,slug,name,role) VALUES($1,$2,$3,$4,$5) ON CONFLICT(organization_id,slug) DO NOTHING",
@@ -331,6 +337,7 @@ async fn change_team_member(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let org = org_id(&tx, &slug).await?;
+    auth::authorize_namespace_action(&tx, &actor, org, NamespaceAction::OrgTeamsWrite).await?;
     lock_org_for_admin(&tx, org, actor.id).await?;
     let team: Uuid = tx
         .query_opt("SELECT id FROM organization_teams WHERE organization_id=$1 AND slug=$2", &[&org, &team_slug])

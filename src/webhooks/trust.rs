@@ -82,7 +82,7 @@ pub async fn bind(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     lock_policy_tx(&tx,repo_id).await?;
-    let access = auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Maintain).await?;
+    let access = auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Maintain,crate::token_scopes::RepoAction::HooksAdmin).await?;
     if access.repo_id!=repo_id{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
     let hook = tx.query_opt(
         "SELECT active,ci_contexts FROM forge_webhooks WHERE id=$1 AND repository_id=$2",
@@ -112,7 +112,7 @@ pub async fn revoke(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     lock_policy_tx(&tx,repo_id).await?;
-    let access = auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Maintain).await?;
+    let access = auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Maintain,crate::token_scopes::RepoAction::HooksAdmin).await?;
     if access.repo_id!=repo_id{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
     let changed = tx.execute(
         "UPDATE forge_trusted_check_contexts SET active=false WHERE repository_id=$1 AND context=$2 AND webhook_id=$3",
@@ -142,7 +142,7 @@ async fn source_grant_inner(state:Arc<AppState>,owner:String,name:String,hook_id
     let actor=auth::authenticate(&state.pool,&headers).await?;
     let mut client=state.pool.get().await.map_err(Error::internal)?;
     let tx=client.transaction().await.map_err(Error::internal)?;
-    let access=auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Maintain).await?;
+    let access=auth::authorize_repo_with_role(&tx,&actor,&owner,&name,Role::Maintain,crate::token_scopes::RepoAction::HooksAdmin).await?;
     let hook=tx.query_opt("SELECT id FROM forge_webhooks WHERE id=$1 AND active=true",&[&hook_id])
         .await.map_err(Error::internal)?;
     if hook.is_none(){return Err(Error::not_found());}

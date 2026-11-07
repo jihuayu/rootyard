@@ -57,7 +57,7 @@ async fn authorized_job(state: &AppState, headers: &HeaderMap, id: Uuid) -> Resu
         return Err(Error::not_found());
     }
     let job = job(&row);
-    service::authorized(state, headers, job.workspace_id, Role::Read).await?;
+    service::authorized(state, headers, job.workspace_id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?;
     Ok(job)
 }
 
@@ -67,7 +67,7 @@ pub async fn start(
     Path(id): Path<Uuid>,
     Json(input): Json<Start>,
 ) -> Result<(StatusCode, Json<Job>), Error> {
-    let ws = service::authorized(&state, &headers, id, Role::Write).await?;
+    let ws = service::authorized(&state, &headers, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     if ws.lease_epoch != input.lease_epoch || ws.host_id != state.storage.volume_id {
         return Err(service::conflict());
     }
@@ -143,7 +143,7 @@ pub async fn stop(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Job>, Error> {
     let existing = authorized_job(&state, &headers, id).await?;
-    service::authorized(&state, &headers, existing.workspace_id, Role::Write).await?;
+    service::authorized(&state, &headers, existing.workspace_id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     let client = state.pool.get().await.map_err(Error::internal)?;
     client.execute("UPDATE sandbox_jobs SET state='cancelled',finished_at=clock_timestamp() WHERE id=$1 AND state IN ('queued','preparing','running')", &[&id]).await.map_err(Error::internal)?;
     let row = client
@@ -172,7 +172,7 @@ pub async fn cleanup(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, Error> {
     let existing = authorized_job(&state, &headers, id).await?;
-    service::authorized(&state, &headers, existing.workspace_id, Role::Write).await?;
+    service::authorized(&state, &headers, existing.workspace_id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     export::require_terminal(&state, id).await?;
     let removed = runner::cleanup_job(&state, id)?;
     Ok(Json(json!({"id":id,"removed":removed})))
@@ -184,7 +184,7 @@ async fn terminal_job(state: &AppState, headers: &HeaderMap, id: Uuid, write: bo
         return Err(Error::not_found());
     }
     if write {
-        service::authorized(state, headers, job.workspace_id, Role::Write).await?;
+        service::authorized(state, headers, job.workspace_id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
         if job.state != "running" {
             return Err(Error(StatusCode::CONFLICT, "terminal is not running"));
         }

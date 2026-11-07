@@ -50,7 +50,7 @@ pub async fn upload_waiters(
     let name = models::normalize_repo_name(&repo_raw)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Admin).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Admin, crate::token_scopes::RepoAction::RepoRead).await?;
     let count = *waiters().lock().unwrap().get(&access.repo_id).unwrap_or(&0);
     auth::finish_tx(tx, &actor, false).await?;
     Ok(lfs_json(StatusCode::OK, serde_json::json!({"waiters":count})))
@@ -114,7 +114,7 @@ async fn upload_inner(
     let (repo_id, tenant_id, expected_size) = {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write).await?;
+        let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
         let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
         let row = tx
             .query_opt(
@@ -155,7 +155,7 @@ async fn upload_inner(
     {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write).await?;
+        auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
         let row = tx
             .query_opt(
                 "SELECT size, state FROM lfs_objects WHERE tenant_id=$1 AND repository_id=$2 AND oid=$3",
@@ -209,7 +209,7 @@ async fn upload_inner(
     let finalize_res: Result<(), Error> = async {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let _ = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write).await?;
+        let _ = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
         let updated = tx
             .execute(
                 "UPDATE lfs_objects SET state = 'ready', updated_at = clock_timestamp() WHERE tenant_id = $1 AND repository_id = $2 AND oid = $3 AND size = $4",

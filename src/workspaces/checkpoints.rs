@@ -30,7 +30,7 @@ pub async fn create(
     Path(id): Path<Uuid>,
     Json(input): Json<CheckpointRequest>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
-    service::authorized(&state, &headers, id, Role::Write).await?;
+    service::authorized(&state, &headers, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     super::capture::reconcile_one(&state, id).await?;
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let key = auth::idempotency_key(&headers)?.ok_or_else(Error::bad_request)?.to_owned();
@@ -38,7 +38,7 @@ pub async fn create(
         hex::encode(Sha256::digest(format!("checkpoint:{}:{}", input.expected_workspace_revision, input.lease_epoch)));
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = service::locked(&tx, &actor, id, Role::Write).await?;
+    let ws = service::locked(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     if let Some(row) = tx
         .query_opt(
             "SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2",
@@ -119,7 +119,7 @@ async fn restore_inner(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let row = tx.query_opt("SELECT w.id,w.repository_id,w.owner_slug,w.repository_name,w.agent_id,w.creator_id,w.state,w.host_id,w.lease_epoch,w.revision,w.git_generation,w.last_checkpoint_id,c.state AS checkpoint_state FROM workspace_checkpoints c JOIN workspaces w ON w.id=c.workspace_id WHERE c.id=$1 AND c.state IN ('local_complete','committed')", &[&cp]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let parent = Workspace::from_row(&row);
-    let access = auth::authorize_repo_with_role(&tx, &actor, &parent.owner, &parent.repository, Role::Write).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &parent.owner, &parent.repository, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     if parent.creator_id != actor.id || access.repo_id != parent.repository_id {
         return Err(Error::not_found());
     }
@@ -183,7 +183,7 @@ pub async fn fork(
     Path(id): Path<Uuid>,
     Json(input): Json<ForkRequest>,
 ) -> Result<(StatusCode, Json<Workspace>), Error> {
-    let ws = service::authorized(&state, &headers, id, Role::Write).await?;
+    let ws = service::authorized(&state, &headers, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client
         .query_opt("SELECT workspace_id FROM workspace_checkpoints WHERE id=$1", &[&input.checkpoint_id])

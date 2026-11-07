@@ -45,14 +45,20 @@ pub async fn git(state: &AppState, repo: &FsPath, args: &[&str], limit: usize) -
     super::git::run(state, repo, args, limit).await
 }
 
-pub async fn authorized(state: &AppState, headers: &HeaderMap, id: Uuid, role: Role) -> Result<Workspace, Error> {
+pub async fn authorized(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: Uuid,
+    role: Role,
+    action: crate::token_scopes::RepoAction,
+) -> Result<Workspace, Error> {
     let actor = auth::authenticate(&state.pool, headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let sql = format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1");
     let row = tx.query_opt(&sql, &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let ws = Workspace::from_row(&row);
-    let access = auth::authorize_repo_with_role(&tx, &actor, &ws.owner, &ws.repository, role).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &ws.owner, &ws.repository, role, action).await?;
     if access.repo_id != ws.repository_id {
         return Err(Error::not_found());
     }
@@ -71,8 +77,9 @@ pub async fn locked(
     actor: &crate::db::Identity,
     id: Uuid,
     role: Role,
+    action: crate::token_scopes::RepoAction,
 ) -> Result<Workspace, Error> {
-    locked_inner(tx, actor, id, role, true).await
+    locked_inner(tx, actor, id, role, action, true).await
 }
 
 async fn locked_inner(
@@ -80,12 +87,13 @@ async fn locked_inner(
     actor: &crate::db::Identity,
     id: Uuid,
     role: Role,
+    action: crate::token_scopes::RepoAction,
     require_mount: bool,
 ) -> Result<Workspace, Error> {
     let sql = format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1");
     let row = tx.query_opt(&sql, &[&id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
     let initial = Workspace::from_row(&row);
-    let access = auth::authorize_repo_with_role(tx, actor, &initial.owner, &initial.repository, role).await?;
+    let access = auth::authorize_repo_with_role(tx, actor, &initial.owner, &initial.repository, role, action).await?;
     if access.repo_id != initial.repository_id {
         return Err(Error::not_found());
     }
@@ -114,7 +122,7 @@ pub async fn get(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Workspace>, Error> {
-    Ok(Json(authorized(&state, &headers, id, Role::Read).await?))
+    Ok(Json(authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?))
 }
 
 pub async fn lease(
@@ -126,7 +134,7 @@ pub async fn lease(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = locked_inner(&tx, &actor, id, Role::Write, false).await?;
+    let ws = locked_inner(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite, false).await?;
     if ws.lease_epoch != input.expected_lease_epoch {
         return Err(conflict());
     }
@@ -255,7 +263,7 @@ pub async fn create(
     ));
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write).await?;
+    let repo = auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     creation_lock(&tx, actor.id, &key).await?;
     if let Some(row) = tx.query_opt("SELECT request_sha256,workspace_id FROM workspace_creations WHERE actor_id=$1 AND idempotency_key=$2 FOR UPDATE", &[&actor.id,&key]).await.map_err(Error::internal)? {
         let existing: String = row.get(0);
@@ -274,7 +282,7 @@ pub async fn create(
         .await
         .map_err(|_| Error::timeout())?;
     source_lease.ensure_active()?;
-    let refreshed = auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write).await?;
+    let refreshed = auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     if refreshed.repo_id != repo.repo_id {
         return Err(Error::not_found());
     }

@@ -142,7 +142,7 @@ pub async fn publish(
     let digest: Option<String> = row.get(5);
     let size: Option<i64> = row.get(6);
     let tenant: Uuid = row.get(7);
-    let ws = service::authorized(&state, &headers, ws_id, Role::Write).await?;
+    let ws = service::authorized(&state, &headers, ws_id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
     if ws.repository_id != repo_id {
         return Err(Error::not_found());
     }

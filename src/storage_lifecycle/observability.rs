@@ -112,7 +112,7 @@ pub async fn list(
     let (limit, after, state_filter) = query.bounds()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain, crate::token_scopes::RepoAction::RepoRead).await?;
     let position = match after {
         Some(job) => Some(cursor_position(&tx, access.repo_id, job).await?),
         None => None,
@@ -146,7 +146,7 @@ pub async fn get(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Maintain, crate::token_scopes::RepoAction::RepoRead).await?;
     let row = tx
         .query_opt(
             &format!("SELECT {JOB_FIELDS} FROM storage_maintenance_jobs j WHERE j.repository_id=$1 AND j.id=$2"),

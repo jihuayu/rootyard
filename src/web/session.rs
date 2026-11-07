@@ -324,6 +324,7 @@ async fn validate_session(state: &Arc<AppState>, secret: &str, csrf: Option<&str
             "SELECT s.csrf_digest FROM web_sessions s \
              JOIN tokens t ON t.id=s.token_id \
              JOIN tokens p ON p.id=$2 AND p.user_id=t.user_id AND p.kind='api' \
+                  AND p.is_restricted = false \
                   AND NOT p.revoked AND (p.expires_at IS NULL OR p.expires_at>clock_timestamp()) \
              WHERE t.digest=$1 AND NOT t.revoked AND NOT s.revoked \
                AND s.expires_at>clock_timestamp()",
@@ -462,14 +463,33 @@ pub async fn login(
     let csrf = new_secret();
     let token_id = Uuid::new_v4();
     let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let kind: Option<String> = client
-        .query_opt("SELECT kind FROM tokens WHERE id=$1 AND user_id=$2", &[&actor.token_id, &actor.id])
+    let parent = client
+        .query_opt(
+            "SELECT kind, is_restricted FROM tokens WHERE id=$1 AND user_id=$2",
+            &[&actor.token_id, &actor.id],
+        )
         .await
-        .map_err(Error::internal)?
-        .map(|row| row.get(0));
-    if kind.as_deref() != Some("api") {
-        let mut response =
-            render_login(&target, Some("API token sign-in is required; browser sessions cannot sign in again."));
+        .map_err(Error::internal)?;
+    let Some(parent) = parent else {
+        return Err(Error::unauthorized());
+    };
+    let kind: String = parent.get(0);
+    let restricted: bool = parent.get(1);
+    if restricted {
+        // Restricted API tokens cannot mint a browser child until a parent
+        // binding exists: a child must never become an unrestricted proxy.
+        let mut response = render_login(
+            &target,
+            Some("Restricted API tokens cannot open a browser session yet."),
+        );
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return Ok(response);
+    }
+    if kind != "api" {
+        let mut response = render_login(
+            &target,
+            Some("API token sign-in is required; browser sessions cannot sign in again."),
+        );
         *response.status_mut() = StatusCode::UNAUTHORIZED;
         return Ok(response);
     }
@@ -477,9 +497,10 @@ pub async fn login(
     auth::verify_token(&tx, &actor, false).await?;
     let inserted = tx
         .execute(
-            "INSERT INTO tokens(id,user_id,digest,read_only,expires_at,kind) \
-             SELECT $1,$2,$3,$4,LEAST(clock_timestamp()+interval '12 hours',COALESCE(p.expires_at,clock_timestamp()+interval '12 hours')),'browser' \
-             FROM tokens p WHERE p.id=$5 AND p.user_id=$2 AND p.kind='api' AND NOT p.revoked",
+            "INSERT INTO tokens(id,user_id,digest,read_only,expires_at,kind,is_restricted) \
+             SELECT $1,$2,$3,$4,LEAST(clock_timestamp()+interval '12 hours',COALESCE(p.expires_at,clock_timestamp()+interval '12 hours')),'browser',p.is_restricted \
+             FROM tokens p WHERE p.id=$5 AND p.user_id=$2 AND p.kind='api' AND NOT p.revoked \
+               AND p.is_restricted = false",
             &[
                 &token_id,
                 &actor.id,
@@ -536,7 +557,22 @@ pub async fn discover(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     let actor = super::handlers::authenticate_web(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let rows=tx.query("SELECT DISTINCT ns.slug,r.name FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id WHERE r.state='ready' AND (ns.user_id=$1 OR EXISTS(SELECT 1 FROM organization_memberships m WHERE m.organization_id=r.owner_id AND m.user_id=$1) OR EXISTS(SELECT 1 FROM organization_team_members tm WHERE tm.organization_id=r.owner_id AND tm.user_id=$1) OR EXISTS(SELECT 1 FROM repository_collaborators c WHERE c.repository_id=r.id AND c.user_id=$1) OR EXISTS(SELECT 1 FROM repository_team_members tm WHERE tm.repository_id=r.id AND tm.user_id=$1)) ORDER BY ns.slug,r.name LIMIT 101", &[&actor.id]).await.map_err(Error::internal)?;
+    auth::verify_token(&tx, &actor, false).await?;
+    // Restricted tokens discover only their exact repository grants. Ownership,
+    // organisation and collaborator rows must not leak other repository names.
+    let restricted = auth::token_is_restricted(&tx, &actor).await?;
+    let rows = if restricted {
+        tx.query(
+            "SELECT DISTINCT ns.slug,r.name FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id \
+             WHERE r.state='ready' AND EXISTS (SELECT 1 FROM token_repository_scopes ts \
+                 WHERE ts.token_id=$1 AND ts.repository_id=r.id) ORDER BY ns.slug,r.name LIMIT 101",
+            &[&actor.token_id],
+        )
+        .await
+        .map_err(Error::internal)?
+    } else {
+        tx.query("SELECT DISTINCT ns.slug,r.name FROM repositories r JOIN namespaces ns ON ns.id=r.owner_id WHERE r.state='ready' AND (ns.user_id=$1 OR EXISTS(SELECT 1 FROM organization_memberships m WHERE m.organization_id=r.owner_id AND m.user_id=$1) OR EXISTS(SELECT 1 FROM organization_team_members tm WHERE tm.organization_id=r.owner_id AND tm.user_id=$1) OR EXISTS(SELECT 1 FROM repository_collaborators c WHERE c.repository_id=r.id AND c.user_id=$1) OR EXISTS(SELECT 1 FROM repository_team_members tm WHERE tm.repository_id=r.id AND tm.user_id=$1)) ORDER BY ns.slug,r.name LIMIT 101", &[&actor.id]).await.map_err(Error::internal)?
+    };
     let mut html = String::from(
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Repositories</title><h1>Repositories</h1><form method=\"post\" action=\"/web/logout\"><button>Sign out</button></form>",
     );

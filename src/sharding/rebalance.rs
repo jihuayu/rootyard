@@ -249,7 +249,7 @@ pub async fn execute_rebalance(
         lease.ensure_active()?;
         let meta = tx.query_opt("SELECT u.slug, r.name, r.storage_generation FROM repositories r JOIN namespaces u ON u.id = r.owner_id WHERE r.id = $1 FOR UPDATE", &[&repo_id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
         let (owner_name, repo_name, repo_gen): (String, String, i64) = (meta.get(0), meta.get(1), meta.get(2));
-        let access = auth::authorize_repo_with_role(&tx, &actor, &owner_name, &repo_name, Role::Admin).await?;
+        let access = auth::authorize_repo_with_role(&tx, &actor, &owner_name, &repo_name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
         let repo_dir = state.storage.verify_path(repo_id).map_err(|_| conflict("bare Git repository volume verification failed"))?;
         let route = load_or_init_repo_route(&tx, access.owner_id, repo_id).await?;
         if route.primary_node_id != input.source_node_id {
@@ -308,7 +308,7 @@ pub async fn list_dr_drills(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoRead).await?;
     let latest = read_dr_drill_receipt_at(&state.storage.repo_path(access.repo_id))?;
     let rows = tx.query("SELECT details FROM repository_audit_log WHERE tenant_id = $1 AND repository_id = $2 AND action = 'shard.dr_drill' ORDER BY id DESC LIMIT 50", &[&access.owner_id, &access.repo_id]).await.map_err(Error::internal)?;
     let mut items: Vec<DrDrillReceipt> = rows.iter().filter_map(|r| serde_json::from_value(r.get::<_, serde_json::Value>(0)).ok()).collect();
@@ -329,7 +329,7 @@ pub async fn execute_dr_drill(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
+    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
     require_operator(&tx, &actor).await?;
     finish(tx, &actor, false).await?;
     Err(conflict("simulated DR inputs cannot promote storage; use native cluster recovery workload"))
