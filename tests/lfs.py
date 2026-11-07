@@ -426,18 +426,32 @@ class LfsHarness(Harness):
         corrupted = bytes([original[0] ^ 0xFF]) + original[1:]
         os.chmod(self.obj_file, 0o600)
         self.obj_file.write_bytes(corrupted)
+        # With no remote configured, corruption must fail closed. With a
+        # configured remote, the cold path may hydrate a verified copy, but the
+        # bytes served must still be the original object, never the tampered
+        # local bytes. This keeps the local-failure requirement intact.
+        endpoint_configured = bool(self.env.get("ROOTYARD_OBJECT_STORE_ENDPOINT"))
+        failure_codes = (422, 500, 503)
         try:
-            self.lfs_get(
-                f"/git/alice/demo.git/info/lfs/objects/{self.oid}/{self.size}",
-                token=self.reader,
-                code=(422, 500, 503),
-            )
+            if endpoint_configured:
+                _, recovered, _ = self.lfs_get(
+                    f"/git/alice/demo.git/info/lfs/objects/{self.oid}/{self.size}",
+                    token=self.reader,
+                    code=200,
+                )
+                assert recovered == original, "remote recovery served unverified bytes"
+            else:
+                self.lfs_get(
+                    f"/git/alice/demo.git/info/lfs/objects/{self.oid}/{self.size}",
+                    token=self.reader,
+                    code=failure_codes,
+                )
             self.lfs_verify(
                 "/git/alice/demo.git/info/lfs/verify",
                 self.oid,
                 self.size,
                 token=self.alice,
-                code=(422, 500, 503),
+                code=200 if endpoint_configured else failure_codes,
             )
         finally:
             self.obj_file.write_bytes(original)

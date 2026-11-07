@@ -3,10 +3,19 @@
 
 A loopback control proxy forwards every request unchanged to the configured
 Garage endpoint, preserving the client Host and SigV4 headers and never logging
-headers, credentials or payloads. For one synthetic 8 MiB LFS object it gates
-the two backend GETs so both native download requests begin while the local
-bytes are missing, and so the second hydration overlaps the first reader's
-in-flight body. Both reads must return the exact SHA-256 and size.
+headers, credentials or payloads. The first target GET is gated while the local
+final path is still absent. A second native download is then started and given
+time to join the in-flight hydration; only after that gate is released may the
+proxy forward bytes. Exactly one backend GET and one HEAD are allowed, and both
+readers must receive the exact SHA-256 and size from overlapping responses.
+
+The same harness also covers:
+* a failed flight returning explicit failures to every waiter, followed by a
+  clean retry that issues exactly one new backend GET;
+* client cancellation while hydration is gated: no partial final file appears,
+  the detached hydration completes with correct bytes, no staging files survive,
+  and a later cold read starts a fresh flight instead of reusing a stale map
+  entry.
 """
 import argparse
 import hashlib
@@ -24,30 +33,33 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from e2e import Harness  # noqa: E402
 from lfs import LfsHarness  # noqa: E402
 
 PAYLOAD_BYTES = 8 * 1024 * 1024
 FIRST_CHUNK = 16 * 1024
 EVENT_TIMEOUT = 60
+FOLLOWER_JOIN_GRACE = 2.0
+FLIGHT_SETTLE = 0.5
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "transfer-encoding",
               "te", "trailer", "upgrade"}
 
 
 class S3ControlProxy:
-    """Threaded pass-through proxy with deterministic GET gating for one oid."""
+    """Threaded pass-through proxy with one-shot GET gating and request counts."""
 
     def __init__(self, target_host, target_port):
         self.target = (target_host, target_port)
         self.oid = None
+        self.watch_path = None
         self.armed = False
         self.lock = threading.Lock()
+        self.get_condition = threading.Condition(self.lock)
+        self.counts = {}
         self.target_gets = 0
-        self.e_get1_received = threading.Event()
-        self.e_get2_received = threading.Event()
-        self.e_client_headers = threading.Event()
-        self.e_first_client_done = threading.Event()
-        self.e_second_first_chunk = threading.Event()
+        self.target_heads = 0
+        self.gate_next_get = False
+        self.fail_gets_remaining = 0
+        self.release = threading.Event()
         self.errors = []
         self.events = []
         proxy = self
@@ -85,10 +97,11 @@ class S3ControlProxy:
         self.thread.start()
 
     def stop(self):
+        self.release.set()
         self.server.shutdown()
         self.server.server_close()
 
-    def arm(self, oid, watch_path=None):
+    def arm(self, oid, watch_path):
         self.oid = oid
         self.watch_path = watch_path
         self.armed = True
@@ -96,12 +109,37 @@ class S3ControlProxy:
     def disarm(self):
         self.armed = False
 
+    def prepare_gate(self, fail=False):
+        with self.get_condition:
+            self.gate_next_get = True
+            # The Rust S3 client retries a 5xx up to three attempts. Fail every
+            # attempt so a failed flight is deterministic; otherwise a retry
+            # could silently turn the scenario into a success.
+            self.fail_gets_remaining = 3 if fail else 0
+            self.release.clear()
+
+    def release_gated(self):
+        self.release.set()
+
+    def wait_for_gets(self, count, timeout=EVENT_TIMEOUT):
+        deadline = time.monotonic() + timeout
+        with self.get_condition:
+            while self.target_gets < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"timed out waiting for target GET #{count}")
+                self.get_condition.wait(remaining)
+
+    def snapshot(self):
+        with self.lock:
+            return self.target_heads, self.target_gets
+
     def note(self, kind, **fields):
         with self.lock:
             self.events.append({"kind": kind, "monotonic": round(time.monotonic(), 6), **fields})
 
-    def is_target_get(self, method, path):
-        if not (self.armed and method == "GET"):
+    def is_target(self, method, path):
+        if not self.armed:
             return False
         leaf = path.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
         return leaf == self.oid
@@ -113,18 +151,34 @@ class S3ControlProxy:
         headers = [(name, value) for name, value in handler.headers.items()
                    if name.lower() not in HOP_BY_HOP
                    and name.lower() not in ("expect", "content-length")]
-        number = 0
-        if self.is_target_get(method, path):
-            with self.lock:
-                self.target_gets += 1
-                number = self.target_gets
-            if number == 1:
-                self.e_get1_received.set()
-                self.note("first_backend_get_received")
-            elif number == 2:
-                exists = bool(self.watch_path and self.watch_path.exists())
-                self.note("second_backend_get_received", local_final_exists=exists)
-                self.e_get2_received.set()
+        target = self.is_target(method, path)
+        gated = fail = False
+        if target:
+            with self.get_condition:
+                self.counts[method] = self.counts.get(method, 0) + 1
+                if method == "GET":
+                    self.target_gets += 1
+                    self.get_condition.notify_all()
+                    gated = self.gate_next_get
+                    self.gate_next_get = False
+                    if self.fail_gets_remaining > 0:
+                        self.fail_gets_remaining -= 1
+                        fail = True
+                elif method == "HEAD":
+                    self.target_heads += 1
+            # `note` re-acquires the non-reentrant lock, so it must run after
+            # leaving the condition block or the handler deadlocks itself.
+            if method == "GET":
+                self.note("target_get_received", local_final_exists=bool(
+                    self.watch_path and self.watch_path.exists()))
+            elif method == "HEAD":
+                self.note("target_head_received")
+        if gated and not self.release.wait(EVENT_TIMEOUT):
+            raise RuntimeError("test never released the gated backend GET")
+        if fail:
+            self.note("target_get_failed")
+            self.relay(handler, "GET", 502, [], b"", 0)
+            return
         conn = http.client.HTTPConnection(*self.target, timeout=EVENT_TIMEOUT)
         try:
             conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
@@ -135,29 +189,26 @@ class S3ControlProxy:
             conn.endheaders(body if body else None)
             response = conn.getresponse()
             status, response_headers = response.status, response.getheaders()
-            if number and status == 200:
-                self.note("target_backend_response", number=number, status=status)
-                return self.serve_target_stream(handler, number, response_headers, response)
             payload = response.read()
         finally:
             conn.close()
-        if number:
-            self.note("target_backend_response", number=number, status=status, bytes=len(payload))
-            return self.relay(handler, "GET", status, response_headers, payload)
-        self.relay(handler, method, status, response_headers, payload)
-        self.note("pass_through", method=method, status=status, bytes=len(payload))
-
-    def relay(self, handler, method, status, headers, payload):
-        keep_length = None
-        for name, value in headers:
+        declared = None
+        for name, value in response_headers:
             if name.lower() == "content-length":
-                keep_length = int(value)
+                declared = int(value)
+        self.relay(handler, method, status, response_headers, payload, declared)
+        if target:
+            self.note("target_response", method=method, status=status, bytes=len(payload))
+        else:
+            self.note("pass_through", method=method, status=status, bytes=len(payload))
+
+    def relay(self, handler, method, status, headers, payload, declared):
         handler.send_response_only(status)
         for name, value in headers:
             if name.lower() in HOP_BY_HOP or name.lower() == "content-length":
                 continue
             handler.send_header(name, value)
-        length = keep_length if method == "HEAD" or status in (204, 304) else len(payload)
+        length = declared if method == "HEAD" or status in (204, 304) else len(payload)
         handler.send_header("Content-Length", str(length if length is not None else 0))
         handler.send_header("Connection", "close")
         handler.end_headers()
@@ -166,53 +217,6 @@ class S3ControlProxy:
             handler.wfile.write(payload)
         handler.wfile.flush()
 
-    def serve_target_stream(self, handler, number, headers, response):
-        length = None
-        for name, value in headers:
-            if name.lower() == "content-length":
-                length = int(value)
-        if length is None:
-            return self.relay(handler, "GET", 200, headers, response.read())
-        if number == 2 and not self.e_client_headers.wait(EVENT_TIMEOUT):
-            raise RuntimeError("first client response headers never observed")
-        self.relay_headers(handler, 200, headers, length)
-        sent = 0
-        first = response.read(FIRST_CHUNK)
-        handler.wfile.write(first)
-        handler.wfile.flush()
-        sent += len(first)
-        if number == 1:
-            self.note("first_backend_first_chunk", chunk=len(first))
-            if not self.e_get2_received.wait(EVENT_TIMEOUT):
-                raise RuntimeError("second hydrating GET never reached the proxy")
-        else:
-            self.e_second_first_chunk.set()
-            self.note("second_backend_first_chunk_while_first_reading",
-                      chunk=len(first), first_client_done=self.e_first_client_done.is_set())
-            if not self.e_first_client_done.wait(EVENT_TIMEOUT):
-                raise RuntimeError("first client never finished reading its body")
-        while sent < length:
-            chunk = response.read(min(64 * 1024, length - sent))
-            if not chunk:
-                break
-            handler.wfile.write(chunk)
-            handler.wfile.flush()
-            sent += len(chunk)
-        if sent != length:
-            raise RuntimeError("backend body length mismatch")
-        self.note("first_backend_body_complete" if number == 1 else "second_backend_body_complete",
-                  bytes=sent)
-
-    def relay_headers(self, handler, status, headers, content_length):
-        handler.send_response_only(status)
-        for name, value in headers:
-            if name.lower() in HOP_BY_HOP or name.lower() == "content-length":
-                continue
-            handler.send_header(name, value)
-        handler.send_header("Content-Length", str(content_length))
-        handler.send_header("Connection", "close")
-        handler.end_headers()
-        handler.close_connection = True
 
 def read_headers(sock):
     buffer = b""
@@ -233,37 +237,43 @@ def read_headers(sock):
     return status, headers, rest
 
 
-def paused_lfs_get(harness_port, path, token, proxy=None):
-    """GET with a small receive buffer; the first reader pauses after 16 KiB."""
+def raw_lfs_get(port, path, token, first_chunks=None, sent=None,
+                cancel_ready=None, error_limit=PAYLOAD_BYTES):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     sock.settimeout(EVENT_TIMEOUT)
-    sock.connect(("127.0.0.1", harness_port))
-    request = (f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{harness_port}\r\n"
+    sock.connect(("127.0.0.1", port))
+    request = (f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
                f"Authorization: Bearer {token}\r\nAccept: */*\r\n"
                "Connection: close\r\n\r\n")
     sock.sendall(request.encode())
+    if sent is not None:
+        sent.set()
+    if cancel_ready is not None:
+        if not cancel_ready.wait(EVENT_TIMEOUT):
+            raise RuntimeError("test never allowed client cancellation")
+        sock.close()
+        return "cancelled", {}, b""
     status, headers, buffered = read_headers(sock)
     body = bytearray(buffered)
-    if proxy is not None:
-        proxy.e_client_headers.set()
+    if first_chunks is not None:
         while len(body) < FIRST_CHUNK:
             chunk = sock.recv(65536)
             if not chunk:
                 break
             body.extend(chunk)
-        if not proxy.e_second_first_chunk.wait(EVENT_TIMEOUT):
-            raise RuntimeError("second hydration never overlapped the first body")
+        first_chunks[threading.current_thread().name].set()
+        for event in first_chunks.values():
+            if not event.wait(EVENT_TIMEOUT):
+                raise RuntimeError("the other reader never received response bytes")
     while True:
         chunk = sock.recv(65536)
         if not chunk:
             break
         body.extend(chunk)
-        if len(body) > PAYLOAD_BYTES:
+        if len(body) > error_limit:
             raise RuntimeError("response exceeded expected object size")
     sock.close()
-    if proxy is not None:
-        proxy.e_first_client_done.set()
     return status, headers, bytes(body)
 
 
@@ -283,11 +293,32 @@ class HydrationHarness(LfsHarness):
         proxy.start()
         self.env["ROOTYARD_OBJECT_STORE_ENDPOINT"] = f"http://127.0.0.1:{proxy.port}"
         try:
-            return self._run_concurrent(proxy, parsed.hostname, backend_port)
+            return self._run(proxy, parsed.hostname, backend_port)
         finally:
+            proxy.release_gated()
             proxy.stop()
 
-    def _run_concurrent(self, proxy, backend_host, backend_port):
+    def _repo_dir(self):
+        return Path(self.env["ROOTYARD_DATA_DIR"]) / "lfs" / self.repo["id"]
+
+    def _clear(self, final):
+        if final.exists() or final.is_symlink():
+            final.unlink()
+        leftovers = sorted(p.name for p in self._repo_dir().iterdir()
+                           if p.name.startswith((".tmp-", ".rootyard-object-")))
+        assert leftovers == [], leftovers
+
+    def _assert_final(self, final, oid, size):
+        assert final.is_file() and not final.is_symlink()
+        meta = final.stat()
+        assert stat.S_IMODE(meta.st_mode) == 0o600, oct(meta.st_mode)
+        assert meta.st_nlink == 1 and meta.st_size == size
+        assert hashlib.sha256(final.read_bytes()).hexdigest() == oid
+        leftovers = sorted(p.name for p in self._repo_dir().iterdir()
+                           if p.name.startswith((".tmp-", ".rootyard-object-")))
+        assert leftovers == [], leftovers
+
+    def _run(self, proxy, backend_host, backend_port):
         self.setup()
         self.api()
         payload = os.urandom(PAYLOAD_BYTES)
@@ -297,87 +328,164 @@ class HydrationHarness(LfsHarness):
         actions = batch["objects"][0]["actions"]
         self.lfs_put(actions["upload"]["href"], payload, token=self.alice, code=200)
         self.lfs_verify(actions["verify"]["href"], oid, size, token=self.alice, code=200)
-        row = self.sql(
+        assert self.sql(
             f"SELECT state || '|' || size FROM lfs_objects "
-            f"WHERE repository_id='{self.repo['id']}' AND oid='{oid}'")
-        assert row == f"ready|{size}", row
-        repo_dir = Path(self.env["ROOTYARD_DATA_DIR"]) / "lfs" / self.repo["id"]
-        final = repo_dir / oid
-        assert final.is_file()
-        uploaded = final.stat()
-        assert stat.S_IMODE(uploaded.st_mode) == 0o600 and uploaded.st_nlink == 1
-        assert hashlib.sha256(final.read_bytes()).hexdigest() == oid
-        final.unlink()
-        assert not final.exists()
-        proxy.arm(oid, final)
+            f"WHERE repository_id='{self.repo['id']}' AND oid='{oid}'") == f"ready|{size}"
+        final = self._repo_dir() / oid
+        self._assert_final(final, oid, size)
         path = f"/git/alice/demo.git/info/lfs/objects/{oid}/{size}"
-        results, failures = {}, []
+        proxy.arm(oid, final)
 
-        def fetch(name, first):
-            try:
-                results[name] = paused_lfs_get(
-                    self.port, path, self.alice["token"], proxy if first else None)
-            except Exception as error:
-                failures.append(f"{name}: {type(error).__name__}: {str(error)[:300]}")
-                proxy.e_get2_received.set()
-                proxy.e_client_headers.set()
-                proxy.e_second_first_chunk.set()
-                proxy.e_first_client_done.set()
+        def run_pair(prefix):
+            first_chunks = {f"{prefix}-leader": threading.Event(),
+                            f"{prefix}-follower": threading.Event()}
+            sent = threading.Event()
+            results, failures = {}, []
 
-        first = threading.Thread(target=fetch, args=("first", True), daemon=True)
-        second = threading.Thread(target=fetch, args=("second", False), daemon=True)
-        first.start()
-        assert proxy.e_get1_received.wait(EVENT_TIMEOUT), "first hydration never reached the backend"
-        second.start()
-        first.join(EVENT_TIMEOUT * 2)
-        second.join(EVENT_TIMEOUT * 2)
-        assert not first.is_alive() and not second.is_alive(), "controlled hydration threads hung"
+            def fetch(name, follower):
+                try:
+                    results[name] = raw_lfs_get(
+                        self.port, path, self.alice["token"], first_chunks,
+                        sent if follower else None, error_limit=size)
+                except Exception as error:
+                    failures.append(f"{name}: {type(error).__name__}: {str(error)[:300]}")
+                    for event in first_chunks.values():
+                        event.set()
+                    sent.set()
+
+            threads = {
+                "leader": threading.Thread(target=fetch, args=(f"{prefix}-leader", False),
+                                           name=f"{prefix}-leader", daemon=True),
+                "follower": threading.Thread(target=fetch, args=(f"{prefix}-follower", True),
+                                             name=f"{prefix}-follower", daemon=True),
+            }
+            threads["leader"].start()
+            return threads, first_chunks, sent, results, failures
+
+        # 1. Successful flight: gate the first backend GET while local bytes are
+        # absent, then establish that the follower is waiting rather than
+        # starting another flight.
+        self._clear(final)
+        proxy.prepare_gate()
+        heads_before, gets_before = proxy.snapshot()
+        threads, first_chunks, sent, results, failures = run_pair("ok")
+        proxy.wait_for_gets(gets_before + 1)
+        assert not final.exists(), "local final existed while hydration was gated"
+        threads["follower"].start()
+        assert sent.wait(EVENT_TIMEOUT), "follower request was never sent"
+        time.sleep(FOLLOWER_JOIN_GRACE)
+        assert proxy.snapshot() == (heads_before + 1, gets_before + 1), (
+            "follower did not join the single-flight hydration", proxy.snapshot())
+        assert threads["follower"].is_alive(), "follower completed without the gated GET"
+        assert not final.exists()
+        proxy.release_gated()
+        for thread in threads.values():
+            thread.join(EVENT_TIMEOUT * 2)
         assert not failures, failures
         assert not proxy.errors, proxy.errors
-        assert proxy.target_gets == 2, proxy.target_gets
-        observed = {}
-        for name in ("first", "second"):
+        assert proxy.snapshot() == (heads_before + 1, gets_before + 1)
+        for name in first_chunks:
             status, headers, body = results[name]
-            assert status == 200, f"{name} status {status}"
+            assert status == 200, (name, status)
             assert int(headers.get("content-length", "-1")) == size, headers
-            assert len(body) == size, (name, len(body))
-            assert hashlib.sha256(body).hexdigest() == oid, name
-            observed[name] = {"status": status, "bytes": len(body),
-                              "sha256": hashlib.sha256(body).hexdigest()}
-        assert proxy.e_second_first_chunk.is_set() and proxy.e_first_client_done.is_set()
-        by_kind = {event["kind"]: event for event in proxy.events}
-        assert by_kind["second_backend_get_received"]["local_final_exists"] is False
-        assert by_kind["second_backend_first_chunk_while_first_reading"][
-            "first_client_done"] is False
-        kinds = [event["kind"] for event in proxy.events]
-        assert kinds.index("second_backend_get_received") < kinds.index(
-            "first_backend_body_complete"), kinds
-        assert kinds.index("first_backend_body_complete") < kinds.index(
-            "second_backend_first_chunk_while_first_reading"), kinds
-        final_state = final.stat()
-        assert stat.S_IMODE(final_state.st_mode) == 0o600, oct(final_state.st_mode)
-        assert final_state.st_nlink == 1 and final_state.st_size == size
-        assert hashlib.sha256(final.read_bytes()).hexdigest() == oid
-        leftovers = sorted(p.name for p in repo_dir.iterdir()
-                           if p.name.startswith((".tmp-", ".rootyard-object-")))
-        assert leftovers == [], leftovers
-        proxy.disarm()
-        final.unlink()
+            assert len(body) == size and hashlib.sha256(body).hexdigest() == oid, name
+        assert all(event.is_set() for event in first_chunks.values())
+        self._assert_final(final, oid, size)
+        time.sleep(FLIGHT_SETTLE)
+
+        # 2. Failed flight: both waiters observe explicit failure, no partial
+        # final appears, and the next request performs a clean retry.
+        self._clear(final)
+        proxy.prepare_gate(fail=True)
+        heads_before, gets_before = proxy.snapshot()
+        threads, _, sent, results, failures = run_pair("fail")
+        proxy.wait_for_gets(gets_before + 1)
+        threads["follower"].start()
+        assert sent.wait(EVENT_TIMEOUT), "failure follower was never sent"
+        time.sleep(FOLLOWER_JOIN_GRACE)
+        assert proxy.snapshot() == (heads_before + 1, gets_before + 1), proxy.snapshot()
+        proxy.release_gated()
+        for thread in threads.values():
+            thread.join(EVENT_TIMEOUT * 2)
+        assert not failures, failures
+        assert not proxy.errors, proxy.errors
+        assert proxy.snapshot() == (heads_before + 1, gets_before + 3), proxy.snapshot()
+        for name, (status, _, _) in results.items():
+            assert status in (500, 503), (name, status)
+        assert not final.exists()
+        assert sorted(p.name for p in self._repo_dir().iterdir()
+                      if p.name.startswith((".tmp-", ".rootyard-object-"))) == []
+        heads_before, gets_before = proxy.snapshot()
         status, body, _ = self.lfs_get(path, token=self.alice, code=200)
-        assert status == 200 and hashlib.sha256(body).hexdigest() == oid
-        rehydrated = hashlib.sha256(final.read_bytes()).hexdigest()
-        assert rehydrated == oid
+        assert status == 200 and body == payload
+        assert proxy.snapshot() == (heads_before + 1, gets_before + 1), (
+            proxy.snapshot(), proxy.events[-12:])
+        self._assert_final(final, oid, size)
+        time.sleep(FLIGHT_SETTLE)
+
+        # 3. Cancellation: abort the only reader while the backend GET is gated.
+        # Detached hydration may finish, but it must publish only complete
+        # verified bytes and leave no staging files. The flight map must then be
+        # empty so a later cold read starts exactly one new GET.
+        self._clear(final)
+        proxy.prepare_gate()
+        cancel_ready = threading.Event()
+        cancelled = {}
+
+        def canceling_fetch():
+            try:
+                cancelled["result"] = raw_lfs_get(
+                    self.port, path, self.alice["token"], cancel_ready=cancel_ready)
+            except Exception as error:
+                cancelled["error"] = f"{type(error).__name__}: {str(error)[:300]}"
+
+        thread = threading.Thread(target=canceling_fetch, name="cancelled", daemon=True)
+        thread.start()
+        heads_before, gets_before = proxy.snapshot()
+        proxy.wait_for_gets(gets_before + 1)
+        assert not final.exists(), "cancelled hydration published before backend bytes"
+        cancel_ready.set()
+        thread.join(EVENT_TIMEOUT)
+        assert not thread.is_alive()
+        assert "error" not in cancelled, cancelled
+        assert cancelled["result"][0] == "cancelled"
+        time.sleep(0.2)
+        assert not final.exists(), "cancellation published a partial final file"
+        proxy.release_gated()
+        deadline = time.monotonic() + 30
+        while not final.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert final.exists(), "detached hydration did not finish after client cancellation"
+        self._assert_final(final, oid, size)
+        time.sleep(FLIGHT_SETTLE)
+        heads_before, gets_before = proxy.snapshot()
+        status, body, _ = self.lfs_get(path, token=self.alice, code=200)
+        assert status == 200 and body == payload
+        assert proxy.snapshot() == (heads_before, gets_before), "warm read touched remote"
+        self._clear(final)
+        heads_before, gets_before = proxy.snapshot()
+        status, body, _ = self.lfs_get(path, token=self.alice, code=200)
+        assert status == 200 and body == payload
+        assert proxy.snapshot() == (heads_before + 1, gets_before + 1), (
+            "stale flight entry prevented a fresh hydration", proxy.snapshot())
+        self._assert_final(final, oid, size)
+
+        proxy.disarm()
         return {
             "s3_backend": {"host": backend_host, "port": backend_port, "kind": "garage"},
             "oid": oid, "size": size, "cold_start_local_missing": True,
-            "backend_get_count": proxy.target_gets,
-            "first_download": observed["first"], "second_download": observed["second"],
-            "second_hydration_overlapped_first_body": True,
-            "local_final_sha256": hashlib.sha256(final.read_bytes()).hexdigest(),
-            "local_final_mode": oct(stat.S_IMODE(final.stat().st_mode)),
-            "local_final_nlink": final.stat().st_nlink,
-            "staging_leftovers": leftovers,
-            "rehydration_after_disarm_sha256": rehydrated,
+            "successful_singleflight": {
+                "backend_gets": 1, "backend_heads": 1,
+                "follower_joined_before_release": True,
+                "both_client_bodies_overlapped": True,
+            },
+            "failed_flight": {"waiters_failed_explicitly": 2, "retry_backend_gets": 1},
+            "cancellation": {
+                "partial_final_never_published": True,
+                "detached_hydration_completed_valid_bytes": True,
+                "staging_leftovers": 0,
+                "fresh_flight_after_completion": True,
+            },
             "proxy_events": proxy.events,
         }
 

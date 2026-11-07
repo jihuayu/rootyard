@@ -1,15 +1,19 @@
 //! Verified streaming object storage and atomic staging for Track 2B Git LFS.
-use crate::storage::remote_objects::{ObjectKey, RemoteObjectStore};
-use crate::{AppState, Error, journal, lfs::models, storage};
+//!
+//! This facade keeps the immutable on-volume layout and upload admission in one
+//! place while delegating read-path verification to `verification` (bounded
+//! identity cache and same-descriptor streaming) and cold remote fetches to
+//! `hydration` (bounded single-flight). Warm verified reads never consult the
+//! object store.
+use crate::storage::remote_objects::ObjectKey;
+use crate::{AppState, Error, journal, lfs::models, lfs::verification, storage};
 use anyhow::{Context, Result, ensure};
 use axum::{body::Body, http::StatusCode};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use std::os::unix::fs::PermissionsExt;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 use std::{
     fs::{self, File, OpenOptions},
-    io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
@@ -18,14 +22,7 @@ use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
-fn remote_store(data_root: &Path) -> Result<Option<RemoteObjectStore>> {
-    if std::env::var_os("ROOTYARD_OBJECT_STORE_ENDPOINT").is_none() {
-        return Ok(None);
-    }
-    Ok(Some(RemoteObjectStore::from_env(
-        data_root.join("remote-objects"),
-    )?))
-}
+use super::hydration;
 
 pub async fn publish_remote(
     state: &AppState,
@@ -34,16 +31,27 @@ pub async fn publish_remote(
     oid: &str,
     size: u64,
 ) -> Result<(), Error> {
-    let Some(store) = remote_store(&state.storage.root).map_err(Error::internal)? else {
+    let Some(store) = hydration::remote_store(&state.storage.root).map_err(Error::internal)? else {
         return Ok(());
     };
     let key = ObjectKey::new(tenant_id, "lfs", oid).map_err(Error::internal)?;
     let path = object_path(&state.storage.root, repo_id, oid).map_err(Error::internal)?;
-    store
-        .put_file(&key, &path, size, Instant::now() + state.config.git_timeout)
-        .await
-        .map_err(Error::internal)?;
+    store.put_file(&key, &path, size, Instant::now() + state.config.git_timeout).await.map_err(Error::internal)?;
     Ok(())
+}
+
+/// Bounded, observable remote repair for an already-acknowledged upload. Never
+/// called from a read path; callers are explicit write workflows such as a
+/// re-issued LFS Batch upload for an object that is already ready locally.
+pub fn schedule_remote_repair(
+    data_root: PathBuf,
+    repo_id: Uuid,
+    tenant_id: Uuid,
+    oid: String,
+    size: u64,
+    timeout: Duration,
+) {
+    hydration::schedule_repair(data_root, repo_id, tenant_id, oid, size, timeout);
 }
 
 pub async fn ensure_readable(
@@ -54,90 +62,7 @@ pub async fn ensure_readable(
     size: u64,
     deadline: Instant,
 ) -> Result<bool> {
-    let local_good = verify_local_until(data_root, repo_id, oid, size, deadline).await?;
-    let Some(store) = remote_store(data_root)? else {
-        return Ok(local_good);
-    };
-    let key = ObjectKey::new(tenant_id, "lfs", oid)?;
-    if local_good {
-        if store
-            .head(&key, deadline)
-            .await?
-            .is_none_or(|head| head.size != size)
-        {
-            let path = object_path(data_root, repo_id, oid)?;
-            store.put_file(&key, &path, size, deadline).await?;
-        }
-        return Ok(true);
-    }
-    if store
-        .head(&key, deadline)
-        .await?
-        .is_none_or(|head| head.size != size)
-    {
-        return Ok(false);
-    }
-    hydrate_verified_remote(&store, &key, data_root, repo_id, oid, size, deadline).await
-}
-
-/// Downloads a remote object into a unique staging file inside this repository's
-/// LFS directory, verifies digest, size, mode and link count, then atomically
-/// renames it over the immutable oid path. The final path therefore only ever
-/// holds complete, verified bytes, and concurrent cold readers stage
-/// independently. Only this request's own staging file is removed on failure.
-async fn hydrate_verified_remote(
-    store: &RemoteObjectStore,
-    key: &ObjectKey,
-    data_root: &Path,
-    repo_id: Uuid,
-    oid: &str,
-    size: u64,
-    deadline: Instant,
-) -> Result<bool> {
-    let dir = ensure_repo_lfs_dir(data_root, repo_id)?;
-    let final_path = object_path(data_root, repo_id, oid)?;
-    let temp_path = dir.join(format!(".tmp-{}", Uuid::new_v4()));
-    let mut guard = StagingFileGuard::new(temp_path.clone());
-
-    store.get_to_file(key, &temp_path, size, deadline).await?;
-
-    let staged = temp_path.clone();
-    let staged_oid = oid.to_owned();
-    let staged_ok = tokio::task::spawn_blocking(move || -> Result<bool> {
-        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
-        File::open(&staged)?.sync_all()?;
-        verify_path_integrity_bounded(&staged, &staged_oid, size, deadline)
-    })
-    .await??;
-    if !staged_ok {
-        return Ok(false);
-    }
-
-    let rename_target = final_path;
-    let dir_for_sync = dir;
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        fs::rename(&temp_path, &rename_target).context("failed to publish hydrated LFS object")?;
-        File::open(&dir_for_sync)?.sync_all()?;
-        Ok(())
-    })
-    .await??;
-    guard.disarm();
-    verify_local_until(data_root, repo_id, oid, size, deadline).await
-}
-
-async fn verify_local_until(
-    data_root: &Path,
-    repo_id: Uuid,
-    oid: &str,
-    size: u64,
-    deadline: Instant,
-) -> Result<bool> {
-    let root = data_root.to_path_buf();
-    let oid = oid.to_owned();
-    tokio::task::spawn_blocking(move || {
-        verify_object_integrity_bounded(&root, repo_id, &oid, size, deadline)
-    })
-    .await?
+    hydration::ensure_readable(data_root, repo_id, tenant_id, oid, size, deadline).await
 }
 
 /// RAII guard that removes the temporary `.tmp-<uuid>` upload file on drop unless disarmed.
@@ -148,10 +73,7 @@ pub struct StagingFileGuard {
 
 impl StagingFileGuard {
     pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            committed: false,
-        }
+        Self { path, committed: false }
     }
 
     pub fn disarm(&mut self) {
@@ -189,20 +111,12 @@ pub fn ensure_repo_lfs_dir(data_root: &Path, repo_id: Uuid) -> Result<PathBuf> {
     Ok(dir)
 }
 
-pub fn object_exists_with_size(
-    data_root: &Path,
-    repo_id: Uuid,
-    oid: &str,
-    expected_size: u64,
-) -> Result<bool> {
+pub fn object_exists_with_size(data_root: &Path, repo_id: Uuid, oid: &str, expected_size: u64) -> Result<bool> {
     let path = object_path(data_root, repo_id, oid)?;
     if !journal::exists(&path)? {
         return Ok(false);
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&path)?;
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path)?;
     let meta = file.metadata()?;
     if !meta.is_file() || meta.nlink() != 1 || (meta.mode() & 0o7777) != 0o600 {
         return Ok(false);
@@ -210,89 +124,20 @@ pub fn object_exists_with_size(
     Ok(meta.len() == expected_size)
 }
 
-pub fn verify_object_integrity(
-    data_root: &Path,
-    repo_id: Uuid,
-    oid: &str,
-    expected_size: u64,
-) -> Result<bool> {
-    verify_object_integrity_bounded(
+pub fn verify_object_integrity(data_root: &Path, repo_id: Uuid, oid: &str, expected_size: u64) -> Result<bool> {
+    let path = object_path(data_root, repo_id, oid)?;
+    verification::verify_path_blocking(
+        &path,
         data_root,
         repo_id,
         oid,
         expected_size,
-        Instant::now() + Duration::from_secs(24 * 60 * 60),
+        StdInstant::now() + Duration::from_secs(24 * 60 * 60),
     )
 }
 
-fn verify_object_integrity_bounded(
-    data_root: &Path,
-    repo_id: Uuid,
-    oid: &str,
-    expected_size: u64,
-    deadline: Instant,
-) -> Result<bool> {
-    let path = object_path(data_root, repo_id, oid)?;
-    verify_path_integrity_bounded(&path, oid, expected_size, deadline)
-}
-
-/// Verifies an object file (the immutable oid path or our own staging file)
-/// against the expected digest, size, mode and link count.
-fn verify_path_integrity_bounded(
-    path: &Path,
-    expected_oid: &str,
-    expected_size: u64,
-    deadline: Instant,
-) -> Result<bool> {
-    if !journal::exists(path)? {
-        return Ok(false);
-    }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file()
-        || meta.nlink() != 1
-        || (meta.mode() & 0o7777) != 0o600
-        || meta.len() != expected_size
-    {
-        return Ok(false);
-    }
-    let mut hasher = Sha256::new();
-    let mut total = 0u64;
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        ensure!(
-            Instant::now() < deadline,
-            "LFS integrity verification timed out"
-        );
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        total = total.saturating_add(n as u64);
-        if total > expected_size {
-            return Ok(false);
-        }
-        hasher.update(&buf[..n]);
-    }
-    if total != expected_size {
-        return Ok(false);
-    }
-    let digest = hex::encode(hasher.finalize());
-    Ok(digest == expected_oid)
-}
-
-pub async fn check_repo_quota(
-    state: &AppState,
-    repo_id: Uuid,
-    additional_bytes: u64,
-) -> Result<(), Error> {
-    let repo_path = state
-        .storage
-        .verify_path(repo_id)
-        .map_err(Error::internal)?;
+pub async fn check_repo_quota(state: &AppState, repo_id: Uuid, additional_bytes: u64) -> Result<(), Error> {
+    let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
     let lfs_dir = repo_lfs_dir(&state.storage.root, repo_id);
     let quota = state.config.max_repo_bytes;
     let used = tokio::task::spawn_blocking(move || -> Result<u64> {
@@ -306,10 +151,7 @@ pub async fn check_repo_quota(
     .map_err(Error::internal)?
     .map_err(Error::internal)?;
     if used.saturating_add(additional_bytes) > quota {
-        return Err(Error(
-            StatusCode::INSUFFICIENT_STORAGE,
-            "repository quota reached",
-        ));
+        return Err(Error(StatusCode::INSUFFICIENT_STORAGE, "repository quota reached"));
     }
     Ok(())
 }
@@ -349,17 +191,11 @@ pub async fn stream_to_staging_and_publish(
 
         if received > state.config.max_request_bytes {
             state.transfer_metrics.record_failure();
-            return Err(Error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request size limit exceeded",
-            ));
+            return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
         }
         if received > expected_size {
             state.transfer_metrics.record_failure();
-            return Err(Error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "LFS object size mismatch",
-            ));
+            return Err(Error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object size mismatch"));
         }
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(Error::internal)?;
@@ -367,33 +203,30 @@ pub async fn stream_to_staging_and_publish(
 
     if received != expected_size {
         state.transfer_metrics.record_failure();
-        return Err(Error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "LFS object size mismatch",
-        ));
+        return Err(Error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object size mismatch"));
     }
 
     let actual_oid = hex::encode(hasher.finalize());
     if actual_oid != expected_oid {
         state.transfer_metrics.record_failure();
-        return Err(Error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "LFS object SHA-256 mismatch",
-        ));
+        return Err(Error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object SHA-256 mismatch"));
     }
 
     file.flush().await.map_err(Error::internal)?;
     file.sync_all().await.map_err(Error::internal)?;
+    let staged_meta = file.metadata().await.map_err(Error::internal)?;
+    let verified_write = verification::capture_verified_write(&staged_meta, expected_size).map_err(Error::internal)?;
     drop(file);
 
-    let final_path =
-        object_path(&state.storage.root, repo_id, expected_oid).map_err(Error::internal)?;
+    let final_path = object_path(&state.storage.root, repo_id, expected_oid).map_err(Error::internal)?;
     let temp_for_rename = temp_path.clone();
     let dir_for_sync = repo_dir.clone();
+    let root = state.storage.root.clone();
+    let oid = expected_oid.to_owned();
     tokio::task::spawn_blocking(move || -> Result<()> {
         fs::rename(&temp_for_rename, &final_path).context("failed to publish LFS object")?;
         File::open(&dir_for_sync)?.sync_all()?;
-        Ok(())
+        verification::record_published_write(&final_path, &verified_write, &root, repo_id, &oid, expected_size)
     })
     .await
     .map_err(Error::internal)?
@@ -410,28 +243,42 @@ pub async fn open_verified_download_stream(
     oid: &str,
     expected_size: u64,
 ) -> Result<Body, Error> {
-    let verified = ensure_readable(
-        &state.storage.root,
+    let deadline = Instant::now() + state.config.git_timeout;
+    let path = object_path(&state.storage.root, repo_id, oid).map_err(Error::internal)?;
+    let mut file = verification::open_verified_file(
+        path.clone(),
+        state.storage.root.clone(),
         repo_id,
-        tenant_id,
-        oid,
+        oid.to_owned(),
         expected_size,
-        Instant::now() + state.config.git_timeout,
+        deadline,
     )
     .await
     .map_err(Error::internal)?;
-
-    if !verified {
+    if file.is_none() {
+        // Cold path only after a verified local descriptor was ruled out.
+        let readable =
+            hydration::ensure_readable(&state.storage.root, repo_id, tenant_id, oid, expected_size, deadline)
+                .await
+                .map_err(Error::internal)?;
+        if readable {
+            file = verification::open_verified_file(
+                path,
+                state.storage.root.clone(),
+                repo_id,
+                oid.to_owned(),
+                expected_size,
+                deadline,
+            )
+            .await
+            .map_err(Error::internal)?;
+        }
+    }
+    let Some(std_file) = file else {
         state.transfer_metrics.record_failure();
         return Err(Error::internal("LFS object missing or corrupt on volume"));
-    }
+    };
 
-    let path = object_path(&state.storage.root, repo_id, oid).map_err(Error::internal)?;
-    let std_file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .map_err(Error::internal)?;
     let file = tokio::fs::File::from_std(std_file);
     let metrics = state.transfer_metrics.clone();
     let stream = ReaderStream::with_capacity(file, 64 * 1024).map(move |res| {

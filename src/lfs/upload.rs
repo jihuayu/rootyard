@@ -1,8 +1,19 @@
 //! Streaming Git LFS upload and admission diagnostics.
 use super::handlers::{lfs_json, sanitize_headers};
-use crate::{AppState, Error, auth, lfs::{models, storage}};
-use axum::{body::Body, extract::{Path, State}, http::{HeaderMap, StatusCode, header}, response::Response};
-use std::{collections::HashMap, sync::{Arc, Mutex, OnceLock}};
+use crate::{
+    AppState, Error, auth,
+    lfs::{models, storage},
+};
+use axum::{
+    body::Body,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::Response,
+};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
 use uuid::Uuid;
 
 static UPLOAD_WAITERS: OnceLock<Mutex<HashMap<Uuid, usize>>> = OnceLock::new();
@@ -39,14 +50,10 @@ pub async fn upload_waiters(
     let name = models::normalize_repo_name(&repo_raw)?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access =
-        auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Admin).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Admin).await?;
     let count = *waiters().lock().unwrap().get(&access.repo_id).unwrap_or(&0);
     auth::finish_tx(tx, &actor, false).await?;
-    Ok(lfs_json(
-        StatusCode::OK,
-        serde_json::json!({"waiters":count}),
-    ))
+    Ok(lfs_json(StatusCode::OK, serde_json::json!({"waiters":count})))
 }
 
 pub async fn upload_object(
@@ -55,11 +62,9 @@ pub async fn upload_object(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Error> {
-    tokio::spawn(
-        async move { upload_inner(state, owner, repo_raw, oid, None, headers, body).await },
-    )
-    .await
-    .map_err(Error::internal)?
+    tokio::spawn(async move { upload_inner(state, owner, repo_raw, oid, None, headers, body).await })
+        .await
+        .map_err(Error::internal)?
 }
 
 pub async fn upload_object_with_size(
@@ -68,11 +73,9 @@ pub async fn upload_object_with_size(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Error> {
-    tokio::spawn(async move {
-        upload_inner(state, owner, repo_raw, oid, Some(size), headers, body).await
-    })
-    .await
-    .map_err(Error::internal)?
+    tokio::spawn(async move { upload_inner(state, owner, repo_raw, oid, Some(size), headers, body).await })
+        .await
+        .map_err(Error::internal)?
 }
 
 async fn upload_inner(
@@ -96,10 +99,7 @@ async fn upload_inner(
             return Err(Error(StatusCode::UNPROCESSABLE_ENTITY, "invalid LFS size"));
         }
         if sz as u64 > state.config.max_request_bytes {
-            return Err(Error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request size limit exceeded",
-            ));
+            return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
         }
     }
     if headers
@@ -108,17 +108,13 @@ async fn upload_inner(
         .and_then(|s| s.parse::<u64>().ok())
         .is_some_and(|cl| cl > state.config.max_request_bytes)
     {
-        return Err(Error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request size limit exceeded",
-        ));
+        return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
     }
 
     let (repo_id, tenant_id, expected_size) = {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let access =
-            auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write).await?;
+        let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write).await?;
         let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
         let row = tx
             .query_opt(
@@ -130,10 +126,7 @@ async fn upload_inner(
         let expected = if let Some(r) = row {
             let db_size: i64 = r.get(0);
             if size_param.is_some_and(|sz| sz != db_size) {
-                return Err(Error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "LFS object size mismatch",
-                ));
+                return Err(Error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object size mismatch"));
             }
             db_size as u64
         } else if let Some(sz) = size_param {
@@ -152,10 +145,9 @@ async fn upload_inner(
     };
 
     let waiter = UploadWaiter::new(repo_id);
-    let _write_guard =
-        tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo_id))
-            .await
-            .map_err(|_| Error::timeout())?;
+    let _write_guard = tokio::time::timeout(state.config.git_timeout, state.storage.write_lock(repo_id))
+        .await
+        .map_err(|_| Error::timeout())?;
     drop(waiter);
 
     // The reservation snapshot predates the lock. A queued upload may now be
@@ -164,16 +156,17 @@ async fn upload_inner(
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
         auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write).await?;
-        let row = tx.query_opt(
-            "SELECT size, state FROM lfs_objects WHERE tenant_id=$1 AND repository_id=$2 AND oid=$3",
-            &[&tenant_id, &repo_id, &oid],
-        ).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
+        let row = tx
+            .query_opt(
+                "SELECT size, state FROM lfs_objects WHERE tenant_id=$1 AND repository_id=$2 AND oid=$3",
+                &[&tenant_id, &repo_id, &oid],
+            )
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(Error::not_found)?;
         let size: i64 = row.get("size");
         if size != expected_size as i64 {
-            return Err(Error(
-                StatusCode::CONFLICT,
-                "LFS object reservation changed",
-            ));
+            return Err(Error(StatusCode::CONFLICT, "LFS object reservation changed"));
         }
         if row.get::<_, &str>("state") == "ready"
             && storage::ensure_readable(
@@ -187,6 +180,14 @@ async fn upload_inner(
             .await
             .map_err(Error::internal)?
         {
+            storage::schedule_remote_repair(
+                state.storage.root.clone(),
+                repo_id,
+                tenant_id,
+                oid.clone(),
+                expected_size,
+                state.config.git_timeout,
+            );
             auth::finish_tx(tx, &actor, true).await?;
             return Ok(lfs_json(
                 StatusCode::OK,
@@ -231,9 +232,5 @@ async fn upload_inner(
     }
 
     state.transfer_metrics.record_success();
-    Ok(lfs_json(
-        StatusCode::OK,
-        serde_json::json!({ "oid": oid, "size": expected_size, "state": "ready" }),
-    ))
+    Ok(lfs_json(StatusCode::OK, serde_json::json!({ "oid": oid, "size": expected_size, "state": "ready" })))
 }
-
