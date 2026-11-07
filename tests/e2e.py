@@ -30,6 +30,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import native_evidence
+import owned_fuse_cleanup
 
 
 class Harness:
@@ -127,7 +128,8 @@ class Harness:
 
     def start(self):
         self.log = open(self.root / "server.log", "ab")
-        self.proc = subprocess.Popen([self.args.binary, "serve"], env=self.env, stdout=self.log, stderr=self.log,
+        command = [*getattr(self, "server_prefix", ()), self.args.binary, "serve"]
+        self.proc = subprocess.Popen(command, env=self.env, stdout=self.log, stderr=self.log,
                                      start_new_session=True)
         until = time.monotonic() + 30
         while time.monotonic() < until:
@@ -150,7 +152,13 @@ class Harness:
                 try:
                     self.proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
+                    if not hard:
+                        os.killpg(self.proc.pid, signal.SIGKILL)
+                    # SIGKILL is already delivered. A FUSE daemon that is also
+                    # its own blocked client never releases the mount, so the
+                    # kernel waiter must be aborted with a forced unmount of
+                    # this fixture's own namespaced mounts before waiting again.
+                    owned_fuse_cleanup.release_owned_fuse_mounts(self)
                     try:
                         self.proc.wait(timeout=5)
                     except subprocess.TimeoutExpired as error:

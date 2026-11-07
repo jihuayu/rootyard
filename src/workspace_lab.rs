@@ -17,6 +17,8 @@ pub mod mutation_gate;
 #[path = "workspace_lab/namespace.rs"]
 #[rustfmt::skip]
 pub mod namespace;
+#[path = "workspace_lab/preflight.rs"]
+pub mod preflight;
 #[path = "workspace_lab/remote.rs"]
 pub mod remote;
 #[path = "workspace_lab/security.rs"]
@@ -97,7 +99,11 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
     if matches!(command, "init" | "checkpoint" | "apply" | "sync-dirty") {
         ensure!(args.last().is_some_and(|x| x == "--quiescent"), "stop ALL writers and explicitly pass --quiescent; this is a caller assumption, not a write barrier");
     }
-    if command == "init" { self::core::check_source_store_overlap(&args[1], &args[2])?; }
+    if command == "init" {
+        self::core::check_source_store_overlap(&args[1], &args[2])?;
+        // Read-only argument and repository preflight before Store::open creates the store.
+        self::core::preflight_init(&args[2], &args[3], &args[4])?;
+    }
     let store = Store::open(Path::new(&args[1]))?;
     let result = match command {
         "init" => store.cmd_init(&args[2], &args[3], &args[4])?,

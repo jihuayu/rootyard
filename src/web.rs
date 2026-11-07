@@ -3,11 +3,13 @@
 //! commit history, commit diffs, branch comparison, Issues, Pull Requests, Reviews,
 //! Check Run status panels, atomic Pull Request merge, and RBAC audit logs under
 //! `/web/repos/{owner}/{name}...` and `/ui/repos/{owner}/{name}...`.
+pub mod detail_pagination;
 pub mod handlers;
 pub mod models;
 pub mod native_reads;
 pub mod sanitize;
 pub mod session;
+pub mod session_gc;
 pub mod templates;
 
 use crate::AppState;
@@ -33,12 +35,21 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/web/repos/{owner}/{name}/commits/{oid}/checks", get(handlers::commit_checks_view))
         .route("/web/repos/{owner}/{name}/compare", get(handlers::compare_view))
         .route("/web/repos/{owner}/{name}/issues", get(handlers::issues_list_view).post(handlers::create_issue_web))
-        .route("/web/repos/{owner}/{name}/issues/{number}", get(handlers::issue_detail_view).post(handlers::update_issue_web).patch(handlers::update_issue_web))
+        .route(
+            "/web/repos/{owner}/{name}/issues/{number}",
+            get(handlers::issue_detail_view).post(handlers::update_issue_web).patch(handlers::update_issue_web),
+        )
         .route("/web/repos/{owner}/{name}/issues/{number}/comments", post(handlers::create_issue_comment_web))
         .route("/web/repos/{owner}/{name}/pulls", get(handlers::pulls_list_view).post(handlers::create_pull_web))
-        .route("/web/repos/{owner}/{name}/pulls/{number}", get(handlers::pull_detail_view).post(handlers::update_pull_web).patch(handlers::update_pull_web))
+        .route(
+            "/web/repos/{owner}/{name}/pulls/{number}",
+            get(handlers::pull_detail_view).post(handlers::update_pull_web).patch(handlers::update_pull_web),
+        )
         .route("/web/repos/{owner}/{name}/pulls/{number}/diff", get(handlers::pull_diff_view))
-        .route("/web/repos/{owner}/{name}/pulls/{number}/reviews", get(handlers::pull_reviews_view).post(handlers::create_review_web))
+        .route(
+            "/web/repos/{owner}/{name}/pulls/{number}/reviews",
+            get(handlers::pull_reviews_view).post(handlers::create_review_web),
+        )
         .route("/web/repos/{owner}/{name}/pulls/{number}/checks", get(handlers::pull_checks_view))
         .route("/web/repos/{owner}/{name}/pulls/{number}/merge", post(handlers::merge_pull_web))
         .route("/web/repos/{owner}/{name}/audit", get(handlers::audit_view))
@@ -52,12 +63,21 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/ui/repos/{owner}/{name}/commits/{oid}/checks", get(handlers::commit_checks_view))
         .route("/ui/repos/{owner}/{name}/compare", get(handlers::compare_view))
         .route("/ui/repos/{owner}/{name}/issues", get(handlers::issues_list_view).post(handlers::create_issue_web))
-        .route("/ui/repos/{owner}/{name}/issues/{number}", get(handlers::issue_detail_view).post(handlers::update_issue_web).patch(handlers::update_issue_web))
+        .route(
+            "/ui/repos/{owner}/{name}/issues/{number}",
+            get(handlers::issue_detail_view).post(handlers::update_issue_web).patch(handlers::update_issue_web),
+        )
         .route("/ui/repos/{owner}/{name}/issues/{number}/comments", post(handlers::create_issue_comment_web))
         .route("/ui/repos/{owner}/{name}/pulls", get(handlers::pulls_list_view).post(handlers::create_pull_web))
-        .route("/ui/repos/{owner}/{name}/pulls/{number}", get(handlers::pull_detail_view).post(handlers::update_pull_web).patch(handlers::update_pull_web))
+        .route(
+            "/ui/repos/{owner}/{name}/pulls/{number}",
+            get(handlers::pull_detail_view).post(handlers::update_pull_web).patch(handlers::update_pull_web),
+        )
         .route("/ui/repos/{owner}/{name}/pulls/{number}/diff", get(handlers::pull_diff_view))
-        .route("/ui/repos/{owner}/{name}/pulls/{number}/reviews", get(handlers::pull_reviews_view).post(handlers::create_review_web))
+        .route(
+            "/ui/repos/{owner}/{name}/pulls/{number}/reviews",
+            get(handlers::pull_reviews_view).post(handlers::create_review_web),
+        )
         .route("/ui/repos/{owner}/{name}/pulls/{number}/checks", get(handlers::pull_checks_view))
         .route("/ui/repos/{owner}/{name}/pulls/{number}/merge", post(handlers::merge_pull_web))
         .route("/ui/repos/{owner}/{name}/audit", get(handlers::audit_view))

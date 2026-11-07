@@ -1,0 +1,15 @@
+{
+  "formatting": "passed on final integrated branch",
+  "clippy_all_targets_pando_lab": "passed on final integrated branch",
+  "rust_library": {
+    "passed": 210,
+    "failed": 0,
+    "log": "observability135-lib.log"
+  },
+  "extracted_typed_error_tests": {
+    "passed": 4,
+    "failed": 0
+  },
+  "schema135_sql_and_native_contracts": "passed: fresh/restored/upgraded/custom-search-path/idempotent",
+  "scope": "No all-issue completion, multi-host qualification or production SLA is inferred."
+}

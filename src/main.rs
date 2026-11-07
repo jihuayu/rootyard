@@ -50,6 +50,9 @@ async fn run() -> Result<()> {
             println!("{count}");
         } else {
             let stop = tokio_util::sync::CancellationToken::new();
+            // Browser-session GC needs only PostgreSQL, so the control-plane
+            // worker runs the same bounded loop as the serving process.
+            let session_gc_task = tokio::spawn(rootyard::web::session_gc::run(pool.clone(), stop.child_token()));
             let mut task = tokio::spawn(rootyard::dispatch::worker(
                 pool,
                 settings,
@@ -58,7 +61,7 @@ async fn run() -> Result<()> {
             ));
             eprintln!("rootyard: PostgreSQL delivery worker started (no Git storage access)");
             tokio::select! {
-                _=shutdown()=>{ stop.cancel(); task.await?; },
+                _=shutdown()=>{ stop.cancel(); task.await?; let _ = session_gc_task.await; },
                 result=&mut task=>{ result?; bail!("delivery worker stopped unexpectedly"); },
             }
         }
@@ -76,7 +79,12 @@ async fn run() -> Result<()> {
                 || (args.len() == 5
                     && matches!(
                         args[4].as_str(),
-                        "--allow-legacy-schema007" | "--allow-legacy-schema130" | "--allow-legacy-schema131"
+                        "--allow-legacy-schema007"
+                            | "--allow-legacy-schema130"
+                            | "--allow-legacy-schema131"
+                            | "--allow-legacy-schema132"
+                            | "--allow-legacy-schema133"
+                            | "--allow-legacy-schema134"
                     )))
                 && args[2] == "--isolated"
                 && args[3] == "--trust-backup" =>
@@ -88,6 +96,9 @@ async fn run() -> Result<()> {
                 legacy == Some("--allow-legacy-schema007"),
                 legacy == Some("--allow-legacy-schema130"),
                 legacy == Some("--allow-legacy-schema131"),
+                legacy == Some("--allow-legacy-schema132"),
+                legacy == Some("--allow-legacy-schema133"),
+                legacy == Some("--allow-legacy-schema134"),
             )
             .await
             .map_err(|_| anyhow::anyhow!("restore failed; keep target isolated and inspect or discard the fresh targets; database commit may have completed; never retry over existing state"))?;
@@ -158,6 +169,7 @@ async fn run() -> Result<()> {
             axum::serve(listener, rootyard::mirror::router(state)).with_graceful_shutdown(shutdown()).await?;
         }
         "serve" if args.len() <= 1 => {
+            rootyard::config::init_workspace_remote_delete_policy()?;
             let dispatch_settings = rootyard::dispatch::Settings::from_env()?;
             let maintenance_policy = rootyard::storage_lifecycle::models::Policy::from_env()?;
             std::fs::read_to_string("/proc/self/stat")
@@ -231,6 +243,10 @@ async fn run() -> Result<()> {
                     state.git_slots.clone(),
                     state.config.max_concurrent_git,
                     state.transfer_metrics.clone(),
+                    rootyard::metrics_workers::Config {
+                        volume_id: state.storage.volume_id,
+                        scan_period_seconds: maintenance_policy.scan_period_seconds,
+                    },
                 );
                 Some(tokio::spawn(async move {
                     if axum::serve(listener, router).await.is_err() {
@@ -284,6 +300,9 @@ async fn run() -> Result<()> {
             let maintenance_task = maintenance_policy
                 .enabled
                 .then(|| tokio::spawn(rootyard::storage_lifecycle::run(state.clone(), maintenance_stop.clone())));
+            let session_gc_stop = tokio_util::sync::CancellationToken::new();
+            let session_gc_task =
+                tokio::spawn(rootyard::web::session_gc::run(state.pool.clone(), session_gc_stop.clone()));
             // A disconnected client must not cancel a started workspace Git
             // mutation: owned jobs finish under the normal Git deadline
             // before the runtime exits. \`router\` consumes the state Arc, so
@@ -293,6 +312,8 @@ async fn run() -> Result<()> {
             rootyard::workspaces::drain_git_jobs(git_shutdown_grace).await;
             worker.abort();
             maintenance_stop.cancel();
+            session_gc_stop.cancel();
+            let _ = session_gc_task.await;
             workspace_capture_stop.cancel();
             let _ = workspace_capture_task.await;
             if let Some(task) = controller_task {
@@ -314,7 +335,7 @@ async fn run() -> Result<()> {
             }
         }
         _ => bail!(
-            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130]]"
+            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130 | --allow-legacy-schema131 | --allow-legacy-schema132 | --allow-legacy-schema133 | --allow-legacy-schema134]]"
         ),
     }
     Ok(())

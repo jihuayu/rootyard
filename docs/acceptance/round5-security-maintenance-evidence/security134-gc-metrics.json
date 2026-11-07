@@ -1,0 +1,84 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "session_gc_metrics_setup",
+      "status": "passed",
+      "seconds": 2.0453,
+      "detail": {
+        "metrics_series": 31,
+        "gc_counters_baseline": {
+          "rootyard_session_gc_cycles_total": 2,
+          "rootyard_session_gc_session_rows_deleted_total": 0,
+          "rootyard_session_gc_tokens_deleted_total": 0,
+          "rootyard_session_gc_failures_total": 0
+        },
+        "gc_interval_seconds": 1
+      }
+    },
+    {
+      "name": "failed_token_pass_keeps_committed_session_deletion",
+      "status": "passed",
+      "seconds": 2.0866,
+      "detail": {
+        "baseline_counters": {
+          "rootyard_session_gc_cycles_total": 2,
+          "rootyard_session_gc_session_rows_deleted_total": 0,
+          "rootyard_session_gc_tokens_deleted_total": 0,
+          "rootyard_session_gc_failures_total": 0
+        },
+        "failed_cycle_counters": {
+          "rootyard_session_gc_cycles_total": 2,
+          "rootyard_session_gc_session_rows_deleted_total": 1,
+          "rootyard_session_gc_tokens_deleted_total": 0,
+          "rootyard_session_gc_failures_total": 1
+        },
+        "recovered_counters": {
+          "rootyard_session_gc_cycles_total": 3,
+          "rootyard_session_gc_session_rows_deleted_total": 1,
+          "rootyard_session_gc_tokens_deleted_total": 1,
+          "rootyard_session_gc_failures_total": 1
+        },
+        "committed_session_rows": 1,
+        "token_deleted_after_recovery": 1,
+        "sql_fault": "BEFORE DELETE trigger raised SQLSTATE 23503 for browser rows"
+      }
+    },
+    {
+      "name": "snapshot_failure_retains_process_gc_counters",
+      "status": "passed",
+      "seconds": 0.0373,
+      "detail": {
+        "forced_snapshot_failure": "event_deliveries renamed",
+        "gc_counters_retained": [
+          "rootyard_session_gc_cycles_total",
+          "rootyard_session_gc_session_rows_deleted_total",
+          "rootyard_session_gc_tokens_deleted_total",
+          "rootyard_session_gc_failures_total"
+        ],
+        "database_gauges_omitted": [
+          "rootyard_repositories",
+          "rootyard_operations_unresolved",
+          "rootyard_event_deliveries",
+          "rootyard_event_delivery_oldest_age_seconds",
+          "rootyard_provisioning_backlog",
+          "rootyard_provisioning_due",
+          "rootyard_provisioning_oldest_age_seconds",
+          "rootyard_browser_web_sessions",
+          "rootyard_browser_tokens",
+          "rootyard_expired_browser_session_oldest_age_seconds",
+          "rootyard_expired_browser_token_oldest_age_seconds"
+        ]
+      }
+    }
+  ],
+  "binary_sha256": "85c66397f755768fa139cf4952fca6a21ca12747bd6d18b042f80c2a62f0eb3d",
+  "failure_traceback": null,
+  "limitations": [
+    "Loopback functional timings are not a scalability benchmark.",
+    "Crash tests kill the service process, not the kernel or PostgreSQL; no power-loss guarantee is inferred.",
+    "Interrupted upload uses a truncated HTTP body; exhaustive transport fault injection is not covered.",
+    "Bulk expired browser rows are seeded with SQL; they are not claimed to be individual browser logins. Login/logout/natural-expiry rows are real.",
+    "The token-pass failure is a temporary local trigger raising SQLSTATE 23503 for browser rows, and the snapshot failure is this harness's own table rename; neither is a PostgreSQL outage."
+  ]
+}
