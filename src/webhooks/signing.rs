@@ -13,7 +13,8 @@ use axum::http::{HeaderMap, StatusCode};
 use deadpool_postgres::Transaction;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{net::SocketAddr, time::Duration};
+use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 pub const SIGNATURE_PREFIX: &str = "sha256=";
@@ -169,6 +170,10 @@ pub fn resolve_callback_identity(
     Ok((event_id, req_sha256))
 }
 
+/// Resolver result future used by the transport. Tests inject an owned,
+/// deliberately delayed resolver; production always uses `lookup_host`.
+type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+
 /// Dispatches over a verified TLS-capable HTTP transport. DNS is resolved and checked
 /// before use, then pinned to prevent a second lookup from bypassing SSRF policy.
 pub async fn send_http11_webhook(
@@ -181,26 +186,71 @@ pub async fn send_http11_webhook(
     signature_256: &str,
     body_bytes: &[u8],
 ) -> Result<u16, String> {
-    // Egress policy is re-evaluated for every attempt, so a hook persisted while the
-    // loopback opt-in was active stops delivering as soon as it is withdrawn.
-    let loopback_allowed = policy::loopback_targets_allowed();
+    send_http11_webhook_with_resolver(
+        url,
+        timeout_ms,
+        event_type,
+        delivery_id,
+        hook_id,
+        attempt,
+        signature_256,
+        body_bytes,
+        // Egress policy is re-evaluated for every attempt, so a hook persisted
+        // while the loopback opt-in was active stops delivering as soon as it
+        // is withdrawn.
+        policy::loopback_targets_allowed(),
+        |host, port| {
+            Box::pin(async move {
+                let resolved = tokio::net::lookup_host((host.as_str(), port)).await?;
+                Ok(resolved.collect())
+            })
+        },
+    )
+    .await
+}
+
+/// Transport with an explicit loopback decision and resolver seam. Both are
+/// private to the crate: no request data can relax SSRF policy, and the public
+/// path always combines the operator policy with the system resolver.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_http11_webhook_with_resolver<F>(
+    url: &str,
+    timeout_ms: i64,
+    event_type: &str,
+    delivery_id: Uuid,
+    hook_id: Uuid,
+    attempt: i64,
+    signature_256: &str,
+    body_bytes: &[u8],
+    loopback_allowed: bool,
+    resolve: F,
+) -> Result<u16, String>
+where
+    F: FnOnce(String, u16) -> ResolveFuture,
+{
     let target = validate_webhook_url_with_policy(url, loopback_allowed)
         .map_err(|_| "invalid or SSRF-blocked target URL".to_owned())?;
     let timeout_dur = Duration::from_millis(timeout_ms.clamp(100, 30_000) as u64);
-    let addresses: Vec<SocketAddr> =
-        tokio::time::timeout(timeout_dur, tokio::net::lookup_host((target.host.as_str(), target.port)))
-            .await
-            .map_err(|_| "webhook DNS timed out".to_owned())?
-            .map_err(|e| format!("webhook DNS error: {e}"))?
-            .collect();
+    // ONE absolute deadline for DNS, connect, TLS and the response. Giving the
+    // resolver and then the HTTP client separate full timeouts would let a hook
+    // with a 30 s timeout occupy about 60 s and break both the scan reserve and
+    // the claim-lease assumption.
+    let deadline = Instant::now() + timeout_dur;
+    let addresses: Vec<SocketAddr> = tokio::time::timeout_at(deadline, resolve(target.host.clone(), target.port))
+        .await
+        .map_err(|_| "webhook DNS timed out".to_owned())?
+        .map_err(|e| format!("webhook DNS error: {e}"))?;
+    // Every answer of a non-loopback name must be publicly routable; a mixed
+    // answer fails closed before any connection is attempted.
     if addresses.is_empty()
         || addresses.iter().any(|a| !policy::permitted_peer(target.is_loopback, a.ip(), loopback_allowed))
     {
         return Err("webhook DNS resolved to a blocked address".to_owned());
     }
+    let remaining = remaining_transport_budget(deadline)?;
     let mut builder = reqwest::Client::builder()
-        .timeout(timeout_dur)
-        .connect_timeout(timeout_dur)
+        .timeout(remaining)
+        .connect_timeout(remaining)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .resolve(&target.host, addresses[0]);
@@ -210,20 +260,36 @@ pub async fn send_http11_webhook(
         builder = builder.add_root_certificate(cert);
     }
     let client = builder.build().map_err(|e| format!("webhook client error: {e}"))?;
-    let response = client
-        .post(url)
-        .header("User-Agent", "Rootyard-Hookshot/1.0")
-        .header("Content-Type", "application/json")
-        .header("X-Rootyard-Event", event_type)
-        .header("X-Rootyard-Delivery", delivery_id.to_string())
-        .header("X-Rootyard-Hook-Id", hook_id.to_string())
-        .header("X-Rootyard-Signature-256", signature_256)
-        .header("X-Rootyard-Attempt", attempt.to_string())
-        .body(body_bytes.to_vec())
-        .send()
-        .await
-        .map_err(|e| format!("webhook transport error: {e:?}"))?;
+    let remaining = remaining_transport_budget(deadline)?;
+    let response = tokio::time::timeout_at(
+        deadline,
+        client
+            .post(url)
+            .header("User-Agent", "Rootyard-Hookshot/1.0")
+            .header("Content-Type", "application/json")
+            .header("X-Rootyard-Event", event_type)
+            .header("X-Rootyard-Delivery", delivery_id.to_string())
+            .header("X-Rootyard-Hook-Id", hook_id.to_string())
+            .header("X-Rootyard-Signature-256", signature_256)
+            .header("X-Rootyard-Attempt", attempt.to_string())
+            .timeout(remaining)
+            .body(body_bytes.to_vec())
+            .send(),
+    )
+    .await
+    .map_err(|_| "webhook transport timed out".to_owned())?
+    .map_err(|e| format!("webhook transport error: {e:?}"))?;
     Ok(response.status().as_u16())
+}
+
+/// Time left before the one end-to-end transport deadline. Exhaustion is a
+/// failed attempt, never a fresh full timeout per stage.
+fn remaining_transport_budget(deadline: Instant) -> Result<Duration, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("webhook transport timed out".to_owned());
+    }
+    Ok(remaining)
 }
 
 /// Upserts a commit-bound `CheckRun` from a verified webhook callback with monotonic
@@ -326,6 +392,8 @@ pub async fn upsert_callback_check_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn rfc4231_hmac_sha256_test_vectors() {
@@ -383,5 +451,154 @@ mod tests {
         assert_eq!(hdrs["X-Rootyard-Hook-Id"], h_id.to_string());
         assert_eq!(hdrs["X-Rootyard-Signature-256"], sig);
         assert_eq!(hdrs["X-Rootyard-Attempt"], "2");
+    }
+
+    struct OwnedPeer {
+        addr: SocketAddr,
+        accepts: Arc<AtomicUsize>,
+    }
+
+    /// Owned loopback HTTP/1.1 peer. It counts accepted connections, reads one
+    /// request, then optionally delays before writing a canned response.
+    fn owned_peer(delay: Duration, response: Vec<u8>) -> OwnedPeer {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind owned peer");
+        listener.set_nonblocking(true).expect("nonblocking owned peer");
+        let addr = listener.local_addr().expect("owned peer address");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.set_nonblocking(false);
+                        let mut request = [0u8; 8192];
+                        let _ = std::io::Read::read(&mut stream, &mut request);
+                        if !delay.is_zero() {
+                            std::thread::sleep(delay);
+                        }
+                        let _ = std::io::Write::write_all(&mut stream, &response);
+                        let _ = std::io::Write::flush(&mut stream);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= until {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        OwnedPeer { addr, accepts }
+    }
+
+    fn empty_ok_response(status: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+    }
+
+    async fn transport_to_owned_peer(
+        peer: &OwnedPeer,
+        timeout_ms: i64,
+        dns_delay: Duration,
+    ) -> (Result<u16, String>, Duration) {
+        let addr = peer.addr;
+        let url = format!("http://127.0.0.1:{}/hook", addr.port());
+        let started = std::time::Instant::now();
+        let result = send_http11_webhook_with_resolver(
+            &url,
+            timeout_ms,
+            "ping",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            1,
+            "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+            b"{\"event\":\"ping\"}",
+            true,
+            move |_host, _port| {
+                Box::pin(async move {
+                    tokio::time::sleep(dns_delay).await;
+                    Ok(vec![addr])
+                })
+            },
+        )
+        .await;
+        (result, started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn one_absolute_deadline_covers_delayed_dns_and_slow_receiver() {
+        let peer = owned_peer(Duration::from_millis(1400), empty_ok_response("204 No Content"));
+        let (result, elapsed) = transport_to_owned_peer(&peer, 2000, Duration::from_millis(1000)).await;
+        assert!(result.is_err(), "combined budget should stop before the slow response: {result:?}");
+        assert_eq!(peer.accepts.load(Ordering::SeqCst), 1, "HTTP phase should start with the remaining budget");
+        // With separate full budgets the DNS phase (1.0 s) plus the HTTP phase
+        // (2.0 s) would run about 3 s. The single deadline stops near 2 s.
+        assert!(elapsed >= Duration::from_millis(1800), "budget was not spent meaningfully: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(2800), "per-stage budgets were not combined: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn delayed_dns_and_receiver_within_one_budget_still_deliver() {
+        let peer = owned_peer(Duration::from_millis(300), empty_ok_response("204 No Content"));
+        let (result, elapsed) = transport_to_owned_peer(&peer, 2500, Duration::from_millis(400)).await;
+        assert_eq!(result, Ok(204), "a legitimate send must not be cancelled early");
+        assert!(elapsed < Duration::from_millis(2500), "{elapsed:?}");
+        assert_eq!(peer.accepts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_dns_answers_fail_before_any_connection() {
+        let peer = owned_peer(Duration::ZERO, empty_ok_response("204 No Content"));
+        let addr = peer.addr;
+        let url = format!("http://127.0.0.1:{}/hook", addr.port());
+        let result = send_http11_webhook_with_resolver(
+            &url,
+            2000,
+            "ping",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            1,
+            "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+            b"{}",
+            true,
+            move |_host, _port| Box::pin(async move { Ok(vec![addr, SocketAddr::from(([10, 0, 0, 1], 80))]) }),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert!(result.unwrap_err().contains("blocked"), "unexpected failure reason");
+        assert_eq!(peer.accepts.load(Ordering::SeqCst), 0, "a blocked answer must not reach the network");
+    }
+
+    #[tokio::test]
+    async fn redirect_response_is_not_followed_to_an_owned_peer() {
+        let target = owned_peer(Duration::ZERO, empty_ok_response("204 No Content"));
+        let redirect_body = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            target.addr.port()
+        )
+        .into_bytes();
+        let redirect = owned_peer(Duration::ZERO, redirect_body);
+        let addr = redirect.addr;
+        let url = format!("http://127.0.0.1:{}/hook", addr.port());
+        let result = send_http11_webhook_with_resolver(
+            &url,
+            2000,
+            "ping",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            1,
+            "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+            b"{}",
+            true,
+            move |_host, _port| Box::pin(async move { Ok(vec![addr]) }),
+        )
+        .await;
+        assert_eq!(result, Ok(302), "{result:?}");
+        assert_eq!(redirect.accepts.load(Ordering::SeqCst), 1);
+        // Give a wrongly-followed redirect a moment to connect.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(target.accepts.load(Ordering::SeqCst), 0, "redirect target must not be contacted");
     }
 }

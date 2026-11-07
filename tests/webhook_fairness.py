@@ -339,6 +339,77 @@ def main():
             "held_delivery_id": held_id,
         }
 
+    def small_backfill_pages_and_drains_over_rounds():
+        worker(False)
+        repo = harness.document("/api/repos", 201, method="POST", body={"name": "fairpage"})
+        hook_count = 8
+        event_count = 17
+        missing_pairs = hook_count * event_count
+        # Deliberately just above one OUTBOX_BACKFILL_LIMIT page. A second round
+        # must select the remainder, and later rounds must drain the delivery
+        # rows. No manual dispatch is called anywhere in this file.
+        assert 128 < missing_pairs < 200, missing_pairs
+        operation = uuid.uuid4()
+        storage = int(harness.sql(
+            f"SELECT storage_generation FROM repositories WHERE id='{repo['id']}'"))
+        harness.sql(
+            "INSERT INTO git_operations(id,repository_id,actor_id,token_id,"
+            "actor_name,sequence,storage_generation,evidence,outcome) "
+            f"VALUES('{operation}','{repo['id']}','{harness.alice['user_id']}',"
+            f"'{harness.alice['token_id']}','alice',1000,{storage},'{{}}','recorded')")
+        harness.sql(
+            "INSERT INTO outbox_events(event_id,operation_id,repository_id,"
+            "storage_generation,operation_sequence,transaction_sequence,"
+            "ref_name,old_oid,new_oid) "
+            "SELECT md5('fairpage-'||g::text)||md5('event-'||g::text),"
+            f"'{operation}','{repo['id']}',{storage},1000,g,"
+            "'refs/heads/page-'||g,repeat('0',40),repeat('a',40) "
+            f"FROM generate_series(1,{event_count}) g")
+        harness.sql(
+            "INSERT INTO forge_webhooks(id,tenant_id,repository_id,url,secret,"
+            "secret_sha256,events,ci_contexts,auto_ci_pin,active,max_attempts,"
+            "timeout_ms) "
+            f"SELECT gen_random_uuid(),'{harness.alice['user_id']}',"
+            f"'{repo['id']}','{receiver.url}','fairpage-secret',"
+            "repeat('a',64),jsonb_build_array('push'),jsonb_build_array('ci/default'),"
+            f"false,true,2,3000 FROM generate_series(1,{hook_count})")
+
+        def push_rows():
+            return int(harness.sql(
+                "SELECT count(*) FROM forge_webhook_deliveries WHERE event_type='push' "
+                f"AND repository_id='{repo['id']}'"))
+
+        def delivered_rows():
+            return int(harness.sql(
+                "SELECT count(*) FROM forge_webhook_deliveries WHERE event_type='push' "
+                f"AND repository_id='{repo['id']}' AND state='delivered'"))
+
+        worker(True)
+        first_page = wait_for("first bounded backfill page", lambda: (
+            lambda rows: rows if rows >= 128 else None)(push_rows()), timeout=30)
+        assert first_page == 128, first_page
+        assert first_page < missing_pairs, (first_page, missing_pairs)
+        next_page = wait_for("next backfill page selected in a later round", lambda: (
+            lambda rows: rows if rows == missing_pairs else None)(push_rows()), timeout=60)
+        delivered_after_next_page = delivered_rows()
+        assert 0 < delivered_after_next_page <= 8, delivered_after_next_page
+        later_round = wait_for("delivery drain advances in later rounds", lambda: (
+            lambda rows: rows if rows >= delivered_after_next_page + 8 else None)(
+                delivered_rows()), timeout=60)
+        delivered_total = wait_for("all bounded pairs delivered over rounds", lambda: (
+            lambda rows: rows if rows == missing_pairs else None)(delivered_rows()), timeout=120)
+        assert receiver.attempts("refs/heads/page-1"), "receiver never saw a backfilled push event"
+        return {
+            "outbox_events": event_count,
+            "active_hooks": hook_count,
+            "missing_pairs": missing_pairs,
+            "bounded_backfill_page_rows": first_page,
+            "rows_after_next_page": next_page,
+            "delivered_after_next_page": delivered_after_next_page,
+            "delivered_in_later_round": later_round,
+            "delivered_total": delivered_total,
+        }
+
     def backlog_failure_restart():
         worker(False)
         backlog_markers = [f"backlog-{index}" for index in range(20)]
@@ -506,6 +577,7 @@ def main():
         harness.env["ROOTYARD_OUTBOX_WORKER"] = "false"
         harness.setup()
         case("two_sorted_repositories_early_slow_does_not_starve_later", two_sorted_repositories)
+        case("small_backfill_next_page_drains_over_rounds", small_backfill_pages_and_drains_over_rounds)
         case("large_outbox_hook_fanout_keeps_later_repo_live", large_outbox_fanout_keeps_later_repo_live)
         case("large_backlog_failure_and_hard_restart", backlog_failure_restart)
         case("graceful_cancel_leaves_durable_claim", graceful_cancel_restart)

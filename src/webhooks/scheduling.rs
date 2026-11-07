@@ -7,8 +7,9 @@
 //! whole scan or every later repository behind it.
 use crate::{AppState, Error};
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     future::Future,
+    ops::Bound,
     pin::Pin,
     sync::{Arc, Mutex},
 };
@@ -43,15 +44,18 @@ pub(crate) const OUTBOX_BACKFILL_LIMIT: i64 = 128;
 /// Backfill stops before this per-repository budget and is separately wrapped
 /// in a timeout, so it can never delay the HTTP phase indefinitely.
 pub(crate) const OUTBOX_BACKFILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-/// Phase two stops *starting* work at this point in a round. The remaining 60 s
-/// of `SCAN_TIMEOUT` covers one 30 s hook transport already in flight plus
-/// scheduling/DB overhead, so the outer timeout never drops a valid send.
+/// Phase two stops *starting* work at this point in a scan. The remaining 60 s
+/// of `SCAN_TIMEOUT` covers one 30 s hook transport already in flight (plus
+/// backfill and scheduling/DB overhead), so the outer timeout never drops a
+/// valid send. The budget is anchored at the start of the scan, before the
+/// candidate query, so query latency cannot consume this reserve.
 pub(crate) const SCAN_WORK_BUDGET: std::time::Duration = std::time::Duration::from_secs(240);
-/// In-process pull cursors are pruned by age and bounded by capacity. They are
-/// touched whenever a repository is examined, so an active multi-page prefix is
-/// not reset, while closed/deleted/backend-changed repositories age out.
-pub(crate) const PULL_CURSOR_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
-pub(crate) const PULL_CURSOR_CAPACITY: usize = 4096;
+/// Cursor pruning examines at most this many repository IDs per round. Because
+/// `PullCursors::set(..., None)` retires a completed prefix immediately, this
+/// only reclaims repositories that became closed/deleted/non-ready or left
+/// GitFS. A full sweep of N retained cursors takes `ceil(N / batch)` rounds, so
+/// pruning is finite work bounded independently of the candidate page.
+pub(crate) const PULL_CURSOR_PRUNE_BATCH: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct RepositoryKey {
@@ -90,55 +94,164 @@ pub(crate) struct RunOutcome {
 /// value means the next page starts at the first open pull. The cursor only
 /// advances after a successfully examined page, so cancellation replays it.
 ///
-/// Entries are bounded by age and capacity rather than being pruned against the
-/// current candidate window, so a repository outside this round's 16-row page
-/// keeps its progress. Every use refreshes the entry; this prevents an active
-/// multi-page prefix from being reset on the next page.
-#[derive(Clone, Copy)]
+/// State is proportional to the repositories that currently have an unfinished
+/// multi-page open-PR prefix, not to history: `set(..., None)` removes a
+/// completed entry immediately and each repository keeps exactly one entry (no
+/// FIFO of old pages). There is deliberately no age TTL or capacity eviction,
+/// because either would silently reset an active prefix whenever more than the
+/// old fixed cap of repositories were busy or a long sweep outlived the TTL.
+/// A rotating, bounded prune instead retires only repository IDs whose row is
+/// deleted, not `ready`, not GitFS-backed, or no longer has an open pull. The
+/// prune never treats a repository outside the current 16-row candidate page as
+/// inactive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PullCursor {
     after: i64,
-    touched: std::time::Instant,
+    /// Global monotonic tag captured when this entry was written. An async prune
+    /// result only removes an entry whose tag still matches, so a cursor that was
+    /// advanced or recreated after the eligibility query cannot be deleted.
+    generation: u64,
+}
+
+#[derive(Default)]
+struct CursorState {
+    entries: BTreeMap<Uuid, PullCursor>,
+    /// Exclusive lower bound of the next rotating prune window. The BTreeMap
+    /// range below gives O(log N + batch) selection without copying every key.
+    prune_after: Option<Uuid>,
+    generation: u64,
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct PullCursors(Arc<Mutex<HashMap<Uuid, PullCursor>>>);
+pub(crate) struct PullCursors(Arc<Mutex<CursorState>>);
 
-fn prune_pull_cursors(cursors: &mut HashMap<Uuid, PullCursor>, now: std::time::Instant) {
-    cursors.retain(|_, cursor| now.saturating_duration_since(cursor.touched) <= PULL_CURSOR_TTL);
-    if cursors.len() <= PULL_CURSOR_CAPACITY {
-        return;
-    }
-    let mut oldest: Vec<(Uuid, std::time::Instant)> =
-        cursors.iter().map(|(repository_id, cursor)| (*repository_id, cursor.touched)).collect();
-    oldest.sort_by_key(|(_, touched)| *touched);
-    for (repository_id, _) in oldest.into_iter().take(cursors.len() - PULL_CURSOR_CAPACITY) {
-        cursors.remove(&repository_id);
-    }
+/// One bounded inspect window over the cursor keys. `candidates` carries the
+/// generation observed under the lock, which fences the later removal pass.
+struct CursorPruneBatch {
+    candidates: Vec<(Uuid, u64)>,
 }
 
 impl PullCursors {
     pub(crate) fn after(&self, repository_id: Uuid) -> Option<i64> {
-        let now = std::time::Instant::now();
-        let mut cursors = self.0.lock().expect("pull cursor poisoned");
-        prune_pull_cursors(&mut cursors, now);
-        let cursor = cursors.get_mut(&repository_id)?;
-        cursor.touched = now;
-        Some(cursor.after)
+        let cursors = self.0.lock().expect("pull cursor poisoned");
+        cursors.entries.get(&repository_id).map(|cursor| cursor.after)
     }
 
     pub(crate) fn set(&self, repository_id: Uuid, after: Option<i64>) {
-        let now = std::time::Instant::now();
         let mut cursors = self.0.lock().expect("pull cursor poisoned");
         match after {
             Some(number) => {
-                cursors.insert(repository_id, PullCursor { after: number, touched: now });
+                cursors.generation = cursors.generation.wrapping_add(1);
+                let generation = cursors.generation;
+                // Replace in place: one current entry per repository, never a
+                // growing chain of stale pages from earlier rounds.
+                cursors.entries.insert(repository_id, PullCursor { after: number, generation });
             }
             None => {
-                cursors.remove(&repository_id);
+                // A repository that reached the last page has no unfinished
+                // prefix, so its state is reclaimed immediately, not by a later
+                // eviction sweep.
+                cursors.entries.remove(&repository_id);
             }
         }
-        prune_pull_cursors(&mut cursors, now);
     }
+
+    /// Select at most `limit` cursor IDs in ascending repository order, starting
+    /// after the rotating bound and wrapping once. Each candidate carries the
+    /// generation seen while holding the lock.
+    fn take_prune_batch(&self, limit: usize) -> CursorPruneBatch {
+        let mut cursors = self.0.lock().expect("pull cursor poisoned");
+        let limit = limit.max(1);
+        let total = cursors.entries.len();
+        if total == 0 {
+            cursors.prune_after = None;
+            return CursorPruneBatch { candidates: Vec::new() };
+        }
+        let after = cursors.prune_after;
+        let mut candidates = Vec::with_capacity(limit.min(total));
+        if let Some(after) = after {
+            for (&repository_id, cursor) in cursors.entries.range((Bound::Excluded(after), Bound::Unbounded)) {
+                if candidates.len() == limit {
+                    break;
+                }
+                candidates.push((repository_id, cursor.generation));
+            }
+            if candidates.len() < limit {
+                for (&repository_id, cursor) in cursors.entries.range(..) {
+                    if candidates.len() == limit || Some(repository_id) == after {
+                        break;
+                    }
+                    candidates.push((repository_id, cursor.generation));
+                }
+            }
+        } else {
+            for (&repository_id, cursor) in cursors.entries.range(..) {
+                if candidates.len() == limit {
+                    break;
+                }
+                candidates.push((repository_id, cursor.generation));
+            }
+        }
+        // Reset after a full sweep so the next round starts from the smallest
+        // retained key; otherwise continue strictly after the last inspected
+        // key. A removed key remains a valid ordering bound.
+        cursors.prune_after =
+            if candidates.len() >= total { None } else { candidates.last().map(|(repository_id, _)| *repository_id) };
+        CursorPruneBatch { candidates }
+    }
+
+    /// Apply an eligibility result. An `Err` retains every cursor; a candidate is
+    /// removed only when the database reported it ineligible *and* its entry
+    /// generation is unchanged, so a concurrent advance/recreate wins.
+    fn apply_prune_outcome(&self, batch: CursorPruneBatch, outcome: Result<Vec<Uuid>, Error>) -> Result<usize, Error> {
+        let ineligible = outcome?;
+        let mut cursors = self.0.lock().expect("pull cursor poisoned");
+        let mut removed = 0;
+        for (repository_id, generation) in batch.candidates {
+            if !ineligible.contains(&repository_id) {
+                continue;
+            }
+            let unchanged = cursors.entries.get(&repository_id).is_some_and(|cursor| cursor.generation == generation);
+            if unchanged && cursors.entries.remove(&repository_id).is_some() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Run one bounded prune page. Query errors are returned and leave the state
+    /// untouched; the caller continues the scan and retries on a later round.
+    pub(crate) async fn prune(&self, state: &AppState) -> Result<usize, Error> {
+        let batch = self.take_prune_batch(PULL_CURSOR_PRUNE_BATCH);
+        if batch.candidates.is_empty() {
+            return Ok(0);
+        }
+        let repository_ids: Vec<Uuid> = batch.candidates.iter().map(|(id, _)| *id).collect();
+        let outcome = ineligible_cursor_repositories(state, &repository_ids).await;
+        self.apply_prune_outcome(batch, outcome)
+    }
+}
+
+/// Returns the subset of `repository_ids` that must no longer keep a PR cursor:
+/// the repository row is gone, not `ready`, no longer GitFS-backed, or has no
+/// open pull left. The array is bounded by `PULL_CURSOR_PRUNE_BATCH`, the pool's
+/// statement timeout bounds the query, and no candidate-page state is consulted.
+async fn ineligible_cursor_repositories(state: &AppState, repository_ids: &[Uuid]) -> Result<Vec<Uuid>, Error> {
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let rows = client
+        .query(
+            "SELECT c.repository_id FROM unnest($1::uuid[]) AS c(repository_id) \
+             WHERE NOT EXISTS ( \
+               SELECT 1 FROM repositories r \
+               WHERE r.id=c.repository_id AND r.state='ready' AND r.storage_backend='gitfs' \
+                 AND EXISTS (SELECT 1 FROM forge_pulls p \
+                             WHERE p.repository_id=r.id AND p.state='open') \
+             )",
+            &[&repository_ids],
+        )
+        .await
+        .map_err(Error::internal)?;
+    Ok(rows.iter().map(|row| row.get(0)).collect())
 }
 
 /// In-process round-robin cursor. Durable state lives in PostgreSQL rows, so a
@@ -208,6 +321,13 @@ impl Scheduler {
             } else {
                 candidates.last().map(|candidate| candidate.key)
             };
+            // Rotate one bounded eligibility page per scan. The cursor window is
+            // independent of `candidates`: repositories outside this round's
+            // 16-row page are not evidence that their PR prefix is inactive.
+            // A failed prune keeps every cursor and does not fail the scan.
+            if let Err(error) = self.pull_cursors.prune(state).await {
+                eprintln!("rootyard: webhook pull cursor prune deferred ({})", error.1);
+            }
             return Ok(candidates);
         }
     }
@@ -253,4 +373,116 @@ where
         }
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored_ids(cursors: &PullCursors) -> Vec<Uuid> {
+        cursors.0.lock().expect("pull cursor poisoned").entries.keys().copied().collect()
+    }
+
+    #[test]
+    fn completed_prefix_is_removed_at_once_and_replaced_in_place() {
+        let cursors = PullCursors::default();
+        let repository_id = Uuid::new_v4();
+        cursors.set(repository_id, Some(17));
+        assert_eq!(cursors.after(repository_id), Some(17));
+        // A later page of the same repository replaces the entry rather than
+        // appending, so a long active prefix cannot leak duplicate state.
+        cursors.set(repository_id, Some(33));
+        assert_eq!(cursors.after(repository_id), Some(33));
+        assert_eq!(stored_ids(&cursors), vec![repository_id]);
+        // Reaching the last page reclaims state immediately.
+        cursors.set(repository_id, None);
+        assert_eq!(cursors.after(repository_id), None);
+        assert!(stored_ids(&cursors).is_empty());
+    }
+
+    #[test]
+    fn retained_cursors_are_not_capacity_evicted() {
+        let cursors = PullCursors::default();
+        let total = 4096 + 3;
+        let mut repository_ids = Vec::with_capacity(total);
+        for _ in 0..total {
+            let repository_id = Uuid::new_v4();
+            cursors.set(repository_id, Some(PULL_RECONCILE_LIMIT));
+            repository_ids.push(repository_id);
+        }
+        // Repeated rounds whose eligibility query finds nothing to retire must
+        // retain every eligible cursor, including all keys above the old 4096
+        // capacity. A capacity policy would have silently dropped three here.
+        for _ in 0..64 {
+            let batch = cursors.take_prune_batch(PULL_CURSOR_PRUNE_BATCH);
+            assert!(!batch.candidates.is_empty());
+            assert!(batch.candidates.len() <= PULL_CURSOR_PRUNE_BATCH);
+            assert_eq!(cursors.apply_prune_outcome(batch, Ok(Vec::new())).unwrap(), 0);
+        }
+        assert_eq!(stored_ids(&cursors).len(), total);
+        for repository_id in repository_ids {
+            assert_eq!(cursors.after(repository_id), Some(PULL_RECONCILE_LIMIT));
+        }
+    }
+
+    #[test]
+    fn prune_retires_cleanup_candidates_but_preserves_a_concurrent_update() {
+        let cursors = PullCursors::default();
+        let closed = Uuid::new_v4();
+        let backend_changed = Uuid::new_v4();
+        let deleted = Uuid::new_v4();
+        let updated = Uuid::new_v4();
+        let active = Uuid::new_v4();
+        for repository_id in [closed, backend_changed, deleted, updated, active] {
+            cursors.set(repository_id, Some(PULL_RECONCILE_LIMIT));
+        }
+        let batch = cursors.take_prune_batch(PULL_CURSOR_PRUNE_BATCH);
+        assert_eq!(batch.candidates.len(), 5);
+        // The database answer was computed before this repository's next page
+        // advanced. The generation fence must keep the newer cursor.
+        cursors.set(updated, Some(PULL_RECONCILE_LIMIT * 2));
+        let removed = cursors.apply_prune_outcome(batch, Ok(vec![closed, backend_changed, deleted, updated])).unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(cursors.after(closed), None);
+        assert_eq!(cursors.after(backend_changed), None);
+        assert_eq!(cursors.after(deleted), None);
+        assert_eq!(cursors.after(updated), Some(PULL_RECONCILE_LIMIT * 2));
+        assert_eq!(cursors.after(active), Some(PULL_RECONCILE_LIMIT));
+    }
+
+    #[test]
+    fn prune_query_error_retains_every_cursor() {
+        let cursors = PullCursors::default();
+        let repository_ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        for repository_id in &repository_ids {
+            cursors.set(*repository_id, Some(PULL_RECONCILE_LIMIT));
+        }
+        let batch = cursors.take_prune_batch(PULL_CURSOR_PRUNE_BATCH);
+        let result = cursors.apply_prune_outcome(batch, Err(Error::internal("prune query failed")));
+        assert!(result.is_err());
+        assert_eq!(stored_ids(&cursors).len(), repository_ids.len());
+        for repository_id in repository_ids {
+            assert_eq!(cursors.after(repository_id), Some(PULL_RECONCILE_LIMIT));
+        }
+    }
+
+    #[test]
+    fn rotating_batches_reach_later_ineligible_ids_without_full_key_copy() {
+        let cursors = PullCursors::default();
+        let mut repository_ids: Vec<Uuid> = (0..(PULL_CURSOR_PRUNE_BATCH * 2 + 5)).map(|_| Uuid::new_v4()).collect();
+        repository_ids.sort();
+        for repository_id in &repository_ids {
+            cursors.set(*repository_id, Some(PULL_RECONCILE_LIMIT));
+        }
+        let target = *repository_ids.last().unwrap();
+        let mut removed = 0;
+        for _ in 0..3 {
+            let batch = cursors.take_prune_batch(PULL_CURSOR_PRUNE_BATCH);
+            assert!(batch.candidates.len() <= PULL_CURSOR_PRUNE_BATCH);
+            removed += cursors.apply_prune_outcome(batch, Ok(vec![target])).unwrap();
+        }
+        assert_eq!(removed, 1);
+        assert_eq!(cursors.after(target), None);
+        assert_eq!(stored_ids(&cursors).len(), repository_ids.len() - 1);
+    }
 }

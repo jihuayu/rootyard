@@ -36,7 +36,7 @@ deleted hooks in the PR reconciliation path without creating deliveries.
    `ci_pull_sync_progress` is written last; the repair query's bounded `LIMIT`
    therefore advances on later rounds.
 2. **Outbox and network delivery**: one bounded outbox backfill call per
-   repository (`LIMIT 200` inside), then at most 8 due deliveries, serial within
+   repository (`LIMIT 128` inside), then at most 8 due deliveries, serial within
    a hook. Sends happen only after every PR reconciliation task in the round has
    finished or been bounded out, so a held webhook receiver cannot delay a later
    repository's PR update.
@@ -50,6 +50,15 @@ request keeps running under that hook's declared transport timeout (at most
 whole scan, and is never abandoned merely to appear fair. Cancellation aborts
 the owned `JoinSet` tasks before the round returns; no detached task survives.
 Work is bounded, but this is not a throughput guarantee.
+
+The work window and the outer timeout share one anchor taken by the worker
+*before* the candidate query. Work stops at `scan_start + 240 s`
+(`SCAN_WORK_BUDGET`) and the outer timeout fires at `scan_start + 300 s`
+(`SCAN_TIMEOUT`), so the last 60 s stay reserved for a request that already
+started even when the candidate query itself is slow. Candidate-query latency
+is charged to the work budget; it can no longer silently shrink the reserve. If
+the work window closes while phase one is running, phase two starts no new
+backfill or send, and an in-flight send is still never cancelled early.
 
 A restart loses only the in-memory cursor and replays from the beginning. That is
 safe because pending deliveries, open PR rows, outbox events and the completion
@@ -65,6 +74,39 @@ only chooses the due batch. A slow batch therefore cannot lease or back off from
 its start time, and retry backoff is scheduled from completion. Due rows are
 selected in `sequence ASC` order for both paths, so an old due retry is not
 inverted behind a newer pending row.
+
+The hook transport uses one absolute end-to-end deadline across DNS resolution,
+TCP/TLS connect and the HTTP response. The resolver, client `connect_timeout`
+and request timeout all receive the time remaining against that deadline; a
+30 s hook can therefore occupy at most about 30 s, not 60 s of separate DNS and
+HTTP budgets. This preserves the scan reserve and the claim lease assumption
+(`timeout_ms` plus five seconds). Answer checking, DNS pinning, disabled
+redirects, `no_proxy` and the default loopback denial/re-check are unchanged.
+
+## Pull cursor state
+
+`PullCursors` keeps one current entry per repository that has an unfinished
+multi-page open-PR prefix. Reaching the last page (`set(..., None)`) removes the
+entry immediately, and advancing a page replaces the entry in place, so memory
+is proportional to the currently eligible repository cardinality rather than to
+historical churn.
+
+There is deliberately no age TTL or fixed capacity eviction. Either policy would
+reset an active prefix whenever more than the old 4096-repository cap was busy
+or a long sweep exceeded the old 30-minute TTL. Instead, one rotating
+`BTreeMap::range` page of at most 128 cursor IDs is checked per round against a
+bounded SQL query. A cursor is pruned only when its repository row is deleted,
+not `ready`, no longer GitFS-backed, or has no open pull left; the current
+16-row candidate page is never used as evidence of inactivity. Entries carry a
+generation tag, so an eligibility result cannot delete a cursor that was
+advanced or recreated while the query was in flight. Query errors retain every
+cursor and defer pruning to a later round. A full sweep of N retained cursors
+takes `ceil(N / 128)` rounds.
+
+Work remains bounded per round: 16 candidates, 4 concurrent repository tasks,
+128 cursor IDs pruned, one 128-pair backfill page and 8 sends per repository.
+None of these is a throughput guarantee; together they bound memory and the
+work the scheduler can start in one scan.
 
 ## Manual dispatch contract
 
@@ -95,6 +137,9 @@ never calls manual dispatch. It covers:
   hard restart and at-least-once recovery;
 - graceful SIGTERM cancellation mid-send, durable `leased,1`, restart with a new
   attempt and completion of the other queued rows.
+- a small >128 missing-pair fixture (8 hooks, 17 events) proving the first
+  bounded backfill page is 128, the next page is selected in a later round and
+  delivery rows keep draining over rounds without manual dispatch;
 
 `tests/webhook_pr_sync.py` covers no active hook, a paused hook and a deleted
 hook. Each case performs a separate PR head push and base push and verifies the

@@ -359,8 +359,11 @@ async fn deliver_single_with_clock(
     delivery_id: Uuid,
     clock: DeliveryClock,
 ) -> Result<WebhookDelivery, Error> {
-    let attempt_now = clock.now();
     let client = state.pool.get().await.map_err(Error::internal)?;
+    // Read the clock after the pool wait, immediately before the claim UPDATE:
+    // pool queueing must not age the lease/backoff timestamp that the claim and
+    // its fence are evaluated against. The manual Fixed clock is unchanged.
+    let attempt_now = clock.now();
     let Some(claim) = claims::claim(&client, tenant_id, repository_id, delivery_id, attempt_now).await? else {
         return claims::current(&client, tenant_id, repository_id, delivery_id).await;
     };
