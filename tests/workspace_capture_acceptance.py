@@ -531,7 +531,6 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             )
             self.assertGreaterEqual(watermark, base_revision + 100)
             self.assertFalse(gate.with_suffix(".timeout").exists(), "read gate expired before the fence")
-            _GATE_FACTS["held_through_revision_fence"] = True
             release.touch()
             _GATE_FACTS["released"] = True
             # Releasing lets the stale first scan finish; the following small
@@ -565,6 +564,7 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             )
             self.assertGreaterEqual(resync.get("snapshot_revision", 0), watermark)
             self.assertFalse(gate.with_suffix(".timeout").exists(), "read gate released without test authorization")
+            _GATE_FACTS["held_through_revision_fence"] = True
         finally:
             if gate is not None:
                 # Never leave the service child blocked in the gate.
