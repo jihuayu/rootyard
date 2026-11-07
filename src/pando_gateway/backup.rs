@@ -1,6 +1,9 @@
 //! Offline Pando backup closure. Caller owns a consistent PostgreSQL snapshot,
 //! volume flock and global migration barrier; this code opens no new DB lease.
-use super::pack_store::{ArtifactReceipt, PackManifest};
+use super::{
+    pack_store::{ArtifactReceipt, PackManifest},
+    retention,
+};
 use crate::storage::remote_objects::{ObjectKey, RemoteObjectStore};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -109,7 +112,7 @@ async fn inventory<C: GenericClient + Sync>(client: &C, repo_id: Uuid) -> Result
     })
 }
 
-fn keys(tenant_id: Uuid, artifact: &ArtifactReceipt) -> Result<[ObjectKey; 2]> {
+fn valid_artifact(artifact: &ArtifactReceipt) -> Result<()> {
     ensure!(
         artifact.envelope.ciphertext_sha256 == artifact.ciphertext_sha256
             && artifact.envelope.ciphertext_bytes == artifact.ciphertext_bytes
@@ -118,36 +121,87 @@ fn keys(tenant_id: Uuid, artifact: &ArtifactReceipt) -> Result<[ObjectKey; 2]> {
             && artifact.envelope.provider == "vault-transit",
         "invalid Pando encrypted artifact"
     );
-    Ok([
-        ObjectKey::new(tenant_id, "pando-cipher", &artifact.ciphertext_sha256)?,
-        ObjectKey::new(tenant_id, "pando-envelope", &artifact.envelope_sha256)?,
-    ])
+    Ok(())
 }
 
-async fn copy_artifact(
+/// Export uses the exact remote path this database resolved for the receipt.
+/// Legacy v1 artifacts fall back to the tenant-only path; those objects are
+/// never deletable. The backup volume itself always uses the authority-free
+/// layout so newer and older binaries read the same archive tree.
+async fn export_artifact<C: GenericClient + Sync>(
+    client: &C,
     remote: &RemoteObjectStore,
     root: &Path,
     tenant_id: Uuid,
     artifact: &ArtifactReceipt,
     deadline: Instant,
-    upload: bool,
 ) -> Result<()> {
-    let [cipher, envelope] = keys(tenant_id, artifact)?;
-    for (key, size) in [(&cipher, artifact.ciphertext_bytes), (&envelope, artifact.envelope_bytes)] {
-        let path = root.join(key.path());
-        if upload {
-            ensure!(fs::symlink_metadata(&path).await?.is_file(), "backup object is not a regular file");
-            remote.put_file(key, &path, size, deadline).await?;
-        } else {
-            remote.get_to_file(key, &path, size, deadline).await?;
-        }
+    valid_artifact(artifact)?;
+    let cipher =
+        retention::resolve_artifact(client, tenant_id, retention::NAMESPACE_CIPHER, &artifact.ciphertext_sha256)
+            .await?;
+    let envelope =
+        retention::resolve_artifact(client, tenant_id, retention::NAMESPACE_ENVELOPE, &artifact.envelope_sha256)
+            .await?;
+    for (key, size) in [(&cipher.key, artifact.ciphertext_bytes), (&envelope.key, artifact.envelope_bytes)] {
+        let path = root.join(key.volume_path());
+        remote.get_to_file(key, &path, size, deadline).await?;
     }
-    let envelope_path = root.join(envelope.path());
+    let envelope_path = root.join(envelope.key.volume_path());
     let bytes = fs::read(envelope_path).await?;
     ensure!(
         hex::encode(Sha256::digest(&bytes)) == artifact.envelope_sha256
             && serde_json::from_slice::<serde_json::Value>(&bytes)? == serde_json::to_value(&artifact.envelope)?,
         "Pando backup envelope differs from PostgreSQL manifest"
+    );
+    Ok(())
+}
+
+/// Restore imports under the target database's freshly minted authority. The
+/// caller has already reset that authority once for the whole database.
+async fn import_artifact<C: GenericClient + Sync>(
+    client: &C,
+    remote: &RemoteObjectStore,
+    root: &Path,
+    tenant_id: Uuid,
+    artifact: &ArtifactReceipt,
+    deadline: Instant,
+) -> Result<()> {
+    valid_artifact(artifact)?;
+    let (cipher_slot, envelope_slot) =
+        retention::reserve_pair(client, tenant_id, &artifact.ciphertext_sha256, &artifact.envelope_sha256).await?;
+    for (slot, namespace, sha, size) in [
+        (&cipher_slot, retention::NAMESPACE_CIPHER, artifact.ciphertext_sha256.as_str(), artifact.ciphertext_bytes),
+        (&envelope_slot, retention::NAMESPACE_ENVELOPE, artifact.envelope_sha256.as_str(), artifact.envelope_bytes),
+    ] {
+        let volume = crate::storage::remote_objects::ObjectKey::new(tenant_id, namespace, sha)?.volume_path();
+        let path = root.join(volume);
+        ensure!(fs::symlink_metadata(&path).await?.is_file(), "backup object is not a regular file");
+        remote.put_file(slot.key(), &path, size, deadline).await?;
+    }
+    ensure!(
+        retention::activate(
+            client,
+            tenant_id,
+            retention::NAMESPACE_CIPHER,
+            &artifact.ciphertext_sha256,
+            artifact.ciphertext_bytes,
+            &cipher_slot,
+        )
+        .await?,
+        "restored artifact reservation was superseded"
+    );
+    ensure!(
+        retention::activate(
+            client,
+            tenant_id,
+            retention::NAMESPACE_ENVELOPE,
+            &artifact.envelope_sha256,
+            artifact.envelope_bytes,
+            &envelope_slot,
+        )
+        .await?,
+        "restored artifact reservation was superseded"
     );
     Ok(())
 }
@@ -165,8 +219,8 @@ pub async fn export_closure<C: GenericClient + Sync>(
     std::fs::DirBuilder::new().mode(0o700).create(destination)?;
     let result = async {
         for pack in &manifest.packs {
-            Box::pin(copy_artifact(remote, destination, manifest.tenant_id, &pack.pack, deadline, false)).await?;
-            Box::pin(copy_artifact(remote, destination, manifest.tenant_id, &pack.index, deadline, false)).await?;
+            Box::pin(export_artifact(client, remote, destination, manifest.tenant_id, &pack.pack, deadline)).await?;
+            Box::pin(export_artifact(client, remote, destination, manifest.tenant_id, &pack.index, deadline)).await?;
         }
         let bytes = serde_json::to_vec(&manifest)?;
         let temp = destination.join(".manifest.tmp");
@@ -201,8 +255,12 @@ pub async fn import_closure<C: GenericClient + Sync>(
         "Pando restore manifest differs from restored PostgreSQL snapshot"
     );
     for pack in &actual.packs {
-        Box::pin(copy_artifact(remote, source, actual.tenant_id, &pack.pack, deadline, true)).await?;
-        Box::pin(copy_artifact(remote, source, actual.tenant_id, &pack.index, deadline, true)).await?;
+        Box::pin(import_artifact(client, remote, source, actual.tenant_id, &pack.pack, deadline)).await?;
+        Box::pin(import_artifact(client, remote, source, actual.tenant_id, &pack.index, deadline)).await?;
+    }
+    let authority = retention::authority(client).await?;
+    for pack in &actual.packs {
+        retention::record_manifest(client, pack, authority.id).await?;
     }
     Ok(actual)
 }

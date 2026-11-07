@@ -8,10 +8,18 @@ use rootyard::{
     AppState,
     config::Config,
     db, dispatch, metrics,
-    pando_gateway::{pack_store::PackStore, snapshot, transition},
-    storage::{self, read_leases},
+    pando_gateway::{
+        backup,
+        pack_store::{PackManifest, PackStore},
+        retention, snapshot, transition,
+    },
+    storage::{
+        self, read_leases,
+        remote_objects::{ObjectKey, RemoteObjectStore},
+    },
     storage_lifecycle::{jobs, models::Policy, scheduler, worker},
 };
+use sha2::{Digest, Sha256};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -80,11 +88,7 @@ fn seed_bare(git: &Path, bare: &Path, work: &Path) -> String {
     run(git, &["init", "--object-format=sha1", "."], work);
     std::fs::write(work.join("README.md"), b"retained Pando root\n").unwrap();
     run(git, &["add", "README.md"], work);
-    run(
-        git,
-        &["-c", "user.name=Pando", "-c", "user.email=pando@test.invalid", "commit", "-m", "root"],
-        work,
-    );
+    run(git, &["-c", "user.name=Pando", "-c", "user.email=pando@test.invalid", "commit", "-m", "root"], work);
     run(git, &["push", bare.to_str().unwrap(), "HEAD:refs/heads/main"], work);
     run(git, &["symbolic-ref", "HEAD", "refs/heads/main"], bare);
     String::from_utf8(output(git, &["rev-parse", "HEAD"], work)).unwrap().trim().to_owned()
@@ -163,13 +167,18 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
     db::migrate(&pool).await.unwrap();
     // This is a role-private disposable database; retire any interrupted job
     // from an earlier failed run before exercising the global claim path.
-    pool.get().await.unwrap().execute(
-        "UPDATE storage_maintenance_jobs SET state='failed',lease_owner=NULL,lease_until=NULL, \
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE storage_maintenance_jobs SET state='failed',lease_owner=NULL,lease_until=NULL, \
          completed_at=clock_timestamp(),updated_at=clock_timestamp(), \
          last_error='retired by pando maintenance fixture' \
          WHERE state IN ('queued','running')",
-        &[],
-    ).await.unwrap();
+            &[],
+        )
+        .await
+        .unwrap();
     let state = Arc::new(AppState {
         mirror_primary: None,
         dispatch: dispatch::Signals::default(),
@@ -226,6 +235,20 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
         .await
         .unwrap()
         .get(0);
+
+    // A paired backup taken before compaction must keep its own byte-identical
+    // copy of every pack, independent of later remote GC.
+    let remote = RemoteObjectStore::from_env(root.join("pando-pack-work")).unwrap();
+    let backup_dir = root.join("pre-compaction-backup");
+    let mut backup_client = pool.get().await.unwrap();
+    let backup_tx = backup_client.transaction().await.unwrap();
+    backup_tx.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await.unwrap();
+    let exported = Box::pin(backup::export_closure(&*backup_tx, &remote, repo, &backup_dir, deadline())).await.unwrap();
+    assert!(exported.packs.len() >= 2, "backup must capture the whole serving closure");
+    let backed_up_old_cipher =
+        backup_dir.join(ObjectKey::new(owner, "pando-cipher", &extra.pack.ciphertext_sha256).unwrap().volume_path());
+    assert!(backed_up_old_cipher.is_file(), "backup did not copy the old pack ciphertext");
+    backup_tx.commit().await.unwrap();
 
     let policy = Policy {
         enabled: true,
@@ -295,14 +318,8 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
     // A fresh serving snapshot must still resolve both the ref root and the
     // unreachable packed object. This is the decisive non-pruning oracle.
     let lease = read_leases::shared(&pool, repo, deadline()).await.unwrap();
-    let view = Box::pin(snapshot::materialize(
-        &state,
-        &repository(repo, &slug, "pando"),
-        &lease,
-        deadline(),
-    ))
-    .await
-    .unwrap();
+    let view =
+        Box::pin(snapshot::materialize(&state, &repository(repo, &slug, "pando"), &lease, deadline())).await.unwrap();
     let status = Command::new(&git)
         .args(["--git-dir", view.path().to_str().unwrap(), "cat-file", "-e", &orphan])
         .status()
@@ -338,14 +355,9 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
         corrupt[offset] ^= 0xff;
         std::fs::write(path, &corrupt).unwrap();
         let lease = read_leases::shared(&pool, repo, deadline()).await.unwrap();
-        let view = Box::pin(snapshot::materialize(
-            &state,
-            &repository(repo, &slug, "pando"),
-            &lease,
-            deadline(),
-        ))
-        .await
-        .unwrap();
+        let view = Box::pin(snapshot::materialize(&state, &repository(repo, &slug, "pando"), &lease, deadline()))
+            .await
+            .unwrap();
         assert!(
             Command::new(&git)
                 .args(["--git-dir", view.path().to_str().unwrap(), "cat-file", "-e", &orphan])
@@ -428,12 +440,81 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
             == 0
     );
 
-    // Remote deletion remains unavailable: there is no object-level pack
-    // index, global content-reference closure, or backup-retention registry.
+    // Old unreferenced packs stay recoverable until a destructive stage is
+    // explicitly enabled and has retired them after proof.
+    for old in [after_packs[0], extra.id] {
+        let destination = root.join(format!("recovery-{old}"));
+        Box::pin(store.recover(&pool, repo, old, &destination, deadline())).await.unwrap();
+        assert!(destination.join(format!("pack-{old}.pack")).is_file());
+    }
+
+    // A stale DB deleter must not be able to finalize the old claim once the
+    // same content address has been resurrected onto a fresh generation path.
+    let old_manifest: PackManifest = {
+        let value: serde_json::Value = client
+            .query_one(
+                "SELECT manifest FROM pando_pack_manifests WHERE repository_id=$1 AND NOT (id = ANY($2::uuid[])) ORDER BY created_at LIMIT 1",
+                &[&repo, &after_packs],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        serde_json::from_value(value).unwrap()
+    };
+    let old_row = client
+        .query_one(
+            "SELECT authority_id,object_generation,remote_path,claim_generation FROM pando_remote_artifacts              WHERE tenant_id=$1 AND namespace='pando-cipher' AND sha256=$2",
+            &[&owner, &old_manifest.pack.ciphertext_sha256],
+        )
+        .await
+        .unwrap();
+    let old_authority: Uuid = old_row.get(0);
+    let old_generation: i64 = old_row.get(1);
+    let old_path: String = old_row.get(2);
+    let old_claim: i64 = old_row.get(3);
+    let (cipher_slot, _envelope_slot) = {
+        let mut reserve_client = pool.get().await.unwrap();
+        let reserve_tx = reserve_client.transaction().await.unwrap();
+        let pair = retention::reserve_pair(
+            &*reserve_tx,
+            owner,
+            &old_manifest.pack.ciphertext_sha256,
+            &old_manifest.pack.envelope_sha256,
+        )
+        .await
+        .unwrap();
+        reserve_tx.commit().await.unwrap();
+        pair
+    };
+    let new_scoped = cipher_slot.key().path();
+    assert_ne!(new_scoped, old_path, "resurrection reused the stale deletable path");
+    assert!(!new_scoped.contains(&format!("/g{old_generation}/")));
+    let stale = client
+        .execute(
+            "UPDATE pando_remote_artifacts SET state='deleted'              WHERE authority_id=$1 AND tenant_id=$2 AND namespace='pando-cipher' AND sha256=$3                AND state='deleting' AND claimed_by=$4 AND claim_generation=$5 AND remote_path=$6",
+            &[&old_authority, &owner, &old_manifest.pack.ciphertext_sha256, &Uuid::new_v4(), &old_claim, &old_path],
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale, 0, "stale claim finalized after resurrection");
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*) FROM pando_remote_artifacts WHERE authority_id=$1 AND tenant_id=$2                  AND namespace='pando-cipher' AND sha256=$3 AND state='reserved' AND remote_path=$4",
+                &[&old_authority, &owner, &old_manifest.pack.ciphertext_sha256, &new_scoped],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+
+    // Destructive deletion is a separate, proof-gated stage. Without the
+    // explicit operator enable it must succeed as a measured dry run and must
+    // not remove any bytes.
     client
         .execute(
-            "INSERT INTO storage_maintenance_jobs(id,repository_id,tenant_id,kind,repository_generation) \
-             VALUES($1,$2,$3,'pando_tombstone_delete',1)",
+            "INSERT INTO storage_maintenance_jobs(id,repository_id,tenant_id,kind,repository_generation)              VALUES($1,$2,$3,'pando_tombstone_delete',1)",
             &[&Uuid::new_v4(), &repo, &owner],
         )
         .await
@@ -441,18 +522,85 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
     worker::run_once(&state, &policy, Uuid::new_v4()).await.unwrap();
     let refused = client
         .query_one(
-            "SELECT state,last_error FROM storage_maintenance_jobs WHERE repository_id=$1 AND kind='pando_tombstone_delete' ORDER BY created_at DESC LIMIT 1",
+            "SELECT state,result FROM storage_maintenance_jobs WHERE repository_id=$1 AND kind='pando_tombstone_delete' ORDER BY created_at DESC LIMIT 1",
             &[&repo],
         )
         .await
         .unwrap();
-    assert!(matches!(refused.get::<_, String>(0).as_str(), "queued" | "failed"));
-    let error: String = refused.get(1);
-    assert!(error.contains("object-level pack index"), "unexpected remote-delete refusal: {error}");
-    for old in [after_packs[0], extra.id] {
-        let destination = root.join(format!("recovery-{old}"));
-        Box::pin(store.recover(&pool, repo, old, &destination, deadline())).await.unwrap();
-        assert!(destination.join(format!("pack-{old}.pack")).is_file());
+    assert_eq!(refused.get::<_, String>(0), "succeeded");
+    let result: serde_json::Value = refused.get(1);
+    assert_eq!(result["remote_deleted"].as_bool(), Some(false));
+    assert_eq!(result["dry_run"].as_bool(), Some(true));
+
+    // An unregistered legacy tenant-only object is permanently protected.
+    let legacy_bytes = b"legacy tenant-only pando ciphertext";
+    let legacy_sha = hex::encode(Sha256::digest(legacy_bytes));
+    let legacy_file = root.join("legacy.bin");
+    std::fs::write(&legacy_file, legacy_bytes).unwrap();
+    let legacy_key = ObjectKey::new(owner, "pando-cipher", &legacy_sha).unwrap();
+    remote.put_file(&legacy_key, &legacy_file, legacy_bytes.len() as u64, deadline()).await.unwrap();
+
+    // Collect the still-retired index artifacts that are eligible and verify
+    // their current generation paths exist before the destructive run.
+    let retired = client
+        .query(
+            "SELECT a.authority_id,a.object_generation,a.namespace,a.sha256,a.remote_path              FROM pando_remote_artifacts a              JOIN pando_manifest_artifacts l ON l.authority_id=a.authority_id AND l.tenant_id=a.tenant_id                AND l.namespace=a.namespace AND l.sha256=a.sha256 
+             WHERE l.repository_id=$1 AND a.state='retired' ORDER BY a.namespace,a.sha256",
+            &[&repo],
+        )
+        .await
+        .unwrap();
+    assert!(!retired.is_empty(), "mark stage retired no unreferenced artifact");
+    let mut retired_keys = Vec::new();
+    for row in &retired {
+        let authority: Uuid = row.get(0);
+        let generation: i64 = row.get(1);
+        let namespace: String = row.get(2);
+        let sha: String = row.get(3);
+        let path: String = row.get(4);
+        let key = ObjectKey::scoped(owner, authority, generation, &namespace, &sha).unwrap();
+        assert_eq!(key.path(), path);
+        assert!(remote.head(&key, deadline()).await.unwrap().is_some());
+        retired_keys.push(key);
     }
-    eprintln!("pando maintenance fixture: compaction/cache/refusal acceptance complete");
+    unsafe { std::env::set_var("ROOTYARD_PANDO_REMOTE_DELETE", "true") };
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    client
+        .execute(
+            "INSERT INTO storage_maintenance_jobs(id,repository_id,tenant_id,kind,repository_generation)              VALUES($1,$2,$3,'pando_tombstone_delete',1)",
+            &[&Uuid::new_v4(), &repo, &owner],
+        )
+        .await
+        .unwrap();
+    worker::run_once(&state, &policy, Uuid::new_v4()).await.unwrap();
+    let deleted = client
+        .query_one(
+            "SELECT result FROM storage_maintenance_jobs WHERE repository_id=$1 AND kind='pando_tombstone_delete'              ORDER BY created_at DESC LIMIT 1",
+            &[&repo],
+        )
+        .await
+        .unwrap();
+    let deleted: serde_json::Value = deleted.get(0);
+    assert_eq!(deleted["remote_deleted"].as_bool(), Some(true));
+    assert!(deleted["deleted"].as_u64().unwrap() >= 1, "no eligible ciphertext was removed: {deleted}");
+    for key in &retired_keys {
+        assert!(remote.head(key, deadline()).await.unwrap().is_none(), "eligible ciphertext survived deletion");
+    }
+    // Serving pack bytes and the unregistered legacy object must survive.
+    let serving_sha: String = client
+        .query_one(
+            "SELECT manifest->'pack'->>'ciphertext_sha256' FROM pando_pack_manifests WHERE repository_id=$1 AND id=$2",
+            &[&repo, &after_packs[0]],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let serving = retention::resolve_artifact(&**client, owner, "pando-cipher", &serving_sha).await.unwrap();
+    if serving.registered {
+        assert!(remote.head(&serving.key, deadline()).await.unwrap().is_some());
+    }
+    assert!(remote.head(&legacy_key, deadline()).await.unwrap().is_some(), "legacy object was deleted");
+    assert!(backed_up_old_cipher.is_file(), "paired backup bytes changed during remote GC");
+    unsafe { std::env::remove_var("ROOTYARD_PANDO_REMOTE_DELETE") };
+    eprintln!("pando maintenance fixture: compaction/cache/backup/delete/resurrection acceptance complete");
 }

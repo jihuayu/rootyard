@@ -1,19 +1,20 @@
 //! Verified encrypted pack publication. Local files are staging/cache only;
 //! the PostgreSQL manifest is the sole authority for a ready pack set.
+use super::retention::{self, Slot};
 use crate::{
     git_http,
     storage::{
         encrypted_objects::{self, Envelope, VaultTransit},
-        remote_objects::{ObjectKey, RemoteObjectStore},
+        remote_objects::RemoteObjectStore,
     },
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     io::Read,
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -81,10 +82,7 @@ impl PackStore {
 
     fn cache_paths(cache_dir: &Path, repository_id: Uuid, pack_id: Uuid) -> (PathBuf, PathBuf) {
         let _ = repository_id;
-        (
-            cache_dir.join(format!("pack-{pack_id}.pack")),
-            cache_dir.join(format!("pack-{pack_id}.idx")),
-        )
+        (cache_dir.join(format!("pack-{pack_id}.pack")), cache_dir.join(format!("pack-{pack_id}.idx")))
     }
 
     fn link_or_copy(source: &Path, target: &Path) -> Result<()> {
@@ -122,10 +120,6 @@ impl PackStore {
         Ok(WorkDir(path))
     }
 
-    fn key(tenant_id: Uuid, namespace: &str, sha256: &str) -> Result<ObjectKey> {
-        ObjectKey::new(tenant_id, namespace, sha256)
-    }
-
     async fn verify_git_pack(&self, pack: &Path, object_format: &str, deadline: Instant) -> Result<()> {
         ensure!(matches!(object_format, "sha1" | "sha256"), "invalid Pando object format");
         let work = self.work_dir()?;
@@ -159,14 +153,13 @@ impl PackStore {
         Ok(())
     }
 
-    async fn publish_artifact(
+    async fn encrypt_artifact(
         &self,
         work: &Path,
         label: &str,
         source: &Path,
-        tenant_id: Uuid,
         deadline: Instant,
-    ) -> Result<ArtifactReceipt> {
+    ) -> Result<(ArtifactReceipt, PathBuf, PathBuf)> {
         let ciphertext = work.join(format!("{label}.cipher"));
         let envelopes = work.join(format!("{label}-envelopes"));
         let envelope = encrypted_objects::encrypt_file(&self.kms, source, &ciphertext, &envelopes, deadline).await?;
@@ -174,31 +167,31 @@ impl PackStore {
         let envelope_bytes = fs::read(&envelope_path).await?;
         ensure!(envelope_bytes.len() <= 64 * 1024, "Pando envelope exceeds limit");
         let envelope_sha256 = hex::encode(Sha256::digest(&envelope_bytes));
-        let cipher_key = Self::key(tenant_id, "pando-cipher", &envelope.ciphertext_sha256)?;
-        let envelope_key = Self::key(tenant_id, "pando-envelope", &envelope_sha256)?;
-        self.remote.put_file(&cipher_key, &ciphertext, envelope.ciphertext_bytes, deadline).await?;
-        self.remote.put_file(&envelope_key, &envelope_path, envelope_bytes.len() as u64, deadline).await?;
-        Ok(ArtifactReceipt {
-            plaintext_sha256: envelope.plaintext_sha256.clone(),
-            plaintext_bytes: envelope.plaintext_bytes,
-            ciphertext_sha256: envelope.ciphertext_sha256.clone(),
-            ciphertext_bytes: envelope.ciphertext_bytes,
-            envelope_sha256,
-            envelope_bytes: envelope_bytes.len() as u64,
-            envelope,
-        })
+        Ok((
+            ArtifactReceipt {
+                plaintext_sha256: envelope.plaintext_sha256.clone(),
+                plaintext_bytes: envelope.plaintext_bytes,
+                ciphertext_sha256: envelope.ciphertext_sha256.clone(),
+                ciphertext_bytes: envelope.ciphertext_bytes,
+                envelope_sha256,
+                envelope_bytes: envelope_bytes.len() as u64,
+                envelope,
+            },
+            ciphertext,
+            envelope_path,
+        ))
     }
 
-    async fn insert_ready_manifest(pool: &Pool, manifest: &PackManifest) -> Result<()> {
-        let mut client = pool.get().await?;
-        let tx = client.transaction().await?;
+    async fn insert_ready_manifest_in<C: tokio_postgres::GenericClient + Sync>(
+        client: &C,
+        manifest: &PackManifest,
+    ) -> Result<()> {
         // FOR SHARE conflicts with generation-changing UPDATE's NO KEY UPDATE
         // lock. A concurrent cutover cannot commit between this recheck and
         // the ready manifest INSERT.
-        let current = tx
+        let current = client
             .query_one(
-                "SELECT owner_id,storage_generation,object_format,state \
-            FROM repositories WHERE id=$1 FOR SHARE",
+                "SELECT owner_id,storage_generation,object_format,state             FROM repositories WHERE id=$1 FOR SHARE",
                 &[&manifest.repository_id],
             )
             .await?;
@@ -210,26 +203,31 @@ impl PackStore {
             "Pando pack publication lost repository generation or ownership"
         );
         let value = serde_json::to_value(manifest)?;
-        tx.execute(
-            "INSERT INTO pando_pack_manifests \
-            (id,repository_id,tenant_id,storage_generation,object_format,manifest) \
-            VALUES($1,$2,$3,$4,$5,$6)",
-            &[
-                &manifest.id,
-                &manifest.repository_id,
-                &manifest.tenant_id,
-                &manifest.storage_generation,
-                &manifest.object_format,
-                &value,
-            ],
-        )
-        .await?;
-        tx.commit().await?;
+        client
+            .execute(
+                "INSERT INTO pando_pack_manifests             (id,repository_id,tenant_id,storage_generation,object_format,manifest)             VALUES($1,$2,$3,$4,$5,$6)",
+                &[
+                    &manifest.id,
+                    &manifest.repository_id,
+                    &manifest.tenant_id,
+                    &manifest.storage_generation,
+                    &manifest.object_format,
+                    &value,
+                ],
+            )
+            .await?;
         Ok(())
     }
 
-    /// Publish a verified pack/index pair. The database INSERT occurs only
-    /// after both remote ciphertexts and envelopes pass read-back verification.
+    async fn upload_slot(&self, slot: &Slot, source: &Path, size: u64, deadline: Instant) -> Result<()> {
+        self.remote.put_file(slot.key(), source, size, deadline).await?;
+        Ok(())
+    }
+
+    /// Publish a verified pack/index pair. Reservations are committed before
+    /// bulk upload; the ready manifest, artifact activation and immutable
+    /// retention links commit in one PostgreSQL transaction only after every
+    /// remote object passed read-back verification.
     pub async fn publish(
         &self,
         pool: &Pool,
@@ -251,8 +249,10 @@ impl PackStore {
         );
         self.verify_git_pack(pack, object_format, deadline).await?;
         let work = self.work_dir()?;
-        let pack_receipt = Box::pin(self.publish_artifact(&work.0, "pack", pack, tenant_id, deadline)).await?;
-        let index_receipt = Box::pin(self.publish_artifact(&work.0, "index", index, tenant_id, deadline)).await?;
+        let (pack_receipt, pack_ciphertext, pack_envelope) =
+            Box::pin(self.encrypt_artifact(&work.0, "pack", pack, deadline)).await?;
+        let (index_receipt, index_ciphertext, index_envelope) =
+            Box::pin(self.encrypt_artifact(&work.0, "index", index, deadline)).await?;
         let manifest = PackManifest {
             version: 1,
             id: Uuid::new_v4(),
@@ -260,27 +260,100 @@ impl PackStore {
             tenant_id,
             storage_generation,
             object_format: object_format.into(),
-            pack: pack_receipt,
-            index: index_receipt,
+            pack: pack_receipt.clone(),
+            index: index_receipt.clone(),
         };
-        Self::insert_ready_manifest(pool, &manifest).await?;
-        Ok(manifest)
+        for _ in 0..3 {
+            let (cipher_slot, pack_envelope_slot, index_cipher_slot, index_envelope_slot) = {
+                let mut client = pool.get().await?;
+                let tx = client.transaction().await?;
+                let (cipher, envelope) = retention::reserve_pair(
+                    &*tx,
+                    tenant_id,
+                    &pack_receipt.ciphertext_sha256,
+                    &pack_receipt.envelope_sha256,
+                )
+                .await?;
+                let (index_cipher, index_envelope) = retention::reserve_pair(
+                    &*tx,
+                    tenant_id,
+                    &index_receipt.ciphertext_sha256,
+                    &index_receipt.envelope_sha256,
+                )
+                .await?;
+                tx.commit().await?;
+                (cipher, envelope, index_cipher, index_envelope)
+            };
+            Box::pin(self.upload_slot(&cipher_slot, &pack_ciphertext, pack_receipt.ciphertext_bytes, deadline)).await?;
+            Box::pin(self.upload_slot(&pack_envelope_slot, &pack_envelope, pack_receipt.envelope_bytes, deadline))
+                .await?;
+            Box::pin(self.upload_slot(&index_cipher_slot, &index_ciphertext, index_receipt.ciphertext_bytes, deadline))
+                .await?;
+            Box::pin(self.upload_slot(&index_envelope_slot, &index_envelope, index_receipt.envelope_bytes, deadline))
+                .await?;
+            let mut client = pool.get().await?;
+            let tx = client.transaction().await?;
+            let authority = retention::authority(&*tx).await?;
+            let active = retention::activate(
+                &*tx,
+                tenant_id,
+                retention::NAMESPACE_CIPHER,
+                &pack_receipt.ciphertext_sha256,
+                pack_receipt.ciphertext_bytes,
+                &cipher_slot,
+            )
+            .await?
+                && retention::activate(
+                    &*tx,
+                    tenant_id,
+                    retention::NAMESPACE_ENVELOPE,
+                    &pack_receipt.envelope_sha256,
+                    pack_receipt.envelope_bytes,
+                    &pack_envelope_slot,
+                )
+                .await?
+                && retention::activate(
+                    &*tx,
+                    tenant_id,
+                    retention::NAMESPACE_CIPHER,
+                    &index_receipt.ciphertext_sha256,
+                    index_receipt.ciphertext_bytes,
+                    &index_cipher_slot,
+                )
+                .await?
+                && retention::activate(
+                    &*tx,
+                    tenant_id,
+                    retention::NAMESPACE_ENVELOPE,
+                    &index_receipt.envelope_sha256,
+                    index_receipt.envelope_bytes,
+                    &index_envelope_slot,
+                )
+                .await?;
+            if !active {
+                continue;
+            }
+            Self::insert_ready_manifest_in(&*tx, &manifest).await?;
+            retention::record_manifest(&*tx, &manifest, authority.id).await?;
+            tx.commit().await?;
+            return Ok(manifest);
+        }
+        bail!("Pando pack publication reservations were repeatedly superseded")
     }
 
     async fn recover_artifact(
         &self,
         work: &Path,
         label: &str,
-        tenant_id: Uuid,
+        cipher_key: &crate::storage::remote_objects::ObjectKey,
+        envelope_key: &crate::storage::remote_objects::ObjectKey,
         receipt: &ArtifactReceipt,
         deadline: Instant,
     ) -> Result<PathBuf> {
-        let cipher_key = Self::key(tenant_id, "pando-cipher", &receipt.ciphertext_sha256)?;
-        let envelope_key = Self::key(tenant_id, "pando-envelope", &receipt.envelope_sha256)?;
         let ciphertext = work.join(format!("{label}.cipher"));
         let envelope_file = work.join(format!("{label}.json"));
-        self.remote.get_to_file(&cipher_key, &ciphertext, receipt.ciphertext_bytes, deadline).await?;
-        self.remote.get_to_file(&envelope_key, &envelope_file, receipt.envelope_bytes, deadline).await?;
+        self.remote.get_to_file(cipher_key, &ciphertext, receipt.ciphertext_bytes, deadline).await?;
+        self.remote.get_to_file(envelope_key, &envelope_file, receipt.envelope_bytes, deadline).await?;
         let envelope_bytes = fs::read(&envelope_file).await?;
         ensure!(
             hex::encode(Sha256::digest(&envelope_bytes)) == receipt.envelope_sha256,
@@ -349,11 +422,7 @@ impl PackStore {
         Ok(hex::encode(hasher.finalize()))
     }
 
-    fn cache_pair_valid(
-        pack: &Path,
-        index: &Path,
-        manifest: &PackManifest,
-    ) -> Result<bool> {
+    fn cache_pair_valid(pack: &Path, index: &Path, manifest: &PackManifest) -> Result<bool> {
         let pack_meta = match std::fs::symlink_metadata(pack) {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -445,11 +514,51 @@ impl PackStore {
         deadline: Instant,
     ) -> Result<PackManifest> {
         let manifest = self.load_manifest(pool, repository_id, pack_id).await?;
+        let (pack_cipher, pack_envelope, index_cipher, index_envelope) = {
+            let client = pool.get().await?;
+            let pack_cipher = retention::resolve_artifact(
+                &**client,
+                manifest.tenant_id,
+                retention::NAMESPACE_CIPHER,
+                &manifest.pack.ciphertext_sha256,
+            )
+            .await?;
+            let pack_envelope = retention::resolve_artifact(
+                &**client,
+                manifest.tenant_id,
+                retention::NAMESPACE_ENVELOPE,
+                &manifest.pack.envelope_sha256,
+            )
+            .await?;
+            let index_cipher = retention::resolve_artifact(
+                &**client,
+                manifest.tenant_id,
+                retention::NAMESPACE_CIPHER,
+                &manifest.index.ciphertext_sha256,
+            )
+            .await?;
+            let index_envelope = retention::resolve_artifact(
+                &**client,
+                manifest.tenant_id,
+                retention::NAMESPACE_ENVELOPE,
+                &manifest.index.envelope_sha256,
+            )
+            .await?;
+            (pack_cipher.key, pack_envelope.key, index_cipher.key, index_envelope.key)
+        };
         let work = self.work_dir()?;
         let pack =
-            Box::pin(self.recover_artifact(&work.0, "pack", manifest.tenant_id, &manifest.pack, deadline)).await?;
-        let index =
-            Box::pin(self.recover_artifact(&work.0, "index", manifest.tenant_id, &manifest.index, deadline)).await?;
+            Box::pin(self.recover_artifact(&work.0, "pack", &pack_cipher, &pack_envelope, &manifest.pack, deadline))
+                .await?;
+        let index = Box::pin(self.recover_artifact(
+            &work.0,
+            "index",
+            &index_cipher,
+            &index_envelope,
+            &manifest.index,
+            deadline,
+        ))
+        .await?;
         self.verify_git_pack(&pack, &manifest.object_format, deadline).await?;
         fs::create_dir_all(destination).await?;
         let target_pack = destination.join(format!("pack-{}.pack", pack_id));
@@ -524,8 +633,14 @@ mod tests {
         let tx = blocker.transaction().await.unwrap();
         tx.execute("UPDATE repositories SET storage_generation=2 WHERE id=$1", &[&repo]).await.unwrap();
         let publishing_pool = pool.clone();
-        let publishing =
-            tokio::spawn(async move { PackStore::insert_ready_manifest(&publishing_pool, &manifest).await });
+        let publishing = tokio::spawn(async move {
+            let mut client = publishing_pool.get().await.unwrap();
+            let tx = client.transaction().await.unwrap();
+            match PackStore::insert_ready_manifest_in(&*tx, &manifest).await {
+                Ok(()) => tx.commit().await.map_err(|error| anyhow::anyhow!(error)),
+                Err(error) => Err(error),
+            }
+        });
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(!publishing.is_finished(), "manifest insert did not wait for generation writer");
         tx.commit().await.unwrap();
