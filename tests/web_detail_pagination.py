@@ -42,8 +42,10 @@ import traceback
 import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from web_sessions import BrowserHarness  # noqa: E402
 import native_evidence  # noqa: E402
+from scripts.build_native import source_digest  # noqa: E402
 
 
 PAGE = 100
@@ -350,6 +352,9 @@ def main():
     passed = False
     failure_traceback = None
     try:
+        assert build.get("attested") is True, "matching build receipt required"
+        report["candidate_source_match"] = build.get("source_inputs_sha256") == source_digest()
+        assert report["candidate_source_match"], "binary source inputs differ from this candidate"
         harness.case("fixture", harness.fixture)
         report["schema_versions"] = harness.schema_versions
         for name in ("comment_traversal", "comment_boundaries", "cursor_rejected",
@@ -379,7 +384,7 @@ def main():
                 "Bulk history is operator SQL (counted by RETURNING) because 105 rows per list are not produced through HTTP; the 106th row and both parents are created by real HTTP/Git.",
                 "The cursor is a scope-bound ordering position, not a signed capability or a snapshot; inserts after the cursor appear later and deletes simply vanish.",
                 "Review pagination is exercised on `/web/.../pulls/{number}`; `/web/.../pulls/{number}/reviews` shares the same renderer but is not separately paged here.",
-                "Revocation and actor binding are covered by the wrong-kind/wrong-parent/anonymous cases; a dedicated revoked-collaborator cursor case is not included in this revision.",
+                "The parent/kind and anonymous cases do not establish actor binding or collaborator revocation; those require separate authenticated-actor cases.",
             ],
         )
         if args.report:
