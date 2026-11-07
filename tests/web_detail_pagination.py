@@ -339,7 +339,7 @@ class DetailPaginationHarness(BrowserHarness):
             {"body": "web-late-comment"},
             "web-late-comment-107",
         )
-        text = html.unescape(body)
+        text = html.unescape(body.decode("utf-8", "replace"))
         assert status == 201, (status, text[:200])
         numbers = [int(number) for number in COMMENT_NUMBERS.findall(text)]
         assert numbers == list(range(1, PAGE + 1)), numbers[:3]
@@ -362,7 +362,7 @@ class DetailPaginationHarness(BrowserHarness):
              "body": "web-late-review"},
             "web-late-review-107",
         )
-        text = html.unescape(body)
+        text = html.unescape(body.decode("utf-8", "replace"))
         assert status == 201, (status, text[:200])
         reviews = [int(number) for number in REVIEW_NUMBERS.findall(text)]
         assert reviews == list(range(1, PAGE + 1)), reviews[:3]
