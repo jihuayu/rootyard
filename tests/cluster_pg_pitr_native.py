@@ -104,7 +104,20 @@ def main():
         (restored / "recovery.signal").touch()
         run(["pg_ctl", "-D", str(restored), "-l", str(root / "restored.log"), "-w", "start"])
         restored_running = True
-        assert sql(root, r_port, "SELECT pg_is_in_recovery()") == "f", "PITR did not promote"
+        # pg_ctl -w can return while the server is briefly accepting read-only
+        # connections just before recovery_target_action=promote completes.
+        # Poll the actual recovery state instead of racing that transition.
+        promoted = False
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if sql(root, r_port, "SELECT pg_is_in_recovery()") == "f":
+                    promoted = True
+                    break
+            except AssertionError:
+                pass
+            time.sleep(.05)
+        assert promoted, "PITR did not promote within 20s"
         h.base_db = f"postgresql://agent@localhost:{r_port}/postgres"
         h.db = h.db.replace(f":{p_port}/", f":{r_port}/")
         h.env["DATABASE_URL"] = h.db
