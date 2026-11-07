@@ -34,6 +34,12 @@ best-effort stderr delivery, subject to the rate and queue limits below:
   task-local request scope, so errors raised inside spawned handler futures are
   correlated by event UUID only; request context does not survive `tokio::spawn`.
   This is a documented limitation, not a claim of end-to-end propagation.
+* Selected background loops use a separate `"scope":"worker"` context with
+  fixed `worker` and `phase` labels, a per-round server-generated
+  `operation_id`, and optionally non-negative persisted `attempt`/`generation`.
+  See `docs/worker-diagnostics.md`. The operation scope takes precedence over a
+  request scope, but worker spawns are created through an explicit helper that
+  never copies request state; a plain spawn remains detached.
 
 The middleware generates its own `X-Request-ID` UUID for every response and
 ignores any client-supplied value. It wraps the routed future, so all responses
@@ -88,9 +94,12 @@ backend GET, returns a controlled 502, captures the failed response
 asserts `kind:"remote_store"`, `remote_op:"get"`, `remote_status:502` and log
 privacy before a clean retry succeeds. It does not mock the Rust error.
 
-Still open (not part of this change): remote repair metrics and any other
-metrics work, the 80-request full-backlog drill, and per-worker coverage. The
-fault metrics on the private listener are unchanged. These scenarios were not
+Still open: remote repair metrics and other metrics work, the 80-request
+full-backlog drill, and per-worker coverage beyond the bounded operation scope
+described in `docs/worker-diagnostics.md`. That document lists exactly which
+workers are wrapped, which are only unit-covered, and which remain entirely
+outside operation scope; it does not claim all issue-80 work is complete. The
+fault metrics on the private listener are unchanged. The new scenarios were not
 executed natively in this implementation branch; the reports in `evidence/`
 remain the authority for what was actually run.
 

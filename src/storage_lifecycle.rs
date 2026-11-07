@@ -26,7 +26,13 @@ pub mod scheduler;
 #[path = "storage_lifecycle/worker.rs"]
 pub mod worker;
 
-use crate::AppState;
+use crate::{
+    AppState,
+    observability::{
+        self,
+        worker::{OperationContext, Phase, WorkerKind},
+    },
+};
 use anyhow::Result;
 use axum::{Router, routing::get};
 use std::sync::Arc;
@@ -52,7 +58,11 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) -> Result<()> {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! { _=stop.cancelled() => return Ok(()), _=interval.tick() => {} }
-        if let Err(error) = scheduler::schedule_once(&state, &policy).await {
+        let operation = OperationContext::new(WorkerKind::StorageLifecycle);
+        if let Err(error) =
+            observability::worker::run(&operation, Phase::Scan, scheduler::schedule_once(&state, &policy)).await
+        {
+            observability::observe_internal(&error);
             eprintln!("rootyard: storage maintenance scheduler deferred: {error:#}");
         }
         // Drain a bounded batch; no maintenance command consumes the online
@@ -61,7 +71,13 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) -> Result<()> {
             if stop.is_cancelled() {
                 return Ok(());
             }
-            match worker::run_once(&state, &policy, owner).await {
+            match observability::worker::run(
+                &operation,
+                Phase::Claim,
+                worker::run_once(&state, &policy, owner, &operation),
+            )
+            .await
+            {
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(error) => {

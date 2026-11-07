@@ -5,7 +5,13 @@ use super::{
     models::{JobOutcome, Policy},
     pando, scheduler,
 };
-use crate::{AppState, db};
+use crate::{
+    AppState, db,
+    observability::{
+        self,
+        worker::{OperationContext, Phase},
+    },
+};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
@@ -13,30 +19,47 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub async fn run_once(state: &Arc<AppState>, policy: &Policy, owner: Uuid) -> Result<Option<JobOutcome>> {
-    let Some(job) = jobs::claim(&state.pool, owner, policy).await? else {
+pub async fn run_once(
+    state: &Arc<AppState>,
+    policy: &Policy,
+    owner: Uuid,
+    operation: &OperationContext,
+) -> Result<Option<JobOutcome>> {
+    let Some(job) =
+        observability::worker::run(operation, Phase::Claim, jobs::claim(&state.pool, owner, policy)).await?
+    else {
         return Ok(None);
     };
-    match run_claimed(state, policy, &job).await {
-        Ok(outcome) => Ok(Some(outcome)),
-        Err(error) => {
-            let accepted = jobs::finish(&state.pool, &job, json!({}), Some(&error.to_string()), policy).await?;
-            let status = if !accepted {
-                "superseded"
-            } else if job.attempt < policy.max_attempts {
-                "queued"
-            } else {
-                "failed"
-            };
-            Ok(Some(JobOutcome {
-                job_id: job.id,
-                kind: job.kind.clone(),
-                repository_id: job.repository_id,
-                attempt: job.attempt,
-                state: status.into(),
-            }))
+    // The persisted attempt and repository generation are safe numeric
+    // correlation. The raw job, repository, tenant and actor IDs stay out.
+    let job_operation = operation
+        .clone()
+        .with_attempt(Some(i64::from(job.attempt)))
+        .with_generation(Some(job.repository_generation));
+    observability::worker::run(&job_operation, Phase::Execute, async {
+        match run_claimed(state, policy, &job).await {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(error) => {
+                observability::observe_internal(&error);
+                let accepted = jobs::finish(&state.pool, &job, json!({}), Some(&error.to_string()), policy).await?;
+                let status = if !accepted {
+                    "superseded"
+                } else if job.attempt < policy.max_attempts {
+                    "queued"
+                } else {
+                    "failed"
+                };
+                Ok(Some(JobOutcome {
+                    job_id: job.id,
+                    kind: job.kind.clone(),
+                    repository_id: job.repository_id,
+                    attempt: job.attempt,
+                    state: status.into(),
+                }))
+            }
         }
-    }
+    })
+    .await
 }
 
 async fn run_claimed(state: &Arc<AppState>, policy: &Policy, job: &super::models::Job) -> Result<JobOutcome> {

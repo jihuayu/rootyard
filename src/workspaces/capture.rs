@@ -15,7 +15,14 @@
 //! remaining API-side hash is a follow-up; the long background scan is already
 //! off-thread and out of the transaction.
 use super::{scan, service};
-use crate::{AppState, Error, workspace_lab::core};
+use crate::{
+    AppState, Error,
+    observability::{
+        self,
+        worker::{OperationContext, Phase, WorkerKind},
+    },
+    workspace_lab::core,
+};
 use futures_util::StreamExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -188,10 +195,13 @@ pub async fn reconcile_one(state: &AppState, id: Uuid) -> Result<bool, Error> {
     Ok(changed)
 }
 
-async fn process_page(state: &AppState, ids: Vec<Uuid>) {
+async fn process_page(state: &AppState, ids: Vec<Uuid>, operation: &OperationContext) {
     futures_util::stream::iter(ids)
-        .map(|id| async move {
-            let _ = reconcile_one(state, id).await;
+        .map(|id| {
+            let operation = operation.clone();
+            async move {
+                let _ = observability::worker::run(&operation, Phase::Reconcile, reconcile_one(state, id)).await;
+            }
         })
         .buffer_unordered(scan::concurrency())
         .collect::<Vec<_>>()
@@ -199,18 +209,24 @@ async fn process_page(state: &AppState, ids: Vec<Uuid>) {
 }
 
 pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
-    tokio::spawn(super::remote_gc::run(state.clone(), stop.child_token()));
+    let remote_operation = OperationContext::new(WorkerKind::WorkspaceRemoteGc);
+    observability::worker::spawn(
+        &remote_operation,
+        Phase::Round,
+        super::remote_gc::run(state.clone(), stop.child_token()),
+    );
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! { _=stop.cancelled()=>break, _=interval.tick()=>{} }
-        let _ = super::mounts::refresh_leases(&state).await;
+        let operation = OperationContext::new(WorkerKind::WorkspaceCapture);
+        let _ = observability::worker::run(&operation, Phase::Scan, super::mounts::refresh_leases(&state)).await;
         let mut cursor = None;
         let mut pages = futures_util::stream::FuturesUnordered::new();
         loop {
             if stop.is_cancelled() {
                 return;
             }
-            let rows = match eligible_page(&state, cursor).await {
+            let rows = match observability::worker::run(&operation, Phase::Scan, eligible_page(&state, cursor)).await {
                 Ok(rows) => rows,
                 Err(_) => break,
             };
@@ -229,7 +245,7 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
             // Pages are processed independently instead of waiting for the
             // previous 100 IDs. A slow or permanently bad early workspace then
             // cannot delay the fair scan of later UUIDs.
-            pages.push(process_page(&state, ids));
+            pages.push(process_page(&state, ids, &operation));
             if pages.len() >= 2 {
                 let _ = pages.next().await;
             }

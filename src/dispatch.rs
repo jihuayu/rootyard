@@ -10,6 +10,11 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::observability::{
+    self,
+    worker::{OperationContext, Phase, WorkerKind},
+};
+
 type Task<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Implementations carry only a hint to rescan PG. They cannot supply a Claim,
 /// mark a delivery complete, choose a repository, or execute a business effect.
@@ -87,10 +92,11 @@ impl Settings {
 /// Runs independently of native Git, volume locks, and journal reconciliation.
 /// A fixed interval remains active even when no transport exists or it fails.
 pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: CancellationToken) {
+    let listener_operation = OperationContext::new(WorkerKind::DurableDispatch);
     let listener = settings.transport.clone().map(|transport| {
         let signal = signal.clone();
         let stop = stop.clone();
-        tokio::spawn(async move {
+        observability::worker::spawn(&listener_operation, Phase::Subscribe, async move {
             tokio::select! {biased;
                 _=stop.cancelled()=>{},
                 _=transport.subscribe(signal,stop.clone())=>{},
@@ -107,6 +113,7 @@ pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: C
             _=ticks.tick()=>{},
             _=signal.notified()=>{},
         }
+        let operation = OperationContext::new(WorkerKind::DurableDispatch);
         let scan = async {
             // A poisoned consumer cannot suppress another consumer's scan.
             let results = futures_util::future::join_all(settings.consumers.iter().map(|consumer| {
@@ -127,15 +134,25 @@ pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: C
             for result in results {
                 match result {
                     Ok(Ok(done)) => count += done,
-                    _ => failed = true,
+                    Ok(Err(error)) => {
+                        observability::observe_internal(&error);
+                        failed = true;
+                    }
+                    Err(_) => {
+                        observability::observe_timeout();
+                        failed = true;
+                    }
                 }
             }
             (count, failed)
         };
         let result = tokio::select! {biased;
             _=stop.cancelled()=>break,
-            result=tokio::time::timeout(Duration::from_secs(30),scan)=>result,
+            result=tokio::time::timeout(Duration::from_secs(30), observability::worker::run(&operation, Phase::Dispatch, scan))=>result,
         };
+        if result.is_err() {
+            observability::observe_timeout();
+        }
         let (count, failed) = result.unwrap_or((0, true));
         if count > 0 {
             signal.notify_one();
