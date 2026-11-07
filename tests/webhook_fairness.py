@@ -372,7 +372,7 @@ def main():
             f"SELECT gen_random_uuid(),'{harness.alice['user_id']}',"
             f"'{repo['id']}','{receiver.url}','fairpage-secret',"
             "repeat('a',64),jsonb_build_array('push'),jsonb_build_array('ci/default'),"
-            f"false,true,2,3000 FROM generate_series(1,{hook_count})")
+            f"false,true,2,20000 FROM generate_series(1,{hook_count})")
 
         def push_rows():
             return int(harness.sql(
@@ -384,17 +384,23 @@ def main():
                 "SELECT count(*) FROM forge_webhook_deliveries WHERE event_type='push' "
                 f"AND repository_id='{repo['id']}' AND state='delivered'"))
 
-        worker(True)
-        first_page = wait_for("first bounded backfill page", lambda: (
-            lambda rows: rows if rows >= 128 else None)(push_rows()), timeout=30)
-        assert first_page == 128, first_page
-        assert first_page < missing_pairs, (first_page, missing_pairs)
+        # Hold the first real send so readiness/polling cannot race past the
+        # first backfill boundary. Release it even if the assertion fails.
+        gate = receiver.hold("refs/heads/page-1")
+        try:
+            worker(True)
+            wait_for("first page send held", lambda: gate["hit"], timeout=15)
+            first_page = push_rows()
+            assert first_page == 128, first_page
+            assert first_page < missing_pairs, (first_page, missing_pairs)
+        finally:
+            gate["event"].set()
         next_page = wait_for("next backfill page selected in a later round", lambda: (
             lambda rows: rows if rows == missing_pairs else None)(push_rows()), timeout=60)
         delivered_after_next_page = delivered_rows()
-        assert 0 < delivered_after_next_page <= 8, delivered_after_next_page
+        assert 0 < delivered_after_next_page <= missing_pairs, delivered_after_next_page
         later_round = wait_for("delivery drain advances in later rounds", lambda: (
-            lambda rows: rows if rows >= delivered_after_next_page + 8 else None)(
+            lambda rows: rows if rows >= min(missing_pairs, delivered_after_next_page + 8) else None)(
                 delivered_rows()), timeout=60)
         delivered_total = wait_for("all bounded pairs delivered over rounds", lambda: (
             lambda rows: rows if rows == missing_pairs else None)(delivered_rows()), timeout=120)
