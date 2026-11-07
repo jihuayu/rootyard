@@ -15,9 +15,13 @@ hardware watchdog, so the production watchdog/fencing requirement is validated
 only as a configuration gate, never certified here.
 """
 import argparse
+import base64
 import json
 import os
 import re
+import socket
+import uuid
+import urllib.request
 from pathlib import Path
 import shutil
 import subprocess
@@ -30,8 +34,62 @@ from e2e import Harness
 import ha_fixture
 import ops_provenance
 
-TABLE_COUNTS = ("repositories", "git_operations", "tokens", "outbox_events", "event_deliveries")
+TABLE_COUNTS = ("repositories", "git_operations", "tokens", "outbox_events", "event_deliveries", "ci_checkout_jobs")
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def mirror_http(base, path, token=None, method="GET", body=None):
+    """Minimal mirror request helper; tokens stay in headers, never in argv."""
+    headers = {}
+    if token:
+        headers["Authorization"] = "Basic " + base64.b64encode(
+            (token["username"] + ":" + token["token"]).encode()).decode()
+    if isinstance(body, dict):
+        body = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(base + path, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+    except (OSError, urllib.error.URLError):
+        return 0, b""
+
+
+def start_mirror(binary, env, log_path, base):
+    log = open(log_path, "ab")
+    proc = subprocess.Popen([binary, "serve-mirror"], env=env, stdout=log, stderr=log,
+                            start_new_session=True)
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(f"mirror exited early; inspect {log_path}")
+        if mirror_http(base, "/health/ready")[0] == 200:
+            return proc, log
+        time.sleep(0.2)
+    raise AssertionError(f"mirror readiness timeout; inspect {log_path}")
+
+
+def stop_mirror(proc, log):
+    if proc and proc.poll() is None:
+        try:
+            os.killpg(proc.pid, 15)
+            proc.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(proc.pid, 9)
+            except OSError:
+                pass
+    if log:
+        log.close()
+
 
 
 def readme_json_examples():
@@ -290,9 +348,11 @@ def main():
         h = Harness(args)
         h.base_db = verify_dsn
         h.db = verify_dsn
+        ci_audience = str(uuid.uuid4())
         h.env.update({"DATABASE_URL": require_dsn, "ROOTYARD_PG_CA_PEM": str(fx.pki / "ca.crt"),
                       "PGSSLMODE": "verify-full", "PGSSLROOTCERT": str(fx.pki / "ca.crt"),
-                      "ROOTYARD_OUTBOX_WORKER": "false"})
+                      "ROOTYARD_OUTBOX_WORKER": "false",
+                      "ROOTYARD_CI_MIRROR_AUDIENCE": ci_audience})
         fx.wait_endpoint_primary()
         h.cli("migrate")
         h.alice = h.account("create-user", "alice")
@@ -596,6 +656,60 @@ def main():
                "post_quorum_recovery_oid": dcs_oid}
 
         # ---- real backup closure and fresh-authority restore -------------
+        # ---- genuine pinned CI job and issued plan before the backup ------
+        ci_generation = int(h.sql("SELECT storage_generation FROM repositories WHERE id='" + h.repo["id"] + "'"))
+        ci_target = acked[-1]["oid"]
+        ci_job = str(uuid.uuid4())
+        ci_pin_body = {"job_id": ci_job, "target_oid": ci_target, "storage_generation": ci_generation}
+        ci_pin = json.loads(h.expect("/api/repos/alice/demo/ci-pins", (200, 201), token=h.alice,
+                                     method="POST", body=ci_pin_body))
+        assert ci_pin["job_id"] == ci_job and ci_pin["target_oid"] == ci_target
+        ci_expires = int(time.time()) + 1800
+        ci_grant = json.loads(h.expect("/api/repos/alice/demo/ci-checkouts", (200, 201), token=h.alice,
+                                       method="POST", body={**ci_pin_body,
+                                                           "mirror_audience": ci_audience,
+                                                           "expires_unix": ci_expires}))
+        ci_token = {"username": "alice", "token": ci_grant["token"]}
+        h.secrets.extend([ci_grant["token"],
+                          base64.b64encode(("alice:" + ci_grant["token"]).encode()).decode()])
+        assert ci_grant["plan"]["job_id"] == ci_job
+        assert ci_grant["plan"]["target_oid"] == ci_target
+        assert ci_grant["plan"]["mirror_audience"] == ci_audience
+        ci_source_state = h.sql("SELECT revoked::text || '|' || cancelled::text || '|' || expires_unix || "
+                                "'|' || (plan->>'mirror_audience') FROM ci_checkout_jobs WHERE repository_id='"
+                                + h.repo["id"] + "' AND job_id='" + ci_job + "'")
+        ci_revoked, ci_cancelled, ci_expiry, ci_aud = ci_source_state.split("|", 3)
+        assert ci_revoked == "false" and ci_cancelled == "false", ci_source_state
+        assert int(ci_expiry) > int(time.time()) and ci_aud == ci_audience, ci_source_state
+        ci_pin_file = Path(h.env["ROOTYARD_DATA_DIR"]) / "ci-pins" / h.repo["id"] / (ci_job + ".json")
+        assert ci_pin_file.is_file(), "CI source pin descriptor missing before backup"
+        ci_mirror_base = "http://127.0.0.1:" + str(free_port())
+        ci_mirror_env = {**h.env, "ROOTYARD_BIND": ci_mirror_base.rsplit("/", 1)[-1],
+                         "ROOTYARD_DATA_DIR": str(root / "source-mirror-data"),
+                         "ROOTYARD_PRIMARY_URL": h.base,
+                         "ROOTYARD_CI_MIRROR_AUDIENCE": ci_audience}
+        ci_mirror_proc = ci_mirror_log = None
+        try:
+            ci_mirror_proc, ci_mirror_log = start_mirror(args.binary, ci_mirror_env,
+                                                         root / "source-mirror.log", ci_mirror_base)
+            status, body = mirror_http(ci_mirror_base, "/api/repos/alice/demo/mirror-sync",
+                                       token=h.reader, method="POST", body=b"")
+            assert status == 200, (status, body[:200])
+            ci_clone = root / "ci-job-clone-before-backup"
+            h.git("clone", ci_mirror_base + "/ci/" + ci_target + "/git/alice/demo.git",
+                  str(ci_clone), token=ci_token)
+            assert h.git("rev-parse", "HEAD", cwd=ci_clone).stdout.decode().strip() == ci_target
+            h.git("fsck", "--full", cwd=ci_clone)
+        finally:
+            stop_mirror(ci_mirror_proc, ci_mirror_log)
+        ci_before_backup = {"job_id": ci_job, "target_oid": ci_target,
+                            "storage_generation": ci_generation,
+                            "pin_descriptor_retained": True,
+                            "grant_state": {"revoked": False, "cancelled": False,
+                                            "expires_in_future": True,
+                                            "mirror_audience_matches": True},
+                            "job_token_clone_head": ci_target}
+
         pre_backup_counts = count_rows(h)
         pre_backup_pending = pending_keys(h.sql)
         assert pre_backup_pending, "no durable delivery backlog before the backup boundary"
@@ -702,13 +816,16 @@ def main():
             restored_counts[table] = int(restored_sql(f"SELECT COUNT(*) FROM {table}"))
         assert restored_counts == pre_backup_counts, (
             f"restored metadata counts differ: {restored_counts} != {pre_backup_counts}")
-        assert restored_sql("SELECT incarnation::text FROM cluster_authority WHERE singleton=true") == \
-            pre_backup_authority
-        restored_sql("BEGIN; UPDATE cluster_authority SET incarnation=gen_random_uuid(), "
-                     "rotated_at=clock_timestamp() WHERE singleton=true; "
-                     "DELETE FROM cluster_transport_nonces; COMMIT;")
-        assert restored_sql("SELECT incarnation::text FROM cluster_authority WHERE singleton=true") != \
-            pre_backup_authority
+        # `rootyard restore --isolated` rotates the delegation authority and
+        # clears transport nonces itself (src/backup/authority.rs); the test
+        # must observe that behavior, not synthesize it with SQL.
+        restored_authority = restored_sql(
+            "SELECT incarnation::text FROM cluster_authority WHERE singleton=true")
+        assert restored_authority and restored_authority != pre_backup_authority, (
+            "restore --isolated did not rotate the delegation authority automatically")
+        assert restored_sql("SELECT COUNT(*) FROM cluster_transport_nonces") == "0"
+        assert restored_sql(
+            "SELECT rotated_at IS NOT NULL FROM cluster_authority WHERE singleton=true") == "t"
         restored_repo = restored_data / "repos" / (h.repo["id"] + ".git")
         restored_refs_map = ref_map(str(restored_repo))
         assert restored_refs_map == pre_backup_refs_map, (
@@ -745,7 +862,8 @@ def main():
         restored = Harness(args)
         restored.env.update({"DATABASE_URL": restored_require, "ROOTYARD_DATA_DIR": str(restored_data),
                              "ROOTYARD_BIND": restored_bind,
-                             "ROOTYARD_PG_CA_PEM": str(fx.pki / "ca.crt")})
+                             "ROOTYARD_PG_CA_PEM": str(fx.pki / "ca.crt"),
+                             "ROOTYARD_CI_MIRROR_AUDIENCE": ci_audience})
         restored.base_db = restored_verify
         restored.db = restored_verify
         restored.base = "http://" + restored_bind
@@ -765,6 +883,71 @@ def main():
         assert restored.http("/api/repos/alice/demo", token=revoked)[0] == 401
         assert restored.http("/api/repos/alice/demo", token=h.bob)[0] in (403, 404)
         assert restored.http("/api/repos/alice/demo", token=h.reader)[0] == 200
+        # ---- restored authority revokes the old CI grant; new fenced plan ---
+        ci_state_after = restored_sql(
+            "SELECT revoked::text || '|' || cancelled::text || '|' || expires_unix || '|' || "
+            "(plan->>'mirror_audience') FROM ci_checkout_jobs WHERE job_id='" + ci_job + "'")
+        r_revoked, r_cancelled, r_expiry, r_audience = ci_state_after.split("|", 3)
+        assert r_revoked == "true", ci_state_after
+        assert r_cancelled == "false", ci_state_after
+        assert int(r_expiry) > int(time.time()), "old grant denial must not be expiry"
+        assert r_audience == ci_audience, "old grant denial must not be audience/config"
+        assert (restored_data / "ci-pins" / h.repo["id"] / (ci_job + ".json")).is_file(),             "historical CI source pin was not retained by the restore"
+        restored_mirror_base = "http://127.0.0.1:" + str(free_port())
+        restored_mirror_env = {**restored.env,
+                               "ROOTYARD_BIND": restored_mirror_base.rsplit("/", 1)[-1],
+                               "ROOTYARD_DATA_DIR": str(root / "restored-mirror-data"),
+                               "ROOTYARD_PRIMARY_URL": restored.base,
+                               "ROOTYARD_CI_MIRROR_AUDIENCE": ci_audience}
+        restored_mirror_proc = restored_mirror_log = None
+        try:
+            restored_mirror_proc, restored_mirror_log = start_mirror(
+                args.binary, restored_mirror_env, root / "restored-mirror.log", restored_mirror_base)
+            status, body = mirror_http(restored_mirror_base,
+                                       "/api/repos/alice/demo/mirror-sync",
+                                       token=h.reader, method="POST", body=b"")
+            assert status == 200, (status, body[:200])
+            old_status, old_body = mirror_http(
+                restored_mirror_base, "/ci/" + ci_target
+                + "/git/alice/demo.git/info/refs?service=git-upload-pack", token=ci_token)
+            assert old_status in (401, 403), (old_status, old_body[:200])
+            new_job = str(uuid.uuid4())
+            new_pin_body = {"job_id": new_job, "target_oid": ci_target,
+                            "storage_generation": ci_generation}
+            new_pin = json.loads(restored.expect("/api/repos/alice/demo/ci-pins", (200, 201),
+                                                 token=h.alice, method="POST", body=new_pin_body))
+            assert new_pin["job_id"] == new_job
+            new_grant = json.loads(restored.expect(
+                "/api/repos/alice/demo/ci-checkouts", (200, 201), token=h.alice, method="POST",
+                body={**new_pin_body, "mirror_audience": ci_audience,
+                      "expires_unix": int(time.time()) + 1800}))
+            new_token = {"username": "alice", "token": new_grant["token"]}
+            h.secrets.extend([new_grant["token"],
+                              base64.b64encode(("alice:" + new_grant["token"]).encode()).decode()])
+            new_clone = root / "ci-job-clone-restored"
+            restored.git("clone", restored_mirror_base + "/ci/" + ci_target
+                         + "/git/alice/demo.git", str(new_clone), token=new_token)
+            new_head = restored.git("rev-parse", "HEAD", cwd=new_clone).stdout.decode().strip()
+            assert new_head == ci_target
+            restored.git("fsck", "--full", cwd=new_clone)
+            new_state = restored_sql(
+                "SELECT revoked::text FROM ci_checkout_jobs WHERE job_id='" + new_job + "'")
+            assert new_state == "false", new_state
+            job_revocation = {
+                "old_job_id": ci_job, "target_oid": ci_target,
+                "old_grant_active_before_backup": True,
+                "old_grant_automatically_revoked_by_restore": True,
+                "old_grant_cancelled": False,
+                "old_grant_expiry_still_future": True,
+                "old_grant_audience_unchanged": True,
+                "old_token_http_status": old_status,
+                "historical_pin_descriptor_retained": True,
+                "new_job_id": new_job, "new_grant_revoked": False,
+                "new_checkout_head": new_head, "new_checkout_fsck": "passed",
+                "source_and_restore_mirror_audience_configured": True,
+            }
+        finally:
+            stop_mirror(restored_mirror_proc, restored_mirror_log)
         restored.git("fetch", restored.remote, "refs/heads/main", cwd=clone, token=h.reader)
         restored.git("reset", "--hard", "FETCH_HEAD", cwd=clone)
         (clone / "restored.txt").write_text("new write on restored authority\n")
@@ -779,6 +962,12 @@ def main():
             "restore_seconds": round(restore_seconds, 2),
             "source_counts": pre_backup_counts, "restored_counts": restored_counts,
             "backup_manifest": backup_manifest, "backup_verify": backup_verify,
+            "authority": {"source_incarnation": pre_backup_authority,
+                          "restored_incarnation": restored_authority,
+                          "rotated_automatically_by_restore": True,
+                          "transport_nonces_cleared": True},
+            "job_before_backup": ci_before_backup,
+            "job_revocation": job_revocation,
             "source_refs": pre_backup_refs, "restored_refs": ref_count(str(restored_repo)),
             "source_ref_map": pre_backup_refs_map, "restored_ref_map": restored_refs_map,
             "restored_ref_map_equals_source": restored_refs_map == pre_backup_refs_map,
@@ -788,7 +977,7 @@ def main():
                                          "ref_count_unchanged": len(post_boundary_refs) == pre_backup_refs},
             "retained_acknowledged_oids": pre_backup_oids,
             "post_boundary_oid_intentionally_absent": post_backup_oid,
-            "delegation_authority_rotated_before_ingress": True,
+            "delegation_authority_rotated_by_restore": True,
             "worker_drained_before_ingress": worker_restored,
             "pre_backup_delivery_ids": len(pre_backup_pending),
             "pre_backup_deliveries_delivered": len(restored_states) - len(restored_undelivered),

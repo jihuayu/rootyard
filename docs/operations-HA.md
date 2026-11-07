@@ -161,8 +161,15 @@ exists for the restored authority until these offline checks pass:
 - every pre-backup acknowledged OID exists and `git fsck --full --strict`
   passes; the post-boundary write is intentionally absent (measured disaster
   RPO, not zero);
-- the delegation authority incarnation is preserved by the restore and then
-  rotated before ingress so old delegation tokens cannot be replayed;
+- the restore CLI itself rotates the delegation authority incarnation and
+  clears transport nonces; the test asserts the restored incarnation is
+  non-empty and different from the source without issuing its own SQL;
+- every CI checkout job/plan issued before the backup is automatically revoked
+  by the restore (format >= 5), while the historical pin descriptor is kept as
+  evidence; the old job token is denied and the test verifies the denial is
+  revocation (not expiry or a mirror-audience/config mismatch);
+- a new fenced CI job/plan is issued under the restored authority and performs
+  a real mirror checkout at the exact retained OID with `git fsck`;
 - the delivery worker drains the retained outbox against the restored
   authority;
 - permissions, read-only tokens, revocation and a new Git push are exercised
