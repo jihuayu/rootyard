@@ -16,6 +16,13 @@ use uuid::Uuid;
 
 type Res = Result<Response, Error>;
 
+// The two paginated list handlers live in a sibling file to keep this module
+// focused on lifecycle and membership mutations. The re-export preserves the
+// historical `organizations::handlers::{list_members,list_teams}` paths.
+#[path = "listing.rs"]
+mod listing;
+pub use listing::{list_members, list_teams};
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewOrganization {
@@ -200,22 +207,6 @@ pub async fn get_organization(State(state): State<Arc<AppState>>, Path(slug): Pa
     ))
 }
 
-pub async fn list_members(State(state): State<Arc<AppState>>, Path(slug): Path<String>, headers: HeaderMap) -> Res {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let org = org_id(&tx, &slug).await?;
-    require_member(&tx, org, actor.id, Role::Read).await?;
-    let rows = tx.query("SELECT u.username,m.role,m.version FROM organization_memberships m JOIN users u ON u.id=m.user_id WHERE m.organization_id=$1 ORDER BY u.username LIMIT 101", &[&org]).await.map_err(Error::internal)?;
-    let items: Vec<_> = rows
-        .iter()
-        .take(100)
-        .map(|r| sjson!({"username":r.get::<_,&str>(0),"role":r.get::<_,&str>(1),"version":r.get::<_,i64>(2)}))
-        .collect();
-    auth::finish_tx(tx, &actor, false).await?;
-    Ok(json(StatusCode::OK, sjson!({"items":items,"truncated":rows.len()>100})))
-}
-
 pub async fn put_member(
     State(state): State<Arc<AppState>>,
     Path((slug, username)): Path<(String, String)>,
@@ -301,24 +292,6 @@ pub async fn delete_member(
     audit(&tx, org, actor.id, "organization.member.removed", &username, sjson!({})).await?;
     auth::finish_tx(tx, &actor, true).await?;
     Ok(json(StatusCode::OK, sjson!({"removed":true,"username":username})))
-}
-
-pub async fn list_teams(State(state): State<Arc<AppState>>, Path(slug): Path<String>, headers: HeaderMap) -> Res {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let org = org_id(&tx, &slug).await?;
-    require_member(&tx, org, actor.id, Role::Read).await?;
-    let rows = tx
-        .query(
-            "SELECT id,slug,name,role,version FROM organization_teams WHERE organization_id=$1 ORDER BY slug LIMIT 101",
-            &[&org],
-        )
-        .await
-        .map_err(Error::internal)?;
-    let items: Vec<_> = rows.iter().take(100).map(|r| sjson!({"id":r.get::<_,Uuid>(0),"slug":r.get::<_,&str>(1),"name":r.get::<_,&str>(2),"role":r.get::<_,&str>(3),"version":r.get::<_,i64>(4)})).collect();
-    auth::finish_tx(tx, &actor, false).await?;
-    Ok(json(StatusCode::OK, sjson!({"items":items,"truncated":rows.len()>100})))
 }
 
 pub async fn create_team(
