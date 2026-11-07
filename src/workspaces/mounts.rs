@@ -18,6 +18,9 @@
 //! after the lease transaction committed a new `lease_epoch`, `prepare` ran with
 //! database authorization, and `with_frozen*` still classifies a proven
 //! pre-COMMIT rollback as the only case that may thaw the old epoch.
+mod registry;
+
+use self::registry::{Admission, MountEntry, Registry};
 use super::lazy;
 use crate::{
     AppState, Error,
@@ -47,21 +50,18 @@ use std::{
 };
 use uuid::Uuid;
 
-/// Where a mounted workspace is actually served.
-enum Mounted {
-    /// Same-process prototype backend; holds the live session and gate.
-    InProcess { _session: MountHandle, gate: Arc<MutationGate>, lazy: Option<Arc<lazy::Reader>> },
-    /// Production backend: only the helper client registration is kept.
-    Helper { client: Arc<HelperClient> },
-    /// A mount was admitted but not confirmed by the child. `mounted()` is
-    /// false, a retry is told the mount is pending, and the guard that owns
-    /// this entry removes it on every failure, cancel or panic path.
-    Pending { _client: Arc<HelperClient> },
+/// Same-process prototype backend payload; holds the live session and gate.
+struct InProcessSlot {
+    _session: MountHandle,
+    gate: Arc<MutationGate>,
+    lazy: Option<Arc<lazy::Reader>>,
 }
 
-static MOUNTS: OnceLock<Mutex<HashMap<Uuid, Mounted>>> = OnceLock::new();
-fn registry() -> &'static Mutex<HashMap<Uuid, Mounted>> {
-    MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+type MountRegistry = Registry<Arc<HelperClient>, InProcessSlot>;
+
+static MOUNTS: OnceLock<Arc<Mutex<MountRegistry>>> = OnceLock::new();
+fn registry() -> &'static Arc<Mutex<MountRegistry>> {
+    MOUNTS.get_or_init(|| Arc::new(Mutex::new(MountRegistry::new())))
 }
 static HELPER: OnceLock<Mutex<Option<Arc<HelperClient>>>> = OnceLock::new();
 
@@ -95,9 +95,9 @@ pub fn mounted(id: Uuid) -> bool {
     }
     let registry = registry().lock().unwrap();
     match registry.get(&id) {
-        Some(Mounted::InProcess { .. }) => true,
-        Some(Mounted::Helper { client }) => client.alive(),
-        Some(Mounted::Pending { .. }) => false,
+        Some(MountEntry::InProcess(_)) => true,
+        // A pending reservation is not a mounted workspace yet.
+        Some(MountEntry::Helper(slot)) => !slot.is_pending() && slot.client.alive(),
         None => false,
     }
 }
@@ -140,14 +140,14 @@ pub fn update_lease(id: Uuid, db_epoch: i64, until: i64) {
     let observer = {
         let registry = registry().lock().unwrap();
         match registry.get(&id) {
-            Some(Mounted::InProcess { gate, .. }) => {
+            Some(MountEntry::InProcess(slot)) => {
                 // Epoch-ordered observe: a late SELECT result cannot fence a
                 // newer handoff, shorten its deadline, or re-authorize an old epoch.
-                let _ = gate.observe_lease(db_epoch, until);
+                let _ = slot.gate.observe_lease(db_epoch, until);
                 return;
             }
-            Some(Mounted::Helper { client }) => client.clone(),
-            Some(Mounted::Pending { .. }) | None => return,
+            Some(MountEntry::Helper(slot)) if !slot.is_pending() => slot.client.clone(),
+            Some(MountEntry::Helper(_)) | None => return,
         }
     };
     // The child orders the observation under its own gate lock; sending it from
@@ -172,10 +172,12 @@ pub async fn refresh_leases(state: &AppState) -> Result<(), Error> {
         let mut helpers = Vec::new();
         for (id, mount) in mounts.iter() {
             match mount {
-                Mounted::InProcess { gate, .. } => in_process.push((*id, gate.clone(), gate.lease_marker())),
-                Mounted::Helper { client } => helpers.push((*id, client.clone())),
+                MountEntry::InProcess(slot) => {
+                    in_process.push((*id, slot.gate.clone(), slot.gate.lease_marker()))
+                }
+                MountEntry::Helper(slot) if !slot.is_pending() => helpers.push((*id, slot.client.clone())),
                 // An unconfirmed mount has no published gate to refresh.
-                Mounted::Pending { .. } => {}
+                MountEntry::Helper(_) => {}
             }
         }
         (in_process, helpers)
@@ -262,9 +264,9 @@ pub fn with_frozen<T>(id: Uuid, work: impl FnOnce() -> Result<T, Error>) -> Resu
     let (gate, client) = {
         let registry = registry().lock().unwrap();
         match registry.get(&id) {
-            Some(Mounted::InProcess { gate, .. }) => (Some(gate.clone()), None),
-            Some(Mounted::Helper { client }) => (None, Some(client.clone())),
-            None => (None, None),
+            Some(MountEntry::InProcess(slot)) => (Some(slot.gate.clone()), None),
+            Some(MountEntry::Helper(slot)) if !slot.is_pending() => (None, Some(slot.client.clone())),
+            Some(MountEntry::Helper(_)) | None => (None, None),
         }
     };
     if let Some(gate) = gate {
@@ -298,9 +300,9 @@ pub async fn with_frozen_async<T>(
     let (gate, client) = {
         let registry = registry().lock().unwrap();
         match registry.get(&id) {
-            Some(Mounted::InProcess { gate, .. }) => (Some(gate.clone()), None),
-            Some(Mounted::Helper { client }) => (None, Some(client.clone())),
-            None => (None, None),
+            Some(MountEntry::InProcess(slot)) => (Some(slot.gate.clone()), None),
+            Some(MountEntry::Helper(slot)) if !slot.is_pending() => (None, Some(slot.client.clone())),
+            Some(MountEntry::Helper(_)) | None => (None, None),
         }
     };
     if let Some(gate) = gate {
@@ -362,14 +364,20 @@ pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(
         return ensure_helper(state, id, db_epoch, until);
     }
     let mut registry = registry().lock().unwrap();
-    if let Some(Mounted::InProcess { gate, .. }) = registry.get(&id) {
-        // The lease handler commits a new database epoch before calling this.
-        // A same-epoch call only renews the deadline. A new epoch is authorized
-        // through the fence-then-authorize handoff, so a concurrent freeze or a
-        // guard admitted under the old epoch leaves the gate fenced and surfaces
-        // an error instead of keeping the superseded epoch writable.
-        gate.handoff(db_epoch, until).map_err(Error::internal)?;
-        return Ok(());
+    match registry.get(&id) {
+        Some(MountEntry::InProcess(slot)) => {
+            // The lease handler commits a new database epoch before calling this.
+            // A same-epoch call only renews the deadline. A new epoch is authorized
+            // through the fence-then-authorize handoff, so a concurrent freeze or a
+            // guard admitted under the old epoch leaves the gate fenced and surfaces
+            // an error instead of keeping the superseded epoch writable.
+            slot.gate.handoff(db_epoch, until).map_err(Error::internal)?;
+            return Ok(());
+        }
+        Some(MountEntry::Helper(_)) => {
+            return Err(Error(StatusCode::CONFLICT, "workspace mount is registered with another backend"));
+        }
+        None => {}
     }
     let lower = lower_path(state, id);
     if !lower.join(".git").is_dir() {
@@ -384,78 +392,64 @@ pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(
     let source: Option<Arc<dyn LazySource>> = lazy.clone().map(|reader| reader as Arc<dyn LazySource>);
     let overlay = Overlay::new_with_gate_and_lazy(lower, upper, gate.clone(), source).map_err(Error::internal)?;
     let session = crate::workspace_lab::fuse_mount::spawn(overlay, &mountpoint).map_err(Error::internal)?;
-    registry.insert(id, Mounted::InProcess { _session: session, gate, lazy });
+    registry.insert_in_process(id, InProcessSlot { _session: session, gate, lazy });
     Ok(())
 }
 
 fn ensure_helper(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(), Error> {
     let client = helper_client()?;
-    enum Registered {
-        Helper(Arc<HelperClient>),
-        Pending,
-        Missing,
-    }
-    let registered = {
-        let registry = registry().lock().unwrap();
-        match registry.get(&id) {
-            Some(Mounted::Helper { client }) => Registered::Helper(client.clone()),
-            Some(Mounted::Pending { .. }) => Registered::Pending,
-            Some(Mounted::InProcess { .. }) | None => Registered::Missing,
-        }
-    };
-    match registered {
-        Registered::Helper(registered) => {
+    let generation = client.generation();
+    // Check and reserve under one registry lock. Only the winner of `admit`
+    // sends the mount RPC; a concurrent ensure sees Pending and returns before
+    // touching the shared helper mount.
+    match registry().admit(id, client.clone(), generation) {
+        Admission::InProcess => Err(Error(
+            StatusCode::CONFLICT,
+            "workspace is already mounted by the in-process backend",
+        )),
+        Admission::Pending => Err(Error(
+            StatusCode::CONFLICT,
+            "workspace mount is still being confirmed by the FUSE helper; retry on the same epoch",
+        )),
+        Admission::Confirmed { client, helper_generation } => {
             // The RPC is issued with the registry lock released so one mount's
             // handoff cannot stall every other workspace.
-            if registered.alive() {
-                return registered.handoff(id, db_epoch, until).map_err(helper_error);
+            if client.alive() {
+                return client.handoff(id, db_epoch, until).map_err(helper_error);
             }
-            registry().lock().unwrap().remove(&id);
-            return Err(Error::internal("workspace FUSE helper is unavailable after a control failure"));
-        }
-        Registered::Pending => {
-            return Err(Error(
+            if registry().lock().unwrap().remove_confirmed(id, helper_generation) {
+                return Err(Error::internal(
+                    "workspace FUSE helper is unavailable after a control failure",
+                ));
+            }
+            // A newer generation replaced this registration while the failure
+            // was observed. Never delete it; the caller retries against it.
+            Err(Error(
                 StatusCode::CONFLICT,
-                "workspace mount is still being confirmed by the FUSE helper; retry on the same epoch",
+                "workspace mount changed while the FUSE helper was unavailable; retry",
             ))
         }
-        Registered::Missing => {}
-    }
-    // The lower tree was prepared by `prepare` under database authorization;
-    // the helper only ever receives the root and this UUID.
-    if !lower_path(state, id).join(".git").is_dir() {
-        return Err(Error::internal("workspace lower Git state missing"));
-    }
-    // Responsibility is registered before the RPC: `mounted(id)` stays false
-    // until the child confirmed the mount, and the guard removes this entry on
-    // every failure path, including a panic or a cancelled caller.
-    registry().lock().unwrap().insert(id, Mounted::Pending { _client: client.clone() });
-    let mut guard = PendingGuard { id, armed: true };
-    client.mount(&state.storage.root, id, db_epoch, until, true).map_err(helper_error)?;
-    {
-        let mut registry = registry().lock().unwrap();
-        if matches!(registry.get(&id), Some(Mounted::Pending { .. })) {
-            registry.insert(id, Mounted::Helper { client });
-        }
-    }
-    guard.armed = false;
-    Ok(())
-}
-
-/// Removes an unconfirmed mount registration unless the mount was confirmed.
-struct PendingGuard {
-    id: Uuid,
-    armed: bool,
-}
-
-impl Drop for PendingGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let mut registry = registry().lock().unwrap();
-        if matches!(registry.get(&self.id), Some(Mounted::Pending { .. })) {
-            registry.remove(&self.id);
+        Admission::Reserved(mut guard) => {
+            // The lower tree was prepared by `prepare` under database
+            // authorization; the helper only ever receives the root and UUID.
+            if !lower_path(state, id).join(".git").is_dir() {
+                return Err(Error::internal("workspace lower Git state missing"));
+            }
+            if let Err(error) = client.mount(&state.storage.root, id, db_epoch, until, true) {
+                return Err(helper_error(error));
+            }
+            if guard.promote(client.clone()).is_err() {
+                // The reservation was superseded while the RPC was in flight
+                // (shutdown or helper-generation replacement). Tear down the
+                // mount this winner created; no other caller shares this
+                // reservation, so this cannot cancel a later owner's mount.
+                let _ = client.unmount(id);
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "workspace mount reservation changed before confirmation; retry",
+                ));
+            }
+            Ok(())
         }
     }
 }
@@ -487,7 +481,7 @@ pub async fn prewarm(
     let server = {
         let registry = registry().lock().unwrap();
         match registry.get(&id) {
-            Some(Mounted::Helper { client }) => Some(client.clone()),
+            Some(MountEntry::Helper(slot)) if !slot.is_pending() => Some(slot.client.clone()),
             _ => None,
         }
     };
@@ -511,8 +505,8 @@ pub async fn prewarm(
         .unwrap()
         .get(&id)
         .and_then(|m| match m {
-            Mounted::InProcess { lazy, .. } => lazy.clone(),
-            Mounted::Helper { .. } | Mounted::Pending { .. } => None,
+            MountEntry::InProcess(slot) => slot.lazy.clone(),
+            MountEntry::Helper(_) => None,
         })
         .ok_or(Error(StatusCode::CONFLICT, "workspace has no remote lazy baseline"))?;
     let (count, bytes) = tokio::task::spawn_blocking(move || reader.prewarm(&paths))
