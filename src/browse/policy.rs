@@ -65,7 +65,8 @@ pub fn validate_hook(op: &crate::journal::Operation, changes: &[RefChange]) -> a
         let tenant_id: Uuid = row.get(0);
         let generation: i64 = row.get(1);
         ensure!(generation == op.storage_generation, "repository generation changed");
-        crate::sharding::fencing::check_hook_fence(&client, op.repository_id, Path::new(&git_dir), op.storage_generation, op.shard_epoch)
+        let volume_id: Uuid = std::fs::read_to_string(Path::new(&data_root).join(".volume-id"))?.trim().parse()?;
+        crate::sharding::fencing::check_hook_fence(&client, op.repository_id, Path::new(&git_dir), op.storage_generation, op.shard_epoch, volume_id)
             .await.map_err(|e| anyhow::anyhow!(e.1))?;
         validate(&client, op.repository_id, changes, Path::new(&git_bin), Path::new(&git_dir), Duration::from_secs(timeout)).await
             .map_err(|e| anyhow::anyhow!(e.1))?;
@@ -85,11 +86,13 @@ pub fn validate_hook_fence(op: &crate::journal::Operation) -> anyhow::Result<()>
     use anyhow::Context;
     let url = std::env::var("ROOTYARD_DATABASE_URL").context("missing hook database URL")?;
     let git_dir = std::env::var("ROOTYARD_GIT_DIR").context("missing hook repository path")?;
+    let data_root = std::env::var("ROOTYARD_DATA_ROOT").context("missing hook data root")?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
         let client = crate::db::connect_url(&url).await?;
         crate::storage::ref_admission::ensure_hook_admitted(&client, op).await?;
-        crate::sharding::fencing::check_hook_fence(&client, op.repository_id, Path::new(&git_dir), op.storage_generation, op.shard_epoch)
+        let volume_id: Uuid = std::fs::read_to_string(Path::new(&data_root).join(".volume-id"))?.trim().parse()?;
+        crate::sharding::fencing::check_hook_fence(&client, op.repository_id, Path::new(&git_dir), op.storage_generation, op.shard_epoch, volume_id)
             .await.map_err(|e| anyhow::anyhow!(e.1))
     })
 }

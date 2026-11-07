@@ -1,0 +1,111 @@
+{
+  "measurement_kind": "native_execution",
+  "simulated_fields": false,
+  "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "source_worktree_dirty": false,
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "python": "3.12.14",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)"
+  },
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "mem_total_kb": 18440100
+  },
+  "topology": "one Rootyard writer, separate PostgreSQL 17 primary and synchronous streaming standby, real TLS/SCRAM",
+  "dataset": "one private repository with an initial push plus concurrent one-file Git pushes during primary failure",
+  "workload": "continuous native Git reads plus native Git push commits while the synchronous primary is stopped; manual standby promotion and Rootyard restart",
+  "limits": [
+    "manual local-host PostgreSQL promotion and Rootyard restart",
+    "no DCS/elected automatic PG leader and no automatic client reconfiguration",
+    "PITR/archive restore tested separately, not integrated with standby promotion",
+    "no cross-host storage fencing; old primary is stopped, not fenced by a shared DCS"
+  ],
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "binary_size_bytes": 316382568,
+  "harness_sha256": "5cc3204dd947d0261fb82586e5c8e60aadb7a46412273c5ba38b7a747e3c6ac8",
+  "kind": "native_postgresql_streaming_promote",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "synchronous_commit": "remote_apply",
+  "standby_sync_state_before_failure": "sync",
+  "postgresql_failure": "pg_ctl immediate stop",
+  "read_statuses_during_failure": [
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    200,
+    503
+  ],
+  "acknowledged_oid_before_failure": "be6c6a2275ad5ed4139793fe9e59493ec16b8b76",
+  "operator_recovery": {
+    "repository_state_after_promotion_restart": "ready:",
+    "http_statuses_after_promotion_restart": [
+      200
+    ],
+    "required": false
+  },
+  "write_load": {
+    "pre_fault_acknowledged": 3,
+    "all_acknowledged": 3,
+    "acknowledged_after_fault": 0,
+    "acknowledged_before_failure": 3,
+    "writer_terminated_before_accounting": true,
+    "failed_or_unacknowledged_during_outage": 3,
+    "acknowledged_oids": [
+      "71bc5283c6f63e643f1ed46f55220617d69f7286",
+      "9795e4fb10076a47f3587ddfcf982d86a47cf149",
+      "79bcc121c350e448c897f6ac46ef22f23682932d"
+    ],
+    "acknowledged_after_fault_oids": [],
+    "pre_fault_ack_timestamps_ns": [
+      7979933568828,
+      7980442877754,
+      7981067435321
+    ],
+    "all_ack_timestamps_ns": [
+      7979933568828,
+      7980442877754,
+      7981067435321
+    ],
+    "failure_at_ns": 7981197896056,
+    "failure_excerpt": [
+      "Command failed (1): error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503\nsend-pack: unexpected disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly\nEverything up-to-date\n",
+      "Command failed (128): fatal: unable to access 'http://127.0.0.1:49819/git/alice/demo.git/': The requested URL returned error: 503\n",
+      "Command failed (128): fatal: unable to access 'http://127.0.0.1:49819/git/alice/demo.git/': The requested URL returned error: 503\n"
+    ]
+  },
+  "rpo_lost_acknowledged_commits": 0,
+  "rpo_lost_acknowledged_writes_under_load": 0,
+  "rto_read_ms": 1351.25,
+  "rto_write_ms": 2072.099,
+  "post_promote_oid": "61d7f7a84119fe830bf55cf99fefa15360c4b67d",
+  "standby_promoted": true
+}

@@ -1,0 +1,1901 @@
+{
+  "attempts": [
+    {
+      "actual_concurrency": 1,
+      "jobs": {
+        "ci_job_checkouts_isolated": {
+          "cases": {
+            "expected": 15,
+            "failed": 0,
+            "ok": true,
+            "passed": 15,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/ci_job_checkouts.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-reports/ci_job_checkouts_isolated.json"
+          ],
+          "database": "round2_vfc_ci_641195e2df",
+          "duration_seconds": 100.034,
+          "env_isolation": {
+            "database": "round2_vfc_ci_641195e2df",
+            "ready_env": "infra/ready.env",
+            "tmpdir": "/tmp"
+          },
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:34:57.344509+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-logs/ci_job_checkouts_isolated.log",
+          "name": "ci_job_checkouts_isolated",
+          "started_at": "2026-11-07T01:33:17.309202+00:00",
+          "status": "passed"
+        },
+        "sandbox_unittest_isolated": {
+          "cases": {
+            "expected": 6,
+            "failed": 0,
+            "ok": true,
+            "passed": 6,
+            "report_passed": null
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "-m",
+            "unittest",
+            "-v",
+            "tests.test_sandbox_service",
+            "tests.test_ci_sandbox"
+          ],
+          "database": "round2_vfc_sandbox_7c6d8da7aa",
+          "duration_seconds": 39.014,
+          "env_isolation": {
+            "database": "round2_vfc_sandbox_7c6d8da7aa",
+            "ready_env": "infra/ready.env",
+            "tmpdir": "/tmp"
+          },
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:35:36.360114+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-logs/sandbox_unittest_isolated.log",
+          "name": "sandbox_unittest_isolated",
+          "started_at": "2026-11-07T01:34:57.345667+00:00",
+          "status": "passed"
+        },
+        "storage_lifecycle_physical_isolated": {
+          "cases": {
+            "expected": 8,
+            "failed": 1,
+            "ok": false,
+            "passed": 0,
+            "report_passed": false
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/storage_lifecycle_physical.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-reports/storage_lifecycle_physical_isolated.json"
+          ],
+          "database": "round2_vfc_physical_0ff86e6e62",
+          "duration_seconds": 60.019,
+          "env_isolation": {
+            "database": "round2_vfc_physical_0ff86e6e62",
+            "ready_env": "infra/ready.env",
+            "tmpdir": "/tmp"
+          },
+          "exit_code": 1,
+          "finished_at": "2026-11-07T01:36:36.381774+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-logs/storage_lifecycle_physical_isolated.log",
+          "name": "storage_lifecycle_physical_isolated",
+          "started_at": "2026-11-07T01:35:36.361628+00:00",
+          "status": "failed"
+        }
+      },
+      "max_concurrency": 2,
+      "phase": "isolated-db-rerun",
+      "started_at": "2026-11-07T01:33:17.308460+00:00"
+    }
+  ],
+  "binary": {
+    "path": "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "reused_without_rebuild": true,
+    "sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+  },
+  "core_passed": false,
+  "db_cleanup": {
+    "ci_job_checkouts_isolated": "dropped_after_success",
+    "sandbox_unittest_isolated": "dropped_after_success",
+    "storage_lifecycle_physical_isolated": "preserved_after_failure"
+  },
+  "db_isolation": {
+    "ci": {
+      "created_with": "PG17 agent CREATEDB",
+      "database": "round2_vfc_ci_641195e2df",
+      "unique": true
+    },
+    "physical": {
+      "created_with": "PG17 agent CREATEDB",
+      "database": "round2_vfc_physical_0ff86e6e62",
+      "unique": true
+    },
+    "sandbox": {
+      "created_with": "PG17 agent CREATEDB",
+      "database": "round2_vfc_sandbox_7c6d8da7aa",
+      "unique": true
+    }
+  },
+  "expected_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "expected_source": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "finalizer_validation": {
+    "artifact": {
+      "expected": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+      "ok": true,
+      "path": "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+      "sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153"
+    },
+    "failed_jobs": [
+      "storage_lifecycle_physical"
+    ],
+    "fresh_migrate": {
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs-first-shared-db-run/fresh-migrate.log",
+      "ok": true,
+      "status": "passed"
+    },
+    "job_details": {
+      "backup_sha256_legacy130": {
+        "cases": {
+          "expected": 3,
+          "failed": 0,
+          "passed": 3,
+          "recorded_expected": null
+        },
+        "database": null,
+        "exit_code": 0,
+        "expected": 3,
+        "ok": true,
+        "reported_from": "first-shared-db-run",
+        "status": "passed"
+      },
+      "ci_job_checkouts": {
+        "cases": {
+          "expected": 15,
+          "failed": 0,
+          "passed": 15,
+          "recorded_expected": null
+        },
+        "database": "round2_vfc_ci_641195e2df",
+        "exit_code": 0,
+        "expected": 15,
+        "ok": true,
+        "reported_from": "isolated-db-rerun",
+        "status": "passed"
+      },
+      "maintenance_jobs": {
+        "cases": {
+          "expected": 7,
+          "failed": 0,
+          "passed": 7,
+          "recorded_expected": null
+        },
+        "database": null,
+        "exit_code": 0,
+        "expected": 7,
+        "ok": true,
+        "reported_from": "first-shared-db-run",
+        "status": "passed"
+      },
+      "pando_maintenance_service": {
+        "cases": {
+          "expected": 2,
+          "failed": 0,
+          "passed": 2,
+          "recorded_expected": null
+        },
+        "database": null,
+        "exit_code": 0,
+        "expected": 2,
+        "ok": true,
+        "reported_from": "first-shared-db-run",
+        "status": "passed"
+      },
+      "sandbox_unittest": {
+        "cases": {
+          "expected": 6,
+          "failed": 0,
+          "passed": 6,
+          "recorded_expected": null
+        },
+        "database": "round2_vfc_sandbox_7c6d8da7aa",
+        "exit_code": 0,
+        "expected": 6,
+        "ok": true,
+        "reported_from": "isolated-db-rerun",
+        "status": "passed"
+      },
+      "schema_contract": {
+        "cases": {
+          "expected": 8,
+          "failed": 0,
+          "passed": 8,
+          "recorded_expected": 6
+        },
+        "database": null,
+        "exit_code": 0,
+        "expected": 8,
+        "ok": true,
+        "reported_from": "first-shared-db-run",
+        "status": "passed"
+      },
+      "sha256_matrix": {
+        "cases": {
+          "expected": 6,
+          "failed": 0,
+          "passed": 6,
+          "recorded_expected": null
+        },
+        "database": null,
+        "exit_code": 0,
+        "expected": 6,
+        "ok": true,
+        "reported_from": "first-shared-db-run",
+        "status": "passed"
+      },
+      "sha256_restore": {
+        "cases": {
+          "expected": 2,
+          "failed": 0,
+          "passed": 2,
+          "recorded_expected": null
+        },
+        "database": null,
+        "exit_code": 0,
+        "expected": 2,
+        "ok": true,
+        "reported_from": "first-shared-db-run",
+        "status": "passed"
+      },
+      "sha256_service": {
+        "cases": {
+          "expected": 2,
+          "failed": 0,
+          "passed": 2,
+          "recorded_expected": null
+        },
+        "database": null,
+        "exit_code": 0,
+        "expected": 2,
+        "ok": true,
+        "reported_from": "first-shared-db-run",
+        "status": "passed"
+      },
+      "storage_lifecycle": {
+        "cases": {
+          "expected": 3,
+          "failed": 0,
+          "passed": 3,
+          "recorded_expected": null
+        },
+        "database": null,
+        "exit_code": 0,
+        "expected": 3,
+        "ok": true,
+        "reported_from": "first-shared-db-run",
+        "status": "passed"
+      },
+      "storage_lifecycle_physical": {
+        "cases": {
+          "expected": 8,
+          "failed": 1,
+          "passed": 0,
+          "recorded_expected": null
+        },
+        "database": "round2_vfc_physical_0ff86e6e62",
+        "exit_code": 1,
+        "expected": 8,
+        "ok": false,
+        "reported_from": "isolated-db-rerun",
+        "status": "failed"
+      }
+    },
+    "jobs_ok": false,
+    "no_new_native_reruns": true,
+    "other_gaps": [
+      {
+        "detail": "one or more isolated reruns still fail; see jobs/logs; physical fixture not force-fixed",
+        "scope": "postprocess"
+      },
+      {
+        "detail": "SystemExit: 1",
+        "scope": "postprocess"
+      }
+    ],
+    "pando_probe": {
+      "ok": true,
+      "preserved_copy": "/workspace/scratch/rootyard-round2/verify_final_core/pando-probe-report.json",
+      "report": "/workspace/scratch/rootyard-round2/verify_final_core/pando-probe-work/run-9ymmuqvx/report.json",
+      "status": "passed"
+    },
+    "rust": {
+      "logs": [
+        "/workspace/scratch/rootyard-round2/verify_final_core/logs-first-shared-db-run/cargo-test-lib.log",
+        "/workspace/scratch/rootyard-round2/verify_final_core/logs-first-shared-db-run/cargo-test-pando-maintenance.log"
+      ],
+      "ok": true,
+      "passed": true
+    },
+    "source": {
+      "now": {
+        "at": "2026-11-07T01:36:39.019773+00:00",
+        "clean": true,
+        "head": "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+      },
+      "ok": true,
+      "recorded": {
+        "after_postprocess": {
+          "at": "2026-11-07T01:36:36.963899+00:00",
+          "clean": true,
+          "head": "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+        },
+        "before_postprocess": {
+          "at": "2026-11-07T01:33:16.929220+00:00",
+          "clean": true,
+          "head": "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+        }
+      }
+    },
+    "wait": {
+      "checks": 41,
+      "final_proc_state": "missing",
+      "finished": true,
+      "seconds": 80.013
+    },
+    "waited_pid": 250386,
+    "wrapper_gaps": []
+  },
+  "finished_at": "2026-11-07T01:36:39.020038+00:00",
+  "gaps": [
+    {
+      "detail": "one or more isolated reruns still fail; see jobs/logs; physical fixture not force-fixed",
+      "scope": "postprocess"
+    },
+    {
+      "detail": "SystemExit: 1",
+      "scope": "postprocess"
+    },
+    {
+      "detail": "failed job validation: storage_lifecycle_physical",
+      "scope": "finalizer"
+    }
+  ],
+  "jobs": {
+    "backup_sha256_legacy130": {
+      "cases": {
+        "checks": null,
+        "expected": 3,
+        "failed": 0,
+        "ok": true,
+        "passed": 3,
+        "report_passed": true
+      },
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python",
+        "tests/backup_sha256_legacy130.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+        "--legacy-binary",
+        "/workspace/scratch/rootyard-round2/legacy130/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round2/verify_final_core/reports/backup_sha256_legacy130.json"
+      ],
+      "duration_seconds": 91.03,
+      "exit_code": 0,
+      "finished_at": "2026-11-07T01:27:37.410541+00:00",
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/backup_sha256_legacy130.log",
+      "name": "backup_sha256_legacy130",
+      "reported_from": "first-shared-db-run",
+      "started_at": "2026-11-07T01:26:06.375848+00:00",
+      "status": "passed"
+    },
+    "ci_job_checkouts": {
+      "cases": {
+        "expected": 15,
+        "failed": 0,
+        "ok": true,
+        "passed": 15,
+        "report_passed": true
+      },
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python",
+        "tests/ci_job_checkouts.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-reports/ci_job_checkouts_isolated.json"
+      ],
+      "database": "round2_vfc_ci_641195e2df",
+      "duration_seconds": 100.034,
+      "env_isolation": {
+        "database": "round2_vfc_ci_641195e2df",
+        "ready_env": "infra/ready.env",
+        "tmpdir": "/tmp"
+      },
+      "exit_code": 0,
+      "finished_at": "2026-11-07T01:34:57.344509+00:00",
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-logs/ci_job_checkouts_isolated.log",
+      "name": "ci_job_checkouts_isolated",
+      "reported_from": "isolated-db-rerun",
+      "rerun_name": "ci_job_checkouts_isolated",
+      "started_at": "2026-11-07T01:33:17.309202+00:00",
+      "status": "passed"
+    },
+    "maintenance_jobs": {
+      "cases": {
+        "checks": null,
+        "expected": 7,
+        "failed": 0,
+        "ok": true,
+        "passed": 7,
+        "report_passed": true
+      },
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python",
+        "tests/maintenance_jobs.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round2/verify_final_core/reports/maintenance_jobs.json"
+      ],
+      "duration_seconds": 6.001,
+      "exit_code": 0,
+      "finished_at": "2026-11-07T01:29:07.435681+00:00",
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/maintenance_jobs.log",
+      "name": "maintenance_jobs",
+      "reported_from": "first-shared-db-run",
+      "started_at": "2026-11-07T01:29:01.433287+00:00",
+      "status": "passed"
+    },
+    "pando_maintenance_service": {
+      "cases": {
+        "checks": null,
+        "expected": 2,
+        "failed": 0,
+        "ok": true,
+        "passed": 2,
+        "report_passed": true
+      },
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python",
+        "tests/pando_maintenance_service.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round2/verify_final_core/reports/pando_maintenance_service.json"
+      ],
+      "duration_seconds": 28.015,
+      "exit_code": 0,
+      "finished_at": "2026-11-07T01:29:36.452798+00:00",
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/pando_maintenance_service.log",
+      "name": "pando_maintenance_service",
+      "reported_from": "first-shared-db-run",
+      "started_at": "2026-11-07T01:29:08.436788+00:00",
+      "status": "passed"
+    },
+    "sandbox_unittest": {
+      "cases": {
+        "expected": 6,
+        "failed": 0,
+        "ok": true,
+        "passed": 6,
+        "report_passed": null
+      },
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python",
+        "-m",
+        "unittest",
+        "-v",
+        "tests.test_sandbox_service",
+        "tests.test_ci_sandbox"
+      ],
+      "database": "round2_vfc_sandbox_7c6d8da7aa",
+      "duration_seconds": 39.014,
+      "env_isolation": {
+        "database": "round2_vfc_sandbox_7c6d8da7aa",
+        "ready_env": "infra/ready.env",
+        "tmpdir": "/tmp"
+      },
+      "exit_code": 0,
+      "finished_at": "2026-11-07T01:35:36.360114+00:00",
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-logs/sandbox_unittest_isolated.log",
+      "name": "sandbox_unittest_isolated",
+      "reported_from": "isolated-db-rerun",
+      "rerun_name": "sandbox_unittest_isolated",
+      "started_at": "2026-11-07T01:34:57.345667+00:00",
+      "status": "passed"
+    },
+    "schema_contract": {
+      "case_count_correction": {
+        "corrected_expected": 8,
+        "corrected_passed": 8,
+        "previous": {
+          "checks": {
+            "canonical": true,
+            "custom_migrate_idempotent": true,
+            "custom_search_path_bootstrap": true,
+            "restored003_upgrade": true,
+            "restored006_upgrade": true,
+            "restored007_upgrade": true,
+            "roundtrip": true,
+            "upgraded_roundtrip": true
+          },
+          "expected": 6,
+          "failed": 0,
+          "ok": true,
+          "passed": 6,
+          "report_passed": null
+        }
+      },
+      "cases": {
+        "expected": 8,
+        "failed": 0,
+        "note": "schema_contract output has 8 catalog checks across 6 legacy branches; 8/8 passed",
+        "passed": 8,
+        "recorded_expected": 6
+      },
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python",
+        "tests/schema_contract.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard"
+      ],
+      "duration_seconds": 6.001,
+      "exit_code": 0,
+      "finished_at": "2026-11-07T01:27:31.407186+00:00",
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/schema_contract.log",
+      "name": "schema_contract",
+      "reported_from": "first-shared-db-run",
+      "started_at": "2026-11-07T01:27:25.404792+00:00",
+      "status": "passed"
+    },
+    "sha256_matrix": {
+      "cases": {
+        "checks": null,
+        "expected": 6,
+        "failed": 0,
+        "ok": true,
+        "passed": 6,
+        "report_passed": true
+      },
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python",
+        "tests/sha256_matrix.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round2/verify_final_core/reports/sha256_matrix.json"
+      ],
+      "duration_seconds": 10.004,
+      "exit_code": 0,
+      "finished_at": "2026-11-07T01:26:05.374803+00:00",
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/sha256_matrix.log",
+      "name": "sha256_matrix",
+      "reported_from": "first-shared-db-run",
+      "started_at": "2026-11-07T01:25:55.369788+00:00",
+      "status": "passed"
+    },
+    "sha256_restore": {
+      "cases": {
+        "checks": null,
+        "expected": 2,
+        "failed": 0,
+        "ok": true,
+        "passed": 2,
+        "report_passed": true
+      },
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python",
+        "tests/sha256_restore.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round2/verify_final_core/reports/sha256_restore.json"
+      ],
+      "duration_seconds": 84.03,
+      "exit_code": 0,
+      "finished_at": "2026-11-07T01:27:24.403517+00:00",
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/sha256_restore.log",
+      "name": "sha256_restore",
+      "reported_from": "first-shared-db-run",
+      "started_at": "2026-11-07T01:26:00.372876+00:00",
+      "status": "passed"
+    },
+    "sha256_service": {
+      "cases": {
+        "checks": null,
+        "expected": 2,
+        "failed": 0,
+        "ok": true,
+        "passed": 2,
+        "report_passed": null
+      },
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python",
+        "tests/sha256_service.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard"
+      ],
+      "duration_seconds": 4.002,
+      "exit_code": 0,
+      "finished_at": "2026-11-07T01:25:59.371605+00:00",
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/sha256_service.log",
+      "name": "sha256_service",
+      "reported_from": "first-shared-db-run",
+      "started_at": "2026-11-07T01:25:55.368871+00:00",
+      "status": "passed"
+    },
+    "storage_lifecycle": {
+      "cases": {
+        "checks": null,
+        "expected": 3,
+        "failed": 0,
+        "ok": true,
+        "passed": 3,
+        "report_passed": true
+      },
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python",
+        "tests/storage_lifecycle.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round2/verify_final_core/reports/storage_lifecycle.json"
+      ],
+      "duration_seconds": 18.006,
+      "exit_code": 0,
+      "finished_at": "2026-11-07T01:27:56.418800+00:00",
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/storage_lifecycle.log",
+      "name": "storage_lifecycle",
+      "reported_from": "first-shared-db-run",
+      "started_at": "2026-11-07T01:27:38.411667+00:00",
+      "status": "passed"
+    },
+    "storage_lifecycle_physical": {
+      "cases": {
+        "expected": 8,
+        "failed": 1,
+        "ok": false,
+        "passed": 0,
+        "report_passed": false
+      },
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python",
+        "tests/storage_lifecycle_physical.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-reports/storage_lifecycle_physical_isolated.json"
+      ],
+      "database": "round2_vfc_physical_0ff86e6e62",
+      "duration_seconds": 60.019,
+      "env_isolation": {
+        "database": "round2_vfc_physical_0ff86e6e62",
+        "ready_env": "infra/ready.env",
+        "tmpdir": "/tmp"
+      },
+      "exit_code": 1,
+      "finished_at": "2026-11-07T01:36:36.381774+00:00",
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-logs/storage_lifecycle_physical_isolated.log",
+      "name": "storage_lifecycle_physical_isolated",
+      "reported_from": "isolated-db-rerun",
+      "rerun_name": "storage_lifecycle_physical_isolated",
+      "started_at": "2026-11-07T01:35:36.361628+00:00",
+      "status": "failed"
+    }
+  },
+  "limitations": [
+    "Postprocess re-runs only the three affected native jobs on fresh task-owned databases.",
+    "Other original jobs are carried from the first shared-database run and are not re-executed.",
+    "Loopback single-host fixtures only; no HA, multi-host, RPO/RTO or power-loss claim."
+  ],
+  "missing_fixture_qualification": "storage_lifecycle_physical did not pass isolated; fixture/lease qualification remains missing; DB/log/report preserved. Coordinator may attach an independently qualified physical fixture patch report.",
+  "no_new_native_reruns": true,
+  "original_run": {
+    "artifact": {
+      "binary_path": "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+      "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+      "build_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+      "created_at": "2026-11-07T01:23:25.829845+00:00",
+      "format_expected": 7,
+      "input_digest": "fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b",
+      "reused": false,
+      "schema_expected": 131,
+      "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+      "verify_valid": true
+    },
+    "core_passed": false,
+    "fresh_migrate": {
+      "actual_schema_version": "131",
+      "duration_seconds": 0.214,
+      "exit_code": 0,
+      "migration_rows": 54,
+      "public_tables": 79,
+      "status": "passed"
+    },
+    "logs_path": "/workspace/scratch/rootyard-round2/verify_final_core/logs-first-shared-db-run",
+    "native": {
+      "backup_sha256_legacy130": {
+        "cases": {
+          "checks": null,
+          "expected": 3,
+          "failed": 0,
+          "ok": true,
+          "passed": 3,
+          "report_passed": true
+        },
+        "status": "passed"
+      },
+      "ci_job_checkouts": {
+        "cases": {
+          "checks": null,
+          "expected": 15,
+          "failed": 1,
+          "ok": false,
+          "passed": 9,
+          "report_passed": false
+        },
+        "status": "failed"
+      },
+      "maintenance_jobs": {
+        "cases": {
+          "checks": null,
+          "expected": 7,
+          "failed": 0,
+          "ok": true,
+          "passed": 7,
+          "report_passed": true
+        },
+        "status": "passed"
+      },
+      "pando_maintenance_service": {
+        "cases": {
+          "checks": null,
+          "expected": 2,
+          "failed": 0,
+          "ok": true,
+          "passed": 2,
+          "report_passed": true
+        },
+        "status": "passed"
+      },
+      "sandbox_unittest": {
+        "cases": {
+          "checks": null,
+          "expected": 6,
+          "failed": 6,
+          "ok": false,
+          "passed": 0,
+          "report_passed": null
+        },
+        "status": "failed"
+      },
+      "schema_contract": {
+        "cases": {
+          "checks": {
+            "canonical": true,
+            "custom_migrate_idempotent": true,
+            "custom_search_path_bootstrap": true,
+            "restored003_upgrade": true,
+            "restored006_upgrade": true,
+            "restored007_upgrade": true,
+            "roundtrip": true,
+            "upgraded_roundtrip": true
+          },
+          "expected": 6,
+          "failed": 0,
+          "ok": true,
+          "passed": 6,
+          "report_passed": null
+        },
+        "status": "passed"
+      },
+      "sha256_matrix": {
+        "cases": {
+          "checks": null,
+          "expected": 6,
+          "failed": 0,
+          "ok": true,
+          "passed": 6,
+          "report_passed": true
+        },
+        "status": "passed"
+      },
+      "sha256_restore": {
+        "cases": {
+          "checks": null,
+          "expected": 2,
+          "failed": 0,
+          "ok": true,
+          "passed": 2,
+          "report_passed": true
+        },
+        "status": "passed"
+      },
+      "sha256_service": {
+        "cases": {
+          "checks": null,
+          "expected": 2,
+          "failed": 0,
+          "ok": true,
+          "passed": 2,
+          "report_passed": null
+        },
+        "status": "passed"
+      },
+      "storage_lifecycle": {
+        "cases": {
+          "checks": null,
+          "expected": 3,
+          "failed": 0,
+          "ok": true,
+          "passed": 3,
+          "report_passed": true
+        },
+        "status": "passed"
+      },
+      "storage_lifecycle_physical": {
+        "cases": {
+          "checks": null,
+          "expected": 8,
+          "failed": 1,
+          "ok": false,
+          "passed": 4,
+          "report_passed": false
+        },
+        "status": "failed"
+      }
+    },
+    "original_report": {
+      "artifact": {
+        "binary_path": "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+        "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+        "build_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+        "created_at": "2026-11-07T01:23:25.829845+00:00",
+        "format_expected": 7,
+        "input_digest": "fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b",
+        "reused": false,
+        "schema_expected": 131,
+        "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+        "verify_valid": true
+      },
+      "cgroup_preflight": {
+        "controllers_present": [
+          "cpu",
+          "cpuset",
+          "hugetlb",
+          "io",
+          "memory",
+          "pids"
+        ],
+        "counted_in_core": false,
+        "optional": true,
+        "reason": "cgroup delegation/write unavailable; optional positive test not run",
+        "status": "BLOCKED"
+      },
+      "commands": [
+        {
+          "command": [
+            "/workspace/scratch/rootyard-round2/build",
+            "verify_final_core",
+            "/workspace/rootyard-worktrees/round2-integrated"
+          ],
+          "duration_seconds": 66.48,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:23:24.433199+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/certified-build.log",
+          "name": "certified-build",
+          "started_at": "2026-11-07T01:22:17.953096+00:00",
+          "status": "passed"
+        },
+        {
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "/workspace/scratch/rootyard-round2/verify_build.py",
+            "verify_final_core",
+            "/workspace/rootyard-worktrees/round2-integrated"
+          ],
+          "duration_seconds": 0.365,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:23:24.798965+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/verify-build.log",
+          "name": "verify-build",
+          "started_at": "2026-11-07T01:23:24.433669+00:00",
+          "status": "passed"
+        },
+        {
+          "command": [
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "migrate"
+          ],
+          "duration_seconds": 0.214,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:23:26.086200+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/fresh-migrate.log",
+          "name": "fresh-migrate",
+          "started_at": "2026-11-07T01:23:25.871305+00:00",
+          "status": "passed"
+        },
+        {
+          "cases": {
+            "env_skip_branch": false,
+            "expected": null,
+            "failed": 0,
+            "ignored": 0,
+            "passed": 139
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "cargo",
+            "test",
+            "--locked",
+            "--lib",
+            "--",
+            "--test-threads=1"
+          ],
+          "duration_seconds": 68.799,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:24:34.922288+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/cargo-test-lib.log",
+          "name": "cargo-test-lib",
+          "started_at": "2026-11-07T01:23:26.123447+00:00",
+          "status": "passed"
+        },
+        {
+          "cases": {
+            "env_skip_branch": false,
+            "expected": 1,
+            "failed": 0,
+            "ignored": 0,
+            "passed": 1
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "cargo",
+            "test",
+            "--locked",
+            "--test",
+            "pando_maintenance",
+            "--",
+            "--test-threads=1"
+          ],
+          "duration_seconds": 80.444,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:25:55.367433+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/cargo-test-pando-maintenance.log",
+          "name": "cargo-test-pando-maintenance",
+          "started_at": "2026-11-07T01:24:34.922867+00:00",
+          "status": "passed"
+        },
+        {
+          "cases": {
+            "checks": null,
+            "expected": 2,
+            "failed": 0,
+            "ok": true,
+            "passed": 2,
+            "report_passed": null
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/sha256_service.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard"
+          ],
+          "duration_seconds": 4.002,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:25:59.371605+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/sha256_service.log",
+          "name": "sha256_service",
+          "started_at": "2026-11-07T01:25:55.368871+00:00",
+          "status": "passed"
+        },
+        {
+          "cases": {
+            "checks": null,
+            "expected": 6,
+            "failed": 0,
+            "ok": true,
+            "passed": 6,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/sha256_matrix.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/sha256_matrix.json"
+          ],
+          "duration_seconds": 10.004,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:26:05.374803+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/sha256_matrix.log",
+          "name": "sha256_matrix",
+          "started_at": "2026-11-07T01:25:55.369788+00:00",
+          "status": "passed"
+        },
+        {
+          "cases": {
+            "checks": null,
+            "expected": 2,
+            "failed": 0,
+            "ok": true,
+            "passed": 2,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/sha256_restore.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/sha256_restore.json"
+          ],
+          "duration_seconds": 84.03,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:27:24.403517+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/sha256_restore.log",
+          "name": "sha256_restore",
+          "started_at": "2026-11-07T01:26:00.372876+00:00",
+          "status": "passed"
+        },
+        {
+          "cases": {
+            "checks": null,
+            "expected": 3,
+            "failed": 0,
+            "ok": true,
+            "passed": 3,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/backup_sha256_legacy130.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--legacy-binary",
+            "/workspace/scratch/rootyard-round2/legacy130/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/backup_sha256_legacy130.json"
+          ],
+          "duration_seconds": 91.03,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:27:37.410541+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/backup_sha256_legacy130.log",
+          "name": "backup_sha256_legacy130",
+          "started_at": "2026-11-07T01:26:06.375848+00:00",
+          "status": "passed"
+        },
+        {
+          "cases": {
+            "checks": {
+              "canonical": true,
+              "custom_migrate_idempotent": true,
+              "custom_search_path_bootstrap": true,
+              "restored003_upgrade": true,
+              "restored006_upgrade": true,
+              "restored007_upgrade": true,
+              "roundtrip": true,
+              "upgraded_roundtrip": true
+            },
+            "expected": 6,
+            "failed": 0,
+            "ok": true,
+            "passed": 6,
+            "report_passed": null
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/schema_contract.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard"
+          ],
+          "duration_seconds": 6.001,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:27:31.407186+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/schema_contract.log",
+          "name": "schema_contract",
+          "started_at": "2026-11-07T01:27:25.404792+00:00",
+          "status": "passed"
+        },
+        {
+          "cases": {
+            "checks": null,
+            "expected": 15,
+            "failed": 1,
+            "ok": false,
+            "passed": 9,
+            "report_passed": false
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/ci_job_checkouts.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/ci_job_checkouts.json"
+          ],
+          "duration_seconds": 88.023,
+          "exit_code": 1,
+          "finished_at": "2026-11-07T01:29:00.432336+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/ci_job_checkouts.log",
+          "name": "ci_job_checkouts",
+          "started_at": "2026-11-07T01:27:32.408459+00:00",
+          "status": "failed"
+        },
+        {
+          "cases": {
+            "checks": null,
+            "expected": 3,
+            "failed": 0,
+            "ok": true,
+            "passed": 3,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/storage_lifecycle.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/storage_lifecycle.json"
+          ],
+          "duration_seconds": 18.006,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:27:56.418800+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/storage_lifecycle.log",
+          "name": "storage_lifecycle",
+          "started_at": "2026-11-07T01:27:38.411667+00:00",
+          "status": "passed"
+        },
+        {
+          "cases": {
+            "checks": null,
+            "expected": 8,
+            "failed": 1,
+            "ok": false,
+            "passed": 4,
+            "report_passed": false
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/storage_lifecycle_physical.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/storage_lifecycle_physical.json"
+          ],
+          "duration_seconds": 73.018,
+          "exit_code": 1,
+          "finished_at": "2026-11-07T01:29:10.438915+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/storage_lifecycle_physical.log",
+          "name": "storage_lifecycle_physical",
+          "started_at": "2026-11-07T01:27:57.419753+00:00",
+          "status": "failed"
+        },
+        {
+          "cases": {
+            "checks": null,
+            "expected": 7,
+            "failed": 0,
+            "ok": true,
+            "passed": 7,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/maintenance_jobs.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/maintenance_jobs.json"
+          ],
+          "duration_seconds": 6.001,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:29:07.435681+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/maintenance_jobs.log",
+          "name": "maintenance_jobs",
+          "started_at": "2026-11-07T01:29:01.433287+00:00",
+          "status": "passed"
+        },
+        {
+          "cases": {
+            "checks": null,
+            "expected": 2,
+            "failed": 0,
+            "ok": true,
+            "passed": 2,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/pando_maintenance_service.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/pando_maintenance_service.json"
+          ],
+          "duration_seconds": 28.015,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:29:36.452798+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/pando_maintenance_service.log",
+          "name": "pando_maintenance_service",
+          "started_at": "2026-11-07T01:29:08.436788+00:00",
+          "status": "passed"
+        },
+        {
+          "cases": {
+            "checks": null,
+            "expected": 6,
+            "failed": 6,
+            "ok": false,
+            "passed": 0,
+            "report_passed": null
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "-m",
+            "unittest",
+            "-v",
+            "tests.test_sandbox_service",
+            "tests.test_ci_sandbox"
+          ],
+          "duration_seconds": 33.012,
+          "exit_code": 1,
+          "finished_at": "2026-11-07T01:29:44.456241+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/sandbox_unittest.log",
+          "name": "sandbox_unittest",
+          "started_at": "2026-11-07T01:29:11.440286+00:00",
+          "status": "failed"
+        },
+        {
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "/workspace/scratch/rootyard-round2/verify_final_core/pando-probe-work/probe_adapted.py"
+          ],
+          "duration_seconds": 85.759,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:31:10.218561+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/pando-paired-probe.log",
+          "name": "pando-paired-probe",
+          "started_at": "2026-11-07T01:29:44.459211+00:00",
+          "status": "passed"
+        }
+      ],
+      "core_passed": false,
+      "expected_source": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+      "failures": [],
+      "finished_at": "2026-11-07T01:31:10.228506+00:00",
+      "fresh_migrate": {
+        "actual_schema_version": "131",
+        "duration_seconds": 0.214,
+        "exit_code": 0,
+        "migration_rows": 54,
+        "public_tables": 79,
+        "status": "passed"
+      },
+      "gaps": [
+        {
+          "detail": "SystemExit: 1",
+          "scope": "pipeline"
+        }
+      ],
+      "limitations": [
+        "Loopback single-host fixtures; no HA, multi-host, RPO/RTO or power-loss claim.",
+        "Cgroup-positive sandbox evidence is optional and not counted if unavailable.",
+        "Pando paired probe reuses the same Garage bucket/Vault fixture; it proves encrypted closure transport, not cross-store disaster recovery."
+      ],
+      "native": {
+        "backup_sha256_legacy130": {
+          "cases": {
+            "checks": null,
+            "expected": 3,
+            "failed": 0,
+            "ok": true,
+            "passed": 3,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/backup_sha256_legacy130.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--legacy-binary",
+            "/workspace/scratch/rootyard-round2/legacy130/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/backup_sha256_legacy130.json"
+          ],
+          "duration_seconds": 91.03,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:27:37.410541+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/backup_sha256_legacy130.log",
+          "name": "backup_sha256_legacy130",
+          "started_at": "2026-11-07T01:26:06.375848+00:00",
+          "status": "passed"
+        },
+        "ci_job_checkouts": {
+          "cases": {
+            "checks": null,
+            "expected": 15,
+            "failed": 1,
+            "ok": false,
+            "passed": 9,
+            "report_passed": false
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/ci_job_checkouts.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/ci_job_checkouts.json"
+          ],
+          "duration_seconds": 88.023,
+          "exit_code": 1,
+          "finished_at": "2026-11-07T01:29:00.432336+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/ci_job_checkouts.log",
+          "name": "ci_job_checkouts",
+          "started_at": "2026-11-07T01:27:32.408459+00:00",
+          "status": "failed"
+        },
+        "maintenance_jobs": {
+          "cases": {
+            "checks": null,
+            "expected": 7,
+            "failed": 0,
+            "ok": true,
+            "passed": 7,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/maintenance_jobs.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/maintenance_jobs.json"
+          ],
+          "duration_seconds": 6.001,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:29:07.435681+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/maintenance_jobs.log",
+          "name": "maintenance_jobs",
+          "started_at": "2026-11-07T01:29:01.433287+00:00",
+          "status": "passed"
+        },
+        "pando_maintenance_service": {
+          "cases": {
+            "checks": null,
+            "expected": 2,
+            "failed": 0,
+            "ok": true,
+            "passed": 2,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/pando_maintenance_service.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/pando_maintenance_service.json"
+          ],
+          "duration_seconds": 28.015,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:29:36.452798+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/pando_maintenance_service.log",
+          "name": "pando_maintenance_service",
+          "started_at": "2026-11-07T01:29:08.436788+00:00",
+          "status": "passed"
+        },
+        "sandbox_unittest": {
+          "cases": {
+            "checks": null,
+            "expected": 6,
+            "failed": 6,
+            "ok": false,
+            "passed": 0,
+            "report_passed": null
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "-m",
+            "unittest",
+            "-v",
+            "tests.test_sandbox_service",
+            "tests.test_ci_sandbox"
+          ],
+          "duration_seconds": 33.012,
+          "exit_code": 1,
+          "finished_at": "2026-11-07T01:29:44.456241+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/sandbox_unittest.log",
+          "name": "sandbox_unittest",
+          "started_at": "2026-11-07T01:29:11.440286+00:00",
+          "status": "failed"
+        },
+        "schema_contract": {
+          "cases": {
+            "checks": {
+              "canonical": true,
+              "custom_migrate_idempotent": true,
+              "custom_search_path_bootstrap": true,
+              "restored003_upgrade": true,
+              "restored006_upgrade": true,
+              "restored007_upgrade": true,
+              "roundtrip": true,
+              "upgraded_roundtrip": true
+            },
+            "expected": 6,
+            "failed": 0,
+            "ok": true,
+            "passed": 6,
+            "report_passed": null
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/schema_contract.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard"
+          ],
+          "duration_seconds": 6.001,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:27:31.407186+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/schema_contract.log",
+          "name": "schema_contract",
+          "started_at": "2026-11-07T01:27:25.404792+00:00",
+          "status": "passed"
+        },
+        "sha256_matrix": {
+          "cases": {
+            "checks": null,
+            "expected": 6,
+            "failed": 0,
+            "ok": true,
+            "passed": 6,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/sha256_matrix.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/sha256_matrix.json"
+          ],
+          "duration_seconds": 10.004,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:26:05.374803+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/sha256_matrix.log",
+          "name": "sha256_matrix",
+          "started_at": "2026-11-07T01:25:55.369788+00:00",
+          "status": "passed"
+        },
+        "sha256_restore": {
+          "cases": {
+            "checks": null,
+            "expected": 2,
+            "failed": 0,
+            "ok": true,
+            "passed": 2,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/sha256_restore.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/sha256_restore.json"
+          ],
+          "duration_seconds": 84.03,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:27:24.403517+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/sha256_restore.log",
+          "name": "sha256_restore",
+          "started_at": "2026-11-07T01:26:00.372876+00:00",
+          "status": "passed"
+        },
+        "sha256_service": {
+          "cases": {
+            "checks": null,
+            "expected": 2,
+            "failed": 0,
+            "ok": true,
+            "passed": 2,
+            "report_passed": null
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/sha256_service.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard"
+          ],
+          "duration_seconds": 4.002,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:25:59.371605+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/sha256_service.log",
+          "name": "sha256_service",
+          "started_at": "2026-11-07T01:25:55.368871+00:00",
+          "status": "passed"
+        },
+        "storage_lifecycle": {
+          "cases": {
+            "checks": null,
+            "expected": 3,
+            "failed": 0,
+            "ok": true,
+            "passed": 3,
+            "report_passed": true
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/storage_lifecycle.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/storage_lifecycle.json"
+          ],
+          "duration_seconds": 18.006,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:27:56.418800+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/storage_lifecycle.log",
+          "name": "storage_lifecycle",
+          "started_at": "2026-11-07T01:27:38.411667+00:00",
+          "status": "passed"
+        },
+        "storage_lifecycle_physical": {
+          "cases": {
+            "checks": null,
+            "expected": 8,
+            "failed": 1,
+            "ok": false,
+            "passed": 4,
+            "report_passed": false
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "python",
+            "tests/storage_lifecycle_physical.py",
+            "--binary",
+            "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+            "--report",
+            "/workspace/scratch/rootyard-round2/verify_final_core/reports/storage_lifecycle_physical.json"
+          ],
+          "duration_seconds": 73.018,
+          "exit_code": 1,
+          "finished_at": "2026-11-07T01:29:10.438915+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/storage_lifecycle_physical.log",
+          "name": "storage_lifecycle_physical",
+          "started_at": "2026-11-07T01:27:57.419753+00:00",
+          "status": "failed"
+        }
+      },
+      "pando_probe": {
+        "archive_format": 7,
+        "counted_in_core": false,
+        "duration_seconds": 85.759,
+        "exit_code": 0,
+        "expected_format": 7,
+        "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/pando-paired-probe.log",
+        "prior_format": 6,
+        "report": "/workspace/scratch/rootyard-round2/verify_final_core/pando-probe-work/run-9ymmuqvx/report.json",
+        "status": "passed"
+      },
+      "passed": false,
+      "report_path": "/workspace/scratch/rootyard-round2/verify_final_core/report.json",
+      "rust": {
+        "lib": {
+          "cases": {
+            "env_skip_branch": false,
+            "expected": null,
+            "failed": 0,
+            "ignored": 0,
+            "passed": 139
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "cargo",
+            "test",
+            "--locked",
+            "--lib",
+            "--",
+            "--test-threads=1"
+          ],
+          "duration_seconds": 68.799,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:24:34.922288+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/cargo-test-lib.log",
+          "name": "cargo-test-lib",
+          "started_at": "2026-11-07T01:23:26.123447+00:00",
+          "status": "passed"
+        },
+        "lib_stats": {
+          "env_skip_branch": false,
+          "failed": 0,
+          "ignored": 0,
+          "passed": 139,
+          "raw_log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/cargo-test-lib.log",
+          "result_lines": [
+            {
+              "failed": 0,
+              "ignored": 0,
+              "outcome": "ok",
+              "passed": 139
+            }
+          ]
+        },
+        "pando_maintenance": {
+          "cases": {
+            "env_skip_branch": false,
+            "expected": 1,
+            "failed": 0,
+            "ignored": 0,
+            "passed": 1
+          },
+          "command": [
+            "/workspace/scratch/deepseek-rootyard/env-run",
+            "cargo",
+            "test",
+            "--locked",
+            "--test",
+            "pando_maintenance",
+            "--",
+            "--test-threads=1"
+          ],
+          "duration_seconds": 80.444,
+          "exit_code": 0,
+          "finished_at": "2026-11-07T01:25:55.367433+00:00",
+          "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/cargo-test-pando-maintenance.log",
+          "name": "cargo-test-pando-maintenance",
+          "started_at": "2026-11-07T01:24:34.922867+00:00",
+          "status": "passed"
+        },
+        "pando_stats": {
+          "env_skip_branch": false,
+          "failed": 0,
+          "ignored": 0,
+          "passed": 1,
+          "raw_log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/cargo-test-pando-maintenance.log",
+          "result_lines": [
+            {
+              "failed": 0,
+              "ignored": 0,
+              "outcome": "ok",
+              "passed": 1
+            }
+          ]
+        },
+        "passed": true
+      },
+      "schema": 1,
+      "source": {
+        "after_all": {
+          "at": "2026-11-07T01:31:10.226601+00:00",
+          "clean": true,
+          "head": "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+        },
+        "before_build": {
+          "at": "2026-11-07T01:22:17.952637+00:00",
+          "clean": true,
+          "head": "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+        }
+      },
+      "stages": [
+        {
+          "at": "2026-11-07T01:22:17.952907+00:00",
+          "name": "build"
+        },
+        {
+          "at": "2026-11-07T01:23:24.799578+00:00",
+          "certificate": {
+            "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+            "built_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+            "production_inputs_sha256": "fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b",
+            "role": "verify_final_core",
+            "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+            "valid": true
+          },
+          "name": "publish"
+        }
+      ],
+      "started_at": "2026-11-07T01:22:17.946225+00:00",
+      "state": "failed",
+      "updated_at": "2026-11-07T01:31:10.228510+00:00"
+    },
+    "pando_probe": {
+      "archive_format": 7,
+      "counted_in_core": false,
+      "duration_seconds": 85.759,
+      "exit_code": 0,
+      "expected_format": 7,
+      "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/pando-paired-probe.log",
+      "prior_format": 6,
+      "report": "/workspace/scratch/rootyard-round2/verify_final_core/pando-probe-work/run-9ymmuqvx/report.json",
+      "status": "passed"
+    },
+    "report_path": "/workspace/scratch/rootyard-round2/verify_final_core/report-first-shared-db-run.json",
+    "rust_passed": true,
+    "state": "failed",
+    "status_path": "/workspace/scratch/rootyard-round2/verify_final_core/status-first-shared-db-run.json"
+  },
+  "pando_probe": {
+    "archive_format": 7,
+    "counted_in_core": false,
+    "duration_seconds": 85.759,
+    "exit_code": 0,
+    "expected_format": 7,
+    "log": "/workspace/scratch/rootyard-round2/verify_final_core/logs/pando-paired-probe.log",
+    "prior_format": 6,
+    "report": "/workspace/scratch/rootyard-round2/verify_final_core/pando-probe-work/run-9ymmuqvx/report.json",
+    "status": "passed"
+  },
+  "passed": false,
+  "phase": "postprocess",
+  "report_path": "/workspace/scratch/rootyard-round2/verify_final_core/report.json",
+  "root_cause_validation": {
+    "conclusions": {
+      "isolation": "CI and sandbox failures were caused by one shared database: DB-global migration/advisory locks and an unqualified information_schema count across random schemas. Both complete suites pass on unique databases.",
+      "physical": "Physical full suite still fails on an isolated database; fixture/lease issue remains. Failure was preserved, not looped or forced; coordinator/maint implementation must fix the fixture."
+    },
+    "isolated_results": {
+      "ci_job_checkouts_isolated": {
+        "cases": {
+          "expected": 15,
+          "failed": 0,
+          "ok": true,
+          "passed": 15,
+          "report_passed": true
+        },
+        "database": "round2_vfc_ci_641195e2df",
+        "log": "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-logs/ci_job_checkouts_isolated.log",
+        "status": "passed"
+      },
+      "sandbox_unittest_isolated": {
+        "cases": {
+          "expected": 6,
+          "failed": 0,
+          "ok": true,
+          "passed": 6,
+          "report_passed": null
+        },
+        "database": "round2_vfc_sandbox_7c6d8da7aa",
+        "log": "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-logs/sandbox_unittest_isolated.log",
+        "status": "passed"
+      },
+      "storage_lifecycle_physical_isolated": {
+        "cases": {
+          "expected": 8,
+          "failed": 1,
+          "ok": false,
+          "passed": 0,
+          "report_passed": false
+        },
+        "database": "round2_vfc_physical_0ff86e6e62",
+        "log": "/workspace/scratch/rootyard-round2/verify_final_core/postprocess-logs/storage_lifecycle_physical_isolated.log",
+        "status": "failed"
+      }
+    },
+    "shared_db_failure_evidence": {
+      "ci": {
+        "key_failure": "cancel_revoke_and_issuer_fences: canceling statement due to lock timeout",
+        "recorded_cases": {
+          "checks": null,
+          "expected": 15,
+          "failed": 1,
+          "ok": false,
+          "passed": 9,
+          "report_passed": false
+        },
+        "recorded_status": "failed"
+      },
+      "physical": {
+        "key_failure": "enospc_pack_rewrite_recovers: maintenance state did not reach true (ref_projection missing)",
+        "recorded_cases": {
+          "checks": null,
+          "expected": 8,
+          "failed": 1,
+          "ok": false,
+          "passed": 4,
+          "report_passed": false
+        },
+        "recorded_status": "failed"
+      },
+      "sandbox": {
+        "key_failures": [
+          "information_schema terminal-column count 3 instead of 1 because query is not schema-qualified while multiple schemas share the database",
+          "migrate canceling statement due to lock timeout"
+        ],
+        "recorded_status": "failed",
+        "unqualified_query": "SELECT count(*) FROM information_schema.columns WHERE table_name='sandbox_jobs' AND column_name='terminal'"
+      }
+    }
+  },
+  "schema": 1,
+  "source_checks": {
+    "after_postprocess": {
+      "at": "2026-11-07T01:36:36.963899+00:00",
+      "clean": true,
+      "head": "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+    },
+    "before_postprocess": {
+      "at": "2026-11-07T01:33:16.929220+00:00",
+      "clean": true,
+      "head": "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+    },
+    "finalizer": {
+      "after": {
+        "at": "2026-11-07T01:36:39.019773+00:00",
+        "clean": true,
+        "head": "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+      },
+      "before": {
+        "at": "2026-11-07T01:35:18.765827+00:00",
+        "clean": true,
+        "head": "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+      }
+    }
+  },
+  "started_at": "2026-11-07T01:33:16.923527+00:00",
+  "state": "failed",
+  "updated_at": "2026-11-07T01:36:36.969221+00:00",
+  "wrapper_correction": {
+    "applies_to_pid": 250386,
+    "loaded_wrapper_had": "except BaseException catching SystemExit(0)",
+    "note": "Wrapper exit-code bug did not alter any job result; validation uses actual per-job records, not the wrapper exit status.",
+    "on_disk_wrappers_fixed": "pipeline.py and postprocess.py now catch Exception and call sys.exit outside main",
+    "wrapper_bug_records": {
+      "/workspace/scratch/rootyard-round2/verify_final_core/report.json": "/workspace/scratch/rootyard-round2/verify_final_core/report-wrapper-systemexit-bug.json",
+      "/workspace/scratch/rootyard-round2/verify_final_core/status.json": "/workspace/scratch/rootyard-round2/verify_final_core/status-wrapper-systemexit-bug.json"
+    },
+    "wrapper_gap_detected": false
+  }
+}

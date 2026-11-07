@@ -1,0 +1,36 @@
+{
+  "measurement_kind": "native_execution",
+  "simulated_fields": false,
+  "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "source_worktree_dirty": false,
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "python": "3.12.14",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)"
+  },
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "mem_total_kb": 18440100
+  },
+  "topology": "one disposable PostgreSQL 17 server with a CA-signed localhost certificate and an external Rootyard client",
+  "dataset": "one migration/connection attempt per positive and negative TLS/auth case",
+  "workload": "Rootyard migrations over verify-full TLS plus wrong-password, wrong-root, hostname-mismatch and explicit sslmode=disable negative checks",
+  "limits": [
+    "one local PostgreSQL server and loopback client",
+    "proves client TLS/auth validation, not database HA or remote network policy"
+  ],
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "binary_size_bytes": 316382568,
+  "harness_sha256": "0dd9157986d94e5a12291389406a00ed6f0b75b471594618ccfbc5a7dc35a39c",
+  "kind": "native_postgresql_tls",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "encrypted": true,
+  "scram_sha256_authenticated": true,
+  "wrong_password_rejected": true,
+  "ca_validation_rejected_wrong_root": true,
+  "hostname_validation_rejected_ip_mismatch": true,
+  "explicit_downgrade_rejected": true
+}

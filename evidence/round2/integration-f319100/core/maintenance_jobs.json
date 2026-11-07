@@ -1,0 +1,56 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "seconds": 0.8354,
+      "detail": null
+    },
+    {
+      "name": "fixtures",
+      "status": "passed",
+      "seconds": 1.0024,
+      "detail": "One repository with all four states plus an exact created_at tie, a 30-row repository, and foreign-repository jobs"
+    },
+    {
+      "name": "detail",
+      "status": "passed",
+      "seconds": 0.0328,
+      "detail": "Detail returns durable identity/progress/result/error/timestamps without lease capabilities; foreign and unknown ids are 404"
+    },
+    {
+      "name": "pagination",
+      "status": "passed",
+      "seconds": 0.4058,
+      "detail": "Pages of every size reproduce one newest-first order including an exact timestamp tie; state filter, 25/100 bounds and repository-scoped cursors hold"
+    },
+    {
+      "name": "rejected_queries",
+      "status": "passed",
+      "seconds": 0.0213,
+      "detail": "Malformed, duplicate, unknown, out-of-range and non-canonical cursor queries are rejected before any read"
+    },
+    {
+      "name": "access",
+      "status": "passed",
+      "seconds": 0.2268,
+      "detail": "Owner read-only tokens are 403, read/triage/write collaborators are 403, maintain/admin can read, unauthorized private access stays 404"
+    },
+    {
+      "name": "scheduler_visibility",
+      "status": "passed",
+      "seconds": 2.6663,
+      "detail": {
+        "observable_job": "60d6065d-4833-4992-bba5-ce376a5e8eb8",
+        "kind": "gitfs_stage_cleanup"
+      }
+    }
+  ],
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "limitations": [
+    "Keyset pages are live views, not snapshots across requests.",
+    "The scheduler case covers one native push on a loopback server; it is not a throughput or multi-node qualification.",
+    "No index is added for the newest-first ordering, so planner choice is not fixed."
+  ]
+}

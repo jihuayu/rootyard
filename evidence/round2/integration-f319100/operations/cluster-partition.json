@@ -1,0 +1,38 @@
+{
+  "measurement_kind": "native_execution",
+  "simulated_fields": false,
+  "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "source_worktree_dirty": false,
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "python": "3.12.14",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)"
+  },
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "mem_total_kb": 18440100
+  },
+  "topology": "two Rust data processes and volumes on one host sharing PostgreSQL through a disposable source-only TCP proxy; trusted local process-session fence",
+  "dataset": "one private repository with an acknowledged commit before isolation and a new push after target promotion",
+  "workload": "native Git push/fetch while all source-only PostgreSQL proxy sockets are cut; measured replica promotion after source session kill and post-takeover push",
+  "limits": [
+    "single-host TCP isolation; no kernel network namespace partition",
+    "local process-session fence only; no cross-host fencing or automatic PostgreSQL leader election"
+  ],
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "binary_size_bytes": 316382568,
+  "harness_sha256": "b5c2c80c558c1932717beede395a6584a2f44afd3d60470063136e48e996dcbc",
+  "kind": "native_tcp_partition_takeover",
+  "fault": "closed source-only PostgreSQL TCP proxy and all its live sockets",
+  "source_metadata_status_after_partition": 503,
+  "old_source_session_killed": true,
+  "durable_restart_block": true,
+  "acknowledged_oid_before_partition": "e87197c6069397e94fa47811f2f731d10d1d8086",
+  "rpo_lost_acknowledged_commits": 0,
+  "takeover_ms": 5220.547,
+  "new_route_epoch": 2,
+  "post_takeover_oid": "e5d455e8aced726ef8724bd2938c64390cbb3e7a"
+}

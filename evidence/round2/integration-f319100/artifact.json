@@ -1,0 +1,12 @@
+{
+  "binary_path": "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "build_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "created_at": "2026-11-07T01:23:25.829845+00:00",
+  "format_expected": 7,
+  "input_digest": "fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b",
+  "reused": false,
+  "schema_expected": 131,
+  "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "verify_valid": true
+}

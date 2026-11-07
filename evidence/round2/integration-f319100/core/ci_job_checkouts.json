@@ -1,0 +1,200 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "setup_checkout",
+      "status": "passed",
+      "seconds": 3.4096,
+      "detail": {
+        "plan_matches_durable_source_receipt": true,
+        "bearer_persisted_only_as_digest": true
+      }
+    },
+    {
+      "name": "native_clones_and_closure",
+      "status": "passed",
+      "seconds": 2.4949,
+      "detail": {
+        "native_protocols": [
+          0,
+          2
+        ],
+        "full_history": true,
+        "exact_physical_object_count": 7,
+        "ordinary_owner_view_separate": true
+      }
+    },
+    {
+      "name": "declared_tags_and_target_history",
+      "status": "passed",
+      "seconds": 2.9934,
+      "detail": {
+        "annotated_tag": true,
+        "only_declared_refs": true,
+        "target_shallow": true,
+        "exact_physical_object_count": 8
+      }
+    },
+    {
+      "name": "object_wants_do_not_escape",
+      "status": "passed",
+      "seconds": 5.8535,
+      "detail": {
+        "target_wants_allowed": true,
+        "ancestors_verified_in_full_clone": true,
+        "known_unrelated_commit_and_blob_wants_denied": true,
+        "protocols": [
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "native_denials_survive_backend_exit",
+      "status": "passed",
+      "seconds": 47.4235,
+      "detail": {
+        "native_exit_precedes_cgi_delivery": true,
+        "denied_requests": 32,
+        "protocols": [
+          0,
+          2
+        ],
+        "explicit_git_denial_preserved": true,
+        "no_pack_bytes": true
+      }
+    },
+    {
+      "name": "early_stdin_failure_preserves_denial",
+      "status": "passed",
+      "seconds": 4.5951,
+      "detail": {
+        "stdin_closed_before_delayed_output": true,
+        "explicit_denial_clean_403": true,
+        "partial_pack_never_clean_success": true,
+        "completed_input_partial_pack_still_fails": true,
+        "denied_backend_descendant_terminated": true,
+        "observations": [
+          {
+            "mode": "denial",
+            "status": 403,
+            "complete": true,
+            "received_bytes": 37,
+            "received_prefix": "b'{\"error\":\"Git target request denied\"}'"
+          },
+          {
+            "mode": "partial-pack",
+            "status": 200,
+            "complete": false,
+            "received_bytes": 8,
+            "received_prefix": "b'0008NAK\\n'"
+          },
+          {
+            "mode": "partial-pack-after-input",
+            "status": 200,
+            "complete": false,
+            "received_bytes": 8,
+            "received_prefix": "b'0008NAK\\n'"
+          }
+        ]
+      }
+    },
+    {
+      "name": "route_and_audience_scope",
+      "status": "passed",
+      "seconds": 0.6539,
+      "detail": {
+        "job_token_not_owner_credential": true,
+        "oid_owner_repo_and_audience_bound": true
+      }
+    },
+    {
+      "name": "immutable_issuance_and_concurrency",
+      "status": "passed",
+      "seconds": 3.8629,
+      "detail": {
+        "exact_retry_has_no_token": true,
+        "immutable_fields": 4,
+        "concurrent_identical_requests": 6,
+        "token_disclosures": 1,
+        "concurrent_cancel_is_terminal": true
+      }
+    },
+    {
+      "name": "source_evidence_and_input_validation",
+      "status": "passed",
+      "seconds": 6.4782,
+      "detail": {
+        "writable_owner_required": true,
+        "receipt_and_native_root_required": true,
+        "malformed_inputs_rejected": true
+      }
+    },
+    {
+      "name": "cancel_revoke_and_issuer_fences",
+      "status": "passed",
+      "seconds": 8.9738,
+      "detail": {
+        "preissue_cancellation_terminal": true,
+        "issued_cancel_and_revoke_terminal": true,
+        "issuer_revoked_readonly_expired_denied": true,
+        "expired_job_denied": true
+      }
+    },
+    {
+      "name": "live_database_and_repository_fences",
+      "status": "passed",
+      "seconds": 0.4188,
+      "detail": {
+        "prepared_view_does_not_bypass_live_sql": true,
+        "recovering_and_generation_fenced": true
+      }
+    },
+    {
+      "name": "tampered_job_views_fail_closed",
+      "status": "passed",
+      "seconds": 2.1497,
+      "detail": {
+        "tampered_metadata_cases": 7,
+        "extra_unreachable_blob_denied": true,
+        "restored_view_serves": true
+      }
+    },
+    {
+      "name": "authorization_rechecked_after_closure",
+      "status": "passed",
+      "seconds": 3.5468,
+      "detail": {
+        "cancel_during_pack_preparation_denied": true,
+        "database_failure_after_preparation_denied": true,
+        "denied_before_http_backend": true
+      }
+    },
+    {
+      "name": "issuer_revoked_during_source_verification",
+      "status": "passed",
+      "seconds": 1.9282,
+      "detail": {
+        "issuer_revoked_during_native_verification": true,
+        "no_credential_or_authority_row_created": true
+      }
+    },
+    {
+      "name": "deleted_source_ref_and_primary_offline",
+      "status": "passed",
+      "seconds": 4.0391,
+      "detail": {
+        "source_ref_deleted_before_first_target_sync": true,
+        "source_gc_survived": true,
+        "primary_offline_job_clone_full_history": true,
+        "failed_sync_preserves_job_view": true
+      }
+    }
+  ],
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "limitations": [
+    "Isolated loopback services and synthetic fixtures, not production performance or power-loss validation.",
+    "Database failures use renamed run-owned schema tables, not a database network outage.",
+    "Active-stream termination is tested separately with a throttled transfer."
+  ]
+}

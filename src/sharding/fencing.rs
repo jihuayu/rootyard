@@ -202,11 +202,12 @@ pub async fn check_hook_fence(
     repo_dir: &StdPath,
     admitted_generation: i64,
     admitted_epoch: i64,
+    volume_id: Uuid,
 ) -> Result<(), Error> {
     let marker = read_volume_marker_at(repo_dir)?;
     let pending = client.query_opt(
-        "SELECT id FROM shard_marker_transitions WHERE repository_id=$1 AND state='pending' LIMIT 1",
-        &[&repo_id],
+        "SELECT id FROM shard_marker_transitions WHERE repository_id=$1          AND volume_id=$2 AND state='pending' LIMIT 1",
+        &[&repo_id, &volume_id],
     ).await.map_err(Error::internal)?.is_some();
     if pending { return Err(conflict("shard marker transition pending")); }
     let repo_generation: i64 = client.query_one(

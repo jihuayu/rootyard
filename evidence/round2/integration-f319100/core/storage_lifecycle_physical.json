@@ -1,0 +1,87 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "physical_loose_packed_and_pin",
+      "status": "passed",
+      "seconds": 18.4436,
+      "detail": {
+        "loose_deleted": "60509233a64a70e3e3d7f718fe589fb53053ebde",
+        "packed_deleted": "69a26da4b5f1cbe03d2e7dbfc8dde9acdc8604c4",
+        "reachable_base_preserved": "2865397dbf68ec9cbcc48ba87005c51314a2cee9",
+        "ci_pin_preserved": "f7d4264fd02da237b2891a9780aed2477157d3e8"
+      }
+    },
+    {
+      "name": "backup_barrier_blocks_due_delete",
+      "status": "passed",
+      "seconds": 15.8906,
+      "detail": {
+        "backup_barrier_blocked_delete": true,
+        "fetch_preserved_base": "82bb5c164dc3b0b94f8f5bc335ac9f51ac523591",
+        "orphan_deleted_after_barrier": "76a26476c9563c476e4be521bebdb0a49c34acba"
+      }
+    },
+    {
+      "name": "active_fetch_snapshot_blocks_gc",
+      "status": "passed",
+      "seconds": 11.2147,
+      "detail": {
+        "fetch_held_native_snapshot": true,
+        "due_delete_waited_for_fetch": true,
+        "orphan_deleted_after_fetch": "d10123ce9131d0fc036d5e5d5b0cfbe5abd63d61"
+      }
+    },
+    {
+      "name": "active_push_publication_blocks_gc",
+      "status": "passed",
+      "seconds": 11.4752,
+      "detail": {
+        "native_receive_pack_held_writer": true,
+        "due_delete_waited_for_push": true,
+        "incoming_commit_preserved": "30ee2a4d98f73f6900206553ea692477095b8b75",
+        "orphan_deleted_after_push": "9f764f3fe132968cd7efc005c5b6561c26297fc5"
+      }
+    },
+    {
+      "name": "enospc_pack_rewrite_recovers",
+      "status": "passed",
+      "seconds": 22.7875,
+      "detail": {
+        "enospc_failed_without_data_loss": true,
+        "retry_deleted_due_packed_oid": "da8d616dbe6e4f08f754be3953b5ecef6799ad8a",
+        "reachable_base_preserved": "ae0d26898be125573b4ba88769187cb26c05a91c"
+      }
+    },
+    {
+      "name": "unlink_crash_reconciles_intent",
+      "status": "passed",
+      "seconds": 23.5168,
+      "detail": {
+        "committed_intent_survived_sigkill": true,
+        "absent_object_reconciled_deleted": "6f4637ddbee9b7feff141f8556158d5045c21b2d",
+        "reachable_base_preserved": "9c61d5db165466ba42604caec08e3cebbb2b53a3"
+      }
+    },
+    {
+      "name": "younger_unreachable_history_keeps_old_blob",
+      "status": "passed",
+      "seconds": 25.8367,
+      "detail": {
+        "younger_commit_preserved_old_blob_until_due": true,
+        "closure_deleted_after_all_graces": true,
+        "retained_base": "4b28f85156fa3be990d88458889cad23b7469cc6"
+      }
+    },
+    {
+      "name": "namespace_source_oid_survives_branch_deletion",
+      "status": "passed",
+      "seconds": 14.2571,
+      "detail": {
+        "deleted_branch_source_retained": "18928689d1afa067b953126b15f422b894b0ec36",
+        "future_namespace_view_created": "bf2156c8-c1ec-466b-b478-4d32c0b2a555"
+      }
+    }
+  ],
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153"
+}

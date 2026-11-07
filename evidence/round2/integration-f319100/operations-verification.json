@@ -1,0 +1,805 @@
+{
+ "artifact": {
+  "binary": {
+   "immutable_mode": true,
+   "inside_repo": false,
+   "mode": "0o500",
+   "path": "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+   "sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "size_bytes": 316382568
+  },
+  "computed_input_digest": "fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b",
+  "current": {
+   "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "source_worktree_dirty": false
+  },
+  "declared": {
+   "format": 7,
+   "schema": 131
+  },
+  "errors": [],
+  "raw_artifact": {
+   "binary_path": "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+   "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "build_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "created_at": "2026-11-07T01:23:25.829845+00:00",
+   "format_expected": 7,
+   "input_digest": "fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b",
+   "reused": false,
+   "schema_expected": 131,
+   "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "verify_valid": true
+  },
+  "values": {
+   "binary_path": "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+   "binary_sha": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "format": "7",
+   "input": "fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b",
+   "schema": "131",
+   "source": "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+  }
+ },
+ "artifact_path": "/workspace/scratch/rootyard-round2/verify_final_core/artifact.json",
+ "binary": {
+  "immutable_mode": true,
+  "inside_repo": false,
+  "mode": "0o500",
+  "path": "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+  "sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "size_bytes": 316382568
+ },
+ "concurrency": 2,
+ "duration_s": 295.819,
+ "error": null,
+ "expected_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+ "finished_at": 1794014810.280631,
+ "gate": {
+  "accepted_expected": true,
+  "binary_sha_matches": true,
+  "blocked_checks": [
+   "2c. external physical-host storage fencing and automatic PostgreSQL HA",
+   "2d. multi-broker Kafka failover"
+  ],
+  "command": [
+   "/workspace/scratch/deepseek-rootyard/env-run",
+   "python3",
+   "tests/cluster_operations_gate.py",
+   "--evidence-dir",
+   "/workspace/scratch/rootyard-round2/verify_final_ops/evidence",
+   "--report",
+   "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-operations-gate.json",
+   "--source-commit",
+   "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+  ],
+  "domain_failures": [],
+  "duration_s": 0.064,
+  "exit_code": 1,
+  "expected_local_result": true,
+  "failed_checks": [],
+  "issues": {
+   "43": "blocked_external_ha_and_source_fence",
+   "44": "passed_local_single_host"
+  },
+  "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/cluster-operations-gate.log",
+  "production_scope": "not_certified; local single-host evidence only",
+  "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-operations-gate.json",
+  "report_sha256": "126f6763817f8ac4b78c3797217eb51c1cb5129c33c76516ac4b4fa8f3351763",
+  "state": "done",
+  "status": "blocked",
+  "timed_out": false
+ },
+ "historical_notes": [
+  "prior source frames native old-scope/bad-cache and ENOSPC failures are historical, not reused",
+  "old source 13/340e receipts were not reused; one frozen f319100 artifact/bin is used"
+ ],
+ "jobs": {
+  "disk": {
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_disk_pressure_native.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-disk-pressure.json"
+   ],
+   "duration_s": 4.042,
+   "exit_code": 0,
+   "finished_at": 1794014720.1376579,
+   "harness_sha256": "3ef587dffabe33879909ebd781754972b81ad7256f475de6204fc10308820321",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/disk.log",
+   "pid": 238553,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-disk-pressure.json",
+   "report_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "report_harness_sha256": "3ef587dffabe33879909ebd781754972b81ad7256f475de6204fc10308820321",
+   "report_present": true,
+   "report_sha256": "ed86af86ee841c31b584322a8936a0cfcf81fc47bce137f240c13932930de957",
+   "report_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "report_worktree_dirty": false,
+   "source_after": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "source_before": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "started_at": 1794014716.0956736,
+   "state": "done",
+   "timeout_s": 900,
+   "validation": {
+    "errors": [],
+    "valid": true
+   }
+  },
+  "gate": {
+   "accepted_expected": true,
+   "binary_sha_matches": true,
+   "blocked_checks": [
+    "2c. external physical-host storage fencing and automatic PostgreSQL HA",
+    "2d. multi-broker Kafka failover"
+   ],
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_operations_gate.py",
+    "--evidence-dir",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-operations-gate.json",
+    "--source-commit",
+    "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+   ],
+   "domain_failures": [],
+   "duration_s": 0.064,
+   "exit_code": 1,
+   "expected_local_result": true,
+   "failed_checks": [],
+   "issues": {
+    "43": "blocked_external_ha_and_source_fence",
+    "44": "passed_local_single_host"
+   },
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/cluster-operations-gate.log",
+   "production_scope": "not_certified; local single-host evidence only",
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-operations-gate.json",
+   "report_sha256": "126f6763817f8ac4b78c3797217eb51c1cb5129c33c76516ac4b4fa8f3351763",
+   "state": "done",
+   "status": "blocked",
+   "timed_out": false
+  },
+  "kafka": {
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_kafka_tls_native.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-kafka-tls.json",
+    "--kafka-home",
+    "/workspace/scratch/rootyard-round2/ops43_44/kafka-home"
+   ],
+   "duration_s": 37.09,
+   "exit_code": 0,
+   "finished_at": 1794014646.8889258,
+   "harness_sha256": "344215c01268bd329adc7a5b988287a80815ceda373a2c63239839a6b1d4ee29",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/kafka.log",
+   "pid": 220527,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-kafka-tls.json",
+   "report_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "report_harness_sha256": "344215c01268bd329adc7a5b988287a80815ceda373a2c63239839a6b1d4ee29",
+   "report_present": true,
+   "report_sha256": "f5c67b7aac17269326010bc18a3a92a24388bda9b954c85408697f67db3c1a38",
+   "report_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "report_worktree_dirty": false,
+   "source_after": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "source_before": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "started_at": 1794014609.7986271,
+   "state": "done",
+   "timeout_s": 1500,
+   "validation": {
+    "errors": [],
+    "valid": true
+   }
+  },
+  "local_profile": {
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_local_profile_native.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-local-profile.json",
+    "--kafka-home",
+    "/workspace/scratch/rootyard-round2/ops43_44/kafka-home"
+   ],
+   "duration_s": 57.143,
+   "exit_code": 0,
+   "finished_at": 1794014669.959365,
+   "harness_sha256": "20bee0ae6361106f0d375a79c5438648c0a793c7af88499b75e2b534a1ea0418",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/local_profile.log",
+   "pid": 221808,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-local-profile.json",
+   "report_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "report_harness_sha256": "20bee0ae6361106f0d375a79c5438648c0a793c7af88499b75e2b534a1ea0418",
+   "report_present": true,
+   "report_sha256": "f2e764caf6bfe42a1b9a795b7a4091d62c27b0a02153e1ff8f5600fea8d154c0",
+   "report_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "report_worktree_dirty": false,
+   "source_after": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "source_before": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "started_at": 1794014612.816764,
+   "state": "done",
+   "timeout_s": 1500,
+   "validation": {
+    "errors": [],
+    "valid": true
+   }
+  },
+  "migration": {
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_migration_native.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-migration.json"
+   ],
+   "duration_s": 14.044,
+   "exit_code": 0,
+   "finished_at": 1794014734.1828525,
+   "harness_sha256": "fc812390917caf6e93827459e89c941526b52176fce3b48a266c503027ed7ef5",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/migration.log",
+   "pid": 239246,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-migration.json",
+   "report_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "report_harness_sha256": "fc812390917caf6e93827459e89c941526b52176fce3b48a266c503027ed7ef5",
+   "report_present": true,
+   "report_sha256": "c1329dfcaa9dc9890bc2122e6be210aee75999b2fb8a1028c3b233495688f110",
+   "report_source_commit": null,
+   "report_worktree_dirty": null,
+   "source_after": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "source_before": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "started_at": 1794014720.1392808,
+   "state": "done",
+   "timeout_s": 1500,
+   "validation": {
+    "errors": [],
+    "valid": true
+   }
+  },
+  "negative_binary_hash_mismatch": {
+   "case": "binary_hash_mismatch",
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_operations_gate.py",
+    "--evidence-dir",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/binary_hash_mismatch",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/binary_hash_mismatch/gate.json",
+    "--source-commit",
+    "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+   ],
+   "duration_s": 0.064,
+   "exit_code": 1,
+   "failed_checks": [
+    "provenance tls"
+   ],
+   "fixture_dir": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/binary_hash_mismatch",
+   "gate_status": "failed",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/binary_hash_mismatch.log",
+   "rejected_as_domain_failure": true,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/binary_hash_mismatch/gate.json"
+  },
+  "negative_dirty": {
+   "case": "dirty",
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_operations_gate.py",
+    "--evidence-dir",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/dirty",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/dirty/gate.json",
+    "--source-commit",
+    "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+   ],
+   "duration_s": 0.064,
+   "exit_code": 1,
+   "failed_checks": [
+    "provenance workload"
+   ],
+   "fixture_dir": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/dirty",
+   "gate_status": "failed",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/dirty.log",
+   "rejected_as_domain_failure": true,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/dirty/gate.json"
+  },
+  "negative_harness_hash_mismatch": {
+   "case": "harness_hash_mismatch",
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_operations_gate.py",
+    "--evidence-dir",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/harness_hash_mismatch",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/harness_hash_mismatch/gate.json",
+    "--source-commit",
+    "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+   ],
+   "duration_s": 0.064,
+   "exit_code": 1,
+   "failed_checks": [
+    "provenance tls"
+   ],
+   "fixture_dir": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/harness_hash_mismatch",
+   "gate_status": "failed",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/harness_hash_mismatch.log",
+   "rejected_as_domain_failure": true,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/harness_hash_mismatch/gate.json"
+  },
+  "negative_missing": {
+   "case": "missing",
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_operations_gate.py",
+    "--evidence-dir",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/missing",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/missing/gate.json",
+    "--source-commit",
+    "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+   ],
+   "duration_s": 0.064,
+   "exit_code": 1,
+   "failed_checks": [
+    "load tls",
+    "1a. PostgreSQL verify-full/SCRAM negative checks"
+   ],
+   "fixture_dir": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/missing",
+   "gate_status": "failed",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/missing.log",
+   "rejected_as_domain_failure": true,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/missing/gate.json"
+  },
+  "negative_simulated": {
+   "case": "simulated",
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_operations_gate.py",
+    "--evidence-dir",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/simulated",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/simulated/gate.json",
+    "--source-commit",
+    "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+   ],
+   "duration_s": 0.064,
+   "exit_code": 1,
+   "failed_checks": [
+    "provenance workload"
+   ],
+   "fixture_dir": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/simulated",
+   "gate_status": "failed",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/simulated.log",
+   "rejected_as_domain_failure": true,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/simulated/gate.json"
+  },
+  "partition": {
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_partition_native.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-partition.json"
+   ],
+   "duration_s": 32.048,
+   "exit_code": 0,
+   "finished_at": 1794014716.0939753,
+   "harness_sha256": "b5c2c80c558c1932717beede395a6584a2f44afd3d60470063136e48e996dcbc",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/partition.log",
+   "pid": 237890,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-partition.json",
+   "report_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "report_harness_sha256": "b5c2c80c558c1932717beede395a6584a2f44afd3d60470063136e48e996dcbc",
+   "report_present": true,
+   "report_sha256": "3b493a421d31dfcdbb12a6d4cdf8dcc04d3b5dc2e38c7bfd8c8aaad0bbd927ec",
+   "report_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "report_worktree_dirty": false,
+   "source_after": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "source_before": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "started_at": 1794014684.0458426,
+   "state": "done",
+   "timeout_s": 1500,
+   "validation": {
+    "errors": [],
+    "valid": true
+   }
+  },
+  "pitr": {
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_pg_pitr_native.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-pg-pitr.json"
+   ],
+   "duration_s": 9.064,
+   "exit_code": 0,
+   "finished_at": 1794014684.0446787,
+   "harness_sha256": "8362c98215785700348cd526de3a438dea09aec3ce80cd9c18f483630258810c",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/pitr.log",
+   "pid": 236824,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-pg-pitr.json",
+   "report_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "report_harness_sha256": "8362c98215785700348cd526de3a438dea09aec3ce80cd9c18f483630258810c",
+   "report_present": true,
+   "report_sha256": "4c2c2f23cf65ac2b19499778a5115ec49a47d9a2ff5c26bd77290a446a77ef12",
+   "report_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "report_worktree_dirty": false,
+   "source_after": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "source_before": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "started_at": 1794014674.9805808,
+   "state": "done",
+   "timeout_s": 1500,
+   "validation": {
+    "errors": [],
+    "valid": true
+   }
+  },
+  "preflight": {
+   "errors": [],
+   "state": "done"
+  },
+  "streaming": {
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_pg_streaming_native.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-pg-streaming.json"
+   ],
+   "duration_s": 11.061,
+   "exit_code": 0,
+   "finished_at": 1794014681.0217125,
+   "harness_sha256": "5cc3204dd947d0261fb82586e5c8e60aadb7a46412273c5ba38b7a747e3c6ac8",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/streaming.log",
+   "pid": 235901,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-pg-streaming.json",
+   "report_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "report_harness_sha256": "5cc3204dd947d0261fb82586e5c8e60aadb7a46412273c5ba38b7a747e3c6ac8",
+   "report_present": true,
+   "report_sha256": "62c79072ad1e026691bc2c02e7801c2131eb91ad5a83dbc50290cd3af2516167",
+   "report_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "report_worktree_dirty": false,
+   "source_after": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "source_before": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "started_at": 1794014669.96039,
+   "state": "done",
+   "timeout_s": 1500,
+   "validation": {
+    "errors": [],
+    "valid": true
+   }
+  },
+  "takeover": {
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_takeover_native.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-takeover-run.json"
+   ],
+   "duration_s": 40.127,
+   "exit_code": 0,
+   "finished_at": 1794014721.1528025,
+   "harness_sha256": "72f9ca1c320566015d2db44c2b1fab3d91477c0c0e3b30b0b425d69deeed1039",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/takeover.log",
+   "pid": 237520,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-takeover-run.json",
+   "report_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "report_harness_sha256": "72f9ca1c320566015d2db44c2b1fab3d91477c0c0e3b30b0b425d69deeed1039",
+   "report_present": true,
+   "report_sha256": "bed52d960a5e2cdd0cd1f24fa918ef4f2305949a95b6b347608551153f158f59",
+   "report_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "report_worktree_dirty": false,
+   "source_after": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "source_before": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "started_at": 1794014681.0258574,
+   "state": "done",
+   "timeout_s": 1500,
+   "validation": {
+    "errors": [],
+    "valid": true
+   }
+  },
+  "tls": {
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_tls_native.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-tls.json"
+   ],
+   "duration_s": 3.024,
+   "exit_code": 0,
+   "finished_at": 1794014612.8158088,
+   "harness_sha256": "0dd9157986d94e5a12291389406a00ed6f0b75b471594618ccfbc5a7dc35a39c",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/tls.log",
+   "pid": 220524,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-tls.json",
+   "report_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "report_harness_sha256": "0dd9157986d94e5a12291389406a00ed6f0b75b471594618ccfbc5a7dc35a39c",
+   "report_present": true,
+   "report_sha256": "7cde780d0d3fa30dcf2c1bb34d7dbdba140c8ae89f556d600f3327d0212bacfd",
+   "report_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "report_worktree_dirty": false,
+   "source_after": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "source_before": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "started_at": 1794014609.7922325,
+   "state": "done",
+   "timeout_s": 900,
+   "validation": {
+    "errors": [],
+    "valid": true
+   }
+  },
+  "workload": {
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_workload_native.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-workload-integration.json"
+   ],
+   "duration_s": 28.09,
+   "exit_code": 0,
+   "finished_at": 1794014674.9793777,
+   "harness_sha256": "95d949255175cffe7a6a474d9bd44ea5ff5ba960958ab36ada81f672129c06ee",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/logs/workload.log",
+   "pid": 231380,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/evidence/cluster-workload-integration.json",
+   "report_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+   "report_harness_sha256": "95d949255175cffe7a6a474d9bd44ea5ff5ba960958ab36ada81f672129c06ee",
+   "report_present": true,
+   "report_sha256": "ede7a1f984372035f7a9b92df3c8afb1b93cf78e6c8b8a877c1dc58513ac6d36",
+   "report_source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+   "report_worktree_dirty": false,
+   "source_after": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "source_before": {
+    "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "source_worktree_dirty": false
+   },
+   "started_at": 1794014646.8898032,
+   "state": "done",
+   "timeout_s": 1500,
+   "validation": {
+    "errors": [],
+    "valid": true
+   }
+  }
+ },
+ "limits": [
+  "single Linux host and loopback; no additional physical hosts",
+  "issue #43 production/external HA and cross-host source fence remain blocked",
+  "issue #44 local single-host evidence only; production not certified",
+  "Kafka is one task-owned KRaft broker",
+  "disk pressure uses a container tmpfs"
+ ],
+ "negative_controls": {
+  "binary_hash_mismatch": {
+   "case": "binary_hash_mismatch",
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_operations_gate.py",
+    "--evidence-dir",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/binary_hash_mismatch",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/binary_hash_mismatch/gate.json",
+    "--source-commit",
+    "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+   ],
+   "duration_s": 0.064,
+   "exit_code": 1,
+   "failed_checks": [
+    "provenance tls"
+   ],
+   "fixture_dir": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/binary_hash_mismatch",
+   "gate_status": "failed",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/binary_hash_mismatch.log",
+   "rejected_as_domain_failure": true,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/binary_hash_mismatch/gate.json"
+  },
+  "dirty": {
+   "case": "dirty",
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_operations_gate.py",
+    "--evidence-dir",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/dirty",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/dirty/gate.json",
+    "--source-commit",
+    "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+   ],
+   "duration_s": 0.064,
+   "exit_code": 1,
+   "failed_checks": [
+    "provenance workload"
+   ],
+   "fixture_dir": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/dirty",
+   "gate_status": "failed",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/dirty.log",
+   "rejected_as_domain_failure": true,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/dirty/gate.json"
+  },
+  "harness_hash_mismatch": {
+   "case": "harness_hash_mismatch",
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_operations_gate.py",
+    "--evidence-dir",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/harness_hash_mismatch",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/harness_hash_mismatch/gate.json",
+    "--source-commit",
+    "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+   ],
+   "duration_s": 0.064,
+   "exit_code": 1,
+   "failed_checks": [
+    "provenance tls"
+   ],
+   "fixture_dir": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/harness_hash_mismatch",
+   "gate_status": "failed",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/harness_hash_mismatch.log",
+   "rejected_as_domain_failure": true,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/harness_hash_mismatch/gate.json"
+  },
+  "missing": {
+   "case": "missing",
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_operations_gate.py",
+    "--evidence-dir",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/missing",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/missing/gate.json",
+    "--source-commit",
+    "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+   ],
+   "duration_s": 0.064,
+   "exit_code": 1,
+   "failed_checks": [
+    "load tls",
+    "1a. PostgreSQL verify-full/SCRAM negative checks"
+   ],
+   "fixture_dir": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/missing",
+   "gate_status": "failed",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/missing.log",
+   "rejected_as_domain_failure": true,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/missing/gate.json"
+  },
+  "simulated": {
+   "case": "simulated",
+   "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "tests/cluster_operations_gate.py",
+    "--evidence-dir",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/simulated",
+    "--report",
+    "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/simulated/gate.json",
+    "--source-commit",
+    "f31910086acbaa87d9e98df440ca8c28c7bb7e08"
+   ],
+   "duration_s": 0.064,
+   "exit_code": 1,
+   "failed_checks": [
+    "provenance workload"
+   ],
+   "fixture_dir": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/simulated",
+   "gate_status": "failed",
+   "log": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/simulated.log",
+   "rejected_as_domain_failure": true,
+   "report": "/workspace/scratch/rootyard-round2/verify_final_ops/negative-controls/simulated/gate.json"
+  }
+ },
+ "no_source_edits": true,
+ "phase": "done",
+ "pipeline_pid": 242203,
+ "role": "final_ops_verifier",
+ "source_after_run": {
+  "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "source_worktree_dirty": false
+ },
+ "started_at": 1794014514.4615917,
+ "status": "completed",
+ "summary": {
+  "gate_domain_failures": [],
+  "gate_ops_reports_expected": 9,
+  "gate_ops_reports_valid_passed": 9,
+  "local_gate_issues": {
+   "43": "blocked_external_ha_and_source_fence",
+   "44": "passed_local_single_host"
+  },
+  "local_gate_status": "blocked",
+  "migration_actual_passed": true,
+  "negative_controls_rejected": true,
+  "production_scope": "not_certified; LOCAL single-host evidence only"
+ },
+ "tmpdir": "/tmp"
+}

@@ -2,7 +2,7 @@
 
 Git hosting and collaborative workspaces in Rust. PostgreSQL holds identities, repository metadata, permissions and durable jobs. **Native bare Git repositories on a durable local volume are authoritative for refs and objects.** Clients create commits locally and use Git Smart HTTP to clone, fetch and push.
 
-This main (`6d2f0b8`) includes the merged #49–#55 work: Forge/browser sessions, organizations, Git LFS and locks, the authenticated Pando gateway and transition operator, remote lazy Workspace hydration, durable independent-ref admission, physical GitFS GC fencing, SHA-256 Forge admission, CI orchestration, local-process cluster fencing and paired offline recovery. Current round-2 fixes for SHA-256 CI checkout, controller post-promotion push and sandbox cgroup acceptance are still in progress. See the [46-task delivery ledger](docs/registered-task-delivery.md) and the [`6d2f0b8` acceptance audit](docs/acceptance/main-6d2f0b8-audit.md) for executed evidence and remaining gates; this main is not a production HA qualification.
+Round-2 final production source `f319100` (certified input `fdfbbfc…`, immutable binary `35d01…`, on merged main `5fa4854`/PR #56) adds SHA-256 format 7/schema 131 with immutable format 6/schema 130, automatic Pando compaction/cache anti-tamper, online shard copy/delta with retired-source fencing, and real dev-namespace sandbox execution. All final NativeCore and Ops matrices passed, including physical GC 8/8. #38 can close after the final PR merge; #23 remote Pando pruning, #25 per-phase crash/CI intent, #26 cross-host fencing, #32 kernel cgroup, #43 automatic HA/DCS and #44 physical hardware qualification remain open. See the [46-task delivery ledger](docs/registered-task-delivery.md) and [round-2 delivery](docs/acceptance/round2-delivery.md); this is not a production HA qualification.
 
 ## Requirements
 
@@ -67,7 +67,7 @@ Use Bearer tokens for REST, or Basic authentication with username and token as p
 ./target/debug/rootyard revoke-token TOKEN_UUID
 ```
 
-The repository is the security boundary. A reader may obtain historical or unreachable objects; there is no branch-level confidentiality. Non-fast-forward branch pushes are rejected, including force pushes. New repositories use SHA-1 objects and default `HEAD` to `main`. Tags and non-default branch deletion use native Git semantics; deleting the branch named by `HEAD` is denied. Native Git manages ref locking, quarantine and push results. A disconnected push can have an unknown outcome: fetch/check refs before retrying.
+The repository is the security boundary. A reader may obtain historical or unreachable objects; there is no branch-level confidentiality. Non-fast-forward branch pushes are rejected, including force pushes. New repositories default to SHA-1 objects and `HEAD` to `main`; creation also accepts an explicit `object_format` of `sha256`. Tags and non-default branch deletion use native Git semantics; deleting the branch named by `HEAD` is denied. Native Git manages ref locking, quarantine and push results. A disconnected push can have an unknown outcome: fetch/check refs before retrying.
 
 ## Configuration
 

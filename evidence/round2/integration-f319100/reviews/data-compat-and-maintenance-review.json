@@ -1,0 +1,103 @@
+{
+  "reviewer": "DeepSeek independent reviewer",
+  "reviewed_at_utc": "2026-11-07T01:06:04.385621+00:00",
+  "sha38": {
+    "commit": "d8540fc2e3bae9ead6568c4ec21a8da6cdb2cae7",
+    "base": "931efb3aad23c76be7cdb3e1f6c1092e463e9de7",
+    "worktree": "/workspace/rootyard-worktrees/round2-sha38",
+    "worktree_status": "clean at exact d8540fc",
+    "binary": {
+      "path": "/workspace/scratch/rootyard-round2/sha38/rootyard",
+      "sha256": "8ef18c51a595f02477629dd8ae1899f73911466ad76b145dfdb3f9058497df70",
+      "build_source": "d8540fc2e3bae9ead6568c4ec21a8da6cdb2cae7",
+      "source_inputs_sha256": "65c42dbb26fa0830eda6f547a0ae2776c3236befe9abea887916bc92e91ca9af",
+      "certificate": "validtrue"
+    },
+    "source_verdict": "APPROVE SOURCE for the d854 backup-compatibility fix. No P1 source defect found in this compatibility diff.",
+    "fixes": [
+      "FORMAT=7 for new archives; format6 catalogs frozen to schema130 and format6 versions capped at <=130 (src/backup/catalog.rs:5-42).",
+      "Explicit --allow-legacy-schema130 opt-in only for format6, mutually exclusive with schema007; exact binary rule bypassed only for that explicit legacy path (src/backup/restore.rs:87-112).",
+      "Format6 restore verifies the restored 130 schema/catalog, resets search_path to public, applies migration 131 through migrate_client, then verifies current 131 catalog/version (src/backup/restore.rs:160-176).",
+      "migrate_client keeps the session advisory lock and uses current_schema()-qualified schema_migrations existence; custom search_path bootstrap test added (src/db.rs:181-212; tests/schema_contract.py).",
+      "Generic error logging reverted; no diagnostic leak in restore/backup errors."
+    ],
+    "legacy130_test": {
+      "report": "legacy130-report.json / legacy130-cert2.log",
+      "binary_sha256": "8ef18c51a595f02477629dd8ae1899f73911466ad76b145dfdb3f9058497df70",
+      "legacy_binary_sha256": "6135f0288cdbfc6f072f1cb071a667bbef35496388385e6b9fb2ccb9be2b9869",
+      "cases": [
+        "create_real_format6_schema130_archive",
+        "candidate_rejects_without_opt_in",
+        "candidate_restores_and_upgrades"
+      ],
+      "result": "PASS 3/3: genuine format6/schema130 archive from 6135, no-flag rejection with no target/guard footprint, explicit restore upgrades to 131, SHA256 exact clone/pin/generation, issued grant revoked, cancellation tombstone preserved."
+    },
+    "source_file_sha256": {
+      "src/backup/catalog.rs": "a028265029acd6833f0610f27497700eeb8f486882d5396f97f638fd6a717eea",
+      "src/backup/restore.rs": "764aec6aa931ac6bc6eed6632e7dfeef213083918a24cd6568d2ed86dbcdde47",
+      "src/db.rs": "c2cd585343447d9271a65f0867b81dfd1ac2abec8cdaa70abae2304d2c57441e",
+      "src/main.rs": "87afca6611b1f9d2b84a0fda65303b478e91b37f1e65598bd36905e126620d9b"
+    },
+    "focused_check": "Fresh disposable schema migrated with d854 binary 8ef18 applied schema_migrations 130 and 131; ci_checkout_jobs had plan_format, plan_presence and plan_shape, with no legacy check1. This confirms the certified binary embeds the fix, unlike the prior stale a8ab artifact."
+  },
+  "maint": {
+    "commit": "32dfea8bd13e6a3c6fa6dcfdb47fa38e3c214f2f",
+    "base": "711852189e80a55294497369ff3cb81855bd5324",
+    "worktree": "/workspace/rootyard-worktrees/round2-maint23",
+    "worktree_status": "clean at exact 32dfea8; only two test files changed relative to 7118521",
+    "binary": {
+      "sha256": "fcc304a155c01ec83120636e42a04a71a799cbaf44e78f8a477cfba42b40c044",
+      "build_source": "711852189e80a55294497369ff3cb81855bd5324",
+      "note": "test-only commit; production binary identical to approved 711/d9"
+    },
+    "test_verdict": "APPROVE TEST CHANGES at 32dfea8. No production source changes; no source P1 reopened.",
+    "tests": [
+      "tests/pando_maintenance_service.py now uses supported branch deletion plus durable repository_ref_projection wait, adds non-ref OID survival through compaction/rollback and same-length cache tamper invalidation.",
+      "tests/storage_lifecycle_physical.py ENOSPC fixture now deletes the temporary branch through Smart HTTP and waits for the durable projection root instead of offline update-ref; it confirms no live SQL ref root before ENOSPC."
+    ],
+    "evidence": {
+      "pando_negative2": "pando_maintenance_service_negative2.json passed with binary fcc304: automatic compaction, cache tamper recovered, non-ref OID survived compaction and rollback, backup barrier retried, remote_deleted false.",
+      "enospc_clean": "enospc_clean.json passed with binary fcc304: ENOSPC no data loss, retry deleted due packed OID, reachable base preserved.",
+      "other_cases": "younger/namespace clean cases passed individually per supplied evidence; no remote GC/pruning added."
+    },
+    "issue23_status": "OPEN due remote Pando object mark/delete/pruning foundation gap; no GC root weakening and no remote deletion claim."
+  },
+  "findings": [
+    {
+      "priority": "P2",
+      "scope": "sha38",
+      "type": "forward-compatibility gap",
+      "location": "src/backup/catalog.rs:42",
+      "scenario": "FORMAT=7 is new and catalogs(7) are frozen to schema131, but versions(7) returns current SCHEMA_VERSIONS dynamically. If migration 132 is later added, old format7 archives will have schema_versions ending 131 while the new binary expects 132, so restore will reject them at verify (schema_versions mismatch). This is the same class of bug being fixed for format6, but it is not a current 131 failure.",
+      "required_action": "Freeze versions(7) to the 131 list (filter <=131 or an explicit frozen list) before relying on format7 as a durable backup contract; update when intentionally introducing format8."
+    },
+    {
+      "priority": "P2",
+      "scope": "sha38",
+      "type": "CLI documentation gap",
+      "location": "src/main.rs:294",
+      "scenario": "The usage/help string still lists only --allow-legacy-schema007; the implemented --allow-legacy-schema130 flag is not shown in the header/help. No semantic validation change is involved.",
+      "required_action": "Add --allow-legacy-schema130 to the header/help during integration."
+    },
+    {
+      "priority": "P2",
+      "scope": "maint",
+      "type": "evidence pipeline",
+      "location": "tests/pando_maintenance_service.py; tests/storage_lifecycle_physical.py",
+      "scenario": "The negative2 and clean ENOSPC reports pass with the approved production binary, but earlier service/ENOSPC logs contain superseded fixture failures. Final acceptance should retain only the final clean reports and label prior runs as superseded.",
+      "required_action": "Keep pando_maintenance_service_negative2.json and enospc_clean.json as the final test evidence pair; do not cite earlier failed fixture attempts as current behavior."
+    }
+  ],
+  "acceptance": {
+    "sha38_current_compat": "PASS for d854 source compatibility: real format6 archive round-trip with explicit opt-in, no-flag rejection, migration131, SHA256 clone/pin/generation/grant revocation/tombstone; format4/5 contracts retained in source.",
+    "sha38_full_issue": "PENDING FINAL INTEGRATION: matrix/sha256_restore/schema_contract/ci_job_checkouts reports are stale old failures; do not claim full #38 acceptance until the final integration rerun of all six matrix/restore/schema/CI checks with the certified binary.",
+    "maint_tests": "PASS for 32dfea8 test-only negative/rollback/ENOSPC fixture changes on the approved 711/d9 production binary.",
+    "maint_issue": "#23 remains OPEN because remote Pando pruning is disabled by design; not a P0 by absence."
+  },
+  "limitations": [
+    "No full native reruns; used certified binaries, reports, and focused source/diff inspection.",
+    "The earlier d854 full matrix/restore/schema/CI reports are stale and must not be cited as current full #38 acceptance.",
+    "The binary certificate/source-input hash and coordinator build-valid result are accepted; I verified commit, build-source, binary hash and report hash where available.",
+    "No source edits, GitHub mutations, pushes or merges."
+  ]
+}

@@ -1,0 +1,252 @@
+{
+  "kind": "cluster_operations_gate",
+  "gate_version": 2,
+  "measurement_kind": "validated_native_evidence",
+  "simulated_fields": false,
+  "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "validated_at_unix": 1794014809,
+  "status": "failed",
+  "issues": {
+    "43": "failed",
+    "44": "passed_local_single_host"
+  },
+  "local_profile_accepted": false,
+  "production_scope": "not_certified; local single-host evidence only",
+  "checks": [
+    {
+      "issue": "43/44",
+      "criterion": "load tls",
+      "status": "failed",
+      "evidence": [
+        "cluster-tls.json"
+      ],
+      "error": "missing evidence file: cluster-tls.json"
+    },
+    {
+      "issue": 43,
+      "criterion": "1. secure split-role profile: real cross-node Git and encrypted authenticated dependencies",
+      "status": "passed",
+      "evidence": [
+        "cluster-local-profile.json"
+      ]
+    },
+    {
+      "issue": 43,
+      "criterion": "1a. PostgreSQL verify-full/SCRAM negative checks",
+      "status": "failed",
+      "evidence": [
+        "cluster-tls.json"
+      ],
+      "error": "required evidence unavailable"
+    },
+    {
+      "issue": 43,
+      "criterion": "1b. Kafka SASL_SSL negative checks and outage semantics",
+      "status": "passed",
+      "evidence": [
+        "cluster-kafka-tls.json"
+      ]
+    },
+    {
+      "issue": 43,
+      "criterion": "3. metadata and storage restore in a new deployment, including worker drain",
+      "status": "passed",
+      "evidence": [
+        "cluster-pg-pitr.json"
+      ]
+    },
+    {
+      "issue": 43,
+      "criterion": "2a. PostgreSQL failover under concurrent read/write load",
+      "status": "passed",
+      "evidence": [
+        "cluster-pg-streaming.json"
+      ]
+    },
+    {
+      "issue": 44,
+      "criterion": "1. real 1/2/4-node client workload with versions/topology/hardware/raw evidence",
+      "status": "passed",
+      "evidence": [
+        "cluster-workload-integration.json"
+      ]
+    },
+    {
+      "issue": 44,
+      "criterion": "2. live serving-volume corruption/recovery and node-stop failure assertions",
+      "status": "passed",
+      "evidence": [
+        "cluster-workload-integration.json"
+      ]
+    },
+    {
+      "issue": 44,
+      "criterion": "3. disk-pressure rejection without moving the acknowledged ref",
+      "status": "passed",
+      "evidence": [
+        "cluster-disk-pressure.json"
+      ]
+    },
+    {
+      "issue": 43,
+      "criterion": "2b. single-host storage takeover and source-only network break",
+      "status": "passed",
+      "evidence": [
+        "cluster-takeover-run.json",
+        "cluster-partition.json"
+      ],
+      "details": {
+        "takeover": {
+          "status": "passed",
+          "file": "cluster-takeover-run.json"
+        },
+        "partition": {
+          "status": "passed",
+          "file": "cluster-partition.json"
+        }
+      }
+    },
+    {
+      "issue": 44,
+      "criterion": "4. simulated benchmark output is visibly separated from measured evidence",
+      "status": "passed",
+      "evidence": []
+    },
+    {
+      "issue": 44,
+      "criterion": "5. readiness/implementation docs distinguish native evidence and limits",
+      "status": "passed",
+      "evidence": []
+    },
+    {
+      "issue": 43,
+      "criterion": "2c. external physical-host storage fencing and automatic PostgreSQL HA",
+      "status": "blocked",
+      "evidence": [],
+      "details": "not executable here; the single-host profile and manual promotion are not full HA"
+    },
+    {
+      "issue": 43,
+      "criterion": "2d. multi-broker Kafka failover",
+      "status": "blocked",
+      "evidence": [],
+      "details": "not executable here; only one task-owned KRaft broker is available"
+    }
+  ],
+  "evidence": {
+    "kafka": {
+      "file": "cluster-kafka-tls.json",
+      "kind": "native_kafka_sasl_ssl",
+      "sha256": "f5c67b7aac17269326010bc18a3a92a24388bda9b954c85408697f67db3c1a38",
+      "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+      "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+      "topology": "one Rootyard writer and one task-owned Apache Kafka KRaft broker with a SASL_SSL listener; controller listener is local plaintext",
+      "limits": [
+        "single local KRaft broker; controller listener is local plaintext",
+        "no multi-broker Kafka failover",
+        "Kafka wake is advisory and PostgreSQL remains the durable event authority"
+      ]
+    },
+    "local_profile": {
+      "file": "cluster-local-profile.json",
+      "kind": "native_local_cluster_profile",
+      "sha256": "f2e764caf6bfe42a1b9a795b7a4091d62c27b0a02153e1ff8f5600fea8d154c0",
+      "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+      "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+      "topology": "two/four separate Rust data processes with distinct volumes plus a PostgreSQL-only delivery worker on one trusted Linux host; external PostgreSQL 17 and Kafka brokers",
+      "limits": [
+        "single trusted Linux host and local process-session fence",
+        "external PostgreSQL and Kafka are real but single-instance in this test",
+        "no cross-host storage fencing, automatic PostgreSQL leader election or multi-broker Kafka failover"
+      ]
+    },
+    "workload": {
+      "file": "cluster-workload-integration.json",
+      "kind": "native_cluster_client_workload",
+      "sha256": "ede7a1f984372035f7a9b92df3c8afb1b93cf78e6c8b8a877c1dc58513ac6d36",
+      "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+      "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+      "topology": "distinct Rust processes and storage directories; one PostgreSQL schema; loopback signed forwarding",
+      "limits": [
+        "single Linux host and shared PostgreSQL schema; loopback traffic",
+        "four processes and volumes are functional sharding, not physical host or network failure domains",
+        "native Git and Rust timings are operational samples, not a capacity plan"
+      ]
+    },
+    "streaming": {
+      "file": "cluster-pg-streaming.json",
+      "kind": "native_postgresql_streaming_promote",
+      "sha256": "62c79072ad1e026691bc2c02e7801c2131eb91ad5a83dbc50290cd3af2516167",
+      "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+      "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+      "topology": "one Rootyard writer, separate PostgreSQL 17 primary and synchronous streaming standby, real TLS/SCRAM",
+      "limits": [
+        "manual local-host PostgreSQL promotion and Rootyard restart",
+        "no DCS/elected automatic PG leader and no automatic client reconfiguration",
+        "PITR/archive restore tested separately, not integrated with standby promotion",
+        "no cross-host storage fencing; old primary is stopped, not fenced by a shared DCS"
+      ]
+    },
+    "pitr": {
+      "file": "cluster-pg-pitr.json",
+      "kind": "native_postgresql_wal_archive_pitr_and_gitfs_snapshot",
+      "sha256": "4c2c2f23cf65ac2b19499778a5115ec49a47d9a2ff5c26bd77290a446a77ef12",
+      "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+      "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+      "topology": "new Rootyard data volume and new loopback endpoint against a PITR-restored PostgreSQL 17 cluster; source archive/base backup on one host",
+      "limits": [
+        "single-host local unencrypted archive and offline matching GitFS snapshot",
+        "manual recovery, new endpoint/volume and traffic restart",
+        "not a remote-retained encrypted backup",
+        "not zero-RPO failover or a supported multi-host PostgreSQL HA deployment"
+      ]
+    },
+    "disk": {
+      "file": "cluster-disk-pressure.json",
+      "kind": "native_rootyard_git_enospc",
+      "sha256": "ed86af86ee841c31b584322a8936a0cfcf81fc47bce137f240c13932930de957",
+      "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+      "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+      "topology": "one Rust service in rootless Docker on a private 366 MiB tmpfs; external PostgreSQL 17 on the host",
+      "limits": [
+        "local rootless Docker tmpfs rather than hardware disk",
+        "tmpfs is sized to fit the supplied executable plus test data; absolute free space differs from a production volume",
+        "one small repository; no production scale or power-loss assertion"
+      ]
+    }
+  },
+  "local_storage_ha": {
+    "takeover": {
+      "status": "passed",
+      "file": "cluster-takeover-run.json"
+    },
+    "partition": {
+      "status": "passed",
+      "file": "cluster-partition.json"
+    }
+  },
+  "limits": [
+    "all multi-process figures are single Linux host and loopback; no additional physical hosts are configured",
+    "PostgreSQL promotion is manual and local; no DCS, automatic leader election, or cross-host fencing",
+    "Kafka uses one KRaft broker; the controller listener is local plaintext",
+    "PITR archive and matching GitFS snapshot are local and unencrypted",
+    "disk pressure uses a container tmpfs, not a hardware volume",
+    "simulated shard benchmark receipts never satisfy these gates"
+  ],
+  "blockers": [
+    "cross-host storage fencing and external PostgreSQL leader election are not proven: no additional physical hosts are configured in this environment"
+  ],
+  "commands": [
+    "python3 tests/cluster_tls_native.py --binary <binary> --report evidence/cluster-tls.json",
+    "python3 tests/cluster_kafka_tls_native.py --binary <binary> --kafka-home <kafka> --report evidence/cluster-kafka-tls.json",
+    "python3 tests/cluster_local_profile_native.py --binary <binary> --kafka-home <kafka> --report evidence/cluster-local-profile.json",
+    "python3 tests/cluster_workload_native.py --binary <binary> --report evidence/cluster-workload-integration.json",
+    "python3 tests/cluster_pg_streaming_native.py --binary <binary> --report evidence/cluster-pg-streaming.json",
+    "python3 tests/cluster_pg_pitr_native.py --binary <binary> --report evidence/cluster-pg-pitr.json",
+    "python3 tests/cluster_takeover_native.py --binary <binary> --report evidence/cluster-takeover-run.json",
+    "python3 tests/cluster_partition_native.py --binary <binary> --report evidence/cluster-partition.json",
+    "python3 tests/cluster_disk_pressure_native.py --binary <binary> --report evidence/cluster-disk-pressure.json",
+    "python3 tests/cluster_operations_gate.py --evidence-dir evidence --report evidence/cluster-operations-gate.json"
+  ]
+}

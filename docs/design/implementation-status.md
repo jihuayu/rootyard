@@ -2,9 +2,20 @@
 
 历史基线：2026-11-04，main [`1fd05a393fe24653687fa3e868f9dca2fb0c9a67`](https://github.com/jihuayu/rootyard/commit/1fd05a393fe24653687fa3e868f9dca2fb0c9a67)。本页历史快照说明该代码具有什么边界，不承诺后续 main，也不把既有测试报告当作本次重新执行的结果。
 
-当前 main 核对基线：2026-11-07，[`6d2f0b845525921339fa045868c2029d6dc42923`](https://github.com/jihuayu/rootyard/commit/6d2f0b845525921339fa045868c2029d6dc42923)。PR #49–#55 已合并；逐条验收证据、met/unproven 分类和未关闭边界见 [主分支验收审计](../acceptance/main-6d2f0b8-audit.md) 与 [46 项任务台账](../registered-task-delivery.md)。2026-11-06 至 2026-11-07 的执行覆盖真实 PG/Git/Garage/Vault/FUSE/bubblewrap/Chromium、本机集群故障与真实客户端流量；每份证据只覆盖其记录的版本和拓扑。下表保留历史 main 的边界，不能用作当前 main 的验收结论。
+最终生产源：`f31910086acbaa87d9e98df440ca8c28c7bb7e08`（format-7 版本 `<=131` 冻结），certified input `fdfbbfc…`，immutable binary `35d01c5f…`，合并主线 `5fa4854`（PR #56 已合并）。除一个 physical-GC 组合 receipt 外，最终 NativeCore+Ops 结果已验证；逐条证据见 [round-2 交付表](../acceptance/round2-delivery.md) 与 [46 项任务台账](../registered-task-delivery.md)。
 
-## 当前 main（6d2f0b8）已合并能力与未验收边界
+历史中间基线：`6d2f0b8`（PR #49–#55）与 `340e668` 的中间记录只作历史，不是最终验收结论；[6d2f0b8 审计](../acceptance/main-6d2f0b8-audit.md) 保持 historical。
+
+## 最终源（f319100）能力与未验收边界
+
+- #38：service 2/2（含 stock Git Forge pull/review/check/merge）、matrix 6/6（mirror/pin/checkout、64-hex plan/receipt、SHA-1 与 mixed/abbreviated/zero-OID negatives）、restore 2/2、真实 legacy format-6 3/3（旧 `6135` archive）、schema contract 8 checks（含 public/custom）、CI checkout 15/15（isolated DB；失败首试保留于 history）均在 `35d01` 通过。满足验收，PR 合并后关闭。
+- #23：GitFS lifecycle 3/3 + API 7/7；automatic Pando 2/2（cache tamper、non-ref rollback）；同仓 format-7 paired backup/restore 通过。远端 Pando mark/delete/pruning 仍 DISABLED，需 foundational global-retention；GitFS physical GC **8/8 通过**（test-only `ed8d074`/`47a93ed` fixture fix，生产 input digest 未变）；issue 仅因远端 Pando GC foundation 保持 OPEN。
+- #25/#26：draining reset、retired-source fencing before commit、online copy+delta、retained SQL roots、list/abort、migration/partition/full takeover 均通过。**#25** 仍缺 per-phase crash matrix 与 CI-sidecar intent/directory handoff；**#26** 同机 session fencing 已证明，physical cross-host fencing 未认证。
+- #43/#44：真实 TLS/SCRAM、Kafka SASL_SSL、手工本地 PG promotion、PITR、ENOSPC 与本地 1/2/4 workload 通过；aggregate 为 #44 `passed_local_single_host`、#43 `blocked_external_ha_and_source_fence`、`production_scope=not_certified`。外部自动 PG HA/DCS、跨主机 source fence、全新部署 restore、物理跨主机/硬件资格仍缺失。
+- #32：真实 dev/CI 6/6（own-DB retry）、tmpfs-only artifact pool、launch-failure cleanup 通过。正向 kernel cgroup 因无 delegated cgroup v2 subtree（rootless Docker cgroup driver `none`、cgroupfs EPERM）而 BLOCKED。
+- #48：umbrella 保持 OPEN，roadmap 可勾选已关闭的 #30（PR #50）和待合并的 #38；#2–#19 不批量关闭（PR #49 历史代码不等于新验收）。
+
+## 历史中间基线（6d2f0b8）已合并能力与未验收边界
 
 - Pando 生产网关、双阶段 GitFS↔Pando 迁移/回滚、加密 pack CAS 与 transition 备份已合并（PR #53）；`tests/pando_transition_service.py` 需要真实 Garage/Vault，本次审计未重跑。
 - 独立 ref 写入使用持久 `git_ref_admissions` 与 epoch fence（PR #51，迁移 126）；物理 GitFS GC 使用迁移 127 admission fence、完整 retention roots、quarantine 与幂等删除（PR #52）。

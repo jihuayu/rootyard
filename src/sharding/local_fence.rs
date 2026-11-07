@@ -1,10 +1,11 @@
 //! Trusted single-host process-group fencing. This driver does not fence remote hosts.
-use crate::sharding::models::valid_node_id;
+use crate::sharding::models::{VolumeFenceMarker, valid_node_id};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use fs2::FileExt;
 use std::{fs::{self, OpenOptions}, os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf}, sync::OnceLock, time::Duration};
+use uuid::Uuid;
 
 static LOCAL_NODE_LOCK: OnceLock<fs::File> = OnceLock::new();
 
@@ -15,6 +16,14 @@ pub struct ProcessIdentity {
     pid: i32,
     start_ticks: u64,
     boot_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeRegistration {
+    pub(crate) node_id: String,
+    pub(crate) data_dir: String,
+    pub(crate) volume_id: Uuid,
 }
 
 #[derive(Clone, Copy)]
@@ -48,6 +57,85 @@ fn directory() -> Result<Option<PathBuf>> {
 fn paths(dir: &Path, node_id: &str) -> Result<(PathBuf, PathBuf)> {
     ensure!(valid_node_id(node_id), "invalid local fence node id");
     Ok((dir.join(format!("{node_id}.process.json")), dir.join(format!("{node_id}.blocked"))))
+}
+
+fn volume_path(dir: &Path, node_id: &str) -> Result<PathBuf> {
+    ensure!(valid_node_id(node_id), "invalid local fence node id");
+    Ok(dir.join(format!("{node_id}.volume.json")))
+}
+
+fn read_volume_identity(data_dir: &Path) -> Result<Uuid> {
+    let meta = fs::symlink_metadata(data_dir)?;
+    ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "registered volume is not a real directory");
+    let bytes = fs::read_to_string(data_dir.join(".volume-id"))?;
+    ensure!(bytes.len() == 36, "invalid registered volume identity");
+    Ok(bytes.parse()?)
+}
+
+/// Publish the trusted node-to-volume binding. A promoter may only write a
+/// retired marker after this binding and the old volume identity agree.
+pub fn register_local_volume(node_id: &str, data_dir: &Path, volume_id: Uuid) -> Result<()> {
+    let Some(dir) = directory()? else { return Ok(()); };
+    ensure!(data_dir.is_absolute(), "registered data directory must be absolute");
+    let canonical = data_dir.canonicalize().context("registered data directory missing")?;
+    ensure!(read_volume_identity(&canonical)? == volume_id, "registered volume identity changed");
+    let registration = VolumeRegistration {
+        node_id: node_id.to_owned(),
+        data_dir: canonical.to_str().context("non-UTF8 registered data directory")?.to_owned(),
+        volume_id,
+    };
+    crate::journal::atomic(&volume_path(&dir, node_id)?, &serde_json::to_vec(&registration)?, true)?;
+    Ok(())
+}
+
+pub fn registered_volume(node_id: &str) -> Result<Option<VolumeRegistration>> {
+    let Some(dir) = directory()? else { return Ok(None); };
+    let path = volume_path(&dir, node_id)?;
+    if !crate::journal::exists(&path)? { return Ok(None); }
+    let bytes = crate::journal::read(&path)?;
+    let registration: VolumeRegistration = serde_json::from_slice(&bytes)?;
+    ensure!(registration.node_id == node_id && registration.volume_id != Uuid::nil()
+        && Path::new(&registration.data_dir).is_absolute(), "invalid local volume registration");
+    Ok(Some(registration))
+}
+
+/// Resolve the registered, still-attached repository directory for a node.
+/// A missing or changed volume identity is an error, never a reason to skip
+/// physical fencing or promote from an unverified target.
+pub fn registered_repository(node_id: &str, repository_id: Uuid) -> Result<(VolumeRegistration, PathBuf)> {
+    let registration = registered_volume(node_id)?.context("old node volume registration is missing")?;
+    let data_dir = PathBuf::from(&registration.data_dir);
+    ensure!(read_volume_identity(&data_dir)? == registration.volume_id,
+        "old node volume identity changed");
+    let repo_dir = data_dir.join("repos").join(format!("{repository_id}.git"));
+    let meta = fs::symlink_metadata(&repo_dir)?;
+    ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "old repository volume is unsafe");
+    ensure!(repo_dir.canonicalize()?.parent() == Some(data_dir.canonicalize()?.join("repos").as_path()),
+        "old repository escaped its registered volume");
+    Ok((registration, repo_dir))
+}
+
+/// After the old process session is verifiably gone, write a retired read-only
+/// marker directly on its still-attached volume. This is same-host fencing:
+/// a detached or inaccessible source volume must block promotion instead.
+pub fn retire_volume_repository(
+    node_id: &str,
+    repository_id: Uuid,
+    marker: &VolumeFenceMarker,
+) -> Result<VolumeRegistration> {
+    ensure!(marker.repository_id == repository_id && marker.read_only_degraded,
+        "retired source marker is not read-only for this repository");
+    let (registration, repo_dir) = registered_repository(node_id, repository_id)?;
+    crate::journal::atomic(
+        &repo_dir.join(crate::sharding::models::VOLUME_FENCE_MARKER_FILE),
+        &serde_json::to_vec_pretty(marker)?,
+        true,
+    )?;
+    let observed = crate::sharding::fencing::read_volume_marker_at(&repo_dir)
+        .map_err(|error| anyhow::anyhow!("retired source marker is unreadable: {}", error.1))?
+        .context("retired source marker did not publish")?;
+    ensure!(&observed == marker, "retired source marker verification failed");
+    Ok(registration)
 }
 
 /// Called before accepting traffic; the service must run as its own session leader.

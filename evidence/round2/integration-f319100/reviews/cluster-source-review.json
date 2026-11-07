@@ -1,0 +1,85 @@
+{
+ "role": "independent DeepSeek cluster25_26 final source followup",
+ "decision": "APPROVE_BOUNDED_SOURCE_INCREMENT",
+ "commit": "bcede6887ef2ade39060bcc88d9d09c8e6697a69",
+ "base": "66abaf0 (feature base; 6442 ancestry)",
+ "scope": "CL1+CL2 follow-up diff only; CL3/CL5/CL6 safety re-check; native final evidence read, no source edits",
+ "build_certificate": {
+  "built_commit": "bcede6887ef2ade39060bcc88d9d09c8e6697a69",
+  "production_inputs_sha256": "ee02313056fddc388c896c99cef73d2e65acdc4d5281f50394e7e25828d02969",
+  "binary_sha256": "6831f6cb5409baa67aec870251eb3859769cea80939a41c7be20851b0ce036f2",
+  "immutable_binary": "/workspace/scratch/rootyard-round2/cluster_finalizer/artifacts/bcede6887ef2ade39060bcc88d9d09c8e6697a69/rootyard",
+  "certificate_valid": true
+ },
+ "cl1": {
+  "status": "FIXED",
+  "evidence": "promote() route UPDATE now sets draining=false,read_only_degraded=false,degraded_reason=''. Sequential exact-test run against certified binary reached the post-takeover push to target and it succeeded, which is impossible if the write barrier still saw draining=true."
+ },
+ "cl2": {
+  "status": "FIXED (bounded, ordering verified)",
+  "ordering": [
+   "fence_local_process kills the old session",
+   "post-fence verify_source proves no live journal and source manifest digest == verified candidate",
+   "promote tx locks route, sets draining/fenced_epoch, fence_epoch() fences ADMITTED writers",
+   "re-validates generation/lease/op/unknown==0 and journal_sequence>=MAX(git_operations.sequence)",
+   "moves route with draining=false (target staged marker built from moved route stays non-degraded)",
+   "retire_volume_repository(old_node, repo, marker{primary=old, read_only_degraded=true, route_epoch=new, fenced_node_id=old}) writes+fsyncs+reads back the marker on the registered old volume",
+   "only then op completed, failover insert, target marker stage, tx.commit"
+  ],
+  "safety": "New writer cannot ACK before commit: route stays old until tx commit, which happens only after physical process fence proof, post-fence digest check, zero unknown git_operations, and durable retired marker. Old volume registration/volume-id and repo path are re-verified; atomic replace + readback equality. Failure returns Err and rolls back promotion. If rollback occurs after marker publication the old volume is read-only while DB route remains old: fail-closed availability loss, no split brain and no new-write path (marker read_only + fenced process session/blocked file)."
+ },
+ "cl3": {
+  "status": "SAFE/unchanged",
+  "evidence": "replicate_only returns before Phase 2; no fenced_epoch advance; source stays writable (verified in earlier 6442 native diag and migration flow)."
+ },
+ "cl5": {
+  "status": "NO_NEW_WRONG_WRITE_PATH; explicit availability gap remains",
+  "evidence": "check_hook_fence and transitions::reject_pending filter by volume_id; target not blocked by dead-source pending for ordinary writes. transitions::stage pending COUNT is still repository-wide and reconcile only scans local volume, so a dead-source pending transition can block a later target promotion. Combined with retire-before-commit rollback, this can leave the old volume read-only and the repository unavailable until operator recovery. Fail-closed only: route remains old, old volume marker is read-only, old session fenced; no new writer can ACK."
+ },
+ "cl6": {
+  "status": "SAFE/unchanged",
+  "evidence": "heartbeat runs whenever ROOTYARD_NODE_ID is configured independent of fence driver; promotion extends target lease_expires_unix and lease_epoch."
+ },
+ "native_evidence": {
+  "finalizer_concurrent_run": {
+   "partition": "PASSED on immutable 6831f6 binary",
+   "migration": "FAILED line 84 expected 409 got 503",
+   "takeover": "FAILED target readiness before line 103",
+   "classification": "environment/harness contention, not attributed to bcede logic: all 3 tests launched concurrently on a 32G overlay with 781M free (98% full); 503 is generic Error::unavailable from storage lease/publication paths. Native pass is NOT claimed."
+  },
+  "sequential_exact_takeover_rerun": {
+   "binary": "6831f6 (build-source bcede, inputs match)",
+   "result": "progressed through first/second replicate_only, live admitted-writer pause (no promotion), resume/retry, eventual takeover, old writer SIGKILL+blocked marker, target fsck, post-takeover push to target succeeded (line 212-213); then failed at line 214.",
+   "line214_cause": "TEST BUG, not target crash: h.expect() uses Harness.self.base, which is the retired source URL killed by takeover. The test queries the dead source instead of target_base. Same pattern existed in 6442. This blocks native takeover acceptance independently of source.",
+   "positive_inference": "Post-takeover push success proves the promotion route is writable (CL1) and that promotion committed only after retire_volume_repository succeeded (CL2 ordering). Marker content assertions at lines 215-220 were not reached."
+  }
+ },
+ "test_oracle_residuals": [
+  "Pause barrier is still has_native_writer_child (any child), not durable admission. A read-only /info/refs advertisement child can trigger the pause before git_ref_admissions.ADMITTED/journal exists; a proven-fence promotion is then legitimate under requirement 26 (no acknowledged write lost) but line 157 would false-fail. Recommended durable barrier: git_ref_admissions state='ADMITTED' AND shard_epoch=route_epoch plus journal active.lock or actual receive-pack child.",
+  "After takeover the test must query target_base, not h.expect/h.base (line 214)."
+ ],
+ "open_acceptance": {
+  "25": "phase-by-phase crash recovery and CI sidecar intent transfer remain open",
+  "26": "cross-host physical fencing qualification remains open; current proof is single-host process-session + on-volume marker only"
+ },
+ "blockers": {
+  "source_p1": "none found in bcede follow-up or CL3/5/6 safety",
+  "acceptance_p1": [
+   "cluster_takeover_native.py line 214 queries dead source base (h.expect) after takeover",
+   "finalizer concurrent 3-test run is invalid evidence under disk pressure; sequential certified rerun required"
+  ]
+ },
+ "verification": {
+  "static_diff_review": true,
+  "immutable_binary_used": true,
+  "source_edits": false,
+  "remote_mutations": false,
+  "full_native_pass_claimed": false
+ },
+ "limits": [
+  "CL2 marker content assertions 215-220 not reached; helper readback equality is static evidence",
+  "Migration 503 not re-run sequentially",
+  "Retry/rollback after marker publication reasoned statically, not crash-injected",
+  "Single host only"
+ ]
+}

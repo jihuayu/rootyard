@@ -1,0 +1,47 @@
+{
+  "measurement_kind": "native_execution",
+  "simulated_fields": false,
+  "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "source_worktree_dirty": false,
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "python": "3.12.14",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)"
+  },
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "mem_total_kb": 18440100
+  },
+  "topology": "one Rust service in rootless Docker on a private 366 MiB tmpfs; external PostgreSQL 17 on the host",
+  "dataset": "one private repository with an acknowledged commit before pressure and an attempted commit during ENOSPC",
+  "workload": "native Git push/fetch/fsck while a real process writes until the container data tmpfs returns ENOSPC, then removes the filler and retries",
+  "limits": [
+    "local rootless Docker tmpfs rather than hardware disk",
+    "tmpfs is sized to fit the supplied executable plus test data; absolute free space differs from a production volume",
+    "one small repository; no production scale or power-loss assertion"
+  ],
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "binary_size_bytes": 316382568,
+  "harness_sha256": "3ef587dffabe33879909ebd781754972b81ad7256f475de6204fc10308820321",
+  "kind": "native_rootyard_git_enospc",
+  "docker_version": "29.9.2",
+  "container_image_id": "sha256:bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731",
+  "git_version": "git version 2.47.3",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "mount_size_mib": 366,
+  "free_kib_at_push": 0,
+  "fault": "dd writes /data/pressure.bin until kernel returns ENOSPC",
+  "retained_acknowledged_oid": "a80fa77ccb0150a39fc88f24c9c86e0c1a9984e7",
+  "rejected_oid": "5d2b7a48bafae20aa110c71f69b8b27e6fa148db",
+  "push_exit_code_during_enospc": 1,
+  "push_stderr_excerpt": "error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503\nsend-pack: unexpected disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly\nEverything up-to-date\n",
+  "git_operation_outcome_counts_during_pressure": [
+    "recorded:2"
+  ],
+  "ref_after_removing_pressure": "a80fa77ccb0150a39fc88f24c9c86e0c1a9984e7",
+  "native_fsck_after_pressure": "passed",
+  "post_pressure_retry_acked": true
+}

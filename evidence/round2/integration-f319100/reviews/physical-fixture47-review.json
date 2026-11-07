@@ -1,0 +1,26 @@
+{
+  "reviewer": "DeepSeek independent reviewer",
+  "reviewed_at_utc": "2026-11-07T01:35:31.643680+00:00",
+  "scope": "test-only fixture commit 47a93ed relative to parent 32dfea8",
+  "worktree": "/workspace/rootyard-worktrees/round2-maint23",
+  "head": "47a93edb6ae2e97fd9b7b66d7bf6c78834a84828",
+  "parent": "32dfea8bd13e6a3c6fa6dcfdb47fa38e3c214f2f",
+  "changed_files": [
+    "tests/storage_lifecycle_physical.py"
+  ],
+  "production_source_changes": "none (test-only; git diff 32dfea8..47a93ed touches only tests/storage_lifecycle_physical.py)",
+  "case1_status": "unchanged; diff begins after physical_loose_packed_and_pin and case1 still uses its offline update-ref fixture",
+  "fix_assessment": {
+    "enospc_sync": "Sound. Before stop, the fixture waits for the live repository_ref_projection row with deleted=false and for the ref-index event_deliveries row to become delivered. event_deliveries rows are created transactionally with the outbox event (src/events.rs:180), so a zero undelivered count after the projection appears is a real delivery barrier, not a no-row shortcut.",
+    "namespace_view_retry": "Sound. Only HTTP 503 is retried, bounded to 20 seconds; any other status or timeout raises the actual failure. This cannot mask a permanent source error.",
+    "retention_rules": "Unchanged. No production GC/retention source edits; the fixture still validates no live SQL ref root before ENOSPC and preserves reachable base/cat-file/fsck assertions. No GC root weakening or deletion added."
+  },
+  "findings": [],
+  "p1": "none",
+  "p2": "none",
+  "verdict": "APPROVE test-only fixture commit 47a93ed. The ENOSPC synchronization is a real durable-projection/ref-index barrier, the namespace view retry is bounded and only handles transient 503, case1 is unchanged, and production GC retention rules are untouched.",
+  "acceptance_boundary": "Full eight-case physical acceptance is running separately; this approval covers only the immutable test diff at 47a93ed. No production source/build/GitHub changes and no remote GC claim.",
+  "limitations": [
+    "Read-only source/diff inspection; no native rerun, build, source edit or remote mutation in this review."
+  ]
+}
