@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Real PostgreSQL WAL archive/PITR with a matched offline GitFS snapshot."""
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +11,7 @@ import tempfile
 import time
 
 from e2e import Harness
+import ops_provenance
 
 
 def run(args, check=True):
@@ -69,6 +69,9 @@ def main():
         revoked = h.account("create-token", "alice")
         h.cli("revoke-token", revoked["token_id"])
         assert h.http("/api/repos/alice/demo", token=revoked)[0] == 401
+        outbox_before = int(h.sql("SELECT COUNT(*) FROM outbox_events"))
+        pending_before = int(h.sql("SELECT COUNT(*) FROM event_deliveries WHERE state <> 'delivered'"))
+        assert outbox_before > 0 and pending_before > 0, "fixture produced no durable worker backlog"
         h.stop()
         run(["pg_basebackup", "-h", str(root), "-p", str(p_port), "-U", "agent", "-D",
              str(backup), "-X", "stream", "--checkpoint=fast"])
@@ -90,7 +93,7 @@ def main():
         while time.monotonic() < until and not (archive / archived_segment).exists():
             time.sleep(.1)
         assert (archive / archived_segment).exists(), "acknowledged later write WAL was not archived"
-        h.stop(hard=True)
+        h.stop()
         run(["pg_ctl", "-D", str(primary), "-m", "immediate", "stop"])
         primary_running = False
         shutil.copytree(backup, restored, symlinks=True)
@@ -101,7 +104,20 @@ def main():
         (restored / "recovery.signal").touch()
         run(["pg_ctl", "-D", str(restored), "-l", str(root / "restored.log"), "-w", "start"])
         restored_running = True
-        assert sql(root, r_port, "SELECT pg_is_in_recovery()") == "f", "PITR did not promote"
+        # pg_ctl -w can return while the server is briefly accepting read-only
+        # connections just before recovery_target_action=promote completes.
+        # Poll the actual recovery state instead of racing that transition.
+        promoted = False
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if sql(root, r_port, "SELECT pg_is_in_recovery()") == "f":
+                    promoted = True
+                    break
+            except AssertionError:
+                pass
+            time.sleep(.05)
+        assert promoted, "PITR did not promote within 20s"
         h.base_db = f"postgresql://agent@localhost:{r_port}/postgres"
         h.db = h.db.replace(f":{p_port}/", f":{r_port}/")
         h.env["DATABASE_URL"] = h.db
@@ -112,8 +128,36 @@ def main():
               "rotated_at=clock_timestamp() WHERE singleton=true; "
               "DELETE FROM cluster_transport_nonces; COMMIT;")
         assert h.sql("SELECT incarnation::text FROM cluster_authority WHERE singleton=true") != original_authority
-        shutil.rmtree(h.root / "data")
-        shutil.copytree(snapshot, h.root / "data", symlinks=True)
+        restored_data = h.root / "restored-deployment-data"
+        shutil.copytree(snapshot, restored_data, symlinks=True)
+        h.env["ROOTYARD_DATA_DIR"] = str(restored_data)
+        h.bare = restored_data / "repos" / (h.repo["id"] + ".git")
+        restored_port = port()
+        h.env["ROOTYARD_BIND"] = "127.0.0.1:" + str(restored_port)
+        h.base = "http://" + h.env["ROOTYARD_BIND"]
+        h.remote = h.base + h.repo["clone_path"]
+        h.git("remote", "set-url", "origin", h.remote, cwd=h.work)
+        h.git("remote", "set-url", "origin", h.remote, cwd=h.copy)
+        h.env["ROOTYARD_OUTBOX_WORKER"] = "false"
+        # The delivery worker only needs PostgreSQL. Run it against the
+        # restored authority before reopening Git ingress and prove that the
+        # retained durable backlog advances without resurrecting the later
+        # post-boundary event.
+        worker_count = 0
+        pending_after = pending_before
+        for _ in range(10):
+            processed = int(h.cli("worker-once"))
+            worker_count += processed
+            pending_after = int(h.sql("SELECT COUNT(*) FROM event_deliveries WHERE state <> 'delivered'"))
+            if pending_after == 0 or processed == 0:
+                break
+        outbox_after = int(h.sql("SELECT COUNT(*) FROM outbox_events"))
+        pending_states = h.sql("SELECT consumer || ':' || state || ':' || COUNT(*) FROM event_deliveries "
+                               "WHERE state <> 'delivered' GROUP BY consumer, state ORDER BY consumer, state")
+        assert worker_count > 0 and pending_after == 0, (
+            f"restored worker did not drain retained deliveries: count={worker_count} "
+            f"pending={pending_after} {pending_states}")
+        assert outbox_after == outbox_before, "post-boundary outbox event survived PITR"
         h.start()
         h.git("fetch", h.remote, "refs/heads/main", cwd=h.copy, token=h.reader)
         assert h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip() == retained_tip
@@ -131,10 +175,17 @@ def main():
         recovery_tip = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
         h.git("push", "origin", "HEAD:main", cwd=h.work, token=h.alice)
         assert h.git("ls-remote", h.remote, "main", token=h.reader).stdout.decode().startswith(recovery_tip)
-        report = {
+        report = ops_provenance.base(
+            args.binary, __file__,
+            topology="new Rootyard data volume and new loopback endpoint against a PITR-restored PostgreSQL 17 cluster; source archive/base backup on one host",
+            dataset="one private repository with two acknowledged commits before the restore point and one acknowledged commit afterwards",
+            workload="native Git push/fetch/browse, token revocation, permission denial, PostgreSQL WAL archive/base backup/PITR, offline matching GitFS snapshot, and delivery-worker drain before reopening ingress",
+            limits=["single-host local unencrypted archive and offline matching GitFS snapshot",
+                    "manual recovery, new endpoint/volume and traffic restart",
+                    "not a remote-retained encrypted backup",
+                    "not zero-RPO failover or a supported multi-host PostgreSQL HA deployment"])
+        report.update({
             "kind": "native_postgresql_wal_archive_pitr_and_gitfs_snapshot",
-            "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
-            "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "pg_basebackup_version": run(["pg_basebackup", "--version"]),
             "postgres_version": sql(root, r_port, "SHOW server_version"),
             "archive_mode": sql(root, r_port, "SHOW archive_mode"),
@@ -145,14 +196,18 @@ def main():
             "later_acknowledged_oid_outside_recovery_point": later_tip,
             "post_restore_acknowledged_oid": recovery_tip,
             "restored_git_operation_rows": operation_count,
+            "restored_deployment": {"data_volume": "new directory copied from the matched offline GitFS snapshot",
+                                   "endpoint": "new loopback port",
+                                   "metadata": "PITR-restored PostgreSQL cluster"},
+            "worker_restore": {"worker_once_processed": worker_count,
+                               "outbox_events_before_boundary": outbox_before,
+                               "outbox_events_after_restore": outbox_after,
+                               "pending_deliveries_before_boundary": pending_before,
+                               "pending_deliveries_after_worker": pending_after},
             "retained_ref_and_objects_fsck": "passed",
             "reader_access_unrelated_tenant_denial_and_token_revocation": "passed",
             "delegation_authority_rotated_before_reopening": True,
-            "later_write_intentionally_lost_at_point_in_time": True,
-            "limits": ["single-host local archive and offline matching GitFS snapshot",
-                       "manual recovery and traffic restart", "not a remote-retained encrypted backup",
-                       "not zero-RPO failover or a supported multi-host PostgreSQL HA deployment"]
-        }
+            "later_write_intentionally_lost_at_point_in_time": True})
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"result": "passed", "report": str(args.report)}))

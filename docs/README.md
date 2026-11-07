@@ -4,6 +4,7 @@
 
 - [完整设计目录](design/README.md)
 - [实现状态与计划边界](design/implementation-status.md)
+- [`6d2f0b8` 主分支验收审计](acceptance/main-6d2f0b8-audit.md)
 - [架构图与 Mermaid 源文件](design/architecture-diagrams.md)
 - [最新分期路线与验收闸门](design/08-roadmap.md)
 - [原始设计快照](design/source-page.md)

@@ -2,7 +2,6 @@
 """Cut the old writer's actual PostgreSQL TCP path and verify fenced takeover."""
 import argparse
 import base64
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from e2e import Harness
 from cluster_workload_native import free_port, request
+import ops_provenance
 
 
 class TcpPartition:
@@ -187,14 +187,20 @@ def main():
         assert push.returncode == 0, h.redact(push_error.decode(errors="replace")[-500:])
         assert h.git("--git-dir=" + str(target_repo), "rev-parse", "refs/heads/main").stdout.decode().strip() == new_tip
         assert h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == ack
-        report = {"kind": "native_tcp_partition_takeover", "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
+        report = ops_provenance.base(
+            args.binary, __file__,
+            topology="two Rust data processes and volumes on one host sharing PostgreSQL through a disposable source-only TCP proxy; trusted local process-session fence",
+            dataset="one private repository with an acknowledged commit before isolation and a new push after target promotion",
+            workload="native Git push/fetch while all source-only PostgreSQL proxy sockets are cut; measured replica promotion after source session kill and post-takeover push",
+            limits=["single-host TCP isolation; no kernel network namespace partition",
+                    "local process-session fence only; no cross-host fencing or automatic PostgreSQL leader election"])
+        report.update({"kind": "native_tcp_partition_takeover",
                   "fault": "closed source-only PostgreSQL TCP proxy and all its live sockets",
                   "source_metadata_status_after_partition": source_status,
                   "old_source_session_killed": True, "durable_restart_block": True,
                   "acknowledged_oid_before_partition": ack, "rpo_lost_acknowledged_commits": 0,
                   "takeover_ms": takeover_ms, "new_route_epoch": promoted["route_epoch"],
-                  "post_takeover_oid": new_tip,
-                  "limits": ["single-host TCP isolation; no kernel network namespace partition", "local process-session fence only"]}
+                  "post_takeover_oid": new_tip})
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"result": "passed", "report": str(args.report), "takeover_ms": takeover_ms}))

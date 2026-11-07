@@ -1,5 +1,5 @@
 //! Signed CI-run sandbox execution bound to one claimed candidate and checkout plan.
-use super::{runner, terminal};
+use super::{export, runner, terminal};
 use crate::{
     AppState, Error, ci_checkouts, db,
     storage::read_leases,
@@ -10,7 +10,6 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
@@ -128,11 +127,57 @@ pub async fn logs(
 ) -> Result<Json<serde_json::Value>, Error> {
     let claim = authorize(&state, &headers, &owner, &name, hook, run, &tuple).await?;
     load_job(&state, &claim, id).await?;
-    let root = runner::job_root(&state, id);
-    let stdout = read_log(root.join("stdout.log"))?;
-    let stderr = read_log(root.join("stderr.log"))?;
-    Ok(Json(json!({"job_id":id,"stdout_base64":STANDARD.encode(stdout),
-        "stderr_base64":STANDARD.encode(stderr)})))
+    let mut payload = export::logs(&runner::job_root(&state, id), export::LOG_LIMIT)?;
+    payload["job_id"] = json!(id);
+    Ok(Json(payload))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactQuery {
+    runner_id: String,
+    attempt: i64,
+    lease_generation: i64,
+    head_oid: String,
+    storage_generation: i64,
+    #[serde(default)]
+    offset: Option<u64>,
+    path: String,
+}
+impl ArtifactQuery {
+    fn claim(&self) -> ClaimTuple {
+        ClaimTuple {
+            runner_id: self.runner_id.clone(),
+            attempt: self.attempt,
+            lease_generation: self.lease_generation,
+            head_oid: self.head_oid.clone(),
+            storage_generation: self.storage_generation,
+            offset: self.offset,
+        }
+    }
+}
+pub async fn artifact(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name, hook, run, id)): Path<(String, String, Uuid, Uuid, Uuid)>,
+    headers: HeaderMap,
+    Query(query): Query<ArtifactQuery>,
+) -> Result<Json<serde_json::Value>, Error> {
+    let claim = authorize(&state, &headers, &owner, &name, hook, run, &query.claim()).await?;
+    load_job(&state, &claim, id).await?;
+    export::require_terminal(&state, id).await?;
+    let artifact = export::artifact(&runner::artifacts_root(&state, id), &query.path)?;
+    Ok(Json(json!({"job_id":id,"artifact":artifact})))
+}
+pub async fn cleanup(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name, hook, run, id)): Path<(String, String, Uuid, Uuid, Uuid)>,
+    headers: HeaderMap,
+    Query(tuple): Query<ClaimTuple>,
+) -> Result<Json<serde_json::Value>, Error> {
+    let claim = authorize(&state, &headers, &owner, &name, hook, run, &tuple).await?;
+    load_job(&state, &claim, id).await?;
+    export::require_terminal(&state, id).await?;
+    let removed = runner::cleanup_job(&state, id)?;
+    Ok(Json(json!({"job_id":id,"removed":removed})))
 }
 pub async fn terminal_input(
     State(state): State<Arc<AppState>>,
@@ -185,24 +230,6 @@ pub async fn terminal_resize(
     terminal::resize(id, size.rows, size.columns)?;
     Ok(Json(json!({"rows":size.rows,"columns":size.columns})))
 }
-fn read_log(path: PathBuf) -> Result<Vec<u8>, Error> {
-    use std::{io::Read, os::unix::fs::OpenOptionsExt};
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(Error::internal)?;
-    if !file.metadata().map_err(Error::internal)?.is_file() {
-        return Err(Error::not_found());
-    }
-    let mut out = Vec::new();
-    file.take(64 * 1024 + 1).read_to_end(&mut out).map_err(Error::internal)?;
-    if out.len() > 64 * 1024 {
-        return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "CI log exceeds limit"));
-    }
-    Ok(out)
-}
-
 pub(crate) async fn start_ci(
     state: Arc<AppState>,
     claim: ClaimedRun,

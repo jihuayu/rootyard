@@ -1,0 +1,109 @@
+{
+  "role": "runner32",
+  "issue_set": [
+    32
+  ],
+  "branch": "codex/deepseek-round2-runner32",
+  "base_commit": "6d2f0b845525921339fa045868c2029d6dc42923",
+  "source_commit": "960d615e59fcc0b345aca36f0fde510cad680f8c",
+  "commits": [
+    "25975a2982af40cff5ece3c8831880bb6a478db4",
+    "e5bd176a5bbc6a6dbd8c09572e09a7609a6a3ffd",
+    "960d615e59fcc0b345aca36f0fde510cad680f8c"
+  ],
+  "certified_binary": {
+    "path": "/workspace/scratch/rootyard-round2/runner32/rootyard",
+    "sha256": "affa4935731dc8476f2e447fe4817800741dd292ea6929c791f8062c5dadf583",
+    "size_bytes": 309474632,
+    "build_helper": "/workspace/scratch/rootyard-round2/build (cargo clean -p rootyard under flock, --locked, input digest before/after, atomic copy)",
+    "production_inputs_sha256": "56b09c53ca347b9e023f3efc14eb8518f982be80b7b1041c1088aa163859a73c",
+    "input_digest_before_after_equal": true,
+    "source_commit_recorded_by_helper": "960d615e59fcc0b345aca36f0fde510cad680f8c",
+    "capability_marker": "strings binary contains \"bounded artifact tmpfs pool required\" (2 occurrences)"
+  },
+  "acceptance": [
+    {
+      "criterion": "Execute a real checkout/build in two isolated tasks and prove they cannot read each other writable state or platform credentials.",
+      "status": "PASS (dev namespace mode, real bwrap/PostgreSQL/Git/gcc); cgroup-mode positive isolation NOT executed (env-blocked)",
+      "evidence": [
+        "tests/test_sandbox_service.py::test_isolated_jobs_logs_artifacts_cancel_and_timeout",
+        "tests/test_ci_sandbox.py::test_two_concurrent_claims_isolated_build_and_export"
+      ],
+      "detail": "Two workspace jobs and two concurrent signed-CI jobs each ran a real git checkout, gcc build and executable. Each only saw its own /workspace and /artifacts: per-job nonces, no sibling file, baseline repository unmodified. env contained only PATH/HOME/TMPDIR; no DATABASE_URL, no ROOTYARD_* config, no /var/run/docker.sock, no /root. CI jobs used distinct signed origin claims and each artifact stayed in its own export directory."
+    },
+    {
+      "criterion": "Resource exhaustion, cancellation and runner crash leave a terminal job result and reclaim processes/storage.",
+      "status": "PASS for dev-mode quota/cancel/crash/startup-reclaim; POSITIVE kernel cgroup enforcement BLOCKED in this environment",
+      "evidence": [
+        "tests/test_sandbox_service.py::test_quota_cancel_crash_cleanup_and_retention",
+        "tests/test_sandbox_service.py::test_artifact_pool_is_bounded_and_validated",
+        "tests/test_sandbox_cgroup_native.py preflight exit 3"
+      ],
+      "detail": "Real artifact and workspace quota overruns became failed terminal jobs with bounded stderr notes. Cancellation and SIGKILL of the service both ended in terminal rows; setsid/double-fork descendants were checked gone, transient workspace copies reclaimed. Startup recovery marks running jobs failed only after proving the process tree is gone; stale cgroup cleanup failure returns an error and aborts startup. Launch-failure cleanup removes partial workspace and artifact/pool directories (focused regression in pool test). Cgroup mode requires a validated tmpfs export pool and fails closed without one."
+    },
+    {
+      "criterion": "Export authorized logs/artifacts and restore/retry only under a new fenced execution attempt.",
+      "status": "PASS (real HTTP/PostgreSQL evidence)",
+      "evidence": [
+        "tests/test_sandbox_service.py",
+        "tests/test_ci_sandbox.py::test_fenced_retry_requires_new_attempt",
+        "tests/test_ci_sandbox.py::test_two_concurrent_claims_isolated_build_and_export"
+      ],
+      "detail": "Owner/claim-scoped logs and artifacts; openat2 RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS rejected traversal/symlink; 16 MiB file bounds with explicit truncation flags; live logs allowed, artifacts terminal-only; cleanup removes retained export and is idempotent; non-owner/wrong claim gets 404/409. Re-claim advanced attempt 1->2 and lease_generation 1->2, created a new job id, old claim got 409, new claim could not read old job (404), old terminal row retained as fenced audit; retention 0 sweep removed roots while rows survived."
+    }
+  ],
+  "commands_and_outcomes": [
+    {
+      "command": "/workspace/scratch/rootyard-round2/build runner32 /workspace/rootyard-worktrees/round2-runner32",
+      "outcome": "PASS: Built private binary; inputs stable; sha256 affa4935...; commit 960d615"
+    },
+    {
+      "command": "ROOTYARD_TEST_DATABASE_URL=postgres://agent@127.0.0.1:55433/round2_runner32 ROOTYARD_BINARY=<private> PYTHONPATH=.:tests env-run python3 -m unittest -v tests.test_sandbox_service tests.test_ci_sandbox",
+      "outcome": "PASS: Ran 6 tests in 39.225s, OK"
+    },
+    {
+      "command": "ROOTYARD_BINARY=<private> PYTHONPATH=.:tests ROOTYARD_TEST_CGROUP_ROOT=/sys/fs/cgroup env-run python3 tests/test_sandbox_cgroup_native.py",
+      "outcome": "BLOCKED: exit 3; cgroup controllers not delegated (subtree_control empty); no cgroup-mode acceptance executed"
+    },
+    {
+      "command": "cargo test --lib sandbox::cgroup (earlier commit 25975a2, same logic)",
+      "outcome": "PASS: 3 tests (limit write/fail, malformed cpu, unreclaimable cgroup failure). These are file-path unit tests, NOT kernel-enforcement proof."
+    }
+  ],
+  "failed_findings_fixed": [
+    "cgroup artifact export read a host path absent in cgroup tmpfs mode -> dedicated /artifacts bind from validated pool",
+    "crash left running-job roots and stale cgroups -> startup reclaim, sweep, retention, cleanup endpoints",
+    "cgroup destroy/reap failures were swallowed -> Result + retained pending cleanup blocks new launches + startup abort",
+    "orphan cleanup did not prove descendants gone -> session-wide group kill plus kernel PID-namespace teardown verification; setsid/double-fork native test",
+    "artifacts lived on unbounded host disk -> cgroup mode requires service-owned tmpfs mount with verified bounded size; ramfs rejected; non-tmpfs dirs 503",
+    "launch failure after copy/pool creation leaked copies -> isolation validated before copy and partial artifact/pool dir cleanup with regression test",
+    "live log access contradicted module contract -> documented as live feature, test asserts running-log 200 and running-artifact 409",
+    "earlier shared-target builds produced another branch binary -> final evidence uses certified clean build helper; old results treated as non-final"
+  ],
+  "environment_blockers": [
+    "No delegated cgroup v2 subtree: /sys/fs/cgroup is host root, root:root 0755, root-owned cgroup files, empty cgroup.subtree_control; no write permission for uid 1000",
+    "No CAP_SYS_ADMIN in host capabilities and no sudo",
+    "Docker is rootless with cgroup driver none; privileged helper container cannot write cgroupfs (EPERM); containers get no memory/pids/cpu limits",
+    "/dev/kvm absent so a nested VM was not available",
+    "Root cause of positive cgroup acceptance block is environmental, not a mocked test: opt-in test exits 3 with preflight diagnostics and is never reported as pass"
+  ],
+  "limitations": [
+    "Issue #32 must remain OPEN: memory.max, pids.max, cpu.max and workspace-tmpfs ENOSPC were not executed against a real delegated cgroup here",
+    "Development rlimits and quota walkers are real but are not aggregate production protection; cgroup mode is the production boundary",
+    "Per-job artifact aggregate quota is polled at 750 ms plus terminal audit; production relies on the kernel-bounded tmpfs pool for the global hard bound",
+    "Exactly one active service instance per ROOTYARD_SANDBOX_CGROUP_ROOT; do not share the root between independent runner nodes",
+    "No remote push/PR/merge/issue changes performed (coordinator owns remote)"
+  ],
+  "files": [
+    "src/sandbox.rs",
+    "src/sandbox/cgroup.rs (new)",
+    "src/sandbox/export.rs (new)",
+    "src/sandbox/runner.rs",
+    "src/sandbox/handlers.rs",
+    "src/sandbox/ci.rs",
+    "tests/test_sandbox_service.py",
+    "tests/test_ci_sandbox.py",
+    "tests/test_sandbox_cgroup_native.py (new)",
+    "docs/sandbox-runner.md"
+  ]
+}

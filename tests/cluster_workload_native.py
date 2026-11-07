@@ -7,7 +7,6 @@ import hmac
 import json
 import os
 from pathlib import Path
-import platform
 import shutil
 import signal
 import socket
@@ -18,6 +17,7 @@ import urllib.request
 import uuid
 
 from e2e import Harness
+import ops_provenance
 
 
 def free_port():
@@ -81,16 +81,24 @@ def main():
     h.env["ROOTYARD_NODE_ID"] = "shard-primary-0"
     h.env["ROOTYARD_CLUSTER_HMAC_KEY"] = base64.b64encode(os.urandom(32)).decode()
     extra = []
-    report = {"kind": "native_cluster_client_workload", "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
-              "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-              "source_base_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], text=True).strip(),
-              "git_version": subprocess.check_output(["git", "--version"], text=True).strip(),
-              "hardware": {"kernel": platform.release(), "machine": platform.machine(), "logical_cpus": os.cpu_count(),
-                           "mem_total_kb": next((int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()
-                                                 if line.startswith("MemTotal:")), None)},
-              "dataset": "one private repository, 24 sequential one-file commits, eight push/fetch pairs per tier",
-              "topology": "distinct Rust processes and storage directories; one PostgreSQL schema; loopback signed forwarding",
-              "tiers": [], "failure": {}, "raw": [], "untested": ["automatic takeover", "physical storage fencing", "PostgreSQL HA", "network partition", "disk pressure", "cache eviction"]}
+    report = ops_provenance.base(
+        args.binary, __file__,
+        topology="distinct Rust processes and storage directories; one PostgreSQL schema; loopback signed forwarding",
+        dataset="one private repository, eight sequential one-file commits and eight push/fetch pairs per tier",
+        workload="1/2/4 data processes; each tier starts with its own acknowledged push/fetch sequence; Git clients use real native push/fetch and routed browse",
+        limits=["single Linux host and shared PostgreSQL schema; loopback traffic",
+                "four processes and volumes are functional sharding, not physical host or network failure domains",
+                "native Git and Rust timings are operational samples, not a capacity plan"])
+    report.update({"kind": "native_cluster_client_workload",
+                   "tiers": [], "failure": {}, "raw": [],
+                   "companion_evidence": {"automatic_storage_takeover": "evidence/cluster-takeover-run.json",
+                                          "source_only_network_partition": "evidence/cluster-partition.json",
+                                          "disk_enospc": "evidence/cluster-disk-pressure.json",
+                                          "postgresql_failover": "evidence/cluster-pg-streaming.json",
+                                          "pitr_restore": "evidence/cluster-pg-pitr.json"},
+                   "not_covered_by_this_report": ["automatic takeover", "physical storage fencing",
+                                                  "PostgreSQL HA", "kernel network partition",
+                                                  "disk pressure", "CI mirror cache eviction"]})
     try:
         h.setup()
         report["postgres_version"] = h.sql("SHOW server_version")
@@ -354,7 +362,70 @@ def main():
                                       "unused_old_browse_and_git_delegations_status": 409,
                                       "fresh_browse_and_git_delegations_status": 200,
                                       "future_required_generation_ingress_status": 409}
-        report["untested"] = [item for item in report["untested"] if item != "cache eviction"] + ["CI mirror cache eviction"]
+        # Corrupt and recover a disposable repository on the real serving node
+        # volume.  The owner process is stopped before the loose blob is
+        # removed and restarted before the stock client fetch, so this is not a
+        # cached or copy-only fixture.  Only this disposable repository is
+        # mutated; the measured workload repository remains intact.
+        status, raw = request(bases[0], "/api/repos", h.alice, "POST", {"name": "live-negative"})
+        assert status in (200, 201), (status, raw[:200])
+        live_repo = json.loads(raw)
+        live_path = live_repo["clone_path"]
+        live_work = h.root / "live-negative-work"
+        h.git("clone", bases[1] + live_path, str(live_work), token=h.alice)
+        h.git("config", "user.name", "Live Negative Control", cwd=live_work)
+        h.git("config", "user.email", "live-negative@example.invalid", cwd=live_work)
+        (live_work / "corrupt-me.bin").write_bytes(os.urandom(4096))
+        h.git("add", "corrupt-me.bin", cwd=live_work)
+        h.git("commit", "-m", "live serving-volume corruption fixture", cwd=live_work)
+        live_tip = h.git("rev-parse", "HEAD", cwd=live_work).stdout.decode().strip()
+        h.git("push", bases[2] + live_path, "HEAD:main", cwd=live_work, token=h.alice)
+        live_bare = h.root / "data" / "repos" / (live_repo["id"] + ".git")
+        h.git("--git-dir=" + str(live_bare), "update-ref",
+              "refs/rootyard-ci/jobs/live-negative", live_tip)
+        live_blob = h.git("--git-dir=" + str(live_bare), "rev-parse",
+                          live_tip + ":corrupt-me.bin").stdout.decode().strip()
+        loose = live_bare / "objects" / live_blob[:2] / live_blob[2:]
+        assert loose.is_file(), "fresh pushed object unexpectedly packed; cannot remove it physically"
+        object_bytes = loose.read_bytes()
+        owner_volume = "live serving node ROOTYARD_DATA_DIR (same volume as the measured workload)"
+        h.stop(hard=True)
+        loose.unlink()
+        h.start()
+        fetch_dir = h.root / "live-negative-fetch"
+        h.git("init", str(fetch_dir))
+        h.git("remote", "add", "origin", bases[1] + live_path, cwd=fetch_dir)
+        failed_fetch = h.git("fetch", "origin", "main", cwd=fetch_dir, token=h.reader, check=False)
+        failed_fsck = h.git("--git-dir=" + str(live_bare), "fsck", "--full", "--strict", check=False)
+        assert failed_fetch.returncode != 0, "stock Git fetch falsely succeeded with a missing retained object"
+        assert failed_fsck.returncode != 0, "native fsck did not detect a physically removed retained object"
+        # Restore the exact bytes and prove the same live service recovers.
+        loose.write_bytes(object_bytes)
+        h.git("--git-dir=" + str(live_bare), "fsck", "--full", "--strict")
+        recovered = h.git("fetch", "origin", "main", cwd=fetch_dir, token=h.reader)
+        assert recovered.returncode == 0
+        recovered_tip = h.git("rev-parse", "FETCH_HEAD", cwd=fetch_dir).stdout.decode().strip()
+        assert recovered_tip == live_tip
+        recovered_clone = h.root / "live-negative-recovered-clone"
+        h.git("clone", bases[2] + live_path, str(recovered_clone), token=h.reader)
+        assert h.git("rev-parse", "HEAD", cwd=recovered_clone).stdout.decode().strip() == live_tip
+        report["live_object_negative_control"] = {
+            "fixture": "disposable repository on the live serving node volume",
+            "owner_volume": owner_volume,
+            "owner_process_stopped_before_object_removal": True,
+            "owner_process_restarted_before_fetch": True,
+            "retained_ref": "refs/rootyard-ci/jobs/live-negative",
+            "acknowledged_tip": live_tip,
+            "removed_loose_blob_oid": live_blob,
+            "stock_fetch_exit_while_corrupt": failed_fetch.returncode,
+            "stock_fetch_stderr_while_corrupt": h.redact(failed_fetch.stderr.decode(errors="replace")[-300:]),
+            "native_fsck_failed_while_corrupt": True,
+            "object_bytes_restored": len(object_bytes),
+            "stock_fetch_exit_after_restore": recovered.returncode,
+            "fetched_tip_after_restore": recovered_tip,
+            "native_fsck_after_restore": "passed",
+            "clone_after_restore": "passed",
+            "note": "only the disposable live-negative repository is mutated; readiness remains a process/dependency check while reachability is asserted by stock fetch and native fsck"}
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"result": "passed", "report": str(args.report), "tiers": [1, 2, 4]}))

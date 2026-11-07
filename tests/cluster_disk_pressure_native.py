@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Exercise a real Rootyard Git service on an isolated, full Docker tmpfs."""
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +10,7 @@ import time
 import uuid
 
 from e2e import Harness
+import ops_provenance
 
 
 def docker(*args, check=True):
@@ -28,6 +28,12 @@ def main():
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
     args.binary = str(args.binary.resolve())
+    # The service keeps a durable copy of its own executable under the data
+    # volume (managed Git hooks), so the private volume must additionally fit
+    # the supplied binary. Size it from the real file instead of assuming a
+    # release-sized executable; the ENOSPC injection still fills it to zero.
+    binary_bytes = Path(args.binary).stat().st_size
+    mount_size_mib = max(128, (binary_bytes + (1 << 20) - 1) // (1 << 20) + 64)
     h = Harness(args)
     name = "rootyard-disk-" + uuid.uuid4().hex[:10]
     started = False
@@ -39,10 +45,11 @@ def main():
         h.bob = h.account("create-user", "bob")
         h.reader = h.account("create-token", "alice", "--read-only")
         # Host libraries and native Git are mounted read-only; only /data is
-        # writable. Docker supplies a private 128 MiB tmpfs, so ENOSPC cannot
-        # consume shared workspace disk or another test's fixture.
+        # writable. Docker supplies a private tmpfs sized for the executable
+        # copy plus a small repository, so ENOSPC cannot consume shared
+        # workspace disk or another test's fixture.
         docker("run", "-d", "--name", name, "--network", "host",
-               "--tmpfs", "/data:rw,exec,size=128m", "--tmpfs", "/tmp:rw,size=16m", "--read-only",
+               "--tmpfs", f"/data:rw,exec,size={mount_size_mib}m", "--tmpfs", "/tmp:rw,size=16m", "--read-only",
                "-v", args.binary + ":/usr/local/bin/rootyard:ro",
                "-v", "/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:ro",
                "-v", "/lib64/ld-linux-x86-64.so.2:/lib64/ld-linux-x86-64.so.2:ro",
@@ -76,7 +83,7 @@ def main():
         assert docker("exec", name, "git", "--git-dir=" + bare, "fsck",
                       "--full", "--strict").returncode == 0
         fill = docker("exec", name, "dd", "if=/dev/zero", "of=/data/pressure.bin",
-                      "bs=1048576", "count=128", check=False)
+                      "bs=1048576", "count=" + str(mount_size_mib), check=False)
         assert fill.returncode != 0 and b"No space left on device" in fill.stderr, (
             "isolated volume did not reach ENOSPC")
         free_kib = int(docker("exec", name, "sh", "-c",
@@ -106,16 +113,22 @@ def main():
             assert after_retry.startswith(rejected_tip)
         else:
             assert after_retry.startswith(retained_tip)
-        report = {
+        report = ops_provenance.base(
+            args.binary, __file__,
+            topology=f"one Rust service in rootless Docker on a private {mount_size_mib} MiB tmpfs; external PostgreSQL 17 on the host",
+            dataset="one private repository with an acknowledged commit before pressure and an attempted commit during ENOSPC",
+            workload="native Git push/fetch/fsck while a real process writes until the container data tmpfs returns ENOSPC, then removes the filler and retries",
+            limits=["local rootless Docker tmpfs rather than hardware disk",
+                    "tmpfs is sized to fit the supplied executable plus test data; absolute free space differs from a production volume",
+                    "one small repository; no production scale or power-loss assertion"])
+        report.update({
             "kind": "native_rootyard_git_enospc",
-            "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
-            "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "docker_version": docker("version", "--format", "{{.Server.Version}}").stdout.decode().strip(),
             "container_image_id": docker("image", "inspect", "alpine:3.20", "--format", "{{.Id}}").stdout.decode().strip(),
             "git_version": docker("exec", name, "git", "--version").stdout.decode().strip(),
             "postgres_version": h.sql("SHOW server_version"),
-            "topology": "one Rust service in rootless Docker; private 128 MiB tmpfs; external PostgreSQL 17",
-            "mount_size_mib": 128, "free_kib_at_push": free_kib,
+            "binary_size_bytes": binary_bytes,
+            "mount_size_mib": mount_size_mib, "free_kib_at_push": free_kib,
             "fault": "dd writes /data/pressure.bin until kernel returns ENOSPC",
             "retained_acknowledged_oid": retained_tip,
             "rejected_oid": rejected_tip,
@@ -124,10 +137,7 @@ def main():
             "git_operation_outcome_counts_during_pressure": outcome_counts_during_pressure,
             "ref_after_removing_pressure": observed_tip,
             "native_fsck_after_pressure": "passed",
-            "post_pressure_retry_acked": retry.returncode == 0,
-            "limits": ["local rootless Docker tmpfs rather than hardware disk",
-                       "one small repository; no production scale or power-loss assertion"]
-        }
+            "post_pressure_retry_acked": retry.returncode == 0})
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"result": "passed", "report": str(args.report),
