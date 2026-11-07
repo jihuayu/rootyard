@@ -52,7 +52,12 @@ deployment:
   health checks; a node that is not the elected primary is never used for the
   write endpoint, and stale client sessions to a failed node are closed
   (`on-marked-down shutdown-sessions`) so the application pool reconnects to
-  the promoted node on the same address.
+  the promoted node on the same address. HAProxy 3.0 has no `init-state`
+  keyword, so a server is assumed UP until its first role checks fail: start
+  the endpoint only once Patroni has an elected leader, and the harness
+  refuses to issue a write until role routing has been stable for several
+  consecutive checks. The replica endpoint is verified with TLS/SCRAM to
+  serve only a standby (`pg_is_in_recovery()`) and never the primary.
 - Every password must be a distinct, non-placeholder value of at least 16
   characters; shared or weak credentials are rejected at render time.
 
@@ -61,17 +66,27 @@ deployment:
 Patroni + etcd provide leader election and *database-role* fencing: only the
 leader accepts writes, and a leader that loses the DCS lease demotes itself.
 That is not sufficient by itself for every failure mode. The production
-profile therefore **requires** a real hardware watchdog device:
+profile therefore **requires** a real watchdog device that the kernel watchdog
+subsystem has registered:
 
 ```json
 {"environment": "production", "watchdog": {"device": "/dev/watchdog", "safety_margin": 5}}
 ```
 
-`render.py` refuses production rendering when the device is absent or is not a
-real character device, and the lab profile refuses a watchdog block. The
-acceptance environment has no hardware watchdog, so this run validates the
-gate but does **not** certify production fencing. For real production use also
-supply:
+`render.py` validates the configured path as a character device and then
+requires its kernel major/minor to appear under `/sys/class/watchdog/*/dev`
+with non-empty `identity` metadata. `/dev/null`, `/dev/urandom` and any other
+software character device are rejected. The validator only reads metadata:
+it never opens the device or issues watchdog ioctls, because opening/arming a
+watchdog during a mere configuration check can reset the machine. This is a
+configuration gate, not physical hardware qualification.
+
+Software watchdogs such as the kernel `softdog` module are emulated timers.
+They can trigger a reboot only while the kernel and scheduler are healthy; they
+are not a substitute for a hardware watchdog that resets a wedged host. Use a
+real hardware/BMC watchdog for production fencing. The acceptance host has no
+registered watchdog, so this run validates the gate but does **not** certify
+production fencing. For real production use also supply:
 
 - actual physical hosts with independent power/network failure domains and a
   real watchdog (or a supported fencing agent) per node;
@@ -107,10 +122,15 @@ would delay the first standby by up to `checkpoint_timeout`. Rootyard serves Git
    the report are measured from those timestamps.
 5. Token revocation, tenant isolation and the durable outbox worker backlog
    are rechecked on the promoted cluster.
-6. DCS quorum loss: two of three etcd members are stopped. The old primary
-   must become read-only (or stop), the stable endpoint must reject writes,
-   and no promotion may occur without quorum. When the quorum returns the
-   cluster becomes writable again without operator promotion.
+6. DCS quorum loss: two of three etcd members are stopped. The test records
+   each node's actual PostgreSQL role and Patroni REST status during the loss
+   window. The old primary must become a read-only standby (or stop), no other
+   node may appear as a primary, and the stable endpoint must reject writes.
+   Patroni's cached REST view during the loss is recorded but not trusted.
+   When the quorum returns Patroni automatically re-acquires its session lock
+   and re-promotes the old primary; the test waits for stable endpoint routing
+   and records the actual PostgreSQL primary before accepting a new write.
+   No manual promotion is performed.
 
 The same-host process scope is reported explicitly. Killing processes on one
 host is not power loss, not a kernel network partition, and not evidence of

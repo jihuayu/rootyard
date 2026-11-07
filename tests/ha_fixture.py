@@ -277,7 +277,8 @@ class HAFixture:
             self.logs[node["name"]] = log
             env = self.env({"ROOTYARD_BOOTSTRAP_DB_PASSWORD": self.secrets["rootyard_password"]})
             self.procs[node["name"]] = subprocess.Popen(
-                [sys.executable, "-m", "patroni", str(config)], env=env,
+                [sys.executable, str(HERE / "ha_reaper.py"), sys.executable, "-m", "patroni", str(config)],
+                env=env,
                 stdout=log, stderr=log, start_new_session=True)
             self.commands.append(["patroni", node["name"]])
         deadline = time.monotonic() + 120
@@ -413,7 +414,7 @@ class HAFixture:
                       "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c", query], env=self.superuser_env())
         return result.stdout.decode().strip()
 
-    def endpoint_sql(self, query, db="postgres", user="rootyard", timeout=20):
+    def endpoint_sql(self, query, db="postgres", user="rootyard", timeout=20, port=None):
         """Run one query through the HAProxy primary endpoint and return its last line.
 
         The statement timeout is passed through PGOPTIONS so psql does not print a
@@ -422,11 +423,49 @@ class HAFixture:
         env = self.env({"PGPASSWORD": self.secrets["rootyard_password"], "PGSSLMODE": "verify-full",
                         "PGSSLROOTCERT": str(self.pki / "ca.crt"),
                         "PGOPTIONS": "-c statement_timeout=5000 -c lock_timeout=3000"})
-        result = run(["psql", "-h", "127.0.0.1", "-p", str(self.ports["haproxy_primary"]),
+        endpoint = self.ports["haproxy_primary"] if port is None else port
+        result = run(["psql", "-h", "127.0.0.1", "-p", str(endpoint),
                      "-U", user, "-d", db, "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c", query],
                      env=env, timeout=timeout)
         lines = [line.strip() for line in result.stdout.decode().splitlines() if line.strip()]
         return lines[-1] if lines else ""
+
+    def replica_role(self, timeout=20):
+        """Return '<f|t>:<server_port>' observed through the replica endpoint."""
+        return self.endpoint_sql("SELECT CASE WHEN pg_is_in_recovery() THEN 't' ELSE 'f' END"
+                                 " || ':' || inet_server_port()", timeout=timeout,
+                                 port=self.ports["haproxy_replica"])
+
+    def wait_replica_endpoint(self, primary_pg_port, timeout=60, stable_samples=3):
+        """Require the replica endpoint to reach a standby, never the primary."""
+        deadline = time.monotonic() + timeout
+        observed = {"values": [], "errors": [], "stats": []}
+        good = 0
+        while time.monotonic() < deadline:
+            try:
+                value = self.replica_role(timeout=8)
+                observed["values"].append(value)
+            except AssertionError as error:
+                value = ""
+                observed["errors"].append(str(error)[:300])
+            stats = self.haproxy_stats()
+            replica_stats = {row["server"]: row["status"] for row in stats
+                             if row.get("backend") == "postgres_replica_nodes"}
+            primary_name = next((n["name"] for n in self.spec["nodes"]
+                                 if n["pg_port"] == int(primary_pg_port)), None)
+            served = value.split(":", 1)[1] if ":" in value else ""
+            served_ok = bool(served) and served != str(primary_pg_port) and                 any(str(n["pg_port"]) == served and replica_stats.get(n["name"]) == "UP"
+                    for n in self.spec["nodes"])
+            primary_excluded = primary_name is None or replica_stats.get(primary_name) != "UP"
+            good = good + 1 if value.startswith("t:") and served_ok and primary_excluded else 0
+            if good >= stable_samples:
+                return value
+            time.sleep(0.25)
+        observed["stats"] = [row for row in self.haproxy_stats()
+                             if row.get("backend") == "postgres_replica_nodes"][-5:]
+        observed = {key: (value[-5:] if isinstance(value, list) else value)
+                    for key, value in observed.items()}
+        raise AssertionError(f"HAProxy replica endpoint did not reach a standby: {observed}")
 
     def endpoint_role(self, timeout=20):
         """Return '<f|t>:<server_port>' observed through the stable endpoint."""

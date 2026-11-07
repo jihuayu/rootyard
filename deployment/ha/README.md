@@ -32,7 +32,7 @@ certification.
   "etcd": {
     "cluster_token": "rootyard-ha",
     "server_cert": "/etc/rootyard/pki/server.crt",
-    "server_key": "/etc/rootyard/pki/server.key",
+    "server_key": "/etc/rootyard/pki/server.key",  // 0600, validated like all TLS keys
     "client_ca": "/etc/rootyard/pki/ca.crt",
     "client_cert": "/etc/rootyard/pki/client.crt",
     "client_key": "/etc/rootyard/pki/client.key",
@@ -88,14 +88,22 @@ All passwords must be distinct and at least 16 characters of
 are required. `postgres_host_ip` is the non-loopback address Patroni
 advertises for PostgreSQL (replication uses `verify-full` against its SAN).
 
-Production mode additionally requires a real watchdog:
+Production mode additionally requires a real watchdog that the kernel
+watchdog subsystem registered:
 
 ```json
 {"environment": "production", "watchdog": {"device": "/dev/watchdog", "safety_margin": 5}}
 ```
 
-Rendering is refused otherwise; do not certify automatic failover on a host
-without working fencing.
+The validator reads only metadata: the path must be a character device whose
+major/minor appears under `/sys/class/watchdog/*/dev` with a non-empty
+`identity`. `/dev/null`, `/dev/urandom` and other software character devices
+are rejected. The device is never opened and no watchdog ioctl is issued, so a
+configuration check cannot arm a machine reset. Software watchdogs (for
+example the `softdog` module) are emulated timers and do not replace a hardware
+watchdog that resets a wedged host. Rendering is refused when the gate is not
+satisfied; do not certify automatic failover on a host without working
+fencing.
 
 ## Render
 
@@ -112,7 +120,7 @@ Artifacts:
 | File | Purpose |
 | --- | --- |
 | `patroni-<node>.yml` | Patroni configuration for one node |
-| `etcd-<node>.args` | etcd argv, one argument per line |
+| `etcd-<node>.args` | etcd argv, one argument per line (server/peer TLS files are validated as private inputs) |
 | `haproxy.cfg` | stable primary/replica endpoints with authenticated role checks |
 | `rootyard.env` | service environment (`DATABASE_URL`, CA, data dir, bind) |
 | `bootstrap-app.sh` | Patroni `post_bootstrap` hook creating the service role/database |

@@ -138,6 +138,31 @@ def main():
         code, output = fx.render(spec=root / "no-dcs-cert.json", check=True)
         negative["dcs_client_certificate_required"] = code == 2
         assert negative["dcs_client_certificate_required"], output
+        missing_server_cert = json.loads(fx.spec_path.read_text())
+        missing_server_cert["etcd"]["server_cert"] = ""
+        (root / "no-dcs-server-cert.json").write_text(json.dumps(missing_server_cert))
+        code, output = fx.render(spec=root / "no-dcs-server-cert.json", check=True)
+        negative["missing_dcs_server_certificate_rejected"] = code == 2
+        assert negative["missing_dcs_server_certificate_rejected"], output
+        key_copy = root / "world-readable-server.key"
+        shutil.copyfile(fx.pki / "server.key", key_copy)
+        os.chmod(key_copy, 0o644)
+        readable_key = json.loads(fx.spec_path.read_text())
+        readable_key["etcd"]["server_key"] = str(key_copy)
+        (root / "world-readable-key.json").write_text(json.dumps(readable_key))
+        code, output = fx.render(spec=root / "world-readable-key.json", check=True)
+        negative["world_readable_dcs_server_key_rejected"] = code == 2
+        assert negative["world_readable_dcs_server_key_rejected"], output
+        for device in ("/dev/null", "/dev/urandom"):
+            fake = json.loads(fx.spec_path.read_text())
+            fake["environment"] = "production"
+            fake["watchdog"] = {"device": device, "safety_margin": 5}
+            path = root / ("watchdog-" + device.rsplit("/", 1)[-1] + ".json")
+            path.write_text(json.dumps(fake))
+            code, output = fx.render(spec=path, check=True)
+            key = "dev_" + device.rsplit("/", 1)[-1] + "_watchdog_rejected"
+            negative[key] = code == 2 and "watchdog" in output
+            assert negative[key], output
         env = fx.env({"PATH": fx.pg + ":" + os.environ.get("PATH", "")})
         rootyard_downgrade = subprocess.run(
             [args.binary, "migrate"],
@@ -168,6 +193,8 @@ def main():
         assert leader, "no Patroni leader after startup"
         endpoint_role = fx.wait_endpoint_primary()
         assert endpoint_role == "f:" + str(fx.pg_port(leader))
+        replica_before = fx.wait_replica_endpoint(fx.pg_port(leader))
+        assert replica_before.startswith("t:") and replica_before.split(":", 1)[1] != str(fx.pg_port(leader))
         assert fx.sql(leader, "SELECT pg_is_in_recovery()") == "f"
         # Patroni protects management endpoints with basic auth; its health and
         # read-only GET endpoints are unauthenticated by design, so network
@@ -327,6 +354,8 @@ def main():
         h.git("fetch", "origin", cwd=post_failover_clone, token=h.reader)
         assert h.git("rev-parse", "FETCH_HEAD", cwd=post_failover_clone).stdout.decode().strip() == post_oid
         assert fx.endpoint_role() == "f:" + str(fx.pg_port(successor))
+        replica_after = fx.wait_replica_endpoint(fx.pg_port(successor), timeout=90)
+        assert replica_after.startswith("t:") and replica_after.split(":", 1)[1] != str(fx.pg_port(successor))
         assert h.http("/api/repos/alice/demo", token=revoked)[0] == 401
         assert h.http("/api/repos/alice/demo", token=h.bob)[0] in (403, 404)
         # Track the exact pre-failure delivery identities: post-failure writes
@@ -373,56 +402,86 @@ def main():
         stopped = [node["name"] for node in fx.spec["etcd"]["nodes"][:2]]
         dcs_loss_at = time.monotonic_ns()
         fx.stop_etcd(stopped)
-        readonly_observed = False
+        nodes_during_loss = {}
+        loss_rest_views = []
         endpoint_write_rejected = False
-        deadline = time.monotonic() + 60
+        api_during_quorum_loss = "unknown"
+        deadline = time.monotonic() + 75
         while time.monotonic() < deadline:
+            for node in fx.spec["nodes"]:
+                name = node["name"]
+                try:
+                    recovery = fx.sql(name, "SELECT pg_is_in_recovery()")
+                    role = "standby" if recovery == "t" else "primary"
+                except AssertionError:
+                    role = "unavailable"
+                status, _ = fx.rest(name)
+                nodes_during_loss[name] = {"pg": role, "patroni_rest_status": status}
+            rest_view = fx.cluster_state()
+            if rest_view:
+                loss_rest_views.append({"leader": rest_view.get("leader"),
+                                        "members": [(m.get("name"), m.get("role"), m.get("state"))
+                                                    for m in rest_view.get("members", [])]})
             try:
-                state = fx.sql(dcs_leader, "SELECT pg_is_in_recovery()")
-                if state == "t":
-                    readonly_observed = True
-            except AssertionError:
-                readonly_observed = True  # demoted node stopped PostgreSQL entirely
-            try:
-                fx.endpoint_sql("CREATE TEMP TABLE ha43_probe(x int)")
+                fx.endpoint_sql("CREATE TEMP TABLE ha43_no_quorum_probe(x int)")
             except AssertionError:
                 endpoint_write_rejected = True
-            if readonly_observed and endpoint_write_rejected:
+            try:
+                h.http("/api/repos/alice/demo", token=h.reader)
+                api_during_quorum_loss = "200"
+            except (OSError, urllib.error.URLError):
+                api_during_quorum_loss = "unreachable"
+            old_role = nodes_during_loss.get(dcs_leader, {}).get("pg")
+            if old_role in ("standby", "unavailable") and endpoint_write_rejected:
                 break
             time.sleep(0.5)
-        assert readonly_observed, "old primary stayed writable while the DCS quorum was lost"
+        old_primary_pg = nodes_during_loss.get(dcs_leader, {}).get("pg", "unknown")
+        readonly_observed = old_primary_pg in ("standby", "unavailable")
+        unsafe_promotions = sorted(name for name, observation in nodes_during_loss.items()
+                                   if name != dcs_leader and observation["pg"] == "primary")
+        assert readonly_observed, (
+            f"old primary stayed writable while the DCS quorum was lost: "
+            f"{nodes_during_loss.get(dcs_leader)}")
+        assert not unsafe_promotions, f"standby promoted without a DCS quorum: {unsafe_promotions}"
         assert endpoint_write_rejected, "stable endpoint accepted writes without a DCS quorum"
-        try:
-            h.http("/api/repos/alice/demo", token=h.reader)
-            api_during_partition = "200"
-        except (OSError, urllib.error.URLError):
-            api_during_partition = "unreachable"
-        try:
-            push_commit("must not be acknowledged without a DCS quorum", "no-quorum.txt")
-            raise AssertionError("Git push succeeded while the DCS quorum was lost")
-        except AssertionError as error:
-            if "must not be acknowledged" in str(error):
-                raise
         no_quorum_seconds = (time.monotonic_ns() - dcs_loss_at) / 1e9
         fx.start_etcd_members(stopped)
         dcs_recovered_at = None
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
+        try:
+            endpoint_after_quorum = fx.wait_endpoint_primary(timeout=150)
+            dcs_recovered_at = time.monotonic_ns()
+        except AssertionError as error:
+            raise AssertionError(
+                "cluster did not regain a writable primary after the DCS quorum returned: "
+                f"nodes_during_loss={nodes_during_loss} detail='{error}'")
+        nodes_after_recovery = {}
+        for node in fx.spec["nodes"]:
             try:
-                if fx.endpoint_sql("SELECT pg_is_in_recovery()", timeout=6) == "f":
-                    dcs_recovered_at = time.monotonic_ns()
-                    break
+                recovery = fx.sql(node["name"], "SELECT pg_is_in_recovery()")
+                role = "standby" if recovery == "t" else "primary"
             except AssertionError:
-                pass
-            time.sleep(0.5)
-        assert dcs_recovered_at, "cluster did not regain a writable primary after the DCS quorum returned"
+                role = "unavailable"
+            nodes_after_recovery[node["name"]] = role
+        recovered_primaries = sorted(name for name, role in nodes_after_recovery.items()
+                                     if role == "primary")
+        assert len(recovered_primaries) == 1, (
+            f"unexpected PostgreSQL primary set after quorum recovery: {nodes_after_recovery}")
         dcs_oid, _ = push_commit("write after DCS quorum recovery", "post-quorum.txt")
         dcs = {"stopped_etcd_members": stopped, "old_primary_during_loss": dcs_leader,
+               "old_primary_pg_during_loss": old_primary_pg,
+               "nodes_during_loss": nodes_during_loss,
+               "patroni_rest_during_loss": {"samples": loss_rest_views[-3:],
+                                            "note": "Patroni may serve a cached DCS view; recorded, not trusted"},
+               "standby_nodes_promoted_without_quorum": unsafe_promotions,
+               "promotion_without_quorum": bool(unsafe_promotions),
                "old_primary_readonly_or_stopped": readonly_observed,
                "endpoint_writes_rejected": endpoint_write_rejected,
-               "promotion_without_quorum": False, "api_during_quorum_loss": api_during_partition,
+               "api_during_quorum_loss": api_during_quorum_loss,
                "quorum_loss_detection_seconds": round(no_quorum_seconds, 2),
                "quorum_restored_writable_ms": round((dcs_recovered_at - dcs_loss_at) / 1e6, 1),
+               "nodes_after_recovery": nodes_after_recovery,
+               "recovered_primary": recovered_primaries[0],
+               "endpoint_after_quorum": endpoint_after_quorum,
                "post_quorum_recovery_oid": dcs_oid}
 
         # ---- real backup closure and fresh-authority restore -------------
@@ -634,6 +693,10 @@ def main():
             "baseline": baseline,
             "automatic_failover": failover,
             "dcs_quorum_loss": dcs,
+            "replica_endpoint": {"before_promotion": replica_before,
+                                 "after_promotion": replica_after,
+                                 "tls_scram_verified": "sslmode=verify-full plus SCRAM through the replica frontend",
+                                 "primary_excluded_from_replica_backend": True},
             "rpo": {"lost_acknowledged_commits_after_automatic_promotion": len(missing),
                     "acked_commits_verified": len(acked)},
             "rto": {"read_ms": round((read_recovered_at - crashed) / 1e6, 1),

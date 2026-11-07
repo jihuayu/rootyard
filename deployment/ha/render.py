@@ -112,8 +112,43 @@ def check_tls(spec):
     peer_ca = private_file(etcd.get("peer_ca", ""), "DCS peer CA certificate")
     peer_cert = private_file(etcd.get("peer_cert", ""), "DCS peer certificate")
     peer_key = private_file(etcd.get("peer_key", ""), "DCS peer key")
+    dcs_server_cert = private_file(etcd.get("server_cert", ""), "DCS server certificate")
+    dcs_server_key = private_file(etcd.get("server_key", ""), "DCS server key")
     return {"ca": ca, "cert": cert, "key": key, "dcs_ca": dcs_ca, "dcs_cert": dcs_cert,
-            "dcs_key": dcs_key, "peer_ca": peer_ca, "peer_cert": peer_cert, "peer_key": peer_key}
+            "dcs_key": dcs_key, "peer_ca": peer_ca, "peer_cert": peer_cert, "peer_key": peer_key,
+            "dcs_server_cert": dcs_server_cert, "dcs_server_key": dcs_server_key}
+
+
+WATCHDOG_SYSFS = Path("/sys/class/watchdog")
+
+
+def registered_watchdogs(sysfs=None):
+    """Map kernel watchdog char-device (major, minor) to sysfs identity metadata.
+
+    Only metadata is read; the device is never opened and no ioctl is issued,
+    because opening/arming a watchdog during a configuration check can reset
+    the machine. A device is a valid fencing candidate only when the kernel
+    watchdog subsystem registered that exact major/minor with a non-empty
+    identity.
+    """
+    base = Path(sysfs) if sysfs else WATCHDOG_SYSFS
+    registered = {}
+    try:
+        entries = sorted(base.iterdir())
+    except OSError:
+        return registered
+    for entry in entries:
+        try:
+            major_minor = (entry / "dev").read_text().strip()
+            major, minor = (int(part) for part in major_minor.split(":"))
+        except (OSError, ValueError):
+            continue
+        try:
+            identity = (entry / "identity").read_text().strip()
+        except OSError:
+            identity = ""
+        registered[(major, minor)] = {"sysfs": str(entry), "identity": identity}
+    return registered
 
 
 def optional_watchdog(spec):
@@ -127,7 +162,19 @@ def optional_watchdog(spec):
                  "automatic failover on a host without fencing")
         device = Path(watchdog["device"])
         if not device.exists() or not device.is_char_device():
-            fail(f"configured watchdog device is not a real character device: {device}")
+            fail(f"configured watchdog device is not a character device: {device}")
+        try:
+            stat = device.stat()
+        except OSError:
+            fail(f"configured watchdog device cannot be inspected: {device}")
+        key = (os.major(stat.st_rdev), os.minor(stat.st_rdev))
+        registration = registered_watchdogs().get(key)
+        if not registration:
+            fail("configured device is not registered by the kernel watchdog subsystem "
+                 f"(/sys/class/watchdog major:minor {key[0]}:{key[1]}); /dev/null, /dev/urandom "
+                 "and other software character devices are not valid fencing")
+        if not registration["identity"] or registration["identity"].lower() in ("none", "unknown"):
+            fail(f"registered watchdog {registration['sysfs']} has no usable identity metadata")
         return (f"\nwatchdog:\n  mode: required\n  device: {device}\n"
                 f"  safety_margin: {int(watchdog.get('safety_margin', 5))}\n")
     if watchdog:
