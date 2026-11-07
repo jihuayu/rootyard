@@ -7060,6 +7060,11 @@ class SchemaBoundaryIntegrationFixture:
             http_domains = (*http_domains, "webhooks", "members")
         if cls.is_m17_integrated() or os.environ.get("ROOTYARD_E2E_REQUIRE_P3") == "1":
             http_domains = (*http_domains, "web", "sharding")
+        # The only domains allowed the single optional `state: Arc<AppState>` parameter.
+        stateful_route_domains: tuple[str, ...] = ("browse", "web")
+        # Roots that declare `mod routes;` and `routes::routes()` delegate the real table.
+        # The delegation target is verified, so an empty delegating root cannot pass.
+        delegated_route_tables: dict[str, str] = {"lfs": "src/lfs/routes.rs", "sharding": "src/sharding/routes.rs"}
         for dom in http_domains:
             if simulated_missing_root == dom:
                 raise AssertionError(f"Domain root file src/{dom}.rs replaced by mod.rs or missing")
@@ -7067,10 +7072,34 @@ class SchemaBoundaryIntegrationFixture:
             if not mod_path.is_file():
                 raise AssertionError(f"Missing regular domain file: {mod_path}")
             src = mod_path.read_text(encoding="utf-8")
-            if simulated_missing_routes_fn == dom or "pub fn routes() -> Router<Arc<AppState>>" not in src:
-                raise AssertionError(f"{dom}.rs missing pub fn routes() -> Router<Arc<AppState>>")
-            if f".merge({dom}::routes())" not in lib_rs:
-                raise AssertionError(f"src/lib.rs does not merge {dom}::routes()")
+            expected_signature = (
+                "pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>>"
+                if dom in stateful_route_domains
+                else "pub fn routes() -> Router<Arc<AppState>>"
+            )
+            if simulated_missing_routes_fn == dom or expected_signature not in src:
+                raise AssertionError(f"{dom}.rs missing {expected_signature}")
+            expected_mount = (
+                f".merge({dom}::routes(state.clone()))"
+                if dom in stateful_route_domains
+                else f".merge({dom}::routes())"
+            )
+            if expected_mount not in lib_rs:
+                raise AssertionError(f"src/lib.rs does not mount {dom} via {expected_mount}")
+            delegation = delegated_route_tables.get(dom)
+            if delegation is not None or "routes::routes()" in src:
+                if delegation is None or "mod routes;" not in src or "routes::routes()" not in src:
+                    raise AssertionError(f"src/{dom}.rs delegates to an undeclared route table")
+                if ".route(" in src:
+                    raise AssertionError(f"src/{dom}.rs both delegates and registers routes")
+                delegated_path = ROOT / delegation
+                if not delegated_path.is_file():
+                    raise AssertionError(f"Missing delegated route table {delegated_path}")
+                delegated_src = delegated_path.read_text(encoding="utf-8")
+                if re.search(r"fn routes\([^)]*\)\s*->\s*Router<Arc<AppState>>", delegated_src) is None:
+                    raise AssertionError(f"{delegation} missing fn routes() -> Router<Arc<AppState>>")
+                if ".route(" not in delegated_src:
+                    raise AssertionError(f"{delegation} registers no HTTP routes")
 
         for extra_root in ("mirror", "workspace_lab"):
             p = ROOT / "src" / f"{extra_root}.rs"
