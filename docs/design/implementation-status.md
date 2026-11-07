@@ -8,8 +8,8 @@
 
 ## 最终源（f319100）能力与未验收边界
 
-- #38：service 2/2、matrix 6/6（stock Git Forge pull/review/check/merge、64-hex mirror plan/receipt、SHA-1 与 mixed/abbreviated/zero-width negatives）、restore 2/2、真实 legacy format-6 3/3（旧 `6135` archive）、schema contract 8 checks（含 public/custom）、CI checkout 15/15 均在 `35d01` 通过。满足验收，PR 合并后关闭。
-- #23：GitFS lifecycle 3/3 + API 7/7；automatic Pando 2/2（cache tamper、non-ref rollback）；同仓 format-7 paired backup/restore 通过。远端 Pando mark/delete/pruning 仍 DISABLED，需 foundational global-retention；GitFS physical GC 仅在已证明模式内完成，唯一组合 receipt 仍 **PENDING**（test-only `47a93ed` fixture fix 已获 APPROVE，生产 input digest 未变）。
+- #38：service 2/2（含 stock Git Forge pull/review/check/merge）、matrix 6/6（mirror/pin/checkout、64-hex plan/receipt、SHA-1 与 mixed/abbreviated/zero-OID negatives）、restore 2/2、真实 legacy format-6 3/3（旧 `6135` archive）、schema contract 8 checks（含 public/custom）、CI checkout 15/15（isolated DB；失败首试保留于 history）均在 `35d01` 通过。满足验收，PR 合并后关闭。
+- #23：GitFS lifecycle 3/3 + API 7/7；automatic Pando 2/2（cache tamper、non-ref rollback）；同仓 format-7 paired backup/restore 通过。远端 Pando mark/delete/pruning 仍 DISABLED，需 foundational global-retention；GitFS physical GC **8/8 通过**（test-only `ed8d074`/`47a93ed` fixture fix，生产 input digest 未变）；issue 仅因远端 Pando GC foundation 保持 OPEN。
 - #25/#26：draining reset、retired-source fencing before commit、online copy+delta、retained SQL roots、list/abort、migration/partition/full takeover 均通过。**#25** 仍缺 per-phase crash matrix 与 CI-sidecar intent/directory handoff；**#26** 同机 session fencing 已证明，physical cross-host fencing 未认证。
 - #43/#44：真实 TLS/SCRAM、Kafka SASL_SSL、手工本地 PG promotion、PITR、ENOSPC 与本地 1/2/4 workload 通过；aggregate 为 #44 `passed_local_single_host`、#43 `blocked_external_ha_and_source_fence`、`production_scope=not_certified`。外部自动 PG HA/DCS、跨主机 source fence、全新部署 restore、物理跨主机/硬件资格仍缺失。
 - #32：真实 dev/CI 6/6（own-DB retry）、tmpfs-only artifact pool、launch-failure cleanup 通过。正向 kernel cgroup 因无 delegated cgroup v2 subtree（rootless Docker cgroup driver `none`、cgroupfs EPERM）而 BLOCKED。
