@@ -1,0 +1,41 @@
+{
+  "measurement_kind": "native_execution",
+  "simulated_fields": false,
+  "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "source_worktree_dirty": false,
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "python": "3.12.14",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)"
+  },
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "mem_total_kb": 18440100
+  },
+  "topology": "one Rootyard writer and one task-owned Apache Kafka KRaft broker with a SASL_SSL listener; controller listener is local plaintext",
+  "dataset": "one private repository with acknowledged Git pushes before and during a broker outage",
+  "workload": "native Git push/fetch while a real Kafka wake transport uses SASL/PLAIN over verified TLS; client negative checks for wrong CA, hostname and password; broker stop and restart",
+  "limits": [
+    "single local KRaft broker; controller listener is local plaintext",
+    "no multi-broker Kafka failover",
+    "Kafka wake is advisory and PostgreSQL remains the durable event authority"
+  ],
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "binary_size_bytes": 316382568,
+  "harness_sha256": "344215c01268bd329adc7a5b988287a80815ceda373a2c63239839a6b1d4ee29",
+  "kind": "native_kafka_sasl_ssl",
+  "kafka_version": "3.9.1",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "wrong_ca_rejected": true,
+  "wrong_hostname_rejected": true,
+  "wrong_sasl_password_rejected": true,
+  "sasl_mechanism": "PLAIN over TLS",
+  "initial_wake_offset": 2,
+  "post_restart_wake_offset": 3,
+  "git_push_during_broker_outage": "b64cf4f895b771f5f012ac7ee1925e7dcfe44f87",
+  "git_push_after_reconnect": "0170aa4b6373f2f401d6033ca29cb12fa62d054a",
+  "broker_restart_reconnected": true
+}

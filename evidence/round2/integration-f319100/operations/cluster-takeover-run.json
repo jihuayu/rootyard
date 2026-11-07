@@ -1,0 +1,48 @@
+{
+  "measurement_kind": "native_execution",
+  "simulated_fields": false,
+  "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "source_worktree_dirty": false,
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "python": "3.12.14",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)"
+  },
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "mem_total_kb": 18440100
+  },
+  "topology": "two or more separate Rust data processes and volumes on one trusted Linux host with a trusted process-session fence directory and shared PostgreSQL",
+  "dataset": "one private repository replicated to a standby, then advanced and written during an admitted native Git upload",
+  "workload": "native Git push/fetch plus migration, stale-replica rejection, SIGSTOP of the old writer, durable fence kill, controller restart and post-takeover push",
+  "limits": [
+    "single-host isolated process session driver",
+    "no cross-host storage fence or PostgreSQL HA",
+    "process-session ownership assumes a single trusted host UID"
+  ],
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "binary_size_bytes": 316382568,
+  "harness_sha256": "72f9ca1c320566015d2db44c2b1fab3d91477c0c0e3b30b0b425d69deeed1039",
+  "kind": "native_local_host_takeover",
+  "result": "passed",
+  "driver": "local_process_session_v1",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "old_session_id": 237595,
+  "replication_operation_id": "6afb8c9b-c28b-442f-9dfc-6375a46e1a2e",
+  "takeover_ms": 1345.258,
+  "stale_replica_rejected": true,
+  "old_writer_sigstop_then_killed": true,
+  "admitted_native_writer_paused_and_promotion_rejected": true,
+  "duplicate_live_node_identity_rejected": true,
+  "unavailable_fence_directory_blocks_promotion": true,
+  "controller_restart_preserved_single_promotion": true,
+  "retired_source_volume_write_rejected_without_fence_env": true,
+  "old_writer_restart_blocked": true,
+  "acknowledged_tip": "cc317ca26743cdca563927cf988b9c1b527ac575",
+  "post_takeover_acknowledged_oid": "2892f0d6f2dd8a10fb8c98075888edae2fbfa0a0",
+  "target_fsck": "passed",
+  "new_epoch": 2
+}

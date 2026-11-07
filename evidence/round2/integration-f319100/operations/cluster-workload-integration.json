@@ -1,0 +1,413 @@
+{
+  "measurement_kind": "native_execution",
+  "simulated_fields": false,
+  "source_base_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "source_worktree_dirty": false,
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "python": "3.12.14",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)"
+  },
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "mem_total_kb": 18440100
+  },
+  "topology": "distinct Rust processes and storage directories; one PostgreSQL schema; loopback signed forwarding",
+  "dataset": "one private repository, eight sequential one-file commits and eight push/fetch pairs per tier",
+  "workload": "1/2/4 data processes; each tier starts with its own acknowledged push/fetch sequence; Git clients use real native push/fetch and routed browse",
+  "limits": [
+    "single Linux host and shared PostgreSQL schema; loopback traffic",
+    "four processes and volumes are functional sharding, not physical host or network failure domains",
+    "native Git and Rust timings are operational samples, not a capacity plan"
+  ],
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "binary_size_bytes": 316382568,
+  "harness_sha256": "95d949255175cffe7a6a474d9bd44ea5ff5ba960958ab36ada81f672129c06ee",
+  "kind": "native_cluster_client_workload",
+  "tiers": [
+    {
+      "node_count": 1,
+      "duration_ms": 5697.989,
+      "push": {
+        "count": 8,
+        "p50_ms": 340.185,
+        "p95_ms": 497.511,
+        "p99_ms": 497.511
+      },
+      "fetch": {
+        "count": 8,
+        "p50_ms": 317.22,
+        "p95_ms": 363.32,
+        "p99_ms": 363.32
+      },
+      "host_loopback_rx_delta_bytes": 2062584,
+      "host_loopback_tx_delta_bytes": 2062584,
+      "git_operation_rows": 11,
+      "processes": [
+        {
+          "pid": 231644,
+          "rss_kb": 41884,
+          "read_bytes": 0,
+          "write_bytes": 317562880
+        }
+      ]
+    },
+    {
+      "node_count": 2,
+      "duration_ms": 5007.244,
+      "push": {
+        "count": 8,
+        "p50_ms": 296.317,
+        "p95_ms": 442.437,
+        "p99_ms": 442.437
+      },
+      "fetch": {
+        "count": 8,
+        "p50_ms": 243.21,
+        "p95_ms": 633.022,
+        "p99_ms": 633.022
+      },
+      "host_loopback_rx_delta_bytes": 2570706,
+      "host_loopback_tx_delta_bytes": 2570706,
+      "git_operation_rows": 19,
+      "processes": [
+        {
+          "pid": 231644,
+          "rss_kb": 41992,
+          "read_bytes": 0,
+          "write_bytes": 318193664
+        },
+        {
+          "pid": 232461,
+          "rss_kb": 37952,
+          "read_bytes": 0,
+          "write_bytes": 316420096
+        }
+      ]
+    },
+    {
+      "node_count": 4,
+      "duration_ms": 4270.829,
+      "push": {
+        "count": 8,
+        "p50_ms": 268.137,
+        "p95_ms": 408.241,
+        "p99_ms": 408.241
+      },
+      "fetch": {
+        "count": 8,
+        "p50_ms": 219.173,
+        "p95_ms": 314.598,
+        "p99_ms": 314.598
+      },
+      "host_loopback_rx_delta_bytes": 2167573,
+      "host_loopback_tx_delta_bytes": 2167573,
+      "git_operation_rows": 27,
+      "processes": [
+        {
+          "pid": 231644,
+          "rss_kb": 42064,
+          "read_bytes": 0,
+          "write_bytes": 318738432
+        },
+        {
+          "pid": 232461,
+          "rss_kb": 38032,
+          "read_bytes": 0,
+          "write_bytes": 316420096
+        },
+        {
+          "pid": 232485,
+          "rss_kb": 36148,
+          "read_bytes": 0,
+          "write_bytes": 316432384
+        },
+        {
+          "pid": 232506,
+          "rss_kb": 37492,
+          "read_bytes": 0,
+          "write_bytes": 316424192
+        }
+      ]
+    }
+  ],
+  "failure": {
+    "read_while_owner_stopped_status": 502,
+    "browse_while_owner_stopped_status": 502,
+    "injection": "SIGKILL owner process group",
+    "rpo_lost_acknowledged_commits": 0,
+    "acknowledged_commits_checked": 24,
+    "unreachable_owner_failed_closed": true,
+    "rto_read_ms": 624.538,
+    "rto_write_ms": 951.055,
+    "post_restart_acknowledged_oid": "ca3f3ad6e4016884d3956985b88d259088419586",
+    "process_restart_ms": 442.433
+  },
+  "raw": [
+    {
+      "tier": 1,
+      "sequence": 0,
+      "ingress_node": 0,
+      "acknowledged_oid": "fe2d180adc98a2efcce76e9dc3ca328189a7b49b",
+      "push_ms": 494.917,
+      "fetch_ms": 232.41
+    },
+    {
+      "tier": 1,
+      "sequence": 1,
+      "ingress_node": 0,
+      "acknowledged_oid": "739c62b6461854bf87d541fe5c7e77287fe50cc3",
+      "push_ms": 334.544,
+      "fetch_ms": 331.043
+    },
+    {
+      "tier": 1,
+      "sequence": 2,
+      "ingress_node": 0,
+      "acknowledged_oid": "db8913cb64d0263e960a0e50723fa21ca0b219f5",
+      "push_ms": 484.092,
+      "fetch_ms": 342.889
+    },
+    {
+      "tier": 1,
+      "sequence": 3,
+      "ingress_node": 0,
+      "acknowledged_oid": "dd1a629587c3067c7387bac1d005770ea807c10e",
+      "push_ms": 497.511,
+      "fetch_ms": 363.32
+    },
+    {
+      "tier": 1,
+      "sequence": 4,
+      "ingress_node": 0,
+      "acknowledged_oid": "dd9c240a8fe09866d5376b8ecb8aee8cf1fd0018",
+      "push_ms": 340.185,
+      "fetch_ms": 325.917
+    },
+    {
+      "tier": 1,
+      "sequence": 5,
+      "ingress_node": 0,
+      "acknowledged_oid": "a8823ee67e625fc5ac5102b77bf50b5784900416",
+      "push_ms": 325.149,
+      "fetch_ms": 317.22
+    },
+    {
+      "tier": 1,
+      "sequence": 6,
+      "ingress_node": 0,
+      "acknowledged_oid": "909b43acb766b0f61e61dccdf7c9181155bd2cbc",
+      "push_ms": 375.825,
+      "fetch_ms": 247.145
+    },
+    {
+      "tier": 1,
+      "sequence": 7,
+      "ingress_node": 0,
+      "acknowledged_oid": "49cdd2c93fa5f278c8acb4c1aed449003051026c",
+      "push_ms": 298.899,
+      "fetch_ms": 243.71
+    },
+    {
+      "tier": 2,
+      "sequence": 0,
+      "ingress_node": 0,
+      "acknowledged_oid": "228ce0cbda1ba0acf0cff6e0ca1ad5c797c9be9a",
+      "push_ms": 442.437,
+      "fetch_ms": 633.022
+    },
+    {
+      "tier": 2,
+      "sequence": 1,
+      "ingress_node": 1,
+      "acknowledged_oid": "1384b4b91801b9593a82fd90c1fe5c95a0a32ca4",
+      "push_ms": 392.556,
+      "fetch_ms": 233.502
+    },
+    {
+      "tier": 2,
+      "sequence": 2,
+      "ingress_node": 0,
+      "acknowledged_oid": "dd12288e9dda3de5aa373b966f768c6deb1062cd",
+      "push_ms": 296.317,
+      "fetch_ms": 282.485
+    },
+    {
+      "tier": 2,
+      "sequence": 3,
+      "ingress_node": 1,
+      "acknowledged_oid": "bfa18ebd4f5a798dcbac922b78a8708ba61ad97c",
+      "push_ms": 371.939,
+      "fetch_ms": 268.923
+    },
+    {
+      "tier": 2,
+      "sequence": 4,
+      "ingress_node": 0,
+      "acknowledged_oid": "eaa1bb0c032c58557bc0c1c52c76c0efbf4b1e5c",
+      "push_ms": 228.367,
+      "fetch_ms": 188.558
+    },
+    {
+      "tier": 2,
+      "sequence": 5,
+      "ingress_node": 1,
+      "acknowledged_oid": "6c0e862919995a4631aea4c967742c4aa6d123f3",
+      "push_ms": 291.522,
+      "fetch_ms": 243.21
+    },
+    {
+      "tier": 2,
+      "sequence": 6,
+      "ingress_node": 0,
+      "acknowledged_oid": "a03c517be39835f92ee9c9db7238daf0edc63293",
+      "push_ms": 298.84,
+      "fetch_ms": 282.349
+    },
+    {
+      "tier": 2,
+      "sequence": 7,
+      "ingress_node": 1,
+      "acknowledged_oid": "a950925ef31252b13f4f877fbb9a326ff58c2068",
+      "push_ms": 260.917,
+      "fetch_ms": 219.429
+    },
+    {
+      "tier": 4,
+      "sequence": 0,
+      "ingress_node": 0,
+      "acknowledged_oid": "76924050a2b9ab7d1960ff5dc2febee40bea0017",
+      "push_ms": 281.173,
+      "fetch_ms": 314.598
+    },
+    {
+      "tier": 4,
+      "sequence": 1,
+      "ingress_node": 1,
+      "acknowledged_oid": "f3c4f2f07fe9ac6acfdd46adb62a6066a4c9c9eb",
+      "push_ms": 408.241,
+      "fetch_ms": 261.712
+    },
+    {
+      "tier": 4,
+      "sequence": 2,
+      "ingress_node": 2,
+      "acknowledged_oid": "1feab38d8a32573a56f6903c046662fb6d64bbd6",
+      "push_ms": 293.728,
+      "fetch_ms": 208.818
+    },
+    {
+      "tier": 4,
+      "sequence": 3,
+      "ingress_node": 3,
+      "acknowledged_oid": "f967eb5f01e80ebf2d9aee7c0ed341baf560efa7",
+      "push_ms": 273.471,
+      "fetch_ms": 245.037
+    },
+    {
+      "tier": 4,
+      "sequence": 4,
+      "ingress_node": 0,
+      "acknowledged_oid": "6c7316616169d08f8d50c1450808f9872d240c42",
+      "push_ms": 263.087,
+      "fetch_ms": 192.29
+    },
+    {
+      "tier": 4,
+      "sequence": 5,
+      "ingress_node": 1,
+      "acknowledged_oid": "f397942cdfc7317b211877958c15805275d881b3",
+      "push_ms": 266.408,
+      "fetch_ms": 268.614
+    },
+    {
+      "tier": 4,
+      "sequence": 6,
+      "ingress_node": 2,
+      "acknowledged_oid": "cc2dde5c2020721d0eb6462b0841ede28ffd0214",
+      "push_ms": 268.137,
+      "fetch_ms": 219.173
+    },
+    {
+      "tier": 4,
+      "sequence": 7,
+      "ingress_node": 3,
+      "acknowledged_oid": "cbf87c45395acb0f7990c3f61c60a182633bece0",
+      "push_ms": 236.407,
+      "fetch_ms": 205.696
+    }
+  ],
+  "companion_evidence": {
+    "automatic_storage_takeover": "evidence/cluster-takeover-run.json",
+    "source_only_network_partition": "evidence/cluster-partition.json",
+    "disk_enospc": "evidence/cluster-disk-pressure.json",
+    "postgresql_failover": "evidence/cluster-pg-streaming.json",
+    "pitr_restore": "evidence/cluster-pg-pitr.json"
+  },
+  "not_covered_by_this_report": [
+    "automatic takeover",
+    "physical storage fencing",
+    "PostgreSQL HA",
+    "kernel network partition",
+    "disk pressure",
+    "CI mirror cache eviction"
+  ],
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "browse_routing": {
+    "read_ingress_nodes": [
+      1,
+      2,
+      3
+    ],
+    "owner_only_ref_transaction_idempotent_across_ingress": true,
+    "unrelated_tenant_denied": true,
+    "delegation_replay_cross_path_and_tamper_rejected": true,
+    "ref_transaction_operation_id": "d638481e-126a-45a0-9902-6df6a3a15e99"
+  },
+  "retained_root": {
+    "ref": "refs/rootyard-ci/jobs/bench",
+    "reachable_oids_after_gc": 79,
+    "native_fsck": "passed",
+    "gc_overlapped_client_fetches": true
+  },
+  "client_cache_eviction": {
+    "removed_local_clone_and_refetched_from_node4": true,
+    "acknowledged_oid": "ca3f3ad6e4016884d3956985b88d259088419586"
+  },
+  "removed_object_negative_control": {
+    "fixture": "copy of owner repository",
+    "removed_pinned_blob_oid": "2409227e1ab2c45dc68c848178aafbb50fd95413",
+    "cat_file_detected_missing": true,
+    "native_fsck_failed": true
+  },
+  "stale_delegation": {
+    "mutation": "native Forge backend PATCH gitfs generation increment",
+    "route_epoch_unchanged": true,
+    "old_generation": 1,
+    "new_generation": 2,
+    "unused_old_browse_and_git_delegations_status": 409,
+    "fresh_browse_and_git_delegations_status": 200,
+    "future_required_generation_ingress_status": 409
+  },
+  "live_object_negative_control": {
+    "fixture": "disposable repository on the live serving node volume",
+    "owner_volume": "live serving node ROOTYARD_DATA_DIR (same volume as the measured workload)",
+    "owner_process_stopped_before_object_removal": true,
+    "owner_process_restarted_before_fetch": true,
+    "retained_ref": "refs/rootyard-ci/jobs/live-negative",
+    "acknowledged_tip": "1eec34ea553b303bee0c9b5e71a87cfd68d8bba6",
+    "removed_loose_blob_oid": "695e643faaf777a754143c9240ab11be1e2084c6",
+    "stock_fetch_exit_while_corrupt": 128,
+    "stock_fetch_stderr_while_corrupt": "error: RPC failed; curl 18 transfer closed with outstanding read data remaining\nfatal: protocol error: bad pack header\n",
+    "native_fsck_failed_while_corrupt": true,
+    "object_bytes_restored": 4117,
+    "stock_fetch_exit_after_restore": 0,
+    "fetched_tip_after_restore": "1eec34ea553b303bee0c9b5e71a87cfd68d8bba6",
+    "native_fsck_after_restore": "passed",
+    "clone_after_restore": "passed",
+    "note": "only the disposable live-negative repository is mutated; readiness remains a process/dependency check while reachability is asserted by stock fetch and native fsck"
+  }
+}

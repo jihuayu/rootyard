@@ -1,0 +1,20 @@
+{
+  "commit": "ed8d074da0aa51d9865c122ad97ae076af932db5",
+  "test_file_sha256": "0dbb558ef525d6bba4f27d862c096da962a0f2012b46bab7ac77a51b56531c0d",
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "binary": "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+  "command": [
+    "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+    "tests/storage_lifecycle_physical.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round2/physical_cold/report.json"
+  ],
+  "cwd": "/workspace/rootyard-worktrees/round2-maint23",
+  "pid": 257571,
+  "database_url": "postgres://agent@127.0.0.1:55433/round2_physical_cold_impl",
+  "report": "/workspace/scratch/rootyard-round2/physical_cold/report.json",
+  "stdout_log": "/workspace/scratch/rootyard-round2/physical_cold/stdout.log",
+  "started_at": "2026-11-07T01:40:23Z"
+}

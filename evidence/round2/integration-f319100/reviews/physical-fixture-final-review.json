@@ -1,0 +1,28 @@
+{
+  "commit": "ed8d074",
+  "parent": "47a93ed",
+  "verdict": "approve",
+  "scope": "Test-only fixture construction change in tests/storage_lifecycle_physical.py::PhysicalHarness.physical_loose_packed_and_pin. Acceptance assertions and post-GC behavior left intact. Static diff review only; no native run claimed here.",
+  "findings": [
+    {"id":"F1","status":"pass","detail":"Diff is test-only: git show --stat reports only tests/storage_lifecycle_physical.py (+24/-1). No src/product changes, no SQL root deletion, no fabricated receipts."},
+    {"id":"F2","status":"pass","detail":"Offline 'git update-ref -d refs/heads/temporary' replaced by supported Smart-HTTP delete 'git push origin :refs/heads/temporary'. Removes the unsupported path that bypassed the durable ref-index projection and left a stale root; source GC retention was correctly protecting that stale projection."},
+    {"id":"F3","status":"pass","detail":"Real delivery barrier added: before packing waits for create projection deleted=false and ref-index outbox undelivered count=0; after delete waits projection deleted=true, asserts no live root (NOT deleted AND oid IS NOT NULL), and waits ref-index delivery drain before stopping. Fixture faithful to supported semantics."},
+    {"id":"F4","status":"pass","detail":"Scheduler deferred via ROOTYARD_STORAGE_MAINTENANCE=false (genuinely parsed setting, src/storage_lifecycle/models.rs:32-35) during fixture construction, restored to 'true' only at acceptance phase before self.start() and pin/GC assertions. Prevents premature GC racing fixture; does not weaken acceptance."},
+    {"id":"F5","status":"pass","detail":"Acceptance assertions unchanged vs parent: loose path absence, cat-file -e packed (pre-GC), fsck --unreachable contains packed, CI pin POST, tombstone->deleted plus cat-file -e returncode!=0 for loose/packed, base+retained preserved, fetch, fsck --full --strict; returned dict identical."},
+    {"id":"F6","status":"pass","detail":"No masking of product defects: stale-projection retention is source behavior already exercised by the approved enospc case, not suppressed here. Change aligns fixture with supported delete; no assertion loosened, removed, or fabricated."}
+  ],
+  "reason": "Commit ed8d074 strictly repairs fixture construction in physical_loose_packed_and_pin. The prior offline update-ref deletion was an unsupported operation that left a stale durable ref-index projection, so source GC retention correctly kept the packed object and the test precondition mismatched supported product behavior. The new flow deletes via Smart-HTTP, waits for the projection tombstone and outbox delivery barrier, and defers the maintenance scheduler until the acceptance phase while restoring it before assertions. Product/GC assertions and the return contract are unchanged; no source edits, no SQL root deletion, no fabricated receipts. Consistent with the already-approved 47-ENOSPC fixture pattern.",
+  "verification": {
+    "method": "git show --stat and filtered diff; diff of physical_loose_packed_and_pin vs parent 47a93ed; full-file read; grep of harness helpers and ROOTYARD_STORAGE_MAINTENANCE source parsing",
+    "source_changes": false,
+    "assertions_changed": false,
+    "sql_root_deletion_added": false,
+    "fabricated_receipts": false,
+    "runtime_claim": false
+  },
+  "limitations": [
+    "Static review only; no native execution performed here and no runtime pass claimed.",
+    "20s wait_sql/outbox timing robustness not independently confirmed without a live run.",
+    "Native 8-case run with immutable f319 binary (f319compiledbin35d01) is being launched separately in its own DB."
+  ]
+}

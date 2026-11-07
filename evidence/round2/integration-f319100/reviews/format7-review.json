@@ -1,0 +1,41 @@
+{
+  "reviewer": "DeepSeek independent reviewer",
+  "reviewed_at_utc": "2026-11-07T01:20:40.985945+00:00",
+  "scope": "only the latest one-line format-7 schema-version freeze and CLI help integration fix",
+  "worktree": "/workspace/rootyard-worktrees/round2-integrated",
+  "head": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "latest_commit": {
+    "hash": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+    "subject": "Freeze format-7 backup schema versions at 131",
+    "changed": "src/backup/catalog.rs (1 insertion, 1 deletion)"
+  },
+  "help_commit": {
+    "hash": "340e668",
+    "subject": "List the supported schema130 restore upgrade flag in CLI help",
+    "confirmed": "usage now includes [--allow-legacy-schema007 | --allow-legacy-schema130]"
+  },
+  "source_fix": {
+    "file": "src/backup/catalog.rs",
+    "line": 42,
+    "from": "7 => Ok(crate::db::SCHEMA_VERSIONS.to_vec())",
+    "to": "7 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 131).collect())",
+    "assessment": "Correct. Format 7 catalogs remain frozen at schema 131 and versions are now explicitly capped at 131, so a future migration 132 cannot invalidate existing format-7 archives. Format 6 remains capped at 130; formats 4/5 unchanged."
+  },
+  "prior_approvals": {
+    "sha38_d854": "Still applies; d854 source compatibility approved with only P2 notes (format7 freeze now addressed; CLI help now addressed).",
+    "maint_32dfea8": "Still applies; test-only maintenance changes approved on 711/d9; issue #23 remains OPEN for remote Pando pruning."
+  },
+  "findings": [],
+  "p1": "none",
+  "acceptance": {
+    "source_fix": "APPROVE",
+    "build_test_status": "NOT CLAIMED: core final pipeline is building exact new source; no new binary/report verification in this review.",
+    "full_38": "PENDING final integration pipeline evidence; prior reports remain stale for full #38 acceptance.",
+    "issue_23": "OPEN due remote Pando mark/delete/pruning foundation gap; unchanged by this fix."
+  },
+  "limitations": [
+    "Read-only git inspection only; no builds, tests, source edits, pushes, merges or GitHub changes.",
+    "Source approval is limited to the one-line freeze and CLI help integration; no full-suite acceptance claim."
+  ],
+  "verdict": "APPROVE SOURCE for the format-7 freeze and CLI help fix at f319100. No P1 source defect. Full #38 integration acceptance and #23 remote-GC closure remain pending/OPEN as previously stated."
+}

@@ -1,0 +1,174 @@
+{
+  "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "production_inputs_sha256": "fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b",
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "scope": "Real local processes, PostgreSQL 17, Git, Garage, Vault and one Kafka broker on one host.",
+  "limits": [
+    "No physical multi-host storage fencing",
+    "No external automatic PostgreSQL HA",
+    "No delegated kernel cgroup enforcement proof",
+    "Pando remote pruning remains disabled"
+  ],
+  "files": {
+    "core-verification.json": {
+      "sha256": "8a845b0335c4623e73ca1b5e621b318134e52942291ca854f4adffed3e71534d",
+      "bytes": 16209
+    },
+    "history/core-shared-database-attempt.json": {
+      "sha256": "53e887d41312d2a4f4d2fc3cf8d64855459aaae5e6d35fd4d9909465c6ba245e",
+      "bytes": 29499
+    },
+    "history/core-isolated-attempt.json": {
+      "sha256": "8a5babe7f9fa13605cceb144adb9154a67bdf1dd1277f86be0622d3945a88bb9",
+      "bytes": 67226
+    },
+    "artifact.json": {
+      "sha256": "e1dc24ed281902b2fb41b1c5a705057009d5f79074d14b265c0c11cfa6771d42",
+      "bytes": 599
+    },
+    "production-inputs.json": {
+      "sha256": "3cadf1a2fccfd664546512484d04316266577ca9aab3a5ec371632ef24ff4659",
+      "bytes": 31768
+    },
+    "core/backup_sha256_legacy130.json": {
+      "sha256": "f1f3e5df190496c12463ca6c346f31dfbe045cae2525ae6fab2a3c45c5e401a3",
+      "bytes": 1409
+    },
+    "core/ci_job_checkouts.json": {
+      "sha256": "2bb0465f41f335d291eb67b358037762c971ed84e4b59fd428686d45c5ac13f7",
+      "bytes": 5618
+    },
+    "core/maintenance_jobs.json": {
+      "sha256": "72cff01ae45512d196160abe6024e7f429720ce0069ec0e3b6decf4b15d4749e",
+      "bytes": 1944
+    },
+    "core/pando_maintenance_service.json": {
+      "sha256": "0e508543213db07157cb3ed15ddd6b9881aa2020ec593c5e171e1feddc5221f3",
+      "bytes": 901
+    },
+    "core/sha256_matrix.json": {
+      "sha256": "705f20172c27b59e621be5d2122bc20b73cbef439c9b1dbce4022e7802adcfd5",
+      "bytes": 3985
+    },
+    "core/sha256_restore.json": {
+      "sha256": "9c13af7f65567401a9ae978101ba7ce2d724d0e630b8dbdd7cb364de80085a7b",
+      "bytes": 970
+    },
+    "core/storage_lifecycle.json": {
+      "sha256": "a62f673f6b30e3f8d1fb9acfa39013493c9494193eca81e119fc071a5a4b7a65",
+      "bytes": 1123
+    },
+    "core/storage_lifecycle_physical.json": {
+      "sha256": "d34e8889c4d55125b6abda795fe4975dce8215b075ca5cba0617341835853d2c",
+      "bytes": 2962
+    },
+    "core/sha256_service-output.json": {
+      "sha256": "9a6225a41ccdc0ddb0f773f0af24c2ccf1f67e1103925d8f14b34dae5a36de23",
+      "bytes": 225
+    },
+    "core/schema_contract-output.json": {
+      "sha256": "79944ae0d4d48e554128e008c57cec7afe9d609bee8f5e741890d5b9fd8328e8",
+      "bytes": 325
+    },
+    "operations-verification.json": {
+      "sha256": "fa2981c26b6d00d34314d159ad68730f0c7efcf6352c7aead23e26300d6358ce",
+      "bytes": 31951
+    },
+    "operations/cluster-disk-pressure.json": {
+      "sha256": "ed86af86ee841c31b584322a8936a0cfcf81fc47bce137f240c13932930de957",
+      "bytes": 2435
+    },
+    "operations/cluster-kafka-tls.json": {
+      "sha256": "f5c67b7aac17269326010bc18a3a92a24388bda9b954c85408697f67db3c1a38",
+      "bytes": 1909
+    },
+    "operations/cluster-local-profile.json": {
+      "sha256": "f2e764caf6bfe42a1b9a795b7a4091d62c27b0a02153e1ff8f5600fea8d154c0",
+      "bytes": 2623
+    },
+    "operations/cluster-migration-provenance.json": {
+      "sha256": "8c316440e2a49cc88988fd4395face1fb1afbdc8b7b849c01ef7bf3839b08625",
+      "bytes": 697
+    },
+    "operations/cluster-migration.json": {
+      "sha256": "c1329dfcaa9dc9890bc2122e6be210aee75999b2fb8a1028c3b233495688f110",
+      "bytes": 1574
+    },
+    "operations/cluster-operations-gate.json": {
+      "sha256": "126f6763817f8ac4b78c3797217eb51c1cb5129c33c76516ac4b4fa8f3351763",
+      "bytes": 11180
+    },
+    "operations/cluster-partition.json": {
+      "sha256": "3b493a421d31dfcdbb12a6d4cdf8dcc04d3b5dc2e38c7bfd8c8aaad0bbd927ec",
+      "bytes": 1875
+    },
+    "operations/cluster-pg-pitr.json": {
+      "sha256": "4c2c2f23cf65ac2b19499778a5115ec49a47d9a2ff5c26bd77290a446a77ef12",
+      "bytes": 2843
+    },
+    "operations/cluster-pg-streaming.json": {
+      "sha256": "62c79072ad1e026691bc2c02e7801c2131eb91ad5a83dbc50290cd3af2516167",
+      "bytes": 3794
+    },
+    "operations/cluster-takeover-run.json": {
+      "sha256": "bed52d960a5e2cdd0cd1f24fa918ef4f2305949a95b6b347608551153f158f59",
+      "bytes": 2274
+    },
+    "operations/cluster-tls.json": {
+      "sha256": "7cde780d0d3fa30dcf2c1bb34d7dbdba140c8ae89f556d600f3327d0212bacfd",
+      "bytes": 1589
+    },
+    "operations/cluster-workload-integration.json": {
+      "sha256": "ede7a1f984372035f7a9b92df3c8afb1b93cf78e6c8b8a877c1dc58513ac6d36",
+      "bytes": 12071
+    },
+    "negative-controls/binary_hash_mismatch.json": {
+      "sha256": "b84a28b46ea44225460e2108bb50cbbc96ddb36c239fb79d48a72f9e3e636ae9",
+      "bytes": 10951
+    },
+    "negative-controls/dirty.json": {
+      "sha256": "8e8ba096cf89e12b1fd34d5056317862c03a99947a535462faf0833f09eceaa6",
+      "bytes": 10895
+    },
+    "negative-controls/harness_hash_mismatch.json": {
+      "sha256": "e932bbb8d10cf66038a4425e5bd354db1abd8f2e7aaaf1a218fc6baa07cd1e0d",
+      "bytes": 10977
+    },
+    "negative-controls/missing.json": {
+      "sha256": "dfe3071be50e22556bd46c738bc3f1efe1446298b45f7f2cbfad48e1995dc741",
+      "bytes": 10766
+    },
+    "negative-controls/simulated.json": {
+      "sha256": "9e0d23fdd761b7e4eec4499306e188b0299d046af403343aa6381ec9a74a4a3d",
+      "bytes": 10899
+    },
+    "reviews/data-compat-and-maintenance-review.json": {
+      "sha256": "29f699f003b9106ac4e56483a8e57aeffbc8958f41677c2374da21e7dee859f8",
+      "bytes": 8086
+    },
+    "reviews/format7-review.json": {
+      "sha256": "76d09da5bbfbbdbb9ec2d56276470f42a9dc4e258caf27bce2d8d4baded09a17",
+      "bytes": 2448
+    },
+    "reviews/cluster-source-review.json": {
+      "sha256": "3702ef4d811efde3a0a74ed99a6a247695fe3646186368b846f5eb3f2fc2d985",
+      "bytes": 6570
+    },
+    "reviews/physical-fixture47-review.json": {
+      "sha256": "dd85730d74d43ebaca78483a33d19ad2a06b2d9644375c768b1d491e037a8cb9",
+      "bytes": 2184
+    },
+    "reviews/physical-fixture-final-review.json": {
+      "sha256": "c09705a0e243d35bed431b937250203abc36387e652458805f2fbfcb2bc101dc",
+      "bytes": 3656
+    },
+    "core/physical-harness-provenance.json": {
+      "sha256": "e4dd1d3472ba728d15fd03e88457114728f48c700b18f1409157a8ec116585e8",
+      "bytes": 1102
+    },
+    "core/pando-paired-backup.json": {
+      "sha256": "6f0a72d47f2f9837f520272c2741d6ac347b5a89a19d0765dac15006b4df1379",
+      "bytes": 4904
+    }
+  }
+}

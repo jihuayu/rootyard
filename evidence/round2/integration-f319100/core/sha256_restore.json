@@ -1,0 +1,33 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "source_setup_and_backup",
+      "status": "passed",
+      "seconds": 50.988,
+      "detail": {
+        "source_database": true,
+        "backup_seconds": 39.58017269,
+        "repositories": 1,
+        "pin_descriptor_retained": true
+      }
+    },
+    {
+      "name": "restore_and_clone",
+      "status": "passed",
+      "seconds": 31.0542,
+      "detail": {
+        "restore_seconds": 29.979390229,
+        "exact_head_and_format": true,
+        "clone_fsck": true,
+        "retained_pin_preserved": true
+      }
+    }
+  ],
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "limitations": [
+    "Synthetic loopback processes and disposable databases, not a production RPO/RTO promise.",
+    "Both databases and the backup volume are local to this run.",
+    "The restore verifies Git objects, refs, pin receipt and repository format; it does not test host power loss."
+  ]
+}

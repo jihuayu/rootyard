@@ -1,0 +1,29 @@
+{
+  "kind": "native_cluster_staged_migration",
+  "result": "passed",
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "harness_sha256": "fc812390917caf6e93827459e89c941526b52176fce3b48a266c503027ed7ef5",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "operation_id": "d2e89d91-8f39-42ae-a960-048c310f463a",
+  "transfer_ms": 5597.434,
+  "partial_copy_rejected_before_cutover": true,
+  "same_operation_resumed_after_target_restart": true,
+  "ahead_journal_rejected_without_replacing_target": true,
+  "failed_online_transfer_preserved_source_writes": true,
+  "online_initial_copy_while_writes_admitted": true,
+  "delta_after_concurrent_write_applied_before_cutover": true,
+  "retained_ci_pin_and_backup_snapshot_roots_survived": true,
+  "retained_ci_pin_sql_outbox_survived": true,
+  "target_exclusive_barrier_waited_for_native_reader": true,
+  "target_process_paused_until_source_barrier_released": true,
+  "foreign_repository_operation_uuid_rejected_without_drain": true,
+  "browse_read_from_retired_ingress_reached_new_owner": true,
+  "source_oid": "807894b51dd1a1ce9918634d15e3a4059cc566d9",
+  "destination_oid_after_push": "ea6cc58b5498be46e1b1775e6370b60c5889bcc8",
+  "source_volume": "/tmp/rootyard-e2e-qlj45td1/data/repos/06e1354a-526e-40b1-8218-357b520a053b.git",
+  "destination_volume": "/tmp/rootyard-e2e-qlj45td1/data-node1/repos/06e1354a-526e-40b1-8218-357b520a053b.git",
+  "limits": [
+    "one PostgreSQL authority, two Rust processes on one Linux host",
+    "physical cross-host fencing remains external"
+  ]
+}

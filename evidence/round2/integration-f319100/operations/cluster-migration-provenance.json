@@ -1,0 +1,16 @@
+{
+ "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+ "harness_sha256": "fc812390917caf6e93827459e89c941526b52176fce3b48a266c503027ed7ef5",
+ "kind": "orchestrator_observed_source_provenance",
+ "note": "migration script does not embed source provenance; observed externally, report bytes unmodified",
+ "observed_at": 1794014809.8757093,
+ "report_sha256": "c1329dfcaa9dc9890bc2122e6be210aee75999b2fb8a1028c3b233495688f110",
+ "source_after": {
+  "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "source_worktree_dirty": false
+ },
+ "source_before": {
+  "source_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "source_worktree_dirty": false
+ }
+}

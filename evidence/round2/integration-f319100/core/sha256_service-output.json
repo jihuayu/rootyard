@@ -1,0 +1,9 @@
+{
+  "kind": "captured_native_stdout",
+  "stdout": [
+    "service_flow: passed",
+    "pull_check_pin_flow: passed"
+  ],
+  "exit_code": 0,
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153"
+}

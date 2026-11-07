@@ -1,0 +1,144 @@
+{
+  "passed": true,
+  "run_dir": "/workspace/scratch/rootyard-round2/verify_final_core/pando-probe-work/run-9ymmuqvx",
+  "binary": "/workspace/scratch/rootyard-round2/verify_final_core/artifacts/f31910086acbaa87d9e98df440ca8c28c7bb7e08-fdfbbfcfe3ac/rootyard",
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "expected_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "source_inputs_sha256": "fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b",
+  "archive_format_expected": 7,
+  "prior_probe_format": 6,
+  "databases": [
+    "rootyard_pando_backup_674f30f702cc",
+    "rootyard_pando_restore_58dfde091809"
+  ],
+  "steps": [
+    {
+      "name": "immutable_binary_and_fresh_databases",
+      "status": "passed",
+      "seconds": 0.133,
+      "detail": {
+        "fresh_databases": 2,
+        "pg": "17",
+        "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153"
+      }
+    },
+    {
+      "name": "migrate_and_owner_tokens",
+      "status": "passed",
+      "seconds": 0.304,
+      "detail": {
+        "owner": "alice",
+        "read_only_token": true
+      }
+    },
+    {
+      "name": "gitfs_commit_push",
+      "status": "passed",
+      "seconds": 0.681,
+      "detail": {
+        "repository_id": "8ad94e39-37fd-4a04-8e4a-a7402659b2f6",
+        "first_oid": "5857c09b703d1e48e4fd42a531b7a0226593764e",
+        "object_format": "sha1"
+      }
+    },
+    {
+      "name": "offline_cutover_to_pando",
+      "status": "passed",
+      "seconds": 0.669,
+      "detail": {
+        "direction": "gitfs_to_pando",
+        "packs": 1,
+        "objects_verified": 3,
+        "epoch": 1
+      }
+    },
+    {
+      "name": "second_http_pando_push_and_clone",
+      "status": "passed",
+      "seconds": 2.317,
+      "detail": {
+        "second_oid": "5b6c0da3a1b64d5bc6f1c71e683fd77969aacba9",
+        "stock_clone_ok": true,
+        "fsck_ok": true,
+        "object_format": "sha1"
+      }
+    },
+    {
+      "name": "pando_database_authority",
+      "status": "passed",
+      "seconds": 0.029,
+      "detail": {
+        "backend": "pando|stable|sha1",
+        "pando_refs": {
+          "refs/heads/main": "5b6c0da3a1b64d5bc6f1c71e683fd77969aacba9"
+        },
+        "git_operations": "2|recorded,recorded",
+        "pando_state": "serving|2|2"
+      }
+    },
+    {
+      "name": "real_backup_with_pando_closure",
+      "status": "passed",
+      "seconds": 48.741,
+      "detail": {
+        "backup_id": "b14525b0-148c-4d2d-b928-37323a298083",
+        "format": 7,
+        "format_expected": 7,
+        "prior_observed_format": 6,
+        "pando_refs": {
+          "refs/heads/main": "5b6c0da3a1b64d5bc6f1c71e683fd77969aacba9"
+        },
+        "head_ref": "refs/heads/main",
+        "packs": 2,
+        "closure_files": 9,
+        "encrypted_artifact_bytes": 5292,
+        "backup_verify": {
+          "authenticity_verified": false,
+          "backup_id": "b14525b0-148c-4d2d-b928-37323a298083",
+          "checksums_verified": true
+        },
+        "top_manifest_pando_entries": 13
+      }
+    },
+    {
+      "name": "paired_restore_fresh_db_and_volume",
+      "status": "passed",
+      "seconds": 29.961,
+      "detail": {
+        "restore_id": "b14525b0-148c-4d2d-b928-37323a298083",
+        "backend": "pando|stable|sha1",
+        "pando_refs": {
+          "refs/heads/main": "5b6c0da3a1b64d5bc6f1c71e683fd77969aacba9"
+        },
+        "git_operations": "2|recorded,recorded",
+        "restored_packs": 2,
+        "isolated_target": "/workspace/scratch/rootyard-round2/verify_final_core/pando-probe-work/run-9ymmuqvx/restored-data"
+      }
+    },
+    {
+      "name": "restored_stock_clone_fetch_fsck",
+      "status": "passed",
+      "seconds": 2.027,
+      "detail": {
+        "clone_ok": true,
+        "fetch_ok": true,
+        "fsck_ok": true,
+        "head": "5b6c0da3a1b64d5bc6f1c71e683fd77969aacba9",
+        "branch": "main",
+        "object_format": "sha1",
+        "pando_era_commit": "5b6c0da3a1b64d5bc6f1c71e683fd77969aacba9",
+        "first_commit_ancestor": "5857c09b703d1e48e4fd42a531b7a0226593764e",
+        "read_only_push_denied": true,
+        "remote_ref": "5b6c0da3a1b64d5bc6f1c71e683fd77969aacba9\trefs/heads/main"
+      }
+    }
+  ],
+  "source_database": "rootyard_pando_backup_674f30f702cc",
+  "restore_database": "rootyard_pando_restore_58dfde091809",
+  "archive": "/workspace/scratch/rootyard-round2/verify_final_core/pando-probe-work/run-9ymmuqvx/archive",
+  "report_path": "/workspace/scratch/rootyard-round2/verify_final_core/pando-probe-work/run-9ymmuqvx/report.json",
+  "limitations": [
+    "Single bounded loopback probe; not HA, cloud qualification, RPO/RTO or power-loss evidence.",
+    "Restore re-uploads the same encrypted pack objects to the same real Garage bucket; it proves closure transport, not a distinct disaster-recovery bucket."
+  ]
+}
