@@ -349,38 +349,64 @@ async fn launch_source(
     terminal: bool,
 ) -> Result<(), Error> {
     let live = matches!(&source, Source::Workspace { live: true, .. });
-    let ci = matches!(&source, Source::Ci { .. });
     if live && std::env::var("ROOTYARD_SANDBOX_MODE").as_deref() != Ok("dev") {
         return Err(Error::internal("live FUSE workspace requires dev namespace mode"));
     }
     cgroup::ensure_clean().await?;
     let limits = cgroup::Limits::from_env()?;
     let production = std::env::var("ROOTYARD_SANDBOX_MODE").as_deref() == Ok("cgroup");
-    let pool = if export::configured_pool().is_some() { Some(export::verify_pool()?) } else { None };
+    // Validate the isolation backend before touching any job-owned copy. A
+    // cgroup that cannot be created must fail the launch without leaving a
+    // workspace snapshot behind on the host.
+    let isolation = isolation_mode(job, &limits)?;
+    let pool = match export::configured_pool() {
+        Some(_) => match export::verify_pool() {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                if let Mode::Cgroup(group) = &isolation {
+                    cgroup::retire(group).await;
+                }
+                return Err(error);
+            }
+        },
+        None => None,
+    };
     if production && pool.is_none() {
+        if let Mode::Cgroup(group) = &isolation {
+            cgroup::retire(group).await;
+        }
         return Err(Error::internal("bounded artifact tmpfs pool required"));
     }
     let root = job_root(&state, job);
-    fs::create_dir_all(&root).map_err(Error::internal)?;
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(Error::internal)?;
-    let artifacts = match &pool {
-        Some(pool) => export::job_pool_dir(pool, job)?,
-        None => {
-            let directory = root.join("artifacts");
-            fs::create_dir_all(&directory).map_err(Error::internal)?;
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(Error::internal)?;
-            directory
+    let workspace_dir = root.join("workspace");
+    let prepared = (|| -> Result<PathBuf, Error> {
+        fs::create_dir_all(&root).map_err(Error::internal)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(Error::internal)?;
+        let artifacts = match &pool {
+            Some(pool) => export::job_pool_dir(pool, job)?,
+            None => {
+                let directory = root.join("artifacts");
+                fs::create_dir_all(&directory).map_err(Error::internal)?;
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(Error::internal)?;
+                directory
+            }
+        };
+        if !live {
+            let source_path = match &source {
+                Source::Workspace { id, .. } => service::workspace_repo(&state, *id),
+                Source::Ci { checkout, .. } => checkout.clone(),
+            };
+            core::copy_all(&source_path, &workspace_dir).map_err(Error::internal)?;
+        }
+        Ok(artifacts)
+    })();
+    let artifacts = match prepared {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            cleanup_failed_setup(&root, &workspace_dir, None, &isolation).await;
+            return Err(error);
         }
     };
-    let workspace_dir = root.join("workspace");
-    if !live {
-        let source_path = match &source {
-            Source::Workspace { id, .. } => service::workspace_repo(&state, *id),
-            Source::Ci { checkout, .. } => checkout.clone(),
-        };
-        core::copy_all(&source_path, &workspace_dir).map_err(Error::internal)?;
-    }
-    let isolation = isolation_mode(job, &limits)?;
     let outcome = launch_inner(
         state.clone(),
         job,
@@ -397,20 +423,24 @@ async fn launch_source(
     )
     .await;
     if outcome.is_err() {
-        // A failed launch must not leave a bounded but unreachable job tree or
-        // an empty cgroup behind.
-        let _ = fs::remove_dir_all(root.join("workspace"));
-        if ci {
-            let _ = fs::remove_dir_all(root.join("checkout"));
-        }
-        if pool.is_some() {
-            let _ = fs::remove_dir_all(&artifacts);
-        }
-        if let Mode::Cgroup(group) = &isolation {
-            cgroup::retire(group).await;
-        }
+        cleanup_failed_setup(&root, &workspace_dir, Some(&artifacts), &isolation).await;
     }
     outcome
+}
+
+/// Remove every job-owned copy created before a failed launch. Retired cgroup
+/// cleanup is retained and blocks new launches if it cannot be proven complete.
+async fn cleanup_failed_setup(root: &Path, workspace: &Path, artifacts: Option<&Path>, isolation: &Mode) {
+    let _ = fs::remove_dir_all(workspace);
+    let _ = fs::remove_dir_all(root.join("checkout"));
+    if let Some(artifacts) = artifacts {
+        if !artifacts.starts_with(root) {
+            let _ = fs::remove_dir_all(artifacts);
+        }
+    }
+    if let Mode::Cgroup(group) = isolation {
+        cgroup::retire(group).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

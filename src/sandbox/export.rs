@@ -228,11 +228,16 @@ pub(super) fn verify_pool() -> Result<PathBuf, Error> {
     }
     let canonical = fs::canonicalize(&configured).map_err(Error::internal)?;
     let (fstype, total_bytes) = mount_filesystem(&canonical)?;
-    if fstype != "tmpfs" && fstype != "ramfs" {
-        return Err(Error::internal("artifact pool must be a tmpfs or ramfs mount"));
+    if fstype != "tmpfs" {
+        return Err(Error::internal(
+            "artifact pool must be a tmpfs mount with a kernel size bound (ramfs has no accounting)",
+        ));
     }
     let limit = pool_limit()?;
-    if total_bytes == 0 || total_bytes > limit {
+    if total_bytes == 0 {
+        return Err(Error::internal("artifact pool mount reports no capacity"));
+    }
+    if total_bytes > limit {
         return Err(Error::internal("artifact pool mount is larger than the configured bound"));
     }
     Ok(canonical)

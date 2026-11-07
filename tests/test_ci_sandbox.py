@@ -177,12 +177,12 @@ class CiSandboxTest(unittest.TestCase):
             status, raw, _ = h.http(f"/api/repos/alice/forge/integrations/{hook['id']}/runs/{runs[context]}/claim",
                 method="POST", body={"runner_id": runner}, extra_headers=headers)
             self.assertEqual(status, 200, raw[:300])
-            claims[context] = (json.loads(raw), runs[context], headers)
+            claims[context] = (json.loads(raw), runs[context], headers, runner)
         return claims
 
     @staticmethod
-    def _tuple(value):
-        return {"runner_id": value["runner_id"], "attempt": value["attempt"],
+    def _tuple(value, runner):
+        return {"runner_id": runner, "attempt": value["attempt"],
             "lease_generation": value["lease_generation"], "head_oid": value["head_oid"],
             "storage_generation": value["storage_generation"]}
 
@@ -200,7 +200,7 @@ class CiSandboxTest(unittest.TestCase):
             base = f"/api/repos/alice/forge/integrations/{hook['id']}/runs"
             jobs = {}
             for context, mark, other in (("ci/a", "nonce-a", "own-b.txt"), ("ci/b", "nonce-b", "own-a.txt")):
-                value, run, headers = claims[context]
+                value, run, headers, runner = claims[context]
                 command = ("git rev-parse HEAD; test -f feature.txt; "
                     f"printf %s {mark} > /workspace/{mark}.txt; mkdir -p /artifacts; "
                     f"printf %s {mark} > /artifacts/who.txt; "
@@ -209,15 +209,15 @@ class CiSandboxTest(unittest.TestCase):
                     "env | sort; test ! -e /var/run/docker.sock; test ! -e /root; "
                     "test -z \"$DATABASE_URL\"; test -z \"$ROOTYARD_SANDBOX_MODE\"; echo BUILD_OK")
                 status, raw, _ = h.http(base + "/" + run + "/sandbox-jobs", method="POST",
-                    body={**self._tuple(value), "argv": ["/bin/sh", "-c", command],
+                    body={**self._tuple(value, runner), "argv": ["/bin/sh", "-c", command],
                         "timeout_seconds": 20}, extra_headers=headers)
                 self.assertEqual(status, 201, raw[:300])
                 jobs[context] = json.loads(raw)
             import concurrent.futures
 
             def wait(context):
-                value, run, headers = claims[context]
-                suffix = "?" + urllib.parse.urlencode(self._tuple(value))
+                value, run, headers, runner = claims[context]
+                suffix = "?" + urllib.parse.urlencode(self._tuple(value, runner))
                 deadline = time.monotonic() + 30
                 while time.monotonic() < deadline:
                     status, raw, _ = h.http(base + "/" + run + "/sandbox-jobs/" + jobs[context]["id"] + suffix,
@@ -232,9 +232,9 @@ class CiSandboxTest(unittest.TestCase):
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 outcomes = dict(zip(("ci/a", "ci/b"), pool.map(wait, ("ci/a", "ci/b"))))
             for context, mark in (("ci/a", "nonce-a"), ("ci/b", "nonce-b")):
-                value, run, headers = claims[context]
+                value, run, headers, runner = claims[context]
                 self.assertEqual(outcomes[context]["state"], "succeeded", h.root)
-                suffix = "?" + urllib.parse.urlencode(self._tuple(value))
+                suffix = "?" + urllib.parse.urlencode(self._tuple(value, runner))
                 status, raw, _ = h.http(base + "/" + run + "/sandbox-jobs/" + jobs[context]["id"] + "/logs" + suffix,
                     extra_headers=headers)
                 self.assertEqual(status, 200, raw[:300])
@@ -246,7 +246,7 @@ class CiSandboxTest(unittest.TestCase):
                 self.assertNotIn(b"DATABASE_URL", stdout)
                 self.assertNotIn(b"ROOTYARD_", stdout)
                 artifact_url = (base + "/" + run + "/sandbox-jobs/" + jobs[context]["id"]
-                    + "/artifacts?" + urllib.parse.urlencode({**self._tuple(value), "path": "who.txt"}))
+                    + "/artifacts?" + urllib.parse.urlencode({**self._tuple(value, runner), "path": "who.txt"}))
                 status, raw, _ = h.http(artifact_url, extra_headers=headers)
                 self.assertEqual(status, 200, raw[:300])
                 content = base64.b64decode(json.loads(raw)["artifact"]["content_base64"])
@@ -257,12 +257,12 @@ class CiSandboxTest(unittest.TestCase):
                     time.sleep(.05)
                 self.assertFalse((job_root / "checkout").exists(), "CI checkout copy was not reclaimed")
                 self.assertTrue((job_root / "artifacts" / "who.txt").is_file())
-            value_a, run_a, headers_a = claims["ci/a"]
-            value_b, run_b, headers_b = claims["ci/b"]
-            swapped = "?" + urllib.parse.urlencode(self._tuple(value_b))
+            value_a, run_a, headers_a, runner_a = claims["ci/a"]
+            value_b, run_b, headers_b, runner_b = claims["ci/b"]
+            swapped = "?" + urllib.parse.urlencode(self._tuple(value_b, runner_b))
             self.assertEqual(h.http(base + "/" + run_a + "/sandbox-jobs/" + jobs["ci/a"]["id"] + swapped,
                 extra_headers=headers_a)[0], 409)
-            suffix = "?" + urllib.parse.urlencode(self._tuple(value_a))
+            suffix = "?" + urllib.parse.urlencode(self._tuple(value_a, runner_a))
             status, raw, _ = h.http(base + "/" + run_a + "/sandbox-jobs/" + jobs["ci/a"]["id"] + "/cleanup" + suffix,
                 method="POST", extra_headers=headers_a)
             self.assertEqual(status, 200, raw[:300])
@@ -283,9 +283,9 @@ class CiSandboxTest(unittest.TestCase):
             h.setup()
             hook, secret = self._hook_with_contexts(h, ["ci/retry"])
             claims = self._claims(h, hook, secret, ["ci/retry"], ["retry-runner"])
-            first, run, headers = claims["ci/retry"]
+            first, run, headers, runner = claims["ci/retry"]
             base = f"/api/repos/alice/forge/integrations/{hook['id']}/runs/{run}/sandbox-jobs"
-            first_tuple = self._tuple(first)
+            first_tuple = self._tuple(first, runner)
             status, raw, _ = h.http(base, method="POST",
                 body={**first_tuple, "argv": ["/bin/sh", "-c",
                     "printf 'first-attempt\\n'; mkdir -p /artifacts; printf first > /artifacts/who.txt"],
@@ -309,7 +309,7 @@ class CiSandboxTest(unittest.TestCase):
             second = json.loads(raw)
             self.assertGreater(second["attempt"], first["attempt"])
             self.assertGreater(second["lease_generation"], first["lease_generation"])
-            second_tuple = self._tuple(second)
+            second_tuple = self._tuple(second, runner)
             self.assertEqual(h.http(base + "/" + first_job + suffix, extra_headers=headers)[0], 409)
             new_suffix = "?" + urllib.parse.urlencode(second_tuple)
             self.assertEqual(h.http(base + "/" + first_job + new_suffix, extra_headers=headers)[0], 404)
@@ -334,9 +334,9 @@ class CiSandboxTest(unittest.TestCase):
             status, raw, _ = h.http(base + "/" + second_job + "/logs" + new_suffix, extra_headers=headers)
             self.assertIn(b"second-attempt", base64.b64decode(json.loads(raw)["stdout_base64"]))
             self.assertEqual(h.sql(f"SELECT attempt||','||lease_generation FROM ci_runs WHERE id='{run}'"), "2,2")
-            self.assertEqual(h.sql(f"SELECT state||','||attempt||','||lease_generation FROM sandbox_jobs WHERE id='{first_job}'"),
+            self.assertEqual(h.sql(f"SELECT state||','||ci_attempt||','||ci_lease_generation FROM sandbox_jobs WHERE id='{first_job}'"),
                 "succeeded,1,1")
-            self.assertEqual(h.sql(f"SELECT attempt||','||lease_generation FROM sandbox_jobs WHERE id='{second_job}'"),
+            self.assertEqual(h.sql(f"SELECT ci_attempt||','||ci_lease_generation FROM sandbox_jobs WHERE id='{second_job}'"),
                 "2,2")
             h.stop()
             h.env["ROOTYARD_SANDBOX_RETENTION_SECONDS"] = "0"

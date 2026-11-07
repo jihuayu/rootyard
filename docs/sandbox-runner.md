@@ -64,11 +64,12 @@ Defaults (all overridable for an operator's deployment):
 `ENOSPC`, not advisory accounting. cgroup v2 has no filesystem-space
 controller, so artifacts need a kernel-bounded store: in cgroup mode the
 deployment must point `ROOTYARD_SANDBOX_ARTIFACTS_POOL` at a service-owned
-tmpfs/ramfs mount whose total size is at most
+tmpfs mount whose total size is at most
 `ROOTYARD_SANDBOX_ARTIFACTS_POOL_MAX_BYTES` (default 256 MiB). The service
 verifies ownership, mode, mount type and mount size before any job starts and
-fails closed with `503` otherwise; a normal host directory is never accepted as
-a production export store. Each job gets its own `0700` directory in that pool
+fails closed with `503` otherwise. Only `tmpfs` is accepted: `ramfs` reports no
+capacity and is rejected explicitly, and a normal host directory is never
+accepted as a production export store. Each job gets its own `0700` directory in that pool
 and the per-job walker enforces the stricter `ARTIFACTS_MAX_BYTES` and entry
 quota at 750 ms intervals and again at terminal state. User files are also
 capped by `RLIMIT_FSIZE` (16 MiB for user code after the baseline copy). A job
@@ -79,7 +80,10 @@ The job cgroup is killed with `cgroup.kill`, waited until `cgroup.procs` is
 empty and removed. Cleanup failure is not swallowed: a terminal job logs the
 incomplete reclamation, and startup recovery refuses to admit new work until it
 can prove every stale job cgroup is empty and removed. The sweep never removes
-a cgroup that is not named after one of its own job UUIDs. Development mode
+a cgroup that is not named after one of its own job UUIDs. Exactly one active
+service instance may own a delegated cgroup root; do not share
+`ROOTYARD_SANDBOX_CGROUP_ROOT` between independent runner nodes or processes,
+because startup recovery reaps every child of that subtree. Development mode
 uses the job root for artifacts and therefore has only the walker (a soft
 aggregate bound); that mode is explicitly not a production resource boundary.
 

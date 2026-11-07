@@ -43,7 +43,12 @@ def logs_of(h, job):
 
 
 def process_alive(pid):
-    return Path(f"/proc/{pid}").exists()
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    state = stat.rsplit(") ", 1)[1].split()[0]
+    return state not in ("Z", "X")
 
 
 def no_cmdline_contains(marker):
@@ -389,6 +394,42 @@ class SandboxServiceTest(unittest.TestCase):
             self.assertEqual(h.sql("SELECT count(*) FROM sandbox_jobs"), str(int(before) + 1))
             self.assertEqual(h.sql("SELECT count(*) FROM sandbox_jobs WHERE state='failed'"), "1")
             self.assertEqual(list(host_pool.iterdir()), [])
+
+            # A failure during workspace preparation after the job cgroup and
+            # export directory exist must reclaim both. Removing the workspace
+            # source makes copy_all fail after those resources were created.
+            import shutil
+
+            h.stop()
+            h.env["ROOTYARD_SANDBOX_ARTIFACTS_POOL"] = str(pool)
+            h.start()
+            broken_ws = json.loads(
+                h.expect(
+                    "/api/workspaces",
+                    201,
+                    token=h.alice,
+                    method="POST",
+                    body={"owner": "alice", "repository": "demo", "agent_id": "sandbox-broken", "base_oid": h.second},
+                    extra_headers={"Idempotency-Key": "sandbox-broken"},
+                )
+            )
+            shutil.rmtree(h.root / "data/workspace-service/workspaces" / broken_ws["id"])
+            status, raw, _ = h.http(
+                f"/api/workspaces/{broken_ws['id']}/sandbox-jobs",
+                token=h.alice,
+                method="POST",
+                body={"argv": ["/bin/true"], "timeout_seconds": 10, "lease_epoch": 1},
+            )
+            self.assertEqual(status, 503, raw[:300])
+            failed_id = h.sql(
+                f"SELECT id FROM sandbox_jobs WHERE workspace_id='{broken_ws['id']}' "
+                "AND state='failed' ORDER BY created_at DESC LIMIT 1"
+            )
+            self.assertTrue(failed_id)
+            failed_root = h.root / "data/sandbox-jobs" / failed_id
+            self.assertFalse((failed_root / "workspace").exists(), "failed launch left a workspace copy")
+            self.assertFalse((failed_root / "artifacts").exists(), "failed launch left an artifact dir")
+            self.assertFalse((pool / failed_id).exists(), "failed launch left a pool export dir")
         finally:
             h.cleanup()
             for entry in pool.iterdir() if pool.exists() else []:
