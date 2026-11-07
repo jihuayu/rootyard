@@ -326,6 +326,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/rootyard")
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
     if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
