@@ -115,7 +115,8 @@ def create_repo(h, name):
 
 def push_commit(h, work, text):
     (work / "state.txt").write_text(text)
-    h.git("commit", "-am", text.strip(), cwd=work)
+    h.git("add", "state.txt", cwd=work)
+    h.git("commit", "-m", text.strip(), cwd=work)
     tip = h.git("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
     h.git("push", "origin", "HEAD:main", cwd=work, token=h.alice)
     return tip
