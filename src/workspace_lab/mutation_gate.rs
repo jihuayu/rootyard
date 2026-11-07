@@ -71,8 +71,8 @@ pub struct MutationGate {
 }
 
 thread_local! {
-    static HELD_GATES: RefCell<Vec<*const MutationGate>> = RefCell::new(Vec::new());
-    static FROZEN_GATES: RefCell<Vec<*const MutationGate>> = RefCell::new(Vec::new());
+    static HELD_GATES: RefCell<Vec<*const MutationGate>> = const { RefCell::new(Vec::new()) };
+    static FROZEN_GATES: RefCell<Vec<*const MutationGate>> = const { RefCell::new(Vec::new()) };
 }
 
 fn mark_held(gate: &MutationGate) {
@@ -447,4 +447,5 @@ fn unix_now() -> io::Result<i64> {
 }
 
 #[cfg(test)]
+#[path = "mutation_gate/tests.rs"]
 mod tests;
