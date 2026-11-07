@@ -19,10 +19,10 @@ labels. Database strings are never interpolated into exposition.
 | `rootyard_git_capacity` | gauge | Configured native Git concurrency limit |
 | `rootyard_git_in_flight` | gauge | Occupied Git slots, including provisioning and process cleanup |
 | `rootyard_db_pool_max_size` | gauge | Configured maximum PostgreSQL pool connections |
-| `rootyard_db_pool_size` | gauge | Physical PostgreSQL pool connections currently established |
-| `rootyard_db_pool_available` | gauge | Idle pool connections immediately available for checkout |
-| `rootyard_db_pool_busy` | gauge | Checked-out pool connections, defined as `size - available` |
-| `rootyard_db_pool_waiting` | gauge | Callers waiting for a pool connection when the scrape started |
+| `rootyard_db_pool_size` | gauge | Tracked established pool objects, excluding creation in progress |
+| `rootyard_db_pool_available` | gauge | Approximate available objects derived from current pool users |
+| `rootyard_db_pool_busy` | gauge | Derived occupied-object estimate: `size - available` |
+| `rootyard_db_pool_waiting` | gauge | Approximate excess users; may include connection creation |
 | `rootyard_git_transfers_total{outcome="success\|failure"}` | counter | Completed Git HTTP transfers by transport outcome |
 | `rootyard_git_transfer_bytes_total{direction="received\|sent"}` | counter | Observed HTTP body bytes by direction |
 | `rootyard_repositories{state="provisioning\|ready\|recovering"}` | gauge | Durable repository metadata counts |
@@ -41,14 +41,14 @@ event assigned to two consumers contributes two outstanding deliveries.
 A resolved unknown operation remains an unknown historical fact; its explicit
 resolution removes it from the unresolved gauge without rewriting history.
 
-The five `rootyard_db_pool_*` gauges are a process-local reading taken at the
-instant each scrape begins, before that scrape acquires its own snapshot
-connection. `size` counts physical pooled connections currently established,
-`available` counts idle ones, `busy = size - available` counts connections
-checked out by callers, and `waiting` counts callers already queued for a
-connection. `size` can be below `max_size` when connections have not yet been
-opened on demand. A scrape that later fails because all pooled connections are
-busy still reports the occupancy it observed.
+The five `rootyard_db_pool_*` gauges read Deadpool 0.13.1 status before the
+scrape acquires its own SQL snapshot connection. They are approximate and can
+be internally inconsistent under concurrent load. `size` counts tracked
+established pool objects, excluding creation in progress; it is not a live
+socket probe. `available` and `waiting` are derived from pool users, and
+`waiting` can include connection creation. `busy = size - available` is a
+derived observation. A scrape that later fails to acquire a connection still
+exports the process-local status it observed.
 
 PostgreSQL is the source of truth. Each scrape obtains a single-statement MVCC
 snapshot inside a read-only transaction. A four-second server-side statement
@@ -99,9 +99,3 @@ positive `busy`/`waiting` gauges and full capacity recovery after unlock.
 ```
 ROOTYARD_TEST_DATABASE_URL=postgresql://... python3 tests/pool_metrics.py --binary target/debug/rootyard --report pool-metrics-report.json
 ```
-
-Deadpool 0.13.1 reports approximate pool snapshots under concurrent load.
-`size` counts tracked established pool objects, excluding creation in progress;
-it is not a live-socket probe. `available` and `waiting` are derived from pool
-users, so `waiting` can include connection creation. `busy = size - available`
-is a derived observation, not a coherent transaction across these counters.

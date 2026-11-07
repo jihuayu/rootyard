@@ -1,0 +1,72 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "seconds": 7.3329,
+      "detail": null
+    },
+    {
+      "name": "migration",
+      "status": "passed",
+      "seconds": 0.0495,
+      "detail": null
+    },
+    {
+      "name": "webhook_crud_and_secret_redaction",
+      "status": "passed",
+      "seconds": 0.0839,
+      "detail": null
+    },
+    {
+      "name": "ping_and_hmac_sha256_signature_verification",
+      "status": "passed",
+      "seconds": 0.022,
+      "detail": null
+    },
+    {
+      "name": "auto_pr_ci_pin_and_queued_check_orchestration",
+      "status": "passed",
+      "seconds": 0.5197,
+      "detail": null
+    },
+    {
+      "name": "idempotent_ci_callbacks_and_monotonic_check_runs",
+      "status": "passed",
+      "seconds": 0.8595,
+      "detail": null
+    },
+    {
+      "name": "outbox_push_and_pull_request_event_dispatch",
+      "status": "passed",
+      "seconds": 0.0188,
+      "detail": null
+    },
+    {
+      "name": "exponential_backoff_retry_and_dead_letter",
+      "status": "passed",
+      "seconds": 0.1179,
+      "detail": null
+    },
+    {
+      "name": "webhook_loopback_default_deny_and_operator_opt_in",
+      "status": "passed",
+      "seconds": 3.1776,
+      "detail": null
+    },
+    {
+      "name": "collaborator_team_and_organization_tenant_scope",
+      "status": "passed",
+      "seconds": 0.822,
+      "detail": null
+    },
+    {
+      "name": "access_and_boundaries",
+      "status": "passed",
+      "seconds": 0.022,
+      "detail": null
+    }
+  ],
+  "binary_sha256": "bf49434c09791eea29cd442da3b5cc7e458fa7ef017340f6249c13a75f0ea726"
+}
