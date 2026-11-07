@@ -17,8 +17,8 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -135,30 +135,9 @@ fn open_lower(lazy: Option<&dyn LazySource>, relative: &Path, source: &Entry) ->
     source.open(libc::O_RDONLY, 0)
 }
 
-pub struct MutationGate {
-    lock: RwLock<()>,
-    writable_until: AtomicI64,
-}
-impl MutationGate {
-    pub fn new(writable_until: i64) -> Arc<Self> {
-        Arc::new(Self { lock: RwLock::new(()), writable_until: AtomicI64::new(writable_until) })
-    }
-    pub fn update(&self, until: i64) {
-        self.writable_until.store(until, Ordering::Release);
-    }
-    pub fn freeze<T>(&self, work: impl FnOnce() -> T) -> T {
-        let _guard = self.lock.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        work()
-    }
-    fn mutation(&self) -> io::Result<std::sync::RwLockReadGuard<'_, ()>> {
-        let guard = self.lock.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(io::Error::other)?.as_secs() as i64;
-        if now >= self.writable_until.load(Ordering::Acquire) {
-            return Err(io::Error::from_raw_os_error(libc::EROFS));
-        }
-        Ok(guard)
-    }
-}
+// The gate now lives in its own module; keep the historical path stable for
+// `crate::workspace_lab::fuse_mount::MutationGate` callers.
+pub use super::mutation_gate::{GatePhase, MutationGate, MutationGuard};
 
 #[path = "fuse_io.rs"]
 mod fuse_io;
@@ -438,6 +417,35 @@ mod tests {
         let entry = Entry::new(root.path(), Path::new(".git/config"), false).unwrap();
         let file = open_lower(Some(&NotManaged), Path::new(".git/config"), &entry).unwrap();
         assert_eq!(file.metadata().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn freeze_rejects_mutations_without_blocking_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let lower = root.path().join("lower");
+        let upper = root.path().join("upper");
+        fs::create_dir_all(&lower).unwrap();
+        fs::write(lower.join("file.txt"), b"readable").unwrap();
+        let gate = MutationGate::new(i64::MAX);
+        let overlay = Overlay::new_with_gate(lower, upper, gate.clone()).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let freeze_gate = gate.clone();
+            scope.spawn(move || {
+                freeze_gate.freeze(|| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let error = gate.mutation().err().and_then(|error| error.raw_os_error());
+            assert_eq!(error, Some(libc::EAGAIN));
+            let attr = overlay.attr(Path::new("file.txt"), 2).expect("read metadata ignores the freeze");
+            assert_eq!(attr.size, 8);
+            release_tx.send(()).unwrap();
+        });
+        drop(gate.mutation().expect("thaw admits mutations"));
     }
 
     #[test]

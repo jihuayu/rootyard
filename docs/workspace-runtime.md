@@ -88,6 +88,29 @@ FUSE gate on the next scan or at the previous deadline. An operation admitted
 before expiry may finish on the old host's local upper layer; the old epoch
 cannot publish a checkpoint or remote manifest after lease handoff.
 
+Workspace FUSE writes pass a process-local mutation gate with `Healthy`,
+`Frozen` and `Fenced` states. A freeze first stops new admissions and then waits
+for already admitted mutations to drain before running its closure; reads are
+not gated. Because FUSE dispatch is a single session thread, a new mutation on a
+frozen gate is rejected immediately with `EAGAIN` instead of sleeping behind the
+freeze, while a fenced or lease-expired gate returns `EROFS`; neither path
+changes content. A fence is terminal for the current lease epoch and does not
+wait for a freeze or for an in-flight mutation. It wakes blocked waiters with
+`EROFS`, ignores the legacy deadline-only lease update, and cannot be cleared by
+that update or by reusing the old epoch. Only `re_authorize` with a strictly
+higher epoch restores writes, and a re-authorization that arrives during a
+freeze still waits for the freeze to finish. The gate's RAII admission count is
+released on error and panic, and a fenced state is never thawed by a freeze
+guard being dropped.
+
+This gate is only a prerequisite for an independent FUSE helper. The session is
+still a `BackgroundSession` in the API process, so an operator `SIGKILL` can
+still leave a thread in `request_wait_answer` holding the same-process FUSE
+descriptor; the helper and parent-loss lifecycle remain open and have no native
+acceptance. Rejected freeze/expiry writes are not queued: a bounded
+asynchronous mutation queue is future work if editors need retry-free behavior
+during checkpoint or scan freezes.
+
 A new host can acquire an expired workspace lease only when its latest revision
 has a committed checkpoint. It verifies and materializes that checkpoint from
 the tenant-scoped remote object store before changing host ownership, then
