@@ -266,7 +266,9 @@ class Harness:
         self.reject_init_before_store("lfs-attributes", source, base)
         checked.append("tracked-gitattributes-filter-lfs")
 
-        # Real ordinary sparse checkout (cone mode, no sparse index).
+        # Real ordinary sparse checkout (cone mode, no sparse index). Git writes its
+        # own sparse configuration (extensions.worktreeConfig plus config.worktree),
+        # which the local Git config allowlist refuses conservatively.
         root, source, _, _ = self.fixture("preflight-sparse", {
             "visible/file.txt": b"visible\n", "excluded/file.txt": b"excluded\n",
         })
