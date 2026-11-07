@@ -83,6 +83,28 @@ The schema contract fixtures are generated only from pristine synthetic migratio
 
 See [the populated Forge integration record](forge-backup-verification.md) and [the earlier recovery integration record](integration-verification.md) and [the original schema-002 drill](backup-verification.md) for actual measured outcomes and remaining gaps. PostgreSQL's [snapshot lock ordering](https://www.postgresql.org/docs/17/sql-lock.html), [pg_dump snapshot/lock behavior](https://www.postgresql.org/docs/17/app-pgdump.html) and [pg_restore trust/transaction boundary](https://www.postgresql.org/docs/17/app-pgrestore.html) are the underlying contracts.
 
+### Workspace remote checkpoint objects
+
+Workspace checkpoint objects in the shared object store are outside this
+archive's LFS/Pando closure and outside the current PITR/delete-broker
+contract. Physical deletion of those tenant/workspace/SHA-256 keys is disabled
+by default. Abandoning a failed checkpoint still marks its SQL row `failed`
+and reports that remote cleanup is pending, but every staging reference is
+retained as a retryable key reference and audit trail. The bytes continue to
+count against object-store quota and retention until a controlled external
+delete broker removes them; the API must not describe them as reclaimed.
+
+The only destructive switch is the explicitly unsafe legacy operator opt-in
+`ROOTYARD_WORKSPACE_UNSAFE_REMOTE_DELETE=true`. It runs the old guarded
+collector, which keeps the advisory lock and refuses a key while any committed
+or resumable staging reference for the same tenant still exists. It never
+derives a key from a caller-supplied tenant, source or authority. This mode is
+not a PITR or disaster-recovery proof: a PostgreSQL clone/PITR rollback of
+workspace root metadata can disagree with the shared bucket, and this mode does
+not detect that. A future delete broker must carry an external deletion epoch
+and isolate PUT credentials; until then the workspace remote-delete fence (#77)
+remains open. Never point an out-of-band metadata copy at the shared bucket.
+
 ### Restored execution authority
 
 New backups use format10 with the executable's current schema134 catalog and include

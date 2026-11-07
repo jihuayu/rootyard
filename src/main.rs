@@ -167,6 +167,7 @@ async fn run() -> Result<()> {
             axum::serve(listener, rootyard::mirror::router(state)).with_graceful_shutdown(shutdown()).await?;
         }
         "serve" if args.len() <= 1 => {
+            rootyard::config::init_workspace_remote_delete_policy()?;
             let dispatch_settings = rootyard::dispatch::Settings::from_env()?;
             let maintenance_policy = rootyard::storage_lifecycle::models::Policy::from_env()?;
             std::fs::read_to_string("/proc/self/stat")

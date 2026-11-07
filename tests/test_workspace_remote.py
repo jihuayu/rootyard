@@ -13,7 +13,13 @@ from tests.e2e import Harness
 @unittest.skipUnless(os.environ.get("ROOTYARD_OBJECT_STORE_ENDPOINT"),"live S3 test requires Garage or MinIO")
 class WorkspaceRemoteTest(unittest.TestCase):
     def test_abandoned_upload_collects_staged_s3_key(self):
+        # ISOLATED LEGACY-PATH FIXTURE: this case explicitly opts into the old
+        # unsafe physical delete to verify the legacy collector only. It is NOT
+        # a PITR-safety proof, and the flag must never be enabled for the whole
+        # suite (the default policy case lives in
+        # tests/workspace_remote_delete_policy.py).
         h=Harness(argparse.Namespace(binary="target/debug/rootyard",keep=False))
+        h.env["ROOTYARD_WORKSPACE_UNSAFE_REMOTE_DELETE"]="true"
         try:
             h.setup();h.api();h.roundtrip()
             ws=json.loads(h.expect("/api/workspaces",201,token=h.alice,method="POST",
@@ -43,6 +49,7 @@ class WorkspaceRemoteTest(unittest.TestCase):
             abandoned=json.loads(h.expect(f"/api/checkpoints/{cid}/abandon",200,token=h.alice,method="POST"))
             self.assertEqual(abandoned["state"],"failed")
             self.assertGreaterEqual(abandoned["objects_collected"],0)
+            self.assertFalse(abandoned["cleanup_pending"])
             self.assertEqual(h.sql(f"SELECT COUNT(*) FROM workspace_remote_staging_objects WHERE checkpoint_id='{cid}'"),"0")
             shutil.rmtree(h.root/"data/workspace-service/checkpoints"/retained_id)
             recovered=json.loads(h.expect(f"/api/checkpoints/{retained_id}/restore",201,
