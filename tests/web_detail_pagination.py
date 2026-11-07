@@ -345,16 +345,7 @@ class DetailPaginationHarness(BrowserHarness):
         assert numbers == list(range(1, PAGE + 1)), numbers[:3]
         assert "web-late-comment" not in text, "mutation page leaked the 107th comment"
         comment_next = bool(NEXT_LINK.findall(text))
-        if not comment_next:
-            # Known production gap (checked against src/web/handlers.rs):
-            # create_issue_comment_web re-renders via render_issue_detail_view
-            # without templates::attach_next_page_nav, so the 201 HTML has no
-            # rel=next link even though a further page exists. The GET path does.
-            self.todos.append(
-                "TODO: create_issue_comment_web 201 HTML omits the rel=next nav "
-                "because it renders without attach_next_page_nav; only the GET "
-                "issue detail view paginates further."
-            )
+        assert comment_next, "comment mutation omitted the next-page link"
 
         status, body, _ = self.web_post(
             f"/web/repos/alice/demo/pulls/{self.pull}/reviews",
@@ -475,7 +466,7 @@ def main():
                 "The cursor is a scope-bound ordering position, not a signed capability or a snapshot; inserts after the cursor appear later and deletes simply vanish.",
                 "Review pagination is exercised on `/web/.../pulls/{number}`; `/web/.../pulls/{number}/reviews` shares the same renderer but is not separately paged here.",
                 "Actor binding is covered with a real read collaborator: a cursor minted for Alice is rejected (400) for Bob, whose pre-membership and post-revocation detail reads are 404 and whose revoked token is 401.",
-                "Mutation re-render is checked for status 201, page-one numbers and the 107th row staying off page one; the comment mutation's missing rel=next nav is recorded as a TODO (see report.todos), not as a verified pass.",
+                "Mutation re-render checks status 201, page-one rows, next-page links, and the new 107th row remaining beyond page one.",
             ],
         )
         if args.report:
