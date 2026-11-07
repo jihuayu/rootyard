@@ -357,6 +357,95 @@ pub async fn verify_repo_write_access<C: GenericClient + Sync>(
     Ok(())
 }
 
+/// Late Git publication authorization on the publication owner's own
+/// PostgreSQL transaction.
+///
+/// The coordinator derives `actor` from the request it already authenticated
+/// and from the admitted operation; a native hook can never supply an identity,
+/// action or digest here. The token row is locked `FOR SHARE` first so grant
+/// writers using the documented `FOR UPDATE` protocol serialize behind native
+/// CAS, and the lock is released only when the owner transaction ends after the
+/// native child is quiescent, durable evidence is settled and the guard dropped.
+/// Repository, role and live-grant checks run after that lock, under a second
+/// statement that observes the real database clock, so a revocation or
+/// narrowing that waited on the lock is still rejected.
+pub async fn authorize_publication_window(
+    tx: &Transaction<'_>,
+    actor: &Identity,
+    repository_id: Uuid,
+    storage_generation: i64,
+) -> Result<(), Error> {
+    let browser = browser_credentials_allowed();
+    // Step 1: take the token row lock. The digest is the parent's verified
+    // immutable token identity, never a hook-reported value.
+    tx.query_opt(
+        "SELECT true FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 \
+         AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) \
+         AND (t.kind='api' OR ($4 AND t.kind='browser' AND t.is_restricted = false AND EXISTS \
+             (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked \
+              AND s.expires_at>clock_timestamp()))) FOR SHARE OF t",
+        &[&actor.token_id, &actor.id, &actor.token_digest, &browser],
+    )
+    .await
+    .map_err(Error::internal)?
+    .ok_or_else(Error::unauthorized)?;
+    // Step 2: an independent statement re-reads the live row after the lock
+    // wait, so expiry, read-only flips and browser-session loss are observed
+    // with the real database clock.
+    let live = tx
+        .query_opt(
+            "SELECT t.read_only, (t.expires_at IS NULL OR t.expires_at > clock_timestamp()), \
+                    (t.kind='api' OR ($4 AND t.kind='browser' AND t.is_restricted = false AND EXISTS \
+                     (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked \
+                      AND s.expires_at>clock_timestamp()))) \
+               FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 AND NOT t.revoked",
+            &[&actor.token_id, &actor.id, &actor.token_digest, &browser],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::unauthorized)?;
+    if !live.get::<_, bool>(1) || !live.get::<_, bool>(2) {
+        return Err(Error::unauthorized());
+    }
+    if live.get::<_, bool>(0) {
+        return Err(Error(StatusCode::FORBIDDEN, "write permission required"));
+    }
+    // Step 3: current repository generation/state and effective write role,
+    // read under the same transaction that now owns the token lock.
+    let repo = tx
+        .query_opt("SELECT owner_id,state,storage_generation FROM repositories WHERE id=$1", &[&repository_id])
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    if repo.get::<_, i64>(2) != storage_generation {
+        return Err(Error(StatusCode::CONFLICT, "repository generation changed before ref publication"));
+    }
+    if repo.get::<_, String>(1) != "ready" {
+        return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
+    }
+    let owner_id: Uuid = repo.get(0);
+    let Some((effective, _, _)) =
+        crate::members::rbac::resolve_effective_role(&**tx, repository_id, owner_id, actor.id).await?
+    else {
+        return Err(Error::not_found());
+    };
+    if effective < Role::Write {
+        return Err(Error(StatusCode::FORBIDDEN, "insufficient repository role"));
+    }
+    // Step 4: the fixed action is ContentsWrite; the token can only narrow.
+    crate::token_scopes::authorize_repository_late(
+        &**tx,
+        actor.token_id,
+        actor.id,
+        repository_id,
+        crate::token_scopes::RepoAction::ContentsWrite,
+        browser,
+    )
+    .await
+    .map_err(scope_error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
