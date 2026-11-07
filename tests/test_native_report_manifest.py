@@ -1,0 +1,261 @@
+"""Fail-closed contract tests for the native acceptance report manifest.
+
+The candidate release gate and the per-pull-request binding step both use
+``scripts/native_report_manifest.py``. These tests prove the gate rejects stale
+binaries, failed cases, missing/empty logs, unrecorded fixtures and evidence
+from another commit, and that the release gate requires one shared compiled
+source digest.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts/native_report_manifest.py"
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+class ManifestFixture:
+    """Ephemeral build receipt, binary, report and log in a temporary tree."""
+
+    def __init__(self, root, commit="a" * 40, source_inputs="b" * 64):
+        self.root = Path(root)
+        self.commit = commit
+        self.source_inputs = source_inputs
+        self.binary = self.root / "target/debug/rootyard"
+        self.binary.parent.mkdir(parents=True, exist_ok=True)
+        self.binary.write_bytes(b"actual-rust-binary")
+        self.receipt = self.root / "target/debug/rootyard.build.json"
+        self.receipt.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "binary_sha256": digest(self.binary),
+                    "source_inputs_sha256": source_inputs,
+                    "workspace_commit": commit,
+                    "rustc": "rustc 1.99.1",
+                    "command": ["cargo", "build", "--locked", "--bin", "rootyard"],
+                }
+            )
+        )
+        self.harness = self.root / "tests/web_sessions.py"
+        self.harness.parent.mkdir(parents=True, exist_ok=True)
+        self.harness.write_text("# harness\n")
+
+    def report(self, name="web_sessions", passed=True, binary_sha=None, case_status="passed", **extra):
+        path = self.root / f"test-results/{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "passed": passed,
+            "binary_sha256": binary_sha if binary_sha is not None else digest(self.binary),
+            "cases": [{"name": "workflow", "status": case_status}],
+            **extra,
+        }
+        path.write_text(json.dumps(payload))
+        return path
+
+    def log(self, text="201 event batches: passed\nconcurrent claim fence: passed\n"):
+        path = self.root / "test-results/webhook-regressions.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def run(self, *arguments, expect=0, env=None):
+        environment = os.environ.copy()
+        environment.pop("GITHUB_SHA", None)
+        for name in ("ROOTYARD_OBJECT_STORE_SECRET_KEY", "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
+                     "ROOTYARD_FIXTURE_SECRET_KEY", "ROOTYARD_FIXTURE_ACCESS_KEY"):
+            environment.pop(name, None)
+        environment.update(env or {})
+        process = subprocess.run(
+            [sys.executable, str(SCRIPT), *map(str, arguments)],
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if process.returncode != expect:
+            raise AssertionError(
+                f"expected exit {expect}, got {process.returncode}\n"
+                f"stdout: {process.stdout[-2000:]}\nstderr: {process.stderr[-2000:]}"
+            )
+        return process
+
+    def job(self, manifest_name="job.json", reports=None, log=None, extra=(), expect=0):
+        reports = reports if reports is not None else {"web_sessions": self.report()}
+        log = log if log is not None else self.log()
+        manifest = self.root / f"manifests/{manifest_name}"
+        arguments = [
+            "--mode", "job",
+            "--manifest-out", manifest,
+            "--build-receipt", self.receipt,
+            "--binary", self.binary,
+            "--expect-commit", self.commit,
+        ]
+        for name, path in reports.items():
+            arguments += ["--report", f"{name}={path}"]
+        arguments += [
+            "--log", f"webhook_regressions={log}",
+            "--log-marker", "webhook_regressions=201 event batches: passed",
+            "--log-marker", "webhook_regressions=concurrent claim fence: passed",
+            "--harness", self.harness,
+            "--fixture", "postgres=postgres:17",
+            *extra,
+        ]
+        self.last_process = self.run(*arguments, expect=expect)
+        return manifest
+
+
+class TestJobManifest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.fixture = ManifestFixture(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_accepts_evidence_bound_to_the_built_binary(self):
+        manifest = json.loads(self.fixture.job().read_text())
+        self.assertEqual(manifest["kind"], "rootyard/native-acceptance-job-manifest")
+        self.assertEqual(manifest["status"], "passed")
+        self.assertEqual(manifest["source_commit"], self.fixture.commit)
+        self.assertEqual(manifest["source_inputs_sha256"], self.fixture.source_inputs)
+        self.assertEqual(manifest["binary_sha256"], digest(self.fixture.binary))
+        self.assertEqual(manifest["harnesses"], {str(self.fixture.harness): digest(self.fixture.harness)})
+        self.assertEqual(manifest["fixtures"], {"postgres": "postgres:17"})
+        self.assertEqual(sorted(manifest["reports"]), ["web_sessions"])
+        self.assertEqual(manifest["logs"]["webhook_regressions"]["bytes"], len(self.fixture.log().read_bytes()))
+
+    def test_rejects_report_from_another_binary(self):
+        report = self.fixture.report(binary_sha="c" * 64)
+        self.fixture.job(reports={"web_sessions": report}, expect=1)
+        self.assertIn("binary digest does not match", self.fixture.last_process.stderr)
+        manifest = json.loads((self.fixture.root / "manifests/job.json").read_text())
+        self.assertEqual(manifest["status"], "failed")
+
+    def test_rejects_failed_case_even_when_the_report_claims_success(self):
+        report = self.fixture.report(case_status="failed")
+        self.fixture.job(reports={"web_sessions": report}, expect=1)
+        self.assertIn("is not passed", self.fixture.last_process.stderr)
+
+    def test_rejects_empty_log_and_missing_marker(self):
+        empty = self.fixture.log("")
+        self.fixture.job(log=empty, expect=1)
+        self.assertIn("empty output", self.fixture.last_process.stderr)
+        partial = self.fixture.log("201 event batches: passed\n")
+        self.fixture.job(log=partial, expect=1)
+        self.assertIn("missing expected output", self.fixture.last_process.stderr)
+
+    def test_rejects_receipt_from_another_commit(self):
+        report = self.fixture.report()
+        manifest = self.fixture.root / "manifests/other.json"
+        process = self.fixture.run(
+            "--mode", "job",
+            "--manifest-out", manifest,
+            "--build-receipt", self.fixture.receipt,
+            "--binary", self.fixture.binary,
+            "--expect-commit", "d" * 40,
+            "--report", f"web_sessions={report}",
+            "--harness", self.fixture.harness,
+            expect=1,
+        )
+        self.assertIn("!= expected commit", process.stderr)
+
+    def test_rejects_live_fixture_credential_in_artifacts(self):
+        secret = "s3cr3t-fixture-key-value"
+        report = self.fixture.report()
+        report.write_text(report.read_text().replace('"cases"', f'"leak":"{secret}","cases"'))
+        process = self.fixture.run(
+            "--mode", "job",
+            "--manifest-out", self.fixture.root / "manifests/leak.json",
+            "--build-receipt", self.fixture.receipt,
+            "--binary", self.fixture.binary,
+            "--expect-commit", self.fixture.commit,
+            "--report", f"web_sessions={report}",
+            "--harness", self.fixture.harness,
+            expect=1,
+            env={"ROOTYARD_OBJECT_STORE_SECRET_KEY": secret},
+        )
+        self.assertIn("live fixture credential", process.stderr)
+
+
+class TestReleaseGate(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.fixture = ManifestFixture(self.temporary.name)
+        self.browser = self.fixture.job(
+            "browser.json", reports={"browser_ui": self.fixture.report("browser_ui")}
+        )
+        self.store = self.fixture.job(
+            "object-store.json",
+            reports={
+                "lfs_hydration": self.fixture.report("lfs_hydration"),
+                "lfs_retention": self.fixture.report("lfs_retention"),
+            },
+            extra=("--fixture", "garage=garage 2.1.0", "--fixture", "git_lfs=git-lfs/3.6.1"),
+        )
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def release(self, *arguments, fixtures=None, expect=0):
+        fixtures = fixtures if fixtures is not None else {"garage": "2.1", "git_lfs": "3.6.1"}
+        output = self.fixture.root / "candidate-release-gate.json"
+        command = [
+            "--mode", "release",
+            "--manifest-out", output,
+            "--expect-commit", self.fixture.commit,
+            "--job-manifest", f"browser={self.browser}",
+            "--job-manifest", f"object-store={self.store}",
+            "--require-report", "browser_ui",
+            "--require-report", "lfs_hydration",
+        ]
+        for name, substring in fixtures.items():
+            command += ["--require-fixture", f"{name}={substring}"]
+        process = self.fixture.run(*command, *arguments, expect=expect)
+        return process, output
+
+    def test_accepts_consistent_job_manifests(self):
+        _, output = self.release()
+        gate = json.loads(output.read_text())
+        self.assertEqual(gate["kind"], "rootyard/candidate-release-gate")
+        self.assertEqual(gate["status"], "passed")
+        self.assertEqual(gate["source_commit"], self.fixture.commit)
+        self.assertEqual(gate["source_inputs_sha256"], self.fixture.source_inputs)
+        self.assertEqual(sorted(gate["jobs"]), ["browser", "object-store"])
+        self.assertEqual(gate["fixtures"]["garage"], "garage 2.1.0")
+        self.assertEqual(gate["reports"], ["browser_ui", "lfs_hydration", "lfs_retention"])
+
+    def test_rejects_missing_required_report_and_wrong_fixture_pin(self):
+        process, _ = self.release("--require-report", "lfs_remote", expect=1)
+        self.assertIn("required candidate reports are missing", process.stderr)
+        process, _ = self.release(fixtures={"garage": "2.0"}, expect=1)
+        self.assertIn("does not contain the required pin", process.stderr)
+
+    def test_rejects_job_manifest_from_another_source_digest(self):
+        other = ManifestFixture(self.fixture.root / "other", source_inputs="e" * 64)
+        second = other.job("second.json", reports={"lfs_remote": other.report("lfs_remote")})
+        process, _ = self.release(
+            "--job-manifest", f"second={second}",
+            "--require-report", "lfs_remote",
+            expect=1,
+        )
+        self.assertIn("disagree on the compiled source-input digest", process.stderr)
+
+    def test_rejects_harness_changed_after_the_job_ran(self):
+        self.fixture.harness.write_text("# harness changed\n")
+        process, _ = self.release(expect=1)
+        self.assertIn("changed after the job ran", process.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

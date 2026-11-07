@@ -138,3 +138,14 @@ backup suites and verifies paired source-plan/receipt/native-root restoration.
 Run both with `--binary target/debug/rootyard --report <output.json>` in addition
 to the original mirror and recovery suites; see the source-retention contract in
 [ci-mirror.md](ci-mirror.md). Do not infer production CI readiness from these tests.
+
+## Native acceptance coverage in CI
+
+Every push and pull request runs the cheap native security/tenancy/concurrency
+regressions (`tests/web_sessions.py`, `tests/ci_webhook_regressions.py`,
+`tests/webhook_worker_recovery.py`) and binds their reports, logs and harness
+digests to the once-built binary with `scripts/native_report_manifest.py`.
+The expensive browser and owned-Garage LFS suites run only in the manual
+candidate release gate; see [ci-acceptance.md](ci-acceptance.md) for the
+coverage split, the fail-closed rules, fixture ownership and the honest current
+status of the candidate workflow.

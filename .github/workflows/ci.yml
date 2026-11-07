@@ -33,7 +33,7 @@ jobs:
           rustc -V && cargo -V && rustfmt -V && cargo clippy -V
       - name: Install matching PostgreSQL client and test tools
         run: |
-          apt-get update && apt-get install -y --no-install-recommends git python3 python3-venv postgresql-17 postgresql-client-17 redis-server gcc g++ make pkg-config openjdk-21-jre-headless curl ca-certificates
+          apt-get update && apt-get install -y --no-install-recommends git python3 python3-venv postgresql-17 postgresql-client-17 redis-server gcc g++ make pkg-config openjdk-21-jre-headless curl ca-certificates openssl
           echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
           echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
       - name: Test bounded Kafka download helper
@@ -169,22 +169,61 @@ jobs:
           fi
       - name: Exercise external CI webhooks, HMAC-SHA256 delivery, and auto PR CI pins
         run: python3 tests/webhooks.py --binary target/debug/rootyard --report test-results/webhooks.json
+      - name: Exercise webhook batching, lease and TLS regressions
+        timeout-minutes: 10
+        env:
+          ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          python3 tests/ci_webhook_regressions.py --binary target/debug/rootyard 2>&1 | tee test-results/ci-webhook-regressions.log
+      - name: Exercise durable webhook worker recovery against real PostgreSQL
+        timeout-minutes: 15
+        env:
+          ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
+        run: python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
       - name: Exercise repository collaborators, teams, 5-role RBAC, and audit log
         run: python3 tests/members.py --binary target/debug/rootyard --report test-results/members.json
       - name: Exercise server-side HTML Web UI views, XSS sanitization, and PR/Issue workflows
         run: python3 tests/web.py --binary target/debug/rootyard --report test-results/web.json
+      - name: Exercise real browser sessions, CSRF, expiry and revocation
+        timeout-minutes: 10
+        env:
+          ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
+        run: python3 tests/web_sessions.py --binary target/debug/rootyard --report test-results/web-sessions.json
       - name: Exercise multi-node repository sharding, epoch write fencing, and automated failover
         run: python3 tests/sharding.py --binary target/debug/rootyard --report test-results/sharding.json
       - name: Exercise multi-node 1/2/4-node concurrency and P95/P99 sharding benchmark suite
         run: python3 tests/benchmark_tiers.py --binary target/debug/rootyard --report test-results/benchmark-tiers.json
       - name: Exercise explicitly labeled 4-tier reference models
         run: ROOTYARD_E2E_REQUIRE_M5=1 ROOTYARD_E2E_REQUIRE_P2=1 ROOTYARD_E2E_REQUIRE_P3=1 python3 tests/e2e_tiers.py --reference-only --tier all --report test-results/reference-tiers.json
+      - name: Bind native regressions to the built binary and source inputs
+        run: |
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/native-pr-gate.json \
+            --build-receipt target/debug/rootyard.build.json \
+            --binary target/debug/rootyard \
+            --report web_sessions=test-results/web-sessions.json \
+            --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
+            --log webhook_regressions=test-results/ci-webhook-regressions.log \
+            --log-marker "webhook_regressions=201 event batches: passed" \
+            --log-marker "webhook_regressions=concurrent claim fence: passed" \
+            --log-marker "webhook_regressions=verified TLS and plaintext rejection: passed" \
+            --log-marker "webhook_regressions=untrusted certificate rejected:" \
+            --harness tests/web_sessions.py \
+            --harness tests/webhook_worker_recovery.py \
+            --harness tests/ci_webhook_regressions.py \
+            --fixture postgres=postgres:17 \
+            --fixture rust="$(rustc -V)"
       - name: Upload end-to-end report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-report
-          path: test-results/*.json
+          path: |
+            test-results/*.json
+            test-results/ci-webhook-regressions.log
+            test-results/evidence/*.jsonl
           if-no-files-found: ignore
 
   container:
