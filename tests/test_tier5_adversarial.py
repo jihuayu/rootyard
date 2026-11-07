@@ -244,13 +244,51 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
     """Class 2: Schema baseline 060, FK topological DAG, backup lock ordering, and relational CHECK constraints."""
 
     def test_migrations_001_to_030_exact_version_sequence_and_staged_sql_byte_parity(self) -> None:
-        self.assertEqual(schema_baseline.SCHEMA_VERSIONS, [1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60])
-        self.assertEqual(schema_baseline.LATEST_VERSION, 60)
-        self.assertEqual(schema_baseline.LATEST_PREFIX, "060")
-        self.assertEqual(schema_baseline.TABLE_COUNT, 34)
+        # Historical (pre-060) versions are frozen: newer migrations may only
+        # append versions after 060, never rewrite the earlier prefix.
+        frozen_versions = [1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60]
+        versions = schema_baseline.SCHEMA_VERSIONS
+        self.assertEqual([v for v in versions if v <= 60], frozen_versions)
+        self.assertEqual(versions, sorted(versions))
+        self.assertEqual(len(set(versions)), len(versions))
+        self.assertEqual(versions[0], 1)
 
+        # The frozen 060 fixture must describe exactly the 34 ordinary tables
+        # created by the historical migrations.
+        frozen_catalog = json.loads((ROOT / "schema/060_catalog.json").read_text(encoding="utf-8"))
+        frozen_tables = sorted(t["name"] for t in frozen_catalog["tables"] if t["kind"] == "r")
+        self.assertEqual(len(frozen_tables), 34)
+        historical_tables: list[str] = []
+        for mig_path in sorted((ROOT / "migrations").glob("*.sql")):
+            if int(mig_path.name.split("_", 1)[0]) > 60:
+                continue
+            body = "\n".join(
+                line.split("--", 1)[0] for line in mig_path.read_text(encoding="utf-8").splitlines()
+            )
+            historical_tables.extend(
+                m.group(1)
+                for m in re.finditer(
+                    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z0-9_]+)\s*\(",
+                    body,
+                    re.IGNORECASE,
+                )
+            )
+        self.assertEqual(sorted(historical_tables), frozen_tables)
+
+        # The live Rust registry must match every migration on disk exactly.
         info = e2e_tiers.SchemaBoundaryIntegrationFixture.verify_db_rs_and_migrations()
-        self.assertEqual(info["versions"], schema_baseline.SCHEMA_VERSIONS)
+        self.assertEqual(info["versions"], versions)
+        self.assertEqual(
+            info["files"], sorted(p.name for p in (ROOT / "migrations").glob("*.sql"))
+        )
+        latest = versions[-1]
+        self.assertEqual(schema_baseline.LATEST_VERSION, latest)
+        self.assertEqual(schema_baseline.LATEST_PREFIX, f"{latest:03d}")
+        self.assertGreaterEqual(latest, 60)
+        self.assertEqual(
+            (ROOT / f"schema/{schema_baseline.LATEST_PREFIX}_catalog.json").read_bytes(),
+            (ROOT / f"schema/{latest:03d}_catalog.json").read_bytes(),
+        )
 
         staged_pairs = [
             ("migrations/009_forge_pulls.sql", "src/pulls/009_forge_pulls.sql", 9),
