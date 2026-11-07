@@ -379,18 +379,22 @@ async fn launch_source(
     }
     let root = job_root(&state, job);
     let workspace_dir = root.join("workspace");
-    let prepared = (|| -> Result<PathBuf, Error> {
+    let artifacts = match &pool {
+        Some(pool) => pool.join(job.to_string()),
+        None => root.join("artifacts"),
+    };
+    let prepared = (|| -> Result<(), Error> {
         fs::create_dir_all(&root).map_err(Error::internal)?;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(Error::internal)?;
-        let artifacts = match &pool {
-            Some(pool) => export::job_pool_dir(pool, job)?,
-            None => {
-                let directory = root.join("artifacts");
-                fs::create_dir_all(&directory).map_err(Error::internal)?;
-                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(Error::internal)?;
-                directory
+        match &pool {
+            Some(pool) => {
+                export::job_pool_dir(pool, job)?;
             }
-        };
+            None => {
+                fs::create_dir_all(&artifacts).map_err(Error::internal)?;
+                fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).map_err(Error::internal)?;
+            }
+        }
         if !live {
             let source_path = match &source {
                 Source::Workspace { id, .. } => service::workspace_repo(&state, *id),
@@ -398,15 +402,12 @@ async fn launch_source(
             };
             core::copy_all(&source_path, &workspace_dir).map_err(Error::internal)?;
         }
-        Ok(artifacts)
+        Ok(())
     })();
-    let artifacts = match prepared {
-        Ok(artifacts) => artifacts,
-        Err(error) => {
-            cleanup_failed_setup(&root, &workspace_dir, None, &isolation).await;
-            return Err(error);
-        }
-    };
+    if let Err(error) = prepared {
+        cleanup_failed_setup(&root, &workspace_dir, Some(&artifacts), &isolation).await;
+        return Err(error);
+    }
     let outcome = launch_inner(
         state.clone(),
         job,
@@ -434,9 +435,7 @@ async fn cleanup_failed_setup(root: &Path, workspace: &Path, artifacts: Option<&
     let _ = fs::remove_dir_all(workspace);
     let _ = fs::remove_dir_all(root.join("checkout"));
     if let Some(artifacts) = artifacts {
-        if !artifacts.starts_with(root) {
-            let _ = fs::remove_dir_all(artifacts);
-        }
+        let _ = fs::remove_dir_all(artifacts);
     }
     if let Mode::Cgroup(group) = isolation {
         cgroup::retire(group).await;
