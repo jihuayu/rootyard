@@ -100,6 +100,9 @@ fn frozen_readwrite_aliases_drain_in_fifo_order_and_other_mount_stays_live() {
     let (lower, upper, mount) = layout(root.path());
     let upper = upper.canonicalize().unwrap();
 
+    // Reads of an inode with a blocked pwrite can serialize inside the kernel.
+    // Use an independent inode to test this mount's read availability.
+    fs::write(lower.join("read-probe.txt"), b"readable").unwrap();
     let gate = MutationGate::new_with_lease(1, i64::MAX).unwrap();
     let overlay = Overlay::new_with_gate(lower, upper.clone(), gate.clone()).unwrap();
     let handle = spawn(overlay, &mount).expect("kernel FUSE mount");
@@ -151,7 +154,7 @@ fn frozen_readwrite_aliases_drain_in_fifo_order_and_other_mount_stays_live() {
         );
 
         // A read through the same frozen mount still returns the pre-freeze byte.
-        assert_eq!(fs::read(mount.join("first.txt")).unwrap(), b"origin");
+        assert_eq!(fs::read(mount.join("read-probe.txt")).unwrap(), b"readable");
 
         let (second_tx, second_rx) = mpsc::channel();
         scope.spawn(move || {
