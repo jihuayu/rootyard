@@ -27,4 +27,11 @@ checks before deleting a key.
 
 `ROOTYARD_LFS_POINTER_VERIFY_BYTES` caps the aggregate ready-object bytes
 verified for a ref update (512 MiB by default, 8 GiB maximum). Ref publication
-fails closed when its verification budget or Git deadline is exhausted.
+fails closed when its verification budget or Git deadline is exhausted. The
+same bounded inspection examines at most 20,000 newly reachable Git objects
+and reads at most 4,096 small (≤ 1 KiB) blobs per ref update; a larger
+new-object set is rejected fail-closed rather than partially inspected, so a
+monorepo push above that bound must be split. This bound applies to
+repositories without LFS content as well, because pointer candidates can only
+be identified after reading blob bytes. No LFS object-delete or garbage-
+collection API exists, so accepted pointers cannot lose bytes to an LFS GC.
