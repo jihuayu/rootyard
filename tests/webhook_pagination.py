@@ -146,9 +146,10 @@ class PaginationHarness(WebhooksHarness):
     def cursor_pagination(self):
         hook = self.hook()
         # Historical global MAX allocation could produce these ties.
-        tied = [self.insert_delivery(hook["id"], seq, f"tie-{i}") for i, seq in enumerate(
-            [1, 2, 2, 2, 3, 3, 4]
-        )]
+        sequence_values = [1, 2, 2, 2, 3, 3, 4]
+        inserted = [(seq, self.insert_delivery(hook["id"], seq, f"tie-{i}"))
+                    for i, seq in enumerate(sequence_values)]
+        tied = [item_id for seq, item_id in sorted(inserted, key=lambda item: (item[0], uuid.UUID(item[1])))]
         seen = []
         cursor = None
         while True:
@@ -164,7 +165,7 @@ class PaginationHarness(WebhooksHarness):
         assert keys == sorted(keys)
 
         # Legacy after=N is accepted but intentionally lossy for tied values.
-        after_two = self.page(hook["id"], "cursor=" + self.delivery_cursor(hook["id"], seen[3]))["items"]
+        after_two = self.page(hook["id"], "after=2")["items"]
         assert {item["sequence"] for item in after_two} == {3, 4}
         assert all(item["id"] not in tied[:4] for item in after_two)
 

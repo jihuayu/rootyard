@@ -510,5 +510,9 @@ pub async fn ci_callback(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Error> {
-    crate::webhooks::ingestion::ci_callback(state, owner, name, hook_id, headers, body).await
+    tokio::spawn(
+        async move { crate::webhooks::ingestion::ci_callback(state, owner, name, hook_id, headers, body).await },
+    )
+    .await
+    .map_err(Error::internal)?
 }
