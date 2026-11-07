@@ -74,7 +74,10 @@ async fn run() -> Result<()> {
         "restore"
             if (args.len() == 4
                 || (args.len() == 5
-                    && matches!(args[4].as_str(), "--allow-legacy-schema007" | "--allow-legacy-schema130")))
+                    && matches!(
+                        args[4].as_str(),
+                        "--allow-legacy-schema007" | "--allow-legacy-schema130" | "--allow-legacy-schema131"
+                    )))
                 && args[2] == "--isolated"
                 && args[3] == "--trust-backup" =>
         {
@@ -84,6 +87,7 @@ async fn run() -> Result<()> {
                 std::path::Path::new(&args[1]),
                 legacy == Some("--allow-legacy-schema007"),
                 legacy == Some("--allow-legacy-schema130"),
+                legacy == Some("--allow-legacy-schema131"),
             )
             .await
             .map_err(|_| anyhow::anyhow!("restore failed; keep target isolated and inspect or discard the fresh targets; database commit may have completed; never retry over existing state"))?;
@@ -189,9 +193,7 @@ async fn run() -> Result<()> {
             });
             let configured_node = std::env::var("ROOTYARD_NODE_ID").ok();
             let local_fence = if std::env::var_os("ROOTYARD_LOCAL_FENCE_DIR").is_some() {
-                let node_id = configured_node
-                    .as_deref()
-                    .context("local process fence requires ROOTYARD_NODE_ID")?;
+                let node_id = configured_node.as_deref().context("local process fence requires ROOTYARD_NODE_ID")?;
                 rootyard::sharding::local_fence::register_local_process(node_id)?;
                 rootyard::sharding::local_fence::register_local_volume(
                     node_id,

@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import time
 import urllib.parse
 import uuid
 
@@ -51,15 +52,28 @@ class Sha256RestoreHarness(Harness):
         return urllib.parse.urlunsplit(
             urllib.parse.urlsplit(self.admin)._replace(path="/" + name, query=""))
 
+    def wait_repo_ready(self, name, seconds=30):
+        """The repo API may provision asynchronously (202); poll to ready."""
+        until = time.monotonic() + seconds
+        last = None
+        while time.monotonic() < until:
+            last = json.loads(self.expect("/api/repos/alice/" + name, 200, token=self.alice))
+            if last.get("state") == "ready":
+                return last
+            time.sleep(.1)
+        raise AssertionError("repository did not become ready: " + json.dumps(last))
+
     def source_setup(self):
         self.cli("migrate")
         self.alice = self.account("create-user", "alice")
         self.reader = self.account("create-token", "alice", "--read-only")
         self.start()
-        self.repo = json.loads(self.expect(
-            "/api/repos", 201, token=self.alice, method="POST",
+        created = json.loads(self.expect(
+            "/api/repos", (201, 202), token=self.alice, method="POST",
             body={"name": "restore", "object_format": "sha256"}))
-        assert self.repo["object_format"] == "sha256"
+        assert created["object_format"] == "sha256"
+        self.repo = self.wait_repo_ready("restore")
+        assert self.repo["object_format"] == "sha256" and self.repo["state"] == "ready"
         self.remote = self.base + self.repo["clone_path"]
         work = self.root / "source-work"
         self.git("init", "--object-format=sha256", "--initial-branch=main", str(work))

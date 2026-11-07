@@ -4,11 +4,8 @@ use rootyard::{
     AppState, auth,
     config::Config,
     db, dispatch, metrics,
-    pando_gateway::{backup, pack_store::PackStore, prepare, publish, snapshot},
-    storage::{
-        self,
-        remote_objects::{ObjectKey, RemoteObjectStore},
-    },
+    pando_gateway::{backup, pack_store::PackStore, prepare, publish, retention, snapshot},
+    storage::{self, remote_objects::RemoteObjectStore},
 };
 use std::{
     path::{Path, PathBuf},
@@ -250,9 +247,10 @@ async fn remote_encrypted_pack_publish_and_restart_recovery() {
             for (namespace, digest) in
                 [("pando-cipher", &artifact.ciphertext_sha256), ("pando-envelope", &artifact.envelope_sha256)]
             {
-                let key = ObjectKey::new(manifest.tenant_id, namespace, digest).unwrap();
-                remote.delete(&key, deadline()).await.unwrap();
-                assert!(remote.head(&key, deadline()).await.unwrap().is_none());
+                let resolved = retention::resolve_artifact(&*tx, manifest.tenant_id, namespace, digest).await.unwrap();
+                assert!(resolved.registered, "fresh publication must be authority registered");
+                remote.delete(&resolved.key, deadline()).await.unwrap();
+                assert!(remote.head(&resolved.key, deadline()).await.unwrap().is_none());
             }
         }
         eprintln!("pando fixture: remote test objects deleted");

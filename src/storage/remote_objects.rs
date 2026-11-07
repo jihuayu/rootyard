@@ -25,11 +25,15 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Clone, Debug)]
 pub struct ObjectKey {
     pub tenant_id: Uuid,
+    // A Pando storage authority scopes deletable objects to one database
+    // installation. Legacy/LFS/workspace keys keep `authority = None` and are
+    // never eligible for Pando remote deletion.
+    pub authority: Option<(Uuid, i64)>,
     pub namespace: String,
     pub sha256: String,
 }
 impl ObjectKey {
-    pub fn new(tenant_id: Uuid, namespace: &str, sha256: &str) -> Result<Self> {
+    fn validate(tenant_id: Uuid, namespace: &str, sha256: &str) -> Result<()> {
         ensure!(!tenant_id.is_nil(), "object key needs a tenant");
         ensure!(
             !namespace.is_empty()
@@ -41,10 +45,42 @@ impl ObjectKey {
             sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
             "invalid object digest"
         );
-        Ok(Self { tenant_id, namespace: namespace.into(), sha256: sha256.into() })
+        Ok(())
     }
-    pub fn path(&self) -> String {
+
+    /// Legacy tenant-only content-addressed key. Never registered as a
+    /// deletable Pando artifact.
+    pub fn new(tenant_id: Uuid, namespace: &str, sha256: &str) -> Result<Self> {
+        Self::validate(tenant_id, namespace, sha256)?;
+        Ok(Self { tenant_id, authority: None, namespace: namespace.into(), sha256: sha256.into() })
+    }
+
+    /// Authority-scoped key for newly acknowledged Pando pack artifacts.
+    pub fn scoped(tenant_id: Uuid, authority_id: Uuid, generation: i64, namespace: &str, sha256: &str) -> Result<Self> {
+        Self::validate(tenant_id, namespace, sha256)?;
+        ensure!(!authority_id.is_nil() && generation > 0, "invalid storage authority identity");
+        Ok(Self {
+            tenant_id,
+            authority: Some((authority_id, generation)),
+            namespace: namespace.into(),
+            sha256: sha256.into(),
+        })
+    }
+
+    /// Authority-free backup volume layout. Backup archives must stay readable
+    /// by older binaries and by a restore that mints a different authority.
+    pub fn volume_path(&self) -> String {
         format!("tenants/{}/{}/{}", self.tenant_id, self.namespace, self.sha256)
+    }
+
+    pub fn path(&self) -> String {
+        match self.authority {
+            Some((authority_id, generation)) => format!(
+                "tenants/{}/authorities/{authority_id}/g{generation}/{}/{}",
+                self.tenant_id, self.namespace, self.sha256
+            ),
+            None => self.volume_path(),
+        }
     }
 }
 
