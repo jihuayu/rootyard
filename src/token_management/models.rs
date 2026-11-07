@@ -136,7 +136,10 @@ pub struct TokenPage {
 }
 
 /// Issue response. `secret` is present exactly once, on create and on rotate.
-#[derive(Clone, Debug, Serialize)]
+///
+/// Deliberately not `Debug`: the plaintext secret must not reach a diagnostic
+/// formatter that could end up in a log or a test failure message.
+#[derive(Clone, Serialize)]
 pub struct IssuedToken {
     #[serde(flatten)]
     pub token: TokenView,
@@ -350,6 +353,28 @@ mod tests {
         let mut foreign = BTreeMap::new();
         foreign.entry(Uuid::from_u128(1)).or_default().insert(RepoAction::ContentsRead);
         assert!(!is_repository_subset(&foreign, &current));
+    }
+
+    #[test]
+    fn token_view_formatting_and_json_carry_no_credentials() {
+        let view = TokenView {
+            id: Uuid::nil(),
+            display_name: Some("deploy".to_owned()),
+            read_only: false,
+            is_restricted: true,
+            scope_version: 1,
+            expires_at: Some("2030-01-01T00:00:00Z".to_owned()),
+            created_at: "2025-01-01T00:00:00Z".to_owned(),
+            repository_grants: Vec::new(),
+            namespace_grants: Vec::new(),
+        };
+        let debug = format!("{view:?}");
+        let json = serde_json::to_string(&view).unwrap();
+        for rendered in [debug, json] {
+            assert!(!rendered.contains("secret"));
+            assert!(!rendered.contains("digest"));
+            assert!(!rendered.contains("csrf"));
+        }
     }
 
     #[test]

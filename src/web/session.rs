@@ -343,6 +343,25 @@ async fn validate_session(state: &Arc<AppState>, secret: &str, csrf: Option<&str
     Ok(())
 }
 
+/// True for a single Basic `Authorization` header. Browsers attach this
+/// ambient credential after a `WWW-Authenticate` challenge, so it cannot be
+/// treated like an explicit non-browser Bearer/API credential on a mutating
+/// web route.
+fn basic_authorization(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|raw| raw.split_once(' '))
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+}
+
 pub async fn middleware(
     State(state): State<Arc<AppState>>,
     request: Request<axum::body::Body>,
@@ -363,6 +382,17 @@ pub async fn middleware(
     let session_mode = matches!(auth_mode, WebAuthMode::CookieOnly | WebAuthMode::BrowserSession);
 
     if mutation {
+        // Ambient Basic credentials are browser authority. Reject them for
+        // every web mutation except the sign-in form itself (which already
+        // enforces Origin), instead of letting them skip Origin/CSRF. Bearer
+        // remains an explicit, non-ambient API credential.
+        if path != "/web/login" && basic_authorization(&headers) {
+            return Error(
+                StatusCode::FORBIDDEN,
+                "browser mutations require a session cookie and CSRF token",
+            )
+            .into_response();
+        }
         if path == "/web/logout" {
             if session_mode && !browser_origin(&headers) {
                 return Error(StatusCode::FORBIDDEN, "browser request origin rejected").into_response();

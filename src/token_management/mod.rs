@@ -19,6 +19,7 @@
 //! module is a private implementation branch; it does not claim those pieces
 //! are released.
 
+pub mod grants;
 pub mod handlers;
 pub mod models;
 pub mod service;
