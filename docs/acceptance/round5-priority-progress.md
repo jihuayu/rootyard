@@ -1,6 +1,20 @@
 # Round 5 priority work: evidence and remaining acceptance
 
-## Later integrated evidence
+## Current acceptance update
+
+DeepSeek implementation and independent Luna Max review continue. The priority branch still uses schema 132 / backup format 8. No issue is closed by this record.
+
+- **#73:** all five [native workspace capture cases](round5-evidence/v6-workspace-capture.json) pass on the [v6 attested binary](round5-evidence/v6-build.json). The actual file-read gate stays held through the revision-fence change; health/row-lock progress, stale publication rejection, epoch handling and owned Git job completion are exercised. The gate is a local slow-read simulation, not a physical disk fault. API baseline hashing and checkpoint copying retain separate follow-up costs.
+- **#80, partial:** all eight [safe-error cases](round5-evidence/v7-observability.json) pass on the [v7 attested binary](round5-evidence/v7-build.json), including an actual PostgreSQL 23503 failure and server-generated request correlation without request secrets/query strings. The [native metrics suite](round5-evidence/v7-metrics-complete.json) also passes, including omission of SQL gauges on a failed snapshot. Full worker backlog and remote-outage coverage remain outstanding.
+- **#74, partial:** the [repository list suite](round5-evidence/v6-repository-pagination.json) passes all six cases, including 1,001 seeded metadata rows, complete traversals, actor-bound cursors and invalid UTF-8/NUL inputs. Organization listing is being verified separately; web/Forge list pagination remains unfinished.
+- **#75:** inherited static checks were repaired to follow actual delegated implementations and current schema contracts without relaxing module limits. The newly unmasked oversized sharding migration and sidecar modules were split; Luna compared every migrated function body and found all 13 migration / 30 sidecar bodies preserved. The final combined Rust and Python gates are running; earlier failing runs below remain historical evidence.
+- **#76:** pinned Garage startup/cleanup and CI evidence validation fixes are integrated. The actual independent fixture recovery passed. Hosted workflow execution is still pending.
+
+The dedicated cgroup acceptance is intentionally skipped by ordinary Python discovery, with subprocess regressions proving that direct native invocation remains strict. It still requires its delegated-cgroup/tmpfs workflow; ordinary discovery cannot establish native kernel acceptance. The last completed all-target Rust run passed 216 tests with two database tests ignored; those database cases previously passed separately. An MSRV 1.88 all-bin build passed at `d1837ec`; subsequent sharding module moves still require the final integrated build checks.
+
+Session GC/schema 133, tenant composite FKs/schema 134, scoped PAT enforcement and Workspace lab preflight remain separate work until their native, schema and restore gates pass. Physical #26/#43/#44 still require independent hosts and controllable storage faults.
+
+## Previous integrated evidence
 
 The newer immutable candidate is binary `7fce5b30de48f66fe676d3c60bf2da0c33e9d3b11d9c30bcc0ecbcc5974306db`, built from commit `5c0f3d71a872b0bd87f657bd2c4d52a27b2c7981` with Rust 1.99.1 and `pando-lab`; see the [receipt](round5-evidence/v4-build.json). Report fields named `source_head` identify the harness checkout at execution, not necessarily the binary's source commit. The binary digest and receipt bind the executable to its compiled source. Results below supersede the earlier open test defects; they do not assert that every issue is complete.
 

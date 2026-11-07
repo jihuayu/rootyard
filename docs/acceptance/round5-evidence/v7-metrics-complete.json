@@ -1,0 +1,63 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "isolated_metrics_setup",
+      "status": "passed",
+      "seconds": 2.8089,
+      "detail": null
+    },
+    {
+      "name": "fixed_private_format",
+      "status": "passed",
+      "seconds": 0.0154,
+      "detail": {
+        "rootyard_error_log_dropped_total": "0",
+        "rootyard_postgres_up": "1",
+        "rootyard_git_capacity": "8",
+        "rootyard_git_in_flight": "0",
+        "rootyard_db_pool_max_size": "16",
+        "rootyard_db_pool_size": "3",
+        "rootyard_db_pool_available": "3",
+        "rootyard_db_pool_busy": "0",
+        "rootyard_db_pool_waiting": "0",
+        "rootyard_git_transfers_total{outcome=\"success\"}": "0",
+        "rootyard_git_transfers_total{outcome=\"failure\"}": "0",
+        "rootyard_git_transfer_bytes_total{direction=\"received\"}": "0",
+        "rootyard_git_transfer_bytes_total{direction=\"sent\"}": "0",
+        "rootyard_repositories{state=\"provisioning\"}": "0",
+        "rootyard_repositories{state=\"ready\"}": "0",
+        "rootyard_repositories{state=\"recovering\"}": "0",
+        "rootyard_operations_unresolved": "0",
+        "rootyard_event_deliveries{state=\"pending\"}": "0",
+        "rootyard_event_deliveries{state=\"leased\"}": "0",
+        "rootyard_event_delivery_oldest_age_seconds": "0",
+        "rootyard_provisioning_backlog": "0",
+        "rootyard_provisioning_due": "0",
+        "rootyard_provisioning_oldest_age_seconds": "0"
+      }
+    },
+    {
+      "name": "authoritative_aggregates",
+      "status": "passed",
+      "seconds": 0.1727,
+      "detail": null
+    },
+    {
+      "name": "database_failure_is_503",
+      "status": "passed",
+      "seconds": 0.0297,
+      "detail": null
+    },
+    {
+      "name": "non_loopback_rejected",
+      "status": "passed",
+      "seconds": 0.0157,
+      "detail": null
+    }
+  ],
+  "binary_sha256": "71c335e3a62cf89256705f064f51e470f41919ada7a14dd178be0040566c5f3d",
+  "limitations": [
+    "Synthetic SQL aggregates and a missing-table fault do not simulate a PostgreSQL outage or production load."
+  ]
+}

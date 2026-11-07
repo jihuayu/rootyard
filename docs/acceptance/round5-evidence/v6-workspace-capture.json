@@ -1,0 +1,53 @@
+{
+  "passed": true,
+  "binary": "/workspace/scratch/round5-implementation/priority-v6/rootyard",
+  "binary_sha256": "6200812d69e819a7b9b2ede9c3e64b7f2702533852e8457998876eab9806ccd9",
+  "tests": [
+    {
+      "name": "__main__.WorkspaceCaptureAcceptance.test_api_write_baseline_does_not_emit_spurious_capture",
+      "status": "success",
+      "seconds": 9.3327
+    },
+    {
+      "name": "__main__.WorkspaceCaptureAcceptance.test_capture_reaches_ids_beyond_fixed_prefix",
+      "status": "success",
+      "seconds": 35.6247
+    },
+    {
+      "name": "__main__.WorkspaceCaptureAcceptance.test_large_inventory_keeps_single_tokio_worker_responsive",
+      "status": "success",
+      "seconds": 31.8907
+    },
+    {
+      "name": "__main__.WorkspaceCaptureAcceptance.test_scan_does_not_hold_row_lock_and_rejects_stale_revision",
+      "status": "success",
+      "seconds": 9.0885
+    },
+    {
+      "name": "__main__.WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing",
+      "status": "success",
+      "seconds": 61.995
+    }
+  ],
+  "summary": {
+    "total_scheduled": 5,
+    "tests_run": 5,
+    "success": 5,
+    "failure": 0,
+    "error": 0,
+    "skipped": 0,
+    "expected_failure": 0,
+    "unexpected_success": 0
+  },
+  "limitations": [
+    "The large-inventory cases create 90000 small files and can take minutes on slow disks.",
+    "Loopback functional timings are not a scalability benchmark."
+  ],
+  "capture_read_gate": {
+    "target": "/tmp/rootyard-e2e-pw0xp4hf/data/workspace-service/workspaces/31160687-f1fc-41c6-a396-e591b98dc193/capture-gated.bin",
+    "marker": "/tmp/rootyard-e2e-pw0xp4hf/capture-gate.hit",
+    "hit": true,
+    "released": true,
+    "held_through_revision_fence": true
+  }
+}
