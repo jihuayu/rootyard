@@ -124,13 +124,35 @@ def main():
         h.git("push", "origin", "HEAD:refs/heads/feature", cwd=work, token=token)
         return head
 
-    def push_base(work, base_oid, token):
+    def push_base(work, base_oid, token, pulls):
         h.git("checkout", "-B", "base-sync", base_oid, cwd=work)
         (work / "base-sync.txt").write_text("base update\n")
         h.git("add", "base-sync.txt", cwd=work)
         h.git("commit", "-m", "base update", cwd=work)
         base = h.git("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
-        h.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=token)
+        # This suite checks ref reconciliation. Let the repository maintainer
+        # temporarily remove the required-check gate for this fixture push;
+        # branch protection is exercised by its own native suites. Restore it
+        # before the worker can inspect the new PR candidate.
+        h.stop()
+        h.env["ROOTYARD_OUTBOX_WORKER"] = "false"
+        h.start()
+        rule_path = pulls.rsplit("/pulls", 1)[0] + "/branch-rules/refs/heads/main"
+        rule = h.document(rule_path, token=token)
+        fields = ("required_approvals", "required_checks", "require_fast_forward",
+                  "prevent_deletion", "prevent_force_push", "prevent_self_approval")
+        original = {key: rule[key] for key in fields}
+        relaxed = h.document(rule_path, 200, token=token, method="PUT",
+                             body={**original, "required_checks": [],
+                                   "expected_version": rule["version"]})
+        try:
+            h.git("push", "origin", "HEAD:refs/heads/main", cwd=work, token=token)
+        finally:
+            h.document(rule_path, 200, token=token, method="PUT",
+                       body={**original, "expected_version": relaxed["version"]})
+            h.stop()
+            h.env["ROOTYARD_OUTBOX_WORKER"] = "true"
+            h.start()
         return base
 
     def sync_head_and_base(repo_id, pr, pulls, base_oid, feat_oid, work, token):
@@ -145,7 +167,7 @@ def main():
         )(queued_run(repo_id, pr["number"], updated["version"], head, base_oid)))
         assert h.document(f"{pulls}/{pr['number']}/checks", token=token)["items"], "pushed head has no check runs"
 
-        base = push_base(work, base_oid, token)
+        base = push_base(work, base_oid, token, pulls)
         base_updated = wait_for("background PR base update", lambda: (
             lambda p: p if p["base_oid"] == base and p["version"] > updated["version"] else None
         )(h.document(f"{pulls}/{pr['number']}", token=token)))
