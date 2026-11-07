@@ -1,0 +1,111 @@
+{
+  "assertions": {
+    "artifact_cgroup_reclaim": true,
+    "artifacts_pool_bounded": true,
+    "bubblewrap_capabilities": true,
+    "cancel_cgroup_removed": true,
+    "ci_checkout_builds": true,
+    "cpu_quota_aggregate": true,
+    "crash_descendants_reaped": true,
+    "fenced_attempt_new_attempt": true,
+    "isolated_concurrent_builds": true,
+    "live_controls": true,
+    "logs_artifact_auth": true,
+    "memory_oom": true,
+    "pids_enforced": true,
+    "platform_credentials_absent": true,
+    "supervised_cgroup_membership": true,
+    "timeout_terminal_reclaim": true,
+    "workspace_disk_enospc": true
+  },
+  "binary_path": "/home/runner/work/rootyard/rootyard/target/debug/rootyard",
+  "binary_sha256": "e4deb3e032ee138376c1b277be7bdaf6476599099a66f130aed2d122b8b17bd7",
+  "cgroup_root": "/sys/fs/cgroup/rootyard-native-42335322441",
+  "evidence_dir": "/home/runner/work/_temp/native-kernel/evidence",
+  "generated_unix": 1794023209,
+  "host": {
+    "kernel": "6.8.0-1070-azure",
+    "python": "3.12.16"
+  },
+  "pool_capacity_bytes_measured": 67108864,
+  "pool_max_bytes_threshold": 67108864,
+  "preflight": {
+    "binary_path": "/home/runner/work/rootyard/rootyard/target/debug/rootyard",
+    "bubblewrap": {
+      "binary_path": "/usr/local/bin/bwrap",
+      "binary_sha256": "6d85da84aaa54e6c1e9d321ba8911743467b9b6222fceaa950b3d8a41afb8342",
+      "probe": {
+        "code": 0,
+        "command": "bwrap",
+        "text": ""
+      },
+      "size_supported": true,
+      "version": "bubblewrap 0.9.0"
+    },
+    "cgroup_type": "domain",
+    "controllers": [
+      "cpuset",
+      "cpu",
+      "io",
+      "memory",
+      "hugetlb",
+      "pids",
+      "rdma",
+      "misc"
+    ],
+    "exists": true,
+    "internal_pids": 0,
+    "ok": true,
+    "path_prefix_ok": true,
+    "pool_capacity_bytes": 67108864,
+    "root": "/sys/fs/cgroup/rootyard-native-42335322441",
+    "run_cgroup": "/rootyard-native-42335322441",
+    "self_cgroup": "/rootyard-native-42335322441/supervisor",
+    "subtree_control": [
+      "cpu",
+      "memory",
+      "pids"
+    ],
+    "tmpfs_fstype": "tmpfs"
+  },
+  "profile": "cgroup",
+  "required_assertions": [
+    "artifact_cgroup_reclaim",
+    "artifacts_pool_bounded",
+    "bubblewrap_capabilities",
+    "cancel_cgroup_removed",
+    "ci_checkout_builds",
+    "cpu_quota_aggregate",
+    "crash_descendants_reaped",
+    "fenced_attempt_new_attempt",
+    "isolated_concurrent_builds",
+    "live_controls",
+    "logs_artifact_auth",
+    "memory_oom",
+    "pids_enforced",
+    "platform_credentials_absent",
+    "supervised_cgroup_membership",
+    "timeout_terminal_reclaim",
+    "workspace_disk_enospc"
+  ],
+  "runner": {
+    "euid": 1001,
+    "gid": 1001,
+    "groups": [
+      4,
+      100,
+      101,
+      127,
+      1001
+    ],
+    "uid": 1001
+  },
+  "schema": "rootyard/native-kernel-cgroup-receipt/v1",
+  "self_cgroup": "/rootyard-native-42335322441/supervisor",
+  "source_commit": "8197377e6d85c3b80082331d7b86cab8c84070f5",
+  "status": "passed",
+  "test_file_sha256": "8034085817aaee74b1644a54c8b098cfc82f33925b97aba0c36ec9539e496f56",
+  "tmpfs_fstype": "tmpfs",
+  "tmpfs_root": "/home/runner/work/_temp/rootyard-native-pool-42335322441",
+  "workflow_file_sha256": "2feddf8079609e9bf62955e70bdaafb05ce08f9e7ed81c94f05b41760a43cc13"
+}

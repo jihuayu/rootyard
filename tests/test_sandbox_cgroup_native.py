@@ -32,7 +32,9 @@ import base64
 import concurrent.futures
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import time
 import unittest
@@ -76,6 +78,7 @@ REQUIRED_PROOF = {
     "supervised_cgroup_membership",
     "artifacts_pool_bounded",
     "ci_checkout_builds",
+    "bubblewrap_capabilities",
 }
 
 
@@ -127,6 +130,153 @@ def pool_capacity(path=TMPFS_ROOT):
     return stat.f_blocks * stat.f_frsize
 
 
+def command_output(argv, limit=400):
+    """Bounded stdout+stderr of one diagnostic command."""
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"command": argv[0], "error": str(error)[:200]}
+    text = ((result.stdout or "") + (result.stderr or "")).strip()
+    return {"command": argv[0], "code": result.returncode, "text": text[:limit]}
+
+
+def bwrap_capability():
+    """Functional probe for the runtime's required bubblewrap --size support.
+
+    Ubuntu 22.04 ships bubblewrap 0.6.1, which predates ``--size``; the
+    production runtime bounds /tmp and /workspace with it. Probe the real binary
+    instead of parsing a version string.
+    """
+    version = command_output(["bwrap", "--version"], limit=200)
+    # Bubblewrap starts from an empty root, so the probe must bind the host
+    # root read-only for /bin/true to exist. Probe-only argv: the real job
+    # mounts are unchanged, /tmp stays size-bounded and the network unshared.
+    probe = command_output(
+        [
+            "bwrap",
+            "--unshare-all",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--size",
+            "1048576",
+            "--tmpfs",
+            "/tmp",
+            "--",
+            "/bin/true",
+        ],
+        limit=400,
+    )
+    binary = shutil.which("bwrap")
+    return {
+        "version": version.get("text"),
+        "binary_path": binary,
+        "binary_sha256": sha256_file(binary) if binary else None,
+        "size_supported": probe.get("code") == 0,
+        "probe": probe,
+    }
+
+
+MASK_PATTERN = re.compile(r"(?i)(password|passwd|secret|token|authorization|api[_-]?key)(\s*[:=]\s*)\S+")
+URL_PATTERN = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s\"']+")
+BEARER_PATTERN = re.compile(r"(?i)bearer\s+\S+")
+
+
+def sanitize(text, h):
+    """Bound and redact failure text. The process environment is never read."""
+    if not text:
+        return None
+    text = h.redact(text)
+    text = BEARER_PATTERN.sub("Bearer [REDACTED]", text)
+    text = MASK_PATTERN.sub(r"\1\2[REDACTED]", text)
+    text = URL_PATTERN.sub("[URL]", text)
+    return text[-4096:]
+
+
+def file_tail(path):
+    try:
+        return (Path(path).read_bytes()[-4096:]).decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def _failure_diagnostics(h, test_name):
+    """Bounded, sanitized failure evidence written outside the checkout.
+
+    The first hosted run uploaded only the receipt because the harness removed
+    the job roots and the service log, so the real cause was unrecoverable. This
+    runs before cleanup and records structured terminal state, job
+    stderr/stdout tails, the service log tail, cgroup membership and the runtime
+    tools. DSNs, tokens, passwords and Authorization headers are redacted; no
+    environment dump, request headers or credentials are recorded.
+    """
+    cgroup_root = Path(CGROUP_ROOT) if CGROUP_ROOT else None
+    jobs = []
+    try:
+        rows = h.sql("SELECT id::text FROM sandbox_jobs ORDER BY created_at DESC LIMIT 10").splitlines()
+    except Exception as error:
+        rows = []
+        jobs.append({"sql_error": type(error).__name__})
+    for job in rows:
+        root = h.root / "data" / "sandbox-jobs" / job
+        entry = {"id": job, "state": None, "files": [], "cgroup_procs": None}
+        try:
+            entry["state"] = h.sql(
+                f"SELECT state||','||coalesce(exit_code::text,'null')||','||coalesce(pid::text,'null') "
+                f"FROM sandbox_jobs WHERE id='{job}'"
+            )
+        except Exception as error:
+            entry["state_error"] = type(error).__name__
+        entry["stderr_tail"] = sanitize(file_tail(root / "stderr.log"), h)
+        entry["stdout_tail"] = sanitize(file_tail(root / "stdout.log"), h)
+        if cgroup_root:
+            try:
+                entry["cgroup_procs"] = (cgroup_root / job / "cgroup.procs").read_text().split()[:64]
+            except OSError:
+                entry["cgroup_procs"] = None
+        if root.is_dir():
+            entry["files"] = sorted(item.name for item in root.iterdir())[:24]
+        jobs.append(entry)
+    try:
+        self_cgroup = cgroup_membership()
+    except (OSError, AssertionError):
+        self_cgroup = None
+    report = {
+        "schema": "rootyard/native-kernel-diagnostics/v1",
+        "failed_test": test_name,
+        "source_commit": os.environ.get("ROOTYARD_SOURCE_COMMIT") or os.environ.get("GITHUB_SHA"),
+        "profile": os.environ.get("ROOTYARD_SANDBOX_MODE", "unset"),
+        "binary_path": str(Path(BINARY).resolve()) if Path(BINARY).exists() else str(BINARY),
+        "binary_sha256": sha256_file(BINARY),
+        "runner": runner_metadata(),
+        "host": {"kernel": os.uname().release, "python": sys.version.split()[0]},
+        "cgroup_root": CGROUP_ROOT,
+        "self_cgroup": self_cgroup,
+        "tools": {
+            "bubblewrap": bwrap_capability(),
+            "gcc": command_output(["gcc", "--version"], limit=200),
+            "pg_dump": command_output(["pg_dump", "--version"], limit=200),
+        },
+        "jobs": jobs,
+        "service_log_tail": sanitize(file_tail(h.root / "server.log"), h),
+    }
+    body = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if EVIDENCE_DIR:
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        (EVIDENCE_DIR / ("failure-" + test_name.replace(".", "-") + ".json")).write_text(body)
+    print("native failure diagnostics: " + json.dumps(report, sort_keys=True)[:12000], flush=True)
+
+
+def failure_diagnostics(h, test_name):
+    """Never let diagnostic collection mask the original failure."""
+    try:
+        _failure_diagnostics(h, test_name)
+    except Exception as error:
+        print("native failure diagnostics unavailable: " + type(error).__name__, flush=True)
+
+
+
 def preflight():
     """Return (ok, diagnostics). Diagnostics contain no credentials."""
     base = CGROUP_ROOT
@@ -139,6 +289,18 @@ def preflight():
         # unprivileged account after the supervisor's setpriv drop.
         data["preflight_status"] = "failed"
         data["reason"] = "native acceptance must run as the unprivileged delegated owner, not euid 0"
+        return False, data
+    # The runtime bounds /tmp and /workspace with `--size`; a bubblewrap without
+    # it fails every job before the start gate, so require the capability up
+    # front with a precise reason instead of an opaque failed job.
+    data["bubblewrap"] = bwrap_capability()
+    if not data["bubblewrap"]["size_supported"]:
+        data["reason"] = (
+            "bubblewrap does not implement --size, which the production runtime requires: "
+            + str(data["bubblewrap"].get("version"))
+            + " "
+            + str(data["bubblewrap"]["probe"].get("text"))
+        )
         return False, data
     path = Path(base)
     data["exists"] = path.is_dir()
@@ -410,6 +572,7 @@ class CgroupSandboxTest(unittest.TestCase):
         h.env.update(sandbox_env())
         h.env["ROOTYARD_SANDBOX_ARTIFACTS_POOL"] = str(pool)
         self.assertEqual(h.env["ROOTYARD_SANDBOX_MODE"], "cgroup")
+        success = False
         try:
             h.setup()
             h.api()
@@ -486,9 +649,13 @@ class CgroupSandboxTest(unittest.TestCase):
                 [
                     "/bin/sh",
                     "-c",
-                    "mkdir -p /artifacts; "
-                    "dd if=/dev/zero of=/workspace/fill bs=1M count=128 2>/tmp/dd.err || printf 'disk-full\\n'; "
-                    "printf 'artifact-ok' > /artifacts/result.txt; tail -2 /tmp/dd.err",
+                    # LC_ALL=C keeps the kernel ENOSPC text deterministic, and
+                    # the whole (tiny, bounded) dd stderr is kept: coreutils dd
+                    # writes error + two summary lines, so `tail -2` would drop
+                    # the actual "No space left on device" line.
+                    "export LC_ALL=C; mkdir -p /artifacts; "
+                    "dd if=/dev/zero of=/workspace/fill bs=1M count=128 2>/tmp/dd.err || printf 'disk-full\n'; "
+                    "printf 'artifact-ok' > /artifacts/result.txt; cat /tmp/dd.err",
                 ],
                 60,
             )
@@ -582,7 +749,10 @@ class CgroupSandboxTest(unittest.TestCase):
             wait_for(lambda: not crash_group.exists(), message="stale cgroup reaped")
             wait_for(lambda: not (h.root / "data/sandbox-jobs" / crash["id"]).exists(), message="crash root reaped")
             proof("crash_descendants_reaped")
+            success = True
         finally:
+            if not success:
+                failure_diagnostics(h, self.id())
             h.cleanup()
             shutil.rmtree(pool, ignore_errors=True)
 
@@ -596,6 +766,7 @@ class CgroupSandboxTest(unittest.TestCase):
         h.env["ROOTYARD_CI_ORIGIN_FALLBACK_GLOBAL"] = "4"
         h.env["ROOTYARD_CI_ORIGIN_FALLBACK_PER_REPO"] = "2"
         h.env["ROOTYARD_CI_MIRROR_AUDIENCE"] = str(uuid.uuid4())
+        success = False
         try:
             h.setup()
             secret = "ci-native-cgroup-integration-secret"
@@ -714,7 +885,10 @@ class CgroupSandboxTest(unittest.TestCase):
                 f"{second['attempt']},{second['lease_generation']}",
             )
             proof("fenced_attempt_new_attempt")
+            success = True
         finally:
+            if not success:
+                failure_diagnostics(h, self.id())
             h.cleanup()
             shutil.rmtree(pool, ignore_errors=True)
 
@@ -800,8 +974,10 @@ def main():
             return 3
         print("FAILED: native acceptance preconditions are broken (see preflight).", flush=True)
         return 1
-    # Preflight proved this process is charged to the delegated subtree.
+    # Preflight proved this process is charged to the delegated subtree and
+    # that bubblewrap implements the required --size option.
     proof("supervised_cgroup_membership")
+    proof("bubblewrap_capabilities")
     if profile != "cgroup":
         write_receipt(
             args.receipt,

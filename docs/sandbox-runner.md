@@ -210,6 +210,37 @@ runs when an operator dispatches it.
   acceptance runs as the ordinary runner account with no `sudo`/`runuser`
   wrapper, so that `PATH` reaches the test and its service unchanged, and the
   build step asserts `pg_dump --version` is 17.
+- Runtime capability: the sandbox runtime bounds `/tmp` and `/workspace` with
+  `--size BYTES --tmpfs DEST`. Ubuntu 22.04 ships bubblewrap 0.6.1, which
+  predates `--size`; the first hosted run therefore failed every job before the
+  start gate. The workflow builds the source Ubuntu 24.04 ships from the signed
+  Ubuntu archive source index (`deb-src ... noble`, verified by the archive key
+  already trusted on the runner) pinned to the exact release `0.9.0-1build1`,
+  which is asserted against `apt-cache showsrc` before the download (a missing
+  pin fails with the available versions instead of building another release),
+  installs it to `/usr/local/bin` ahead of `/usr/bin`, and requires the
+  capability functionally with `bwrap --unshare-all --die-with-parent
+  --ro-bind / / --size 1048576 --tmpfs /tmp -- /bin/true`. Bubblewrap starts
+  from an empty root, so the host root is bound read-only in every probe argv;
+  that argv is setup-only and never changes the untrusted job mounts, and the
+  probe still runs with a size-bounded `/tmp` and an unshared network. AppArmor and the rest of the runner policy are untouched. The
+  service probes the same capability once (`bwrap_supports_size`) and fails
+  closed with a static, secret-free `rootyard: bubblewrap does not support
+  --size` diagnostic instead of starting an unbounded job; the native preflight
+  probes it too and reports BLOCKED with the observed version and probe stderr,
+  and the receipt records `bubblewrap` version/support as the
+  `bubblewrap_capabilities` assertion.
+- Failure diagnostics: on any assertion failure the native script records a
+  bounded (`<= 4096` bytes per field, 10 most recent jobs) sanitized report
+  outside the checkout at `${RUNNER_TEMP}/native-kernel/evidence/
+  failure-<test>.json`. It contains the structured terminal state, exit code and
+  PID, job stderr/stdout tails, cgroup membership of the job and of the test
+  process, the service log tail, and tool versions (`bwrap`, `gcc`, `pg_dump`,
+  kernel, Python). DSNs, `Authorization`/`Bearer` headers, tokens, passwords and
+  API-key style assignments are redacted; the process environment, request
+  headers and credentials are never recorded. The report is uploaded with the
+  receipt artifact, so a failing hosted run is diagnosable without a second
+  guess.
 - Source equivalence: the checkout step uses `persist-credentials: false`, the
   build step requires `git rev-parse HEAD == GITHUB_SHA` with a clean tree,
   builds with `cargo build --locked --bin rootyard`, and the receipt records
@@ -282,9 +313,29 @@ database; it never kills or removes the parent runner cgroup. The parent runner
 cgroup is never written by `setup` beyond `rootyard-native-<run-id>` creation
 and the root `cgroup.subtree_control` enable that cgroup v2 requires.
 
-On the current managed development host there is no delegated cgroup v2
-subtree (rootless Docker cgroup driver `none`, cgroupfs writes denied), so
-positive local acceptance remains BLOCKED until the coordinator dispatches this
-workflow on the supported VM. Local verification of this change is limited to
-shell syntax, YAML parsing, Python byte-compilation and the existing target
-Rust unit tests; it is not a substitute for the hosted run.
+## Verified native acceptance (hosted VM)
+
+Production kernel resource acceptance is **verified** for the supported profile
+(`workflow_dispatch` on a GitHub-hosted Ubuntu 22.04 VM, unprivileged uid 1001,
+delegated cgroup v2 subtree, rebuilt bubblewrap implementing `--size`) by run
+[42335322441](https://github.com/jihuayu/rootyard/actions/runs/42335322441),
+job `128290838175`, artifact `13559178383` (ZIP SHA-256
+`4107dfdfd0cd96cb3f1c5a85c5cf5f1ea0586e93efbfb4e08a34be018232bc73`), compiled
+source `8197377e6d85c3b80082331d7b86cab8c84070f5` and binary
+`e4deb3e032ee138376c1b277be7bdaf6476599099a66f130aed2d122b8b17bd7`. The receipt is
+`passed` with profile `cgroup`, 17/17 required assertions true, a real 64 MiB
+artifact tmpfs and a non-root runner identity. Permanent evidence (the exact
+receipt, the `source_digest.py` input map, an artifact manifest with every stored
+file hash, the unchanged independent runtime review for production source
+`9bad208`, and the two earlier failed attempts recorded as failures) is in
+[`evidence/round3/kernel32-vm-8197377/`](../evidence/round3/kernel32-vm-8197377/README.md).
+Compiled source `8197377` differs from reviewed production source `9bad208` only
+in `tests/test_sandbox_cgroup_native.py` (the ENOSPC fixture), so that runtime
+review applies unchanged to the production code.
+
+This closes the kernel resource gap only for the profile recorded above. The
+managed development host still cannot execute native cgroup acceptance (no
+delegated cgroup v2 subtree; rootless Docker cgroup driver `none`), which is an
+execution-environment fact rather than a product regression. This evidence is
+not a physical cross-host HA qualification and is not a completion claim for any
+other feature or profile.
