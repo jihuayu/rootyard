@@ -24,6 +24,35 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub(crate) use super::remote_errors::{RemoteOp, RemoteStoreError};
 
+/// One remote body boundary read. Deadline exhaustion maps to a typed
+/// `RemoteStoreError::timeout(op)` and an explicit `reqwest` stream failure
+/// (connection reset or mid-body decode error) maps to
+/// `RemoteStoreError::transport(op, error)` with the source chain kept intact.
+/// Local file readers never pass through this helper, so local I/O faults are
+/// never misattributed to the remote store.
+async fn remote_chunk<S>(stream: &mut S, op: RemoteOp, deadline: Instant) -> Result<Option<bytes::Bytes>>
+where
+    S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+{
+    match tokio::time::timeout_at(deadline, stream.next()).await {
+        Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
+        Ok(Some(Err(error))) => Err(RemoteStoreError::transport(op, error).into()),
+        Ok(None) => Ok(None),
+        Err(_) => Err(RemoteStoreError::timeout(op).into()),
+    }
+}
+
+/// Read a small remote control-response body under the same deadline, mapping
+/// body-boundary timeout and transport failures onto the typed remote-store
+/// error for `op` instead of surfacing a raw `reqwest` error.
+async fn remote_text(response: reqwest::Response, op: RemoteOp, deadline: Instant) -> Result<String> {
+    match tokio::time::timeout_at(deadline, response.text()).await {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(error)) => Err(RemoteStoreError::transport(op, error).into()),
+        Err(_) => Err(RemoteStoreError::timeout(op).into()),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ObjectKey {
     pub tenant_id: Uuid,
@@ -242,8 +271,7 @@ impl RemoteObjectStore {
                         return Err(RemoteStoreError::http(RemoteOp::Get, response.status().as_u16()).into());
                     }
                     let mut stream = response.bytes_stream();
-                    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next()).await? {
-                        let chunk = chunk?;
+                    while let Some(chunk) = remote_chunk(&mut stream, RemoteOp::Get, deadline).await? {
                         size += chunk.len() as u64;
                         ensure!(size <= expected_size, "stored object exceeds expected size");
                         hash.update(&chunk);
@@ -287,8 +315,7 @@ impl RemoteObjectStore {
                 }
                 let mut stream = response.bytes_stream();
                 let mut bytes = Vec::with_capacity(len as usize);
-                while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next()).await? {
-                    let chunk = chunk?;
+                while let Some(chunk) = remote_chunk(&mut stream, RemoteOp::Get, deadline).await? {
                     ensure!(chunk.len() <= len as usize - bytes.len(), "object range response exceeds limit");
                     bytes.extend_from_slice(&chunk);
                 }
@@ -541,7 +568,7 @@ impl S3Store {
         if !initiated.status().is_success() {
             return Err(RemoteStoreError::http(RemoteOp::MultipartInitiate, initiated.status().as_u16()).into());
         }
-        let xml = tokio::time::timeout_at(deadline, initiated.text()).await??;
+        let xml = remote_text(initiated, RemoteOp::MultipartInitiate, deadline).await?;
         let upload_id = xml
             .split("<UploadId>")
             .nth(1)
@@ -588,7 +615,7 @@ impl S3Store {
             if !response.status().is_success() {
                 return Err(RemoteStoreError::http(RemoteOp::MultipartComplete, response.status().as_u16()).into());
             }
-            let text = tokio::time::timeout_at(deadline, response.text()).await??;
+            let text = remote_text(response, RemoteOp::MultipartComplete, deadline).await?;
             ensure!(!text.contains("<Error>"), "multipart completion reported an error");
             Ok::<(), anyhow::Error>(())
         }
@@ -629,6 +656,22 @@ mod typed_error_tests {
         assert_eq!(error.op().as_str(), "head");
         assert!(!error.to_string().contains("://"));
         assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[tokio::test]
+    async fn body_boundary_exhaustion_maps_to_typed_remote_timeout() {
+        let mut empty = futures_util::stream::iter(Vec::<reqwest::Result<bytes::Bytes>>::new());
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        assert!(remote_chunk(&mut empty, RemoteOp::Get, ready_deadline).await.unwrap().is_none());
+
+        let mut pending = futures_util::stream::pending::<reqwest::Result<bytes::Bytes>>();
+        let error = remote_chunk(&mut pending, RemoteOp::MultipartPart, Instant::now()).await.unwrap_err();
+        let typed = error.downcast_ref::<RemoteStoreError>().expect("typed remote body timeout");
+        assert_eq!(typed.op(), RemoteOp::MultipartPart);
+        assert_eq!(typed.http_status(), None);
+        let display = typed.to_string();
+        assert!(display.contains("timed out") && display.contains("multipart_part"));
+        assert!(!display.contains("://") && !display.contains("Authorization"));
     }
 
     #[test]
