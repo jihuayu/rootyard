@@ -196,7 +196,7 @@ pub async fn lease(
     };
     let (saved, deadline) =
         if same_host { super::mounts::with_frozen_async(id, commit).await? } else { commit.await? };
-    super::mounts::ensure(&state, id, deadline)?;
+    super::mounts::ensure(&state, id, saved.lease_epoch, deadline)?;
     Ok(Json(saved))
 }
 

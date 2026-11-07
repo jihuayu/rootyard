@@ -66,18 +66,18 @@ pub async fn record_current_at(tx: &deadpool_postgres::Transaction<'_>, id: Uuid
     Ok(())
 }
 
-async fn eligible_page(state: &AppState, cursor: Option<Uuid>) -> Result<Vec<(Uuid, i64)>, Error> {
+async fn eligible_page(state: &AppState, cursor: Option<Uuid>) -> Result<Vec<(Uuid, i64, i64)>, Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let rows = client
         .query(
-            "SELECT id,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces \
+            "SELECT id,lease_epoch,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces \
              WHERE host_id=$1 AND state='ready' AND lease_until>clock_timestamp() \
              AND ($2::uuid IS NULL OR id>$2) ORDER BY id LIMIT $3",
             &[&state.storage.volume_id, &cursor, &PAGE],
         )
         .await
         .map_err(Error::internal)?;
-    Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    Ok(rows.iter().map(|row| (row.get(0), row.get(1), row.get(2))).collect())
 }
 
 async fn eligible(state: &AppState, id: Uuid) -> Result<Option<(i64, i64)>, Error> {
@@ -221,8 +221,8 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
             let last = rows.last().map(|row| row.0);
             let ids: Vec<Uuid> = rows
                 .into_iter()
-                .map(|(id, deadline)| {
-                    super::mounts::update_lease(id, deadline);
+                .map(|(id, epoch, deadline)| {
+                    super::mounts::update_lease(id, epoch, deadline);
                     id
                 })
                 .collect();

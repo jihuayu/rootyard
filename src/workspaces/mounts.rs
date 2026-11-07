@@ -44,9 +44,14 @@ pub fn mount_path(state: &AppState, id: Uuid) -> PathBuf {
 pub fn mounted(id: Uuid) -> bool {
     !enabled() || registry().lock().unwrap().contains_key(&id)
 }
-pub fn update_lease(id: Uuid, until: i64) {
-    if let Some(mount) = registry().lock().unwrap().get(&id) {
-        mount.gate.update(until);
+pub fn update_lease(id: Uuid, db_epoch: i64, until: i64) {
+    let gate = registry().lock().unwrap().get(&id).map(|mount| mount.gate.clone());
+    if let Some(gate) = gate
+        && !gate.renew(db_epoch, until)
+    {
+        // The database has moved past this mount, or the gate was fenced. Do not
+        // keep admitting writes under a stale local epoch.
+        gate.fence();
     }
 }
 pub async fn refresh_leases(state: &AppState) -> Result<(), Error> {
@@ -60,16 +65,19 @@ pub async fn refresh_leases(state: &AppState) -> Result<(), Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let rows = client
         .query(
-            "SELECT id,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces \
+            "SELECT id,lease_epoch,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces \
              WHERE id=ANY($1::uuid[]) AND host_id=$2 AND state='ready'",
             &[&ids, &state.storage.volume_id],
         )
         .await
         .map_err(Error::internal)?;
-    let deadlines: HashMap<Uuid, i64> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    let leases: HashMap<Uuid, (i64, i64)> = rows.iter().map(|r| (r.get(0), (r.get(1), r.get(2)))).collect();
     let mounts = registry().lock().unwrap();
     for (id, mount) in mounts.iter() {
-        mount.gate.update(*deadlines.get(id).unwrap_or(&0));
+        match leases.get(id) {
+            Some((epoch, until)) if mount.gate.renew(*epoch, *until) => {}
+            _ => mount.gate.fence(),
+        }
     }
     Ok(())
 }
@@ -111,13 +119,19 @@ pub async fn with_frozen_async<T>(id: Uuid, work: impl Future<Output = Result<T,
     guard.await.map_err(Error::internal)?;
     outcome
 }
-pub fn ensure(state: &AppState, id: Uuid, until: i64) -> Result<(), Error> {
+pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(), Error> {
     if !enabled() {
         return Ok(());
     }
     let mut registry = registry().lock().unwrap();
     if let Some(existing) = registry.get(&id) {
-        existing.gate.update(until);
+        if existing.gate.renew(db_epoch, until) {
+            return Ok(());
+        }
+        // The lease handler commits a new database epoch before calling this.
+        // Re-authorization is non-blocking: a concurrent freeze or an old active
+        // guard is surfaced instead of being bypassed.
+        existing.gate.re_authorize(db_epoch, until).map_err(Error::internal)?;
         return Ok(());
     }
     let lower = lower_path(state, id);
@@ -128,7 +142,7 @@ pub fn ensure(state: &AppState, id: Uuid, until: i64) -> Result<(), Error> {
     let mountpoint = mount_path(state, id);
     fs::create_dir_all(&upper).map_err(Error::internal)?;
     fs::create_dir_all(&mountpoint).map_err(Error::internal)?;
-    let gate = MutationGate::new(until);
+    let gate = MutationGate::new_with_lease(db_epoch, until).map_err(Error::internal)?;
     let lazy = lazy::Reader::open(state, id)?;
     let source: Option<Arc<dyn LazySource>> = lazy.clone().map(|reader| reader as Arc<dyn LazySource>);
     let overlay = Overlay::new_with_gate_and_lazy(lower, upper, gate.clone(), source).map_err(Error::internal)?;
@@ -190,12 +204,13 @@ pub async fn ensure_from_database(state: &AppState, id: Uuid) -> Result<(), Erro
     let client = state.pool.get().await.map_err(Error::internal)?;
     let row = client
         .query_one(
-            "SELECT EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces WHERE id=$1 AND host_id=$2 AND state='ready'",
+            "SELECT lease_epoch,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces \
+             WHERE id=$1 AND host_id=$2 AND state='ready'",
             &[&id, &state.storage.volume_id],
         )
         .await
         .map_err(Error::internal)?;
-    ensure(state, id, row.get(0))
+    ensure(state, id, row.get(0), row.get(1))
 }
 pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
     let mode = std::env::var("ROOTYARD_WORKSPACE_MOUNT_MODE").unwrap_or_else(|_| "direct".into());
@@ -207,10 +222,10 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
     }
     let client = state.pool.get().await.map_err(Error::internal)?;
     let rows=client.query(
-        "SELECT id,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces WHERE host_id=$1 AND state='ready' ORDER BY id",
+        "SELECT id,lease_epoch,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces WHERE host_id=$1 AND state='ready' ORDER BY id",
         &[&state.storage.volume_id]).await.map_err(Error::internal)?;
     for row in rows {
-        ensure(state, row.get(0), row.get(1))?;
+        ensure(state, row.get(0), row.get(1), row.get(2))?;
     }
     Ok(())
 }

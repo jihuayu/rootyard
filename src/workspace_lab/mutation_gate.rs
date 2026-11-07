@@ -46,10 +46,10 @@ pub enum GatePhase {
 struct GateState {
     phase: GatePhase,
     active_mutators: usize,
-    freeze_depth: usize,
+    freeze_active: bool,
     generation: u64,
-    epoch: u64,
-    fence_floor: u64,
+    epoch: i64,
+    fence_floor: i64,
     writable_until: i64,
 }
 
@@ -64,6 +64,7 @@ pub struct MutationGate {
 
 thread_local! {
     static HELD_GATES: RefCell<Vec<*const MutationGate>> = RefCell::new(Vec::new());
+    static FROZEN_GATES: RefCell<Vec<*const MutationGate>> = RefCell::new(Vec::new());
 }
 
 fn mark_held(gate: &MutationGate) {
@@ -86,38 +87,67 @@ fn held_on_this_thread(gate: &MutationGate) -> bool {
     HELD_GATES.with(|held| held.borrow().iter().any(|candidate| std::ptr::eq(*candidate, gate)))
 }
 
+fn mark_frozen(gate: &MutationGate) {
+    let gate = std::ptr::from_ref(gate);
+    FROZEN_GATES.with(|held| held.borrow_mut().push(gate));
+}
+
+fn unmark_frozen(gate: &MutationGate) {
+    let gate = std::ptr::from_ref(gate);
+    FROZEN_GATES.with(|held| {
+        let mut held = held.borrow_mut();
+        if let Some(index) = held.iter().rposition(|candidate| std::ptr::eq(*candidate, gate)) {
+            held.remove(index);
+        }
+    });
+}
+
+fn frozen_on_this_thread(gate: &MutationGate) -> bool {
+    let gate = std::ptr::from_ref(gate);
+    FROZEN_GATES.with(|held| held.borrow().iter().any(|candidate| std::ptr::eq(*candidate, gate)))
+}
+
 impl MutationGate {
-    /// Create a healthy gate whose lease deadline is `writable_until` (Unix
-    /// seconds). The legacy constructor interface is unchanged.
-    pub fn new(writable_until: i64) -> Arc<Self> {
-        Arc::new(Self {
+    /// Create a healthy gate from the real database lease epoch and deadline.
+    ///
+    /// There is no zero-epoch fallback: a database epoch must be positive, and
+    /// both the authorized epoch and the fence floor start at that value so an
+    /// old `re_authorize` can never revive the lease.
+    pub fn new_with_lease(db_epoch: i64, writable_until: i64) -> io::Result<Arc<Self>> {
+        if db_epoch <= 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        Ok(Arc::new(Self {
             state: Mutex::new(GateState {
                 phase: GatePhase::Healthy,
                 active_mutators: 0,
-                freeze_depth: 0,
+                freeze_active: false,
                 generation: 0,
-                epoch: 0,
-                fence_floor: 0,
+                epoch: db_epoch,
+                fence_floor: db_epoch,
                 writable_until,
             }),
             changed: Condvar::new(),
-        })
+        }))
     }
 
     fn lock_state(&self) -> MutexGuard<'_, GateState> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Legacy deadline-only update. It is intentionally unable to clear a fence:
-    /// the helper must call [`Self::re_authorize`] with a strictly higher epoch.
-    pub fn update(&self, until: i64) {
+    /// Renew the deadline only for the currently authorized database epoch.
+    ///
+    /// A stale epoch or any fenced state is rejected without changing the
+    /// deadline. This never lifts a fence and never changes the epoch.
+    pub fn renew(&self, db_epoch: i64, until: i64) -> bool {
         let mut state = self.lock_state();
-        if state.phase == GatePhase::Fenced {
-            return;
+        if state.phase == GatePhase::Fenced || db_epoch != state.epoch {
+            return false;
         }
         state.writable_until = until;
         drop(state);
         self.changed.notify_all();
+        true
     }
 
     /// Freeze the gate for the duration of `work`.
@@ -136,20 +166,24 @@ impl MutationGate {
             !held_on_this_thread(self),
             "MutationGate::freeze cannot run on a thread that holds an admitted mutation; it would wait on itself"
         );
+        assert!(
+            !frozen_on_this_thread(self),
+            "MutationGate::freeze is not re-entrant on one thread; nested freezes must be sequenced"
+        );
         let mut state = self.lock_state();
-        if state.freeze_depth == 0 {
-            if state.phase == GatePhase::Healthy {
-                state.phase = GatePhase::Frozen;
-                state.generation = state.generation.saturating_add(1);
-            }
-            state.freeze_depth = 1;
-        } else {
-            state.freeze_depth = state.freeze_depth.saturating_add(1);
+        while state.freeze_active {
+            state = self.changed.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        state.freeze_active = true;
+        if state.phase == GatePhase::Healthy {
+            state.phase = GatePhase::Frozen;
+            state.generation = state.generation.saturating_add(1);
         }
         while state.active_mutators > 0 {
             state = self.changed.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         drop(state);
+        mark_frozen(self);
         FreezeGuard { gate: self }
     }
 
@@ -171,16 +205,20 @@ impl MutationGate {
     /// Explicitly authorize a new lease epoch and deadline.
     ///
     /// The epoch must be strictly greater than both the current epoch and the
-    /// epoch that was fenced. Re-authorization during a freeze records the new
-    /// epoch but does not admit mutations until the freeze guard is dropped.
-    pub fn re_authorize(&self, epoch: u64, until: i64) -> io::Result<()> {
+    /// epoch that was fenced. It is rejected with `EWOULDBLOCK` while a freeze
+    /// owns the gate or an old mutation guard is still alive, so a control
+    /// caller must retry after those have drained. This function never waits.
+    pub fn re_authorize(&self, epoch: i64, until: i64) -> io::Result<()> {
         let mut state = self.lock_state();
         if epoch <= state.epoch || epoch <= state.fence_floor {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
+        if state.active_mutators > 0 || state.freeze_active {
+            return Err(io::Error::from_raw_os_error(libc::EWOULDBLOCK));
+        }
         state.epoch = epoch;
         state.writable_until = until;
-        state.phase = if state.freeze_depth == 0 { GatePhase::Healthy } else { GatePhase::Frozen };
+        state.phase = GatePhase::Healthy;
         state.generation = state.generation.saturating_add(1);
         drop(state);
         self.changed.notify_all();
@@ -222,10 +260,7 @@ impl MutationGate {
             }
             let lease_seconds = state.writable_until.saturating_sub(now).max(1) as u64;
             let wait = (timeout - elapsed).min(Duration::from_secs(lease_seconds));
-            let (next, _) = self
-                .changed
-                .wait_timeout(state, wait)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (next, _) = self.changed.wait_timeout(state, wait).unwrap_or_else(std::sync::PoisonError::into_inner);
             state = next;
         }
     }
@@ -272,26 +307,31 @@ impl MutationGate {
     }
 
     /// Current authorized lease epoch.
-    pub fn epoch(&self) -> u64 {
+    pub fn epoch(&self) -> i64 {
         self.lock_state().epoch
     }
 
     /// Highest epoch invalidated by a fence.
-    pub fn fenced_epoch(&self) -> u64 {
+    pub fn fenced_epoch(&self) -> i64 {
         self.lock_state().fence_floor
+    }
+
+    /// Whether a freeze closure currently owns the gate.
+    pub fn active_freeze(&self) -> bool {
+        self.lock_state().freeze_active
     }
 }
 
 /// RAII admission permit. The mutation count is released on drop on every path.
 pub struct MutationGuard<'a> {
     gate: &'a MutationGate,
-    epoch: u64,
+    epoch: i64,
     generation: u64,
 }
 
 impl MutationGuard<'_> {
     /// Epoch that was authorized when this mutation was admitted.
-    pub fn epoch(&self) -> u64 {
+    pub fn epoch(&self) -> i64 {
         self.epoch
     }
 
@@ -308,11 +348,8 @@ impl Drop for MutationGuard<'_> {
         if state.active_mutators > 0 {
             state.active_mutators -= 1;
         }
-        let drained = state.active_mutators == 0;
         drop(state);
-        if drained {
-            self.gate.changed.notify_all();
-        }
+        self.gate.changed.notify_all();
     }
 }
 
@@ -322,19 +359,16 @@ struct FreezeGuard<'a> {
 
 impl Drop for FreezeGuard<'_> {
     fn drop(&mut self) {
+        unmark_frozen(self.gate);
         let mut state = self.gate.lock_state();
-        if state.freeze_depth > 0 {
-            state.freeze_depth -= 1;
-        }
-        let thawed = state.freeze_depth == 0 && state.phase == GatePhase::Frozen;
+        state.freeze_active = false;
+        let thawed = state.phase == GatePhase::Frozen;
         if thawed {
             state.phase = GatePhase::Healthy;
             state.generation = state.generation.saturating_add(1);
         }
         drop(state);
-        if thawed {
-            self.gate.changed.notify_all();
-        }
+        self.gate.changed.notify_all();
     }
 }
 
@@ -368,7 +402,7 @@ mod tests {
 
     #[test]
     fn freeze_drains_existing_mutator_before_running_and_rejects_new_ones() {
-        let gate = MutationGate::new(deadline());
+        let gate = MutationGate::new_with_lease(1, deadline()).unwrap();
         let (admitted_tx, admitted_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let (dropped_tx, dropped_rx) = mpsc::channel();
@@ -411,7 +445,7 @@ mod tests {
 
     #[test]
     fn fence_is_immediate_during_freeze_and_only_a_higher_epoch_restores() {
-        let gate = MutationGate::new(deadline());
+        let gate = MutationGate::new_with_lease(1, deadline()).unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (freeze_release_tx, freeze_release_rx) = mpsc::channel::<()>();
         let (done_tx, done_rx) = mpsc::channel();
@@ -436,36 +470,31 @@ mod tests {
             fence_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(gate.is_fenced());
             assert_eq!(mutation_error(&gate), Some(libc::EROFS));
-            gate.update(deadline());
+            assert!(!gate.renew(1, deadline()), "a fenced gate must ignore its old lease renewal");
             assert_eq!(mutation_error(&gate), Some(libc::EROFS));
-            assert_eq!(
-                gate.re_authorize(0, deadline()).unwrap_err().raw_os_error(),
-                Some(libc::ESTALE)
-            );
-
-            gate.re_authorize(1, deadline()).expect("a higher epoch authorizes while frozen");
-            assert_eq!(gate.phase(), GatePhase::Frozen);
-            assert_eq!(mutation_error(&gate), Some(libc::EAGAIN));
+            assert_eq!(gate.re_authorize(1, deadline()).unwrap_err().raw_os_error(), Some(libc::ESTALE));
+            assert_eq!(gate.re_authorize(2, deadline()).unwrap_err().raw_os_error(), Some(libc::EWOULDBLOCK));
+            assert!(!gate.renew(1, deadline()), "a fenced gate must ignore its old lease renewal");
             freeze_release_tx.send(()).unwrap();
             done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(gate.phase(), GatePhase::Fenced);
+            gate.re_authorize(2, deadline()).expect("a higher epoch restores writes after the freeze");
             assert_eq!(gate.phase(), GatePhase::Healthy);
             let guard = gate.mutation().expect("re-authorized gate admits after freeze");
-            assert_eq!(guard.epoch(), 1);
+            assert_eq!(guard.epoch(), 2);
             drop(guard);
 
             gate.fence();
-            assert_eq!(
-                gate.re_authorize(1, deadline()).unwrap_err().raw_os_error(),
-                Some(libc::ESTALE)
-            );
-            gate.re_authorize(2, deadline()).expect("only a strictly higher epoch restores writes");
+            assert!(!gate.renew(2, deadline()), "renewal must not clear a fence");
+            assert_eq!(gate.re_authorize(2, deadline()).unwrap_err().raw_os_error(), Some(libc::ESTALE));
+            gate.re_authorize(3, deadline()).expect("only a strictly higher epoch restores writes");
             assert_eq!(gate.phase(), GatePhase::Healthy);
         });
     }
 
     #[test]
     fn fence_wakes_a_frozen_waiter_with_erofs() {
-        let gate = MutationGate::new(deadline());
+        let gate = MutationGate::new_with_lease(1, deadline()).unwrap();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (freeze_release_tx, freeze_release_rx) = mpsc::channel::<()>();
         std::thread::scope(|scope| {
@@ -492,7 +521,7 @@ mod tests {
 
     #[test]
     fn panic_and_error_paths_release_admission_and_preserve_fence() {
-        let gate = MutationGate::new(deadline());
+        let gate = MutationGate::new_with_lease(1, deadline()).unwrap();
         let panicking_gate = gate.clone();
         let panicked = std::thread::spawn(move || {
             let _guard = panicking_gate.mutation().expect("healthy gate admits");
@@ -517,12 +546,12 @@ mod tests {
         assert!(fenced_panic.is_err());
         assert!(gate.is_fenced());
         assert_eq!(mutation_error(&gate), Some(libc::EROFS));
-        gate.re_authorize(1, deadline()).unwrap();
+        gate.re_authorize(2, deadline()).unwrap();
     }
 
     #[test]
     fn freeze_from_an_admitted_mutation_fails_fast_instead_of_deadlocking() {
-        let gate = MutationGate::new(deadline());
+        let gate = MutationGate::new_with_lease(1, deadline()).unwrap();
         let guard = gate.mutation().unwrap();
         let outcome = catch_unwind(AssertUnwindSafe(|| gate.freeze(|| ())));
         assert!(outcome.is_err());
@@ -532,28 +561,79 @@ mod tests {
     }
 
     #[test]
-    fn nested_freeze_keeps_writes_blocked_until_the_outermost_guard_drops() {
-        let gate = MutationGate::new(deadline());
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (outer_release_tx, outer_release_rx) = mpsc::channel::<()>();
-        let (done_tx, done_rx) = mpsc::channel();
+    fn concurrent_freezes_are_serialized_until_the_first_closure_releases() {
+        let gate = MutationGate::new_with_lease(1, deadline()).unwrap();
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (first_release_tx, first_release_rx) = mpsc::channel::<()>();
+        let (first_done_tx, first_done_rx) = mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let (second_done_tx, second_done_rx) = mpsc::channel();
         std::thread::scope(|scope| {
-            let freeze_gate = gate.clone();
+            let first_gate = gate.clone();
             scope.spawn(move || {
-                freeze_gate.freeze(|| {
-                    entered_tx.send(()).unwrap();
-                    outer_release_rx.recv().unwrap();
+                first_gate.freeze(|| {
+                    first_entered_tx.send(()).unwrap();
+                    first_release_rx.recv().unwrap();
                 });
-                done_tx.send(()).unwrap();
+                first_done_tx.send(()).unwrap();
             });
-            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-            gate.freeze(|| ());
+            first_entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let second_gate = gate.clone();
+            scope.spawn(move || {
+                second_gate.freeze(|| {
+                    second_entered_tx.send(()).unwrap();
+                });
+                second_done_tx.send(()).unwrap();
+            });
+            assert!(second_entered_rx.try_recv().is_err(), "second freeze entered before the first released");
             assert_eq!(gate.phase(), GatePhase::Frozen);
             assert_eq!(mutation_error(&gate), Some(libc::EAGAIN));
-            outer_release_tx.send(()).unwrap();
-            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            first_release_tx.send(()).unwrap();
+            first_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            second_entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            second_done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert_eq!(gate.phase(), GatePhase::Healthy);
             drop(gate.mutation().unwrap());
+        });
+    }
+
+    #[test]
+    fn nested_freeze_on_one_thread_fails_fast_instead_of_deadlocking() {
+        let gate = MutationGate::new_with_lease(1, deadline()).unwrap();
+        let outcome = catch_unwind(AssertUnwindSafe(|| gate.freeze(|| gate.freeze(|| ()))));
+        assert!(outcome.is_err());
+        assert_eq!(gate.phase(), GatePhase::Healthy);
+        assert!(!gate.active_freeze());
+    }
+
+    #[test]
+    fn re_authorize_is_busy_until_the_old_active_guard_is_dropped() {
+        let gate = MutationGate::new_with_lease(1, deadline()).unwrap();
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let mutator_gate = gate.clone();
+            scope.spawn(move || {
+                let guard = mutator_gate.mutation().expect("initial epoch admits");
+                admitted_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(guard);
+                dropped_tx.send(()).unwrap();
+            });
+            admitted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            gate.fence();
+            assert_eq!(gate.re_authorize(2, deadline()).unwrap_err().raw_os_error(), Some(libc::EWOULDBLOCK));
+            assert_eq!(mutation_error(&gate), Some(libc::EROFS));
+            release_tx.send(()).unwrap();
+            dropped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(gate.active_mutators(), 0);
+            assert!(gate.is_fenced());
+            gate.re_authorize(2, deadline()).expect("explicit retry succeeds after the old guard drains");
+            assert_eq!(gate.phase(), GatePhase::Healthy);
+            let guard = gate.mutation().expect("new epoch admits mutations");
+            assert_eq!(guard.epoch(), 2);
+            drop(guard);
         });
     }
 }

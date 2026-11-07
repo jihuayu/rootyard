@@ -155,7 +155,7 @@ pub struct Overlay {
 }
 impl Overlay {
     pub fn new(lower: PathBuf, upper: PathBuf) -> io::Result<Self> {
-        Self::new_with_gate(lower, upper, MutationGate::new(i64::MAX))
+        Self::new_with_gate(lower, upper, MutationGate::new_with_lease(1, i64::MAX)?)
     }
     pub fn new_with_gate(lower: PathBuf, upper: PathBuf, gate: Arc<MutationGate>) -> io::Result<Self> {
         Self::new_with_gate_and_lazy(lower, upper, gate, None)
@@ -426,7 +426,7 @@ mod tests {
         let upper = root.path().join("upper");
         fs::create_dir_all(&lower).unwrap();
         fs::write(lower.join("file.txt"), b"readable").unwrap();
-        let gate = MutationGate::new(i64::MAX);
+        let gate = MutationGate::new_with_lease(1, i64::MAX).unwrap();
         let overlay = Overlay::new_with_gate(lower, upper, gate.clone()).unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
