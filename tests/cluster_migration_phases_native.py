@@ -438,6 +438,7 @@ def case_target_delta(h, args, target_url, node1_data, holder, fixture):
         status, raw, _ = pending.result(timeout=20)
     holder["log"].close()
     assert status == 502, ("killed target did not fail the source transfer as 502", status, raw[:300])
+    crash_status = status
     dest = target_bare(node1_data, repo["id"])
     after = {"operation_state": sql_op(h, op), "route": sql_route(h, repo["id"]),
              "target_repo_present": dest.is_dir(),
@@ -462,7 +463,7 @@ def case_target_delta(h, args, target_url, node1_data, holder, fixture):
               "fault_marker": {"phase": marker["phase"], "pid": marker["pid"],
                                "repository_bound": True, "operation_bound": True},
               "fault_pid": marker["pid"], "process_returncode": killed_rc,
-              "source_transfer_status": status,
+              "source_transfer_status": crash_status,
               "durable_state_after_fault": after,
               "drained_source_was_not_promoted_while_target_dead": True,
               "recovery_ms": recovery_ms, "recovery_result": "completed",
