@@ -61,8 +61,10 @@ class BrowserHarness(Harness):
             "/web/login", "POST", urllib.parse.urlencode(fields), headers
         )
 
-    def sign_in(self, return_to=None):
-        status, data, headers = self.login(return_to=return_to)
+    def sign_in(self, return_to=None, username="alice", token=None):
+        status, data, headers = self.login(
+            token=token, username=username, return_to=return_to
+        )
         assert status == 303, (status, data)
         cookies, raw = self.split_cookies(headers)
         assert cookies["rootyard_session"].startswith("ryt_")
@@ -78,6 +80,27 @@ class BrowserHarness(Harness):
         self.setup()
         self.api()
         self.roundtrip()
+
+        # A collaborator discovered at sign-in loses repository access as soon
+        # as membership is removed, while the browser session itself remains.
+        repo_id = self.repo["id"]
+        tenant_id = self.sql(f"SELECT owner_id FROM repositories WHERE id='{repo_id}'")
+        bob_id = self.bob["user_id"]
+        self.sql(
+            f"INSERT INTO repository_collaborators(repository_id,tenant_id,user_id,role) VALUES('{repo_id}','{tenant_id}','{bob_id}','read')"
+        )
+        bob_cookies, _, _ = self.sign_in(username="bob", token=self.bob["token"])
+        bob_headers = {"Cookie": self.cookie_header(bob_cookies)}
+        assert self.request("/web/repos", headers=bob_headers)[0] == 200
+        bob_page = self.request("/web/repos", headers=bob_headers)[1]
+        assert b"alice/demo" in bob_page
+        assert self.request("/web/repos/alice/demo", headers=bob_headers)[0] == 200
+        self.sql(
+            f"DELETE FROM repository_collaborators WHERE repository_id='{repo_id}' AND user_id='{bob_id}'"
+        )
+        assert self.request("/web/repos/alice/demo", headers=bob_headers)[0] in (403, 404)
+        bob_page = self.request("/web/repos", headers=bob_headers)[1]
+        assert b"alice/demo" not in bob_page
 
         login_page = self.request("/web/login")
         assert login_page[0] == 200 and b"type=\"password\"" in login_page[1]
@@ -126,6 +149,10 @@ class BrowserHarness(Harness):
             "/web/repos/alice/demo",
             headers={"X-Rootyard-Token": self.alice["token"]},
         )[0] == 401
+        assert self.request(
+            "/web/repos/alice/demo",
+            headers={"Cookie": "token=" + self.alice["token"]},
+        )[0] == 401
 
         # A browser session cannot mint another session by replaying itself in
         # the API-token field, so revocation cannot be extended indefinitely.
@@ -146,6 +173,30 @@ class BrowserHarness(Harness):
             "/web/repos/alice/demo",
             headers={"Authorization": "Bearer " + self.alice["token"]},
         )[0] == 200
+
+        # A stale cookie must not shadow an explicit API Authorization. The
+        # API header wins, so no browser CSRF token is needed for this write.
+        stale_cookies, _, _ = self.sign_in()
+        stale_headers = {"Cookie": self.cookie_header(stale_cookies)}
+        api_header = {
+            **stale_headers,
+            "Authorization": "Bearer " + self.alice["token"],
+            "Content-Type": "application/json",
+        }
+        assert self.request("/web/repos", headers=api_header)[0] == 200
+        path = "/web/repos/alice/demo/issues"
+        api_issue = json.dumps({"title": "API header issue", "body": "explicit header wins"})
+        assert self.request(path, "POST", api_issue, api_header)[0] == 201
+
+        # Cookie/header mismatch is rejected even when both are browser tokens.
+        second_cookies, _, _ = self.sign_in()
+        assert self.request(
+            "/web/repos",
+            headers={
+                "Cookie": self.cookie_header(cookies),
+                "Authorization": "Bearer " + second_cookies["rootyard_session"],
+            },
+        )[0] == 401
 
         path = "/web/repos/alice/demo/issues"
         payload = json.dumps({"title": "Browser issue", "body": "Started in UI"})
@@ -210,13 +261,30 @@ class BrowserHarness(Harness):
         assert b"merged" in body
 
         # Return-to is constrained to same-origin web/UI paths.
-        for bad in ("https://evil.example/x", "//evil.example/x", "/\\evil.example", "/web/login"):
+        bad_returns = (
+            "https://evil.example/x",
+            "//evil.example/x",
+            "/\\evil.example",
+            "/web/login",
+            "/web/../api/repos",
+            "/web/%2e%2e/api/repos",
+            "/web/%2E%2E/web/login",
+            "/web/%252e%252e/api/repos",
+            "/web/%C3%A9",
+            "/web/é",
+            "/web/repos x",
+            "/web/repos?q=%0a",
+        )
+        for bad in bad_returns:
             status, _, headers = self.login(return_to=bad)
             assert status == 303, (bad, status)
             assert self.response_header(headers, "Location") == "/web/repos", bad
             ret_cookies, _ = self.split_cookies(headers)
             session_headers = {"Cookie": self.cookie_header(ret_cookies)}
             assert self.request("/web/repos", headers=session_headers)[0] == 200
+
+        probe = self.request("/web/login?return_to=%2Fweb%2F..%2Fapi%2Frepos")
+        assert probe[0] == 200 and b'value="/web/repos"' in probe[1]
 
         # HTTPS/proxy semantics: non-loopback HTTP is rejected, while a trusted
         # HTTPS termination marks the browser cookies Secure.
@@ -270,6 +338,24 @@ class BrowserHarness(Harness):
         )
         self.sql(f"UPDATE web_sessions SET revoked=true WHERE token_id='{token_id}'")
         assert self.request("/web/repos", headers=headers)[0] == 401
+
+        # Parent API expiry denies the session even while the child browser
+        # token and web_sessions row still have future expiry timestamps.
+        cookies, _, _ = self.sign_in()
+        headers = {"Cookie": self.cookie_header(cookies)}
+        child_alive = self.sql(
+            "SELECT expires_at>clock_timestamp() FROM tokens WHERE id=(SELECT token_id FROM web_sessions ORDER BY created_at DESC LIMIT 1)"
+        )
+        assert child_alive == "t"
+        self.sql(
+            f"UPDATE tokens SET expires_at=clock_timestamp()-interval '1 second' WHERE id='{self.alice['token_id']}'"
+        )
+        assert self.request("/web/repos", headers=headers)[0] == 401
+        status, _, expired_parent = self.request("/web/repos", headers={**headers, **nav})
+        assert status == 303
+        assert self.response_header(expired_parent, "Location").startswith("/web/login")
+        assert self.login()[0] == 401
+        self.sql(f"UPDATE tokens SET expires_at=NULL WHERE id='{self.alice['token_id']}'")
 
         # Cross-origin logout is rejected; same-origin logout revokes the old
         # cookie so it cannot be replayed.

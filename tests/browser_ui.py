@@ -94,6 +94,13 @@ class UiHarness(BrowserHarness):
             assert session_secret not in content and session_secret not in page.url
             assert csrf not in content
 
+            # Real discovery: the signed-in profile sees the repository link on
+            # /web/repos and navigates into it from that DOM element.
+            page.goto(self.base + "/web/repos")
+            page.get_by_role("link", name="alice/demo").wait_for(timeout=10000)
+            page.get_by_role("link", name="alice/demo").click()
+            page.wait_for_url(self.base + "/web/repos/alice/demo")
+
             # Cross-origin browser form submission is rejected and creates no
             # issue. Ports differ, so Origin differs while the host is the same.
             before = self.sql("SELECT count(*) FROM forge_issues")
@@ -145,6 +152,7 @@ class UiHarness(BrowserHarness):
                 page.locator('input[name="token"]').fill(self.alice["token"])
                 page.get_by_role("button", name="Sign in").click()
                 page.wait_for_url(self.base + "/web/repos")
+                page.get_by_role("link", name="alice/demo").wait_for(timeout=10000)
                 assert context.cookies()
 
             # Expired browser session navigates back to a usable sign-in page.

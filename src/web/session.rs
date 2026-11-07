@@ -79,19 +79,33 @@ fn authorization_credential(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-async fn reject_browser_authorization(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WebAuthMode {
+    CookieOnly,
+    BrowserSession,
+    HeaderApiOrOther,
+}
+
+async fn web_auth_mode(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     session: Option<&str>,
-) -> Result<(), Response> {
+) -> Result<WebAuthMode, Response> {
+    if !headers.contains_key(header::AUTHORIZATION) {
+        return Ok(if session.is_some() {
+            WebAuthMode::CookieOnly
+        } else {
+            WebAuthMode::HeaderApiOrOther
+        });
+    }
     let Some(credential) = authorization_credential(headers) else {
-        return Ok(());
+        return Ok(WebAuthMode::HeaderApiOrOther);
     };
     if credential.len() != 68
         || !credential.starts_with(SESSION_PREFIX)
         || !credential[4..].bytes().all(|b| b.is_ascii_hexdigit())
     {
-        return Ok(());
+        return Ok(WebAuthMode::HeaderApiOrOther);
     }
     let client = state
         .pool
@@ -105,15 +119,22 @@ async fn reject_browser_authorization(
         )
         .await
         .map_err(|_| Error::internal("database unavailable").into_response())?;
-    if row.as_ref().is_some_and(|row| row.get::<_, String>(0) == "browser")
-        && session != Some(credential.as_str())
-    {
+    let is_browser = row
+        .as_ref()
+        .is_some_and(|row| row.get::<_, String>(0) == "browser");
+    if is_browser {
+        if session == Some(credential.as_str()) {
+            return Ok(WebAuthMode::BrowserSession);
+        }
         // Browser credentials are only accepted through the HttpOnly session
         // cookie, where the middleware can bind them to the parent API token
-        // and require CSRF for mutations. API tokens remain independent.
+        // and require CSRF for mutations.
         return Err(Error::unauthorized().into_response());
     }
-    Ok(())
+    // An explicit Authorization header wins over any stale browser cookie.
+    // API tokens remain independent; malformed/unknown credentials fail in
+    // the handler without the stale cookie shadowing them.
+    Ok(WebAuthMode::HeaderApiOrOther)
 }
 
 fn browser_origin(headers: &HeaderMap) -> bool {
@@ -202,13 +223,81 @@ fn clear_cookies(res: &mut Response, headers: &HeaderMap) {
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
 }
 
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_ascii(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let decoded = hex_value(bytes[index + 1])? * 16 + hex_value(bytes[index + 2])?;
+            if decoded > 0x7f {
+                return None;
+            }
+            out.push(decoded);
+            index += 3;
+        } else {
+            if byte > 0x7f {
+                return None;
+            }
+            out.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn header_safe_ascii(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 2048
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'_' | b'.' | b'~' | b'/' | b'?' | b'&' | b'=' | b'%' | b':' | b'+'
+                        | b'!' | b'$' | b'\'' | b'(' | b')' | b'*' | b'@' | b',' | b';' | b'['
+                        | b']'
+                )
+        })
+}
+
 fn is_safe_return_to(value: &str) -> bool {
-    (value.starts_with("/web/") || value.starts_with("/ui/"))
-        && !value.starts_with("//")
-        && !value.contains("//")
-        && !value.contains('\\')
-        && !value.starts_with("/web/login")
-        && !value.chars().any(char::is_control)
+    if !header_safe_ascii(value) || value.starts_with("//") || value.contains("//") {
+        return false;
+    }
+    let Some(decoded) = percent_decode_ascii(value) else {
+        return false;
+    };
+    if !decoded.is_ascii()
+        || decoded.contains('\\')
+        || decoded.contains("//")
+        || decoded.contains('%')
+        || decoded.contains('#')
+        || decoded.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let path = decoded.split('?').next().unwrap_or("");
+    if !(path.starts_with("/web/") || path.starts_with("/ui/"))
+        || path.starts_with("/web/login")
+    {
+        return false;
+    }
+    !path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
 }
 
 fn safe_return_to(value: Option<&str>) -> &str {
@@ -322,15 +411,18 @@ pub async fn middleware(
     );
     let is_navigation = browser_navigation(&headers);
 
-    if let Err(response) =
-        reject_browser_authorization(&state, &headers, session.as_deref()).await
-    {
-        return response;
-    }
+    let auth_mode = match web_auth_mode(&state, &headers, session.as_deref()).await {
+        Ok(mode) => mode,
+        Err(response) => return response,
+    };
+    let session_mode = matches!(
+        auth_mode,
+        WebAuthMode::CookieOnly | WebAuthMode::BrowserSession
+    );
 
     if mutation {
         if path == "/web/logout" {
-            if session.is_some() && !browser_origin(&headers) {
+            if session_mode && !browser_origin(&headers) {
                 return Error(StatusCode::FORBIDDEN, "browser request origin rejected")
                     .into_response();
             }
@@ -339,7 +431,10 @@ pub async fn middleware(
                 return Error(StatusCode::FORBIDDEN, "browser request origin rejected")
                     .into_response();
             }
-        } else if let Some(secret) = session.as_deref() {
+        } else if session_mode {
+            let Some(secret) = session.as_deref() else {
+                return Error::unauthorized().into_response();
+            };
             if !browser_origin(&headers) {
                 return Error(StatusCode::FORBIDDEN, "browser request origin rejected")
                     .into_response();
@@ -351,13 +446,15 @@ pub async fn middleware(
                 return response;
             }
         }
-    } else if let Some(secret) = session.as_deref() {
-        if let Err(response) = validate_session(&state, secret, None).await {
-            return if is_navigation {
-                login_redirect(&path, query.as_deref(), &headers)
-            } else {
-                response
-            };
+    } else if session_mode {
+        if let Some(secret) = session.as_deref() {
+            if let Err(response) = validate_session(&state, secret, None).await {
+                return if is_navigation {
+                    login_redirect(&path, query.as_deref(), &headers)
+                } else {
+                    response
+                };
+            }
         }
     }
 
