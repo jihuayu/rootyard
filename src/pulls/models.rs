@@ -15,8 +15,10 @@ use uuid::Uuid;
 pub const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 pub const ZERO_OID_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 pub const PULL_FIELDS: &str = "repository_id,number,author_id,title,body,state,head_ref,base_ref,head_oid,base_oid,merge_commit_oid,merged_storage_generation,version,created_at::text,updated_at::text";
-pub const REVIEW_FIELDS: &str = "repository_id,pull_number,number,author_id,state,commit_oid,pull_version,body,created_at::text";
-pub const CHECK_FIELDS: &str = "repository_id,commit_oid,context,attempt,sequence,status,conclusion,output,created_at::text,updated_at::text";
+pub const REVIEW_FIELDS: &str =
+    "repository_id,pull_number,number,author_id,state,commit_oid,pull_version,body,created_at::text";
+pub const CHECK_FIELDS: &str =
+    "repository_id,commit_oid,context,attempt,sequence,status,conclusion,output,created_at::text,updated_at::text";
 pub const RULE_FIELDS: &str = "repository_id,branch_ref,required_approvals,required_checks,require_fast_forward,prevent_deletion,prevent_force_push,version,created_at::text,updated_at::text";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,11 +263,7 @@ pub struct PullPage {
 }
 impl PullPage {
     pub fn bounds(&self) -> Result<(i64, i64), Error> {
-        Page {
-            after: self.after,
-            limit: self.limit,
-        }
-        .bounds()
+        Page { after: self.after, limit: self.limit }.bounds()
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -301,11 +299,7 @@ pub fn json(status: StatusCode, value: impl Serialize) -> Response {
     (status, [(header::CACHE_CONTROL, "no-store")], Json(value)).into_response()
 }
 pub fn positive(number: i64) -> Result<(), Error> {
-    if number <= 0 {
-        Err(Error::bad_request())
-    } else {
-        Ok(())
-    }
+    if number <= 0 { Err(Error::bad_request()) } else { Ok(()) }
 }
 pub fn title_valid(title: &str) -> bool {
     !title.trim().is_empty() && title.len() <= 256 && !title.chars().any(char::is_control)
@@ -313,9 +307,7 @@ pub fn title_valid(title: &str) -> bool {
 pub fn body_valid(body: &str, required: bool) -> bool {
     body.len() <= 8192
         && (!required || !body.trim().is_empty())
-        && !body
-            .chars()
-            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        && !body.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
 }
 pub fn valid_format(format: &str) -> bool {
     matches!(format, "sha1" | "sha256")
@@ -336,9 +328,7 @@ pub fn zero_oid(format: &str) -> Option<String> {
 pub fn valid_oid(oid: &str) -> bool {
     matches!(oid.len(), 40 | 64)
         && oid.bytes().any(|b| b != b'0')
-        && oid
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && oid.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn valid_oid_for_format(oid: &str, format: &str) -> bool {
@@ -348,10 +338,7 @@ pub fn valid_oid_for_format(oid: &str, format: &str) -> bool {
 /// Load the repository's immutable Git object format for the current
 /// transaction. Callers validate inbound OIDs against this value instead of
 /// inferring a format from the supplied hex length.
-pub async fn repository_object_format(
-    tx: &Transaction<'_>,
-    repo: Uuid,
-) -> Result<String, Error> {
+pub async fn repository_object_format(tx: &Transaction<'_>, repo: Uuid) -> Result<String, Error> {
     let format: String = tx
         .query_one("SELECT object_format FROM repositories WHERE id=$1", &[&repo])
         .await
@@ -371,10 +358,9 @@ pub fn valid_review_state(state: &str) -> bool {
 pub fn valid_check_status_and_conclusion(status: &str, conclusion: Option<&str>) -> bool {
     match status {
         "queued" | "in_progress" => conclusion.is_none(),
-        "completed" => matches!(
-            conclusion,
-            Some("success" | "failure" | "neutral" | "cancelled" | "timed_out" | "skipped")
-        ),
+        "completed" => {
+            matches!(conclusion, Some("success" | "failure" | "neutral" | "cancelled" | "timed_out" | "skipped"))
+        }
         _ => false,
     }
 }
@@ -388,18 +374,11 @@ pub fn valid_branch_ref(s: &str) -> bool {
         && !s.ends_with('.')
         && !s.contains("..")
         && !s.contains("@{")
-        && s.split('/')
-            .all(|p| !p.is_empty() && !p.starts_with('.') && !p.ends_with(".lock"))
-        && !s
-            .bytes()
-            .any(|b| b <= 32 || b == 127 || b"~^:?*[\\".contains(&b))
+        && s.split('/').all(|p| !p.is_empty() && !p.starts_with('.') && !p.ends_with(".lock"))
+        && !s.bytes().any(|b| b <= 32 || b == 127 || b"~^:?*[\\".contains(&b))
 }
 pub fn normalize_branch_ref(raw: &str) -> Result<String, Error> {
-    let branch_ref = if raw.starts_with("refs/") {
-        raw.to_owned()
-    } else {
-        format!("refs/heads/{raw}")
-    };
+    let branch_ref = if raw.starts_with("refs/") { raw.to_owned() } else { format!("refs/heads/{raw}") };
     if !valid_branch_ref(&branch_ref) {
         return Err(Error::bad_request());
     }
@@ -433,9 +412,7 @@ pub async fn creation_replay(
     if row.get::<_, Value>("request") != *request {
         return Err(Error(StatusCode::CONFLICT, "idempotency key conflict"));
     }
-    row.get::<_, Option<Value>>("response")
-        .map(Some)
-        .ok_or_else(|| Error::internal("incomplete creation record"))
+    row.get::<_, Option<Value>>("response").map(Some).ok_or_else(|| Error::internal("incomplete creation record"))
 }
 
 pub async fn record_creation(
@@ -460,12 +437,7 @@ pub async fn record_creation(
     Ok(())
 }
 
-pub async fn pull_exists(
-    tx: &Transaction<'_>,
-    actor: Uuid,
-    repo: Uuid,
-    number: i64,
-) -> Result<(), Error> {
+pub async fn pull_exists(tx: &Transaction<'_>, actor: Uuid, repo: Uuid, number: i64) -> Result<(), Error> {
     tx.query_opt(
         "SELECT number FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND number=$3",
         &[&actor, &repo, &number],
@@ -484,40 +456,21 @@ pub async fn repo_tenant_id(tx: &Transaction<'_>, repo: Uuid) -> Result<Uuid, Er
 pub fn git_cmd(state: &AppState, repo: Uuid) -> Result<tokio::process::Command, Error> {
     let path = state.storage.verify_path(repo).map_err(Error::internal)?;
     let mut cmd = state.storage.git(&state.config);
-    cmd.arg("--no-replace-objects")
-        .arg("-c")
-        .arg("core.hooksPath=/dev/null")
-        .arg("--git-dir")
-        .arg(path);
+    cmd.arg("--no-replace-objects").arg("-c").arg("core.hooksPath=/dev/null").arg("--git-dir").arg(path);
     Ok(cmd)
 }
 
-pub async fn resolve_ref_oid(
-    state: &AppState,
-    repo: Uuid,
-    branch_ref: &str,
-) -> Result<Option<String>, Error> {
+pub async fn resolve_ref_oid(state: &AppState, repo: Uuid, branch_ref: &str) -> Result<Option<String>, Error> {
     let mut cmd = git_cmd(state, repo)?;
-    cmd.args([
-        "for-each-ref",
-        "--count=1",
-        "--format=%(objectname)%00%(objecttype)%00%(symref)",
-        branch_ref,
-    ]);
-    let out = git_http::collect_git_output(cmd, 4096, state.config.git_timeout)
-        .await
-        .map_err(Error::internal)?;
+    cmd.args(["for-each-ref", "--count=1", "--format=%(objectname)%00%(objecttype)%00%(symref)", branch_ref]);
+    let out = git_http::collect_git_output(cmd, 4096, state.config.git_timeout).await.map_err(Error::internal)?;
     if out.is_empty() {
         return Ok(None);
     }
     let text = std::str::from_utf8(&out).map_err(Error::internal)?;
     let line = text.strip_suffix('\n').unwrap_or(text);
     let mut parts = line.split('\0');
-    let (oid, obj_type, symref) = (
-        parts.next().unwrap_or(""),
-        parts.next().unwrap_or(""),
-        parts.next().unwrap_or(""),
-    );
+    let (oid, obj_type, symref) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     if !symref.is_empty() || obj_type != "commit" || !valid_oid(oid) {
         return Ok(None);
     }
@@ -536,12 +489,7 @@ pub async fn verify_commit_exists(state: &AppState, repo: Uuid, oid: &str) -> Re
     ))
 }
 
-pub async fn merge_base(
-    state: &AppState,
-    repo: Uuid,
-    base_oid: &str,
-    head_oid: &str,
-) -> Result<Option<String>, Error> {
+pub async fn merge_base(state: &AppState, repo: Uuid, base_oid: &str, head_oid: &str) -> Result<Option<String>, Error> {
     let mut cmd = git_cmd(state, repo)?;
     cmd.args(["merge-base", base_oid, head_oid]);
     match git_http::collect_git_output(cmd, 256, state.config.git_timeout).await {
@@ -554,65 +502,5 @@ pub async fn merge_base(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::extract::Query;
-
-    #[test]
-    fn pull_filter_query_contract() {
-        for (query, expected) in [
-            ("", None),
-            ("?state=open", Some("open")),
-            ("?state=closed&after=4&limit=2", Some("closed")),
-            ("?state=merged&limit=10", Some("merged")),
-        ] {
-            let uri = format!("/pulls{query}").parse().unwrap();
-            let Query(page) = Query::<PullPage>::try_from_uri(&uri).unwrap();
-            assert_eq!(page.state.as_ref().map(PullStateFilter::as_str), expected);
-            assert!(page.bounds().is_ok());
-        }
-        for query in ["?state=", "?state=all", "?state=Open", "?state=open&state=closed", "?state=open&unknown=1"] {
-            let uri = format!("/pulls{query}").parse().unwrap();
-            assert!(Query::<PullPage>::try_from_uri(&uri).is_err());
-        }
-        for query in ["?state=open&after=-1", "?state=closed&limit=0", "?state=merged&limit=101"] {
-            let uri = format!("/pulls{query}").parse().unwrap();
-            let Query(page) = Query::<PullPage>::try_from_uri(&uri).unwrap();
-            assert!(page.bounds().is_err());
-        }
-    }
-
-    #[test]
-    fn branch_ref_normalization_and_validation() {
-        assert_eq!(normalize_branch_ref("main").unwrap(), "refs/heads/main");
-        assert_eq!(normalize_branch_ref("refs/heads/feature/x").unwrap(), "refs/heads/feature/x");
-        for bad in ["", "HEAD", "refs/heads/HEAD", "refs/tags/v1", "refs/rootyard-ci/jobs/1", "refs/heads/", "refs/heads/.hidden", "refs/heads/foo..bar", "refs/heads/foo.lock", "refs/heads/foo/", "refs/heads/foo@{1}", "refs/heads/foo bar"] {
-            assert!(normalize_branch_ref(bad).is_err(), "expected error for {bad}");
-        }
-    }
-
-    #[test]
-    fn oid_and_check_state_validators() {
-        assert!(valid_oid("0123456789abcdef0123456789abcdef01234567"));
-        for bad_oid in ["", ZERO_OID, "0123456789ABCDEF0123456789abcdef01234567", "0123456789abcdef0123456789abcdef0123456", "0123456789abcdef0123456789abcdef0123456g"] {
-            assert!(!valid_oid(bad_oid));
-        }
-        let sha1 = "a".repeat(40);
-        let sha256 = "b".repeat(64);
-        assert!(valid_oid_for_format(&sha1, "sha1"));
-        assert!(!valid_oid_for_format(&sha1, "sha256"));
-        assert!(valid_oid_for_format(&sha256, "sha256"));
-        assert!(!valid_oid_for_format(&sha256, "sha1"));
-        assert!(!valid_oid_for_format(&sha1, "sha512"));
-        assert_eq!(zero_oid("sha1").as_deref(), Some(ZERO_OID));
-        assert_eq!(zero_oid("sha256").as_deref(), Some(ZERO_OID_SHA256));
-        assert!(zero_oid("sha512").is_none());
-        assert!(valid_check_status_and_conclusion("queued", None));
-        assert!(valid_check_status_and_conclusion("in_progress", None));
-        assert!(!valid_check_status_and_conclusion("queued", Some("success")));
-        assert!(!valid_check_status_and_conclusion("completed", None));
-        assert!(valid_check_status_and_conclusion("completed", Some("success")));
-        assert!(valid_check_status_and_conclusion("completed", Some("failure")));
-        assert!(!valid_check_status_and_conclusion("completed", Some("unknown")));
-    }
-}
+#[path = "models_tests.rs"]
+mod tests;
