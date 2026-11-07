@@ -30,6 +30,13 @@ use axum::{
     routing::{get, post},
 };
 pub use service::fence_restored;
+
+/// Graceful-shutdown hook: wait for owned workspace Git mutations to reach
+/// their bounded finish before the runtime exits. A SIGKILLed server cannot
+/// provide this guarantee; retry an unknown mutation with the same key.
+pub async fn drain_git_jobs(grace: std::time::Duration) {
+    git::drain(grace).await;
+}
 use std::sync::Arc;
 
 pub fn routes() -> Router<Arc<AppState>> {

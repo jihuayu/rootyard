@@ -12,6 +12,7 @@ uses real workspaces, real Git clones and real filesystem inventories:
 import argparse
 from collections import Counter
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -75,6 +76,30 @@ def wait_event(h, workspace, timeout=30.0, after=0, kind="external_capture"):
             return found[0]
         time.sleep(0.2)
     raise AssertionError(f"workspace {workspace['id']} did not emit {kind} within {timeout}s")
+
+
+def wait_durable_capture(h, workspace, after=0, timeout=30.0):
+    """Read the committed event row directly.
+
+    The public events API must answer a synthetic revision gap with
+    RESYNC_REQUIRED and cannot page across it, but the scan still commits its
+    guarded revision and event durably. CAS assertions therefore read the
+    durable log instead of weakening the public gap semantics.
+    """
+    deadline = time.monotonic() + timeout
+    query = (
+        "SELECT max(revision) FROM workspace_events WHERE workspace_id='%s' "
+        "AND kind='external_capture' AND revision>%d" % (workspace["id"], after)
+    )
+    while time.monotonic() < deadline:
+        value = h.sql(query)
+        if value:
+            return {"kind": "external_capture", "revision": int(value)}
+        time.sleep(0.2)
+    raise AssertionError(
+        "workspace %s did not commit a durable external_capture within %ss"
+        % (workspace["id"], timeout)
+    )
 
 
 def bulk(repo_path, count, size=512):
@@ -161,15 +186,25 @@ def selected_suite(loader, names, module):
     return suite
 
 
-def result_entries(result, suite):
+def scheduled_test_ids(suite):
+    """Snapshot every scheduled test ID before execution.
+
+    ``unittest.TestSuite`` replaces each executed entry with ``None`` to free
+    memory, so a suite can no longer be inspected after ``run``. Reporting must
+    use this snapshot, otherwise every result (including failures) is lost and
+    the report itself raises instead of recording the run.
+    """
+    return [test.id() for test in flatten(suite)]
+
+
+def result_entries(result, scheduled_ids):
     failures = {test.id(): detail for test, detail in result.failures}
     errors = {test.id(): detail for test, detail in result.errors}
     skipped = {test.id(): reason for test, reason in result.skipped}
     expected = {test.id(): detail for test, detail in result.expectedFailures}
     unexpected = {test.id(): detail for test, detail in result.unexpectedSuccesses}
     entries = []
-    for test in flatten(suite):
-        test_id = test.id()
+    for test_id in scheduled_ids:
         if test_id in failures:
             status, detail = "failure", failures[test_id]
         elif test_id in errors:
@@ -193,10 +228,10 @@ def result_entries(result, suite):
     return entries
 
 
-def build_report(result, suite, binary, binary_sha256):
-    entries = result_entries(result, suite) if result is not None else []
+def build_report(result, scheduled_ids, binary, binary_sha256):
+    entries = result_entries(result, scheduled_ids) if result is not None else []
     counts = Counter(entry["status"] for entry in entries)
-    total_scheduled = suite.countTestCases()
+    total_scheduled = len(scheduled_ids)
     passed = (
         result is not None
         and result.wasSuccessful()
@@ -223,6 +258,41 @@ def build_report(result, suite, binary, binary_sha256):
             "Loopback functional timings are not a scalability benchmark.",
         ],
     }
+
+
+class _SyntheticReportTests(unittest.TestCase):
+    """Fixed outcomes used only by the report unit; not selected natively."""
+
+    def synthetic_pass(self):
+        self.assertTrue(True)
+
+    def synthetic_fail(self):
+        self.fail("intentional failure for report coverage")
+
+
+class ReportUnitTests(unittest.TestCase):
+    def test_report_records_every_outcome_after_suite_consumption(self):
+        suite = unittest.TestSuite(
+            [_SyntheticReportTests("synthetic_pass"), _SyntheticReportTests("synthetic_fail")]
+        )
+        scheduled = scheduled_test_ids(suite)
+        self.assertEqual(len(scheduled), 2)
+        stream = io.StringIO()
+        result = unittest.TextTestRunner(
+            stream=stream, verbosity=0, resultclass=TimedTextTestResult
+        ).run(suite)
+        # unittest.TestSuite consumes its entries; this is exactly why the
+        # report needs the pre-run snapshot.
+        self.assertEqual([test for test in flatten(suite)], [None, None])
+        report = build_report(result, scheduled, Path("/nonexistent/rootyard"), "0" * 64)
+        statuses = {entry["name"]: entry["status"] for entry in report["tests"]}
+        self.assertEqual(statuses[scheduled[0]], "success")
+        self.assertEqual(statuses[scheduled[1]], "failure")
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["summary"]["total_scheduled"], 2)
+        self.assertEqual(report["summary"]["tests_run"], 2)
+        self.assertEqual(report["summary"]["failure"], 1)
+        self.assertIn("intentional failure", report["tests"][1]["detail"])
 
 
 class WorkspaceCaptureAcceptance(unittest.TestCase):
@@ -362,23 +432,57 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
                 "AND state='idle in transaction' AND query LIKE '%FROM workspaces%FOR UPDATE%'"
             )
             self.assertEqual(idle, "0", "capture left a workspace row locked while scanning")
+            # The bounded scan must still be in flight; a capture committed
+            # before the fence would make the revision jump legal instead of a
+            # stale-scan test.
+            self.assertEqual(
+                h.sql(
+                    "SELECT count(*) FROM workspace_events WHERE workspace_id='%s' "
+                    "AND kind='external_capture'" % workspace["id"]
+                ),
+                "0",
+                "the bounded scan finished before the revision fence was injected",
+            )
+            # Jump the revision without matching event rows: an artificial,
+            # illegal gap that shadows the race. Metadata-only jumps like this
+            # are reported to public readers as RESYNC_REQUIRED, never hidden.
             h.sql(
                 "UPDATE workspaces SET revision=revision+100 WHERE id='%s'" % workspace["id"]
             )
-            event = wait_event(h, workspace, timeout=30, after=base_revision)
+            watermark = int(
+                h.sql("SELECT revision FROM workspaces WHERE id='%s'" % workspace["id"])
+            )
+            self.assertGreaterEqual(watermark, base_revision + 100)
+            # The API cannot page across the injected gap, so the scan's guarded
+            # commit is asserted against the durable event log.
+            event = wait_durable_capture(h, workspace, after=base_revision, timeout=30)
             self.assertEqual(event["kind"], "external_capture")
             self.assertGreaterEqual(
                 event["revision"],
-                base_revision + 100,
+                watermark,
                 "stale scan overwrote a newer API revision",
             )
-            stale = [
-                item
-                for item in events(h, workspace)
-                if item["kind"] == "external_capture"
-                and base_revision < item["revision"] < base_revision + 100
-            ]
-            self.assertEqual(stale, [], "scan committed an event from before the revision CAS")
+            stale = h.sql(
+                "SELECT count(*) FROM workspace_events WHERE workspace_id='%s' "
+                "AND kind='external_capture' AND revision>%d AND revision<%d"
+                % (workspace["id"], base_revision, base_revision + 100)
+            )
+            self.assertEqual(stale, "0", "scan committed an event from before the revision CAS")
+            # Product gap semantics stay intact: a reader that has not seen the
+            # jumped revisions must be told to resync, not silently continue.
+            resync = json.loads(
+                h.expect(
+                    f"/api/workspaces/{workspace['id']}/events?after_revision={base_revision}",
+                    200,
+                    token=h.alice,
+                )
+            )
+            self.assertEqual(
+                resync.get("kind"),
+                "RESYNC_REQUIRED",
+                "an artificial revision gap was not reported as RESYNC_REQUIRED",
+            )
+            self.assertGreaterEqual(resync.get("snapshot_revision", 0), watermark)
         finally:
             h.cleanup()
 
@@ -420,7 +524,6 @@ def main(argv=None):
     parser.add_argument(
         "--binary",
         type=Path,
-        required=True,
         metavar="PATH",
         help="native rootyard binary to exercise (resolved to an absolute path)",
     )
@@ -431,6 +534,11 @@ def main(argv=None):
         help="optional JSON path for per-test results and the binary SHA-256",
     )
     parser.add_argument("--keep", action="store_true", help="keep disposable test directories")
+    parser.add_argument(
+        "--report-unit",
+        action="store_true",
+        help="run only the in-memory report unit (needs no binary or database)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose unittest output")
     parser.add_argument(
         "tests",
@@ -440,6 +548,13 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    if args.report_unit:
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(ReportUnitTests)
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        return 0 if result.wasSuccessful() else 1
+
+    if args.binary is None:
+        parser.error("--binary is required")
     binary = args.binary.resolve()
     if not binary.is_absolute():
         parser.error(f"--binary did not resolve to an absolute path: {binary}")
@@ -456,7 +571,8 @@ def main(argv=None):
     binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
     loader = unittest.TestLoader()
     suite = selected_suite(loader, args.tests, sys.modules[__name__])
-    if suite.countTestCases() == 0:
+    scheduled_ids = scheduled_test_ids(suite)
+    if not scheduled_ids:
         parser.error("no tests selected")
 
     result = None
@@ -467,7 +583,7 @@ def main(argv=None):
         )
         result = runner.run(suite)
     finally:
-        report = build_report(result, suite, binary, binary_sha256)
+        report = build_report(result, scheduled_ids, binary, binary_sha256)
         if args.report:
             args.report.parent.mkdir(parents=True, exist_ok=True)
             args.report.write_text(json.dumps(report, indent=2) + "\n")

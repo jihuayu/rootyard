@@ -284,7 +284,13 @@ async fn run() -> Result<()> {
             let maintenance_task = maintenance_policy
                 .enabled
                 .then(|| tokio::spawn(rootyard::storage_lifecycle::run(state.clone(), maintenance_stop.clone())));
+            // A disconnected client must not cancel a started workspace Git
+            // mutation: owned jobs finish under the normal Git deadline
+            // before the runtime exits. \`router\` consumes the state Arc, so
+            // the drain grace is computed before serving.
+            let git_shutdown_grace = state.config.git_timeout + std::time::Duration::from_secs(30);
             axum::serve(listener, rootyard::router(state)).with_graceful_shutdown(shutdown()).await?;
+            rootyard::workspaces::drain_git_jobs(git_shutdown_grace).await;
             worker.abort();
             maintenance_stop.cancel();
             workspace_capture_stop.cancel();

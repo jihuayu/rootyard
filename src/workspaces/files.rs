@@ -18,6 +18,7 @@ use std::{
     path::{Path as FsPath, PathBuf},
     sync::Arc,
 };
+use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
 fn safe_path(raw: &str) -> Result<PathBuf, Error> {
@@ -185,12 +186,42 @@ pub async fn put(
     Ok(Json(result))
 }
 
+/// `POST /api/workspaces/{id}/git`: reserve capacity, then hand the *entire*
+/// mutation to an owned job. A caller disconnect drops only the response
+/// future; the job keeps its permit, row lock and child process until the
+/// bounded Git deadline and commit finish. The client response is then unknown
+/// and must be retried with the same `Idempotency-Key`, which replays the
+/// committed result instead of repeating the mutation.
 pub async fn git(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
     Json(input): Json<GitAction>,
 ) -> Result<Json<Value>, Error> {
+    // Taken before the job is spawned and before any DB transaction or row
+    // lock, so a full Git capacity is a retryable 503 without side effects.
+    let permit = super::git::try_slot(&state)?;
+    let response = super::git::spawn_job(git_mutation(state, headers, id, input, permit));
+    match response.await {
+        Ok(result) => result.map(Json),
+        // The sender disappears only on panic or an aborted job; never report
+        // the mutation as failed, because Git may already have changed the index.
+        Err(_) => Err(Error::internal("owned workspace Git job ended without a result")),
+    }
+}
+
+/// Owned workspace Git mutation. Authentication, the DB client and transaction,
+/// the row lock, lease checks, the child process and the fingerprint/event/
+/// idempotency commit all happen here so none of them can be cancelled
+/// half-way by a disconnected client future.
+async fn git_mutation(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    id: Uuid,
+    input: GitAction,
+    permit: OwnedSemaphorePermit,
+) -> Result<Value, Error> {
+    let _permit = permit;
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let key = auth::idempotency_key(&headers)?.ok_or_else(Error::bad_request)?.to_owned();
     let request_hash = hex::encode(Sha256::digest(
@@ -218,7 +249,7 @@ pub async fn git(
             return Err(service::conflict());
         }
         if row.get::<_, String>(1) == "committed" {
-            return Ok(Json(row.get(2)));
+            return Ok(row.get(2));
         }
         return Err(service::conflict());
     }
@@ -249,7 +280,9 @@ pub async fn git(
         _ => return Err(Error::bad_request()),
     };
     args.extend(paths.iter().map(String::as_str));
-    let output = service::git(&state, &service::workspace_repo(&state, id), &args, 64 * 1024).await?;
+    let output =
+        super::git::run_in_job(&service::workspace_repo(&state, id), &args, 64 * 1024, state.config.git_timeout)
+            .await?;
     let revision = ws.revision + 1;
     let generation = ws.git_generation + 1;
     let result = json!({"action":input.action,"workspace_revision":revision,"git_generation":generation,"output_base64":STANDARD.encode(output)});
@@ -263,5 +296,5 @@ pub async fn git(
     tx.execute("INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) VALUES($1,$2,$3,$4,'git','committed',$5)", &[&Uuid::new_v4(),&id,&key,&request_hash,&result]).await.map_err(Error::internal)?;
     super::capture::record_current(&tx, &state, id).await?;
     tx.commit().await.map_err(Error::internal)?;
-    Ok(Json(result))
+    Ok(result)
 }

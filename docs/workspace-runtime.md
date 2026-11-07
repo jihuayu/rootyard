@@ -63,6 +63,24 @@ native Git wrapper that reuses the GitFS collector: stdout is capped per call
 discarded, the command runs in its own process group, and the shared Git
 timeout applies. A timed-out or cancelled command kills the whole process group
 before the caller continues, so no descendant outlives the request.
+
+Reads and mutations take one owned `git_slots` permit before the child is
+spawned, so a full capacity is a retryable 503 instead of unbounded spawning.
+Mutations additionally hand the *entire* operation to an owned Tokio job:
+authentication, transaction, `FOR UPDATE` row lock, lease checks, the Git
+child, and the fingerprint/event/idempotency commit. A client disconnect drops
+only the response future; the job keeps its permit, row lock and child until
+the normal Git deadline and commit finish. The response is then unknown and a
+retry must reuse the same `Idempotency-Key`, which replays the committed result
+instead of repeating the mutation. Completed jobs are pruned on admission and
+graceful HTTP shutdown joins every owned job before the runtime exits. The
+shutdown grace duration is only a warning threshold: the process keeps waiting
+for owned jobs rather than aborting them, because aborting would drop a live
+child into the collector's process-group kill and could leave a real
+`.git/index.lock` behind. An operator force-kill (`SIGKILL`) or a power loss is
+outside that graceful guarantee. Nothing unlinks
+`.git/index.lock`: a lock this process did not create stays untouched and the
+mutation fails cleanly rather than deleting another writer's lock.
 Lease handoff rejects active sandbox jobs, and sandbox admission and execution
 are bound to a persisted lease epoch. A running job is cancelled when its lease
 or database authority disappears. Database lease changes are reflected in the
