@@ -33,7 +33,9 @@ class WebTrack1ContractTest(unittest.TestCase):
             100,
             f"src/web.rs must remain < 100 lines, got {len(web_lines)}",
         )
-        self.assertIn("pub fn routes() -> Router<Arc<AppState>>", web_src)
+        self.assertIn("pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>>", web_src)
+        self.assertIn("from_fn_with_state(state, session::middleware)", web_src)
+        self.assertIn(".merge(web::routes(state.clone()))", (ROOT / "src/lib.rs").read_text())
 
         for sql_kw in ("SELECT ", "INSERT ", "UPDATE ", "DELETE "):
             self.assertNotIn(
@@ -72,7 +74,21 @@ class WebTrack1ContractTest(unittest.TestCase):
         web_rs = ROOT / "src/web.rs"
         web_src = web_rs.read_text(encoding="utf-8")
         regs = t5._extract_route_registrations(web_rs)
-        self.assertEqual(len(regs), 38, f"Expected 38 route registrations (19 /web + 19 /ui), got {len(regs)}")
+        self.assertEqual(len(regs), 42, f"Expected 19 repository pairs and 4 session routes, got {len(regs)}")
+        session_routes = {path: set(methods) for path, methods in regs if not path.startswith(("/web/repos/", "/ui/repos/"))}
+        self.assertEqual(session_routes, {
+            "/web/login": {"GET", "POST"},
+            "/web/app.js": {"GET"},
+            "/web/logout": {"POST"},
+            "/web/repos": {"GET"},
+        })
+        repository_pairs = []
+        for prefix in ("/web", "/ui"):
+            routes = {path.removeprefix(prefix): set(methods) for path, methods in regs
+                      if path.startswith(prefix + "/repos/")}
+            self.assertEqual(len(routes), 19)
+            repository_pairs.append(routes)
+        self.assertEqual(*repository_pairs, "Web/UI repository routes and methods must agree")
 
         # Verify e2e_tiers route_block_re matches every route in src/web.rs
         route_block_re = re.compile(
