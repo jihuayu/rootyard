@@ -2,11 +2,11 @@
 //! orchestration (`on_pull_synchronized`), and SSRF-safe HTTP/1.1 delivery with exponential backoff.
 use crate::{
     AppState, Error, ci_pins, db, events, git_http, journal,
-    pulls::models::{PULL_FIELDS, PullRequest, resolve_ref_oid},
+    pulls::models::{PullRequest, resolve_ref_oid},
     reliability,
     webhooks::{
         claims,
-        models::{DELIVERY_FIELDS, WebhookDelivery, ensure_schema},
+        models::{WebhookDelivery, ensure_schema},
         signing::{build_delivery_headers, send_http11_webhook, signature_header},
     },
 };
@@ -88,181 +88,10 @@ pub fn pull_ci_job_id(repository_id: Uuid, pull_number: i64, head_oid: &str, sto
     Uuid::from_bytes(bytes)
 }
 
-#[rustfmt::skip]
-pub async fn enqueue_webhook_delivery(
-    client: &tokio_postgres::Client,
-    tenant_id: Uuid,
-    repository_id: Uuid,
-    webhook_id: Uuid,
-    secret: &str,
-    max_attempts: i64,
-    event_id: &str,
-    event_type: &str,
-    payload: &Value,
-) -> Result<Option<WebhookDelivery>, Error> {
-    let delivery_id = Uuid::new_v4();
-    let payload_bytes = serde_json::to_vec(payload).map_err(Error::internal)?;
-    let sig = signature_header(secret, &payload_bytes);
-    let req_headers = build_delivery_headers(event_type, delivery_id, webhook_id, 1, &sig);
-    let sql = format!(
-        "INSERT INTO forge_webhook_deliveries \
-         (id,webhook_id,tenant_id,repository_id,sequence,event_id,event_type,payload,request_headers,signature_256,state,attempts,max_attempts,next_attempt_unix) \
-         VALUES ($1,$2,$3,$4,(SELECT COALESCE(MAX(sequence), 0) + 1 FROM forge_webhook_deliveries),$5,$6,$7,$8,$9,'pending',0,$10,0) \
-         ON CONFLICT (webhook_id, event_id) DO NOTHING RETURNING {DELIVERY_FIELDS}"
-    );
-    let row = client
-        .query_opt(&sql, &[&delivery_id, &webhook_id, &tenant_id, &repository_id, &event_id, &event_type, payload, &req_headers, &sig, &max_attempts])
-        .await
-        .map_err(Error::internal)?;
-    Ok(row.as_ref().map(WebhookDelivery::row))
-}
-
-/// Scans `outbox_events` (excluding `refs/rootyard-ci/*`) and enqueues signed `push` deliveries.
-#[rustfmt::skip]
-pub async fn sync_outbox_events(
-    state: &AppState,
-    tenant_id: Uuid,
-    repository_id: Uuid,
-) -> Result<usize, Error> {
-    ensure_schema(&state.pool).await?;
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let hooks = client
-        .query("SELECT id, secret, max_attempts, events FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND active=true ORDER BY created_at ASC, id ASC", &[&tenant_id, &repository_id])
-        .await
-        .map_err(Error::internal)?;
-    if hooks.is_empty() {
-        return Ok(0);
-    }
-
-    let outbox_rows = client
-        .query(
-            "SELECT e.event_id, e.operation_id, e.storage_generation, e.ref_name, e.old_oid, e.new_oid \
-             FROM outbox_events e JOIN git_operations o ON o.id = e.operation_id \
-             WHERE e.repository_id=$1 AND o.outcome <> 'unknown' AND e.ref_name NOT LIKE 'refs/rootyard-ci/%' \
-               AND EXISTS ( \
-                 SELECT 1 FROM forge_webhooks w \
-                 WHERE w.repository_id=e.repository_id AND w.active=true AND w.events ? 'push' \
-                   AND NOT EXISTS (SELECT 1 FROM forge_webhook_deliveries d \
-                                   WHERE d.webhook_id=w.id AND d.event_id='outbox:' || e.event_id) \
-               ) \
-             ORDER BY e.operation_sequence ASC, e.transaction_sequence ASC LIMIT 200",
-            &[&repository_id],
-        )
-        .await
-        .map_err(Error::internal)?;
-
-    let mut enqueued = 0usize;
-    for ev in &outbox_rows {
-        let raw_event_id: String = ev.get("event_id");
-        let ref_name: String = ev.get("ref_name");
-        if ci_pins::reserved(&ref_name) {
-            continue;
-        }
-        let delivery_event_id = format!("outbox:{raw_event_id}");
-        let payload = json!({
-            "event": "push", "event_id": raw_event_id,
-            "operation_id": ev.get::<_, Uuid>("operation_id"), "repository_id": repository_id,
-            "storage_generation": ev.get::<_, i64>("storage_generation"), "ref_name": ref_name,
-            "old_oid": ev.get::<_, String>("old_oid"), "new_oid": ev.get::<_, String>("new_oid"),
-        });
-        for hook in &hooks {
-            let subscribed = hook.get::<_, Value>("events").as_array().is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("push")));
-            if subscribed
-                && enqueue_webhook_delivery(&client, tenant_id, repository_id, hook.get("id"), &hook.get::<_, String>("secret"), hook.get("max_attempts"), &delivery_event_id, "push", &payload)
-                    .await?
-                    .is_some()
-            {
-                enqueued += 1;
-            }
-        }
-    }
-    Ok(enqueued)
-}
-
-/// Bounded background backfill for missing `(outbox event, active push hook)`
-/// pairs. Unlike the manual `LIMIT 200` event scan above, this selects pairs in
-/// one anti-join, so memory follows `pair_limit` instead of the number of active
-/// hooks. Each call inserts at most one page; inserted pairs disappear from the
-/// next anti-join, so durable replay advances through a backlog. The pool's
-/// 5 s statement timeout bounds the SELECT and each INSERT, while `deadline`
-/// stops the loop between pairs.
-#[rustfmt::skip]
-pub(crate) async fn sync_outbox_events_bounded(
-    state: &AppState,
-    tenant_id: Uuid,
-    repository_id: Uuid,
-    pair_limit: i64,
-    deadline: tokio::time::Instant,
-) -> Result<usize, Error> {
-    if tokio::time::Instant::now() >= deadline {
-        return Ok(0);
-    }
-    ensure_schema(&state.pool).await?;
-    if tokio::time::Instant::now() >= deadline {
-        return Ok(0);
-    }
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let pairs = client
-        .query(
-            "SELECT e.event_id, e.operation_id, e.storage_generation, e.ref_name, e.old_oid, e.new_oid, \
-                    w.id AS webhook_id, w.secret, w.max_attempts \
-             FROM outbox_events e \
-             JOIN git_operations o ON o.id = e.operation_id \
-             JOIN forge_webhooks w ON w.repository_id = e.repository_id \
-               AND w.tenant_id = $1 AND w.active = true AND w.events ? 'push' \
-             WHERE e.repository_id = $2 AND o.outcome <> 'unknown' \
-               AND e.ref_name <> 'refs/rootyard-ci' \
-               AND e.ref_name NOT LIKE 'refs/rootyard-ci/%' \
-               AND NOT EXISTS (SELECT 1 FROM forge_webhook_deliveries d \
-                               WHERE d.webhook_id = w.id AND d.event_id = 'outbox:' || e.event_id) \
-             ORDER BY e.operation_sequence ASC, e.transaction_sequence ASC, w.created_at ASC, w.id ASC \
-             LIMIT $3",
-            &[&tenant_id, &repository_id, &pair_limit],
-        )
-        .await
-        .map_err(Error::internal)?;
-
-    let mut enqueued = 0usize;
-    let mut first_error: Option<Error> = None;
-    for ev in &pairs {
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        let raw_event_id: String = ev.get("event_id");
-        let ref_name: String = ev.get("ref_name");
-        if ci_pins::reserved(&ref_name) {
-            continue;
-        }
-        let delivery_event_id = format!("outbox:{raw_event_id}");
-        let payload = json!({
-            "event": "push", "event_id": raw_event_id,
-            "operation_id": ev.get::<_, Uuid>("operation_id"), "repository_id": repository_id,
-            "storage_generation": ev.get::<_, i64>("storage_generation"), "ref_name": ref_name,
-            "old_oid": ev.get::<_, String>("old_oid"), "new_oid": ev.get::<_, String>("new_oid"),
-        });
-        match enqueue_webhook_delivery(
-            &client, tenant_id, repository_id, ev.get("webhook_id"),
-            &ev.get::<_, String>("secret"), ev.get("max_attempts"),
-            &delivery_event_id, "push", &payload,
-        )
-        .await
-        {
-            Ok(Some(_)) => enqueued += 1,
-            Ok(None) => {}
-            // One bad pair must not discard the rest of the bounded page. It
-            // stays selected for a later round, while successful pairs advance.
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(enqueued),
-    }
-}
+// The allocator and outbox scans live in `ingestion`; these facade exports keep
+// the existing delivery API for handlers, background scheduling and callers.
+pub(crate) use crate::webhooks::ingestion::sync_outbox_events_bounded;
+pub use crate::webhooks::ingestion::{enqueue_webhook_delivery, sync_outbox_events, sync_pull_events};
 
 #[rustfmt::skip]
 pub(crate) async fn ensure_pull_ci_pin(
@@ -396,7 +225,7 @@ pub async fn on_pull_synchronized(
         format!("refs/rootyard-ci/jobs/{job_id}")
     };
 
-    let client = state.pool.get().await.map_err(Error::internal)?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
     let mut contexts: Vec<String> = Vec::new();
     if let Some(rule_row) = client
         .query_opt("SELECT required_checks FROM forge_branch_rules WHERE tenant_id=$1 AND repository_id=$2 AND branch_ref=$3", &[&tenant_id, &repository_id, &pull.base_ref])
@@ -474,7 +303,7 @@ pub async fn on_pull_synchronized(
     for hook in &hooks {
         let subscribed = hook.get::<_, Value>("events").as_array().is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("pull_request")));
         if subscribed
-            && enqueue_webhook_delivery(&client, tenant_id, repository_id, hook.get("id"), &hook.get::<_, String>("secret"), hook.get("max_attempts"), &delivery_event_id, "pull_request", &payload)
+            && enqueue_webhook_delivery(&mut client, tenant_id, repository_id, hook.get("id"), &hook.get::<_, String>("secret"), hook.get("max_attempts"), &delivery_event_id, "pull_request", &payload)
                 .await?
                 .is_some()
         {
@@ -503,29 +332,6 @@ pub async fn orchestrate_pull_ci(
     action: &str,
 ) -> Result<PullCiOrchestration, Error> {
     on_pull_synchronized(state, repository_id, pull, action).await
-}
-
-#[rustfmt::skip]
-pub async fn sync_pull_events(
-    state: &AppState,
-    tenant_id: Uuid,
-    repository_id: Uuid,
-) -> Result<Vec<PullCiOrchestration>, Error> {
-    ensure_schema(&state.pool).await?;
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let pull_rows = client
-        .query(&format!("SELECT {PULL_FIELDS} FROM forge_pulls WHERE tenant_id=$1 AND repository_id=$2 AND state='open' ORDER BY number ASC"), &[&tenant_id, &repository_id])
-        .await
-        .map_err(Error::internal)?;
-    drop(client);
-
-    let mut results = Vec::with_capacity(pull_rows.len());
-    for row in &pull_rows {
-        let pull = PullRequest::row(row);
-        let action = if pull.version <= 1 { "opened" } else { "synchronize" };
-        results.push(on_pull_synchronized(state, repository_id, &pull, action).await?);
-    }
-    Ok(results)
 }
 
 #[rustfmt::skip]

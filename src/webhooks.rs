@@ -4,6 +4,7 @@ pub(crate) mod claimed;
 pub mod claims;
 pub mod delivery;
 pub mod handlers;
+pub mod ingestion;
 pub mod mirrors;
 pub mod models;
 pub mod policy;

@@ -138,7 +138,7 @@ class WebhooksTrackAContractTest(unittest.TestCase):
             self.assertNotIn(sql_kw, src, f"src/webhooks.rs must not contain inline SQL ({sql_kw})")
         self.assertNotIn("Command::new", src, "src/webhooks.rs must not spawn subprocesses directly")
 
-        submodules = ("models", "signing", "delivery", "handlers")
+        submodules = ("models", "signing", "delivery", "handlers", "ingestion")
         for sub in submodules:
             self.assertIn(f"pub mod {sub};", src)
             sub_path = ROOT / "src/webhooks" / f"{sub}.rs"
@@ -149,11 +149,18 @@ class WebhooksTrackAContractTest(unittest.TestCase):
                 50,
                 f"src/webhooks/{sub}.rs must be > 50 lines (got {len(sub_lines)})",
             )
-            self.assertLess(
-                len(sub_lines),
-                550,
-                f"src/webhooks/{sub}.rs must be < 550 lines (got {len(sub_lines)})",
-            )
+            if sub == "ingestion":
+                self.assertLessEqual(
+                    len(sub_lines),
+                    500,
+                    f"src/webhooks/{sub}.rs must stay <= 500 lines (got {len(sub_lines)})",
+                )
+            else:
+                self.assertLess(
+                    len(sub_lines),
+                    550,
+                    f"src/webhooks/{sub}.rs must be < 550 lines (got {len(sub_lines)})",
+                )
 
         expected_routes = {
             "/api/repos/{owner}/{name}/webhooks": ["GET", "POST"],
@@ -165,6 +172,12 @@ class WebhooksTrackAContractTest(unittest.TestCase):
             "/api/repos/{owner}/{name}/webhooks/{hook_id}/deliveries/{delivery_id}": ["GET"],
             "/api/repos/{owner}/{name}/webhooks/{hook_id}/deliveries/{delivery_id}/retry": ["POST"],
             "/api/repos/{owner}/{name}/integrations/{hook_id}/check-runs": ["POST"],
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/trusted-contexts": ["PUT", "DELETE"],
+            "/api/repos/{owner}/{name}/ci-source-grants/{hook_id}": ["PUT", "DELETE"],
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/claim": ["POST"],
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/report": ["POST"],
+            "/api/repos/{owner}/{name}/integrations/{hook_id}/runs/{run_id}/heartbeat": ["POST"],
+            "/api/repos/{owner}/{name}/ci-mirrors/{mirror_id}/heartbeat": ["POST"],
         }
         extracted = dict(t5._extract_route_registrations(webhooks_rs))
         self.assertEqual(extracted, expected_routes)
@@ -230,6 +243,7 @@ class WebhooksTrackAContractTest(unittest.TestCase):
         signing_src = (ROOT / "src/webhooks/signing.rs").read_text(encoding="utf-8")
         delivery_src = (ROOT / "src/webhooks/delivery.rs").read_text(encoding="utf-8")
         handlers_src = (ROOT / "src/webhooks/handlers.rs").read_text(encoding="utf-8")
+        ingestion_src = (ROOT / "src/webhooks/ingestion.rs").read_text(encoding="utf-8")
 
         self.assertGreaterEqual(models_src.count("#[serde(deny_unknown_fields)]"), 8)
         self.assertIn("#[cfg(test)]", models_src)
@@ -242,28 +256,69 @@ class WebhooksTrackAContractTest(unittest.TestCase):
             "finish(",
             "idempotency_key",
             "tokio::spawn",
-            "verify_signature_header",
         ):
             self.assertIn(token, handlers_src, f"handlers.rs missing required token: {token}")
+        self.assertIn("verify_signature_header", ingestion_src,
+                      "ingestion.rs must keep CI callback signature verification")
 
+        # These are the actual guards after the #72 read-lease/publication
+        # refactor; the old write_lock()/before_push()/begin() spellings no
+        # longer exist. Permission, reliability and claims fencing stay required.
         for token in (
             "pub async fn on_pull_synchronized(",
             "pub async fn orchestrate_pull_ci(",
-            "pub async fn sync_outbox_events(",
+            "sync_outbox_events",
             "pub fn backoff_delay_seconds(",
             "git_slots",
-            "write_lock(",
-            "reliability::before_push(",
+            "ref_publication::acquire(",
+            "publication.enter_window(",
+            "reliability::ensure_gitfs_current(",
+            "reliability::before_gitfs_push(",
+            "claims::claim(",
+            "claims::complete(",
             "core.hooksPath=/dev/null",
             "update-ref",
             "--no-deref",
-            "journal::begin(",
+            "journal::begin_ci_service(",
             "journal::finish(",
             "events::publish(",
             "state.dispatch.committed()",
             "journal::retire(",
         ):
             self.assertIn(token, delivery_src, f"delivery.rs missing required token: {token}")
+
+        # The allocator transaction, per-hook index-backed maximum and event
+        # idempotency live in the extracted ingestion module.
+        for token in (
+            "build_transaction()",
+            "IsolationLevel::ReadCommitted",
+            "FOR UPDATE",
+            "ORDER BY sequence DESC LIMIT 1",
+            "ON CONFLICT (webhook_id, event_id) DO NOTHING",
+            "checked_add(1)",
+            "Error::not_found()",
+        ):
+            self.assertIn(token, ingestion_src, f"ingestion.rs missing required token: {token}")
+
+        # Cursor and legacy after share one composite SQL predicate. The cursor
+        # is taken from the last returned row, not the limit+1 probe.
+        self.assertIn("pub struct DeliveryCursor", models_src)
+        self.assertIn("deny_unknown_fields", models_src)
+        for token in ("(sequence, id) > ($4, $5)", "ORDER BY sequence ASC, id ASC", "next_cursor"):
+            self.assertIn(token, handlers_src, f"handlers.rs missing cursor token: {token}")
+
+        self.assertIn("IsolationLevel::ReadCommitted", ingestion_src)
+        native = (ROOT / "tests/webhook_pagination.py").read_text(encoding="utf-8")
+        for token in (
+            "--binary",
+            "--report",
+            "held_transaction",
+            "wait_for_allocator_lock",
+            "EXPLAIN",
+            "next_cursor",
+
+        ):
+            self.assertIn(token, native, f"native pagination evidence missing token: {token}")
 
     def test_rfc2104_hmac_sha256_vectors_and_constant_time_verification(self):
         # Verify RFC 4231 vectors match both Python stdlib hmac and our block-level implementation.

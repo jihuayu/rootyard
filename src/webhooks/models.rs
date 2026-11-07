@@ -223,6 +223,8 @@ pub struct DeliveriesQuery {
     #[serde(default)]
     pub after: Option<i64>,
     #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
     pub limit: Option<i64>,
     #[serde(default)]
     pub state: Option<String>,
@@ -230,7 +232,67 @@ pub struct DeliveriesQuery {
     pub event_type: Option<String>,
 }
 
+/// Opaque, hook-bound `(sequence, id)` cursor. Version and field count are
+/// strict: unknown versions, extra fields, non-positive sequences and malformed
+/// UUIDs are rejected. The legacy numeric `after` path remains accepted but is
+/// lossy for historic duplicate sequence values; clients wanting every tied ID
+/// exactly once should follow `next_cursor` instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliveryCursor {
+    pub hook_id: Uuid,
+    pub sequence: i64,
+    pub id: Uuid,
+}
+
+impl DeliveryCursor {
+    const VERSION: &'static str = "v1";
+    const MAX_BYTES: usize = 160;
+
+    pub fn encode(self) -> String {
+        format!("{}.{}.{}.{}", Self::VERSION, self.hook_id, self.sequence, self.id)
+    }
+
+    pub fn parse(raw: &str, hook_id: Uuid) -> Result<Self, Error> {
+        if raw.is_empty() || raw.len() > Self::MAX_BYTES || raw.bytes().any(|b| b <= 32 || b == 127) {
+            return Err(Error::bad_request());
+        }
+        let mut parts = raw.split('.');
+        if parts.next() != Some(Self::VERSION) {
+            return Err(Error::bad_request());
+        }
+        let (Some(hook), Some(sequence), Some(id), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(Error::bad_request());
+        };
+        let parsed_hook = Uuid::parse_str(hook).map_err(|_| Error::bad_request())?;
+        if parsed_hook != hook_id || parsed_hook.is_nil() {
+            return Err(Error::bad_request());
+        }
+        if sequence.is_empty() || !sequence.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::bad_request());
+        }
+        let sequence: i64 = sequence.parse().map_err(|_| Error::bad_request())?;
+        if sequence <= 0 {
+            return Err(Error::bad_request());
+        }
+        let id = Uuid::parse_str(id).map_err(|_| Error::bad_request())?;
+        if id.is_nil() {
+            return Err(Error::bad_request());
+        }
+        Ok(Self { hook_id, sequence, id })
+    }
+}
+
 impl DeliveriesQuery {
+    /// `after` and `cursor` describe the same position and cannot be combined.
+    pub fn cursor(&self, hook_id: Uuid) -> Result<Option<DeliveryCursor>, Error> {
+        match (&self.cursor, &self.after) {
+            (Some(_), Some(_)) => Err(Error::bad_request()),
+            (Some(raw), None) => DeliveryCursor::parse(raw, hook_id).map(Some),
+            (None, _) => Ok(None),
+        }
+    }
+
     pub fn bounds(&self) -> Result<(i64, i64), Error> {
         let after = self.after.unwrap_or(0);
         let limit = self.limit.unwrap_or(50);
