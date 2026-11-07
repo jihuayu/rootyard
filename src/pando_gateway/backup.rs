@@ -4,7 +4,7 @@ use super::{
     pack_store::{ArtifactReceipt, PackManifest},
     retention,
 };
-use crate::storage::remote_objects::{ObjectKey, RemoteObjectStore};
+use crate::storage::remote_objects::RemoteObjectStore;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -169,7 +169,8 @@ async fn import_artifact<C: GenericClient + Sync>(
 ) -> Result<()> {
     valid_artifact(artifact)?;
     let (cipher_slot, envelope_slot) =
-        retention::reserve_pair(client, tenant_id, &artifact.ciphertext_sha256, &artifact.envelope_sha256).await?;
+        retention::reserve_pair(client, tenant_id, None, &artifact.ciphertext_sha256, &artifact.envelope_sha256)
+            .await?;
     for (slot, namespace, sha, size) in [
         (&cipher_slot, retention::NAMESPACE_CIPHER, artifact.ciphertext_sha256.as_str(), artifact.ciphertext_bytes),
         (&envelope_slot, retention::NAMESPACE_ENVELOPE, artifact.envelope_sha256.as_str(), artifact.envelope_bytes),

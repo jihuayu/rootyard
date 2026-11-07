@@ -17,6 +17,7 @@ use uuid::Uuid;
 pub const NAMESPACE_CIPHER: &str = "pando-cipher";
 pub const NAMESPACE_ENVELOPE: &str = "pando-envelope";
 const RESERVATION_SECONDS: i64 = 300;
+const PENDING_PUBLICATION_SECONDS: i64 = 3600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Authority {
@@ -54,15 +55,22 @@ pub async fn authority<C: GenericClient + Sync>(client: &C) -> Result<Authority>
 pub async fn reserve_pair<C: GenericClient + Sync>(
     client: &C,
     tenant_id: Uuid,
+    publication: Option<Uuid>,
     ciphertext_sha256: &str,
     envelope_sha256: &str,
 ) -> Result<(Slot, Slot)> {
-    let cipher = reserve(client, tenant_id, NAMESPACE_CIPHER, ciphertext_sha256).await?;
-    let envelope = reserve(client, tenant_id, NAMESPACE_ENVELOPE, envelope_sha256).await?;
+    let cipher = reserve(client, tenant_id, publication, NAMESPACE_CIPHER, ciphertext_sha256).await?;
+    let envelope = reserve(client, tenant_id, publication, NAMESPACE_ENVELOPE, envelope_sha256).await?;
     Ok((cipher, envelope))
 }
 
-async fn reserve<C: GenericClient + Sync>(client: &C, tenant_id: Uuid, namespace: &str, sha256: &str) -> Result<Slot> {
+async fn reserve<C: GenericClient + Sync>(
+    client: &C,
+    tenant_id: Uuid,
+    publication: Option<Uuid>,
+    namespace: &str,
+    sha256: &str,
+) -> Result<Slot> {
     // Serialize reservations for this authority for the duration of the tx.
     let auth = client
         .query_one("SELECT authority_id,generation FROM pando_storage_authorities WHERE singleton FOR UPDATE", &[])
@@ -82,6 +90,9 @@ async fn reserve<C: GenericClient + Sync>(client: &C, tenant_id: Uuid, namespace
         let state: String = row.get(0);
         let object_generation: i64 = row.get(1);
         if state == "active" {
+            if let Some(manifest_id) = publication {
+                fence_publication(client, manifest_id, authority_id, tenant_id, namespace, sha256).await?;
+            }
             return Ok(Slot::Reuse(ObjectKey::scoped(tenant_id, authority_id, object_generation, namespace, sha256)?));
         }
     }
@@ -104,7 +115,7 @@ async fn reserve<C: GenericClient + Sync>(client: &C, tenant_id: Uuid, namespace
     client
         .execute(
             "INSERT INTO pando_remote_artifacts(authority_id,tenant_id,namespace,sha256,object_generation,remote_path,state,reserved_owner,lease_until) \
-             VALUES($1,$2,$3,$4,$5,$6,'reserved',$7,clock_timestamp()+make_interval(secs=>$8)) \
+             VALUES($1,$2,$3,$4,$5,$6,'reserved',$7,clock_timestamp()+make_interval(secs=>($8::bigint)::double precision)) \
              ON CONFLICT(authority_id,tenant_id,namespace,sha256) DO UPDATE SET \
                  object_generation=EXCLUDED.object_generation,remote_path=EXCLUDED.remote_path,state='reserved', \
                  reserved_owner=EXCLUDED.reserved_owner,lease_until=EXCLUDED.lease_until,claimed_by=NULL, \
@@ -121,7 +132,29 @@ async fn reserve<C: GenericClient + Sync>(client: &C, tenant_id: Uuid, namespace
             ],
         )
         .await?;
+    if let Some(manifest_id) = publication {
+        fence_publication(client, manifest_id, authority_id, tenant_id, namespace, sha256).await?;
+    }
     Ok(Slot::Reserved { key, owner })
+}
+
+/// Durable pending-publication root: the closure is protected from reservation
+/// commit until the serving CAS deletes this fence or the bounded lease expires.
+async fn fence_publication<C: GenericClient + Sync>(
+    client: &C,
+    manifest_id: Uuid,
+    authority_id: Uuid,
+    tenant_id: Uuid,
+    namespace: &str,
+    sha256: &str,
+) -> Result<()> {
+    client
+        .execute(
+            "INSERT INTO pando_publication_fences(manifest_id,authority_id,tenant_id,namespace,sha256,lease_until)              VALUES($1,$2,$3,$4,$5,clock_timestamp()+make_interval(secs=>($6::bigint)::double precision))              ON CONFLICT(manifest_id,namespace,sha256) DO UPDATE SET                lease_until=GREATEST(pando_publication_fences.lease_until,EXCLUDED.lease_until)",
+            &[&manifest_id, &authority_id, &tenant_id, &namespace, &sha256, &PENDING_PUBLICATION_SECONDS],
+        )
+        .await?;
+    Ok(())
 }
 
 /// Mark a previously uploaded reservation active. Returns false when another
@@ -134,6 +167,21 @@ pub async fn activate<C: GenericClient + Sync>(
     size: u64,
     slot: &Slot,
 ) -> Result<bool> {
+    if let Slot::Reuse(key) = slot {
+        let Some((authority_id, _generation)) = key.authority else {
+            anyhow::bail!("reused artifact lost its authority scope");
+        };
+        // Only a still-active row may be acknowledged. A concurrent mark that
+        // retired this address forces a fresh generation and re-upload instead
+        // of publishing a path a deleter may already own.
+        let active = client
+            .query_opt(
+                "SELECT 1 FROM pando_remote_artifacts WHERE authority_id=$1 AND tenant_id=$2                  AND namespace=$3 AND sha256=$4 AND state='active' FOR SHARE",
+                &[&authority_id, &tenant_id, &namespace, &sha256],
+            )
+            .await?;
+        return Ok(active.is_some());
+    }
     let Slot::Reserved { key, owner } = slot else { return Ok(true) };
     let Some((authority_id, generation)) = key.authority else {
         anyhow::bail!("reserved artifact lost its authority scope");
@@ -226,18 +274,18 @@ pub async fn resolve_artifact<C: GenericClient + Sync>(
 /// bucket could delete each other's bytes. Called before the serving closure is
 /// re-imported under the fresh authority.
 pub async fn reset_authority(client: &mut tokio_postgres::Client) -> Result<Authority> {
-    client
-        .batch_execute(
-            "BEGIN;
-             DELETE FROM pando_manifest_artifacts;
-             DELETE FROM pando_remote_artifacts;
-             UPDATE pando_storage_authorities
-                SET authority_id=gen_random_uuid(),generation=1,
-                    created_at=clock_timestamp(),rotated_at=clock_timestamp()
-                WHERE singleton;
-             COMMIT;",
-        )
-        .await?;
+    // Use a real transaction rather than embedding BEGIN/COMMIT so this can
+    // never commit a caller-owned transaction.
+    let tx = client.transaction().await?;
+    tx.execute("DELETE FROM pando_manifest_artifacts", &[]).await?;
+    tx.execute("DELETE FROM pando_publication_fences", &[]).await?;
+    tx.execute("DELETE FROM pando_remote_artifacts", &[]).await?;
+    tx.execute(
+        "UPDATE pando_storage_authorities SET authority_id=gen_random_uuid(),generation=1,          created_at=clock_timestamp(),rotated_at=clock_timestamp() WHERE singleton",
+        &[],
+    )
+    .await?;
+    tx.commit().await?;
     authority(client).await
 }
 

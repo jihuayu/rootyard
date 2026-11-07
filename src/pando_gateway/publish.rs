@@ -179,6 +179,11 @@ pub async fn publish(
             return Err(conflict());
         }
         pack_ids.push(pack.id);
+        // Serving CAS: the publication fence ends exactly when the pack becomes
+        // part of the authoritative serving set.
+        tx.execute("DELETE FROM pando_publication_fences WHERE manifest_id=$1", &[&pack.id])
+            .await
+            .map_err(Error::internal)?;
     }
     for change in &prepared.changes {
         if change.new_oid.bytes().all(|byte| byte == b'0') {

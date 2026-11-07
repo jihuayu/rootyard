@@ -195,6 +195,9 @@ pub(super) async fn complete_cutover(
     )
     .await
     .map_err(Error::internal)?;
+    tx.execute("DELETE FROM pando_publication_fences WHERE manifest_id=$1", &[&pack.id])
+        .await
+        .map_err(Error::internal)?;
     tx.execute("DELETE FROM pando_refs WHERE repository_id=$1 AND NOT (ref_name = ANY($2))", &[&repo.id, &names])
         .await
         .map_err(Error::internal)?;

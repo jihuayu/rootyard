@@ -217,6 +217,14 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
     .await
     .unwrap();
     let client = pool.get().await.unwrap();
+    // A committed but not-yet-serving closure carries a durable publication
+    // fence so maintenance cannot retire it before the serving CAS.
+    let fenced: i64 = client
+        .query_one("SELECT count(*) FROM pando_publication_fences WHERE manifest_id=$1", &[&extra.id])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(fenced, 4, "published closure lacked durable publication fences");
     client
         .execute(
             "UPDATE pando_repository_states SET pack_ids=array_append(pack_ids,$2) WHERE repository_id=$1",
@@ -224,6 +232,7 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
         )
         .await
         .unwrap();
+    client.execute("DELETE FROM pando_publication_fences WHERE manifest_id=$1", &[&extra.id]).await.unwrap();
     let before_packs: i32 = client
         .query_one("SELECT cardinality(pack_ids) FROM pando_repository_states WHERE repository_id=$1", &[&repo])
         .await
@@ -478,6 +487,7 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
         let pair = retention::reserve_pair(
             &*reserve_tx,
             owner,
+            Some(old_manifest.id),
             &old_manifest.pack.ciphertext_sha256,
             &old_manifest.pack.envelope_sha256,
         )

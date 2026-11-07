@@ -317,7 +317,11 @@ const RETAINED_LINK: &str = "EXISTS (SELECT 1 FROM pando_manifest_artifacts l \
      AND l.namespace=a.namespace AND l.sha256=a.sha256 \
      AND (r.storage_backend <> 'pando' OR r.state <> 'ready' OR r.transition_state <> 'stable' \
        OR EXISTS (SELECT 1 FROM pando_repository_states s \
-                  WHERE s.repository_id=m.repository_id AND m.id = ANY(s.pack_ids))))";
+                  WHERE s.repository_id=m.repository_id AND m.id = ANY(s.pack_ids)) \
+       OR EXISTS (SELECT 1 FROM pando_publication_fences p \
+                  WHERE p.authority_id=a.authority_id AND p.tenant_id=a.tenant_id \
+                    AND p.namespace=a.namespace AND p.sha256=a.sha256 \
+                    AND p.lease_until>clock_timestamp()))";
 
 async fn mark_unreachable(
     state: &std::sync::Arc<AppState>,
@@ -366,7 +370,7 @@ async fn mark_unreachable(
     ensure!(!cancel.is_cancelled(), "maintenance lease lost before Pando mark commit");
     let update = format!(
         "UPDATE pando_remote_artifacts a SET state='retired',updated_at=clock_timestamp(), \
-          delete_after=clock_timestamp()+make_interval(secs=>$4) \
+          delete_after=clock_timestamp()+make_interval(secs=>($4::bigint)::double precision) \
          WHERE a.authority_id=$1 AND a.tenant_id=$2 AND a.state='active' \
            AND a.remote_path LIKE '%/authorities/%' AND {linked} AND NOT {RETAINED_LINK}"
     );
@@ -419,13 +423,13 @@ async fn delete_tombstones(
         "WITH candidates AS ( \
            SELECT a.authority_id,a.tenant_id,a.namespace,a.sha256 \
            FROM pando_remote_artifacts a \
-           WHERE a.authority_id=$1 AND a.tenant_id=$2 AND a.state='retired' \
-             AND a.delete_after<=clock_timestamp() AND a.remote_path LIKE '%/authorities/%' \
+           WHERE a.authority_id=$1 AND a.tenant_id=$2 AND ((a.state='retired' AND a.delete_after<=clock_timestamp()) OR (a.state='deleting' AND (a.lease_until IS NULL OR a.lease_until<=clock_timestamp()))) \
+             AND a.remote_path LIKE '%/authorities/%' \
              AND {linked} AND NOT {RETAINED_LINK} \
-           ORDER BY a.delete_after,a.namespace,a.sha256 LIMIT 32 FOR UPDATE SKIP LOCKED) \
+           ORDER BY COALESCE(a.delete_after,a.lease_until),a.namespace,a.sha256 LIMIT 32 FOR UPDATE SKIP LOCKED) \
          UPDATE pando_remote_artifacts a SET state='deleting',claimed_by=$4, \
            claim_generation=a.claim_generation+1,attempts=a.attempts+1,last_error=NULL, \
-           lease_until=clock_timestamp()+make_interval(secs=>$5),updated_at=clock_timestamp() \
+           lease_until=clock_timestamp()+make_interval(secs=>($5::bigint)::double precision),updated_at=clock_timestamp() \
          FROM candidates c WHERE a.authority_id=c.authority_id AND a.tenant_id=c.tenant_id \
            AND a.namespace=c.namespace AND a.sha256=c.sha256 \
          RETURNING a.tenant_id,a.namespace,a.sha256,a.object_generation,a.remote_path,a.claim_generation"

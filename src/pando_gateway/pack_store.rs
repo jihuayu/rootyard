@@ -270,6 +270,7 @@ impl PackStore {
                 let (cipher, envelope) = retention::reserve_pair(
                     &*tx,
                     tenant_id,
+                    Some(manifest.id),
                     &pack_receipt.ciphertext_sha256,
                     &pack_receipt.envelope_sha256,
                 )
@@ -277,6 +278,7 @@ impl PackStore {
                 let (index_cipher, index_envelope) = retention::reserve_pair(
                     &*tx,
                     tenant_id,
+                    Some(manifest.id),
                     &index_receipt.ciphertext_sha256,
                     &index_receipt.envelope_sha256,
                 )

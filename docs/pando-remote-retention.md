@@ -26,12 +26,14 @@ importing every serving repository closure, so a restored database sharing the
 same bucket never inherits the source installation's deletable namespace.
 
 Arbitrary metadata-only PostgreSQL PITR snapshots or external base backups are
-**not** a supported backup authority for Pando remote GC: restoring such a
-snapshot after remote deletion can point at bytes this GC removed. Operators
-must retain a paired Rootyard archive, or re-register/pin the required closure,
-before enabling destructive Pando deletion. The feature therefore fails closed
-on unknown backup authority instead of assuming every database snapshot is a
-retention root.
+**not** a supported backup authority for Pando remote GC. Such a copy retains
+the source `authority_id` and registry rows, so it is **not detected** and the
+deleter does **not** fail closed for it: starting that copy against the shared
+bucket would let it treat the source installation's live, non-serving artifacts
+as its own. Never run an out-of-band metadata copy against the shared bucket.
+Operators must retain a paired Rootyard archive (the only path that rotates the
+authority once for the whole restored database), or re-register/pin the
+required closure, before enabling destructive Pando deletion.
 
 ## Explicit exclusions
 

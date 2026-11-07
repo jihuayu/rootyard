@@ -74,4 +74,24 @@ CREATE INDEX pando_manifest_artifacts_artifact
 CREATE INDEX pando_manifest_artifacts_repository
     ON pando_manifest_artifacts(repository_id, manifest_id);
 
+
+-- Durable pending-publication roots. A manifest becomes serving only when a
+-- later transaction appends its id to pando_repository_states.pack_ids. Between
+-- manifest commit and that serving CAS the pack must not be treated as an
+-- unreferenced artifact. Each reservation writes one row per encrypted object
+-- with a bounded lease; the serving CAS deletes them. A crash therefore leaves
+-- the closure protected until the lease expires, then it is an ordinary orphan.
+CREATE TABLE pando_publication_fences (
+    manifest_id UUID NOT NULL,
+    authority_id UUID NOT NULL REFERENCES pando_storage_authorities(authority_id) ON DELETE RESTRICT,
+    tenant_id UUID NOT NULL,
+    namespace TEXT NOT NULL CHECK (namespace IN ('pando-cipher','pando-envelope')),
+    sha256 TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    lease_until TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (manifest_id, namespace, sha256)
+);
+CREATE INDEX pando_publication_fences_artifact
+    ON pando_publication_fences(authority_id, tenant_id, namespace, sha256, lease_until);
+
 INSERT INTO schema_migrations (version) VALUES (132) ON CONFLICT DO NOTHING;

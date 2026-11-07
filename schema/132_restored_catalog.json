@@ -3800,6 +3800,83 @@
       "default": null,
       "generated": "",
       "identity": "",
+      "name": "manifest_id",
+      "not_null": true,
+      "position": 1,
+      "table": "pando_publication_fences",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "authority_id",
+      "not_null": true,
+      "position": 2,
+      "table": "pando_publication_fences",
+      "type": "uuid"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "tenant_id",
+      "not_null": true,
+      "position": 3,
+      "table": "pando_publication_fences",
+      "type": "uuid"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "namespace",
+      "not_null": true,
+      "position": 4,
+      "table": "pando_publication_fences",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "sha256",
+      "not_null": true,
+      "position": 5,
+      "table": "pando_publication_fences",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "name": "lease_until",
+      "not_null": true,
+      "position": 6,
+      "table": "pando_publication_fences",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "clock_timestamp()",
+      "generated": "",
+      "identity": "",
+      "name": "created_at",
+      "not_null": true,
+      "position": 7,
+      "table": "pando_publication_fences",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
       "name": "repository_id",
       "not_null": true,
       "position": 1,
@@ -10262,6 +10339,42 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "FOREIGN KEY (authority_id) REFERENCES public.pando_storage_authorities(authority_id) ON DELETE RESTRICT",
+      "name": "pando_publication_fences_authority_id_fkey",
+      "table": "pando_publication_fences",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((namespace = ANY (ARRAY['pando-cipher'::text, 'pando-envelope'::text])))",
+      "name": "pando_publication_fences_namespace_check",
+      "table": "pando_publication_fences",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (manifest_id, namespace, sha256)",
+      "name": "pando_publication_fences_pkey",
+      "table": "pando_publication_fences",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((sha256 ~ '^[0-9a-f]{64}$'::text))",
+      "name": "pando_publication_fences_sha256_check",
+      "table": "pando_publication_fences",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "CHECK (((oid ~ '^[0-9a-f]{40}$'::text) OR (oid ~ '^[0-9a-f]{64}$'::text)))",
       "name": "pando_refs_oid_check",
       "table": "pando_refs",
@@ -13568,6 +13681,24 @@
       "valid": true
     },
     {
+      "definition": "CREATE INDEX pando_publication_fences_artifact ON public.pando_publication_fences USING btree (authority_id, tenant_id, namespace, sha256, lease_until)",
+      "live": true,
+      "name": "pando_publication_fences_artifact",
+      "ready": true,
+      "table": "pando_publication_fences",
+      "tablespace": null,
+      "valid": true
+    },
+    {
+      "definition": "CREATE UNIQUE INDEX pando_publication_fences_pkey ON public.pando_publication_fences USING btree (manifest_id, namespace, sha256)",
+      "live": true,
+      "name": "pando_publication_fences_pkey",
+      "ready": true,
+      "table": "pando_publication_fences",
+      "tablespace": null,
+      "valid": true
+    },
+    {
       "definition": "CREATE UNIQUE INDEX pando_refs_pkey ON public.pando_refs USING btree (repository_id, ref_name)",
       "live": true,
       "name": "pando_refs_pkey",
@@ -14770,6 +14901,16 @@
       "force_row_security": false,
       "kind": "r",
       "name": "pando_pack_manifests",
+      "options": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "tablespace": null
+    },
+    {
+      "force_row_security": false,
+      "kind": "r",
+      "name": "pando_publication_fences",
       "options": null,
       "persistence": "p",
       "replica_identity": "d",
