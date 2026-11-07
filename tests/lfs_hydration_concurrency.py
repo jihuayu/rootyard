@@ -41,6 +41,9 @@ from lfs import LfsHarness  # noqa: E402
 
 PAYLOAD_BYTES = 8 * 1024 * 1024
 FIRST_CHUNK = 16 * 1024
+# Bytes forwarded before a scripted mid-body disconnect: far below the declared
+# length so the client must observe a transport failure, not a clean EOF.
+TRUNCATED_BODY_BYTES = 2 * FIRST_CHUNK
 EVENT_TIMEOUT = 60
 FOLLOWER_JOIN_GRACE = 2.0
 FLIGHT_SETTLE = 0.5
@@ -63,6 +66,7 @@ class S3ControlProxy:
         self.target_heads = 0
         self.gate_next_get = False
         self.fail_gets_remaining = 0
+        self.truncate_gets_remaining = 0
         self.release = threading.Event()
         self.errors = []
         self.events = []
@@ -113,13 +117,16 @@ class S3ControlProxy:
     def disarm(self):
         self.armed = False
 
-    def prepare_gate(self, fail=False):
+    def prepare_gate(self, fail=False, truncate=False):
         with self.get_condition:
             self.gate_next_get = True
             # The Rust S3 client retries a 5xx up to three attempts. Fail every
             # attempt so a failed flight is deterministic; otherwise a retry
             # could silently turn the scenario into a success.
             self.fail_gets_remaining = 3 if fail else 0
+            # A truncated body is not retried by the client (the failure happens
+            # after the response headers), so one shot is enough.
+            self.truncate_gets_remaining = 1 if truncate else 0
             self.release.clear()
 
     def release_gated(self):
@@ -156,7 +163,7 @@ class S3ControlProxy:
                    if name.lower() not in HOP_BY_HOP
                    and name.lower() not in ("expect", "content-length")]
         target = self.is_target(method, path)
-        gated = fail = False
+        gated = fail = truncate = False
         if target:
             with self.get_condition:
                 self.counts[method] = self.counts.get(method, 0) + 1
@@ -168,6 +175,9 @@ class S3ControlProxy:
                     if self.fail_gets_remaining > 0:
                         self.fail_gets_remaining -= 1
                         fail = True
+                    elif self.truncate_gets_remaining > 0:
+                        self.truncate_gets_remaining -= 1
+                        truncate = True
                 elif method == "HEAD":
                     self.target_heads += 1
             # `note` re-acquires the non-reentrant lock, so it must run after
@@ -200,6 +210,11 @@ class S3ControlProxy:
         for name, value in response_headers:
             if name.lower() == "content-length":
                 declared = int(value)
+        if truncate:
+            partial = payload[:TRUNCATED_BODY_BYTES]
+            self.note("target_get_truncated", declared=declared, forwarded=len(partial))
+            self.relay_truncated(handler, method, status, response_headers, partial, declared)
+            return
         self.relay(handler, method, status, response_headers, payload, declared)
         if target:
             self.note("target_response", method=method, status=status, bytes=len(payload))
@@ -219,6 +234,26 @@ class S3ControlProxy:
         handler.close_connection = True
         if method != "HEAD" and payload:
             handler.wfile.write(payload)
+        handler.wfile.flush()
+
+
+    def relay_truncated(self, handler, method, status, headers, partial, declared):
+        """Send real success headers with the full declared length, then stop.
+
+        Returning after a short body closes the backend connection before
+        `declared` bytes arrive, so the client sees an incomplete body instead
+        of a clean EOF with a shorter payload.
+        """
+        handler.send_response_only(status)
+        for name, value in headers:
+            if name.lower() in HOP_BY_HOP or name.lower() == "content-length":
+                continue
+            handler.send_header(name, value)
+        handler.send_header("Content-Length", str(declared))
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.close_connection = True
+        handler.wfile.write(partial)
         handler.wfile.flush()
 
 
@@ -491,6 +526,68 @@ class HydrationHarness(LfsHarness):
         self._assert_final(final, oid, size)
         time.sleep(FLIGHT_SETTLE)
 
+        # 2b. Truncated body: the proxy relays real 200 headers and the full
+        # Content-Length, then closes the backend connection mid-body. Both
+        # waiters share the one flight, observe a typed remote_store/get
+        # failure without any raw URL or token, no partial final is published,
+        # and a later cold read recovers with its own fresh flight.
+        self._clear(final)
+        proxy.prepare_gate(truncate=True)
+        heads_before, gets_before = proxy.snapshot()
+        threads, _, sent, results, failures = run_pair("truncated")
+        proxy.wait_for_gets(gets_before + 1)
+        threads["follower"].start()
+        assert sent.wait(EVENT_TIMEOUT), "truncated-body follower was never sent"
+        time.sleep(FOLLOWER_JOIN_GRACE)
+        assert proxy.snapshot() == (heads_before + 1, gets_before + 1), (
+            "follower did not join the truncated flight", proxy.snapshot())
+        assert not final.exists(), "local final appeared before the body was truncated"
+        proxy.release_gated()
+        for thread in threads.values():
+            thread.join(EVENT_TIMEOUT * 2)
+        assert not failures, failures
+        assert not proxy.errors, proxy.errors
+        assert proxy.snapshot() == (heads_before + 1, gets_before + 1), (
+            "a body-boundary failure must not restart the S3 request", proxy.snapshot())
+        truncated_ids = []
+        for name, (status, headers, body) in results.items():
+            assert status in (500, 503), (name, status)
+            assert len(body) < size, (name, "truncated flight streamed a full body")
+            request_id = headers.get("x-request-id")
+            assert request_id, (name, "failed response lost the server X-Request-ID")
+            try:
+                uuid.UUID(request_id)
+            except ValueError:
+                raise AssertionError((name, "failed response X-Request-ID is not a UUID")) from None
+            truncated_ids.append(request_id)
+        assert len(truncated_ids) == 2, truncated_ids
+        truncated_events = []
+        for request_id in truncated_ids:
+            events = self._wait_error_events(request_id)
+            assert len(events) == 1, ("expected one correlated event", request_id, len(events))
+            event = events[0]
+            assert event.get("scope") == "request", event
+            assert event.get("kind") == "remote_store", event
+            assert event.get("remote_op") == "get", event
+            assert "remote_status" not in event, event
+            assert event.get("status") == 503, event
+            assert event.get("route") == "/git/{owner}/{name}/info/lfs/objects/{oid}/{size}", event
+            rendered = json.dumps(event)
+            assert "://" not in rendered and self.alice["token"] not in rendered, event
+            truncated_events.append(event)
+        self._assert_remote_log_privacy()
+        assert not final.exists(), "a truncated body published a partial final"
+        assert sorted(p.name for p in self._repo_dir().iterdir()
+                      if p.name.startswith((".tmp-", ".rootyard-object-"))) == []
+        heads_before, gets_before = proxy.snapshot()
+        status, body, _ = self.lfs_get(path, token=self.alice, code=200)
+        assert status == 200 and body == payload
+        assert proxy.snapshot() == (heads_before + 1, gets_before + 1), (
+            "truncated flight did not recover through a fresh GET",
+            proxy.snapshot(), proxy.events[-12:])
+        self._assert_final(final, oid, size)
+        time.sleep(FLIGHT_SETTLE)
+
         # 3. Cancellation: abort the only reader while the backend GET is gated.
         # Detached hydration may finish, but it must publish only complete
         # verified bytes and leave no staging files. The flight map must then be
@@ -553,6 +650,19 @@ class HydrationHarness(LfsHarness):
                 "correlated_events": len(remote_events),
                 "kind": "remote_store", "remote_op": "get", "remote_status": 502,
                 "secret_or_header_text_absent": True,
+            },
+            "truncated_body_flight": {
+                "waiters_failed_explicitly": 2,
+                "backend_gets_for_shared_flight": 1,
+                "retry_backend_gets": 1,
+                "partial_final_published": False,
+                "staging_leftovers": 0,
+            },
+            "truncated_body_observability": {
+                "correlated_events": len(truncated_events),
+                "kind": "remote_store", "remote_op": "get",
+                "remote_status_present": False,
+                "raw_url_or_token_absent": True,
             },
             "cancellation": {
                 "partial_final_never_published": True,
