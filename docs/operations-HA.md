@@ -84,7 +84,9 @@ supply:
 The native test starts three etcd members (mutual TLS), three Patroni-managed
 PostgreSQL 17 nodes (TLS + SCRAM, `synchronous_mode: true`,
 `synchronous_mode_strict: true`, `synchronous_commit: remote_apply`) and one
-HAProxy stable primary endpoint. Rootyard serves Git through that endpoint.
+HAProxy stable primary endpoint. Replica bootstrap passes
+`pg_basebackup --checkpoint=fast`; the pg_basebackup default (spread)
+would delay the first standby by up to `checkpoint_timeout`. Rootyard serves Git through that endpoint.
 
 1. Real Git clone/push/fetch/fsck workload records every acknowledged OID and
    its acknowledgement time.

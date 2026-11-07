@@ -182,7 +182,7 @@ def render_haproxy(spec, secrets, out):
     auth = base64.b64encode((spec["haproxy"]["health_user"] + ":"
                              + secrets["haproxy_health_password"]).encode()).decode()
     servers = "\n".join(
-        f"    server {node['name']} {spec['postgres_host_ip']}:{node['pg_port']} check port {node['rest_port']}"
+        f"    server {node['name']} 127.0.0.1:{node['pg_port']} check port {node['rest_port']}"
         for node in spec["nodes"])
     values = {"primary_port": spec["haproxy"]["primary_port"],
               "replica_port": spec["haproxy"]["replica_port"],

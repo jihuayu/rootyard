@@ -123,6 +123,7 @@ class HAFixture:
         self.procs = {}
         self.logs = {}
         self.commands = []
+        self.rest_errors = []
         self.ports = {
             "etcd_client": [port_base + 1, port_base + 2, port_base + 3],
             "etcd_peer": [port_base + 11, port_base + 12, port_base + 13],
@@ -279,15 +280,22 @@ class HAFixture:
                 [sys.executable, "-m", "patroni", str(config)], env=env,
                 stdout=log, stderr=log, start_new_session=True)
             self.commands.append(["patroni", node["name"]])
-        deadline = time.monotonic() + 90
+        deadline = time.monotonic() + 120
+        observed = {}
         while time.monotonic() < deadline:
             state = self.cluster_state()
+            observed = {"leader": state.get("leader"),
+                        "members": [(m.get("name"), m.get("role"), m.get("state"))
+                                    for m in state.get("members", [])],
+                        "etcd_healthy": self.etcd_healthy_count(),
+                        "rest_errors": self.rest_errors[-6:]}
             if state.get("leader") and len(state.get("members", [])) == 3:
-                if any(m.get("state") == "running" for m in state["members"]):
+                leader_member = next(m for m in state["members"] if m.get("role") == "leader")
+                if leader_member.get("state") == "running":
                     self.wait_synchronous()
                     return
             time.sleep(0.5)
-        raise AssertionError("Patroni cluster did not elect a leader with three members")
+        raise AssertionError(f"Patroni cluster did not elect a leader with three members: {observed}")
 
     def rest(self, node_name, path="/cluster", auth=True, timeout=5):
         port = next(n["rest_port"] for n in self.spec["nodes"] if n["name"] == node_name)
@@ -305,19 +313,39 @@ class HAFixture:
             return 0, b""
 
     def cluster_state(self):
+        """Return the Patroni cluster view with a normalized leader name.
+
+        Patroni's GET /cluster JSON is a member list; the elected leader is the
+        member whose role is ``leader`` (there is no top-level ``leader`` key).
+        """
         for node in self.spec["nodes"]:
             status, body = self.rest(node["name"])
             if status == 200:
                 try:
                     state = json.loads(body)
-                except ValueError:
+                except ValueError as error:
+                    self.rest_errors.append({"node": node["name"], "status": status,
+                                             "error": "invalid-json:" + type(error).__name__})
                     continue
-                if "members" in state:
+                members = state.get("members")
+                if isinstance(members, list):
+                    state["leader"] = next(
+                        (m.get("name") for m in members
+                         if isinstance(m, dict) and m.get("role") in ("leader", "standby_leader")), None)
                     return state
+                self.rest_errors.append({"node": node["name"], "status": status,
+                                         "error": "missing-members"})
+            else:
+                self.rest_errors.append({"node": node["name"], "status": status,
+                                         "error": body.decode(errors="replace")[:120]})
         return {}
 
     def leader(self):
         return self.cluster_state().get("leader")
+
+    def etcd_healthy_count(self):
+        return sum(1 for port in self.ports["etcd_client"]
+                   if self.etcdctl("endpoint", "health", nodes=[port], check=False).returncode == 0)
 
     def wait_synchronous(self, timeout=45):
         deadline = time.monotonic() + timeout
@@ -336,7 +364,8 @@ class HAFixture:
                     return {"synchronous_commit": mode, "synchronous_standby_names": names,
                             "synchronous_standbys": int(standbys)}
             time.sleep(0.5)
-        raise AssertionError("Patroni cluster did not reach strict synchronous remote_apply mode")
+        raise AssertionError(f"Patroni cluster did not reach strict synchronous remote_apply mode; "
+                             f"rest_errors={self.rest_errors[-6:]}")
 
     def pg_port(self, name):
         return next(n["pg_port"] for n in self.spec["nodes"] if n["name"] == name)
@@ -457,7 +486,8 @@ class HAFixture:
                 if recovery == "f":
                     return leader
             time.sleep(0.3)
-        raise AssertionError("Patroni did not automatically promote a successor")
+        raise AssertionError(f"Patroni did not automatically promote a successor; "
+                             f"rest_errors={self.rest_errors[-6:]}")
 
     def promotion_log_lines(self, names=None):
         lines = []

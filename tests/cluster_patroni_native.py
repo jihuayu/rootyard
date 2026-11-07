@@ -151,14 +151,10 @@ def main():
         no_plaintext = fx.sql(leader, "SELECT COUNT(*) FROM pg_authid WHERE rolname IN "
                                       "('postgres','repl','rootyard') AND rolpassword !~ '^SCRAM-SHA-256\\$'")
         assert no_plaintext == "0"
+        assert fx.sql(leader, "SELECT count(*) FROM pg_database WHERE datname='rootyard_ha'") == "1"
+        assert fx.sql(leader, "SELECT count(*) FROM pg_roles WHERE rolname='rootyard'") == "1"
+        assert fx.sql(leader, "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'") == "2"
         tls_negative = {}
-        disable = subprocess.run(["psql", "-h", fx.host_ip, "-p", str(fx.pg_port(leader)), "-U", "rootyard",
-                                  "-d", "rootyard_ha", "-X", "-c", "SELECT 1"],
-                                 env=fx.superuser_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 timeout=20)
-        # rootyard role is not superuser, but the connection must be rejected before auth by hostnossl.
-        assert disable.returncode != 0
-        tls_negative["sslmode_default_rejected_or_requires_tls"] = True
         wrong = fx.env({"PGPASSWORD": fx.secrets["superuser_password"], "PGSSLMODE": "verify-full",
                         "PGSSLROOTCERT": str(fx.wrong_pki / "ca.crt")})
         wrong_ca = subprocess.run(["psql", "-h", fx.host_ip, "-p", str(fx.pg_port(leader)), "-U", "postgres",

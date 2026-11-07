@@ -47,8 +47,17 @@ bootstrap:
 postgresql:
   bin_dir: $pg_bin_dir
   data_dir: $data_dir
-  listen: $postgres_host_ip:$pg_port
+  # Bind all local interfaces inside the private deployment network; pg_hba
+  # only permits TLS+SCRAM from loopback and the advertised node address.
+  # connect_address remains the non-loopback address used for replication.
+  listen: 0.0.0.0:$pg_port
   connect_address: $postgres_host_ip:$pg_port
+  # Replica bootstrap must not wait for a spread checkpoint: pg_basebackup's
+  # default spread mode can delay the first standby by checkpoint_timeout.
+  create_replica_methods:
+    - basebackup
+  basebackup:
+    - checkpoint: fast
   authentication:
     superuser:
       username: postgres
