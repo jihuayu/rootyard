@@ -954,6 +954,7 @@ pub(crate) async fn finalize(
     if bundle.source_generation != source_generation
         || bundle.target_generation != generation
         || bundle.journal_sequence != sequence
+        || bundle.refs_sha256 != refs_sha256
     {
         return Err(conflict("staged CI sidecar differs from the committed operation sequence"));
     }

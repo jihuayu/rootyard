@@ -83,28 +83,42 @@ async fn send_transfer(
     };
     let body = reqwest::Body::wrap_stream(prefix.chain(ReaderStream::new(reader)));
     let http = transport::cluster_client(state.config.git_timeout)?;
+    let delegation = transport::sign(envelope)?;
     let upstream = http
         .post(url)
-        .header(DELEGATION_HEADER, transport::sign(envelope)?)
+        .header(DELEGATION_HEADER, delegation.clone())
         .body(body)
         .send()
         .await
         .map_err(|_| Error(StatusCode::BAD_GATEWAY, "replica transfer interrupted"))?;
     let status = upstream.status();
     if status != StatusCode::OK {
-        // Preserve a bounded, sanitized target error for operators. Target
-        // rejections are static JSON application errors, never credentials or
-        // raw request bodies; do not collapse every cause into one message.
-        let body = upstream.bytes().await.unwrap_or_default();
-        let bounded = &body[..body.len().min(512)];
-        let message = String::from_utf8_lossy(bounded)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(512)
-            .collect::<String>();
-        eprintln!("rootyard: replica transfer rejected target_status={status} target_error={message}");
+        // Read a small fixed prefix, then stop. The stream is dropped rather
+        // than draining an arbitrarily large or streaming error body. Only a
+        // known static JSON `error` field is logged; raw response bytes are
+        // never emitted. The exact signed delegation header is retained only
+        // to redact it if a broken upstream echoes it.
+        let mut stream = upstream.bytes_stream();
+        let mut bounded = Vec::with_capacity(512);
+        while bounded.len() < 512 {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    let take = (512 - bounded.len()).min(chunk.len());
+                    bounded.extend_from_slice(&chunk[..take]);
+                    if take < chunk.len() {
+                        break;
+                    }
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+        let target_error = serde_json::from_slice::<serde_json::Value>(&bounded)
+            .ok()
+            .and_then(|value| value.get("error").and_then(|error| error.as_str()).map(str::to_owned))
+            .map(|message| message.chars().filter(|character| !character.is_control()).take(256).collect::<String>())
+            .map(|message| message.replace(&delegation, "[redacted]"))
+            .unwrap_or_else(|| "unavailable".to_owned());
+        eprintln!("rootyard: replica transfer rejected target_status={status} target_error={target_error}");
         return match status {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 Err(conflict("replica rejected snapshot transfer: unauthorized"))
