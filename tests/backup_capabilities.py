@@ -98,7 +98,11 @@ class CapabilityBackupHarness(BackupHarness):
                 'lfs_lock_identity_preserved': True, 'lfs_bytes_preserved': True, 'workspace_bytes_preserved': True,
                 'old_workspace_lease_rejected': True, 'renewed_lease_accepted': True,
                 'browser_session_revoked': True, 'cluster_authority_rotated': True,
-                'stock_git_clone_fsck': True, 'remote_lfs_hydrated_without_target_endpoint': remote_lfs}
+                'stock_git_clone_fsck': True, 'remote_lfs_hydrated_without_target_endpoint': remote_lfs,
+                'backup_manifest_format': manifest['format'],
+                'backup_manifest_schema_versions': manifest['schema_versions'],
+                'backup_schema_contract_sha256': manifest['schema_contract_sha256'],
+                'restored_schema_versions_verified': True}
 
 
 def main():
