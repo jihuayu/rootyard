@@ -41,10 +41,14 @@ class WorkerHarness(MetricsHarness):
         self.fuse = os.environ.get("ROOTYARD_TEST_WORKSPACE_FUSE") == "1"
         if self.fuse:
             self.env["ROOTYARD_WORKSPACE_MOUNT_MODE"] = "fuse"
+            # Keep mounts private to the server so shutdown cannot leave a
+            # disconnected mount in the harness namespace. The attested binary
+            # remains args.binary; unshare execs it in the same owned process.
+            self.server_prefix = ["unshare", "-Urm", "--"]
 
     # -- helpers ---------------------------------------------------------
     def volume_id(self):
-        return (self.root / ".volume-id").read_text().strip()
+        return (Path(self.env["ROOTYARD_DATA_DIR"]) / ".volume-id").read_text().strip()
 
     def create_repo(self):
         body = {"name": REPO_NAME}

@@ -128,7 +128,8 @@ class Harness:
 
     def start(self):
         self.log = open(self.root / "server.log", "ab")
-        self.proc = subprocess.Popen([self.args.binary, "serve"], env=self.env, stdout=self.log, stderr=self.log,
+        command = [*getattr(self, "server_prefix", ()), self.args.binary, "serve"]
+        self.proc = subprocess.Popen(command, env=self.env, stdout=self.log, stderr=self.log,
                                      start_new_session=True)
         until = time.monotonic() + 30
         while time.monotonic() < until:
