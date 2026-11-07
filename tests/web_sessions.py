@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import traceback
 import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -66,6 +67,7 @@ class BrowserHarness(Harness):
         cookies, raw = self.split_cookies(headers)
         assert cookies["rootyard_session"].startswith("ryt_")
         assert cookies["rootyard_csrf"]
+        self.secrets.extend(cookies.values())
         return cookies, raw, headers
 
     @staticmethod
@@ -212,7 +214,7 @@ class BrowserHarness(Harness):
             status, _, headers = self.login(return_to=bad)
             assert status == 303, (bad, status)
             assert self.response_header(headers, "Location") == "/web/repos", bad
-            ret_cookies, _, _ = self.split_cookies(headers)
+            ret_cookies, _ = self.split_cookies(headers)
             session_headers = {"Cookie": self.cookie_header(ret_cookies)}
             assert self.request("/web/repos", headers=session_headers)[0] == 200
 
@@ -307,17 +309,21 @@ def main():
         parser.error("ROOTYARD_TEST_DATABASE_URL is required")
     harness = BrowserHarness(args)
     passed = False
+    failure_traceback = None
     try:
         harness.case("browser_session_workflow", harness.run_flow)
         passed = True
     except Exception as exc:
+        failure_traceback = harness.redact(traceback.format_exc(limit=12))[-4000:]
         print(harness.redact(exc), file=sys.stderr)
+        print(failure_traceback, file=sys.stderr)
     finally:
         harness.cleanup()
         report = {
             "passed": passed,
             "cases": harness.results,
             "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
+            "failure_traceback": failure_traceback,
         }
         if args.report:
             args.report.parent.mkdir(parents=True, exist_ok=True)
