@@ -118,6 +118,21 @@ def wait_marker_or_response(data, phase, pending, h, timeout=20):
     raise AssertionError("fault marker did not persist (request still pending): " + phase)
 
 
+def clear_marker(data, phase):
+    path = data / ".native-test-faults" / (phase + ".json")
+    if path.exists():
+        path.unlink()
+
+
+def assert_marker_binding(marker_data, phase, repo_id, operation_id=None):
+    detail = marker_data.get("detail") or {}
+    assert detail.get("repository_id") == repo_id, \
+        ("fault marker belongs to another repository", phase, detail, repo_id)
+    if detail.get("operation_id") is not None:
+        assert detail.get("operation_id") == operation_id, \
+            ("fault marker belongs to another operation", phase, detail, operation_id)
+
+
 def create_repository(h, name):
     status, raw, _ = h.http("/api/repos", token=h.alice, method="POST",
                             body={"name": name})
@@ -581,15 +596,18 @@ def main():
         chaos_dest = node1_data / "repos" / (chaos["id"] + ".git")
         acknowledged = [chaos_tip]
 
-        def source_killed(phase, body, recover_phase=None):
+        def source_killed(phase, body, repo="chaosharness", repo_id=None, recover_phase=None):
+            clear_marker(h.root / "data", phase)
             h.stop(hard=True)
             h.env["ROOTYARD_TEST_FAULT"] = phase
             h.env["ROOTYARD_TEST_FAULT_ACTION"] = "kill"
             h.start()
             with ThreadPoolExecutor(max_workers=1) as pool:
-                pending = pool.submit(h.http, "/api/repos/alice/chaosharness/shard-migrate",
+                pending = pool.submit(h.http, "/api/repos/alice/" + repo + "/shard-migrate",
                                       token=h.alice, method="POST", body=body)
-                wait_marker_or_response(h.root / "data", phase, pending, h)
+                marker_data = wait_marker_or_response(h.root / "data", phase, pending, h)
+                assert_marker_binding(marker_data, phase, repo_id,
+                                      body.get("operation_id"))
                 h.proc.wait(timeout=20)
                 assert h.proc.returncode == -signal.SIGKILL
                 try:
@@ -599,11 +617,14 @@ def main():
             h.env.pop("ROOTYARD_TEST_FAULT", None)
             h.env.pop("ROOTYARD_TEST_FAULT_ACTION", None)
             if recover_phase:
+                clear_marker(h.root / "data", recover_phase)
                 h.env["ROOTYARD_TEST_FAULT"] = recover_phase
                 h.env["ROOTYARD_TEST_FAULT_ACTION"] = "pause"
                 h.env["ROOTYARD_TEST_FAULT_PAUSE_MS"] = "1500"
                 h.start()
-                marker(h.root / "data", recover_phase)
+                recovered = marker(h.root / "data", recover_phase)
+                assert_marker_binding(recovered, recover_phase, repo_id,
+                                      body.get("operation_id"))
                 h.env.pop("ROOTYARD_TEST_FAULT", None)
                 h.env.pop("ROOTYARD_TEST_FAULT_ACTION", None)
                 h.env.pop("ROOTYARD_TEST_FAULT_PAUSE_MS", None)
@@ -613,10 +634,10 @@ def main():
         body = {"target_node_id": "node1",
                 "expected_route_epoch": chaos_route["route_epoch"],
                 "operation_id": chaos_op}
-        source_killed("final-delta-before-transfer", body)
+        source_killed("final-delta-before-transfer", body, repo="chaosharness", repo_id=chaos["id"])
         assert h.sql("SELECT draining::text FROM repository_shard_routes WHERE repository_id='"
                      + chaos["id"] + "'") == "true"
-        source_killed("cutover-before-commit", body)
+        source_killed("cutover-before-commit", body, repo="chaosharness", repo_id=chaos["id"])
         assert h.sql("SELECT draining::text FROM repository_shard_routes WHERE repository_id='"
                      + chaos["id"] + "'") == "true"
         kill(target)
@@ -648,7 +669,7 @@ def main():
         recover_body = {"target_node_id": "node1",
                         "expected_route_epoch": recover_route["route_epoch"],
                         "operation_id": recover_op}
-        source_killed("cutover-after-commit", recover_body, recover_phase="recover-before-reconcile")
+        source_killed("cutover-after-commit", recover_body, repo="recoverharness", repo_id=recover["id"], recover_phase="recover-before-reconcile")
         assert h.sql("SELECT state FROM shard_replication_operations WHERE id='"
                      + recover_op + "'") == "completed"
         # The target was never asked to finalize (source died in the marker
