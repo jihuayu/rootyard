@@ -2,14 +2,18 @@
 
 > **Status:** the authorisation helpers, the discovery predicates, the common
 > repository/namespace action enforcement and the browser-login rejection are
-> wired in *this* integration branch. Restricted PAT issuance is **not**
-> released: there is no public API, CLI or UI to create or edit grants, the Git
-> CAS parent-token lock is still missing, and exact browser-child inheritance
-> for a restricted parent remains unimplemented. The schema/backup contract is
-> now schema 136 / backup format 12 with real SQL-generated fixtures; the native
-> format12 legacy135 restore drill has not been executed yet, so this remains a
-> private integration branch and is not evidence that schema136 is production
-> ready. Do not publish or deploy it.
+> wired in *this* integration branch. A private management API/UI for restricted
+> PATs is staged separately (`/api/tokens`, `/api/sessions`,
+> `/web/settings/tokens`, `/web/settings/sessions`; see
+> `docs/token-management.md`), but it is **not** released: the Git CAS
+> parent-token lock is still missing, exact browser-child inheritance for a
+> restricted parent remains unimplemented, and the native management suite has
+> not been executed by the implementation worker. The existing CLI
+> `create-token` continues to issue unrestricted tokens and is unchanged. The
+> schema/backup contract is now schema 136 / backup format 12 with real
+> SQL-generated fixtures; the native format12 legacy135 restore drill has not
+> been executed yet, so this remains a private integration branch and is not
+> evidence that schema136 is production ready. Do not publish or deploy it.
 
 ## Integration provenance
 
