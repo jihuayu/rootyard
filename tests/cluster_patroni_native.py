@@ -45,6 +45,40 @@ def count_rows(h):
     return counts
 
 
+def pending_keys(query):
+    """Exact durable delivery identities (event_id, consumer) still pending."""
+    rows = query("SELECT event_id || '|' || consumer FROM event_deliveries "
+                 "WHERE state <> 'delivered' ORDER BY 1")
+    return {line.strip() for line in rows.splitlines() if line.strip()}
+
+
+def delivery_states(query, keys):
+    """Current state of the exact tracked delivery identities."""
+    if not keys:
+        return {}
+    literals = ",".join("'" + key.replace("'", "''") + "'" for key in sorted(keys))
+    rows = query("SELECT (event_id || '|' || consumer) || '=' || state FROM event_deliveries "
+                 f"WHERE (event_id || '|' || consumer) IN ({literals})")
+    return dict(row.split("=", 1) for row in rows.splitlines() if "=" in row)
+
+
+def drain_deliveries(worker, query, keys, rounds=120):
+    """Call the real worker until every tracked pre-fault delivery is delivered.
+
+    Only the exact pre-fault identity set is tracked; the global pending count
+    is intentionally not used because new writes after the fault legitimately
+    add new deliveries. Nothing is marked delivered by SQL.
+    """
+    processed = 0
+    for _ in range(rounds):
+        states = delivery_states(query, keys)
+        if states and len(states) == len(keys) and all(state == "delivered" for state in states.values()):
+            return processed
+        processed += worker()
+        time.sleep(0.1)
+    return processed
+
+
 def ref_count(git_dir):
     result = subprocess.run(["git", f"--git-dir={git_dir}", "for-each-ref", "--format=%(refname)"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -214,8 +248,8 @@ def main():
                     "server_port": fx.endpoint_sql("SELECT inet_server_port()")}
         assert baseline["server_port"] == str(fx.pg_port(leader))
         outbox_before = int(h.sql("SELECT COUNT(*) FROM outbox_events"))
-        pending_before = int(h.sql("SELECT COUNT(*) FROM event_deliveries WHERE state <> 'delivered'"))
-        assert outbox_before > 0 and pending_before > 0, "fixture produced no durable worker backlog"
+        pre_fault_pending = pending_keys(h.sql)
+        assert outbox_before > 0 and pre_fault_pending, "fixture produced no durable worker backlog"
 
         def push_commit(message, marker):
             (h.work / marker).write_text(message + "\n")
@@ -231,6 +265,10 @@ def main():
         h.git("fetch", "origin", cwd=h.copy, token=h.reader)
         pre_failure_tip = h.git("rev-parse", "origin/main", cwd=h.copy).stdout.decode().strip()
         assert pre_failure_tip == acked[-1]["oid"]
+        # Re-capture the exact pending delivery identities at the failure
+        # boundary, including deliveries created by the pre-failure pushes.
+        pre_fault_pending = pending_keys(h.sql)
+        assert pre_fault_pending, "no pending deliveries at the failure boundary"
         rootyard_pid = h.proc.pid
 
         # ---- hard crash of the complete old primary node -----------------
@@ -291,11 +329,17 @@ def main():
         assert fx.endpoint_role() == "f:" + str(fx.pg_port(successor))
         assert h.http("/api/repos/alice/demo", token=revoked)[0] == 401
         assert h.http("/api/repos/alice/demo", token=h.bob)[0] in (403, 404)
-        worker_processed = int(h.cli("worker-once"))
-        pending_after = int(h.sql("SELECT COUNT(*) FROM event_deliveries WHERE state <> 'delivered'"))
-        assert worker_processed > 0 and pending_after < pending_before, (
-            f"worker backlog did not advance after failover: processed={worker_processed} "
-            f"pending={pending_after}/{pending_before}")
+        # Track the exact pre-failure delivery identities: post-failure writes
+        # legitimately create new deliveries, so a global count cannot prove
+        # that the retained backlog advanced.
+        worker_processed = drain_deliveries(lambda: int(h.cli("worker-once")), h.sql, pre_fault_pending)
+        pre_fault_states = delivery_states(h.sql, pre_fault_pending)
+        assert len(pre_fault_states) == len(pre_fault_pending), (
+            f"pre-failure deliveries disappeared after failover: "
+            f"{len(pre_fault_states)}/{len(pre_fault_pending)} retained")
+        undelivered = sorted(key for key, state in pre_fault_states.items() if state != "delivered")
+        assert not undelivered, f"worker did not deliver pre-failure deliveries: {undelivered[:5]}"
+        assert worker_processed > 0, "real worker processed no pre-failure deliveries after failover"
         post_crash_commands = [entry for entry in fx.commands if "promote" in " ".join(entry).lower()
                                or "failover" in " ".join(entry).lower()]
         assert not post_crash_commands, "operator/script promotion was invoked during automatic failover"
@@ -309,7 +353,12 @@ def main():
             "crash_at_ns": crash_at,
             "missing_acked_oids": missing,
             "worker_processed_after_promotion": worker_processed,
-            "pending_deliveries_before": pending_before, "pending_deliveries_after": pending_after,
+            "pre_failure_delivery_ids": len(pre_fault_pending),
+            "pre_failure_deliveries_delivered": len(pre_fault_states) - len(undelivered),
+            "worker_accounting": "exact pre-failure (event_id,consumer) identity set; global pending "
+                                 "total excluded because new acknowledged writes add new deliveries",
+            "worker_invocation": "worker-once processes a bounded per-consumer batch; the real binary "
+                                 "was invoked repeatedly until every tracked pre-failure delivery was delivered",
             "rootyard_pid_before": rootyard_pid, "rootyard_pid_after": h.proc.pid,
             "rootyard_health_statuses": health_statuses,
             "promotion_log_excerpt": promotion_log,
@@ -378,6 +427,8 @@ def main():
 
         # ---- real backup closure and fresh-authority restore -------------
         pre_backup_counts = count_rows(h)
+        pre_backup_pending = pending_keys(h.sql)
+        assert pre_backup_pending, "no durable delivery backlog before the backup boundary"
         pre_backup_refs = ref_count(git_dir)
         pre_backup_oids = [item["oid"] for item in acked] + [post_oid, dcs_oid]
         pre_backup_authority = h.sql("SELECT incarnation::text FROM cluster_authority WHERE singleton=true")
@@ -474,12 +525,20 @@ def main():
                                  post_backup_oid + "^{commit}"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         assert absent.returncode != 0, "post-boundary write survived the offline backup closure"
-        worker_restored = int(ha_fixture.run(
-            [args.binary, "worker-once"],
-            env={**restore_env, "DATABASE_URL": restored_require}).stdout.decode().strip())
-        pending_restored = int(restored_sql("SELECT COUNT(*) FROM event_deliveries WHERE state <> 'delivered'"))
-        assert worker_restored > 0 and pending_restored == 0, (
-            f"restored authority worker did not drain retained deliveries: {worker_restored}/{pending_restored}")
+        worker_restored = drain_deliveries(
+            lambda: int(ha_fixture.run(
+                [args.binary, "worker-once"],
+                env={**restore_env, "DATABASE_URL": restored_require}).stdout.decode().strip()),
+            restored_sql, pre_backup_pending)
+        restored_states = delivery_states(restored_sql, pre_backup_pending)
+        assert len(restored_states) == len(pre_backup_pending), (
+            f"pre-backup deliveries missing from the restored authority: "
+            f"{len(restored_states)}/{len(pre_backup_pending)}")
+        restored_undelivered = sorted(key for key, state in restored_states.items()
+                                      if state != "delivered")
+        assert not restored_undelivered, (
+            f"restored worker did not deliver retained deliveries: {restored_undelivered[:5]}")
+        assert worker_restored > 0, "restored authority worker processed no retained deliveries"
         # Only now may the restored deployment open ingress.
         restored_bind = f"127.0.0.1:{fx.ports['restored_rootyard']}"
         restored = Harness(args)
@@ -523,7 +582,10 @@ def main():
             "post_boundary_oid_intentionally_absent": post_backup_oid,
             "delegation_authority_rotated_before_ingress": True,
             "worker_drained_before_ingress": worker_restored,
-            "pending_deliveries_after_restore": pending_restored,
+            "pre_backup_delivery_ids": len(pre_backup_pending),
+            "pre_backup_deliveries_delivered": len(restored_states) - len(restored_undelivered),
+            "worker_accounting": "exact pre-backup (event_id,consumer) identity set on the restored "
+                                 "authority; global pending total excluded",
             "restored_endpoint": restored_bind, "restored_new_data_directory": str(restored_data),
             "writes_held_until_offline_checks_passed": True,
             "reader_access_and_token_revocation_and_tenant_denial": "passed",
