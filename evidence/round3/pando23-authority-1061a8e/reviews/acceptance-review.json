@@ -1,0 +1,99 @@
+{
+  "acceptance_reviewer": "DeepSeek independent acceptance reviewer",
+  "issue": "issue23 - Pando authority-scoped remote retention / GC",
+  "verdict": "ACCEPT_FOR_DOCUMENTED_MODE",
+  "closable_23": true,
+  "scope_of_acceptance": "managed authority-scoped remote GC with paired Rootyard archives as the only supported backup authority, destructive stage opt-in via ROOTYARD_PANDO_REMOTE_DELETE",
+  "source": {
+    "compiled_source_commit": "89ba6a8bad9fd709bdf39f16e828bb8459f34bd2",
+    "harness_source_commit": "f35285d9b106a0d13ac57d2a112e2437fea8eaeb",
+    "test_only_overlays": [
+      "724b94c test(pando-service): wait for automatic repack convergence, add failure snapshot",
+      "f35285d test(sha256-restore): accept async repo provisioning and poll ready"
+    ],
+    "binary": "/workspace/scratch/rootyard-round3/pando23/artifacts/89ba6a8bad9fd709bdf39f16e828bb8459f34bd2/rootyard",
+    "binary_sha256": "eb1e4a09bf1a9c244272a88e300fbf011cb017243313214f0ab359898515d9da",
+    "production_inputs_sha256": "e44e5bbd9a96e3a757f6aafc1338668281cdb387b7424b9d3a6c97500ad8fb5b",
+    "certificate_valid": true,
+    "production_inputs_unchanged_after_compile": true
+  },
+  "reports": {
+    "coordinator_status": "/workspace/scratch/rootyard-round3/pando23/coordinator-status.json state=passed stage=complete updated=1794024286.14518",
+    "jobs": {
+      "rust-lib": "passed (cargo log only by design)",
+      "rust-pando": "passed - logs/rust-pando-1794023024.log shows running 1 test / test result: ok. 1 passed; 0 failed; finished in 11.86s",
+      "schema": "passed (cargo log only by design)",
+      "pando-service": "passed - logs/pando-service-1794023570.json",
+      "legacy131": "passed - logs/legacy131-1794023597.json",
+      "legacy130": "passed - logs/legacy130-1794023691.json",
+      "sha256-matrix": "passed - logs/sha256-matrix-1794023779.json",
+      "sha256-restore": "passed - logs/sha256-restore-1794024214.json"
+    },
+    "same_binary_across_all_case_reports": true,
+    "report_absence_explained": "coordinator_pipeline.py passes --report only for jobs not in (rust-lib, rust-pando, schema); the report field recorded for those three is a path that is never written. This is coordinator design, not lost evidence: the rust-pando evidence is the cargo log plus exit_code 0 in coordinator-status.json."
+  },
+  "environment": {
+    "real_infra": "coordinator_pipeline.py private_env() loads /workspace/scratch/rootyard-round2/infra/ready.env into every job env, so the rust-pando cargo test ran with the real S3/Garage + Vault endpoints and a disposable PostgreSQL database (ROOTYARD_TEST_DATABASE_URL per job, dropped after success). No secret values were read by this reviewer.",
+    "rust_pando_command": "cargo test --locked --test pando_maintenance -- --test-threads=1, cwd=<source>, flock on the shared cargo lock",
+    "no_native_calls_by_reviewer": true
+  },
+  "criteria": [
+    {
+      "criterion": "thresholds cause actual maintenance without a manual lifecycle API",
+      "status": "pass",
+      "evidence": "pando-service case automatic_compaction_and_cache passed with detail automatic_compaction=true, serving_packs=1, old_pack_manifests_retained=8, cache_hydrated_evicted_rehydrated=true, cache_tamper_recovered=true, backup_barrier_retried=true, non_ref_oid_survived_compaction_and_rollback=3e951da0. Compaction and cache work were driven by the scheduler/threshold path; no lifecycle API call is in the passing detail. The first attempt failed (automatic compaction did not replace the serving pack set: 2) and the passing run needed test-only 724b94c to wait for convergence; the final assertions still require serving_packs==1 and old manifests retained."
+    },
+    {
+      "criterion": "worker death / duplicate wakeups / expired claims recover without overlapping destructive work or retained-object deletion",
+      "status": "pass_with_bounded_gap",
+      "evidence": "Rust Pando (rust-pando job) exercised the SQL lease/fence fault-injection surface against real S3: expired publication fence fails the serving proof, renew restores it, expired re-reservation gets a fresh generation path, expired deleting claims are re-claimable with claim_generation+1, resurrection makes a stale finalize a no-op, and dry-run/opt-in gating holds. Genuine process death + duplicate wakeups are exercised by tests/storage_lifecycle.py and tests/physical.py against the shared worker engine, but those jobs (GitFS lifecycle3 / physical8) belong to the round3-integrated rebuild that has no reports yet.",
+      "gap": "No Pando-specific process SIGKILL of the mark/delete worker was executed inside the pando23 suite; Pando-side death handling is proven by SQL/lease fault injection, and real process-death recovery proof is pending in the integrated suite."
+    },
+    {
+      "criterion": "concurrent push/fetch/GC with backup/active snapshots preserves retained objects",
+      "status": "pass_with_bounded_gap",
+      "evidence": "rust-pando exports a paired backup before GC and asserts the archived old ciphertext is byte-unchanged after destructive deletion, asserts serving pack ciphertext survives (resolve_artifact + HEAD present), asserts the unregistered legacy tenant-only object survives, and re-materialises serving snapshots (read leases) before and after compaction. pando-service reports backup_barrier_retried=true.",
+      "gap": "A live push racing mark/delete end-to-end is serialised by the worker per-repo write lock inside one process and is not exercised as a multi-connection race in these suites; the durable publication fence and the serving-CAS proof are the in-product guarantees for that window."
+    },
+    {
+      "criterion": "legacy / unregistered / foreign authority bytes permanently protected",
+      "status": "pass",
+      "evidence": "GC predicates pin authority_id and require remote_path LIKE %/authorities/%; resolve_artifact falls back to the authority-free legacy path for unregistered artifacts; mark/claim/delete all include the retained-link and fence predicates; the rust-pando test legacy-object assertion passed."
+    },
+    {
+      "criterion": "metadata-only raw PG/PITR copies are explicitly unsupported and undetected against a shared bucket; new mode is opt-in",
+      "status": "pass",
+      "evidence": "docs/pando-remote-retention.md states such a copy keeps the source authority_id and registry rows, is NOT detected and the deleter does NOT fail closed, and forbids running it against the shared bucket; destructive deletion requires ROOTYARD_PANDO_REMOTE_DELETE=true and the rust-pando dry-run case asserts remote_deleted=false/dry_run=true before the opt-in stage."
+    },
+    {
+      "criterion": "backup format 8 / frozen legacy 4-7 / schema 132 contract",
+      "status": "pass",
+      "evidence": "legacy130: genuine format6/schema130 archive from legacy binary 6135f028, rejected without opt-in, restored and upgraded to max(version) 132 with sha256 clone exact, pin/generation preserved, grant revoked, tombstone preserved. legacy131: genuine format7/schema131 archive from legacy binary 35d01c5f, same pass set. schema job passed against the 132 golden catalog. sha256-matrix and sha256-restore (async-provisioning fix f35285d) passed with exact head/format and retained pin."
+    }
+  ],
+  "integration": {
+    "combined_source": "1061a8e Integrate authority-scoped Pando retention with verified sandbox runtime (round3-integrated)",
+    "ancestry_verified": [
+      "89ba6a8 is an ancestor of 1061a8e",
+      "f35285d is an ancestor",
+      "724b94c is an ancestor",
+      "946955b (merged sandbox work) is an ancestor"
+    ],
+    "diff_89ba_to_1061": "src changes limited to src/sandbox/cgroup.rs and src/sandbox/runner.rs (sandbox runtime), no Pando retention source delta",
+    "combined_runtime": "primary is force-clean rebuilding and rerunning the same suite plus GitFS lifecycle3/physical8 (genuine worker SIGKILL and volume barrier); a separate VM kernel17 run will pin the combined source. No combined report exists yet, so nothing in this document claims combined tests pass."
+  },
+  "meaningful_gaps": [
+    "Pando worker SIGKILL / duplicate-wakeup recovery for the delete path is proven by SQL/lease fault injection only in the pando23 suite; the real process-death assertion lives in the integrated GitFS lifecycle/physical jobs and is pending.",
+    "No multi-instance (two-process) concurrent push+GC race test; single-node loopback fixtures only, as stated in every report limitations field.",
+    "rust-lib/rust-pando/schema jobs have cargo-log evidence only (coordinator design); a future Pando change should add a case-level report for the rust-pando test or assert its exit status explicitly in the coordinator status.",
+    "Combined source 1061a8e and the VM kernel17 pin are unreported at review time; this acceptance is for the pando23 source 89ba6a8 evidence only."
+  ],
+  "non_gaps_explicitly_excluded": [
+    "No physical-host power-loss, kernel, or multi-zone durability requirement is invented for this storage-maintenance issue; the reports are explicitly loopback/synthetic.",
+    "Secret values were not read; only the fact that ready.env supplies endpoints is cited."
+  ],
+  "honesty_notes": [
+    "Two jobs first failed and passed after test-only convergence fixes (724b94c, f35285d) with the SAME binary_sha256 eb1e4a09 in every report, which is consistent with harness timing defects rather than product fixes; the pre-fix failure lines are recorded in logs/pando-service-1794023097.json and logs/sha256-restore-1794023791.json.",
+    "The passing rust-pando evidence is one integration test binary (1 test, 11.86s); it is not a Pando test-suite breadth claim."
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "state": "passed",
+  "database": "round3_focused_gc_6156de3317",
+  "source_commit": "750ccce7571dc5eed7bc9ccaaf3aa04e31755760",
+  "compiled_source_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+  "binary": "/workspace/scratch/rootyard-round3/pando61/artifacts/1061a8ee9d1ecc783189d33949980eac6b3bd6ea/rootyard",
+  "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+  "started": 1794025793.0068827,
+  "exit_code": 0,
+  "finished": 1794025813.7945614
+}
