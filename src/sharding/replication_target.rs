@@ -4,11 +4,13 @@
 use crate::{
     AppState, Error, auth, db, journal,
     sharding::{
-        models::{self, REPO_ROUTE_FIELDS, RepoShardRoute, conflict, json},
+        faults,
+        models::{self, RepoShardRoute, conflict, json},
         replication::{self, FrameReader},
         router::load_or_init_repo_route,
         security::require_operator,
-        transport::{self, DELEGATION_HEADER, ENVELOPE_LIFETIME_SECONDS, Envelope},
+        sidecar,
+        transport::{self, DELEGATION_HEADER, ENVELOPE_LIFETIME_SECONDS},
     },
 };
 use axum::{
@@ -48,6 +50,7 @@ struct TransferAuth {
     owner: String,
     name: String,
     owner_id: Uuid,
+    object_format: String,
     generation: i64,
     op_state: String,
     op_digest: Option<String>,
@@ -56,8 +59,7 @@ struct TransferAuth {
 }
 
 fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -72,12 +74,14 @@ async fn authorize_transfer(
     if headers.contains_key(axum::http::header::AUTHORIZATION) {
         return Err(Error::unauthorized());
     }
-    let raw = headers.get(DELEGATION_HEADER).and_then(|value| value.to_str().ok())
-        .ok_or_else(Error::unauthorized)?;
+    let raw = headers.get(DELEGATION_HEADER).and_then(|value| value.to_str().ok()).ok_or_else(Error::unauthorized)?;
     let env = transport::verify(raw)?;
     let now = models::unix_now();
-    if env.version != 1 || env.nonce.is_nil() || env.expires_unix < now
-        || env.expires_unix > now + ENVELOPE_LIFETIME_SECONDS || env.method != method
+    if env.version != 1
+        || env.nonce.is_nil()
+        || env.expires_unix < now
+        || env.expires_unix > now + ENVELOPE_LIFETIME_SECONDS
+        || env.method != method
         || env.path_and_query != uri.path_and_query().map_or(uri.path(), |path| path.as_str())
         || env.repository_id != repo_id
         || transport::node_id()?.as_deref() != Some(env.target_node_id.as_str())
@@ -124,7 +128,7 @@ async fn authorize_transfer(
     require_operator(&tx, &actor).await?;
     let repo = tx
         .query_one(
-            "SELECT u.slug,r.name,r.storage_generation,r.owner_id FROM repositories r \
+            "SELECT u.slug,r.name,r.storage_generation,r.owner_id,r.object_format FROM repositories r \
              JOIN namespaces u ON u.id=r.owner_id WHERE r.id=$1",
             &[&repo_id],
         )
@@ -134,6 +138,7 @@ async fn authorize_transfer(
     let name: String = repo.get(1);
     let generation: i64 = repo.get(2);
     let owner_id: Uuid = repo.get(3);
+    let object_format: String = repo.get(4);
     auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Admin).await?;
     let op = tx
         .query_opt(
@@ -151,14 +156,17 @@ async fn authorize_transfer(
     let op_state: String = op.get(4);
     let op_digest: Option<String> = op.get(5);
     let op_sequence: Option<i64> = op.get(6);
-    if target != env.target_node_id || epoch != env.route_epoch
-        || source_generation != env.storage_generation || generation != source_generation
+    if target != env.target_node_id
+        || epoch != env.route_epoch
+        || source_generation != env.storage_generation
+        || generation != source_generation
         || !matches!(op_state.as_str(), "copying" | "verified")
     {
         return Err(conflict("snapshot operation or generation changed"));
     }
     let route = load_or_init_repo_route(&tx, owner_id, repo_id).await?;
-    if route.route_epoch != env.route_epoch || route.fencing_token != env.fencing_token
+    if route.route_epoch != env.route_epoch
+        || route.fencing_token != env.fencing_token
         || route.primary_node_id != source
     {
         return Err(conflict("source placement changed before snapshot transfer"));
@@ -169,6 +177,7 @@ async fn authorize_transfer(
         owner,
         name,
         owner_id,
+        object_format,
         generation,
         op_state,
         op_digest,
@@ -230,7 +239,7 @@ pub(crate) async fn receive_snapshot(
     }
     let mut frame = FrameReader::new(body);
     let meta = frame.read_meta().await?;
-    if meta.final_refs.is_some() {
+    if meta.final_refs.is_some() || meta.sidecars.is_some() {
         return Err(Error::bad_request());
     }
     let _auth = authorize_transfer(&state, &headers, &uri, repo_id, op_id, "POST").await?;
@@ -242,6 +251,11 @@ pub(crate) async fn receive_snapshot(
     replication::clean_staging(&bundle)?;
     replication::clean_staging(&staging)?;
     let total = frame.write_bundle(&bundle, state.config.max_repo_bytes, false).await?;
+    faults::hit(
+        &state.storage.root,
+        "target-copy-after-receive",
+        serde_json::json!({"repository_id": repo_id, "operation_id": op_id, "bytes": total}),
+    );
     if total == 0 {
         return Err(conflict("empty snapshot bundle"));
     }
@@ -269,6 +283,11 @@ pub(crate) async fn receive_snapshot(
     if measured != query.refs_sha256 || measured != meta.base.digest() {
         return Err(conflict("target refs differ from source snapshot"));
     }
+    faults::hit(
+        &state.storage.root,
+        "target-verify-before-publish",
+        serde_json::json!({"repository_id": repo_id, "operation_id": op_id, "refs_sha256": measured}),
+    );
     replication::configure_target(&state, &staging, repo_id).await?;
     target.ensure_active()?;
     let sync_stage = staging.clone();
@@ -314,11 +333,7 @@ pub(crate) async fn receive_snapshot(
     }
     let _ = replication::clean_staging(&backup);
     let _ = replication::clean_staging(&bundle);
-    Ok(json(StatusCode::OK, SnapshotReceipt {
-        operation_id: op_id,
-        refs_sha256: measured,
-        state: "verified".into(),
-    }))
+    Ok(json(StatusCode::OK, SnapshotReceipt { operation_id: op_id, refs_sha256: measured, state: "verified".into() }))
 }
 
 pub(crate) async fn receive_delta(
@@ -329,9 +344,7 @@ pub(crate) async fn receive_delta(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Error> {
-    if !valid_digest(&query.base_refs_sha256) || !valid_digest(&query.refs_sha256)
-        || query.journal_sequence < 0
-    {
+    if !valid_digest(&query.base_refs_sha256) || !valid_digest(&query.refs_sha256) || query.journal_sequence < 0 {
         return Err(Error::bad_request());
     }
     let mut frame = FrameReader::new(body);
@@ -341,6 +354,14 @@ pub(crate) async fn receive_delta(
     };
     if meta.base.digest() != query.base_refs_sha256 || final_refs.digest() != query.refs_sha256 {
         return Err(Error::bad_request());
+    }
+    let sidecars = meta.sidecars.as_ref().ok_or_else(|| conflict("delta is missing its CI sidecar closure"))?;
+    if sidecars.repository_id != repo_id
+        || sidecars.operation_id != op_id
+        || sidecars.refs_sha256 != query.refs_sha256
+        || sidecars.journal_sequence != query.journal_sequence
+    {
+        return Err(conflict("CI sidecar bundle differs from the drained delta"));
     }
     let auth = authorize_transfer(&state, &headers, &uri, repo_id, op_id, "POST").await?;
     if auth.op_state != "verified" {
@@ -357,7 +378,8 @@ pub(crate) async fn receive_delta(
     let stage = replication::staging_root(&state)?;
     let bundle = stage.join(format!("{op_id}.incoming.delta.bundle"));
     replication::clean_staging(&bundle)?;
-    let total = frame.write_bundle(&bundle, state.config.max_repo_bytes, query.base_refs_sha256 == query.refs_sha256).await?;
+    let total =
+        frame.write_bundle(&bundle, state.config.max_repo_bytes, query.base_refs_sha256 == query.refs_sha256).await?;
     let current = replication::refs_digest_lease(&state, &repo, &target.lease).await?;
     if current == query.refs_sha256 {
         if total != 0 {
@@ -407,6 +429,13 @@ pub(crate) async fn receive_delta(
     if measured != query.refs_sha256 {
         return Err(conflict("target refs differ from the drained source snapshot"));
     }
+    target.ensure_active()?;
+    sidecar::stage_incoming(&state, sidecars, repo_id, op_id, auth.owner_id, &auth.object_format, final_refs)?;
+    faults::hit(
+        &state.storage.root,
+        "target-delta-before-verified",
+        serde_json::json!({"repository_id": repo_id, "operation_id": op_id, "refs_sha256": measured}),
+    );
     let repo_sync = repo.clone();
     tokio::task::spawn_blocking(move || crate::storage::sync_tree(&repo_sync))
         .await
@@ -436,9 +465,138 @@ pub(crate) async fn receive_delta(
         return Err(conflict("snapshot operation changed before delta publication"));
     }
     let _ = replication::clean_staging(&bundle);
-    Ok(json(StatusCode::OK, SnapshotReceipt {
-        operation_id: op_id,
-        refs_sha256: measured,
-        state: "verified".into(),
-    }))
+    Ok(json(StatusCode::OK, SnapshotReceipt { operation_id: op_id, refs_sha256: measured, state: "verified".into() }))
+}
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct FinalizeReceipt {
+    pub(crate) operation_id: Uuid,
+    pub(crate) state: String,
+}
+
+struct FinalizeAuth {
+    generation: i64,
+}
+
+/// A sidecar finalization is only accepted after the cutover transaction has
+/// committed and this process is the new primary generation. The envelope is
+/// bound to the new route epoch/token; a stale or replayed request is rejected.
+async fn authorize_finalize(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    repo_id: Uuid,
+    op_id: Uuid,
+) -> Result<FinalizeAuth, Error> {
+    if headers.contains_key(axum::http::header::AUTHORIZATION) {
+        return Err(Error::unauthorized());
+    }
+    let raw = headers.get(DELEGATION_HEADER).and_then(|value| value.to_str().ok()).ok_or_else(Error::unauthorized)?;
+    let env = transport::verify(raw)?;
+    let now = models::unix_now();
+    if env.version != 1
+        || env.nonce.is_nil()
+        || env.expires_unix < now
+        || env.expires_unix > now + ENVELOPE_LIFETIME_SECONDS
+        || env.method != "POST"
+        || env.path_and_query != uri.path_and_query().map_or(uri.path(), |path| path.as_str())
+        || env.repository_id != repo_id
+        || transport::node_id()?.as_deref() != Some(env.target_node_id.as_str())
+    {
+        return Err(Error::unauthorized());
+    }
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let current_incarnation: Uuid = tx
+        .query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    if current_incarnation != env.authority_incarnation {
+        return Err(Error::unauthorized());
+    }
+    let inserted = tx
+        .execute(
+            "INSERT INTO cluster_transport_nonces(nonce,expires_at) VALUES($1,to_timestamp($2::bigint::double precision)) ON CONFLICT DO NOTHING",
+            &[&env.nonce, &env.expires_unix],
+        )
+        .await
+        .map_err(Error::internal)?;
+    if inserted != 1 {
+        return Err(Error::unauthorized());
+    }
+    let row = tx
+        .query_opt(
+            "SELECT u.username,t.read_only,t.digest FROM tokens t JOIN users u ON u.id=t.user_id \
+             WHERE t.id=$1 AND t.user_id=$2 AND NOT t.revoked \
+             AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())",
+            &[&env.token_id, &env.actor_id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::unauthorized)?;
+    let actor = db::Identity {
+        id: env.actor_id,
+        token_id: env.token_id,
+        username: row.get(0),
+        read_only: row.get(1),
+        token_digest: row.get(2),
+    };
+    require_operator(&tx, &actor).await?;
+    let repo = tx
+        .query_one(
+            "SELECT u.slug,r.name,r.storage_generation,r.owner_id,r.object_format FROM repositories r \
+             JOIN namespaces u ON u.id=r.owner_id WHERE r.id=$1",
+            &[&repo_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    let owner: String = repo.get(0);
+    let name: String = repo.get(1);
+    let generation: i64 = repo.get(2);
+    let owner_id: Uuid = repo.get(3);
+    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Admin).await?;
+    let op = tx
+        .query_opt(
+            "SELECT target_node_id,source_route_epoch,source_generation,state \
+             FROM shard_replication_operations WHERE id=$1 AND repository_id=$2",
+            &[&op_id, &repo_id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    let target: String = op.get(0);
+    let source_epoch: i64 = op.get(1);
+    let source_generation: i64 = op.get(2);
+    let op_state: String = op.get(3);
+    if target != env.target_node_id
+        || op_state != "completed"
+        || env.route_epoch != source_epoch + 1
+        || env.storage_generation != source_generation + 1
+        || generation != env.storage_generation
+    {
+        return Err(conflict("CI sidecar finalization differs from the committed cutover"));
+    }
+    let route = load_or_init_repo_route(&tx, owner_id, repo_id).await?;
+    if route.primary_node_id != env.target_node_id
+        || route.route_epoch != env.route_epoch
+        || route.fencing_token != env.fencing_token
+        || route.draining
+        || route.read_only_degraded
+    {
+        return Err(conflict("CI sidecar finalization raced the shard route"));
+    }
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(FinalizeAuth { generation })
+}
+
+pub(crate) async fn finalize_sidecar(
+    State(state): State<Arc<AppState>>,
+    Path((repo_id, op_id)): Path<(Uuid, Uuid)>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let auth = authorize_finalize(&state, &headers, &uri, repo_id, op_id).await?;
+    sidecar::finalize(&state, repo_id, op_id, auth.generation, true).await?;
+    Ok(json(StatusCode::OK, FinalizeReceipt { operation_id: op_id, state: "published".into() }))
 }

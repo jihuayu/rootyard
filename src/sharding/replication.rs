@@ -4,9 +4,11 @@
 //! safe journal sequence, then the bundle itself is produced while ordinary
 //! clients keep writing. The target installs exactly the recorded refs, not the
 //! refs that happened to be current while a bundle was being generated.
-use crate::{AppState, Error, journal, sharding::models::conflict};
+use crate::{
+    AppState, Error, journal,
+    sharding::{models::conflict, sidecar::SidecarBundle},
+};
 use axum::body::{Body, BodyDataStream};
-use bytes::Bytes;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,10 +22,9 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-pub(crate) const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REFS: usize = 4096;
 const SNAPSHOT_RETRIES: usize = 80;
-
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +47,9 @@ pub(crate) struct TransferMeta {
     pub(crate) base: RefManifest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) final_refs: Option<RefManifest>,
+    /// Exact CI pin/checkout sidecar image measured with `final_refs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sidecars: Option<SidecarBundle>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -60,11 +64,7 @@ pub(crate) struct SnapshotBase {
     pub(crate) manifest: RefManifest,
 }
 
-pub(crate) async fn git_output(
-    state: &AppState,
-    args: &[&str],
-    timeout: Duration,
-) -> Result<Vec<u8>, Error> {
+pub(crate) async fn git_output(state: &AppState, args: &[&str], timeout: Duration) -> Result<Vec<u8>, Error> {
     let mut command = state.storage.git(&state.config);
     command.args(args);
     crate::git_http::collect_git_output(command, 16 * 1024 * 1024, timeout)
@@ -97,11 +97,7 @@ pub(crate) async fn refs_digest_lease(
     Ok(manifest.digest())
 }
 
-pub(crate) async fn configure_target(
-    state: &AppState,
-    repo: &FsPath,
-    repo_id: Uuid,
-) -> Result<(), Error> {
+pub(crate) async fn configure_target(state: &AppState, repo: &FsPath, repo_id: Uuid) -> Result<(), Error> {
     let path = repo.to_str().ok_or_else(Error::bad_request)?;
     let _ = git_output(
         state,
@@ -133,15 +129,13 @@ pub(crate) async fn configure_target(
         ("pack.deltaCacheSize", "32m".into()),
     ];
     for (name, value) in settings {
-        git_output(state, &["--git-dir", path, "config", name, &value], state.config.git_timeout)
-            .await?;
+        git_output(state, &["--git-dir", path, "config", name, &value], state.config.git_timeout).await?;
     }
     Ok(())
 }
 
 pub(crate) fn valid_oid(value: &str) -> bool {
-    matches!(value.len(), 40 | 64)
-        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl RefManifest {
@@ -149,7 +143,9 @@ impl RefManifest {
         if self.refs.is_empty() || self.refs.len() > MAX_REFS {
             return Err(conflict("source ref manifest is empty or too large"));
         }
-        if !self.head.starts_with("refs/") || self.head.contains('\0') || self.head.contains('\n')
+        if !self.head.starts_with("refs/")
+            || self.head.contains('\0')
+            || self.head.contains('\n')
             || !journal::valid_ref(&self.head)
         {
             return Err(conflict("source ref manifest has an invalid HEAD"));
@@ -198,9 +194,7 @@ pub(crate) fn clean_staging(path: &FsPath) -> Result<(), Error> {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
             fs::remove_dir_all(path).map_err(Error::internal)
         }
-        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
-            fs::remove_file(path).map_err(Error::internal)
-        }
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => fs::remove_file(path).map_err(Error::internal),
         Ok(_) => Err(conflict("unsafe existing shard staging path")),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(Error::internal(err)),
@@ -225,8 +219,7 @@ pub(crate) fn read_base(
         return Ok(None);
     }
     let bytes = journal::read(&path).map_err(Error::internal)?;
-    let base: SnapshotBase = serde_json::from_slice(&bytes)
-        .map_err(|_| conflict("corrupt shard snapshot manifest"))?;
+    let base: SnapshotBase = serde_json::from_slice(&bytes).map_err(|_| conflict("corrupt shard snapshot manifest"))?;
     if base.operation_id != operation_id || base.repository_id != repository_id {
         return Err(conflict("shard snapshot manifest belongs to another operation"));
     }
@@ -245,24 +238,29 @@ fn write_base(state: &AppState, base: &SnapshotBase) -> Result<(), Error> {
 
 pub(crate) async fn read_manifest_plain(state: &AppState, repo: &FsPath) -> Result<RefManifest, Error> {
     let path = repo.to_str().ok_or_else(Error::bad_request)?;
-    let raw = git_output(state, &["--git-dir", path, "for-each-ref",
-        "--format=%(refname)%00%(objectname)%00%(symref)"], state.config.git_timeout).await?;
+    let raw = git_output(
+        state,
+        &["--git-dir", path, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"],
+        state.config.git_timeout,
+    )
+    .await?;
     let mut refs = BTreeMap::new();
     for line in std::str::from_utf8(&raw).map_err(|_| conflict("non UTF-8 ref listing"))?.lines() {
         let mut fields = line.split('\0');
-        let Some(name) = fields.next() else { continue };
+        let Some(name) = fields.next() else {
+            continue;
+        };
         let oid = fields.next().ok_or_else(|| conflict("malformed ref listing"))?;
         let symref = fields.next().unwrap_or_default();
         if name.is_empty() {
             continue;
         }
-        refs.insert(name.to_owned(), RefEntry {
-            oid: oid.to_owned(),
-            symref: (!symref.is_empty()).then(|| symref.to_owned()),
-        });
+        refs.insert(
+            name.to_owned(),
+            RefEntry { oid: oid.to_owned(), symref: (!symref.is_empty()).then(|| symref.to_owned()) },
+        );
     }
-    let head = git_output(state, &["--git-dir", path, "symbolic-ref", "HEAD"],
-        state.config.git_timeout).await?;
+    let head = git_output(state, &["--git-dir", path, "symbolic-ref", "HEAD"], state.config.git_timeout).await?;
     let head = std::str::from_utf8(&head).map_err(|_| conflict("non UTF-8 HEAD"))?.trim().to_owned();
     let manifest = RefManifest { refs, head };
     manifest.validate()?;
@@ -275,24 +273,31 @@ pub(crate) async fn read_manifest_lease(
     lease: &crate::storage::read_leases::Lease,
 ) -> Result<RefManifest, Error> {
     let path = repo.to_str().ok_or_else(Error::bad_request)?;
-    let raw = git_output_lease(state, &["--git-dir", path, "for-each-ref",
-        "--format=%(refname)%00%(objectname)%00%(symref)"], state.config.git_timeout, lease).await?;
+    let raw = git_output_lease(
+        state,
+        &["--git-dir", path, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)"],
+        state.config.git_timeout,
+        lease,
+    )
+    .await?;
     let mut refs = BTreeMap::new();
     for line in std::str::from_utf8(&raw).map_err(|_| conflict("non UTF-8 ref listing"))?.lines() {
         let mut fields = line.split('\0');
-        let Some(name) = fields.next() else { continue };
+        let Some(name) = fields.next() else {
+            continue;
+        };
         let oid = fields.next().ok_or_else(|| conflict("malformed ref listing"))?;
         let symref = fields.next().unwrap_or_default();
         if name.is_empty() {
             continue;
         }
-        refs.insert(name.to_owned(), RefEntry {
-            oid: oid.to_owned(),
-            symref: (!symref.is_empty()).then(|| symref.to_owned()),
-        });
+        refs.insert(
+            name.to_owned(),
+            RefEntry { oid: oid.to_owned(), symref: (!symref.is_empty()).then(|| symref.to_owned()) },
+        );
     }
-    let head = git_output_lease(state, &["--git-dir", path, "symbolic-ref", "HEAD"],
-        state.config.git_timeout, lease).await?;
+    let head =
+        git_output_lease(state, &["--git-dir", path, "symbolic-ref", "HEAD"], state.config.git_timeout, lease).await?;
     let head = std::str::from_utf8(&head).map_err(|_| conflict("non UTF-8 HEAD"))?.trim().to_owned();
     let manifest = RefManifest { refs, head };
     manifest.validate()?;
@@ -313,8 +318,14 @@ fn journal_repository(state: &AppState, repository_id: Uuid) -> Result<PathBuf, 
 
 fn sequence_lock(state: &AppState, repository_id: Uuid) -> Result<Option<File>, Error> {
     let repo = journal_repository(state, repository_id)?;
-    let lock = OpenOptions::new().read(true).write(true).create(true).mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW).open(repo.join("sequence.lock")).map_err(Error::internal)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(repo.join("sequence.lock"))
+        .map_err(Error::internal)?;
     match fs2::FileExt::try_lock_exclusive(&lock) {
         Ok(()) => Ok(Some(lock)),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -324,9 +335,11 @@ fn sequence_lock(state: &AppState, repository_id: Uuid) -> Result<Option<File>, 
 
 fn unique_oids(manifest: &RefManifest) -> Vec<&str> {
     let mut seen = BTreeSet::new();
-    manifest.refs.values().filter_map(|entry| {
-        if seen.insert(entry.oid.as_str()) { Some(entry.oid.as_str()) } else { None }
-    }).collect()
+    manifest
+        .refs
+        .values()
+        .filter_map(|entry| if seen.insert(entry.oid.as_str()) { Some(entry.oid.as_str()) } else { None })
+        .collect()
 }
 
 async fn bundle_create(
@@ -375,9 +388,7 @@ pub(crate) async fn capture_source_snapshot(
             continue;
         };
         let pending = journal::pending(&state.storage.root, repository_id).map_err(Error::internal)?;
-        if pending.iter().any(|operation| {
-            journal::ActiveGuard::operation_is_live(operation).unwrap_or(true)
-        }) {
+        if pending.iter().any(|operation| journal::ActiveGuard::operation_is_live(operation).unwrap_or(true)) {
             drop(admission);
             drop(guard);
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -390,8 +401,11 @@ pub(crate) async fn capture_source_snapshot(
         drop(guard);
         clean_staging(&bundle)?;
         let lease = crate::storage::read_leases::shared(
-            &state.pool, repository_id, tokio::time::Instant::now() + state.config.git_timeout,
-        ).await?;
+            &state.pool,
+            repository_id,
+            tokio::time::Instant::now() + state.config.git_timeout,
+        )
+        .await?;
         let _read = state.storage.read_snapshot_lock(repository_id).await;
         if let Err(error) = bundle_create(state, &repo, &bundle, &manifest, None, Some(&lease)).await {
             last = error;
@@ -489,23 +503,18 @@ impl FrameReader {
         }
         let json = self.buffered[8..8 + length].to_vec();
         self.buffered.drain(..8 + length);
-        let meta: TransferMeta = serde_json::from_slice(&json)
-            .map_err(|_| conflict("corrupt snapshot manifest"))?;
+        let meta: TransferMeta = serde_json::from_slice(&json).map_err(|_| conflict("corrupt snapshot manifest"))?;
         meta.base.validate()?;
-        if let Some(final_refs) = &meta.final_refs { final_refs.validate()?; }
+        if let Some(final_refs) = &meta.final_refs {
+            final_refs.validate()?;
+        }
         Ok(meta)
     }
 
     /// Write the remaining bytes of the request body to `path` and return the
     /// measured size. The caller owns the newly-created private staging file.
-    pub(crate) async fn write_bundle(
-        &mut self,
-        path: &FsPath,
-        maximum: u64,
-        allow_empty: bool,
-    ) -> Result<u64, Error> {
-        let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
-            .map_err(Error::internal)?;
+    pub(crate) async fn write_bundle(&mut self, path: &FsPath, maximum: u64, allow_empty: bool) -> Result<u64, Error> {
+        let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).map_err(Error::internal)?;
         let mut file = tokio::fs::File::from_std(file);
         let mut total = self.buffered.len() as u64;
         if total > maximum {
@@ -541,12 +550,19 @@ pub(crate) async fn apply_manifest(
 ) -> Result<(), Error> {
     manifest.validate()?;
     let path = repo.to_str().ok_or_else(Error::bad_request)?;
-    let raw = git_output_lease(state, &["--git-dir", path, "for-each-ref",
-        "--format=%(refname)%00%(symref)"], state.config.git_timeout, lease).await?;
+    let raw = git_output_lease(
+        state,
+        &["--git-dir", path, "for-each-ref", "--format=%(refname)%00%(symref)"],
+        state.config.git_timeout,
+        lease,
+    )
+    .await?;
     let mut current = BTreeMap::new();
     for line in std::str::from_utf8(&raw).map_err(|_| conflict("non UTF-8 ref listing"))?.lines() {
         let mut fields = line.split('\0');
-        let Some(name) = fields.next() else { continue };
+        let Some(name) = fields.next() else {
+            continue;
+        };
         let symref = fields.next().unwrap_or_default();
         if !name.is_empty() {
             current.insert(name.to_owned(), (!symref.is_empty()).then(|| symref.to_owned()));
@@ -557,23 +573,48 @@ pub(crate) async fn apply_manifest(
             continue;
         }
         if symref.is_some() {
-            let _ = git_output_lease(state, &["--git-dir", path, "symbolic-ref", "--delete", name],
-                state.config.git_timeout, lease).await;
+            let _ = git_output_lease(
+                state,
+                &["--git-dir", path, "symbolic-ref", "--delete", name],
+                state.config.git_timeout,
+                lease,
+            )
+            .await;
         }
-        git_output_lease(state, &["--git-dir", path, "update-ref", "--no-deref", "-d", name],
-            state.config.git_timeout, lease).await?;
+        git_output_lease(
+            state,
+            &["--git-dir", path, "update-ref", "--no-deref", "-d", name],
+            state.config.git_timeout,
+            lease,
+        )
+        .await?;
     }
     for (name, entry) in &manifest.refs {
         if let Some(target) = &entry.symref {
-            git_output_lease(state, &["--git-dir", path, "symbolic-ref", name, target],
-                state.config.git_timeout, lease).await?;
+            git_output_lease(
+                state,
+                &["--git-dir", path, "symbolic-ref", name, target],
+                state.config.git_timeout,
+                lease,
+            )
+            .await?;
         } else {
-            git_output_lease(state, &["--git-dir", path, "update-ref", "--no-deref", name, &entry.oid],
-                state.config.git_timeout, lease).await?;
+            git_output_lease(
+                state,
+                &["--git-dir", path, "update-ref", "--no-deref", name, &entry.oid],
+                state.config.git_timeout,
+                lease,
+            )
+            .await?;
         }
     }
-    git_output_lease(state, &["--git-dir", path, "symbolic-ref", "HEAD", &manifest.head],
-        state.config.git_timeout, lease).await?;
+    git_output_lease(
+        state,
+        &["--git-dir", path, "symbolic-ref", "HEAD", &manifest.head],
+        state.config.git_timeout,
+        lease,
+    )
+    .await?;
     let observed = read_manifest_lease(state, repo, lease).await?;
     if &observed != manifest {
         return Err(conflict("target refs differ from the transferred manifest"));

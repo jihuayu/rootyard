@@ -8,6 +8,8 @@ pub mod rebalance;
 pub mod router;
 pub mod security;
 pub mod transitions;
+pub mod faults;
+pub mod sidecar;
 pub mod transport;
 pub mod migration;
 pub mod replication;
@@ -54,6 +56,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/repos/{owner}/{name}/shard-migrate/abort", post(migration::abort_migration))
         .route("/internal/shards/{repo_id}/snapshot/{op_id}", post(replication_target::receive_snapshot))
         .route("/internal/shards/{repo_id}/delta/{op_id}", post(replication_target::receive_delta))
+        .route("/internal/shards/{repo_id}/sidecar/{op_id}", post(replication_target::finalize_sidecar))
         .route(
             "/api/shards/benchmark",
             get(benchmark::list_cluster_benchmarks).post(benchmark::run_cluster_benchmark),

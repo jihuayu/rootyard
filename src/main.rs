@@ -144,6 +144,9 @@ async fn run() -> Result<()> {
             };
             rootyard::reliability::recover_startup(&state).await?;
             rootyard::sharding::transitions::reconcile_pending(&state).await.map_err(|e| anyhow::anyhow!(e.1))?;
+            rootyard::sharding::sidecar::reconcile_startup(&state)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.1))?;
             println!("offline reconciliation finished; inspect repository states for unresolved incidents");
         }
         "serve-mirror" if args.len() == 1 => {
@@ -204,6 +207,9 @@ async fn run() -> Result<()> {
             };
             rootyard::reliability::recover_startup(&state).await?;
             rootyard::sharding::transitions::reconcile_pending(&state).await.map_err(|e| anyhow::anyhow!(e.1))?;
+            rootyard::sharding::sidecar::reconcile_startup(&state)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.1))?;
             rootyard::recover(&state).await?;
             rootyard::sandbox::reconcile_startup(&state)
                 .await
