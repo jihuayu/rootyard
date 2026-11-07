@@ -107,8 +107,12 @@ pub async fn with_frozen_async<T>(id: Uuid, work: impl Future<Output = Result<T,
     let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     let guard = tokio::task::spawn_blocking(move || {
         // Hold the exclusive gate until the database transaction finishes or
-        // its future is cancelled; then outstanding callbacks have drained.
-        gate.freeze(|| {
+        // its future is cancelled, then fence the epoch it superseded before
+        // the freeze is released. The caller authorizes the committed epoch
+        // afterwards, so no mutation can be admitted under the old epoch in
+        // between, and a failed or cancelled commit fails closed instead of
+        // thawing that epoch.
+        gate.freeze_then_fence(|| {
             let _ = ready_tx.send(());
             let _ = release_rx.blocking_recv();
         });
@@ -125,13 +129,12 @@ pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(
     }
     let mut registry = registry().lock().unwrap();
     if let Some(existing) = registry.get(&id) {
-        if existing.gate.renew(db_epoch, until) {
-            return Ok(());
-        }
         // The lease handler commits a new database epoch before calling this.
-        // Re-authorization is non-blocking: a concurrent freeze or an old active
-        // guard is surfaced instead of being bypassed.
-        existing.gate.re_authorize(db_epoch, until).map_err(Error::internal)?;
+        // A same-epoch call only renews the deadline. A new epoch is authorized
+        // through the fence-then-authorize handoff, so a concurrent freeze or a
+        // guard admitted under the old epoch leaves the gate fenced and surfaces
+        // an error instead of keeping the superseded epoch writable.
+        existing.gate.handoff(db_epoch, until).map_err(Error::internal)?;
         return Ok(());
     }
     let lower = lower_path(state, id);

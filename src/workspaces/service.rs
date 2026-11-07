@@ -194,6 +194,11 @@ pub async fn lease(
         tx.commit().await.map_err(Error::internal)?;
         Ok((Workspace::from_row(&row), deadline))
     };
+    // On this host the commit runs inside one freeze that fences the superseded
+    // epoch before it is released, so that epoch cannot admit writes between the
+    // commit and the authorization below. A failed, unknown or cancelled commit
+    // leaves the gate fenced rather than thawing the old epoch, and the mount
+    // stays read-only until a later committed epoch is authorized here.
     let (saved, deadline) =
         if same_host { super::mounts::with_frozen_async(id, commit).await? } else { commit.await? };
     super::mounts::ensure(&state, id, saved.lease_epoch, deadline)?;

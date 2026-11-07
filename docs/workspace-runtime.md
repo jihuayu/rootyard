@@ -97,11 +97,25 @@ freeze, while a fenced or lease-expired gate returns `EROFS`; neither path
 changes content. A fence is terminal for the current lease epoch and does not
 wait for a freeze or for an in-flight mutation. It wakes blocked waiters with
 `EROFS`, ignores the legacy deadline-only lease update, and cannot be cleared by
-that update or by reusing the old epoch. Only `re_authorize` with a strictly
-higher epoch restores writes, and a re-authorization that arrives during a
-freeze still waits for the freeze to finish. The gate's RAII admission count is
-released on error and panic, and a fenced state is never thawed by a freeze
-guard being dropped.
+that update or by reusing the old epoch. Only a strictly higher epoch restores
+writes. Both `re_authorize` and the lease handoff reject a request that arrives
+during a freeze or while a guard admitted under the old epoch is still alive;
+that rejection is `EWOULDBLOCK` and is never bypassed. The gate's RAII admission
+count is released on error and panic, and a fenced state is never thawed by a
+freeze guard being dropped.
+
+A same-host lease commit runs inside a single freeze that fences the old epoch
+before that freeze is released, and the committed epoch is authorized afterwards
+through the same fence-then-authorize handoff used by the mount `ensure` path.
+The old epoch can therefore not admit a new mutation in the window between the
+commit and the new-epoch authorization, and a handoff that is rejected leaves
+the gate `Fenced` instead of `Healthy` on the superseded epoch. A commit that
+errors, panics or is cancelled (the caller drops the future) also leaves the gate
+`Fenced`: the drop of the freeze's completion signal is not treated as a
+successful thaw. Such a mount stays read-only, returning `EROFS` for new
+mutations, until a later committed lease epoch is authorized by a lease acquire,
+checkpoint completion or startup reconcile. The periodic lease refresh only
+renews a live epoch and never clears a fence.
 
 This gate is only a prerequisite for an independent FUSE helper. The session is
 still a `BackgroundSession` in the API process, so an operator `SIGKILL` can
