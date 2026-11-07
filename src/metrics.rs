@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use deadpool_postgres::Pool;
+use deadpool_postgres::{Pool, Status};
 use std::{
     fmt::Write,
     net::SocketAddr,
@@ -119,9 +119,12 @@ async fn snapshot(pool: &Pool) -> anyhow::Result<Snapshot> {
 }
 
 async fn scrape(State(state): State<MetricsState>) -> Response {
+    // Sample pool occupancy before this scrape checks out its own snapshot
+    // session, so the gauges describe demand that was already present.
+    let pool = state.pool.status();
     let snapshot = tokio::time::timeout(Duration::from_secs(5), snapshot(&state.pool)).await.ok().and_then(Result::ok);
     let status = if snapshot.is_some() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    let body = render(state.capacity, state.git_slots.available_permits(), &state.counters, snapshot.as_ref());
+    let body = render(state.capacity, state.git_slots.available_permits(), &state.counters, &pool, snapshot.as_ref());
     (
         status,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (header::CACHE_CONTROL, "no-store")],
@@ -133,8 +136,16 @@ async fn scrape(State(state): State<MetricsState>) -> Response {
 fn gauge(output: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
     let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}");
 }
-fn render(capacity: usize, available: usize, counters: &TransferCounters, snapshot: Option<&Snapshot>) -> String {
+fn render(
+    capacity: usize,
+    available: usize,
+    counters: &TransferCounters,
+    pool: &Status,
+    snapshot: Option<&Snapshot>,
+) -> String {
     let mut output = String::new();
+    output.push_str("# HELP rootyard_error_log_dropped_total Accepted error records lost to queue or writer failure; excludes rate limiting and shutdown.\n# TYPE rootyard_error_log_dropped_total counter\n");
+    let _ = writeln!(output, "rootyard_error_log_dropped_total {}", crate::observability::dropped_event_count());
     gauge(
         &mut output,
         "rootyard_postgres_up",
@@ -147,6 +158,31 @@ fn render(capacity: usize, available: usize, counters: &TransferCounters, snapsh
         "rootyard_git_in_flight",
         "Occupied native Git slots including provisioning and cleanup.",
         capacity.saturating_sub(available),
+    );
+    gauge(&mut output, "rootyard_db_pool_max_size", "Configured maximum PostgreSQL pool connections.", pool.max_size);
+    gauge(
+        &mut output,
+        "rootyard_db_pool_size",
+        "Tracked established pool objects; excludes connection creation and is not a socket liveness probe.",
+        pool.size,
+    );
+    gauge(
+        &mut output,
+        "rootyard_db_pool_available",
+        "Approximate idle pool objects reported by Deadpool before this scrape.",
+        pool.available,
+    );
+    gauge(
+        &mut output,
+        "rootyard_db_pool_busy",
+        "Approximate checked-out pool objects (tracked size minus reported available).",
+        pool.size.saturating_sub(pool.available),
+    );
+    gauge(
+        &mut output,
+        "rootyard_db_pool_waiting",
+        "Estimated excess pool users; can include callers waiting for connection creation.",
+        pool.waiting,
     );
     output.push_str("# HELP rootyard_git_transfers_total Completed Git HTTP transfers by transport outcome.\n# TYPE rootyard_git_transfers_total counter\n");
     let _ = writeln!(
@@ -162,7 +198,7 @@ fn render(capacity: usize, available: usize, counters: &TransferCounters, snapsh
         counters.received.load(Ordering::Relaxed),
         counters.sent.load(Ordering::Relaxed)
     );
-    // On failure emit no database-derived gauges: zero would falsely imply health.
+    // A failed SQL snapshot omits only database-derived gauges: zero would falsely imply health.
     if let Some(s) = snapshot {
         output.push_str("# HELP rootyard_repositories Repositories by durable metadata state.\n# TYPE rootyard_repositories gauge\n");
         for (state, count) in ["provisioning", "ready", "recovering"].iter().zip(s.repositories) {
@@ -229,9 +265,15 @@ mod tests {
     }
     #[test]
     fn failed_snapshot_never_fabricates_backlog() {
-        let text = render(8, 6, &TransferCounters::default(), None);
+        let pool = Status { max_size: 16, size: 13, available: 1, waiting: 7 };
+        let text = render(8, 6, &TransferCounters::default(), &pool, None);
         assert!(text.contains("rootyard_postgres_up 0\n"));
         assert!(text.contains("rootyard_git_in_flight 2\n"));
+        assert!(text.contains("rootyard_db_pool_max_size 16\n"));
+        assert!(text.contains("rootyard_db_pool_size 13\n"));
+        assert!(text.contains("rootyard_db_pool_available 1\n"));
+        assert!(text.contains("rootyard_db_pool_busy 12\n"));
+        assert!(text.contains("rootyard_db_pool_waiting 7\n"));
         assert!(!text.contains("rootyard_repositories"));
         assert!(!text.contains("rootyard_event_deliveries"));
         assert!(!text.contains("rootyard_provisioning"));
@@ -244,7 +286,8 @@ mod tests {
         counters.record_failure();
         counters.add_received_bytes(42);
         counters.add_sent_bytes(17);
-        let text = render(8, 8, &counters, Some(&Snapshot::default()));
+        let pool = Status { max_size: 16, size: 1, available: 1, waiting: 0 };
+        let text = render(8, 8, &counters, &pool, Some(&Snapshot::default()));
         assert!(text.contains("rootyard_git_transfer_bytes_total{direction=\"received\"} 42\n"));
         assert!(text.contains("rootyard_git_transfer_bytes_total{direction=\"sent\"} 17\n"));
         assert!(text.contains("rootyard_git_transfers_total{outcome=\"success\"} 1\n"));
@@ -270,7 +313,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), 17);
+        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), 23);
     }
     #[test]
     fn counters_saturate_instead_of_wrapping() {

@@ -125,11 +125,10 @@ async fn fetch_lfs(state:&AppState,primary:&str,headers:&HeaderMap,repo:&db::Rep
     }.await;
     drop(file);
     if let Err(error)=result {let _=std::fs::remove_file(&stage);return Err(error);}
-    if let Some(scope)=scope {
-        if let Err(error)=scope.validate_source(state,repo.id).await {
+    if let Some(scope)=scope
+        && let Err(error)=scope.validate_source(state,repo.id).await {
             let _=std::fs::remove_file(&stage);return Err(error);
         }
-    }
     std::fs::rename(&stage,&target).map_err(Error::internal)?;
     std::fs::File::open(&dir).and_then(|f|f.sync_all()).map_err(Error::internal)?;
     Ok(())

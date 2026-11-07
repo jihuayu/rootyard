@@ -82,14 +82,13 @@ async fn merge_pull_inner(
     if repo.state != "ready" {
         return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
     }
-    if let Some(expected_gen) = input.storage_generation {
-        if repo.storage_generation != expected_gen {
+    if let Some(expected_gen) = input.storage_generation
+        && repo.storage_generation != expected_gen {
             return Err(Error(
                 StatusCode::CONFLICT,
                 "repository storage generation mismatch",
             ));
         }
-    }
     if !valid_oid_for_format(&input.expected_head_oid, &repo.object_format)
         || !valid_oid_for_format(&input.expected_base_oid, &repo.object_format)
     {

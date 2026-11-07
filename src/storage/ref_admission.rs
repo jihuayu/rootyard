@@ -279,10 +279,10 @@ pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
         if epoch != admitted_epoch || draining || degraded || fenced >= epoch {
             anyhow::bail!("ref admission route epoch changed or is fenced");
         }
-        if let Some(local) = crate::sharding::transport::node_id().map_err(|error| anyhow::anyhow!(error.1))? {
-            if local != primary {
-                anyhow::bail!("ref admission writer is not the current repository primary");
-            }
+        if let Some(local) = crate::sharding::transport::node_id().map_err(|error| anyhow::anyhow!(error.1))?
+            && local != primary
+        {
+            anyhow::bail!("ref admission writer is not the current repository primary");
         }
     }
     auth::verify_repo_write_access(tx, actor_id, token_id, repository_id, false)
@@ -355,10 +355,9 @@ pub async fn operation_is_fenced(state: &AppState, operation: &journal::Operatio
     }
     if let (Some(local), Some(primary)) =
         (crate::sharding::transport::node_id().map_err(|error| anyhow::anyhow!(error.1))?, primary)
+        && local != primary
     {
-        if local != primary {
-            return Ok(true);
-        }
+        return Ok(true);
     }
     Ok(false)
 }

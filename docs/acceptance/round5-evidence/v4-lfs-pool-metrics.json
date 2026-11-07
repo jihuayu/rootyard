@@ -1,0 +1,1088 @@
+{
+  "binary_sha256": "7fce5b30de48f66fe676d3c60bf2da0c33e9d3b11d9c30bcc0ecbcc5974306db",
+  "object_bytes": 8388608,
+  "results": [
+    {
+      "phase": "restart_existing_local_empty_cache",
+      "concurrent_clients": 1,
+      "waves": 1,
+      "wall_seconds": 0.27754183700017165,
+      "served_bytes": 8388608,
+      "process_deltas": {
+        "rchar": 16777217,
+        "wchar": 8396340,
+        "syscr": 258,
+        "syscw": 159,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 23,
+        "cpu_system_ticks": 1
+      },
+      "cpu_seconds": 0.24,
+      "rss_before_bytes": 32432128,
+      "rss_after_bytes": 35315712,
+      "rchar_per_served_byte": 2.0000001192092896,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 13586.806521067,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13586.806522401,
+            "completed_monotonic": 13586.815593193,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13586.949310955,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13586.949312402,
+            "completed_monotonic": 13586.970402531,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.26786790100049984,
+      "p95_seconds": 0.26786790100049984,
+      "p99_seconds": 0.26786790100049984,
+      "samples_seconds": [
+        0.26786790100049984
+      ],
+      "sample_count": 1
+    },
+    {
+      "phase": "warm_batch_get",
+      "concurrent_clients": 1,
+      "waves": 32,
+      "wall_seconds": 2.068015849999938,
+      "served_bytes": 268435456,
+      "process_deltas": {
+        "rchar": 268435456,
+        "wchar": 268523079,
+        "syscr": 4096,
+        "syscw": 4693,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 73,
+        "cpu_system_ticks": 43
+      },
+      "cpu_seconds": 1.16,
+      "rss_before_bytes": 35315712,
+      "rss_after_bytes": 35749888,
+      "rchar_per_served_byte": 1.0,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 13587.105601765,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13587.105602452,
+            "completed_monotonic": 13587.120114658,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 3,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13587.243394217,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13587.243395266,
+            "completed_monotonic": 13587.247875322,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13587.384334647,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13587.384335611,
+            "completed_monotonic": 13587.393967344,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 3,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13587.573772218,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13587.573773074,
+            "completed_monotonic": 13587.581105859,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13587.71853843,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13587.718539073,
+            "completed_monotonic": 13587.721887939,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13587.855088176,
+          "connections": 3,
+          "active_sql": 1,
+          "pool_status": {
+            "requested_monotonic": 13587.85508905,
+            "completed_monotonic": 13587.858290119,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13587.997911477,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13587.997912291,
+            "completed_monotonic": 13588.005721953,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 3,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13588.146926766,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13588.146927764,
+            "completed_monotonic": 13588.152960157,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 3,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13588.27323732,
+          "connections": 3,
+          "active_sql": 1,
+          "pool_status": {
+            "requested_monotonic": 13588.273237972,
+            "completed_monotonic": 13588.295075459,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13588.426251002,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13588.426252169,
+            "completed_monotonic": 13588.432118745,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 3,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13588.569866006,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13588.569866684,
+            "completed_monotonic": 13588.574358423,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 3,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13588.714160838,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13588.714161584,
+            "completed_monotonic": 13588.719174156,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 3,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13588.84213965,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13588.842140534,
+            "completed_monotonic": 13588.850522762,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13588.97705857,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13588.977059293,
+            "completed_monotonic": 13588.98447579,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13589.108491788,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13589.108492534,
+            "completed_monotonic": 13589.11568379,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 3,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.05927344799965795,
+      "p95_seconds": 0.11036703900026623,
+      "p99_seconds": 0.15619415800028946,
+      "samples_seconds": [
+        0.03641856000103871,
+        0.03933834700001171,
+        0.04103892300008738,
+        0.04127144799895177,
+        0.046628960999441915,
+        0.046641901000839425,
+        0.047025083000335144,
+        0.051375406999795814,
+        0.05195966599967505,
+        0.05248672100060503,
+        0.052487162000034004,
+        0.05257790599898726,
+        0.05423632000020007,
+        0.054878974999155616,
+        0.058626659998481045,
+        0.05927344799965795,
+        0.06199776999892492,
+        0.06226590699952794,
+        0.0645320690000517,
+        0.06528181499925267,
+        0.06572716700065939,
+        0.06595474400091916,
+        0.06618233199878887,
+        0.06693088599968178,
+        0.06756890399992699,
+        0.06971342700126115,
+        0.0747618790010165,
+        0.07725281200146128,
+        0.08205481899858569,
+        0.0830222180011333,
+        0.11036703900026623,
+        0.15619415800028946
+      ],
+      "sample_count": 32
+    },
+    {
+      "phase": "remote_cold_batch_get",
+      "concurrent_clients": 1,
+      "waves": 1,
+      "wall_seconds": 0.5580942760007019,
+      "served_bytes": 8388608,
+      "process_deltas": {
+        "rchar": 8388782,
+        "wchar": 16792861,
+        "syscr": 130,
+        "syscw": 228,
+        "read_bytes": 0,
+        "write_bytes": 8388608,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 31,
+        "cpu_system_ticks": 3
+      },
+      "cpu_seconds": 0.34,
+      "rss_before_bytes": 35749888,
+      "rss_after_bytes": 37953536,
+      "rchar_per_served_byte": 1.0000207424163818,
+      "remote_requests": {
+        "HEAD": 1,
+        "GET": 1
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 13589.157005366,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13589.157006118,
+            "completed_monotonic": 13589.161443365,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13589.319111171,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13589.31911221,
+            "completed_monotonic": 13589.330569033,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13589.465931743,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13589.465932678,
+            "completed_monotonic": 13589.472045453,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13589.597512698,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13589.597513486,
+            "completed_monotonic": 13589.601774484,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 3,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 1,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.5531533289995423,
+      "p95_seconds": 0.5531533289995423,
+      "p99_seconds": 0.5531533289995423,
+      "samples_seconds": [
+        0.5531533289995423
+      ],
+      "sample_count": 1
+    },
+    {
+      "phase": "restart_existing_local_empty_cache",
+      "concurrent_clients": 4,
+      "waves": 1,
+      "wall_seconds": 0.30373543099995004,
+      "served_bytes": 33554432,
+      "process_deltas": {
+        "rchar": 41943045,
+        "wchar": 33565414,
+        "syscr": 643,
+        "syscw": 527,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 27,
+        "cpu_system_ticks": 4
+      },
+      "cpu_seconds": 0.31,
+      "rss_before_bytes": 32321536,
+      "rss_after_bytes": 36737024,
+      "rchar_per_served_byte": 1.250000149011612,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 13590.815137616,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13590.815138308,
+            "completed_monotonic": 13590.825899695,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 4,
+              "rootyard_db_pool_available": 0,
+              "rootyard_db_pool_busy": 4,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13590.94414018,
+          "connections": 5,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13590.944140782,
+            "completed_monotonic": 13590.948540484,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 5,
+              "rootyard_db_pool_available": 1,
+              "rootyard_db_pool_busy": 4,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13591.110206024,
+          "connections": 5,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13591.110206702,
+            "completed_monotonic": 13591.116224431,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 5,
+              "rootyard_db_pool_available": 5,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.29127593399971374,
+      "p95_seconds": 0.2975646369995957,
+      "p99_seconds": 0.2975646369995957,
+      "samples_seconds": [
+        0.27099718499994196,
+        0.29127593399971374,
+        0.2940616499981843,
+        0.2975646369995957
+      ],
+      "sample_count": 4
+    },
+    {
+      "phase": "warm_batch_get",
+      "concurrent_clients": 4,
+      "waves": 8,
+      "wall_seconds": 0.829513845999827,
+      "served_bytes": 268435456,
+      "process_deltas": {
+        "rchar": 268435456,
+        "wchar": 268487026,
+        "syscr": 4096,
+        "syscw": 4142,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 50,
+        "cpu_system_ticks": 41
+      },
+      "cpu_seconds": 0.91,
+      "rss_before_bytes": 36737024,
+      "rss_after_bytes": 37642240,
+      "rchar_per_served_byte": 1.0,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 13591.159104078,
+          "connections": 5,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13591.159104958,
+            "completed_monotonic": 13591.177769933,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 5,
+              "rootyard_db_pool_available": 5,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13591.360047808,
+          "connections": 5,
+          "active_sql": 1,
+          "pool_status": {
+            "requested_monotonic": 13591.360048519,
+            "completed_monotonic": 13591.365646146,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 5,
+              "rootyard_db_pool_available": 3,
+              "rootyard_db_pool_busy": 2,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13591.491004434,
+          "connections": 5,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13591.491005248,
+            "completed_monotonic": 13591.508473186,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 5,
+              "rootyard_db_pool_available": 5,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13591.692950834,
+          "connections": 5,
+          "active_sql": 1,
+          "pool_status": {
+            "requested_monotonic": 13591.692951602,
+            "completed_monotonic": 13591.699916976,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 5,
+              "rootyard_db_pool_available": 1,
+              "rootyard_db_pool_busy": 4,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13591.846289807,
+          "connections": 5,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13591.846290413,
+            "completed_monotonic": 13591.860509883,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 5,
+              "rootyard_db_pool_available": 5,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.08765373899950646,
+      "p95_seconds": 0.1169119430014689,
+      "p99_seconds": 0.12075359099981142,
+      "samples_seconds": [
+        0.05457381499945768,
+        0.05574611799966078,
+        0.05860638299964194,
+        0.06553062400053022,
+        0.06636541499938176,
+        0.06976966799993534,
+        0.07118539600014628,
+        0.07337506700059748,
+        0.07386389000021154,
+        0.07537089200013725,
+        0.07804023999960918,
+        0.08005073200001789,
+        0.08258312300131365,
+        0.08332437799981562,
+        0.08609588000035728,
+        0.08765373899950646,
+        0.08890321499893616,
+        0.09066124799937825,
+        0.09193731200139155,
+        0.09219811699949787,
+        0.09497733299940592,
+        0.09591241999987687,
+        0.09866336600134673,
+        0.1010852290000912,
+        0.10227435500019055,
+        0.10230843699901015,
+        0.1033488370012492,
+        0.10559003399976064,
+        0.10659576000034576,
+        0.1164450249998481,
+        0.1169119430014689,
+        0.12075359099981142
+      ],
+      "sample_count": 32
+    },
+    {
+      "phase": "remote_cold_batch_get",
+      "concurrent_clients": 4,
+      "waves": 1,
+      "wall_seconds": 0.39924631100075203,
+      "served_bytes": 33554432,
+      "process_deltas": {
+        "rchar": 33554606,
+        "wchar": 41958539,
+        "syscr": 514,
+        "syscw": 578,
+        "read_bytes": 0,
+        "write_bytes": 8388608,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 27,
+        "cpu_system_ticks": 8
+      },
+      "cpu_seconds": 0.35,
+      "rss_before_bytes": 37642240,
+      "rss_after_bytes": 41558016,
+      "rchar_per_served_byte": 1.0000051856040955,
+      "remote_requests": {
+        "HEAD": 1,
+        "GET": 1
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 13591.971857799,
+          "connections": 5,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13591.97185848,
+            "completed_monotonic": 13591.985464758,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 5,
+              "rootyard_db_pool_available": 0,
+              "rootyard_db_pool_busy": 5,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13592.103168174,
+          "connections": 6,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13592.103168884,
+            "completed_monotonic": 13592.110573448,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 6,
+              "rootyard_db_pool_available": 2,
+              "rootyard_db_pool_busy": 4,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13592.25691217,
+          "connections": 6,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13592.256912906,
+            "completed_monotonic": 13592.265960166,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 6,
+              "rootyard_db_pool_available": 6,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.37895980199937185,
+      "p95_seconds": 0.39504517299974395,
+      "p99_seconds": 0.39504517299974395,
+      "samples_seconds": [
+        0.36486366399913095,
+        0.37895980199937185,
+        0.3933580049997545,
+        0.39504517299974395
+      ],
+      "sample_count": 4
+    },
+    {
+      "phase": "restart_existing_local_empty_cache",
+      "concurrent_clients": 16,
+      "waves": 1,
+      "wall_seconds": 0.5934239300004265,
+      "served_bytes": 134217728,
+      "process_deltas": {
+        "rchar": 142606341,
+        "wchar": 134236541,
+        "syscr": 2179,
+        "syscw": 1707,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 43,
+        "cpu_system_ticks": 23
+      },
+      "cpu_seconds": 0.66,
+      "rss_before_bytes": 32940032,
+      "rss_after_bytes": 40415232,
+      "rchar_per_served_byte": 1.062500037252903,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 13593.762578122,
+          "connections": 3,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13593.762578854,
+            "completed_monotonic": 13593.958853582,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 16,
+              "rootyard_db_pool_available": 0,
+              "rootyard_db_pool_busy": 16,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13594.298214252,
+          "connections": 16,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13594.298214991,
+            "completed_monotonic": 13594.304508562,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 16,
+              "rootyard_db_pool_available": 16,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.539892474998851,
+      "p95_seconds": 0.5737714449987834,
+      "p99_seconds": 0.5737714449987834,
+      "samples_seconds": [
+        0.4019963139999163,
+        0.4592809440000565,
+        0.46808457400038606,
+        0.47084888300014427,
+        0.4972885990009672,
+        0.5071655499996268,
+        0.5169698370009428,
+        0.539892474998851,
+        0.5434042820015748,
+        0.5448338869991858,
+        0.5475003159990592,
+        0.549731609000446,
+        0.5559005480008636,
+        0.5632199829997262,
+        0.5652585530006036,
+        0.5737714449987834
+      ],
+      "sample_count": 16
+    },
+    {
+      "phase": "warm_batch_get",
+      "concurrent_clients": 16,
+      "waves": 2,
+      "wall_seconds": 0.6261508019997564,
+      "served_bytes": 268435456,
+      "process_deltas": {
+        "rchar": 268435456,
+        "wchar": 268472812,
+        "syscr": 4096,
+        "syscw": 3589,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 47,
+        "cpu_system_ticks": 31
+      },
+      "cpu_seconds": 0.78,
+      "rss_before_bytes": 40415232,
+      "rss_after_bytes": 42651648,
+      "rchar_per_served_byte": 1.0,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 13594.344620705,
+          "connections": 16,
+          "active_sql": 2,
+          "pool_status": {
+            "requested_monotonic": 13594.344621406,
+            "completed_monotonic": 13594.3612127,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 16,
+              "rootyard_db_pool_available": 3,
+              "rootyard_db_pool_busy": 13,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13594.665657898,
+          "connections": 16,
+          "active_sql": 2,
+          "pool_status": {
+            "requested_monotonic": 13594.665658616,
+            "completed_monotonic": 13594.675101299,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 16,
+              "rootyard_db_pool_available": 10,
+              "rootyard_db_pool_busy": 6,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13594.945102899,
+          "connections": 16,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13594.945103698,
+            "completed_monotonic": 13594.951568631,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 16,
+              "rootyard_db_pool_available": 16,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.2505702390008082,
+      "p95_seconds": 0.30080677500154707,
+      "p99_seconds": 0.3030927639993024,
+      "samples_seconds": [
+        0.1346367719997943,
+        0.1502501030008716,
+        0.1721246319993952,
+        0.1757872819998738,
+        0.19053168699974776,
+        0.19121757699940645,
+        0.19257925399870146,
+        0.19490307999876677,
+        0.19779287699930137,
+        0.20572896899830084,
+        0.23306549099834228,
+        0.23657626300155243,
+        0.23872032899998885,
+        0.2451067290003266,
+        0.24906778800141183,
+        0.2505702390008082,
+        0.2509486589988228,
+        0.2527427170007286,
+        0.25851873200008413,
+        0.25879539499874227,
+        0.26208277699879545,
+        0.26864264299911156,
+        0.2711928369990346,
+        0.2746990759987966,
+        0.2767303670007095,
+        0.2772476000009192,
+        0.28277646499918774,
+        0.294301161000476,
+        0.2949588629999198,
+        0.3006333209996228,
+        0.30080677500154707,
+        0.3030927639993024
+      ],
+      "sample_count": 32
+    },
+    {
+      "phase": "remote_cold_batch_get",
+      "concurrent_clients": 16,
+      "waves": 1,
+      "wall_seconds": 0.6014998730006482,
+      "served_bytes": 134217728,
+      "process_deltas": {
+        "rchar": 134217902,
+        "wchar": 142629499,
+        "syscr": 2050,
+        "syscw": 1953,
+        "read_bytes": 0,
+        "write_bytes": 8392704,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 45,
+        "cpu_system_ticks": 17
+      },
+      "cpu_seconds": 0.62,
+      "rss_before_bytes": 42651648,
+      "rss_after_bytes": 47947776,
+      "rchar_per_served_byte": 1.0000012964010239,
+      "remote_requests": {
+        "HEAD": 1,
+        "GET": 1
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 13594.976637411,
+          "connections": 16,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13594.976638051,
+            "completed_monotonic": 13594.990242495,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 16,
+              "rootyard_db_pool_available": 0,
+              "rootyard_db_pool_busy": 16,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13595.114090598,
+          "connections": 16,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13595.114091451,
+            "completed_monotonic": 13595.277919931,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 16,
+              "rootyard_db_pool_available": 0,
+              "rootyard_db_pool_busy": 16,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        },
+        {
+          "monotonic": 13595.564821901,
+          "connections": 16,
+          "active_sql": 0,
+          "pool_status": {
+            "requested_monotonic": 13595.564822521,
+            "completed_monotonic": 13595.570190096,
+            "values": {
+              "rootyard_db_pool_max_size": 16,
+              "rootyard_db_pool_size": 16,
+              "rootyard_db_pool_available": 16,
+              "rootyard_db_pool_busy": 0,
+              "rootyard_db_pool_waiting": 0
+            }
+          }
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.5381039320000127,
+      "p95_seconds": 0.5917643249995308,
+      "p99_seconds": 0.5917643249995308,
+      "samples_seconds": [
+        0.4290641349998623,
+        0.4606856930004142,
+        0.48375874100020155,
+        0.4954075969999394,
+        0.5005598910011031,
+        0.5269921269991755,
+        0.528029166000124,
+        0.5381039320000127,
+        0.5387163899995357,
+        0.5421146519984177,
+        0.5554777159995865,
+        0.5658444599994255,
+        0.569723022999824,
+        0.5761780680004449,
+        0.5810940549999941,
+        0.5917643249995308
+      ],
+      "sample_count": 16
+    }
+  ],
+  "scope": "Actual native Rust service / configured PostgreSQL and owned S3-compatible fixture through counting proxy, one host, random8MiB object; endpoints and tokens excluded.",
+  "limitations": [
+    "Debug build; timings under shared host load, no production throughput/SLA inference. Small cold samples give empirical order statistics only.",
+    "rchar counts all process read syscalls; read_bytes/write_bytes kernel storage accounting can be zero due pagecache; no direct disk device busy measurement.",
+    "PostgreSQL active_sql/connection samples match service-owned TCP client ports. pool_status contains the private metrics listener pre-scrape Deadpool counters when available; older binaries return an empty values map. These are approximate concurrent snapshots, not a coherent live-socket or exact queue probe. The sampler itself issues a bounded database metrics snapshot, adding a small observer workload.",
+    "CPU ticks are service process CPU including internal worker threads; excludes PostgreSQL/Garage CPU."
+  ]
+}

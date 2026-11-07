@@ -363,8 +363,8 @@ pub(crate) fn evict_repo_directory(
             .and_then(|s| s.strip_suffix(".json"))
             .and_then(parse_gen_oid)
         {
-            if let Ok(bytes) = sync::read_regular(&path, 4096) {
-                if let Ok(meta) = serde_json::from_slice::<Snapshot>(&bytes) {
+            if let Ok(bytes) = sync::read_regular(&path, 4096)
+                && let Ok(meta) = serde_json::from_slice::<Snapshot>(&bytes) {
                     let pin_dir_path = repo_root
                         .join(meta.snapshot.to_string())
                         .join("pins")
@@ -388,9 +388,8 @@ pub(crate) fn evict_repo_directory(
                         protected,
                     });
                 }
-            }
-        } else if let Ok(snap_uuid) = name.parse::<Uuid>() {
-            if path.is_dir() {
+        } else if let Ok(snap_uuid) = name.parse::<Uuid>()
+            && path.is_dir() {
                 let mtime_ns = mtime_nanos(&path).unwrap_or(0);
                 let bytes = storage::disk_bytes(&path, u64::MAX).unwrap_or(0);
                 snapshots.insert(
@@ -403,11 +402,10 @@ pub(crate) fn evict_repo_directory(
                     },
                 );
             }
-        }
     }
 
-    if let Some(high) = input.high_watermark_bytes {
-        if disk_bytes_before <= high
+    if let Some(high) = input.high_watermark_bytes
+        && disk_bytes_before <= high
             && effective_target.is_none()
             && input.max_pins.is_none()
             && input.max_job_views.is_none()
@@ -434,7 +432,6 @@ pub(crate) fn evict_repo_directory(
                 dry_run,
             });
         }
-    }
 
     let byte_goal = if let Some(high) = input.high_watermark_bytes {
         input

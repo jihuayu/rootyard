@@ -122,24 +122,22 @@ pub struct RefsQuery {
 impl RefsQuery {
     pub fn validate(&self) -> Result<(Option<&str>, Option<&str>, usize), Error> {
         let limit = validate_limit(self.limit)?;
-        if let Some(ref prefix) = self.prefix {
-            if prefix.is_empty()
+        if let Some(ref prefix) = self.prefix
+            && (prefix.is_empty()
                 || prefix.len() > 1024
                 || !prefix.starts_with("refs/")
                 || crate::ci_pins::reserved(prefix)
                 || prefix.starts_with("refs/rootyard-ci")
                 || "refs/rootyard-ci".starts_with(prefix.as_str()) && prefix != "refs/"
                 || prefix.contains("..")
-                || prefix.bytes().any(|b| b <= 32 || b == 127)
+                || prefix.bytes().any(|b| b <= 32 || b == 127))
             {
                 return Err(Error::bad_request());
             }
-        }
-        if let Some(ref after) = self.after {
-            if !valid_public_ref(after) {
+        if let Some(ref after) = self.after
+            && !valid_public_ref(after) {
                 return Err(Error::bad_request());
             }
-        }
         Ok((self.prefix.as_deref(), self.after.as_deref(), limit))
     }
 }
@@ -191,16 +189,15 @@ pub struct TreeByOidQuery {
 }
 
 pub fn validate_tree_after(after: Option<&str>) -> Result<Option<&str>, Error> {
-    if let Some(cursor) = after {
-        if cursor.is_empty()
+    if let Some(cursor) = after
+        && (cursor.is_empty()
             || cursor.len() > 1024
             || cursor == "."
             || cursor == ".."
-            || cursor.bytes().any(|b| b < 32 || b == 127 || b == b'/')
+            || cursor.bytes().any(|b| b < 32 || b == 127 || b == b'/'))
         {
             return Err(Error::bad_request());
         }
-    }
     Ok(after)
 }
 
@@ -463,11 +460,10 @@ impl RefTransactionRequest {
                 new_oid,
             });
         }
-        if let Some(id) = proposal_pin {
-            if out.len() != 1 || out[0].ref_name != crate::namespace_service::proposal_pin_ref(id) {
+        if let Some(id) = proposal_pin
+            && (out.len() != 1 || out[0].ref_name != crate::namespace_service::proposal_pin_ref(id)) {
                 return Err(Error::bad_request());
             }
-        }
         // Check directory/file prefix conflicts among target refs that will exist after the transaction.
         for (i, a) in out.iter().enumerate() {
             if is_zero_oid(&a.new_oid) {

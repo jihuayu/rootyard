@@ -49,8 +49,8 @@ pub(crate) fn read_repo_git_config_backend(repo_path: &std::path::Path) -> (Opti
         let line = raw.trim();
         if line.starts_with('[') && line.ends_with(']') {
             in_ry = line[1..line.len() - 1].trim().eq_ignore_ascii_case("rootyard");
-        } else if in_ry {
-            if let Some((k, v)) = line.split_once('=') {
+        } else if in_ry
+            && let Some((k, v)) = line.split_once('=') {
                 let (k, v) = (k.trim(), v.trim().trim_matches('"'));
                 if k.eq_ignore_ascii_case("storagebackend") && matches!(v, "gitfs" | "pando") {
                     backend = Some(v.to_owned());
@@ -58,7 +58,6 @@ pub(crate) fn read_repo_git_config_backend(repo_path: &std::path::Path) -> (Opti
                     paused = v.eq_ignore_ascii_case("true") || v == "1" || v.eq_ignore_ascii_case("yes");
                 }
             }
-        }
     }
     (backend, paused)
 }

@@ -1,0 +1,19 @@
+{
+  "binary_sha256": "9fb0ebea0f06d5e6de890acb2f5c2484b6f33324325a7e4fadb64c5859deb335",
+  "slow_receiver_entered": true,
+  "healthy_delivered_while_slow_held": true,
+  "observation_seconds": 1.1976,
+  "observations": [
+    {
+      "path": "/fast",
+      "monotonic": 8433.733875191,
+      "slow_released": false
+    },
+    {
+      "path": "/slow",
+      "monotonic": 8433.746002654,
+      "slow_released": false
+    }
+  ],
+  "scope": "Actual Rust worker; isolated PostgreSQL17; two sorted repositories and owned HTTP receivers. No manual dispatch."
+}

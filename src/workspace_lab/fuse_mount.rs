@@ -312,27 +312,27 @@ impl Overlay {
     }
     fn prepare(&mut self, p: &Path) -> io::Result<Entry> {
         let to = Entry::new(&self.upper, p, true)?;
-        if to.lstat().is_err() {
-            if let Ok(from) = self.selected(p) {
-                let source = self.host_entry(&from, false)?;
-                let m = source.lstat()?;
-                if m.is_file() {
-                    let mut input = if from.starts_with(&self.lower) {
-                        open_lower(self.lazy.as_deref(), p, &source)?
-                    } else {
-                        source.open(libc::O_RDONLY, 0)?
-                    };
-                    let mut output =
-                        to.open(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, m.permissions().mode() & 0o777)?;
-                    io::copy(&mut input, &mut output)?;
-                    output.sync_all()?;
-                } else if m.file_type().is_symlink() {
-                    let target = source.read_link()?;
-                    safe_link_at(&target, p)?;
-                    to.symlink(&target)?;
-                } else if m.is_dir() {
-                    to.mkdir(m.permissions().mode() & 0o777)?;
-                }
+        if to.lstat().is_err()
+            && let Ok(from) = self.selected(p)
+        {
+            let source = self.host_entry(&from, false)?;
+            let m = source.lstat()?;
+            if m.is_file() {
+                let mut input = if from.starts_with(&self.lower) {
+                    open_lower(self.lazy.as_deref(), p, &source)?
+                } else {
+                    source.open(libc::O_RDONLY, 0)?
+                };
+                let mut output =
+                    to.open(libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, m.permissions().mode() & 0o777)?;
+                io::copy(&mut input, &mut output)?;
+                output.sync_all()?;
+            } else if m.file_type().is_symlink() {
+                let target = source.read_link()?;
+                safe_link_at(&target, p)?;
+                to.symlink(&target)?;
+            } else if m.is_dir() {
+                to.mkdir(m.permissions().mode() & 0o777)?;
             }
         }
         Ok(to)

@@ -27,7 +27,9 @@ pub mod maintenance;
 pub mod members;
 pub mod metrics;
 pub mod namespace_service;
+pub mod observability;
 pub mod organizations;
+pub mod pagination;
 #[rustfmt::skip]
 pub mod mirror;
 #[rustfmt::skip]
@@ -80,5 +82,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(namespace_service::routes())
         .fallback(|State(state): State<Arc<AppState>>, request| async move { git_http::handle(state, request).await })
         .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(axum::middleware::from_fn(observability::middleware))
         .with_state(state)
 }

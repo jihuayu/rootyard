@@ -1,0 +1,372 @@
+name: Candidate release native acceptance
+
+# Manual candidate-release gate, not per-pull-request CI.
+#
+# Ordinary push/pull_request CI (.github/workflows/ci.yml) runs the cheap native
+# security/tenancy/concurrency regressions: tests/web_sessions.py,
+# tests/ci_webhook_regressions.py and tests/webhook_worker_recovery.py, bound to
+# the once-built binary by scripts/native_report_manifest.py. This workflow adds
+# the expensive suites a release candidate needs and does not overload the
+# specialised cgroup VM gate in native-kernel-acceptance.yml:
+#
+# * tests/browser_ui.py on a real system Chromium (/usr/bin/chromium) driven by
+#   a pinned Playwright client;
+# * tests/lfs_hydration_concurrency.py, tests/lfs_remote.py and
+#   tests/lfs_retention_acceptance.py against an ephemeral, job-owned Garage 2.1
+#   S3 fixture. Retention runs with no object-store endpoint at all.
+#
+# Dispatch this workflow on the branch/tag head that is the candidate commit; it
+# records github.sha and every report must match the build receipt of the binary
+# built here. See docs/ci-acceptance.md for the gate contract and limits.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Fixed, reviewed inputs only. workflow_dispatch accepts no version/image
+# overrides, so no dispatch value can reach a shell command or the fixture.
+env:
+  GARAGE_IMAGE: dxflrs/garage:v2.1.0@sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a
+  GARAGE_IMAGE_DIGEST: sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a
+  PLAYWRIGHT_VERSION: "1.49.0"
+  GIT_LFS_VERSION: "3.6.1"
+
+concurrency:
+  group: candidate-release-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  browser-native:
+    name: Real Chromium browser sessions against the built binary
+    runs-on: ubuntu-24.04
+    container:
+      image: rust:1-trixie
+      options: --init
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_PASSWORD: rootyard-ci-only
+          POSTGRES_DB: rootyard_candidate
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_candidate"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard:rootyard-ci-only@postgres:5432/rootyard_candidate
+      ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/candidate/browser/evidence
+      ROOTYARD_SOURCE_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Checkout the dispatched candidate commit without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V
+      - name: Install system Chromium, PostgreSQL 17 clients and test tools
+        timeout-minutes: 10
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates chromium git openssl postgresql-17 postgresql-client-17 \
+            python3 python3-venv
+          test -x /usr/bin/chromium
+          /usr/bin/chromium --version
+      - name: Install pinned Playwright client against the system Chromium
+        timeout-minutes: 10
+        run: |
+          python3 -m venv test-results/tools/playwright-venv
+          test-results/tools/playwright-venv/bin/pip install --disable-pip-version-check \
+            "playwright==${PLAYWRIGHT_VERSION}"
+          test-results/tools/playwright-venv/bin/python -c 'import playwright; print("playwright client ready")'
+      - name: Build the candidate binary once and record its receipt
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          mkdir -p test-results/candidate/browser
+          python3 scripts/build_native.py --features pando-lab
+          test "$(target/debug/rootyard --rootyard-hook-self-check)" = rootyard-hook-v1
+          cp target/debug/rootyard.build.json test-results/candidate/browser/rootyard.build.json
+      - name: Exercise real Chromium sign-in, Issue/PR workflow and session revocation
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          test-results/tools/playwright-venv/bin/python tests/browser_ui.py \
+            --binary target/debug/rootyard \
+            --report test-results/candidate/browser/browser-ui.json \
+            2>&1 | tee test-results/candidate/browser/browser-ui.log
+      - name: Bind the browser report to the built binary
+        if: always()
+        run: |
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/candidate/browser/native-job-manifest.json \
+            --build-receipt test-results/candidate/browser/rootyard.build.json \
+            --binary target/debug/rootyard \
+            --report browser_ui=test-results/candidate/browser/browser-ui.json \
+            --log browser_ui=test-results/candidate/browser/browser-ui.log \
+            --harness tests/browser_ui.py \
+            --harness tests/web_sessions.py \
+            --fixture "playwright_version=$(test-results/tools/playwright-venv/bin/python -c 'import importlib.metadata; print(importlib.metadata.version("playwright"))')" \
+            --fixture "chromium_version=$(/usr/bin/chromium --version)" \
+            --fixture "postgres_server_version=$(psql "$ROOTYARD_TEST_DATABASE_URL" -tAc 'show server_version')" \
+            --fixture "postgres_client_version=$(psql --version)" \
+            --fixture "rust=$(rustc -V)"
+      - name: Upload browser candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-browser
+          path: |
+            test-results/candidate/browser/*.json
+            test-results/candidate/browser/*.log
+            test-results/candidate/browser/evidence/*.jsonl
+          if-no-files-found: error
+
+  object-store-native:
+    name: LFS hydration, recovery and publication on owned Garage 2.1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: rootyard_candidate
+          # Ephemeral isolated service; no repository secret is used.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_candidate"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:5432/rootyard_candidate
+      ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/candidate/object-store/evidence
+      ROOTYARD_SOURCE_COMMIT: ${{ github.sha }}
+      TMPDIR: /tmp
+    steps:
+      - name: Checkout the dispatched candidate commit without persisted credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install PostgreSQL 17 clients and test tools
+        timeout-minutes: 8
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl gcc git gnupg libc6-dev openssl python3 util-linux
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >>"$GITHUB_PATH"
+          git --version
+          python3 --version
+          docker --version
+      - name: Install pinned Git LFS client with official checksum verification
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/git-lfs" "$RUNNER_TEMP/bin"
+          scripts/install_git_lfs.sh \
+            --version "$GIT_LFS_VERSION" \
+            --destination "$RUNNER_TEMP/bin" \
+            --work "$RUNNER_TEMP/git-lfs" \
+            --sha-output "$RUNNER_TEMP/git-lfs-tarball.sha256"
+          echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+          PATH="$RUNNER_TEMP/bin:$PATH" git lfs version | tee "$RUNNER_TEMP/git-lfs-version.txt"
+          grep -F "git-lfs/${GIT_LFS_VERSION}" "$RUNNER_TEMP/git-lfs-version.txt"
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V
+      - name: Build the candidate binary once and record its receipt
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          mkdir -p test-results/candidate/object-store
+          python3 scripts/build_native.py --features pando-lab
+          test "$(target/debug/rootyard --rootyard-hook-self-check)" = rootyard-hook-v1
+          cp target/debug/rootyard.build.json test-results/candidate/object-store/rootyard.build.json
+      - name: Start the job-owned Garage 2.1 S3 fixture
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?}"
+          mkdir -p "$RUNNER_TEMP/owned-garage"
+          echo "OBJECT_STORE_ENV_FILE=$RUNNER_TEMP/owned-garage/object-store.env" >>"$GITHUB_ENV"
+          scripts/owned_garage_fixture.sh start \
+            --directory "$RUNNER_TEMP/owned-garage/fixture" \
+            --image "$GARAGE_IMAGE" \
+            --output-env "$RUNNER_TEMP/owned-garage/object-store.env" \
+            --bucket-prefix rootyard-ci \
+            --region garage
+          python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version_line"])' \
+            "$RUNNER_TEMP/owned-garage/fixture/garage-image.json"
+      - name: Exercise concurrent cold LFS hydration against the owned Garage
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          set -a
+          . "$OBJECT_STORE_ENV_FILE"
+          set +a
+          python3 tests/lfs_hydration_concurrency.py \
+            --binary target/debug/rootyard \
+            --report test-results/candidate/object-store/lfs-hydration.json \
+            2>&1 | tee test-results/candidate/object-store/lfs-hydration.log
+      - name: Exercise second-node LFS recovery after source volume loss
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          set -a
+          . "$OBJECT_STORE_ENV_FILE"
+          set +a
+          python3 tests/lfs_remote.py \
+            --binary target/debug/rootyard \
+            --report test-results/candidate/object-store/lfs-remote.json \
+            2>&1 | tee test-results/candidate/object-store/lfs-remote.log
+      - name: Exercise LFS publication and retention without any remote object store
+        timeout-minutes: 25
+        # This suite owns local bytes only; an inherited endpoint would silently
+        # invalidate it. The endpoint is explicitly cleared and asserted empty.
+        env:
+          ROOTYARD_OBJECT_STORE_ENDPOINT: ""
+          ROOTYARD_OBJECT_STORE_BUCKET: ""
+        run: |
+          set -euo pipefail
+          test -z "${ROOTYARD_OBJECT_STORE_ENDPOINT:-}"
+          test -z "${ROOTYARD_OBJECT_STORE_BUCKET:-}"
+          python3 tests/lfs_retention_acceptance.py \
+            --binary target/debug/rootyard \
+            --report test-results/candidate/object-store/lfs-retention.json \
+            2>&1 | tee test-results/candidate/object-store/lfs-retention.log
+      - name: Bind object-store reports to the built binary
+        if: always()
+        run: |
+          set -euo pipefail
+          test -s "${OBJECT_STORE_ENV_FILE:?}"
+          # Source the private fixture file in THIS shell: the credential scanner
+          # needs the keys generated by this job, and env does not persist across
+          # actions steps. Nothing is echoed or uploaded.
+          set -a
+          . "$OBJECT_STORE_ENV_FILE"
+          set +a
+          garage_json="$RUNNER_TEMP/owned-garage/fixture/garage-image.json"
+          garage_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$garage_json")
+          garage_version_line=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version_line"])' "$garage_json")
+          garage_image=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"])' "$garage_json")
+          garage_image_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_id"])' "$garage_json")
+          garage_image_digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_digest"])' "$garage_json")
+          git_lfs_version=$(sed -n 's#^git-lfs/\([0-9][0-9.]*\).*#\1#p' "$RUNNER_TEMP/git-lfs-version.txt")
+          git_lfs_sha256=$(cat "$RUNNER_TEMP/git-lfs-tarball.sha256")
+          postgres_server_version=$(psql "$ROOTYARD_TEST_DATABASE_URL" -tAc 'show server_version')
+          python3 scripts/native_report_manifest.py --mode job \
+            --manifest-out test-results/candidate/object-store/native-job-manifest.json \
+            --build-receipt test-results/candidate/object-store/rootyard.build.json \
+            --binary target/debug/rootyard \
+            --report lfs_hydration=test-results/candidate/object-store/lfs-hydration.json \
+            --report lfs_remote=test-results/candidate/object-store/lfs-remote.json \
+            --report lfs_retention=test-results/candidate/object-store/lfs-retention.json \
+            --log lfs_hydration=test-results/candidate/object-store/lfs-hydration.log \
+            --log lfs_remote=test-results/candidate/object-store/lfs-remote.log \
+            --log lfs_retention=test-results/candidate/object-store/lfs-retention.log \
+            --harness tests/lfs_hydration_concurrency.py \
+            --harness tests/lfs_remote.py \
+            --harness tests/lfs_retention_acceptance.py \
+            --fixture "garage_version=$garage_version" \
+            --fixture "garage_version_output=$garage_version_line" \
+            --fixture "garage_image=$garage_image" \
+            --fixture "garage_image_id=$garage_image_id" \
+            --fixture "garage_image_digest=$garage_image_digest" \
+            --fixture "git_lfs_version=$git_lfs_version" \
+            --fixture "git_lfs_output=$(cat "$RUNNER_TEMP/git-lfs-version.txt")" \
+            --fixture "git_lfs_tarball_sha256=$git_lfs_sha256" \
+            --fixture "postgres_server_version=$postgres_server_version" \
+            --fixture "postgres_client_version=$(psql --version)" \
+            --fixture "rust=$(rustc -V)"
+      - name: Remove the owned fixture and private environment file
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${OBJECT_STORE_ENV_FILE:-}" ]; then
+            case "$OBJECT_STORE_ENV_FILE" in
+              "$GITHUB_WORKSPACE"/*) echo "refusing to remove an env file inside the checkout" >&2; exit 1 ;;
+            esac
+            rm -f -- "$OBJECT_STORE_ENV_FILE"
+          fi
+          # stop is idempotent when the fixture directory is absent (a start
+          # that failed early), so a nonzero exit here means the owned fixture
+          # could not be verified or removed and must fail the job.
+          scripts/owned_garage_fixture.sh stop \
+            --directory "$RUNNER_TEMP/owned-garage/fixture"
+      - name: Upload object-store candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-object-store
+          path: |
+            test-results/candidate/object-store/*.json
+            test-results/candidate/object-store/*.log
+            test-results/candidate/object-store/evidence/*.jsonl
+          if-no-files-found: error
+
+  release-gate:
+    name: Candidate release gate over the job manifests
+    needs: [browser-native, object-store-native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout the dispatched candidate commit for harness verification
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download candidate evidence artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: candidate-*
+          path: artifacts
+      - name: Verify the candidate release gate
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if find artifacts -name '*.env' -o -name 'object-store.env' | grep -q .; then
+            echo "a private fixture environment file reached the artifacts" >&2
+            exit 1
+          fi
+          python3 scripts/native_report_manifest.py --mode release \
+            --manifest-out candidate-release-gate.json \
+            --expect-commit "$GITHUB_SHA" \
+            --artifact-dir browser=artifacts/candidate-browser \
+            --artifact-dir object-store=artifacts/candidate-object-store \
+            --job-manifest browser=artifacts/candidate-browser/native-job-manifest.json \
+            --job-manifest object-store=artifacts/candidate-object-store/native-job-manifest.json \
+            --require-report browser_ui \
+            --require-report lfs_hydration \
+            --require-report lfs_remote \
+            --require-report lfs_retention \
+            --require-fixture-exact garage_version=2.1.0 \
+            --require-fixture-exact garage_image_digest=sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a \
+            --require-fixture-exact git_lfs_version=3.6.1 \
+            --require-fixture-exact playwright_version=1.49.0 \
+            --require-fixture chromium_version=Chromium
+      - name: Upload candidate release gate manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-release-gate
+          path: candidate-release-gate.json
+          if-no-files-found: error

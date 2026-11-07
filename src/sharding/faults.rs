@@ -37,7 +37,7 @@ fn marker_directory(root: &Path) -> Result<PathBuf, std::io::Error> {
     let dir = root.join(".native-test-faults");
     match fs::symlink_metadata(&dir) {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => Ok(dir),
-        Ok(_) => Err(std::io::Error::new(std::io::ErrorKind::Other, "unsafe fault marker directory")),
+        Ok(_) => Err(std::io::Error::other("unsafe fault marker directory")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(&dir)?;
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
@@ -57,8 +57,7 @@ fn write_marker(root: &Path, phase: &str, detail: &Value) -> Result<(), std::io:
         "unix": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
         "detail": detail,
     });
-    let bytes =
-        serde_json::to_vec_pretty(&record).map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+    let bytes = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let token = now.as_nanos() ^ ((std::process::id() as u128) << 96);
     let temporary = dir.join(format!(".tmp-{}-{token:032x}", std::process::id()));

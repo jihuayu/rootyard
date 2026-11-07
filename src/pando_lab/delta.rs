@@ -102,9 +102,9 @@ pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for i in 16..80 {
@@ -345,7 +345,7 @@ pub fn inflate_zlib_stream(input: &[u8], max_output: usize) -> Result<(Vec<u8>, 
     ensure!(input.len() >= 6, "truncated zlib stream");
     let (cmf, flg) = (input[0], input[1]);
     ensure!((cmf & 0x0f) == 8 && (cmf >> 4) <= 7, "invalid zlib CMF header");
-    ensure!(((cmf as u16) * 256 + (flg as u16)) % 31 == 0, "invalid zlib header check bits");
+    ensure!(((cmf as u16) * 256 + (flg as u16)).is_multiple_of(31), "invalid zlib header check bits");
     ensure!((flg & 0x20) == 0, "zlib preset dictionary not supported");
 
     let mut bits = BitReader::new(input, 2);

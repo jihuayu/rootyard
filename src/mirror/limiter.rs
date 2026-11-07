@@ -48,14 +48,13 @@ impl SyncPermit {
 
 impl Drop for SyncPermit {
     fn drop(&mut self) {
-        if let Ok(mut map) = self.repo_slots.lock() {
-            if let Some(slot) = map.get_mut(&self.repo_id) {
+        if let Ok(mut map) = self.repo_slots.lock()
+            && let Some(slot) = map.get_mut(&self.repo_id) {
                 slot.in_flight = false;
                 if self.completed {
                     slot.last_completed = Some(Instant::now());
                 }
             }
-        }
     }
 }
 

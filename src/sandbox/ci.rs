@@ -301,8 +301,8 @@ fn spawn_preparation(
             // Keep the owned task until PostgreSQL acknowledges a terminal
             // update. A short DB outage must not strand a preparing row.
             loop {
-                if let Ok(client) = state.pool.get().await {
-                    if client
+                if let Ok(client) = state.pool.get().await
+                    && client
                         .execute(
                             "UPDATE sandbox_jobs SET state='failed',finished_at=clock_timestamp(),pid=NULL \
                         WHERE id=$1 AND state IN ('preparing','running')",
@@ -310,9 +310,8 @@ fn spawn_preparation(
                         )
                         .await
                         .is_ok()
-                    {
-                        break;
-                    }
+                {
+                    break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }

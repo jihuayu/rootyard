@@ -73,7 +73,9 @@ fn require_bubblewrap() -> Result<(), Error> {
         return Ok(());
     }
     // Static, secret-free diagnostic: the API body stays generic on purpose.
-    eprintln!("rootyard: bubblewrap does not support --size; the sandbox runtime requires a bubblewrap that implements --size");
+    eprintln!(
+        "rootyard: bubblewrap does not support --size; the sandbox runtime requires a bubblewrap that implements --size"
+    );
     Err(Error::internal("sandbox runtime requires bubblewrap --size support"))
 }
 
@@ -321,36 +323,36 @@ fn live_job_pids(root: &Path) -> std::io::Result<Vec<i32>> {
 /// this exact job root. Verification failure keeps the job row retryable and
 /// prevents root deletion; unrelated PIDs are never signalled.
 async fn reclaim_orphan(root: &Path, pid: Option<i32>) -> Result<(), Error> {
-    if let Some(pid) = pid.filter(|pid| *pid > 1) {
-        if let Some(stat) = proc_stat(pid).map_err(Error::internal)? {
-            let cmdline = fs::read(format!("/proc/{pid}/cmdline")).map_err(Error::internal)?;
-            let needle = root.to_string_lossy();
-            let ours = cmdline.windows(5).any(|window| window == b"bwrap")
-                && cmdline.windows(needle.len()).any(|window| window == needle.as_bytes());
-            if ours {
-                if stat.session != pid || stat.group != pid {
-                    return Err(Error::internal("sandbox leader is not the isolated session leader"));
+    if let Some(pid) = pid.filter(|pid| *pid > 1)
+        && let Some(stat) = proc_stat(pid).map_err(Error::internal)?
+    {
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline")).map_err(Error::internal)?;
+        let needle = root.to_string_lossy();
+        let ours = cmdline.windows(5).any(|window| window == b"bwrap")
+            && cmdline.windows(needle.len()).any(|window| window == needle.as_bytes());
+        if ours {
+            if stat.session != pid || stat.group != pid {
+                return Err(Error::internal("sandbox leader is not the isolated session leader"));
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                for group in session_groups(pid).map_err(Error::internal)? {
+                    // SAFETY: every group belongs to the sandbox session
+                    // created by our own setsid launcher.
+                    unsafe { libc::kill(-group, libc::SIGKILL) };
                 }
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    for group in session_groups(pid).map_err(Error::internal)? {
-                        // SAFETY: every group belongs to the sandbox session
-                        // created by our own setsid launcher.
-                        unsafe { libc::kill(-group, libc::SIGKILL) };
-                    }
-                    // SAFETY: identity (bwrap plus this job root) was verified
-                    // above; PID reuse would have changed the cmdline.
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                    let leader_alive = matches!(proc_stat(pid).map_err(Error::internal)?, Some(stat)
+                // SAFETY: identity (bwrap plus this job root) was verified
+                // above; PID reuse would have changed the cmdline.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                let leader_alive = matches!(proc_stat(pid).map_err(Error::internal)?, Some(stat)
                         if stat.state != b'Z' && stat.state != b'X');
-                    if !leader_alive && session_groups(pid).map_err(Error::internal)?.is_empty() {
-                        break;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(Error::internal("sandbox session did not terminate"));
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                if !leader_alive && session_groups(pid).map_err(Error::internal)?.is_empty() {
+                    break;
                 }
+                if Instant::now() >= deadline {
+                    return Err(Error::internal("sandbox session did not terminate"));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
     }
@@ -647,13 +649,13 @@ async fn launch_inner(
         Mode::Cgroup(group) => Some(group.clone()),
         Mode::Dev => None,
     };
-    if let Some(group) = &group {
-        if cgroup::attach(group, pid).is_err() {
-            let _ = crate::git_http::stop_group_child(&mut child).await;
-            terminal::close(job);
-            cgroup::retire(group).await;
-            return Err(Error::internal("sandbox cgroup attach failed"));
-        }
+    if let Some(group) = &group
+        && cgroup::attach(group, pid).is_err()
+    {
+        let _ = crate::git_http::stop_group_child(&mut child).await;
+        terminal::close(job);
+        cgroup::retire(group).await;
+        return Err(Error::internal("sandbox cgroup attach failed"));
     }
     let registration = tokio::time::timeout(Duration::from_secs(5), async {
         match source {
@@ -679,10 +681,10 @@ async fn launch_inner(
         }
         return Err(error);
     }
-    if let Ok(delay) = std::env::var("ROOTYARD_TEST_SANDBOX_GATE_PAUSE_MS") {
-        if let Ok(delay) = delay.parse::<u64>() {
-            tokio::time::sleep(Duration::from_millis(delay.min(2000))).await;
-        }
+    if let Ok(delay) = std::env::var("ROOTYARD_TEST_SANDBOX_GATE_PAUSE_MS")
+        && let Ok(delay) = delay.parse::<u64>()
+    {
+        tokio::time::sleep(Duration::from_millis(delay.min(2000))).await;
     }
     if let Err(error) = open_start_gate(&state, job, source, root).await {
         let _ = crate::git_http::stop_group_child(&mut child).await;
@@ -760,11 +762,11 @@ async fn launch_inner(
             code = None;
             note(&root_owned, &reason);
         }
-        if let Source::Ci { claim, .. } = &source_owned {
-            if !super::ci::still_active(&state, claim, job).await.unwrap_or(false) {
-                state_name = "cancelled";
-                code = None;
-            }
+        if let Source::Ci { claim, .. } = &source_owned
+            && !super::ci::still_active(&state, claim, job).await.unwrap_or(false)
+        {
+            state_name = "cancelled";
+            code = None;
         }
         if let Ok(client) = state.pool.get().await {
             let _ = client.execute("UPDATE sandbox_jobs SET state=$2,exit_code=$3,finished_at=clock_timestamp(),pid=NULL WHERE id=$1 AND state='running'", &[&job,&state_name,&code]).await;

@@ -39,7 +39,10 @@ class MetricsHarness(Harness):
         assert headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
         assert headers["cache-control"] == "no-store"
         values = dict(line.split(" ", 1) for line in text.splitlines() if not line.startswith("#"))
-        assert len(values) == 17, values
+        assert len(values) == 23, values
+        for name in ("max_size", "size", "available", "busy", "waiting"):
+            assert "rootyard_db_pool_" + name in values
+        assert "rootyard_error_log_dropped_total" in values
         assert values["rootyard_postgres_up"] == "1"
         assert self.http("/metrics")[0] != 200, "Metrics leaked onto application listener"
         for name, value in values.items():

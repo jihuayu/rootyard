@@ -78,8 +78,21 @@ class ShardingTrack4ContractTest(unittest.TestCase):
             "/api/repos/{owner}/{name}/shard-dr-drill",
             "/api/repos/{owner}/{name}/shard-benchmark",
         )
+        self.assertIn("mod routes;", sharding_src)
+        self.assertIn("routes::routes()", sharding_src)
+
+        sharding_routes_rs = ROOT / "src/sharding/routes.rs"
+        self.assertTrue(
+            sharding_routes_rs.is_file(),
+            "src/sharding/routes.rs must contain the router construction",
+        )
+        sharding_routes_src = sharding_routes_rs.read_text(encoding="utf-8")
         for route in expected_routes:
-            self.assertIn(route, sharding_src, f"Route {route} missing from src/sharding.rs")
+            self.assertIn(
+                route,
+                sharding_routes_src,
+                f"Route {route} missing from src/sharding/routes.rs",
+            )
 
         benchmark_src = (ROOT / "src/sharding/benchmark.rs").read_text(encoding="utf-8")
         benchmark_lines = benchmark_src.splitlines()

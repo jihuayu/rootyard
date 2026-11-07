@@ -99,15 +99,23 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
         "src/reliability.rs",
         "src/forge.rs",
         "src/pulls.rs",
-        "src/lfs.rs",
+        "src/lfs/routes.rs",
         "src/members.rs",
         "src/web.rs",
-        "src/sharding.rs",
+        "src/sharding/routes.rs",
     )
     ALL_PRIMARY_ROUTER_FILES = (
         *PRIMARY_ROUTER_FILES,
         "src/webhooks.rs",
     )
+    # Roots that only declare `mod routes;` and delegate must not hide an empty
+    # route table: the connected delegated file is checked instead of the root.
+    DELEGATED_ROUTE_FILES = {
+        "lfs": "src/lfs/routes.rs",
+        "sharding": "src/sharding/routes.rs",
+    }
+    # The single optional `state: Arc<AppState>` parameter is allowed here only.
+    STATE_ROUTE_DOMAINS = ("browse", "web")
 
     def test_all_seven_domain_routers_and_lib_rs_have_zero_method_path_collisions(self) -> None:
         lib_text = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
@@ -124,7 +132,59 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
             "web",
             "sharding",
         ):
-            self.assertIn(f".merge({domain}::routes())", lib_text)
+            root_rs = ROOT / "src" / f"{domain}.rs"
+            self.assertTrue(root_rs.is_file(), f"Missing domain root src/{domain}.rs")
+            root_src = root_rs.read_text(encoding="utf-8")
+            if domain in self.STATE_ROUTE_DOMAINS:
+                self.assertIn(
+                    "pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>>",
+                    root_src,
+                    f"src/{domain}.rs must take exactly the optional state parameter",
+                )
+                self.assertNotIn(
+                    "pub fn routes() -> Router<Arc<AppState>>",
+                    root_src,
+                    f"src/{domain}.rs must not keep a zero-argument routes() that the mount cannot call",
+                )
+                mount = f".merge({domain}::routes(state.clone()))"
+            else:
+                self.assertIn(
+                    "pub fn routes() -> Router<Arc<AppState>>",
+                    root_src,
+                    f"src/{domain}.rs missing pub fn routes() -> Router<Arc<AppState>>",
+                )
+                mount = f".merge({domain}::routes())"
+            self.assertIn(mount, lib_text, f"src/lib.rs does not mount {domain} routes via {mount}")
+            delegated = self.DELEGATED_ROUTE_FILES.get(domain)
+            if delegated is None:
+                self.assertNotIn(
+                    "routes::routes()",
+                    root_src,
+                    f"src/{domain}.rs has no declared delegation; keep its route table inline",
+                )
+            else:
+                self.assertIn("mod routes;", root_src, f"src/{domain}.rs must declare `mod routes;`")
+                self.assertTrue(
+                    e2e_tiers.SchemaBoundaryIntegrationFixture.directly_delegates_routes(root_src),
+                    f"src/{domain}.rs must delegate to routes::routes()",
+                )
+                empty_root = root_src.replace("routes::routes()", "Router::new()", 1)
+                empty_root += "\nfn unused() { let _ = routes::routes(); }\n"
+                self.assertFalse(
+                    e2e_tiers.SchemaBoundaryIntegrationFixture.directly_delegates_routes(empty_root),
+                    "an unused call must not disguise an empty exported router",
+                )
+                delegated_src = (ROOT / delegated).read_text(encoding="utf-8")
+                self.assertIn(
+                    "fn routes() -> Router<Arc<AppState>>",
+                    delegated_src,
+                    f"{delegated} must own the connected route table",
+                )
+                self.assertGreater(
+                    len(_extract_route_registrations(ROOT / delegated)),
+                    0,
+                    f"Delegated route file {delegated} registers no routes",
+                )
 
         seen_bindings: dict[tuple[str, str], tuple[str, str]] = {}
         total_bindings = 0
@@ -208,7 +268,10 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
         self.assertEqual(wildcard_routes, [("src/pulls.rs", "/api/repos/{owner}/{name}/branch-rules/{*branch}")])
 
     def test_lfs_upload_routes_disable_default_body_limit_while_api_router_caps_at_16kib(self) -> None:
-        lfs_src = (ROOT / "src/lfs.rs").read_text(encoding="utf-8")
+        lfs_root = (ROOT / "src/lfs.rs").read_text(encoding="utf-8")
+        self.assertIn("mod routes;", lfs_root, "src/lfs.rs must declare `mod routes;`")
+        self.assertIn("routes::routes()", lfs_root, "src/lfs.rs must delegate to routes::routes()")
+        lfs_src = (ROOT / "src/lfs/routes.rs").read_text(encoding="utf-8")
         lib_src = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
         mirror_src = (ROOT / "src/mirror.rs").read_text(encoding="utf-8")
 
@@ -219,8 +282,17 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
 
         # Ensure only PUT object routes are inside upload_routes before .layer(DefaultBodyLimit::disable())
         upload_block = lfs_src.split("DefaultBodyLimit::disable()", 1)[0]
-        self.assertEqual(upload_block.count("put(handlers::upload_object"), 8)
+        self.assertEqual(upload_block.count("put(upload::upload_object"), 8)
+        self.assertEqual(upload_block.count("put(upload::upload_object)"), 4)
+        self.assertEqual(upload_block.count("put(upload::upload_object_with_size)"), 4)
         self.assertNotIn("post(handlers::batch)", upload_block)
+        for other_method in ("get(", "post(", "patch(", "delete("):
+            self.assertNotIn(
+                other_method,
+                upload_block,
+                f"Only PUT LFS object uploads may bypass DefaultBodyLimit ({other_method})",
+            )
+        self.assertEqual(upload_block.count("objects/{oid}"), 8)
 
     def test_mirror_router_isolation_and_route_table_completeness(self) -> None:
         mirror_regs = _extract_route_registrations(ROOT / "src/mirror.rs")
@@ -244,13 +316,47 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
     """Class 2: Schema baseline 060, FK topological DAG, backup lock ordering, and relational CHECK constraints."""
 
     def test_migrations_001_to_030_exact_version_sequence_and_staged_sql_byte_parity(self) -> None:
-        self.assertEqual(schema_baseline.SCHEMA_VERSIONS, [1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60])
-        self.assertEqual(schema_baseline.LATEST_VERSION, 60)
-        self.assertEqual(schema_baseline.LATEST_PREFIX, "060")
-        self.assertEqual(schema_baseline.TABLE_COUNT, 34)
+        # Historical (pre-060) versions are frozen: newer migrations may only
+        # append versions after 060, never rewrite the earlier prefix.
+        frozen_versions = [1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60]
+        versions = schema_baseline.SCHEMA_VERSIONS
+        self.assertEqual([v for v in versions if v <= 60], frozen_versions)
+        self.assertEqual(versions, sorted(versions))
+        self.assertEqual(len(set(versions)), len(versions))
+        self.assertEqual(versions[0], 1)
 
+        # The frozen 060 fixture must describe exactly the 34 ordinary tables
+        # created by the historical migrations.
+        frozen_catalog = json.loads((ROOT / "schema/060_catalog.json").read_text(encoding="utf-8"))
+        frozen_tables = sorted(t["name"] for t in frozen_catalog["tables"] if t["kind"] == "r")
+        self.assertEqual(len(frozen_tables), 34)
+        historical_tables: list[str] = []
+        for mig_path in sorted((ROOT / "migrations").glob("*.sql")):
+            if int(mig_path.name.split("_", 1)[0]) > 60:
+                continue
+            body = "\n".join(
+                line.split("--", 1)[0] for line in mig_path.read_text(encoding="utf-8").splitlines()
+            )
+            historical_tables.extend(
+                m.group(1)
+                for m in re.finditer(
+                    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z0-9_]+)\s*\(",
+                    body,
+                    re.IGNORECASE,
+                )
+            )
+        self.assertEqual(sorted(historical_tables), frozen_tables)
+
+        # The live Rust registry must match every migration on disk exactly.
         info = e2e_tiers.SchemaBoundaryIntegrationFixture.verify_db_rs_and_migrations()
-        self.assertEqual(info["versions"], schema_baseline.SCHEMA_VERSIONS)
+        self.assertEqual(info["versions"], versions)
+        self.assertEqual(
+            info["files"], sorted(p.name for p in (ROOT / "migrations").glob("*.sql"))
+        )
+        latest = versions[-1]
+        self.assertEqual(schema_baseline.LATEST_VERSION, latest)
+        self.assertEqual(schema_baseline.LATEST_PREFIX, f"{latest:03d}")
+        self.assertGreaterEqual(latest, 60)
 
         staged_pairs = [
             ("migrations/009_forge_pulls.sql", "src/pulls/009_forge_pulls.sql", 9),
@@ -350,7 +456,10 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         self.assertEqual(len(created_order), schema_baseline.TABLE_COUNT)
         self.assertEqual(set(created_order), schema_baseline.EXPECTED_TABLES)
         expected_composite = {
+            "ci_checkout_delegations",
             "ci_checkout_jobs",
+            "ci_integration_checkout_jobs",
+            "ci_runs",
             "forge_branch_rules",
             "forge_check_runs",
             "forge_creation_requests",
@@ -358,11 +467,15 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             "forge_issues",
             "forge_pull_counters",
             "forge_pulls",
+            "forge_trusted_check_contexts",
             "forge_webhook_callbacks",
             "forge_webhook_deliveries",
             "forge_webhooks",
             "git_operations",
+            "lfs_locks",
             "lfs_objects",
+            "pando_pack_manifests",
+            "pando_repository_states",
             "repository_audit_log",
             "repository_collaborators",
             "repository_shard_routes",
@@ -370,35 +483,71 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             "shard_failover_operations",
         }
         self.assertEqual(composite_tenant_tables, expected_composite)
+        # CREATE declarations include the historical actor/owner FK on
+        # git_operations. Later RBAC migrations separate its actor from the
+        # repository owner so collaborators can publish. Validate the current
+        # tenant FKs too, including constraints introduced through ALTER TABLE.
+        live = json.loads(schema_baseline.CATALOG_JSON_PATH.read_text())
+        current_composite = set()
+        for constraint in live["constraints"]:
+            definition = constraint["definition"].replace("public.", "").replace('"', "")
+            if re.search(
+                r"FOREIGN KEY \(repository_id, (?:tenant_id|owner_id)\) "
+                r"REFERENCES repositories\(id, owner_id\)", definition,
+            ):
+                current_composite.add(constraint["table"])
+        self.assertEqual(current_composite, expected_composite - {"git_operations"})
+        # Comments/reviews inherit tenant+repository identity through their
+        # composite issue/PR parent rather than a second direct repository FK.
+        for table, parent, number in (
+            ("forge_issue_comments", "forge_issues", "issue_number"),
+            ("forge_pull_reviews", "forge_pulls", "pull_number"),
+        ):
+            expected = (f"FOREIGN KEY (tenant_id, repository_id, {number}) "
+                        f"REFERENCES public.{parent}(tenant_id, repository_id, number)")
+            self.assertTrue(any(c["table"] == table and c["definition"] == expected
+                                for c in live["constraints"]), f"{table} lost its tenant-scoped parent FK")
 
     def test_backup_tables_lexicographical_lock_ordering_and_advisory_lock_barrier(self) -> None:
         info = e2e_tiers.SchemaBoundaryIntegrationFixture.verify_backup_tables_parity()
         self.assertEqual(info["count"], schema_baseline.TABLE_COUNT)
         self.assertEqual(info["tables"], sorted(schema_baseline.EXPECTED_TABLES))
+        self.assertEqual(info["catalog"], f"schema/{schema_baseline.LATEST_PREFIX}_catalog.json")
+        self.assertIsInstance(info["format"], int)
+        # The full catalog includes non-table relations. The snapshot's LOCK
+        # TABLE list uses only the ordinary-table subset, not those views.
+        self.assertTrue(set(info["tables"]) < set(info["relations"]))
+        self.assertEqual(info["relations"], sorted(info["relations"]))
 
+        # The root module must delegate to the frozen catalog instead of
+        # carrying its own copy of the relation list.
         backup_src = (ROOT / "src/backup.rs").read_text(encoding="utf-8")
-        adv_pos = backup_src.find("pg_advisory_lock(738390103)")
-        lock_pos = backup_src.find("LOCK TABLE {list} IN SHARE MODE")
-        self.assertGreater(adv_pos, 0)
-        self.assertGreater(lock_pos, adv_pos, "pg_advisory_lock must precede LOCK TABLE in src/backup.rs")
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_catalog.sql")', backup_src)
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_catalog.json")', backup_src)
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_restored_catalog.json")', backup_src)
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_upgraded_catalog.json")', backup_src)
-        for tbl in (
-            "forge_webhook_callbacks",
-            "forge_webhook_deliveries",
-            "forge_webhooks",
-            "repository_audit_log",
-            "repository_collaborators",
-            "repository_shard_routes",
-            "repository_team_members",
-            "repository_teams",
-            "shard_failover_operations",
-            "shard_nodes",
-            "shard_virtual_buckets",
-        ):
-            self.assertIn(f'"{tbl}"', backup_src)
+        self.assertNotIn("const TABLES", backup_src)
+        self.assertIn("use catalog::{", backup_src)
+        self.assertIn("FORMAT", backup_src)
+
+        catalog_src = (ROOT / "src/backup/catalog.rs").read_text(encoding="utf-8")
+        for suffix in ("catalog.json", "restored_catalog.json", "upgraded_catalog.json"):
+            self.assertIn(
+                f'include_str!("../../schema/{schema_baseline.LATEST_PREFIX}_{suffix}")',
+                catalog_src,
+            )
+        self.assertIn('entry["kind"] == "r"', catalog_src)
+        self.assertIn("names.sort();", catalog_src)
+
+        snapshot_src = (ROOT / "src/backup/snapshot.rs").read_text(encoding="utf-8")
+        adv_pos = snapshot_src.find("pg_advisory_lock(738390103)")
+        rel_pos = snapshot_src.find("catalog::relations(FORMAT, true)")
+        lock_pos = snapshot_src.find("LOCK TABLE {list} IN SHARE MODE")
+        self.assertGreater(adv_pos, 0, "advisory lock must be taken in src/backup/snapshot.rs")
+        transaction_pos = snapshot_src.find("client.build_transaction()")
+        self.assertGreater(transaction_pos, adv_pos, "backup must take the barrier before opening its snapshot transaction")
+        self.assertGreater(rel_pos, adv_pos, "catalog relations must be read after the advisory lock")
+        self.assertGreater(lock_pos, rel_pos, "pg_advisory_lock and the catalog relation list must precede LOCK TABLE")
+
+        postgres_src = (ROOT / "src/backup/postgres.rs").read_text(encoding="utf-8")
+        self.assertIn("catalog::relations(format, false)", postgres_src)
+        self.assertIn("backup supports only the exact Rootyard public schema", postgres_src)
 
     def test_schema_030_catalog_json_structural_invariants_and_contract_digest(self) -> None:
         self.assertEqual(
@@ -414,7 +563,17 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             )
         ]
         for cat in catalogs:
-            self.assertEqual(len(cat["tables"]), schema_baseline.TABLE_COUNT)
+            # The catalog lists every relation; TABLE_COUNT covers ordinary
+            # tables only (kind == "r"), views are validated separately below.
+            ordinary = [t for t in cat["tables"] if t["kind"] == "r"]
+            self.assertEqual(len(ordinary), schema_baseline.TABLE_COUNT)
+            # Non-table relations are sequences and must stay explicit.
+            non_tables = [t for t in cat["tables"] if t["kind"] != "r"]
+            self.assertEqual(
+                sorted(t["kind"] for t in non_tables),
+                ["S"] * len(non_tables),
+            )
+            self.assertEqual(len(ordinary) + len(non_tables), len(cat["tables"]))
             self.assertGreaterEqual(len(cat["columns"]), 314)
             self.assertGreaterEqual(len(cat["constraints"]), 254)
             self.assertGreaterEqual(len(cat["indexes"]), 70)
@@ -453,7 +612,15 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         c2 = [c for c in catalogs[2]["constraints"] if c["table"] in new_tables]
         self.assertEqual(c0, c1)
         self.assertEqual(c1, c2)
-        self.assertEqual(len(c0), 158)
+        # Anchor on the frozen 060 fixture; the live catalog may only grow
+        # because later migrations add constraints to these tables.
+        frozen = json.loads((ROOT / "schema/060_catalog.json").read_text(encoding="utf-8"))
+        frozen_new = [c for c in frozen["constraints"] if c["table"] in new_tables]
+        self.assertEqual(len(frozen_new), 158)
+        self.assertGreaterEqual(len(c0), len(frozen_new))
+        live_keys = {(c["table"], c["name"]) for c in c0}
+        for con in frozen_new:
+            self.assertIn((con["table"], con["name"]), live_keys)
 
     def test_sqlite_relational_constraint_adversarial_rejection_on_009_020_030_tables(self) -> None:
         with tempfile.TemporaryDirectory(prefix="rootyard-tier5-sql-") as tmp:
@@ -677,7 +844,9 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
         # Verify shared auth::authenticate, authorize_repo, finish_tx, and tokio::spawn disconnect safety
         merge_src = (ROOT / "src/pulls/merge.rs").read_text(encoding="utf-8")
         tx_src = (ROOT / "src/browse/transactions.rs").read_text(encoding="utf-8")
-        lfs_src = (ROOT / "src/lfs/handlers.rs").read_text(encoding="utf-8")
+        lfs_root = (ROOT / "src/lfs.rs").read_text(encoding="utf-8")
+        self.assertIn("mod upload;", lfs_root, "src/lfs.rs must declare the upload submodule")
+        lfs_src = (ROOT / "src/lfs/upload.rs").read_text(encoding="utf-8")
         wh_src = (ROOT / "src/webhooks/handlers.rs").read_text(encoding="utf-8")
         self.assertIn("tokio::spawn", merge_src)
         self.assertIn("finish_tx", merge_src)
@@ -685,6 +854,15 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
         self.assertIn("finish_tx", tx_src)
         self.assertIn("tokio::spawn", lfs_src)
         self.assertIn("auth::authenticate", lfs_src)
+        self.assertIn("sanitize_headers", lfs_src)
+        self.assertEqual(lfs_src.count("tokio::spawn(async move { upload_inner("), 2)
+        upload_inner = lfs_src.split("async fn upload_inner(", 1)[1]
+        self.assertLess(
+            upload_inner.index("sanitize_headers(&headers)"),
+            upload_inner.index("auth::authenticate"),
+            "LFS upload must strip conflicting auth headers before authenticating",
+        )
+        self.assertIn("auth::writable(&actor)", upload_inner)
         self.assertIn("tokio::spawn", wh_src)
 
 

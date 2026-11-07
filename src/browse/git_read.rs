@@ -2,15 +2,26 @@
 use crate::{
     AppState, Error,
     browse::models::{
-        self, BlobResponse, CommitDetail, CommitSummary, CommitsResponse, CompareResponse,
-        HeadInfo, MAX_BROWSE_BLOB_BYTES, MAX_DIFF_BYTES, RefItem, TreeEntry, TreeResponse,
+        self, BlobResponse, CommitDetail, CommitSummary, CommitsResponse, CompareResponse, HeadInfo,
+        MAX_BROWSE_BLOB_BYTES, MAX_DIFF_BYTES, RefItem, TreeEntry, TreeResponse,
     },
 };
 use axum::http::StatusCode;
 use base64::Engine;
-use std::{fs::OpenOptions, io::{Seek, SeekFrom, Write}, os::unix::fs::OpenOptionsExt, process::Stdio};
+use std::{
+    fs::OpenOptions,
+    io::{Seek, SeekFrom, Write},
+    os::unix::fs::OpenOptionsExt,
+    process::Stdio,
+};
 use tokio::process::Command;
 use uuid::Uuid;
+
+#[path = "commit_decode.rs"]
+mod commit_decode;
+
+use commit_decode::parse_batch_commits;
+pub use commit_decode::parse_commit_raw;
 
 pub(crate) fn git_cmd(state: &AppState, repo_id: Uuid) -> Result<Command, Error> {
     let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
@@ -35,38 +46,26 @@ pub(crate) fn git_cmd(state: &AppState, repo_id: Uuid) -> Result<Command, Error>
             Ok(())
         });
     }
-    cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects", "--git-dir"])
-        .arg(repo_path);
+    cmd.args(["-c", "core.hooksPath=/dev/null", "--no-replace-objects", "--git-dir"]).arg(repo_path);
     Ok(cmd)
 }
 
-pub(crate) async fn run_git(
-    state: &AppState,
-    repo_id: Uuid,
-    args: &[&str],
-    limit: usize,
-) -> Result<Vec<u8>, Error> {
+pub(crate) async fn run_git(state: &AppState, repo_id: Uuid, args: &[&str], limit: usize) -> Result<Vec<u8>, Error> {
     let mut cmd = git_cmd(state, repo_id)?;
     cmd.args(args);
-    crate::git_http::collect_git_output(cmd, limit, state.config.git_timeout)
-        .await
-        .map_err(|err| {
-            let msg = err.to_string();
-            if msg.contains("timed out") {
-                Error::timeout()
-            } else if msg.contains("exceeds limit") {
-                Error(StatusCode::PAYLOAD_TOO_LARGE, "Git output exceeds limit")
-            } else {
-                Error::not_found()
-            }
-        })
+    crate::git_http::collect_git_output(cmd, limit, state.config.git_timeout).await.map_err(|err| {
+        let msg = err.to_string();
+        if msg.contains("timed out") {
+            Error::timeout()
+        } else if msg.contains("exceeds limit") {
+            Error(StatusCode::PAYLOAD_TOO_LARGE, "Git output exceeds limit")
+        } else {
+            Error::not_found()
+        }
+    })
 }
 
-pub(crate) async fn object_type(
-    state: &AppState,
-    repo_id: Uuid,
-    spec: &str,
-) -> Result<Option<String>, Error> {
+pub(crate) async fn object_type(state: &AppState, repo_id: Uuid, spec: &str) -> Result<Option<String>, Error> {
     match run_git(state, repo_id, &["cat-file", "-t", spec], 64).await {
         Ok(out) => {
             let kind = String::from_utf8_lossy(&out).trim().to_owned();
@@ -86,10 +85,7 @@ pub fn parse_for_each_ref_output(raw: &[u8]) -> Vec<RefItem> {
             continue;
         }
         let (name, oid) = (parts[0], parts[1]);
-        if crate::ci_pins::reserved(name)
-            || !models::valid_public_ref(name)
-            || !models::valid_non_zero_oid(oid)
-        {
+        if crate::ci_pins::reserved(name) || !models::valid_public_ref(name) || !models::valid_non_zero_oid(oid) {
             continue;
         }
         let kind = if name.starts_with("refs/heads/") {
@@ -99,26 +95,14 @@ pub fn parse_for_each_ref_output(raw: &[u8]) -> Vec<RefItem> {
         } else {
             continue;
         };
-        let peeled_oid = parts
-            .get(2)
-            .copied()
-            .filter(|p| models::valid_non_zero_oid(p))
-            .map(str::to_owned);
-        items.push(RefItem {
-            name: name.to_owned(),
-            oid: oid.to_owned(),
-            kind: kind.to_owned(),
-            peeled_oid,
-        });
+        let peeled_oid = parts.get(2).copied().filter(|p| models::valid_non_zero_oid(p)).map(str::to_owned);
+        items.push(RefItem { name: name.to_owned(), oid: oid.to_owned(), kind: kind.to_owned(), peeled_oid });
     }
     items.sort_by(|a, b| a.name.cmp(&b.name));
     items
 }
 
-pub(crate) async fn read_head_and_refs(
-    state: &AppState,
-    repo_id: Uuid,
-) -> Result<(HeadInfo, Vec<RefItem>), Error> {
+pub(crate) async fn read_head_and_refs(state: &AppState, repo_id: Uuid) -> Result<(HeadInfo, Vec<RefItem>), Error> {
     let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
     let head_raw = crate::journal::read(&repo_path.join("HEAD")).map_err(Error::internal)?;
     let head_text = String::from_utf8_lossy(&head_raw).trim().to_owned();
@@ -185,10 +169,7 @@ pub(crate) async fn page_refs(
     // Git forbids --start-after with include patterns, so query each public
     // namespace separately. Cursor traversal stays bounded even when another
     // namespace (including private CI refs) contains millions of entries.
-    for (namespace, excluded) in [
-        ("refs/heads/", "--exclude=refs/tags/*"),
-        ("refs/tags/", "--exclude=refs/heads/*"),
-    ] {
+    for (namespace, excluded) in [("refs/heads/", "--exclude=refs/tags/*"), ("refs/tags/", "--exclude=refs/heads/*")] {
         if !prefix.is_none_or(|p| namespace.starts_with(p) || p.starts_with(namespace)) {
             continue;
         }
@@ -198,25 +179,30 @@ pub(crate) async fn page_refs(
         let marker = after.filter(|cursor| cursor.starts_with(namespace)).unwrap_or(namespace);
         let start_after = format!("--start-after={marker}");
         let count = format!("--count={}", limit + 1);
-        let args = ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(*objectname)",
-            count.as_str(), start_after.as_str(), excluded, "--exclude=refs/rootyard-ci/*"];
+        let args = [
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(*objectname)",
+            count.as_str(),
+            start_after.as_str(),
+            excluded,
+            "--exclude=refs/rootyard-ci/*",
+        ];
         let raw = run_git(state, repo_id, &args, 256 * 1024).await?;
         items.extend(parse_for_each_ref_output(&raw).into_iter().filter(|r| r.name.starts_with(namespace)));
-        if items.len() > limit { break; }
+        if items.len() > limit {
+            break;
+        }
     }
     items.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(items.into_iter()
+    Ok(items
+        .into_iter()
         .filter(|r| prefix.is_none_or(|p| r.name.starts_with(p)))
         .filter(|r| after.is_none_or(|cursor| r.name.as_str() > cursor))
         .take(limit + 1)
         .collect())
 }
 
-pub(crate) async fn resolve_commit_oid(
-    state: &AppState,
-    repo_id: Uuid,
-    spec: &str,
-) -> Result<String, Error> {
+pub(crate) async fn resolve_commit_oid(state: &AppState, repo_id: Uuid, spec: &str) -> Result<String, Error> {
     if !models::valid_revision_spec(spec) {
         return Err(Error::bad_request());
     }
@@ -233,119 +219,32 @@ pub(crate) async fn resolve_commit_oid(
     let query = format!("{spec}^{{commit}}");
     let out = run_git(state, repo_id, &["rev-parse", "--verify", "--quiet", &query], 128).await?;
     let oid = String::from_utf8_lossy(&out).trim().to_owned();
-    if !models::valid_non_zero_oid(&oid)
-        || object_type(state, repo_id, &oid).await?.as_deref() != Some("commit")
-    {
+    if !models::valid_non_zero_oid(&oid) || object_type(state, repo_id, &oid).await?.as_deref() != Some("commit") {
         return Err(Error::not_found());
     }
     Ok(oid)
 }
 
-fn parse_signature(sig: &str) -> (String, String, i64) {
-    let Some(lt) = sig.rfind('<') else {
-        return (sig.trim().to_owned(), String::new(), 0);
-    };
-    let name = sig[..lt].trim().to_owned();
-    let rest = &sig[lt + 1..];
-    let Some(gt) = rest.find('>') else {
-        return (name, String::new(), 0);
-    };
-    let email = rest[..gt].trim().to_owned();
-    let ts = rest[gt + 1..]
-        .split_whitespace()
-        .next()
-        .and_then(|t| t.parse::<i64>().ok())
-        .unwrap_or(0);
-    (name, email, ts)
-}
-
-pub fn parse_commit_raw(oid: &str, raw: &[u8]) -> Result<CommitSummary, Error> {
-    let text = String::from_utf8_lossy(raw);
-    let (header_block, body_block) = text.split_once("\n\n").unwrap_or((text.as_ref(), ""));
-    let mut tree_oid = String::new();
-    let mut parents = Vec::new();
-    let (mut author_name, mut author_email, mut authored_at) = (String::new(), String::new(), 0);
-    let (mut committer_name, mut committer_email, mut committed_at) =
-        (String::new(), String::new(), 0);
-
-    for line in header_block.lines() {
-        if let Some(rest) = line.strip_prefix("tree ") {
-            tree_oid = rest.trim().to_owned();
-        } else if let Some(rest) = line.strip_prefix("parent ") {
-            let p = rest.trim();
-            if models::valid_non_zero_oid(p) {
-                parents.push(p.to_owned());
-            }
-        } else if let Some(rest) = line.strip_prefix("author ") {
-            (author_name, author_email, authored_at) = parse_signature(rest);
-        } else if let Some(rest) = line.strip_prefix("committer ") {
-            (committer_name, committer_email, committed_at) = parse_signature(rest);
-        }
-    }
-    if !models::valid_non_zero_oid(&tree_oid) {
-        return Err(Error::not_found());
-    }
-    let message = body_block.trim_end_matches(['\r', '\n']).to_owned();
-    let subject = message.lines().next().unwrap_or("").to_owned();
-    Ok(CommitSummary {
-        oid: oid.to_owned(),
-        tree_oid,
-        parents,
-        author_name,
-        author_email,
-        authored_at,
-        committer_name,
-        committer_email,
-        committed_at,
-        subject,
-        message,
-    })
-}
-
-pub(crate) async fn read_commit_summary(
-    state: &AppState,
-    repo_id: Uuid,
-    oid: &str,
-) -> Result<CommitSummary, Error> {
+pub(crate) async fn read_commit_summary(state: &AppState, repo_id: Uuid, oid: &str) -> Result<CommitSummary, Error> {
     let raw = run_git(state, repo_id, &["cat-file", "commit", oid], 256 * 1024).await?;
     parse_commit_raw(oid, &raw)
 }
 
-fn parse_batch_commits(raw: &[u8], oids: &[String]) -> Result<Vec<CommitSummary>, Error> {
-    let mut offset = 0usize;
-    let mut result = Vec::with_capacity(oids.len());
-    for oid in oids {
-        let end = raw[offset..].iter().position(|&b| b == b'\n').ok_or_else(Error::not_found)? + offset;
-        let header = std::str::from_utf8(&raw[offset..end]).map_err(|_| Error::not_found())?;
-        let mut parts = header.split(' ');
-        if parts.next() != Some(oid.as_str()) || parts.next() != Some("commit") {
-            return Err(Error::not_found());
-        }
-        let size: usize = parts.next().and_then(|s| s.parse().ok()).ok_or_else(Error::not_found)?;
-        if parts.next().is_some() || size > 256 * 1024 || size > raw.len().saturating_sub(end + 1) {
-            return Err(Error::not_found());
-        }
-        let start = end + 1;
-        let finish = start + size;
-        if raw.get(finish) != Some(&b'\n') {
-            return Err(Error::not_found());
-        }
-        result.push(parse_commit_raw(oid, &raw[start..finish])?);
-        offset = finish + 1;
-    }
-    if offset != raw.len() {
-        return Err(Error::not_found());
-    }
-    Ok(result)
-}
-
 async fn read_commit_batch(state: &AppState, repo_id: Uuid, oids: &[String]) -> Result<Vec<CommitSummary>, Error> {
-    if oids.is_empty() { return Ok(Vec::new()); }
+    if oids.is_empty() {
+        return Ok(Vec::new());
+    }
     let journal_root = state.storage.root.join("journal");
     crate::journal::mkdir(&journal_root).map_err(Error::internal)?;
     let path = journal_root.join(format!(".tmp-cat-file-{}", Uuid::new_v4()));
-    let mut input = OpenOptions::new().read(true).write(true).create_new(true)
-        .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path).map_err(Error::internal)?;
+    let mut input = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(Error::internal)?;
     std::fs::remove_file(&path).map_err(Error::internal)?;
     for oid in oids {
         writeln!(input, "{oid}").map_err(Error::internal)?;
@@ -353,20 +252,22 @@ async fn read_commit_batch(state: &AppState, repo_id: Uuid, oids: &[String]) -> 
     input.seek(SeekFrom::Start(0)).map_err(Error::internal)?;
     let mut cmd = git_cmd(state, repo_id)?;
     cmd.args(["cat-file", "--batch"]);
-    let raw = crate::git_http::collect_git_output_input(cmd, 4 * 1024 * 1024, state.config.git_timeout, Stdio::from(input))
-        .await.map_err(|err| {
-            if err.to_string().contains("timed out") { Error::timeout() }
-            else if err.to_string().contains("exceeds limit") { Error(StatusCode::PAYLOAD_TOO_LARGE, "Git output exceeds limit") }
-            else { Error::not_found() }
-        })?;
+    let raw =
+        crate::git_http::collect_git_output_input(cmd, 4 * 1024 * 1024, state.config.git_timeout, Stdio::from(input))
+            .await
+            .map_err(|err| {
+                if err.to_string().contains("timed out") {
+                    Error::timeout()
+                } else if err.to_string().contains("exceeds limit") {
+                    Error(StatusCode::PAYLOAD_TOO_LARGE, "Git output exceeds limit")
+                } else {
+                    Error::not_found()
+                }
+            })?;
     parse_batch_commits(&raw, oids)
 }
 
-pub(crate) async fn get_commit_detail(
-    state: &AppState,
-    repo_id: Uuid,
-    oid: &str,
-) -> Result<CommitDetail, Error> {
+pub(crate) async fn get_commit_detail(state: &AppState, repo_id: Uuid, oid: &str) -> Result<CommitDetail, Error> {
     if !models::valid_non_zero_oid(oid) {
         return Err(Error::bad_request());
     }
@@ -374,13 +275,9 @@ pub(crate) async fn get_commit_detail(
         return Err(Error::not_found());
     }
     let summary = read_commit_summary(state, repo_id, oid).await?;
-    let diff_raw = run_git(
-        state,
-        repo_id,
-        &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", oid],
-        512 * 1024,
-    )
-    .await?;
+    let diff_raw =
+        run_git(state, repo_id, &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", oid], 512 * 1024)
+            .await?;
     let changed_paths = diff_raw
         .split(|&b| b == 0)
         .filter(|s| !s.is_empty())
@@ -400,13 +297,7 @@ pub(crate) async fn list_commits(
     let start_oid = resolve_commit_oid(state, repo_id, spec).await?;
     let max_arg = format!("--max-count={}", limit + 1);
     let skip_arg = format!("--skip={after}");
-    let out = run_git(
-        state,
-        repo_id,
-        &["rev-list", &max_arg, &skip_arg, &start_oid, "--"],
-        64 * 1024,
-    )
-    .await?;
+    let out = run_git(state, repo_id, &["rev-list", &max_arg, &skip_arg, &start_oid, "--"], 64 * 1024).await?;
     let oids: Vec<String> = String::from_utf8_lossy(&out)
         .lines()
         .map(str::trim)
@@ -416,11 +307,7 @@ pub(crate) async fn list_commits(
     let more = oids.len() > limit;
     let selected: Vec<String> = oids.into_iter().take(limit).collect();
     let items = read_commit_batch(state, repo_id, &selected).await?;
-    Ok(CommitsResponse {
-        repository_id: repo_id,
-        items,
-        next_after: more.then_some(after + limit),
-    })
+    Ok(CommitsResponse { repository_id: repo_id, items, next_after: more.then_some(after + limit) })
 }
 
 pub fn parse_ls_tree_output(raw: &[u8], rel_path: &str) -> Result<Vec<TreeEntry>, Error> {
@@ -432,11 +319,7 @@ pub fn parse_ls_tree_output(raw: &[u8], rel_path: &str) -> Result<Vec<TreeEntry>
         if name.is_empty() || parts.len() < 4 || !models::valid_non_zero_oid(parts[2]) {
             continue;
         }
-        let path = if rel_path.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{rel_path}/{name}")
-        };
+        let path = if rel_path.is_empty() { name.to_owned() } else { format!("{rel_path}/{name}") };
         entries.push(TreeEntry {
             name: name.to_owned(),
             path,
@@ -450,20 +333,13 @@ pub fn parse_ls_tree_output(raw: &[u8], rel_path: &str) -> Result<Vec<TreeEntry>
     Ok(entries)
 }
 
-async fn resolve_commit_or_tree_oid(
-    state: &AppState,
-    repo_id: Uuid,
-    spec_opt: Option<&str>,
-) -> Result<String, Error> {
+async fn resolve_commit_or_tree_oid(state: &AppState, repo_id: Uuid, spec_opt: Option<&str>) -> Result<String, Error> {
     let spec = spec_opt.unwrap_or("HEAD");
     if !models::valid_revision_spec(spec) {
         return Err(Error::bad_request());
     }
     if models::valid_non_zero_oid(spec) {
-        if !matches!(
-            object_type(state, repo_id, spec).await?.as_deref(),
-            Some("commit" | "tree")
-        ) {
+        if !matches!(object_type(state, repo_id, spec).await?.as_deref(), Some("commit" | "tree")) {
             return Err(Error::not_found());
         }
         return Ok(spec.to_owned());
@@ -480,11 +356,7 @@ pub(crate) async fn read_tree(
     limit: usize,
 ) -> Result<TreeResponse, Error> {
     let root_oid = resolve_commit_or_tree_oid(state, repo_id, oid_or_spec).await?;
-    let tree_spec = if rel_path.is_empty() {
-        format!("{root_oid}^{{tree}}")
-    } else {
-        format!("{root_oid}:{rel_path}")
-    };
+    let tree_spec = if rel_path.is_empty() { format!("{root_oid}^{{tree}}") } else { format!("{root_oid}:{rel_path}") };
     let out = run_git(state, repo_id, &["rev-parse", "--verify", "--quiet", &tree_spec], 128).await?;
     let tree_oid = String::from_utf8_lossy(&out).trim().to_owned();
     if !models::valid_non_zero_oid(&tree_oid)
@@ -568,8 +440,12 @@ pub(crate) async fn compare_commits(
     let ahead: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let log_range = format!("{base_oid}..{head_oid}");
     let rev_out = run_git(state, repo_id, &["rev-list", "--max-count=100", &log_range, "--"], 64 * 1024).await?;
-    let commit_oids: Vec<String> = String::from_utf8_lossy(&rev_out).lines().map(str::trim)
-        .filter(|line| models::valid_non_zero_oid(line)).map(str::to_owned).collect();
+    let commit_oids: Vec<String> = String::from_utf8_lossy(&rev_out)
+        .lines()
+        .map(str::trim)
+        .filter(|line| models::valid_non_zero_oid(line))
+        .map(str::to_owned)
+        .collect();
     let commits = read_commit_batch(state, repo_id, &commit_oids).await?;
     let diff_out = run_git(
         state,

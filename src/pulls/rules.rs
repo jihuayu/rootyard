@@ -94,11 +94,10 @@ pub async fn put_branch_rule_by_path(
     Json(input): Json<BranchRuleInput>,
 ) -> Result<Response, Error> {
     let branch_ref = normalize_branch_ref(&branch)?;
-    if let Some(ref body_branch) = input.branch_ref {
-        if normalize_branch_ref(body_branch)? != branch_ref {
+    if let Some(ref body_branch) = input.branch_ref
+        && normalize_branch_ref(body_branch)? != branch_ref {
             return Err(Error::bad_request());
         }
-    }
     upsert_branch_rule_inner(state, owner, name, branch_ref, headers, input).await
 }
 
@@ -444,11 +443,9 @@ pub async fn evaluate_branch_policy(
             if let Some(role) =
                 rbac::resolve_effective_role_by_id(tx, repository_id, tenant_id, reviewer_id)
                     .await?
-            {
-                if role >= Role::Write {
+                && role >= Role::Write {
                     distinct_approvers.insert(reviewer_id);
                 }
-            }
         }
         distinct_approvers.len() as i64
     } else {

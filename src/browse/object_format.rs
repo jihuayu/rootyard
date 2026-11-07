@@ -54,17 +54,14 @@ pub struct ObjectFormatReceipt {
 }
 
 pub fn detect_git_dir_object_format(repo_path: &StdPath) -> Option<ObjectFormat> {
-    if let Ok(raw) = std::fs::read(repo_path.join("rootyard-object-format.json")) {
-        if let Ok(r) = serde_json::from_slice::<ObjectFormatReceipt>(&raw) { return Some(r.object_format); }
-    }
+    if let Ok(raw) = std::fs::read(repo_path.join("rootyard-object-format.json"))
+        && let Ok(r) = serde_json::from_slice::<ObjectFormatReceipt>(&raw) { return Some(r.object_format); }
     if let Ok(raw) = std::fs::read_to_string(repo_path.join("config")) {
         for line in raw.lines() {
             let trimmed = line.split(['#', ';']).next().unwrap_or("").trim();
-            if let Some((k, v)) = trimmed.split_once('=') {
-                if k.trim().eq_ignore_ascii_case("objectformat") {
-                    if let Some(fmt) = ObjectFormat::from_str_name(v) { return Some(fmt); }
-                }
-            }
+            if let Some((k, v)) = trimmed.split_once('=')
+                && k.trim().eq_ignore_ascii_case("objectformat")
+                    && let Some(fmt) = ObjectFormat::from_str_name(v) { return Some(fmt); }
         }
     }
     None
@@ -73,9 +70,8 @@ pub fn detect_git_dir_object_format(repo_path: &StdPath) -> Option<ObjectFormat>
 pub async fn detect_repo_object_format(state: &AppState, repo_id: Uuid) -> Result<ObjectFormat, Error> {
     let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
     if let Some(fmt) = detect_git_dir_object_format(&repo_path) { return Ok(fmt); }
-    if let Ok(out) = git_read::run_git(state, repo_id, &["rev-parse", "--show-object-format"], 64).await {
-        if let Some(fmt) = ObjectFormat::from_str_name(&String::from_utf8_lossy(&out)) { return Ok(fmt); }
-    }
+    if let Ok(out) = git_read::run_git(state, repo_id, &["rev-parse", "--show-object-format"], 64).await
+        && let Some(fmt) = ObjectFormat::from_str_name(&String::from_utf8_lossy(&out)) { return Ok(fmt); }
     Ok(ObjectFormat::Sha1)
 }
 

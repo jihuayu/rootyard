@@ -1,12 +1,12 @@
 # ADR 004: an offline backup and isolated restore slice
 
-Status: current integration uses backup format 7 and the exact migration/catalog set embedded in the producing executable (`src/db.rs`, `schema/131_*`). Format 6 remains frozen at schema 130 for archives made before migration 131; restoring it requires the explicit `--allow-legacy-schema130` upgrade path. This is a Linux, single-node GitFS maintenance tool, not online replication, failover, PITR, encrypted object storage or a zero-loss guarantee. It does not stop or deploy a service, switch traffic, or automatically repair unknown pushes.
+Status: current integration uses backup format 8 and the exact migration/catalog set embedded in the producing executable (`src/db.rs`, `schema/132_*`). Formats 6 and 7 stay frozen at schema 130 and 131 for archives made before migrations 131/132; restoring them requires the explicit `--allow-legacy-schema130` or `--allow-legacy-schema131` upgrade path. This is a Linux, single-node GitFS maintenance tool, not online replication, failover, PITR, encrypted object storage or a zero-loss guarantee. It does not stop or deploy a service, switch traffic, or automatically repair unknown pushes.
 
 ## Supported boundary
 
 Except for the explicit legacy schema007 compatibility option below, use the exact Rootyard executable that made the backup, Git >= 2.43, PostgreSQL 17 and matching `pg_dump`/`pg_restore` clients. Keep that executable separately in your trusted release archive. The manifest includes its SHA-256; the copied hook runner is evidence, never an executable used by the restore tool.
 
-The current format requires the reviewed public catalog embedded in its executable: columns/defaults, constraints, indexes, function definitions and attributes, enabled triggers, rules and row-security policies. Format 7 binds that complete catalog and the existing volume UUID. Format 6 binds the frozen schema130 catalog and is verified against schema/130_* before the reviewed schema131 migration is applied. Retain each producing executable with its archive; schema125 is still evolving on the draft integration branch and is not a released cross-version compatibility promise. Earlier format-1/schema-002, format-2/schema-003 and format-3/schema-006 archives require their original trusted executable and a separate reviewed upgrade, not this restore command. Unknown tables, non-public application schemas, additional/modified routines, user-defined types, extensions other than plpgsql, large objects, non-permanent/non-ordinary tables and connection `options` are rejected. The connection must explicitly name one host, a user and a database; URLs and passwords are never passed as subprocess arguments. There is no automatic migration on backup or restore. Future schema versions or catalog/deparser changes require an explicit reviewed contract update and another fresh-database restore drill. Database roles, ACLs, configuration, credentials, extensions and tablespaces are not portable backup inputs; restoration owns the imported tables as the destination service identity and does not import owners/ACLs.
+The current format requires the reviewed public catalog embedded in its executable: columns/defaults, constraints, indexes, function definitions and attributes, enabled triggers, rules and row-security policies. Format 8 binds that complete schema132 catalog and the existing volume UUID, including the Pando remote-retention authority state added by migration 132. Format 7 binds the frozen schema131 catalog and format 6 the frozen schema130 catalog; each is verified against its own `schema/13*_*` fixture set before the reviewed migrations 131 and 132 are applied in the same restore session. Retain each producing executable with its archive; schema125 is still evolving on the draft integration branch and is not a released cross-version compatibility promise. Earlier format-1/schema-002, format-2/schema-003 and format-3/schema-006 archives require their original trusted executable and a separate reviewed upgrade, not this restore command. Unknown tables, non-public application schemas, additional/modified routines, user-defined types, extensions other than plpgsql, large objects, non-permanent/non-ordinary tables and connection `options` are rejected. The connection must explicitly name one host, a user and a database; URLs and passwords are never passed as subprocess arguments. There is no automatic migration on backup or restore. Future schema versions or catalog/deparser changes require an explicit reviewed contract update and another fresh-database restore drill. Database roles, ACLs, configuration, credentials, extensions and tablespaces are not portable backup inputs; restoration owns the imported tables as the destination service identity and does not import owners/ACLs.
 
 The existing data directory, the backup's parent, the destination's parent and all their ancestors must be real operator-controlled directories. Do not use symlink paths, hostile shared writable parents, nested mounts or concurrent manual filesystem changes. Only the three managed hook symlinks pointing to `.runner` are accepted. Other symlinks, hard-linked regular files, special files, setuid/setgid/sticky modes and non-UTF-8 filenames are rejected. Repositories using alternates/http-alternates, shallow/promisor/partial-clone object storage, commondir/linked-worktree routing or include configuration are rejected rather than depending on the source machine to pass integrity checks.
 
@@ -85,15 +85,16 @@ See [the populated Forge integration record](forge-backup-verification.md) and [
 
 ### Restored execution authority
 
-New backups use format7 with the executable's current schema131 catalog and include
-`ci_checkout_jobs` grants and permanent cancellation tombstones. The paired
+New backups use format8 with the executable's current schema132 catalog and include
+`ci_checkout_jobs` grants, permanent cancellation tombstones and the Pando
+remote-retention authority state. The paired
 volume still supplies source-pin files and native Git roots; SQL rows alone do
 not prove retention. All restored issued checkout grants are permanently marked
 revoked before the restore guard is removed. This deliberately differs from the
 backup's `revoked` values: restoring a snapshot taken before cancellation must
 never resurrect an old bearer. Plans, tombstones and source pins remain intact.
 Use a new job ID and establish its source pin before issuing a new checkout.
-Format7 also rotates cluster delegation incarnation, clears transport nonces, cancels queued/leased CI runs and queued/running sandbox jobs, disables mirror readiness, expires Workspace epochs and revokes browser sessions/tokens. Leased webhook deliveries become pending with a new lease generation. Ordinary
+Every restored format 6, 7 or 8 archive also rotates cluster delegation incarnation, clears transport nonces, cancels queued/leased CI runs and queued/running sandbox jobs, disables mirror readiness, expires Workspace epochs and revokes browser sessions/tokens. Leased webhook deliveries become pending with a new lease generation. Ordinary
 owner tokens retain the existing backup-boundary restore behavior; reconcile
 post-backup owner-token revocations before reopening external ingress.
 
@@ -113,7 +114,7 @@ upgrades it to the current schema. Neither checksums nor this compatibility flag
 archive authenticity; use only trusted, operator-controlled archives.
 
 Format6/schema130 archives remain readable against their frozen catalogs and
-contract digest. Restoring one with the current format7 binary requires a
+contract digest. Restoring one with the current format8 binary requires a
 different explicit final option, because the current binary hash necessarily
 differs from the historical producer:
 
@@ -122,14 +123,24 @@ rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schem
 ```
 
 This verifies the complete format6/schema130 catalog before applying the
-reviewed migration 131 on the same restore session; it never relabels an archive
-as format7 or rewrites its manifest. A format6 archive is rejected without this
-option, and the option is rejected for other formats. Format4/format5 archives
-retain their existing exact-producer rule except for the explicit format4/schema007
-option above.
+reviewed migrations 131 and 132 on the same restore session; it never relabels an
+archive as format8 or rewrites its manifest. A format6 archive is rejected
+without this option, and the option is rejected for other formats. Format7/schema131
+archives have the equivalent final opt-in:
+
+```
+rootyard restore /absolute/backup --isolated --trust-backup --allow-legacy-schema131
+```
+
+It verifies the frozen schema131 catalog and its contract digest before applying
+migration 132, it is rejected for formats other than 7, and at most one legacy
+opt-in may be chosen. Format4/format5 archives retain their existing
+exact-producer rule except for the explicit format4/schema007 option above.
 
 ### Remote LFS closure
 
-Format7 and frozen format6 inventory every ready LFS object by tenant/repository/OID/size while the database and volume barriers are held. Missing local bytes are downloaded through the configured authenticated remote store, then SHA-256 and size are verified before copying. The manifest carries this closure; backup verification checks local bytes and restore compares imported metadata against it. The restored target needs no remote endpoint for these objects. Failed hydration or digest mismatch prevents backup publication. Stop Workspace mounts and all service descendants before the offline capture.
+Formats 6, 7 and 8 inventory every ready LFS object by tenant/repository/OID/size while the database and volume barriers are held. Missing local bytes are downloaded through the configured authenticated remote store, then SHA-256 and size are verified before copying. The manifest carries this closure; backup verification checks local bytes and restore compares imported metadata against it. The restored target needs no remote endpoint for these objects. Failed hydration or digest mismatch prevents backup publication.
+
+Pando repositories are captured the same way: the archive carries `pando_refs`/`HEAD` rows plus the encrypted pack closure of every `storage_backend='pando'` repository, and restore re-imports that closure through the configured object store before the volume is published. A missing or unreachable closure fails the restore instead of publishing a partially complete target. Stop Workspace mounts and all service descendants before the offline capture.
 
 Executed receipts: `evidence/backup-integration.json`, `evidence/backup-remote-lfs.json`, `evidence/backup-upgrade-integration.json` and `evidence/backup-recovery-integration.json`. They record local functional/fault drills, not production RPO/RTO guarantees.

@@ -176,10 +176,8 @@ pub(super) async fn settle(
     };
     let granted = coordinator.as_ref().is_some_and(Handle::granted);
     let mut coordinator = coordinator;
-    if !granted {
-        if let Some(handle) = coordinator.take() {
-            handle.abort().await;
-        }
+    if !granted && let Some(handle) = coordinator.take() {
+        handle.abort().await;
     }
     let _fallback = if granted {
         None

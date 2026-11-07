@@ -144,11 +144,10 @@ pub async fn get_tree(
     let limit = models::validate_limit(query.limit)?;
     let after = models::validate_tree_after(query.after.as_deref())?;
     let rel_path = models::normalize_rel_path(query.path.as_deref())?;
-    if let Some(ref spec) = query.oid {
-        if !models::valid_revision_spec(spec) {
+    if let Some(ref spec) = query.oid
+        && !models::valid_revision_spec(spec) {
             return Err(Error::bad_request());
         }
-    }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;
@@ -218,11 +217,10 @@ pub async fn get_blob(
         if !models::valid_non_zero_oid(oid) {
             return Err(Error::bad_request());
         }
-    } else if let Some(ref spec) = query.oid {
-        if !models::valid_revision_spec(spec) {
+    } else if let Some(ref spec) = query.oid
+        && !models::valid_revision_spec(spec) {
             return Err(Error::bad_request());
         }
-    }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let repo_id = auth::authorize_repo(&tx, &actor, &owner, &name, false).await?;

@@ -57,11 +57,10 @@ pub fn normalize_web_headers(headers: &HeaderMap) -> HeaderMap {
         return headers.clone();
     }
     let mut out = headers.clone();
-    if let Some(tok) = super::session::session_token(headers) {
-        if let Ok(hv) = HeaderValue::from_str(&format!("Bearer {tok}")) {
+    if let Some(tok) = super::session::session_token(headers)
+        && let Ok(hv) = HeaderValue::from_str(&format!("Bearer {tok}")) {
             out.insert(header::AUTHORIZATION, hv);
         }
-    }
     out
 }
 
@@ -178,13 +177,11 @@ pub async fn repo_overview(State(state): App, Path((owner, name)): RepoPath, hea
             let summary = git_read::read_commit_summary(&state, access.repo_id, oid).await.ok();
             let root_tree = git_read::read_tree(&state, access.repo_id, Some(oid), "", None, 100).await.ok();
             let mut readme = None;
-            if let Some(ref t) = root_tree {
-                if let Some(entry) = t.items.iter().find(|e| e.kind == "blob" && matches!(e.name.to_ascii_lowercase().as_str(), "readme.md" | "readme.markdown" | "readme.txt" | "readme")) {
-                    if let Ok(preview) = read_web_blob_preview(&state, access.repo_id, Some(&entry.oid), None, DEFAULT_WEB_BLOB_PREVIEW_BYTES).await {
+            if let Some(ref t) = root_tree
+                && let Some(entry) = t.items.iter().find(|e| e.kind == "blob" && matches!(e.name.to_ascii_lowercase().as_str(), "readme.md" | "readme.markdown" | "readme.txt" | "readme"))
+                    && let Ok(preview) = read_web_blob_preview(&state, access.repo_id, Some(&entry.oid), None, DEFAULT_WEB_BLOB_PREVIEW_BYTES).await {
                         readme = preview.text_preview.map(|txt| render_safe_markdown(&txt));
                     }
-                }
-            }
             (summary, root_tree, readme)
         } else { (None, None, None) };
         Ok::<_,Error>((head,branches,tags,latest_commit,tree,readme_html))

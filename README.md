@@ -20,12 +20,17 @@ Round-3 HA reference profile (issues #43/#44, still **open**): an actual native 
 
 ## Requirements
 
-- Linux, Rust stable (edition 2024), Git 2.43 or newer, PostgreSQL 17.
+- Linux (64-bit), Rust 1.88 or newer (declared `rust-version`, required for edition 2024 let-chains), Git 2.43 or newer, PostgreSQL 17. The gates and acceptance evidence use the pinned 1.99.1 toolchain; see [development](docs/development.md) and `rust-toolchain.toml`.
 - A durable, private local filesystem for `ROOTYARD_DATA_DIR`; one serving process per directory.
 - TLS termination in front of HTTP outside localhost. The app does not terminate TLS.
 - PostgreSQL 17: use `sslmode=require` plus `ROOTYARD_PG_CA_PEM` for certificate/hostname verification outside local development. Optional client certificate/key variables support mutual TLS. Supplying a CA with a weaker mode is rejected; credentials belong in the trusted runtime environment.
 
 These are baseline requirements, not a claim that every version or storage device has been qualified. See [verification](docs/development.md).
+
+## Known open gaps (not claimed)
+
+- Physical HA stays open: #26 (physical cross-host fencing), #43/#44 (HA reference profile) and roadmap #48 are not closed by this tree. Accepted evidence covers one trusted Linux host with separate Rust nodes/volumes, PostgreSQL and a local process-session fence; there is no cross-host storage fencing, hardware watchdog/power-loss, rack/zone, Kafka HA, HAProxy HA or Git-volume replication claim.
+- Pando remote retention is limited to the documented `ROOTYARD_PANDO_REMOTE_DELETE=true` mode that deletes only registered current-authority, unreferenced obsolete artifacts, and is re-keyed only by a paired Rootyard archive restore. A raw metadata-only PostgreSQL copy or PITR snapshot taken against the same object-store bucket is undetected, unsupported and **not fail-closed** until the tracked #77 hardening lands; never treat it as a recovery path.
 
 ## Local quick start
 
@@ -67,14 +72,16 @@ Creating the same repository again is idempotent by owner and name. Names contai
 ## API and access
 
 - `POST /api/repos`, JSON `{"name":"demo"}`: provision your repository.
-- `GET /api/repos`: list up to 1,000 of your repositories, ordered by name; pagination is not implemented.
+- `GET /api/repos`: list up to 1,000 repositories visible to your identity, ordered by name; pagination is not implemented.
 - `GET /api/repos/alice/demo`: inspect your own repository.
 - `/git/alice/demo.git`: authenticated Smart HTTP endpoint, not a browsable directory.
 - `GET /health/live`: process liveness; `GET /health/ready`: database reachability and repository-directory presence, not a full integrity scan.
 
 Create returns `201` for a new ready repository, `200` for an existing ready one, or `202` while provisioning remains pending. Startup and a periodic scan resume pending provisioning in batches of at most 64, with persisted attempt counts and a 30-second retry backoff. Inspect the repository state before cloning. `serve` applies migrations automatically before recovery and accepting requests.
 
-Use Bearer tokens for REST, or Basic authentication with username and token as password. Read-only tokens can clone/fetch and read metadata, but cannot create repositories or push. There is no sharing model: users access only their own repositories.
+Use Bearer tokens for REST, or Basic authentication with username and token as password. Read-only tokens can clone/fetch and read metadata, but cannot create repositories or push.
+
+Access is not owner-only. A repository can be reached through direct organization membership, organization teams, repository collaborators or repository teams, with the five-level role ladder `read` < `triage` < `write` < `maintain` < `admin`; the strongest effective grant wins and removing a membership or team removes inherited access immediately. A personal repository stays private to its owner until such a grant exists. Numbering, organization ownership, last-administrator protection and the immutable-ownership rule are described in [organizations](docs/organizations.md); the API surface is in `src/members.rs`. Roles are per repository, not per branch.
 
 ```sh
 ./target/debug/rootyard create-token alice --read-only
@@ -87,7 +94,7 @@ The repository is the security boundary. A reader may obtain historical or unrea
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DATABASE_URL` | required | PostgreSQL metadata connection; no built-in TLS |
+| `DATABASE_URL` | required | PostgreSQL metadata connection; verified TLS through `sslmode=require` plus `ROOTYARD_PG_CA_PEM` |
 | `ROOTYARD_DATA_DIR` | `data` | Durable repository volume |
 | `ROOTYARD_BIND` | `127.0.0.1:8080` | HTTP listening address |
 | `ROOTYARD_GIT` | Git found in `PATH` | Native Git executable |
@@ -97,8 +104,12 @@ The repository is the security boundary. A reader may obtain historical or unrea
 | `ROOTYARD_GIT_TIMEOUT_SECONDS` | `120` | Git request deadline |
 | `ROOTYARD_GIT_MEMORY_BYTES` | `1073741824` | Per-child address-space resource limit |
 | `ROOTYARD_MAX_REPO_BYTES` | `1073741824` | Repository size admission threshold |
+| `ROOTYARD_PG_CA_PEM` | unset | CA bundle used with `sslmode=require` for certificate/hostname verification |
+| `ROOTYARD_PG_CLIENT_CERT_PEM` / `ROOTYARD_PG_CLIENT_KEY_PEM` | unset | Optional PostgreSQL client certificate and key for mutual TLS |
 
 Smart HTTP accepts streaming `gzip`/`x-gzip` request bodies; both wire bytes and expanded bytes are bounded by the request limit. Other content encodings are rejected. The Git transfer deadline continues even when a client stops reading. If a timeout, cap or child failure occurs after response headers have been sent, the response stream fails or is truncated; an initial HTTP `200` alone does not mean the Git operation succeeded.
+
+`sslmode=require` without `ROOTYARD_PG_CA_PEM` is rejected, as is a CA supplied together with a weaker mode; credentials belong in the trusted runtime environment. The HTTP listener itself stays plaintext and must sit behind your TLS terminator.
 
 Numeric limits must be positive. Repository size checks are not filesystem quotas; concurrent writes and temporary packs can require extra disk. Use a dedicated filesystem quota and headroom where a hard disk limit is needed. Process limits and stream bounds do not establish a total service RSS bound. See [operations](docs/operations.md).
 

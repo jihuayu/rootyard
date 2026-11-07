@@ -11,11 +11,10 @@ use crate::{
         locks,
         models::{self, REPO_ROUTE_FIELDS, RepoShardRoute, VolumeFenceMarker, conflict, json, unix_now},
         replication::{self, TransferMeta},
-        replication_target::{self, SnapshotReceipt},
         router::{fetch_node, load_or_init_repo_route},
         security::require_operator,
         sidecar, transitions,
-        transport::{self, DELEGATION_HEADER, ENVELOPE_LIFETIME_SECONDS, Envelope},
+        transport::{self},
     },
 };
 use axum::{
@@ -24,13 +23,21 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Response,
 };
-use bytes::Bytes;
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json as sjson;
-use std::{path::Path as FsPath, sync::Arc};
-use tokio_util::io::ReaderStream;
+use std::sync::Arc;
 use uuid::Uuid;
+#[path = "migration_admin.rs"]
+mod migration_admin;
+#[path = "migration_transport.rs"]
+mod migration_transport;
+
+pub use migration_admin::{abort_migration, list_migrations};
+use migration_transport::{envelope, send_sidecar_finalize, send_transfer};
+
+#[cfg(test)]
+#[path = "migration_tests.rs"]
+mod tests;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,136 +66,6 @@ pub struct MigrationReceipt {
     old_route_epoch: i64,
     new_route_epoch: i64,
     state: &'static str,
-}
-
-const MAX_RECEIPT_BYTES: usize = 2048;
-
-/// Collect a peer receipt with a hard byte cap. The body may have unknown
-/// length; only this bounded buffer is allocated and an oversized single chunk
-/// is rejected before being appended. Error text is never logged or returned.
-async fn collect_bounded<S, E>(mut stream: S, cap: usize) -> Result<Vec<u8>, Error>
-where
-    S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin,
-{
-    let mut body = Vec::with_capacity(cap.min(512));
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| Error(StatusCode::BAD_GATEWAY, "replica receipt interrupted"))?;
-        if chunk.len() > cap.saturating_sub(body.len()) {
-            return Err(Error(StatusCode::BAD_GATEWAY, "replica receipt too large"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-async fn read_receipt<T: serde::de::DeserializeOwned>(upstream: reqwest::Response) -> Result<T, Error> {
-    let body = collect_bounded(upstream.bytes_stream(), MAX_RECEIPT_BYTES).await?;
-    serde_json::from_slice(&body).map_err(Error::internal)
-}
-
-async fn send_transfer(
-    state: &AppState,
-    target_url: &str,
-    envelope: &Envelope,
-    path_and_query: &str,
-    meta: &TransferMeta,
-    bundle: Option<&FsPath>,
-) -> Result<SnapshotReceipt, Error> {
-    let mut url = transport::validate_endpoint(target_url)?;
-    let (path, query) = path_and_query.split_once('?').ok_or_else(Error::bad_request)?;
-    url.set_path(path);
-    url.set_query(Some(query));
-    let prefix = futures_util::stream::once({
-        let bytes = replication::encode_meta(meta)?;
-        async move { Ok::<_, std::io::Error>(Bytes::from(bytes)) }
-    });
-    let reader: Box<dyn tokio::io::AsyncRead + Send + Unpin> = match bundle {
-        Some(path) => Box::new(tokio::fs::File::open(path).await.map_err(Error::internal)?),
-        None => Box::new(tokio::io::empty()),
-    };
-    let body = reqwest::Body::wrap_stream(prefix.chain(ReaderStream::new(reader)));
-    let http = transport::cluster_client(state.config.git_timeout)?;
-    let upstream = http
-        .post(url)
-        .header(DELEGATION_HEADER, transport::sign(envelope)?)
-        .body(body)
-        .send()
-        .await
-        .map_err(|_| Error(StatusCode::BAD_GATEWAY, "replica transfer interrupted"))?;
-    let status = upstream.status();
-    if status != StatusCode::OK {
-        // Never log or return untrusted peer error text. Only the HTTP status
-        // and a fixed source-facing class cross the trust boundary.
-        eprintln!("rootyard: replica transfer rejected target_status={status}");
-        return match status {
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                Err(conflict("replica rejected snapshot transfer: unauthorized"))
-            }
-            StatusCode::CONFLICT => Err(conflict("replica rejected snapshot transfer: conflict")),
-            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY => {
-                Err(conflict("replica rejected snapshot transfer: invalid body"))
-            }
-            status if status.is_server_error() => {
-                Err(Error(StatusCode::BAD_GATEWAY, "replica transfer failed on target"))
-            }
-            _ => Err(conflict("replica rejected snapshot transfer")),
-        };
-    }
-    read_receipt::<SnapshotReceipt>(upstream).await
-}
-
-async fn send_sidecar_finalize(
-    state: &AppState,
-    target_url: &str,
-    envelope: &Envelope,
-    path: &str,
-    operation_id: Uuid,
-) -> Result<(), Error> {
-    let mut url = transport::validate_endpoint(target_url)?;
-    url.set_path(path);
-    let http = transport::cluster_client(state.config.git_timeout)?;
-    let upstream = http
-        .post(url)
-        .header(DELEGATION_HEADER, transport::sign(envelope)?)
-        .body(Vec::new())
-        .send()
-        .await
-        .map_err(|_| Error(StatusCode::BAD_GATEWAY, "target sidecar finalization interrupted"))?;
-    if upstream.status() != StatusCode::OK {
-        return Err(conflict("cutover committed but target CI sidecar publication is pending recovery"));
-    }
-    let receipt = read_receipt::<replication_target::FinalizeReceipt>(upstream).await?;
-    if receipt.operation_id != operation_id || receipt.state != "published" {
-        return Err(conflict("target CI sidecar finalization receipt mismatch"));
-    }
-    Ok(())
-}
-
-fn envelope(
-    authority_incarnation: Uuid,
-    actor: &crate::db::Identity,
-    repository_id: Uuid,
-    target_node_id: &str,
-    route_epoch: i64,
-    fencing_token: i64,
-    storage_generation: i64,
-    path_and_query: String,
-) -> Envelope {
-    Envelope {
-        version: 1,
-        authority_incarnation,
-        nonce: Uuid::new_v4(),
-        expires_unix: unix_now() + ENVELOPE_LIFETIME_SECONDS,
-        actor_id: actor.id,
-        token_id: actor.token_id,
-        repository_id,
-        target_node_id: target_node_id.to_owned(),
-        route_epoch,
-        fencing_token,
-        storage_generation,
-        method: "POST".into(),
-        path_and_query,
-    }
 }
 
 async fn operation_state(
@@ -298,7 +175,7 @@ pub async fn migrate_repository(
         )
         .await
         .map_err(Error::internal)?;
-    let mut op_state = if let Some(row) = prior {
+    if let Some(row) = prior {
         let prior_repo: Uuid = tx
             .query_one("SELECT repository_id FROM shard_replication_operations WHERE id=$1", &[&operation_id])
             .await
@@ -320,7 +197,6 @@ pub async fn migrate_repository(
         if matches!(state.as_str(), "completed" | "aborted") {
             return Err(conflict("replication operation is already terminal"));
         }
-        state
     } else {
         if route.draining {
             return Err(conflict("repository is drained by another migration"));
@@ -339,19 +215,14 @@ pub async fn migrate_repository(
         )
         .await
         .map_err(Error::internal)?;
-        "copying".to_owned()
-    };
+    }
     finish(tx, &actor, true).await?;
 
     // Phase 1: an initial snapshot can be taken while clients keep writing.
     // Resume from a durable verified copy only when its recorded manifest is
     // present; otherwise replace the standby with a fresh measured snapshot.
     let mut base = replication::read_base(&state, operation_id, access.repo_id)?;
-    let (op_digest, _) = {
-        let (state_name, digest, _) = operation_state(&state, access.repo_id, operation_id).await?;
-        op_state = state_name;
-        (digest, ())
-    };
+    let (op_state, op_digest, _) = operation_state(&state, access.repo_id, operation_id).await?;
     let initial_done = !input.replicate_only
         && op_state == "verified"
         && base.as_ref().is_some_and(|base| {
@@ -405,9 +276,8 @@ pub async fn migrate_repository(
         base = Some(snapshot);
     }
     let base = base.ok_or_else(|| conflict("source snapshot manifest is missing"))?;
-    let (state_name, digest, _sequence) = operation_state(&state, access.repo_id, operation_id).await?;
-    op_state = state_name;
-    if op_state != "verified" {
+    let (verified_state, digest, _sequence) = operation_state(&state, access.repo_id, operation_id).await?;
+    if verified_state != "verified" {
         return Err(conflict("target snapshot was not durably verified"));
     }
     if input.replicate_only {
@@ -714,223 +584,4 @@ pub async fn migrate_repository(
             state: "completed",
         },
     ))
-}
-
-pub async fn abort_migration(
-    State(state): State<Arc<AppState>>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
-    Json(input): Json<AbortInput>,
-) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
-    require_operator(&tx, &actor).await?;
-    let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
-    finish(tx, &actor, false).await?;
-    if transport::node_id()?.as_deref() != Some(route.primary_node_id.as_str()) {
-        return Err(conflict("migration abort must run on the source storage node"));
-    }
-    let _migration = locks::migration(&state, access.repo_id).await?;
-    let mutation = locks::exclusive(&state, access.repo_id).await?;
-    mutation.ensure_active()?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::verify_token(&tx, &actor, true).await?;
-    require_operator(&tx, &actor).await?;
-    let generation: i64 = tx
-        .query_one("SELECT storage_generation FROM repositories WHERE id=$1 FOR UPDATE", &[&access.repo_id])
-        .await
-        .map_err(Error::internal)?
-        .get(0);
-    let route_sql =
-        format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id=$1 FOR UPDATE");
-    let route = RepoShardRoute::row(&tx.query_one(&route_sql, &[&access.repo_id]).await.map_err(Error::internal)?);
-    if input.expected_route_epoch.is_some_and(|epoch| epoch != route.route_epoch) {
-        return Err(conflict("migration abort route epoch mismatch"));
-    }
-    let op = tx
-        .query_opt(
-            "SELECT source_node_id,state,source_route_epoch FROM shard_replication_operations \
-             WHERE id=$1 AND repository_id=$2 FOR UPDATE",
-            &[&input.operation_id, &access.repo_id],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
-    let source: String = op.get(0);
-    let op_state: String = op.get(1);
-    let op_epoch: i64 = op.get(2);
-    if source != route.primary_node_id {
-        return Err(conflict("migration abort source mismatch"));
-    }
-    if op_state == "aborted" {
-        finish(tx, &actor, false).await?;
-        return Ok(json(
-            StatusCode::OK,
-            sjson!({
-                "operation_id": input.operation_id,
-                "repository_id": access.repo_id,
-                "state": "aborted",
-            }),
-        ));
-    }
-    if op_state == "completed" {
-        return Err(conflict("migration operation is already terminal"));
-    }
-    if route.draining && op_epoch != route.route_epoch {
-        return Err(conflict("migration operation epoch differs from the drained route"));
-    }
-    if route.draining {
-        let new_epoch = route.route_epoch + 1;
-        let new_token = route.fencing_token.max(new_epoch) + 1;
-        let upd = format!(
-            "UPDATE repository_shard_routes SET route_epoch=$2, fencing_token=$3, fenced_epoch=$4, \
-             required_generation=$5, draining=false, read_only_degraded=false, degraded_reason='', \
-             version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 \
-             RETURNING {REPO_ROUTE_FIELDS}"
-        );
-        let updated = RepoShardRoute::row(
-            &tx.query_one(&upd, &[&access.repo_id, &new_epoch, &new_token, &route.route_epoch, &generation])
-                .await
-                .map_err(Error::internal)?,
-        );
-        crate::storage::ref_admission::fence_epoch(&tx, access.repo_id, route.route_epoch, std::time::Duration::ZERO)
-            .await?;
-        let marker = VolumeFenceMarker::from_route(&updated, generation, None, unix_now());
-        tx.execute(
-            "UPDATE shard_replication_operations SET state='aborted', updated_at=clock_timestamp() WHERE id=$1",
-            &[&input.operation_id],
-        )
-        .await
-        .map_err(Error::internal)?;
-        record_audit_event(
-            &tx,
-            access.owner_id,
-            access.repo_id,
-            &actor,
-            "shard.migration_aborted",
-            "shard_replication",
-            &route.primary_node_id,
-            sjson!({"operation_id": input.operation_id, "released_drain": true, "route_epoch": new_epoch}),
-        )
-        .await?;
-        let transition_id = transitions::stage(&tx, &state, &marker).await?;
-        mutation.ensure_active()?;
-        transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
-        let _ = replication::clean_staging(&replication::base_path(&state, input.operation_id)?);
-        return Ok(json(
-            StatusCode::OK,
-            sjson!({
-                "operation_id": input.operation_id,
-                "repository_id": access.repo_id,
-                "state": "aborted",
-                "route_epoch": new_epoch,
-            }),
-        ));
-    }
-    tx.execute(
-        "UPDATE shard_replication_operations SET state='aborted', updated_at=clock_timestamp() WHERE id=$1",
-        &[&input.operation_id],
-    )
-    .await
-    .map_err(Error::internal)?;
-    record_audit_event(
-        &tx,
-        access.owner_id,
-        access.repo_id,
-        &actor,
-        "shard.migration_aborted",
-        "shard_replication",
-        &route.primary_node_id,
-        sjson!({"operation_id": input.operation_id, "released_drain": false}),
-    )
-    .await?;
-    finish(tx, &actor, true).await?;
-    let _ = replication::clean_staging(&replication::base_path(&state, input.operation_id)?);
-    Ok(json(
-        StatusCode::OK,
-        sjson!({
-            "operation_id": input.operation_id,
-            "repository_id": access.repo_id,
-            "state": "aborted",
-            "route_epoch": route.route_epoch,
-        }),
-    ))
-}
-
-/// List durable migration operations so an operator can resume a
-/// server-generated operation id or abort a drained transfer after a crash.
-/// Listing never resumes or promotes on its own.
-pub async fn list_migrations(
-    State(state): State<Arc<AppState>>,
-    Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap,
-) -> Result<Response, Error> {
-    let actor = auth::authenticate(&state.pool, &headers).await?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read).await?;
-    require_operator(&tx, &actor).await?;
-    let rows = tx
-        .query(
-            "SELECT id,target_node_id,state,source_route_epoch,source_generation, \
-             refs_sha256,journal_sequence,created_at::text,updated_at::text \
-             FROM shard_replication_operations WHERE repository_id=$1 \
-             ORDER BY created_at DESC, id DESC LIMIT 100",
-            &[&access.repo_id],
-        )
-        .await
-        .map_err(Error::internal)?;
-    let items: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|row| {
-            let state_name: String = row.get(2);
-            sjson!({
-                "operation_id": row.get::<_, Uuid>(0),
-                "target_node_id": row.get::<_, String>(1),
-                "state": state_name,
-                "source_route_epoch": row.get::<_, i64>(3),
-                "source_generation": row.get::<_, i64>(4),
-                "refs_sha256": row.get::<_, Option<String>>(5),
-                "journal_sequence": row.get::<_, Option<i64>>(6),
-                "created_at": row.get::<_, String>(7),
-                "updated_at": row.get::<_, String>(8),
-                "resumable": matches!(state_name.as_str(), "copying" | "verified"),
-            })
-        })
-        .collect();
-    finish(tx, &actor, false).await?;
-    Ok(json(StatusCode::OK, sjson!({"items": items})))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::collect_bounded;
-    use bytes::Bytes;
-
-    fn chunks(parts: &[&'static [u8]]) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Unpin {
-        futures_util::stream::iter(parts.iter().map(|part| Ok(Bytes::from_static(part))).collect::<Vec<_>>())
-    }
-
-    #[tokio::test]
-    async fn receipt_reader_accepts_unknown_length_within_cap() {
-        let body = collect_bounded(chunks(&[br#"{"error":"x","#, br#""#]), 64).await.unwrap();
-        assert_eq!(body, br#"{"error":"x","#);
-        let exact = collect_bounded(chunks(&[b"1234", b"5678"]), 8).await.unwrap();
-        assert_eq!(exact, b"12345678");
-    }
-
-    #[tokio::test]
-    async fn receipt_reader_rejects_chunked_overflow_before_appending_it() {
-        let error = collect_bounded(chunks(&[b"1234", b"56789"]), 8).await.unwrap_err();
-        assert_eq!(error.1, "replica receipt too large");
-    }
-
-    #[tokio::test]
-    async fn receipt_reader_rejects_oversized_single_chunk() {
-        let error = collect_bounded(chunks(&[b"0123456789"]), 4).await.unwrap_err();
-        assert_eq!(error.1, "replica receipt too large");
-    }
 }

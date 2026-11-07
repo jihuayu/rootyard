@@ -15,7 +15,9 @@
 ## 运行与实现契约
 
 - [运行与部署](operations.md)
-- [开发与测试](development.md)
+- [HA 参考配置与物理 HA 未闭项（#26/#43/#44）](operations-HA.md)
+- [开发与测试、MSRV 1.88 与 fmt/Clippy 门禁工具链](development.md)
+- [仓库列表严格键集分页 API](repository-pagination.md)
 - [并行开发与模块边界](parallel-development.md)
 - [配对离线备份与恢复](backup-restore.md)
 - [显式事故恢复](manual-recovery.md)

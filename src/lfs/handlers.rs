@@ -3,8 +3,8 @@ use crate::{
     AppState, Error, auth,
     lfs::{
         models::{
-            self, BatchActionLink, BatchActions, BatchObjectError, BatchObjectResult,
-            BatchObjectSpec, BatchRequest, BatchResponse, LFS_MEDIA_TYPE,
+            self, BatchActionLink, BatchActions, BatchObjectError, BatchObjectResult, BatchObjectSpec, BatchRequest,
+            BatchResponse, LFS_MEDIA_TYPE,
         },
         storage,
     },
@@ -17,20 +17,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use std::{
-    collections::BTreeMap,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 /// Deduplicates multiple byte-for-byte identical `Authorization` headers while leaving
 /// distinct conflicting `Authorization` headers untouched so `auth::authenticate` rejects them.
 pub fn sanitize_headers(headers: &HeaderMap) -> HeaderMap {
     let mut out = headers.clone();
-    let auth_values: Vec<HeaderValue> = headers
-        .get_all(header::AUTHORIZATION)
-        .iter()
-        .cloned()
-        .collect();
+    let auth_values: Vec<HeaderValue> = headers.get_all(header::AUTHORIZATION).iter().cloned().collect();
     if auth_values.len() > 1 {
         let first = &auth_values[0];
         if auth_values.iter().all(|v| v.as_bytes() == first.as_bytes()) {
@@ -42,30 +35,18 @@ pub fn sanitize_headers(headers: &HeaderMap) -> HeaderMap {
 
 pub(super) fn lfs_json(status: StatusCode, value: impl Serialize) -> Response {
     let mut res = (status, Json(value)).into_response();
-    res.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(LFS_MEDIA_TYPE),
-    );
-    res.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    res.headers_mut().insert(
-        HeaderName::from_static("x-content-type-options"),
-        HeaderValue::from_static("nosniff"),
-    );
+    res.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(LFS_MEDIA_TYPE));
+    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res.headers_mut().insert(HeaderName::from_static("x-content-type-options"), HeaderValue::from_static("nosniff"));
     if status == StatusCode::UNAUTHORIZED {
-        res.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Basic realm=\"Rootyard\", charset=\"UTF-8\""),
-        );
+        res.headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"Rootyard\", charset=\"UTF-8\""));
     }
     res
 }
 
 fn lfs_error(status: StatusCode, message: &str) -> Response {
-    lfs_json(
-        status,
-        serde_json::json!({ "message": message, "error": message }),
-    )
+    lfs_json(status, serde_json::json!({ "message": message, "error": message }))
 }
 
 fn obj_error(oid: String, size: i64, code: u16, msg: &str) -> BatchObjectResult {
@@ -74,10 +55,7 @@ fn obj_error(oid: String, size: i64, code: u16, msg: &str) -> BatchObjectResult 
         size,
         authenticated: None,
         actions: None,
-        error: Some(BatchObjectError {
-            code,
-            message: msg.to_owned(),
-        }),
+        error: Some(BatchObjectError { code, message: msg.to_owned() }),
     }
 }
 
@@ -88,18 +66,11 @@ fn build_base_url(headers: &HeaderMap) -> String {
         .filter(|s| s.eq_ignore_ascii_case("https"))
         .map(|_| "https")
         .unwrap_or("http");
-    let Some(host) = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|h| {
-            !h.is_empty()
-                && h.len() <= 255
-                && h.bytes().all(|b| {
-                    b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'-' | b'[' | b']')
-                })
-        })
-    else {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()).map(str::trim).filter(|h| {
+        !h.is_empty()
+            && h.len() <= 255
+            && h.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'-' | b'[' | b']'))
+    }) else {
         return String::new();
     };
     format!("{scheme}://{host}")
@@ -126,16 +97,10 @@ pub async fn batch(
         auth::writable(&actor)?;
     }
     if !req.transfers.is_empty() && !req.transfers.iter().any(|t| t == "basic") {
-        return Ok(lfs_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "only basic transfer adapter is supported",
-        ));
+        return Ok(lfs_error(StatusCode::UNPROCESSABLE_ENTITY, "only basic transfer adapter is supported"));
     }
     if req.hash_algo.as_deref().is_some_and(|h| h != "sha256") {
-        return Ok(lfs_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "only sha256 hash_algo is supported",
-        ));
+        return Ok(lfs_error(StatusCode::UNPROCESSABLE_ENTITY, "only sha256 hash_algo is supported"));
     }
     if req.objects.is_empty() || req.objects.len() > models::MAX_BATCH_OBJECTS {
         return Err(Error::bad_request());
@@ -148,42 +113,25 @@ pub async fn batch(
         &actor,
         &owner,
         name,
-        if write {
-            auth::Role::Write
-        } else {
-            auth::Role::Read
-        },
+        if write { auth::Role::Write } else { auth::Role::Read },
     )
     .await?;
     let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
 
     let base_url = build_base_url(&headers);
     let mut action_header = BTreeMap::new();
-    if let Some(auth_val) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(auth_val) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
         action_header.insert("Authorization".to_owned(), auth_val.to_owned());
     }
 
     let mut results = Vec::with_capacity(req.objects.len());
     for spec in req.objects {
         if !models::valid_lfs_oid(&spec.oid) || spec.size < 0 {
-            results.push(obj_error(
-                spec.oid,
-                spec.size,
-                422,
-                "Invalid LFS object oid or size",
-            ));
+            results.push(obj_error(spec.oid, spec.size, 422, "Invalid LFS object oid or size"));
             continue;
         }
         if spec.size as u64 > state.config.max_request_bytes {
-            results.push(obj_error(
-                spec.oid,
-                spec.size,
-                413,
-                "LFS object exceeds maximum request size",
-            ));
+            results.push(obj_error(spec.oid, spec.size, 413, "LFS object exceeds maximum request size"));
             continue;
         }
 
@@ -194,22 +142,14 @@ pub async fn batch(
             )
             .await
             .map_err(Error::internal)?;
-        let object_href = format!(
-            "{base_url}/git/{owner}/{name}.git/info/lfs/objects/{}/{}",
-            spec.oid, spec.size
-        );
+        let object_href = format!("{base_url}/git/{owner}/{name}.git/info/lfs/objects/{}/{}", spec.oid, spec.size);
         let verify_href = format!("{base_url}/git/{owner}/{name}.git/info/lfs/verify");
 
         if write {
             if let Some(r) = row {
                 let (existing_size, existing_state): (i64, String) = (r.get(0), r.get(1));
                 if existing_size != spec.size {
-                    results.push(obj_error(
-                        spec.oid,
-                        spec.size,
-                        422,
-                        "Object size mismatch with existing record",
-                    ));
+                    results.push(obj_error(spec.oid, spec.size, 422, "Object size mismatch with existing record"));
                     continue;
                 }
                 let on_disk = storage::ensure_readable(
@@ -223,6 +163,15 @@ pub async fn batch(
                 .await
                 .map_err(Error::internal)?;
                 if existing_state == "ready" && on_disk {
+                    // Explicit write-path repair hook: never touched by reads.
+                    storage::schedule_remote_repair(
+                        state.storage.root.clone(),
+                        repo_id,
+                        tenant_id,
+                        spec.oid.clone(),
+                        spec.size as u64,
+                        state.config.git_timeout,
+                    );
                     results.push(BatchObjectResult {
                         oid: spec.oid,
                         size: spec.size,
@@ -248,10 +197,7 @@ pub async fn batch(
             }
 
             let mut upload_header = action_header.clone();
-            upload_header.insert(
-                "Content-Type".to_owned(),
-                "application/octet-stream".to_owned(),
-            );
+            upload_header.insert("Content-Type".to_owned(), "application/octet-stream".to_owned());
             let mut verify_header = action_header.clone();
             verify_header.insert("Content-Type".to_owned(), LFS_MEDIA_TYPE.to_owned());
 
@@ -260,17 +206,9 @@ pub async fn batch(
                 size: spec.size,
                 authenticated: Some(true),
                 actions: Some(BatchActions {
-                    upload: Some(BatchActionLink {
-                        href: object_href,
-                        header: upload_header,
-                        expires_in: Some(3600),
-                    }),
+                    upload: Some(BatchActionLink { href: object_href, header: upload_header, expires_in: Some(3600) }),
                     download: None,
-                    verify: Some(BatchActionLink {
-                        href: verify_href,
-                        header: verify_header,
-                        expires_in: Some(3600),
-                    }),
+                    verify: Some(BatchActionLink { href: verify_href, header: verify_header, expires_in: Some(3600) }),
                 }),
                 error: None,
             });
@@ -309,25 +247,13 @@ pub async fn batch(
                     error: None,
                 });
             } else {
-                results.push(obj_error(
-                    spec.oid,
-                    spec.size,
-                    404,
-                    "LFS object does not exist",
-                ));
+                results.push(obj_error(spec.oid, spec.size, 404, "LFS object does not exist"));
             }
         }
     }
 
     auth::finish_tx(tx, &actor, write).await?;
-    Ok(lfs_json(
-        StatusCode::OK,
-        BatchResponse {
-            transfer: "basic",
-            objects: results,
-            hash_algo: "sha256",
-        },
-    ))
+    Ok(lfs_json(StatusCode::OK, BatchResponse { transfer: "basic", objects: results, hash_algo: "sha256" }))
 }
 
 pub async fn post_object_or_verify(
@@ -356,16 +282,12 @@ pub async fn verify_object(
 
     let spec: BatchObjectSpec = serde_json::from_slice(&body).map_err(|_| Error::bad_request())?;
     if !models::valid_lfs_oid(&spec.oid) || spec.size < 0 {
-        return Ok(lfs_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid LFS object oid or size",
-        ));
+        return Ok(lfs_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid LFS object oid or size"));
     }
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access =
-        auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write).await?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Write).await?;
     let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
 
     let row = tx
@@ -381,10 +303,7 @@ pub async fn verify_object(
         return Err(Error::not_found());
     }
     if db_size != spec.size {
-        return Ok(lfs_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "LFS object size mismatch",
-        ));
+        return Ok(lfs_error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object size mismatch"));
     }
 
     let verified = storage::ensure_readable(
@@ -398,17 +317,11 @@ pub async fn verify_object(
     .await
     .map_err(Error::internal)?;
     if !verified {
-        return Ok(lfs_error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "LFS object integrity verification failed",
-        ));
+        return Ok(lfs_error(StatusCode::UNPROCESSABLE_ENTITY, "LFS object integrity verification failed"));
     }
 
     auth::finish_tx(tx, &actor, true).await?;
-    Ok(lfs_json(
-        StatusCode::OK,
-        serde_json::json!({ "oid": spec.oid, "size": spec.size, "verified": true }),
-    ))
+    Ok(lfs_json(StatusCode::OK, serde_json::json!({ "oid": spec.oid, "size": spec.size, "verified": true })))
 }
 
 pub async fn download_object(
@@ -448,8 +361,7 @@ async fn download_inner(
     let (repo_id, tenant_id, expected_size) = {
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let access =
-            auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Read).await?;
+        let access = auth::authorize_repo_with_role(&tx, &actor, &owner, name, auth::Role::Read).await?;
         let (repo_id, tenant_id) = (access.repo_id, access.owner_id);
         let row = tx
             .query_opt(
@@ -467,9 +379,7 @@ async fn download_inner(
         (repo_id, tenant_id, db_size as u64)
     };
 
-    let stream_body =
-        storage::open_verified_download_stream(&state, repo_id, tenant_id, &oid, expected_size)
-            .await?;
+    let stream_body = storage::open_verified_download_stream(&state, repo_id, tenant_id, &oid, expected_size).await?;
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")

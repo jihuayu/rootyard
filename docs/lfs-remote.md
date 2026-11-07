@@ -2,13 +2,75 @@
 
 When `ROOTYARD_OBJECT_STORE_ENDPOINT` is configured, a verified LFS upload is
 streamed to the configured S3-compatible object store before its metadata is
-marked `ready`. The immutable key is scoped to the repository owner's
-namespace ID and the SHA-256 digest. A serving node verifies its local copy
-before download; if that copy is missing, it fetches and verifies the remote
-object. Verification and download use the same authenticated repository role
-checks as the LFS Batch API. Clients receive service URLs, not object-store
-credentials or pre-signed URLs. Removing a role or revoking a token blocks new
-downloads, including on another node.
+marked `ready`. The acknowledgement contract is unchanged: the server hashes
+the source, writes the immutable key, checks its size with HEAD, and reads the
+object back through the same verification path before the `ready` transaction
+commits. The key is scoped to the repository owner's namespace ID and the
+SHA-256 digest. Clients receive service URLs, not object-store credentials or
+pre-signed URLs. Removing a role or revoking a token blocks new downloads,
+including on another node.
+
+## Read-path verification and cache
+
+A serving node verifies its local copy before download. Verification admits a
+file only after opening it with `O_NOFOLLOW` and validating that it is a regular
+single-link `0600` file whose size equals the promised size. The cache key is
+the complete file identity, not just `(oid, size)`:
+
+```
+data_root / repository_id / oid / promised_size /
+dev / ino / mtime seconds+nanoseconds / ctime seconds+nanoseconds / size / mode / nlink
+```
+
+A same-length in-place tamper, truncate, or inode replacement therefore changes
+the identity and forces a fresh SHA-256 pass. The cache is a bounded,
+time-limited metadata cache (4,096 entries, 15 minutes); it never makes a
+missing, replaced, or unreadable path acceptable. Verification and the download
+body use one already-open descriptor, so a path cannot be swapped between the
+digest check and the response stream. Concurrent cache-miss readers of the
+same admitted identity share one digest pass (bounded by the eight blocking
+verification slots); followers wait under their own request deadlines and never
+open the path again, so they cannot hash a different inode or start a duplicate
+full-file pass. This coalescing is local-only and is not cold hydration: an
+absent or inadmissible local file still takes the explicit hydration path.
+
+The eight-slot verification limit applies to the asynchronous Batch/download
+entry points (`verify_local` and `open_verified_file`). Synchronous integrity
+checks used by CI dependency scans, mirror preparation and backup inventory
+share the identity cache and singleflight, but do not acquire this semaphore;
+their concurrency remains the responsibility of those calling jobs. This is
+not a process-wide eight-hash guarantee across all maintenance operations.
+
+Warm verified reads are local-only. They do not construct an object-store
+client, issue a remote HEAD/GET, or perform a synchronous remote repair. An
+unreachable or misconfigured endpoint cannot turn a verified local download
+into a 5xx; issue #71 is covered by the regression test
+`tests/lfs_read_amplification.py`. A cold miss (`local file absent, corrupt, or
+unverifiable`) is explicit: if the configured remote has no correct-size copy,
+batch download reports the object as unavailable and a direct GET fails with a
+service error rather than streaming partial bytes.
+
+Cold hydration is coalesced. Concurrent readers of the same
+`(data_root, repository, tenant, oid, size)` share one bounded single-flight
+fetch (maximum four hydrations in flight, maximum eight blocking verifications),
+wait with their own request deadlines, and each then streams through its own
+identity-validated descriptor. A cancelled HTTP request does not abort the
+leader fetch into a partial publication: bytes are fetched into a unique
+`.tmp-<uuid>` staging file, digest/size verified, permissioned and synced, then
+renamed atomically. The staging guard only removes its own temporary path.
+
+## Deferred repair
+
+Because warm reads never probe the remote, a remote copy that is lost while
+verified local bytes remain is **not** repaired silently on read. Local verified
+bytes and the paired backup remain authoritative; reads continue to succeed.
+The explicit supported repair workflow is a later LFS Batch **upload** request
+for the same already-ready object (for example
+`git lfs push --object-id origin <oid>`). That write-path request schedules a
+bounded background republish (at most two concurrent repairs, deadline-bound,
+failure logged as `rootyard: deferred LFS remote repair failed`), while the
+batch response remains an idempotent dedup. No read path claims that a missing
+remote object was repaired.
 
 Without the endpoint, LFS remains on the local data volume and belongs in the
 paired database/volume backup. With the endpoint, the remote store preserves

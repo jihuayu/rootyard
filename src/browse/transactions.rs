@@ -210,8 +210,8 @@ async fn execute_ref_transaction_inner(
         "atomic": input.atomic,
         "updates": normalized_updates,
     });
-    if let Some(ref key) = idem_key {
-        if let Some(saved_response) =
+    if let Some(ref key) = idem_key
+        && let Some(saved_response) =
             creation_replay(&tx, actor.id, repo_id, key, &request_json).await?
         {
             auth::finish_tx(tx, &actor, true).await?;
@@ -222,13 +222,11 @@ async fn execute_ref_transaction_inner(
             )
                 .into_response());
         }
-    }
 
-    if let Some(expected_gen) = input.storage_generation {
-        if expected_gen != current_generation {
+    if let Some(expected_gen) = input.storage_generation
+        && expected_gen != current_generation {
             return Err(Error(StatusCode::CONFLICT, "storage generation mismatch"));
         }
-    }
     repo.storage_generation = current_generation;
     reliability::before_gitfs_push(&state, &repo).await?;
 
