@@ -32,7 +32,8 @@
 //! `shutdown` is the only exit that reports success.
 use super::protocol::{
     Body, ErrorReply, FenceIfUnchanged, Frame, FreezeBegin, FreezeFinish, Handoff, HEARTBEAT_DEADLINE, Heartbeat, Hello,
-    Observe, OkReply, PROTOCOL_VERSION, Prewarm, StateReply, read_frame, write_frame,
+    MOUNT_OP_DEADLINE, Observe, OkReply, PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, StateReply, read_frame,
+    write_frame,
 };
 use crate::workspace_lab::fuse_mount::{MountHandle, MutationGate};
 use crate::workspaces::lazy::Reader;
@@ -68,6 +69,12 @@ const OPS_WORKERS: usize = 4;
 const PREWARM_WORKERS: usize = 4;
 const OPS_QUEUE: usize = 16;
 const PREWARM_QUEUE: usize = 8;
+/// AbortMount cleanup is separate from the mount/unmount pool: a full ops
+/// queue must never make the control reader run a slow session join inline.
+/// One worker with a small bounded queue absorbs a cancel burst; if both
+/// bounded queues are full the helper fail-stops instead of spawning threads.
+const CLEANUP_WORKERS: usize = 1;
+const CLEANUP_QUEUE: usize = 8;
 /// Bounded memory of cancelled operation ids, so a cancel that races ahead of
 /// its begin/mount frame cannot be forgotten and a late frame cannot revive it.
 pub(super) const TOMBSTONES: usize = 64;
@@ -127,10 +134,11 @@ pub(super) struct State {
     pub freeze_tombstones: Mutex<VecDeque<u64>>,
     pub ops: SyncSender<Job>,
     pub prewarm: SyncSender<Job>,
+    pub cleanup: SyncSender<Job>,
 }
 
 impl State {
-    fn new(control: UnixStream, ops: SyncSender<Job>, prewarm: SyncSender<Job>) -> Self {
+    fn new(control: UnixStream, ops: SyncSender<Job>, prewarm: SyncSender<Job>, cleanup: SyncSender<Job>) -> Self {
         Self {
             generation: AtomicU64::new(0),
             hello: AtomicBool::new(false),
@@ -143,6 +151,7 @@ impl State {
             freeze_tombstones: Mutex::new(VecDeque::new()),
             ops,
             prewarm,
+            cleanup,
         }
     }
 
@@ -243,23 +252,18 @@ pub fn run() -> io::Result<()> {
     let reader = control.try_clone()?;
     let (ops, ops_jobs) = mpsc::sync_channel::<Job>(OPS_QUEUE);
     let (prewarm, prewarm_jobs) = mpsc::sync_channel::<Job>(PREWARM_QUEUE);
-    let state = Arc::new(State::new(control, ops, prewarm));
+    let (cleanup, cleanup_jobs) = mpsc::sync_channel::<Job>(CLEANUP_QUEUE);
+    let state = Arc::new(State::new(control, ops, prewarm, cleanup));
 
-    // A panic anywhere in the child must fence before anything else: the hook
-    // runs before unwinding continues, so a half-finished operation can never
-    // leave a writable mount behind. Worker jobs are additionally guarded with
-    // `catch_unwind` below so a panic turns into one failstop, not a live
-    // process that pretends the mount is still healthy.
-    let hook_state = state.clone();
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        hook_state.fence_all();
-        hook_state.release_freezes();
-        previous(info);
-    }));
+    // Child-only panic policy: a panic may already hold the state, mount or
+    // gate mutex, so the hook must not fence, unmount, join or format output.
+    // `_exit` is the only lock-free, non-returnable fail-stop here; the kernel
+    // closes every inherited and FUSE descriptor, which aborts each session.
+    install_panic_failstop();
 
     spawn_pool(state.clone(), "fuse-helper-op", OPS_WORKERS, ops_jobs)?;
     spawn_pool(state.clone(), "fuse-helper-prewarm", PREWARM_WORKERS, prewarm_jobs)?;
+    spawn_pool(state.clone(), "fuse-helper-cleanup", CLEANUP_WORKERS, cleanup_jobs)?;
     let watchdog_state = state.clone();
     thread::Builder::new().name("fuse-helper-watchdog".into()).spawn(move || watchdog(watchdog_state))?;
     let heartbeat_state = state.clone();
@@ -279,6 +283,40 @@ pub fn run() -> io::Result<()> {
         Ok(Ok(LoopOutcome::Closed)) => teardown(&state, "control loop closed", 1),
         Ok(Err(_)) => teardown(&state, "control loop failed", 1),
         Err(_) => teardown(&state, "control loop panicked", 1),
+    }
+}
+
+/// Exit code for a child panic fail-stop. `libtest` also uses 101 for a failed
+/// test, but the subprocess fixture additionally proves the old self-locking
+/// fence path is gone by holding a state mutex across the panic.
+const PANIC_FAILSTOP_EXIT: i32 = 101;
+
+/// Child-only lock-free panic fail-stop.
+///
+/// A panic can interrupt any thread while it owns `state.mounts`,
+/// `state.pending` or a gate mutex. Taking one of those locks here would
+/// deadlock the process instead of stopping it. `_exit` never returns, never
+/// runs destructors or joins, and makes the kernel close every FUSE descriptor
+/// so no mount can keep admitting writes. A normal `shutdown` still exits 0.
+fn install_panic_failstop() {
+    std::panic::set_hook(Box::new(|_info| {
+        // SAFETY: `_exit` is async-signal-safe and does not touch Rust state.
+        unsafe { libc::_exit(PANIC_FAILSTOP_EXIT) };
+    }));
+}
+
+/// Route one AbortMount cleanup off the control reader. The ops pool is tried
+/// first so normal capacity keeps one cancel isolated to its own mount; a
+/// dedicated bounded cleanup worker absorbs an ops-pool burst. `Err` means both
+/// bounded queues are full and the caller must fail-stop, never run the slow
+/// session join inline and never spawn an unbounded thread.
+fn send_abort_job(ops: &SyncSender<Job>, cleanup: &SyncSender<Job>, job: Job) -> Result<(), Job> {
+    match ops.try_send(job) {
+        Ok(()) => Ok(()),
+        Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => match cleanup.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job)) => Err(job),
+        },
     }
 }
 
@@ -466,13 +504,18 @@ fn dispatch(
     db_epoch: i64,
     body: Body,
 ) -> Option<LoopOutcome> {
+    // Capture the absolute admission time before a job is queued: queue delay
+    // is part of the caller's budget, not free time for the worker.
+    let admitted = Instant::now();
     match body {
         Body::Heartbeat(_) => {
             *lock(&state.last_heartbeat) = Instant::now();
         }
         Body::Mount(request_body) => {
             let job_state = state.clone();
-            let job: Job = Box::new(move || ops::mount(&job_state, request, workspace, db_epoch, request_body));
+            let deadline = admitted + MOUNT_OP_DEADLINE;
+            let job: Job =
+                Box::new(move || ops::mount(&job_state, request, workspace, db_epoch, request_body, deadline));
             if state.ops.try_send(job).is_err() {
                 reply_error(state, request, workspace, libc::EBUSY, "workspace FUSE helper operation slots are full");
             }
@@ -491,12 +534,13 @@ fn dispatch(
             let removed = ops::cancel_mount(state, workspace, abort.request);
             let job_state = state.clone();
             let job: Job = Box::new(move || ops::abort_mount_reply(&job_state, request, workspace, removed));
-            if let Err(error) = state.ops.try_send(job) {
-                // The pool is full: run the bounded compensation here so the
-                // cancelled session is still joined instead of leaked.
-                match error {
-                    mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job) => job(),
-                }
+            match send_abort_job(&state.ops, &state.cleanup, job) {
+                Ok(()) => {}
+                // The synchronous cancel/fence above already happened. Both
+                // bounded queues are full, so an inline join would stall every
+                // workspace on the control reader: fail-stop closes the FUSE
+                // descriptors instead.
+                Err(_job) => failstop(state, "abort mount cleanup capacity exhausted", 1),
             }
         }
         Body::Handoff(Handoff { epoch, until }) => match workspace.and_then(|ws| gate_for(state, ws)) {
@@ -540,7 +584,8 @@ fn dispatch(
         }
         Body::Prewarm(Prewarm { paths }) => {
             let job_state = state.clone();
-            let job: Job = Box::new(move || ops::prewarm(&job_state, request, workspace, paths));
+            let deadline = admitted + PREWARM_DEADLINE;
+            let job: Job = Box::new(move || ops::prewarm(&job_state, request, workspace, paths, deadline));
             if state.prewarm.try_send(job).is_err() {
                 reply_error(state, request, workspace, libc::EBUSY, "workspace FUSE helper prewarm slots are full");
             }

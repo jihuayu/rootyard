@@ -6,7 +6,7 @@
 //! operation has an independent deadline so a caller that disappeared cannot
 //! park a gate or a per-workspace slot forever.
 use super::super::protocol::{
-    Body, FREEZE_OP_DEADLINE, MOUNT_OP_DEADLINE, MountRequest, MountedReply, OkReply, PREWARM_DEADLINE, PrewarmReply,
+    Body, FREEZE_OP_DEADLINE, MountRequest, MountedReply, OkReply, PrewarmReply,
 };
 use super::{
     FreezeOp, MOUNT_QUEUE_CAPACITY, Mounted, PendingMount, State, TOMBSTONES, gate_for, lock, reply, reply_error,
@@ -115,6 +115,7 @@ pub(super) fn mount(
     workspace: Option<Uuid>,
     db_epoch: i64,
     body: MountRequest,
+    deadline: Instant,
 ) {
     let Some(claimed) = workspace else {
         return reply_error(state, request, None, libc::EINVAL, "mount requires a workspace id");
@@ -157,7 +158,6 @@ pub(super) fn mount(
         );
     }
     let cancel = Arc::new(AtomicBool::new(false));
-    let deadline = Instant::now() + MOUNT_OP_DEADLINE;
     if let Err((code, message)) = register_pending(state, body.workspace, request, deadline, cancel.clone()) {
         return reply_error(state, request, workspace, code, message);
     }
@@ -519,16 +519,22 @@ pub(super) fn freeze_release(
     }
 }
 
-pub(super) fn prewarm(state: &Arc<State>, request: u64, workspace: Option<Uuid>, paths: Vec<String>) {
+pub(super) fn prewarm(
+    state: &Arc<State>,
+    request: u64,
+    workspace: Option<Uuid>,
+    paths: Vec<String>,
+    deadline: Instant,
+) {
     let Some(ws) = workspace else {
         return reply_error(state, request, None, libc::EINVAL, "prewarm requires a workspace id");
     };
     if paths.len() > 4 {
         return reply_error(state, request, workspace, libc::EINVAL, "prewarm accepts at most four paths");
     }
-    // One deadline for the whole request: queued work plus hydration shares
-    // the caller's 60s budget instead of multiplying it per path.
-    let deadline = Instant::now() + PREWARM_DEADLINE;
+    // The absolute deadline comes from control admission, so queued work plus
+    // hydration shares the caller's 60s budget instead of multiplying it per
+    // path. `prewarm_until` re-checks it before every path.
     let relative: Vec<PathBuf> = match paths.iter().map(|path| relative_path(path)).collect() {
         Ok(paths) => paths,
         Err(error) => return reply_errno(state, request, workspace, error),
@@ -542,7 +548,7 @@ pub(super) fn prewarm(state: &Arc<State>, request: u64, workspace: Option<Uuid>,
     if Instant::now() >= deadline {
         return reply_error(state, request, workspace, libc::ETIMEDOUT, "prewarm deadline expired before it started");
     }
-    match reader.prewarm(&relative) {
+    match reader.prewarm_until(&relative, deadline) {
         Ok((files, bytes)) => reply(
             state,
             request,
@@ -581,6 +587,18 @@ mod tests {
         assert!(relative_path("/etc/shadow").is_err());
         assert!(relative_path("../escape").is_err());
         assert!(relative_path("a/../../b").is_err());
+    }
+
+    #[test]
+    fn queue_delay_is_charged_to_the_admission_deadline() {
+        let admitted = Instant::now();
+        let deadline = admitted + Duration::from_millis(10);
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(
+            checkpoint(&AtomicBool::new(false), deadline).unwrap_err().0,
+            libc::ETIMEDOUT,
+            "a worker that starts after the admission budget must not run"
+        );
     }
 
     #[test]
