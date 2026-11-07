@@ -325,7 +325,6 @@ fn rapid_freeze_fence_handoff_cannot_replay_the_old_epoch_when_fenced_is_missed(
             assert_eq!(current.write_at(b"fresh!", 0).unwrap(), 6);
             assert_eq!(fs::read(mount.join(&name)).unwrap(), b"fresh!");
             assert_eq!(fs::read(&path).unwrap(), b"fresh!");
-            epoch = next;
             wait_until_queue_drained(&handle, "new-epoch write to drain");
             break;
         }
