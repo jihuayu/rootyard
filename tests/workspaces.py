@@ -195,6 +195,172 @@ class Harness:
                     "Rejected operation published a destination")
         return result
 
+    def reject_init_before_store(self, label, source, base, agent="agent-preflight"):
+        """A rejected init must fail before the store exists and must not touch the source."""
+        store = source.parent / (label + "-store")
+        require(not store.exists(), label + ": preflight fixture reused an existing store path")
+        before = tree(source)
+        refs = self.git("for-each-ref", "--format=%(refname) %(objectname)", cwd=source).stdout
+        index = source / ".git/index"
+        index_before = index.read_bytes() if index.is_file() else None
+        result = self.lab("init", store, source, agent, base, "--quiescent", check=False)
+        require(result.returncode != 0, label + ": unsupported source was accepted by init")
+        require(not store.exists(), label + ": rejected init created the store directory")
+        require(not (store / "staging").exists(), label + ": rejected init created a staging directory")
+        require(not (store / "workspaces").exists(), label + ": rejected init created a workspace directory")
+        require(self.published(store, "workspaces") == set(), label + ": rejected init published a workspace")
+        self.equal(tree(source), before, label + ": rejected init modified the source bytes")
+        require(self.git("for-each-ref", "--format=%(refname) %(objectname)", cwd=source).stdout == refs,
+                label + ": rejected init changed source refs")
+        if index_before is not None:
+            require(index.read_bytes() == index_before, label + ": rejected init rewrote the source index")
+        return True
+
+    def preflight_rejections_before_store(self):
+        """Real Git shapes that init must refuse before creating or locking any store."""
+        checked = []
+
+        # Real linked worktree: a .git pointer file plus shared administration in the
+        # main repository. Both shapes are unsupported; neither may create a store.
+        root, source, _, base = self.fixture("preflight-worktree")
+        linked = root / "linked-worktree"
+        self.git("worktree", "add", str(linked), "-b", "linked-branch", cwd=source)
+        require((linked / ".git").is_file(), "worktree fixture did not create a .git pointer file")
+        require((source / ".git/worktrees").is_dir(), "worktree fixture did not create shared admin")
+        self.reject_init_before_store("linked-worktree", linked, base)
+        self.reject_init_before_store("worktree-shared-admin", source, base)
+        checked.extend(["linked-worktree-git-file", "worktree-shared-admin"])
+
+        # Real submodule with a local owned URL. File transport is allowed for this
+        # fixture clone only, never for lab Git invocations.
+        root, source, _, _ = self.fixture("preflight-submodule")
+        library = root / "library"
+        self.git("init", "-b", "main", library)
+        self.write(library, "lib.txt", b"library\n")
+        self.git("add", "--all", cwd=library)
+        self.git("commit", "-m", "library base", cwd=library)
+        self.git("-c", "protocol.file.allow=always", "submodule", "add",
+                 str(library), "vendor/library", cwd=source)
+        self.git("commit", "-m", "add local submodule", cwd=source)
+        base = self.oid(source)
+        require((source / ".git/modules/vendor/library").is_dir(), "submodule fixture has no .git/modules")
+        require((source / ".gitmodules").is_file(), "submodule fixture has no .gitmodules")
+        self.reject_init_before_store("submodule", source, base)
+        checked.append("submodule-git-modules")
+
+        # Tracked .gitattributes requesting an LFS filter. The fixture configures a
+        # trivial filter only to create the commit, then removes it so the tracked
+        # attribute file itself is the sole reason for rejection.
+        root, source, _, _ = self.fixture("preflight-lfs-attributes", {"blob.bin": b"ordinary bytes\n"})
+        self.git("config", "filter.lfs.clean", "cat", cwd=source)
+        self.git("config", "filter.lfs.smudge", "cat", cwd=source)
+        self.write(source, ".gitattributes", b"*.bin filter=lfs diff=lfs merge=lfs -text\n")
+        self.git("add", ".gitattributes", "blob.bin", cwd=source)
+        self.git("commit", "-m", "tracked LFS attributes", cwd=source)
+        self.git("config", "--remove-section", "filter.lfs", cwd=source)
+        base = self.oid(source)
+        require(b"filter=lfs" in (source / ".gitattributes").read_bytes(),
+                "LFS fixture did not track a filter attribute")
+        require(b"filter" not in (source / ".git/config").read_bytes(),
+                "LFS fixture left filter configuration behind")
+        self.reject_init_before_store("lfs-attributes", source, base)
+        checked.append("tracked-gitattributes-filter-lfs")
+
+        # Real ordinary sparse checkout (cone mode, no sparse index).
+        root, source, _, _ = self.fixture("preflight-sparse", {
+            "visible/file.txt": b"visible\n", "excluded/file.txt": b"excluded\n",
+        })
+        self.git("sparse-checkout", "init", "--cone", cwd=source)
+        self.git("sparse-checkout", "set", "visible", cwd=source)
+        require(b"sdir" not in (source / ".git/index").read_bytes(),
+                "ordinary sparse fixture unexpectedly produced a sparse index")
+        require(b"040000 " not in self.git("ls-files", "--sparse", "--stage", cwd=source).stdout,
+                "ordinary sparse fixture unexpectedly produced sparse directory entries")
+        base = self.oid(source)
+        self.reject_init_before_store("sparse-checkout", source, base)
+        checked.append("sparse-checkout-ordinary-mode")
+
+        # Real split index generated by Git itself.
+        _, source, _, base = self.fixture("preflight-split-index")
+        self.git("update-index", "--split-index", cwd=source)
+        require(any(name.startswith("sharedindex.") for name in os.listdir(source / ".git")),
+                "split-index fixture produced no shared index")
+        self.reject_init_before_store("split-index", source, base)
+        checked.append("split-index")
+
+        # Real external object alternates created by a local shared clone.
+        root, source, _, _ = self.fixture("preflight-alternates")
+        shared = root / "shared-clone"
+        self.git("clone", "--shared", str(source), str(shared), cwd=root)
+        require((shared / ".git/objects/info/alternates").is_file(),
+                "shared clone produced no alternates file")
+        self.reject_init_before_store("alternates", shared, self.oid(shared))
+        checked.append("external-alternates")
+
+        # Real SHA-256 repository (rejected; SHA-256 support is not implemented).
+        root, _, _, _ = self.fixture("preflight-sha256")
+        sha = root / "sha256-repository"
+        self.git("init", "--object-format=sha256", "-b", "main", sha)
+        self.write(sha, "plain.txt", b"sha256\n")
+        self.git("add", "--all", cwd=sha)
+        self.git("commit", "-m", "sha256 base", cwd=sha)
+        self.reject_init_before_store("sha256", sha, self.oid(sha))
+        checked.append("sha256-repository")
+
+        # Managed worktree symlinks that capture used to reject only after the store
+        # already existed. Each variant is its own fresh repository.
+        root, source, _, base = self.fixture("preflight-absolute-symlink")
+        (source / "absolute-link").symlink_to(source / "plain.txt")
+        self.reject_init_before_store("absolute-symlink", source, base)
+        root, source, _, base = self.fixture("preflight-escaping-symlink")
+        (root / "outside.txt").write_bytes(b"outside\n")
+        (source / "escaping-link").symlink_to("../outside.txt")
+        self.reject_init_before_store("escaping-symlink", source, base)
+        root, source, _, base = self.fixture("preflight-git-target-symlink")
+        (source / "git-target-link").symlink_to(".git/config")
+        self.reject_init_before_store("git-target-symlink", source, base)
+        checked.extend(["absolute-symlink", "escaping-symlink", "git-target-symlink"])
+
+        # Argument validation also precedes store creation.
+        _, source, _, base = self.fixture("preflight-arguments")
+        self.reject_init_before_store("invalid-agent", source, base, agent="invalid agent!")
+        self.reject_init_before_store("invalid-oid", source, "0" * 39)
+        checked.extend(["invalid-agent-before-store", "invalid-oid-before-store"])
+
+        # No false rejection: a .rootyardignore-excluded untracked attribute file is
+        # unmanaged for capture, so init must still succeed and must not copy it.
+        _, source, store, base = self.fixture("preflight-ignored-attributes")
+        self.write(source, ".rootyardignore", b"generated/\n")
+        self.write(source, "generated/.gitattributes", b"*.bin filter=lfs\n")
+        info, work = self.init(store, source, base)
+        require(not (work / "generated").exists(),
+                "rootyardignore-excluded attribute file was captured despite preflight")
+        self.checkpoint(store, info)
+
+        # Ordinary non-filter attributes stay supported.
+        _, source, store, base = self.fixture("preflight-ordinary-attributes")
+        self.write(source, ".gitattributes", b"*.txt text eol=lf\n")
+        self.git("add", ".gitattributes", cwd=source)
+        self.git("commit", "-m", "ordinary attributes", cwd=source)
+        base = self.oid(source)
+        info, work = self.init(store, source, base)
+        require((work / ".gitattributes").read_bytes() == b"*.txt text eol=lf\n",
+                "ordinary .gitattributes was not copied byte-for-byte")
+        checked.extend(["rootyardignore-ignored-attributes-accepted", "ordinary-attributes-accepted"])
+
+        # No false rejection: a Git-ignored link that escapes the repository is
+        # unmanaged, so init must still succeed.
+        root, source, store, base = self.fixture("preflight-ignored-symlink")
+        (root / "outside.txt").write_bytes(b"outside\n")
+        self.write(source, ".gitignore", b"ignored-link\n")
+        (source / "ignored-link").symlink_to("../outside.txt")
+        self.init(store, source, base)
+        checked.append("git-ignored-escaping-symlink-accepted")
+
+        return {"preflight_rejections": checked, "fresh_store_paths_absent": True,
+                "source_bytes_refs_index_preserved": True,
+                "unmanaged_attributes_and_symlinks_not_rejected": True}
+
     def equal(self, left, right, label):
         require(left == right,
                 label + "; differing byte paths: "
@@ -773,6 +939,7 @@ class Harness:
             self.fail_closed_corruption, self.unsupported_sources,
             self.checkpoint_rejections_and_quiescence, self.overlapping_store_leaves_source_untouched,
             self.unsupported_native_indexes,
+            self.preflight_rejections_before_store,
             self.recorded_git_version_mismatch, self.publication_failpoints,
             self.external_git_config_isolation, self.safe_config_and_raw_eol,
             self.status_and_rootyardignore, self.changeset_and_three_way_apply,
