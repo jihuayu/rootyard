@@ -1,0 +1,18 @@
+physical_loose_packed_and_pin: passed
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "physical_loose_packed_and_pin",
+      "status": "passed",
+      "seconds": 19.6391,
+      "detail": {
+        "loose_deleted": "60509233a64a70e3e3d7f718fe589fb53053ebde",
+        "packed_deleted": "1f9a87c7235230dd75e09174d75efe82049724fa",
+        "reachable_base_preserved": "d80b791ff9f62c0b183e665778180a0c9a14be6e",
+        "ci_pin_preserved": "076a7495aae58ef7f433bda4123b4bc8f7892e18"
+      }
+    }
+  ],
+  "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba"
+}

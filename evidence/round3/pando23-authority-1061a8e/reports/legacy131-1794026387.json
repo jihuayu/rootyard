@@ -1,0 +1,45 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "create_real_format7_schema131_archive",
+      "status": "passed",
+      "seconds": 51.4359,
+      "detail": {
+        "format": 7,
+        "schema_last": 131,
+        "legacy_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+        "sha256_head": "6ec298fecf049de70ec0540a60f490796b16072d490acc2e00dbf343fc581513",
+        "generation": 1
+      }
+    },
+    {
+      "name": "candidate_rejects_without_opt_in",
+      "status": "passed",
+      "seconds": 17.9875,
+      "detail": {
+        "explicit_opt_in_required": true,
+        "no_target_or_guard_written": true
+      }
+    },
+    {
+      "name": "candidate_restores_and_upgrades",
+      "status": "passed",
+      "seconds": 20.785,
+      "detail": {
+        "schema_upgraded_to_132": true,
+        "sha256_clone_exact": true,
+        "pin_preserved": true,
+        "generation_preserved": true,
+        "issued_grant_revoked": true,
+        "cancellation_tombstone_preserved": true
+      }
+    }
+  ],
+  "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+  "legacy_binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "limitations": [
+    "Synthetic loopback backup/restore, not a production RPO/RTO claim.",
+    "The legacy archive is produced by the trusted baseline binary, not rewritten."
+  ]
+}

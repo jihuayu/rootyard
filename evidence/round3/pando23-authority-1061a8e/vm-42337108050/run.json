@@ -1,0 +1,25 @@
+{
+  "schema": "rootyard/pando23-vm-run-reference/v1",
+  "derived_from": [
+    "receipt.json",
+    "download-verification.json"
+  ],
+  "run_id": 42337108050,
+  "job_id": 128296401784,
+  "url": "https://github.com/jihuayu/rootyard/actions/runs/42337108050",
+  "conclusion": "success",
+  "source_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+  "artifact_id": 13559528645,
+  "artifact_zip_sha256": "692d86087ccfeeb1815d35d891926241f4e3b0c2d6d1cddac7183b5ba7f3d168",
+  "artifact_zip_bytes": 2810,
+  "artifact_zip_stored_in_repo": false,
+  "vm_binary_sha256": "f0061754a2ccb4678db272cfc3662cc106945ee2819838b5a4868fde9d413046",
+  "assertions_verified": 17,
+  "local_certified_build_same_source_commit": {
+    "compiled_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+    "production_inputs_sha256": "9e33859aad991589c57863af6f6b46fe42290071b3e271f90eda44f6d707feac",
+    "local_binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+    "why_same_production_input": "The VM receipt pins source_commit 1061a8ee... and the workflow rebuilt that commit. The production-input digest is a pure function of that source tree (src/, migrations/, schema/, Cargo.toml, Cargo.lock); the local certified build for the same commit records 9e33859..., and re-running source_digest.py on the current tree at 750ccce reproduces 9e33859... because only tests/docs changed."
+  },
+  "binary_hash_note": "The VM binary f0061754... and the local binary 6f76d709... are distinct artifacts built in different environments from the same production input. No equal-binary-hash-across-platforms claim is made; no VM binary is stored here."
+}

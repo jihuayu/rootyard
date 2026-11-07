@@ -1,0 +1,308 @@
+{
+  "acceptance": {
+    "closable_23": true,
+    "code_review_p1": 0,
+    "code_review_p2": 0,
+    "code_review_p3": 4,
+    "code_review_verdict": "APPROVE_SCOPED_MODE",
+    "code_reviewed_commit": "89ba6a8bad9fd709bdf39f16e828bb8459f34bd2",
+    "issue_closes_only_after_primary_final_review_and_merge": true,
+    "reviewed_binary_sha256": "eb1e4a09bf1a9c244272a88e300fbf011cb017243313214f0ab359898515d9da",
+    "reviewed_source_commit": "89ba6a8bad9fd709bdf39f16e828bb8459f34bd2",
+    "scope_of_acceptance": "managed authority-scoped remote GC with paired Rootyard archives as the only supported backup authority, destructive stage opt-in via ROOTYARD_PANDO_REMOTE_DELETE",
+    "verdict": "ACCEPT_FOR_DOCUMENTED_MODE"
+  },
+  "evidence_role": "permanent combined-source acceptance evidence for Pando authority-scoped remote retention",
+  "failed_attempt": {
+    "case": "physical_loose_packed_and_pin",
+    "case_seconds": 53.3013,
+    "cause": "UNCLASSIFIED",
+    "coordinator_state": "failed",
+    "error": "maintenance state did not reach deleted: pending",
+    "exit_code": 1,
+    "focused_rerun_passed": true,
+    "focused_rerun_seconds": 19.6391,
+    "full_suite_physical_passed_later": "8/8 in 149.71 s",
+    "runtime_fix_claimed": false,
+    "sql_snapshot_retained": false,
+    "stage": "gitfs-physical"
+  },
+  "files": {
+    "README.md": {
+      "bytes": 13999,
+      "sha256": "4969e6e7c22b27504a88fd421c8da043bcc59793a1b07c405435247a5789935b"
+    },
+    "attempts/pre-gc-physical-1794024719/focused-gc-state.json": {
+      "bytes": 495,
+      "sha256": "d04328eaf1377378668fc3f885b841d0fc140a8e1b89c91439b96a7767aed4d6"
+    },
+    "attempts/pre-gc-physical-1794024719/focused-gc.json": {
+      "bytes": 553,
+      "sha256": "94d2288195c554df2eee196b6186c2f24a03ad0f4855dfb36d729f67a40cefab"
+    },
+    "attempts/pre-gc-physical-1794024719/focused-gc.log": {
+      "bytes": 591,
+      "sha256": "d8d8408dbbc9d63483e357215dae925fe1e164673950559b8f66c4a4784010b1"
+    },
+    "attempts/pre-gc-physical-1794024719/gitfs-physical-1794024719.json": {
+      "bytes": 304,
+      "sha256": "ee5ec89dcc8af5025fe55fe15b0fe848da2e2662aa67198db02e7f9c1ddb9e96"
+    },
+    "attempts/pre-gc-physical-1794024719/gitfs-physical-1794024719.log": {
+      "bytes": 1191,
+      "sha256": "a1f6f963e6470df36f3a52a8e34e59a7c2330ff81f82c0d98d306dcc002738ff"
+    },
+    "attempts/pre-gc-physical-1794024719/status.json": {
+      "bytes": 5552,
+      "sha256": "8d1342fa92a19ec1d9cf97e6c5dfef322f92070d64a348bc4efae45c98299602"
+    },
+    "logs/rust-lib-1794024574.log": {
+      "bytes": 14167,
+      "sha256": "89a422c699fc8ce21aac202e24059e0c002f4f74f34a36393925004d29bb881a"
+    },
+    "logs/rust-pando-1794024629.log": {
+      "bytes": 4475,
+      "sha256": "9d328770b3195e8df95a03509a61f6eb22d92cad513d80970ca44a1dc7831948"
+    },
+    "logs/schema-1794024696.log": {
+      "bytes": 299,
+      "sha256": "0da544241a2596a345f9bef7b921df89c21502dd33f6e5e89d8bca97e141a658"
+    },
+    "pando23-source-89ba6a8/failed-pre-fix/pando-service-1794023097.json": {
+      "bytes": 516,
+      "sha256": "86f44422f0f88b9319120ecaba6111cd94a0fc514bc3c85a558096c6130c4b70"
+    },
+    "pando23-source-89ba6a8/failed-pre-fix/sha256-restore-1794023791.json": {
+      "bytes": 832,
+      "sha256": "be4a1400093eb7874d2b37e91b42de885af90a0002f666de78a5d8b78ed5dc08"
+    },
+    "pando23-source-89ba6a8/reports/legacy130-1794023691.json": {
+      "bytes": 1409,
+      "sha256": "c15079c35c586e6fc28949ca05c91b317e08f29d2c62b4ad0cd19f9991023598"
+    },
+    "pando23-source-89ba6a8/reports/legacy131-1794023597.json": {
+      "bytes": 1409,
+      "sha256": "d82f2da5025a41d68dfa221b16a77ce79753b31dbd55a4a3640be372ea2d81aa"
+    },
+    "pando23-source-89ba6a8/reports/pando-service-1794023570.json": {
+      "bytes": 929,
+      "sha256": "dd41533125cf66dbf13e524568a8fba618f78fa50ad9b511ebfe39677637833b"
+    },
+    "pando23-source-89ba6a8/reports/sha256-matrix-1794023779.json": {
+      "bytes": 3985,
+      "sha256": "1bb5204f5197c9e7614da7400a68d070e1c03c4829f74d53bc54ff07e689b72e"
+    },
+    "pando23-source-89ba6a8/reports/sha256-restore-1794024214.json": {
+      "bytes": 972,
+      "sha256": "009087d8afcf3a6a49f710545327612db7668c5f034d633c506ba7e62a83e387"
+    },
+    "pando23-source-89ba6a8/rust-pando-1794023024.log": {
+      "bytes": 4472,
+      "sha256": "d4634042d52632417920846a1627ef5a9f4418ff9eea52f27ed3ec4d25cee194"
+    },
+    "pando23-source-89ba6a8/schema-1794023092.log": {
+      "bytes": 299,
+      "sha256": "0da544241a2596a345f9bef7b921df89c21502dd33f6e5e89d8bca97e141a658"
+    },
+    "pando23-source-89ba6a8/status.json": {
+      "bytes": 8816,
+      "sha256": "82be558aa315a6812a489a05adda11a2989b44955acca993e2602e4a097c854e"
+    },
+    "reports/gitfs-lifecycle-1794024701.json": {
+      "bytes": 1122,
+      "sha256": "0e20475bf7e11effc0675ad8048757e7ec146aa7dc9794d0dd8c5218e34b542c"
+    },
+    "reports/gitfs-physical-1794026210.json": {
+      "bytes": 2960,
+      "sha256": "07e276692e34fc5d94a3063e0ce532c263614a140211d15b3fce10c7caffb247"
+    },
+    "reports/legacy130-1794026478.json": {
+      "bytes": 1409,
+      "sha256": "aabec8356cfee57b8b75da155dcb66e98b021ea0edd0b28e8c17a5b789d8318f"
+    },
+    "reports/legacy131-1794026387.json": {
+      "bytes": 1408,
+      "sha256": "171eb866d85dcdd19cd9da5e2b1e3a082919c6b65f2c7649db1a674a0a1dbd69"
+    },
+    "reports/pando-service-1794026360.json": {
+      "bytes": 929,
+      "sha256": "ae3020c7bbe3e44cc1e465a51faa0957586159b20b71d2323bc5c0c5274c53d4"
+    },
+    "reports/sha256-matrix-1794026568.json": {
+      "bytes": 3985,
+      "sha256": "5caa4a2d3e5cc7e2a4e4992269da14400d14a44a8c9880e95ab23765fc56e055"
+    },
+    "reports/sha256-restore-1794026579.json": {
+      "bytes": 971,
+      "sha256": "5d0697260b5a67e80aa2cb63c5d519e3d92ffd5803d483757dec260ed04e453a"
+    },
+    "reviews/acceptance-review.json": {
+      "bytes": 9711,
+      "sha256": "979e5aa696a19080d31affd00328427a46fbdee08828ddc4dc1cf9d280454852"
+    },
+    "reviews/acceptance-review.md": {
+      "bytes": 6614,
+      "sha256": "51149b387cc169a2c2f07de9deb35672834719be7d545fb48c961b1c52245f73"
+    },
+    "reviews/review-final.json": {
+      "bytes": 10813,
+      "sha256": "a287fd117bd7bcce6129cddb74a09a331da0c7608608038d5a375fa162b6a4fa"
+    },
+    "reviews/review-final.md": {
+      "bytes": 9709,
+      "sha256": "8adf4870b1ba7395ad643b86f2d195e85167032ec044b91d118526c60aa6135e"
+    },
+    "source-inputs.json": {
+      "bytes": 32380,
+      "sha256": "5142b8fdf31484967b7b647414e697bfac78c3a58c4dd3b7e3bbda7cbd71283b"
+    },
+    "source-inputs.sha256": {
+      "bytes": 489,
+      "sha256": "e2754de128e8832e3f9ad59bbaf7c5d031c55d6c86d1830b75c4210ebb8dc432"
+    },
+    "status.json": {
+      "bytes": 10880,
+      "sha256": "a7a17802141108f2456add89deb61a0e8395e41896697dc847ea573b0e03d6e0"
+    },
+    "vm-42337108050/binary.sha256": {
+      "bytes": 124,
+      "sha256": "2fa11fafa9929efa9e4bf24d7e41981d0f6a48e69842278d0830318f31c23768"
+    },
+    "vm-42337108050/download-verification.json": {
+      "bytes": 383,
+      "sha256": "52451b56fd2cd7f0b54845e4b645c9dcb8cb6bb0ee8f6684754c4ab0fdd0fa71"
+    },
+    "vm-42337108050/native-cgroup-receipt.json": {
+      "bytes": 3278,
+      "sha256": "0b7025274cfb3afc8454c40e799783b6ba0f2fa00eaf3c445fd7c66f86ca01fe"
+    },
+    "vm-42337108050/receipt.json": {
+      "bytes": 3278,
+      "sha256": "0b7025274cfb3afc8454c40e799783b6ba0f2fa00eaf3c445fd7c66f86ca01fe"
+    },
+    "vm-42337108050/run.json": {
+      "bytes": 1651,
+      "sha256": "f9fbeb01ad0a1612cda7f24ecb305d8c4bc12228ecc3f7991c62599dc76f0cac"
+    }
+  },
+  "issue": 23,
+  "not_stored": [
+    "binary artifacts",
+    "artifact ZIP",
+    "backup sets",
+    "PKI/keys",
+    "database dumps",
+    "raw SQL snapshot",
+    "raw ready.env/credentials"
+  ],
+  "pipeline": {
+    "job_states": {
+      "gitfs-lifecycle": "passed",
+      "gitfs-physical": "passed",
+      "legacy130": "passed",
+      "legacy131": "passed",
+      "pando-service": "passed",
+      "rust-lib": "passed",
+      "rust-pando": "passed",
+      "schema": "passed",
+      "sha256-matrix": "passed",
+      "sha256-restore": "passed"
+    },
+    "jobs_failed": 0,
+    "jobs_passed": 10,
+    "jobs_total": 10,
+    "report_cases_failed": 0,
+    "report_cases_total": 27,
+    "report_jsons_present": 7,
+    "rust_and_schema_reports_are_stdout_logs_only": true,
+    "rust_lib_tests_passed": 142,
+    "rust_pando_tests_passed": 1,
+    "schema_contract_checks_passed": 8,
+    "stage": "complete",
+    "state": "passed"
+  },
+  "reports": {
+    "reports/gitfs-lifecycle-1794024701.json": {
+      "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+      "cases": 3,
+      "failed": 0,
+      "passed": true
+    },
+    "reports/gitfs-physical-1794026210.json": {
+      "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+      "cases": 8,
+      "failed": 0,
+      "passed": true
+    },
+    "reports/legacy130-1794026478.json": {
+      "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+      "cases": 3,
+      "failed": 0,
+      "passed": true
+    },
+    "reports/legacy131-1794026387.json": {
+      "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+      "cases": 3,
+      "failed": 0,
+      "passed": true
+    },
+    "reports/pando-service-1794026360.json": {
+      "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+      "cases": 2,
+      "failed": 0,
+      "passed": true
+    },
+    "reports/sha256-matrix-1794026568.json": {
+      "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+      "cases": 6,
+      "failed": 0,
+      "passed": true
+    },
+    "reports/sha256-restore-1794026579.json": {
+      "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+      "cases": 2,
+      "failed": 0,
+      "passed": true
+    }
+  },
+  "schema": "rootyard/pando23-authority-evidence-manifest/v1",
+  "source": {
+    "backup_format": 8,
+    "certificate": {
+      "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+      "built_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+      "production_inputs_sha256": "9e33859aad991589c57863af6f6b46fe42290071b3e271f90eda44f6d707feac",
+      "role": "pando61",
+      "source_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+      "valid": true
+    },
+    "compiled_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+    "harness_commit": "750ccce7571dc5eed7bc9ccaaf3aa04e31755760",
+    "local_binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+    "migration_132_pushed_immutable": true,
+    "production_input_files": 329,
+    "production_inputs_sha256": "9e33859aad991589c57863af6f6b46fe42290071b3e271f90eda44f6d707feac",
+    "production_inputs_unchanged_after_compile": true,
+    "schema_version": 132,
+    "source_inputs_file_sha256": "5142b8fdf31484967b7b647414e697bfac78c3a58c4dd3b7e3bbda7cbd71283b"
+  },
+  "verification": {
+    "current_tree_production_inputs_sha256": "9e33859aad991589c57863af6f6b46fe42290071b3e271f90eda44f6d707feac",
+    "current_tree_source_digest_matches": true,
+    "manifest_excludes_itself": true,
+    "report_hashes_equal_status_report_sha256": true,
+    "secret_scan_clean": true
+  },
+  "vm": {
+    "artifact_zip_sha256": "692d86087ccfeeb1815d35d891926241f4e3b0c2d6d1cddac7183b5ba7f3d168",
+    "artifact_zip_stored": false,
+    "assertions_verified": 17,
+    "conclusion": "success",
+    "job_id": 128296401784,
+    "run_id": 42337108050,
+    "same_binary_hash_claimed": false,
+    "same_production_input_as_local": true,
+    "source_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+    "vm_binary_sha256": "f0061754a2ccb4678db272cfc3662cc106945ee2819838b5a4868fde9d413046"
+  }
+}

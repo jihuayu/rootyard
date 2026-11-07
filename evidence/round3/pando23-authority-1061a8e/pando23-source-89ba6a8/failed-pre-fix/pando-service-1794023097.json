@@ -1,0 +1,21 @@
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "seconds": 0.7417,
+      "detail": null
+    },
+    {
+      "name": "automatic_compaction_and_cache",
+      "status": "failed",
+      "seconds": 9.2278,
+      "error": "automatic compaction did not replace the serving pack set: 2"
+    }
+  ],
+  "binary_sha256": "eb1e4a09bf1a9c244272a88e300fbf011cb017243313214f0ab359898515d9da",
+  "limitations": [
+    "Loopback single-node fixture; no remote-delete qualification."
+  ]
+}
