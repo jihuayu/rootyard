@@ -33,14 +33,28 @@ labels. Database strings are never interpolated into exposition.
 | `rootyard_provisioning_backlog` | gauge | All provisioning rows, including delayed retries |
 | `rootyard_provisioning_due` | gauge | Provisioning rows whose retry time has arrived |
 | `rootyard_provisioning_oldest_age_seconds` | gauge | Age of oldest provisioning row |
+| `rootyard_browser_web_sessions` | gauge | Stored browser session rows, including revoked and already expired rows |
+| `rootyard_browser_tokens` | gauge | Stored browser child tokens, including revoked and already expired rows; API tokens are excluded |
+| `rootyard_expired_browser_session_oldest_age_seconds` | gauge | Database-clock age of oldest expired browser session; an empty set or only unexpired rows report 0 |
+| `rootyard_expired_browser_token_oldest_age_seconds` | gauge | Database-clock age of oldest expired browser token; an empty set or only unexpired rows report 0 |
+| `rootyard_session_gc_cycles_total` | counter | GC cycles whose session and token passes both committed |
+| `rootyard_session_gc_session_rows_deleted_total` | counter | Expired browser session rows whose own short transaction committed as deleted |
+| `rootyard_session_gc_tokens_deleted_total` | counter | Expired browser tokens whose own short transaction committed as deleted after reference probes |
+| `rootyard_session_gc_failures_total` | counter | Failed GC cycles; rows committed by an earlier pass remain counted |
 
 The `|` notation in this table enumerates distinct label values; it is not a
-literal label value. A healthy scrape always exports all 23 time series,
+literal label value. A healthy scrape always exports all 31 time series,
 including zero-valued states. Delivery age includes leased entries (including
 expired leases) and delayed retries. Counts represent delivery rows, so one
 event assigned to two consumers contributes two outstanding deliveries.
 A resolved unknown operation remains an unknown historical fact; its explicit
 resolution removes it from the unresolved gauge without rewriting history.
+
+All four GC counters are process-local and label-free. Each GC pass records its
+own committed rows once, immediately after that pass commits, so a cycle whose
+session pass committed and whose token pass then failed increments the failure
+counter while keeping the committed session-row count. `serve` and `worker`
+each report only their own loop's counters.
 
 The five `rootyard_db_pool_*` gauges read Deadpool 0.13.1 status before the
 scrape acquires its own SQL snapshot connection. They are approximate and can
@@ -56,10 +70,11 @@ snapshot inside a read-only transaction. A four-second server-side statement
 timeout bounds the query; pool acquisition and query have a combined five-second
 timeout. On
 any database/schema/query failure or timeout, the endpoint returns HTTP 503,
-exports `rootyard_postgres_up 0` plus process-local metrics, and omits every
-database-derived gauge. The process-local pool gauges above remain exported
-because they do not assert database health. The endpoint never substitutes an
-empty/healthy backlog or serves a stale cached snapshot. Alert on both
+exports `rootyard_postgres_up 0` plus the process-local pool gauges, transfer
+counters and four GC counters, and omits every database-derived gauge,
+including all four browser-session gauges. The process-local metrics remain
+exported because they do not assert database health. The endpoint never
+substitutes an empty/healthy backlog or serves a stale cached snapshot. Alert on both
 Prometheus scrape failure and PostgreSQL health; standard Prometheus marks a
 503 scrape unsuccessful rather than ingesting its body.
 
@@ -91,6 +106,19 @@ The harness owns and removes only its randomly named schema and temporary
 storage. It seeds explicit synthetic metadata to verify aggregation and briefly
 renames its own delivery table to verify fail-closed exposition. This is not a
 PostgreSQL outage, production load, or monitoring-system integration test.
+
+`tests/session_gc_metrics.py` exercises the GC counters end to end with the real
+binary, a one-second GC interval and this listener. It seeds an expired browser
+session/token, installs a temporary `BEFORE DELETE` trigger on `tokens` that
+raises SQLSTATE `23503` only for `browser` rows so the session pass commits and
+the token pass fails, then checks that `rootyard_session_gc_failures_total` and
+`rootyard_session_gc_session_rows_deleted_total` grow, that
+`rootyard_session_gc_tokens_deleted_total` does not, and that the session row is
+gone while the token row remains. After dropping the trigger it waits for a
+committed token pass and the real deletion, then renames `event_deliveries` to
+force HTTP 503 and checks that every SQL-derived gauge is omitted while all four
+GC counters remain. That script has not been executed against a built binary as
+part of this change; native acceptance is pending.
 
 `tests/pool_metrics.py` runs the actual service on an owned loopback metrics
 port with a fresh schema. It holds a PostgreSQL row lock on its repository

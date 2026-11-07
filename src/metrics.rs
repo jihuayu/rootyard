@@ -18,6 +18,8 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+use crate::web::session_gc::{self, CounterSnapshot};
+
 /// Validate before binding: wildcard, public and private LAN addresses are forbidden.
 pub fn validate_bind(address: SocketAddr) -> anyhow::Result<SocketAddr> {
     anyhow::ensure!(address.ip().is_loopback(), "metrics listener must bind a loopback address");
@@ -73,6 +75,10 @@ pub fn router(pool: Pool, git_slots: Arc<Semaphore>, capacity: usize, counters: 
 // One SQL statement provides one consistent MVCC snapshot, without exposing any
 // database strings. Unknown operations remain unknown after explicit resolution;
 // the resolution relation determines whether operator attention is outstanding.
+// Browser row counts cover every stored row of that kind, revoked and already
+// expired included; the two oldest-expiry subqueries only consider rows whose
+// expiry is already past, so an unexpired session is never the "oldest expired"
+// sample, an empty set reports zero and the database clock is authoritative.
 const SNAPSHOT_SQL: &str = r#"
 SELECT
  (SELECT count(*) FROM repositories WHERE state='provisioning'),
@@ -86,7 +92,14 @@ SELECT
     FROM event_deliveries d JOIN outbox_events e ON e.event_id=d.event_id WHERE d.state<>'delivered'),
  (SELECT count(*) FROM repositories WHERE state='provisioning' AND next_retry_at<=statement_timestamp()),
  (SELECT COALESCE(GREATEST(EXTRACT(EPOCH FROM (statement_timestamp()-min(created_at))),0),0)::double precision
-    FROM repositories WHERE state='provisioning')
+    FROM repositories WHERE state='provisioning'),
+ (SELECT count(*) FROM web_sessions s JOIN tokens t ON t.id=s.token_id WHERE t.kind='browser'),
+ (SELECT count(*) FROM tokens WHERE kind='browser'),
+ (SELECT COALESCE(GREATEST(EXTRACT(EPOCH FROM (statement_timestamp()-min(s.expires_at))),0),0)::double precision
+    FROM web_sessions s JOIN tokens t ON t.id=s.token_id
+    WHERE t.kind='browser' AND s.expires_at<statement_timestamp()),
+ (SELECT COALESCE(GREATEST(EXTRACT(EPOCH FROM (statement_timestamp()-min(t.expires_at))),0),0)::double precision
+    FROM tokens t WHERE t.kind='browser' AND t.expires_at IS NOT NULL AND t.expires_at<statement_timestamp())
 "#;
 
 #[derive(Default)]
@@ -98,6 +111,10 @@ struct Snapshot {
     delivery_age: f64,
     provisioning_due: i64,
     provisioning_age: f64,
+    browser_sessions: i64,
+    browser_tokens: i64,
+    expired_session_age: f64,
+    expired_token_age: f64,
 }
 async fn snapshot(pool: &Pool) -> anyhow::Result<Snapshot> {
     let mut client = pool.get().await?;
@@ -115,6 +132,10 @@ async fn snapshot(pool: &Pool) -> anyhow::Result<Snapshot> {
         delivery_age: row.try_get(6)?,
         provisioning_due: row.try_get(7)?,
         provisioning_age: row.try_get(8)?,
+        browser_sessions: row.try_get(9)?,
+        browser_tokens: row.try_get(10)?,
+        expired_session_age: row.try_get(11)?,
+        expired_token_age: row.try_get(12)?,
     })
 }
 
@@ -122,9 +143,14 @@ async fn scrape(State(state): State<MetricsState>) -> Response {
     // Sample pool occupancy before this scrape checks out its own snapshot
     // session, so the gauges describe demand that was already present.
     let pool = state.pool.status();
+    // The GC counters are process-local and carry no labels. They are sampled
+    // from the single GC counter set outside the snapshot attempt, so a failed
+    // SQL snapshot cannot hide or reset them.
+    let gc = session_gc::counters().snapshot();
     let snapshot = tokio::time::timeout(Duration::from_secs(5), snapshot(&state.pool)).await.ok().and_then(Result::ok);
     let status = if snapshot.is_some() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    let body = render(state.capacity, state.git_slots.available_permits(), &state.counters, &pool, snapshot.as_ref());
+    let body =
+        render(state.capacity, state.git_slots.available_permits(), &state.counters, &gc, &pool, snapshot.as_ref());
     (
         status,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (header::CACHE_CONTROL, "no-store")],
@@ -136,10 +162,14 @@ async fn scrape(State(state): State<MetricsState>) -> Response {
 fn gauge(output: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
     let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}");
 }
+fn counter(output: &mut String, name: &str, help: &str, value: u64) {
+    let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}");
+}
 fn render(
     capacity: usize,
     available: usize,
     counters: &TransferCounters,
+    gc: &CounterSnapshot,
     pool: &Status,
     snapshot: Option<&Snapshot>,
 ) -> String {
@@ -198,6 +228,28 @@ fn render(
         counters.received.load(Ordering::Relaxed),
         counters.sent.load(Ordering::Relaxed)
     );
+    // The GC counters describe this process's own bounded loop. They stay
+    // exported on a failed SQL snapshot because they never assert database
+    // health, and they are read from the GC module's single counter set.
+    counter(&mut output, "rootyard_session_gc_cycles_total", "Committed bounded browser-session GC cycles.", gc.cycles);
+    counter(
+        &mut output,
+        "rootyard_session_gc_session_rows_deleted_total",
+        "Expired browser web_sessions rows committed as deleted by GC.",
+        gc.session_rows_deleted,
+    );
+    counter(
+        &mut output,
+        "rootyard_session_gc_tokens_deleted_total",
+        "Expired browser tokens committed as deleted by GC after reference probes.",
+        gc.tokens_deleted,
+    );
+    counter(
+        &mut output,
+        "rootyard_session_gc_failures_total",
+        "Browser-session GC cycles that failed; rows committed by an earlier pass remain counted.",
+        gc.failures,
+    );
     // A failed SQL snapshot omits only database-derived gauges: zero would falsely imply health.
     if let Some(s) = snapshot {
         output.push_str("# HELP rootyard_repositories Repositories by durable metadata state.\n# TYPE rootyard_repositories gauge\n");
@@ -240,6 +292,30 @@ fn render(
             "Age of oldest repository awaiting provisioning.",
             s.provisioning_age,
         );
+        gauge(
+            &mut output,
+            "rootyard_browser_web_sessions",
+            "Browser sign-in session rows including revoked and already expired rows.",
+            s.browser_sessions,
+        );
+        gauge(
+            &mut output,
+            "rootyard_browser_tokens",
+            "Browser tokens including revoked and already expired rows; API tokens are excluded.",
+            s.browser_tokens,
+        );
+        gauge(
+            &mut output,
+            "rootyard_expired_browser_session_oldest_age_seconds",
+            "Database-clock age of the oldest expired browser session; unexpired rows and an empty set report 0.",
+            s.expired_session_age,
+        );
+        gauge(
+            &mut output,
+            "rootyard_expired_browser_token_oldest_age_seconds",
+            "Database-clock age of the oldest expired browser token; unexpired rows and an empty set report 0.",
+            s.expired_token_age,
+        );
     }
     output
 }
@@ -266,7 +342,8 @@ mod tests {
     #[test]
     fn failed_snapshot_never_fabricates_backlog() {
         let pool = Status { max_size: 16, size: 13, available: 1, waiting: 7 };
-        let text = render(8, 6, &TransferCounters::default(), &pool, None);
+        let gc = CounterSnapshot { cycles: 4, session_rows_deleted: 9, tokens_deleted: 2, failures: 1 };
+        let text = render(8, 6, &TransferCounters::default(), &gc, &pool, None);
         assert!(text.contains("rootyard_postgres_up 0\n"));
         assert!(text.contains("rootyard_git_in_flight 2\n"));
         assert!(text.contains("rootyard_db_pool_max_size 16\n"));
@@ -278,6 +355,13 @@ mod tests {
         assert!(!text.contains("rootyard_event_deliveries"));
         assert!(!text.contains("rootyard_provisioning"));
         assert!(!text.contains("rootyard_operations_unresolved"));
+        assert!(!text.contains("rootyard_browser_"));
+        assert!(!text.contains("rootyard_expired_browser_"));
+        // Process-local GC counters survive the failed snapshot unchanged.
+        assert!(text.contains("rootyard_session_gc_cycles_total 4\n"));
+        assert!(text.contains("rootyard_session_gc_session_rows_deleted_total 9\n"));
+        assert!(text.contains("rootyard_session_gc_tokens_deleted_total 2\n"));
+        assert!(text.contains("rootyard_session_gc_failures_total 1\n"));
     }
     #[test]
     fn fixed_labels_and_counter_values() {
@@ -287,7 +371,8 @@ mod tests {
         counters.add_received_bytes(42);
         counters.add_sent_bytes(17);
         let pool = Status { max_size: 16, size: 1, available: 1, waiting: 0 };
-        let text = render(8, 8, &counters, &pool, Some(&Snapshot::default()));
+        let gc = CounterSnapshot::default();
+        let text = render(8, 8, &counters, &gc, &pool, Some(&Snapshot::default()));
         assert!(text.contains("rootyard_git_transfer_bytes_total{direction=\"received\"} 42\n"));
         assert!(text.contains("rootyard_git_transfer_bytes_total{direction=\"sent\"} 17\n"));
         assert!(text.contains("rootyard_git_transfers_total{outcome=\"success\"} 1\n"));
@@ -313,7 +398,40 @@ mod tests {
                 );
             }
         }
-        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), 23);
+        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), 31);
+    }
+
+    #[test]
+    fn browser_session_gauges_and_gc_counters_use_fixed_series() {
+        let gc = CounterSnapshot { cycles: 3, session_rows_deleted: 5, tokens_deleted: 7, failures: 1 };
+        let snapshot = Snapshot {
+            browser_sessions: 4,
+            browser_tokens: 9,
+            expired_session_age: 3600.0,
+            expired_token_age: 691_200.0,
+            ..Default::default()
+        };
+        let pool = Status { max_size: 16, size: 1, available: 1, waiting: 0 };
+        let text = render(4, 4, &TransferCounters::default(), &gc, &pool, Some(&snapshot));
+        for line in [
+            "rootyard_session_gc_cycles_total 3\n",
+            "rootyard_session_gc_session_rows_deleted_total 5\n",
+            "rootyard_session_gc_tokens_deleted_total 7\n",
+            "rootyard_session_gc_failures_total 1\n",
+            "rootyard_browser_web_sessions 4\n",
+            "rootyard_browser_tokens 9\n",
+            "rootyard_expired_browser_session_oldest_age_seconds 3600\n",
+            "rootyard_expired_browser_token_oldest_age_seconds 691200\n",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in:\n{text}");
+        }
+        // No browser-session sample gains a label: the series stay fixed.
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let (name, value) = line.split_once(' ').unwrap();
+            assert!(name.starts_with("rootyard_"));
+            assert!(value.parse::<f64>().is_ok());
+            assert!(!name.contains('{') || !name.contains("browser"), "unexpected label on {name}");
+        }
     }
     #[test]
     fn counters_saturate_instead_of_wrapping() {

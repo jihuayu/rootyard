@@ -21,7 +21,10 @@
 use deadpool_postgres::Pool;
 use std::{
     env,
-    sync::{atomic::Ordering, Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -89,14 +92,29 @@ fn signed(name: &str, default: i64) -> anyhow::Result<i64> {
     }
 }
 
-/// Bounded, monotonic counter state. It has no label cardinality and can be
-/// sampled from the metrics surface without changing this module.
+/// Bounded, saturating counter state. It has no label cardinality and the
+/// metrics surface samples this one counter set through `snapshot()`. Values
+/// reset on process restart and are held at `u64::MAX` instead of wrapping.
 #[derive(Debug, Default)]
 pub struct Counters {
-    cycles: std::sync::atomic::AtomicU64,
-    session_rows: std::sync::atomic::AtomicU64,
-    tokens: std::sync::atomic::AtomicU64,
-    failures: std::sync::atomic::AtomicU64,
+    cycles: AtomicU64,
+    session_rows: AtomicU64,
+    tokens: AtomicU64,
+    failures: AtomicU64,
+}
+
+/// Saturating increment shared by every counter. A plain `fetch_add` would wrap
+/// past `u64::MAX` and a wrapped value reads as a decrease, so the update is a
+/// compare-exchange loop on `saturating_add` (valid on the declared MSRV).
+fn bump(value: &AtomicU64, amount: u64) {
+    let mut current = value.load(Ordering::Relaxed);
+    loop {
+        match value.compare_exchange_weak(current, current.saturating_add(amount), Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// Immutable point-in-time counter sample.
@@ -109,14 +127,23 @@ pub struct CounterSnapshot {
 }
 
 impl Counters {
-    fn add(&self, purged: Purged) {
-        self.cycles.fetch_add(1, Ordering::Relaxed);
-        self.session_rows.fetch_add(purged.sessions, Ordering::Relaxed);
-        self.tokens.fetch_add(purged.tokens, Ordering::Relaxed);
+    /// Record rows whose deletion transaction is already committed. It is
+    /// called at each pass boundary, not once per cycle: a session pass can
+    /// commit and be counted before a later token pass fails, while a
+    /// successful cycle passes its newly committed rows here exactly once.
+    fn deleted(&self, purged: Purged) {
+        bump(&self.session_rows, purged.sessions);
+        bump(&self.tokens, purged.tokens);
+    }
+
+    /// Record one completed cycle. Only a cycle whose both passes committed
+    /// increments this, so a failed attempt is never also counted as a cycle.
+    fn completed(&self) {
+        bump(&self.cycles, 1);
     }
 
     fn failed(&self) {
-        self.failures.fetch_add(1, Ordering::Relaxed);
+        bump(&self.failures, 1);
     }
 
     pub fn snapshot(&self) -> CounterSnapshot {
@@ -167,15 +194,16 @@ pub async fn run(pool: Pool, stop: CancellationToken) {
         "rootyard: browser-session GC every {}s with {}s retention (batch {BATCH_LIMIT})",
         policy.interval_seconds, policy.retention_seconds
     );
+    let counters = counters();
     let mut cursor = TokenCursor::default();
     loop {
         if stop.is_cancelled() {
             return;
         }
-        match purge_cycle(&pool, policy.retention_seconds, &mut cursor).await {
-            Ok(purged) => counters().add(purged),
+        match purge_cycle(&pool, policy.retention_seconds, &mut cursor, &counters).await {
+            Ok(_) => counters.completed(),
             Err(error) => {
-                counters().failed();
+                counters.failed();
                 // Route through the shared classification surface: only a fixed
                 // kind, the validated SQLSTATE and request correlation are
                 // recorded, never database text, URLs or row content.
@@ -193,18 +221,38 @@ pub async fn run(pool: Pool, stop: CancellationToken) {
 /// One bounded cycle from the head of the expiry order: expired session rows,
 /// then unreferenced expired tokens. Kept as a single-batch entry point; the
 /// background loop uses the same internals with its own advancing cursor.
+///
+/// A direct caller records the rows each pass really committed, through the
+/// same process counter set as the loop, so its deletions are observable and
+/// explainable. Only [`run`] additionally records completed cycles and failed
+/// attempts, because those describe loop iterations rather than one call.
 pub async fn purge_once(pool: &Pool, retention_seconds: i64) -> anyhow::Result<Purged> {
     let mut cursor = TokenCursor::default();
-    purge_cycle(pool, retention_seconds, &mut cursor).await
+    let counters = counters();
+    purge_cycle(pool, retention_seconds, &mut cursor, &counters).await
 }
 
-async fn purge_cycle(pool: &Pool, retention_seconds: i64, cursor: &mut TokenCursor) -> anyhow::Result<Purged> {
+/// Two independent short transactions. Each pass's committed row count is
+/// added to `counters` immediately after that pass's `COMMIT` and before the
+/// next pass can fail, so a committed session deletion is never lost when the
+/// token pass fails. A successful pass is not added again by the caller, and
+/// the cycle itself is recorded only by [`run`] after this returns `Ok`.
+async fn purge_cycle(
+    pool: &Pool,
+    retention_seconds: i64,
+    cursor: &mut TokenCursor,
+    counters: &Counters,
+) -> anyhow::Result<Purged> {
     anyhow::ensure!(
         retention_seconds >= 0,
         "retention_seconds must not be negative; a negative retention would move the expiry cutoff into the future"
     );
     let sessions = purge_sessions(pool, retention_seconds).await?;
+    // purge_sessions returns only after COMMIT, so these rows are durable even
+    // if the token pass below fails and this attempt counts as a failure.
+    counters.deleted(Purged { sessions, tokens: 0 });
     let tokens = purge_tokens(pool, retention_seconds, cursor).await?;
+    counters.deleted(Purged { sessions: 0, tokens });
     Ok(Purged { sessions, tokens })
 }
 
@@ -380,14 +428,51 @@ mod tests {
     }
 
     #[test]
-    fn counters_are_monotonic_and_bounded() {
+    fn counters_accumulate_without_labels() {
         let counters = Counters::default();
-        counters.add(Purged { sessions: 3, tokens: 2 });
-        counters.add(Purged { sessions: 1, tokens: 0 });
+        counters.deleted(Purged { sessions: 3, tokens: 2 });
+        counters.completed();
+        counters.deleted(Purged { sessions: 1, tokens: 0 });
+        counters.completed();
         counters.failed();
         assert_eq!(
             counters.snapshot(),
             CounterSnapshot { cycles: 2, session_rows_deleted: 4, tokens_deleted: 2, failures: 1 }
+        );
+    }
+
+    #[test]
+    fn partial_cycle_counts_each_pass_only_after_its_commit() {
+        let counters = Counters::default();
+        // purge_cycle records the session pass immediately after its COMMIT,
+        // before the token pass starts. The token pass then fails, so run
+        // records one failure and no completed cycle.
+        counters.deleted(Purged { sessions: 4, tokens: 0 });
+        counters.failed();
+        assert_eq!(
+            counters.snapshot(),
+            CounterSnapshot { cycles: 0, session_rows_deleted: 4, tokens_deleted: 0, failures: 1 }
+        );
+        // The retry commits no new session rows and three token rows: every
+        // pass is recorded once, and only the whole successful cycle counts.
+        counters.deleted(Purged { sessions: 0, tokens: 3 });
+        counters.completed();
+        assert_eq!(
+            counters.snapshot(),
+            CounterSnapshot { cycles: 1, session_rows_deleted: 4, tokens_deleted: 3, failures: 1 }
+        );
+    }
+
+    #[test]
+    fn counters_saturate_at_the_maximum_instead_of_wrapping() {
+        let counters = Counters::default();
+        counters.deleted(Purged { sessions: u64::MAX, tokens: u64::MAX });
+        counters.deleted(Purged { sessions: 1, tokens: 1 });
+        bump(&counters.failures, u64::MAX);
+        counters.failed();
+        assert_eq!(
+            counters.snapshot(),
+            CounterSnapshot { cycles: 0, session_rows_deleted: u64::MAX, tokens_deleted: u64::MAX, failures: u64::MAX }
         );
     }
 

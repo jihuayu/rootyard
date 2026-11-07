@@ -12,10 +12,10 @@ import urllib.error
 import urllib.request
 import uuid
 
-from e2e import Harness
+from web_sessions import BrowserHarness
 
 
-class MetricsHarness(Harness):
+class MetricsHarness(BrowserHarness):
     def __init__(self, args):
         super().__init__(args)
         with socket.socket() as s:
@@ -23,6 +23,9 @@ class MetricsHarness(Harness):
             self.metrics_port = s.getsockname()[1]
         self.env["ROOTYARD_METRICS_BIND"] = "127.0.0.1:" + str(self.metrics_port)
         self.env["ROOTYARD_OUTBOX_WORKER"] = "false"
+        # Deterministic fixture: stored browser rows are seeded with SQL and must
+        # still be there when the gauges are compared, so the loop stays off here.
+        self.env["ROOTYARD_SESSION_GC"] = "false"
 
     def scrape(self):
         url = "http://127.0.0.1:" + str(self.metrics_port) + "/metrics"
@@ -39,11 +42,20 @@ class MetricsHarness(Harness):
         assert headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
         assert headers["cache-control"] == "no-store"
         values = dict(line.split(" ", 1) for line in text.splitlines() if not line.startswith("#"))
-        assert len(values) == 23, values
+        assert len(values) == 31, values
         for name in ("max_size", "size", "available", "busy", "waiting"):
             assert "rootyard_db_pool_" + name in values
         assert "rootyard_error_log_dropped_total" in values
         assert values["rootyard_postgres_up"] == "1"
+        # GC counters and browser-session gauges are fixed, label-free series.
+        for name in ("rootyard_session_gc_cycles_total", "rootyard_session_gc_session_rows_deleted_total",
+                     "rootyard_session_gc_tokens_deleted_total", "rootyard_session_gc_failures_total",
+                     "rootyard_browser_web_sessions", "rootyard_browser_tokens",
+                     "rootyard_expired_browser_session_oldest_age_seconds",
+                     "rootyard_expired_browser_token_oldest_age_seconds"):
+            assert name in values, (name, sorted(values))
+            assert not any(metric.startswith(name + "{") for metric in values), name
+            assert float(values[name]) >= 0, (name, values)
         assert self.http("/metrics")[0] != 200, "Metrics leaked onto application listener"
         for name, value in values.items():
             assert re.fullmatch(r"rootyard_[a-z_]+(?:\{(?:state|outcome|direction)=\"(?:ready|recovering|provisioning|pending|leased|success|failure|received|sent)\"\})?", name), name
@@ -88,14 +100,87 @@ class MetricsHarness(Harness):
         assert self.verify()["rootyard_operations_unresolved"] == "0"
         assert self.sql(f"SELECT outcome FROM git_operations WHERE id='{operation}'") == "unknown"
 
+    def seed_browser_row(self, expires, kind="browser", revoked=False, with_session=True):
+        # Only digest columns are written: no plaintext secret is invented here.
+        token_id = str(uuid.uuid4())
+        digest = hashlib.sha256(("metrics-fixture-" + token_id).encode()).hexdigest()
+        flag = "true" if revoked else "false"
+        self.sql(
+            "INSERT INTO tokens(id,user_id,digest,read_only,revoked,expires_at,kind) VALUES("
+            f"'{token_id}','{self.alice['user_id']}',decode('{digest}','hex'),false,{flag},{expires},'{kind}')"
+        )
+        if with_session:
+            self.sql(
+                "INSERT INTO web_sessions(token_id,csrf_digest,expires_at,revoked) VALUES("
+                f"'{token_id}',decode('{digest}','hex'),{expires},{flag})"
+            )
+        return token_id
+
+    def browser_session_metrics(self):
+        values = self.verify()
+        for name in ("rootyard_browser_web_sessions", "rootyard_browser_tokens",
+                     "rootyard_expired_browser_session_oldest_age_seconds",
+                     "rootyard_expired_browser_token_oldest_age_seconds"):
+            assert values[name] == "0", (name, values)
+
+        # Real HTTP sign-in and sign-out through the service. Sign-out revokes the
+        # row instead of deleting it, so the counts stay and no expired age appears.
+        cookies, _, _ = self.sign_in()
+        headers = {"Cookie": self.cookie_header(cookies)}
+        assert self.request("/web/repos", headers=headers)[0] == 200
+        assert self.request("/web/logout", "POST", headers={**headers, "Origin": self.base})[0] == 303
+        assert self.request("/web/repos", headers=headers)[0] == 401
+        revoked = self.verify()
+        assert revoked["rootyard_browser_web_sessions"] == "1", revoked
+        assert revoked["rootyard_browser_tokens"] == "1", revoked
+        assert revoked["rootyard_expired_browser_session_oldest_age_seconds"] == "0", revoked
+        assert revoked["rootyard_expired_browser_token_oldest_age_seconds"] == "0", revoked
+
+        # Controlled history: two expired sessions, one active session, one
+        # revoked-but-expired session and one expired API token.
+        self.seed_browser_row("clock_timestamp() - interval '8 days'")
+        self.seed_browser_row("clock_timestamp() - interval '2 hours'")
+        self.seed_browser_row("clock_timestamp() + interval '1 hour'")
+        self.seed_browser_row("clock_timestamp() - interval '3 days'", revoked=True)
+        self.seed_browser_row("clock_timestamp() - interval '30 days'", kind="api", with_session=False)
+        values = self.verify()
+        assert values["rootyard_browser_web_sessions"] == self.sql(
+            "SELECT count(*) FROM web_sessions s JOIN tokens t ON t.id=s.token_id WHERE t.kind='browser'")
+        assert values["rootyard_browser_web_sessions"] == "5", values
+        assert values["rootyard_browser_tokens"] == self.sql("SELECT count(*) FROM tokens WHERE kind='browser'")
+        assert values["rootyard_browser_tokens"] == "5", values
+        # The oldest expired row dominates; the active row and the expired API
+        # token must move neither gauge.
+        for name in ("rootyard_expired_browser_session_oldest_age_seconds",
+                     "rootyard_expired_browser_token_oldest_age_seconds"):
+            assert 8 * 24 * 3600 <= float(values[name]) < 9 * 24 * 3600, (name, values)
+        # A disabled loop neither deletes rows nor fabricates cycles or failures.
+        for name in ("rootyard_session_gc_cycles_total", "rootyard_session_gc_session_rows_deleted_total",
+                     "rootyard_session_gc_tokens_deleted_total", "rootyard_session_gc_failures_total"):
+            assert values[name] == "0", (name, values)
+        return {
+            "browser_web_sessions": int(values["rootyard_browser_web_sessions"]),
+            "browser_tokens": int(values["rootyard_browser_tokens"]),
+            "expired_session_oldest_age_seconds": float(values["rootyard_expired_browser_session_oldest_age_seconds"]),
+            "expired_token_oldest_age_seconds": float(values["rootyard_expired_browser_token_oldest_age_seconds"]),
+            "gc_disabled_counters": "0",
+            "deletion_growth_and_failed_cycle_counters": "separate native drill tests/session_gc_metrics.py; not executed by this harness",
+        }
+
     def database_failure(self):
         self.sql("ALTER TABLE event_deliveries RENAME TO metrics_hidden_deliveries")
         try:
             status, text, _ = self.scrape()
             assert status == 503
             assert "rootyard_postgres_up 0\n" in text
-            for name in ("repositories", "operations_unresolved", "event_deliveries", "event_delivery_oldest", "provisioning"):
+            for name in ("repositories", "operations_unresolved", "event_deliveries", "event_delivery_oldest",
+                         "provisioning", "browser_web_sessions", "browser_tokens",
+                         "expired_browser_session_oldest_age", "expired_browser_token_oldest_age"):
                 assert "rootyard_" + name not in text
+            # The process-local GC counters are retained, not reset or hidden.
+            for name in ("rootyard_session_gc_cycles_total", "rootyard_session_gc_session_rows_deleted_total",
+                         "rootyard_session_gc_tokens_deleted_total", "rootyard_session_gc_failures_total"):
+                assert name in text, name
         finally:
             self.sql("ALTER TABLE metrics_hidden_deliveries RENAME TO event_deliveries")
         assert self.scrape()[0] == 200
@@ -121,7 +206,9 @@ def main():
     success = False
     try:
         for name, test in [("isolated_metrics_setup", harness.setup), ("fixed_private_format", harness.verify),
-                           ("authoritative_aggregates", harness.aggregates), ("database_failure_is_503", harness.database_failure),
+                           ("authoritative_aggregates", harness.aggregates),
+                           ("browser_session_metrics", harness.browser_session_metrics),
+                           ("database_failure_is_503", harness.database_failure),
                            ("non_loopback_rejected", harness.reject_non_loopback)]:
             harness.case(name, test)
         success = True
@@ -135,7 +222,12 @@ def main():
             success = False
         report = dict(passed=success, cases=harness.results,
                       binary_sha256=hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
-                      limitations=["Synthetic SQL aggregates and a missing-table fault do not simulate a PostgreSQL outage or production load."])
+                      limitations=[
+                          "Synthetic SQL aggregates and a missing-table fault do not simulate a PostgreSQL outage or production load.",
+                          "Browser-session rows beyond the real HTTP login/logout are SQL seeds with GC disabled; "
+                          "counter growth after real deletions and counter retention on a failed snapshot are covered by the separate "
+                          "native drill tests/session_gc_metrics.py, which this harness does not execute.",
+                      ])
         if args.report:
             args.report.parent.mkdir(parents=True, exist_ok=True)
             args.report.write_text(json.dumps(report, indent=2) + "\n")

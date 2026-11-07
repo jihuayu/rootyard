@@ -128,9 +128,66 @@ revocation, the browser child still expires within the 12-hour session lifetime
 and is then subject to the same retention window, which bounds eventual cleanup
 without changing the admission-time parent validation described above.
 
-Bounded monotonic counters (`cycles`, `session_rows_deleted`, `tokens_deleted`,
-`failures`) live in the GC module for a later metrics surface; they carry no
-per-session labels.
+### GC and browser-session metrics
+
+The private metrics listener described in `docs/metrics.md` exports this loop's
+counters and the stored browser-session gauges. Every series has a fixed name
+and a fixed series count; none of them carries a tenant, account, session,
+token, cookie, path or error-message label.
+
+- `rootyard_session_gc_cycles_total` counts GC cycles whose session and
+  token passes both committed, `rootyard_session_gc_session_rows_deleted_total`
+  and `rootyard_session_gc_tokens_deleted_total` count rows whose own short
+  transaction committed as deleted, and `rootyard_session_gc_failures_total`
+  counts failed cycles. Each pass is recorded immediately after its `COMMIT`,
+  so a cycle whose session pass committed and whose token pass then failed
+  raises the failure counter while still counting the committed session rows;
+  a successful cycle never counts its rows twice. They are rendered from the
+  same counter set the loop increments (`Counters::snapshot()`), so there is
+  no second, divergent count. All four are process-lifetime values: a restart starts at zero, and
+  each increment saturates at `u64::MAX` instead of wrapping, so a saturated
+  counter never reads as a decrease. `serve` and `worker` each report only
+  their own process's cycles.
+- `rootyard_browser_web_sessions` and `rootyard_browser_tokens` count every
+  stored row of that kind, including revoked and already expired rows. A
+  signed-out session is revoked rather than deleted, so it stays counted until
+  the GC removes it after expiry plus retention. API and operator-issued tokens
+  are excluded from the token gauge by `kind`, revoked or not.
+- `rootyard_expired_browser_session_oldest_age_seconds` and
+  `rootyard_expired_browser_token_oldest_age_seconds` are the age, measured by
+  the database clock inside the snapshot statement, of the oldest row whose
+  expiry is already in the past. Unexpired (active) rows never become the
+  oldest sample, an empty set reports `0`, and the result is clamped at `0` so
+  a clock adjustment cannot produce a negative age.
+
+A high oldest-expired-token age is not by itself evidence of a stuck collector.
+A token referenced by one of the six durable roots, or still carrying a
+`web_sessions` row, is deliberately retained, so its stale expiry keeps that
+age high while cleanup is behaving as designed. Alerting on the age gauge alone
+would page for correct retention; it has to be read together with
+`rootyard_session_gc_failures_total`, `rootyard_session_gc_cycles_total` and
+the two row-count gauges.
+
+Both row counts may use an index-only or a full relation scan, so their cost is
+bounded only by the snapshot's server-side four-second statement timeout and
+the five-second HTTP scrape timeout, not by the GC batch limit. If any part of
+the snapshot fails, including these subqueries, the endpoint answers HTTP
+`503`, exports `rootyard_postgres_up 0`, omits every database-derived gauge —
+including all four browser-session gauges, rather than reporting a false zero —
+and still exports the process-local GC counters above.
+
+The native drill `tests/session_gc_metrics.py` starts this loop with a
+one-second interval and the private metrics listener, seeds one expired browser
+session/token, and installs a temporary PostgreSQL `BEFORE DELETE` trigger on
+`tokens` that raises SQLSTATE `23503` for `browser` rows only. The session pass
+must commit while the token pass fails; the drill asserts the failure and
+session-deletion counters grow, the token-deletion counter does not, and the
+real rows reflect exactly that. It drops the trigger, waits for the next
+committed token pass and the real token deletion, then renames
+`event_deliveries` to force a snapshot failure and checks HTTP `503`, omission
+of every database-derived gauge and retention of all four GC counters. That
+script has not been executed against a built binary as part of this change;
+native acceptance is pending.
 
 No `EXPLAIN` output is captured by the regression suite, so no claim is made
 about measured scanned rows or about which plan the planner picks; the index
