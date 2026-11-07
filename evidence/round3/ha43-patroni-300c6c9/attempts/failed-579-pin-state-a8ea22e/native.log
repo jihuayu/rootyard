@@ -1,0 +1,11 @@
+ha_endpoint_repository_api: passed
+ha_git_roundtrip: passed
+FAILED: AssertionError: {'version': 1, 'job_id': '19cb3f1a-6c76-486f-940c-a569557979b2', 'owner_id': 'bc6ac9a1-b782-43f1-98ff-ba04d4100054', 'repository_id': '2dbbc852-1190-417a-baef-7e601d50ea9d', 'storage_generation': 1, 'object_format': 'sha1', 'target_oid': '09475bc98f7e9eadcb2bbf0c375a10d6170a3fe1', 'retention_ref': 'refs/rootyard-ci/jobs/19cb3f1a-6c76-486f-940c-a569557979b2'}
+Traceback (most recent call last):
+  File "/workspace/rootyard-worktrees/round3-ops/tests/cluster_patroni_native.py", line 1133, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/workspace/rootyard-worktrees/round3-ops/tests/cluster_patroni_native.py", line 699, in main
+    assert source_descriptor.get("state") == "pinned", source_descriptor
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'version': 1, 'job_id': '19cb3f1a-6c76-486f-940c-a569557979b2', 'owner_id': 'bc6ac9a1-b782-43f1-98ff-ba04d4100054', 'repository_id': '2dbbc852-1190-417a-baef-7e601d50ea9d', 'storage_generation': 1, 'object_format': 'sha1', 'target_oid': '09475bc98f7e9eadcb2bbf0c375a10d6170a3fe1', 'retention_ref': 'refs/rootyard-ci/jobs/19cb3f1a-6c76-486f-940c-a569557979b2'}

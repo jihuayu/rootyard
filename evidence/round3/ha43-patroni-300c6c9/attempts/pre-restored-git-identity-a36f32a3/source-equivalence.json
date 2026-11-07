@@ -1,0 +1,10 @@
+{
+  "compiled_source_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+  "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+  "production_inputs_sha256": "9e33859aad991589c57863af6f6b46fe42290071b3e271f90eda44f6d707feac",
+  "scope": "composed Pando schema132/format8 runtime with HA be247 deployment/test; all production file paths/digests identical to certified compile",
+  "deployment_commit": "a36f32a3b64a04cc520c7f205cc5db368f442085",
+  "production_inputs_identical": true,
+  "file_count": 329,
+  "proof": "all production input paths and SHA256 digests equal the certified compile"
+}

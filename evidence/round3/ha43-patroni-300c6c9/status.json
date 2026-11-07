@@ -1,0 +1,38 @@
+{
+  "state": "passed",
+  "pid": 356890,
+  "started": 1794028273.0634537,
+  "source_equivalence": {
+    "compiled_source_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+    "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+    "production_inputs_sha256": "9e33859aad991589c57863af6f6b46fe42290071b3e271f90eda44f6d707feac",
+    "scope": "composed Pando schema132/format8 runtime with HA be247 deployment/test; all production file paths/digests identical to certified compile",
+    "deployment_commit": "ac54f7163561ad98fb83e4c5f45cd2e1f7151f74",
+    "production_inputs_identical": true,
+    "file_count": 329,
+    "proof": "all production input paths and SHA256 digests equal the certified compile"
+  },
+  "updated": 1794028421.325039,
+  "harness_source_commit": "ac54f7163561ad98fb83e4c5f45cd2e1f7151f74",
+  "harness_sha256": {
+    "tests/cluster_patroni_native.py": "07c5265aa0f3ec7c7ccb963fea7648e5c0bd8ba8fd17d4f6ade3b81c10feb9e1",
+    "tests/ha_fixture.py": "ef14ad3ad05c827a2310c0b264b48de84be80adddf4b853e717fda48dff7bc7b",
+    "deployment/ha/render.py": "95dd01fbc9266c3c7e11fad526b9c94b6b6c608717c907fd4030c3da5822db4b"
+  },
+  "command": [
+    "/workspace/scratch/deepseek-rootyard/env-run",
+    "python3",
+    "/workspace/rootyard-worktrees/round3-ops/tests/cluster_patroni_native.py",
+    "--binary",
+    "/workspace/scratch/rootyard-round3/pando61/artifacts/1061a8ee9d1ecc783189d33949980eac6b3bd6ea/rootyard",
+    "--report",
+    "/workspace/scratch/rootyard-round3/ops43/coordinator-report.json",
+    "--port-base",
+    "29000"
+  ],
+  "log": "/workspace/scratch/rootyard-round3/ops43/coordinator-native.log",
+  "report": "/workspace/scratch/rootyard-round3/ops43/coordinator-report.json",
+  "exit_code": 0,
+  "report_sha256": "43655b1a59fc49aeac2049010a9ed022c5832daf9db5d09a8f568680f9ad9dea",
+  "finished": 1794028421.3250377
+}

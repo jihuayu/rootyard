@@ -1,0 +1,75 @@
+{
+  "reviewer": "independent DeepSeek final source review (HA43/ops43 delta)",
+  "issue": 43,
+  "reviewed_at_utc": "2026-11-07T05:12:12.196302+00:00",
+  "reviewed_ha_head": "300c6c93cc054fbd723af2243a8f321307835cbc",
+  "reviewed_ha_head_short": "300c6c9",
+  "reviewed_delta": "300c6c9 only (replaces nonexistent Intent.state with version=1; validates durable <job>.pinned.json receipt against Intent before/after restore; retains 579 strong fields/ref/OID/cat-file checks)",
+  "composed_head_from_git": "ac54f7163561ad98fb83e4c5f45cd2e1f7151f74",
+  "composed_head_note": "Current /workspace/rootyard-worktrees/round3-ops HEAD is ac54f71, which includes HA 300c6c9 and the Pando schema132/format8 composition; requested merged main 9a27f4a is earlier in the lineage.",
+  "prior_review_preserved": {
+    "path": "/workspace/scratch/rootyard-round3/ops43/source-review-579.json",
+    "meaning": "The prior 579 failed review is preserved unchanged as source-review-579.json/.md."
+  },
+  "source_equivalence": {
+    "deployment_commit": "ac54f7163561ad98fb83e4c5f45cd2e1f7151f74",
+    "compiled_source_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+    "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+    "production_inputs_sha256": "9e33859aad991589c57863af6f6b46fe42290071b3e271f90eda44f6d707feac",
+    "production_inputs_identical": true,
+    "file_count": 329,
+    "harness_sha256": "07c5265aa0f3ec7c7ccb963fea7648e5c0bd8ba8fd17d4f6ade3b81c10feb9e1",
+    "proof": "ops43 coordinator status records all 329 production paths/digests equal to Pando61 compiled source 1061a8ee / binary 6f76d709; current harness hash equals HA 300c6c9 test."
+  },
+  "native_status": {
+    "state": "running",
+    "exit_code": null,
+    "report_exists": false,
+    "status_path": "/workspace/scratch/rootyard-round3/ops43/coordinator-status.json",
+    "log_path": "/workspace/scratch/rootyard-round3/ops43/coordinator-native.log",
+    "report_path": "/workspace/scratch/rootyard-round3/ops43/coordinator-report.json",
+    "pending_statement": "Current 300 composed 132/8 native rerun is pending at review time; no report exists. Do not count the archived 85 pass as a 300 pass. No native result is claimed by this source review.",
+    "archived_85_pass": {
+      "path": "/workspace/scratch/rootyard-round3/ops43/attempts/passed-85b8a2f-pre-pin-content-cfa89ce",
+      "status": "passed",
+      "meaning": "Archived pre-pin-content 85 pass only; truthful for that checkpoint, not a 300/579 pass."
+    }
+  },
+  "source_verdict": "SOURCE APPROVED - 0 P1/P2 in the 300c6c9 delta; native 300 result remains pending.",
+  "p1_count": 0,
+  "p2_count": 0,
+  "findings": [],
+  "schema_and_receipt_proof": {
+    "intent_schema": [
+      "src/ci_pins/models.rs:31-42: Intent is version:u32, job_id:Uuid, owner_id:Uuid, repository_id:Uuid, storage_generation:i64, object_format:String, target_oid:String, retention_ref:String; #[serde(deny_unknown_fields)]; no state field"
+    ],
+    "version_validation": [
+      "src/ci_pins/models.rs:43-52: validate requires version == 1, valid object_format/OID, storage_generation > 0, retention_ref == refs/rootyard-ci/jobs/<job_id>"
+    ],
+    "durable_intent_file": [
+      "src/ci_pins/store.rs:6-15: load_intent parses <job>.json as Intent and validates repository/job identity"
+    ],
+    "durable_receipt": [
+      "src/ci_pins/store.rs:17-22: receipt writes serde_json::to_vec(&intent) to <job>.pinned.json"
+    ],
+    "receipt_integrity": [
+      "src/ci_pins/store.rs:35-70: intents reads .pinned.json and requires its bytes equal serde_json::to_vec(intent)"
+    ],
+    "test_source_assertions": [
+      "tests/cluster_patroni_native.py:690-711: parse <job>.json Intent; assert version==1, job/repo/owner(if present)/target/storage/object_format/retention_ref; parse <job>.pinned.json receipt; require receipt == Intent and canonical SHA-256 equality; API overlap limited to job_id/target_oid/retention_ref; Git rev-parse retention_ref == target and cat-file commit"
+    ],
+    "test_restore_assertions": [
+      "tests/cluster_patroni_native.py:933-949: parse restored <job>.json and <job>.pinned.json; require restored descriptor == source Intent, canonical hash equality, restored receipt == source Intent, restored retention_ref OID == target and cat-file commit"
+    ],
+    "report_booleans": [
+      "tests/cluster_patroni_native.py:998-1008: source_pin_receipt_matches_intent and restored_pin_receipt_matches_source_intent are true only after the real receipt/Intent assertions; root-field equality uses version, not state."
+    ],
+    "no_weakening": [
+      "300c6c9 is test-only; no global Git config, no authority SQL rotation, no grant SQL rewrite, no assertion removal; prior full-scope checks remain."
+    ],
+    "scope": [
+      "No physical cross-host, hardware watchdog/power-loss or Kafka HA qualification; #43/#44 remain open. The bounded reference profile should not be blocked on unavailable physical hardware; this review is source-only and native-pending."
+    ],
+    "review_method": "Read-only git/source/status inspection; no project edits, Cargo/native test, network or GitHub mutation."
+  }
+}
