@@ -40,9 +40,17 @@ at 16 MiB; logs are returned with explicit
 `ROOTYARD_SANDBOX_CGROUP_ROOT` to a delegated cgroup v2 subtree owned by the
 service account; the runner only creates and removes children of that subtree
 and never writes the host root hierarchy. `cgroup.controllers` must expose
-`cpu`, `memory` and `pids`, and the subtree must allow the service to write
-`cgroup.procs`, the limit files and `cgroup.kill`; otherwise the launch fails
-closed with a `503` and no job process starts.
+`cpu`, `memory` and `pids`, and **the same controllers must already be enabled
+in `cgroup.subtree_control`** so job children receive `memory.max`, `pids.max`
+and `cpu.max`. Reads of both files return bare controller names
+(`cpu memory pids`); only writes use the `+cpu`/`-cpu` form. The subtree must
+be a `domain` cgroup (not threaded) and the service account must be able to
+write `cgroup.procs`, the limit files and `cgroup.kill`; otherwise the launch
+fails closed with a `503` and no job process starts. Follow the cgroup v2
+no-internal-process rule when provisioning: keep the delegated job root empty
+and run the service supervisor in a leaf below it (or in a sibling owned by the
+same service), because a non-root cgroup may not both contain processes and
+delegate controllers to children.
 
 Defaults (all overridable for an operator's deployment):
 
@@ -145,3 +153,46 @@ The native tests for this boundary are `tests/test_sandbox_service.py`,
 (`ROOTYARD_TEST_DATABASE_URL`), the real service binary
 (`ROOTYARD_BINARY`), `bwrap`, `git` and `gcc`; they do not use a shared target
 directory or simulate success.
+
+## Native kernel acceptance workflow
+
+`.github/workflows/native-kernel-acceptance.yml` is a manual
+`workflow_dispatch` job, intentionally separate from ordinary push/pull_request
+CI. It has no dispatch inputs, runs on a GitHub-hosted Ubuntu 24.04 VM with
+`permissions: contents: read` and `persist-credentials: false`, uses no
+repository secrets or provider API keys, and has a bounded job timeout. It
+builds the real checked-out source with `cargo build --locked --bin rootyard`
+and a disposable PostgreSQL 17 service container. Every native test script
+receives its own freshly created database (`rootyard_sandbox_service_<run>` and
+`rootyard_native_cgroup_<run_attempt>`); schemas are not shared between scripts.
+
+`scripts/native_kernel_cgroup_setup.sh` provisions only
+`/sys/fs/cgroup/rootyard-native-<run-id>`: it enables `cpu`, `memory` and
+`pids` for that run root, creates an empty `supervisor` leaf, and moves the test
+supervisor into that leaf before the service starts. Sandbox job cgroups are
+the run root's other children, so internal-process constraints are satisfied.
+The artifact export pool is a unique 64 MiB tmpfs mounted at
+`$RUNNER_TEMP/rootyard-native-pool-<run-id>`; the test reads
+`ROOTYARD_TEST_TMPFS_ROOT` instead of hard-coding `/dev/shm`. The workflow
+measures the mount's real `statvfs` capacity and passes it as
+`ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES`; that value is an acceptance threshold
+for the mounted capacity, **not** a claim that a configured byte cap is the
+physical tmpfs bound. Cleanup removes only the run-specific cgroup subtree,
+that mount, its files and the two disposable databases; it never kills or
+removes the parent runner cgroup.
+
+The native script writes a sanitized receipt to
+`${RUNNER_TEMP}/native-kernel/receipt.json` (uploaded as the
+`native-kernel-cgroup-receipt-<run-id>` artifact). It exits `0` only after all
+required real-kernel assertions executed and passed with profile `cgroup`: live
+controls and attachment, cancellation and timeout reclamation, memory OOM,
+`pids.max`, aggregate CPU quota, workspace `ENOSPC`, bounded artifact export,
+cross-job build isolation and credential absence, logs/artifact authorization,
+artifact/cgroup reclamation, service-crash descendant teardown and stale-cgroup
+reaping, and a fenced retry executed as a new attempt. Exit `3` means BLOCKED
+(no usable delegated cgroup v2 subtree) and is never a pass; a setup failure
+still uploads a BLOCKED receipt and then fails the workflow. On the current
+managed development host there is no delegated cgroup v2 subtree (rootless
+Docker cgroup driver `none`, cgroupfs writes denied), so positive local
+acceptance remains BLOCKED until the coordinator dispatches this workflow on
+the supported VM.

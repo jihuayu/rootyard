@@ -78,6 +78,53 @@ impl Limits {
     }
 }
 
+/// Parse a cgroup control file into controller names.
+///
+/// Reads of `cgroup.controllers` and `cgroup.subtree_control` return bare
+/// names (`cpu memory pids`); only writes to `cgroup.subtree_control` use the
+/// `+cpu`/`-cpu` form. Accepting an optional leading `+` keeps the parser
+/// tolerant of operator tooling that echoes the write form, but the read form
+/// must never be rejected.
+fn controller_tokens(path: &Path) -> Result<Vec<String>, Error> {
+    let raw = fs::read_to_string(path).map_err(Error::internal)?;
+    Ok(raw.split_whitespace().map(|item| item.strip_prefix('+').unwrap_or(item).to_owned()).collect())
+}
+
+fn has_controller(tokens: &[String], name: &str) -> bool {
+    tokens.iter().any(|item| item == name)
+}
+
+/// Validate that a cgroup v2 directory exposes and has delegated the
+/// controllers required for aggregate sandbox enforcement. Checking both
+/// files matters: `cgroup.controllers` only advertises what may be enabled,
+/// while a child cgroup only receives `memory.max`, `pids.max` and `cpu.max`
+/// after the parent enabled them in `cgroup.subtree_control`.
+fn validate_delegation(base: &Path) -> Result<Vec<String>, Error> {
+    for name in ["cgroup.controllers", "cgroup.procs", "cgroup.subtree_control"] {
+        if !base.join(name).is_file() {
+            return Err(Error::internal("delegated cgroup v2 root required"));
+        }
+    }
+    if let Ok(kind) = fs::read_to_string(base.join("cgroup.type")) {
+        let kind = kind.trim();
+        if kind != "domain" {
+            return Err(Error::internal("delegated cgroup must be a domain cgroup"));
+        }
+    }
+    let controllers = controller_tokens(&base.join("cgroup.controllers"))?;
+    let enabled = controller_tokens(&base.join("cgroup.subtree_control"))?;
+    let required = ["cpu", "memory", "pids"];
+    for name in required {
+        if !has_controller(&controllers, name) {
+            return Err(Error::internal("delegated cgroup is missing a required controller"));
+        }
+        if !has_controller(&enabled, name) {
+            return Err(Error::internal("delegated cgroup has not enabled a required controller for children"));
+        }
+    }
+    Ok(controllers)
+}
+
 /// The operator-delegated cgroup v2 subtree. Only this subtree is ever written;
 /// the host root hierarchy is never modified.
 pub(super) fn delegated_root() -> Result<PathBuf, Error> {
@@ -87,17 +134,7 @@ pub(super) fn delegated_root() -> Result<PathBuf, Error> {
     if !base.starts_with("/sys/fs/cgroup/") || base == Path::new("/sys/fs/cgroup/") {
         return Err(Error::internal("delegated cgroup v2 root required"));
     }
-    for name in ["cgroup.controllers", "cgroup.procs", "cgroup.subtree_control"] {
-        if !base.join(name).is_file() {
-            return Err(Error::internal("delegated cgroup v2 root required"));
-        }
-    }
-    let controllers = fs::read_to_string(base.join("cgroup.controllers")).map_err(Error::internal)?;
-    for required in ["cpu", "memory", "pids"] {
-        if !controllers.split_whitespace().any(|item| item == required) {
-            return Err(Error::internal("delegated cgroup is missing a required controller"));
-        }
-    }
+    validate_delegation(&base)?;
     Ok(base)
 }
 
@@ -311,6 +348,26 @@ mod tests {
         // proven empty; cleanup must fail instead of silently returning.
         fs::write(group.join("cgroup.procs"), "1\n").unwrap();
         assert!(destroy_with_timeout(&group, Duration::from_millis(60)).await.is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delegation_accepts_sysfs_read_tokens_and_rejects_incomplete_subtrees() {
+        let root = std::env::temp_dir().join(format!("rootyard-cgroup-delegation-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("cgroup.controllers"), "cpu memory pids\n").unwrap();
+        fs::write(root.join("cgroup.procs"), "").unwrap();
+        // Actual sysfs reads of cgroup.subtree_control contain bare names.
+        fs::write(root.join("cgroup.subtree_control"), "cpu memory pids\n").unwrap();
+        assert_eq!(validate_delegation(&root).unwrap(), ["cpu", "memory", "pids"]);
+        // The write form is accepted too, without weakening the required set.
+        fs::write(root.join("cgroup.subtree_control"), "+cpu +memory +pids\n").unwrap();
+        assert!(validate_delegation(&root).is_ok());
+        fs::write(root.join("cgroup.subtree_control"), "cpu pids\n").unwrap();
+        assert!(validate_delegation(&root).is_err());
+        fs::write(root.join("cgroup.subtree_control"), "cpu memory pids\n").unwrap();
+        fs::write(root.join("cgroup.type"), "threaded\n").unwrap();
+        assert!(validate_delegation(&root).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
