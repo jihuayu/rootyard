@@ -38,11 +38,7 @@ jobs:
           --health-cmd "pg_isready -U rootyard -d rootyard_native"
           --health-interval 5s --health-timeout 5s --health-retries 12
     env:
-      RECEIPT_DIR: ${{ runner.temp }}/native-kernel
-      RECEIPT: ${{ runner.temp }}/native-kernel/receipt.json
-      EVIDENCE_DIR: ${{ runner.temp }}/native-kernel/evidence
       ROOTYARD_TEST_CGROUP_ROOT: /sys/fs/cgroup/rootyard-native-${{ github.run_id }}
-      ROOTYARD_TEST_TMPFS_ROOT: ${{ runner.temp }}/rootyard-native-pool-${{ github.run_id }}
       ROOTYARD_SANDBOX_MODE: cgroup
       ROOTYARD_SOURCE_COMMIT: ${{ github.sha }}
       ROOTYARD_BINARY: ${{ github.workspace }}/target/debug/rootyard
@@ -51,6 +47,13 @@ jobs:
       PG_URL_BASE: postgresql://rootyard@127.0.0.1:5432
       NATIVE_DB: rootyard_native_cgroup_${{ github.run_id }}_${{ github.run_attempt }}
     steps:
+      - name: Prepare paths outside the checkout
+        run: |
+          echo "RECEIPT_DIR=$RUNNER_TEMP/native-kernel" >>"$GITHUB_ENV"
+          echo "RECEIPT=$RUNNER_TEMP/native-kernel/receipt.json" >>"$GITHUB_ENV"
+          echo "EVIDENCE_DIR=$RUNNER_TEMP/native-kernel/evidence" >>"$GITHUB_ENV"
+          echo "ROOTYARD_TEST_TMPFS_ROOT=$RUNNER_TEMP/rootyard-native-pool-$GITHUB_RUN_ID" >>"$GITHUB_ENV"
+
       - name: Checkout without persisted credentials
         uses: actions/checkout@v4
         with:
