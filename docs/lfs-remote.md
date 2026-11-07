@@ -12,9 +12,13 @@ downloads, including on another node.
 
 Without the endpoint, LFS remains on the local data volume and belongs in the
 paired database/volume backup. With the endpoint, the remote store preserves
-objects between backups. A format-6 paired backup inventories every ready LFS
-object and hydrates any missing local copy from the remote store before it
-publishes the backup. Restore verifies those bytes and can serve them without
+objects between backups. A current paired backup (manifest format 8, schema versions through 132)
+inventories every ready LFS object and hydrates any missing local copy from the
+remote store before it publishes the backup. Restore accepts manifest formats 4
+through 8; frozen older archives are read against their own catalogs and need a
+documented explicit opt-in (see [backup and restore](backup-restore.md) and
+`src/backup/restore.rs`) rather than an unpublished legacy binary. The current
+tested path is format 8 / schema 132. Restore verifies those bytes and can serve them without
 an object-store endpoint. The remote store must remain available during backup
 if any ready object's local copy is missing; retain completed paired backups
 for recovery if the store is lost afterward.
@@ -27,4 +31,18 @@ checks before deleting a key.
 
 `ROOTYARD_LFS_POINTER_VERIFY_BYTES` caps the aggregate ready-object bytes
 verified for a ref update (512 MiB by default, 8 GiB maximum). Ref publication
-fails closed when its verification budget or Git deadline is exhausted.
+fails closed when its verification budget or Git deadline is exhausted. The
+same bounded inspection examines at most 20,000 newly reachable Git objects
+and reads at most 4,096 small (≤ 1 KiB) blobs per ref update; a larger
+new-object set is rejected fail-closed rather than partially inspected, so a
+monorepo push above that bound must be split. This bound applies to
+repositories without LFS content as well, because pointer candidates can only
+be identified after reading blob bytes. Pointer blobs are normalized before validation: the official client's LF and
+CRLF forms, leading Unicode whitespace including NBSP, the legacy
+`https://hawser.github.com/spec/v1` header and the legacy
+`http://git-media.io/v/2` header are recognized, and every distinct `(OID,
+promised size)` pair is validated before the ref moves. Binary or non-UTF-8
+blobs, and header/scheme shapes the official client itself rejects, are not valid
+stock-client pointers and remain ordinary content. No LFS object-delete or
+garbage-collection API exists, so accepted pointers cannot lose bytes to an LFS
+GC.

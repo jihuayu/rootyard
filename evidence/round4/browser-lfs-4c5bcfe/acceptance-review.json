@@ -1,0 +1,273 @@
+{
+  "role": "independent-final-acceptance-review",
+  "read_only": true,
+  "generated_at_utc": "2026-11-07T08:47:41.277645+00:00",
+  "verdict": "APPROVED",
+  "pending": false,
+  "candidate": {
+    "source_commit": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+    "compiled_source": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+    "head_matches": true,
+    "worktree_clean": true,
+    "baseline_commit": "a91c93f",
+    "baseline_commit_full": "a91c93f3a63914c8416fa96c653f5d28212af785",
+    "baseline_display": "origin/main (a91c93f)"
+  },
+  "binary": {
+    "path": "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+    "sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45",
+    "copy_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45",
+    "certificate_valid": true
+  },
+  "production_inputs": {
+    "canonical_content_sha256": "8f399a064af9701de018bad5d527cd652767f03131a96affde8582fb6aac0034",
+    "file_sha256": "e67ed362bbc8d621d9e92ae34e92fc20c16096674bed0b39cf60d65871aea7db",
+    "file_count": 331,
+    "before_after_equal": true,
+    "canonical_map_recomputed_equal": true,
+    "changed_paths_from_a91_main": [
+      "src/lfs/publication.rs",
+      "src/lfs/storage.rs",
+      "src/web/handlers.rs",
+      "src/web/session.rs"
+    ],
+    "changed_path_count": 4,
+    "changed_areas": [
+      "src/web/handlers.rs + src/web/session.rs (browser handlers/session)",
+      "src/lfs/publication.rs + src/lfs/storage.rs (LFS publication/storage)"
+    ],
+    "task_hypothesis_of_three_paths": "Actual canonical map shows 4 changed production files in 3 intended areas; no unexpected production path.",
+    "migrations_or_schema_diff": [],
+    "new_ddl": false,
+    "actual_schema_max_version": 132,
+    "backup_manifest_format": 8
+  },
+  "jobs": {
+    "total": 11,
+    "passed": 11,
+    "failed": 0,
+    "running": 0,
+    "queued": 0,
+    "exit_zero": 11,
+    "final_state": "passed",
+    "final_stage": "complete",
+    "reports_present": 9,
+    "reports_passed": 9,
+    "report_cases_passed": 25,
+    "rust_lib": {
+      "passed": 145,
+      "failed": 0,
+      "ignored": 0,
+      "filtered_out": 0,
+      "seconds": 8.25
+    },
+    "webhook_regressions": {
+      "exit_code": 0,
+      "report_json": false,
+      "stdout_named_checks": [
+        "201 event batches: passed",
+        "concurrent claim fence: passed",
+        "verified TLS and plaintext rejection: passed",
+        "untrusted certificate rejected (transport error observed)"
+      ],
+      "manual_dispatch_used": true,
+      "manual_endpoint": "/webhooks/dispatch"
+    },
+    "total_reported_test_cases_passed": 170,
+    "db_backed_jobs_dropped_after_success": 11,
+    "harness_hashes_verified": 10,
+    "reports": {
+      "sessions": {
+        "path": "/workspace/scratch/rootyard-round4/integrated/logs/sessions.json",
+        "sha256": "bcc875d2cfba1ca23995417428836c735a19f95efa98869b9c202731fc22b86c",
+        "passed": true,
+        "cases": 1,
+        "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45"
+      },
+      "chromium": {
+        "path": "/workspace/scratch/rootyard-round4/integrated/logs/chromium.json",
+        "sha256": "70a56d1316ce0c365cdb5aa7fc4914cc88bde17d164418ab51d527bf33216c0b",
+        "passed": true,
+        "cases": 1,
+        "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45"
+      },
+      "lfs": {
+        "path": "/workspace/scratch/rootyard-round4/integrated/logs/lfs.json",
+        "sha256": "23b95c9deea9a5ac299d0d27d2bee5ea4267b7406879740c198b69aefde16065",
+        "passed": true,
+        "cases": 10,
+        "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45"
+      },
+      "lfs-publication": {
+        "path": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-publication.json",
+        "sha256": "3c4e975b2ca20029f6bb932eb091eb874c5bfd00134370edb50d16774ce5f0d8",
+        "passed": true,
+        "cases": 2,
+        "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45"
+      },
+      "lfs-retention": {
+        "path": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-retention.json",
+        "sha256": "e2381582049c8b8e90e16b783ad8be627d29a9aa5422641efdd3446f33994cff",
+        "passed": true,
+        "cases": 3,
+        "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45"
+      },
+      "lfs-remote": {
+        "path": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-remote.json",
+        "sha256": "24b26018bb47aff2f46f134df2727f218b3fd4aa9b48178cf38ed3c8f83c6f78",
+        "passed": true,
+        "cases": 1,
+        "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45"
+      },
+      "lfs-hydration": {
+        "path": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-hydration.json",
+        "sha256": "bfa68cc8f2d3014c1df68858ce2ead39fa019f2fb9a537f0254026a746d3d098",
+        "passed": true,
+        "cases": 1,
+        "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45"
+      },
+      "backup-capabilities": {
+        "path": "/workspace/scratch/rootyard-round4/integrated/logs/backup-capabilities.json",
+        "sha256": "b16def062adb08e21f7fec4dc95f584e38959594a4c8700b96e645ee196bc873",
+        "passed": true,
+        "cases": 1,
+        "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45"
+      },
+      "webhook-worker": {
+        "path": "/workspace/scratch/rootyard-round4/integrated/logs/webhook-worker.json",
+        "sha256": "86ed9a75f063a6856963989718e8c9384db0fcb0a138470e8879f1d1f008718a",
+        "passed": true,
+        "cases": 5,
+        "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45"
+      }
+    },
+    "webhook_worker_manual_dispatch_calls": 0,
+    "manual_vs_automatic_proof_split": "webhook-regressions exercises explicit POST /webhooks/dispatch (manual); webhook-worker proves automatic worker delivery/retry with manual_dispatch_calls=0"
+  },
+  "primary_consistency": {
+    "path": "/workspace/scratch/rootyard-round4/integrated/primary-consistency.json",
+    "present": true,
+    "sha256": "1aaa091ae32bfaea989569267eef0471a86bc1c7a153c2077f9366b50b1f2189",
+    "reported": "primary independently rehashed binary, all 331 production inputs, all harness hashes, all 9 report hashes, DB cleanup, and scanned for private-key/token markers",
+    "independent_checks_here": {
+      "binary": true,
+      "production_inputs_331": true,
+      "harness_hashes_10_of_10": true,
+      "report_hashes_9_of_9": true,
+      "db_cleanup_status": true,
+      "credential_marker_scan": "as reported by primary-consistency.json"
+    }
+  },
+  "criteria": {
+    "39": {
+      "title": "Store and recover LFS objects through the remote object-storage backend",
+      "closable": true,
+      "blocker": null,
+      "evidence": [
+        "lfs-remote: real stock git-lfs upload, source object volume removed, second-process second-node clone downloaded exact 1 MiB bytes; remote-only pointer push hydrated by native hook.",
+        "lfs-retention: failed/duplicate/interrupted uploads preserved committed digest; interrupted-first stayed pending then retry became ready; permission removal denied new read and bytes retained after regrant.",
+        "lfs: 10 native cases including streaming upload/download, hash/size mismatch rejection, tenant isolation, revocation, stalled-body deadline, locks, corrupted blob fail-closed, offline paired backup/restore.",
+        "backup-capabilities: fresh database+volume offline restore, LFS bytes/locks preserved, remote LFS hydrated without target endpoint, organization access preserved, browser session revoked."
+      ]
+    },
+    "40": {
+      "title": "Validate newly introduced Git LFS pointers before publishing refs",
+      "closable": true,
+      "blocker": null,
+      "evidence": [
+        "lfs-publication: 12 missing/wrong-size/corrupt pointer kinds rejected before ref move across smart HTTP receive, atomic smart HTTP receive, ref transaction, and PR merge publication paths.",
+        "lfs-publication: 12 bad/missing/wrong-size/corrupt pointer cases were server-rejected; 18 official git-lfs 3.6.1 client probes matched 18 expected accepted/rejected shapes. Invalid header/scheme client-negative forms remain ordinary server content and are not claimed as server-rejected.",
+        "lfs-retention: atomic multi-ref push, normal non-LFS push (300 files), retained tag/history, gitfs_stage_cleanup job with native PostgreSQL ShareLock (application_name=rootyard) held through publication, 4000 stale staging files untouched until release, LFS bytes retained.",
+        "lfs-retention: no LFS object-delete/GC API exists; race covered against real staging cleanup, not object deletion."
+      ],
+      "client_probe_shapes": {
+        "official_client_probes": 18,
+        "matched_expected_shapes": 18,
+        "server_rejected_bad_pointer_cases": 12,
+        "invalid_header_or_scheme_client_negative_forms": "ordinary server content, not claimed server-rejected"
+      }
+    },
+    "47": {
+      "title": "Add browser sign-in, sign-out and revocable Web UI sessions",
+      "closable": true,
+      "blocker": null,
+      "evidence": [
+        "chromium: real /usr/bin/chromium 155.0.8059.79 playwright workflow; fresh login, repository discovery, Issue creation, PR creation/merge, logout, old cookie rejected with 401.",
+        "web_sessions: expired/revoked sessions rejected, parent browser token expiry/revocation rejected, cross-origin state-changing requests rejected, CSRF enforced, session/CSRF secrets absent from URL/page source.",
+        "web_sessions: Git push and API token auth work independently; mixed cookie/Authorization handling prefers explicit API auth and does not create cookie-auth bypass.",
+        "backup-capabilities: after offline restore, old browser session cookies return 401 while repository/API access and restored RBAC still work."
+      ]
+    }
+  },
+  "blockers": {
+    "p0": [],
+    "p1": [],
+    "acceptance_blockers": []
+  },
+  "residuals_p2": [
+    {
+      "id": "pointer-nonutf8-bounded",
+      "scope": "#40",
+      "detail": "Invalid UTF-8 tail/field/oid is ordinary bounded behaviour: actual installed git-lfs --check exits 1 for all such inputs (not a valid client pointer); preserved residual, not a new valid-pointer bypass."
+    },
+    {
+      "id": "pointer-normalizer-dedup-3p2",
+      "scope": "#40",
+      "detail": "Three P2 pointer-normalizer dedup findings accepted in prior independent pointer-delta review; not new blockers."
+    },
+    {
+      "id": "browser-parent-revocation-inflight",
+      "scope": "#47",
+      "detail": "Parent-token revocation is checked on new requests only; an already-admitted in-flight write may finish. Documented as separate accepted #37 P2."
+    },
+    {
+      "id": "adapter-atomic-baseline-not-truncate-fix",
+      "scope": "#39/#40",
+      "detail": "Adapter was already atomic on the old 8 MiB baseline (PASSED). This round adds caller staging 0600-before-rename hardening, not a truncate fix; do not claim a truncate repair."
+    },
+    {
+      "id": "no-object-delete-api",
+      "scope": "#39/#40",
+      "detail": "No LFS object-delete/GC API; retention is asserted against failed uploads and role removal, and the race is against staging cleanup."
+    },
+    {
+      "id": "no-physical-ha-vendor-claim",
+      "scope": "scope",
+      "detail": "Loopback single-node backup has no hardware-failure guarantee; no vendor or physical-HA claim."
+    },
+    {
+      "id": "no-pando-native-gate-runtime",
+      "scope": "scope",
+      "detail": "No Pando-native gate/runtime in this round; the same gate call is source-verified only."
+    },
+    {
+      "id": "ordinary-ci-not-wired",
+      "scope": "CI",
+      "detail": "User ignores ordinary CI; the new harness is not wired into CI and is non-blocking for this acceptance."
+    }
+  ],
+  "prior_reviews_reused": [
+    {
+      "path": "/workspace/scratch/rootyard-round4/web47/delta-review.json",
+      "status": "accepted no P1; exact b849 auth source"
+    },
+    {
+      "path": "/workspace/scratch/rootyard-round4/lfs39/native-lease-review.json",
+      "status": "B2 closed with real native holder (raw gc17)"
+    },
+    {
+      "path": "/workspace/scratch/rootyard-round4/lfs-hydration/source-review.json",
+      "status": "869 storage hardening accepted"
+    },
+    {
+      "path": "/workspace/scratch/rootyard-round4/lfs-hydration/pointer-delta-review.json",
+      "status": "78 normalizer dedup accepted; 3 P2"
+    }
+  ],
+  "scope_limitations": [
+    "Read-only acceptance review: no repo edits, builds, tests, or network used.",
+    "Source acceptance only; publisher later docs/facts review.",
+    "No mass close of other issues.",
+    "DeepSeek source and independent reviews reused; primary certified native runs."
+  ]
+}

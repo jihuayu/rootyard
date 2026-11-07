@@ -1,0 +1,18 @@
+chromium_browser_workflow: passed
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "chromium_browser_workflow",
+      "status": "passed",
+      "seconds": 7.7433,
+      "detail": null
+    }
+  ],
+  "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45",
+  "runtime": {
+    "browser": "155.0.8059.79",
+    "chromium": "/usr/bin/chromium",
+    "git_head": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f"
+  }
+}

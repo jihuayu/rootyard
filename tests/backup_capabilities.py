@@ -12,10 +12,7 @@ from backup import BackupHarness
 from web_sessions import BrowserHarness
 
 
-class CapabilityBackupHarness(BackupHarness):
-    request = BrowserHarness.request
-    sign_in = BrowserHarness.sign_in
-    cookie_header = BrowserHarness.cookie_header
+class CapabilityBackupHarness(BackupHarness, BrowserHarness):
 
     def populated_restore(self):
         self.setup()
@@ -47,7 +44,7 @@ class CapabilityBackupHarness(BackupHarness):
                    'lease_epoch': workspace['lease_epoch']}
         self.expect(file_path, 200, token=self.alice, method='PUT', body=payload,
                     extra_headers={'Idempotency-Key': 'restore-edit'})
-        cookies = self.sign_in()
+        cookies, _, _ = self.sign_in()
         headers = {'Cookie': self.cookie_header(cookies)}
         assert self.request('/web/repos', headers=headers)[0] == 200
         before_authority = self.query(self.db, 'SELECT incarnation FROM cluster_authority')
@@ -67,6 +64,10 @@ class CapabilityBackupHarness(BackupHarness):
             self.env.pop('ROOTYARD_OBJECT_STORE_ENDPOINT')
         self.cli('backup-verify', str(self.backup))
         self.restore_command()
+        restored_versions = [int(value) for value in self.query(
+            self.target_db, "SELECT version FROM schema_migrations ORDER BY version").splitlines()]
+        assert restored_versions == manifest["schema_versions"], (
+            restored_versions, manifest["schema_versions"])
         assert self.query(self.target_db, 'SELECT incarnation FROM cluster_authority') != before_authority
         assert self.query(self.target_db, 'SELECT count(*) FROM web_sessions WHERE NOT revoked') == '0'
         assert self.query(self.target_db, "SELECT count(*) FROM tokens WHERE kind='browser' AND NOT revoked") == '0'
@@ -98,7 +99,12 @@ class CapabilityBackupHarness(BackupHarness):
                 'lfs_lock_identity_preserved': True, 'lfs_bytes_preserved': True, 'workspace_bytes_preserved': True,
                 'old_workspace_lease_rejected': True, 'renewed_lease_accepted': True,
                 'browser_session_revoked': True, 'cluster_authority_rotated': True,
-                'stock_git_clone_fsck': True, 'remote_lfs_hydrated_without_target_endpoint': remote_lfs}
+                'stock_git_clone_fsck': True, 'remote_lfs_hydrated_without_target_endpoint': remote_lfs,
+                'backup_manifest_format': manifest['format'],
+                'backup_manifest_schema_versions': manifest['schema_versions'],
+                'backup_schema_contract_sha256': manifest['schema_contract_sha256'],
+                'restored_schema_versions': restored_versions,
+                'restored_schema_versions_verified': restored_versions == manifest['schema_versions']}
 
 
 def main():

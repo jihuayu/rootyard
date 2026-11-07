@@ -49,28 +49,16 @@ type OidPath = Path<(String, String, String)>;
 type NumPath = Path<(String, String, i64)>;
 type Res = Result<Response, Error>;
 
-fn extract_cookie_token(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    for part in raw.split(';') {
-        if let Some(val) = part.trim().strip_prefix("rootyard_token=").or_else(|| part.trim().strip_prefix("token=")) {
-            let clean = val.trim().trim_matches('"');
-            if !clean.is_empty() {
-                return Some(clean.to_owned());
-            }
-        }
-    }
-    None
-}
-
 pub fn normalize_web_headers(headers: &HeaderMap) -> HeaderMap {
+    // The browser credential is only the HttpOnly session cookie minted by
+    // /web/login. Long-lived API tokens must not be replayed as raw web
+    // cookies or headers; API clients can still use Authorization directly.
     if headers.contains_key(header::AUTHORIZATION) {
         return headers.clone();
     }
-    let token_opt = super::session::session_token(headers).or_else(|| headers.get("x-rootyard-token").and_then(|v| v.to_str().ok()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)).or_else(|| extract_cookie_token(headers));
     let mut out = headers.clone();
-    if let Some(tok) = token_opt {
-        let bearer = if tok.starts_with("Bearer ") || tok.starts_with("Basic ") { tok } else { format!("Bearer {tok}") };
-        if let Ok(hv) = HeaderValue::from_str(&bearer) {
+    if let Some(tok) = super::session::session_token(headers) {
+        if let Ok(hv) = HeaderValue::from_str(&format!("Bearer {tok}")) {
             out.insert(header::AUTHORIZATION, hv);
         }
     }

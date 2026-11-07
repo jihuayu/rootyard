@@ -1,0 +1,141 @@
+setup_lfs: passed
+batch_upload_stream_verify_and_download: passed
+hash_and_size_mismatch_rejection: passed
+permissions_and_tenant_isolation: passed
+concurrent_upload_revocation: passed
+stalled_body_deadline: passed
+stock_lfs_locks: passed
+corrupted_on_disk_blob_fails_closed: passed
+storage_layout_for_backup: passed
+paired_backup_and_restore: passed
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "setup_lfs",
+      "status": "passed",
+      "seconds": 2.1992,
+      "detail": null
+    },
+    {
+      "name": "batch_upload_stream_verify_and_download",
+      "status": "passed",
+      "seconds": 0.0729,
+      "detail": null
+    },
+    {
+      "name": "hash_and_size_mismatch_rejection",
+      "status": "passed",
+      "seconds": 0.0633,
+      "detail": null
+    },
+    {
+      "name": "permissions_and_tenant_isolation",
+      "status": "passed",
+      "seconds": 0.1125,
+      "detail": null
+    },
+    {
+      "name": "concurrent_upload_revocation",
+      "status": "passed",
+      "seconds": 0.1161,
+      "detail": null
+    },
+    {
+      "name": "stalled_body_deadline",
+      "status": "passed",
+      "seconds": 3.4147,
+      "detail": null
+    },
+    {
+      "name": "stock_lfs_locks",
+      "status": "passed",
+      "seconds": 0.6848,
+      "detail": null
+    },
+    {
+      "name": "corrupted_on_disk_blob_fails_closed",
+      "status": "passed",
+      "seconds": 0.0224,
+      "detail": null
+    },
+    {
+      "name": "storage_layout_for_backup",
+      "status": "passed",
+      "seconds": 0.0003,
+      "detail": null
+    },
+    {
+      "name": "paired_backup_and_restore",
+      "status": "passed",
+      "seconds": 1.7479,
+      "detail": {
+        "metadata": "pg_dump/pg_restore of isolated schema",
+        "storage": "offline full directory copy",
+        "lfs_bytes_and_locks_preserved": true
+      }
+    }
+  ],
+  "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45",
+  "schema_versions": [
+    1,
+    2,
+    3,
+    6,
+    7,
+    8,
+    9,
+    20,
+    30,
+    40,
+    50,
+    60,
+    70,
+    72,
+    73,
+    74,
+    75,
+    80,
+    81,
+    82,
+    83,
+    84,
+    85,
+    86,
+    90,
+    91,
+    92,
+    93,
+    94,
+    95,
+    96,
+    97,
+    98,
+    105,
+    106,
+    107,
+    108,
+    109,
+    110,
+    111,
+    112,
+    113,
+    114,
+    115,
+    116,
+    120,
+    121,
+    125,
+    126,
+    127,
+    128,
+    129,
+    130,
+    131,
+    132
+  ],
+  "limitations": [
+    "Only the Git LFS basic transfer adapter and sha256 object digests are supported.",
+    "LFS objects are scoped per repository and subject to repository disk quotas."
+  ]
+}

@@ -1,0 +1,151 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "probe_pointer_variants",
+      "status": "passed",
+      "seconds": 0.1901,
+      "detail": {
+        "client_available": true,
+        "client_version": "git-lfs/3.6.1 (GitHub; linux amd64; go 1.24.4)",
+        "variants": {
+          "canonical": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          },
+          "crlf": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          },
+          "header-no-newline": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          },
+          "header-tab": {
+            "exit": 1,
+            "accepted": false,
+            "expected_accept": false
+          },
+          "header-trailing-space": {
+            "exit": 1,
+            "accepted": false,
+            "expected_accept": false
+          },
+          "leading-crlf": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          },
+          "leading-nbsp": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          },
+          "leading-newline": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          },
+          "leading-space": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          },
+          "leading-tab": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          },
+          "leading-vtab": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          },
+          "legacy-hawser": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          },
+          "legacy-hawser-http": {
+            "exit": 1,
+            "accepted": false,
+            "expected_accept": false
+          },
+          "legacy-http": {
+            "exit": 1,
+            "accepted": false,
+            "expected_accept": false
+          },
+          "legacy-media-http": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          },
+          "legacy-media-https": {
+            "exit": 1,
+            "accepted": false,
+            "expected_accept": false
+          },
+          "reordered": {
+            "exit": 1,
+            "accepted": false,
+            "expected_accept": false
+          },
+          "trailing-space": {
+            "exit": 0,
+            "accepted": true,
+            "expected_accept": true
+          }
+        }
+      }
+    },
+    {
+      "name": "reject_pointer_publication",
+      "status": "passed",
+      "seconds": 27.1816,
+      "detail": {
+        "pointer_kinds": [
+          "crlf_missing",
+          "crlf_wrong_size",
+          "invalid",
+          "legacy_hawser_missing",
+          "legacy_media_wrong_size",
+          "missing",
+          "nbsp_missing",
+          "nbsp_wrong_size",
+          "ready_corrupt_bytes",
+          "ready_missing_bytes",
+          "same_oid_good_and_wrong_size",
+          "wrong_size"
+        ],
+        "publication_paths": [
+          "smart_http_receive",
+          "atomic_smart_http_receive",
+          "ref_transaction",
+          "pull_merge"
+        ],
+        "rejected_before_ref_move": true,
+        "crlf_client_pointer_check": {
+          "available": true,
+          "nonstrict_exit": 0,
+          "strict_exit": 2
+        },
+        "valid_pointers_published": {
+          "crlf_valid": "refs/heads/crlf_valid",
+          "nbsp_valid": "refs/heads/nbsp_valid",
+          "legacy_hawser_valid": "refs/heads/legacy_hawser_valid",
+          "legacy_media_valid": "refs/heads/legacy_media_valid"
+        },
+        "same_oid_wrong_size_order": {
+          "good_blob_oid": "14cf9af66d16481bb87ed67fcfa8bd95d561cb7a",
+          "wrong_size": 65538,
+          "wrong_blob_oid": "420700e44f28a57ebe9025a05b82b19c70a03ecf"
+        }
+      }
+    }
+  ],
+  "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45"
+}

@@ -1,0 +1,64 @@
+{
+  "head": "78eeffe2f665b4ccaac0ef4fb92e573673869d5a",
+  "parent": "869be7d42398ec301387883cb678cf4752007821",
+  "scope": [
+    "src/lfs/publication.rs",
+    "tests/lfs_publication.py"
+  ],
+  "diffstat": "2 files changed, 228 insertions(+), 55 deletions(-)",
+  "method": "source reading of the delta and its call path (batch-check size filter, BTreeSet ordering, models::parse_pointer, legacy-line mapping); no build, no native run, no edits",
+  "verdict": {
+    "blockers": 0,
+    "p1": 0,
+    "p2": 3,
+    "overall": "NO BLOCKER for 78eeffe in the reviewed 2 files. Recognition is a strict superset of 869be7d (everything previously recognized is still recognized), stays bounded at MAX_POINTER_BYTES and fails closed on recognized-but-invalid field content. The (oid,size) dedup fixes a real fail-open and the new test constructs the ordering deterministically. One concrete P2: a blob that starts with a recognized version line but has a non-UTF-8 tail now falls through as ordinary content, which 869be7d and 79987b4 both rejected."
+  },
+  "canonical_pointer_bytes_review": {
+    "recognition_set": "leading Unicode whitespace (trim_start, White_Space incl. NBSP; BOM not trimmed) then a first line exactly equal to canonical v1, legacy hawser https v1, or legacy git-media http v/2, with an optional trailing CR before LF; the remainder is LF/CRLF folded and a legacy header rewritten to canonical",
+    "monotone_vs_869be7d": "yes: a blob starting with the canonical v1 line is still recognized in every case, so the CRLF fix cannot regress. Scheme-swapped legacy lines and a trailing space/tab on the version line remain ordinary content, matching the recorded client probes.",
+    "bounds": "len > MAX_POINTER_BYTES returns None before from_utf8/trim, so allocation is capped at 1024 bytes plus the version line; in this call path the batch loop already rejects any blob with size > MAX_POINTER_BYTES, so that branch is defensive only.",
+    "fail_closed_on_recognized_invalid": "yes for field-level invalidity (not-hex oid, non-numeric size, missing fields): the canonical bytes reach parse_pointer, which returns None, and the gate answers CONFLICT invalid LFS pointer.",
+    "legacy_mapping": "the legacy header is replaced by the canonical line and the original remainder is folded, so parse_pointer first-line equality holds; checked for LF and CRLF variants of both legacy lines.",
+    "ordinary_content": "unchanged for everything else: trailing-space-on-header, header-tab, reordered fields, http git-lfs, https media and http hawser all return None and are stored as content, which is what the client itself does with them."
+  },
+  "dedup_review": {
+    "change": "inspected_lfs_oids: BTreeSet<String> -> inspected_lfs_promises: BTreeSet<(String,i64)>",
+    "fail_open_fixed": "the old key collapsed a second pointer for the same oid before the size comparison, so a batch containing a correct-size pointer plus a wrong-size pointer to the same object validated only the first promise; the wrong-size promise never reached the lfs_objects row comparison.",
+    "closed": "keying by (oid,size) makes every distinct promise go through the row-size comparison and ensure_readable; identical (oid,size) pairs still collapse correctly because validation is a pure function of that pair.",
+    "ordering_determinism": "objects is a BTreeSet of git oids fed to cat-file --batch-check, whose output preserves input order and feeds small in that same order, so the gate inspects blobs in git-oid order; the test raises the wrong-size pointer until its blob oid sorts after the good canonical blob oid, making the pre-fix skip deterministic rather than incidental.",
+    "side_effect": "inspected_lfs_bytes is now charged once per distinct (oid,size) instead of once per oid, so an adversarial batch promising one large oid at many sizes consumes the ROOTYARD_LFS_POINTER_VERIFY_BYTES budget faster and can be rejected earlier than before. That is over-rejection only, bounded by the same cap."
+  },
+  "p2_findings": [
+    {
+      "id": "P2-1",
+      "title": "non-UTF-8 tail after a recognized version line now falls through as ordinary content",
+      "detail": "canonical_pointer_bytes begins with std::str::from_utf8(bytes).ok()?, so a blob of at most 1024 bytes that starts with the canonical (or an accepted legacy) version line and then contains invalid UTF-8 bytes after the oid/size lines returns None and is published as ordinary content. 79987b4 and 869be7d both reached parse_pointer on such a blob and answered CONFLICT invalid LFS pointer, so this delta relaxes fail-closedness for that shape while a line-oriented client decode can still read oid/size from the valid prefix.",
+      "impact": "narrow (deliberately crafted non-UTF-8 tail in a small blob); same failure class the gate exists to stop, i.e. a published pointer to unavailable bytes; no data corruption and no bypass for well-formed pointers.",
+      "suggested_fix": "when from_utf8 fails, still byte-prefix test for a recognized version line (after ASCII whitespace trim) and answer Err(CONFLICT) instead of None, or split the API into recognized()/canonical() so an unparsable recognised blob fails closed.",
+      "test_coverage": "none; the new variant matrix has no invalid-UTF-8 case."
+    },
+    {
+      "id": "P2-2",
+      "title": "test recomputes git blob ids with SHA-1 instead of asking Git",
+      "detail": "the helper hashes the blob header plus body with SHA-1. The harness bare repo is created with git init --bare (sha1 by default) so the ordering construction is correct today, but the gate derives oid_len from rev-parse --show-object-format, and in a sha256 repository the constructed pair would not be oid-ordered, leaving the regression case nondeterministic while still passing.",
+      "suggested_fix": "compute both blob ids with git hash-object --stdin -t blob (or assert the repository object format) when building the good/wrong-size pair."
+    },
+    {
+      "id": "P2-3",
+      "title": "byte-budget accounting per (oid,size) is undocumented and untested",
+      "detail": "the extra charge per distinct size is intentional but neither a comment at the accounting site nor a test records the resulting earlier CONFLICT at the ROOTYARD_LFS_POINTER_VERIFY_BYTES cap.",
+      "suggested_fix": "one comment line at the accounting site; a dedicated test is not required."
+    }
+  ],
+  "test_review": {
+    "pointer_kinds": "12 rejection kinds (missing, wrong_size, invalid, crlf_missing, crlf_wrong_size, nbsp_missing, nbsp_wrong_size, legacy_hawser_missing, legacy_media_wrong_size, same_oid_good_and_wrong_size, ready_missing_bytes, ready_corrupt_bytes), each asserted on all 4 publication paths (direct smart-HTTP receive, --atomic receive with a good ref that must also not move, ref transaction 409, pull/merge 409) with ref-not-visible ls-remote checks and object hold/corrupt/restore.",
+    "valid_variants": "4 success variants (crlf_valid, nbsp_valid, legacy_hawser_valid, legacy_media_valid), each pushed with returncode 0 asserted and ls-remote head equality against a ready digest-verified object, so normalization is proven not to over-reject.",
+    "client_probe": "probe_pointer_variants records git lfs pointer --check exits for 18 shapes and asserts them against the recorded expectations, so the client-compatibility premise is re-verified on the machine that runs the suite instead of being asserted in prose (skipped gracefully when git-lfs is absent).",
+    "gaps": "no invalid-UTF-8-tail case (P2-1); no cat-file assertion that the committed blob equals the pointer bytes, so client pass-through is still inferred; pando publication (fifth validate_new_refs_with_client call site) is not exercised. CI wiring is out of scope per instruction and not raised."
+  },
+  "unverified_here": [
+    "fresh native build of 78eeffe (primary is running the integrated build)",
+    "native tests/lfs_publication.py run on 78eeffe: 12 kinds x 4 paths rejection, 4 valid variants publish, client probe matrix"
+  ],
+  "baseline_note": "The get_to_file truncation hypothesis remains disproved (the callee already stages, verifies, fsyncs and renames, and the baseline concurrency test passed). Nothing in this delta revives it, and the storage hardening approved previously is untouched by 78eeffe."
+}

@@ -1,0 +1,12 @@
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "reject_pointer_publication",
+      "status": "failed",
+      "seconds": 8.4803,
+      "error": "direct Git push accepted crlf_missing pointer"
+    }
+  ],
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f"
+}
