@@ -50,6 +50,7 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -84,6 +85,7 @@ class Session:
 
     def __init__(self, h):
         self.h = h
+        assert shutil.which("stdbuf"), "coreutils stdbuf is required for line-buffered lock sessions"
         self.proc = subprocess.Popen(
             ["stdbuf", "-oL", "-eL", "psql", "--dbname", h.db, "-X", "-At", "-v", "ON_ERROR_STOP=1"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=h.env,
@@ -191,7 +193,10 @@ def ref_oid(h, repo, name, token=None):
 
 
 def markers(h):
-    return sorted(str(path.relative_to(h.root)) for path in (Path(h.root) / "data").rglob("publication.grant"))
+    # Journal layout is data/journal/<repository>/<operation>/publication.grant;
+    # scanning only that small tree keeps the barrier poll tight.
+    journal = Path(h.root) / "data" / "journal"
+    return sorted(str(path.relative_to(h.root)) for path in journal.rglob("publication.grant")) if journal.exists() else []
 
 
 def counts(h, repository_id):
