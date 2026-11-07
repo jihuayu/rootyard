@@ -91,9 +91,10 @@ class RepositoryPaginationHarness(Harness):
             self.doc("/api/repos", 201, token=self.bob, method="POST", body={"name": name})
         owner = self.alice["user_id"]
         inserted = self.sql(
-            "INSERT INTO repositories(id,owner_id,name,state) SELECT gen_random_uuid(),'"
-            + owner + "','bulk-'||lpad(g::text,4,'0'),'ready' FROM generate_series(0,998) g RETURNING id")
-        assert len(inserted.splitlines()) == 999, inserted[-200:]
+            "WITH inserted AS (INSERT INTO repositories(id,owner_id,name,state) SELECT gen_random_uuid(),'"
+            + owner + "','bulk-'||lpad(g::text,4,'0'),'ready' FROM generate_series(0,998) g RETURNING id) "
+            "SELECT count(*) FROM inserted")
+        assert inserted == "999", inserted
         self.expected, pages = self.walk(1000)
         assert len(self.expected) == 1001 and pages == 2, (len(self.expected), pages)
         self.expected_keys = {key(repo) for repo in self.expected}
