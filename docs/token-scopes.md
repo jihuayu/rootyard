@@ -1,19 +1,22 @@
 # Personal access token scopes (schema 136)
 
-> **Status:** the authorisation helpers, the discovery predicates and the
-> browser-login rejection below are wired in *this* integration branch. Restricted
-> PAT issuance is **not** released: there is no public API, CLI or UI to create or
-> edit grants, the Git CAS parent-token lock is still missing, and browser-child
-> inheritance (an exact parent binding for a restricted parent) is not
-> implemented. Nothing in this document is evidence that the schema/backup
-> contract is finished — the generated fixtures under `schema/` are still the
-> schema-135 set and the backup format is still 11 (see "Contract follow-up").
+> **Status:** the authorisation helpers, the discovery predicates, the common
+> repository/namespace action enforcement and the browser-login rejection are
+> wired in *this* integration branch. Restricted PAT issuance is **not**
+> released: there is no public API, CLI or UI to create or edit grants, the Git
+> CAS parent-token lock is still missing, and exact browser-child inheritance
+> for a restricted parent remains unimplemented. The schema/backup contract is
+> now schema 136 / backup format 12 with real SQL-generated fixtures; the native
+> format12 legacy135 restore drill has not been executed yet, so this remains a
+> private integration branch and is not evidence that schema136 is production
+> ready. Do not publish or deploy it.
 
 ## Integration provenance
 
 The module comes from `codex/round5-pat-scopes` (`dd1228f`, cumulative diff
 `6abfddf..dd1228f`) applied *selectively* on top of the current main line
-(schema 135 / backup format 11):
+(schema 135 / backup format 11 at integration time; this branch now carries the
+schema136 / format12 contract):
 
 * Taken: `src/token_scopes.rs` (split below), `migrations/136_token_scopes.sql`,
   the explicit `RepoAction`/`NamespaceAction` call-site changes, the
@@ -152,13 +155,20 @@ API/CLI/UI is unwired.
   browser login (`POST /web/login`, form-urlencoded, `Origin` set → `403` with no
   `Set-Cookie`).
 
-## Contract follow-up (deliberate, not done here)
+## Contract status
 
-`schema/` still contains the generated schema-135 fixtures and the backup format
-is still 11. This branch does **not** add `schema/136_*` fixtures and does not
-widen the format-11 version table: schema 136 must land together with a format 12
-bump and regenerated fixtures, which is separate follow-up work. Until that
-happens the binary expects migration 136 (`db::MIGRATIONS`/`SCHEMA_VERSIONS`) but
-the published schema/backup contract is still the 135/format-11 contract, so this
-stays a private integration branch and must not be published as a contract
-change.
+`schema/136_catalog.sql` (the frozen 135 catalog projection query copied
+unchanged) and the three `schema/136_*_catalog.json` fixtures were generated
+from real PostgreSQL 17 databases with the reviewed SQL migration path
+(`tests/schema_contract.py --sql-migrate --write`). The backup code now uses
+format 12 / schema 136, keeps format 11 frozen at schema 135, and accepts a
+genuine format11/schema135 archive only with
+`--allow-legacy-schema135`, upgrading it through migration 136 in the same
+restore session. The old format 4-10 contracts and their opt-ins are unchanged.
+
+Not yet verified: no cargo build, clippy run, native format12 restore drill or
+`tests/backup_legacy135_scopes.py` execution was performed in this task. The
+shared legacy runner now targets schema 136 for the 132/133/134/135 source
+profiles and checks the restored PAT columns, token-scope tables and legacy
+tokens' `is_restricted = false` default, but it still requires the coordinator's
+prebuilt legacy binary. Native execution remains the publish gate.

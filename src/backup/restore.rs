@@ -19,7 +19,7 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
     ensure!(expected.len() == 64 && hash(&source.join("manifest.json"))? == expected, "incomplete or damaged manifest");
     let manifest: Manifest = serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
     ensure!(
-        matches!(manifest.format, 4..=11)
+        matches!(manifest.format, 4..=12)
             && manifest.schema_versions == schema_versions(manifest.format)?
             && manifest.schema_contract_sha256 == schema_contract_digest(manifest.format)?,
         "unsupported backup format"
@@ -93,6 +93,7 @@ pub async fn restore(
     allow_legacy_schema132: bool,
     allow_legacy_schema133: bool,
     allow_legacy_schema134: bool,
+    allow_legacy_schema135: bool,
 ) -> Result<()> {
     let started = Instant::now();
     let source = absolute(source, true)?;
@@ -106,6 +107,7 @@ pub async fn restore(
             + u8::from(allow_legacy_schema132)
             + u8::from(allow_legacy_schema133)
             + u8::from(allow_legacy_schema134)
+            + u8::from(allow_legacy_schema135)
             <= 1,
         "choose one explicit legacy schema upgrade"
     );
@@ -115,6 +117,7 @@ pub async fn restore(
     ensure!(!allow_legacy_schema132 || manifest.format == 8, "legacy opt-in requires format8/schema132");
     ensure!(!allow_legacy_schema133 || manifest.format == 9, "legacy opt-in requires format9/schema133");
     ensure!(!allow_legacy_schema134 || manifest.format == 10, "legacy opt-in requires format10/schema134");
+    ensure!(!allow_legacy_schema135 || manifest.format == 11, "legacy opt-in requires format11/schema135");
     ensure!(
         (allow_legacy_schema007 && manifest.format == 4)
             || (allow_legacy_schema130 && manifest.format == 6)
@@ -122,6 +125,7 @@ pub async fn restore(
             || (allow_legacy_schema132 && manifest.format == 8)
             || (allow_legacy_schema133 && manifest.format == 9)
             || (allow_legacy_schema134 && manifest.format == 10)
+            || (allow_legacy_schema135 && manifest.format == 11)
             || manifest.binary_sha256 == hash(&std::env::current_exe()?)?,
         "restore requires the exact backup binary; upgrade separately"
     );
@@ -176,13 +180,13 @@ pub async fn restore(
     // The catalog projection ends with SET search_path=pg_catalog. Restore the
     // target's public application schema before applying the reviewed upgrade.
     client.batch_execute("SET search_path=public").await?;
-    // Formats 6/7/8/9/10 are frozen at schema 130/131/132/133/134. Preserve them
+    // Formats 6/7/8/9/10/11 are frozen at schema 130/131/132/133/134/135. Preserve them
     // for old archives and apply the reviewed Rust migration path only after the
     // exact frozen catalog and version list have been verified from the restored
     // dump. Those formats always need their explicit legacy opt-in, so no
     // restored database can serve the current schema without the reviewed later
-    // migrations (including schema135 metrics index support).
-    if matches!(manifest.format, 6..=10) {
+    // migrations (including schema135 metrics index and schema136 token scopes).
+    if matches!(manifest.format, 6..=11) {
         let mut upgraded = client;
         crate::db::migrate_client(&mut upgraded).await?;
         ensure!(

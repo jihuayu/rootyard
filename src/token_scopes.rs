@@ -1,11 +1,12 @@
 //! Personal access token scopes for human users.
 //!
 //! This module owns the *authorisation data model* for restricted personal
-//! access tokens (PATs). It is deliberately not wired into any issuance,
-//! login or HTTP handler yet: until every authorised entry point (native API,
-//! CLI, browser sessions) consults [`authorize_repository`] and the browser
-//! inheritance policy from schema 136 is implemented, restricted tokens are
-//! not issued anywhere.
+//! access tokens (PATs). The common repository/namespace action enforcement is
+//! wired into the native API and web routes on this integration branch, and
+//! browser login rejects a restricted parent token. Restricted PAT issuance is
+//! still not released: there is no public issuer/CLI, the Git CAS parent-token
+//! lock is missing, and exact browser-child inheritance for a restricted parent
+//! is not implemented.
 //!
 //! # Semantics
 //!

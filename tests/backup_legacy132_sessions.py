@@ -54,8 +54,13 @@ INDEXES = (
     "tokens_browser_expiry_idx",
 )
 # schema135 adds the partial covering metrics index to the six GC indexes every
-# reviewed restore target must contain.
+# reviewed restore target must contain; schema136 adds the two token-scope
+# reference indexes plus the PAT column/table contract checked below.
 TARGET_INDEXES = INDEXES + ("storage_maintenance_metrics",)
+SCHEMA136_INDEXES = TARGET_INDEXES + (
+    "token_repository_scopes_repository_idx",
+    "token_namespace_scopes_organization_idx",
+)
 
 SCHEMA134_FOREIGN_KEYS = (
     "pando_manifest_artifacts_manifest_identity_fkey",
@@ -74,23 +79,27 @@ class ArchiveContract:
     schema: int
     flag: str
     source_label: str
-    target_schema: int = 134
-    indexes: tuple = INDEXES
+    target_schema: int = 136
+    indexes: tuple = SCHEMA136_INDEXES
     foreign_keys: tuple = SCHEMA134_FOREIGN_KEYS
     unique_constraints: tuple = SCHEMA134_UNIQUE
     removed_foreign_key: str = SCHEMA134_REMOVED_FOREIGN_KEY
 
 
 LEGACY132 = ArchiveContract(format=8, schema=132, flag="--allow-legacy-schema132",
-                            source_label="schema132", target_schema=135,
-                            indexes=TARGET_INDEXES)
+                            source_label="schema132", target_schema=136,
+                            indexes=SCHEMA136_INDEXES)
 LEGACY133 = ArchiveContract(format=9, schema=133, flag="--allow-legacy-schema133",
-                            source_label="schema133", target_schema=135,
-                            indexes=TARGET_INDEXES)
+                            source_label="schema133", target_schema=136,
+                            indexes=SCHEMA136_INDEXES)
 # Format10/schema134 is the immediately previous frozen contract.  Its archive
-# upgrades through the same reviewed path to the current schema135 target.
+# upgrades through the same reviewed path to the current schema136 target.
 LEGACY134 = replace(LEGACY132, format=10, schema=134,
                     flag="--allow-legacy-schema134", source_label="schema134")
+# Format11/schema135 is the immediate predecessor of the current format12
+# contract. It carries the frozen schema135 catalog and no schema136 tables.
+LEGACY135 = replace(LEGACY134, format=11, schema=135,
+                    flag="--allow-legacy-schema135", source_label="schema135")
 
 
 class LegacyArchiveHarness(BackupHarness):
@@ -393,6 +402,28 @@ class LegacyArchiveHarness(BackupHarness):
             "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' "
             "AND conname='" + self.contract.removed_foreign_key + "'")
         assert removed == "0", removed
+        token_columns = self.query(
+            self.restore_db,
+            "SELECT string_agg(column_name || ':' || data_type || ':' || "
+            "is_nullable || ':' || coalesce(column_default,''), ',' ORDER BY "
+            "column_name) FROM information_schema.columns WHERE "
+            "table_schema='public' AND table_name='tokens' AND column_name IN "
+            "('is_restricted','scope_version','display_name')")
+        expected_token_columns = ('display_name:text:YES:,'
+                                  'is_restricted:boolean:NO:false,'
+                                  'scope_version:bigint:NO:1')
+        assert token_columns == expected_token_columns, token_columns
+        scope_tables = self.query(
+            self.restore_db,
+            "SELECT string_agg(table_name, ',' ORDER BY table_name) FROM "
+            "information_schema.tables WHERE table_schema='public' AND "
+            "table_name IN ('token_repository_scopes',"
+            "'token_namespace_scopes')")
+        assert scope_tables == ('token_namespace_scopes,'
+                                'token_repository_scopes'), scope_tables
+        assert self.query(
+            self.restore_db,
+            "SELECT count(*) FROM tokens WHERE is_restricted") == "0"
         authority = self.query(
             self.restore_db,
             "SELECT authority_id FROM pando_storage_authorities WHERE singleton")
@@ -441,6 +472,8 @@ class LegacyArchiveHarness(BackupHarness):
         return dict(schema_version=int(last), indexes=len(self.contract.indexes),
                     schema134_identity_constraints=True,
                     schema135_metrics_index=True,
+                    schema136_token_scope_schema=True,
+                    legacy_tokens_default_unrestricted=True,
                     target_authority_id=authority,
                     target_authority_differs_from_source=True,
                     target_manifest_artifacts=links,
