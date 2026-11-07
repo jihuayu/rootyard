@@ -6,11 +6,9 @@
 //! frame, never across a wait. The heartbeat socket is written by its own
 //! standard thread every [`HEARTBEAT_INTERVAL`], so liveness never depends on
 //! Tokio progress or on the control reader.
-//!
 //! A child crash surfaces as a control EOF: every pending request fails with
-//! `ECONNRESET`, `alive()` turns false and the registry in
-//! [`crate::workspaces::mounts`] reports the workspace as not mounted. Nothing
-//! here pretends a crashed child kept serving reads.
+//! `ECONNRESET` and `alive()` turns false. Nothing here pretends a crashed
+//! child kept serving reads.
 use super::protocol::{
     ABORT_DEADLINE, AbortFreeze, AbortMount, Body, ErrorReply, FenceIfUnchanged, Frame, FREEZE_DEADLINE,
     FreezeBegin, FreezeFinish, Handoff, HEARTBEAT_INTERVAL, Heartbeat, Hello, MAX_INFLIGHT, MOUNT_DEADLINE,
@@ -83,9 +81,8 @@ struct PendingReply {
     db_epoch: i64,
 }
 
-/// A cancellation that must still reach the child when the waiting caller is
-/// gone. The child also bounds every mount/freeze operation on its own, so a
-/// full queue is a lost hint, never an orphan.
+/// A cancellation that must still reach the child when the caller is gone.
+/// The child also bounds every operation, so a full queue is a lost hint.
 enum AbortJob {
     Freeze { workspace: Uuid, epoch: i64, op_id: u64 },
     Mount { workspace: Uuid, request: u64 },
@@ -127,13 +124,18 @@ impl Inner {
         // generation, workspace or epoch must not be mistaken for this answer.
         let result = if frame.generation != self.generation {
             Err(HelperError::protocol("helper reply carries another generation"))
-        } else if frame.workspace != expected.workspace
-            || (expected.db_epoch != 0 && frame.db_epoch != expected.db_epoch)
-        {
-            Err(HelperError::protocol("helper reply does not match the request workspace/epoch"))
+        } else if frame.workspace != expected.workspace {
+            Err(HelperError::protocol("helper reply does not match the request workspace"))
         } else {
             match frame.body() {
+                // Error frames keep the caller's errno even when the child
+                // answers with a zero epoch (a fast-failing busy/stale reply).
+                // They are decoded before the success-frame epoch check, which
+                // stays strict for every non-error body.
                 Ok(Body::Error(ErrorReply { code, message })) => Err(HelperError::new(code, message)),
+                Ok(body) if expected.db_epoch != 0 && frame.db_epoch != expected.db_epoch => Err(
+                    HelperError::protocol("helper reply does not match the request epoch"),
+                ),
                 Ok(body) => Ok(body),
                 Err(error) => Err(HelperError::protocol(error.to_string())),
             }
@@ -548,8 +550,7 @@ fn heartbeat_writer(inner: Arc<Inner>) {
 }
 
 /// Bounded cancel worker: one thread for every abandoned freeze or mount, not
-/// one per call. Cancels are best effort; the child's own operation deadline is
-/// the fail-closed backstop when a cancel is lost.
+/// one per call; the child's operation deadline is the fail-closed backstop.
 fn abort_worker(inner: Arc<Inner>, jobs: mpsc::Receiver<AbortJob>) {
     loop {
         let job = match jobs.recv_timeout(Duration::from_millis(100)) {
@@ -575,10 +576,8 @@ fn abort_worker(inner: Arc<Inner>, jobs: mpsc::Receiver<AbortJob>) {
 }
 
 /// One freeze attempt whose operation id exists before the begin frame.
-///
 /// Dropping an attempt that never began aborts the op id, so an unanswered
-/// `freeze_begin` (timeout, cancelled async caller, panic) cannot leave the
-/// child holding the gate and a per-workspace freeze slot forever.
+/// `freeze_begin` cannot park the gate and the per-mount freeze slot.
 pub struct FreezeAttempt {
     client: HelperClient,
     workspace: Uuid,
@@ -644,9 +643,8 @@ impl Drop for FreezeAttempt {
 /// One remote freeze grant.
 ///
 /// The token is one-shot: [`RemoteFreezeToken::finish`] sends exactly one
-/// `freeze_finish` with the epoch the freeze was admitted under. Dropping an
-/// unfinished token sends `abort_freeze`, which the child treats as a fence; a
-/// dropped channel is never interpreted as a successful thaw.
+/// `freeze_finish`. Dropping an unfinished token sends `abort_freeze`, which
+/// the child treats as a fence, never as a successful thaw.
 pub struct RemoteFreezeToken {
     client: HelperClient,
     workspace: Uuid,

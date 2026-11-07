@@ -32,7 +32,7 @@
 //! `shutdown` is the only exit that reports success.
 use super::protocol::{
     Body, ErrorReply, FenceIfUnchanged, Frame, FreezeBegin, FreezeFinish, Handoff, HEARTBEAT_DEADLINE, Heartbeat, Hello,
-    MountRequest, Observe, OkReply, PROTOCOL_VERSION, Prewarm, StateReply, read_frame, write_frame,
+    Observe, OkReply, PROTOCOL_VERSION, Prewarm, StateReply, read_frame, write_frame,
 };
 use crate::workspace_lab::fuse_mount::{MountHandle, MutationGate};
 use crate::workspaces::lazy::Reader;
@@ -58,6 +58,10 @@ mod ops;
 /// Per-mount operation queue, mirrored from `fuse_dispatch` for diagnostics.
 pub(super) const MOUNT_QUEUE_CAPACITY: u32 = 128;
 const WATCHDOG_TICK: Duration = Duration::from_millis(100);
+/// After a freeze drain misses its deadline the gate is fenced and the begin is
+/// cancelled; if the freeze thread still cannot leave the drain (an admitted
+/// IO that never returns) the helper fail-stops instead of pretending a drain.
+const FREEZE_JOIN_GRACE: Duration = Duration::from_secs(5);
 /// Blocking operations run beside the control reader; four slots per pool keep
 /// a burst of mounts from multiplying threads or starving heartbeats.
 const OPS_WORKERS: usize = 4;
@@ -103,6 +107,8 @@ pub(super) struct FreezeOp {
     /// workspace/epoch and removal is conditional on this request.
     pub begin_request: u64,
     pub deadline: Instant,
+    pub failstop_at: Instant,
+    pub expired: AtomicBool,
     pub decision: SyncSender<bool>,
     /// Request id that receives the `finished` reply once the gate is free.
     pub done: Mutex<Option<u64>>,
@@ -180,7 +186,7 @@ impl State {
     }
 
     fn failstop(&self, reason: &str, code: i32) -> ! {
-        teardown(self, reason, code)
+        failstop(self, reason, code)
     }
 }
 
@@ -311,7 +317,73 @@ fn watchdog(state: Arc<State>) {
             // socket open, so EOF alone is not a liveness signal.
             teardown(&state, "heartbeat deadline missed", 1);
         }
+        enforce_freeze_deadlines(&state);
     }
+}
+
+/// A freeze can block inside `begin_freeze` while an admitted mutation never
+/// drains; the waiter deadline alone would never fire there. The watchdog does
+/// it independently: fence the gate, cancel the begin and release the decision
+/// as a fence. If the thread still cannot leave the drain, exit the helper.
+fn enforce_freeze_deadlines(state: &State) {
+    let now = Instant::now();
+    let expired: Vec<(u64, Uuid, i64, u64, Instant)> = {
+        let freezes = lock(&state.freezes);
+        freezes
+            .iter()
+            .filter(|(_, op)| op.deadline <= now)
+            .map(|(op_id, op)| (*op_id, op.workspace, op.epoch, op.begin_request, op.failstop_at))
+            .collect()
+    };
+    for (op_id, workspace, _epoch, begin_request, failstop_at) in expired {
+        // Fence once per operation. A thaw already buffered in the decision
+        // channel cannot revive a fenced gate, so reply with a timeout instead
+        // of ever reporting a drained gate.
+        let first = {
+            let freezes = lock(&state.freezes);
+            match freezes.get(&op_id) {
+                Some(op) => {
+                    if op.expired.swap(true, Ordering::AcqRel) {
+                        false
+                    } else {
+                        // Release the decision as a fence when the drain is
+                        // still stuck; a thaw already buffered stays harmless
+                        // because the gate is fenced below.
+                        let _ = op.decision.send(false);
+                        true
+                    }
+                }
+                None => continue,
+            }
+        };
+        if first {
+            if let Some(gate) = gate_for(state, workspace) {
+                gate.fence();
+            }
+            reply_error(
+                state,
+                begin_request,
+                Some(workspace),
+                libc::ETIMEDOUT,
+                "freeze drain deadline expired; the epoch stays fenced",
+            );
+        }
+        if now >= failstop_at {
+            // The drain still did not release: bounded fail-stop, never a
+            // healthy reply and never an unbounded wait for the IO.
+            failstop(&state, "freeze drain could not be released within its deadline", 1);
+        }
+    }
+}
+
+fn failstop(state: &State, reason: &str, code: i32) -> ! {
+    // Do not join FUSE sessions here: the point of this path is that an
+    // admitted IO may never return. Fencing and process exit are the bounded
+    // termination; the kernel aborts the mount when the descriptors close.
+    eprintln!("rootyard: workspace FUSE helper {reason}; fencing before fail-stop");
+    state.fence_all();
+    state.release_freezes();
+    std::process::exit(code)
 }
 
 fn heartbeat_reader(state: Arc<State>, mut stream: UnixStream) {
@@ -461,10 +533,10 @@ fn dispatch(
         }
         Body::FreezeBegin(FreezeBegin { op_id }) => ops::freeze_begin(state, request, workspace, db_epoch, op_id),
         Body::FreezeFinish(FreezeFinish { op_id, epoch, thaw }) => {
-            ops::freeze_release(state, request, workspace, op_id, epoch, thaw)
+            ops::freeze_release(state, request, workspace, op_id, db_epoch, epoch, thaw)
         }
         Body::AbortFreeze(crate::workspace_lab::fuse_helper::protocol::AbortFreeze { op_id }) => {
-            ops::freeze_release(state, request, workspace, op_id, -1, false)
+            ops::freeze_release(state, request, workspace, op_id, db_epoch, -1, false)
         }
         Body::Prewarm(Prewarm { paths }) => {
             let job_state = state.clone();
@@ -490,60 +562,5 @@ fn dispatch(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_state() -> Arc<State> {
-        let (_parent, child) = UnixStream::pair().unwrap();
-        let (ops, ops_jobs) = mpsc::sync_channel::<Job>(1);
-        let (prewarm, prewarm_jobs) = mpsc::sync_channel::<Job>(1);
-        // Keep the receivers alive for the lifetime of the state.
-        std::mem::forget(ops_jobs);
-        std::mem::forget(prewarm_jobs);
-        Arc::new(State::new(child, ops, prewarm))
-    }
-
-    #[test]
-    fn teardown_policy_can_only_fence() {
-        // A dropped freeze waiter is a fence: the receiver sees `Err` and the
-        // freeze thread applies `FreezeDecision::Fence`.
-        let (sender, receiver) = mpsc::sync_channel::<bool>(1);
-        drop(sender);
-        assert!(receiver.recv().is_err());
-    }
-
-    #[test]
-    fn operation_tombstones_are_bounded() {
-        let state = test_state();
-        for op_id in 0..(TOMBSTONES as u64 + 8) {
-            ops::push_freeze_tombstone(&state, op_id);
-            ops::push_mount_tombstone(&state, Uuid::nil(), op_id);
-        }
-        assert_eq!(lock(&state.freeze_tombstones).len(), TOMBSTONES);
-        assert_eq!(lock(&state.mount_tombstones).len(), TOMBSTONES);
-        // The oldest entry was evicted, the newest is still known.
-        assert!(ops::take_freeze_tombstone(&state, 0));
-        assert!(ops::take_freeze_tombstone(&state, TOMBSTONES as u64 + 7));
-        assert!(!ops::take_freeze_tombstone(&state, TOMBSTONES as u64 + 7), "a tombstone is one-shot");
-    }
-
-    #[test]
-    fn pending_mount_gate_is_fenced_without_being_published() {
-        let state = test_state();
-        let gate = MutationGate::new_with_lease(4, i64::MAX).unwrap();
-        lock(&state.pending).insert(
-            Uuid::nil(),
-            PendingMount {
-                request: 7,
-                deadline: Instant::now() + Duration::from_secs(1),
-                cancelled: Arc::new(AtomicBool::new(false)),
-                gate: Some(gate.clone()),
-            },
-        );
-        state.fence_all();
-        assert!(gate.is_fenced(), "a half-built mount must be fenced by the watchdog path");
-        assert!(ops::checkpoint(&AtomicBool::new(false), Instant::now() + Duration::from_secs(1)).is_ok());
-        assert!(ops::checkpoint(&AtomicBool::new(true), Instant::now() + Duration::from_secs(1)).is_err());
-        assert!(ops::checkpoint(&AtomicBool::new(false), Instant::now()).is_err());
-    }
-}
+#[path = "server_tests.rs"]
+mod tests;

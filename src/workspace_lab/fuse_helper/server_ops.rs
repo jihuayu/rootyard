@@ -78,6 +78,30 @@ fn take_mount_tombstone(state: &State, workspace: Uuid, request: u64) -> bool {
     }
 }
 
+/// Linearize admission with `cancel_mount`: the tombstone check, the busy
+/// check and the pending insert share one `pending` guard, so an abort cannot
+/// fall between the check and the registration.
+pub(super) fn register_pending(
+    state: &State,
+    workspace: Uuid,
+    request: u64,
+    deadline: Instant,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), (i32, String)> {
+    let mut pending = lock(&state.pending);
+    if let Some(entry) = pending.get(&workspace) {
+        if entry.cancelled.load(Ordering::Acquire) || Instant::now() >= entry.deadline {
+            return Err((libc::ETIMEDOUT, "the previous operation on this workspace timed out".into()));
+        }
+        return Err((libc::EBUSY, "another mount or unmount owns this workspace".into()));
+    }
+    if take_mount_tombstone(state, workspace, request) {
+        return Err((libc::ECANCELED, "mount was cancelled before it was admitted".into()));
+    }
+    pending.insert(workspace, PendingMount { request, deadline, cancelled: cancel, gate: None });
+    Ok(())
+}
+
 fn remove_pending(state: &State, workspace: Uuid, request: u64) {
     let mut pending = lock(&state.pending);
     if pending.get(&workspace).map(|entry| entry.request) == Some(request) {
@@ -132,27 +156,10 @@ pub(super) fn mount(
             "workspace is already mounted at another epoch or root; reconcile the lease first",
         );
     }
-    if take_mount_tombstone(state, body.workspace, request) {
-        return reply_error(state, request, workspace, libc::ECANCELED, "mount was cancelled before it started");
-    }
     let cancel = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + MOUNT_OP_DEADLINE;
-    {
-        let mut pending = lock(&state.pending);
-        if let Some(entry) = pending.get(&body.workspace) {
-            let stale = entry.cancelled.load(Ordering::Acquire) || Instant::now() >= entry.deadline;
-            return reply_error(
-                state,
-                request,
-                workspace,
-                if stale { libc::ETIMEDOUT } else { libc::EBUSY },
-                "another mount or unmount owns this workspace",
-            );
-        }
-        pending.insert(
-            body.workspace,
-            PendingMount { request, deadline, cancelled: cancel.clone(), gate: None },
-        );
+    if let Err((code, message)) = register_pending(state, body.workspace, request, deadline, cancel.clone()) {
+        return reply_error(state, request, workspace, code, message);
     }
     match build(state, &body, db_epoch, &cancel, deadline) {
         Ok((handle, gate, reader, root)) => publish(state, request, workspace, body.workspace, handle, gate, reader, root),
@@ -275,20 +282,32 @@ fn publish(
 /// reply was lost. Returns the published mount so a worker can join it.
 pub(super) fn cancel_mount(state: &Arc<State>, workspace: Option<Uuid>, mount_request: u64) -> Option<Mounted> {
     let ws = workspace?;
-    {
+    // Registration and this cancel share the `pending` guard: either the
+    // pending entry exists here, or it can no longer be admitted. The tombstone
+    // is stored under the same guard so a mount that has not reached
+    // `register_pending` yet is refused when it does.
+    let pending_gate = {
         let mut pending = lock(&state.pending);
-        if let Some(entry) = pending.get_mut(&ws) {
-            if entry.request == mount_request {
+        push_mount_tombstone(state, ws, mount_request);
+        match pending.get_mut(&ws) {
+            Some(entry) if entry.request == mount_request => {
                 entry.cancelled.store(true, Ordering::Release);
+                entry.gate.clone()
             }
+            _ => None,
         }
+    };
+    // Fence synchronously, before the slow session join is queued: a cancelling
+    // mount must stop admitting mutations even while its handle still exists.
+    if let Some(gate) = pending_gate {
+        gate.fence();
     }
-    push_mount_tombstone(state, ws, mount_request);
-    // Only the mount this cancel names may be removed; a newer confirmed mount
-    // for the same workspace stays.
     let mut mounts = lock(&state.mounts);
     match mounts.get(&ws) {
-        Some(mount) if mount.request == mount_request => mounts.remove(&ws),
+        Some(mount) if mount.request == mount_request => {
+            mount.gate.fence();
+            mounts.remove(&ws)
+        }
         _ => None,
     }
 }
@@ -356,6 +375,8 @@ pub(super) fn freeze_begin(state: &Arc<State>, request: u64, workspace: Option<U
             epoch: db_epoch,
             begin_request: request,
             deadline,
+            failstop_at: deadline + super::FREEZE_JOIN_GRACE,
+            expired: AtomicBool::new(false),
             decision,
             done: done.clone(),
             released: AtomicBool::new(false),
@@ -386,16 +407,23 @@ fn freeze_thread(
     // loop keeps serving other mounts while this thread waits. The wait has an
     // independent deadline: a begin whose caller vanished releases the gate as
     // a fence instead of holding it (and the per-mount slot) forever.
-    let _ = gate.freeze_with_decision(|| {
-        reply(&state, begin_request, Some(workspace), epoch, Body::Ok(OkReply { op_id: Some(op_id) }));
-        let wait = deadline.saturating_duration_since(Instant::now());
-        let thaw = match waiter.recv_timeout(wait) {
-            Ok(thaw) => thaw,
-            // Timeout or a dropped sender: a fence, never a thaw.
-            Err(_) => false,
-        };
-        ((), if thaw { FreezeDecision::Thaw } else { FreezeDecision::Fence })
-    });
+    let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = gate.freeze_with_decision(|| {
+            reply(&state, begin_request, Some(workspace), epoch, Body::Ok(OkReply { op_id: Some(op_id) }));
+            let wait = deadline.saturating_duration_since(Instant::now());
+            let thaw = match waiter.recv_timeout(wait) {
+                Ok(thaw) => thaw,
+                // Timeout or a dropped sender: a fence, never a thaw.
+                Err(_) => false,
+            };
+            ((), if thaw { FreezeDecision::Thaw } else { FreezeDecision::Fence })
+        });
+    }));
+    if drained.is_err() {
+        // A panicking worker must fail the whole helper, not keep serving with
+        // a gate that only looks fenced.
+        super::failstop(&state, "freeze worker panicked", 1);
+    }
     // Remove this op only if it is still the same one, even when a late
     // finish/abort raced the deadline. That keeps the next freeze from failing
     // with EBUSY against a stale map entry.
@@ -415,40 +443,54 @@ fn take_freeze_op(state: &State, op_id: u64, begin_request: u64) -> Option<Freez
     }
 }
 
-/// One-shot finish/abort. `epoch < 0` marks an abort: it still has to name the
-/// same workspace, and it fences the gate before releasing the freeze thread.
+/// One-shot finish/abort.
+///
+/// `frame_epoch` is the envelope `db_epoch` of the finish/abort frame: it must
+/// name this operation's epoch, so a frame for another epoch/workspace cannot
+/// release a freeze it does not own. `epoch < 0` marks an abort, which still
+/// names the same workspace and fences the gate before releasing the thread.
+/// An accepted release records the actual finish request in `done`; the freeze
+/// thread replies with that id and the operation epoch once the decision has
+/// been applied, so `finish` never waits for an acknowledgement nobody sends.
 pub(super) fn freeze_release(
     state: &Arc<State>,
     request: u64,
     workspace: Option<Uuid>,
     op_id: u64,
+    frame_epoch: i64,
     epoch: i64,
     thaw: bool,
 ) {
-    let claimed = {
+    let (claimed, exists) = {
         let freezes = lock(&state.freezes);
         match freezes.get(&op_id) {
-            Some(op) if workspace == Some(op.workspace) => {
+            Some(op) if workspace == Some(op.workspace) && frame_epoch == op.epoch => {
                 if epoch >= 0 && epoch != op.epoch {
-                    Err((libc::ESTALE, "freeze epoch does not match the operation"))
+                    (Err((libc::ESTALE, "freeze epoch does not match the operation")), true)
                 } else if op.released.swap(true, Ordering::AcqRel) {
-                    Err((libc::ESTALE, "freeze operation was already released"))
+                    (Err((libc::ESTALE, "freeze operation was already released")), true)
                 } else {
-                    Ok(op.workspace)
+                    let mut done = lock(&op.done);
+                    if done.is_some() {
+                        (Err((libc::ESTALE, "freeze operation already has a finishing request")), true)
+                    } else {
+                        *done = Some(request);
+                        (Ok(op.workspace), true)
+                    }
                 }
             }
-            Some(_) => Err((libc::ESTALE, "freeze workspace does not match the operation")),
-            None => Err((libc::ESTALE, "freeze operation is not pending")),
+            Some(_) => (Err((libc::ESTALE, "freeze frame does not match the operation context")), true),
+            None => (Err((libc::ESTALE, "freeze operation is not pending")), false),
         }
     };
     let op_workspace = match claimed {
         Ok(workspace) => workspace,
         Err((code, message)) => {
-            if epoch < 0 {
-                // Idempotent cancel: remember the op so a late begin cannot
-                // revive it, and report success to the caller that gave up.
+            if epoch < 0 && !exists {
+                // Idempotent cancel of a freeze that never registered:
+                // remember the op so a late begin cannot revive it.
                 push_freeze_tombstone(state, op_id);
-                return reply(state, request, workspace, 0, Body::Ok(OkReply { op_id: Some(op_id) }));
+                return reply(state, request, workspace, frame_epoch, Body::Ok(OkReply { op_id: Some(op_id) }));
             }
             return reply_error(state, request, workspace, code, message);
         }
@@ -463,6 +505,16 @@ pub(super) fn freeze_release(
         freezes.get(&op_id).map(|op| op.decision.send(thaw).is_ok()).unwrap_or(false)
     };
     if !sent {
+        // The decision could not be delivered (the thread is gone or the
+        // watchdog already queued a fence). Drop our acknowledgement claim so
+        // no stale `finished` reply can claim the decision was applied.
+        let mut done = { let freezes = lock(&state.freezes); freezes.get(&op_id).map(|op| op.done.clone()) };
+        if let Some(slot) = done.as_mut() {
+            let mut slot = lock(&**slot);
+            if *slot == Some(request) {
+                *slot = None;
+            }
+        }
         reply_error(state, request, workspace, libc::ESRCH, "freeze thread is gone; the epoch stays fenced");
     }
 }
