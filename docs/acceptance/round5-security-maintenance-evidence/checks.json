@@ -1,0 +1,37 @@
+{
+  "api_binary_sha256": "85c66397f755768fa139cf4952fca6a21ca12747bd6d18b042f80c2a62f0eb3d",
+  "compiled_input_digest": "7e2eb98931cdbc8f4f3cc9e2d98dd15855a89c398dc555bef6b6e3b75bfda709",
+  "all_target_rust": {
+    "passed": 223,
+    "failed": 0,
+    "ignored": 2
+  },
+  "ignored_postgres_tests_separately_passed": 2,
+  "python": {
+    "tests": 281,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 2,
+    "skip_reason": "Dedicated cgroup entrypoint; hosted 17-assertion run is recorded separately."
+  },
+  "python_log_sha256": "1e0e5fd1036c5eb3a837038b50fa700c16553b9f47c48d404eff325c5d62f66f",
+  "schema_contract": {
+    "schema": 134,
+    "migration_modes": [
+      "sql",
+      "binary"
+    ],
+    "roundtrip": true,
+    "custom_schema_and_idempotence": true
+  },
+  "msrv_context": {
+    "rust": "1.88.0",
+    "profile_dev_debug": 0,
+    "scope": "all-bin compilation, not a performance comparison"
+  },
+  "limits": [
+    "Owned synthetic PostgreSQL/Garage/Vault on one host.",
+    "The full unittest invocation did not capture a separate harness git revision; individual native reports record their own provenance.",
+    "FUSE same-process crash architecture remains issue91; post-crash fixture reclaim is not its production fix."
+  ]
+}

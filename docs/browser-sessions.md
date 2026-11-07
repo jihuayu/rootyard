@@ -185,9 +185,10 @@ session-deletion counters grow, the token-deletion counter does not, and the
 real rows reflect exactly that. It drops the trigger, waits for the next
 committed token pass and the real token deletion, then renames
 `event_deliveries` to force a snapshot failure and checks HTTP `503`, omission
-of every database-derived gauge and retention of all four GC counters. That
-script has not been executed against a built binary as part of this change;
-native acceptance is pending.
+of every database-derived gauge and retention of all four GC counters. The
+[recorded native drill](acceptance/round5-security-maintenance-evidence/security134-gc-metrics.json)
+passed all three cases against the attested schema134 candidate; these controlled
+faults do not establish database-outage or production-load behavior.
 
 No `EXPLAIN` output is captured by the regression suite, so no claim is made
 about measured scanned rows or about which plan the planner picks; the index

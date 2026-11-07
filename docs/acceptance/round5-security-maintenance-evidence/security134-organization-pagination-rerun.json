@@ -1,0 +1,95 @@
+{
+  "binary_sha256": "85c66397f755768fa139cf4952fca6a21ca12747bd6d18b042f80c2a62f0eb3d",
+  "source_head": "12c0191ff22fb636c873255d7dd9ce08578797ca",
+  "passed": true,
+  "cases": [
+    {
+      "name": "fixture",
+      "status": "passed",
+      "seconds": 2.9127,
+      "detail": {
+        "api_created": [
+          "organization:acme",
+          "owner admin membership"
+        ],
+        "sql_seeded_users_with_read_memberships": 100,
+        "sql_seeded_teams": 101,
+        "members_total": 101,
+        "teams_total": 101
+      }
+    },
+    {
+      "name": "default_boundary",
+      "status": "passed",
+      "seconds": 0.043,
+      "detail": {
+        "members_first_page": 100,
+        "members_tail": 1,
+        "teams_first_page": 100,
+        "teams_tail": 1
+      }
+    },
+    {
+      "name": "bounded_traversal",
+      "status": "passed",
+      "seconds": 0.1884,
+      "detail": {
+        "member_pages_at_7": 15,
+        "team_pages_at_13": 8,
+        "unique_members": 101,
+        "unique_teams": 101
+      }
+    },
+    {
+      "name": "cursor_contract",
+      "status": "passed",
+      "seconds": 0.0871,
+      "detail": {
+        "malformed_rejected": 12,
+        "limits_rejected": 5,
+        "unknown_query_rejected": 1
+      }
+    },
+    {
+      "name": "read_only_scope",
+      "status": "passed",
+      "seconds": 0.0459,
+      "detail": {
+        "listed_members": 2,
+        "resumed_with_read_only": true,
+        "member_write_rejected": 403,
+        "team_write_rejected": 403
+      }
+    },
+    {
+      "name": "scope_binding",
+      "status": "passed",
+      "seconds": 0.0676,
+      "detail": {
+        "cross_org": 400,
+        "cross_kind": 400,
+        "cross_actor": 400,
+        "revoked_member_resume": 404,
+        "other_org": "other"
+      }
+    },
+    {
+      "name": "mutation_resume",
+      "status": "passed",
+      "seconds": 0.0241,
+      "detail": {
+        "pages_after_cursor": 2,
+        "deleted_absent": true,
+        "replayed_rows": 0,
+        "traversed_after_delete": 100
+      }
+    }
+  ],
+  "limitations": [
+    "One loopback process and one disposable PostgreSQL schema; not a scalability benchmark.",
+    "The cursor is a bounded scope-bound ordering position, not a signed capability or snapshot.",
+    "Membership and team ordering relies on (username,user_id) and (slug,id); renames change position and may be missed by an in-flight traversal.",
+    "Concurrent inserts after the cursor appear later; inserts before it are not replayed; deletions simply vanish.",
+    "A backup restore that rewinds metadata can leave a cursor outside current rows; clients restart from page one."
+  ]
+}
