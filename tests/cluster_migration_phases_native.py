@@ -261,6 +261,16 @@ def wait_route_primary(url, h, name, node, timeout=40):
     raise AssertionError("controller did not promote measured target; last=" + h.redact(json.dumps(last)))
 
 
+def prepare_repo(h, name):
+    repo, work, tip = create_repo(h, name)
+    prior = generation(h, repo["id"])
+    job = str(uuid.uuid4())
+    pin(h, name, job, tip, prior)
+    add_retained_roots(h, source_bare(h, repo["id"]), tip)
+    return {"name": name, "repo": repo, "work": work, "tip": tip, "prior": prior,
+            "job": job, "route0": route(h, name)}
+
+
 def generation(h, repo_id):
     return int(h.sql("SELECT storage_generation FROM repositories WHERE id='" + repo_id + "'"))
 
@@ -296,15 +306,11 @@ def assert_migrated(h, name, repo, work, job, tip, route0, node1_data, target_ur
             "old_source_volume_unchanged_after_new_push": True}
 
 
-def case_copy_before(h, target_url, node1_data):
+def case_copy_before(h, target_url, node1_data, fixture):
     phase = "copy-before-transfer"
-    name = "copybefore"
-    repo, work, tip = create_repo(h, name)
-    prior = generation(h, repo["id"])
-    job = str(uuid.uuid4())
-    pin(h, name, job, tip, prior)
-    add_retained_roots(h, source_bare(h, repo["id"]), tip)
-    route0 = route(h, name)
+    name = fixture["name"]
+    repo, work, tip = fixture["repo"], fixture["work"], fixture["tip"]
+    prior, job, route0 = fixture["prior"], fixture["job"], fixture["route0"]
     op = str(uuid.uuid4())
     body = {"target_node_id": TARGET, "expected_route_epoch": route0["route_epoch"],
             "operation_id": op}
@@ -352,15 +358,11 @@ def case_copy_before(h, target_url, node1_data):
     return result
 
 
-def case_copy_after(h, target_url, node1_data):
+def case_copy_after(h, target_url, node1_data, fixture):
     phase = "copy-after-transfer"
-    name = "copyafter"
-    repo, work, tip = create_repo(h, name)
-    prior = generation(h, repo["id"])
-    job = str(uuid.uuid4())
-    pin(h, name, job, tip, prior)
-    add_retained_roots(h, source_bare(h, repo["id"]), tip)
-    route0 = route(h, name)
+    name = fixture["name"]
+    repo, work, tip = fixture["repo"], fixture["work"], fixture["tip"]
+    prior, job, route0 = fixture["prior"], fixture["job"], fixture["route0"]
     op = str(uuid.uuid4())
     body = {"target_node_id": TARGET, "expected_route_epoch": route0["route_epoch"],
             "operation_id": op}
@@ -412,15 +414,11 @@ def case_copy_after(h, target_url, node1_data):
     return result
 
 
-def case_target_delta(h, args, target_url, node1_data, holder):
+def case_target_delta(h, args, target_url, node1_data, holder, fixture):
     phase = "target-delta-before-verified"
-    name = "targetdelta"
-    repo, work, tip = create_repo(h, name)
-    prior = generation(h, repo["id"])
-    job = str(uuid.uuid4())
-    pin(h, name, job, tip, prior)
-    add_retained_roots(h, source_bare(h, repo["id"]), tip)
-    route0 = route(h, name)
+    name = fixture["name"]
+    repo, work, tip = fixture["repo"], fixture["work"], fixture["tip"]
+    prior, job, route0 = fixture["prior"], fixture["job"], fixture["route0"]
     op = str(uuid.uuid4())
     body = {"target_node_id": TARGET, "expected_route_epoch": route0["route_epoch"],
             "operation_id": op}
@@ -500,9 +498,12 @@ def migration_phases(args):
             "node_id": TARGET, "endpoint": target_url, "role": "replica",
             "status": "healthy", "lease_ttl_seconds": 120})
         assert status in (200, 201), status
-        records = [case_copy_before(h, target_url, node1_data),
-                   case_copy_after(h, target_url, node1_data)]
-        records.append(case_target_delta(h, args, target_url, node1_data, holder))
+        fixtures = {key: prepare_repo(h, key)
+                    for key in ("copybefore", "copyafter", "targetdelta")}
+        records = [case_copy_before(h, target_url, node1_data, fixtures["copybefore"]),
+                   case_copy_after(h, target_url, node1_data, fixtures["copyafter"])]
+        records.append(case_target_delta(h, args, target_url, node1_data, holder,
+                                         fixtures["targetdelta"]))
         return h, records
     except Exception:
         redacted_tails(h)
