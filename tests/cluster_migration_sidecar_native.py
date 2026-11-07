@@ -97,9 +97,24 @@ def marker(data, phase):
     raise AssertionError("fault marker did not persist: " + phase)
 
 
+def create_repository(h, name):
+    status, raw, _ = h.http("/api/repos", token=h.alice, method="POST",
+                            body={"name": name})
+    assert status in (201, 202), (status, raw[:300])
+    repo = json.loads(raw)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        status, raw, _ = h.http("/api/repos/alice/" + name, token=h.alice)
+        assert status == 200, (status, raw[:300])
+        repo = json.loads(raw)
+        if repo["state"] == "ready":
+            return repo
+        time.sleep(.05)
+    raise AssertionError("repository provisioning did not become ready: " + name)
+
+
 def create_repo(h, name):
-    repo = json.loads(h.expect("/api/repos", 201, method="POST", token=h.alice,
-                               body={"name": name}))
+    repo = create_repository(h, name)
     work = h.root / ("work-" + name)
     remote = h.base + repo["clone_path"]
     h.git("clone", remote, str(work), token=h.alice)
@@ -581,8 +596,7 @@ def main():
         # the previous LIMIT 32 window must survive a target restart.
         dummy_ops = []
         for index in range(34):
-            dummy_repo = json.loads(h.expect("/api/repos", 201, method="POST", token=h.alice,
-                                             body={"name": "window" + str(index)}))
+            dummy_repo = create_repository(h, "window" + str(index))
             dummy_op = str(uuid.uuid4())
             dummy_ops.append((dummy_repo["id"], dummy_op))
             h.sql("UPDATE repositories SET storage_generation=2 WHERE id='" + dummy_repo["id"] + "'")
