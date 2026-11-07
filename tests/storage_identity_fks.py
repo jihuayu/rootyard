@@ -3,19 +3,28 @@
 
 The shared Harness starts the real `rootyard` binary against a private
 PostgreSQL schema. Two repositories with two different owners are created and
-pushed with real stock Git; one of them is cut over to Pando so the genuine
+pushed with real stock Git; both are cut over to Pando, so the genuine
 publication path writes `pando_pack_manifests` and `pando_manifest_artifacts`
-through real Garage + Vault Transit. The positives are therefore produced by
-trusted code, never by this script.
+through real Garage + Vault Transit for each owner. Every positive link asserted
+below is therefore produced by trusted code, never by this script.
 
-Negative cases are plain SQL inserts into this run's own schema. A synthetic
-manifest row is copied from a legal one (fresh ids, same repository/tenant) so
-its `(manifest_id, artifact_role)` primary key is still free: a rejection can
-only come from the intended composite foreign key, not from a duplicate key or
-a check constraint. The synthetic remote-artifact row used for the artifact
-tenant case carries no remote bytes, exists only to satisfy the independent
-artifact authority/tenant FK in the negative test, and is deleted afterwards.
-It is not evidence that anything was uploaded.
+Negative cases are plain SQL inserts into this run's own schema. The synthetic
+manifest rows are copies of a real manifest with fresh ids and the same
+repository/tenant triple, and they carry no artifact links, so their
+`(manifest_id, artifact_role)` primary key is free. Each negative probe is
+pre-validated before it runs: the manifest triple exists, the referenced
+artifact tuple exists for exactly one owner, and the deliberately wrong tuple is
+absent. A rejection can therefore only come from the intended composite foreign
+key, and the probe asserts SQLSTATE 23503 plus the exact constraint name. A
+different error is never treated as a pass.
+
+No synthetic remote-artifact metadata is inserted at all. The probes reference
+only the real remote rows that the two genuine publications registered, so a
+missing-reference case is a missing (tenant, namespace, sha256) tuple rather
+than a fake row. Real published objects are retained by the dedicated synthetic
+bucket used by the test environment; this script never deletes remote objects.
+Dirty schema133 upgrade refusal is a separate native entry point:
+tests/storage_identity_upgrade.py.
 
 Runtime fail-closed proofs (stale generation, wrong backend, not-ready
 repository) are intentionally NOT re-implemented here as SQL text checks; they
@@ -69,6 +78,10 @@ INDEX_BASELINE = {
     },
 }
 
+MANIFEST_IDENTITY_FK = "pando_manifest_artifacts_manifest_identity_fkey"
+ARTIFACT_AUTHORITY_FK = "pando_manifest_artifacts_authority_id_tenant_id_namespace__fkey"
+PANDO_ROLES = "index-cipher,index-envelope,pack-cipher,pack-envelope"
+
 
 def require_environment():
     missing = [name for name in REQUIRED_ENV if not os.environ.get(name)]
@@ -87,8 +100,13 @@ class IdentityHarness(Harness):
             "they prove the database constraints only, not that any object was uploaded."
         )
         self.limits.append(
-            "Dirty pre-upgrade refusal (inconsistent rows on a schema133 database) is not "
-            "exercised by this script; it is a documented follow-up case."
+            "The test environment must provide a dedicated synthetic Garage bucket. "
+            "This script preserves every published remote object and never deletes a "
+            "valid remote artifact; do not point it at production or shared live data."
+        )
+        self.limits.append(
+            "Dirty pre-upgrade refusal (inconsistent rows on a schema133 database) is "
+            "proved by tests/storage_identity_upgrade.py, not by this script."
         )
         self.limits.append(
             "Backup format 9 / legacy schema133 restore gates are out of scope for this "
@@ -99,7 +117,6 @@ class IdentityHarness(Harness):
             "reused from tests/storage_lifecycle.py and tests/storage_lifecycle_physical.py."
         )
         self.synthetic_manifest_ids = []
-        self.synthetic_artifact_paths = []
 
     # ---- fixture helpers ---------------------------------------------------------
     def create_repo(self, token, name, object_format="sha1"):
@@ -131,6 +148,20 @@ class IdentityHarness(Harness):
     def generation(self, repo):
         return self.sql("SELECT storage_generation::text FROM repositories WHERE id='" + repo["id"] + "'")
 
+    def cutover_all(self, repos):
+        """Cut over every repository while the server is stopped, then restart once."""
+        self.stop()
+        reports = {}
+        for repo in repos:
+            report = json.loads(self.cli(
+                "pando-transition", "cutover", "--repository", repo["id"]
+            ))
+            assert report["direction"] == "gitfs_to_pando", report
+            assert report["new_storage_backend"] == "pando", report
+            reports[repo["id"]] = report
+        self.start()
+        return reports
+
     def probe_fk(self, statement, expected_constraint):
         """Run one insert that must be refused by exactly `expected_constraint`."""
         self.sql("DELETE FROM schema134_probe")
@@ -159,6 +190,103 @@ class IdentityHarness(Harness):
         assert state == "23503", (observed, state, expected_constraint)
         assert observed == expected_constraint, (observed, expected_constraint)
         return {"sqlstate": state, "constraint": observed}
+
+    def remote_tuple_exists(self, authority, tenant, namespace, sha256):
+        return self.sql(
+            "SELECT count(*) FROM pando_remote_artifacts WHERE authority_id='" + authority
+            + "' AND tenant_id='" + tenant + "' AND namespace='" + namespace
+            + "' AND sha256='" + sha256 + "'"
+        ) == "1"
+
+    def manifest_identity_exists(self, manifest_id, repository_id, tenant_id):
+        return self.sql(
+            "SELECT count(*) FROM pando_pack_manifests WHERE id='" + manifest_id
+            + "' AND repository_id='" + repository_id + "' AND tenant_id='" + tenant_id + "'"
+        ) == "1"
+
+    def synthetic_manifest_copy(self, source):
+        """Copy one real manifest with a fresh id; leave its artifact roles free."""
+        manifest_id = str(uuid.uuid4())
+        self.synthetic_manifest_ids.append(manifest_id)
+        self.sql(
+            "INSERT INTO pando_pack_manifests"
+            "(id,repository_id,tenant_id,storage_generation,object_format,manifest) "
+            "SELECT '" + manifest_id + "',repository_id,tenant_id,storage_generation,"
+            "object_format,manifest FROM pando_pack_manifests WHERE id='" + source + "'"
+        )
+        assert self.sql(
+            "SELECT count(*) FROM pando_pack_manifests WHERE id='" + manifest_id + "'"
+        ) == "1"
+        assert self.sql(
+            "SELECT count(*) FROM pando_manifest_artifacts WHERE manifest_id='"
+            + manifest_id + "'"
+        ) == "0", "synthetic manifest copy must keep the (manifest_id, artifact_role) key free"
+        return manifest_id
+
+    def latest_manifest(self, repo):
+        return self.sql(
+            "SELECT id::text FROM pando_pack_manifests WHERE repository_id='"
+            + repo["id"] + "' ORDER BY created_at DESC, id DESC LIMIT 1"
+        )
+
+    def artifact_tuple(self, manifest_id):
+        raw = self.sql(
+            "SELECT authority_id::text || '|' || tenant_id::text || '|' || namespace "
+            "|| '|' || sha256 FROM pando_manifest_artifacts WHERE manifest_id='"
+            + manifest_id + "' AND artifact_role='pack-cipher'"
+        )
+        assert raw, (manifest_id, "missing pack-cipher link")
+        authority, tenant, namespace, sha256 = raw.split("|")
+        return {
+            "authority_id": authority,
+            "tenant_id": tenant,
+            "namespace": namespace,
+            "sha256": sha256,
+        }
+
+    def clone_fetch_fsck(self, label, remote, token, expected_head):
+        checkout = self.root / ("clone-" + label)
+        self.git("clone", remote, str(checkout), token=token)
+        assert self.git("rev-parse", "HEAD", cwd=checkout).stdout.decode().strip() == expected_head
+        self.git("fetch", "origin", cwd=checkout, token=token)
+        self.git("fsck", "--full", cwd=checkout)
+        return checkout
+
+    def published_closure(self, label, repo, owner, remote, token, expected_head):
+        raw = self.sql(
+            "SELECT count(*),"
+            " count(*) FILTER (WHERE l.repository_id=m.repository_id AND l.tenant_id=m.tenant_id),"
+            " count(*) FILTER (WHERE l.repository_id='" + repo["id"] + "' AND l.tenant_id='"
+            + owner + "'),"
+            " count(*) FILTER (WHERE r.sha256 IS NULL)"
+            " FROM pando_manifest_artifacts l"
+            " JOIN pando_pack_manifests m ON m.id=l.manifest_id"
+            " LEFT JOIN pando_remote_artifacts r ON r.authority_id=l.authority_id"
+            "  AND r.tenant_id=l.tenant_id AND r.namespace=l.namespace AND r.sha256=l.sha256"
+            " WHERE m.repository_id='" + repo["id"] + "'"
+        )
+        total, matched, owned, missing_remote = (int(value) for value in raw.split("|"))
+        assert total >= 4, (label, total)
+        assert matched == total, (label, total, matched)
+        assert owned == total, (label, total, owned)
+        assert missing_remote == 0, (label, missing_remote)
+        roles = self.sql(
+            "SELECT string_agg(DISTINCT artifact_role, ',' ORDER BY artifact_role) "
+            "FROM pando_manifest_artifacts l JOIN pando_pack_manifests m ON m.id=l.manifest_id "
+            "WHERE m.repository_id='" + repo["id"] + "'"
+        )
+        assert roles == PANDO_ROLES, (label, roles)
+        source = self.latest_manifest(repo)
+        assert self.sql(
+            "SELECT count(*) FROM pando_manifest_artifacts WHERE manifest_id='" + source + "'"
+        ) == "4", (label, source, "published manifest must link four artifacts")
+        self.clone_fetch_fsck(label, remote, token, expected_head)
+        return {
+            "manifest_id": source,
+            "pack_cipher": self.artifact_tuple(source),
+            "published_links": total,
+            "artifact_roles": roles,
+        }
 
     # ---- schema contract ---------------------------------------------------------
     def schema_contract(self):
@@ -213,7 +341,7 @@ class IdentityHarness(Harness):
             assert "ON DELETE CASCADE" in definition, (name, definition)
             assert validated == "t", (name, validated)
         assert "pando_manifest_artifacts_manifest_id_fkey" not in definitions, definitions
-        assert "pando_manifest_artifacts_authority_id_tenant_id_namespace__fkey" in definitions, (
+        assert ARTIFACT_AUTHORITY_FK in definitions, (
             "independent artifact authority/tenant FK was removed"
         )
         unique, _ = definitions["pando_pack_manifests_id_repository_tenant_key"]
@@ -357,169 +485,148 @@ class IdentityHarness(Harness):
 
     # ---- Pando publication links -------------------------------------------------
     def pando_identity_links(self):
-        repo, remote, work = self.create_repo(self.alice, "identity-pando")
-        owner = self.owner(repo)
-        self.commit_and_push(work, self.alice, "first.txt", "gitfs before cutover")
-        self.stop()
-        report = json.loads(self.cli("pando-transition", "cutover", "--repository", repo["id"]))
-        assert report["direction"] == "gitfs_to_pando", report
-        self.start()
-        head = self.commit_and_push(work, self.alice, "second.txt", "pando publication")
+        repo_a, remote_a, work_a = self.create_repo(self.alice, "identity-pando-a")
+        repo_b, remote_b, work_b = self.create_repo(self.bob, "identity-pando-b")
+        owner_a, owner_b = self.owner(repo_a), self.owner(repo_b)
+        assert owner_a != owner_b, "the two Pando repositories must belong to different owners"
 
-        # Positive: the trusted publication produced links that agree with their
-        # manifest on both identity columns, and every artifact role is present.
-        raw = self.sql(
-            "SELECT count(*),count(*) FILTER (WHERE l.repository_id=m.repository_id "
-            "AND l.tenant_id=m.tenant_id) FROM pando_manifest_artifacts l "
-            "JOIN pando_pack_manifests m ON m.id=l.manifest_id "
-            "WHERE m.repository_id='" + repo["id"] + "'"
-        )
-        total, matched = (int(value) for value in raw.split("|"))
-        assert total >= 4, (total, matched)
-        assert matched == total, (total, matched)
-        roles = self.sql(
-            "SELECT string_agg(DISTINCT artifact_role, ',' ORDER BY artifact_role) "
-            "FROM pando_manifest_artifacts l JOIN pando_pack_manifests m ON m.id=l.manifest_id "
-            "WHERE m.repository_id='" + repo["id"] + "'"
-        )
-        assert roles == "index-cipher,index-envelope,pack-cipher,pack-envelope", roles
+        self.commit_and_push(work_a, self.alice, "a-gitfs.txt", "owner a gitfs before cutover")
+        self.commit_and_push(work_b, self.bob, "b-gitfs.txt", "owner b gitfs before cutover")
+        cutovers = self.cutover_all((repo_a, repo_b))
+        head_a = self.commit_and_push(work_a, self.alice, "a-pando.txt", "owner a pando publication")
+        head_b = self.commit_and_push(work_b, self.bob, "b-pando.txt", "owner b pando publication")
 
-        clone = self.root / "clone-published"
-        self.git("clone", remote, str(clone), token=self.alice)
-        assert self.git("rev-parse", "HEAD", cwd=clone).stdout.decode().strip() == head
-        self.git("fsck", "--full", cwd=clone)
-
-        source = self.sql(
-            "SELECT id::text FROM pando_pack_manifests WHERE repository_id='"
-            + repo["id"] + "' ORDER BY created_at DESC LIMIT 1"
+        closure_a = self.published_closure(
+            "pando-a", repo_a, owner_a, remote_a, self.alice, head_a
         )
-        pack_link = self.sql(
-            "SELECT authority_id::text || '|' || tenant_id::text || '|' || namespace "
-            "|| '|' || sha256 FROM pando_manifest_artifacts WHERE manifest_id='"
-            + source + "' AND artifact_role='pack-cipher'"
+        closure_b = self.published_closure(
+            "pando-b", repo_b, owner_b, remote_b, self.bob, head_b
         )
-        authority, artifact_tenant, namespace, sha256 = pack_link.split("|")
-        assert artifact_tenant == owner, (artifact_tenant, owner)
+        assert closure_a["pack_cipher"]["tenant_id"] == owner_a
+        assert closure_b["pack_cipher"]["tenant_id"] == owner_b
 
-        # Two unlinked manifest copies: fresh ids, identical legal payload, so the
-        # artifact-role primary key is free for the negative inserts below.
-        manifest_a, manifest_b = str(uuid.uuid4()), str(uuid.uuid4())
-        self.synthetic_manifest_ids = [manifest_a, manifest_b]
-        for manifest_id in self.synthetic_manifest_ids:
-            self.sql(
-                "INSERT INTO pando_pack_manifests"
-                "(id,repository_id,tenant_id,storage_generation,object_format,manifest) "
-                "SELECT '" + manifest_id + "',repository_id,tenant_id,storage_generation,"
-                "object_format,manifest FROM pando_pack_manifests WHERE id='" + source + "'"
+        artifact_a = closure_a["pack_cipher"]
+        artifact_b = closure_b["pack_cipher"]
+        manifest_a = self.synthetic_manifest_copy(closure_a["manifest_id"])
+        manifest_b = self.synthetic_manifest_copy(closure_b["manifest_id"])
+        assert self.manifest_identity_exists(manifest_a, repo_a["id"], owner_a)
+        assert self.manifest_identity_exists(manifest_b, repo_b["id"], owner_b)
+
+        try:
+            # The artifact tuples below are all real registrations from the two
+            # genuine publications; no synthetic remote metadata is needed.
+            assert self.remote_tuple_exists(
+                artifact_a["authority_id"], artifact_a["tenant_id"],
+                artifact_a["namespace"], artifact_a["sha256"])
+            assert self.remote_tuple_exists(
+                artifact_b["authority_id"], artifact_b["tenant_id"],
+                artifact_b["namespace"], artifact_b["sha256"])
+
+            # manifest_a names owner a, so only the manifest identity triple fails.
+            wrong_repo = self.probe_fk(
+                "INSERT INTO pando_manifest_artifacts"
+                "(manifest_id,repository_id,authority_id,tenant_id,namespace,sha256,artifact_role) "
+                "VALUES('" + manifest_a + "','" + repo_b["id"] + "','"
+                + artifact_a["authority_id"] + "','" + artifact_a["tenant_id"] + "','"
+                + artifact_a["namespace"] + "','" + artifact_a["sha256"] + "','pack-cipher')",
+                MANIFEST_IDENTITY_FK,
             )
-            assert self.sql(
-                "SELECT count(*) FROM pando_manifest_artifacts WHERE manifest_id='"
-                + manifest_id + "'"
-            ) == "0"
 
-        # A second repository with a different owner, only used as the wrong
-        # repository id in the first negative case.
-        other_repo = self.create_repo(self.bob, "identity-pando-other")[0]
-        other_owner = self.owner(other_repo)
-        assert other_owner != owner
+            # manifest_a still names owner a; the artifact tuple belongs to the
+            # real owner b publication, so once again only the manifest triple fails.
+            wrong_tenant = self.probe_fk(
+                "INSERT INTO pando_manifest_artifacts"
+                "(manifest_id,repository_id,authority_id,tenant_id,namespace,sha256,artifact_role) "
+                "VALUES('" + manifest_a + "','" + repo_a["id"] + "','"
+                + artifact_b["authority_id"] + "','" + artifact_b["tenant_id"] + "','"
+                + artifact_b["namespace"] + "','" + artifact_b["sha256"] + "','pack-cipher')",
+                MANIFEST_IDENTITY_FK,
+            )
 
-        wrong_repo = self.probe_fk(
-            "INSERT INTO pando_manifest_artifacts"
-            "(manifest_id,repository_id,authority_id,tenant_id,namespace,sha256,artifact_role) "
-            "VALUES('" + manifest_a + "','" + other_repo["id"] + "','" + authority + "','"
-            + artifact_tenant + "','" + namespace + "','" + sha256 + "','pack-cipher')",
-            "pando_manifest_artifacts_manifest_identity_fkey",
-        )
+            # manifest_b names owner b and repository b (a legal triple). The row
+            # reuses owner a's real artifact namespace and sha256 with owner b, so
+            # the tuple is absent. The namespace matches the remote row contract;
+            # only the target artifact foreign key can reject this insert.
+            assert self.manifest_identity_exists(manifest_b, repo_b["id"], owner_b)
+            assert self.remote_tuple_exists(
+                artifact_a["authority_id"], owner_a,
+                artifact_a["namespace"], artifact_a["sha256"])
+            assert not self.remote_tuple_exists(
+                artifact_a["authority_id"], owner_b,
+                artifact_a["namespace"], artifact_a["sha256"]), (
+                "owner b unexpectedly owns owner a's artifact tuple; cannot prove a missing reference"
+            )
+            artifact_tenant_probe = self.probe_fk(
+                "INSERT INTO pando_manifest_artifacts"
+                "(manifest_id,repository_id,authority_id,tenant_id,namespace,sha256,artifact_role) "
+                "VALUES('" + manifest_b + "','" + repo_b["id"] + "','"
+                + artifact_a["authority_id"] + "','" + owner_b + "','"
+                + artifact_a["namespace"] + "','" + artifact_a["sha256"] + "','pack-cipher')",
+                ARTIFACT_AUTHORITY_FK,
+            )
 
-        # The artifact tenant case needs an artifact row owned by the other tenant
-        # so only the manifest triple can fail. It has no remote bytes, is state
-        # 'deleted' (never a deletion candidate) and is removed below.
-        synthetic_sha = hashlib.sha256(("schema134-" + str(uuid.uuid4())).encode()).hexdigest()
-        synthetic_path = "schema134-negative/" + str(uuid.uuid4())
-        self.synthetic_artifact_paths.append(synthetic_path)
-        self.sql(
-            "INSERT INTO pando_remote_artifacts"
-            "(authority_id,tenant_id,namespace,sha256,size,object_generation,remote_path,"
-            "state,deleted_at) VALUES('" + authority + "','" + other_owner
-            + "','pando-cipher','" + synthetic_sha + "',0,1,'" + synthetic_path
-            + "','deleted',clock_timestamp())"
-        )
-
-        wrong_tenant = self.probe_fk(
-            "INSERT INTO pando_manifest_artifacts"
-            "(manifest_id,repository_id,authority_id,tenant_id,namespace,sha256,artifact_role) "
-            "VALUES('" + manifest_a + "','" + repo["id"] + "','" + authority + "','"
-            + other_owner + "','pando-cipher','" + synthetic_sha + "','pack-cipher')",
-            "pando_manifest_artifacts_manifest_identity_fkey",
-        )
-        artifact_tenant_probe = self.probe_fk(
-            "INSERT INTO pando_manifest_artifacts"
-            "(manifest_id,repository_id,authority_id,tenant_id,namespace,sha256,artifact_role) "
-            "VALUES('" + manifest_b + "','" + repo["id"] + "','" + authority + "','"
-            + other_owner + "','pando-envelope','" + synthetic_sha + "','pack-envelope')",
-            "pando_manifest_artifacts_authority_id_tenant_id_namespace__fkey",
-        )
-
-        # Legal path still works after the refusals: another real publication and
-        # a real fetch of the new head.
-        second = self.commit_and_push(work, self.alice, "third.txt", "pando after refusals")
-        assert int(
-            self.sql(
+            # Legal path still works after the refusals: a real publication for
+            # each owner and a real clone/fetch/fsck of the new head.
+            before_a = int(self.sql(
                 "SELECT count(*) FROM pando_pack_manifests WHERE repository_id='"
-                + repo["id"] + "'"
-            )
-        ) >= 2
-        clone2 = self.root / "clone-after-refusals"
-        self.git("clone", remote, str(clone2), token=self.alice)
-        assert self.git("rev-parse", "HEAD", cwd=clone2).stdout.decode().strip() == second
-        self.git("fsck", "--full", cwd=clone2)
-
-        # Remove exactly this run's synthetic rows.
-        for manifest_id in self.synthetic_manifest_ids:
-            self.sql("DELETE FROM pando_manifest_artifacts WHERE manifest_id='" + manifest_id + "'")
-            self.sql("DELETE FROM pando_pack_manifests WHERE id='" + manifest_id + "'")
-        for path in self.synthetic_artifact_paths:
-            self.sql("DELETE FROM pando_remote_artifacts WHERE remote_path='" + path + "'")
-        for manifest_id in self.synthetic_manifest_ids:
-            assert self.sql(
-                "SELECT count(*) FROM pando_manifest_artifacts WHERE manifest_id='"
-                + manifest_id + "'"
-            ) == "0"
-        assert self.sql(
-            "SELECT count(*) FROM pando_remote_artifacts WHERE remote_path LIKE 'schema134-negative/%'"
-        ) == "0"
-        self.synthetic_manifest_ids = []
-        self.synthetic_artifact_paths = []
+                + repo_a["id"] + "'"))
+            before_b = int(self.sql(
+                "SELECT count(*) FROM pando_pack_manifests WHERE repository_id='"
+                + repo_b["id"] + "'"))
+            second_a = self.commit_and_push(
+                work_a, self.alice, "a-after-refusals.txt", "owner a pando after refusals")
+            second_b = self.commit_and_push(
+                work_b, self.bob, "b-after-refusals.txt", "owner b pando after refusals")
+            assert int(self.sql(
+                "SELECT count(*) FROM pando_pack_manifests WHERE repository_id='"
+                + repo_a["id"] + "'")) > before_a
+            assert int(self.sql(
+                "SELECT count(*) FROM pando_pack_manifests WHERE repository_id='"
+                + repo_b["id"] + "'")) > before_b
+            self.clone_fetch_fsck("pando-a-after", remote_a, self.alice, second_a)
+            self.clone_fetch_fsck("pando-b-after", remote_b, self.bob, second_b)
+        finally:
+            self.drop_synthetic_manifests()
 
         return {
-            "repository_id": repo["id"],
-            "published_links": total,
-            "artifact_roles": roles,
+            "owners": {"a": owner_a, "b": owner_b},
+            "repositories": {"a": repo_a["id"], "b": repo_b["id"]},
+            "cutovers": {key: {"direction": value["direction"],
+                               "new_storage_backend": value["new_storage_backend"]}
+                         for key, value in cutovers.items()},
+            "published": {
+                "a": {key: value for key, value in closure_a.items() if key != "pack_cipher"},
+                "b": {key: value for key, value in closure_b.items() if key != "pack_cipher"},
+            },
             "rejected": {
                 "wrong_manifest_repository": wrong_repo,
                 "wrong_manifest_tenant": wrong_tenant,
                 "artifact_tenant_mismatch": artifact_tenant_probe,
             },
-            "publication_after_refusals": second,
+            "publication_after_refusals": {"a": second_a, "b": second_b},
+            "synthetic_remote_metadata": False,
             "real_artifacts_touched": False,
         }
+
+    def drop_synthetic_manifests(self):
+        for manifest_id in self.synthetic_manifest_ids:
+            self.sql("DELETE FROM pando_manifest_artifacts WHERE manifest_id='" + manifest_id + "'")
+            self.sql("DELETE FROM pando_pack_manifests WHERE id='" + manifest_id + "'")
+            assert self.sql(
+                "SELECT count(*) FROM pando_manifest_artifacts WHERE manifest_id='"
+                + manifest_id + "'"
+            ) == "0"
+            assert self.sql(
+                "SELECT count(*) FROM pando_pack_manifests WHERE id='" + manifest_id + "'"
+            ) == "0"
+        self.synthetic_manifest_ids = []
 
     def cleanup(self):
         try:
             if self.schema_created:
-                for manifest_id in self.synthetic_manifest_ids:
-                    self.sql(
-                        "DELETE FROM pando_manifest_artifacts WHERE manifest_id='"
-                        + manifest_id + "'"
-                    )
-                    self.sql("DELETE FROM pando_pack_manifests WHERE id='" + manifest_id + "'")
-                for path in self.synthetic_artifact_paths:
-                    self.sql(
-                        "DELETE FROM pando_remote_artifacts WHERE remote_path='" + path + "'"
-                    )
+                self.drop_synthetic_manifests()
         finally:
             self.synthetic_manifest_ids = []
-            self.synthetic_artifact_paths = []
             super().cleanup()
 
 
@@ -561,7 +668,8 @@ def main():
         "required_environment": list(REQUIRED_ENV),
         "not_tested": [
             "Dirty pre-upgrade refusal on a schema133 database containing inconsistent "
-            "identity pairs (fixed count-only abort) is not exercised here.",
+            "identity pairs is proved by tests/storage_identity_upgrade.py, a separate "
+            "native entry point; this script never runs a legacy binary.",
             "Backup format/catalog gates and legacy schema133 restore are coordinator-owned "
             "follow-ups; this branch makes no backup gate claim.",
         ],
