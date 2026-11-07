@@ -321,7 +321,7 @@ const RETAINED_LINK: &str = "EXISTS (SELECT 1 FROM pando_manifest_artifacts l \
        OR EXISTS (SELECT 1 FROM pando_publication_fences p \
                   WHERE p.authority_id=a.authority_id AND p.tenant_id=a.tenant_id \
                     AND p.namespace=a.namespace AND p.sha256=a.sha256 \
-                    AND p.lease_until>clock_timestamp()))";
+                    AND p.lease_until>clock_timestamp())))";
 
 async fn mark_unreachable(
     state: &std::sync::Arc<AppState>,
@@ -629,6 +629,12 @@ async fn repack(
         "Pando pack-set authority changed during compaction"
     );
     ensure!(!cancel.is_cancelled(), "maintenance lease lost before Pando pack-set CAS");
+    if !crate::pando_gateway::retention::verify_publication_ready(&*tx, manifest.id)
+        .await
+        .map_err(|error| anyhow::anyhow!("publication fence proof failed: {error:#}"))?
+    {
+        bail!("compacted pack publication fence expired or artifacts are not active; republish");
+    }
     let new_packs = vec![manifest.id];
     let changed = tx
         .execute(
@@ -646,6 +652,7 @@ async fn repack(
         )
         .await?;
     ensure!(changed == 1, "Pando pack-set CAS was superseded");
+    tx.execute("DELETE FROM pando_publication_fences WHERE manifest_id=$1", &[&manifest.id]).await?;
     ensure!(!cancel.is_cancelled(), "maintenance lease lost before Pando pack-set commit");
     let state_updated = tx
         .execute(

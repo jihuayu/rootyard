@@ -12,11 +12,22 @@ become deletion candidates:
 - marking retires an active artifact only when **no** link belongs to any
   serving `pando_repository_states.pack_ids` and no owning repository is in a
   non-stable/non-Pando transition;
+- `pando_publication_fences` is a durable pending-publication root: it is
+  written atomically with each reservation, renewed in the activation
+  transaction after all four remote objects pass read-back verification, and
+  removed only by the serving `pack_ids` CAS. Marking and deletion treat any
+  nonexpired fence as a retention root, so a publisher paused past its lease is
+  fenced rather than deleted;
+- the serving CAS verifies, with row locks in that same transaction, that all
+  four linked artifact rows are `active` and their publication fences are
+  nonexpired. Any expired/retired/deleting/missing artifact fails the CAS so the
+  caller must republish a fresh generation;
 - deletion claims use owner + claim generation + lease, re-prove the absence of
-  serving/transition links immediately before `DELETE`, and finalize with a
-  claim-generation CAS. Resurrecting a retired content address bumps the
-  authority generation onto a fresh path, so a stale deleter can only remove
-  abandoned bytes and never a newly acknowledged object.
+  serving/transition/fence references immediately before `DELETE`, and finalize
+  with a claim-generation CAS. Expired `deleting` claims are retried with a new
+  claim generation. Resurrecting a retired content address bumps the authority
+  generation onto a fresh path, so a stale deleter can only remove abandoned
+  bytes and never a newly acknowledged object.
 
 ## Supported backup contract
 

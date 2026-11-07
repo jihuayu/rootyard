@@ -89,7 +89,17 @@ async fn reserve<C: GenericClient + Sync>(
     if let Some(row) = &existing {
         let state: String = row.get(0);
         let object_generation: i64 = row.get(1);
-        if state == "active" {
+        let fence_live = match publication {
+            Some(manifest_id) => client
+                .query_opt(
+                    "SELECT lease_until>clock_timestamp() FROM pando_publication_fences                      WHERE manifest_id=$1 AND namespace=$2 AND sha256=$3",
+                    &[&manifest_id, &namespace, &sha256],
+                )
+                .await?
+                .map(|row| row.get::<_, bool>(0)),
+            None => None,
+        };
+        if state == "active" && fence_live != Some(false) {
             if let Some(manifest_id) = publication {
                 fence_publication(client, manifest_id, authority_id, tenant_id, namespace, sha256).await?;
             }
@@ -287,6 +297,32 @@ pub async fn reset_authority(client: &mut tokio_postgres::Client) -> Result<Auth
     .await?;
     tx.commit().await?;
     authority(client).await
+}
+
+/// Extend the durable pending-publication lease after every remote object of a
+/// publication has been verified/activated. Called inside the activation tx.
+pub async fn renew_publication<C: GenericClient + Sync>(client: &C, manifest_id: Uuid) -> Result<()> {
+    client
+        .execute(
+            "UPDATE pando_publication_fences              SET lease_until=clock_timestamp()+make_interval(secs=>($2::bigint)::double precision)              WHERE manifest_id=$1",
+            &[&manifest_id, &PENDING_PUBLICATION_SECONDS],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Serving-CAS proof: lock the registered artifact rows and their publication
+/// fences, and require all four to be active with a nonexpired pending lease.
+/// An expired/retired/deleting/missing object fails closed so the caller must
+/// republish a fresh generation instead of acknowledging a deletable path.
+pub async fn verify_publication_ready<C: GenericClient + Sync>(client: &C, manifest_id: Uuid) -> Result<bool> {
+    let rows = client
+        .query(
+            "SELECT 1 FROM pando_manifest_artifacts l              JOIN pando_remote_artifacts a ON a.authority_id=l.authority_id                AND a.tenant_id=l.tenant_id AND a.namespace=l.namespace AND a.sha256=l.sha256              JOIN pando_publication_fences p ON p.manifest_id=l.manifest_id                AND p.authority_id=l.authority_id AND p.tenant_id=l.tenant_id                AND p.namespace=l.namespace AND p.sha256=l.sha256              WHERE l.manifest_id=$1 AND a.state='active' AND p.lease_until>clock_timestamp()              FOR SHARE OF a,p",
+            &[&manifest_id],
+        )
+        .await?;
+    Ok(rows.len() == 4)
 }
 
 #[derive(Debug, Serialize)]

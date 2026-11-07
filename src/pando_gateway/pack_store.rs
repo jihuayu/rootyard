@@ -335,6 +335,11 @@ impl PackStore {
             if !active {
                 continue;
             }
+            // All four remote objects passed read-back verification and are
+            // active: extend the pending-publication lease before the manifest
+            // row is acknowledged. A publisher paused past the old lease must
+            // still fail serving-CAS proof later rather than get a free pass.
+            retention::renew_publication(&*tx, manifest.id).await?;
             Self::insert_ready_manifest_in(&*tx, &manifest).await?;
             retention::record_manifest(&*tx, &manifest, authority.id).await?;
             tx.commit().await?;

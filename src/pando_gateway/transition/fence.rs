@@ -188,6 +188,9 @@ pub(super) async fn complete_cutover(
         .map_err(Error::internal)?
         .get(0);
     journal::ensure_sequence_at_least(&state.storage.root, repo.id, journal_floor).map_err(Error::internal)?;
+    if !crate::pando_gateway::retention::verify_publication_ready(&*tx, pack.id).await.map_err(Error::internal)? {
+        return Err(conflict());
+    }
     let names: Vec<String> = refs.keys().cloned().collect();
     tx.execute(
         "INSERT INTO pando_repository_states         (repository_id,tenant_id,storage_generation,ref_generation,object_format,state,pack_ids,head_ref,operation_sequence)         VALUES($1,$2,$3,1,$4,'serving',ARRAY[$5]::uuid[],$6,$7)         ON CONFLICT(repository_id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id,         storage_generation=EXCLUDED.storage_generation,ref_generation=1,         object_format=EXCLUDED.object_format,state='serving',pack_ids=EXCLUDED.pack_ids,         head_ref=EXCLUDED.head_ref,operation_sequence=EXCLUDED.operation_sequence,         updated_at=clock_timestamp()",

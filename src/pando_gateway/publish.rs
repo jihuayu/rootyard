@@ -178,6 +178,9 @@ pub async fn publish(
         if row.get::<_, serde_json::Value>(0) != serde_json::to_value(pack).map_err(Error::internal)? {
             return Err(conflict());
         }
+        if !crate::pando_gateway::retention::verify_publication_ready(&*tx, pack.id).await.map_err(Error::internal)? {
+            return Err(conflict());
+        }
         pack_ids.push(pack.id);
         // Serving CAS: the publication fence ends exactly when the pack becomes
         // part of the authoritative serving set.

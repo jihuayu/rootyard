@@ -232,6 +232,45 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
         )
         .await
         .unwrap();
+    let policy = Policy {
+        enabled: true,
+        poll: Duration::from_secs(1),
+        lease_seconds: 5,
+        loose_threshold: 1,
+        pack_threshold: 2,
+        stage_age_seconds: 1,
+        cache_max_age_seconds: 60,
+        tombstone_grace_seconds: 1,
+        scan_period_seconds: 1,
+        quiescence_seconds: 1,
+        max_attempts: 3,
+    };
+    // While the publication is still pending (not in pack_ids) a mark pass must
+    // retain every one of its four artifacts because of the durable fence.
+    jobs::enqueue(&pool, repo, owner, 1, "pando_unreachable_mark").await.unwrap();
+    drain(&state, &policy).await;
+    let fenced_active: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pando_remote_artifacts a JOIN pando_manifest_artifacts l              ON l.authority_id=a.authority_id AND l.tenant_id=a.tenant_id                AND l.namespace=a.namespace AND l.sha256=a.sha256              WHERE l.manifest_id=$1 AND a.state='active'",
+            &[&extra.id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(fenced_active, 4, "live pending publication was marked for deletion");
+    client
+        .execute(
+            "UPDATE pando_publication_fences SET lease_until=clock_timestamp()-interval '1 second' WHERE manifest_id=$1",
+            &[&extra.id],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !retention::verify_publication_ready(&**client, extra.id).await.unwrap(),
+        "expired publication fence passed serving-CAS proof"
+    );
+    retention::renew_publication(&**client, extra.id).await.unwrap();
+    assert!(retention::verify_publication_ready(&**client, extra.id).await.unwrap());
     client.execute("DELETE FROM pando_publication_fences WHERE manifest_id=$1", &[&extra.id]).await.unwrap();
     let before_packs: i32 = client
         .query_one("SELECT cardinality(pack_ids) FROM pando_repository_states WHERE repository_id=$1", &[&repo])
@@ -259,19 +298,6 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
     assert!(backed_up_old_cipher.is_file(), "backup did not copy the old pack ciphertext");
     backup_tx.commit().await.unwrap();
 
-    let policy = Policy {
-        enabled: true,
-        poll: Duration::from_secs(1),
-        lease_seconds: 5,
-        loose_threshold: 1,
-        pack_threshold: 2,
-        stage_age_seconds: 1,
-        cache_max_age_seconds: 60,
-        tombstone_grace_seconds: 1,
-        scan_period_seconds: 1,
-        quiescence_seconds: 1,
-        max_attempts: 3,
-    };
     let scheduled = scheduler::schedule_once(&state, &policy).await.unwrap();
     assert!(scheduled >= 2, "automatic Pando threshold did not schedule work: {scheduled}");
     assert!(
@@ -462,7 +488,7 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
     let old_manifest: PackManifest = {
         let value: serde_json::Value = client
             .query_one(
-                "SELECT manifest FROM pando_pack_manifests WHERE repository_id=$1 AND NOT (id = ANY($2::uuid[])) ORDER BY created_at LIMIT 1",
+                "SELECT m.manifest FROM pando_pack_manifests m                  WHERE m.repository_id=$1 AND NOT (m.id = ANY($2::uuid[]))                    AND EXISTS (SELECT 1 FROM pando_manifest_artifacts l                      JOIN pando_remote_artifacts a ON a.authority_id=l.authority_id                        AND a.tenant_id=l.tenant_id AND a.namespace=l.namespace AND a.sha256=l.sha256                      WHERE l.manifest_id=m.id AND a.state='retired')                  ORDER BY m.created_at LIMIT 1",
                 &[&repo, &after_packs],
             )
             .await
@@ -472,7 +498,7 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
     };
     let old_row = client
         .query_one(
-            "SELECT authority_id,object_generation,remote_path,claim_generation FROM pando_remote_artifacts              WHERE tenant_id=$1 AND namespace='pando-cipher' AND sha256=$2",
+            "SELECT authority_id,object_generation,remote_path,claim_generation FROM pando_remote_artifacts              WHERE tenant_id=$1 AND namespace='pando-cipher' AND sha256=$2 AND state='retired'",
             &[&owner, &old_manifest.pack.ciphertext_sha256],
         )
         .await
@@ -612,5 +638,64 @@ async fn automatic_pando_compaction_preserves_all_packed_objects() {
     assert!(remote.head(&legacy_key, deadline()).await.unwrap().is_some(), "legacy object was deleted");
     assert!(backed_up_old_cipher.is_file(), "paired backup bytes changed during remote GC");
     unsafe { std::env::remove_var("ROOTYARD_PANDO_REMOTE_DELETE") };
+    let late_oid = hash_object(&git, &bare, b"late publisher resumed after lease loss\n");
+    let late_pack = pack_one(&git, &bare, &late_oid);
+    let late = Box::pin(store.publish(
+        &pool,
+        repo,
+        owner,
+        1,
+        "sha1",
+        &late_pack,
+        &late_pack.with_extension("idx"),
+        deadline(),
+    ))
+    .await
+    .unwrap();
+    client
+        .execute(
+            "UPDATE pando_publication_fences SET lease_until=clock_timestamp()-interval '1 second' WHERE manifest_id=$1",
+            &[&late.id],
+        )
+        .await
+        .unwrap();
+    assert!(!retention::verify_publication_ready(&**client, late.id).await.unwrap());
+    let late_old: String = client
+        .query_one(
+            "SELECT a.remote_path FROM pando_remote_artifacts a JOIN pando_manifest_artifacts l              ON l.authority_id=a.authority_id AND l.tenant_id=a.tenant_id                AND l.namespace=a.namespace AND l.sha256=a.sha256              WHERE l.manifest_id=$1 AND l.artifact_role='pack-cipher'",
+            &[&late.id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let (late_slot, _late_envelope) = {
+        let mut c = pool.get().await.unwrap();
+        let tx = c.transaction().await.unwrap();
+        let pair = retention::reserve_pair(
+            &*tx,
+            owner,
+            Some(late.id),
+            &late.pack.ciphertext_sha256,
+            &late.pack.envelope_sha256,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        pair
+    };
+    assert_ne!(late_slot.key().path(), late_old, "expired publication reused a deletable path");
+    assert!(
+        !retention::verify_publication_ready(&**client, late.id).await.unwrap(),
+        "un-uploaded re-reservation must not pass serving proof"
+    );
+    let late_state: String = client
+        .query_one(
+            "SELECT a.state FROM pando_remote_artifacts a JOIN pando_manifest_artifacts l              ON l.authority_id=a.authority_id AND l.tenant_id=a.tenant_id                AND l.namespace=a.namespace AND l.sha256=a.sha256              WHERE l.manifest_id=$1 AND l.artifact_role='pack-cipher'",
+            &[&late.id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(late_state, "reserved", "expired publication did not require re-reservation");
     eprintln!("pando maintenance fixture: compaction/cache/backup/delete/resurrection acceptance complete");
 }
