@@ -79,10 +79,21 @@ def drain_deliveries(worker, query, keys, rounds=120):
     return processed
 
 
-def ref_count(git_dir):
-    result = subprocess.run(["git", f"--git-dir={git_dir}", "for-each-ref", "--format=%(refname)"],
+def ref_map(git_dir):
+    """Exact refname -> object id map for one repository."""
+    result = subprocess.run(["git", f"--git-dir={git_dir}", "for-each-ref",
+                             "--format=%(refname) %(objectname)"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-    return len(result.stdout.decode().split())
+    refs = {}
+    for line in result.stdout.decode().splitlines():
+        name, _, oid = line.partition(" ")
+        if name:
+            refs[name] = oid
+    return refs
+
+
+def ref_count(git_dir):
+    return len(ref_map(git_dir))
 
 
 def main():
@@ -488,7 +499,10 @@ def main():
         pre_backup_counts = count_rows(h)
         pre_backup_pending = pending_keys(h.sql)
         assert pre_backup_pending, "no durable delivery backlog before the backup boundary"
-        pre_backup_refs = ref_count(git_dir)
+        pre_backup_refs_map = ref_map(git_dir)
+        pre_backup_refs = len(pre_backup_refs_map)
+        pre_backup_main = pre_backup_refs_map.get("refs/heads/main")
+        assert pre_backup_main, f"pre-backup refs/heads/main missing: {sorted(pre_backup_refs_map)}"
         pre_backup_oids = [item["oid"] for item in acked] + [post_oid, dcs_oid]
         pre_backup_authority = h.sql("SELECT incarnation::text FROM cluster_authority WHERE singleton=true")
         h.stop()
@@ -507,7 +521,18 @@ def main():
         h.start()
         post_backup_oid, _ = push_commit("write after backup boundary", "after-boundary.txt")
         h.stop()
-        assert ref_count(git_dir) == pre_backup_refs + 1
+        post_boundary_refs = ref_map(git_dir)
+        changed_refs = {ref for ref in set(pre_backup_refs_map) | set(post_boundary_refs)
+                        if pre_backup_refs_map.get(ref) != post_boundary_refs.get(ref)}
+        assert changed_refs == {"refs/heads/main"}, (
+            f"post-boundary acknowledged write must only advance refs/heads/main: {changed_refs}")
+        assert post_boundary_refs["refs/heads/main"] == post_backup_oid
+        post_boundary_parent = h.git("--git-dir=" + git_dir, "rev-parse", post_backup_oid + "^")
+        assert post_boundary_parent.stdout.decode().strip() == pre_backup_main, (
+            "post-boundary commit does not extend the pre-backup acknowledged tip")
+        assert len(post_boundary_refs) == pre_backup_refs, (
+            "a committing write must not change the number of refs: "
+            f"{pre_backup_refs} -> {len(post_boundary_refs)}")
 
         # Fresh, unused PostgreSQL 17 deployment for the restored authority.
         restored_pg_dir = root / "restored-pg"
@@ -574,6 +599,12 @@ def main():
         assert restored_sql("SELECT incarnation::text FROM cluster_authority WHERE singleton=true") != \
             pre_backup_authority
         restored_repo = restored_data / "repos" / (h.repo["id"] + ".git")
+        restored_refs_map = ref_map(str(restored_repo))
+        assert restored_refs_map == pre_backup_refs_map, (
+            "restored ref/OID map differs from the pre-backup closure: "
+            f"source={sorted(pre_backup_refs_map.items())} restored={sorted(restored_refs_map.items())}")
+        assert post_backup_oid not in set(restored_refs_map.values()), (
+            "post-boundary acknowledged OID is reachable from a restored ref")
         assert ref_count(str(restored_repo)) == pre_backup_refs
         subprocess.run(["git", f"--git-dir={restored_repo}", "fsck", "--full", "--strict"],
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -637,6 +668,12 @@ def main():
             "restore_seconds": round(restore_seconds, 2),
             "source_counts": pre_backup_counts, "restored_counts": restored_counts,
             "source_refs": pre_backup_refs, "restored_refs": ref_count(str(restored_repo)),
+            "source_ref_map": pre_backup_refs_map, "restored_ref_map": restored_refs_map,
+            "restored_ref_map_equals_source": restored_refs_map == pre_backup_refs_map,
+            "post_boundary_ref_change": {"ref": "refs/heads/main",
+                                         "before": pre_backup_main, "after": post_backup_oid,
+                                         "parent": pre_backup_main,
+                                         "ref_count_unchanged": len(post_boundary_refs) == pre_backup_refs},
             "retained_acknowledged_oids": pre_backup_oids,
             "post_boundary_oid_intentionally_absent": post_backup_oid,
             "delegation_authority_rotated_before_ingress": True,
