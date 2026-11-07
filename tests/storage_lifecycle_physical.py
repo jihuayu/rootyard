@@ -23,6 +23,124 @@ class PhysicalHarness(LifecycleHarness):
         super().__init__(args)
         self.env["ROOTYARD_STORAGE_TOMBSTONE_GRACE_SECONDS"]="2"
 
+    @staticmethod
+    def _bounded(text,limit=6000):
+        text=str(text)
+        return text if len(text)<=limit else text[:limit]+"\n...[snapshot truncated]"
+
+    def failure_snapshot(self):
+        """Bounded diagnostic facts captured before cleanup drops the schema.
+
+        Only scheduling/retention state is read: never environment variables,
+        DSNs, tokens or passwords. Every section is length-capped so a broken
+        case cannot turn the report into an unbounded database or log dump.
+        """
+        if not getattr(self,"schema_created",False) or not hasattr(self,"alice"):
+            return {"available":False,"reason":"fixture schema was not created"}
+        try:
+            owner=str(uuid.UUID(self.alice["user_id"]))
+            row=self.sql("SELECT id,name FROM repositories WHERE owner_id='"+owner
+                         +"' ORDER BY (name='physical') DESC,created_at DESC LIMIT 1")
+        except Exception as error:
+            return {"available":False,"error":self.redact(f"{type(error).__name__}: {error}")[:1000]}
+        if not row:
+            return {"available":False,"reason":"fixture repository row not found"}
+        repo_id,repo_name=(row.split("|",1)+[""])[:2]
+        snapshot={"available":True,"repository_id":repo_id,"repository_name":repo_name}
+        queries={
+            "repository":
+                "SELECT state,storage_backend,storage_generation::text,gc_epoch::text,"
+                "COALESCE(gc_owner::text,''),COALESCE(gc_job_id::text,''),"
+                "COALESCE(gc_lease_until::text,''),COALESCE(gc_fence_started_at::text,''),"
+                "COALESCE(gc_quiesced_at::text,'') FROM repositories WHERE id='"+repo_id+"'",
+            "maintenance_repo_state":
+                "SELECT COALESCE(last_scan_at::text,''),COALESCE(last_scan_generation::text,''),"
+                "loose_count,pack_count,COALESCE(last_repack_at::text,''),last_scan::text "
+                "FROM storage_maintenance_repo_state WHERE repository_id='"+repo_id+"'",
+            "tombstones":
+                "SELECT oid,object_kind,state,attempts,repository_generation::text,"
+                "delete_after::text,marked_at::text,COALESCE(deleted_at::text,''),"
+                "COALESCE(last_error,''),"
+                "round(EXTRACT(EPOCH FROM (clock_timestamp()-delete_after))::numeric,3)::text,"
+                "round(EXTRACT(EPOCH FROM (clock_timestamp()-marked_at))::numeric,3)::text "
+                "FROM storage_maintenance_tombstones WHERE repository_id='"+repo_id+"' "
+                "ORDER BY marked_at,oid LIMIT 60",
+            "jobs":
+                "SELECT id,kind,state,attempt,claim_generation,COALESCE(lease_owner::text,''),"
+                "COALESCE(lease_until::text,''),not_before::text,created_at::text,"
+                "COALESCE(completed_at::text,''),COALESCE(last_error,''),"
+                "COALESCE(result::text,''),COALESCE(progress::text,''),"
+                "round(EXTRACT(EPOCH FROM (clock_timestamp()-not_before))::numeric,3)::text "
+                "FROM storage_maintenance_jobs WHERE repository_id='"+repo_id+"' "
+                "ORDER BY created_at DESC,id LIMIT 40",
+            "ref_projection":
+                "SELECT ref_name,COALESCE(oid::text,''),deleted::text,updated_at::text "
+                "FROM repository_ref_projection WHERE repository_id='"+repo_id+"' "
+                "AND (ref_name LIKE '%temporary%' OR ref_name='refs/heads/main') "
+                "ORDER BY ref_name LIMIT 20",
+            "outbox_deliveries":
+                "SELECT e.ref_name,d.consumer,d.state,count(*)::text "
+                "FROM outbox_events e LEFT JOIN event_deliveries d USING(event_id) "
+                "WHERE e.repository_id='"+repo_id+"' AND e.ref_name LIKE '%temporary%' "
+                "GROUP BY e.ref_name,d.consumer,d.state ORDER BY 1,2,3 LIMIT 20",
+        }
+        for name,query in queries.items():
+            try:
+                snapshot[name]=self._bounded(self.sql(query))
+            except Exception as error:
+                snapshot[name]="query failed: "+self.redact(f"{type(error).__name__}: {error}")[:800]
+        bare=self.root/"data"/"repos"/(repo_id+".git")
+        native={"bare_exists":bare.is_dir()}
+        try:
+            if bare.is_dir():
+                refs=self.git("--git-dir",str(bare),"for-each-ref",
+                              "--format=%(refname) %(objectname)","refs/rootyard-ci",check=False)
+                native["ci_keep_refs"]=self._bounded(refs.stdout.decode(errors="replace"),2000)
+                fsck=self.git("--git-dir",str(bare),"fsck","--unreachable","--no-progress",check=False)
+                unreachable_text=fsck.stdout.decode(errors="replace")
+                unreachable=set()
+                for line in unreachable_text.splitlines():
+                    fields=line.split()
+                    if len(fields)>=3 and fields[0] in ("unreachable","dangling"):
+                        unreachable.add(fields[2])
+                native["fsck_unreachable"]=self._bounded(unreachable_text,4000)
+                pending=self.sql("SELECT oid FROM storage_maintenance_tombstones WHERE repository_id='"
+                                 +repo_id+"' AND state='pending' ORDER BY marked_at,oid LIMIT 20")
+                native["pending_objects"]=[
+                    {"oid":oid,
+                     "loose_file":(bare/"objects"/oid[:2]/oid[2:]).is_file(),
+                     "cat_file_present":self.git("--git-dir",str(bare),"cat-file","-e",oid,
+                                                 check=False).returncode==0,
+                     "fsck_unreachable":oid in unreachable}
+                    for oid in pending.splitlines() if oid]
+        except Exception as error:
+            native["error"]=self.redact(f"{type(error).__name__}: {error}")[:1000]
+        snapshot["native"]=native
+        try:
+            if self.log is not None:
+                self.log.flush()
+            log_path=self.root/"server.log"
+            if log_path.is_file():
+                snapshot["server_log_tail"]=self.redact(
+                    log_path.read_bytes()[-4000:].decode(errors="replace"))
+        except Exception as error:
+            snapshot["server_log_tail"]="read failed: "+self.redact(f"{type(error).__name__}: {error}")[:500]
+        return json.loads(self.redact(json.dumps(snapshot)))
+
+    def case(self,name,fn):
+        start=time.monotonic()
+        try:
+            detail=fn()
+            self.results.append(dict(name=name,status="passed",
+                seconds=round(time.monotonic()-start,4),detail=detail))
+        except Exception as error:
+            snapshot=self.failure_snapshot()
+            self.results.append(dict(name=name,status="failed",
+                seconds=round(time.monotonic()-start,4),error=self.redact(error),
+                failure_snapshot=snapshot))
+            raise
+        print(name+": passed",flush=True)
+
     def new_repo(self,name):
         repo=json.loads(self.expect("/api/repos",201,token=self.alice,
             method="POST",body={"name":name}))
