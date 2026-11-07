@@ -298,7 +298,7 @@ pub async fn migrate_repository(
         )
         .await
         .map_err(Error::internal)?;
-    let mut op_state = if let Some(row) = prior {
+    if let Some(row) = prior {
         let prior_repo: Uuid = tx
             .query_one("SELECT repository_id FROM shard_replication_operations WHERE id=$1", &[&operation_id])
             .await
@@ -320,7 +320,6 @@ pub async fn migrate_repository(
         if matches!(state.as_str(), "completed" | "aborted") {
             return Err(conflict("replication operation is already terminal"));
         }
-        state
     } else {
         if route.draining {
             return Err(conflict("repository is drained by another migration"));
@@ -339,19 +338,14 @@ pub async fn migrate_repository(
         )
         .await
         .map_err(Error::internal)?;
-        "copying".to_owned()
-    };
+    }
     finish(tx, &actor, true).await?;
 
     // Phase 1: an initial snapshot can be taken while clients keep writing.
     // Resume from a durable verified copy only when its recorded manifest is
     // present; otherwise replace the standby with a fresh measured snapshot.
     let mut base = replication::read_base(&state, operation_id, access.repo_id)?;
-    let (op_digest, _) = {
-        let (state_name, digest, _) = operation_state(&state, access.repo_id, operation_id).await?;
-        op_state = state_name;
-        (digest, ())
-    };
+    let (op_state, op_digest, _) = operation_state(&state, access.repo_id, operation_id).await?;
     let initial_done = !input.replicate_only
         && op_state == "verified"
         && base.as_ref().is_some_and(|base| {
@@ -405,9 +399,8 @@ pub async fn migrate_repository(
         base = Some(snapshot);
     }
     let base = base.ok_or_else(|| conflict("source snapshot manifest is missing"))?;
-    let (state_name, digest, _sequence) = operation_state(&state, access.repo_id, operation_id).await?;
-    op_state = state_name;
-    if op_state != "verified" {
+    let (verified_state, digest, _sequence) = operation_state(&state, access.repo_id, operation_id).await?;
+    if verified_state != "verified" {
         return Err(conflict("target snapshot was not durably verified"));
     }
     if input.replicate_only {

@@ -1,0 +1,14 @@
+# Toolchain contract for local builds, `cargo fmt` and `cargo clippy`.
+#
+# `channel` pins the exact toolchain the recorded formatting/lint gates and the
+# acceptance evidence were produced with (rustc/cargo 1.99.1, rustfmt
+# 1.10.0-stable, clippy 0.1.99). CI installs the same numbered toolchain before
+# running the gates. Hosts that need bit-reproducible builds should mirror it.
+#
+# This is *not* the minimum supported Rust version: `rust-version` in Cargo.toml
+# is 1.88 because the crate uses edition-2024 let-chains. See
+# docs/development.md for both versions and how to check each one.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

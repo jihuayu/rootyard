@@ -73,7 +73,9 @@ fn require_bubblewrap() -> Result<(), Error> {
         return Ok(());
     }
     // Static, secret-free diagnostic: the API body stays generic on purpose.
-    eprintln!("rootyard: bubblewrap does not support --size; the sandbox runtime requires a bubblewrap that implements --size");
+    eprintln!(
+        "rootyard: bubblewrap does not support --size; the sandbox runtime requires a bubblewrap that implements --size"
+    );
     Err(Error::internal("sandbox runtime requires bubblewrap --size support"))
 }
 

@@ -5,7 +5,11 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Single-node Git hosting with PostgreSQL metadata and native Git storage"
-rust-version = "1.85"
+# Lowest Rust that can build this crate: edition 2024 let-chains are already
+# used in storage/sharding/workspace code, and dependencies declare at most
+# 1.85. The accepted gate toolchain is 1.99.1 (rust-toolchain.toml); see
+# docs/development.md for both versions and the reason they differ.
+rust-version = "1.88"
 
 [features]
 pando-lab = []

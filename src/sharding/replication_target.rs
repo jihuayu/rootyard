@@ -5,7 +5,7 @@ use crate::{
     AppState, Error, auth, db, journal,
     sharding::{
         faults,
-        models::{self, RepoShardRoute, conflict, json},
+        models::{self, conflict, json},
         replication::{self, FrameReader},
         router::load_or_init_repo_route,
         security::require_operator,
@@ -45,17 +45,16 @@ pub(crate) struct SnapshotReceipt {
     pub(crate) state: String,
 }
 
+/// Everything a receiver needs after the delegation envelope and the operation
+/// row have been validated: the target-side tenant/format that the staged CI
+/// sidecar must match, and the verified base digest a delta may be applied on.
+/// Placement, generation and actor checks are enforced here on the source's
+/// behalf and are not re-read by the transfer handlers.
 struct TransferAuth {
-    actor: db::Identity,
-    owner: String,
-    name: String,
     owner_id: Uuid,
     object_format: String,
-    generation: i64,
     op_state: String,
     op_digest: Option<String>,
-    op_sequence: Option<i64>,
-    route: RepoShardRoute,
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -142,7 +141,7 @@ async fn authorize_transfer(
     auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Admin).await?;
     let op = tx
         .query_opt(
-            "SELECT source_node_id,target_node_id,source_route_epoch,source_generation,state,refs_sha256,journal_sequence \
+            "SELECT source_node_id,target_node_id,source_route_epoch,source_generation,state,refs_sha256 \
              FROM shard_replication_operations WHERE id=$1 AND repository_id=$2",
             &[&op_id, &repo_id],
         )
@@ -155,7 +154,6 @@ async fn authorize_transfer(
     let source_generation: i64 = op.get(3);
     let op_state: String = op.get(4);
     let op_digest: Option<String> = op.get(5);
-    let op_sequence: Option<i64> = op.get(6);
     if target != env.target_node_id
         || epoch != env.route_epoch
         || source_generation != env.storage_generation
@@ -172,18 +170,7 @@ async fn authorize_transfer(
         return Err(conflict("source placement changed before snapshot transfer"));
     }
     tx.commit().await.map_err(Error::internal)?;
-    Ok(TransferAuth {
-        actor,
-        owner,
-        name,
-        owner_id,
-        object_format,
-        generation,
-        op_state,
-        op_digest,
-        op_sequence,
-        route,
-    })
+    Ok(TransferAuth { owner_id, object_format, op_state, op_digest })
 }
 
 async fn maximum_sequence(state: &AppState, repo_id: Uuid) -> Result<i64, Error> {

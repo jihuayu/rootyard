@@ -34,6 +34,7 @@ const POINTER_LEGACY_MEDIA: &str = "version http://git-media.io/v/2";
 ///   git-media http v/2 version line (no trailing space or tab);
 /// * LF or CRLF line terminators, optional final newline;
 /// * the legacy version line is mapped to canonical before parsing.
+///
 /// Anything else (trailing space/tab on the version line, reordered fields, or
 /// unsupported legacy schemes such as http git-lfs, https media or http
 /// hawser) is not pointer-shaped and remains ordinary content, matching the

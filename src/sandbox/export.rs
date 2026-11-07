@@ -207,8 +207,10 @@ fn mount_filesystem(target: &Path) -> Result<(String, u64), Error> {
         return Err(Error::internal(std::io::Error::last_os_error()));
     }
     let stat = unsafe { stat.assume_init() };
-    let block = if stat.f_frsize > 0 { stat.f_frsize } else { stat.f_bsize };
-    Ok((fstype, (stat.f_blocks as u64).saturating_mul(block as u64)))
+    // `statvfs` reports 64-bit `f_frsize`/`f_blocks` on the supported 64-bit
+    // Linux targets; 32-bit targets are not supported by this crate.
+    let block: u64 = if stat.f_frsize > 0 { stat.f_frsize } else { stat.f_bsize };
+    Ok((fstype, stat.f_blocks.saturating_mul(block)))
 }
 
 /// Validate the operator-provisioned export pool before any job starts. A

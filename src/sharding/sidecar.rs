@@ -446,6 +446,17 @@ pub(crate) fn write_progress(state: &AppState, bundle: &SidecarBundle) -> Result
     journal::atomic(&progress_path(state, bundle.operation_id)?, &bytes, true).map_err(Error::internal)
 }
 
+/// Decode a persisted progress record and prove it belongs to this exact
+/// operation and repository, so evidence written for another handoff can never
+/// be read as proof for this one.
+fn decode_progress(bytes: &[u8], operation_id: Uuid, repository_id: Uuid) -> Result<SidecarBundle, Error> {
+    let bundle: SidecarBundle = serde_json::from_slice(bytes).map_err(|_| conflict("corrupt CI sidecar progress"))?;
+    if bundle.repository_id != repository_id || bundle.operation_id != operation_id {
+        return Err(conflict("CI sidecar progress belongs to another operation"));
+    }
+    Ok(bundle)
+}
+
 pub(crate) fn read_progress(
     state: &AppState,
     operation_id: Uuid,
@@ -456,11 +467,7 @@ pub(crate) fn read_progress(
         return Ok(None);
     }
     let bytes = journal::read(&path).map_err(Error::internal)?;
-    let bundle: SidecarBundle = serde_json::from_slice(&bytes).map_err(|_| conflict("corrupt CI sidecar progress"))?;
-    if bundle.repository_id != repository_id || bundle.operation_id != operation_id {
-        return Err(conflict("CI sidecar progress belongs to another operation"));
-    }
-    Ok(Some(bundle))
+    decode_progress(&bytes, operation_id, repository_id).map(Some)
 }
 
 /// Validate and durably stage a transferred bundle. The live `ci-pins`
@@ -944,8 +951,19 @@ pub(crate) async fn finalize(
 ) -> Result<bool, Error> {
     let staged = staged_path(state, operation_id)?;
     if !safe_directory(&staged)? || !journal::exists(&staged.join("bundle.json")).map_err(Error::internal)? {
-        return verify_published_receipt(state, repo_id, operation_id, generation, expected_route, require_staged)
-            .await;
+        let published =
+            verify_published_receipt(state, repo_id, operation_id, generation, expected_route, require_staged)
+                .await?;
+        if !published {
+            // The progress record proves that a measured image was staged for
+            // this operation. With no staged directory and no publication
+            // receipt the handoff evidence was lost without a commit, so fail
+            // closed instead of reporting that there is nothing to publish.
+            if read_progress(state, operation_id, repo_id)?.is_some() {
+                return Err(conflict("staged CI sidecar image vanished before publication"));
+            }
+        }
+        return Ok(published);
     }
     let bundle: SidecarBundle =
         serde_json::from_slice(&journal::read(&staged.join("bundle.json")).map_err(Error::internal)?)
@@ -1026,10 +1044,9 @@ async fn reconcile_operation(state: &AppState, node_id: &str, operation: &Operat
         && operation.target_node_id == node_id
         && primary.as_deref() == Some(node_id)
         && generation == operation.source_generation + 1
+        && let Err(error) = finalize(state, operation.repository_id, operation.id, generation, None, false).await
     {
-        if let Err(error) = finalize(state, operation.repository_id, operation.id, generation, None, false).await {
-            eprintln!("rootyard: CI sidecar finalization for {} deferred: {}", operation.id, error.1);
-        }
+        eprintln!("rootyard: CI sidecar finalization for {} deferred: {}", operation.id, error.1);
     }
     Ok(())
 }
@@ -1136,4 +1153,58 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bundle(repo: Uuid, op: Uuid) -> SidecarBundle {
+        SidecarBundle {
+            version: SIDECAR_VERSION,
+            repository_id: repo,
+            operation_id: op,
+            source_generation: 3,
+            target_generation: 4,
+            refs_sha256: "a".repeat(64),
+            journal_sequence: 11,
+            files: vec![SidecarFile {
+                name: format!("{}.json", Uuid::new_v4()),
+                sha256: "b".repeat(64),
+                content: "{}".to_owned(),
+            }],
+            retained_refs: vec!["refs/rootyard-ci/snapshots/example".to_owned()],
+        }
+    }
+
+    #[test]
+    fn progress_record_round_trips_for_its_own_operation() {
+        let repo = Uuid::new_v4();
+        let op = Uuid::new_v4();
+        let bundle = bundle(repo, op);
+        let bytes = serde_json::to_vec(&bundle).unwrap();
+        assert_eq!(decode_progress(&bytes, op, repo).unwrap(), bundle);
+    }
+
+    #[test]
+    fn progress_record_for_another_operation_or_repository_is_rejected() {
+        let repo = Uuid::new_v4();
+        let op = Uuid::new_v4();
+        let bytes = serde_json::to_vec(&bundle(repo, op)).unwrap();
+        assert!(decode_progress(&bytes, Uuid::new_v4(), repo).is_err());
+        assert!(decode_progress(&bytes, op, Uuid::new_v4()).is_err());
+    }
+
+    #[test]
+    fn progress_record_with_unknown_or_missing_fields_is_rejected() {
+        let repo = Uuid::new_v4();
+        let op = Uuid::new_v4();
+        let mut value = serde_json::to_value(bundle(repo, op)).unwrap();
+        value["unexpected"] = serde_json::json!(true);
+        assert!(decode_progress(value.to_string().as_bytes(), op, repo).is_err());
+        let mut value = serde_json::to_value(bundle(repo, op)).unwrap();
+        value.as_object_mut().unwrap().remove("retained_refs");
+        assert!(decode_progress(value.to_string().as_bytes(), op, repo).is_err());
+        assert!(decode_progress(b"not json", op, repo).is_err());
+    }
 }

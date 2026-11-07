@@ -90,7 +90,7 @@ async fn web_auth_mode(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     session: Option<&str>,
-) -> Result<WebAuthMode, Response> {
+) -> Result<WebAuthMode, Box<Response>> {
     if !headers.contains_key(header::AUTHORIZATION) {
         return Ok(if session.is_some() {
             WebAuthMode::CookieOnly
@@ -111,14 +111,14 @@ async fn web_auth_mode(
         .pool
         .get()
         .await
-        .map_err(|_| Error::internal("database unavailable").into_response())?;
+        .map_err(|_| Box::new(Error::internal("database unavailable").into_response()))?;
     let row = client
         .query_opt(
             "SELECT kind FROM tokens WHERE digest=$1",
             &[&db::digest(&credential)],
         )
         .await
-        .map_err(|_| Error::internal("database unavailable").into_response())?;
+        .map_err(|_| Box::new(Error::internal("database unavailable").into_response()))?;
     let is_browser = row
         .as_ref()
         .is_some_and(|row| row.get::<_, String>(0) == "browser");
@@ -129,7 +129,7 @@ async fn web_auth_mode(
         // Browser credentials are only accepted through the HttpOnly session
         // cookie, where the middleware can bind them to the parent API token
         // and require CSRF for mutations.
-        return Err(Error::unauthorized().into_response());
+        return Err(Box::new(Error::unauthorized().into_response()));
     }
     // An explicit Authorization header wins over any stale browser cookie.
     // API tokens remain independent; malformed/unknown credentials fail in
@@ -369,15 +369,15 @@ async fn validate_session(
     state: &Arc<AppState>,
     secret: &str,
     csrf: Option<&str>,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let Some(parent) = session_parent(secret) else {
-        return Err(Error::unauthorized().into_response());
+        return Err(Box::new(Error::unauthorized().into_response()));
     };
     let client = state
         .pool
         .get()
         .await
-        .map_err(|_| Error::internal("database unavailable").into_response())?;
+        .map_err(|_| Box::new(Error::internal("database unavailable").into_response()))?;
     let row = client
         .query_opt(
             "SELECT s.csrf_digest FROM web_sessions s \
@@ -389,14 +389,14 @@ async fn validate_session(
             &[&db::digest(secret), &parent],
         )
         .await
-        .map_err(|_| Error::internal("database unavailable").into_response())?;
+        .map_err(|_| Box::new(Error::internal("database unavailable").into_response()))?;
     let Some(row) = row else {
-        return Err(Error::unauthorized().into_response());
+        return Err(Box::new(Error::unauthorized().into_response()));
     };
-    if let Some(csrf) = csrf {
-        if row.get::<_, Vec<u8>>(0) != db::digest(csrf) {
-            return Err(Error(StatusCode::FORBIDDEN, "CSRF token invalid").into_response());
-        }
+    if let Some(csrf) = csrf
+        && row.get::<_, Vec<u8>>(0) != db::digest(csrf)
+    {
+        return Err(Box::new(Error(StatusCode::FORBIDDEN, "CSRF token invalid").into_response()));
     }
     Ok(())
 }
@@ -419,7 +419,7 @@ pub async fn middleware(
 
     let auth_mode = match web_auth_mode(&state, &headers, session.as_deref()).await {
         Ok(mode) => mode,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let session_mode = matches!(
         auth_mode,
@@ -449,19 +449,18 @@ pub async fn middleware(
                 return Error(StatusCode::FORBIDDEN, "CSRF token required").into_response();
             };
             if let Err(response) = validate_session(&state, secret, Some(csrf)).await {
-                return response;
+                return *response;
             }
         }
-    } else if session_mode {
-        if let Some(secret) = session.as_deref() {
-            if let Err(response) = validate_session(&state, secret, None).await {
-                return if is_navigation {
-                    login_redirect(&path, query.as_deref(), &headers)
-                } else {
-                    response
-                };
-            }
-        }
+    } else if session_mode
+        && let Some(secret) = session.as_deref()
+        && let Err(response) = validate_session(&state, secret, None).await
+    {
+        return if is_navigation {
+            login_redirect(&path, query.as_deref(), &headers)
+        } else {
+            *response
+        };
     }
 
     let response = auth::web_scope(next.run(request)).await;

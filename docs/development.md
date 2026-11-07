@@ -1,15 +1,68 @@
 # Development and verification
 
-## Build
+## Toolchain, MSRV and gates
 
-Use Linux, stable Rust, Git >= 2.43, Python 3, the `psql`, `pg_dump` and `pg_restore` clients and PostgreSQL 17. Commit `Cargo.lock` for reproducible dependency resolution. Containers use moving official image tags; deployments needing reproducible base images should pin reviewed image digests.
+Use 64-bit Linux, Git >= 2.43, Python 3, the `psql`, `pg_dump` and `pg_restore`
+clients and PostgreSQL 17.
+
+Two different Rust versions matter and are deliberately kept apart:
+
+- **Minimum supported Rust (build floor): 1.88**, declared as
+  `rust-version = "1.88"` in `Cargo.toml`. That is the lowest toolchain that can
+  build the crate: edition 2024 plus the let-chains already used in
+  `src/storage`, `src/sharding` and `src/workspace_lab` (let-chains stabilize in
+  1.88). Dependencies declare at most 1.85, so the crate floor governs. Verify
+  the floor itself with `cargo +1.88.0 check --locked --lib`.
+- **Accepted gate toolchain: 1.99.1** (rustc 1.99.1, cargo 1.99.1, rustfmt
+  1.10.0-stable, clippy 0.1.99), pinned by `channel = "1.99.1"` in
+  `rust-toolchain.toml` and installed by the same numbered step in
+  `.github/workflows/ci.yml`. This is the "known good" version: the formatting,
+  lint and test gates below and the recorded acceptance evidence come from it.
+  A build with 1.88-1.99.0 is supported by the declared floor but is not the
+  gate version; pin 1.99.1 when reproducing gate results.
+
+`rust-toolchain.toml` pins `channel = "1.99.1"` with the `rustfmt` and `clippy`
+components, so a plain `cargo`/`rustfmt`/`cargo clippy` invocation inside this
+checkout resolves to the gate toolchain. Hosts must have that exact toolchain
+installed (`rustup toolchain install 1.99.1 --profile minimal --component
+rustfmt --component clippy`); an offline or packaged host that cannot install it
+will fail the toolchain override loudly rather than silently building the gates
+with a different compiler. If you must use another installed toolchain, select
+it explicitly (for example `cargo +1.88.0 check --locked --lib`) and treat its
+formatting/lint output as advisory, not as the gate result. CI installs the same
+numbered toolchain before running the gates.
+
+## Build and gate commands
+
+Commit `Cargo.lock` for reproducible dependency resolution. Containers use moving
+official image tags; deployments needing reproducible base images should pin
+reviewed image digests. Run the gates exactly as CI does:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --all-targets --features pando-lab -- -D warnings
 cargo test --locked --all-targets
 cargo build --locked
 ```
+
+`cargo fmt --all -- --check` and the `-D warnings` Clippy run are gates, not
+suggestions: a change that only passes after adding `#[allow(...)]` for a new
+diagnostic, or after lowering the declared `rust-version` so that MSRV-gated
+lints stay silent, is treated as a defect. Prefer fixing the code (for example
+boxing a large `Err` variant, using `std::io::Error::other`, deleting dead code)
+over suppressing the lint, and do not reformat unrelated modules just to make
+the diff uniform. `cargo fmt` uses the repository `rustfmt.toml`
+(`max_width = 120`, `use_small_heuristics = "Max"`); run it on the files you
+changed rather than across the whole tree while other work is in flight.
+
+Because `rust-version` is now truthfully 1.88, Clippy's MSRV-aware
+`collapsible_if` proposes let-chain rewrites for nested `if` sites that predate
+this rule. The current tree still contains those sites in modules whose owners
+are mid-change (`src/web/{handlers,models,sanitize}.rs`, `src/webhooks`,
+`src/workspaces`, `src/workspace_lab`, `src/browse`, `src/sandbox` and others),
+so a full `-D warnings` run is expected to report them until that migration
+lands. Do not silence them with `#[allow]` or by lowering `rust-version`; fix
+the files you own and leave the rest to a coordinated change.
 
 ## End-to-end tests
 
