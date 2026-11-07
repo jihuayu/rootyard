@@ -1,0 +1,239 @@
+{
+ "bundle": "round3/ha43-patroni-300c6c9",
+ "issues": [
+  43,
+  44
+ ],
+ "issue_state": "OPEN - bounded single-host reference profile evidence only; #43/#44 are not closed by this bundle",
+ "generated_at_utc": "2026-11-07T05:17:12+00:00",
+ "deployment_head": "ac54f7163561ad98fb83e4c5f45cd2e1f7151f74",
+ "branch": "codex/deepseek-round3-ops",
+ "worktree_clean_at_manifest": false,
+ "source": {
+  "compiled_production_source": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+  "production_inputs_sha256": "9e33859aad991589c57863af6f6b46fe42290071b3e271f90eda44f6d707feac",
+  "production_inputs_file_count": 329,
+  "production_inputs_identical_to_certified_compile": true,
+  "immutable_binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+  "current_tree_source_digest_reproduced": "9e33859aad991589c57863af6f6b46fe42290071b3e271f90eda44f6d707feac (329 files, recomputed with scratchops43 source_digest.py)",
+  "native_harness_commit_tests_cluster_patroni_native_py": "300c6c93cc054fbd723af2243a8f321307835cbc",
+  "deployment_support_commit_tests_ha_fixture_py_deployment_ha_render_py": "0223b244faf5f20f19956a61879420385e48dc4c",
+  "native_harness_sha256": {
+   "tests/cluster_patroni_native.py": "07c5265aa0f3ec7c7ccb963fea7648e5c0bd8ba8fd17d4f6ade3b81c10feb9e1",
+   "tests/ha_fixture.py": "ef14ad3ad05c827a2310c0b264b48de84be80adddf4b853e717fda48dff7bc7b",
+   "deployment/ha/render.py": "95dd01fbc9266c3c7e11fad526b9c94b6b6c608717c907fd4030c3da5822db4b"
+  }
+ },
+ "run": {
+  "measurement_kind": "native_execution",
+  "simulated_fields": false,
+  "kind": "native_external_patroni_etcd_haproxy_failover_and_restore",
+  "coordinator_state": "passed",
+  "coordinator_exit_code": 0,
+  "recorded_report_sha256": "43655b1a59fc49aeac2049010a9ed022c5832daf9db5d09a8f568680f9ad9dea",
+  "published_report_sha256": "43655b1a59fc49aeac2049010a9ed022c5832daf9db5d09a8f568680f9ad9dea",
+  "report_sha256_matches": true,
+  "topology": "one Linux host: 3 etcd members with mutual TLS, 3 Patroni-managed PostgreSQL 17 nodes with TLS/SCRAM and strict synchronous_mode, 1 HAProxy stable primary endpoint, 1 Rootyard server on the stable endpoint; no second physical host and no hardware watchdog",
+  "physical_scope": {
+   "hosts": 1,
+   "cross_host_failover": false,
+   "hardware_watchdog": false,
+   "production_certified": false,
+   "note": "same-host process scope only; production requires real fencing"
+  },
+  "backup_manifest_format": 8,
+  "backup_manifest_schema_versions": [
+   1,
+   2,
+   3,
+   6,
+   7,
+   8,
+   9,
+   20,
+   30,
+   40,
+   50,
+   60,
+   70,
+   72,
+   73,
+   74,
+   75,
+   80,
+   81,
+   82,
+   83,
+   84,
+   85,
+   86,
+   90,
+   91,
+   92,
+   93,
+   94,
+   95,
+   96,
+   97,
+   98,
+   105,
+   106,
+   107,
+   108,
+   109,
+   110,
+   111,
+   112,
+   113,
+   114,
+   115,
+   116,
+   120,
+   121,
+   125,
+   126,
+   127,
+   128,
+   129,
+   130,
+   131,
+   132
+  ],
+  "rto_ms": {
+   "read_ms": 18519.1,
+   "write_ms": 19896.9,
+   "rootyard_ready_ms": 18596.6
+  },
+  "rpo": {
+   "lost_acknowledged_commits_after_automatic_promotion": 0,
+   "acked_commits_verified": 6
+  }
+ },
+ "checks": {
+  "status_state_passed": true,
+  "report_exists_and_hash_matches_status": true,
+  "native_execution_not_simulated": true,
+  "binary_sha256_matches_report": true,
+  "all_329_production_inputs_equal_certified_compile": true,
+  "current_tree_reproduces_certified_production_input_digest": true,
+  "backup_format_8_schema_132_from_actual_manifest": true,
+  "automatic_promotion_without_manual_promote": true,
+  "zero_measured_acknowledged_promotion_loss": true,
+  "restore_intentionally_loses_one_post_backup_ack_oid": true,
+  "backup_authenticity_verified_false": true,
+  "single_physical_host_no_production_certification": true
+ },
+ "secret_scan": {
+  "method": "regex scan of every published text file for password assignments, passphrases, private-key blocks, API keys and non-placeholder bearer tokens",
+  "patterns": [
+   "password\\s*=\\s*<value>",
+   "passphrase",
+   "BEGIN ... PRIVATE KEY",
+   "api_key/api-key assignment",
+   "bearer <token>"
+  ],
+  "hits": 0,
+  "benign_flag_names_only": "report.json contains JSON flag names weak_password_rejected/shared_password_rejected; no credential values",
+  "no_private_key_or_credential_material_published": true
+ },
+ "published_exclusions": [
+  "no rootyard binary",
+  "no build archive/ZIP",
+  "no TLS CA/certificate/private key or PKI material",
+  "no env/config credential files",
+  "no backup sets or DB data directories",
+  "no raw service/PostgreSQL logs",
+  "no private backup contents"
+ ],
+ "files": {
+  "README.md": {
+   "sha256": "b93efae20e0df62cbbf1ec0116d090f7b9db387e60992a1ac9d3a4d1fa1978b6",
+   "bytes": 15494
+  },
+  "attempts/failed-579-pin-state-a8ea22e/native.log": {
+   "sha256": "f9615694737bc2e66f9748af23fe182909e3bc36b4ab4cbf1c5dde0ff8b091c2",
+   "bytes": 1232
+  },
+  "attempts/failed-579-pin-state-a8ea22e/source-equivalence.json": {
+   "sha256": "19ef834d198db3efb1a661b0bb3e7edbd1a6a2cf02a6c44a0c65763883ff3a7a",
+   "bytes": 626
+  },
+  "attempts/failed-579-pin-state-a8ea22e/status.json": {
+   "sha256": "6e3a2582761d29e990bc0aa024551590c20502ce03a918ef8b3d4bcbfbc29fd0",
+   "bytes": 1794
+  },
+  "attempts/pre-restored-git-identity-a36f32a3/native.log": {
+   "sha256": "f5da52cc6739ea6e73bb2f11061ace263d16e6d8451686e2ede3efeda9a51ce0",
+   "bytes": 1599
+  },
+  "attempts/pre-restored-git-identity-a36f32a3/source-equivalence.json": {
+   "sha256": "884ec6c4abd0a4ab140626cc7e8f686a82f8729f2d4f7c7677fb12ce3f472b4a",
+   "bytes": 626
+  },
+  "attempts/pre-restored-git-identity-a36f32a3/status.json": {
+   "sha256": "8e0cd80fe2783b2de05708adaaa205f0c41d88035f47464eee7d3f2225b48f49",
+   "bytes": 1794
+  },
+  "checkpoint-85/native.log": {
+   "sha256": "8d581577c18259a86fbcb8dfc7625c4cbd705154a28bd3a86912ab698ed1acd6",
+   "bytes": 211
+  },
+  "checkpoint-85/report.json": {
+   "sha256": "62f607a5d357ebf31cac7625d518cd181e6b8ed9142c8fdf0ebbdea648a8e2d6",
+   "bytes": 17355
+  },
+  "checkpoint-85/source-equivalence.json": {
+   "sha256": "a9b614f6c7db34dd0787f43e055f3447ea7c6564e2abe5c1c8f21c1e3d4b815d",
+   "bytes": 626
+  },
+  "checkpoint-85/status.json": {
+   "sha256": "da49a590bdf2ec8c9ab8a50ce89bfd556c16a3c99fbf7c4ca8190bf343808b99",
+   "bytes": 1881
+  },
+  "logs/coordinator-native.log": {
+   "sha256": "cad22c823e5b657ab7b5083e75be00ab752bb778fa69ae62691520bd5a0d4de8",
+   "bytes": 211
+  },
+  "production-inputs.json": {
+   "sha256": "5142b8fdf31484967b7b647414e697bfac78c3a58c4dd3b7e3bbda7cbd71283b",
+   "bytes": 32380
+  },
+  "report.json": {
+   "sha256": "43655b1a59fc49aeac2049010a9ed022c5832daf9db5d09a8f568680f9ad9dea",
+   "bytes": 17748
+  },
+  "source-equivalence.json": {
+   "sha256": "b7c8c7c612af0940325aa82c648890ed8e4c3ae9370605f668d2e133088bad3c",
+   "bytes": 626
+  },
+  "source-review.json": {
+   "sha256": "02ed9a093d2d31becc7a480f2537058327f981cb2f290c65c93bd220b40f6fa3",
+   "bytes": 5179
+  },
+  "source-review.md": {
+   "sha256": "6beb979e209c2a4d0c840d1aa82e849089ef857e945ee3a95ef6371b482bf42f",
+   "bytes": 3709
+  },
+  "status.json": {
+   "sha256": "3fb675166ab661604d0b6035e98ef62dbc10a96d82c43e755851c00f2123b432",
+   "bytes": 1880
+  }
+ },
+ "delivery": {
+  "pull_request": "https://github.com/jihuayu/rootyard/pull/62",
+  "issue_closure": "none; #43/#44/#26/#48 remain OPEN",
+  "content": "evidence + documentation only; no production, schema or test change"
+ },
+ "copy_normalization": {
+  "attempts/pre-restored-git-identity-a36f32a3/native.log": {
+   "upstream_scratch_sha256": "3bd0c36c3b160329ee27c6ad536428f27d640f94d8cd0d4e689fe92e7bc986a9",
+   "published_sha256": "f5da52cc6739ea6e73bb2f11061ace263d16e6d8451686e2ede3efeda9a51ce0",
+   "normalization": "one trailing blank line removed so git diff --check is clean"
+  },
+  "source-review.md": {
+   "upstream_scratch_sha256": "1621f36393e7e70f21ecf9b0d0cb81e371ae7d934f1013f7cebc64458af61acb",
+   "published_sha256": "6beb979e209c2a4d0c840d1aa82e849089ef857e945ee3a95ef6371b482bf42f",
+   "normalization": "one trailing blank line removed so git diff --check is clean"
+  }
+ }
+}

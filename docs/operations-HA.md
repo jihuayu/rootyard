@@ -6,6 +6,8 @@ stack (Patroni + etcd + HAProxy), not a custom in-process consensus protocol,
 and it is not certified for production on the local virtual machine used for
 the acceptance run (no hardware watchdog, one physical host).
 
+Round-3 acceptance (current result, still bounded): the composed round-3 source `1061a8e` with HA harness `300c6c9` passed this profile natively on one host — automatic Patroni promotion after killing the whole old leader, unchanged Rootyard PID, 0 measured acknowledged-commit loss on promotion, 2-of-3 etcd quorum loss with all PostgreSQL roles refusing writes, and an offline format-8/schema-132 restore. Numbers and the failed-attempt ledger: [`evidence/round3/ha43-patroni-300c6c9/`](../evidence/round3/ha43-patroni-300c6c9/README.md); summary: [`acceptance/round3-ha43.md`](acceptance/round3-ha43.md). Issues #43/#44 remain **OPEN**: single physical host only, no cross-host fencing, hardware watchdog arming, power-loss or HAProxy HA.
+
 ## Roles and components
 
 | Component | Reference implementation | Evidence in this repository |
@@ -178,7 +180,7 @@ exists for the restored authority until these offline checks pass:
 ### Backup format/schema compatibility (including Pando)
 
 The acceptance derives format and schema from the verified manifest instead of
-hardcoding them. The certified local binary produces format 7/schema 131 today.
+hardcoding them. The round-2 certified binary produced format 7/schema 131 (historical snapshot; round 3 has since exercised format 8/schema 132 — see the acceptance pointer above).
 A composed binary that produces Pando schema132/backup format8 must be recorded
 honestly from its own verified manifest and must pass the same gates: untouched
 `backup-verify`, exact ref/OID-map equality, pre-boundary ACK survival, absence
