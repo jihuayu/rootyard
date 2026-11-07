@@ -11,7 +11,10 @@ readers must receive the exact SHA-256 and size from overlapping responses.
 
 The same harness also covers:
 * a failed flight returning explicit failures to every waiter, followed by a
-  clean retry that issues exactly one new backend GET;
+  clean retry that issues exactly one new backend GET. Each failed response's
+  server X-Request-ID is correlated with a structured `remote_store` event in
+  the owned service log, including the fixed GET stage and controlled 502
+  status, without any credential, URL, query or header text;
 * client cancellation while hydration is gated: no partial final file appears,
   the detached hydration completes with correct bytes, no staging files survive,
   and a later cold read starts a fresh flight instead of reusing a stale map
@@ -29,6 +32,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -301,6 +305,48 @@ class HydrationHarness(LfsHarness):
     def _repo_dir(self):
         return Path(self.env["ROOTYARD_DATA_DIR"]) / "lfs" / self.repo["id"]
 
+    def _service_log_text(self):
+        return (self.root / "server.log").read_text(errors="replace")
+
+    def _wait_error_events(self, request_id, timeout=EVENT_TIMEOUT):
+        """Bounded read of the owned service log for one correlated event."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                text = self._service_log_text()
+            except FileNotFoundError:
+                time.sleep(0.05)
+                continue
+            matched = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (isinstance(event, dict) and event.get("event") == "rootyard_error"
+                        and event.get("request_id") == request_id):
+                    matched.append(event)
+            if matched:
+                return matched
+            time.sleep(0.05)
+        raise AssertionError(
+            "structured remote-store event for the failed hydration response was not written")
+
+    def _assert_remote_log_privacy(self):
+        text = self._service_log_text()
+        assert self.alice["token"] not in text, "service log leaked the request token"
+        for key in ("ROOTYARD_OBJECT_STORE_ACCESS_KEY", "ROOTYARD_OBJECT_STORE_SECRET_KEY",
+                    "ROOTYARD_OBJECT_STORE_SESSION_TOKEN", "ROOTYARD_OBJECT_STORE_ENDPOINT"):
+            value = self.env.get(key)
+            if value:
+                assert value not in text, "service log leaked fixture " + key
+        for marker in ("AWS4-HMAC-SHA256", "X-Amz-Security-Token", "x-amz-security-token",
+                       "X-Amz-Signature", "X-Amz-Credential"):
+            assert marker not in text, "service log leaked signing header text " + marker
+
     def _clear(self, final):
         if final.exists() or final.is_symlink():
             final.unlink()
@@ -410,8 +456,30 @@ class HydrationHarness(LfsHarness):
         assert not failures, failures
         assert not proxy.errors, proxy.errors
         assert proxy.snapshot() == (heads_before + 1, gets_before + 3), proxy.snapshot()
-        for name, (status, _, _) in results.items():
+        failed_ids = []
+        for name, (status, headers, _) in results.items():
             assert status in (500, 503), (name, status)
+            request_id = headers.get("x-request-id")
+            assert request_id, (name, "failed response lost the server X-Request-ID")
+            try:
+                uuid.UUID(request_id)
+            except ValueError:
+                raise AssertionError((name, "failed response X-Request-ID is not a UUID")) from None
+            failed_ids.append(request_id)
+        assert len(failed_ids) == 2, failed_ids
+        remote_events = []
+        for request_id in failed_ids:
+            events = self._wait_error_events(request_id)
+            assert len(events) == 1, ("expected one correlated event", request_id, len(events))
+            event = events[0]
+            assert event.get("scope") == "request", event
+            assert event.get("kind") == "remote_store", event
+            assert event.get("remote_op") == "get", event
+            assert event.get("remote_status") == 502, event
+            assert event.get("status") == 503, event
+            assert event.get("route") == "/git/{owner}/{name}/info/lfs/objects/{oid}/{size}", event
+            remote_events.append(event)
+        self._assert_remote_log_privacy()
         assert not final.exists()
         assert sorted(p.name for p in self._repo_dir().iterdir()
                       if p.name.startswith((".tmp-", ".rootyard-object-"))) == []
@@ -479,7 +547,13 @@ class HydrationHarness(LfsHarness):
                 "follower_joined_before_release": True,
                 "both_client_bodies_overlapped": True,
             },
-            "failed_flight": {"waiters_failed_explicitly": 2, "retry_backend_gets": 1},
+            "failed_flight": {"waiters_failed_explicitly": 2, "retry_backend_gets": 1,
+                              "responses_with_server_request_id": 2},
+            "remote_failure_observability": {
+                "correlated_events": len(remote_events),
+                "kind": "remote_store", "remote_op": "get", "remote_status": 502,
+                "secret_or_header_text_absent": True,
+            },
             "cancellation": {
                 "partial_final_never_published": True,
                 "detached_hydration_completed_valid_bytes": True,

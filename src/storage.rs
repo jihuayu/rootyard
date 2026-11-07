@@ -21,6 +21,7 @@ pub mod encrypted_objects;
 pub mod read_leases;
 pub mod ref_admission;
 pub mod ref_publication;
+mod remote_errors;
 pub mod remote_objects;
 
 pub struct Storage {

@@ -22,6 +22,8 @@ const PART_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_RANGE_BYTES: u64 = 1024 * 1024;
 type HmacSha256 = Hmac<Sha256>;
 
+pub(crate) use super::remote_errors::{RemoteOp, RemoteStoreError};
+
 #[derive(Clone, Debug)]
 pub struct ObjectKey {
     pub tenant_id: Uuid,
@@ -235,8 +237,10 @@ impl RemoteObjectStore {
                     }
                 }
                 Self::S3(s3) => {
-                    let response = s3.send(Method::GET, key, "", None, None, deadline).await?;
-                    ensure!(response.status() == StatusCode::OK, "object GET failed: {}", response.status());
+                    let response = s3.send(RemoteOp::Get, key, "", None, None, deadline).await?;
+                    if response.status() != StatusCode::OK {
+                        return Err(RemoteStoreError::http(RemoteOp::Get, response.status().as_u16()).into());
+                    }
                     let mut stream = response.bytes_stream();
                     while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next()).await? {
                         let chunk = chunk?;
@@ -277,12 +281,10 @@ impl RemoteObjectStore {
             }
             Self::S3(s3) => {
                 let range = format!("bytes={start}-{end}");
-                let response = s3.send(Method::GET, key, "", None, Some((&header::RANGE, &range)), deadline).await?;
-                ensure!(
-                    response.status() == StatusCode::PARTIAL_CONTENT,
-                    "object range GET failed: {}",
-                    response.status()
-                );
+                let response = s3.send(RemoteOp::Get, key, "", None, Some((&header::RANGE, &range)), deadline).await?;
+                if response.status() != StatusCode::PARTIAL_CONTENT {
+                    return Err(RemoteStoreError::http(RemoteOp::Get, response.status().as_u16()).into());
+                }
                 let mut stream = response.bytes_stream();
                 let mut bytes = Vec::with_capacity(len as usize);
                 while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next()).await? {
@@ -304,8 +306,10 @@ impl RemoteObjectStore {
                 Err(e) => Err(e.into()),
             },
             Self::S3(s3) => {
-                let response = s3.send(Method::DELETE, key, "", None, None, deadline).await?;
-                ensure!(response.status().is_success(), "object DELETE failed: {}", response.status());
+                let response = s3.send(RemoteOp::Delete, key, "", None, None, deadline).await?;
+                if !response.status().is_success() {
+                    return Err(RemoteStoreError::http(RemoteOp::Delete, response.status().as_u16()).into());
+                }
                 Ok(())
             }
         }
@@ -452,14 +456,17 @@ impl S3Store {
 
     async fn send(
         &self,
-        method: Method,
+        op: RemoteOp,
         key: &ObjectKey,
         query: &str,
         payload: Option<Payload>,
         extra: Option<(&header::HeaderName, &str)>,
         deadline: Instant,
     ) -> Result<reqwest::Response> {
-        let mut last = None;
+        let method = op.method();
+        // Retries keep only the last finite typed error; no URL, header, query
+        // or body text is copied between attempts.
+        let mut last: Option<RemoteStoreError> = None;
         for attempt in 0..3 {
             let mut request = self.signed(&method, key, query, extra)?;
             if let Some(body) = &payload {
@@ -477,23 +484,30 @@ impl S3Store {
             }
             match tokio::time::timeout_at(deadline, request.send()).await {
                 Ok(Ok(response)) if !response.status().is_server_error() => return Ok(response),
-                Ok(Ok(response)) => last = Some(format!("object store HTTP {}", response.status())),
-                Ok(Err(error)) => last = Some(error.to_string()),
-                Err(_) => bail!("object store request timed out"),
+                Ok(Ok(response)) => last = Some(RemoteStoreError::http(op, response.status().as_u16())),
+                Ok(Err(error)) => last = Some(RemoteStoreError::transport(op, error)),
+                // Deadline exhaustion is terminal, not retried, matching the
+                // previous retry policy.
+                Err(_) => return Err(RemoteStoreError::timeout(op).into()),
             }
             if attempt < 2 {
                 tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
             }
         }
-        bail!("object store request failed: {}", last.unwrap_or_default())
+        match last {
+            Some(error) => Err(error.into()),
+            None => Err(RemoteStoreError::no_recorded_cause(op).into()),
+        }
     }
 
     async fn head(&self, key: &ObjectKey, deadline: Instant) -> Result<Option<StoredObject>> {
-        let response = self.send(Method::HEAD, key, "", None, None, deadline).await?;
+        let response = self.send(RemoteOp::Head, key, "", None, None, deadline).await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        ensure!(response.status().is_success(), "object HEAD failed: {}", response.status());
+        if !response.status().is_success() {
+            return Err(RemoteStoreError::http(RemoteOp::Head, response.status().as_u16()).into());
+        }
         let size =
             response.headers().get(header::CONTENT_LENGTH).context("object HEAD missing length")?.to_str()?.parse()?;
         Ok(Some(StoredObject { sha256: key.sha256.clone(), size }))
@@ -507,7 +521,7 @@ impl S3Store {
         if size <= PART_BYTES {
             let response = self
                 .send(
-                    Method::PUT,
+                    RemoteOp::Put,
                     key,
                     "",
                     Some(Payload::FileRange(source.to_owned(), 0, size)),
@@ -515,17 +529,18 @@ impl S3Store {
                     deadline,
                 )
                 .await?;
-            ensure!(
-                response.status().is_success()
-                    || response.status() == StatusCode::PRECONDITION_FAILED
-                        && self.head(key, deadline).await?.is_some(),
-                "object PUT failed: {}",
-                response.status()
-            );
+            let status = response.status();
+            if !(status.is_success()
+                || status == StatusCode::PRECONDITION_FAILED && self.head(key, deadline).await?.is_some())
+            {
+                return Err(RemoteStoreError::http(RemoteOp::Put, status.as_u16()).into());
+            }
             return Ok(());
         }
-        let initiated = self.send(Method::POST, key, "uploads=", None, None, deadline).await?;
-        ensure!(initiated.status().is_success(), "multipart initiation failed: {}", initiated.status());
+        let initiated = self.send(RemoteOp::MultipartInitiate, key, "uploads=", None, None, deadline).await?;
+        if !initiated.status().is_success() {
+            return Err(RemoteStoreError::http(RemoteOp::MultipartInitiate, initiated.status().as_u16()).into());
+        }
         let xml = tokio::time::timeout_at(deadline, initiated.text()).await??;
         let upload_id = xml
             .split("<UploadId>")
@@ -545,7 +560,7 @@ impl S3Store {
                 let query = format!("partNumber={number}&uploadId={encoded}");
                 let response = self
                     .send(
-                        Method::PUT,
+                        RemoteOp::MultipartPart,
                         key,
                         &query,
                         Some(Payload::FileRange(source.to_owned(), offset, len)),
@@ -553,7 +568,9 @@ impl S3Store {
                         deadline,
                     )
                     .await?;
-                ensure!(response.status().is_success(), "multipart part failed: {}", response.status());
+                if !response.status().is_success() {
+                    return Err(RemoteStoreError::http(RemoteOp::MultipartPart, response.status().as_u16()).into());
+                }
                 let etag = response.headers().get(header::ETAG).context("multipart ETag missing")?.to_str()?.to_owned();
                 ensure!(etag.starts_with('"') && etag.ends_with('"') && etag.len() < 256, "invalid multipart ETag");
                 parts.push((number, etag));
@@ -565,9 +582,12 @@ impl S3Store {
             }
             body.push_str("</CompleteMultipartUpload>");
             let query = format!("uploadId={encoded}");
-            let response =
-                self.send(Method::POST, key, &query, Some(Payload::Bytes(body.into_bytes())), None, deadline).await?;
-            ensure!(response.status().is_success(), "multipart completion failed: {}", response.status());
+            let response = self
+                .send(RemoteOp::MultipartComplete, key, &query, Some(Payload::Bytes(body.into_bytes())), None, deadline)
+                .await?;
+            if !response.status().is_success() {
+                return Err(RemoteStoreError::http(RemoteOp::MultipartComplete, response.status().as_u16()).into());
+            }
             let text = tokio::time::timeout_at(deadline, response.text()).await??;
             ensure!(!text.contains("<Error>"), "multipart completion reported an error");
             Ok::<(), anyhow::Error>(())
@@ -575,8 +595,67 @@ impl S3Store {
         .await;
         if result.is_err() {
             let query = format!("uploadId={encoded}");
-            let _ = self.send(Method::DELETE, key, &query, None, None, deadline).await;
+            let _ = self.send(RemoteOp::MultipartAbort, key, &query, None, None, deadline).await;
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod typed_error_tests {
+    use super::*;
+
+    #[test]
+    fn status_error_keeps_fixed_op_and_bounded_status() {
+        let error = RemoteStoreError::http(RemoteOp::Get, 502);
+        assert_eq!(error.op(), RemoteOp::Get);
+        assert_eq!(error.http_status(), Some(502));
+        let display = error.to_string();
+        assert!(display.contains("get") && display.contains("502"));
+        assert!(!display.contains("http://") && !display.contains("://"));
+        assert!(!display.contains("Authorization"));
+    }
+
+    #[test]
+    fn timeout_and_transport_never_expose_a_status_or_url() {
+        let timeout = RemoteStoreError::timeout(RemoteOp::Put);
+        assert_eq!(timeout.http_status(), None);
+        assert!(!timeout.to_string().contains("://"));
+        assert!(!format!("{timeout:?}").contains("://"));
+        let client = Client::new();
+        let transport = client.request(Method::GET, "http://[").unwrap_err();
+        let error = RemoteStoreError::transport(RemoteOp::Head, transport);
+        assert_eq!(error.http_status(), None);
+        assert_eq!(error.op().as_str(), "head");
+        assert!(!error.to_string().contains("://"));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn operation_labels_are_a_fixed_enumeration() {
+        let labels = [
+            RemoteOp::Get,
+            RemoteOp::Head,
+            RemoteOp::Put,
+            RemoteOp::Delete,
+            RemoteOp::MultipartInitiate,
+            RemoteOp::MultipartPart,
+            RemoteOp::MultipartComplete,
+            RemoteOp::MultipartAbort,
+        ]
+        .map(RemoteOp::as_str);
+        assert_eq!(
+            labels,
+            [
+                "get",
+                "head",
+                "put",
+                "delete",
+                "multipart_initiate",
+                "multipart_part",
+                "multipart_complete",
+                "multipart_abort",
+            ]
+        );
     }
 }

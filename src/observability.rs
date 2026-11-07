@@ -3,6 +3,7 @@
 //! Only fixed classifications, a validated SQLSTATE, a server-generated UUID and
 //! the router's matched path pattern are emitted. Error Display/Debug text, URLs,
 //! headers, query strings, user content and source strings are never formatted.
+use crate::storage::remote_objects::RemoteStoreError;
 use axum::{
     extract::{MatchedPath, Request},
     http::{HeaderName, HeaderValue},
@@ -138,10 +139,37 @@ pub async fn middleware(request: Request, next: Next) -> Response {
 struct Classification {
     kind: &'static str,
     sqlstate: Option<String>,
+    remote_op: Option<&'static str>,
+    remote_status: Option<u16>,
 }
 impl Classification {
     fn kind(kind: &'static str) -> Self {
-        Self { kind, sqlstate: None }
+        Self { kind, sqlstate: None, remote_op: None, remote_status: None }
+    }
+
+    fn database(sqlstate: Option<String>) -> Self {
+        Self { kind: "database", sqlstate, remote_op: None, remote_status: None }
+    }
+
+    /// Finite remote-store classification: a fixed operation label and, when
+    /// a response completed, its bounded numeric status. No URL, key, header,
+    /// query or transport text is copied.
+    fn remote(error: &RemoteStoreError) -> Self {
+        Self {
+            kind: "remote_store",
+            sqlstate: None,
+            remote_op: Some(error.op().as_str()),
+            remote_status: error.http_status(),
+        }
+    }
+
+    fn http(error: &reqwest::Error) -> Self {
+        Self {
+            kind: if error.is_timeout() { "timeout" } else { "http" },
+            sqlstate: None,
+            remote_op: None,
+            remote_status: error.status().map(|status| status.as_u16()),
+        }
     }
 }
 
@@ -151,10 +179,8 @@ fn valid_sqlstate(code: &str) -> bool {
 
 fn pg_classification(error: &tokio_postgres::Error) -> Classification {
     match error.code() {
-        Some(code) if valid_sqlstate(code.code()) => {
-            Classification { kind: "database", sqlstate: Some(code.code().to_owned()) }
-        }
-        _ => Classification::kind("database"),
+        Some(code) if valid_sqlstate(code.code()) => Classification::database(Some(code.code().to_owned())),
+        _ => Classification::database(None),
     }
 }
 
@@ -167,6 +193,9 @@ fn pool_classification(error: &deadpool_postgres::PoolError) -> Classification {
 
 fn anyhow_classification(error: &anyhow::Error) -> Classification {
     for cause in error.chain() {
+        if let Some(remote) = cause.downcast_ref::<RemoteStoreError>() {
+            return Classification::remote(remote);
+        }
         if let Some(pg) = cause.downcast_ref::<tokio_postgres::Error>() {
             return pg_classification(pg);
         }
@@ -174,7 +203,7 @@ fn anyhow_classification(error: &anyhow::Error) -> Classification {
             return Classification::kind("io");
         }
         if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
-            return Classification::kind(if http.is_timeout() { "timeout" } else { "http" });
+            return Classification::http(http);
         }
         if let Some(pool) = cause.downcast_ref::<deadpool_postgres::PoolError>() {
             return pool_classification(pool);
@@ -191,6 +220,9 @@ fn anyhow_classification(error: &anyhow::Error) -> Classification {
 
 /// Finite type-based classification only. No type name or error text is used.
 fn classify(error: &dyn Any) -> Classification {
+    if let Some(remote) = error.downcast_ref::<RemoteStoreError>() {
+        return Classification::remote(remote);
+    }
     if let Some(pg) = error.downcast_ref::<tokio_postgres::Error>() {
         return pg_classification(pg);
     }
@@ -201,7 +233,7 @@ fn classify(error: &dyn Any) -> Classification {
         return Classification::kind("io");
     }
     if let Some(error) = error.downcast_ref::<reqwest::Error>() {
-        return Classification::kind(if error.is_timeout() { "timeout" } else { "http" });
+        return Classification::http(error);
     }
     if let Some(pool) = error.downcast_ref::<deadpool_postgres::PoolError>() {
         return pool_classification(pool);
@@ -245,6 +277,12 @@ fn event_json(error: &dyn Any) -> String {
     if let Some(sqlstate) = classification.sqlstate {
         event.insert("sqlstate".to_owned(), json!(sqlstate));
     }
+    if let Some(remote_op) = classification.remote_op {
+        event.insert("remote_op".to_owned(), json!(remote_op));
+    }
+    if let Some(remote_status) = classification.remote_status {
+        event.insert("remote_status".to_owned(), json!(remote_status));
+    }
     serde_json::to_string(&Value::Object(event))
         .unwrap_or_else(|_| r#"{"event":"rootyard_error","scope":"detached","kind":"unknown","status":503}"#.to_owned())
 }
@@ -273,6 +311,7 @@ pub(crate) fn observe_internal(error: &dyn Any) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::remote_objects::RemoteOp;
     use std::sync::atomic::AtomicBool;
 
     const SENTINEL: &str = "SECRET-sqlstate-23503-token-https://user:pass@example.invalid/?q=leak";
@@ -410,5 +449,56 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
         saturating_increment(&counter);
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn typed_remote_status_is_classified_without_error_text() {
+        let remote = RemoteStoreError::http(RemoteOp::Get, 502);
+        let text = event_json(&remote as &dyn Any);
+        assert!(!text.contains("SECRET"));
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["kind"].as_str(), Some("remote_store"));
+        assert_eq!(value["remote_op"].as_str(), Some("get"));
+        assert_eq!(value["remote_status"].as_u64(), Some(502));
+        assert!(value.get("sqlstate").is_none());
+    }
+
+    #[test]
+    fn remote_chain_keeps_typed_status_and_never_formats_context() {
+        let chained = anyhow::Error::new(RemoteStoreError::http(RemoteOp::Put, 503)).context(SENTINEL);
+        let text = event_json(&chained as &dyn Any);
+        assert!(!text.contains("SECRET"));
+        assert!(!text.contains("https://"));
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["kind"].as_str(), Some("remote_store"));
+        assert_eq!(value["remote_op"].as_str(), Some("put"));
+        assert_eq!(value["remote_status"].as_u64(), Some(503));
+    }
+
+    #[test]
+    fn reqwest_transport_chain_stays_remote_and_never_formats_display() {
+        let client = reqwest::Client::new();
+        let transport = client.request(reqwest::Method::GET, "http://[").unwrap_err();
+        let chained = anyhow::Error::new(RemoteStoreError::transport(RemoteOp::Head, transport)).context(SENTINEL);
+        let text = event_json(&chained as &dyn Any);
+        assert!(!text.contains("SECRET"));
+        assert!(!text.contains("http://"));
+        assert!(!text.contains("://"));
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["kind"].as_str(), Some("remote_store"));
+        assert_eq!(value["remote_op"].as_str(), Some("head"));
+        assert!(value.get("remote_status").is_none());
+    }
+
+    #[test]
+    fn bare_reqwest_error_uses_fixed_http_kind_without_status_or_text() {
+        let client = reqwest::Client::new();
+        let error = client.request(reqwest::Method::GET, "http://[").unwrap_err();
+        let text = event_json(&error as &dyn Any);
+        assert!(!text.contains("://"));
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["kind"].as_str(), Some("http"));
+        assert!(value.get("remote_op").is_none());
+        assert!(value.get("remote_status").is_none());
     }
 }
