@@ -1,7 +1,7 @@
 # Round-3 issue #23 acceptance — Pando authority-scoped remote retention
 
-Status: **ACCEPT_FOR_DOCUMENTED_MODE / closable**, pending the primary's final
-review and merge. This is an opt-in managed-authority mode, not universal
+Status: **ACCEPT_FOR_DOCUMENTED_MODE**; source, acceptance and final
+publication reviews approved. Delivered by [PR #61](https://github.com/jihuayu/rootyard/pull/61). This is an opt-in managed-authority mode, not universal
 production GC. Permanent evidence:
 [`evidence/round3/pando23-authority-1061a8e/`](../../evidence/round3/pando23-authority-1061a8e/README.md).
 
@@ -32,14 +32,14 @@ production GC. Permanent evidence:
 - Hosted VM run [42337108050](https://github.com/jihuayu/rootyard/actions/runs/42337108050)
   passed all 17/17 kernel-cgroup assertions on combined source `1061a8e`;
   general supported-profile cgroup evidence remains the already-merged
-  [kernel32 bundle](../kernel32-vm-8197377/README.md).
+  [kernel32 bundle](../../evidence/round3/kernel32-vm-8197377/README.md).
 
 ## Scope explicitly accepted
 
 - Destructive deletion is opt-in via `ROOTYARD_PANDO_REMOTE_DELETE=true`; the
   default path marks and dry-runs without deleting.
 - Only artifacts registered by this installation under its current storage
-  authority, unreferenced by every serving pack set, stable transition and
+  authority, unreferenced by every serving pack set, protected transition root and
   nonexpired publication fence, are eligible. Deletion uses exact registered
   keys; S3 `LIST` is never a retention authority.
 - Legacy PackManifest v1 tenant-only keys, uploaded-but-unlinked objects and
@@ -58,6 +58,9 @@ production GC. Permanent evidence:
 - A raw metadata-only PostgreSQL dump/PITR copy against the shared bucket is
   **unsupported, undetected and not fail-closed**; it retains the source
   authority and registry rows.
+- Pando-specific process SIGKILL and two-process push/GC stress were not
+  executed; Pando fault evidence uses SQL leases/publication fences. Common
+  worker process-death recovery is covered by the GitFS lifecycle fixtures.
 - No per-OID pruning inside serving packs; no hardware power-loss, cross-host
   HA, multi-zone durability or production scaling claim.
 - The first combined physical-GC attempt failed with a pending tombstone after
@@ -70,8 +73,8 @@ production GC. Permanent evidence:
   fixture CAS not transactional) remain open follow-ups, not runtime
   blockers for the documented mode.
 
-## Closure condition
+## Delivery
 
-Issue #23 may close only after the primary's final review and merge of this
-documentation/evidence change. Roadmap #48 remains open with #25, #26, #43 and
+Final publication review is [ACCEPT_EVIDENCE_AND_CLAIMS](../../evidence/round3/pando23-publication-review.json),
+with zero P1/P2 findings; issue #23 is completed for the documented mode in PR #61. Roadmap #48 remains open with #25, #26, #43 and
 #44; #32 is closed via PR #60 and #38 via PR #57.
