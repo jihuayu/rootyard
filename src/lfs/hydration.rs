@@ -191,7 +191,7 @@ async fn run_hydration(key: &HydrationKey, deadline: Instant) -> FlightOutcome {
         Err(error) => {
             // Keep only the bounded typed cause; never flatten error Display
             // or its transport source into text stored on the shared flight.
-            let remote = error.downcast::<RemoteStoreError>().ok().map(|boxed| *boxed);
+            let remote = error.downcast::<RemoteStoreError>().ok();
             FlightOutcome::Failed(Arc::new(FlightFailure { remote }))
         }
     }

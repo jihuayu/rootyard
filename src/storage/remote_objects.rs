@@ -623,7 +623,7 @@ mod typed_error_tests {
         assert!(!timeout.to_string().contains("://"));
         assert!(!format!("{timeout:?}").contains("://"));
         let client = Client::new();
-        let transport = client.request(Method::GET, "http://[").unwrap_err();
+        let transport = client.request(Method::GET, "http://[").build().unwrap_err();
         let error = RemoteStoreError::transport(RemoteOp::Head, transport);
         assert_eq!(error.http_status(), None);
         assert_eq!(error.op().as_str(), "head");

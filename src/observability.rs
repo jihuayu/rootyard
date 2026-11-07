@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn reqwest_transport_chain_stays_remote_and_never_formats_display() {
         let client = reqwest::Client::new();
-        let transport = client.request(reqwest::Method::GET, "http://[").unwrap_err();
+        let transport = client.request(reqwest::Method::GET, "http://[").build().unwrap_err();
         let chained = anyhow::Error::new(RemoteStoreError::transport(RemoteOp::Head, transport)).context(SENTINEL);
         let text = event_json(&chained as &dyn Any);
         assert!(!text.contains("SECRET"));
@@ -493,7 +493,7 @@ mod tests {
     #[test]
     fn bare_reqwest_error_uses_fixed_http_kind_without_status_or_text() {
         let client = reqwest::Client::new();
-        let error = client.request(reqwest::Method::GET, "http://[").unwrap_err();
+        let error = client.request(reqwest::Method::GET, "http://[").build().unwrap_err();
         let text = event_json(&error as &dyn Any);
         assert!(!text.contains("://"));
         let value: Value = serde_json::from_str(&text).unwrap();
