@@ -39,6 +39,9 @@ The cursor is bound to the authenticated actor; using another user's cursor is a
 
 Pagination is keyset-based, not a snapshot. Inserts that sort after the cursor
 appear on later pages; inserts before it are not replayed and deletes simply
-disappear. Clients must not assume a stable total count between pages. A backup
+disappear. A rename or ownership transfer changes an ordering key and can make
+a repository appear again or be skipped during an ongoing traversal; restart
+discovery when a stable inventory is needed after such changes. Clients must
+not assume a stable total count between pages. A backup
 restore or other catalog rewind can move a cursor outside the current data set,
 so clients restart from the first page after restore.

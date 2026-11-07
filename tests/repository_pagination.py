@@ -145,6 +145,10 @@ class RepositoryPaginationHarness(Harness):
             "short": self.encode(f"v1:{len(scope)}:{scope}"),
             "long": self.encode(f"v1:{len(scope)}:{scope}:1:a:1:b:1:c:1:d"),
             "utf8_split": self.encode(f"v1:{len(scope)}:{scope}:1:é"),
+            "nul_owner": self.encode(
+                f"v1:{len(scope)}:{scope}:1:\x00:1:a:36:00000000-0000-0000-0000-000000000001"),
+            "invalid_name": self.encode(
+                f"v1:{len(scope)}:{scope}:5:alice:3:a/b:36:00000000-0000-0000-0000-000000000001"),
         }
         for label, raw in malformed.items():
             self.reject("limit=1&cursor=" + urllib.parse.quote(raw, safe=""))

@@ -42,7 +42,7 @@ fn decode_repo_cursor(raw: &str, actor: Uuid) -> Result<(String, String, Uuid), 
         return Err(invalid());
     };
     let id = Uuid::parse_str(id).map_err(|_| invalid())?;
-    if id.is_nil() {
+    if id.is_nil() || !db::valid_name(owner) || !db::valid_name(name) {
         return Err(invalid());
     }
     Ok((owner.clone(), name.clone(), id))
