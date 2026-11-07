@@ -1,25 +1,13 @@
-use super::{runner, terminal};
+use super::{export, runner, terminal};
 use crate::{AppState, Error, members::models::Role, workspaces::service};
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::{
-    ffi::CString,
-    fs::{self, File, OpenOptions},
-    io::Read,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::fs::OpenOptionsExt,
-    },
-    path::Path as FsPath,
-    sync::Arc,
-};
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -157,7 +145,7 @@ pub async fn stop(
     let existing = authorized_job(&state, &headers, id).await?;
     service::authorized(&state, &headers, existing.workspace_id, Role::Write).await?;
     let client = state.pool.get().await.map_err(Error::internal)?;
-    client.execute("UPDATE sandbox_jobs SET state='cancelled',finished_at=clock_timestamp() WHERE id=$1 AND state IN ('queued','running')", &[&id]).await.map_err(Error::internal)?;
+    client.execute("UPDATE sandbox_jobs SET state='cancelled',finished_at=clock_timestamp() WHERE id=$1 AND state IN ('queued','preparing','running')", &[&id]).await.map_err(Error::internal)?;
     let row = client
         .query_one(
             "SELECT id,workspace_id,state,exit_code,timeout_seconds,terminal FROM sandbox_jobs WHERE id=$1",
@@ -173,13 +161,21 @@ pub async fn logs(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, Error> {
     authorized_job(&state, &headers, id).await?;
-    let root = runner::job_root(&state, id);
-    let stdout = fs::read(root.join("stdout.log")).map_err(Error::internal)?;
-    let stderr = fs::read(root.join("stderr.log")).map_err(Error::internal)?;
-    if stdout.len() > 16 * 1024 * 1024 || stderr.len() > 16 * 1024 * 1024 {
-        return Err(Error::internal("sandbox log limit exceeded"));
-    }
-    Ok(Json(json!({"stdout_base64":STANDARD.encode(stdout),"stderr_base64":STANDARD.encode(stderr)})))
+    Ok(Json(export::logs(&runner::job_root(&state, id), export::LOG_LIMIT)?))
+}
+
+/// Remove a terminal job's retained logs and artifacts. The result row remains
+/// as the durable job identity; a second request is an idempotent no-op.
+pub async fn cleanup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, Error> {
+    let existing = authorized_job(&state, &headers, id).await?;
+    service::authorized(&state, &headers, existing.workspace_id, Role::Write).await?;
+    export::require_terminal(&state, id).await?;
+    let removed = runner::cleanup_job(&state, id)?;
+    Ok(Json(json!({"id":id,"removed":removed})))
 }
 
 async fn terminal_job(state: &AppState, headers: &HeaderMap, id: Uuid, write: bool) -> Result<Job, Error> {
@@ -230,39 +226,6 @@ pub struct ArtifactQuery {
     pub path: String,
 }
 
-#[repr(C)]
-struct OpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
-}
-
-fn artifact_file(root: &FsPath, relative: &str) -> Result<File, Error> {
-    let path = crate::browse::models::normalize_rel_path(Some(relative))?;
-    if path.is_empty() || path != relative {
-        return Err(Error::bad_request());
-    }
-    let name = CString::new(path).map_err(|_| Error::bad_request())?;
-    let dir = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(root)
-        .map_err(|_| Error::not_found())?;
-    // RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS.
-    let how = OpenHow {
-        flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
-        mode: 0,
-        resolve: 0x08 | 0x04 | 0x02,
-    };
-    let fd = unsafe {
-        libc::syscall(libc::SYS_openat2, dir.as_raw_fd(), name.as_ptr(), &how, std::mem::size_of::<OpenHow>())
-    };
-    if fd < 0 {
-        return Err(Error::not_found());
-    }
-    Ok(unsafe { File::from_raw_fd(fd as i32) })
-}
-
 pub async fn artifact(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -270,31 +233,6 @@ pub async fn artifact(
     Query(query): Query<ArtifactQuery>,
 ) -> Result<Json<Value>, Error> {
     authorized_job(&state, &headers, id).await?;
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let row =
-        client.query_one("SELECT state,pid FROM sandbox_jobs WHERE id=$1", &[&id]).await.map_err(Error::internal)?;
-    let status: String = row.get(0);
-    if !matches!(status.as_str(), "succeeded" | "failed" | "timed_out" | "cancelled")
-        || row.get::<_, Option<i32>>(1).is_some()
-    {
-        return Err(Error(StatusCode::CONFLICT, "sandbox job is still running"));
-    }
-    let root = runner::job_root(&state, id).join("workspace/artifacts");
-    let file = artifact_file(&root, &query.path)?;
-    let meta = file.metadata().map_err(Error::internal)?;
-    if !meta.is_file() {
-        return Err(Error::not_found());
-    }
-    const MAX: usize = 16 * 1024 * 1024;
-    if meta.len() > MAX as u64 {
-        return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "artifact too large"));
-    }
-    let mut bytes = Vec::new();
-    file.take((MAX + 1) as u64).read_to_end(&mut bytes).map_err(Error::internal)?;
-    if bytes.len() > MAX {
-        return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "artifact too large"));
-    }
-    Ok(Json(
-        json!({"path":query.path,"size":bytes.len(),"sha256":hex::encode(Sha256::digest(&bytes)),"content_base64":STANDARD.encode(bytes)}),
-    ))
+    export::require_terminal(&state, id).await?;
+    Ok(Json(export::artifact(&runner::artifacts_root(&state, id), &query.path)?))
 }
