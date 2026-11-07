@@ -265,6 +265,7 @@ SELECT (SELECT count(*) FROM candidates)::bigint AS scanned,
 /// The single fixed keyset predicate for the after-cursor branch. It is a
 /// strict row comparison (never `cursor IS NULL OR ...`), so the planner keeps
 /// the `(expires_at, id)` index range instead of re-filtering a large prefix.
+#[cfg(test)]
 const TOKEN_CURSOR_BOUND_AFTER: &str = "    AND (t.expires_at, t.id) > ($3::text::timestamptz, $4::uuid)\n";
 
 /// Fixed after-cursor branch: identical shape to the first window except for
