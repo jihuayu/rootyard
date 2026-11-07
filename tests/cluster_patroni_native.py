@@ -16,6 +16,7 @@ only as a configuration gate, never certified here.
 """
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -160,6 +161,11 @@ def drain_deliveries(worker, query, keys, rounds=120):
         processed += worker()
         time.sleep(0.1)
     return processed
+
+
+def canonical_sha256(payload):
+    """Stable non-secret digest of a JSON document."""
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def ref_map(git_dir):
@@ -682,7 +688,24 @@ def main():
         assert ci_revoked == "false" and ci_cancelled == "false", ci_source_state
         assert int(ci_expiry) > int(time.time()) and ci_aud == ci_audience, ci_source_state
         ci_pin_file = Path(h.env["ROOTYARD_DATA_DIR"]) / "ci-pins" / h.repo["id"] / (ci_job + ".json")
-        assert ci_pin_file.is_file(), "CI source pin descriptor missing before backup"
+        source_descriptor = json.loads(ci_pin_file.read_text())
+        assert source_descriptor.get("job_id") == ci_job, source_descriptor
+        assert source_descriptor.get("repository_id") == h.repo["id"], source_descriptor
+        if "owner_id" in source_descriptor:
+            assert source_descriptor["owner_id"] == h.sql(
+                "SELECT id::text FROM users WHERE username='alice'"), source_descriptor
+        assert source_descriptor.get("target_oid") == ci_target, source_descriptor
+        assert source_descriptor.get("storage_generation") == ci_generation, source_descriptor
+        assert source_descriptor.get("state") == "pinned", source_descriptor
+        assert source_descriptor.get("object_format") == "sha1", source_descriptor
+        retention_ref = source_descriptor.get("retention_ref")
+        assert retention_ref == "refs/rootyard-ci/jobs/" + ci_job, source_descriptor
+        source_descriptor_sha256 = canonical_sha256(source_descriptor)
+        for api_key in ("job_id", "target_oid", "retention_ref", "state"):
+            if api_key in ci_pin:
+                assert ci_pin[api_key] == source_descriptor[api_key], (api_key, ci_pin, source_descriptor)
+        assert h.git("--git-dir=" + str(h.bare), "rev-parse", retention_ref).stdout.decode().strip() == ci_target
+        h.git("--git-dir=" + str(h.bare), "cat-file", "-e", ci_target + "^{commit}")
         ci_mirror_base = "http://127.0.0.1:" + str(free_port())
         ci_mirror_env = {**h.env, "ROOTYARD_BIND": ci_mirror_base.rsplit("/", 1)[-1],
                          "ROOTYARD_DATA_DIR": str(root / "source-mirror-data"),
@@ -705,6 +728,13 @@ def main():
         ci_before_backup = {"job_id": ci_job, "target_oid": ci_target,
                             "storage_generation": ci_generation,
                             "pin_descriptor_retained": True,
+                            "pin_descriptor_sha256": source_descriptor_sha256,
+                            "pin_descriptor_root_fields": {
+                                "repository_id": source_descriptor["repository_id"],
+                                "state": source_descriptor["state"],
+                                "retention_ref": retention_ref,
+                                "retention_ref_points_to_target": True,
+                                "target_commit_present": True},
                             "grant_state": {"revoked": False, "cancelled": False,
                                             "expires_in_future": True,
                                             "mirror_audience_matches": True},
@@ -896,7 +926,20 @@ def main():
         assert r_cancelled == "false", ci_state_after
         assert int(r_expiry) > int(time.time()), "old grant denial must not be expiry"
         assert r_audience == ci_audience, "old grant denial must not be audience/config"
-        assert (restored_data / "ci-pins" / h.repo["id"] / (ci_job + ".json")).is_file(),             "historical CI source pin was not retained by the restore"
+        restored_pin_file = restored_data / "ci-pins" / h.repo["id"] / (ci_job + ".json")
+        restored_descriptor = json.loads(restored_pin_file.read_text())
+        assert restored_descriptor == source_descriptor, (
+            "restored CI pin descriptor differs from the source closure; restore must not rebind pin evidence")
+        restored_descriptor_sha256 = canonical_sha256(restored_descriptor)
+        assert restored_descriptor_sha256 == source_descriptor_sha256
+        restored_retention_ref = restored_descriptor["retention_ref"]
+        restored_retention_oid = subprocess.run(
+            ["git", f"--git-dir={restored_repo}", "rev-parse", restored_retention_ref],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout.decode().strip()
+        assert restored_retention_oid == ci_target
+        subprocess.run(["git", f"--git-dir={restored_repo}", "cat-file", "-e",
+                        ci_target + "^{commit}"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       check=True)
         restored_mirror_base = "http://127.0.0.1:" + str(free_port())
         restored_mirror_env = {**restored.env,
                                "ROOTYARD_BIND": restored_mirror_base.rsplit("/", 1)[-1],
@@ -946,6 +989,14 @@ def main():
                 "old_grant_audience_unchanged": True,
                 "old_token_http_status": old_status,
                 "historical_pin_descriptor_retained": True,
+                "pin_descriptor_source_sha256": source_descriptor_sha256,
+                "pin_descriptor_restored_sha256": restored_descriptor_sha256,
+                "pin_descriptor_full_json_equal": restored_descriptor == source_descriptor,
+                "pin_descriptor_root_fields_equal": all(
+                    restored_descriptor.get(key) == source_descriptor.get(key)
+                    for key in ("job_id", "repository_id", "owner_id", "target_oid",
+                                "storage_generation", "state", "retention_ref", "object_format")),
+                "restored_retention_ref_points_to_target": restored_retention_oid == ci_target,
                 "new_job_id": new_job, "new_grant_revoked": False,
                 "new_checkout_head": new_head, "new_checkout_fsck": "passed",
                 "source_and_restore_mirror_audience_configured": True,
