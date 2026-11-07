@@ -16,6 +16,8 @@ import tempfile
 import time
 from urllib.parse import quote
 
+import ops_provenance
+
 
 def run(argv, *, env=None, data=None, timeout=90, check=True):
     result = subprocess.run(argv, env=env, input=data, stdout=subprocess.PIPE,
@@ -76,6 +78,7 @@ def main():
     binary = args.binary.resolve(strict=True)
     kafka_home = args.kafka_home.resolve(strict=True)
     kafka = kafka_home / "bin"
+    kafka_version = run([str(kafka / "kafka-topics.sh"), "--version"], timeout=30).stdout.decode().strip()
     launcher = Path(__file__).resolve().parents[1] / "deployment/local_cluster.py"
     prove_descendant_shutdown(launcher)
     root = Path(tempfile.mkdtemp(prefix="rootyard-secure-profile-"))
@@ -202,6 +205,8 @@ def main():
         migrate_env.update(DATABASE_URL=f"postgresql://migrator:{credentials['migrator']}@localhost:{pg_port}/rootyard?sslmode=require",
                            ROOTYARD_PG_CA_PEM=ca, ROOTYARD_DATA_DIR=str(state / "node0" / "data"))
         run([str(binary), "migrate"], env=migrate_env)
+        postgres_version = run(["psql", "-h", str(root), "-p", str(pg_port), "-U", "agent",
+                                "-d", "rootyard", "-X", "-At", "-c", "SHOW server_version"]).stdout.decode().strip()
         account = json.loads(run([str(binary), "create-user", "alice"], env=migrate_env).stdout)
         private(config / "operator.json", json.dumps(account))
         grant_env = os.environ.copy()
@@ -230,12 +235,20 @@ def main():
         run([*profile_cmd, "verify", "--state-dir", str(state),
              "--account", str(config / "operator.json"), "--report", str(native_report)], timeout=120)
         report = json.loads(native_report.read_text())
-        report.update(kafka_version="4.4.0", postgres_tls="verify-full",
-                      postgres_auth="SCRAM-SHA-256", kafka_auth="SASL/PLAIN over TLS",
+        report.update(ops_provenance.base(
+            binary, __file__,
+            topology="two/four separate Rust data processes with distinct volumes plus a PostgreSQL-only delivery worker on one trusted Linux host; external PostgreSQL 17 and Kafka brokers",
+            dataset="one private repository created by the operator account; a native clone, one acknowledged commit and push through non-owner ingress, owner clone and routed browse",
+            workload="real native Git push/fetch/clone and routed browse over loopback with TLS PostgreSQL and SASL_SSL Kafka; distinct PostgreSQL and Kafka identities per role",
+            limits=["single trusted Linux host and local process-session fence",
+                    "external PostgreSQL and Kafka are real but single-instance in this test",
+                    "no cross-host storage fencing, automatic PostgreSQL leader election or multi-broker Kafka failover"]))
+        report.update(kafka_version=kafka_version, postgres_version=postgres_version,
+                      postgres_tls="verify-full", postgres_auth="SCRAM-SHA-256",
+                      kafka_auth="SASL/PLAIN over TLS",
                       wrong_kafka_role_password_rejected_before_start=True,
                       failed_preflight_secrets_cleaned=True,
                       sigterm_resistant_descendant_killed=True,
-                      binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                       launcher_sha256=hashlib.sha256(launcher.read_bytes()).hexdigest())
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")

@@ -75,7 +75,14 @@ python3 tests/cluster_pg_streaming_native.py --binary target/debug/rootyard --re
 python3 tests/cluster_pg_pitr_native.py --binary target/debug/rootyard --report evidence/cluster-pg-pitr.json
 python3 tests/cluster_disk_pressure_native.py --binary target/debug/rootyard --report evidence/cluster-disk-pressure.json
 python3 tests/cluster_kafka_tls_native.py --binary target/debug/rootyard --kafka-home /path/to/kafka_2.13-3.9.1 --report evidence/cluster-kafka-tls.json
+python3 tests/cluster_operations_gate.py --evidence-dir evidence --report evidence/cluster-operations-gate.json
 ```
+
+The gate script validates that every native report carries matching source,
+binary, harness, tool, topology, dataset, workload, hardware and limits
+provenance and that no simulated field satisfies a gate. The full operations
+map, restore ordering, RPO/RTO assumptions, upgrade/rollback and untested
+boundaries are in [cluster-operations.md](cluster-operations.md).
 
 These tests require the PostgreSQL 17 binaries, `ROOTYARD_TEST_DATABASE_URL`,
 native Git, and a built Rust binary. The workload report measures 1/2/4
@@ -123,8 +130,11 @@ retention policy, automated leader failover, or a supported multi-host
 deployment.
 
 The disk-pressure drill runs the real Rust service and native Git in a
-rootless Docker container with a private 128 MiB executable tmpfs for its
-repository volume. It fills that volume until the kernel returns ENOSPC,
+rootless Docker container with a private executable tmpfs for its repository
+volume. The mount is sized from the supplied executable plus headroom because
+the service keeps a durable hook copy of itself under the data volume; this
+keeps the check valid for large debug binaries as well as release binaries. It
+fills that volume until the kernel returns ENOSPC,
 checks that the attempted Git push fails without moving the acknowledged
 ref, removes the filler, then fetches, runs native `git fsck`, and retries the
 push. It cannot exhaust the shared workspace disk. The test covers one

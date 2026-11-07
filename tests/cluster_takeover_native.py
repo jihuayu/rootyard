@@ -2,7 +2,6 @@
 """Live local-host process fence, measured replica, stale-data rejection, takeover."""
 import argparse
 import base64
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +13,7 @@ import uuid
 
 from e2e import Harness
 from cluster_workload_native import free_port, request
+import ops_provenance
 
 
 def wait_ready(base, token, process):
@@ -238,9 +238,16 @@ def main():
                         os.killpg(bypass.pid, signal.SIGKILL)
                         bypass.wait(timeout=10)
         assert h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == stale_volume_tip
-        report = {"kind": "native_local_host_takeover", "result": "passed", "driver": "local_process_session_v1",
-                  "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
-                  "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        report = ops_provenance.base(
+            args.binary, __file__,
+            topology="two or more separate Rust data processes and volumes on one trusted Linux host with a trusted process-session fence directory and shared PostgreSQL",
+            dataset="one private repository replicated to a standby, then advanced and written during an admitted native Git upload",
+            workload="native Git push/fetch plus migration, stale-replica rejection, SIGSTOP of the old writer, durable fence kill, controller restart and post-takeover push",
+            limits=["single-host isolated process session driver",
+                    "no cross-host storage fence or PostgreSQL HA",
+                    "process-session ownership assumes a single trusted host UID"])
+        report.update({"kind": "native_local_host_takeover", "result": "passed",
+                  "driver": "local_process_session_v1",
                   "postgres_version": h.sql("SHOW server_version"),
                   "old_session_id": old_pid, "replication_operation_id": operation_id,
                   "takeover_ms": takeover_ms,
@@ -252,8 +259,7 @@ def main():
                           "retired_source_volume_write_rejected_without_fence_env": True,
                           "old_writer_restart_blocked": True, "acknowledged_tip": acknowledged_tip,
                           "post_takeover_acknowledged_oid": target_tip,
-                          "target_fsck": "passed", "new_epoch": promoted["route_epoch"],
-                  "limits": ["single-host isolated process session driver", "no cross-host storage fence or PostgreSQL HA"]}
+                          "target_fsck": "passed", "new_epoch": promoted["route_epoch"]})
         if args.report:
             args.report.parent.mkdir(parents=True, exist_ok=True)
             args.report.write_text(json.dumps(report, indent=2) + "\n")
