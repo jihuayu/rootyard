@@ -2,9 +2,20 @@
 
 历史基线：2026-11-04，main [`1fd05a393fe24653687fa3e868f9dca2fb0c9a67`](https://github.com/jihuayu/rootyard/commit/1fd05a393fe24653687fa3e868f9dca2fb0c9a67)。本页历史快照说明该代码具有什么边界，不承诺后续 main，也不把既有测试报告当作本次重新执行的结果。
 
-当前 main 核对基线：2026-11-07，[`6d2f0b845525921339fa045868c2029d6dc42923`](https://github.com/jihuayu/rootyard/commit/6d2f0b845525921339fa045868c2029d6dc42923)。PR #49–#55 已合并；逐条验收证据、met/unproven 分类和未关闭边界见 [主分支验收审计](../acceptance/main-6d2f0b8-audit.md) 与 [46 项任务台账](../registered-task-delivery.md)。2026-11-06 至 2026-11-07 的执行覆盖真实 PG/Git/Garage/Vault/FUSE/bubblewrap/Chromium、本机集群故障与真实客户端流量；每份证据只覆盖其记录的版本和拓扑。下表保留历史 main 的边界，不能用作当前 main 的验收结论。
+当前交付候选：2026-11-07，round-2 `340e6681aef3b78a440dc1b0fc8a13ce497621ea`（合并主线 `5fa4854`，PR #56 已合并）。逐条状态、qualified chunk 与 PENDING 证据见 [round-2 交付表](../acceptance/round2-delivery.md) 与 [46 项任务台账](../registered-task-delivery.md)。最终 NativeCore+Ops 组合验证仍为 **PENDING**，本页不宣称组合 PASS。
 
-## 当前 main（6d2f0b8）已合并能力与未验收边界
+历史中间基线：`6d2f0b8`（PR #49–#55 合并点）及其 [验收审计](../acceptance/main-6d2f0b8-audit.md) 保留为历史记录，不是当前候选的验收结论。
+
+## 当前候选（340e668）能力与未验收边界
+
+- #38：SHA-931 + `d8540fc` 已完成 format 7/schema 131、不可变 format 6/schema 130、显式 `--allow-legacy-schema130` 升级；3 个真实 legacy-130、无 flag 拒绝+opt-in、SHA-256 clone/pin/gen/grant revocation 已单独通过。关闭需同时满足 6 SHA-256 + 2 restore + 3 legacy + schema 131 + 15 CI checkout 的组合矩阵，当前 PENDING。
+- #23：`7cc01d0`/`d9eb6d9`/`7118521`/`32dfea8` 实现自动 Pando compaction、cache anti-tamper、non-ref rollback；生产同构 `FCC/bf6` 的两个自动 Pando 用例及 GitFS lifecycle 3 + API 7 + physical 8 已在 qualified chunk 通过。远端 Pando mark/delete/pruning 仍禁用，需全局 retention 基础。
+- #25/#26：`66abaf0`/`bcede68`/`73a673c` 实现 draining reset、旧卷 retirement、online copy+delta、retained SQL roots、list/abort 与 promoted-owner 检查；同机迁移/分区/接管已通过（certified source `6831`），跨主机物理 fencing 未认证。
+- #43/#44：`7a77c83` 已提交真实 TLS/SCRAM、Kafka SASL_SSL、手工本地 PG promotion、PITR、ENOSPC 与本地 1/2/4 workload；gate 仅 `passed_local_single_host` / `production_scope=not_certified`。外部自动 PG HA/DCS、跨主机 source fence、全新部署 restore 与物理跨主机/硬件资格仍缺失。
+- #32：`960d615` 的真实 dev namespace 6 例、tmpfs-only artifact pool 与 launch-failure cleanup 已通过；正向 kernel cgroup 执行因缺少 delegated cgroup v2 subtree（rootless Docker cgroup driver `none`、cgroupfs EPERM）而 BLOCKED。
+- #48：umbrella 保持 OPEN；#30 已通过 PR #50 CLOSED，不能把所有子项都描述为未关闭或未合并；#2–#19 的实现与当前验收需逐项核对，不做批量关闭。
+
+## 历史中间基线（6d2f0b8）已合并能力与未验收边界
 
 - Pando 生产网关、双阶段 GitFS↔Pando 迁移/回滚、加密 pack CAS 与 transition 备份已合并（PR #53）；`tests/pando_transition_service.py` 需要真实 Garage/Vault，本次审计未重跑。
 - 独立 ref 写入使用持久 `git_ref_admissions` 与 epoch fence（PR #51，迁移 126）；物理 GitFS GC 使用迁移 127 admission fence、完整 retention roots、quarantine 与幂等删除（PR #52）。
