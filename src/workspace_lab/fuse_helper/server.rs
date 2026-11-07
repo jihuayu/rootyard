@@ -7,35 +7,41 @@
 //!
 //! Threads:
 //!
-//! * the control loop owns request dispatch; it must never block on a freeze or
-//!   a hydration job,
+//! * the control loop owns the reader: it decodes frames and answers the short
+//!   gate queries itself, so a slow mount, unmount, prewarm or session join can
+//!   never delay a marker, handoff, finish or heartbeat,
+//! * two bounded worker pools run the blocking operations (mount/unmount and
+//!   prewarm) with a fixed number of slots; a full pool is an immediate
+//!   `EBUSY`, never an unbounded thread,
 //! * one heartbeat reader updates the watchdog deadline,
 //! * one watchdog fences and exits when the deadline passes,
-//! * one freeze thread per granted freeze, one blocking thread per prewarm,
+//! * one freeze thread per granted freeze (at most one per mount), never one
+//!   per cancel,
 //! * one FUSE actor thread per mount plus the process-wide read pool created by
 //!   `fuse_dispatch`.
 //!
+//! Every operation that can outlive its caller has an independent child-side
+//! deadline. A missing cancel, a lost begin reply or a dead control socket
+//! therefore releases the gate as a fence and frees the per-mount operation
+//! slot; no path relies on EOF to clean up.
+//!
 //! Failure policy: a panic, a heartbeat EOF, a missed heartbeat deadline or a
-//! lost control socket fences every gate, drops every freeze waiter (a dropped
-//! waiter is a fence, never a thaw), unmounts every workspace and exits. The
-//! parent then sees control EOF and reports those workspaces as no longer
-//! mounted.
+//! lost control socket fences every gate (including gates of mounts that are
+//! still being built), drops every freeze waiter (a dropped waiter is a fence,
+//! never a thaw), unmounts every workspace and exits non-zero. An explicit
+//! `shutdown` is the only exit that reports success.
 use super::protocol::{
-    AbortFreeze, Body, ErrorReply, FenceIfUnchanged, Frame, FreezeBegin, FreezeFinish, Handoff, HEARTBEAT_DEADLINE,
-    Heartbeat, Hello, MountRequest, MountedReply, Observe, OkReply, PROTOCOL_VERSION, Prewarm, PrewarmReply, StateReply,
-    read_frame, write_frame,
+    Body, ErrorReply, FenceIfUnchanged, Frame, FreezeBegin, FreezeFinish, Handoff, HEARTBEAT_DEADLINE, Heartbeat, Hello,
+    MountRequest, Observe, OkReply, PROTOCOL_VERSION, Prewarm, StateReply, read_frame, write_frame,
 };
-use super::{validate_root, workspace_paths};
-use crate::{
-    workspace_lab::fuse_mount::{FreezeDecision, LazySource, MountHandle, MutationGate, Overlay, spawn as spawn_mount},
-    workspaces::lazy::Reader,
-};
+use crate::workspace_lab::fuse_mount::{MountHandle, MutationGate};
+use crate::workspaces::lazy::Reader;
 use std::{
-    collections::HashMap,
-    fs, io,
+    collections::{HashMap, VecDeque},
+    io,
     os::fd::{FromRawFd, OwnedFd},
     os::unix::net::UnixStream,
-    path::{Component, Path},
+    path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -46,52 +52,105 @@ use std::{
 };
 use uuid::Uuid;
 
+#[path = "server_ops.rs"]
+mod ops;
+
 /// Per-mount operation queue, mirrored from `fuse_dispatch` for diagnostics.
-const MOUNT_QUEUE_CAPACITY: u32 = 128;
+pub(super) const MOUNT_QUEUE_CAPACITY: u32 = 128;
 const WATCHDOG_TICK: Duration = Duration::from_millis(100);
+/// Blocking operations run beside the control reader; four slots per pool keep
+/// a burst of mounts from multiplying threads or starving heartbeats.
+const OPS_WORKERS: usize = 4;
+const PREWARM_WORKERS: usize = 4;
+const OPS_QUEUE: usize = 16;
+const PREWARM_QUEUE: usize = 8;
+/// Bounded memory of cancelled operation ids, so a cancel that races ahead of
+/// its begin/mount frame cannot be forgotten and a late frame cannot revive it.
+pub(super) const TOMBSTONES: usize = 64;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-struct Mounted {
-    handle: MountHandle,
-    gate: Arc<MutationGate>,
-    reader: Option<Arc<Reader>>,
+/// One blocking job. `Box<dyn FnOnce>` keeps the pools type-agnostic.
+pub(super) type Job = Box<dyn FnOnce() + Send + 'static>;
+
+pub(super) struct Mounted {
+    pub handle: MountHandle,
+    pub gate: Arc<MutationGate>,
+    pub reader: Option<Arc<Reader>>,
+    /// Canonical root the mount was built from, for an idempotent retry.
+    pub root: PathBuf,
+    /// Mount frame that currently owns this registration. A cancel only tears
+    /// down the mount it names, and an idempotent retry takes ownership so a
+    /// delayed cancel of the previous frame cannot remove the confirmed mount.
+    pub request: u64,
 }
 
-struct FreezeOp {
-    workspace: Uuid,
-    epoch: i64,
-    decision: SyncSender<bool>,
-    /// Request id that must receive the `finished` reply once the gate is free.
-    done: Arc<Mutex<Option<u64>>>,
+/// A mount that has been admitted but not published. The gate is registered
+/// here as soon as it exists so the watchdog can fence a half-built mount.
+pub(super) struct PendingMount {
+    pub request: u64,
+    pub deadline: Instant,
+    pub cancelled: Arc<AtomicBool>,
+    pub gate: Option<Arc<MutationGate>>,
 }
 
-struct State {
-    generation: AtomicU64,
-    hello: AtomicBool,
-    last_heartbeat: Mutex<Instant>,
-    control: Mutex<UnixStream>,
-    mounts: Mutex<HashMap<Uuid, Mounted>>,
-    freezes: Mutex<HashMap<u64, FreezeOp>>,
+pub(super) struct FreezeOp {
+    pub workspace: Uuid,
+    pub epoch: i64,
+    /// Begin frame that owns this op; a cancel or finish must address the same
+    /// workspace/epoch and removal is conditional on this request.
+    pub begin_request: u64,
+    pub deadline: Instant,
+    pub decision: SyncSender<bool>,
+    /// Request id that receives the `finished` reply once the gate is free.
+    pub done: Mutex<Option<u64>>,
+    pub released: AtomicBool,
+}
+
+pub(super) struct State {
+    pub generation: AtomicU64,
+    pub hello: AtomicBool,
+    pub last_heartbeat: Mutex<Instant>,
+    pub control: Mutex<UnixStream>,
+    pub mounts: Mutex<HashMap<Uuid, Mounted>>,
+    pub pending: Mutex<HashMap<Uuid, PendingMount>>,
+    pub mount_tombstones: Mutex<VecDeque<(Uuid, u64)>>,
+    pub freezes: Mutex<HashMap<u64, FreezeOp>>,
+    pub freeze_tombstones: Mutex<VecDeque<u64>>,
+    pub ops: SyncSender<Job>,
+    pub prewarm: SyncSender<Job>,
 }
 
 impl State {
-    fn new(control: UnixStream) -> Self {
+    fn new(control: UnixStream, ops: SyncSender<Job>, prewarm: SyncSender<Job>) -> Self {
         Self {
             generation: AtomicU64::new(0),
             hello: AtomicBool::new(false),
             last_heartbeat: Mutex::new(Instant::now()),
             control: Mutex::new(control),
             mounts: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            mount_tombstones: Mutex::new(VecDeque::new()),
             freezes: Mutex::new(HashMap::new()),
+            freeze_tombstones: Mutex::new(VecDeque::new()),
+            ops,
+            prewarm,
         }
     }
 
+    /// Fence every published mount and every gate that is still being built.
     fn fence_all(&self) {
-        let gates: Vec<Arc<MutationGate>> = lock(&self.mounts).values().map(|m| m.gate.clone()).collect();
-        for gate in gates {
+        let pending: Vec<Arc<MutationGate>> = {
+            let pending = lock(&self.pending);
+            pending.values().filter_map(|entry| entry.gate.clone()).collect()
+        };
+        let mounted: Vec<Arc<MutationGate>> = {
+            let mounts = lock(&self.mounts);
+            mounts.values().map(|mount| mount.gate.clone()).collect()
+        };
+        for gate in pending.into_iter().chain(mounted) {
             gate.fence();
         }
     }
@@ -101,12 +160,27 @@ impl State {
         lock(&self.freezes).clear();
     }
 
+    /// Fence first (via the caller), then cancel pending work and unmount one
+    /// mount at a time so a slow session join cannot hold the mount registry.
     fn unmount_all(&self) {
-        let mounts: Vec<Mounted> = lock(&self.mounts).drain().map(|(_, mount)| mount).collect();
+        {
+            let pending = lock(&self.pending);
+            for entry in pending.values() {
+                entry.cancelled.store(true, Ordering::Release);
+            }
+        }
+        let mounts: Vec<Mounted> = {
+            let mut mounts = lock(&self.mounts);
+            mounts.drain().map(|(_, mount)| mount).collect()
+        };
         for mount in mounts {
             mount.handle.shutdown();
             drop(mount.handle);
         }
+    }
+
+    fn failstop(&self, reason: &str, code: i32) -> ! {
+        teardown(self, reason, code)
     }
 }
 
@@ -161,12 +235,15 @@ pub fn run() -> io::Result<()> {
     let control = stream_from_fd(0)?;
     let heartbeat = stream_from_fd(1)?;
     let reader = control.try_clone()?;
-    let state = Arc::new(State::new(control));
+    let (ops, ops_jobs) = mpsc::sync_channel::<Job>(OPS_QUEUE);
+    let (prewarm, prewarm_jobs) = mpsc::sync_channel::<Job>(PREWARM_QUEUE);
+    let state = Arc::new(State::new(control, ops, prewarm));
 
     // A panic anywhere in the child must fence before anything else: the hook
     // runs before unwinding continues, so a half-finished operation can never
-    // leave a writable mount behind. The control loop is additionally guarded
-    // with `catch_unwind` below.
+    // leave a writable mount behind. Worker jobs are additionally guarded with
+    // `catch_unwind` below so a panic turns into one failstop, not a live
+    // process that pretends the mount is still healthy.
     let hook_state = state.clone();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -175,6 +252,8 @@ pub fn run() -> io::Result<()> {
         previous(info);
     }));
 
+    spawn_pool(state.clone(), "fuse-helper-op", OPS_WORKERS, ops_jobs)?;
+    spawn_pool(state.clone(), "fuse-helper-prewarm", PREWARM_WORKERS, prewarm_jobs)?;
     let watchdog_state = state.clone();
     thread::Builder::new().name("fuse-helper-watchdog".into()).spawn(move || watchdog(watchdog_state))?;
     let heartbeat_state = state.clone();
@@ -184,12 +263,35 @@ pub fn run() -> io::Result<()> {
 
     let loop_state = state.clone();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| control_loop(loop_state, reader)));
-    let reason = match outcome {
-        Ok(Ok(())) => "control loop closed",
-        Ok(Err(_)) => "control loop failed",
-        Err(_) => "control loop panicked",
-    };
-    teardown(&state, reason, 1)
+    match outcome {
+        // An explicit shutdown was acknowledged and handed to a worker that
+        // fences, unmounts and exits 0. This thread only waits for it; if the
+        // worker panics the job guard calls failstop instead of hanging.
+        Ok(Ok(LoopOutcome::Shutdown)) => loop {
+            thread::park_timeout(Duration::from_secs(1));
+        },
+        Ok(Ok(LoopOutcome::Closed)) => teardown(&state, "control loop closed", 1),
+        Ok(Err(_)) => teardown(&state, "control loop failed", 1),
+        Err(_) => teardown(&state, "control loop panicked", 1),
+    }
+}
+
+fn spawn_pool(state: Arc<State>, name: &str, workers: usize, jobs: Receiver<Job>) -> io::Result<()> {
+    let jobs = Arc::new(Mutex::new(jobs));
+    for index in 0..workers {
+        let state = state.clone();
+        let jobs = jobs.clone();
+        thread::Builder::new().name(format!("{name}-{index}")).spawn(move || loop {
+            let job = match lock(&jobs).recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                state.failstop("operation worker panicked", 1);
+            }
+        })?;
+    }
+    Ok(())
 }
 
 fn stream_from_fd(fd: i32) -> io::Result<UnixStream> {
@@ -237,7 +339,15 @@ fn teardown(state: &State, reason: &str, code: i32) -> ! {
     std::process::exit(code)
 }
 
-fn control_loop(state: Arc<State>, mut stream: UnixStream) -> io::Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopOutcome {
+    /// The control socket closed or failed without an explicit shutdown.
+    Closed,
+    /// A `shutdown` frame was acknowledged; a worker owns the teardown.
+    Shutdown,
+}
+
+fn control_loop(state: Arc<State>, mut stream: UnixStream) -> io::Result<LoopOutcome> {
     loop {
         let frame = read_frame(&mut stream)?;
         if !state.hello.load(Ordering::Acquire) {
@@ -270,19 +380,53 @@ fn control_loop(state: Arc<State>, mut stream: UnixStream) -> io::Result<()> {
                 continue;
             }
         };
-        if dispatch(&state, frame.request_id, frame.workspace, frame.db_epoch, body) {
-            return Ok(());
+        if let Some(outcome) = dispatch(&state, frame.request_id, frame.workspace, frame.db_epoch, body) {
+            return Ok(outcome);
         }
     }
 }
 
-/// Returns true when the child must stop serving.
-fn dispatch(state: &Arc<State>, request: u64, workspace: Option<Uuid>, db_epoch: i64, body: Body) -> bool {
+/// Returns `Some` when the control loop must stop reading.
+fn dispatch(
+    state: &Arc<State>,
+    request: u64,
+    workspace: Option<Uuid>,
+    db_epoch: i64,
+    body: Body,
+) -> Option<LoopOutcome> {
     match body {
         Body::Heartbeat(_) => {
             *lock(&state.last_heartbeat) = Instant::now();
         }
-        Body::Mount(request_body) => mount(state, request, workspace, db_epoch, request_body),
+        Body::Mount(request_body) => {
+            let job_state = state.clone();
+            let job: Job = Box::new(move || ops::mount(&job_state, request, workspace, db_epoch, request_body));
+            if state.ops.try_send(job).is_err() {
+                reply_error(state, request, workspace, libc::EBUSY, "workspace FUSE helper operation slots are full");
+            }
+        }
+        Body::Unmount => {
+            let job_state = state.clone();
+            let job: Job = Box::new(move || ops::unmount(&job_state, request, workspace));
+            if state.ops.try_send(job).is_err() {
+                reply_error(state, request, workspace, libc::EBUSY, "workspace FUSE helper operation slots are full");
+            }
+        }
+        Body::AbortMount(abort) => {
+            // Cancel the exact mount frame on the reader thread so a pending
+            // mount cannot publish after this point; the slow session teardown
+            // is handed to a worker.
+            let removed = ops::cancel_mount(state, workspace, abort.request);
+            let job_state = state.clone();
+            let job: Job = Box::new(move || ops::abort_mount_reply(&job_state, request, workspace, removed));
+            if let Err(error) = state.ops.try_send(job) {
+                // The pool is full: run the bounded compensation here so the
+                // cancelled session is still joined instead of leaked.
+                match error {
+                    mpsc::TrySendError::Full(job) | mpsc::TrySendError::Disconnected(job) => job(),
+                }
+            }
+        }
         Body::Handoff(Handoff { epoch, until }) => match workspace.and_then(|ws| gate_for(state, ws)) {
             Some(gate) => match gate.handoff(epoch, until) {
                 Ok(()) => reply(state, request, workspace, epoch, Body::Ok(OkReply { op_id: None })),
@@ -315,252 +459,48 @@ fn dispatch(state: &Arc<State>, request: u64, workspace: Option<Uuid>, db_epoch:
                 None => reply_error(state, request, workspace, libc::ENOENT, "workspace is not mounted"),
             }
         }
-        Body::FreezeBegin(FreezeBegin { op_id }) => freeze_begin(state, request, workspace, db_epoch, op_id),
+        Body::FreezeBegin(FreezeBegin { op_id }) => ops::freeze_begin(state, request, workspace, db_epoch, op_id),
         Body::FreezeFinish(FreezeFinish { op_id, epoch, thaw }) => {
-            freeze_release(state, request, workspace, op_id, epoch, thaw)
+            ops::freeze_release(state, request, workspace, op_id, epoch, thaw)
         }
-        Body::AbortFreeze(AbortFreeze { op_id }) => freeze_release(state, request, workspace, op_id, -1, false),
-        Body::Prewarm(Prewarm { paths }) => prewarm(state, request, workspace, paths),
-        Body::Unmount => {
-            let removed = workspace.and_then(|ws| lock(&state.mounts).remove(&ws));
-            match removed {
-                Some(mount) => {
-                    mount.handle.shutdown();
-                    drop(mount);
-                    reply(state, request, workspace, 0, Body::Unmounted);
-                }
-                None => reply_error(state, request, workspace, libc::ENOENT, "workspace is not mounted"),
+        Body::AbortFreeze(crate::workspace_lab::fuse_helper::protocol::AbortFreeze { op_id }) => {
+            ops::freeze_release(state, request, workspace, op_id, -1, false)
+        }
+        Body::Prewarm(Prewarm { paths }) => {
+            let job_state = state.clone();
+            let job: Job = Box::new(move || ops::prewarm(&job_state, request, workspace, paths));
+            if state.prewarm.try_send(job).is_err() {
+                reply_error(state, request, workspace, libc::EBUSY, "workspace FUSE helper prewarm slots are full");
             }
         }
         Body::Shutdown => {
             reply(state, request, None, 0, Body::ShuttingDown);
-            state.fence_all();
-            state.release_freezes();
-            state.unmount_all();
-            return true;
+            let job_state = state.clone();
+            let job: Job = Box::new(move || teardown(&job_state, "explicit shutdown", 0));
+            if state.ops.try_send(job).is_err() {
+                teardown(state, "shutdown could not be scheduled", 1);
+            }
+            return Some(LoopOutcome::Shutdown);
         }
         other => {
             reply_error(state, request, workspace, libc::EPROTO, format!("unexpected operation `{}`", other.op()));
         }
     }
-    false
-}
-
-fn mount(state: &Arc<State>, request: u64, workspace: Option<Uuid>, db_epoch: i64, body: MountRequest) {
-    let Some(claimed) = workspace else {
-        return reply_error(state, request, None, libc::EINVAL, "mount requires a workspace id");
-    };
-    if claimed != body.workspace {
-        return reply_error(state, request, workspace, libc::EINVAL, "workspace id mismatch");
-    }
-    if db_epoch <= 0 {
-        return reply_error(state, request, workspace, libc::EINVAL, "mount requires a lease epoch");
-    }
-    if lock(&state.mounts).contains_key(&body.workspace) {
-        return reply_error(state, request, workspace, libc::EEXIST, "workspace is already mounted");
-    }
-    let root = match validate_root(&body.root) {
-        Ok(root) => root,
-        Err(error) => return reply_errno(state, request, workspace, error),
-    };
-    let paths = workspace_paths(&root, body.workspace);
-    if !paths.lower.join(".git").is_dir() {
-        return reply_error(state, request, workspace, libc::ENOENT, "workspace lower Git state missing");
-    }
-    if let Err(error) = fs::create_dir_all(&paths.upper).and_then(|()| fs::create_dir_all(&paths.mountpoint)) {
-        return reply_errno(state, request, workspace, error);
-    }
-    let gate = match MutationGate::new_with_lease(db_epoch, body.lease_until) {
-        Ok(gate) => gate,
-        Err(error) => return reply_errno(state, request, workspace, error),
-    };
-    let reader = if body.lazy {
-        match Reader::open_root(&root, body.workspace) {
-            Ok(reader) => reader,
-            Err(_) => {
-                return reply_error(
-                    state,
-                    request,
-                    workspace,
-                    libc::EIO,
-                    "workspace lazy baseline is unavailable",
-                );
-            }
-        }
-    } else {
-        None
-    };
-    let source: Option<Arc<dyn LazySource>> = reader.clone().map(|reader| reader as Arc<dyn LazySource>);
-    let overlay = match Overlay::new_with_gate_and_lazy(paths.lower, paths.upper, gate.clone(), source) {
-        Ok(overlay) => overlay,
-        Err(error) => return reply_errno(state, request, workspace, error),
-    };
-    let handle = match spawn_mount(overlay, &paths.mountpoint) {
-        Ok(handle) => handle,
-        Err(error) => return reply_errno(state, request, workspace, error),
-    };
-    let epoch = gate.epoch();
-    lock(&state.mounts).insert(body.workspace, Mounted { handle, gate, reader });
-    reply(
-        state,
-        request,
-        workspace,
-        epoch,
-        Body::Mounted(MountedReply { epoch, queue_capacity: MOUNT_QUEUE_CAPACITY }),
-    );
-}
-
-fn freeze_begin(state: &Arc<State>, request: u64, workspace: Option<Uuid>, db_epoch: i64, op_id: u64) {
-    let Some(ws) = workspace else {
-        return reply_error(state, request, None, libc::EINVAL, "freeze requires a workspace id");
-    };
-    let Some(gate) = gate_for(state, ws) else {
-        return reply_error(state, request, workspace, libc::ENOENT, "workspace is not mounted");
-    };
-    if db_epoch != gate.epoch() {
-        return reply_error(state, request, workspace, libc::ESTALE, "freeze epoch is not the mounted epoch");
-    }
-    {
-        let freezes = lock(&state.freezes);
-        if freezes.values().any(|op| op.workspace == ws) {
-            return reply_error(state, request, workspace, libc::EBUSY, "workspace already has a freeze operation");
-        }
-        if freezes.contains_key(&op_id) {
-            return reply_error(state, request, workspace, libc::EEXIST, "freeze operation id reused");
-        }
-    }
-    let (decision, waiter) = mpsc::sync_channel::<bool>(1);
-    let done = Arc::new(Mutex::new(None::<u64>));
-    lock(&state.freezes).insert(op_id, FreezeOp { workspace: ws, epoch: db_epoch, decision, done: done.clone() });
-    let thread_state = state.clone();
-    let spawned = thread::Builder::new().name(format!("fuse-helper-freeze-{op_id}")).spawn(move || {
-        freeze_thread(thread_state, ws, op_id, db_epoch, gate, request, waiter, done)
-    });
-    if let Err(error) = spawned {
-        lock(&state.freezes).remove(&op_id);
-        reply_error(state, request, workspace, libc::EAGAIN, format!("cannot start freeze thread: {error}"));
-    }
-}
-
-fn freeze_thread(
-    state: Arc<State>,
-    workspace: Uuid,
-    op_id: u64,
-    epoch: i64,
-    gate: Arc<MutationGate>,
-    begin_request: u64,
-    waiter: Receiver<bool>,
-    done: Arc<Mutex<Option<u64>>>,
-) {
-    // The acknowledgement is sent by this thread once the gate really drained;
-    // the control loop keeps serving other mounts while it waits.
-    let _ = gate.freeze_with_decision(|| {
-        reply(
-            &state,
-            begin_request,
-            Some(workspace),
-            epoch,
-            Body::Ok(OkReply { op_id: Some(op_id) }),
-        );
-        let thaw = waiter.recv().unwrap_or(false);
-        let decision = if thaw { FreezeDecision::Thaw } else { FreezeDecision::Fence };
-        ((), decision)
-    });
-    let finished = { let mut slot = lock(&done); slot.take() };
-    if let Some(request) = finished {
-        reply(
-            &state,
-            request,
-            Some(workspace),
-            epoch,
-            Body::Ok(OkReply { op_id: Some(op_id) }),
-        );
-    }
-}
-
-/// One-shot finish/abort. `epoch < 0` skips the epoch comparison for an abort.
-fn freeze_release(
-    state: &Arc<State>,
-    request: u64,
-    workspace: Option<Uuid>,
-    op_id: u64,
-    epoch: i64,
-    thaw: bool,
-) {
-    let op = lock(&state.freezes).remove(&op_id);
-    let Some(op) = op else {
-        return reply_error(state, request, workspace, libc::ESTALE, "freeze operation is not pending");
-    };
-    if epoch >= 0 && epoch != op.epoch {
-        // Put it back: a mismatched epoch must not consume the one-shot.
-        lock(&state.freezes).insert(op_id, op);
-        return reply_error(state, request, workspace, libc::ESTALE, "freeze epoch mismatch");
-    }
-    *lock(&op.done) = Some(request);
-    if op.decision.send(thaw).is_err() {
-        reply_error(state, request, workspace, libc::ESRCH, "freeze thread is gone; the epoch stays fenced");
-    }
-}
-
-fn prewarm(state: &Arc<State>, request: u64, workspace: Option<Uuid>, paths: Vec<String>) {
-    let Some(ws) = workspace else {
-        return reply_error(state, request, None, libc::EINVAL, "prewarm requires a workspace id");
-    };
-    if paths.len() > 4 {
-        return reply_error(state, request, workspace, libc::EINVAL, "prewarm accepts at most four paths");
-    }
-    let relative: Vec<std::path::PathBuf> = match paths.iter().map(|path| relative_path(path)).collect() {
-        Ok(paths) => paths,
-        Err(error) => return reply_errno(state, request, workspace, error),
-    };
-    let reader = match lock(&state.mounts).get(&ws).and_then(|mount| mount.reader.clone()) {
-        Some(reader) => reader,
-        None => return reply_error(state, request, workspace, libc::ENOENT, "workspace has no lazily hydrated baseline"),
-    };
-    let thread_state = state.clone();
-    let spawned = thread::Builder::new().name("fuse-helper-prewarm".into()).spawn(move || {
-        match reader.prewarm(&relative) {
-            Ok((files, bytes)) => reply(
-                &thread_state,
-                request,
-                Some(ws),
-                0,
-                Body::Prewarmed(PrewarmReply { files: files as u64, bytes }),
-            ),
-            Err(error) => {
-                let code = error.raw_os_error().unwrap_or(libc::EIO);
-                reply_error(&thread_state, request, Some(ws), code, error.to_string());
-            }
-        }
-    });
-    if let Err(error) = spawned {
-        reply_error(state, request, workspace, libc::EAGAIN, format!("cannot start prewarm thread: {error}"));
-    }
-}
-
-/// Prewarm paths are caller-relative: no absolute path and no parent traversal.
-fn relative_path(raw: &str) -> io::Result<std::path::PathBuf> {
-    let path = Path::new(raw);
-    if path.is_absolute() && !raw.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "prewarm path must be relative"));
-    }
-    if !path.components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir)) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "prewarm path escapes the workspace"));
-    }
-    Ok(path.to_path_buf())
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn prewarm_paths_must_stay_inside_the_workspace() {
-        assert!(relative_path("src/main.rs").is_ok());
-        assert!(relative_path("./a").is_ok());
-        assert!(relative_path("/etc/shadow").is_err());
-        assert!(relative_path("../escape").is_err());
-        assert!(relative_path("a/../../b").is_err());
+    fn test_state() -> Arc<State> {
+        let (_parent, child) = UnixStream::pair().unwrap();
+        let (ops, ops_jobs) = mpsc::sync_channel::<Job>(1);
+        let (prewarm, prewarm_jobs) = mpsc::sync_channel::<Job>(1);
+        // Keep the receivers alive for the lifetime of the state.
+        std::mem::forget(ops_jobs);
+        std::mem::forget(prewarm_jobs);
+        Arc::new(State::new(child, ops, prewarm))
     }
 
     #[test]
@@ -570,5 +510,40 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel::<bool>(1);
         drop(sender);
         assert!(receiver.recv().is_err());
+    }
+
+    #[test]
+    fn operation_tombstones_are_bounded() {
+        let state = test_state();
+        for op_id in 0..(TOMBSTONES as u64 + 8) {
+            ops::push_freeze_tombstone(&state, op_id);
+            ops::push_mount_tombstone(&state, Uuid::nil(), op_id);
+        }
+        assert_eq!(lock(&state.freeze_tombstones).len(), TOMBSTONES);
+        assert_eq!(lock(&state.mount_tombstones).len(), TOMBSTONES);
+        // The oldest entry was evicted, the newest is still known.
+        assert!(ops::take_freeze_tombstone(&state, 0));
+        assert!(ops::take_freeze_tombstone(&state, TOMBSTONES as u64 + 7));
+        assert!(!ops::take_freeze_tombstone(&state, TOMBSTONES as u64 + 7), "a tombstone is one-shot");
+    }
+
+    #[test]
+    fn pending_mount_gate_is_fenced_without_being_published() {
+        let state = test_state();
+        let gate = MutationGate::new_with_lease(4, i64::MAX).unwrap();
+        lock(&state.pending).insert(
+            Uuid::nil(),
+            PendingMount {
+                request: 7,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                gate: Some(gate.clone()),
+            },
+        );
+        state.fence_all();
+        assert!(gate.is_fenced(), "a half-built mount must be fenced by the watchdog path");
+        assert!(ops::checkpoint(&AtomicBool::new(false), Instant::now() + Duration::from_secs(1)).is_ok());
+        assert!(ops::checkpoint(&AtomicBool::new(true), Instant::now() + Duration::from_secs(1)).is_err());
+        assert!(ops::checkpoint(&AtomicBool::new(false), Instant::now()).is_err());
     }
 }

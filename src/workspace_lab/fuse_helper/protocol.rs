@@ -35,6 +35,21 @@ pub const HEARTBEAT_DEADLINE: Duration = Duration::from_millis(1500);
 pub const MAX_INFLIGHT: usize = 64;
 /// Default deadline for one control request that does not outlive the caller.
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+/// Parent deadline for creating one mount in the child.
+pub const MOUNT_DEADLINE: Duration = Duration::from_secs(15);
+/// Parent deadline for a freeze acknowledgement (the child drains mutations).
+pub const FREEZE_DEADLINE: Duration = Duration::from_secs(30);
+/// Parent deadline for the child-side blocking prewarm job.
+pub const PREWARM_DEADLINE: Duration = Duration::from_secs(60);
+/// Deadline for the out-of-band cancel frame. A cancel that cannot be sent in
+/// this window is covered by the child-side operation deadline instead.
+pub const ABORT_DEADLINE: Duration = Duration::from_secs(2);
+/// Child-side mount deadline: the parent gives up first, and a mount that
+/// outlives this window must not be published as writable.
+pub const MOUNT_OP_DEADLINE: Duration = Duration::from_secs(20);
+/// Child-side freeze deadline: a freeze whose caller vanished (or whose begin
+/// reply was lost) fences itself instead of holding the gate forever.
+pub const FREEZE_OP_DEADLINE: Duration = Duration::from_secs(35);
 
 /// One control frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +160,14 @@ pub struct AbortFreeze {
     pub op_id: u64,
 }
 
+/// Cancel a `mount` whose reply the parent gave up on. `request` names the
+/// `request_id` of that mount frame, so a cancel cannot target another mount.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbortMount {
+    pub request: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prewarm {
@@ -207,6 +230,7 @@ pub enum Body {
     FreezeBegin(FreezeBegin),
     FreezeFinish(FreezeFinish),
     AbortFreeze(AbortFreeze),
+    AbortMount(AbortMount),
     Prewarm(Prewarm),
     Unmount,
     Shutdown,
@@ -238,6 +262,7 @@ impl Body {
             Body::FreezeBegin(_) => "freeze_begin",
             Body::FreezeFinish(_) => "freeze_finish",
             Body::AbortFreeze(_) => "abort_freeze",
+            Body::AbortMount(_) => "abort_mount",
             Body::Prewarm(_) => "prewarm",
             Body::Unmount => "unmount",
             Body::Shutdown => "shutdown",
@@ -263,6 +288,7 @@ impl Body {
             Body::FreezeBegin(v) => encode(v)?,
             Body::FreezeFinish(v) => encode(v)?,
             Body::AbortFreeze(v) => encode(v)?,
+            Body::AbortMount(v) => encode(v)?,
             Body::Prewarm(v) => encode(v)?,
             Body::Ok(v) => encode(v)?,
             Body::State(v) => encode(v)?,
@@ -284,6 +310,7 @@ impl Body {
             "freeze_begin" => Body::FreezeBegin(decode_args(op, args)?),
             "freeze_finish" => Body::FreezeFinish(decode_args(op, args)?),
             "abort_freeze" => Body::AbortFreeze(decode_args(op, args)?),
+            "abort_mount" => Body::AbortMount(decode_args(op, args)?),
             "prewarm" => Body::Prewarm(decode_args(op, args)?),
             "unmount" => Body::Unmount,
             "shutdown" => Body::Shutdown,
@@ -391,6 +418,29 @@ mod tests {
         let extra = serde_json::json!({"epoch": 1, "until": 2, "path": "/etc/shadow"});
         let error = Body::decode("observe", extra).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn control_work_deadlines_are_bounded() {
+        // One unanswered-request cap and deadlines that cannot outlive the
+        // caller's own operation window.
+        assert_eq!(MAX_INFLIGHT, 64);
+        assert!(REQUEST_DEADLINE <= Duration::from_secs(30));
+        assert!(MOUNT_DEADLINE < MOUNT_OP_DEADLINE);
+        assert!(FREEZE_DEADLINE < FREEZE_OP_DEADLINE);
+        assert!(HEARTBEAT_INTERVAL * 6 <= HEARTBEAT_DEADLINE);
+    }
+
+    #[test]
+    fn abort_frames_carry_the_operation_they_cancel() {
+        assert!(matches!(
+            roundtrip(Body::AbortFreeze(AbortFreeze { op_id: 4 })),
+            Body::AbortFreeze(AbortFreeze { op_id: 4 })
+        ));
+        assert!(matches!(
+            roundtrip(Body::AbortMount(AbortMount { request: 9 })),
+            Body::AbortMount(AbortMount { request: 9 })
+        ));
     }
 
     #[test]

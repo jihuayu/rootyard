@@ -23,7 +23,7 @@ use crate::{
     AppState, Error,
     members::models::Role,
     workspace_lab::{
-        fuse_helper::{HelperClient, HelperError},
+        fuse_helper::{HelperClient, HelperError, protocol::FREEZE_DEADLINE},
         fuse_mount::{FreezeDecision, LazySource, MountHandle, MutationGate, Overlay},
     },
 };
@@ -41,7 +41,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -53,11 +53,10 @@ enum Mounted {
     InProcess { _session: MountHandle, gate: Arc<MutationGate>, lazy: Option<Arc<lazy::Reader>> },
     /// Production backend: only the helper client registration is kept.
     Helper { client: Arc<HelperClient> },
-}
-
-struct Observer {
-    gate: Option<(Arc<MutationGate>, (i64, u64))>,
-    client: Option<Arc<HelperClient>>,
+    /// A mount was admitted but not confirmed by the child. `mounted()` is
+    /// false, a retry is told the mount is pending, and the guard that owns
+    /// this entry removes it on every failure, cancel or panic path.
+    Pending { _client: Arc<HelperClient> },
 }
 
 static MOUNTS: OnceLock<Mutex<HashMap<Uuid, Mounted>>> = OnceLock::new();
@@ -65,7 +64,6 @@ fn registry() -> &'static Mutex<HashMap<Uuid, Mounted>> {
     MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 static HELPER: OnceLock<Mutex<Option<Arc<HelperClient>>>> = OnceLock::new();
-static NEXT_FREEZE_OP: AtomicU64 = AtomicU64::new(1);
 
 fn helper_slot() -> &'static Mutex<Option<Arc<HelperClient>>> {
     HELPER.get_or_init(|| Mutex::new(None))
@@ -99,6 +97,7 @@ pub fn mounted(id: Uuid) -> bool {
     match registry.get(&id) {
         Some(Mounted::InProcess { .. }) => true,
         Some(Mounted::Helper { client }) => client.alive(),
+        Some(Mounted::Pending { .. }) => false,
         None => false,
     }
 }
@@ -136,10 +135,6 @@ fn helper_error(error: HelperError) -> Error {
     }
 }
 
-fn next_op() -> u64 {
-    NEXT_FREEZE_OP.fetch_add(1, Ordering::SeqCst)
-}
-
 /// Ordered lease observation from a periodic or page-based refresh.
 pub fn update_lease(id: Uuid, db_epoch: i64, until: i64) {
     let observer = {
@@ -152,7 +147,7 @@ pub fn update_lease(id: Uuid, db_epoch: i64, until: i64) {
                 return;
             }
             Some(Mounted::Helper { client }) => client.clone(),
-            None => return,
+            Some(Mounted::Pending { .. }) | None => return,
         }
     };
     // The child orders the observation under its own gate lock; sending it from
@@ -166,38 +161,66 @@ pub async fn refresh_leases(state: &AppState) -> Result<(), Error> {
     if !enabled() {
         return Ok(());
     }
-    let observers: Vec<(Uuid, Observer)> = {
+    // Capture the conditional-fence marker *before* the SELECT: a marker read
+    // after a slow query could match a newer handoff and fence it. The marker
+    // is a snapshot of (epoch, generation); the child compares it under its
+    // own gate lock, so an observation/handoff that lands during the query
+    // leaves the newer gate untouched.
+    let (in_process, helpers): (Vec<(Uuid, Arc<MutationGate>, (i64, u64))>, Vec<(Uuid, Arc<HelperClient>)>) = {
         let mounts = registry().lock().unwrap();
-        mounts
-            .iter()
-            .map(|(id, mount)| {
-                let observer = match mount {
-                    Mounted::InProcess { gate, .. } => {
-                        Observer { gate: Some((gate.clone(), gate.lease_marker())), client: None }
-                    }
-                    Mounted::Helper { client } => Observer { gate: None, client: Some(client.clone()) },
-                };
-                (*id, observer)
-            })
-            .collect()
+        let mut in_process = Vec::new();
+        let mut helpers = Vec::new();
+        for (id, mount) in mounts.iter() {
+            match mount {
+                Mounted::InProcess { gate, .. } => in_process.push((*id, gate.clone(), gate.lease_marker())),
+                Mounted::Helper { client } => helpers.push((*id, client.clone())),
+                // An unconfirmed mount has no published gate to refresh.
+                Mounted::Pending { .. } => {}
+            }
+        }
+        (in_process, helpers)
     };
-    if observers.is_empty() {
+    if in_process.is_empty() && helpers.is_empty() {
         return Ok(());
     }
-    let ids: Vec<Uuid> = observers.iter().map(|(id, _)| *id).collect();
+    let helpers = tokio::task::spawn_blocking(move || {
+        helpers
+            .into_iter()
+            .map(|(id, client)| {
+                let marker = client.marker(id).ok().map(|state| (state.epoch, state.generation));
+                (id, client, marker)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(Error::internal)?;
+    let ids: Vec<Uuid> = in_process.iter().map(|(id, _, _)| *id).chain(helpers.iter().map(|(id, _, _)| *id)).collect();
     let client = state.pool.get().await.map_err(Error::internal)?;
     let rows = client
         .query(
-            "SELECT id,lease_epoch,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces \
-             WHERE id=ANY($1::uuid[]) AND host_id=$2 AND state='ready'",
+            "SELECT id,lease_epoch,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces              WHERE id=ANY($1::uuid[]) AND host_id=$2 AND state='ready'",
             &[&ids, &state.storage.volume_id],
         )
         .await
         .map_err(Error::internal)?;
     let leases: HashMap<Uuid, (i64, i64)> = rows.iter().map(|r| (r.get(0), (r.get(1), r.get(2)))).collect();
     tokio::task::spawn_blocking(move || {
-        for (id, observer) in observers {
-            apply_refresh(id, observer, leases.get(&id).copied());
+        for (id, gate, marker) in in_process {
+            apply_refresh(gate, marker, leases.get(&id).copied());
+        }
+        for (id, client, marker) in helpers {
+            match leases.get(&id).copied() {
+                Some((epoch, until)) => {
+                    let _ = client.observe(id, epoch, until);
+                }
+                None => {
+                    // Only the marker read before the query may be fenced; a
+                    // missing row that raced a handoff leaves the new gate alone.
+                    if let Some((epoch, generation)) = marker {
+                        let _ = client.fence_if_unchanged(id, epoch, generation);
+                    }
+                }
+            }
         }
     })
     .await
@@ -205,31 +228,15 @@ pub async fn refresh_leases(state: &AppState) -> Result<(), Error> {
     Ok(())
 }
 
-fn apply_refresh(id: Uuid, observer: Observer, lease: Option<(i64, i64)>) {
-    if let Some((gate, marker)) = observer.gate {
-        match lease {
-            Some((epoch, until)) => {
-                let _ = gate.observe_lease(epoch, until);
-            }
-            None => {
-                // A missing row may be an old snapshot. Only fence when this gate
-                // still matches the marker captured before the query.
-                let _ = gate.fence_if_unchanged(marker);
-            }
-        }
-        return;
-    }
-    let Some(client) = observer.client else { return };
+fn apply_refresh(gate: Arc<MutationGate>, marker: (i64, u64), lease: Option<(i64, i64)>) {
     match lease {
         Some((epoch, until)) => {
-            let _ = client.observe(id, epoch, until);
+            let _ = gate.observe_lease(epoch, until);
         }
         None => {
-            // The child must resolve marker and conditional fence synchronously,
-            // otherwise a stale query could fence a newer handoff.
-            if let Ok(state) = client.marker(id) {
-                let _ = client.fence_if_unchanged(id, state.epoch, state.generation);
-            }
+            // A missing row may be an old snapshot. Only fence when this gate
+            // still matches the marker captured before the query.
+            let _ = gate.fence_if_unchanged(marker);
         }
     }
 }
@@ -239,8 +246,13 @@ fn freeze_grant(
     client: &Arc<HelperClient>,
     epoch: i64,
 ) -> Result<crate::workspace_lab::fuse_helper::RemoteFreezeToken, Error> {
-    let op_id = next_op();
-    client.freeze_begin(id, epoch, op_id).map_err(helper_error)
+    // The attempt (and therefore its operation id) exists before the begin
+    // frame is written. It is RAII: a begin timeout, a cancelled async caller
+    // or a panic queues an `abort_freeze`, and the child's own freeze deadline
+    // is the backstop.
+    let attempt = client.freeze_attempt(id, epoch);
+    let _op_id = attempt.op_id();
+    attempt.begin(FREEZE_DEADLINE).map_err(helper_error)
 }
 
 pub fn with_frozen<T>(id: Uuid, work: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
@@ -378,30 +390,74 @@ pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(
 
 fn ensure_helper(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(), Error> {
     let client = helper_client()?;
+    enum Registered {
+        Helper(Arc<HelperClient>),
+        Pending,
+        Missing,
+    }
     let registered = {
         let registry = registry().lock().unwrap();
         match registry.get(&id) {
-            Some(Mounted::Helper { client }) => Some(client.clone()),
-            _ => None,
+            Some(Mounted::Helper { client }) => Registered::Helper(client.clone()),
+            Some(Mounted::Pending { .. }) => Registered::Pending,
+            Some(Mounted::InProcess { .. }) | None => Registered::Missing,
         }
     };
-    if let Some(registered) = registered {
-        // The RPC is issued with the registry lock released so one mount's
-        // handoff cannot stall every other workspace.
-        if registered.alive() {
-            return registered.handoff(id, db_epoch, until).map_err(helper_error);
+    match registered {
+        Registered::Helper(registered) => {
+            // The RPC is issued with the registry lock released so one mount's
+            // handoff cannot stall every other workspace.
+            if registered.alive() {
+                return registered.handoff(id, db_epoch, until).map_err(helper_error);
+            }
+            registry().lock().unwrap().remove(&id);
+            return Err(Error::internal("workspace FUSE helper is unavailable after a control failure"));
         }
-        registry().lock().unwrap().remove(&id);
-        return Err(Error::internal("workspace FUSE helper is unavailable after a control failure"));
+        Registered::Pending => {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "workspace mount is still being confirmed by the FUSE helper; retry on the same epoch",
+            ))
+        }
+        Registered::Missing => {}
     }
     // The lower tree was prepared by `prepare` under database authorization;
     // the helper only ever receives the root and this UUID.
     if !lower_path(state, id).join(".git").is_dir() {
         return Err(Error::internal("workspace lower Git state missing"));
     }
+    // Responsibility is registered before the RPC: `mounted(id)` stays false
+    // until the child confirmed the mount, and the guard removes this entry on
+    // every failure path, including a panic or a cancelled caller.
+    registry().lock().unwrap().insert(id, Mounted::Pending { _client: client.clone() });
+    let mut guard = PendingGuard { id, armed: true };
     client.mount(&state.storage.root, id, db_epoch, until, true).map_err(helper_error)?;
-    registry().lock().unwrap().insert(id, Mounted::Helper { client });
+    {
+        let mut registry = registry().lock().unwrap();
+        if matches!(registry.get(&id), Some(Mounted::Pending { .. })) {
+            registry.insert(id, Mounted::Helper { client });
+        }
+    }
+    guard.armed = false;
     Ok(())
+}
+
+/// Removes an unconfirmed mount registration unless the mount was confirmed.
+struct PendingGuard {
+    id: Uuid,
+    armed: bool,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut registry = registry().lock().unwrap();
+        if matches!(registry.get(&self.id), Some(Mounted::Pending { .. })) {
+            registry.remove(&self.id);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -456,7 +512,7 @@ pub async fn prewarm(
         .get(&id)
         .and_then(|m| match m {
             Mounted::InProcess { lazy, .. } => lazy.clone(),
-            Mounted::Helper { .. } => None,
+            Mounted::Helper { .. } | Mounted::Pending { .. } => None,
         })
         .ok_or(Error(StatusCode::CONFLICT, "workspace has no remote lazy baseline"))?;
     let (count, bytes) = tokio::task::spawn_blocking(move || reader.prewarm(&paths))

@@ -12,9 +12,10 @@
 //! [`crate::workspaces::mounts`] reports the workspace as not mounted. Nothing
 //! here pretends a crashed child kept serving reads.
 use super::protocol::{
-    AbortFreeze, Body, ErrorReply, FenceIfUnchanged, Frame, FreezeBegin, FreezeFinish, Handoff, HEARTBEAT_INTERVAL,
-    Heartbeat, Hello, MAX_INFLIGHT, MountRequest, Observe, PROTOCOL_VERSION, Prewarm, PrewarmReply,
-    REQUEST_DEADLINE, StateReply, write_frame, read_frame,
+    ABORT_DEADLINE, AbortFreeze, AbortMount, Body, ErrorReply, FenceIfUnchanged, Frame, FREEZE_DEADLINE,
+    FreezeBegin, FreezeFinish, Handoff, HEARTBEAT_INTERVAL, Heartbeat, Hello, MAX_INFLIGHT, MOUNT_DEADLINE,
+    MountRequest, Observe, PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, PrewarmReply, REQUEST_DEADLINE,
+    StateReply, read_frame, write_frame,
 };
 use crate::workspace_lab::fuse_mount::FreezeDecision;
 use std::{
@@ -36,12 +37,9 @@ use std::{
 };
 use uuid::Uuid;
 
-/// Bounded deadline for creating a mount in the child.
-pub const MOUNT_DEADLINE: Duration = Duration::from_secs(15);
-/// Bounded deadline for a freeze acknowledgement (drain of admitted mutations).
-pub const FREEZE_DEADLINE: Duration = Duration::from_secs(30);
-/// Bounded deadline for a prewarm reply; the child runs it as a blocking job.
-pub const PREWARM_DEADLINE: Duration = Duration::from_secs(60);
+/// Bound on queued cancel frames. One worker sends them, so a caller that
+/// abandons a begin/mount can never spawn an unbounded number of threads.
+const ABORT_QUEUE: usize = 64;
 
 /// Failure while talking to the helper. The code is an errno value when one is
 /// meaningful, so callers can distinguish `EBUSY`/`ESTALE`/timeouts.
@@ -77,13 +75,28 @@ impl std::fmt::Display for HelperError {
 
 impl std::error::Error for HelperError {}
 
-type Pending = mpsc::Sender<Result<Body, HelperError>>;
+struct PendingReply {
+    sender: mpsc::Sender<Result<Body, HelperError>>,
+    /// Workspace the request was addressed to; a reply must name it again.
+    workspace: Option<Uuid>,
+    /// Non-zero when the reply must echo the request epoch.
+    db_epoch: i64,
+}
+
+/// A cancellation that must still reach the child when the waiting caller is
+/// gone. The child also bounds every mount/freeze operation on its own, so a
+/// full queue is a lost hint, never an orphan.
+enum AbortJob {
+    Freeze { workspace: Uuid, epoch: i64, op_id: u64 },
+    Mount { workspace: Uuid, request: u64 },
+}
 
 struct Inner {
     generation: u64,
     control: Mutex<UnixStream>,
     heartbeat: Mutex<UnixStream>,
-    pending: Mutex<HashMap<u64, Pending>>,
+    pending: Mutex<HashMap<u64, PendingReply>>,
+    aborts: mpsc::SyncSender<AbortJob>,
     next_request: AtomicU64,
     dead: AtomicBool,
     stop: AtomicBool,
@@ -98,24 +111,110 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Inner {
     fn mark_dead(&self) {
         self.dead.store(true, Ordering::Release);
-        let orphaned: Vec<Pending> = {
+        let orphaned: Vec<PendingReply> = {
             let mut pending = lock(&self.pending);
-            pending.drain().map(|(_, sender)| sender).collect()
+            pending.drain().map(|(_, pending)| pending).collect()
         };
-        for sender in orphaned {
-            let _ = sender.send(Err(HelperError::disconnected()));
+        for pending in orphaned {
+            let _ = pending.sender.send(Err(HelperError::disconnected()));
         }
     }
 
     fn deliver(&self, frame: Frame) {
-        let sender = lock(&self.pending).remove(&frame.request_id);
-        let Some(sender) = sender else { return };
-        let result = match frame.body() {
-            Ok(Body::Error(ErrorReply { code, message })) => Err(HelperError::new(code, message)),
-            Ok(body) => Ok(body),
-            Err(error) => Err(HelperError::protocol(error.to_string())),
+        let expected = lock(&self.pending).remove(&frame.request_id);
+        let Some(expected) = expected else { return };
+        // Bind the reply to the request that is still waiting: another
+        // generation, workspace or epoch must not be mistaken for this answer.
+        let result = if frame.generation != self.generation {
+            Err(HelperError::protocol("helper reply carries another generation"))
+        } else if frame.workspace != expected.workspace
+            || (expected.db_epoch != 0 && frame.db_epoch != expected.db_epoch)
+        {
+            Err(HelperError::protocol("helper reply does not match the request workspace/epoch"))
+        } else {
+            match frame.body() {
+                Ok(Body::Error(ErrorReply { code, message })) => Err(HelperError::new(code, message)),
+                Ok(body) => Ok(body),
+                Err(error) => Err(HelperError::protocol(error.to_string())),
+            }
         };
-        let _ = sender.send(result);
+        let _ = expected.sender.send(result);
+    }
+
+    fn queue_abort(&self, job: AbortJob) {
+        // Non-blocking by design: the child-side operation deadline covers a
+        // full queue, and a dead helper has nothing left to cancel. This is
+        // what keeps a dropped freeze token from spawning one thread per call.
+        let _ = self.aborts.try_send(job);
+    }
+
+    fn next_request(&self) -> u64 {
+        self.next_request.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Send one request and wait for the matching reply with a deadline.
+    ///
+    /// The request id is returned even when the wait timed out, so the caller
+    /// can send a cancel that names exactly this frame.
+    fn call_full(
+        &self,
+        workspace: Option<Uuid>,
+        db_epoch: i64,
+        body: Body,
+        deadline: Duration,
+    ) -> (u64, Result<Body, HelperError>) {
+        if self.dead.load(Ordering::Acquire) {
+            return (0, Err(HelperError::disconnected()));
+        }
+        let request_id = self.next_request();
+        let (sender, receiver) = mpsc::channel();
+        {
+            let mut pending = lock(&self.pending);
+            if pending.len() >= MAX_INFLIGHT {
+                return (
+                    request_id,
+                    Err(HelperError::new(libc::EBUSY, "too many unanswered workspace FUSE helper requests")),
+                );
+            }
+            pending.insert(request_id, PendingReply { sender, workspace, db_epoch });
+        }
+        let frame = match Frame::request(self.generation, request_id, workspace, db_epoch, &body) {
+            Ok(frame) => frame,
+            Err(error) => {
+                lock(&self.pending).remove(&request_id);
+                return (request_id, Err(HelperError::protocol(error.to_string())));
+            }
+        };
+        let written = {
+            // Only the write of this frame is under the mutex; the reply is
+            // awaited with the lock released so one slow operation cannot
+            // serialize every other mount's control traffic.
+            let mut control = lock(&self.control);
+            write_frame(&mut *control, &frame)
+        };
+        if let Err(error) = written {
+            lock(&self.pending).remove(&request_id);
+            self.mark_dead();
+            return (
+                request_id,
+                Err(HelperError::new(libc::ECONNRESET, format!("helper control write failed: {error}"))),
+            );
+        }
+        match receiver.recv_timeout(deadline) {
+            Ok(result) => (request_id, result),
+            Err(RecvTimeoutError::Timeout) => {
+                lock(&self.pending).remove(&request_id);
+                (
+                    request_id,
+                    Err(HelperError::new(libc::ETIMEDOUT, "workspace FUSE helper request deadline expired")),
+                )
+            }
+            Err(RecvTimeoutError::Disconnected) => (request_id, Err(HelperError::disconnected())),
+        }
+    }
+
+    fn call(&self, workspace: Option<Uuid>, db_epoch: i64, body: Body, deadline: Duration) -> Result<Body, HelperError> {
+        self.call_full(workspace, db_epoch, body, deadline).1
     }
 
     fn wait_exit(&self, grace: Duration) -> Result<(), HelperError> {
@@ -234,11 +333,13 @@ impl HelperClient {
 
         let reader_stream = control.try_clone()?;
         let heartbeat_stream = parent_heartbeat;
+        let (aborts, abort_jobs) = mpsc::sync_channel(ABORT_QUEUE);
         let inner = Arc::new(Inner {
             generation,
             control: Mutex::new(control),
             heartbeat: Mutex::new(heartbeat_stream),
             pending: Mutex::new(HashMap::new()),
+            aborts,
             next_request: AtomicU64::new(1),
             dead: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -254,9 +355,14 @@ impl HelperClient {
         let heartbeat = thread::Builder::new()
             .name("fuse-helper-heartbeat".into())
             .spawn(move || heartbeat_writer(heartbeat_inner))?;
+        let abort_inner = inner.clone();
+        let aborts = thread::Builder::new()
+            .name("fuse-helper-freeze-abort".into())
+            .spawn(move || abort_worker(abort_inner, abort_jobs))?;
         let mut threads = lock(&inner.threads);
         threads.push(reader);
         threads.push(heartbeat);
+        threads.push(aborts);
         drop(threads);
         Ok(Self { inner })
     }
@@ -270,53 +376,9 @@ impl HelperClient {
         !self.inner.dead.load(Ordering::Acquire)
     }
 
-    fn next_request(&self) -> u64 {
-        self.inner.next_request.fetch_add(1, Ordering::SeqCst) + 1
-    }
-
     /// Send one request and wait for the matching reply with a deadline.
     pub fn call(&self, workspace: Option<Uuid>, db_epoch: i64, body: Body, deadline: Duration) -> Result<Body, HelperError> {
-        if !self.alive() {
-            return Err(HelperError::disconnected());
-        }
-        let request_id = self.next_request();
-        let (sender, receiver) = mpsc::channel();
-        {
-            let mut pending = lock(&self.inner.pending);
-            if pending.len() >= MAX_INFLIGHT {
-                return Err(HelperError::new(libc::EBUSY, "too many unanswered workspace FUSE helper requests"));
-            }
-            pending.insert(request_id, sender);
-        }
-        let frame = Frame::request(self.inner.generation, request_id, workspace, db_epoch, &body)
-            .map_err(|error| HelperError::protocol(error.to_string()));
-        let frame = match frame {
-            Ok(frame) => frame,
-            Err(error) => {
-                lock(&self.inner.pending).remove(&request_id);
-                return Err(error);
-            }
-        };
-        let written = {
-            // Only the write of this frame is under the mutex; the reply is
-            // awaited with the lock released so one slow operation cannot
-            // serialize every other mount's control traffic.
-            let mut control = lock(&self.inner.control);
-            write_frame(&mut *control, &frame)
-        };
-        if let Err(error) = written {
-            lock(&self.inner.pending).remove(&request_id);
-            self.inner.mark_dead();
-            return Err(HelperError::new(libc::ECONNRESET, format!("helper control write failed: {error}")));
-        }
-        match receiver.recv_timeout(deadline) {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => {
-                lock(&self.inner.pending).remove(&request_id);
-                Err(HelperError::new(libc::ETIMEDOUT, "workspace FUSE helper request deadline expired"))
-            }
-            Err(RecvTimeoutError::Disconnected) => Err(HelperError::disconnected()),
-        }
+        self.inner.call(workspace, db_epoch, body, deadline)
     }
 
     /// Mount one workspace. Only the storage root and the UUID are sent.
@@ -332,16 +394,24 @@ impl HelperClient {
             .to_str()
             .ok_or_else(|| HelperError::new(libc::EINVAL, "storage root is not valid UTF-8"))?
             .to_owned();
-        let reply = self.call(
+        let (request_id, reply) = self.inner.call_full(
             Some(workspace),
             db_epoch,
             Body::Mount(MountRequest { root, workspace, lease_until, lazy }),
             MOUNT_DEADLINE,
-        )?;
-        match reply {
-            Body::Mounted(_) => Ok(()),
-            other => Err(HelperError::protocol(format!("unexpected mount reply `{}`", other.op()))),
+        );
+        let failed = match reply {
+            Ok(Body::Mounted(_)) => return Ok(()),
+            Ok(other) => HelperError::protocol(format!("unexpected mount reply `{}`", other.op())),
+            Err(error) => error,
+        };
+        // The reply is not proof the child stopped working: on a timeout or a
+        // malformed answer, cancel the exact mount frame so a late child-side
+        // completion is torn down instead of staying writable without an owner.
+        if request_id != 0 && matches!(failed.code, libc::ETIMEDOUT | libc::EPROTO) {
+            self.inner.queue_abort(AbortJob::Mount { workspace, request: request_id });
         }
+        Err(failed)
     }
 
     pub fn handoff(&self, workspace: Uuid, epoch: i64, until: i64) -> Result<(), HelperError> {
@@ -372,19 +442,18 @@ impl HelperClient {
         Ok(state_reply(reply)?.applied.unwrap_or(false))
     }
 
-    /// Start a freeze and wait for the drain acknowledgement.
-    pub fn freeze_begin(&self, workspace: Uuid, epoch: i64, op_id: u64) -> Result<RemoteFreezeToken, HelperError> {
-        let reply =
-            self.call(Some(workspace), epoch, Body::FreezeBegin(FreezeBegin { op_id }), FREEZE_DEADLINE)?;
-        match reply {
-            Body::Ok(_) => Ok(RemoteFreezeToken {
-                client: self.clone(),
-                workspace,
-                epoch,
-                op_id,
-                finished: AtomicBool::new(false),
-            }),
-            other => Err(HelperError::protocol(format!("unexpected freeze reply `{}`", other.op()))),
+    /// Register a freeze attempt before the begin frame is written.
+    ///
+    /// The operation id exists before the RPC, so a timeout, a cancelled async
+    /// task or a panic always has a cancel to send. The returned attempt is
+    /// RAII: dropping it without [`FreezeAttempt::begin`] success aborts the op.
+    pub fn freeze_attempt(&self, workspace: Uuid, epoch: i64) -> FreezeAttempt {
+        FreezeAttempt {
+            client: self.clone(),
+            workspace,
+            epoch,
+            op_id: self.inner.next_request(),
+            armed: true,
         }
     }
 
@@ -478,6 +547,100 @@ fn heartbeat_writer(inner: Arc<Inner>) {
     }
 }
 
+/// Bounded cancel worker: one thread for every abandoned freeze or mount, not
+/// one per call. Cancels are best effort; the child's own operation deadline is
+/// the fail-closed backstop when a cancel is lost.
+fn abort_worker(inner: Arc<Inner>, jobs: mpsc::Receiver<AbortJob>) {
+    loop {
+        let job = match jobs.recv_timeout(Duration::from_millis(100)) {
+            Ok(job) => job,
+            Err(RecvTimeoutError::Timeout) => {
+                if inner.stop.load(Ordering::Acquire) || inner.dead.load(Ordering::Acquire) {
+                    return;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        let (workspace, epoch, body) = match job {
+            AbortJob::Freeze { workspace, epoch, op_id } => (
+                workspace,
+                epoch,
+                Body::AbortFreeze(AbortFreeze { op_id }),
+            ),
+            AbortJob::Mount { workspace, request } => (workspace, 0, Body::AbortMount(AbortMount { request })),
+        };
+        let _ = inner.call(Some(workspace), epoch, body, ABORT_DEADLINE);
+    }
+}
+
+/// One freeze attempt whose operation id exists before the begin frame.
+///
+/// Dropping an attempt that never began aborts the op id, so an unanswered
+/// `freeze_begin` (timeout, cancelled async caller, panic) cannot leave the
+/// child holding the gate and a per-workspace freeze slot forever.
+pub struct FreezeAttempt {
+    client: HelperClient,
+    workspace: Uuid,
+    epoch: i64,
+    op_id: u64,
+    armed: bool,
+}
+
+impl FreezeAttempt {
+    pub fn op_id(&self) -> u64 {
+        self.op_id
+    }
+
+    /// Send the begin frame and wait for the drain acknowledgement.
+    pub fn begin(mut self, deadline: Duration) -> Result<RemoteFreezeToken, HelperError> {
+        let reply = self.client.call(
+            Some(self.workspace),
+            self.epoch,
+            Body::FreezeBegin(FreezeBegin { op_id: self.op_id }),
+            deadline,
+        );
+        match reply {
+            Ok(Body::Ok(_)) => {
+                self.armed = false;
+                Ok(RemoteFreezeToken {
+                    client: self.client.clone(),
+                    workspace: self.workspace,
+                    epoch: self.epoch,
+                    op_id: self.op_id,
+                    finished: AtomicBool::new(false),
+                })
+            }
+            Ok(other) => {
+                let error = HelperError::protocol(format!("unexpected freeze reply `{}`", other.op()));
+                self.abort();
+                Err(error)
+            }
+            Err(error) => {
+                self.abort();
+                Err(error)
+            }
+        }
+    }
+
+    fn abort(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.client.inner.queue_abort(AbortJob::Freeze {
+                workspace: self.workspace,
+                epoch: self.epoch,
+                op_id: self.op_id,
+            });
+        }
+    }
+}
+
+impl Drop for FreezeAttempt {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 /// One remote freeze grant.
 ///
 /// The token is one-shot: [`RemoteFreezeToken::finish`] sends exactly one
@@ -495,6 +658,10 @@ pub struct RemoteFreezeToken {
 impl RemoteFreezeToken {
     pub fn epoch(&self) -> i64 {
         self.epoch
+    }
+
+    pub fn op_id(&self) -> u64 {
+        self.op_id
     }
 
     pub fn finish(&self, decision: FreezeDecision) -> Result<(), HelperError> {
@@ -521,41 +688,14 @@ impl Drop for RemoteFreezeToken {
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        // Best effort on an already failing path, and on a detached thread so a
-        // drop in an async context never blocks a runtime worker. The child
-        // fences the epoch even when this abort never arrives (lost control
-        // channel or a dead helper both leave the gate fenced).
-        let client = self.client.clone();
-        let (workspace, epoch, op_id) = (self.workspace, self.epoch, self.op_id);
-        let _ = thread::Builder::new().name("fuse-helper-freeze-abort".into()).spawn(move || {
-            let _ = client.call(
-                Some(workspace),
-                epoch,
-                Body::AbortFreeze(AbortFreeze { op_id }),
-                REQUEST_DEADLINE,
-            );
+        // Queued on the bounded cancel worker so a drop in an async context
+        // neither blocks nor spawns one thread per abandoned freeze. The child
+        // fences the epoch even when this abort never arrives: its own freeze
+        // deadline releases the decision as a fence, never as a thaw.
+        self.client.inner.queue_abort(AbortJob::Freeze {
+            workspace: self.workspace,
+            epoch: self.epoch,
+            op_id: self.op_id,
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn oversized_or_unknown_control_work_is_bounded() {
-        // The frame limit and the pending bound are the two hard caps on
-        // control-plane work; both are compile-time constants so a bug cannot
-        // widen them at runtime.
-        assert_eq!(MAX_INFLIGHT, 64);
-        assert!(REQUEST_DEADLINE <= Duration::from_secs(30));
-        assert!(HEARTBEAT_INTERVAL * 6 <= super::super::protocol::HEARTBEAT_DEADLINE);
-    }
-
-    #[test]
-    fn a_lost_helper_is_reported_as_disconnected_not_as_success() {
-        let error = HelperError::disconnected();
-        assert!(error.is_disconnected());
-        assert_eq!(error.code, libc::ECONNRESET);
     }
 }
