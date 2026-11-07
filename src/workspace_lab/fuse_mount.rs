@@ -1,10 +1,14 @@
 //! Transparent Linux FUSE overlay over an immutable snapshot and private CoW layer.
-use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
-};
+//!
+//! Dispatch is bounded and per-mount: the kernel-facing shim in `fuse_ops` copies
+//! each request into an owned operation, and exactly one actor thread in
+//! `fuse_dispatch` owns this [`Overlay`] and the [`MutationGate`]. The actor is
+//! the only caller of `MutationGate::mutation`, so a mutation is admitted once
+//! and no thread-local `MutationGuard` is moved to another thread. Freeze,
+//! thaw-drain, fence and queue limits are documented in `fuse_dispatch`.
+use fuser::{FileAttr, FileType, MountOption};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::{self, File},
     io,
@@ -16,10 +20,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    sync::{
-        Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -34,94 +35,6 @@ const TTL: Duration = Duration::ZERO;
 /// than serving the zero-filled sparse placeholder.
 pub trait LazySource: Send + Sync {
     fn file(&self, relative: &Path) -> io::Result<Option<File>>;
-}
-
-const READ_WORKERS: usize = 4;
-const READ_QUEUE_BYTES: usize = 256;
-type ReadJob = Box<dyn FnOnce() + Send + 'static>;
-
-/// FUSE request dispatch is a single session thread. Hydration and pread for
-/// lazy lower files run on this bounded pool so one unreachable blob cannot
-/// block every other operation, and so distinct blobs hydrate concurrently.
-struct ReadPool {
-    queue: Mutex<VecDeque<ReadJob>>,
-    ready: Condvar,
-    capacity: usize,
-    closed: AtomicBool,
-}
-
-impl ReadPool {
-    fn new(workers: usize, capacity: usize) -> io::Result<Arc<Self>> {
-        let pool = Arc::new(Self {
-            queue: Mutex::new(VecDeque::new()),
-            ready: Condvar::new(),
-            capacity,
-            closed: AtomicBool::new(false),
-        });
-        for index in 0..workers {
-            let worker = pool.clone();
-            let result =
-                std::thread::Builder::new().name(format!("rootyard-fuse-read-{index}")).spawn(move || worker.run());
-            if let Err(error) = result {
-                pool.close();
-                return Err(error);
-            }
-        }
-        Ok(pool)
-    }
-
-    fn execute(&self, job: ReadJob) -> Result<(), ReadJob> {
-        let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.closed.load(Ordering::Acquire) || queue.len() >= self.capacity {
-            return Err(job);
-        }
-        queue.push_back(job);
-        drop(queue);
-        self.ready.notify_one();
-        Ok(())
-    }
-
-    fn run(&self) {
-        loop {
-            let job = {
-                let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                while queue.is_empty() && !self.closed.load(Ordering::Acquire) {
-                    queue = self.ready.wait(queue).unwrap_or_else(std::sync::PoisonError::into_inner);
-                }
-                queue.pop_front()
-            };
-            match job {
-                Some(job) => job(),
-                None => return,
-            }
-        }
-    }
-
-    fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.ready.notify_all();
-    }
-}
-
-fn read_pool() -> io::Result<&'static ReadPool> {
-    static POOL: OnceLock<Result<Arc<ReadPool>, String>> = OnceLock::new();
-    POOL.get_or_init(|| ReadPool::new(READ_WORKERS, READ_QUEUE_BYTES).map_err(|e| e.to_string()))
-        .as_ref()
-        .map(|pool| pool.as_ref())
-        .map_err(|error| io::Error::other(error.clone()))
-}
-
-fn submit_read(job: ReadJob) {
-    match read_pool() {
-        Ok(pool) => {
-            if let Err(job) = pool.execute(job) {
-                // The bounded queue is saturated: preserve correctness by
-                // doing this one bounded read on the FUSE thread.
-                job();
-            }
-        }
-        Err(_) => job(),
-    }
 }
 
 fn open_lower(lazy: Option<&dyn LazySource>, relative: &Path, source: &Entry) -> io::Result<File> {
@@ -139,9 +52,34 @@ fn open_lower(lazy: Option<&dyn LazySource>, relative: &Path, source: &Entry) ->
 // `crate::workspace_lab::fuse_mount::MutationGate` callers.
 pub use super::mutation_gate::{GatePhase, MutationGate, MutationGuard};
 
+#[path = "fuse_dispatch.rs"]
+mod fuse_dispatch;
 #[path = "fuse_io.rs"]
 mod fuse_io;
+#[path = "fuse_ops.rs"]
+mod fuse_ops;
+#[path = "inner_ops.rs"]
+mod inner_ops;
+#[path = "owned_ops.rs"]
+mod owned_ops;
+
 use fuse_io::{Entry, safe_link_at, walk_dir};
+use fuse_dispatch::MountFs;
+
+pub use self::fuse_dispatch::QueueUsage as DispatchQueueUsage;
+
+/// Live kernel mount. Dropping the session unmounts and drops the shim, which
+/// stops the actor and drains every queued reply.
+pub struct MountHandle {
+    _session: fuser::BackgroundSession,
+    dispatcher: Arc<fuse_dispatch::Dispatcher>,
+}
+
+impl MountHandle {
+    pub fn queue_usage(&self) -> DispatchQueueUsage {
+        self.dispatcher.usage()
+    }
+}
 
 pub struct Overlay {
     lower: PathBuf,
@@ -384,11 +322,23 @@ impl Overlay {
     }
 }
 
-#[path = "fuse_ops.rs"]
-mod fuse_ops;
+/// Spawn the bounded per-mount dispatcher and mount `overlay` in the background.
+///
+/// Every mount owns its own queue and actor, so a slow read on one mount cannot
+/// stall another mount. Queue limits are shared per helper and per process.
+pub fn spawn(overlay: Overlay, mountpoint: &Path) -> io::Result<MountHandle> {
+    let fs = MountFs::new(overlay)?;
+    let dispatcher = fs.dispatcher().clone();
+    let session = fuser::spawn_mount2(
+        fs,
+        mountpoint,
+        &[MountOption::FSName("rootyard-vfs".into()), MountOption::DefaultPermissions],
+    )?;
+    Ok(MountHandle { _session: session, dispatcher })
+}
 
 pub fn mount(lower: PathBuf, upper: PathBuf, mountpoint: PathBuf) -> io::Result<()> {
-    let fs = Overlay::new(lower, upper)?;
+    let fs = MountFs::new(Overlay::new(lower, upper)?)?;
     fuser::mount2(fs, mountpoint, &[MountOption::FSName("rootyard-vfs".into()), MountOption::DefaultPermissions])
 }
 
@@ -446,29 +396,5 @@ mod tests {
             release_tx.send(()).unwrap();
         });
         drop(gate.mutation().expect("thaw admits mutations"));
-    }
-
-    #[test]
-    fn read_pool_executes_distinct_jobs_concurrently() {
-        let pool = ReadPool::new(2, 8).unwrap();
-        let state = Arc::new((Mutex::new(0usize), Condvar::new()));
-        let (sender, receiver) = std::sync::mpsc::channel();
-        for _ in 0..2 {
-            let state = state.clone();
-            let sender = sender.clone();
-            pool.execute(Box::new(move || {
-                let (lock, ready) = &*state;
-                let mut count = lock.lock().unwrap();
-                *count += 1;
-                ready.notify_all();
-                let (count, timed_out) =
-                    ready.wait_timeout_while(count, Duration::from_millis(500), |count| *count < 2).unwrap();
-                sender.send(*count == 2 && !timed_out.timed_out()).unwrap();
-            }))
-            .ok()
-            .expect("read pool rejected a test job");
-        }
-        let results: Vec<bool> = (0..2).map(|_| receiver.recv_timeout(Duration::from_secs(2)).unwrap()).collect();
-        assert!(results.iter().all(|result| *result), "read pool serialized independent jobs");
     }
 }

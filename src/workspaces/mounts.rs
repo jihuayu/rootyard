@@ -3,14 +3,13 @@ use super::lazy;
 use crate::{
     AppState, Error,
     members::models::Role,
-    workspace_lab::fuse_mount::{LazySource, MutationGate, Overlay},
+    workspace_lab::fuse_mount::{LazySource, MountHandle, MutationGate, Overlay},
 };
 use axum::{
     Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
-use fuser::{BackgroundSession, MountOption};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -23,7 +22,7 @@ use std::{
 use uuid::Uuid;
 
 struct Mounted {
-    _session: BackgroundSession,
+    _session: MountHandle,
     gate: Arc<MutationGate>,
     lazy: Option<Arc<lazy::Reader>>,
 }
@@ -149,12 +148,7 @@ pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(
     let lazy = lazy::Reader::open(state, id)?;
     let source: Option<Arc<dyn LazySource>> = lazy.clone().map(|reader| reader as Arc<dyn LazySource>);
     let overlay = Overlay::new_with_gate_and_lazy(lower, upper, gate.clone(), source).map_err(Error::internal)?;
-    let session = fuser::spawn_mount2(
-        overlay,
-        &mountpoint,
-        &[MountOption::FSName("rootyard-workspace".into()), MountOption::DefaultPermissions],
-    )
-    .map_err(Error::internal)?;
+    let session = crate::workspace_lab::fuse_mount::spawn(overlay, &mountpoint).map_err(Error::internal)?;
     registry.insert(id, Mounted { _session: session, gate, lazy });
     Ok(())
 }
