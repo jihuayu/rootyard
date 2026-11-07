@@ -68,3 +68,5 @@ five-phase extra report, three stdout logs, source and final acceptance reviews,
 manifest hashes, and the retained pre-fix failed takeover attempt. This
 publication pass changes docs/evidence only: no runtime, schema, test, build or
 native re-run was performed, and no issue is closed by this change alone.
+
+The [final composition publication review](../../evidence/round3/final-combination-157748add-review.json) accepted the current-binary HA/checkout addendum and permits PR #63 to merge; the original migration publication receipt remains unchanged.
