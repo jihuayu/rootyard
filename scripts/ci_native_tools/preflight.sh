@@ -39,7 +39,7 @@ prefix=$(resolve_absolute "$prefix")
 state_dir=$(resolve_absolute "$state_dir")
 mkdir -p -- "$state_dir"
 
-export PATH="$prefix/bin:/usr/lib/postgresql/17/bin:$PATH"
+export PATH="$prefix/bin:/usr/lib/postgresql/17/bin:/usr/lib/jvm/java-21-openjdk-amd64/bin:$PATH"
 
 git_bin="$prefix/bin/git"
 bwrap_bin="$prefix/bin/bwrap"
@@ -58,6 +58,13 @@ git_probe=$(mktemp -d "${TMPDIR:-/tmp}/rootyard-ci-git.XXXXXX")
 trap 'rm -rf -- "$git_probe"' EXIT
 "$git_bin" init --quiet "$git_probe"
 [ -f "$git_probe/.git/HEAD" ] || fail "Git cannot initialise a repository for the workspace lab"
+cat > "$git_probe/NativeJavaProbe.java" <<'JAVA'
+class NativeJavaProbe {
+    public static void main(String[] args) { System.out.print("rootyard-java21"); }
+}
+JAVA
+[ "$(java --source 21 "$git_probe/NativeJavaProbe.java")" = rootyard-java21 ] ||
+  fail "Java 21 source-file compilation is unavailable"
 
 "$bwrap_bin" --unshare-all --die-with-parent --ro-bind / / \
   --size 1048576 --tmpfs /tmp -- /bin/true

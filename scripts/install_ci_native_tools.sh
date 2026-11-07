@@ -126,6 +126,14 @@ if [ "$mode" = install ]; then
   "$helper_dir/ci_native_tools/build_bubblewrap_source.sh" \
     --prefix "$prefix" --state-dir "$state_dir" --work "$work/bubblewrap"
   append_github_path "$prefix/bin"
+  # Hosted images prepend an older JDK to PATH. Source-file JGit probes need
+  # the Java 21 compiler module, not merely an installed runtime package.
+  java_home=/usr/lib/jvm/java-21-openjdk-amd64
+  [ -x "$java_home/bin/java" ] && [ -x "$java_home/bin/javac" ] || fail "Java 21 JDK is missing"
+  append_github_path "$java_home/bin"
+  if [ -n "${GITHUB_ENV:-}" ]; then
+    printf 'JAVA_HOME=%s\n' "$java_home" >> "$GITHUB_ENV"
+  fi
 fi
 
 # Refuse to claim the profile when any required capability is absent. The

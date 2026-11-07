@@ -58,7 +58,7 @@ class NativeCiProfileTest(unittest.TestCase):
             "fuse3",
             "util-linux",
             "redis-server",
-            "openjdk-21-jre-headless",
+            "openjdk-21-jdk-headless",
             "postgresql-17 postgresql-client-17",
         ):
             self.assertTrue(

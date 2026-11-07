@@ -53,7 +53,7 @@ apt_install \
   libssl-dev libcurl4-openssl-dev libexpat1-dev zlib1g-dev \
   gcc g++ make \
   git-lfs fuse3 util-linux redis-server \
-  openjdk-21-jre-headless python3-venv \
+  openjdk-21-jdk-headless python3-venv \
   postgresql-17 postgresql-client-17
 
 python3 - "$state_dir/apt.json" <<'PY'
@@ -84,7 +84,7 @@ packages = [
     "fuse3",
     "util-linux",
     "redis-server",
-    "openjdk-21-jre-headless",
+    "openjdk-21-jdk-headless",
     "python3-venv",
     "postgresql-17",
     "postgresql-client-17",
