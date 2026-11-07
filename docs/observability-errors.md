@@ -31,8 +31,8 @@ keep their status, body and existing header/security behavior.
 
 Error text, `Display`/`Debug`, URLs, headers, query strings, user content and
 source strings are never formatted into the event. Logging uses a bounded global
-one-second counter (100 events) with no per-request map; a backwards clock never
-extends the allowance. A first fault in a quiet window is therefore never
+one-second monotonic window (100 events) serialized by one short mutex, with no
+per-request map. Wall-clock changes do not reset the allowance. A first fault in a quiet window is therefore never
 suppressed, while a storm cannot grow memory or log volume without bound.
 
 Backlog/fault metrics, per-worker coverage and the native hostile-database test

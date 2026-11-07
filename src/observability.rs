@@ -11,15 +11,33 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::any::Any;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::task_local;
 use uuid::Uuid;
 
 /// Bounded fixed-class rate limit for error events: one fixed global window.
 const LOG_LIMIT_PER_SECOND: u64 = 100;
-static LOG_WINDOW: AtomicU64 = AtomicU64::new(0);
-static LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+static LOG_LIMITER: OnceLock<Mutex<LogLimiter>> = OnceLock::new();
+
+struct LogLimiter {
+    start: Instant,
+    count: u64,
+}
+
+impl LogLimiter {
+    fn allow(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.start) >= Duration::from_secs(1) {
+            self.start = now;
+            self.count = 0;
+        }
+        if self.count >= LOG_LIMIT_PER_SECOND {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+}
 
 #[derive(Clone)]
 struct RequestScope {
@@ -67,6 +85,13 @@ fn pg_classification(error: &tokio_postgres::Error) -> Classification {
     }
 }
 
+fn pool_classification(error: &deadpool_postgres::PoolError) -> Classification {
+    if let deadpool_postgres::PoolError::Backend(pg) = error {
+        return pg_classification(pg);
+    }
+    Classification::kind("database_pool")
+}
+
 fn anyhow_classification(error: &anyhow::Error) -> Classification {
     for cause in error.chain() {
         if let Some(pg) = cause.downcast_ref::<tokio_postgres::Error>() {
@@ -78,8 +103,8 @@ fn anyhow_classification(error: &anyhow::Error) -> Classification {
         if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
             return Classification::kind(if http.is_timeout() { "timeout" } else { "http" });
         }
-        if cause.downcast_ref::<deadpool_postgres::PoolError>().is_some() {
-            return Classification::kind("database_pool");
+        if let Some(pool) = cause.downcast_ref::<deadpool_postgres::PoolError>() {
+            return pool_classification(pool);
         }
         if cause.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
             return Classification::kind("timeout");
@@ -105,8 +130,8 @@ fn classify(error: &dyn Any) -> Classification {
     if let Some(error) = error.downcast_ref::<reqwest::Error>() {
         return Classification::kind(if error.is_timeout() { "timeout" } else { "http" });
     }
-    if error.downcast_ref::<deadpool_postgres::PoolError>().is_some() {
-        return Classification::kind("database_pool");
+    if let Some(pool) = error.downcast_ref::<deadpool_postgres::PoolError>() {
+        return pool_classification(pool);
     }
     if error.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
         return Classification::kind("timeout");
@@ -152,13 +177,9 @@ fn event_json(error: &dyn Any) -> String {
 }
 
 fn allow_event() -> bool {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs()).unwrap_or(0);
-    let window = LOG_WINDOW.load(Ordering::Relaxed);
-    // A backwards clock never advances the window, so the fixed cap still applies.
-    if now > window && LOG_WINDOW.compare_exchange(window, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        LOG_COUNT.store(0, Ordering::Relaxed);
-    }
-    LOG_COUNT.fetch_add(1, Ordering::Relaxed) < LOG_LIMIT_PER_SECOND
+    let limiter = LOG_LIMITER.get_or_init(|| Mutex::new(LogLimiter { start: Instant::now(), count: 0 }));
+    let mut limiter = limiter.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    limiter.allow(Instant::now())
 }
 
 pub(crate) fn observe_internal(error: &dyn Any) {
@@ -171,7 +192,7 @@ pub(crate) fn observe_internal(error: &dyn Any) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const SENTINEL: &str = "SECRET-sqlstate-23503-token-https://user:pass@example.invalid/?q=leak";
     static FORMATTED: AtomicBool = AtomicBool::new(false);
@@ -225,6 +246,29 @@ mod tests {
         for invalid in ["", "2350", "235030", "2350\n", "2350é", "23-03"] {
             assert!(!valid_sqlstate(invalid), "accepted invalid SQLSTATE {invalid:?}");
         }
+    }
+
+    #[test]
+    fn concurrent_error_storm_has_one_bounded_monotonic_window() {
+        let now = Instant::now();
+        let limiter = Mutex::new(LogLimiter { start: now, count: 0 });
+        let accepted = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..100 {
+                        if limiter.lock().unwrap().allow(now) {
+                            accepted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(accepted.load(Ordering::Relaxed), LOG_LIMIT_PER_SECOND);
+        let mut limiter = limiter.into_inner().unwrap();
+        assert!(!limiter.allow(now + Duration::from_millis(999)));
+        assert!(limiter.allow(now + Duration::from_secs(1)));
+        assert_eq!(limiter.count, 1);
     }
 
     #[tokio::test]
