@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Real schema132/format8 backup restored by the current schema133/format9 binary.
+"""Shared real legacy-archive restore drill (format8/schema132 entry point).
 
-A trusted pre-migration-133 binary creates genuine repositories, pushes real Git
+A trusted pre-schema134 binary creates genuine repositories, pushes real Git
 history through the stock server, and performs real CLI cutovers to Pando-backed
 repository authority.  The legacy binary writes an offline archive.  The
-candidate must reject that archive unless ``--allow-legacy-schema132`` is
-explicit, restore into a brand-new database/data directory under one newly
-minted Pando authority, and serve stock Git fetch/clone for both repositories.
+candidate must reject that archive unless its explicit legacy schema opt-in is
+given, restore into a brand-new database/data directory under one newly minted
+Pando authority, apply the reviewed current migrations, and serve stock Git
+fetch/clone for both repositories.
+
+``backup_legacy133_identity.py`` reuses this harness with the format9/schema133
+contract and asserts the same Pando/session/Git boundaries after the schema134
+identity-constraint upgrade.
 
 Only random task-owned databases and temporary storage are used.  Secrets, DSNs,
 raw HTTP logs and Garage/Vault credentials are never printed; recorded failures
@@ -22,6 +27,8 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
+
+from dataclasses import dataclass
 
 from backup import BackupHarness
 
@@ -45,10 +52,40 @@ INDEXES = (
     "tokens_browser_expiry_idx",
 )
 
+SCHEMA134_FOREIGN_KEYS = (
+    "pando_manifest_artifacts_manifest_identity_fkey",
+    "storage_maintenance_repo_state_repository_owner_fkey",
+    "storage_maintenance_jobs_repository_owner_fkey",
+    "storage_maintenance_tombstones_repository_owner_fkey",
+)
+SCHEMA134_UNIQUE = ("pando_pack_manifests_id_repository_tenant_key",)
+SCHEMA134_REMOVED_FOREIGN_KEY = "pando_manifest_artifacts_manifest_id_fkey"
 
-class Legacy132Harness(BackupHarness):
-    def __init__(self, args):
+
+@dataclass(frozen=True)
+class ArchiveContract:
+    """The frozen source format plus the reviewed target schema it upgrades to."""
+    format: int
+    schema: int
+    flag: str
+    source_label: str
+    target_schema: int = 134
+    indexes: tuple = INDEXES
+    foreign_keys: tuple = SCHEMA134_FOREIGN_KEYS
+    unique_constraints: tuple = SCHEMA134_UNIQUE
+    removed_foreign_key: str = SCHEMA134_REMOVED_FOREIGN_KEY
+
+
+LEGACY132 = ArchiveContract(format=8, schema=132, flag="--allow-legacy-schema132",
+                            source_label="schema132")
+LEGACY133 = ArchiveContract(format=9, schema=133, flag="--allow-legacy-schema133",
+                            source_label="schema133")
+
+
+class LegacyArchiveHarness(BackupHarness):
+    def __init__(self, args, contract):
         super().__init__(args)
+        self.contract = contract
         # Parent created a disposable restore target; use it only for the
         # no-opt-in rejection.  The real restore gets another untouched pair.
         self.reject_db = self.target_db
@@ -56,7 +93,7 @@ class Legacy132Harness(BackupHarness):
         self.restore_db = self.new_database(self.restore_admin)
         self.restore_data = self.root / "candidate-data"
         self.source_data = self.root / "legacy-source-data"
-        self.legacy_backup = self.root / "legacy-132-backup"
+        self.legacy_backup = self.root / ("legacy-" + str(contract.schema) + "-backup")
         self.legacy_env = self.env.copy()
         self.legacy_env.update(DATABASE_URL=self.source_db,
                                ROOTYARD_DATA_DIR=str(self.source_data))
@@ -130,13 +167,13 @@ class Legacy132Harness(BackupHarness):
         remote = self.base + repo["clone_path"]
         work = self.root / (name + "-work")
         self.git("init", "--initial-branch=main", str(work))
-        self.git("config", "user.name", "Legacy schema132", cwd=work)
-        self.git("config", "user.email", "legacy132@example.invalid", cwd=work)
+        self.git("config", "user.name", "Legacy " + self.contract.source_label, cwd=work)
+        self.git("config", "user.email", "legacy" + str(self.contract.schema) + "@example.invalid", cwd=work)
         self.git("remote", "add", "origin", remote, cwd=work)
-        content = "schema132 pando source for " + name + "\n"
+        content = self.contract.source_label + " pando source for " + name + "\n"
         (work / (name + ".txt")).write_text(content)
         self.git("add", name + ".txt", cwd=work)
-        self.git("commit", "-m", "schema132 " + name, cwd=work)
+        self.git("commit", "-m", self.contract.source_label + " " + name, cwd=work)
         head = self.git("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
         self.git("push", "origin", "HEAD:refs/heads/main", cwd=work,
                  token=self.alice)
@@ -245,9 +282,9 @@ class Legacy132Harness(BackupHarness):
             (self.legacy_backup / "manifest.json").read_text())
         legacy_sha = hashlib.sha256(
             Path(self.args.legacy_binary).read_bytes()).hexdigest()
-        assert manifest["format"] == 8, manifest["format"]
-        assert manifest["schema_versions"][-1] == 132, manifest["schema_versions"]
-        assert 133 not in manifest["schema_versions"]
+        assert manifest["format"] == self.contract.format, manifest["format"]
+        assert manifest["schema_versions"][-1] == self.contract.schema, manifest["schema_versions"]
+        assert self.contract.schema + 1 not in manifest["schema_versions"]
         assert manifest["binary_sha256"] == legacy_sha
         assert result["complete"] is True
         self.run([self.args.legacy_binary, "backup-verify",
@@ -255,10 +292,34 @@ class Legacy132Harness(BackupHarness):
         self.assert_source_closure()
         return dict(format=manifest["format"],
                     schema_last=manifest["schema_versions"][-1],
-                    schema_contains_133=False,
+                    schema_contains_next=False,
                     repository_count=len(manifest["repositories"]),
                     legacy_binary_sha256=legacy_sha,
                     backup_verified=True)
+
+    def candidate_cli_usage_errors(self):
+        self.use_candidate(self.reject_db, self.reject_data)
+        self.args.binary = self.candidate_binary
+        missing = self.run([self.candidate_binary, "restore"],
+                           env=self.env, check=False)
+        assert missing.returncode != 0
+        assert b"usage:" in missing.stderr, missing.stderr[-400:]
+        no_archive_flags = self.run(
+            [self.candidate_binary, "restore", str(self.legacy_backup)],
+            env=self.env, check=False)
+        assert no_archive_flags.returncode != 0
+        assert b"usage:" in no_archive_flags.stderr, no_archive_flags.stderr[-400:]
+        other = ("--allow-legacy-schema132"
+                 if self.contract.schema != 132 else "--allow-legacy-schema133")
+        mixed = self.run(
+            [self.candidate_binary, "restore", str(self.legacy_backup),
+             "--isolated", "--trust-backup", self.contract.flag, other],
+            env=self.env, check=False)
+        assert mixed.returncode != 0
+        assert b"usage:" in mixed.stderr, mixed.stderr[-400:]
+        assert not self.reject_data.exists()
+        return dict(missing_arguments_usage=True, missing_flags_usage=True,
+                    mixed_legacy_flags_usage=True)
 
     def candidate_rejects_without_opt_in(self):
         self.use_candidate(self.reject_db, self.reject_data)
@@ -267,6 +328,13 @@ class Legacy132Harness(BackupHarness):
             [self.candidate_binary, "restore", str(self.legacy_backup),
              "--isolated", "--trust-backup"], env=self.env, check=False)
         assert result.returncode != 0
+        wrong = ("--allow-legacy-schema132"
+                 if self.contract.schema != 132 else "--allow-legacy-schema133")
+        mismatched = self.run(
+            [self.candidate_binary, "restore", str(self.legacy_backup),
+             "--isolated", "--trust-backup", wrong], env=self.env, check=False)
+        assert mismatched.returncode != 0
+        assert b"usage:" not in mismatched.stderr, mismatched.stderr[-400:]
         assert not self.reject_data.exists()
         guard = self.reject_data.parent / (
             "." + self.reject_data.name + ".rootyard-restoring")
@@ -277,7 +345,8 @@ class Legacy132Harness(BackupHarness):
             "ON n.oid=c.relnamespace WHERE n.nspname NOT IN "
             "('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'")
         assert objects == "0", objects
-        return dict(explicit_schema132_opt_in_required=True,
+        return dict(explicit_schema_opt_in_required=True,
+                    mismatched_legacy_opt_in_rejected=True,
                     target_data_published=False, target_database_empty=True)
 
     def candidate_restores_and_rotates_authority(self):
@@ -285,16 +354,34 @@ class Legacy132Harness(BackupHarness):
         self.args.binary = self.candidate_binary
         self.run([self.candidate_binary, "restore",
                   str(self.legacy_backup), "--isolated", "--trust-backup",
-                  "--allow-legacy-schema132"], env=self.env)
+                  self.contract.flag], env=self.env)
         last = self.query(
             self.restore_db, "SELECT max(version) FROM schema_migrations")
-        assert last == "133", last
+        assert last == str(self.contract.target_schema), last
         names = self.query(
             self.restore_db,
             "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes "
             "WHERE schemaname='public' AND indexname IN ('" +
-            "','".join(INDEXES) + "')")
-        assert names and sorted(names.split(",")) == sorted(INDEXES), names
+            "','".join(self.contract.indexes) + "')")
+        assert names and sorted(names.split(",")) == sorted(
+            self.contract.indexes), names
+        constraints = self.query(
+            self.restore_db,
+            "SELECT string_agg(conname || ':' || contype || ':' || "
+            "convalidated::text, ',' ORDER BY conname) FROM pg_constraint k "
+            "JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n "
+            "ON n.oid=c.relnamespace WHERE n.nspname='public' AND conname IN ('" +
+            "','".join(self.contract.foreign_keys + self.contract.unique_constraints) + "')")
+        expected_constraints = sorted(
+            [name + ":f:true" for name in self.contract.foreign_keys] +
+            [name + ":u:true" for name in self.contract.unique_constraints])
+        assert constraints and sorted(constraints.split(",")) == expected_constraints, constraints
+        removed = self.query(
+            self.restore_db,
+            "SELECT count(*) FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid "
+            "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' "
+            "AND conname='" + self.contract.removed_foreign_key + "'")
+        assert removed == "0", removed
         authority = self.query(
             self.restore_db,
             "SELECT authority_id FROM pando_storage_authorities WHERE singleton")
@@ -340,7 +427,8 @@ class Legacy132Harness(BackupHarness):
             "SELECT count(*) FROM tokens WHERE kind='browser' AND revoked")
         assert revoked_sessions == "1", revoked_sessions
         assert revoked_browser == "1", revoked_browser
-        return dict(schema_version=133, indexes=len(INDEXES),
+        return dict(schema_version=int(last), indexes=len(self.contract.indexes),
+                    schema134_identity_constraints=True,
                     target_authority_id=authority,
                     target_authority_differs_from_source=True,
                     target_manifest_artifacts=links,
@@ -447,13 +535,14 @@ def harness_git_head():
         return "unavailable"
 
 
-def main():
+def run_main(contract=None, argv=None):
+    contract = contract or LEGACY132
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/rootyard")
     parser.add_argument("--legacy-binary", required=True)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--keep", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     candidate = str(Path(args.binary).resolve())
     legacy = str(Path(args.legacy_binary).resolve())
     if not Path(candidate).is_file():
@@ -465,16 +554,20 @@ def main():
         parser.error("missing required environment names: " + ", ".join(missing))
     args.binary = candidate
     args.legacy_binary = legacy
-    harness = Legacy132Harness(args)
+    harness = LegacyArchiveHarness(args, contract)
     success = False
     try:
-        harness.case("create_real_schema132_pando_source",
+        harness.case("create_real_" + contract.source_label + "_pando_source",
                      harness.create_real_source)
-        harness.case("legacy_binary_writes_format8_schema132_archive",
+        harness.case("legacy_binary_writes_format" + str(contract.format) +
+                     "_schema" + str(contract.schema) + "_archive",
                      harness.legacy_archive)
-        harness.case("candidate_rejects_without_schema132_opt_in",
-                     harness.candidate_rejects_without_opt_in)
-        harness.case("candidate_restores_schema133_one_new_authority",
+        harness.case("candidate_cli_usage_and_mixed_legacy_flags",
+                     harness.candidate_cli_usage_errors)
+        harness.case("candidate_rejects_without_schema" + str(contract.schema) +
+                     "_opt_in", harness.candidate_rejects_without_opt_in)
+        harness.case("candidate_restores_schema" + str(contract.target_schema) +
+                     "_one_new_authority",
                      harness.candidate_restores_and_rotates_authority)
         harness.case("restored_service_git_and_session_boundaries",
                      harness.restored_service_and_git)
@@ -497,7 +590,7 @@ def main():
             harness_git_head=harness_git_head(),
             limitations=[
                 "Loopback functional drill; no production RPO/RTO or power-loss claim.",
-                "The legacy archive is produced by the trusted format8 binary and is never edited.",
+                "The legacy archive is produced by the trusted format" + str(contract.format) + " binary and is never edited.",
                 "source_head values are repository heads, not binary build provenance.",
             ])
         if args.keep:
@@ -507,6 +600,10 @@ def main():
             args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2))
     return 0 if success else 1
+
+
+def main():
+    return run_main(LEGACY132)
 
 
 if __name__ == "__main__":

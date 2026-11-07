@@ -83,6 +83,7 @@ async fn run() -> Result<()> {
                             | "--allow-legacy-schema130"
                             | "--allow-legacy-schema131"
                             | "--allow-legacy-schema132"
+                            | "--allow-legacy-schema133"
                     )))
                 && args[2] == "--isolated"
                 && args[3] == "--trust-backup" =>
@@ -95,6 +96,7 @@ async fn run() -> Result<()> {
                 legacy == Some("--allow-legacy-schema130"),
                 legacy == Some("--allow-legacy-schema131"),
                 legacy == Some("--allow-legacy-schema132"),
+                legacy == Some("--allow-legacy-schema133"),
             )
             .await
             .map_err(|_| anyhow::anyhow!("restore failed; keep target isolated and inspect or discard the fresh targets; database commit may have completed; never retry over existing state"))?;
@@ -326,7 +328,7 @@ async fn run() -> Result<()> {
             }
         }
         _ => bail!(
-            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130 | --allow-legacy-schema131 | --allow-legacy-schema132]]"
+            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130 | --allow-legacy-schema131 | --allow-legacy-schema132 | --allow-legacy-schema133]]"
         ),
     }
     Ok(())
