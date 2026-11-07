@@ -1,0 +1,653 @@
+{
+  "binary_sha256": "9fb0ebea0f06d5e6de890acb2f5c2484b6f33324325a7e4fadb64c5859deb335",
+  "object_bytes": 8388608,
+  "results": [
+    {
+      "phase": "restart_existing_local_empty_cache",
+      "concurrent_clients": 1,
+      "waves": 1,
+      "wall_seconds": 0.30924842700005684,
+      "served_bytes": 8388608,
+      "process_deltas": {
+        "rchar": 16777217,
+        "wchar": 8389806,
+        "syscr": 258,
+        "syscw": 163,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 26,
+        "cpu_system_ticks": 0
+      },
+      "cpu_seconds": 0.26,
+      "rss_before_bytes": 34516992,
+      "rss_after_bytes": 36917248,
+      "rchar_per_served_byte": 2.0000001192092896,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 8552.428602117,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8552.545349653,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8552.662701311,
+          "connections": 3,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.30073774799893727,
+      "p95_seconds": 0.30073774799893727,
+      "p99_seconds": 0.30073774799893727,
+      "samples_seconds": [
+        0.30073774799893727
+      ],
+      "sample_count": 1
+    },
+    {
+      "phase": "warm_batch_get",
+      "concurrent_clients": 1,
+      "waves": 32,
+      "wall_seconds": 1.3386415749992011,
+      "served_bytes": 268435456,
+      "process_deltas": {
+        "rchar": 268435456,
+        "wchar": 268473400,
+        "syscr": 4096,
+        "syscw": 3239,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 48,
+        "cpu_system_ticks": 28
+      },
+      "cpu_seconds": 0.76,
+      "rss_before_bytes": 36917248,
+      "rss_after_bytes": 37711872,
+      "rchar_per_served_byte": 1.0,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 8552.726655297,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8552.849661472,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8553.008665955,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8553.127243407,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8553.246513864,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8553.375351528,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8553.500191784,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8553.630510034,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8553.784685361,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8553.906439863,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8554.02627119,
+          "connections": 3,
+          "active_sql": 1
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.03632642000047781,
+      "p95_seconds": 0.07545183299953351,
+      "p99_seconds": 0.0818399550007598,
+      "samples_seconds": [
+        0.028289046998906997,
+        0.030411132000153884,
+        0.03057078699930571,
+        0.03248745100063388,
+        0.0325006859984569,
+        0.032781186999272904,
+        0.033026289000190445,
+        0.03354064800078049,
+        0.03361722600129724,
+        0.03394795299936959,
+        0.03466786900025909,
+        0.03478935600105615,
+        0.03480658499938727,
+        0.03516179100006411,
+        0.03622655599974678,
+        0.03632642000047781,
+        0.03690266000012343,
+        0.03773467700011679,
+        0.037828402000741335,
+        0.03984626700002991,
+        0.04059193899956881,
+        0.04122221600118792,
+        0.04143598700102302,
+        0.04217030199833971,
+        0.04462781899928814,
+        0.045886103000157163,
+        0.04602596599943354,
+        0.0474376010006381,
+        0.05124124199937796,
+        0.0566716159992211,
+        0.07545183299953351,
+        0.0818399550007598
+      ],
+      "sample_count": 32
+    },
+    {
+      "phase": "remote_cold_batch_get",
+      "concurrent_clients": 1,
+      "waves": 1,
+      "wall_seconds": 0.3145215009990352,
+      "served_bytes": 8388608,
+      "process_deltas": {
+        "rchar": 8388782,
+        "wchar": 16779541,
+        "syscr": 130,
+        "syscw": 141,
+        "read_bytes": 0,
+        "write_bytes": 8396800,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 22,
+        "cpu_system_ticks": 1
+      },
+      "cpu_seconds": 0.23,
+      "rss_before_bytes": 37711872,
+      "rss_after_bytes": 40144896,
+      "rchar_per_served_byte": 1.0000207424163818,
+      "remote_requests": {
+        "HEAD": 1,
+        "GET": 1
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 8554.067090054,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8554.186236088,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8554.302056285,
+          "connections": 3,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.3131831880000391,
+      "p95_seconds": 0.3131831880000391,
+      "p99_seconds": 0.3131831880000391,
+      "samples_seconds": [
+        0.3131831880000391
+      ],
+      "sample_count": 1
+    },
+    {
+      "phase": "restart_existing_local_empty_cache",
+      "concurrent_clients": 4,
+      "waves": 1,
+      "wall_seconds": 0.3194289700004447,
+      "served_bytes": 33554432,
+      "process_deltas": {
+        "rchar": 41943045,
+        "wchar": 33558944,
+        "syscr": 643,
+        "syscw": 529,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 28,
+        "cpu_system_ticks": 6
+      },
+      "cpu_seconds": 0.34,
+      "rss_before_bytes": 34324480,
+      "rss_after_bytes": 38973440,
+      "rchar_per_served_byte": 1.250000149011612,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 8555.733811686,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8555.856384034,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8556.007047775,
+          "connections": 4,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.30153162900023744,
+      "p95_seconds": 0.3160549490003177,
+      "p99_seconds": 0.3160549490003177,
+      "samples_seconds": [
+        0.2887267510013771,
+        0.30153162900023744,
+        0.3114454120004666,
+        0.3160549490003177
+      ],
+      "sample_count": 4
+    },
+    {
+      "phase": "warm_batch_get",
+      "concurrent_clients": 4,
+      "waves": 8,
+      "wall_seconds": 0.9608572670003923,
+      "served_bytes": 268435456,
+      "process_deltas": {
+        "rchar": 268435456,
+        "wchar": 268471640,
+        "syscr": 4096,
+        "syscw": 4215,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 57,
+        "cpu_system_ticks": 49
+      },
+      "cpu_seconds": 1.06,
+      "rss_before_bytes": 38973440,
+      "rss_after_bytes": 40394752,
+      "rchar_per_served_byte": 1.0,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 8556.051460443,
+          "connections": 4,
+          "active_sql": 1
+        },
+        {
+          "monotonic": 8556.175946595,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8556.363826037,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8556.499152265,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8556.646077367,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8556.807066892,
+          "connections": 4,
+          "active_sql": 2
+        },
+        {
+          "monotonic": 8556.935890183,
+          "connections": 4,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.0951199600003747,
+      "p95_seconds": 0.18515397400005895,
+      "p99_seconds": 0.18713870999999926,
+      "samples_seconds": [
+        0.06171855700085871,
+        0.061770386000716826,
+        0.07187120899834554,
+        0.07345046999944316,
+        0.07476130499890132,
+        0.0813828869995632,
+        0.08313932999953977,
+        0.08403883499886433,
+        0.08486518099925888,
+        0.08557557899985113,
+        0.08775999600038631,
+        0.08873327699984657,
+        0.09126531699985208,
+        0.09319514100025117,
+        0.09506106499975431,
+        0.0951199600003747,
+        0.09517846000017016,
+        0.09882129499965231,
+        0.10188838000067335,
+        0.10299010500057193,
+        0.10848460299894214,
+        0.10917136799980653,
+        0.11124327200013795,
+        0.11267998699986492,
+        0.11329320799995912,
+        0.11406745000022056,
+        0.11597797899958096,
+        0.11905711500003235,
+        0.1705556559991237,
+        0.17348640099953627,
+        0.18515397400005895,
+        0.18713870999999926
+      ],
+      "sample_count": 32
+    },
+    {
+      "phase": "remote_cold_batch_get",
+      "concurrent_clients": 4,
+      "waves": 1,
+      "wall_seconds": 0.40901013700022304,
+      "served_bytes": 33554432,
+      "process_deltas": {
+        "rchar": 33554606,
+        "wchar": 41948455,
+        "syscr": 514,
+        "syscw": 535,
+        "read_bytes": 0,
+        "write_bytes": 8388608,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 28,
+        "cpu_system_ticks": 5
+      },
+      "cpu_seconds": 0.33,
+      "rss_before_bytes": 40394752,
+      "rss_after_bytes": 43044864,
+      "rchar_per_served_byte": 1.0000051856040955,
+      "remote_requests": {
+        "HEAD": 1,
+        "GET": 1
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 8557.026048145,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8557.164281184,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8557.286544378,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8557.426288081,
+          "connections": 4,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.3821829890002846,
+      "p95_seconds": 0.40347321599983843,
+      "p99_seconds": 0.40347321599983843,
+      "samples_seconds": [
+        0.3727579499991407,
+        0.3821829890002846,
+        0.39365816399913456,
+        0.40347321599983843
+      ],
+      "sample_count": 4
+    },
+    {
+      "phase": "restart_existing_local_empty_cache",
+      "concurrent_clients": 16,
+      "waves": 1,
+      "wall_seconds": 0.638613709999845,
+      "served_bytes": 134217728,
+      "process_deltas": {
+        "rchar": 142606341,
+        "wchar": 134233856,
+        "syscr": 2179,
+        "syscw": 1821,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 42,
+        "cpu_system_ticks": 22
+      },
+      "cpu_seconds": 0.64,
+      "rss_before_bytes": 34394112,
+      "rss_after_bytes": 41754624,
+      "rchar_per_served_byte": 1.062500037252903,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 8558.835611753,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8558.954172499,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8559.433078608,
+          "connections": 16,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.45051615800002764,
+      "p95_seconds": 0.6269373949999135,
+      "p99_seconds": 0.6269373949999135,
+      "samples_seconds": [
+        0.33123374699971464,
+        0.36058452900033444,
+        0.39523739899959764,
+        0.4237473339999269,
+        0.4263822579996486,
+        0.43248882700027025,
+        0.4380960739999864,
+        0.45051615800002764,
+        0.45775326200055133,
+        0.5809697579989006,
+        0.5911569870004314,
+        0.6012888920013211,
+        0.6042670620008721,
+        0.616164064998884,
+        0.6194947870008036,
+        0.6269373949999135
+      ],
+      "sample_count": 16
+    },
+    {
+      "phase": "warm_batch_get",
+      "concurrent_clients": 16,
+      "waves": 2,
+      "wall_seconds": 0.6505944420005108,
+      "served_bytes": 268435456,
+      "process_deltas": {
+        "rchar": 268435456,
+        "wchar": 268466424,
+        "syscr": 4096,
+        "syscw": 3593,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 47,
+        "cpu_system_ticks": 30
+      },
+      "cpu_seconds": 0.77,
+      "rss_before_bytes": 41754624,
+      "rss_after_bytes": 43855872,
+      "rchar_per_served_byte": 1.0,
+      "remote_requests": {},
+      "postgres_connection_samples": [
+        {
+          "monotonic": 8559.467628112,
+          "connections": 16,
+          "active_sql": 2
+        },
+        {
+          "monotonic": 8559.796050241,
+          "connections": 16,
+          "active_sql": 6
+        },
+        {
+          "monotonic": 8560.091326643,
+          "connections": 16,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.2613895209997281,
+      "p95_seconds": 0.3117647560011392,
+      "p99_seconds": 0.3172287659999711,
+      "samples_seconds": [
+        0.1486284530001285,
+        0.15380442199966637,
+        0.1648799289996532,
+        0.18143637600041984,
+        0.19586180199985392,
+        0.19863861600060773,
+        0.21798713899988797,
+        0.22258243599935668,
+        0.22825365000062448,
+        0.23216953999872203,
+        0.23376369099969452,
+        0.2346143539998593,
+        0.24259212700053467,
+        0.24968299600004684,
+        0.2530442730003415,
+        0.2613895209997281,
+        0.2646828840006492,
+        0.265556648000711,
+        0.2757497210004658,
+        0.2808567909996782,
+        0.2844096080007148,
+        0.2875349300011294,
+        0.2893271850007295,
+        0.29046430499874987,
+        0.29107667199969,
+        0.2937005219991988,
+        0.2963234359995113,
+        0.3021084250012791,
+        0.30376243600039743,
+        0.3041292149991932,
+        0.3117647560011392,
+        0.3172287659999711
+      ],
+      "sample_count": 32
+    },
+    {
+      "phase": "remote_cold_batch_get",
+      "concurrent_clients": 16,
+      "waves": 1,
+      "wall_seconds": 0.6861268060001748,
+      "served_bytes": 134217728,
+      "process_deltas": {
+        "rchar": 134217902,
+        "wchar": 142622623,
+        "syscr": 2050,
+        "syscw": 1785,
+        "read_bytes": 0,
+        "write_bytes": 8388608,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 49,
+        "cpu_system_ticks": 12
+      },
+      "cpu_seconds": 0.61,
+      "rss_before_bytes": 43855872,
+      "rss_after_bytes": 46768128,
+      "rchar_per_served_byte": 1.0000012964010239,
+      "remote_requests": {
+        "HEAD": 1,
+        "GET": 1
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 8560.132947227,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8560.251131744,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8560.371344606,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 8560.794836047,
+          "connections": 16,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.5640803650003363,
+      "p95_seconds": 0.6701595949998591,
+      "p99_seconds": 0.6701595949998591,
+      "samples_seconds": [
+        0.49275642599968705,
+        0.511431076000008,
+        0.5200635520013748,
+        0.5387249650011654,
+        0.5420957860005728,
+        0.5512059869997756,
+        0.5560855410003569,
+        0.5640803650003363,
+        0.6275335459995404,
+        0.6381996029995207,
+        0.6433892770000966,
+        0.6446078860008129,
+        0.6571298430008028,
+        0.6597681559997,
+        0.6643188650014054,
+        0.6701595949998591
+      ],
+      "sample_count": 16
+    }
+  ],
+  "scope": "Actual native Rust service / configured PostgreSQL and owned S3-compatible fixture through counting proxy, one host, random8MiB object; endpoints and tokens excluded.",
+  "limitations": [
+    "Debug build; timings under shared host load, no production throughput/SLA inference. Small cold samples give empirical order statistics only.",
+    "rchar counts all process read syscalls; read_bytes/write_bytes kernel storage accounting can be zero due pagecache; no direct disk device busy measurement.",
+    "PostgreSQL samples match service-owned TCP client ports: active_sql counts executing/waiting SQL, total counts physical pooled connections. Checked-out idle clients/pool waiter counts are not directly instrumented; these are not exact busy pool occupancy.",
+    "CPU ticks are service process CPU including internal worker threads; excludes PostgreSQL/Garage CPU."
+  ]
+}

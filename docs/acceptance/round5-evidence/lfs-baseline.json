@@ -1,0 +1,2055 @@
+{
+  "binary_sha256": "216585161cf8e70394b23d5079f282769805667349486daeab2ac95d023a3fed",
+  "object_bytes": 8388608,
+  "results": [
+    {
+      "phase": "restart_existing_local_empty_cache",
+      "concurrent_clients": 1,
+      "waves": 1,
+      "wall_seconds": 1.017285816000367,
+      "served_bytes": 8388608,
+      "process_deltas": {
+        "rchar": 25165999,
+        "wchar": 8390646,
+        "syscr": 389,
+        "syscw": 88,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 61,
+        "cpu_system_ticks": 3
+      },
+      "cpu_seconds": 0.64,
+      "rss_before_bytes": 34889728,
+      "rss_after_bytes": 39849984,
+      "rchar_per_served_byte": 3.0000208616256714,
+      "remote_requests": {
+        "HEAD": 2
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 6721.87801359,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6722.018668033,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6722.208485623,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6722.376236622,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6722.519631509,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6722.686259433,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6722.84165638,
+          "connections": 3,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 1.0063654020004833,
+      "p95_seconds": 1.0063654020004833,
+      "p99_seconds": 1.0063654020004833,
+      "samples_seconds": [
+        1.0063654020004833
+      ],
+      "sample_count": 1
+    },
+    {
+      "phase": "warm_batch_get",
+      "concurrent_clients": 1,
+      "waves": 32,
+      "wall_seconds": 21.482059253999978,
+      "served_bytes": 268435456,
+      "process_deltas": {
+        "rchar": 805306368,
+        "wchar": 268508568,
+        "syscr": 12352,
+        "syscw": 4565,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 1671,
+        "cpu_system_ticks": 52
+      },
+      "cpu_seconds": 17.23,
+      "rss_before_bytes": 39849984,
+      "rss_after_bytes": 42106880,
+      "rchar_per_served_byte": 3.0,
+      "remote_requests": {
+        "HEAD": 64
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 6722.894800296,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6723.065955122,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6723.208609335,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6723.341533992,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6723.508351038,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6723.668395564,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6723.825027099,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6723.996206547,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6724.164756835,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6724.312767864,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6724.482636619,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6724.627729512,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6724.792685253,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6724.962148191,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6725.107703217,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6725.267473016,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6725.411961101,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6725.577350265,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6725.720221875,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6725.898201527,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6726.084767907,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6726.270864864,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6726.483991262,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6726.635281262,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6726.805263946,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6726.965268381,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6727.100464478,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6727.228830818,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6727.356318129,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6727.485040317,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6727.607508655,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6727.733401699,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6727.864198521,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6727.999611602,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6728.123466936,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6728.247862724,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6728.387985581,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6728.517110942,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6728.641055344,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6728.775905035,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6728.903785996,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6729.028094124,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6729.176742913,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6729.324585493,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6729.469774972,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6729.624435736,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6729.770424443,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6729.9041056,
+          "connections": 3,
+          "active_sql": 1
+        },
+        {
+          "monotonic": 6730.041113594,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6730.182708002,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6730.305842866,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6730.429917269,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6730.549028139,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6730.672412038,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6730.788194203,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6730.912795611,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6731.028388777,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6731.146051099,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6731.27315896,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6731.401316824,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6731.526641281,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6731.678810254,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6731.80185746,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6731.944314671,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6732.066642609,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6732.191151116,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6732.314061719,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6732.453946472,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6732.592205604,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6732.716590632,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6732.839657067,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6732.968251431,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6733.103633425,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6733.223560793,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6733.344277276,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6733.462592933,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6733.590809825,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6733.711473777,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6733.834004079,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6733.952573687,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6734.082594704,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6734.20140355,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6734.330910347,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6734.450027457,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6734.567793044,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6734.689943355,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6734.806169733,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6734.929142424,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6735.053875203,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6735.180200232,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6735.296247363,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6735.421062486,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6735.54916796,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6735.694836702,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6735.814474961,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6735.938630309,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6736.06106839,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6736.191535672,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6736.391507384,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6736.510756122,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6736.628667382,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6736.754104813,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6736.872207978,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6737.014685321,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6737.137727902,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6737.259107518,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6737.382953249,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6737.50771223,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6737.62456668,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6737.761735493,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6737.906008012,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6738.030887443,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6738.157924237,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6738.292877352,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6738.500503079,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6738.623207816,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6738.746603053,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6738.867748987,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6739.007242132,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6739.127628969,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6739.265175397,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6739.387092144,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6739.535249273,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6739.65252288,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6739.80690465,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6739.970716738,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6740.093426066,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6740.248530455,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6740.383838844,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6740.503678852,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6740.649938049,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6740.786064986,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6740.91973703,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6741.115508229,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6741.263973524,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6741.416378273,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6741.579000583,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6741.731813569,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6741.899947716,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6742.036187311,
+          "connections": 3,
+          "active_sql": 1
+        },
+        {
+          "monotonic": 6742.200079564,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6742.371304161,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6742.522648165,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6742.69934555,
+          "connections": 3,
+          "active_sql": 1
+        },
+        {
+          "monotonic": 6742.870323617,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6742.99428298,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6743.170177386,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6743.330128805,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6743.499824235,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6743.662619738,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6743.826839528,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6743.97133682,
+          "connections": 3,
+          "active_sql": 1
+        },
+        {
+          "monotonic": 6744.107060984,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6744.293732705,
+          "connections": 3,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.658763103999263,
+      "p95_seconds": 0.9315777149995483,
+      "p99_seconds": 0.9912900529998296,
+      "samples_seconds": [
+        0.4307016590000785,
+        0.4384516159998384,
+        0.46594257299966557,
+        0.4743448310000531,
+        0.4777681630002917,
+        0.48571795699990616,
+        0.5500249489996349,
+        0.579922410999643,
+        0.5820859539999219,
+        0.584739988000365,
+        0.5919688289995975,
+        0.6195684639997125,
+        0.620449001000452,
+        0.6208093189998181,
+        0.6429231780002738,
+        0.658763103999263,
+        0.6757627290007804,
+        0.6768536859999585,
+        0.6997248540001237,
+        0.7111963359993752,
+        0.7120080889999372,
+        0.7269272650000858,
+        0.7352341390005677,
+        0.7444506370002273,
+        0.765936562999741,
+        0.7725485370001479,
+        0.8475822279997374,
+        0.8507029820002572,
+        0.8531047679998665,
+        0.9136220230002436,
+        0.9315777149995483,
+        0.9912900529998296
+      ],
+      "sample_count": 32
+    },
+    {
+      "phase": "remote_cold_batch_get",
+      "concurrent_clients": 1,
+      "waves": 1,
+      "wall_seconds": 1.277666973000123,
+      "served_bytes": 8388608,
+      "process_deltas": {
+        "rchar": 33554432,
+        "wchar": 16779833,
+        "syscr": 515,
+        "syscw": 151,
+        "read_bytes": 0,
+        "write_bytes": 8388608,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 82,
+        "cpu_system_ticks": 2
+      },
+      "cpu_seconds": 0.84,
+      "rss_before_bytes": 42106880,
+      "rss_after_bytes": 43077632,
+      "rchar_per_served_byte": 4.0,
+      "remote_requests": {
+        "HEAD": 2,
+        "GET": 1
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 6744.377619294,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6744.519468313,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6744.717104472,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6744.893794744,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6745.062055466,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6745.22094682,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6745.3830079,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6745.52708355,
+          "connections": 3,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 1.2723616739995123,
+      "p95_seconds": 1.2723616739995123,
+      "p99_seconds": 1.2723616739995123,
+      "samples_seconds": [
+        1.2723616739995123
+      ],
+      "sample_count": 1
+    },
+    {
+      "phase": "restart_existing_local_empty_cache",
+      "concurrent_clients": 4,
+      "waves": 1,
+      "wall_seconds": 1.3165073270001812,
+      "served_bytes": 33554432,
+      "process_deltas": {
+        "rchar": 100663471,
+        "wchar": 33563400,
+        "syscr": 1547,
+        "syscw": 524,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 198,
+        "cpu_system_ticks": 9
+      },
+      "cpu_seconds": 2.07,
+      "rss_before_bytes": 34533376,
+      "rss_after_bytes": 42450944,
+      "rchar_per_served_byte": 3.000005215406418,
+      "remote_requests": {
+        "HEAD": 8
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 6747.116345443,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6747.276157979,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6747.412958665,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6747.580767761,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6747.718821552,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6747.910753937,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6748.112480939,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6748.286168016,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6748.405627808,
+          "connections": 4,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 1.1934409759996925,
+      "p95_seconds": 1.299406676000217,
+      "p99_seconds": 1.299406676000217,
+      "samples_seconds": [
+        1.1005360440003642,
+        1.1934409759996925,
+        1.2391632569997455,
+        1.299406676000217
+      ],
+      "sample_count": 4
+    },
+    {
+      "phase": "warm_batch_get",
+      "concurrent_clients": 4,
+      "waves": 8,
+      "wall_seconds": 5.431126413000129,
+      "served_bytes": 268435456,
+      "process_deltas": {
+        "rchar": 805306372,
+        "wchar": 268507488,
+        "syscr": 12353,
+        "syscw": 4946,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 1584,
+        "cpu_system_ticks": 46
+      },
+      "cpu_seconds": 16.3,
+      "rss_before_bytes": 42450944,
+      "rss_after_bytes": 44339200,
+      "rchar_per_served_byte": 3.000000014901161,
+      "remote_requests": {
+        "HEAD": 64
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 6748.451483454,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6748.603954787,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6748.77957356,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6748.918339091,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6749.041343446,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6749.168833535,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6749.312232397,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6749.436812829,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6749.58025676,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6749.705953125,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6749.840575945,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6749.972873266,
+          "connections": 4,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6750.098960467,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6750.240181431,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6750.372195221,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6750.49399122,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6750.639034089,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6750.775700812,
+          "connections": 5,
+          "active_sql": 1
+        },
+        {
+          "monotonic": 6750.901957696,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6751.02104964,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6751.155185562,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6751.333894557,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6751.464955419,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6751.586321278,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6751.710953405,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6751.842171666,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6751.972701063,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6752.098869635,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6752.221398355,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6752.348893514,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6752.48306289,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6752.612304519,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6752.741334003,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6752.87094051,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6753.009844504,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6753.138566826,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6753.262936385,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6753.388243225,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6753.535779065,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6753.669959782,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6753.792288717,
+          "connections": 5,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 0.615141266000137,
+      "p95_seconds": 0.7705539950002276,
+      "p99_seconds": 0.8052256829996622,
+      "samples_seconds": [
+        0.4891814650000015,
+        0.4958551770005215,
+        0.5010212690003755,
+        0.5320377499992901,
+        0.5394244520002758,
+        0.5529317599994101,
+        0.5597289980005371,
+        0.5611958209992736,
+        0.5714779699992505,
+        0.5744154699996216,
+        0.5870789320006224,
+        0.5889912820002792,
+        0.596652911000092,
+        0.5991851290000341,
+        0.613766872999804,
+        0.615141266000137,
+        0.6203242569999929,
+        0.6223201110005903,
+        0.6224021820007692,
+        0.6282678139996278,
+        0.6394613759994172,
+        0.6402814049997687,
+        0.6478911359999984,
+        0.6559702750000724,
+        0.6595642709999083,
+        0.6665056550000372,
+        0.6774616909997349,
+        0.7003178030008712,
+        0.70458133000011,
+        0.7169055410004148,
+        0.7705539950002276,
+        0.8052256829996622
+      ],
+      "sample_count": 32
+    },
+    {
+      "phase": "remote_cold_batch_get",
+      "concurrent_clients": 4,
+      "waves": 1,
+      "wall_seconds": 2.5888178230006815,
+      "served_bytes": 33554432,
+      "process_deltas": {
+        "rchar": 134217728,
+        "wchar": 67120196,
+        "syscr": 2060,
+        "syscw": 778,
+        "read_bytes": 0,
+        "write_bytes": 33570816,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 426,
+        "cpu_system_ticks": 19
+      },
+      "cpu_seconds": 4.45,
+      "rss_before_bytes": 44339200,
+      "rss_after_bytes": 46264320,
+      "rchar_per_served_byte": 4.0,
+      "remote_requests": {
+        "HEAD": 8,
+        "GET": 4
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 6753.867048207,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6754.000190791,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6754.141870508,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6754.307603622,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6754.467480962,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6754.704611827,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6754.883913033,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6755.040674872,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6755.215499159,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6755.377060924,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6755.50928553,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6755.680191764,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6755.882064118,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6756.03050437,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6756.202920223,
+          "connections": 5,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6756.374222699,
+          "connections": 5,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 2.344733414000075,
+      "p95_seconds": 2.5798181219997787,
+      "p99_seconds": 2.5798181219997787,
+      "samples_seconds": [
+        2.1634852080005658,
+        2.344733414000075,
+        2.578165588999582,
+        2.5798181219997787
+      ],
+      "sample_count": 4
+    },
+    {
+      "phase": "restart_existing_local_empty_cache",
+      "concurrent_clients": 16,
+      "waves": 1,
+      "wall_seconds": 3.6647931879997486,
+      "served_bytes": 134217728,
+      "process_deltas": {
+        "rchar": 402653363,
+        "wchar": 134252264,
+        "syscr": 6180,
+        "syscw": 2161,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 881,
+        "cpu_system_ticks": 22
+      },
+      "cpu_seconds": 9.03,
+      "rss_before_bytes": 34471936,
+      "rss_after_bytes": 48214016,
+      "rchar_per_served_byte": 3.000001333653927,
+      "remote_requests": {
+        "HEAD": 32
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 6758.82509776,
+          "connections": 3,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6759.080217437,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6759.424803516,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6759.704340924,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6759.934928873,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6760.232882401,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6760.481084517,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6760.739917421,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6760.982840633,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6761.224304839,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6761.431335404,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6761.677756538,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6761.908417209,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6762.069567325,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6762.242745263,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6762.38947852,
+          "connections": 16,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 3.011584784000661,
+      "p95_seconds": 3.6031289389993617,
+      "p99_seconds": 3.6031289389993617,
+      "samples_seconds": [
+        2.3177722539994647,
+        2.4120390529997167,
+        2.4145120929997574,
+        2.6742503410005156,
+        2.7621864239999923,
+        2.950980016000358,
+        2.9808752580001965,
+        3.011584784000661,
+        3.0839478239995515,
+        3.2044778429999496,
+        3.3613479370005734,
+        3.426035657000284,
+        3.4988949249991492,
+        3.524288460999742,
+        3.5704444229995715,
+        3.6031289389993617
+      ],
+      "sample_count": 16
+    },
+    {
+      "phase": "warm_batch_get",
+      "concurrent_clients": 16,
+      "waves": 2,
+      "wall_seconds": 8.038312261999636,
+      "served_bytes": 268435456,
+      "process_deltas": {
+        "rchar": 805306368,
+        "wchar": 268502832,
+        "syscr": 12352,
+        "syscw": 4189,
+        "read_bytes": 0,
+        "write_bytes": 0,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 1736,
+        "cpu_system_ticks": 56
+      },
+      "cpu_seconds": 17.92,
+      "rss_before_bytes": 48214016,
+      "rss_after_bytes": 50638848,
+      "rchar_per_served_byte": 3.0,
+      "remote_requests": {
+        "HEAD": 64
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 6762.516978442,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6762.728180703,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6762.936320515,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6763.21315858,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6763.464240931,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6763.636202286,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6763.861161184,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6764.096519893,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6764.316179689,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6764.561237262,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6764.812353803,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6765.09225563,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6765.401315675,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6765.783844887,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6766.067874664,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6766.216658757,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6766.412210922,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6766.920652707,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6767.07619518,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6767.308195727,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6767.513401746,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6767.870215294,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6768.128213267,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6768.388280579,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6768.628229434,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6768.904324822,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6769.223210315,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6769.483342046,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6769.804229933,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6770.167798443,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6770.392687278,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6770.540283241,
+          "connections": 16,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 3.353974802000266,
+      "p95_seconds": 4.093518454000332,
+      "p99_seconds": 4.189550858000075,
+      "samples_seconds": [
+        2.5048929419999695,
+        2.7756895789998453,
+        2.887651549999646,
+        2.9289885400003186,
+        2.934263899999678,
+        2.9417810199993255,
+        2.996762258000672,
+        3.232882365000478,
+        3.2736295989998325,
+        3.284628666999197,
+        3.3027790930000265,
+        3.3173469109997313,
+        3.320426201999908,
+        3.336042952000753,
+        3.3414265179999347,
+        3.353974802000266,
+        3.388311464999788,
+        3.4739920209995034,
+        3.4948789580002995,
+        3.5120531359998495,
+        3.5304514409999683,
+        3.5364807360001578,
+        3.5500145030000567,
+        3.557921183999497,
+        3.5860884000003352,
+        3.6444233949996487,
+        3.655575145000512,
+        3.7025498749999315,
+        3.782127410000612,
+        3.925474310000027,
+        4.093518454000332,
+        4.189550858000075
+      ],
+      "sample_count": 32
+    },
+    {
+      "phase": "remote_cold_batch_get",
+      "concurrent_clients": 16,
+      "waves": 1,
+      "wall_seconds": 8.530745889999707,
+      "served_bytes": 134217728,
+      "process_deltas": {
+        "rchar": 536870912,
+        "wchar": 268477936,
+        "syscr": 8240,
+        "syscw": 2908,
+        "read_bytes": 0,
+        "write_bytes": 134225920,
+        "cancelled_write_bytes": 0,
+        "cpu_user_ticks": 1747,
+        "cpu_system_ticks": 58
+      },
+      "cpu_seconds": 18.05,
+      "rss_before_bytes": 50638848,
+      "rss_after_bytes": 56987648,
+      "rchar_per_served_byte": 4.0,
+      "remote_requests": {
+        "HEAD": 32,
+        "GET": 16
+      },
+      "postgres_connection_samples": [
+        {
+          "monotonic": 6770.66191672,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6770.924153979,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6771.319807077,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6771.523715496,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6771.815039177,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6772.183987994,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6772.928400911,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6773.116880253,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6773.365449666,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6773.612503492,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6773.861352384,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6774.061159056,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6774.280066927,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6774.477587945,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6774.736473123,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6774.932195466,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6775.192231295,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6775.388191031,
+          "connections": 16,
+          "active_sql": 3
+        },
+        {
+          "monotonic": 6775.671001898,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6775.970628335,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6776.216402173,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6776.42821457,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6776.613510114,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6776.909073543,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6777.11175102,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6777.300219614,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6777.52483482,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6777.711028313,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6777.934608254,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6778.099872529,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6778.328410063,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6778.48297315,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6778.623082562,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6778.810939996,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6778.988660209,
+          "connections": 16,
+          "active_sql": 0
+        },
+        {
+          "monotonic": 6779.124903201,
+          "connections": 16,
+          "active_sql": 0
+        }
+      ],
+      "postgres_sampler_error_kinds": [],
+      "p50_seconds": 7.455465629999708,
+      "p95_seconds": 8.418174557000384,
+      "p99_seconds": 8.418174557000384,
+      "samples_seconds": [
+        6.2635396200003015,
+        6.39486112800023,
+        6.436214554000799,
+        6.694706994000626,
+        6.744626653000523,
+        7.262885887000266,
+        7.28405409700008,
+        7.455465629999708,
+        7.500253765999332,
+        7.551768055000139,
+        7.694734503000291,
+        7.751355461000458,
+        7.85166175500035,
+        8.175346566999906,
+        8.36587201400016,
+        8.418174557000384
+      ],
+      "sample_count": 16
+    }
+  ],
+  "scope": "Actual native Rust service / PostgreSQL17 / Garage2.1 through owned counting proxy, one host, random8MiB object; endpoints and tokens excluded.",
+  "limitations": [
+    "Debug build; timings under shared host load, no production throughput/SLA inference. Small cold samples give empirical order statistics only.",
+    "rchar counts all process read syscalls; read_bytes/write_bytes kernel storage accounting can be zero due pagecache; no direct disk device busy measurement.",
+    "PostgreSQL samples match service-owned TCP client ports: active_sql counts executing/waiting SQL, total counts physical pooled connections. Checked-out idle clients/pool waiter counts are not directly instrumented; these are not exact busy pool occupancy.",
+    "CPU ticks are service process CPU including internal worker threads; excludes PostgreSQL/Garage CPU."
+  ]
+}
