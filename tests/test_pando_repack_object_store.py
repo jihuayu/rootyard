@@ -362,11 +362,28 @@ class PandoObjectStoreAndRepackContractTests(unittest.TestCase):
 
     def test_main_server_forge_and_browse_expose_backend_and_storage_route_endpoints(self):
         forge_text = (ROOT / "src" / "forge.rs").read_text(encoding="utf-8")
+        # The backend handlers moved into the forge/backend.rs module that the domain root
+        # declares and merges into its router.
+        self.assertIn('#[path = "forge/backend.rs"]', forge_text)
+        self.assertIn("mod backend;", forge_text)
         self.assertIn('"/api/repos/{owner}/{name}/backend"', forge_text)
-        self.assertIn("get(get_backend).patch(set_backend)", forge_text)
-        self.assertIn("repository.storage_backend.changed", forge_text)
-        self.assertIn("pando_gateway", forge_text)
-        self.assertIn("gitfs_local", forge_text)
+        self.assertRegex(
+            forge_text,
+            r"get\(backend::get_backend\)\.patch\(backend::set_backend\)",
+            "forge backend route must mount backend::get_backend/backend::set_backend",
+        )
+        backend_text = (ROOT / "src" / "forge" / "backend.rs").read_text(encoding="utf-8")
+        self.assertIn("pub async fn get_backend", backend_text)
+        self.assertIn("pub async fn set_backend", backend_text)
+        self.assertIn("repository.storage_backend.changed", backend_text)
+        # Pando gateway backend selection and readiness are reported by the real status builder.
+        self.assertIn(
+            'matches!(input.storage_backend.as_str(), "gitfs" | "pando")',
+            backend_text,
+            "backend patch must accept the pando gateway backend",
+        )
+        self.assertIn("pando_ready", backend_text, "backend status must expose pando readiness")
+        self.assertIn("gitfs_local", backend_text)
 
         browse_path = ROOT / "src" / "browse.rs"
         browse_text = browse_path.read_text(encoding="utf-8")

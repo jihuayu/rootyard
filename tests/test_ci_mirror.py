@@ -54,6 +54,8 @@ class CiMirrorTrack3Test(unittest.TestCase):
             self.assertLessEqual(sub_lines, 700, f"{submod} exceeds modular size bound ({sub_lines} lines)")
         auto_origin_lines = len((ROOT / "src" / "mirror" / "auto_origin.rs").read_text().splitlines())
         self.assertGreaterEqual(auto_origin_lines, 120)
+        # Bound intentionally kept at 450: auto_origin.rs is 452 lines and is pending
+        # extraction by the source-decomposition worker; never raise this bound.
         self.assertLess(auto_origin_lines, 450)
 
     def test_staged_migration_030_ci_mirror_sql_contract(self):
@@ -106,6 +108,15 @@ class CiMirrorTrack3Test(unittest.TestCase):
     def test_f14_ci_pins_release_and_lease_coordination_in_source(self):
         ci_pins_rs = (ROOT / "src" / "ci_pins.rs").read_text()
         ci_checkouts_rs = (ROOT / "src" / "ci_checkouts.rs").read_text()
+        # Checkout-lease helpers moved to ci_checkouts/leases.rs; the domain root must declare
+        # and re-export that module before the helper semantics are inspected in it.
+        self.assertIn("mod leases;", ci_checkouts_rs, "src/ci_checkouts.rs must declare its leases submodule")
+        self.assertIn(
+            "pub use leases::*;",
+            ci_checkouts_rs,
+            "src/ci_checkouts.rs must re-export the lease helpers",
+        )
+        leases_rs = (ROOT / "src" / "ci_checkouts" / "leases.rs").read_text()
 
         self.assertIn("pub fn routes() -> Router<Arc<AppState>>", ci_pins_rs)
         self.assertIn('"/api/repos/{owner}/{name}/ci-pins"', ci_pins_rs)
@@ -119,20 +130,38 @@ class CiMirrorTrack3Test(unittest.TestCase):
             "pub async fn active_job_ids(",
             "pub async fn active_pinned_oids(",
         ):
-            self.assertIn(fn_sig, ci_checkouts_rs, f"Missing helper in src/ci_checkouts.rs: {fn_sig}")
+            self.assertIn(fn_sig, leases_rs, f"Missing helper in src/ci_checkouts/leases.rs: {fn_sig}")
 
+        # Release/pinned-root logic moved into ci_pins submodules re-exported by src/ci_pins.rs.
+        for reexport in (
+            "pub use lifecycle::{list_pins,get_pin,release_pin};",
+            "pub use roots::{git_dir_pinned_roots,active_pinned_oids};",
+        ):
+            self.assertIn(reexport, ci_pins_rs, f"Missing re-export in src/ci_pins.rs: {reexport}")
+
+        lifecycle_rs = (ROOT / "src" / "ci_pins" / "lifecycle.rs").read_text()
         for pin_contract in (
-            "crate::ci_checkouts::has_active_lease_on(&tx, repo.id, job)",
+            "crate::ci_checkouts::has_active_lease_on(&*tx, repo.id, job)",
             "active checkout lease exists for job",
             "StatusCode::CONFLICT",
-            "update-ref",
-            "-d",
-            "--no-deref",
+            '"update-ref"',
+            '"-d"',
+            '"--no-deref"',
             "observed_immutable_ci_root",
             '"released"',
-            "pub async fn active_pinned_oids(",
         ):
-            self.assertIn(pin_contract, ci_pins_rs, f"Missing F14 contract in src/ci_pins.rs: {pin_contract}")
+            self.assertIn(
+                pin_contract,
+                lifecycle_rs,
+                f"Missing F14 contract in src/ci_pins/lifecycle.rs: {pin_contract}",
+            )
+
+        roots_rs = (ROOT / "src" / "ci_pins" / "roots.rs").read_text()
+        self.assertIn(
+            "pub async fn active_pinned_oids(",
+            roots_rs,
+            "Missing pinned-oid query in src/ci_pins/roots.rs",
+        )
 
     def test_f15_limiter_and_observability_in_source(self):
         mirror_rs = (ROOT / "src" / "mirror.rs").read_text()
@@ -352,6 +381,7 @@ class CiMirrorTrack3Test(unittest.TestCase):
         auto_lines = len(auto_origin_path.read_text().splitlines())
         self.assertLess(mirror_lines, 140)
         self.assertGreaterEqual(auto_lines, 120)
+        # Same pending-extraction cap as the modular test above: never raised to mask size.
         self.assertLess(auto_lines, 450)
 
         mirror_src = mirror_rs_path.read_text()
