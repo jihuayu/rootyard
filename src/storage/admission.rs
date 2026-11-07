@@ -248,13 +248,14 @@ mod tests {
         let Ok(base) = std::env::var("ROOTYARD_TEST_DATABASE_URL") else {
             return None;
         };
-        let admin = crate::db::pool(&base).ok()?;
+        let admin = crate::db::pool(&base).expect("configured admission test database must be valid");
         let schema = format!("admission_{}", Uuid::new_v4().simple());
-        admin.get().await.ok()?.batch_execute(&format!("CREATE SCHEMA {schema}")).await.ok()?;
-        let mut url = reqwest::Url::parse(&base).ok()?;
+        admin.get().await.expect("connect admission fixture administrator")
+            .batch_execute(&format!("CREATE SCHEMA {schema}")).await.expect("create admission fixture schema");
+        let mut url = reqwest::Url::parse(&base).expect("parse admission fixture database URL");
         url.query_pairs_mut().append_pair("options", &format!("-csearch_path={schema}"));
-        let pool = crate::db::pool(url.as_str()).ok()?;
-        let client = pool.get().await.ok()?;
+        let pool = crate::db::pool(url.as_str()).expect("configure admission fixture pool");
+        let client = pool.get().await.expect("connect admission fixture pool");
         client
             .batch_execute(
                 "CREATE TABLE repositories( \
@@ -265,12 +266,12 @@ mod tests {
                  CREATE TABLE storage_write_admissions( \
                    id uuid PRIMARY KEY, repository_id uuid NOT NULL REFERENCES repositories(id), \
                    gc_epoch bigint NOT NULL, owner uuid NOT NULL, kind text NOT NULL, \
-                   state text NOT NULL, admitted_at timestamptz NOT NULL DEFAULT clock_timestamp(), \
+                   state text NOT NULL DEFAULT 'active', admitted_at timestamptz NOT NULL DEFAULT clock_timestamp(), \
                    heartbeat_at timestamptz NOT NULL DEFAULT clock_timestamp(), \
                    lease_until timestamptz NOT NULL, finished_at timestamptz, detail text)",
             )
             .await
-            .ok()?;
+            .expect("create admission fixture tables");
         Some(pool)
     }
 

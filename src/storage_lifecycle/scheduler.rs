@@ -182,6 +182,33 @@ async fn schedule_pando(state: &AppState, policy: &Policy) -> Result<usize> {
         {
             scheduled += 1;
         }
+        // Any committed manifest no longer in the serving pack set is a mark
+        // candidate. Marking is non-destructive and proves per-artifact
+        // retention before anything can be retired.
+        let retireable: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM pando_pack_manifests m                  WHERE m.repository_id=$1 AND NOT (m.id = ANY($2::uuid[])))",
+                &[&repo, &pack_ids],
+            )
+            .await?
+            .get(0);
+        if retireable && jobs::enqueue(&state.pool, repo, tenant, generation, "pando_unreachable_mark").await? {
+            scheduled += 1;
+        }
+        let delete_enabled = std::env::var("ROOTYARD_PANDO_REMOTE_DELETE").ok().as_deref() == Some("true");
+        let due = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM pando_remote_artifacts a                  WHERE a.authority_id=(SELECT authority_id FROM pando_storage_authorities WHERE singleton)                    AND a.tenant_id=$1 AND a.state IN ('retired','deleting')                    AND a.delete_after<=clock_timestamp())",
+                &[&tenant],
+            )
+            .await?
+            .get::<_, bool>(0);
+        if due
+            && delete_enabled
+            && jobs::enqueue(&state.pool, repo, tenant, generation, "pando_tombstone_delete").await?
+        {
+            scheduled += 1;
+        }
     }
     Ok(scheduled)
 }

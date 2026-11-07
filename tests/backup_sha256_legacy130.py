@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Real format6/schema130 backup restored by the current format7 binary.
+"""Real format6/schema130 backup restored by the current format8 binary.
 
 The pre-migration-131 binary creates a genuine archive and SHA-256 repository
 plus a SHA-1 checkout grant and cancellation tombstone. The current binary must
 reject that archive without explicit opt-in, verify the frozen format6/schema130
-catalog, restore the volume, apply migration 131, and preserve the SHA-256
+catalog, restore the volume, apply migration 132, and preserve the SHA-256
 objects/refs/pin, repository generation and checkout authority semantics.
 
 Requires a disposable ROOTYARD_TEST_DATABASE_URL with CREATEDB and a trusted
@@ -161,7 +161,7 @@ class Legacy130Harness(Harness):
         self.run([self.args.binary, "restore", str(self.backup), "--isolated",
                   "--trust-backup", "--allow-legacy-schema130"], env=self.env)
         assert self.query(self.target_db,
-                          "SELECT max(version) FROM schema_migrations") == "131"
+                          "SELECT max(version) FROM schema_migrations") == "132"
         names = self.query(self.target_db,
                            "SELECT string_agg(conname, ',' ORDER BY conname) FROM pg_constraint "
                            "WHERE conrelid='public.ci_checkout_jobs'::regclass")
@@ -189,7 +189,7 @@ class Legacy130Harness(Harness):
         assert grant["plan"] is True and grant["revoked"] is True
         assert tombstone["plan"] is False and tombstone["cancelled"] is True
         self.stop()
-        return dict(schema_upgraded_to_131=True, sha256_clone_exact=True,
+        return dict(schema_upgraded_to_132=True, sha256_clone_exact=True,
                     pin_preserved=True, generation_preserved=True,
                     issued_grant_revoked=True, cancellation_tombstone_preserved=True)
 

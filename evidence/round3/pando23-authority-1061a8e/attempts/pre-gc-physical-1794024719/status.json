@@ -1,0 +1,131 @@
+{
+  "jobs": {
+    "rust-lib": {
+      "state": "passed",
+      "database": "round3_pando_rust_lib_8efddf704b",
+      "command": [
+        "flock",
+        "/workspace/scratch/rootyard-round2/cargo.lock",
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/pando61/logs/rust-lib-1794024574.log",
+      "report": "/workspace/scratch/rootyard-round3/pando61/logs/rust-lib-1794024574.json",
+      "started": 1794024574.9384313,
+      "harness_sha256": null,
+      "exit_code": 0,
+      "finished": 1794024628.995554,
+      "database_cleanup": "dropped_after_success"
+    },
+    "rust-pando": {
+      "state": "passed",
+      "database": "round3_pando_rust_pando_3e4d5b7952",
+      "command": [
+        "flock",
+        "/workspace/scratch/rootyard-round2/cargo.lock",
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "pando_maintenance",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/pando61/logs/rust-pando-1794024629.log",
+      "report": "/workspace/scratch/rootyard-round3/pando61/logs/rust-pando-1794024629.json",
+      "started": 1794024629.2076159,
+      "harness_sha256": "b33017868dd1b97238006c4b17a348caf9bd1878545cc97be2f713ba7959cc0c",
+      "exit_code": 0,
+      "finished": 1794024696.8194706,
+      "database_cleanup": "dropped_after_success"
+    },
+    "schema": {
+      "state": "passed",
+      "database": "round3_pando_schema_23d0a66ca8",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/schema_contract.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/pando61/artifacts/1061a8ee9d1ecc783189d33949980eac6b3bd6ea/rootyard"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/pando61/logs/schema-1794024696.log",
+      "report": "/workspace/scratch/rootyard-round3/pando61/logs/schema-1794024696.json",
+      "started": 1794024696.8926234,
+      "harness_sha256": "aa596da54cd49ecb5ccffdc6a7344b6ef15a4c4d5d545daeb0c076d3ca4f4a11",
+      "exit_code": 0,
+      "finished": 1794024701.7253342,
+      "database_cleanup": "dropped_after_success"
+    },
+    "gitfs-lifecycle": {
+      "state": "passed",
+      "database": "round3_pando_gitfs_lifecycle_c6ed2ee455",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/storage_lifecycle.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/pando61/artifacts/1061a8ee9d1ecc783189d33949980eac6b3bd6ea/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round3/pando61/logs/gitfs-lifecycle-1794024701.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/pando61/logs/gitfs-lifecycle-1794024701.log",
+      "report": "/workspace/scratch/rootyard-round3/pando61/logs/gitfs-lifecycle-1794024701.json",
+      "started": 1794024701.7852254,
+      "harness_sha256": "6b1b46434ba0da9cd879cc72fc422800296761f3f3989fc163ef261931020703",
+      "exit_code": 0,
+      "finished": 1794024719.5050097,
+      "report_sha256": "0e20475bf7e11effc0675ad8048757e7ec146aa7dc9794d0dd8c5218e34b542c",
+      "database_cleanup": "dropped_after_success"
+    },
+    "gitfs-physical": {
+      "state": "failed",
+      "database": "round3_pando_gitfs_physical_f8187b61d2",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/storage_lifecycle_physical.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/pando61/artifacts/1061a8ee9d1ecc783189d33949980eac6b3bd6ea/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round3/pando61/logs/gitfs-physical-1794024719.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/pando61/logs/gitfs-physical-1794024719.log",
+      "report": "/workspace/scratch/rootyard-round3/pando61/logs/gitfs-physical-1794024719.json",
+      "started": 1794024719.5645201,
+      "harness_sha256": "0dbb558ef525d6bba4f27d862c096da962a0f2012b46bab7ac77a51b56531c0d",
+      "exit_code": 1,
+      "finished": 1794024773.3690805,
+      "report_sha256": "ee5ec89dcc8af5025fe55fe15b0fe848da2e2662aa67198db02e7f9c1ddb9e96"
+    }
+  },
+  "started": 1794024504.4744933,
+  "state": "failed",
+  "pid": 314694,
+  "updated": 1794024773.3697214,
+  "attempt_started": 1794024504.4745007,
+  "stage": "gitfs-physical",
+  "certificate": {
+    "role": "pando61",
+    "source_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+    "built_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+    "production_inputs_sha256": "9e33859aad991589c57863af6f6b46fe42290071b3e271f90eda44f6d707feac",
+    "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+    "valid": true
+  },
+  "binary": "/workspace/scratch/rootyard-round3/pando61/artifacts/1061a8ee9d1ecc783189d33949980eac6b3bd6ea/rootyard",
+  "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+  "production_inputs_sha256": "9e33859aad991589c57863af6f6b46fe42290071b3e271f90eda44f6d707feac",
+  "source_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+  "harness_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+  "compiled_source_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+  "production_inputs_unchanged_after_compile": true,
+  "failed_job": "gitfs-physical",
+  "finished": 1794024773.3697197
+}

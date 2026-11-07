@@ -1,0 +1,17 @@
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "source_setup_and_backup",
+      "status": "failed",
+      "seconds": 0.9807,
+      "error": "/api/repos: expected 201, got 202: b'{\"id\":\"0dec6ff4-d49e-4c96-8203-15c45d79d13e\",\"name\":\"restore\",\"owner\":\"alice\",\"state\":\"provisioning\",\"clone_path\":\"/git/alice/restore.git\",\"storage_backend\":\"gitfs\",\"storage_generation\":1,\"object_format\":\"sha256\"}'"
+    }
+  ],
+  "binary_sha256": "eb1e4a09bf1a9c244272a88e300fbf011cb017243313214f0ab359898515d9da",
+  "limitations": [
+    "Synthetic loopback processes and disposable databases, not a production RPO/RTO promise.",
+    "Both databases and the backup volume are local to this run.",
+    "The restore verifies Git objects, refs, pin receipt and repository format; it does not test host power loss."
+  ]
+}

@@ -8,6 +8,8 @@ pub mod pack_store;
 pub mod prepare;
 #[path = "pando_gateway/publish.rs"]
 pub mod publish;
+#[path = "pando_gateway/retention.rs"]
+pub mod retention;
 #[path = "pando_gateway/snapshot.rs"]
 pub mod snapshot;
 pub mod transition;

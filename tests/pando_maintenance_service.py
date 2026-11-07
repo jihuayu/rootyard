@@ -40,7 +40,9 @@ class PandoMaintenanceHarness(Harness):
             ROOTYARD_STORAGE_MAINTENANCE="true",
             ROOTYARD_STORAGE_MAINTENANCE_POLL_SECONDS="1",
             ROOTYARD_STORAGE_SCAN_PERIOD_SECONDS="1",
-            ROOTYARD_STORAGE_REPACK_PACKS="3",
+            # Two-pack threshold keeps convergence deterministic when a push
+            # lands after a compaction triggered by the previous crossing.
+            ROOTYARD_STORAGE_REPACK_PACKS="2",
             ROOTYARD_STORAGE_REPACK_LOOSE_OBJECTS="1000000",
             ROOTYARD_STORAGE_CACHE_MAX_AGE_SECONDS="60",
             ROOTYARD_STORAGE_STAGE_AGE_SECONDS="1",
@@ -110,12 +112,23 @@ class PandoMaintenanceHarness(Harness):
         latest = None
         for index in (1, 2, 3):
             latest = self.pando_push(work, index)
-        self.wait_count(
-            "SELECT count(*) FROM storage_maintenance_jobs WHERE " + base
-            + " AND kind='pando_repack' AND state='succeeded'", seconds=90,
-            label="automatic pando_repack")
-        packs = self.sql("SELECT cardinality(pack_ids) FROM pando_repository_states WHERE " + base)
-        assert packs == "1", "automatic compaction did not replace the serving pack set: " + packs
+        # A push can land after a compaction triggered by the previous threshold
+        # crossing. Wait for the durable converged state (one serving pack and
+        # no queued/running repack), not merely the first success.
+        convergence = self.wait_sql(
+            "SELECT cardinality(pack_ids)::text || '/' || "
+            "(SELECT count(*) FROM storage_maintenance_jobs WHERE " + base
+            + " AND kind='pando_repack' AND state IN ('queued','running')) "
+            "FROM pando_repository_states WHERE " + base,
+            lambda value: value == "1/0", seconds=90,
+            label="automatic pando_repack convergence")
+        packs = convergence.split("/", 1)[0]
+        assert packs == "1", "automatic compaction did not converge to one serving pack: " + convergence
+        assert int(self.sql("SELECT count(*) FROM storage_maintenance_jobs WHERE " + base
+                            + " AND kind='pando_repack' AND state='succeeded'")) >= 1
+        failed_repacks = self.sql("SELECT count(*) FROM storage_maintenance_jobs WHERE " + base
+                                  + " AND kind='pando_repack' AND state='failed'")
+        assert failed_repacks == "0", "automatic repack jobs failed: " + failed_repacks
         result = self.sql("SELECT result::text FROM storage_maintenance_jobs WHERE " + base
                           + " AND kind='pando_repack' AND state='succeeded' ORDER BY completed_at DESC LIMIT 1")
         result = json.loads(result)
@@ -243,6 +256,28 @@ class PandoMaintenanceHarness(Harness):
             "remote_deleted": False,
         }
 
+    def failure_snapshot(self):
+        """Bounded, sanitized job/repo state captured before cleanup."""
+        snapshot = {}
+        for name, query in (
+            ("maintenance_jobs",
+             "SELECT COALESCE(json_agg(x),'[]'::json)::text FROM ("
+             "SELECT kind,state,attempt,left(coalesce(last_error,''),512) AS last_error,"
+             "progress::text AS progress,"
+             "result::text AS result,created_at::text AS created_at,"
+             "completed_at::text AS completed_at FROM storage_maintenance_jobs "
+             "ORDER BY created_at DESC LIMIT 25) x"),
+            ("pando_state",
+             "SELECT COALESCE(json_agg(x),'[]'::json)::text FROM ("
+             "SELECT repository_id,storage_backend,transition_state,state,"
+             "cardinality(pack_ids) AS packs,ref_generation FROM pando_repository_states) x"),
+        ):
+            try:
+                snapshot[name] = json.loads(self.sql(query))
+            except Exception as error:
+                snapshot[name] = {"snapshot_error": type(error).__name__}
+        return snapshot
+
 
 def require_environment():
     missing = [name for name in REQUIRED_ENV if not os.environ.get(name)]
@@ -265,12 +300,14 @@ def main():
         parser.error(str(error))
     h = PandoMaintenanceHarness(args)
     passed = False
+    failure_snapshot = None
     try:
         h.case("setup", h.setup)
         h.case("automatic_compaction_and_cache", h.automatic_compaction_and_cache)
         passed = True
     except Exception:
         args.keep = True
+        failure_snapshot = h.failure_snapshot()
         print(h.redact(traceback.format_exc()), file=sys.stderr)
         log = h.root / "server.log"
         if log.exists():
@@ -279,6 +316,7 @@ def main():
         h.cleanup()
     report = {"passed": passed, "cases": h.results,
               "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
+              "failure_snapshot": failure_snapshot,
               "limitations": ["Loopback single-node fixture; no remote-delete qualification."]}
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)

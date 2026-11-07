@@ -1,0 +1,25 @@
+Traceback (most recent call last):
+  File "/workspace/rootyard-worktrees/round3-integrated/tests/storage_lifecycle_physical.py", line 469, in main
+    if not args.case or args.case==name: h.case(name,case)
+                                         ^^^^^^^^^^^^^^^^^
+  File "/workspace/rootyard-worktrees/round3-integrated/tests/e2e.py", line 163, in case
+    detail = fn()
+             ^^^^
+  File "/workspace/rootyard-worktrees/round3-integrated/tests/storage_lifecycle_physical.py", line 104, in physical_loose_packed_and_pin
+    self.wait_sql("SELECT state FROM storage_maintenance_tombstones WHERE repository_id='"
+  File "/workspace/rootyard-worktrees/round3-integrated/tests/storage_lifecycle.py", line 36, in wait_sql
+    raise AssertionError("maintenance state did not reach " + expected + ": " + self.sql(query))
+AssertionError: maintenance state did not reach deleted: pending
+
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "physical_loose_packed_and_pin",
+      "status": "failed",
+      "seconds": 53.3013,
+      "error": "maintenance state did not reach deleted: pending"
+    }
+  ],
+  "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba"
+}

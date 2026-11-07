@@ -99,13 +99,7 @@ async fn serving(state: &AppState, repo: &Repository) -> Result<Serving> {
     })
 }
 
-async fn pando_git(
-    state: &AppState,
-    path: &Path,
-    args: &[&str],
-    lease: &Lease,
-    deadline: Instant,
-) -> Result<Vec<u8>> {
+async fn pando_git(state: &AppState, path: &Path, args: &[&str], lease: &Lease, deadline: Instant) -> Result<Vec<u8>> {
     lease.ensure_active().map_err(|error| anyhow::anyhow!(error.1))?;
     let mut command = Command::new(&state.config.git);
     command
@@ -149,12 +143,7 @@ async fn pando_git_input(
     ensure!(!timeout.is_zero(), "Pando maintenance deadline elapsed");
     let file = std::fs::File::open(input)?;
     lease
-        .guard(git_http::collect_git_output_input(
-            command,
-            64 * 1024 * 1024,
-            timeout,
-            Stdio::from(file),
-        ))
+        .guard(git_http::collect_git_output_input(command, 64 * 1024 * 1024, timeout, Stdio::from(file)))
         .await
         .map_err(|error| anyhow::anyhow!(error.1))?
 }
@@ -186,9 +175,7 @@ async fn all_objects(
         let oid = fields.next().context("missing Pando object identity")?;
         let kind = fields.next().context("missing Pando object type")?;
         ensure!(
-            fields.next().is_none()
-                && valid_oid(oid)
-                && matches!(kind, "commit" | "tree" | "blob" | "tag"),
+            fields.next().is_none() && valid_oid(oid) && matches!(kind, "commit" | "tree" | "blob" | "tag"),
             "invalid Pando native object listing"
         );
         ensure!(objects.insert(oid.to_owned(), kind.to_owned()).is_none(), "duplicate Pando object identity");
@@ -262,19 +249,12 @@ async fn verify_candidate(
         std::fs::copy(index, &target_index)?;
     }
     for (name, oid) in &snapshot.refs {
-        pando_git(
-            state,
-            &verify.0,
-            &["update-ref", "--no-deref", name, oid],
-            lease,
-            deadline,
-        )
-        .await?;
+        pando_git(state, &verify.0, &["update-ref", "--no-deref", name, oid], lease, deadline).await?;
     }
     pando_git(state, &verify.0, &["symbolic-ref", "HEAD", &snapshot.head_ref], lease, deadline).await?;
     pando_git(state, &verify.0, &["fsck", "--full", "--strict"], lease, deadline).await?;
-    let raw = pando_git(state, &verify.0, &["for-each-ref", "--format=%(refname) %(objectname)"], lease, deadline)
-        .await?;
+    let raw =
+        pando_git(state, &verify.0, &["for-each-ref", "--format=%(refname) %(objectname)"], lease, deadline).await?;
     let text = String::from_utf8(raw)?;
     let mut actual = BTreeMap::new();
     for line in text.lines() {
@@ -287,7 +267,14 @@ async fn verify_candidate(
 }
 
 fn write_allowed(kind: &str) -> bool {
-    kind == "pando_repack" || kind == "pando_cache_hydrate" || kind == "pando_cache_evict"
+    matches!(
+        kind,
+        "pando_repack"
+            | "pando_cache_hydrate"
+            | "pando_cache_evict"
+            | "pando_unreachable_mark"
+            | "pando_tombstone_delete"
+    )
 }
 
 /// Execute one claimed Pando job while the caller holds the global backup
@@ -303,13 +290,7 @@ pub async fn execute(
 ) -> Result<Value> {
     ensure!(repo.storage_backend == "pando", "Pando maintenance requires a Pando repository");
     ensure!(!cancel.is_cancelled(), "maintenance lease lost");
-    if !write_allowed(&job.kind) {
-        bail!(
-            "Pando object marking and remote deletion are disabled: no object-level pack index, \
-             global content-reference closure or backup retention registry can yet prove that a \
-             remote ciphertext is unreferenced"
-        );
-    }
+    ensure!(write_allowed(&job.kind), "unsupported Pando maintenance job kind");
     match job.kind.as_str() {
         "pando_repack" => repack(state, repo, job, lease, cancel).await,
         "pando_cache_hydrate" => cache_hydrate(state, repo, lease, cancel).await,
@@ -319,8 +300,234 @@ pub async fn execute(
             lease.ensure_active().map_err(|error| anyhow::anyhow!(error.1))?;
             Ok(json!({"cache_files_removed":removed,"remote_deleted":false}))
         }
+        "pando_unreachable_mark" => mark_unreachable(state, repo, job, lease, policy, cancel).await,
+        "pando_tombstone_delete" => delete_tombstones(state, repo, job, lease, policy, cancel).await,
         _ => bail!("unsupported Pando maintenance job kind"),
     }
+}
+
+/// SQL predicate shared by marking and deletion. An artifact is retained if
+/// *any* manifest that links it is still part of a serving pack set, or if the
+/// owning repository is not a stable ready Pando repository. S3 object listing
+/// is never consulted.
+const RETAINED_LINK: &str = "EXISTS (SELECT 1 FROM pando_manifest_artifacts l \
+   JOIN pando_pack_manifests m ON m.id=l.manifest_id \
+   JOIN repositories r ON r.id=m.repository_id \
+   WHERE l.authority_id=a.authority_id AND l.tenant_id=a.tenant_id \
+     AND l.namespace=a.namespace AND l.sha256=a.sha256 \
+     AND (r.storage_backend <> 'pando' OR r.state <> 'ready' OR r.transition_state <> 'stable' \
+       OR EXISTS (SELECT 1 FROM pando_repository_states s \
+                  WHERE s.repository_id=m.repository_id AND m.id = ANY(s.pack_ids)) \
+       OR EXISTS (SELECT 1 FROM pando_publication_fences p \
+                  WHERE p.authority_id=a.authority_id AND p.tenant_id=a.tenant_id \
+                    AND p.namespace=a.namespace AND p.sha256=a.sha256 \
+                    AND p.lease_until>clock_timestamp())))";
+
+async fn mark_unreachable(
+    state: &std::sync::Arc<AppState>,
+    repo: &Repository,
+    job: &Job,
+    lease: &Lease,
+    policy: &Policy,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    lease.ensure_active().map_err(|error| anyhow::anyhow!(error.1))?;
+    ensure!(!cancel.is_cancelled(), "maintenance lease lost before Pando mark");
+    let client = state.pool.get().await?;
+    let authority = crate::pando_gateway::retention::authority(&**client).await?;
+    let tenant = job.tenant_id;
+    let linked = "EXISTS (SELECT 1 FROM pando_manifest_artifacts l \
+        WHERE l.authority_id=a.authority_id AND l.tenant_id=a.tenant_id \
+          AND l.namespace=a.namespace AND l.sha256=a.sha256 AND l.repository_id=$3)";
+    let eligible = format!(
+        "SELECT count(*) FROM pando_remote_artifacts a \
+         WHERE a.authority_id=$1 AND a.tenant_id=$2 AND a.state='active' \
+           AND a.remote_path LIKE '%/authorities/%' AND {linked} AND NOT {RETAINED_LINK}"
+    );
+    let protected_serving = format!(
+        "SELECT count(*) FROM pando_remote_artifacts a \
+         WHERE a.authority_id=$1 AND a.tenant_id=$2 AND a.state='active' AND {linked} \
+           AND EXISTS (SELECT 1 FROM pando_manifest_artifacts l \
+             JOIN pando_pack_manifests m ON m.id=l.manifest_id \
+             JOIN pando_repository_states s ON s.repository_id=m.repository_id \
+             WHERE l.authority_id=a.authority_id AND l.tenant_id=a.tenant_id \
+               AND l.namespace=a.namespace AND l.sha256=a.sha256 AND m.id = ANY(s.pack_ids))"
+    );
+    let protected_transition = format!(
+        "SELECT count(*) FROM pando_remote_artifacts a \
+         WHERE a.authority_id=$1 AND a.tenant_id=$2 AND a.state='active' AND {linked} \
+           AND EXISTS (SELECT 1 FROM pando_manifest_artifacts l \
+             JOIN pando_pack_manifests m ON m.id=l.manifest_id \
+             JOIN repositories r ON r.id=m.repository_id \
+             WHERE l.authority_id=a.authority_id AND l.tenant_id=a.tenant_id \
+               AND l.namespace=a.namespace AND l.sha256=a.sha256 \
+               AND (r.storage_backend <> 'pando' OR r.state <> 'ready' OR r.transition_state <> 'stable'))"
+    );
+    let dry: i64 = client.query_one(&eligible, &[&authority.id, &tenant, &repo.id]).await?.get(0);
+    let serving: i64 = client.query_one(&protected_serving, &[&authority.id, &tenant, &repo.id]).await?.get(0);
+    let transition: i64 = client.query_one(&protected_transition, &[&authority.id, &tenant, &repo.id]).await?.get(0);
+    lease.ensure_active().map_err(|error| anyhow::anyhow!(error.1))?;
+    ensure!(!cancel.is_cancelled(), "maintenance lease lost before Pando mark commit");
+    let update = format!(
+        "UPDATE pando_remote_artifacts a SET state='retired',updated_at=clock_timestamp(), \
+          delete_after=clock_timestamp()+make_interval(secs=>($4::bigint)::double precision) \
+         WHERE a.authority_id=$1 AND a.tenant_id=$2 AND a.state='active' \
+           AND a.remote_path LIKE '%/authorities/%' AND {linked} AND NOT {RETAINED_LINK}"
+    );
+    let marked = client.execute(&update, &[&authority.id, &tenant, &repo.id, &policy.tombstone_grace_seconds]).await?;
+    let counts = crate::pando_gateway::retention::counts(&**client, tenant).await?;
+    Ok(json!({
+        "authority_id": authority.id,
+        "eligible": dry,
+        "marked_retired": marked,
+        "protected_serving": serving,
+        "protected_transition": transition,
+        "reserved_uploads": counts.reserved,
+        "active": counts.active,
+        "retired": counts.retired,
+        "deleting": counts.deleting,
+        "deleted": counts.deleted,
+        "remote_deleted": false,
+        "authority": "authority-scoped registered artifacts only; legacy v1 keys excluded"
+    }))
+}
+
+async fn delete_tombstones(
+    state: &std::sync::Arc<AppState>,
+    repo: &Repository,
+    job: &Job,
+    lease: &Lease,
+    policy: &Policy,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    lease.ensure_active().map_err(|error| anyhow::anyhow!(error.1))?;
+    let client = state.pool.get().await?;
+    let authority = crate::pando_gateway::retention::authority(&**client).await?;
+    let tenant = job.tenant_id;
+    let counts = crate::pando_gateway::retention::counts(&**client, tenant).await?;
+    let enabled = std::env::var("ROOTYARD_PANDO_REMOTE_DELETE").ok().as_deref() == Some("true");
+    if !enabled {
+        return Ok(json!({
+            "remote_deleted": false,
+            "dry_run": true,
+            "reason": "ROOTYARD_PANDO_REMOTE_DELETE is not enabled; marking and proofs remain active",
+            "retired": counts.retired,
+            "deleting": counts.deleting,
+            "deleted": counts.deleted
+        }));
+    }
+    let linked = "EXISTS (SELECT 1 FROM pando_manifest_artifacts l \
+        WHERE l.authority_id=a.authority_id AND l.tenant_id=a.tenant_id \
+          AND l.namespace=a.namespace AND l.sha256=a.sha256 AND l.repository_id=$3)";
+    let claim = format!(
+        "WITH candidates AS ( \
+           SELECT a.authority_id,a.tenant_id,a.namespace,a.sha256 \
+           FROM pando_remote_artifacts a \
+           WHERE a.authority_id=$1 AND a.tenant_id=$2 AND ((a.state='retired' AND a.delete_after<=clock_timestamp()) OR (a.state='deleting' AND (a.lease_until IS NULL OR a.lease_until<=clock_timestamp()))) \
+             AND a.remote_path LIKE '%/authorities/%' \
+             AND {linked} AND NOT {RETAINED_LINK} \
+           ORDER BY COALESCE(a.delete_after,a.lease_until),a.namespace,a.sha256 LIMIT 32 FOR UPDATE SKIP LOCKED) \
+         UPDATE pando_remote_artifacts a SET state='deleting',claimed_by=$4, \
+           claim_generation=a.claim_generation+1,attempts=a.attempts+1,last_error=NULL, \
+           lease_until=clock_timestamp()+make_interval(secs=>($5::bigint)::double precision),updated_at=clock_timestamp() \
+         FROM candidates c WHERE a.authority_id=c.authority_id AND a.tenant_id=c.tenant_id \
+           AND a.namespace=c.namespace AND a.sha256=c.sha256 \
+         RETURNING a.tenant_id,a.namespace,a.sha256,a.object_generation,a.remote_path,a.claim_generation"
+    );
+    let claimed =
+        client.query(&claim, &[&authority.id, &tenant, &repo.id, &job.lease_owner, &policy.lease_seconds]).await?;
+    let remote =
+        crate::storage::remote_objects::RemoteObjectStore::from_env(state.storage.root.join("pando-pack-work"))?;
+    let deadline = Instant::now() + MAINTENANCE_DEADLINE;
+    let mut deleted = 0usize;
+    let mut fenced = 0usize;
+    let mut retryable = 0usize;
+    for row in &claimed {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let namespace: String = row.get(1);
+        let sha256: String = row.get(2);
+        let generation: i64 = row.get(3);
+        let remote_path: String = row.get(4);
+        let claim_generation: i64 = row.get(5);
+        let key = match crate::storage::remote_objects::ObjectKey::scoped(
+            tenant,
+            authority.id,
+            generation,
+            &namespace,
+            &sha256,
+        ) {
+            Ok(key) if key.path() == remote_path => key,
+            _ => {
+                fenced += 1;
+                continue;
+            }
+        };
+        let still = format!(
+            "SELECT 1 FROM pando_remote_artifacts a WHERE a.authority_id=$1 AND a.tenant_id=$2 \
+               AND a.namespace=$3 AND a.sha256=$4 AND a.state='deleting' AND a.claimed_by=$5 \
+               AND a.claim_generation=$6 AND a.remote_path=$7 AND NOT {RETAINED_LINK}"
+        );
+        let current = client
+            .query_opt(
+                &still,
+                &[&authority.id, &tenant, &namespace, &sha256, &job.lease_owner, &claim_generation, &remote_path],
+            )
+            .await?;
+        if current.is_none() {
+            fenced += 1;
+            continue;
+        }
+        if lease.ensure_active().is_err() {
+            break;
+        }
+        if let Err(error) = remote.delete(&key, deadline).await {
+            let _ = client
+                .execute(
+                    "UPDATE pando_remote_artifacts SET state='retired',claimed_by=NULL,lease_until=NULL, \
+                     delete_after=clock_timestamp()+make_interval(secs=>60),last_error=$5,updated_at=clock_timestamp() \
+                     WHERE authority_id=$1 AND tenant_id=$2 AND namespace=$3 AND sha256=$4 \
+                       AND state='deleting' AND claimed_by=$6 AND claim_generation=$7",
+                    &[
+                        &authority.id,
+                        &tenant,
+                        &namespace,
+                        &sha256,
+                        &format!("remote delete failed: {error:#}"),
+                        &job.lease_owner,
+                        &claim_generation,
+                    ],
+                )
+                .await?;
+            retryable += 1;
+            continue;
+        }
+        let finalized = client
+            .execute(
+                "UPDATE pando_remote_artifacts SET state='deleted',deleted_at=clock_timestamp(), \
+                 claimed_by=NULL,lease_until=NULL,last_error=NULL,updated_at=clock_timestamp() \
+                 WHERE authority_id=$1 AND tenant_id=$2 AND namespace=$3 AND sha256=$4 \
+                   AND state='deleting' AND claimed_by=$5 AND claim_generation=$6 AND remote_path=$7",
+                &[&authority.id, &tenant, &namespace, &sha256, &job.lease_owner, &claim_generation, &remote_path],
+            )
+            .await?;
+        if finalized == 1 {
+            deleted += 1;
+        } else {
+            fenced += 1;
+        }
+    }
+    let after = crate::pando_gateway::retention::counts(&**client, tenant).await?;
+    Ok(json!({
+        "remote_deleted": true,
+        "claimed": claimed.len(),
+        "deleted": deleted,
+        "fenced_or_resurrected": fenced,
+        "retryable": retryable,
+        "retired": after.retired,
+        "deleted_total": after.deleted
+    }))
 }
 
 async fn repack(
@@ -333,9 +540,8 @@ async fn repack(
     let before = serving(state, repo).await?;
     ensure!(before.tenant_id == job.tenant_id, "Pando maintenance tenant changed");
     let deadline = Instant::now() + MAINTENANCE_DEADLINE;
-    let snapshot = snapshot::materialize(state, repo, lease, deadline)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.1))?;
+    let snapshot =
+        snapshot::materialize(state, repo, lease, deadline).await.map_err(|error| anyhow::anyhow!(error.1))?;
     ensure!(!cancel.is_cancelled(), "maintenance lease lost before Pando repack");
     ensure!(
         snapshot.storage_generation == before.storage_generation
@@ -423,6 +629,12 @@ async fn repack(
         "Pando pack-set authority changed during compaction"
     );
     ensure!(!cancel.is_cancelled(), "maintenance lease lost before Pando pack-set CAS");
+    if !crate::pando_gateway::retention::verify_publication_ready(&*tx, manifest.id)
+        .await
+        .map_err(|error| anyhow::anyhow!("publication fence proof failed: {error:#}"))?
+    {
+        bail!("compacted pack publication fence expired or artifacts are not active; republish");
+    }
     let new_packs = vec![manifest.id];
     let changed = tx
         .execute(
@@ -440,6 +652,7 @@ async fn repack(
         )
         .await?;
     ensure!(changed == 1, "Pando pack-set CAS was superseded");
+    tx.execute("DELETE FROM pando_publication_fences WHERE manifest_id=$1", &[&manifest.id]).await?;
     ensure!(!cancel.is_cancelled(), "maintenance lease lost before Pando pack-set commit");
     let state_updated = tx
         .execute(
@@ -487,9 +700,8 @@ async fn cache_hydrate(
     // Force a complete reconstructed snapshot through the cache. This checks
     // every authoritative ref and pack pair with native Git before reporting a
     // successful hydration.
-    let snapshot = snapshot::materialize(state, repo, lease, deadline)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.1))?;
+    let snapshot =
+        snapshot::materialize(state, repo, lease, deadline).await.map_err(|error| anyhow::anyhow!(error.1))?;
     drop(snapshot);
     Ok(json!({
         "packs": serving.pack_ids.len(),
@@ -517,8 +729,7 @@ pub fn cache_incomplete(storage_root: &Path, repo: Uuid, pack_ids: &[Uuid]) -> b
         return !pack_ids.is_empty();
     }
     pack_ids.iter().any(|id| {
-        !cache_dir.join(format!("pack-{id}.pack")).is_file()
-            || !cache_dir.join(format!("pack-{id}.idx")).is_file()
+        !cache_dir.join(format!("pack-{id}.pack")).is_file() || !cache_dir.join(format!("pack-{id}.idx")).is_file()
     })
 }
 
@@ -563,20 +774,12 @@ pub fn cache_evict_due(storage_root: &Path, repo: Uuid, max_age_seconds: i64) ->
 /// Delete only expired local cache pairs. Remote pack bytes and PostgreSQL
 /// manifests are untouched; active snapshots hold hard links to the same
 /// inode, so unlinking a cache name cannot remove bytes from a live reader.
-pub fn evict_expired(
-    storage_root: &Path,
-    repo: Uuid,
-    max_age_seconds: i64,
-    cancel: &CancellationToken,
-) -> Result<u64> {
+pub fn evict_expired(storage_root: &Path, repo: Uuid, max_age_seconds: i64, cancel: &CancellationToken) -> Result<u64> {
     let cache_dir = PackStore::cache_dir(storage_root, repo);
     let mut removed = 0u64;
     for id in expired_ids(&cache_dir, max_age_seconds, Some(cancel))? {
         ensure!(!cancel.is_cancelled(), "maintenance lease lost during Pando cache eviction");
-        for path in [
-            cache_dir.join(format!("pack-{id}.pack")),
-            cache_dir.join(format!("pack-{id}.idx")),
-        ] {
+        for path in [cache_dir.join(format!("pack-{id}.pack")), cache_dir.join(format!("pack-{id}.idx"))] {
             match std::fs::remove_file(&path) {
                 Ok(()) => removed += 1,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -617,8 +820,8 @@ mod tests {
         assert!(write_allowed("pando_repack"));
         assert!(write_allowed("pando_cache_hydrate"));
         assert!(write_allowed("pando_cache_evict"));
-        assert!(!write_allowed("pando_unreachable_mark"));
-        assert!(!write_allowed("pando_tombstone_delete"));
+        assert!(write_allowed("pando_unreachable_mark"));
+        assert!(write_allowed("pando_tombstone_delete"));
         assert!(!write_allowed("gitfs_repack"));
         assert!(is_pando_kind("pando_tombstone_delete"));
     }
