@@ -34,6 +34,13 @@ open the path again, so they cannot hash a different inode or start a duplicate
 full-file pass. This coalescing is local-only and is not cold hydration: an
 absent or inadmissible local file still takes the explicit hydration path.
 
+The eight-slot verification limit applies to the asynchronous Batch/download
+entry points (`verify_local` and `open_verified_file`). Synchronous integrity
+checks used by CI dependency scans, mirror preparation and backup inventory
+share the identity cache and singleflight, but do not acquire this semaphore;
+their concurrency remains the responsibility of those calling jobs. This is
+not a process-wide eight-hash guarantee across all maintenance operations.
+
 Warm verified reads are local-only. They do not construct an object-store
 client, issue a remote HEAD/GET, or perform a synchronous remote repair. An
 unreachable or misconfigured endpoint cannot turn a verified local download
