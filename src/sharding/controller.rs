@@ -1,9 +1,9 @@
 //! Recoverable local-host takeover. The trusted process fence is a prerequisite,
 //! not a user-supplied receipt or a substitute for a verified Git snapshot.
-use crate::{AppState, journal, storage::read_leases::Lease, sharding::{local_fence, locks, migration,
+use crate::{AppState, journal, storage::read_leases::Lease, sharding::{local_fence, locks, replication,
     models::{self, REPO_ROUTE_FIELDS, RepoShardRoute, VolumeFenceMarker}, transitions}};
 use anyhow::{Context, Result, ensure};
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 use uuid::Uuid;
 
 struct Candidate {
@@ -51,12 +51,30 @@ async fn candidates(state: &AppState, node_id: &str) -> Result<Vec<Candidate>> {
         route_epoch: r.get(2), operation_id: r.get(3), refs_sha256: r.get(4), journal_sequence: r.get(5) }).collect())
 }
 
+/// Before killing the old session, prove its still-attached volume matches the
+/// measured snapshot and has no live native writer. This prevents promotion
+/// when an admitted push already advanced (or is about to advance) source refs.
+async fn verify_source(state: &AppState, candidate: &Candidate) -> Result<()> {
+    let (registration, repo) = local_fence::registered_repository(
+        &candidate.old_node, candidate.repo_id)?;
+    let pending = journal::pending(&PathBuf::from(&registration.data_dir), candidate.repo_id)?;
+    for operation in &pending {
+        ensure!(!journal::ActiveGuard::operation_is_live(operation)?,
+            "source volume has a live native Git writer");
+    }
+    let manifest = replication::read_manifest_plain(state, &repo)
+        .await.map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    ensure!(manifest.digest() == candidate.refs_sha256,
+        "source refs advanced beyond the measured replica snapshot");
+    Ok(())
+}
+
 async fn verify_target(state: &AppState, candidate: &Candidate, lease: &Lease) -> Result<()> {
     lease.ensure_active().map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let repo = state.storage.verify_path(candidate.repo_id)?;
-    migration::git_output_lease(state, &["--git-dir", repo.to_str().context("non-UTF8 repository path")?,
+    replication::git_output_lease(state, &["--git-dir", repo.to_str().context("non-UTF8 repository path")?,
         "fsck", "--full", "--strict"], state.config.git_timeout, lease).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let digest = migration::refs_digest_lease(state, &repo, lease).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let digest = replication::refs_digest_lease(state, &repo, lease).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
     ensure!(digest == candidate.refs_sha256, "replica refs changed since verified transfer");
     ensure!(journal::sequence(&state.storage.root, candidate.repo_id)? >= candidate.journal_sequence,
         "replica journal is behind measured transfer");
@@ -139,17 +157,39 @@ async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
     let new_generation = generation + 1;
     tx.execute("UPDATE shard_nodes SET role='fenced',status='fenced',fenced_epoch=GREATEST(fenced_epoch,$2),version=version+1 WHERE node_id=$1",
         &[&candidate.old_node,&new_epoch]).await?;
-    tx.execute("UPDATE shard_nodes SET role='primary',lease_epoch=GREATEST(lease_epoch,$2),version=version+1 WHERE node_id=$1",
-        &[&node_id,&new_epoch]).await?;
+    tx.execute("UPDATE shard_nodes SET role='primary',lease_epoch=GREATEST(lease_epoch,$2),         lease_expires_unix=GREATEST(lease_expires_unix,$3),status='healthy',version=version+1 WHERE node_id=$1",
+        &[&node_id,&new_epoch,&(models::unix_now()+10)]).await?;
     tx.execute("UPDATE repositories SET storage_generation=$2 WHERE id=$1 AND storage_generation=$3",
         &[&candidate.repo_id,&new_generation,&generation]).await?;
     let moved = RepoShardRoute::row(&tx.query_one(&format!(
         "UPDATE repository_shard_routes SET primary_node_id=$2,route_epoch=$3,fencing_token=$4, \
             fenced_epoch=$5,required_generation=$6,required_op_sequence=GREATEST(required_op_sequence,$7), \
-            explicit_override=true,read_replica_nodes='[]'::jsonb,replica_watermarks='{{}}'::jsonb, \
+            draining=false,read_only_degraded=false,degraded_reason='',explicit_override=true, \
+            read_replica_nodes='[]'::jsonb,replica_watermarks='{{}}'::jsonb, \
             version=version+1,updated_at=clock_timestamp() WHERE repository_id=$1 RETURNING {REPO_ROUTE_FIELDS}"),
         &[&candidate.repo_id,&node_id,&new_epoch,&new_token,&route.route_epoch,&new_generation,&sequence],
     ).await?);
+    // Retire the old source volume before this promotion commits. The physical
+    // process fence and the post-fence source re-verification already proved the
+    // old session is gone and its refs still match the measured snapshot, so the
+    // marker can only land on a quiescent source. It is built from the new route
+    // and generation and marked read-only, so a process that mounts the old
+    // volume and claims the new node id without a fence driver is still rejected
+    // by the on-disk barrier. The helper fsyncs and verifies the marker before
+    // returning: a failed or unverifiable write returns Err and rolls this
+    // transaction back, so promotion never commits without a durable retired
+    // marker. If the rollback happens after the marker was published, the old
+    // volume stays read-only (fail-closed availability loss), never a split
+    // brain, until an operator completes recovery.
+    let retired_source = VolumeFenceMarker {
+        primary_node_id: candidate.old_node.clone(),
+        read_only_degraded: true,
+        ..VolumeFenceMarker::from_route(&moved, new_generation,
+            Some(candidate.old_node.clone()), models::unix_now())
+    };
+    local_fence::retire_volume_repository(
+        &candidate.old_node, candidate.repo_id, &retired_source,
+    ).map_err(|error| anyhow::anyhow!("retired source marker is not durable: {error:#}"))?;
     tx.execute("UPDATE shard_replication_operations SET state='completed',updated_at=clock_timestamp() WHERE id=$1 AND state='verified'",
         &[&candidate.operation_id]).await?;
     tx.execute(
@@ -173,16 +213,24 @@ async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
 /// locks elect one promoter; physical fencing and measured data remain mandatory.
 pub async fn run(state: Arc<AppState>) {
     let Ok(Some(node_id)) = super::transport::node_id() else { return; };
-    if std::env::var_os("ROOTYARD_LOCAL_FENCE_DIR").is_none() { return; }
+    let physical_fence = std::env::var_os("ROOTYARD_LOCAL_FENCE_DIR").is_some();
     loop {
         if let Err(error) = heartbeat(&state, &node_id).await { eprintln!("rootyard: cluster heartbeat failed: {error:#}"); }
+        if !physical_fence {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
+        }
         match candidates(&state, &node_id).await {
             Ok(items) => for candidate in items {
                 let attempt: anyhow::Result<bool> = async {
                     let mutation = locks::exclusive(&state, candidate.repo_id).await
                         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     verify_target(&state, &candidate, &mutation.lease).await?;
+                    verify_source(&state, &candidate).await?;
                     let proof = local_fence::fence_local_process(&candidate.old_node).await?;
+                    // Re-read the now-quiescent source: a writer that raced the
+                    // first check cannot leave promotion with a stale target.
+                    verify_source(&state, &candidate).await?;
                     mutation.ensure_active().map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     let promoted = promote(&state, &node_id, &candidate, &proof, &mutation.lease).await?;
                     if promoted && let Err(error) = crate::storage::ref_admission::cleanup_fenced(

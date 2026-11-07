@@ -187,10 +187,18 @@ async fn run() -> Result<()> {
                 dispatch: rootyard::dispatch::Signals::default(),
                 git_slots: slots,
             });
+            let configured_node = std::env::var("ROOTYARD_NODE_ID").ok();
             let local_fence = if std::env::var_os("ROOTYARD_LOCAL_FENCE_DIR").is_some() {
-                let node_id =
-                    std::env::var("ROOTYARD_NODE_ID").context("local process fence requires ROOTYARD_NODE_ID")?;
-                rootyard::sharding::local_fence::register_local_process(&node_id)?
+                let node_id = configured_node
+                    .as_deref()
+                    .context("local process fence requires ROOTYARD_NODE_ID")?;
+                rootyard::sharding::local_fence::register_local_process(node_id)?;
+                rootyard::sharding::local_fence::register_local_volume(
+                    node_id,
+                    &state.storage.root,
+                    state.storage.volume_id,
+                )?;
+                true
             } else {
                 false
             };
@@ -204,8 +212,13 @@ async fn run() -> Result<()> {
                 .await
                 .map_err(|_| anyhow::anyhow!("workspace FUSE mount recovery failed"))?;
             let listener = tokio::net::TcpListener::bind(state.config.bind).await?;
-            let controller_task =
-                if local_fence { Some(tokio::spawn(rootyard::sharding::controller::run(state.clone()))) } else { None };
+            // Lease renewal is independent of the single-host fencing driver;
+            // takeover scanning still requires a verifiable physical fence.
+            let controller_task = if configured_node.is_some() || local_fence {
+                Some(tokio::spawn(rootyard::sharding::controller::run(state.clone())))
+            } else {
+                None
+            };
             eprintln!("rootyard listening on {} (GitFS single-node)", listener.local_addr()?);
             let metrics_worker = if let Some(address) = state.config.metrics_bind {
                 let listener = tokio::net::TcpListener::bind(rootyard::metrics::validate_bind(address)?).await?;
