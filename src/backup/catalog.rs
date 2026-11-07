@@ -39,7 +39,7 @@ pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
         4 => Ok(vec![1, 2, 3, 6, 7]),
         5 => Ok(vec![1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60]),
         6 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 130).collect()),
-        7 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
+        7 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 131).collect()),
         _ => bail!("unsupported backup format"),
     }
 }
