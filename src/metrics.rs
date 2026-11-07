@@ -18,7 +18,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-use crate::web::session_gc::{self, CounterSnapshot};
+use crate::{metrics_workers, web::session_gc::{self, CounterSnapshot}};
 
 /// Validate before binding: wildcard, public and private LAN addresses are forbidden.
 pub fn validate_bind(address: SocketAddr) -> anyhow::Result<SocketAddr> {
@@ -65,11 +65,20 @@ struct MetricsState {
     git_slots: Arc<Semaphore>,
     capacity: usize,
     counters: Arc<TransferCounters>,
+    workers: metrics_workers::Config,
 }
 
 /// Mount only on the separately configured loopback listener, never the app router.
-pub fn router(pool: Pool, git_slots: Arc<Semaphore>, capacity: usize, counters: Arc<TransferCounters>) -> Router {
-    Router::new().route("/metrics", get(scrape)).with_state(MetricsState { pool, git_slots, capacity, counters })
+pub fn router(
+    pool: Pool,
+    git_slots: Arc<Semaphore>,
+    capacity: usize,
+    counters: Arc<TransferCounters>,
+    workers: metrics_workers::Config,
+) -> Router {
+    Router::new()
+        .route("/metrics", get(scrape))
+        .with_state(MetricsState { pool, git_slots, capacity, counters, workers })
 }
 
 // One SQL statement provides one consistent MVCC snapshot, without exposing any
@@ -116,15 +125,22 @@ struct Snapshot {
     expired_session_age: f64,
     expired_token_age: f64,
 }
-async fn snapshot(pool: &Pool) -> anyhow::Result<Snapshot> {
+async fn snapshot(
+    pool: &Pool,
+    config: metrics_workers::Config,
+) -> anyhow::Result<(Snapshot, metrics_workers::Snapshot)> {
     let mut client = pool.get().await?;
     // The server-side timeout prevents a cancelled HTTP scrape from leaving an
     // expensive or lock-blocked query running indefinitely on a pooled session.
+    // Repeatable read gives every statement of one scrape the same MVCC
+    // snapshot; the transaction is read-only, so it can neither take write
+    // locks nor block writers beyond an ordinary SELECT.
     let transaction = client.build_transaction().read_only(true).start().await?;
-    transaction.batch_execute("SET LOCAL statement_timeout = '4000ms'").await?;
+    transaction
+        .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; SET LOCAL statement_timeout = '4000ms'")
+        .await?;
     let row = transaction.query_one(SNAPSHOT_SQL, &[]).await?;
-    transaction.commit().await?;
-    Ok(Snapshot {
+    let core = Snapshot {
         repositories: [row.try_get(0)?, row.try_get(1)?, row.try_get(2)?],
         unresolved: row.try_get(3)?,
         pending: row.try_get(4)?,
@@ -136,7 +152,10 @@ async fn snapshot(pool: &Pool) -> anyhow::Result<Snapshot> {
         browser_tokens: row.try_get(10)?,
         expired_session_age: row.try_get(11)?,
         expired_token_age: row.try_get(12)?,
-    })
+    };
+    let workers = metrics_workers::query(&transaction, config).await?;
+    transaction.commit().await?;
+    Ok((core, workers))
 }
 
 async fn scrape(State(state): State<MetricsState>) -> Response {
@@ -147,10 +166,19 @@ async fn scrape(State(state): State<MetricsState>) -> Response {
     // from the single GC counter set outside the snapshot attempt, so a failed
     // SQL snapshot cannot hide or reset them.
     let gc = session_gc::counters().snapshot();
-    let snapshot = tokio::time::timeout(Duration::from_secs(5), snapshot(&state.pool)).await.ok().and_then(Result::ok);
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), snapshot(&state.pool, state.workers))
+        .await
+        .ok()
+        .and_then(Result::ok);
     let status = if snapshot.is_some() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    let body =
-        render(state.capacity, state.git_slots.available_permits(), &state.counters, &gc, &pool, snapshot.as_ref());
+    let body = render(
+        state.capacity,
+        state.git_slots.available_permits(),
+        &state.counters,
+        &gc,
+        &pool,
+        snapshot.as_ref(),
+    );
     (
         status,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (header::CACHE_CONTROL, "no-store")],
@@ -171,7 +199,7 @@ fn render(
     counters: &TransferCounters,
     gc: &CounterSnapshot,
     pool: &Status,
-    snapshot: Option<&Snapshot>,
+    snapshot: Option<(&Snapshot, &metrics_workers::Snapshot)>,
 ) -> String {
     let mut output = String::new();
     output.push_str("# HELP rootyard_error_log_dropped_total Accepted error records lost to queue or writer failure; excludes rate limiting and shutdown.\n# TYPE rootyard_error_log_dropped_total counter\n");
@@ -251,7 +279,7 @@ fn render(
         gc.failures,
     );
     // A failed SQL snapshot omits only database-derived gauges: zero would falsely imply health.
-    if let Some(s) = snapshot {
+    if let Some((s, workers)) = snapshot {
         output.push_str("# HELP rootyard_repositories Repositories by durable metadata state.\n# TYPE rootyard_repositories gauge\n");
         for (state, count) in ["provisioning", "ready", "recovering"].iter().zip(s.repositories) {
             let _ = writeln!(output, "rootyard_repositories{{state=\"{state}\"}} {count}");
@@ -316,6 +344,7 @@ fn render(
             "Database-clock age of the oldest expired browser token; unexpired rows and an empty set report 0.",
             s.expired_token_age,
         );
+        metrics_workers::render(&mut output, workers);
     }
     output
 }
@@ -357,6 +386,8 @@ mod tests {
         assert!(!text.contains("rootyard_operations_unresolved"));
         assert!(!text.contains("rootyard_browser_"));
         assert!(!text.contains("rootyard_expired_browser_"));
+        assert!(!text.contains("rootyard_workspace_"));
+        assert!(!text.contains("rootyard_storage_maintenance"));
         // Process-local GC counters survive the failed snapshot unchanged.
         assert!(text.contains("rootyard_session_gc_cycles_total 4\n"));
         assert!(text.contains("rootyard_session_gc_session_rows_deleted_total 9\n"));
@@ -372,7 +403,9 @@ mod tests {
         counters.add_sent_bytes(17);
         let pool = Status { max_size: 16, size: 1, available: 1, waiting: 0 };
         let gc = CounterSnapshot::default();
-        let text = render(8, 8, &counters, &gc, &pool, Some(&Snapshot::default()));
+        let core = Snapshot::default();
+        let workers = crate::metrics_workers::Snapshot::default();
+        let text = render(8, 8, &counters, &gc, &pool, Some((&core, &workers)));
         assert!(text.contains("rootyard_git_transfer_bytes_total{direction=\"received\"} 42\n"));
         assert!(text.contains("rootyard_git_transfer_bytes_total{direction=\"sent\"} 17\n"));
         assert!(text.contains("rootyard_git_transfers_total{outcome=\"success\"} 1\n"));
@@ -382,23 +415,36 @@ mod tests {
             assert!(name.starts_with("rootyard_"));
             assert!(value.parse::<f64>().unwrap().is_finite());
             if let Some((_, label)) = name.split_once('{') {
-                assert!(
-                    [
-                        "outcome=\"success\"}",
-                        "outcome=\"failure\"}",
-                        "direction=\"received\"}",
-                        "direction=\"sent\"}",
-                        "state=\"provisioning\"}",
-                        "state=\"ready\"}",
-                        "state=\"recovering\"}",
-                        "state=\"pending\"}",
-                        "state=\"leased\"}"
-                    ]
-                    .contains(&label)
-                );
+                let mut allowed: Vec<String> = [
+                    "outcome=\"success\"}",
+                    "outcome=\"failure\"}",
+                    "direction=\"received\"}",
+                    "direction=\"sent\"}",
+                    "state=\"provisioning\"}",
+                    "state=\"ready\"}",
+                    "state=\"recovering\"}",
+                    "state=\"pending\"}",
+                    "state=\"leased\"}"
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+                for (backend, kind) in crate::metrics_workers::JOB_KINDS {
+                    for state in crate::metrics_workers::JOB_STATES {
+                        allowed.push(format!("backend=\"{backend}\",kind=\"{kind}\",state=\"{state}\"}}"));
+                    }
+                    allowed.push(format!("backend=\"{backend}\",kind=\"{kind}\"}}"));
+                }
+                for backend in crate::metrics_workers::BACKENDS {
+                    for state in crate::metrics_workers::SCAN_STATES {
+                        allowed.push(format!("backend=\"{backend}\",state=\"{state}\"}}"));
+                    }
+                    allowed.push(format!("backend=\"{backend}\"}}"));
+                }
+                assert!(allowed.iter().any(|entry| entry.as_str() == label), "unexpected label {label}");
             }
         }
-        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), 31);
+        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), 91);
     }
 
     #[test]
@@ -412,7 +458,8 @@ mod tests {
             ..Default::default()
         };
         let pool = Status { max_size: 16, size: 1, available: 1, waiting: 0 };
-        let text = render(4, 4, &TransferCounters::default(), &gc, &pool, Some(&snapshot));
+        let workers = crate::metrics_workers::Snapshot::default();
+        let text = render(4, 4, &TransferCounters::default(), &gc, &pool, Some((&snapshot, &workers)));
         for line in [
             "rootyard_session_gc_cycles_total 3\n",
             "rootyard_session_gc_session_rows_deleted_total 5\n",

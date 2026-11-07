@@ -240,6 +240,10 @@ async fn run() -> Result<()> {
                     state.git_slots.clone(),
                     state.config.max_concurrent_git,
                     state.transfer_metrics.clone(),
+                    rootyard::metrics_workers::Config {
+                        volume_id: state.storage.volume_id,
+                        scan_period_seconds: maintenance_policy.scan_period_seconds,
+                    },
                 );
                 Some(tokio::spawn(async move {
                     if axum::serve(listener, router).await.is_err() {
