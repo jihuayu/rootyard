@@ -3,7 +3,7 @@ use super::lazy;
 use crate::{
     AppState, Error,
     members::models::Role,
-    workspace_lab::fuse_mount::{LazySource, MountHandle, MutationGate, Overlay},
+    workspace_lab::fuse_mount::{FreezeDecision, LazySource, MountHandle, MutationGate, Overlay},
 };
 use axum::{
     Json,
@@ -17,7 +17,10 @@ use std::{
     fs,
     future::Future,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use uuid::Uuid;
 
@@ -45,19 +48,21 @@ pub fn mounted(id: Uuid) -> bool {
 }
 pub fn update_lease(id: Uuid, db_epoch: i64, until: i64) {
     let gate = registry().lock().unwrap().get(&id).map(|mount| mount.gate.clone());
-    if let Some(gate) = gate
-        && !gate.renew(db_epoch, until)
-    {
-        // The database has moved past this mount, or the gate was fenced. Do not
-        // keep admitting writes under a stale local epoch.
-        gate.fence();
+    if let Some(gate) = gate {
+        // Epoch-ordered observe: a late SELECT result cannot fence a newer
+        // handoff, shorten its deadline, or re-authorize an old epoch.
+        let _ = gate.observe_lease(db_epoch, until);
     }
 }
 pub async fn refresh_leases(state: &AppState) -> Result<(), Error> {
     if !enabled() {
         return Ok(());
     }
-    let ids: Vec<Uuid> = registry().lock().unwrap().keys().copied().collect();
+    let (ids, observed): (Vec<Uuid>, Vec<(i64, u64)>) = {
+        let mounts = registry().lock().unwrap();
+        mounts.iter().map(|(id, mount)| (*id, mount.gate.lease_marker())).unzip()
+    };
+    let markers: HashMap<Uuid, (i64, u64)> = ids.iter().copied().zip(observed).collect();
     if ids.is_empty() {
         return Ok(());
     }
@@ -74,8 +79,16 @@ pub async fn refresh_leases(state: &AppState) -> Result<(), Error> {
     let mounts = registry().lock().unwrap();
     for (id, mount) in mounts.iter() {
         match leases.get(id) {
-            Some((epoch, until)) if mount.gate.renew(*epoch, *until) => {}
-            _ => mount.gate.fence(),
+            Some((epoch, until)) => {
+                let _ = mount.gate.observe_lease(*epoch, *until);
+            }
+            None => {
+                // A missing row may be an old snapshot. Only fence when this gate
+                // still matches the marker captured before the query.
+                if let Some(marker) = markers.get(id) {
+                    let _ = mount.gate.fence_if_unchanged(*marker);
+                }
+            }
         }
     }
     Ok(())
@@ -92,7 +105,25 @@ pub fn with_frozen<T>(id: Uuid, work: impl FnOnce() -> Result<T, Error>) -> Resu
         .ok_or_else(|| Error::internal("workspace FUSE mount missing"))?;
     gate.freeze(work)
 }
-pub async fn with_frozen_async<T>(id: Uuid, work: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    KnownRollback,
+    Fence,
+}
+
+fn release_after<T>(outcome: &Result<T, Error>, commit_started: bool) -> Release {
+    match outcome {
+        Ok(_) => Release::Fence,
+        Err(_) if !commit_started => Release::KnownRollback,
+        Err(_) => Release::Fence,
+    }
+}
+
+pub async fn with_frozen_async<T>(
+    id: Uuid,
+    commit_started: Arc<AtomicBool>,
+    work: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
     if !enabled() {
         return work.await;
     }
@@ -103,22 +134,24 @@ pub async fn with_frozen_async<T>(id: Uuid, work: impl Future<Output = Result<T,
         .map(|m| m.gate.clone())
         .ok_or_else(|| Error::internal("workspace FUSE mount missing"))?;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<Release>();
     let guard = tokio::task::spawn_blocking(move || {
-        // Hold the exclusive gate until the database transaction finishes or
-        // its future is cancelled, then fence the epoch it superseded before
-        // the freeze is released. The caller authorizes the committed epoch
-        // afterwards, so no mutation can be admitted under the old epoch in
-        // between, and a failed or cancelled commit fails closed instead of
-        // thawing that epoch.
-        gate.freeze_then_fence(|| {
+        // Hold the exclusive gate until the caller reaches a decision. Only an
+        // explicit pre-COMMIT rollback thaws the old epoch; commit success,
+        // transport errors, caller cancellation and a lost channel fence it.
+        gate.freeze_with_decision(|| {
             let _ = ready_tx.send(());
-            let _ = release_rx.blocking_recv();
+            let decision = match release_rx.blocking_recv() {
+                Ok(Release::KnownRollback) => FreezeDecision::Thaw,
+                Ok(Release::Fence) | Err(_) => FreezeDecision::Fence,
+            };
+            ((), decision)
         });
     });
     ready_rx.await.map_err(Error::internal)?;
     let outcome = work.await;
-    drop(release_tx);
+    let release = release_after(&outcome, commit_started.load(Ordering::Acquire));
+    let _ = release_tx.send(release);
     guard.await.map_err(Error::internal)?;
     outcome
 }
@@ -225,4 +258,18 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
         ensure(state, row.get(0), row.get(1), row.get(2))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_precommit_error_is_a_known_rollback() {
+        let success: Result<(), Error> = Ok(());
+        let error: Result<(), Error> = Err(Error::internal("conflict"));
+        assert_eq!(release_after(&success, false), Release::Fence);
+        assert_eq!(release_after(&error, false), Release::KnownRollback);
+        assert_eq!(release_after(&error, true), Release::Fence, "a COMMIT transport error is unknown");
+    }
 }

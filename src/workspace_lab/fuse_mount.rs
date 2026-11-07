@@ -50,7 +50,7 @@ fn open_lower(lazy: Option<&dyn LazySource>, relative: &Path, source: &Entry) ->
 
 // The gate now lives in its own module; keep the historical path stable for
 // `crate::workspace_lab::fuse_mount::MutationGate` callers.
-pub use super::mutation_gate::{GatePhase, MutationGate, MutationGuard};
+pub use super::mutation_gate::{FreezeDecision, GatePhase, LeaseObservation, MutationGate, MutationGuard};
 
 #[path = "fuse_dispatch.rs"]
 mod fuse_dispatch;

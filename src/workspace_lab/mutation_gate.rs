@@ -26,10 +26,10 @@
 //! Lease epochs are bound to the gate: [`MutationGate::handoff`] is the only path
 //! that moves the gate to a new database epoch, and it fences the old epoch
 //! before it authorizes the new one, so a rejected authorization fails closed
-//! instead of leaving the superseded epoch writable. [`MutationGate::freeze_then_fence`]
-//! is the frozen variant used by the same-host lease commit: the fence is taken
-//! while the freeze still owns the gate, so a failed, panicking, unknown or
-//! cancelled commit stays fenced rather than thawing back to the old epoch.
+//! instead of leaving the superseded epoch writable. [`MutationGate::freeze_with_decision`]
+//! is the frozen variant used by the same-host lease commit: a caller that proves
+//! the transaction never reached COMMIT can explicitly thaw the old epoch, while
+//! success, an unknown commit outcome, a panic or a cancelled caller stays fenced.
 //!
 //! This is still not the native FUSE helper. Nothing here survives process death
 //! or fences a second process, and the parent-loss lifecycle remains open.
@@ -48,6 +48,29 @@ pub enum GatePhase {
     /// A freeze owns the gate. New mutations fail with `EAGAIN`.
     Frozen,
     /// The current epoch is fenced. New mutations fail with `EROFS`.
+    Fenced,
+}
+
+/// Whether the frozen operation proved a rollback before COMMIT or an unknown
+/// outcome that must fence the superseded epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezeDecision {
+    /// The transaction is known not to have committed; thaw the old epoch.
+    Thaw,
+    /// The commit succeeded or its outcome is unknown; keep the old epoch fenced.
+    Fence,
+}
+
+/// Result of applying a database lease observation to the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseObservation {
+    /// The observation is older than the current epoch; nothing changed.
+    Stale,
+    /// The observation matched a healthy epoch and only renewed its deadline.
+    Renewed,
+    /// The observation matched a frozen or fenced epoch; it did not thaw it.
+    Blocked,
+    /// The observation is newer than the current epoch; the current epoch is fenced.
     Fenced,
 }
 
@@ -152,7 +175,67 @@ impl MutationGate {
         if state.phase == GatePhase::Fenced || db_epoch != state.epoch {
             return false;
         }
-        state.writable_until = until;
+        state.writable_until = state.writable_until.max(until);
+        state.generation = state.generation.saturating_add(1);
+        drop(state);
+        self.changed.notify_all();
+        true
+    }
+
+    /// Apply a lease row observed by a periodic or page-based refresh.
+    ///
+    /// The observation is ordered against the current epoch under one lock:
+    /// a lower epoch is stale and is ignored without shortening the deadline; an
+    /// equal epoch only renews a `Healthy` gate; a higher epoch fences the
+    /// current epoch but never authorizes the observed one. Authorization stays
+    /// the explicit [`MutationGate::handoff`] path, so a late refresh can never
+    /// unlock a newer epoch or revive an older one.
+    pub fn observe_lease(&self, db_epoch: i64, until: i64) -> LeaseObservation {
+        let mut state = self.lock_state();
+        if db_epoch < state.epoch {
+            return LeaseObservation::Stale;
+        }
+        if db_epoch == state.epoch {
+            if state.phase != GatePhase::Healthy {
+                return LeaseObservation::Blocked;
+            }
+            state.writable_until = state.writable_until.max(until);
+            state.generation = state.generation.saturating_add(1);
+            drop(state);
+            self.changed.notify_all();
+            return LeaseObservation::Renewed;
+        }
+        if state.phase != GatePhase::Fenced {
+            state.phase = GatePhase::Fenced;
+            state.fence_floor = state.fence_floor.max(state.epoch);
+            state.writable_until = 0;
+            state.generation = state.generation.saturating_add(1);
+            drop(state);
+            self.changed.notify_all();
+        }
+        LeaseObservation::Fenced
+    }
+
+    /// Atomically read the epoch/generation pair used by a conditional refresh.
+    pub fn lease_marker(&self) -> (i64, u64) {
+        let state = self.lock_state();
+        (state.epoch, state.generation)
+    }
+
+    /// Fence only when the gate has not changed since `marker` was captured.
+    ///
+    /// A missing lease row can be an old query snapshot. If a handoff renewed or
+    /// advanced the gate while the query was in flight, the marker no longer
+    /// matches and the newer epoch is left alone.
+    pub fn fence_if_unchanged(&self, marker: (i64, u64)) -> bool {
+        let mut state = self.lock_state();
+        if (state.epoch, state.generation) != marker || state.phase == GatePhase::Fenced {
+            return false;
+        }
+        state.phase = GatePhase::Fenced;
+        state.fence_floor = state.fence_floor.max(state.epoch);
+        state.writable_until = 0;
+        state.generation = state.generation.saturating_add(1);
         drop(state);
         self.changed.notify_all();
         true
@@ -273,26 +356,32 @@ impl MutationGate {
         Ok(())
     }
 
-    /// Freeze the gate, run `work`, and leave the old epoch fenced.
+    /// Freeze the gate and run a closure that reports whether to thaw or fence.
     ///
-    /// This is the lease-handoff variant of [`MutationGate::freeze`]. The fence
-    /// is taken while the freeze still owns the gate, before any thaw, so no
-    /// mutation can be admitted under the epoch the database has just superseded
-    /// in the window between the commit and the new-epoch authorization. A
-    /// `work` that returns an error, panics, or never reports a result (the
-    /// caller dropped its future and with it the completion signal) leaves the
-    /// gate `Fenced`: dropping that signal is not a successful thaw, and the old
-    /// epoch stays unwritable until [`MutationGate::handoff`] authorizes a higher
-    /// one.
-    pub fn freeze_then_fence<T>(&self, work: impl FnOnce() -> T) -> T {
-        self.freeze(|| {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-            self.fence();
-            match outcome {
-                Ok(value) => value,
-                Err(payload) => std::panic::resume_unwind(payload),
+    /// The decision is applied while the freeze still owns the gate, before any
+    /// thaw. A panic, including an unwind with no decision, always fences. This
+    /// is the production wrapper for the same-host lease commit: only a proven
+    /// pre-COMMIT rollback may return [`FreezeDecision::Thaw`].
+    pub fn freeze_with_decision<T>(&self, work: impl FnOnce() -> (T, FreezeDecision)) -> T {
+        self.freeze(|| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            Ok((value, FreezeDecision::Thaw)) => value,
+            Ok((value, FreezeDecision::Fence)) => {
+                self.fence();
+                value
+            }
+            Err(payload) => {
+                self.fence();
+                std::panic::resume_unwind(payload)
             }
         })
+    }
+
+    /// Fail-closed variant of [`MutationGate::freeze_with_decision`].
+    ///
+    /// Kept for tests and callers that genuinely have no known rollback path.
+    /// Production lease commits should use the explicit decision instead.
+    pub fn freeze_then_fence<T>(&self, work: impl FnOnce() -> T) -> T {
+        self.freeze_with_decision(|| (work(), FreezeDecision::Fence))
     }
 
     /// Admit one mutation without ever blocking the caller.

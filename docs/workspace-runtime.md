@@ -118,13 +118,24 @@ before that freeze is released, and the committed epoch is authorized afterwards
 through the same fence-then-authorize handoff used by the mount `ensure` path.
 The old epoch can therefore not admit a new mutation in the window between the
 commit and the new-epoch authorization, and a handoff that is rejected leaves
-the gate `Fenced` instead of `Healthy` on the superseded epoch. A commit that
-errors, panics or is cancelled (the caller drops the future) also leaves the gate
-`Fenced`: the drop of the freeze's completion signal is not treated as a
-successful thaw. Such a mount stays read-only, returning `EROFS` for new
-mutations, until a later committed lease epoch is authorized by a lease acquire,
-checkpoint completion or startup reconcile. The periodic lease refresh only
-renews a live epoch and never clears a fence.
+the gate `Fenced` instead of `Healthy` on the superseded epoch. The wrapper
+separates a proven pre-COMMIT rollback from an unknown outcome: an error before
+the commit flag is signalled as a known rollback and thaws the original epoch,
+while commit success, a COMMIT transport error, a panic or a cancelled caller
+(dropped future or lost release channel) leaves the gate `Fenced`. A remaining
+pre-COMMIT conflict such as an active sandbox therefore returns normally and
+keeps the same healthy epoch writable. Such a fenced mount stays read-only,
+returning `EROFS` for new mutations, until a later committed lease epoch is
+authorized by a lease acquire, checkpoint completion or startup reconcile.
+
+Lease refresh observations are epoch-ordered under the gate lock. A late epoch
+`N` response that arrives after handoff `N+1` is ignored: it neither fences the
+new epoch nor lowers its deadline. An equal observation renews only a `Healthy`
+gate and cannot clear a fence; a newer observed epoch fences the current one but
+never authorizes the observed epoch, which still requires an explicit handoff
+that passes the fence floor. A missing refresh row may be an old query snapshot,
+so it fences only if the gate's epoch and generation still match the snapshot
+taken before the query; a concurrent handoff wins over the old missing row.
 
 This gate is only a prerequisite for an independent FUSE helper. The session is
 still a `BackgroundSession` in the API process, so an operator `SIGKILL` can
