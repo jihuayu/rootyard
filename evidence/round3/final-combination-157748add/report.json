@@ -1,0 +1,502 @@
+{
+  "measurement_kind": "native_execution",
+  "simulated_fields": false,
+  "source_base_commit": "0d9f48211e8e05ba02d402c920d397e1e1c117ac",
+  "source_worktree_dirty": false,
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "python": "3.12.14",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)"
+  },
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "mem_total_kb": 18440100
+  },
+  "topology": "one Linux host: 3 etcd members with mutual TLS, 3 Patroni-managed PostgreSQL 17 nodes with TLS/SCRAM and strict synchronous_mode, 1 HAProxy stable primary endpoint, 1 Rootyard server on the stable endpoint; no second physical host and no hardware watchdog",
+  "dataset": "one private repository with acknowledged Git pushes before the crash, a post-failover push, an observed DCS-quorum-loss probe and a real format-8 (schema [1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 72, 73, 74, 75, 80, 81, 82, 83, 84, 85, 86, 90, 91, 92, 93, 94, 95, 96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 121, 125, 126, 127, 128, 129, 130, 131, 132]) backup/restore closure derived from the verified manifest",
+  "workload": "native Git clone/push/fetch/fsck and HTTP browse through the stable primary endpoint; complete old primary node (Patroni + unmanaged postmaster session) hard-killed; automatic Patroni promotion without pg_ctl promote; two-of-three etcd quorum loss; offline backup and fresh-deployment restore with ingress held until checks pass",
+  "limits": [
+    "single Linux host for all etcd and PostgreSQL nodes; same kernel, no cross-host/rack/zone claim",
+    "no hardware watchdog or physical fencing available; production profile rejects such a host",
+    "process/port/session crash injection, not power loss or kernel network partitions",
+    "two-of-three etcd quorum loss on one host, not a multi-host network partition",
+    "HAProxy is a single local stable-endpoint process; its own failover is out of scope",
+    "restore target is a fresh local PostgreSQL 17 cluster with a local unencrypted backup closure",
+    "single-broker Kafka and multi-broker failover are not covered by this run"
+  ],
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "binary_size_bytes": 278933112,
+  "harness_sha256": "07c5265aa0f3ec7c7ccb963fea7648e5c0bd8ba8fd17d4f6ade3b81c10feb9e1",
+  "kind": "native_external_patroni_etcd_haproxy_failover_and_restore",
+  "supported_stack": {
+    "dcs": "etcd v3.5.17 (3 members, mutual TLS)",
+    "ha_controller": "Patroni 4.0.4",
+    "stable_endpoint": "HAProxy 3.0.11 role-health routing",
+    "database": "PostgreSQL 17"
+  },
+  "physical_scope": {
+    "hosts": 1,
+    "cross_host_failover": false,
+    "hardware_watchdog": false,
+    "production_certified": false,
+    "note": "same-host process scope only; production requires real fencing"
+  },
+  "configuration": {
+    "rendered_by": "deployment/ha/render.py",
+    "environment": "lab",
+    "synchronous_commit": "remote_apply",
+    "synchronous_standby_names": "*",
+    "synchronous_standbys": 1,
+    "postgres_tls": "verify-full + SCRAM-SHA-256, ssl_min_protocol_version TLSv1.3",
+    "dcs_tls": "mutual TLS with client certificate authentication",
+    "patroni_rest": {
+      "unauthenticated_management": 401,
+      "authenticated_management": 404,
+      "read_only_health_http": 200,
+      "loopback_only": {
+        "pg1": [
+          "127.0.0.1"
+        ],
+        "pg2": [
+          "127.0.0.1"
+        ],
+        "pg3": [
+          "127.0.0.1"
+        ]
+      },
+      "note": "Patroni health/GET endpoints are unauthenticated by design; management endpoints need basic auth; REST binds loopback only"
+    },
+    "negative_gates": {
+      "readme_json_examples_valid": 3,
+      "production_without_watchdog_rejected": true,
+      "weak_password_rejected": true,
+      "shared_password_rejected": true,
+      "dcs_client_certificate_required": true,
+      "missing_dcs_server_certificate_rejected": true,
+      "world_readable_dcs_server_key_rejected": true,
+      "dev_null_watchdog_rejected": true,
+      "dev_urandom_watchdog_rejected": true,
+      "rootyard_tls_downgrade_rejected": true,
+      "dcs_mtls_required": true,
+      "patroni_rest_authentication": {
+        "unauthenticated_management": 401,
+        "authenticated_management": 404,
+        "read_only_health_http": 200,
+        "loopback_only": {
+          "pg1": [
+            "127.0.0.1"
+          ],
+          "pg2": [
+            "127.0.0.1"
+          ],
+          "pg3": [
+            "127.0.0.1"
+          ]
+        },
+        "note": "Patroni health/GET endpoints are unauthenticated by design; management endpoints need basic auth; REST binds loopback only"
+      }
+    },
+    "tls_negative_runtime": {
+      "untrusted_ca_rejected": true,
+      "plaintext_rejected": true
+    },
+    "role_attributes": "repl|false|false|true\nrootyard|false|true|false"
+  },
+  "baseline": {
+    "refs": 1,
+    "counts": {
+      "repositories": 1,
+      "git_operations": 2,
+      "tokens": 4,
+      "outbox_events": 2,
+      "event_deliveries": 4,
+      "ci_checkout_jobs": 0
+    },
+    "sync": {
+      "synchronous_commit": "remote_apply",
+      "synchronous_standby_names": "*",
+      "synchronous_standbys": 1
+    },
+    "leader": "pg2",
+    "server_port": "30032"
+  },
+  "automatic_failover": {
+    "old_primary": "pg2",
+    "successor": "pg3",
+    "manual_promotion_invoked": false,
+    "old_node_processes_after_crash": 0,
+    "old_pg_port_closed": true,
+    "crash_to_successor_elected_ms": 19076.3,
+    "acked_oids": [
+      "b2430e6cb571ac004cb7631f1829e09f1636e29e",
+      "a39a284569392e4a84264f21484e5f444352279a",
+      "c6c8b571b314a21294b0e1fec65e123eee19a492",
+      "bcc9b31a414fd9052925c4bc344d7fe6116bd2a5",
+      "fb65c5c7b9ad032d05ba237d63f15717aebd5bf8",
+      "deac9589ed8f08648362032cc73892063bb4e833"
+    ],
+    "acked_ack_timestamps_ns": [
+      22192079974295,
+      22192079974295,
+      22192688754266,
+      22193122657705,
+      22193557476176,
+      22193996183496
+    ],
+    "crash_at_ns": 22194294087955,
+    "missing_acked_oids": [],
+    "worker_processed_after_promotion": 12,
+    "pre_failure_delivery_ids": 12,
+    "pre_failure_deliveries_delivered": 12,
+    "worker_accounting": "exact pre-failure (event_id,consumer) identity set; global pending total excluded because new acknowledged writes add new deliveries",
+    "worker_invocation": "worker-once processes a bounded per-consumer batch; the real binary was invoked repeatedly until every tracked pre-failure delivery was delivered",
+    "rootyard_pid_before": 363224,
+    "rootyard_pid_after": 363224,
+    "rootyard_health_statuses": [
+      200
+    ],
+    "promotion_log_excerpt": [
+      {
+        "node": "pg2",
+        "line": "2026-11-07 05:21:20,658 INFO: no action. I am (pg2), the leader with the lock"
+      },
+      {
+        "node": "pg2",
+        "line": "2026-11-07 05:21:22,582 INFO: no action. I am (pg2), the leader with the lock"
+      },
+      {
+        "node": "pg2",
+        "line": "2026-11-07 05:21:26,796 INFO: no action. I am (pg2), the leader with the lock"
+      },
+      {
+        "node": "pg2",
+        "line": "2026-11-07 05:21:26,957 INFO: no action. I am (pg2), the leader with the lock"
+      },
+      {
+        "node": "pg2",
+        "line": "2026-11-07 05:21:28,940 INFO: no action. I am (pg2), the leader with the lock"
+      },
+      {
+        "node": "pg3",
+        "line": "2026-11-07 05:21:49,478 INFO: promoted self to leader by acquiring session lock"
+      },
+      {
+        "node": "pg3",
+        "line": "server promoting"
+      },
+      {
+        "node": "pg3",
+        "line": "2026-11-07 05:21:49.480 UTC [363054] LOG:  received promote request"
+      },
+      {
+        "node": "pg3",
+        "line": "2026-11-07 05:21:52,866 INFO: no action. I am (pg3), the leader with the lock"
+      },
+      {
+        "node": "pg3",
+        "line": "2026-11-07 05:21:53,013 INFO: no action. I am (pg3), the leader with the lock"
+      },
+      {
+        "node": "pg3",
+        "line": "2026-11-07 05:21:53,154 INFO: no action. I am (pg3), the leader with the lock"
+      }
+    ],
+    "post_promotion_oid": "7e29742bed61903bfcfba0bb7d92383d15d742af",
+    "endpoint_primary_pg_port_before": 30032,
+    "endpoint_primary_pg_port_after": 30033
+  },
+  "dcs_quorum_loss": {
+    "stopped_etcd_members": [
+      "etcd1",
+      "etcd2"
+    ],
+    "old_primary_during_loss": "pg3",
+    "old_primary_pg_during_loss": "standby",
+    "nodes_during_loss": {
+      "pg1": {
+        "pg": "standby",
+        "patroni_rest_status": 200
+      },
+      "pg2": {
+        "pg": "unavailable",
+        "patroni_rest_status": 0
+      },
+      "pg3": {
+        "pg": "standby",
+        "patroni_rest_status": 200
+      }
+    },
+    "role_history_samples": 19,
+    "role_transitions": [
+      {
+        "elapsed_s": 2.04,
+        "nodes": {
+          "pg1": {
+            "pg": "standby",
+            "patroni_rest_status": 200
+          },
+          "pg2": {
+            "pg": "unavailable",
+            "patroni_rest_status": 0
+          },
+          "pg3": {
+            "pg": "primary",
+            "patroni_rest_status": 200
+          }
+        }
+      },
+      {
+        "elapsed_s": 6.53,
+        "nodes": {
+          "pg1": {
+            "pg": "standby",
+            "patroni_rest_status": 200
+          },
+          "pg2": {
+            "pg": "unavailable",
+            "patroni_rest_status": 0
+          },
+          "pg3": {
+            "pg": "standby",
+            "patroni_rest_status": 200
+          }
+        }
+      }
+    ],
+    "standby_nodes_promoted_without_quorum": [],
+    "promotion_without_quorum": false,
+    "old_primary_readonly_or_stopped": true,
+    "old_primary_states_after_demotion": [
+      "standby",
+      "standby",
+      "standby",
+      "standby",
+      "standby"
+    ],
+    "endpoint_writes_rejected": true,
+    "api_during_quorum_loss": "200",
+    "demotion_detection_seconds": 6.53,
+    "post_demotion_verification_window_seconds_target": 5.0,
+    "post_demotion_verification_window_seconds_observed": 5.57,
+    "post_demotion_write_probes": 10,
+    "post_demotion_write_rejections": 10,
+    "valid_lease_write_probes_accepted": 8,
+    "healthy_write_probe": {
+      "accepted": true,
+      "result": "UPDATE 1"
+    },
+    "last_write_probe": {
+      "accepted": false,
+      "old_primary_pg": "standby",
+      "result": "psql failed (2): psql: error: connection to server at \"127.0.0.1\", port 30040 failed: server closed the connection unexp"
+    },
+    "quorum_loss_detection_seconds": 12.1,
+    "quorum_restored_writable_ms": 13944.7,
+    "nodes_after_recovery": {
+      "pg1": "standby",
+      "pg2": "unavailable",
+      "pg3": "primary"
+    },
+    "recovered_primary": "pg3",
+    "old_primary_recovered_as_primary": true,
+    "endpoint_after_quorum": "f:30033",
+    "post_quorum_recovery_oid": "84922e084d2932c266fe689e20f8377d9be79699"
+  },
+  "replica_endpoint": {
+    "before_promotion": "t:30033",
+    "after_promotion": "t:30031",
+    "tls_scram_verified": "sslmode=verify-full plus SCRAM through the replica frontend",
+    "primary_excluded_from_replica_backend": true
+  },
+  "rpo": {
+    "lost_acknowledged_commits_after_automatic_promotion": 0,
+    "acked_commits_verified": 6
+  },
+  "rto": {
+    "read_ms": 19522.7,
+    "write_ms": 20762.3,
+    "rootyard_ready_ms": 19597.6
+  },
+  "restore": {
+    "backup_closure_seconds": 41.63,
+    "restore_seconds": 24.63,
+    "source_counts": {
+      "repositories": 1,
+      "git_operations": 9,
+      "tokens": 4,
+      "outbox_events": 9,
+      "event_deliveries": 18,
+      "ci_checkout_jobs": 1
+    },
+    "restored_counts": {
+      "repositories": 1,
+      "git_operations": 9,
+      "tokens": 4,
+      "outbox_events": 9,
+      "event_deliveries": 18,
+      "ci_checkout_jobs": 1
+    },
+    "backup_manifest": {
+      "format": 8,
+      "schema_versions": [
+        1,
+        2,
+        3,
+        6,
+        7,
+        8,
+        9,
+        20,
+        30,
+        40,
+        50,
+        60,
+        70,
+        72,
+        73,
+        74,
+        75,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        90,
+        91,
+        92,
+        93,
+        94,
+        95,
+        96,
+        97,
+        98,
+        105,
+        106,
+        107,
+        108,
+        109,
+        110,
+        111,
+        112,
+        113,
+        114,
+        115,
+        116,
+        120,
+        121,
+        125,
+        126,
+        127,
+        128,
+        129,
+        130,
+        131,
+        132
+      ],
+      "backup_id": "204f8d82-d58f-47e3-ac7e-b3557534c6ed",
+      "rootyard_version": "0.1.0"
+    },
+    "backup_verify": {
+      "authenticity_verified": false,
+      "backup_id": "204f8d82-d58f-47e3-ac7e-b3557534c6ed",
+      "checksums_verified": true
+    },
+    "authority": {
+      "source_incarnation": "a85a8e99-811e-4107-b86a-a61fe2043258",
+      "restored_incarnation": "339fcc92-e67d-4e2d-843b-318b9b3120b8",
+      "rotated_automatically_by_restore": true,
+      "transport_nonces_cleared": true
+    },
+    "job_before_backup": {
+      "job_id": "bb737267-35f5-4394-be83-9ea0411c20cd",
+      "target_oid": "deac9589ed8f08648362032cc73892063bb4e833",
+      "storage_generation": 1,
+      "pin_descriptor_retained": true,
+      "pin_receipt_matches_intent": true,
+      "pin_descriptor_sha256": "d56f6e6375bd7583d705663a699a26390c80be090fb3ba03f7c8195ef9387bf1",
+      "pin_descriptor_root_fields": {
+        "repository_id": "51beeb1e-2b33-41ba-865b-a4db7b957c03",
+        "version": 1,
+        "retention_ref": "refs/rootyard-ci/jobs/bb737267-35f5-4394-be83-9ea0411c20cd",
+        "retention_ref_points_to_target": true,
+        "target_commit_present": true
+      },
+      "grant_state": {
+        "revoked": false,
+        "cancelled": false,
+        "expires_in_future": true,
+        "mirror_audience_matches": true
+      },
+      "job_token_clone_head": "deac9589ed8f08648362032cc73892063bb4e833"
+    },
+    "job_revocation": {
+      "old_job_id": "bb737267-35f5-4394-be83-9ea0411c20cd",
+      "target_oid": "deac9589ed8f08648362032cc73892063bb4e833",
+      "old_grant_active_before_backup": true,
+      "old_grant_automatically_revoked_by_restore": true,
+      "old_grant_cancelled": false,
+      "old_grant_expiry_still_future": true,
+      "old_grant_audience_unchanged": true,
+      "old_token_http_status": 401,
+      "historical_pin_descriptor_retained": true,
+      "source_pin_receipt_matches_intent": true,
+      "restored_pin_receipt_matches_source_intent": true,
+      "pin_descriptor_source_sha256": "d56f6e6375bd7583d705663a699a26390c80be090fb3ba03f7c8195ef9387bf1",
+      "pin_descriptor_restored_sha256": "d56f6e6375bd7583d705663a699a26390c80be090fb3ba03f7c8195ef9387bf1",
+      "pin_descriptor_full_json_equal": true,
+      "pin_descriptor_root_fields_equal": true,
+      "restored_retention_ref_points_to_target": true,
+      "new_job_id": "858b70c9-de32-4977-9190-46f775b0c097",
+      "new_grant_revoked": false,
+      "new_checkout_head": "deac9589ed8f08648362032cc73892063bb4e833",
+      "new_checkout_fsck": "passed",
+      "source_and_restore_mirror_audience_configured": true
+    },
+    "source_refs": 2,
+    "restored_refs": 3,
+    "source_ref_map": {
+      "refs/heads/main": "84922e084d2932c266fe689e20f8377d9be79699",
+      "refs/rootyard-ci/jobs/bb737267-35f5-4394-be83-9ea0411c20cd": "deac9589ed8f08648362032cc73892063bb4e833"
+    },
+    "restored_ref_map": {
+      "refs/heads/main": "84922e084d2932c266fe689e20f8377d9be79699",
+      "refs/rootyard-ci/jobs/bb737267-35f5-4394-be83-9ea0411c20cd": "deac9589ed8f08648362032cc73892063bb4e833"
+    },
+    "restored_ref_map_equals_source": true,
+    "post_boundary_ref_change": {
+      "ref": "refs/heads/main",
+      "before": "84922e084d2932c266fe689e20f8377d9be79699",
+      "after": "d17a8fdce5d627409f19132917ceed474ae5c583",
+      "parent": "84922e084d2932c266fe689e20f8377d9be79699",
+      "ref_count_unchanged": true
+    },
+    "retained_acknowledged_oids": [
+      "b2430e6cb571ac004cb7631f1829e09f1636e29e",
+      "a39a284569392e4a84264f21484e5f444352279a",
+      "c6c8b571b314a21294b0e1fec65e123eee19a492",
+      "bcc9b31a414fd9052925c4bc344d7fe6116bd2a5",
+      "fb65c5c7b9ad032d05ba237d63f15717aebd5bf8",
+      "deac9589ed8f08648362032cc73892063bb4e833",
+      "7e29742bed61903bfcfba0bb7d92383d15d742af",
+      "84922e084d2932c266fe689e20f8377d9be79699"
+    ],
+    "post_boundary_oid_intentionally_absent": "d17a8fdce5d627409f19132917ceed474ae5c583",
+    "delegation_authority_rotated_by_restore": true,
+    "worker_drained_before_ingress": 6,
+    "pre_backup_delivery_ids": 6,
+    "pre_backup_deliveries_delivered": 6,
+    "worker_accounting": "exact pre-backup (event_id,consumer) identity set on the restored authority; global pending total excluded",
+    "restored_endpoint": "127.0.0.1:30051",
+    "restored_new_data_directory": "/tmp/rootyard-ha43-7kjexyke/restored-deployment-data",
+    "writes_held_until_offline_checks_passed": true,
+    "reader_access_and_token_revocation_and_tenant_denial": "passed",
+    "git_fsck": "passed",
+    "restored_push_oid": "d0ad417619909d0bf74cf5cc1dc9cf5d83bb1f2a"
+  },
+  "total_pipeline_seconds": 137.8
+}

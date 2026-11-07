@@ -1,0 +1,56 @@
+{
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "compiled_source": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "coordinator_exit_code": 0,
+  "coordinator_state": "passed",
+  "evidence_role": "additional current-binary combined PR63 migration + PR62 HA profile restore compatibility proof",
+  "files": {
+    "README.md": {
+      "bytes": 2975,
+      "sha256": "02ed06dca3dc1b9785944bd9e83638f236c48956fb043cf785cec1343cedcb96"
+    },
+    "coordinator-native.log": {
+      "bytes": 223,
+      "sha256": "2fbdb6644d11bfdefa795769ff24a716a25151a056605a403106c37fc94a3d0b"
+    },
+    "production-inputs.json": {
+      "bytes": 32569,
+      "sha256": "1468d0f93ce3d1732881eca82f5d212d2f1dcce10d3c12b5f0a5dc2440bb165c"
+    },
+    "report.json": {
+      "bytes": 17367,
+      "sha256": "efcfd7e455b3aa05750ffeaa637871ee00d6a62d232b80f5339871678b0bf118"
+    },
+    "source-equivalence.json": {
+      "bytes": 592,
+      "sha256": "6c2757c742167742212b21695e5866f2ace9cde61081e26e96310259f85b4b76"
+    },
+    "status.json": {
+      "bytes": 1910,
+      "sha256": "487d9a8b2721b7020550e0dfcef87237214acbe393e2f6db860dbce167bec7a3"
+    }
+  },
+  "harness_source_commit": "0d9f48211e8e05ba02d402c920d397e1e1c117ac",
+  "identities_separate_from_old_ha_report": true,
+  "native_log_result": "passed",
+  "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+  "report_has_top_level_result_field": false,
+  "report_sha256": "efcfd7e455b3aa05750ffeaa637871ee00d6a62d232b80f5339871678b0bf118",
+  "restore": {
+    "authority_rotated_by_restore": true,
+    "format": 8,
+    "new_checkout_fsck": "passed",
+    "old_token_http_status": 401,
+    "schema_versions_include": 132
+  },
+  "rpo": {
+    "acked_commits_verified": 6,
+    "lost_acknowledged_commits_after_automatic_promotion": 0
+  },
+  "rto": {
+    "read_ms": 19522.7,
+    "rootyard_ready_ms": 19597.6,
+    "write_ms": 20762.3
+  },
+  "source_input_file_count": 331
+}

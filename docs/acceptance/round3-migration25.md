@@ -55,6 +55,10 @@ claim. #26 physical cross-host fencing remains unqualified.
 3. Unknown orphan sidecar staging is retained forever with no quarantine,
    audit signal or observability (deliberate retain-on-unknown; disk growth).
 
+## Final combined HA/CI compatibility
+
+Final combined compatibility: after PR62 merged and main was merged into the accepted root, an additional actual native run on the **same current binary** `157748add` / production input `0f865a0…` (331 files) / harness-deployment `0d9f4821…` passed: 6 acknowledged commits with **0 lost** on automatic promotion, RTO read 19522.7 ms / write 20762.3 ms, a real pre-backup CI grant revoked to **401** while a fresh grant checked out the exact retained OID with `fsck=passed`, full intent/receipt/ref-OID compatibility and an offline format-8/schema-132 restore. This is additional current-binary proof, not the older `6f76d70` PR62 HA report; identities stay separate. See [final-combination-157748add](../../evidence/round3/final-combination-157748add/README.md).
+
 ## Evidence
 
 Permanent bundle:

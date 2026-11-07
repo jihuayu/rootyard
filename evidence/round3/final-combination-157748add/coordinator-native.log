@@ -1,0 +1,3 @@
+ha_endpoint_repository_api: passed
+ha_git_roundtrip: passed
+{"result": "passed", "report": "/workspace/scratch/rootyard-round3/final-combination/coordinator-report.json", "rto_write_ms": 20762.3, "failover_seconds": 19.08}

@@ -1,0 +1,10 @@
+{
+  "compiled_source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+  "scope": "PR63 migration runtime and PR62 HA profile combined, actual format8/schema132 CI restore compatibility",
+  "deployment_commit": "0d9f48211e8e05ba02d402c920d397e1e1c117ac",
+  "production_inputs_identical": true,
+  "file_count": 331,
+  "proof": "all production input paths and SHA256 digests equal the certified compile"
+}
