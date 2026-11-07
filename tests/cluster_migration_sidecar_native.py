@@ -331,15 +331,65 @@ def main():
         # carried by the final delta before cutover.
         target_log.close()
         target_log = open(node1_data.parent / "node1.log", "ab")
-        target = start_target(h, args, node1, node1_data, log=target_log)
+        h.stop(hard=True)
+        h.env["ROOTYARD_TEST_FAULT"] = "cutover-before-sidecar-finalize"
+        h.env["ROOTYARD_TEST_FAULT_ACTION"] = "pause"
+        h.env["ROOTYARD_TEST_FAULT_PAUSE_MS"] = "4000"
+        h.start()
+        h.env.pop("ROOTYARD_TEST_FAULT_ACTION", None)
+        h.env.pop("ROOTYARD_TEST_FAULT_PAUSE_MS", None)
+        stale_marker = node1_data / ".native-test-faults" / "target-sidecar-before-publish.json"
+        if stale_marker.exists():
+            stale_marker.unlink()
+        target = start_target(h, args, node1, node1_data,
+                              {"ROOTYARD_TEST_FAULT": "target-sidecar-before-publish",
+                               "ROOTYARD_TEST_FAULT_ACTION": "pause",
+                               "ROOTYARD_TEST_FAULT_PAUSE_MS": "6000"},
+                              log=target_log)
         acknowledged = [h.second]
         acknowledged.append(push_commit(h, h.work, "acknowledged while target restarts\n"))
-        status, raw, _ = h.http("/api/repos/alice/demo/shard-migrate", token=h.alice,
-                                method="POST",
-                                body={"target_node_id": "node1",
-                                      "expected_route_epoch": route["route_epoch"],
-                                      "operation_id": op})
+        concurrent_job = str(uuid.uuid4())
+        concurrent_oid = acknowledged[-1]
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(h.http, "/api/repos/alice/demo/shard-migrate",
+                                  token=h.alice, method="POST",
+                                  body={"target_node_id": "node1",
+                                        "expected_route_epoch": route["route_epoch"],
+                                        "operation_id": op})
+            marker(h.root / "data", "cutover-before-sidecar-finalize")
+            merged_job = str(uuid.uuid4())
+            merged_status, merged_raw = request(
+                node1, "/api/repos/alice/demo/ci-pins", h.alice, "POST",
+                {"job_id": merged_job, "target_oid": concurrent_oid,
+                 "storage_generation": demo_generation + 1})
+            assert merged_status in (200, 201), (merged_status, merged_raw[:300])
+            marker(node1_data, "target-sidecar-before-publish")
+            pin_status, pin_raw = request(
+                node1, "/api/repos/alice/demo/ci-pins", h.alice, "POST",
+                {"job_id": concurrent_job, "target_oid": concurrent_oid,
+                 "storage_generation": demo_generation + 1})
+            assert pin_status in (200, 201, 409, 503), (pin_status, pin_raw[:300])
+            status, raw, _ = pending.result(timeout=40)
         assert status == 200, (status, raw[:500])
+        if pin_status not in (200, 201):
+            pin_status, pin_raw = request(
+                node1, "/api/repos/alice/demo/ci-pins", h.alice, "POST",
+                {"job_id": concurrent_job, "target_oid": concurrent_oid,
+                 "storage_generation": demo_generation + 1})
+            assert pin_status in (200, 201), (pin_status, pin_raw[:300])
+        concurrent_sidecar = node1_data / "ci-pins" / h.repo["id"] / (concurrent_job + ".json")
+        assert concurrent_sidecar.is_file(), "accepted post-cutover pin was lost by finalization"
+        assert (concurrent_sidecar.parent / (concurrent_job + ".pinned.json")).is_file()
+        dest_repo_id = node1_data / "repos" / (h.repo["id"] + ".git")
+        assert h.git("--git-dir=" + str(dest_repo_id), "rev-parse",
+                     "refs/rootyard-ci/jobs/" + concurrent_job
+                     ).stdout.decode().strip() == concurrent_oid
+        merged_sidecar = concurrent_sidecar.parent / (merged_job + ".json")
+        assert merged_sidecar.is_file(), "pre-finalize accepted pin was overwritten"
+        assert (merged_sidecar.parent / (merged_job + ".pinned.json")).is_file()
+        assert h.git("--git-dir=" + str(dest_repo_id), "rev-parse",
+                     "refs/rootyard-ci/jobs/" + merged_job
+                     ).stdout.decode().strip() == concurrent_oid
         receipt = json.loads(raw)
         assert receipt["state"] == "completed" and receipt["target_node_id"] == "node1"
         dest = node1_data / "repos" / (h.repo["id"] + ".git")
@@ -379,6 +429,10 @@ def main():
         status, _ = issue_checkout(h, node1, "demo", job_released, h.second,
                                    new_generation, audience)
         assert status == 409, "released pin was resurrected"
+        status, concurrent_raw = issue_checkout(h, node1, "demo", concurrent_job,
+                                                concurrent_oid, new_generation, audience)
+        assert status in (200, 201), (status, concurrent_raw[:400])
+        assert json.loads(concurrent_raw)["plan"]["target_oid"] == concurrent_oid
         # A fresh job/attempt/generation issues a fresh durable pin and plan.
         fresh_job = str(uuid.uuid4())
         pinned = pin_at(h, node1, "demo", fresh_job, acknowledged[-1], new_generation)
@@ -406,6 +460,14 @@ def main():
             "fresh acknowledged commit after cutover\n")
         acknowledged.append(fresh_tip)
         old_volume_unchanged = True
+
+        kill(target)
+        target_log.close()
+        target_log = open(node1_data.parent / "node1.log", "ab")
+        target = start_target(h, args, node1, node1_data, log=target_log)
+        h.env.pop("ROOTYARD_TEST_FAULT", None)
+        h.stop(hard=True)
+        h.start()
 
         # Second repository: source SIGKILL at final drain, before cutover
         # commit, and immediately after the cutover commit. The old source is
@@ -454,21 +516,15 @@ def main():
         source_killed("final-delta-before-transfer", body)
         assert h.sql("SELECT draining::text FROM repository_shard_routes WHERE repository_id='"
                      + chaos["id"] + "'") == "true"
-        chaos_old = h.root / "data" / "repos" / (chaos["id"] + ".git")
-        chaos_fresh, chaos_proxied = fenced_source_push(
-            h, node0, chaos_old, node1, chaos_dest, chaos_work,
-            chaos["clone_path"], "fresh commit after chaos cutover\n")
-        acknowledged.append(chaos_fresh)
-        replicate_body = dict(body, replicate_only=True)
-        status, raw, _ = h.http("/api/repos/alice/chaosharness/shard-migrate",
-                                token=h.alice, method="POST", body=replicate_body)
-        assert status == 200, (status, raw[:400])
-        assert json.loads(raw)["state"] == "verified"
-
         source_killed("cutover-before-commit", body)
         assert h.sql("SELECT draining::text FROM repository_shard_routes WHERE repository_id='"
                      + chaos["id"] + "'") == "true"
-        acknowledged.append(push_commit(h, chaos_work, "acknowledged after delta resume\n"))
+        kill(target)
+        target_log.close()
+        target_log = open(node1_data.parent / "node1.log", "ab")
+        target = start_target(h, args, node1, node1_data, log=target_log)
+        assert (node1_data / "shard-staging" / (chaos_op + ".sidecar")).is_dir(), \
+            "verified staged sidecar was deleted by startup reconciliation"
         status, raw, _ = h.http("/api/repos/alice/chaosharness/shard-migrate",
                                 token=h.alice, method="POST", body=body)
         assert status == 200, (status, raw[:400])
@@ -479,6 +535,11 @@ def main():
         git_ok(h, chaos_dest)
         assert h.git("--git-dir=" + str(chaos_dest), "rev-parse", "refs/heads/main"
                      ).stdout.decode().strip() == acknowledged[-1]
+        chaos_old = h.root / "data" / "repos" / (chaos["id"] + ".git")
+        chaos_fresh, chaos_proxied = fenced_source_push(
+            h, node0, chaos_old, node1, chaos_dest, chaos_work,
+            chaos["clone_path"], "fresh commit after chaos cutover\n")
+        acknowledged.append(chaos_fresh)
 
         # A second migration back is not needed: exercise the committed-cutover
         # recovery boundary on a third repository so the post-commit source
@@ -515,6 +576,38 @@ def main():
             h, node0, recover_old, node1, recover_dest, recover_work,
             recover["clone_path"], "fresh commit after recovered cutover\n")
 
+        # Focused reconcile-window fixture (metadata/staging only, not a claim
+        # of 34 whole migrations): completed and verified staged bundles beyond
+        # the previous LIMIT 32 window must survive a target restart.
+        dummy_ops = []
+        for index in range(34):
+            dummy_repo = json.loads(h.expect("/api/repos", 201, method="POST", token=h.alice,
+                                             body={"name": "window" + str(index)}))
+            dummy_op = str(uuid.uuid4())
+            dummy_ops.append((dummy_repo["id"], dummy_op))
+            h.sql("UPDATE repositories SET storage_generation=2 WHERE id='" + dummy_repo["id"] + "'")
+            h.sql("INSERT INTO repository_shard_routes(tenant_id,repository_id,bucket_id,"
+                  "primary_node_id,route_epoch,fencing_token,required_generation) VALUES ('"
+                  + h.alice["user_id"] + "','" + dummy_repo["id"] + "',0,'node1',2,2,2) "
+                  "ON CONFLICT (tenant_id,repository_id) DO UPDATE SET primary_node_id='node1',"
+                  "route_epoch=2,fencing_token=2,required_generation=2")
+            state_name = "completed" if index % 2 == 0 else "verified"
+            h.sql("INSERT INTO shard_replication_operations(id,repository_id,source_node_id,"
+                  "target_node_id,source_route_epoch,source_generation,refs_sha256,state) "
+                  "VALUES ('" + dummy_op + "','" + dummy_repo["id"] + "','shard-primary-0','node1',1,1,"
+                  "'" + "a" * 64 + "','" + state_name + "')")
+            staged = node1_data / "shard-staging" / (dummy_op + ".sidecar")
+            staged.mkdir(parents=True)
+            (staged / "incomplete-exchange-marker").write_text("metadata-only fixture\n")
+        kill(target)
+        target_log.close()
+        target_log = open(node1_data.parent / "node1.log", "ab")
+        target = start_target(h, args, node1, node1_data, log=target_log)
+        surviving = sum(1 for _, dummy_op in dummy_ops
+                        if (node1_data / "shard-staging" / (dummy_op + ".sidecar")).is_dir())
+        assert surviving == len(dummy_ops), \
+            "reconcile deleted staged sidecars outside its previous window"
+
         report = {
             "kind": "native_migration_sidecar_crash_matrix",
             "result": "passed",
@@ -522,16 +615,28 @@ def main():
             "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "postgres_version": h.sql("SHOW server_version"),
             "disposable_database": database,
+            "hooks_registered": 13,
             "phases_actual": [fault_phase, "target-verify-before-publish",
+                              "target-sidecar-before-publish+concurrent-fresh-pin",
+                              "cutover-before-sidecar-finalize+pre-finalize-pin",
+                              "verified-restart-with-staged-sidecar",
                               "final-delta-before-transfer", "cutover-before-commit",
                               "cutover-after-commit", "recover-before-reconcile",
                               "startup-sidecar-reconcile"],
+            "hooks_unexercised": ["copy-before-transfer", "copy-after-transfer",
+                                   "target-delta-before-verified",
+                                   "takeover-after-source-verify",
+                                   "takeover-before-promote"],
             "sidecar_symlink_fail_closed": True,
             "sidecar_foreign_tenant_fail_closed": True,
             "cancelled_grant_denied_after_handoff": True,
             "released_pin_tombstone_preserved": True,
             "old_generation_pin_not_rebound": True,
             "fresh_checkout_after_handoff": True,
+            "fresh_pin_accepted_during_finalize_survives": True,
+            "pre_finalize_pin_merged_with_source_evidence": True,
+            "verified_staged_sidecar_survives_target_restart": True,
+            "reconcile_window_fixture_34_retained": surviving,
             "retained_ci_backup_snapshot_roots": True,
             "stock_git_fsck_and_acknowledged_commits": True,
             "old_source_nonwriter_after_true_fence": True,

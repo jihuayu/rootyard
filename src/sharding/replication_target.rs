@@ -476,6 +476,8 @@ pub(crate) struct FinalizeReceipt {
 
 struct FinalizeAuth {
     generation: i64,
+    route_epoch: i64,
+    fencing_token: i64,
 }
 
 /// A sidecar finalization is only accepted after the cutover transaction has
@@ -587,7 +589,7 @@ async fn authorize_finalize(
         return Err(conflict("CI sidecar finalization raced the shard route"));
     }
     tx.commit().await.map_err(Error::internal)?;
-    Ok(FinalizeAuth { generation })
+    Ok(FinalizeAuth { generation, route_epoch: env.route_epoch, fencing_token: env.fencing_token })
 }
 
 pub(crate) async fn finalize_sidecar(
@@ -597,6 +599,7 @@ pub(crate) async fn finalize_sidecar(
     headers: HeaderMap,
 ) -> Result<Response, Error> {
     let auth = authorize_finalize(&state, &headers, &uri, repo_id, op_id).await?;
-    sidecar::finalize(&state, repo_id, op_id, auth.generation, true).await?;
+    sidecar::finalize(&state, repo_id, op_id, auth.generation, Some((auth.route_epoch, auth.fencing_token)), true)
+        .await?;
     Ok(json(StatusCode::OK, FinalizeReceipt { operation_id: op_id, state: "published".into() }))
 }

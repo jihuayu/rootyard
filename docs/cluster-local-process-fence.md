@@ -166,21 +166,37 @@ Symlinked, non-canonical, foreign-tenant or mismatched descriptors fail the
 migration before any operation row or drain is created.
 
 Sidecar files are written with `O_NOFOLLOW`, fsynced and staged in a private
-directory. They are published to the target's live `ci-pins` directory only
-after the cutover transaction commits and the target holds the new route epoch,
-fencing token and storage generation. A master/standby still verifies the
+directory. They are published only after the cutover transaction commits and
+the target holds the new route epoch, fencing token and storage generation.
+Publication takes the same repository exclusive lease/publication/maintenance
+guard as a normal pin, revalidates the committed operation manifest and route
+before and after the swap, and merges every legitimate new-generation intent
+and receipt accepted on the new primary instead of replacing the live
+directory with the old source image. A pending marker transition is not a
+reason to bypass that guard: the internal finalize path may complete only the
+exact committed operation while ordinary new writes are blocked by the same
+fence, so it cannot deadlock its own recovery. The directory swap uses
+`RENAME_EXCHANGE` on Linux with a journaled fallback and startup reconciliation
+of interrupted `.stage-`/`.retired-` names. A master/standby still verifies the
 whole transferred repository and sidecar closure before the replication
 operation becomes `verified`; a stale, corrupt, empty or partial target can
 never satisfy that condition. If the source dies after committing the cutover,
 both the pending marker transition and the staged sidecars are republished by
-startup reconciliation on their respective volumes.
+startup reconciliation on their respective volumes. A durable per-operation
+publication receipt makes a lost finalize response idempotent instead of a
+permanent conflict.
 
 Released pins and cancelled checkout jobs are tombstones. An intent whose
 retained CI root is not in the measured manifest is omitted instead of being
 resurrected, and a receipt without its root fails closed. The old-generation
 intent and receipt are preserved verbatim on the new primary only as retention
 evidence and cannot authorize a checkout under the new generation: a fresh
-job/attempt must issue a fresh pin, and cancelled or released jobs stay denied.
+job/attempt must issue a fresh pin, and cancelled or released jobs stay denied. Startup reconciliation enumerates every operation
+for the target node instead of a small completion window; it retains staged
+bundles for copying, verified and completed operations, resolves an exact
+operation row before cleanup, and deletes only staging proven aborted or
+foreign. It never treats absence from a bounded query as permission to delete
+the only surviving copy of a committed sidecar image.
 
 ## Opt-in native crash-phase hooks
 

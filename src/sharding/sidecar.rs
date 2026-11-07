@@ -12,11 +12,14 @@
 //! Released pins and cancelled jobs are tombstones: an intent whose retained CI
 //! root is no longer in the measured manifest is dropped, never recreated. A
 //! receipt without its retained root, an unmanaged CI root, a symlink, a
-//! non-canonical path or a mismatched descriptor fails closed.
+//! non-canonical path or a mismatched descriptor fails closed. Publication is
+//! serialized with ordinary pin issuance by the repository exclusive guard and
+//! merges every legitimately accepted new-generation live intent instead of
+//! replacing the live directory with the old source image.
 use crate::{
     AppState, Error, journal,
     sharding::{
-        faults,
+        faults, locks,
         models::conflict,
         replication::{self, RefManifest},
     },
@@ -25,9 +28,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::CString,
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
 };
 use uuid::Uuid;
@@ -62,6 +66,30 @@ pub(crate) struct SidecarBundle {
     /// Every `refs/rootyard-*` root outside the CI job namespace that the
     /// measured manifest retained (backup, snapshot and hidden retention roots).
     pub(crate) retained_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PublishedFile {
+    name: String,
+    sha256: String,
+}
+
+/// Durable proof that a committed operation's sidecar image was published.
+/// Retries after a lost HTTP response and startup recovery consult this receipt
+/// instead of treating an intentionally removed staging directory as failure.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PublicationReceipt {
+    version: u32,
+    repository_id: Uuid,
+    operation_id: Uuid,
+    target_generation: i64,
+    refs_sha256: String,
+    journal_sequence: i64,
+    route_epoch: i64,
+    fencing_token: i64,
+    files: Vec<PublishedFile>,
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -108,21 +136,20 @@ struct Scanned {
     receipts: BTreeMap<Uuid, Vec<u8>>,
 }
 
-fn scan_source(
-    root: &FsPath,
+fn read_sidecar_directory(
+    directory: &FsPath,
     repo_id: Uuid,
     owner_id: Uuid,
     object_format: &str,
-    source_generation: i64,
+    expected_generation: Option<i64>,
 ) -> Result<Scanned, Error> {
     let mut scanned = Scanned { intents: BTreeMap::new(), receipts: BTreeMap::new() };
-    let directory = sidecar_directory(root, repo_id);
-    if !safe_directory(&directory)? {
+    if !safe_directory(directory)? {
         return Ok(scanned);
     }
     let mut files = 0usize;
     let mut bytes = 0usize;
-    for entry in fs::read_dir(&directory).map_err(Error::internal)? {
+    for entry in fs::read_dir(directory).map_err(Error::internal)? {
         let entry = entry.map_err(Error::internal)?;
         let name = entry.file_name().into_string().map_err(|_| conflict("non UTF-8 CI sidecar filename"))?;
         if name.starts_with(".tmp-") {
@@ -144,6 +171,11 @@ fn scan_source(
         let intent: crate::ci_pins::Intent =
             serde_json::from_slice(&content).map_err(|_| conflict("corrupt CI sidecar descriptor"))?;
         intent.validate().map_err(|_| conflict("invalid CI sidecar descriptor"))?;
+        if let Some(generation) = expected_generation
+            && intent.storage_generation != generation
+        {
+            return Err(conflict("CI sidecar generation differs from its directory image"));
+        }
         if name.ends_with(".pinned.json") {
             let job = canonical_job(&name, ".pinned.json")?;
             if scanned.receipts.insert(job, content).is_some() {
@@ -156,7 +188,6 @@ fn scan_source(
             || intent.repository_id != repo_id
             || intent.owner_id != owner_id
             || intent.object_format != object_format
-            || intent.storage_generation != source_generation
             || intent.retention_ref != format!("{CI_PREFIX}{job}")
         {
             return Err(conflict("CI sidecar descriptor differs from its tenant or generation"));
@@ -174,6 +205,16 @@ fn scan_source(
         }
     }
     Ok(scanned)
+}
+
+fn scan_source(
+    root: &FsPath,
+    repo_id: Uuid,
+    owner_id: Uuid,
+    object_format: &str,
+    source_generation: i64,
+) -> Result<Scanned, Error> {
+    read_sidecar_directory(&sidecar_directory(root, repo_id), repo_id, owner_id, object_format, Some(source_generation))
 }
 
 fn manifest_ci_roots(manifest: &RefManifest) -> Result<BTreeMap<String, String>, Error> {
@@ -281,31 +322,25 @@ pub(crate) fn capture(
     })
 }
 
-fn validate_bundle(
+fn bundle_intents(
     bundle: &SidecarBundle,
     repo_id: Uuid,
     operation_id: Uuid,
     owner_id: Uuid,
     object_format: &str,
     source_generation: i64,
-    manifest: &RefManifest,
-    refs_sha256: &str,
-    journal_sequence: i64,
-) -> Result<(), Error> {
+) -> Result<(BTreeMap<Uuid, crate::ci_pins::Intent>, BTreeSet<Uuid>), Error> {
     if bundle.version != SIDECAR_VERSION
         || bundle.repository_id != repo_id
         || bundle.operation_id != operation_id
         || bundle.source_generation != source_generation
         || bundle.target_generation != source_generation + 1
-        || bundle.refs_sha256 != refs_sha256
-        || bundle.journal_sequence != journal_sequence
-        || !valid_digest(&bundle.refs_sha256)
-        || manifest.digest() != refs_sha256
         || bundle.files.len() > MAX_SIDECAR_FILES
+        || bundle.journal_sequence < 0
+        || !valid_digest(&bundle.refs_sha256)
     {
         return Err(conflict("CI sidecar bundle differs from the measured transfer"));
     }
-    let roots = manifest_ci_roots(manifest)?;
     let mut names = BTreeSet::new();
     let mut intents: BTreeMap<Uuid, crate::ci_pins::Intent> = BTreeMap::new();
     let mut receipts: BTreeSet<Uuid> = BTreeSet::new();
@@ -332,12 +367,6 @@ fn validate_bundle(
         {
             return Err(conflict("transferred CI descriptor differs from its tenant or generation"));
         }
-        let oid = roots
-            .get(&intent.retention_ref)
-            .ok_or_else(|| conflict("transferred CI intent has no measured retained root"))?;
-        if oid != &intent.target_oid {
-            return Err(conflict("transferred CI intent differs from the measured root"));
-        }
         if receipt {
             let source = intents.get(&job).ok_or_else(|| conflict("transferred CI receipt has no intent"))?;
             if source != &intent {
@@ -348,8 +377,37 @@ fn validate_bundle(
             return Err(conflict("duplicate transferred CI intent"));
         }
     }
-    if receipts.len() > intents.len() {
-        return Err(conflict("transferred CI receipts exceed intents"));
+    Ok((intents, receipts))
+}
+
+/// Strict transfer-time validation: the bundle must describe the exact
+/// measured refs digest and every measured CI retention root.
+fn validate_bundle_stage(
+    bundle: &SidecarBundle,
+    repo_id: Uuid,
+    operation_id: Uuid,
+    owner_id: Uuid,
+    object_format: &str,
+    source_generation: i64,
+    manifest: &RefManifest,
+    refs_sha256: &str,
+    journal_sequence: i64,
+) -> Result<(), Error> {
+    let (intents, _) = bundle_intents(bundle, repo_id, operation_id, owner_id, object_format, source_generation)?;
+    if bundle.refs_sha256 != refs_sha256
+        || manifest.digest() != refs_sha256
+        || bundle.journal_sequence != journal_sequence
+    {
+        return Err(conflict("CI sidecar bundle differs from the measured transfer"));
+    }
+    let roots = manifest_ci_roots(manifest)?;
+    for intent in intents.values() {
+        let oid = roots
+            .get(&intent.retention_ref)
+            .ok_or_else(|| conflict("transferred CI intent has no measured retained root"))?;
+        if oid != &intent.target_oid {
+            return Err(conflict("transferred CI intent differs from the measured root"));
+        }
     }
     for retention in roots.keys() {
         let represented = intents.values().any(|intent| &intent.retention_ref == retention);
@@ -371,6 +429,10 @@ pub(crate) fn progress_path(state: &AppState, operation_id: Uuid) -> Result<Path
 
 pub(crate) fn staged_path(state: &AppState, operation_id: Uuid) -> Result<PathBuf, Error> {
     Ok(replication::staging_root(state)?.join(format!("{operation_id}.sidecar")))
+}
+
+fn receipt_path(state: &AppState, operation_id: Uuid) -> Result<PathBuf, Error> {
+    Ok(replication::staging_root(state)?.join(format!("{operation_id}.sidecar.published.json")))
 }
 
 /// Persist the captured sidecar image before its transfer so a restart can
@@ -411,7 +473,7 @@ pub(crate) fn stage_incoming(
     object_format: &str,
     manifest: &RefManifest,
 ) -> Result<(), Error> {
-    validate_bundle(
+    validate_bundle_stage(
         bundle,
         repo_id,
         operation_id,
@@ -472,52 +534,84 @@ pub(crate) fn stage_incoming(
     Ok(())
 }
 
-fn desired_files(
-    bundle: &SidecarBundle,
+/// New-generation files written by the new primary after cutover. They are
+/// legitimate and must survive finalization; they are only accepted when their
+/// retained root is in the current manifest and their receipt matches.
+fn scan_live_new_generation(
+    directory: &FsPath,
+    repo_id: Uuid,
     owner_id: Uuid,
     object_format: &str,
-    generation: i64,
+    target_generation: i64,
+    source_generation: i64,
     manifest: &RefManifest,
 ) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+    let scanned = read_sidecar_directory(directory, repo_id, owner_id, object_format, None)?;
     let roots = manifest_ci_roots(manifest)?;
-    let mut intents: BTreeMap<Uuid, crate::ci_pins::Intent> = BTreeMap::new();
-    let mut receipts: BTreeSet<Uuid> = BTreeSet::new();
-    for file in &bundle.files {
-        let is_receipt = file.name.ends_with(".pinned.json");
-        let job = canonical_job(&file.name, if is_receipt { ".pinned.json" } else { ".json" })?;
-        if is_receipt {
-            receipts.insert(job);
-        } else {
-            let intent: crate::ci_pins::Intent =
-                serde_json::from_str(&file.content).map_err(|_| conflict("corrupt staged CI descriptor"))?;
-            intents.insert(job, intent);
+    let mut values = BTreeMap::new();
+    for (job, (intent, content)) in &scanned.intents {
+        if intent.storage_generation == source_generation {
+            continue;
         }
-    }
-    let mut desired = BTreeMap::new();
-    for (job, intent) in intents {
-        if intent.repository_id != bundle.repository_id
-            || intent.owner_id != owner_id
-            || intent.object_format != object_format
-            || intent.storage_generation != bundle.source_generation
-            || intent.job_id != job
-        {
-            return Err(conflict("staged CI descriptor differs from the target tenant"));
+        if intent.storage_generation != target_generation {
+            return Err(conflict("live CI sidecar has an unexpected storage generation"));
         }
         let Some(oid) = roots.get(&intent.retention_ref) else {
-            // The retention root was released after the cutover committed.
-            // Never resurrect its intent or receipt on the new primary.
+            return Err(conflict("live CI intent has no retained root"));
+        };
+        if oid != &intent.target_oid {
+            return Err(conflict("live CI intent differs from its retained root"));
+        }
+        values.insert(format!("{job}.json"), content.clone());
+        if let Some(receipt) = scanned.receipts.get(job) {
+            values.insert(format!("{job}.pinned.json"), receipt.clone());
+        }
+    }
+    for job in scanned.receipts.keys() {
+        if !scanned.intents.contains_key(job) {
+            return Err(conflict("live CI receipt has no intent"));
+        }
+    }
+    Ok(values)
+}
+
+fn desired_files(
+    bundle: &SidecarBundle,
+    repo_id: Uuid,
+    owner_id: Uuid,
+    object_format: &str,
+    live: &BTreeMap<String, Vec<u8>>,
+    manifest: &RefManifest,
+) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+    let (intents, receipts) =
+        bundle_intents(bundle, repo_id, bundle.operation_id, owner_id, object_format, bundle.source_generation)?;
+    let roots = manifest_ci_roots(manifest)?;
+    let mut desired: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (job, intent) in intents {
+        let Some(oid) = roots.get(&intent.retention_ref) else {
+            if receipts.contains(&job) {
+                return Err(conflict("CI pinned receipt has no retained root"));
+            }
             continue;
         };
         if oid != &intent.target_oid {
-            return Err(conflict("staged CI intent differs from the target retained root"));
+            return Err(conflict("CI intent differs from the target retained root"));
         }
-        // Preserve the exact old-generation intent and receipt as retention
-        // evidence. They intentionally do not authorize a checkout under the
-        // new generation: a fresh job/attempt must issue a fresh pin.
-        let _ = generation;
-        desired.insert(format!("{job}.json"), serde_json::to_vec(&intent).map_err(Error::internal)?);
+        let bytes = serde_json::to_vec(&intent).map_err(Error::internal)?;
+        if let Some(existing) = desired.insert(format!("{job}.json"), bytes.clone())
+            && existing != bytes
+        {
+            return Err(conflict("conflicting CI intent images during finalization"));
+        }
         if receipts.contains(&job) {
-            desired.insert(format!("{job}.pinned.json"), serde_json::to_vec(&intent).map_err(Error::internal)?);
+            desired.insert(format!("{job}.pinned.json"), bytes);
+        }
+    }
+    for (name, content) in live {
+        if let Some(existing) = desired.insert(name.clone(), content.clone())
+            && existing != *content
+        {
+            return Err(conflict("new-primary CI pin conflicts with transferred evidence"));
         }
     }
     for name in &bundle.retained_refs {
@@ -528,10 +622,51 @@ fn desired_files(
     Ok(desired)
 }
 
+fn directory_image(path: &FsPath) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+    let mut values = BTreeMap::new();
+    for entry in fs::read_dir(path).map_err(Error::internal)? {
+        let entry = entry.map_err(Error::internal)?;
+        let name = entry.file_name().into_string().map_err(|_| conflict("non UTF-8 CI sidecar filename"))?;
+        if name.starts_with(".tmp-") {
+            continue;
+        }
+        let kind = entry.file_type().map_err(Error::internal)?;
+        if !kind.is_file() || kind.is_symlink() {
+            return Err(conflict("unsafe entry in live CI sidecar directory"));
+        }
+        values.insert(name, journal::read(&entry.path()).map_err(Error::internal)?);
+    }
+    Ok(values)
+}
+
+fn rename_exchange(left: &FsPath, right: &FsPath) -> std::io::Result<()> {
+    let left = CString::new(left.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+    let right = CString::new(right.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+    // RENAME_EXCHANGE is 2 on Linux; the syscall atomically swaps both names.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            2 as libc::c_uint,
+        )
+    };
+    if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
 fn publish_directory(root: &FsPath, repo_id: Uuid, desired: &BTreeMap<String, Vec<u8>>) -> Result<(), Error> {
     let base = root.join("ci-pins");
     if !safe_directory(&base)? {
         journal::mkdir(&base).map_err(Error::internal)?;
+    }
+    if let Ok(meta) = fs::symlink_metadata(&base)
+        && (meta.file_type().is_symlink() || meta.uid() != unsafe { libc::geteuid() })
+    {
+        return Err(conflict("unsafe live CI sidecar root"));
     }
     let temporary = base.join(format!(".{repo_id}.stage-{}", Uuid::new_v4()));
     fs::create_dir(&temporary).map_err(Error::internal)?;
@@ -556,106 +691,288 @@ fn publish_directory(root: &FsPath, repo_id: Uuid, desired: &BTreeMap<String, Ve
         return Err(error);
     }
     let destination = base.join(repo_id.to_string());
-    let had_previous = safe_directory(&destination)?;
-    if had_previous {
-        if same_directory(&destination, &temporary)? {
-            let _ = fs::remove_dir_all(&temporary);
-            return Ok(());
-        }
-        let retired = base.join(format!(".{repo_id}.retired-{}", Uuid::new_v4()));
-        fs::rename(&destination, &retired).map_err(Error::internal)?;
-        if let Err(error) = fs::rename(&temporary, &destination) {
-            let _ = fs::rename(&retired, &destination);
-            return Err(Error::internal(error));
-        }
+    if !safe_directory(&destination)? {
+        fs::rename(&temporary, &destination).map_err(Error::internal)?;
         sync_directory(&base)?;
-        let _ = fs::remove_dir_all(&retired);
         return Ok(());
     }
-    fs::rename(&temporary, &destination).map_err(Error::internal)?;
-    sync_directory(&base)?;
-    Ok(())
-}
-
-fn same_directory(left: &FsPath, right: &FsPath) -> Result<bool, Error> {
-    let read = |path: &FsPath| -> Result<BTreeMap<String, Vec<u8>>, Error> {
-        let mut values = BTreeMap::new();
-        for entry in fs::read_dir(path).map_err(Error::internal)? {
-            let entry = entry.map_err(Error::internal)?;
-            let kind = entry.file_type().map_err(Error::internal)?;
-            if !kind.is_file() || kind.is_symlink() {
-                return Ok(BTreeMap::new());
-            }
-            let name = entry.file_name().into_string().map_err(|_| conflict("non UTF-8 CI sidecar filename"))?;
-            values.insert(name, journal::read(&entry.path()).map_err(Error::internal)?);
+    let desired_image: BTreeMap<String, Vec<u8>> =
+        desired.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+    if directory_image(&destination)? == desired_image {
+        let _ = fs::remove_dir_all(&temporary);
+        return Ok(());
+    }
+    match rename_exchange(&temporary, &destination) {
+        Ok(()) => {
+            sync_directory(&base)?;
+            let _ = fs::remove_dir_all(&temporary);
+            Ok(())
         }
-        Ok(values)
-    };
-    Ok(read(left)? == read(right)?)
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) || error.raw_os_error() == Some(libc::ENOSYS) => {
+            let retired = base.join(format!(".{repo_id}.retired-{}", Uuid::new_v4()));
+            fs::rename(&destination, &retired).map_err(Error::internal)?;
+            if let Err(second) = fs::rename(&temporary, &destination) {
+                let _ = fs::rename(&retired, &destination);
+                return Err(Error::internal(second));
+            }
+            sync_directory(&base)?;
+            let _ = fs::remove_dir_all(&retired);
+            Ok(())
+        }
+        Err(error) => Err(Error::internal(error)),
+    }
 }
 
-/// Publish a committed operation's staged bundle. Returns whether a staged
-/// directory existed.
+async fn operation_context(
+    state: &AppState,
+    repo_id: Uuid,
+    operation_id: Uuid,
+    generation: i64,
+    expected_route: Option<(i64, i64)>,
+) -> Result<(Uuid, i64, String, i64, i64, i64, String), Error> {
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let row = client
+        .query_opt(
+            "SELECT o.state,o.source_generation,o.refs_sha256,o.journal_sequence,o.target_node_id, \
+                    p.owner_id,p.object_format,p.storage_generation, \
+                    r.primary_node_id,r.route_epoch,r.fencing_token,r.draining,r.read_only_degraded \
+             FROM shard_replication_operations o \
+             JOIN repositories p ON p.id=o.repository_id \
+             LEFT JOIN repository_shard_routes r ON r.repository_id=o.repository_id \
+             WHERE o.id=$1 AND o.repository_id=$2",
+            &[&operation_id, &repo_id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
+    let op_state: String = row.get(0);
+    let source_generation: i64 = row.get(1);
+    let refs_sha256: Option<String> = row.get(2);
+    let journal_sequence: Option<i64> = row.get(3);
+    let target: String = row.get(4);
+    let owner_id: Uuid = row.get(5);
+    let object_format: String = row.get(6);
+    let repo_generation: i64 = row.get(7);
+    let primary: Option<String> = row.get(8);
+    let route_epoch: Option<i64> = row.get(9);
+    let fencing_token: Option<i64> = row.get(10);
+    let draining: Option<bool> = row.get(11);
+    let degraded: Option<bool> = row.get(12);
+    let node = crate::sharding::transport::node_id()?.unwrap_or_default();
+    let (Some(primary), Some(route_epoch), Some(fencing_token)) = (primary, route_epoch, fencing_token) else {
+        return Err(conflict("committed cutover has no shard route"));
+    };
+    if op_state != "completed"
+        || target != node
+        || primary != node
+        || draining != Some(false)
+        || degraded != Some(false)
+        || source_generation + 1 != generation
+        || repo_generation != generation
+    {
+        return Err(conflict("CI sidecar finalization differs from the committed route"));
+    }
+    if let Some((expected_epoch, expected_token)) = expected_route
+        && (route_epoch != expected_epoch || fencing_token != expected_token)
+    {
+        return Err(conflict("CI sidecar finalization envelope raced the shard route"));
+    }
+    let refs_sha256 = refs_sha256.ok_or_else(|| conflict("committed operation has no ref digest"))?;
+    Ok((
+        owner_id,
+        source_generation,
+        object_format,
+        route_epoch,
+        fencing_token,
+        journal_sequence.unwrap_or(-1),
+        refs_sha256,
+    ))
+}
+
+async fn verify_published_receipt(
+    state: &AppState,
+    repo_id: Uuid,
+    operation_id: Uuid,
+    generation: i64,
+    expected_route: Option<(i64, i64)>,
+    require_staged: bool,
+) -> Result<bool, Error> {
+    let path = receipt_path(state, operation_id)?;
+    if !journal::exists(&path).map_err(Error::internal)? {
+        return if require_staged { Err(conflict("target CI sidecar staging is missing")) } else { Ok(false) };
+    }
+    let receipt: PublicationReceipt = serde_json::from_slice(&journal::read(&path).map_err(Error::internal)?)
+        .map_err(|_| conflict("corrupt CI sidecar publication receipt"))?;
+    let (owner_id, source_generation, object_format, route_epoch, fencing_token, sequence, refs_sha256) =
+        operation_context(state, repo_id, operation_id, generation, expected_route).await?;
+    if receipt.version != SIDECAR_VERSION
+        || receipt.repository_id != repo_id
+        || receipt.operation_id != operation_id
+        || receipt.target_generation != generation
+        || receipt.journal_sequence != sequence
+        || receipt.refs_sha256 != refs_sha256
+        || receipt.route_epoch != route_epoch
+        || receipt.fencing_token != fencing_token
+    {
+        return Err(conflict("CI sidecar publication receipt differs from the committed operation"));
+    }
+    let live = read_sidecar_directory(
+        &sidecar_directory(&state.storage.root, repo_id),
+        repo_id,
+        owner_id,
+        &object_format,
+        None,
+    )?;
+    let _ = source_generation;
+    let _ = live;
+    let directory = sidecar_directory(&state.storage.root, repo_id);
+    if !safe_directory(&directory)? {
+        return Err(conflict("CI sidecar publication receipt has no live directory"));
+    }
+    for file in &receipt.files {
+        let path = directory.join(&file.name);
+        let content = journal::read(&path).map_err(|_| conflict("published CI sidecar file is missing"))?;
+        if digest(&content) != file.sha256 {
+            return Err(conflict("published CI sidecar file changed"));
+        }
+    }
+    Ok(true)
+}
+
+fn write_receipt(
+    state: &AppState,
+    repo_id: Uuid,
+    operation_id: Uuid,
+    generation: i64,
+    refs_sha256: &str,
+    journal_sequence: i64,
+    route_epoch: i64,
+    fencing_token: i64,
+    desired: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), Error> {
+    let receipt = PublicationReceipt {
+        version: SIDECAR_VERSION,
+        repository_id: repo_id,
+        operation_id,
+        target_generation: generation,
+        refs_sha256: refs_sha256.to_owned(),
+        journal_sequence,
+        route_epoch,
+        fencing_token,
+        files: desired
+            .iter()
+            .map(|(name, content)| PublishedFile { name: name.clone(), sha256: digest(content) })
+            .collect(),
+    };
+    journal::atomic(&receipt_path(state, operation_id)?, &serde_json::to_vec(&receipt).map_err(Error::internal)?, true)
+        .map_err(Error::internal)
+}
+
+/// Publish a committed operation's staged bundle under the repository exclusive
+/// guard, merging any legitimate new-generation live pins accepted after
+/// cutover. Returns whether the operation was already published or staged.
 pub(crate) async fn finalize(
     state: &AppState,
     repo_id: Uuid,
     operation_id: Uuid,
     generation: i64,
+    expected_route: Option<(i64, i64)>,
     require_staged: bool,
 ) -> Result<bool, Error> {
     let staged = staged_path(state, operation_id)?;
-    if !safe_directory(&staged)? {
-        if require_staged {
-            return Err(conflict("target CI sidecar staging is missing"));
-        }
-        return Ok(false);
+    if !safe_directory(&staged)? || !journal::exists(&staged.join("bundle.json")).map_err(Error::internal)? {
+        return verify_published_receipt(state, repo_id, operation_id, generation, expected_route, require_staged)
+            .await;
     }
-    let manifest_path = staged.join("bundle.json");
-    if !journal::exists(&manifest_path).map_err(Error::internal)? {
-        return Err(conflict("target CI sidecar staging has no bundle"));
+    let bundle: SidecarBundle =
+        serde_json::from_slice(&journal::read(&staged.join("bundle.json")).map_err(Error::internal)?)
+            .map_err(|_| conflict("corrupt staged CI sidecar bundle"))?;
+    let guard = locks::exclusive(state, repo_id).await?;
+    guard.ensure_active()?;
+    let (owner_id, source_generation, object_format, route_epoch, fencing_token, sequence, refs_sha256) =
+        operation_context(state, repo_id, operation_id, generation, expected_route).await?;
+    if bundle.source_generation != source_generation
+        || bundle.target_generation != generation
+        || bundle.journal_sequence != sequence
+    {
+        return Err(conflict("staged CI sidecar differs from the committed operation sequence"));
     }
-    let bundle: SidecarBundle = serde_json::from_slice(&journal::read(&manifest_path).map_err(Error::internal)?)
-        .map_err(|_| conflict("corrupt staged CI sidecar bundle"))?;
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let row = client
-        .query_one(
-            "SELECT owner_id,object_format FROM repositories WHERE id=$1 AND storage_generation=$2",
-            &[&repo_id, &generation],
-        )
-        .await
-        .map_err(|_| conflict("repository generation changed before CI sidecar publication"))?;
-    let owner_id: Uuid = row.get(0);
-    let object_format: String = row.get(1);
     let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
     let manifest = replication::read_manifest_plain(state, &repo_path).await?;
-    validate_bundle(
-        &bundle,
+    bundle_intents(&bundle, repo_id, operation_id, owner_id, &object_format, source_generation)?;
+    let live = scan_live_new_generation(
+        &sidecar_directory(&state.storage.root, repo_id),
         repo_id,
-        operation_id,
         owner_id,
         &object_format,
-        bundle.source_generation,
+        generation,
+        source_generation,
         &manifest,
-        &bundle.refs_sha256,
-        bundle.journal_sequence,
     )?;
-    if bundle.target_generation != generation || bundle.source_generation + 1 != generation {
-        return Err(conflict("staged CI sidecar generation differs from the target"));
-    }
-    let desired = desired_files(&bundle, owner_id, &object_format, generation, &manifest)?;
+    let desired = desired_files(&bundle, repo_id, owner_id, &object_format, &live, &manifest)?;
     faults::hit(
         &state.storage.root,
         "target-sidecar-before-publish",
         serde_json::json!({"repository_id": repo_id, "operation_id": operation_id, "files": desired.len()}),
     );
+    guard.ensure_active()?;
     publish_directory(&state.storage.root, repo_id, &desired)?;
+    guard.ensure_active()?;
+    // Revalidate the exact committed operation and route after publication.
+    operation_context(state, repo_id, operation_id, generation, expected_route).await?;
+    write_receipt(
+        state,
+        repo_id,
+        operation_id,
+        generation,
+        &bundle.refs_sha256,
+        sequence,
+        route_epoch,
+        fencing_token,
+        &desired,
+    )?;
     let _ = fs::remove_dir_all(&staged);
     let _ = fs::remove_file(progress_path(state, operation_id)?);
     Ok(true)
 }
 
-/// Startup recovery: republish a committed cutover whose sidecar finalization
-/// was interrupted, and discard staging for operations that never committed.
+struct OperationState {
+    id: Uuid,
+    repository_id: Uuid,
+    state: String,
+    source_generation: i64,
+    target_node_id: String,
+}
+
+async fn reconcile_operation(state: &AppState, node_id: &str, operation: &OperationState) -> Result<(), Error> {
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let row = client
+        .query_opt(
+            "SELECT p.storage_generation,r.primary_node_id \
+             FROM repositories p LEFT JOIN repository_shard_routes r ON r.repository_id=p.id \
+             WHERE p.id=$1",
+            &[&operation.repository_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    let Some(row) = row else { return Ok(()) };
+    let generation: i64 = row.get(0);
+    let primary: Option<String> = row.get(1);
+    if operation.state == "completed"
+        && operation.target_node_id == node_id
+        && primary.as_deref() == Some(node_id)
+        && generation == operation.source_generation + 1
+    {
+        if let Err(error) = finalize(state, operation.repository_id, operation.id, generation, None, false).await {
+            eprintln!("rootyard: CI sidecar finalization for {} deferred: {}", operation.id, error.1);
+        }
+    }
+    Ok(())
+}
+
+/// Startup recovery: republish every committed cutover whose finalization was
+/// interrupted, retain staged bundles for resumable/verified operations, and
+/// remove only staging proven to belong to an aborted or foreign operation.
 pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
     let Ok(Some(node_id)) = crate::sharding::transport::node_id() else {
         return Ok(());
@@ -663,26 +980,29 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let rows = client
         .query(
-            "SELECT DISTINCT ON (o.repository_id) o.id,o.repository_id,p.storage_generation \
-             FROM shard_replication_operations o \
-             JOIN repository_shard_routes r ON r.repository_id=o.repository_id \
-             JOIN repositories p ON p.id=o.repository_id \
-             WHERE o.target_node_id=$1 AND o.state='completed' \
-               AND r.primary_node_id=$1 AND p.storage_generation=o.source_generation+1 \
-             ORDER BY o.repository_id,o.updated_at DESC LIMIT 32",
+            "SELECT id,repository_id,target_node_id,state,source_generation \
+             FROM shard_replication_operations \
+             WHERE target_node_id=$1 AND state IN ('copying','verified','completed') \
+             ORDER BY updated_at,id",
             &[&node_id],
         )
         .await
         .map_err(Error::internal)?;
-    let mut committed = BTreeSet::new();
-    for row in rows {
-        let operation_id: Uuid = row.get(0);
-        let repository_id: Uuid = row.get(1);
-        let generation: i64 = row.get(2);
-        committed.insert(operation_id);
-        if let Err(error) = finalize(state, repository_id, operation_id, generation, false).await {
-            eprintln!("rootyard: CI sidecar finalization for {} deferred: {}", operation_id, error.1);
-        }
+    let known: BTreeMap<Uuid, OperationState> = rows
+        .into_iter()
+        .map(|row| {
+            let operation = OperationState {
+                id: row.get(0),
+                repository_id: row.get(1),
+                target_node_id: row.get(2),
+                state: row.get(3),
+                source_generation: row.get(4),
+            };
+            (row.get::<_, Uuid>(0), operation)
+        })
+        .collect();
+    for operation in known.values() {
+        reconcile_operation(state, &node_id, operation).await?;
     }
     let staging = replication::staging_root(state)?;
     for entry in fs::read_dir(&staging).map_err(Error::internal)? {
@@ -694,14 +1014,59 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
         let Ok(operation_id) = raw.parse::<Uuid>() else {
             continue;
         };
-        if committed.contains(&operation_id) {
+        if known.contains_key(&operation_id) {
             continue;
         }
-        let kind = entry.file_type().map_err(Error::internal)?;
-        if kind.is_dir() && !kind.is_symlink() {
-            let _ = fs::remove_dir_all(entry.path());
-        } else {
-            let _ = fs::remove_file(entry.path());
+        // Never delete an uninspected directory. Resolve this exact operation
+        // before cleanup; only a proven aborted or foreign target stage goes.
+        let exact = client
+            .query_opt("SELECT target_node_id,state FROM shard_replication_operations WHERE id=$1", &[&operation_id])
+            .await
+            .map_err(Error::internal)?;
+        let remove = match exact {
+            None => true,
+            Some(row) => {
+                let target: String = row.get(0);
+                let state_name: String = row.get(1);
+                target != node_id || state_name == "aborted"
+            }
+        };
+        if remove {
+            let kind = entry.file_type().map_err(Error::internal)?;
+            if kind.is_dir() && !kind.is_symlink() {
+                let _ = fs::remove_dir_all(entry.path());
+            } else {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    // Reconcile interrupted atomic directory publication. A fallback swap may
+    // leave a retired directory; restore it when the live name is absent.
+    let base = state.storage.root.join("ci-pins");
+    if safe_directory(&base)? {
+        for entry in fs::read_dir(&base).map_err(Error::internal)? {
+            let entry = entry.map_err(Error::internal)?;
+            let name = entry.file_name().into_string().map_err(|_| conflict("non UTF-8 CI sidecar filename"))?;
+            let kind = entry.file_type().map_err(Error::internal)?;
+            if !kind.is_dir() || kind.is_symlink() {
+                continue;
+            }
+            if name.contains(".stage-") {
+                let _ = fs::remove_dir_all(entry.path());
+                continue;
+            }
+            if let Some(raw) =
+                name.strip_prefix('.').and_then(|value| value.split_once(".retired-").map(|(repo, _)| repo))
+            {
+                let Ok(repo_id) = raw.parse::<Uuid>() else { continue };
+                let live = base.join(repo_id.to_string());
+                if safe_directory(&live)? {
+                    let _ = fs::remove_dir_all(entry.path());
+                } else {
+                    fs::rename(entry.path(), &live).map_err(Error::internal)?;
+                    sync_directory(&base)?;
+                }
+            }
         }
     }
     Ok(())
