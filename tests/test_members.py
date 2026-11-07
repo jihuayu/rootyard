@@ -138,8 +138,13 @@ class MembersTrackBContractTest(unittest.TestCase):
         ):
             self.assertIn(sig, auth_src)
 
-        self.assertIn("Role::Triage", forge_src)
-        self.assertIn("Role::Read", forge_src)
+        for module in ("handlers", "comments"):
+            self.assertIn(f'#[path = "forge/{module}.rs"]', forge_src)
+            self.assertIn(f"mod {module};", forge_src)
+            self.assertIn(f"{module}::", forge_src)
+            implementation = (ROOT / f"src/forge/{module}.rs").read_text(encoding="utf-8")
+            self.assertIn("Role::Triage", implementation)
+            self.assertIn("Role::Read", implementation)
         self.assertIn("resolve_effective_role", rbac_src)
         self.assertIn("check_review_permission", rbac_src)
         self.assertIn("is_self_approval_disallowed", pulls_rules)

@@ -140,8 +140,12 @@ class PullsTrack1ContractTest(unittest.TestCase):
 
         for required_merge_token in (
             "git_slots",
-            "write_lock(",
-            "reliability::before_push(",
+            "storage::ref_publication::acquire(",
+            "publication.enter_window(",
+            "storage::admission::acquire(",
+            "publication.ensure_active()?",
+            "reliability::before_gitfs_push(",
+            "auth::verify_token(&tx, &actor, true)",
             "core.hooksPath=/dev/null",
             "update-ref",
             "--no-deref",
