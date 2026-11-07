@@ -52,9 +52,10 @@ transaction. That preserves the historical revision/event contract: an API
 write is never reported as an external capture, a later native edit still is,
 and a failed baseline cannot silently adopt native changes. It is the remaining
 per-request full-tree read on a locked row; removing it is follow-up work, not
-part of this change. Checkpoint capture copies the tree on the same bounded
-worker and revalidates revision, lease epoch and host under the row lock
-afterwards, so the copy itself holds no database lock.
+part of this change. Checkpoint capture still performs its existing full working-tree
+copy; that copy is not covered by the bounded background-scan worker and must
+not be treated as a short-lock or off-thread operation. Explicit API fingerprint
+hashing and checkpoint copy remain existing costs pending a separate safe design.
 
 Workspace repository inspection and mutation commands run through one bounded
 native Git wrapper that reuses the GitFS collector: stdout is capped per call

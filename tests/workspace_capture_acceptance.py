@@ -10,18 +10,36 @@ uses real workspaces, real Git clones and real filesystem inventories:
   lease-epoch change during that scan is never overwritten by the stale result.
 """
 import argparse
+from collections import Counter
+import hashlib
 import json
 import os
+from pathlib import Path
+import sys
 import threading
 import time
 import unittest
 import urllib.request
 
-from tests.e2e import Harness
+TESTS_DIR = Path(__file__).resolve().parent
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+
+from e2e import Harness
 
 BULK_COUNT = 90000
 BULK_SIZE = 1024
 SCAN_IO_DELTA = 5_000_000
+
+_TEST_BINARY = None
+_TEST_KEEP = False
+
+
+def harness():
+    """Build a Harness for the binary selected on the command line."""
+    if not _TEST_BINARY:
+        raise RuntimeError("workspace capture tests must run through main() with --binary")
+    return Harness(argparse.Namespace(binary=_TEST_BINARY, keep=_TEST_KEEP))
 
 
 def create(h, index):
@@ -95,9 +113,121 @@ def row_lock_nowait(h, workspace):
     )
 
 
+class TimedTextTestResult(unittest.TextTestResult):
+    """TextTestResult that also records how long each test ran."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.seconds = {}
+        self._started = {}
+
+    def startTest(self, test):
+        self._started[test.id()] = time.monotonic()
+        super().startTest(test)
+
+    def stopTest(self, test):
+        super().stopTest(test)
+        started = self._started.pop(test.id(), None)
+        if started is not None:
+            self.seconds[test.id()] = round(time.monotonic() - started, 4)
+
+
+def flatten(suite):
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            yield from flatten(test)
+        else:
+            yield test
+
+
+def selected_suite(loader, names, module):
+    if not names:
+        return loader.loadTestsFromTestCase(WorkspaceCaptureAcceptance)
+    suite = unittest.TestSuite()
+    for name in names:
+        short = name
+        if short.startswith(module.__name__ + "."):
+            short = short[len(module.__name__) + 1:]
+        if short == WorkspaceCaptureAcceptance.__name__ or short.startswith(
+            WorkspaceCaptureAcceptance.__name__ + "."
+        ):
+            suite.addTests(loader.loadTestsFromName(short, module))
+        elif short.startswith("test_"):
+            suite.addTests(
+                loader.loadTestsFromName(f"{WorkspaceCaptureAcceptance.__name__}.{short}", module)
+            )
+        else:
+            suite.addTests(loader.loadTestsFromName(name))
+    return suite
+
+
+def result_entries(result, suite):
+    failures = {test.id(): detail for test, detail in result.failures}
+    errors = {test.id(): detail for test, detail in result.errors}
+    skipped = {test.id(): reason for test, reason in result.skipped}
+    expected = {test.id(): detail for test, detail in result.expectedFailures}
+    unexpected = {test.id(): detail for test, detail in result.unexpectedSuccesses}
+    entries = []
+    for test in flatten(suite):
+        test_id = test.id()
+        if test_id in failures:
+            status, detail = "failure", failures[test_id]
+        elif test_id in errors:
+            status, detail = "error", errors[test_id]
+        elif test_id in skipped:
+            status, detail = "skipped", skipped[test_id]
+        elif test_id in expected:
+            status, detail = "expected_failure", expected[test_id]
+        elif test_id in unexpected:
+            status, detail = "unexpected_success", unexpected[test_id]
+        else:
+            status, detail = "success", None
+        entry = {
+            "name": test_id,
+            "status": status,
+            "seconds": result.seconds.get(test_id),
+        }
+        if detail is not None:
+            entry["detail"] = detail
+        entries.append(entry)
+    return entries
+
+
+def build_report(result, suite, binary, binary_sha256):
+    entries = result_entries(result, suite) if result is not None else []
+    counts = Counter(entry["status"] for entry in entries)
+    total_scheduled = suite.countTestCases()
+    passed = (
+        result is not None
+        and result.wasSuccessful()
+        and result.testsRun == total_scheduled
+        and counts["skipped"] == 0
+    )
+    return {
+        "passed": passed,
+        "binary": str(binary),
+        "binary_sha256": binary_sha256,
+        "tests": entries,
+        "summary": {
+            "total_scheduled": total_scheduled,
+            "tests_run": result.testsRun if result is not None else 0,
+            "success": counts["success"],
+            "failure": counts["failure"],
+            "error": counts["error"],
+            "skipped": counts["skipped"],
+            "expected_failure": counts["expected_failure"],
+            "unexpected_success": counts["unexpected_success"],
+        },
+        "limitations": [
+            "The large-inventory cases create 90000 small files and can take minutes on slow disks.",
+            "Loopback functional timings are not a scalability benchmark.",
+        ],
+    }
+
+
 class WorkspaceCaptureAcceptance(unittest.TestCase):
     def test_capture_reaches_ids_beyond_fixed_prefix(self):
-        h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        h = harness()
         h.env.update(
             ROOTYARD_WORKSPACE_SCAN_WORKERS="2",
             ROOTYARD_WORKSPACE_SCAN_QUEUE="8",
@@ -127,7 +257,7 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             h.cleanup()
 
     def test_api_write_baseline_does_not_emit_spurious_capture(self):
-        h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        h = harness()
         try:
             h.setup()
             h.api()
@@ -163,7 +293,7 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             h.cleanup()
 
     def test_large_inventory_keeps_single_tokio_worker_responsive(self):
-        h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        h = harness()
         h.env.update(
             TOKIO_WORKER_THREADS="1",
             ROOTYARD_WORKSPACE_SCAN_WORKERS="1",
@@ -209,7 +339,7 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             h.cleanup()
 
     def test_scan_does_not_hold_row_lock_and_rejects_stale_revision(self):
-        h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        h = harness()
         h.env.update(
             ROOTYARD_WORKSPACE_SCAN_WORKERS="2",
             ROOTYARD_WORKSPACE_SCAN_TIMEOUT_MS="60000",
@@ -253,7 +383,7 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             h.cleanup()
 
     def test_scan_revalidates_lease_epoch_before_committing(self):
-        h = Harness(argparse.Namespace(binary="target/debug/rootyard", keep=False))
+        h = harness()
         h.env.update(
             ROOTYARD_WORKSPACE_SCAN_WORKERS="2",
             ROOTYARD_WORKSPACE_SCAN_TIMEOUT_MS="60000",
@@ -285,7 +415,65 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             h.cleanup()
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--binary",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="native rootyard binary to exercise (resolved to an absolute path)",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        metavar="PATH",
+        help="optional JSON path for per-test results and the binary SHA-256",
+    )
+    parser.add_argument("--keep", action="store_true", help="keep disposable test directories")
+    parser.add_argument("-v", "--verbose", action="store_true", help="verbose unittest output")
+    parser.add_argument(
+        "tests",
+        nargs="*",
+        metavar="TEST",
+        help="optional unittest names, e.g. WorkspaceCaptureAcceptance.test_scan_revalidates_lease_epoch_before_committing",
+    )
+    args = parser.parse_args(argv)
+
+    binary = args.binary.resolve()
+    if not binary.is_absolute():
+        parser.error(f"--binary did not resolve to an absolute path: {binary}")
+    if not binary.is_file():
+        parser.error(f"--binary does not exist or is not a file: {binary}")
+    if not os.access(binary, os.X_OK):
+        parser.error(f"--binary is not executable: {binary}")
     if not os.environ.get("ROOTYARD_TEST_DATABASE_URL"):
-        raise SystemExit("ROOTYARD_TEST_DATABASE_URL is required; use a dedicated test database")
-    unittest.main()
+        parser.error("ROOTYARD_TEST_DATABASE_URL is required; use a dedicated test database")
+
+    global _TEST_BINARY, _TEST_KEEP
+    _TEST_BINARY, _TEST_KEEP = str(binary), args.keep
+
+    binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+    loader = unittest.TestLoader()
+    suite = selected_suite(loader, args.tests, sys.modules[__name__])
+    if suite.countTestCases() == 0:
+        parser.error("no tests selected")
+
+    result = None
+    try:
+        runner = unittest.TextTestRunner(
+            verbosity=2 if args.verbose else 1,
+            resultclass=TimedTextTestResult,
+        )
+        result = runner.run(suite)
+    finally:
+        report = build_report(result, suite, binary, binary_sha256)
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report, indent=2))
+    return 0 if report["passed"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

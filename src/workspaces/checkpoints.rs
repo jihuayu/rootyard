@@ -20,12 +20,6 @@ fn copy_snapshot(source: &FsPath, dest: &FsPath) -> Result<(), Error> {
     core::copy_all(source, dest).map_err(Error::internal)?;
     core::sync_tree(dest).map_err(Error::internal)
 }
-/// A checkpoint copy is user initiated and previously unbounded; keep it well
-/// above the reconciliation scan budget so large repositories still work while
-/// the shared bounded worker keeps a hard ceiling on a stuck copy.
-fn copy_timeout() -> std::time::Duration {
-    super::scan::timeout().max(std::time::Duration::from_secs(300))
-}
 fn valid_agent(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
@@ -42,8 +36,6 @@ pub async fn create(
     let key = auth::idempotency_key(&headers)?.ok_or_else(Error::bad_request)?.to_owned();
     let hash =
         hex::encode(Sha256::digest(format!("checkpoint:{}:{}", input.expected_workspace_revision, input.lease_epoch)));
-    // Preflight reads the row and idempotency record but releases the lock
-    // before the bounded, frozen copy. No full-tree work runs under a row lock.
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let ws = service::locked(&tx, &actor, id, Role::Write).await?;
@@ -74,92 +66,21 @@ pub async fn create(
     if !lease_ok || ws.revision != input.expected_workspace_revision {
         return Err(service::conflict());
     }
-    let repository_id = ws.repository_id;
-    tx.commit().await.map_err(Error::internal)?;
     let cp = Uuid::new_v4();
     let source = service::workspace_repo(&state, id);
     let dest = service::checkpoint_repo(&state, cp);
-    let copy_dest = dest.clone();
     // Check the native index and worktree around the immutable copy. A changed
-    // source is rejected; external editors are fenced by the FUSE mutation gate
-    // when enabled and by the double fingerprint in direct mode.
-    let retry_until = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let snapshot = loop {
-        let scan_source = source.clone();
-        let scan_dest = copy_dest.clone();
-        let attempt = super::scan::frozen(id, copy_timeout(), move || {
-            let before = super::capture::fingerprint(&scan_source)?;
-            let before_index = fs::read(scan_source.join(".git/index")).unwrap_or_default();
-            // The worker owns the destination until its closure returns, so it
-            // also removes a partial copy when the copy itself fails. A caller
-            // timeout never touches the directory: the worker is still writing.
-            let copied = copy_snapshot(&scan_source, &scan_dest).and_then(|()| {
-                let captured = super::capture::fingerprint(&scan_dest)?;
-                let after = super::capture::fingerprint(&scan_source)?;
-                let after_index = fs::read(scan_source.join(".git/index")).unwrap_or_default();
-                Ok((captured, after, after_index))
-            });
-            let (captured, after, after_index) = match copied {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = fs::remove_dir_all(&scan_dest);
-                    return Err(error);
-                }
-            };
-            Ok((before, before_index, captured, after, after_index))
-        })
-        .await;
-        match attempt {
-            Err(super::scan::ScanFailure::Busy) if tokio::time::Instant::now() < retry_until => {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            result => break result,
-        }
-    };
-    let (before, before_index, captured, after, after_index) = match snapshot {
-        Ok(value) => value,
-        Err(super::scan::ScanFailure::Failed(error)) => return Err(error),
-        Err(_) => return Err(service::conflict()),
-    };
+    // source is rejected; external editors are not fenced by this DB lock.
+    let (before, before_index, captured, after, after_index) = super::mounts::with_frozen(id, || {
+        let before = super::capture::fingerprint(&source)?;
+        let before_index = fs::read(source.join(".git/index")).unwrap_or_default();
+        copy_snapshot(&source, &dest)?;
+        let captured = super::capture::fingerprint(&dest)?;
+        let after = super::capture::fingerprint(&source)?;
+        let after_index = fs::read(source.join(".git/index")).unwrap_or_default();
+        Ok((before, before_index, captured, after, after_index))
+    })?;
     if before != after || before != captured || before_index != after_index {
-        let _ = fs::remove_dir_all(&dest);
-        return Err(service::conflict());
-    }
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = service::locked(&tx, &actor, id, Role::Write).await?;
-    if ws.repository_id != repository_id {
-        let _ = fs::remove_dir_all(&dest);
-        return Err(Error::not_found());
-    }
-    if let Some(row) = tx
-        .query_opt(
-            "SELECT request_sha256,state,result FROM workspace_operations WHERE workspace_id=$1 AND idempotency_key=$2",
-            &[&id, &key],
-        )
-        .await
-        .map_err(Error::internal)?
-    {
-        if row.get::<_, String>(0) != hash {
-            let _ = fs::remove_dir_all(&dest);
-            return Err(service::conflict());
-        }
-        if row.get::<_, String>(1) == "committed" {
-            let _ = fs::remove_dir_all(&dest);
-            return Ok((StatusCode::OK, Json(row.get(2))));
-        }
-        let _ = fs::remove_dir_all(&dest);
-        return Err(service::conflict());
-    }
-    let lease_ok: bool = tx
-        .query_one(
-            "SELECT host_id=$2 AND lease_epoch=$3 AND lease_until>clock_timestamp() FROM workspaces WHERE id=$1",
-            &[&id, &state.storage.volume_id, &input.lease_epoch],
-        )
-        .await
-        .map_err(Error::internal)?
-        .get(0);
-    if !lease_ok || ws.revision != input.expected_workspace_revision {
         let _ = fs::remove_dir_all(&dest);
         return Err(service::conflict());
     }
@@ -171,18 +92,7 @@ pub async fn create(
         .map_err(Error::internal)?
         .and_then(|row| row.get(0));
     tx.execute("INSERT INTO workspace_checkpoints(id,workspace_id,repository_id,captured_revision,lease_epoch,state,excluded_summary,base_oid) VALUES($1,$2,$3,$4,$5,'local_complete',$6,$7)", &[&cp,&id,&ws.repository_id,&ws.revision,&ws.lease_epoch,&json!({"native_entries":"included"}),&base_oid]).await.map_err(Error::internal)?;
-    let updated = tx
-        .execute(
-            "UPDATE workspaces SET revision=$2,last_checkpoint_id=$3,lease_until=clock_timestamp()+interval '5 minutes' \
-             WHERE id=$1 AND revision=$4 AND lease_epoch=$5 AND host_id=$6",
-            &[&id, &revision, &cp, &ws.revision, &input.lease_epoch, &state.storage.volume_id],
-        )
-        .await
-        .map_err(Error::internal)?;
-    if updated != 1 {
-        let _ = fs::remove_dir_all(&dest);
-        return Err(service::conflict());
-    }
+    tx.execute("UPDATE workspaces SET revision=$2,last_checkpoint_id=$3,lease_until=clock_timestamp()+interval '5 minutes' WHERE id=$1", &[&id,&revision,&cp]).await.map_err(Error::internal)?;
     tx.execute(
         "INSERT INTO workspace_events(workspace_id,revision,kind,payload) VALUES($1,$2,'checkpoint',$3)",
         &[&id, &revision, &result],
