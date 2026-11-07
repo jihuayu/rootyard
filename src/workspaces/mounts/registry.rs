@@ -90,7 +90,7 @@ pub(crate) enum Admission<C, I> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PromoteConflict;
 
-impl<C: Clone, I> Registry<C, I> {
+impl<C, I> Registry<C, I> {
     pub(crate) fn new() -> Self {
         Self::default()
     }
