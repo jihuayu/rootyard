@@ -52,6 +52,23 @@ and run the service supervisor in a leaf below it (or in a sibling owned by the
 same service), because a non-root cgroup may not both contain processes and
 delegate controllers to children.
 
+Delegation can be unprivileged and that is the tested shape in
+`scripts/native_kernel_cgroup_setup.sh`: root creates only
+`/sys/fs/cgroup/rootyard-native-<run-id>`, enables `cpu`, `memory` and `pids`
+for it, and `chown`s just the run root, its `cgroup.procs`,
+`cgroup.subtree_control` and the `supervisor` leaf (plus that leaf's
+`cgroup.procs`) to the ordinary runner UID/GID. The supervisor and the service
+then run as that ordinary account, create their own job cgroups and move
+themselves into the supervisor leaf; nothing above the run root is handed over
+and no step runs the service as root. `supervisor <run-id> -- <command>` writes
+its own `$$` into the leaf, proves the `/proc/self/cgroup` path equals the leaf,
+checks that the run root still has no internal processes, and then `exec`s the
+command in that same process, so the service and every sandbox job inherit the
+leaf. A helper that moves a short-lived child and returns leaves the real test
+process outside the cgroup; the native acceptance preflight rejects that (see
+below). `cgroup.procs` is a pseudo file with `st_size` 0, so every emptiness
+check reads the file content instead of using a size test.
+
 Defaults (all overridable for an operator's deployment):
 
 | Variable | Default | Meaning |
@@ -112,9 +129,14 @@ artifact walkers. It is **not** an aggregate production protection boundary
 (for example it cannot account all descendants' memory or enforce a kernel
 process limit), so it must not be used for untrusted production jobs.
 `tests/test_sandbox_cgroup_native.py` is the opt-in native acceptance for the
-production cgroup mode. It exits `3` with a preflight diagnosis when no
-delegated cgroup subtree is available; that is an unexecuted acceptance, never
-a pass.
+production cgroup mode. It must be started through
+`scripts/native_kernel_cgroup_setup.sh supervisor <run-id> -- python3
+tests/test_sandbox_cgroup_native.py`, and its preflight fails when the test
+process itself is not charged to the delegated run root. It exits `3` with a
+preflight diagnosis only when the delegated subtree or the bounded tmpfs pool
+is unavailable; that is an unexecuted acceptance, never a pass. Exit `1` is a
+real failure, including a broken/unpinned `ROOTYARD_BINARY` or a native
+assertion that failed.
 
 ## Lifecycle and recovery
 
@@ -158,41 +180,96 @@ directory or simulate success.
 
 `.github/workflows/native-kernel-acceptance.yml` is a manual
 `workflow_dispatch` job, intentionally separate from ordinary push/pull_request
-CI. It has no dispatch inputs, runs on a GitHub-hosted Ubuntu 24.04 VM with
-`permissions: contents: read` and `persist-credentials: false`, uses no
-repository secrets or provider API keys, and has a bounded job timeout. It
-builds the real checked-out source with `cargo build --locked --bin rootyard`
-and a disposable PostgreSQL 17 service container. Every native test script
-receives its own freshly created database (`rootyard_sandbox_service_<run>` and
-`rootyard_native_cgroup_<run_attempt>`); schemas are not shared between scripts.
+CI. It has no dispatch inputs, runs with `permissions: contents: read` and
+`persist-credentials: false`, uses no repository secrets or provider API keys,
+and has a bounded job timeout. Ordinary CI is unchanged: this workflow only
+runs when an operator dispatches it.
 
-`scripts/native_kernel_cgroup_setup.sh` provisions only
-`/sys/fs/cgroup/rootyard-native-<run-id>`: it enables `cpu`, `memory` and
-`pids` for that run root, creates an empty `supervisor` leaf, and moves the test
-supervisor into that leaf before the service starts. Sandbox job cgroups are
-the run root's other children, so internal-process constraints are satisfied.
-The artifact export pool is a unique 64 MiB tmpfs mounted at
-`$RUNNER_TEMP/rootyard-native-pool-<run-id>`; the test reads
-`ROOTYARD_TEST_TMPFS_ROOT` instead of hard-coding `/dev/shm`. The workflow
-measures the mount's real `statvfs` capacity and passes it as
-`ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES`; that value is an acceptance threshold
-for the mounted capacity, **not** a claim that a configured byte cap is the
-physical tmpfs bound. Cleanup removes only the run-specific cgroup subtree,
-that mount, its files and the two disposable databases; it never kills or
-removes the parent runner cgroup.
+- Runner image: `ubuntu-22.04`. Ubuntu 24.04 confines unprivileged user
+  namespaces with AppArmor, which makes Bubblewrap fail on a stock runner and
+  would produce a false BLOCKED. The supported targets are therefore the 22.04
+  hosted VM or a dedicated ephemeral VM prepared for rootless `bwrap`; AppArmor
+  is never weakened on the current managed cloud host, and that host is never
+  modified by this repository.
+- Toolchain: `bubblewrap`, `gcc`, `libc6-dev`, `git`, `python3`, `util-linux`
+  plus `postgresql-client-17` installed from the official signed PGDG
+  repository (`apt.postgresql.org`, key
+  `/etc/apt/keyrings/postgresql.gpg`, suite `${VERSION_CODENAME}-pgdg`). The
+  service is `postgres:17`, so the distributed clients (14/16) are not enough:
+  the dev-roundtrip `pg_dump` must match the server major version.
+  `/usr/lib/postgresql/17/bin` is put first on `PATH` with `GITHUB_PATH`; the
+  acceptance runs as the ordinary runner account with no `sudo`/`runuser`
+  wrapper, so that `PATH` reaches the test and its service unchanged, and the
+  build step asserts `pg_dump --version` is 17.
+- Source equivalence: the checkout step uses `persist-credentials: false`, the
+  build step requires `git rev-parse HEAD == GITHUB_SHA` with a clean tree,
+  builds with `cargo build --locked --bin rootyard`, and the receipt records
+  both `source_commit` and `binary_sha256` (also written to
+  `binary.sha256`). The receipt therefore pins which source was compiled and
+  which binary ran; it never claims that a different commit produced an older
+  hash. This fix commit changes only workflow/test/script/docs files, so `src/`
+  and `Cargo.*` stay byte-identical to the qualified 4c28c39 tree and the
+  reported binary hash is directly comparable with the preserved 4c28c39
+  artifacts.
+- Setup (root, bounded): `scripts/native_kernel_cgroup_setup.sh setup
+  "$GITHUB_RUN_ID" "$(id -u)" "$(id -g)"` provisions only
+  `/sys/fs/cgroup/rootyard-native-<run-id>` and delegates it to the runner
+  account. A unique 64 MiB tmpfs (`size=64m,mode=0700,nodev,nosuid,noexec`) is
+  mounted at `$RUNNER_TEMP/rootyard-native-pool-<run-id>`; the mount is
+  root-owned `0700` by option, so the workflow `chown`s that one bounded mount
+  path to the runner UID/GID and asserts owner and mode. The workflow then reads
+  the real capacity with `statvfs` and exports it as
+  `ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES`; that number is an acceptance
+  threshold for the mounted capacity (asserted `> 0` and `<= 64 MiB`), not a
+  logical quota pretending to be the physical bound. The test re-measures the
+  mount, records `pool_capacity_bytes_measured` and configures the service with
+  the measured value.
+- Test execution (unprivileged): `scripts/native_kernel_cgroup_setup.sh
+  supervisor "$GITHUB_RUN_ID" -- python3 tests/test_sandbox_cgroup_native.py
+  --receipt "$RECEIPT"` runs as the ordinary runner account. The supervisor
+  writes its own PID into the leaf, proves `/proc/self/cgroup` membership and
+  `exec`s the test, so the service, Bubblewrap and every sandbox job are charged
+  to the delegated subtree while the run root stays empty. The earlier
+  dev-mode regression step was removed from this VM lane because the dev
+  profile is already qualified locally; the native lane must execute the
+  production `cgroup` profile, and the receipt validation rejects a passing
+  receipt whose `profile` is not `cgroup` or whose actual `runner.uid` is 0.
+- Database: one fresh database per dispatch
+  (`rootyard_native_cgroup_<run_id>_<run_attempt>`), created and dropped with
+  the PostgreSQL 17 client. Schemas are not shared with any other script.
+- Failure classification: a setup/preflight that cannot be provided (no
+  delegated cgroup v2 subtree, no writable parent `subtree_control`, no
+  bounded tmpfs, or a test process that is outside the delegated subtree)
+  produces a `blocked` receipt and exit `3`. A successful setup followed by a
+  native assertion process that fails or writes no receipt is `failed` (exit
+  `1`), never `blocked`. The workflow writes a sanitized fallback receipt for
+  the no-receipt case, validates schema, commit, test-file hash, binary hash and
+  runner identity, and the `if-no-files-found: error` upload plus the final
+  enforce step fail the job for a missing receipt and for every status other
+  than `passed`.
 
 The native script writes a sanitized receipt to
-`${RUNNER_TEMP}/native-kernel/receipt.json` (uploaded as the
-`native-kernel-cgroup-receipt-<run-id>` artifact). It exits `0` only after all
-required real-kernel assertions executed and passed with profile `cgroup`: live
-controls and attachment, cancellation and timeout reclamation, memory OOM,
-`pids.max`, aggregate CPU quota, workspace `ENOSPC`, bounded artifact export,
-cross-job build isolation and credential absence, logs/artifact authorization,
-artifact/cgroup reclamation, service-crash descendant teardown and stale-cgroup
-reaping, and a fenced retry executed as a new attempt. Exit `3` means BLOCKED
-(no usable delegated cgroup v2 subtree) and is never a pass; a setup failure
-still uploads a BLOCKED receipt and then fails the workflow. On the current
-managed development host there is no delegated cgroup v2 subtree (rootless
-Docker cgroup driver `none`, cgroupfs writes denied), so positive local
-acceptance remains BLOCKED until the coordinator dispatches this workflow on
-the supported VM.
+`${RUNNER_TEMP}/native-kernel/receipt.json` and a copy to
+`${RUNNER_TEMP}/native-kernel/evidence/` (outside the checkout). The uploaded
+`native-kernel-cgroup-receipt-<run-id>` artifact contains the receipt, the
+binary hash and the evidence directory. A pass requires every executed
+assertion, collected from real kernel observations: supervisor cgroup
+membership and live controls, cancellation and timeout reclamation, memory OOM,
+`pids.max`, aggregate CPU quota, workspace `ENOSPC`, the measured bounded
+artifact pool, cross-job build isolation and credential absence, logs/artifact
+authorization, artifact/cgroup reclamation, service-crash descendant teardown
+and stale-cgroup reaping, two real production CI checkouts that compile inside
+their own cgroups, and a fenced retry executed as a new attempt.
+
+Reclaim removes only the run-specific cgroup subtree (its own `cgroup.kill`
+scoped to that subtree), that tmpfs mount, its files and the disposable
+database; it never kills or removes the parent runner cgroup. The parent runner
+cgroup is never written by `setup` beyond `rootyard-native-<run-id>` creation
+and the root `cgroup.subtree_control` enable that cgroup v2 requires.
+
+On the current managed development host there is no delegated cgroup v2
+subtree (rootless Docker cgroup driver `none`, cgroupfs writes denied), so
+positive local acceptance remains BLOCKED until the coordinator dispatches this
+workflow on the supported VM. Local verification of this change is limited to
+shell syntax, YAML parsing, Python byte-compilation and the existing target
+Rust unit tests; it is not a substitute for the hosted run.

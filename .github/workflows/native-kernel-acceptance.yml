@@ -16,7 +16,13 @@ concurrency:
 jobs:
   native-kernel-cgroup:
     name: Delegated cgroup v2 native acceptance
-    runs-on: ubuntu-24.04
+    # Ubuntu 24.04 confines unprivileged user namespaces with AppArmor, so
+    # Bubblewrap cannot create the sandbox on a stock runner image and this
+    # acceptance would report a false BLOCKED. Ubuntu 22.04 keeps rootless
+    # bwrap usable without disabling LSM policy on the managed cloud host; the
+    # only other supported target is a dedicated ephemeral VM that is set up
+    # for rootless bwrap. Never weaken AppArmor on the current cloud host.
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     services:
       postgres:
@@ -34,14 +40,15 @@ jobs:
     env:
       RECEIPT_DIR: ${{ runner.temp }}/native-kernel
       RECEIPT: ${{ runner.temp }}/native-kernel/receipt.json
+      EVIDENCE_DIR: ${{ runner.temp }}/native-kernel/evidence
       ROOTYARD_TEST_CGROUP_ROOT: /sys/fs/cgroup/rootyard-native-${{ github.run_id }}
       ROOTYARD_TEST_TMPFS_ROOT: ${{ runner.temp }}/rootyard-native-pool-${{ github.run_id }}
       ROOTYARD_SANDBOX_MODE: cgroup
       ROOTYARD_SOURCE_COMMIT: ${{ github.sha }}
+      ROOTYARD_BINARY: ${{ github.workspace }}/target/debug/rootyard
       PYTHONPATH: ${{ github.workspace }}
       TMPDIR: /tmp
       PG_URL_BASE: postgresql://rootyard@127.0.0.1:5432
-      SERVICE_DB: rootyard_sandbox_service_${{ github.run_id }}_${{ github.run_attempt }}
       NATIVE_DB: rootyard_native_cgroup_${{ github.run_id }}_${{ github.run_attempt }}
     steps:
       - name: Checkout without persisted credentials
@@ -49,24 +56,48 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install native sandbox toolchain
+      - name: Install native sandbox toolchain and PostgreSQL 17 clients
         timeout-minutes: 8
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bubblewrap gcc libc6-dev git python3 postgresql-client util-linux
+            bubblewrap ca-certificates curl gcc git gnupg libc6-dev python3 util-linux
+          # The service is postgres:17. psql/createdb from an older client can
+          # connect, but pg_dump must match the server major version for a real
+          # roundtrip, and Ubuntu 22.04 only ships 14/16. Install 17 from the
+          # signed official PGDG repository.
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          # Put the 17 clients first on PATH for every later step. The native
+          # test runs as the ordinary runner account (no sudo/runuser), so this
+          # PATH is handed to the test and its service unchanged.
+          echo "/usr/lib/postgresql/17/bin" >>"$GITHUB_PATH"
           bwrap --version
           gcc --version | head -1
-          psql --version
-          rustc --version
-          cargo --version
 
-      - name: Build actual production binary from locked source
+      - name: Build actual production binary from the dispatched commit
         timeout-minutes: 20
         run: |
+          mkdir -p "$RECEIPT_DIR" "$EVIDENCE_DIR"
+          command -v pg_dump
+          pg_dump --version
+          pg_dump --version | grep -Eq '^pg_dump \(PostgreSQL\) 17\.'
+          psql --version
+          # Source equivalence is proved by commit and hashes: the checked-out
+          # HEAD is the dispatched commit, the tree is clean, and the receipt
+          # records both source_commit and the binary sha256 that was built.
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
           cargo build --locked --bin rootyard
-          test -x target/debug/rootyard
-          test "$(target/debug/rootyard --rootyard-hook-self-check)" = rootyard-hook-v1
+          test -x "$ROOTYARD_BINARY"
+          test "$("$ROOTYARD_BINARY" --rootyard-hook-self-check)" = rootyard-hook-v1
+          sha256sum "$ROOTYARD_BINARY" | tee "$RECEIPT_DIR/binary.sha256"
 
       - name: Run production cgroup validator unit tests
         timeout-minutes: 10
@@ -77,50 +108,52 @@ jobs:
         continue-on-error: true
         timeout-minutes: 3
         run: |
-          mkdir -p "$RECEIPT_DIR"
-          sudo scripts/native_kernel_cgroup_setup.sh setup "$GITHUB_RUN_ID"
+          runner_uid=$(id -u)
+          runner_gid=$(id -g)
+          # Root provisions only this run-specific subtree and hands the run
+          # root plus its supervisor leaf to the ordinary runner account.
+          sudo scripts/native_kernel_cgroup_setup.sh setup "$GITHUB_RUN_ID" "$runner_uid" "$runner_gid"
           sudo mkdir -p "$ROOTYARD_TEST_TMPFS_ROOT"
           sudo mount -t tmpfs -o size=64m,mode=0700,nodev,nosuid,noexec tmpfs "$ROOTYARD_TEST_TMPFS_ROOT"
-          capacity=$(sudo python3 -c 'import os,sys; s=os.statvfs(sys.argv[1]); print(s.f_blocks*s.f_frsize)' "$ROOTYARD_TEST_TMPFS_ROOT")
+          # The mount is root-owned 0700 by option; give the bounded 64 MiB
+          # mount path (and nothing else) to the ordinary runner account so the
+          # service owns and validates its own export pool.
+          sudo chown "$runner_uid:$runner_gid" "$ROOTYARD_TEST_TMPFS_ROOT"
+          test "$(stat -c %u "$ROOTYARD_TEST_TMPFS_ROOT")" = "$runner_uid"
+          test "$(stat -c %a "$ROOTYARD_TEST_TMPFS_ROOT")" = "700"
+          capacity=$(python3 -c 'import os,sys; s=os.statvfs(sys.argv[1]); print(s.f_blocks*s.f_frsize)' "$ROOTYARD_TEST_TMPFS_ROOT")
+          # Acceptance threshold on the real mounted capacity, read from the
+          # kernel: never a configured logical byte cap pretending to be the
+          # physical tmpfs bound.
           test "$capacity" -gt 0
+          test "$capacity" -le 67108864
           echo "ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES=$capacity" >>"$GITHUB_ENV"
+          echo "measured artifact tmpfs capacity: $capacity bytes"
 
-      - name: Create one disposable database per native test script
+      - name: Create the disposable native database
         if: steps.native_setup.outcome == 'success'
         timeout-minutes: 2
-        run: |
-          createdb -h 127.0.0.1 -p 5432 -U rootyard "$SERVICE_DB"
-          createdb -h 127.0.0.1 -p 5432 -U rootyard "$NATIVE_DB"
+        run: createdb -h 127.0.0.1 -p 5432 -U rootyard "$NATIVE_DB"
 
-      - name: Exercise dev-mode sandbox lifecycle regression
-        if: steps.native_setup.outcome == 'success'
-        timeout-minutes: 15
-        run: |
-          PYTHONPATH="$PWD" \
-          ROOTYARD_BINARY="$PWD/target/debug/rootyard" \
-          ROOTYARD_TEST_DATABASE_URL="$PG_URL_BASE/$SERVICE_DB" \
-          python3 tests/test_sandbox_service.py
-
-      - name: Run native cgroup acceptance in a supervisor leaf
+      - name: Run native cgroup acceptance in the delegated supervisor leaf
         id: native_test
         if: steps.native_setup.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 20
+        env:
+          ROOTYARD_TEST_DATABASE_URL: ${{ env.PG_URL_BASE }}/${{ env.NATIVE_DB }}
+          ROOTYARD_NATIVE_RECEIPT: ${{ env.RECEIPT }}
+          ROOTYARD_EVIDENCE_DIR: ${{ env.EVIDENCE_DIR }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          sudo -E env \
-            ROOTYARD_BINARY="$PWD/target/debug/rootyard" \
-            ROOTYARD_TEST_DATABASE_URL="$PG_URL_BASE/$NATIVE_DB" \
-            ROOTYARD_TEST_CGROUP_ROOT="$ROOTYARD_TEST_CGROUP_ROOT" \
-            ROOTYARD_TEST_TMPFS_ROOT="$ROOTYARD_TEST_TMPFS_ROOT" \
-            ROOTYARD_SANDBOX_MODE=cgroup \
-            ROOTYARD_SOURCE_COMMIT="$GITHUB_SHA" \
-            ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES="$ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES" \
-            PYTHONPATH="$PWD" \
-            ROOTYARD_NATIVE_RECEIPT="$RECEIPT" \
-            GITHUB_SHA="$GITHUB_SHA" \
-            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
-            TMPDIR=/tmp \
-            sh -c 'scripts/native_kernel_cgroup_setup.sh supervisor "$GITHUB_RUN_ID" && exec python3 tests/test_sandbox_cgroup_native.py --receipt "$RECEIPT"'
+          # The helper writes its own PID into the supervisor leaf, proves
+          # /proc/self/cgroup membership and then execs this command in that
+          # same process. The service and every sandbox job inherit the leaf
+          # while the run root stays free of internal processes. No sudo: the
+          # whole acceptance runs as the ordinary runner account.
+          scripts/native_kernel_cgroup_setup.sh supervisor "$GITHUB_RUN_ID" -- \
+            python3 tests/test_sandbox_cgroup_native.py --receipt "$RECEIPT"
 
       - name: Write or validate sanitized native receipt
         if: always()
@@ -128,10 +161,10 @@ jobs:
           SETUP_OUTCOME: ${{ steps.native_setup.outcome }}
           TEST_OUTCOME: ${{ steps.native_test.outcome }}
         run: |
-          mkdir -p "$RECEIPT_DIR"
+          mkdir -p "$RECEIPT_DIR" "$EVIDENCE_DIR"
           if [ ! -s "$RECEIPT" ]; then
             python3 - "$RECEIPT" <<'PY'
-          import hashlib, json, os, sys, time
+          import hashlib, json, os, socket, sys, time
           def digest(path):
               try:
                   h = hashlib.sha256()
@@ -141,24 +174,46 @@ jobs:
                   return h.hexdigest()
               except OSError:
                   return None
-          reason = "native assertion process did not write a receipt"
-          if os.environ.get("SETUP_OUTCOME") != "success":
+          setup_ok = os.environ.get("SETUP_OUTCOME") == "success"
+          # Classification is not a free choice: unavailable setup/preflight is
+          # BLOCKED; a successful setup followed by a native assertion process
+          # that produced no receipt is FAILED.
+          if setup_ok:
+              status = "failed"
+              reason = "native assertion process exited without writing a receipt"
+          else:
+              status = "blocked"
               reason = "cgroup delegation/tmpfs setup did not complete"
-          elif os.environ.get("TEST_OUTCOME") == "failure":
-              reason = "native cgroup test process exited without a receipt"
           receipt = {
               "schema": "rootyard/native-kernel-cgroup-receipt/v1",
-              "status": "blocked",
-              "profile": "cgroup",
+              "status": status,
+              "profile": os.environ.get("ROOTYARD_SANDBOX_MODE", "unset"),
               "source_commit": os.environ.get("ROOTYARD_SOURCE_COMMIT") or os.environ.get("GITHUB_SHA"),
-              "binary_sha256": digest("target/debug/rootyard"),
+              "binary_sha256": digest(os.environ.get("ROOTYARD_BINARY", "target/debug/rootyard")),
               "test_file_sha256": digest("tests/test_sandbox_cgroup_native.py"),
               "workflow_file_sha256": digest(".github/workflows/native-kernel-acceptance.yml"),
+              "cgroup_root": os.environ.get("ROOTYARD_TEST_CGROUP_ROOT"),
+              "tmpfs_root": os.environ.get("ROOTYARD_TEST_TMPFS_ROOT"),
+              "pool_max_bytes_config": os.environ.get("ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES"),
+              "runner": {
+                  "uid": os.getuid(),
+                  "gid": os.getgid(),
+                  "groups": sorted(os.getgroups()),
+                  "euid": os.geteuid(),
+              },
+              "host": {
+                  "kernel": os.uname().release,
+                  "python": sys.version.split()[0],
+                  "hostname": socket.gethostname(),
+              },
+              "evidence_dir": os.environ.get("EVIDENCE_DIR"),
+              "test_outcome": os.environ.get("TEST_OUTCOME"),
               "preflight": {"reason": reason},
               "assertions": {},
               "generated_unix": int(time.time()),
           }
-          open(sys.argv[1], "w").write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+          with open(sys.argv[1], "w") as handle:
+              handle.write(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
           PY
           fi
           python3 - "$RECEIPT" <<'PY'
@@ -167,13 +222,25 @@ jobs:
           assert data.get("schema") == "rootyard/native-kernel-cgroup-receipt/v1"
           assert data.get("status") in ("passed", "failed", "blocked")
           assert data.get("source_commit") == os.environ.get("GITHUB_SHA")
-          test_sha = hashlib.sha256(open("tests/test_sandbox_cgroup_native.py", "rb").read()).hexdigest()
-          assert data.get("test_file_sha256") == test_sha
+          digest = hashlib.sha256(open("tests/test_sandbox_cgroup_native.py", "rb").read()).hexdigest()
+          assert data.get("test_file_sha256") == digest
+          assert data.get("binary_sha256") is not None
+          runner = data.get("runner") or {}
+          assert runner.get("uid") == os.getuid(), runner
+          if data["status"] == "passed":
+              # A pass must be a real unprivileged production-cgroup run, not a
+              # root-only controller claim.
+              assert data.get("profile") == "cgroup", data.get("profile")
+              assert runner.get("uid") not in (None, 0), runner
+              assert data.get("assertions"), "passing receipt has no executed assertions"
+          evidence = data.get("evidence_dir")
+          assert evidence, "receipt does not name its evidence directory"
+          assert os.path.realpath(evidence).startswith(os.path.realpath(os.environ["RECEIPT_DIR"]))
           print("native receipt status:", data["status"])
           print("assertions:", ",".join(sorted(data.get("assertions", {}))))
           PY
 
-      - name: Reclaim run-specific cgroup, mount, databases and files
+      - name: Reclaim run-specific cgroup, mount, database and files
         if: always()
         timeout-minutes: 3
         run: |
@@ -182,20 +249,25 @@ jobs:
             sudo umount "$ROOTYARD_TEST_TMPFS_ROOT"
           fi
           sudo rm -rf "$ROOTYARD_TEST_TMPFS_ROOT"
-          dropdb -h 127.0.0.1 -p 5432 -U rootyard --if-exists "$SERVICE_DB" || true
           dropdb -h 127.0.0.1 -p 5432 -U rootyard --if-exists "$NATIVE_DB" || true
 
-      - name: Upload sanitized native acceptance receipt
+      - name: Upload sanitized native acceptance receipt and evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: native-kernel-cgroup-receipt-${{ github.run_id }}
           path: ${{ env.RECEIPT_DIR }}
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
 
       - name: Enforce acceptance result
         if: always()
         run: |
+          if [ ! -s "$RECEIPT" ]; then
+            echo "native receipt is missing: the acceptance produced no evidence" >&2
+            exit 1
+          fi
           status=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status", "missing"))' "$RECEIPT")
+          echo "native acceptance status: $status"
+          # BLOCKED and FAILED both fail the job; only a real pass is accepted.
           test "$status" = "passed"

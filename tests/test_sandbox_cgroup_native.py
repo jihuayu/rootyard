@@ -14,9 +14,18 @@ a green unittest run: ``native_receipt`` records every executed assertion.
 
 The bounded artifact tmpfs root defaults to ``/dev/shm`` for ad-hoc use and can
 be replaced with ``ROOTYARD_TEST_TMPFS_ROOT`` on a machine where ``/dev/shm`` is
-not a usable tmpfs. ``ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES`` is an acceptance
+not a usable tmpfs, and ``ROOTYARD_EVIDENCE_DIR`` keeps sanitized proof outside
+the checkout. ``ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES`` is an acceptance
 threshold for the mounted capacity, never a claim that a configured byte cap is
-the physical tmpfs bound.
+the physical tmpfs bound: the service is configured with the capacity measured
+from ``statvfs``.
+
+The script must already run inside the delegated subtree. Start it through
+``scripts/native_kernel_cgroup_setup.sh supervisor <run-id> -- python3
+tests/test_sandbox_cgroup_native.py``; that helper writes its own PID into the
+supervisor leaf and execs this command in the same process. Preflight fails when
+the acceptance process itself is outside the run root, so a helper that only
+moved a short-lived child can never be reported as a pass.
 """
 import argparse
 import base64
@@ -37,10 +46,14 @@ from tests.webhooks import WebhooksHarness
 BINARY = os.environ.get("ROOTYARD_BINARY", "target/debug/rootyard")
 CGROUP_ROOT = os.environ.get("ROOTYARD_TEST_CGROUP_ROOT") or os.environ.get("ROOTYARD_SANDBOX_CGROUP_ROOT")
 TMPFS_ROOT = Path(os.environ.get("ROOTYARD_TEST_TMPFS_ROOT") or "/dev/shm")
-# Acceptance cap for the real mounted pool size. The workflow mounts a unique
-# 64 MiB tmpfs and exports its statvfs capacity here; the value is not itself a
-# physical bound.
-POOL_MAX_BYTES = int(os.environ.get("ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES") or str(16 * 1024**3))
+EVIDENCE_DIR = Path(os.environ["ROOTYARD_EVIDENCE_DIR"]) if os.environ.get("ROOTYARD_EVIDENCE_DIR") else None
+# Acceptance threshold for the real mounted pool size. The workflow mounts a
+# unique 64 MiB tmpfs, measures its statvfs capacity and exports it here; the
+# service is then configured with that measured capacity.
+_pool_threshold = os.environ.get("ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES")
+POOL_MAX_THRESHOLD = int(_pool_threshold) if _pool_threshold else None
+# Measured statvfs capacity of TMPFS_ROOT, filled in by preflight.
+POOL_CAPACITY_BYTES = 0
 MEMORY_MAX = 134217728
 PIDS_MAX = 32
 CPU_MAX = "50000 100000"
@@ -60,6 +73,9 @@ REQUIRED_PROOF = {
     "artifact_cgroup_reclaim",
     "crash_descendants_reaped",
     "fenced_attempt_new_attempt",
+    "supervised_cgroup_membership",
+    "artifacts_pool_bounded",
+    "ci_checkout_builds",
 }
 
 
@@ -75,6 +91,40 @@ def tokens(path):
     an optional leading ``+`` is tolerated but the read form is authoritative.
     """
     return [item[1:] if item.startswith("+") else item for item in path.read_text().split()]
+
+
+def cgroup_membership():
+    """Return this process's cgroup v2 path from /proc/self/cgroup."""
+    for line in Path("/proc/self/cgroup").read_text().splitlines():
+        if line.startswith("0::"):
+            return line[3:]
+    raise AssertionError("no cgroup v2 membership line in /proc/self/cgroup")
+
+
+def mount_fstype(target):
+    """Return the filesystem type of the mount holding ``target``.
+
+    The longest matching mount point wins, exactly like the service's own pool
+    validation, so a tmpfs mounted below another tmpfs is still resolved to the
+    real mount.
+    """
+    best = None
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        left, _, right = line.partition(" - ")
+        fields = left.split()
+        if len(fields) < 5 or not right.split():
+            continue
+        mount = fields[4]
+        if str(target) == mount or str(target).startswith(mount.rstrip("/") + "/"):
+            if best is None or len(mount) >= len(best[0]):
+                best = (mount, right.split()[0])
+    return best[1] if best else None
+
+
+def pool_capacity(path=TMPFS_ROOT):
+    """Kernel-reported byte capacity of the pool mount."""
+    stat = os.statvfs(path)
+    return stat.f_blocks * stat.f_frsize
 
 
 def preflight():
@@ -94,6 +144,27 @@ def preflight():
     )
     if not data["path_prefix_ok"]:
         data["reason"] = "delegated cgroup root must be below /sys/fs/cgroup"
+        return False, data
+    # The acceptance process itself must already be charged to the delegated
+    # subtree. A helper that only moves a short-lived child leaves this process
+    # (and therefore the service and every sandbox job) outside the cgroup.
+    run_rel = str(path)[len("/sys/fs/cgroup"):] or "/"
+    try:
+        self_path = cgroup_membership()
+    except (OSError, AssertionError) as error:
+        data["reason"] = "cannot read /proc/self/cgroup: " + str(error)
+        return False, data
+    data["self_cgroup"] = self_path
+    data["run_cgroup"] = run_rel
+    if not (self_path == run_rel or self_path.startswith(run_rel.rstrip("/") + "/")):
+        data["preflight_status"] = "blocked"
+        data["reason"] = (
+            "native acceptance process is outside the delegated run root: "
+            + self_path
+            + " is not below "
+            + run_rel
+            + "; start it with scripts/native_kernel_cgroup_setup.sh supervisor <run-id> -- <command>"
+        )
         return False, data
     try:
         controllers = tokens(path / "cgroup.controllers")
@@ -150,6 +221,36 @@ def preflight():
             probe.rmdir()
         except OSError:
             pass
+    # The tested binary must be an immutable, absolute artifact. A missing or
+    # relative build is a broken build, not an unavailable environment.
+    binary = Path(BINARY)
+    if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
+        data["preflight_status"] = "failed"
+        data["reason"] = "ROOTYARD_BINARY is not an absolute executable artifact: " + str(binary)
+        return False, data
+    data["binary_path"] = str(binary.resolve())
+    if not TMPFS_ROOT.is_dir():
+        data["reason"] = "bounded artifact tmpfs root does not exist: " + str(TMPFS_ROOT)
+        return False, data
+    fstype = mount_fstype(TMPFS_ROOT.resolve())
+    data["tmpfs_fstype"] = fstype
+    if fstype != "tmpfs":
+        data["reason"] = "artifact pool root is not a tmpfs mount: " + str(fstype)
+        return False, data
+    global POOL_CAPACITY_BYTES
+    POOL_CAPACITY_BYTES = pool_capacity(TMPFS_ROOT)
+    data["pool_capacity_bytes"] = POOL_CAPACITY_BYTES
+    if POOL_CAPACITY_BYTES <= 0:
+        data["reason"] = "artifact pool mount reports no capacity"
+        return False, data
+    if POOL_MAX_THRESHOLD is not None and POOL_CAPACITY_BYTES > POOL_MAX_THRESHOLD:
+        data["reason"] = (
+            "artifact pool mount capacity "
+            + str(POOL_CAPACITY_BYTES)
+            + " exceeds the measured acceptance threshold "
+            + str(POOL_MAX_THRESHOLD)
+        )
+        return False, data
     data["ok"] = True
     return True, data
 
@@ -196,7 +297,7 @@ def sandbox_env():
         "ROOTYARD_SANDBOX_WORKSPACE_MAX_BYTES": "8388608",
         "ROOTYARD_SANDBOX_TMP_MAX_BYTES": "8388608",
         "ROOTYARD_SANDBOX_ARTIFACTS_MAX_BYTES": "1048576",
-        "ROOTYARD_SANDBOX_ARTIFACTS_POOL_MAX_BYTES": str(POOL_MAX_BYTES),
+        "ROOTYARD_SANDBOX_ARTIFACTS_POOL_MAX_BYTES": str(POOL_CAPACITY_BYTES or pool_capacity(TMPFS_ROOT)),
         "ROOTYARD_SANDBOX_MAX_ENTRIES": "2000",
     }
 
@@ -397,6 +498,15 @@ class CgroupSandboxTest(unittest.TestCase):
             self.assertEqual(h.http(f"/api/sandbox-jobs/{disk['id']}/artifacts?path=result.txt", token=h.bob)[0], 404)
             pool_job = pool / disk["id"]
             self.assertTrue((pool_job / "result.txt").is_file())
+            # The export store is the kernel-bounded mount measured in
+            # preflight, not a logical byte cap: capacity is read back from
+            # statvfs and the service was configured with that number.
+            self.assertGreater(POOL_CAPACITY_BYTES, 0)
+            self.assertEqual(pool_capacity(TMPFS_ROOT), POOL_CAPACITY_BYTES)
+            self.assertEqual(Path(pool).parent, TMPFS_ROOT)
+            if POOL_MAX_THRESHOLD is not None:
+                self.assertLessEqual(POOL_CAPACITY_BYTES, POOL_MAX_THRESHOLD)
+            proof("artifacts_pool_bounded")
             proof("workspace_disk_enospc")
             proof("logs_artifact_auth")
             cleaned = json.loads(
@@ -541,7 +651,10 @@ class CgroupSandboxTest(unittest.TestCase):
                         **params,
                         "argv": ["/bin/sh", "-c",
                                  ("printf '#include <stdio.h>\\nint main(void){puts(\"attempt-%d\");return 0;}\\n' > main.c; "
-                                  "gcc main.c -o app && ./app; git rev-parse HEAD >/dev/null") % value["attempt"]],
+                                  "gcc main.c -o app && ./app; "
+                                  "test \"$(git rev-parse HEAD)\" = \"%s\"; "
+                                  "git rev-parse HEAD > /artifacts/head.txt")
+                                 % (value["attempt"], value["head_oid"])],
                         "timeout_seconds": 20,
                     },
                     extra_headers=headers,
@@ -578,6 +691,10 @@ class CgroupSandboxTest(unittest.TestCase):
             self.assertNotEqual(second_job["id"], first_job["id"])
             self.assertEqual(wait(second_job, second_params)["state"], "succeeded")
             wait_for(lambda: not (Path(CGROUP_ROOT) / second_job["id"]).exists(), message="terminal retry cgroup removal")
+            # Both attempts really compiled inside a production CI checkout of
+            # their own claimed head_oid; the shell assertion above would have
+            # failed the job otherwise.
+            proof("ci_checkout_builds")
             self.assertEqual(
                 h.sql(
                     f"SELECT state||','||ci_attempt||','||ci_lease_generation FROM sandbox_jobs WHERE id='{first_job['id']}'"
@@ -609,18 +726,36 @@ def sha256_file(path):
         return None
 
 
+def runner_metadata():
+    """Actual identity the assertions ran as, never a configured claim."""
+    return {
+        "uid": os.getuid(),
+        "euid": os.geteuid(),
+        "gid": os.getgid(),
+        "groups": sorted(os.getgroups()),
+    }
+
+
 def write_receipt(path, status, preflight_data, error=None):
+    binary = Path(BINARY)
     receipt = {
         "schema": "rootyard/native-kernel-cgroup-receipt/v1",
         "status": status,
         "profile": os.environ.get("ROOTYARD_SANDBOX_MODE", "unset"),
         "source_commit": os.environ.get("ROOTYARD_SOURCE_COMMIT") or os.environ.get("GITHUB_SHA"),
+        "binary_path": str(binary.resolve()) if binary.exists() else str(binary),
         "binary_sha256": sha256_file(BINARY),
         "test_file_sha256": sha256_file(Path(__file__).resolve()),
         "workflow_file_sha256": sha256_file(Path(".github/workflows/native-kernel-acceptance.yml")),
         "cgroup_root": CGROUP_ROOT,
+        "self_cgroup": preflight_data.get("self_cgroup"),
         "tmpfs_root": str(TMPFS_ROOT),
-        "pool_max_bytes_config": POOL_MAX_BYTES,
+        "tmpfs_fstype": preflight_data.get("tmpfs_fstype"),
+        "pool_capacity_bytes_measured": preflight_data.get("pool_capacity_bytes"),
+        "pool_max_bytes_threshold": POOL_MAX_THRESHOLD,
+        "runner": runner_metadata(),
+        "host": {"kernel": os.uname().release, "python": sys.version.split()[0]},
+        "evidence_dir": str(EVIDENCE_DIR) if EVIDENCE_DIR else None,
         "preflight": preflight_data,
         "assertions": dict(sorted(PROOF.items())),
         "required_assertions": sorted(REQUIRED_PROOF),
@@ -628,10 +763,14 @@ def write_receipt(path, status, preflight_data, error=None):
     }
     if error:
         receipt["detail"] = str(error)[:2000]
+    body = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
     if path:
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+        destination.write_text(body)
+    if EVIDENCE_DIR:
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        (EVIDENCE_DIR / "native-cgroup-receipt.json").write_text(body)
     print(json.dumps(receipt, sort_keys=True), flush=True)
 
 
@@ -646,9 +785,17 @@ def main():
     ok, diagnostics = preflight()
     print(json.dumps({"cgroup_preflight": diagnostics}, sort_keys=True), flush=True)
     if not ok:
-        write_receipt(args.receipt, "blocked", diagnostics)
-        print("BLOCKED: no usable delegated cgroup v2 subtree; cgroup acceptance was not executed.", flush=True)
-        return 3
+        # Unavailable setup/preflight is BLOCKED; a broken build or profile is
+        # FAILED. Neither is ever reported as a pass.
+        status = diagnostics.get("preflight_status", "blocked")
+        write_receipt(args.receipt, status, diagnostics)
+        if status == "blocked":
+            print("BLOCKED: no usable delegated cgroup v2 subtree or bounded tmpfs pool.", flush=True)
+            return 3
+        print("FAILED: native acceptance preconditions are broken (see preflight).", flush=True)
+        return 1
+    # Preflight proved this process is charged to the delegated subtree.
+    proof("supervised_cgroup_membership")
     if profile != "cgroup":
         write_receipt(
             args.receipt,
