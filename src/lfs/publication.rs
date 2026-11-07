@@ -17,36 +17,58 @@ const MAX_SMALL_BLOBS: usize = 4_096;
 const MAX_LIST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_POINTER_BYTES: usize = 1024;
 
-/// The canonical Git LFS v1 pointer version line. Installed clients accept a
-/// CRLF terminator here (`git lfs pointer --check` exits 0 while `--strict`
-/// rejects it), so this gate must recognize it too; otherwise a CRLF pointer to
-/// missing or wrong-size bytes would be treated as ordinary content and skip
-/// verification.
-const POINTER_VERSION_LINE: &[u8] = b"version https://git-lfs.github.com/spec/v1";
+/// Canonical Git LFS v1 version line emitted by current clients.
+const POINTER_VERSION_LINE: &str = "version https://git-lfs.github.com/spec/v1";
+/// Legacy version lines still accepted by the installed client
+/// (`git lfs pointer --check` exit 0): hawser (https only) and git-media v/2
+/// (http only). Scheme-swapped variants are rejected by the client and stay
+/// ordinary content here.
+const POINTER_LEGACY_HAWSER: &str = "version https://hawser.github.com/spec/v1";
+const POINTER_LEGACY_MEDIA: &str = "version http://git-media.io/v/2";
 
-fn starts_lfs_pointer(bytes: &[u8]) -> bool {
-    let Some(rest) = bytes.strip_prefix(POINTER_VERSION_LINE) else {
-        return false;
-    };
-    rest.starts_with(b"\n") || rest.starts_with(b"\r\n")
-}
-
-/// Bounded CRLF -> LF normalization so the canonical v1 parser sees the same
-/// field lines regardless of the writer's line ending style. Only applied to
-/// blobs already recognized as pointer-shaped, so ordinary text is untouched.
-fn normalize_pointer_line_endings(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len());
+/// Rewrites a recognized pointer blob into the canonical v1 byte form the
+/// bounded parser expects. Recognized, client-compatible shapes:
+/// * leading Unicode whitespace trimmed like Go `bytes.TrimSpace` (space,
+///   tab, LF, CR, VT, FF, NBSP, ...); a leading BOM is not trimmed;
+/// * first line exactly the canonical v1, legacy hawser https v1, or legacy
+///   git-media http v/2 version line (no trailing space or tab);
+/// * LF or CRLF line terminators, optional final newline;
+/// * the legacy version line is mapped to canonical before parsing.
+/// Anything else (trailing space/tab on the version line, reordered fields, or
+/// unsupported legacy schemes such as http git-lfs, https media or http
+/// hawser) is not pointer-shaped and remains ordinary content, matching the
+/// client's own pointer recognition.
+fn canonical_pointer_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() > MAX_POINTER_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?.trim_start();
+    let line_end = text.find('\n').unwrap_or(text.len());
+    let mut header = &text[..line_end];
+    if let Some(stripped) = header.strip_suffix('\r') {
+        header = stripped;
+    }
+    if header != POINTER_VERSION_LINE
+        && header != POINTER_LEGACY_HAWSER
+        && header != POINTER_LEGACY_MEDIA
+    {
+        return None;
+    }
+    let remainder = &text[line_end..];
+    let mut out = Vec::with_capacity(POINTER_VERSION_LINE.len() + remainder.len());
+    out.extend_from_slice(POINTER_VERSION_LINE.as_bytes());
+    let rest = remainder.as_bytes();
     let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+    while index < rest.len() {
+        if rest[index] == b'\r' && rest.get(index + 1) == Some(&b'\n') {
             out.push(b'\n');
             index += 2;
         } else {
-            out.push(bytes[index]);
+            out.push(rest[index]);
             index += 1;
         }
     }
-    out
+    Some(out)
 }
 
 pub(crate) async fn git_input(
@@ -182,7 +204,12 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
         .unwrap_or(512 * 1024 * 1024)
         .min(8 * 1024 * 1024 * 1024);
     let mut inspected_lfs_bytes = 0u64;
-    let mut inspected_lfs_oids = std::collections::BTreeSet::new();
+    // Key inspection by the promised (oid, size) pair, not oid alone: a batch
+    // may contain a valid pointer and a wrong-size pointer to the same object.
+    // De-duplicating by oid before the size check would validate the first
+    // promise and silently skip the second; distinct sizes must each be
+    // checked, while identical oid+size pairs still collapse.
+    let mut inspected_lfs_promises = std::collections::BTreeSet::new();
     let format = git_input(
         git_dir,
         git_bin,
@@ -315,13 +342,12 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
             .ok_or(Error(StatusCode::CONFLICT, "truncated Git blob batch"))?;
         let bytes = &payload[cursor..end];
         cursor = end + 1;
-        if !starts_lfs_pointer(bytes) {
+        let Some(normalized) = canonical_pointer_bytes(bytes) else {
             continue;
-        }
-        let normalized = normalize_pointer_line_endings(bytes);
+        };
         let spec = models::parse_pointer(&normalized)
             .ok_or(Error(StatusCode::CONFLICT, "invalid LFS pointer"))?;
-        if !inspected_lfs_oids.insert(spec.oid.clone()) {
+        if !inspected_lfs_promises.insert((spec.oid.clone(), spec.size)) {
             continue;
         }
         inspected_lfs_bytes = inspected_lfs_bytes
