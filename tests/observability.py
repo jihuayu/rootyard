@@ -197,7 +197,7 @@ def main():
                 cases.append({"name": "harness_cleanup", "status": "failed", "error": redact_error(h, error, sentinel)})
                 passed = False
     receipt = None
-    for candidate in (binary.with_suffix(".receipt.json"), binary.parent / "rootyard.receipt.json"):
+    for candidate in (binary.with_suffix(".build.json"), binary.with_suffix(".receipt.json")):
         if candidate.is_file():
             receipt = {"path": str(candidate), "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest()}
             break

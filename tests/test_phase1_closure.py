@@ -48,9 +48,23 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         self.assertIn("cargo build --locked", ci_text)
         self.assertRegex(
             ci_text,
-            r"cargo\s+build\s+--locked\s+(?:--bins\s+--features\s+pando-lab|--features\s+pando-lab(?:\s+--bins)?)\b",
-            "ci.yml must build rootyard-pando-lab with --features pando-lab",
+            r"python3\s+scripts/build_native\.py\s+--features\s+pando-lab\s+--bins\b",
+            "ci.yml must invoke the attested native build for all pando-lab binaries",
         )
+        build_script = (ROOT / "scripts/build_native.py").read_text(encoding="utf-8")
+        for required in (
+            "command = ['cargo', 'build', '--locked']",
+            "['--bins'] if args.bins",
+            "command += ['--features', args.features]",
+            "subprocess.run(command, cwd=ROOT, check=True)",
+            "before = source_digest()",
+            "after = source_digest()",
+            "if before != after:",
+            "'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest()",
+            "'source_inputs_sha256': before",
+            "temporary.replace(destination)",
+        ):
+            self.assertIn(required, build_script, f"native build wrapper lost {required}")
         self.assertRegex(
             ci_text,
             r"cargo\s+clippy\s+--locked\s+--all-targets\s+--features\s+pando-lab\b",
