@@ -540,6 +540,7 @@ def compile_and_run(source, name, extra=""):
     )
 
 
+@unittest.skipUnless(__name__ == "__main__", "run the native cgroup entrypoint with its required preflight and receipt")
 class CgroupSandboxTest(unittest.TestCase):
     def start(self, h, workspace_id, argv, timeout=10):
         return json.loads(
