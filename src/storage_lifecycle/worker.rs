@@ -32,10 +32,8 @@ pub async fn run_once(
     };
     // The persisted attempt and repository generation are safe numeric
     // correlation. The raw job, repository, tenant and actor IDs stay out.
-    let job_operation = operation
-        .clone()
-        .with_attempt(Some(i64::from(job.attempt)))
-        .with_generation(Some(job.repository_generation));
+    let job_operation =
+        operation.clone().with_attempt(Some(i64::from(job.attempt))).with_generation(Some(job.repository_generation));
     observability::worker::run(&job_operation, Phase::Execute, async {
         match run_claimed(state, policy, &job).await {
             Ok(outcome) => Ok(Some(outcome)),

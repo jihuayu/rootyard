@@ -29,7 +29,7 @@ pub mod worker;
 use crate::{
     AppState,
     observability::{
-        self,
+        self as error_observability,
         worker::{OperationContext, Phase, WorkerKind},
     },
 };
@@ -60,9 +60,9 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) -> Result<()> {
         tokio::select! { _=stop.cancelled() => return Ok(()), _=interval.tick() => {} }
         let operation = OperationContext::new(WorkerKind::StorageLifecycle);
         if let Err(error) =
-            observability::worker::run(&operation, Phase::Scan, scheduler::schedule_once(&state, &policy)).await
+            error_observability::worker::run(&operation, Phase::Scan, scheduler::schedule_once(&state, &policy)).await
         {
-            observability::observe_internal(&error);
+            error_observability::observe_internal(&error);
             eprintln!("rootyard: storage maintenance scheduler deferred: {error:#}");
         }
         // Drain a bounded batch; no maintenance command consumes the online
@@ -71,7 +71,7 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) -> Result<()> {
             if stop.is_cancelled() {
                 return Ok(());
             }
-            match observability::worker::run(
+            match error_observability::worker::run(
                 &operation,
                 Phase::Claim,
                 worker::run_once(&state, &policy, owner, &operation),

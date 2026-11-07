@@ -169,9 +169,11 @@ async fn scan_round(
             // No whole-repository timeout here: a legitimate in-flight request
             // may use up to the hook's declared 30 s transport timeout. The
             // shared round deadline only stops starting new sends.
-            Box::pin(observability::worker::run(&operation, Phase::Deliver, async move {
-                deliver_candidate(&state, candidate, round_deadline).await
-            }))
+            Box::pin(async move {
+                observability::worker::run(&operation, Phase::Deliver, async move {
+                    deliver_candidate(&state, candidate, round_deadline).await
+                }).await
+            })
         })
         .await;
         summary.merge(outcome);

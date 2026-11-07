@@ -210,8 +210,9 @@ mod tests {
                 let context = OperationContext::new(WorkerKind::WebhooksBackground);
                 let inline = run(&context, Phase::Scan, async { event_json(&io_error()) }).await;
                 let child_context = context.clone();
-                let spawned =
-                    spawn(&child_context, Phase::Deliver, async { event_json(&io_error()) }).await.expect("child joined");
+                let spawned = spawn(&child_context, Phase::Deliver, async { event_json(&io_error()) })
+                    .await
+                    .expect("child joined");
                 (inline, spawned)
             })
             .await;
@@ -254,9 +255,8 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_numeric_attempt_and_generation_are_the_only_job_fields() {
-        let context = OperationContext::new(WorkerKind::StorageLifecycle)
-            .with_attempt(Some(3))
-            .with_generation(Some(42));
+        let context =
+            OperationContext::new(WorkerKind::StorageLifecycle).with_attempt(Some(3)).with_generation(Some(42));
         let text = run(&context, Phase::Execute, async { event_json(&io_error()) }).await;
         let value = parse(&text);
         assert_eq!(value["scope"].as_str(), Some("worker"));
@@ -268,14 +268,12 @@ mod tests {
             assert!(value.get(forbidden).is_none(), "raw field {forbidden} was emitted");
         }
 
-        let negative = OperationContext::new(WorkerKind::StorageLifecycle)
-            .with_attempt(Some(-1))
-            .with_generation(Some(-2));
+        let negative =
+            OperationContext::new(WorkerKind::StorageLifecycle).with_attempt(Some(-1)).with_generation(Some(-2));
         let value = REQUEST_SCOPE
-            .scope(
-                RequestScope { request_id: Uuid::new_v4(), route: Some("/api/private".to_owned()) },
-                async { parse(&run(&negative, Phase::Claim, async { event_json(&io_error()) }).await) },
-            )
+            .scope(RequestScope { request_id: Uuid::new_v4(), route: Some("/api/private".to_owned()) }, async {
+                parse(&run(&negative, Phase::Claim, async { event_json(&io_error()) }).await)
+            })
             .await;
         assert!(value.get("attempt").is_none(), "negative attempt was emitted");
         assert!(value.get("generation").is_none(), "negative generation was emitted");
