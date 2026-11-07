@@ -21,21 +21,35 @@
 //!   1024 ops / 32 MiB) replies `EAGAIN`; a normal freeze parks writes until the
 //!   thaw succeeds.
 //!
+//! A queued mutation is bound to the lease epoch that was authorized when the
+//! shim enqueued it. The actor admits the mutation once and compares the guard's
+//! epoch with that stamp; a mismatch (the gate moved to a newer lease while the
+//! operation was parked) drops the guard and replies `EROFS` without running the
+//! operation. This closes the window where a 10 ms actor poll misses a transient
+//! `Fenced` phase and observes only the new `Healthy` epoch.
+//!
 //! Every queued operation holds an RAII [`Permit`] charged against both budgets
 //! until its reply is sent, so queued bytes and delayed read replies are counted,
 //! not only the frozen FIFO. Delayed lazy reads are handed to the global read
 //! pool (4 workers, 256 jobs); saturation replies `EAGAIN` instead of doing the
-//! read inline on the actor. Deferred jobs always own their reply and therefore
-//! send exactly one reply even when the mount shuts down.
+//! read inline on the actor. Each deferred job owns and sends exactly one reply.
+//! Shutdown drains every reply still sitting in a queue slot; a read already
+//! executing in the pool checks the shutdown flag after its I/O and replies
+//! `EIO` instead of a late success. Joining that in-flight read is still a
+//! helper-phase responsibility, not something this dispatch loop can prove.
 use super::inner_ops::{ReadPlan, read_at};
 use super::owned_ops::OwnedOp;
 use super::*;
 use fuser::ReplyData;
+use read_pool::{ReadJob, ReadPool, global as global_read_pool};
 use std::collections::VecDeque;
 use std::sync::{
     Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
+
+#[path = "fuse_dispatch/read_pool.rs"]
+mod read_pool;
 
 pub const MOUNT_QUEUE_OPS: usize = 128;
 pub const MOUNT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
@@ -43,8 +57,6 @@ const GLOBAL_QUEUE_OPS: usize = 1024;
 const GLOBAL_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 /// Upper bound on how long the actor waits before re-checking the gate phase.
 pub const ACTOR_POLL: Duration = Duration::from_millis(10);
-const READ_WORKERS: usize = 4;
-const READ_JOBS: usize = 256;
 
 /// Exact queue accounting exposed for tests and diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -137,20 +149,82 @@ impl Drop for Permit {
 
 struct Queued {
     op: OwnedOp,
+    /// Lease epoch observed at enqueue time for a mutation. `None` for reads and
+    /// for any path that failed to stamp; a mutation with no stamp fails closed.
+    epoch: Option<i64>,
     _permit: Permit,
 }
 
-struct QueueState {
-    ready: VecDeque<Queued>,
-    frozen: VecDeque<Queued>,
+/// Ready/frozen work with shutdown admission kept inside one lock.
+///
+/// The executor uses the non-draining pops, which refuse to pop after
+/// [`WorkQueue::close`]. Shutdown cleanup uses the explicit drain pops so queued
+/// replies are still removed and failed instead of being leaked.
+struct WorkQueue<T> {
+    ready: VecDeque<T>,
+    frozen: VecDeque<T>,
     shutdown: bool,
 }
 
+impl<T> WorkQueue<T> {
+    fn new() -> Self {
+        Self { ready: VecDeque::new(), frozen: VecDeque::new(), shutdown: false }
+    }
+
+    /// `None` on success, `Some(item)` once the queue is closed.
+    fn push_ready(&mut self, item: T) -> Option<T> {
+        if self.shutdown {
+            return Some(item);
+        }
+        self.ready.push_back(item);
+        None
+    }
+
+    fn push_frozen_back(&mut self, item: T) {
+        self.frozen.push_back(item);
+    }
+
+    fn pop_ready(&mut self) -> Option<T> {
+        if self.shutdown {
+            return None;
+        }
+        self.ready.pop_front()
+    }
+
+    fn pop_frozen(&mut self) -> Option<T> {
+        if self.shutdown {
+            return None;
+        }
+        self.frozen.pop_front()
+    }
+
+    fn pop_ready_for_drain(&mut self) -> Option<T> {
+        self.ready.pop_front()
+    }
+
+    fn pop_frozen_for_drain(&mut self) -> Option<T> {
+        self.frozen.pop_front()
+    }
+
+    fn close(&mut self) {
+        self.shutdown = true;
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown
+    }
+
+    fn lens(&self) -> (usize, usize) {
+        (self.ready.len(), self.frozen.len())
+    }
+}
+
 struct Shared {
-    state: Mutex<QueueState>,
+    state: Mutex<WorkQueue<Queued>>,
     wake: Condvar,
-    /// Deferred lazy reads that still own an unsent reply, so shutdown can
-    /// drain them instead of waiting for a pool worker.
+    /// Deferred lazy reads that have not completed. A slot may already be empty
+    /// when its pool worker is doing I/O; shutdown cannot answer that read, but
+    /// the worker re-checks the shutdown flag before replying.
     deferred: Mutex<Vec<(u64, Arc<Mutex<Option<DeferredRead>>>)>>,
     next_deferred: AtomicUsize,
 }
@@ -158,59 +232,59 @@ struct Shared {
 impl Shared {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(QueueState { ready: VecDeque::new(), frozen: VecDeque::new(), shutdown: false }),
+            state: Mutex::new(WorkQueue::new()),
             wake: Condvar::new(),
             deferred: Mutex::new(Vec::new()),
             next_deferred: AtomicUsize::new(0),
         })
     }
 
-    fn lock(&self) -> MutexGuard<'_, QueueState> {
+    fn lock(&self) -> MutexGuard<'_, WorkQueue<Queued>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// `None` on success, `Some(queued)` when the queue is already closed.
     fn push_ready(&self, queued: Queued) -> Option<Queued> {
         let mut state = self.lock();
-        if state.shutdown {
-            return Some(queued);
-        }
-        state.ready.push_back(queued);
+        let rejected = state.push_ready(queued);
         drop(state);
-        self.wake.notify_all();
-        None
+        if rejected.is_none() {
+            self.wake.notify_all();
+        }
+        rejected
     }
 
     fn push_frozen_back(&self, queued: Queued) {
-        self.lock().frozen.push_back(queued);
+        self.lock().push_frozen_back(queued);
         self.wake.notify_all();
     }
 
     fn take_frozen_front(&self) -> Option<Queued> {
-        self.lock().frozen.pop_front()
+        self.lock().pop_frozen()
     }
 
     fn pop_ready_timeout(&self, timeout: Duration) -> Option<Queued> {
         let mut state = self.lock();
-        if state.ready.is_empty() && !state.shutdown {
+        if state.is_shutdown() {
+            return None;
+        }
+        if state.ready.is_empty() {
             let (next, _) = self.wake.wait_timeout(state, timeout).unwrap_or_else(PoisonError::into_inner);
             state = next;
         }
-        state.ready.pop_front()
+        state.pop_ready()
     }
 
     fn is_shutdown(&self) -> bool {
-        self.lock().shutdown
+        self.lock().is_shutdown()
     }
 
     fn close(&self) {
-        self.lock().shutdown = true;
+        self.lock().close();
         self.wake.notify_all();
     }
 
     fn lens(&self) -> (usize, usize) {
-        let state = self.lock();
-        (state.ready.len(), state.frozen.len())
+        self.lock().lens()
     }
 
     fn register_deferred(&self, slot: Arc<Mutex<Option<DeferredRead>>>) -> u64 {
@@ -223,13 +297,17 @@ impl Shared {
         self.deferred.lock().unwrap_or_else(PoisonError::into_inner).retain(|(candidate, _)| *candidate != id);
     }
 
+    /// Number of deferred reads that still have a registered slot, including a
+    /// worker currently executing I/O outside the slot lock.
     fn pending_deferred(&self) -> usize {
         self.deferred.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 
-    /// Reply to every still-pending deferred read with one errno. Whichever
-    /// thread wins the per-slot `Option` sends the single reply; the other path
-    /// sees `None` and leaves it alone.
+    /// Reply to every deferred read whose reply is still in its slot with one
+    /// errno. A worker that already took the slot is doing I/O and re-checks the
+    /// shutdown flag itself; it sends the one reply for that read. This never
+    /// holds a slot lock across I/O, so a slow lower source cannot block the
+    /// control plane.
     fn drain_deferred(&self, errno: i32) {
         let entries = std::mem::take(&mut *self.deferred.lock().unwrap_or_else(PoisonError::into_inner));
         for (_, slot) in entries {
@@ -238,78 +316,6 @@ impl Shared {
             }
         }
     }
-}
-
-type ReadJob = Box<dyn FnOnce() + Send + 'static>;
-
-/// Global bounded pool for lazy lower-layer hydration/pread. Saturation is
-/// reported to the caller so the actor can reply `EAGAIN` instead of blocking.
-struct ReadPool {
-    queue: Mutex<VecDeque<ReadJob>>,
-    ready: Condvar,
-    capacity: usize,
-    closed: AtomicBool,
-}
-
-impl ReadPool {
-    fn new(workers: usize, capacity: usize) -> io::Result<Arc<Self>> {
-        let pool = Arc::new(Self {
-            queue: Mutex::new(VecDeque::new()),
-            ready: Condvar::new(),
-            capacity,
-            closed: AtomicBool::new(false),
-        });
-        for index in 0..workers {
-            let worker = pool.clone();
-            let result =
-                std::thread::Builder::new().name(format!("rootyard-fuse-read-{index}")).spawn(move || worker.run());
-            if let Err(error) = result {
-                pool.close();
-                return Err(error);
-            }
-        }
-        Ok(pool)
-    }
-
-    fn execute(&self, job: ReadJob) -> Result<(), ReadJob> {
-        let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-        if self.closed.load(Ordering::Acquire) || queue.len() >= self.capacity {
-            return Err(job);
-        }
-        queue.push_back(job);
-        drop(queue);
-        self.ready.notify_one();
-        Ok(())
-    }
-
-    fn run(&self) {
-        loop {
-            let job = {
-                let mut queue = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
-                while queue.is_empty() && !self.closed.load(Ordering::Acquire) {
-                    queue = self.ready.wait(queue).unwrap_or_else(PoisonError::into_inner);
-                }
-                queue.pop_front()
-            };
-            match job {
-                Some(job) => job(),
-                None => return,
-            }
-        }
-    }
-
-    fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.ready.notify_all();
-    }
-}
-
-fn read_pool() -> io::Result<&'static ReadPool> {
-    static POOL: OnceLock<Result<Arc<ReadPool>, String>> = OnceLock::new();
-    POOL.get_or_init(|| ReadPool::new(READ_WORKERS, READ_JOBS).map_err(|e| e.to_string()))
-        .as_ref()
-        .map(|pool| pool.as_ref())
-        .map_err(|error| io::Error::other(error.clone()))
 }
 
 /// A lazy read whose reply and budget charge travel to the read pool together.
@@ -336,8 +342,14 @@ impl DeferredRead {
             let file = open_lower(Some(self.lazy.as_ref()), &self.relative, &self.source)?;
             read_at(&file, self.offset, self.size)
         })();
+        // The worker takes the reply out of the shared slot before I/O, so a
+        // shutdown drain cannot answer this read. Re-check the flag instead of
+        // returning a success after the mount has closed the queue.
+        let shutdown = self.shared.is_shutdown();
         match result {
+            Ok(_) if shutdown => reply.error(libc::EIO),
             Ok(data) => reply.data(&data),
+            Err(_) if shutdown => reply.error(libc::EIO),
             Err(error) => reply.error(Overlay::err(error)),
         }
     }
@@ -359,34 +371,46 @@ struct Actor {
 impl Actor {
     fn run(mut self) {
         loop {
-            match self.gate.phase() {
-                GatePhase::Fenced => self.fail_frozen(libc::EROFS),
-                GatePhase::Healthy => self.drain_frozen(),
-                GatePhase::Frozen => {}
-            }
+            // Shutdown wins over phase handling: a queued mutation must not be
+            // executed after close just because the gate still looked healthy.
             if self.shared.is_shutdown() {
                 self.fail_frozen(libc::EIO);
                 self.fail_ready(libc::EIO);
                 self.shared.drain_deferred(libc::EIO);
                 return;
             }
-            if let Some(queued) = self.shared.pop_ready_timeout(ACTOR_POLL) {
-                self.route(queued);
+            match self.gate.phase() {
+                GatePhase::Fenced => self.fail_frozen(libc::EROFS),
+                GatePhase::Healthy => self.drain_frozen(),
+                GatePhase::Frozen => {}
             }
+            if self.shared.is_shutdown() {
+                continue;
+            }
+            let Some(queued) = self.shared.pop_ready_timeout(ACTOR_POLL) else { continue };
+            // `pop_ready_timeout` refuses a closed queue, but shutdown can race
+            // the successful pop. Do not execute an operation the shim already
+            // considers closed.
+            if self.shared.is_shutdown() {
+                queued.op.fail(libc::EIO);
+                continue;
+            }
+            self.route(queued);
         }
     }
 
     fn fail_frozen(&mut self, errno: i32) {
-        while let Some(queued) = self.shared.take_frozen_front() {
+        loop {
+            let queued = self.shared.lock().pop_frozen_for_drain();
+            let Some(queued) = queued else { return };
             queued.op.fail(errno);
         }
     }
 
     fn fail_ready(&mut self, errno: i32) {
         loop {
-            let mut state = self.shared.lock();
-            let Some(queued) = state.ready.pop_front() else { return };
-            drop(state);
+            let queued = self.shared.lock().pop_ready_for_drain();
+            let Some(queued) = queued else { return };
             queued.op.fail(errno);
         }
     }
@@ -418,7 +442,7 @@ impl Actor {
     /// Admit and execute one operation. Returns true when a mutation was parked
     /// again because admission raced a new freeze.
     fn execute(&mut self, queued: Queued) -> bool {
-        let Queued { op, _permit: permit } = queued;
+        let Queued { op, epoch, _permit: permit } = queued;
         if !op.is_mutation() {
             self.run_op(op, permit);
             return false;
@@ -426,12 +450,17 @@ impl Actor {
         let gate = self.gate.clone();
         match gate.mutation() {
             Ok(guard) => {
+                if !epoch_matches(epoch, guard.epoch()) {
+                    drop(guard);
+                    op.fail(libc::EROFS);
+                    return false;
+                }
                 self.run_op(op, permit);
                 drop(guard);
                 false
             }
             Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => {
-                self.shared.push_frozen_back(Queued { op, _permit: permit });
+                self.shared.push_frozen_back(Queued { op, epoch, _permit: permit });
                 true
             }
             Err(error) => {
@@ -549,10 +578,17 @@ impl Actor {
     }
 }
 
+/// A queued mutation may run only under the lease epoch it was stamped with.
+fn epoch_matches(queued: Option<i64>, guard: i64) -> bool {
+    queued == Some(guard)
+}
+
 pub(super) struct Dispatcher {
     shared: Arc<Shared>,
     mount_budget: Arc<Budget>,
     global_budget: Arc<Budget>,
+    /// Kept for enqueue-time epoch stamping and shutdown fencing.
+    gate: Arc<MutationGate>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -562,11 +598,12 @@ impl Dispatcher {
         let shared = Shared::new();
         let mount_budget = Arc::new(Budget::new(MOUNT_QUEUE_OPS, MOUNT_QUEUE_BYTES));
         let global_budget = global_budget();
-        let pool = read_pool()?;
+        let pool = global_read_pool()?;
         let dispatcher = Arc::new(Self {
             shared: shared.clone(),
             mount_budget,
             global_budget,
+            gate: gate.clone(),
             worker: Mutex::new(None),
         });
         let actor = Actor { overlay, shared, gate, pool };
@@ -579,11 +616,13 @@ impl Dispatcher {
         if self.shared.is_shutdown() {
             return Err(Reject::Closed(op));
         }
+        // Stamp only mutations. Reads are not gated and do not need admission.
+        let epoch = op.is_mutation().then(|| self.gate.epoch());
         let bytes = op.payload_bytes();
         let Some(permit) = Permit::acquire(&self.mount_budget, &self.global_budget, bytes) else {
             return Err(Reject::Saturated(op));
         };
-        match self.shared.push_ready(Queued { op, _permit: permit }) {
+        match self.shared.push_ready(Queued { op, epoch, _permit: permit }) {
             None => Ok(()),
             Some(queued) => Err(Reject::Closed(queued.op)),
         }
@@ -598,6 +637,9 @@ impl Dispatcher {
     }
 
     pub(super) fn shutdown(&self) {
+        // Fence first so no replay can admit a new mutation, then close the
+        // queue and let the actor fail everything still queued with EIO.
+        self.gate.fence();
         self.shared.close();
         let handle = self.worker.lock().unwrap_or_else(PoisonError::into_inner).take();
         if let Some(handle) = handle {
@@ -608,6 +650,7 @@ impl Dispatcher {
 
 impl Drop for Dispatcher {
     fn drop(&mut self) {
+        self.gate.fence();
         self.shared.close();
         if let Some(handle) = self.worker.lock().unwrap_or_else(PoisonError::into_inner).take() {
             let _ = handle.join();
@@ -646,32 +689,5 @@ impl Drop for MountFs {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn budget_caps_ops_and_bytes_and_releases_exactly() {
-        let budget = Budget::new(2, 100);
-        assert!(budget.try_acquire(60));
-        assert!(!budget.try_acquire(50), "byte cap must reject oversize operations");
-        assert!(budget.try_acquire(40));
-        assert!(!budget.try_acquire(1), "operation cap must reject a third operation");
-        assert_eq!(budget.used(), (2, 100));
-        budget.release(60);
-        assert_eq!(budget.used(), (1, 40));
-        budget.release(40);
-        assert_eq!(budget.used(), (0, 0));
-    }
-
-    #[test]
-    fn permit_charges_both_budgets_and_releases_on_drop() {
-        let mount = Arc::new(Budget::new(8, 1024));
-        let global = Arc::new(Budget::new(8, 2048));
-        let permit = Permit::acquire(&mount, &global, 128).expect("permit");
-        assert_eq!(mount.used(), (1, 128));
-        assert_eq!(global.used(), (1, 128));
-        drop(permit);
-        assert_eq!(mount.used(), (0, 0));
-        assert_eq!(global.used(), (0, 0));
-    }
-}
+#[path = "fuse_dispatch/tests.rs"]
+mod tests;

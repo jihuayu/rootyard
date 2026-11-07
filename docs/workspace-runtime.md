@@ -99,11 +99,19 @@ replies held, while reads, lookup, readdir and read-only open continue. After a
 successful thaw the actor drains the FIFO in order; it notices the thaw with a
 bounded 10 ms poll and an enqueue notification, not a new kernel request. A
 fenced or lease-expired gate returns `EROFS` for parked and new mutations;
-neither path changes content. Only a queue-limit breach returns `EAGAIN`
+neither path changes content. A queued mutation is stamped with the lease epoch
+seen at enqueue, and admission checks the guard's epoch against that stamp, so
+an actor poll that misses a transient fence and observes the new healthy epoch
+still rejects the old write with `EROFS`. Only a queue-limit breach returns `EAGAIN`
 (per mount 128 operations/8 MiB, all mounts 1024/32 MiB, released exactly once
 when the reply is sent). Lazy reads use the global 4-worker/256-job pool and a
-saturated pool replies `EAGAIN` instead of running inline on the actor. See
-[fuse-dispatch-phase2](fuse-dispatch-phase2.md). A fence is terminal for the current lease epoch and does not
+saturated pool replies `EAGAIN` instead of running inline on the actor. On
+normal shutdown the gate is fenced and the queue closed; the actor checks
+shutdown before gate phase handling and fails ready and parked replies with
+`EIO` without executing them, while an already-admitted mutation may finish. A
+lazy read already executing in the pool replays no content but checks shutdown
+after I/O and returns `EIO`; joining that in-flight read belongs to the helper
+phase. See [fuse-dispatch-phase2](fuse-dispatch-phase2.md). A fence is terminal for the current lease epoch and does not
 wait for a freeze or for an in-flight mutation. It wakes blocked waiters with
 `EROFS`, ignores the legacy deadline-only lease update, and cannot be cleared by
 that update or by reusing the old epoch. Only a strictly higher epoch restores

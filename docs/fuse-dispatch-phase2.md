@@ -51,6 +51,14 @@ new kernel request. A fence is terminal for the current epoch, so parked
 replies fail with `EROFS` and later mutations fail with `EROFS` without
 changing content.
 
+Every queued mutation is stamped with the lease epoch that was authorized when
+the shim enqueued it. The actor admits the mutation exactly once and compares
+the resulting guard's epoch with the stamp. If the gate moved to a newer lease
+while the operation was parked, the actor drops the guard and replies `EROFS`
+without executing the operation. This covers the case where the 10 ms poll
+misses a transient `Fenced` phase and only observes the new `Healthy` epoch:
+the old queued write still cannot run on the new authority.
+
 Only a queue-limit breach replies `EAGAIN`. A normal freeze parks writes until
 the thaw succeeds; it does not turn editor writes into `EAGAIN`.
 
@@ -65,12 +73,14 @@ Every enqueued `OwnedOp` acquires an RAII `Permit` charged against both budgets
 before it enters the ready queue; the charge is released exactly once when the
 reply is sent (including reply-error, fence-drain, shutdown and deferred-read
 paths). A read reserves its reply size in the same byte budget, and
-`QueueUsage::pending_reads` exposes deferred replies that still own an unsent
-reply. Mount shutdown drains those slots and replies `EIO`; a pool worker that
-later finds the slot empty does not reply twice. The accounting therefore covers operations already sitting in the
-channel/ready queue, parked frozen operations and delayed read replies — not
-just the frozen FIFO. A rejected enqueue releases its partial charge
-immediately.
+`QueueUsage::pending_reads` counts deferred reads with a registered slot,
+including a worker currently executing I/O outside the slot lock. Shutdown can
+answer only the replies still in their slot. A worker that already took its
+slot re-checks the shutdown flag after I/O and replies `EIO`, so it cannot send
+a late success and does not reply twice. The accounting therefore covers
+operations already sitting in the channel/ready queue, parked frozen
+operations and delayed read replies — not just the frozen FIFO. A rejected
+enqueue releases its partial charge immediately.
 
 ## Delayed reads
 
@@ -80,15 +90,27 @@ replies `EAGAIN` and keeps its own loop free. A deferred job owns its
 `ReplyData`, its budget permit and a marker for the owning queue, so it always
 sends exactly one reply — including after mount shutdown, where it replies
 `EIO` instead of touching a lower source. Queue limits are per mount, so a slow
-read on one mount cannot stall another mount's actor.
+read on one mount cannot stall another mount's actor. A deferred job owns its
+`ReplyData`, its budget permit and a marker for the owning queue, so it sends
+exactly one reply. The worker takes the reply out of the shared slot before it
+starts I/O; shutdown therefore cannot answer a read that is already in flight.
+The worker checks the shutdown flag after I/O and replies `EIO` instead of a
+late success. Joining an in-flight lower-source read remains part of the helper
+lifecycle; this same-process dispatch loop does not claim it has drained that
+I/O.
 
 ## Shutdown and fake-session limits
 
-Dropping `MountFs` (session unmount) stops the actor; the actor drains every
-ready and parked operation with `EIO`/`EROFS` and exits. This is still only a
-same-process session: an operator `SIGKILL` of the API process can still leave a
-blocked `request_wait_answer` in the kernel and cannot be fenced by this
-prototype. Queue contents are memory only and are lost on process death.
+Dropping `MountFs` (session unmount) or calling `MountHandle::shutdown` stops the
+actor. Shutdown fences the gate first, then closes the queue. The actor checks
+shutdown before any gate phase handling, and the queue's ordinary pop refuses a
+closed queue; only the explicit fail-ready/fail-frozen drain paths may remove
+entries after close. Ready and parked operations therefore reply `EIO` and
+cannot execute after shutdown, while a mutation that was already admitted may
+still finish. This is still only a same-process session: an operator `SIGKILL`
+of the API process can still leave a blocked `request_wait_answer` in the
+kernel and cannot be fenced by this prototype. Queue contents are memory only
+and are lost on process death.
 
 ## Verification
 

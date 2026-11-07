@@ -6,6 +6,9 @@
 //! the only caller of `MutationGate::mutation`, so a mutation is admitted once
 //! and no thread-local `MutationGuard` is moved to another thread. Freeze,
 //! thaw-drain, fence and queue limits are documented in `fuse_dispatch`.
+//! Each queued mutation is stamped with the lease epoch observed at enqueue and
+//! is rejected if the actor admits it under a different epoch, so a lease
+//! handoff cannot replay an old write on the new authority.
 use fuser::{FileAttr, FileType, MountOption};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -78,6 +81,14 @@ pub struct MountHandle {
 impl MountHandle {
     pub fn queue_usage(&self) -> DispatchQueueUsage {
         self.dispatcher.usage()
+    }
+
+    /// Stop the per-mount actor before the session is unmounted. Every reply
+    /// still sitting in a queue slot fails with `EIO`; an operation already
+    /// admitted to the gate may still finish. Reads executing in the global
+    /// read pool re-check the shutdown flag after I/O and reply `EIO`.
+    pub fn shutdown(&self) {
+        self.dispatcher.shutdown();
     }
 }
 
