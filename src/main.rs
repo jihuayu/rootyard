@@ -50,6 +50,9 @@ async fn run() -> Result<()> {
             println!("{count}");
         } else {
             let stop = tokio_util::sync::CancellationToken::new();
+            // Browser-session GC needs only PostgreSQL, so the control-plane
+            // worker runs the same bounded loop as the serving process.
+            let session_gc_task = tokio::spawn(rootyard::web::session_gc::run(pool.clone(), stop.child_token()));
             let mut task = tokio::spawn(rootyard::dispatch::worker(
                 pool,
                 settings,
@@ -58,7 +61,7 @@ async fn run() -> Result<()> {
             ));
             eprintln!("rootyard: PostgreSQL delivery worker started (no Git storage access)");
             tokio::select! {
-                _=shutdown()=>{ stop.cancel(); task.await?; },
+                _=shutdown()=>{ stop.cancel(); task.await?; let _ = session_gc_task.await; },
                 result=&mut task=>{ result?; bail!("delivery worker stopped unexpectedly"); },
             }
         }
@@ -76,7 +79,10 @@ async fn run() -> Result<()> {
                 || (args.len() == 5
                     && matches!(
                         args[4].as_str(),
-                        "--allow-legacy-schema007" | "--allow-legacy-schema130" | "--allow-legacy-schema131"
+                        "--allow-legacy-schema007"
+                            | "--allow-legacy-schema130"
+                            | "--allow-legacy-schema131"
+                            | "--allow-legacy-schema132"
                     )))
                 && args[2] == "--isolated"
                 && args[3] == "--trust-backup" =>
@@ -88,6 +94,7 @@ async fn run() -> Result<()> {
                 legacy == Some("--allow-legacy-schema007"),
                 legacy == Some("--allow-legacy-schema130"),
                 legacy == Some("--allow-legacy-schema131"),
+                legacy == Some("--allow-legacy-schema132"),
             )
             .await
             .map_err(|_| anyhow::anyhow!("restore failed; keep target isolated and inspect or discard the fresh targets; database commit may have completed; never retry over existing state"))?;
@@ -284,6 +291,9 @@ async fn run() -> Result<()> {
             let maintenance_task = maintenance_policy
                 .enabled
                 .then(|| tokio::spawn(rootyard::storage_lifecycle::run(state.clone(), maintenance_stop.clone())));
+            let session_gc_stop = tokio_util::sync::CancellationToken::new();
+            let session_gc_task =
+                tokio::spawn(rootyard::web::session_gc::run(state.pool.clone(), session_gc_stop.clone()));
             // A disconnected client must not cancel a started workspace Git
             // mutation: owned jobs finish under the normal Git deadline
             // before the runtime exits. \`router\` consumes the state Arc, so
@@ -293,6 +303,8 @@ async fn run() -> Result<()> {
             rootyard::workspaces::drain_git_jobs(git_shutdown_grace).await;
             worker.abort();
             maintenance_stop.cancel();
+            session_gc_stop.cancel();
+            let _ = session_gc_task.await;
             workspace_capture_stop.cancel();
             let _ = workspace_capture_task.await;
             if let Some(task) = controller_task {
@@ -314,7 +326,7 @@ async fn run() -> Result<()> {
             }
         }
         _ => bail!(
-            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130]]"
+            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130 | --allow-legacy-schema131 | --allow-legacy-schema132]]"
         ),
     }
     Ok(())
