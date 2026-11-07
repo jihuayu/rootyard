@@ -42,8 +42,11 @@ use std::{
 };
 use uuid::Uuid;
 
+#[path = "fuse_helper/client.rs"]
 pub mod client;
+#[path = "fuse_helper/protocol.rs"]
 pub mod protocol;
+#[path = "fuse_helper/server.rs"]
 pub mod server;
 
 pub use client::{HelperClient, HelperError, RemoteFreezeToken};
