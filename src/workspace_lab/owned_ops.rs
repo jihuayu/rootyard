@@ -86,8 +86,4 @@ impl OwnedOp {
             Self::Unlink { reply, .. } | Self::Rmdir { reply, .. } | Self::Rename { reply, .. } => reply.error(errno),
         }
     }
-
-    pub(super) fn fail_io(self, error: io::Error) {
-        self.fail(Overlay::err(error));
-    }
 }

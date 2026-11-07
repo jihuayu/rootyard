@@ -460,7 +460,11 @@ fn a_newer_lease_observation_fences_but_does_not_authorize() {
     assert_eq!(gate.epoch(), 2, "observation never authorizes the epoch it saw");
     assert_eq!(mutation_error(&gate), Some(libc::EROFS));
     assert!(!gate.renew(2, deadline()));
-    assert_eq!(gate.observe_lease(2, deadline()), LeaseObservation::Blocked);
+    assert_eq!(
+        gate.observe_lease(2, deadline()),
+        LeaseObservation::Stale,
+        "epoch 2 is below the highest observed epoch and is ignored"
+    );
     assert!(gate.is_fenced());
     gate.handoff(3, deadline()).expect("only an explicit epoch-3 handoff restores writes");
     assert_eq!(gate.phase(), GatePhase::Healthy);
@@ -483,4 +487,48 @@ fn a_missing_row_fences_only_when_the_gate_did_not_advance() {
     gate.handoff(3, deadline()).expect("an explicit newer handoff restores writes");
     assert_eq!(gate.phase(), GatePhase::Healthy);
     assert_eq!(gate.epoch(), 3);
+}
+
+#[test]
+fn a_delayed_handoff_below_the_observed_epoch_stays_fenced() {
+    let gate = MutationGate::new_with_lease(1, deadline()).unwrap();
+    assert_eq!(gate.observe_lease(3, deadline()), LeaseObservation::Fenced);
+    assert_eq!(gate.epoch(), 1, "observation never authorizes the epoch it saw");
+    assert_eq!(gate.fenced_epoch(), 1, "the fence floor names the epoch that was actually served");
+    let stale = gate.handoff(2, deadline()).unwrap_err();
+    assert_eq!(stale.raw_os_error(), Some(libc::ESTALE), "epoch 2 is older than the observed epoch 3");
+    assert_eq!(gate.phase(), GatePhase::Fenced);
+    assert_eq!(gate.epoch(), 1);
+    assert_eq!(mutation_error(&gate), Some(libc::EROFS));
+    let stale = gate.re_authorize(2, deadline()).unwrap_err();
+    assert_eq!(stale.raw_os_error(), Some(libc::ESTALE), "re_authorize must not bypass the observed epoch");
+    assert_eq!(gate.phase(), GatePhase::Fenced);
+    assert_eq!(gate.epoch(), 1);
+    gate.handoff(3, deadline()).expect("the explicitly observed epoch is still authorized");
+    assert_eq!(gate.phase(), GatePhase::Healthy);
+    assert_eq!(gate.epoch(), 3);
+    let guard = gate.mutation().expect("the epoch-3 handoff is writable");
+    assert_eq!(guard.epoch(), 3);
+}
+
+#[test]
+fn a_higher_observation_advances_the_marker_even_while_fenced() {
+    let gate = MutationGate::new_with_lease(1, deadline()).unwrap();
+    assert_eq!(gate.observe_lease(3, deadline()), LeaseObservation::Fenced);
+    let after_three = gate.lease_marker();
+    assert_eq!(after_three.0, 1, "observation never changes the authorized epoch");
+    assert_eq!(gate.observe_lease(4, deadline()), LeaseObservation::Fenced);
+    let after_four = gate.lease_marker();
+    assert_ne!(after_four.1, after_three.1, "a higher observation must advance the generation while fenced");
+    assert_eq!(after_four.0, 1);
+    assert_eq!(gate.handoff(3, deadline()).unwrap_err().raw_os_error(), Some(libc::ESTALE));
+    assert_eq!(gate.epoch(), 1);
+    assert_eq!(gate.phase(), GatePhase::Fenced);
+    assert_eq!(gate.observe_lease(3, deadline()), LeaseObservation::Stale, "an observation below the highest is ignored");
+    assert!(gate.is_fenced());
+    gate.handoff(4, deadline()).expect("the highest observed epoch restores writes");
+    assert_eq!(gate.epoch(), 4);
+    let until = gate.writable_until();
+    assert_eq!(gate.observe_lease(2, 0), LeaseObservation::Stale);
+    assert_eq!(gate.writable_until(), until, "a stale observation must not lower the deadline");
 }

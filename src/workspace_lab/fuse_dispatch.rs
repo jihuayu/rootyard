@@ -169,15 +169,16 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn push_ready(&self, queued: Queued) -> Result<(), Queued> {
+    /// `None` on success, `Some(queued)` when the queue is already closed.
+    fn push_ready(&self, queued: Queued) -> Option<Queued> {
         let mut state = self.lock();
         if state.shutdown {
-            return Err(queued);
+            return Some(queued);
         }
         state.ready.push_back(queued);
         drop(state);
         self.wake.notify_all();
-        Ok(())
+        None
     }
 
     fn push_frozen_back(&self, queued: Queued) {
@@ -319,7 +320,8 @@ struct DeferredRead {
     offset: i64,
     size: u32,
     reply: Option<ReplyData>,
-    permit: Permit,
+    /// RAII queue budget for the read reply; dropped when the reply is sent.
+    _permit: Permit,
     shared: Arc<Shared>,
 }
 
@@ -517,7 +519,7 @@ impl Actor {
                     offset,
                     size,
                     reply: Some(reply),
-                    permit,
+                    _permit: permit,
                     shared: self.shared.clone(),
                 });
             }
@@ -551,7 +553,6 @@ pub(super) struct Dispatcher {
     shared: Arc<Shared>,
     mount_budget: Arc<Budget>,
     global_budget: Arc<Budget>,
-    gate: Arc<MutationGate>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -566,7 +567,6 @@ impl Dispatcher {
             shared: shared.clone(),
             mount_budget,
             global_budget,
-            gate: gate.clone(),
             worker: Mutex::new(None),
         });
         let actor = Actor { overlay, shared, gate, pool };
@@ -584,8 +584,8 @@ impl Dispatcher {
             return Err(Reject::Saturated(op));
         };
         match self.shared.push_ready(Queued { op, _permit: permit }) {
-            Ok(()) => Ok(()),
-            Err(queued) => Err(Reject::Closed(queued.op)),
+            None => Ok(()),
+            Some(queued) => Err(Reject::Closed(queued.op)),
         }
     }
 

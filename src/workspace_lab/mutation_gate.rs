@@ -80,6 +80,8 @@ struct GateState {
     freeze_active: bool,
     generation: u64,
     epoch: i64,
+    /// Highest epoch any database observation has reported, authorized or not.
+    highest_observed_epoch: i64,
     fence_floor: i64,
     writable_until: i64,
 }
@@ -155,6 +157,7 @@ impl MutationGate {
                 freeze_active: false,
                 generation: 0,
                 epoch: db_epoch,
+                highest_observed_epoch: db_epoch,
                 fence_floor: db_epoch,
                 writable_until,
             }),
@@ -185,16 +188,19 @@ impl MutationGate {
     /// Apply a lease row observed by a periodic or page-based refresh.
     ///
     /// The observation is ordered against the current epoch under one lock:
-    /// a lower epoch is stale and is ignored without shortening the deadline; an
-    /// equal epoch only renews a `Healthy` gate; a higher epoch fences the
-    /// current epoch but never authorizes the observed one. Authorization stays
-    /// the explicit [`MutationGate::handoff`] path, so a late refresh can never
-    /// unlock a newer epoch or revive an older one.
+    /// a lower epoch than the authorized or the highest already observed epoch is
+    /// stale and is ignored without shortening the deadline; an equal epoch only
+    /// renews a `Healthy` gate; a higher epoch fences the current epoch, records
+    /// itself as the highest observation and advances the generation even when
+    /// the gate is already fenced, but never authorizes the observed epoch.
+    /// Authorization stays the explicit [`MutationGate::handoff`] path, so a late
+    /// refresh can never unlock a newer epoch or revive an older one.
     pub fn observe_lease(&self, db_epoch: i64, until: i64) -> LeaseObservation {
         let mut state = self.lock_state();
-        if db_epoch < state.epoch {
+        if db_epoch < state.epoch || db_epoch < state.highest_observed_epoch {
             return LeaseObservation::Stale;
         }
+        state.highest_observed_epoch = db_epoch;
         if db_epoch == state.epoch {
             if state.phase != GatePhase::Healthy {
                 return LeaseObservation::Blocked;
@@ -209,10 +215,13 @@ impl MutationGate {
             state.phase = GatePhase::Fenced;
             state.fence_floor = state.fence_floor.max(state.epoch);
             state.writable_until = 0;
-            state.generation = state.generation.saturating_add(1);
-            drop(state);
-            self.changed.notify_all();
         }
+        // Record the newer observation even when the gate is already fenced: a
+        // conditional missing-row fence compares this generation, so silently
+        // ignoring a higher epoch would make the gate look unchanged.
+        state.generation = state.generation.saturating_add(1);
+        drop(state);
+        self.changed.notify_all();
         LeaseObservation::Fenced
     }
 
@@ -301,13 +310,14 @@ impl MutationGate {
     /// caller must retry after those have drained. This function never waits.
     pub fn re_authorize(&self, epoch: i64, until: i64) -> io::Result<()> {
         let mut state = self.lock_state();
-        if epoch <= state.epoch || epoch <= state.fence_floor {
+        if epoch <= state.epoch || epoch < state.highest_observed_epoch || epoch <= state.fence_floor {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
         if state.active_mutators > 0 || state.freeze_active {
             return Err(io::Error::from_raw_os_error(libc::EWOULDBLOCK));
         }
         state.epoch = epoch;
+        state.highest_observed_epoch = epoch;
         state.writable_until = until;
         state.phase = GatePhase::Healthy;
         state.generation = state.generation.saturating_add(1);
@@ -319,17 +329,20 @@ impl MutationGate {
     /// Move the gate to the lease epoch the database just committed.
     ///
     /// A same-epoch call only renews the deadline, exactly like [`MutationGate::renew`].
-    /// Otherwise the epoch must be strictly higher than both the epoch this gate
-    /// still serves and the epoch a fence invalidated; the old epoch is fenced
+    /// Otherwise the epoch must be strictly higher than the epoch this gate still
+    /// serves and not older than the highest observed epoch, and it must exceed
+    /// the epoch a fence invalidated; the old epoch is fenced
     /// *before* authorization is attempted. A rejection therefore surfaces as
     /// `EWOULDBLOCK` (a freeze owns the gate, or a guard admitted under the old
     /// epoch has not drained) with the gate already `Fenced`, never as a still
     /// `Healthy` old epoch. A stale or already fenced epoch is rejected with
     /// `ESTALE` and changes nothing, so a late handoff cannot resurrect an epoch
-    /// the database has moved past. This never waits.
+    /// the database has moved past even when the gate never observed it itself.
+    /// The fence floor keeps naming the epoch that was actually served, so a
+    /// handoff to the observed epoch itself still succeeds. This never waits.
     pub fn handoff(&self, epoch: i64, until: i64) -> io::Result<()> {
         let mut state = self.lock_state();
-        if epoch < state.epoch || epoch <= state.fence_floor {
+        if epoch < state.epoch || epoch < state.highest_observed_epoch || epoch <= state.fence_floor {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
         if epoch == state.epoch && state.phase != GatePhase::Fenced {
@@ -348,6 +361,7 @@ impl MutationGate {
             return Err(io::Error::from_raw_os_error(libc::EWOULDBLOCK));
         }
         state.epoch = epoch;
+        state.highest_observed_epoch = epoch;
         state.writable_until = until;
         state.phase = GatePhase::Healthy;
         state.generation = state.generation.saturating_add(1);

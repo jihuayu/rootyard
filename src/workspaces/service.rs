@@ -205,7 +205,7 @@ pub async fn lease(
     // thaws the old epoch; success, a COMMIT transport error or cancellation
     // leaves the gate fenced until a later committed epoch is authorized here.
     let (saved, deadline) =
-        if same_host { super::mounts::with_frozen_async(id, commit_started, commit).await? } else { commit.await? };
+        if same_host { super::mounts::with_frozen_async(id, commit_started.clone(), commit).await? } else { commit.await? };
     super::mounts::ensure(&state, id, saved.lease_epoch, deadline)?;
     Ok(Json(saved))
 }
