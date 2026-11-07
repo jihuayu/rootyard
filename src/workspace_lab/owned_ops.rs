@@ -40,9 +40,11 @@ impl OwnedOp {
             | Self::Rmdir { .. }
             | Self::Rename { .. } => true,
             Self::Open { flags, .. } => flags & (libc::O_WRONLY | libc::O_RDWR) != 0,
-            Self::Lookup { .. } | Self::Getattr { .. } | Self::Readdir { .. } | Self::Readlink { .. } | Self::Read { .. } => {
-                false
-            }
+            Self::Lookup { .. }
+            | Self::Getattr { .. }
+            | Self::Readdir { .. }
+            | Self::Readlink { .. }
+            | Self::Read { .. } => false,
         }
     }
 
@@ -53,6 +55,9 @@ impl OwnedOp {
         const OVERHEAD: usize = 192;
         let data = match self {
             Self::Write { data, .. } => data.len(),
+            // Reserve the read reply size so delayed replies are part of the
+            // same bounded accounting as the request channel itself.
+            Self::Read { size, .. } => (*size).min(1024 * 1024) as usize,
             _ => 0,
         };
         let names = match self {
@@ -71,8 +76,7 @@ impl OwnedOp {
     /// shutdown, fence and freeze-drain paths; the reply is never dropped unsent.
     pub(super) fn fail(self, errno: i32) {
         match self {
-            Self::Lookup { reply, .. }
-            | Self::Mkdir { reply, .. } => reply.error(errno),
+            Self::Lookup { reply, .. } | Self::Mkdir { reply, .. } => reply.error(errno),
             Self::Getattr { reply, .. } | Self::Setattr { reply, .. } => reply.error(errno),
             Self::Readdir { reply, .. } => reply.error(errno),
             Self::Readlink { reply, .. } | Self::Read { reply, .. } => reply.error(errno),

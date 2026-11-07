@@ -97,12 +97,7 @@ impl Overlay {
         Ok(count as u32)
     }
 
-    pub(super) fn op_setattr(
-        &mut self,
-        ino: u64,
-        mode: Option<u32>,
-        size: Option<u64>,
-    ) -> io::Result<FileAttr> {
+    pub(super) fn op_setattr(&mut self, ino: u64, mode: Option<u32>, size: Option<u64>) -> io::Result<FileAttr> {
         let p = self.rel(ino)?;
         if mode.is_some() || size.is_some() {
             let entry = self.prepare(&p)?;

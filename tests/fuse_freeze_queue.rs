@@ -68,7 +68,7 @@ fn frozen_writes_queue_reads_pass_thaw_drains_fifo_and_fence_erofs() {
     let gate = MutationGate::new_with_lease(1, i64::MAX).unwrap();
     let overlay = Overlay::new_with_gate(lower.clone(), upper.clone(), gate.clone()).unwrap();
     let handle = spawn(overlay, &mount).expect("kernel FUSE mount");
-    assert_eq!(handle.queue_usage(), Default::default(), "fresh mount must start with empty budgets");
+    wait_until(|| handle.queue_usage() == Default::default(), "fresh mount to start with empty budgets");
 
     // Sanity: reads work before the freeze.
     assert_eq!(fs::read(mount.join("base.txt")).unwrap(), b"base");

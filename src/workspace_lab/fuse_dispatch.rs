@@ -34,7 +34,7 @@ use fuser::ReplyData;
 use std::collections::VecDeque;
 use std::sync::{
     Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 pub const MOUNT_QUEUE_OPS: usize = 128;
@@ -55,6 +55,7 @@ pub struct QueueUsage {
     pub global_bytes: usize,
     pub ready: usize,
     pub frozen: usize,
+    pub pending_reads: usize,
 }
 
 /// Why the shim could not enqueue. Saturation is the only `EAGAIN`; a closed
@@ -148,6 +149,10 @@ struct QueueState {
 struct Shared {
     state: Mutex<QueueState>,
     wake: Condvar,
+    /// Deferred lazy reads that still own an unsent reply, so shutdown can
+    /// drain them instead of waiting for a pool worker.
+    deferred: Mutex<Vec<(u64, Arc<Mutex<Option<DeferredRead>>>)>>,
+    next_deferred: AtomicUsize,
 }
 
 impl Shared {
@@ -155,6 +160,8 @@ impl Shared {
         Arc::new(Self {
             state: Mutex::new(QueueState { ready: VecDeque::new(), frozen: VecDeque::new(), shutdown: false }),
             wake: Condvar::new(),
+            deferred: Mutex::new(Vec::new()),
+            next_deferred: AtomicUsize::new(0),
         })
     }
 
@@ -204,6 +211,32 @@ impl Shared {
         let state = self.lock();
         (state.ready.len(), state.frozen.len())
     }
+
+    fn register_deferred(&self, slot: Arc<Mutex<Option<DeferredRead>>>) -> u64 {
+        let id = self.next_deferred.fetch_add(1, Ordering::Relaxed) as u64;
+        self.deferred.lock().unwrap_or_else(PoisonError::into_inner).push((id, slot));
+        id
+    }
+
+    fn complete_deferred(&self, id: u64) {
+        self.deferred.lock().unwrap_or_else(PoisonError::into_inner).retain(|(candidate, _)| *candidate != id);
+    }
+
+    fn pending_deferred(&self) -> usize {
+        self.deferred.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+
+    /// Reply to every still-pending deferred read with one errno. Whichever
+    /// thread wins the per-slot `Option` sends the single reply; the other path
+    /// sees `None` and leaves it alone.
+    fn drain_deferred(&self, errno: i32) {
+        let entries = std::mem::take(&mut *self.deferred.lock().unwrap_or_else(PoisonError::into_inner));
+        for (_, slot) in entries {
+            if let Some(deferred) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                deferred.reject(errno);
+            }
+        }
+    }
 }
 
 type ReadJob = Box<dyn FnOnce() + Send + 'static>;
@@ -227,9 +260,8 @@ impl ReadPool {
         });
         for index in 0..workers {
             let worker = pool.clone();
-            let result = std::thread::Builder::new()
-                .name(format!("rootyard-fuse-read-{index}"))
-                .spawn(move || worker.run());
+            let result =
+                std::thread::Builder::new().name(format!("rootyard-fuse-read-{index}")).spawn(move || worker.run());
             if let Err(error) = result {
                 pool.close();
                 return Err(error);
@@ -333,6 +365,7 @@ impl Actor {
             if self.shared.is_shutdown() {
                 self.fail_frozen(libc::EIO);
                 self.fail_ready(libc::EIO);
+                self.shared.drain_deferred(libc::EIO);
                 return;
             }
             if let Some(queued) = self.shared.pop_ready_timeout(ACTOR_POLL) {
@@ -495,14 +528,18 @@ impl Actor {
     /// `EAGAIN`; the read is never executed inline on the actor.
     fn submit_deferred(&self, deferred: DeferredRead) {
         let slot = Arc::new(Mutex::new(Some(deferred)));
+        let request_id = self.shared.register_deferred(slot.clone());
         let job_slot = slot.clone();
+        let shared = self.shared.clone();
         let job: ReadJob = Box::new(move || {
             if let Some(deferred) = job_slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
                 deferred.run();
             }
+            shared.complete_deferred(request_id);
         });
         if let Err(job) = self.pool.execute(job) {
             drop(job);
+            self.shared.complete_deferred(request_id);
             if let Some(deferred) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
                 deferred.reject(libc::EAGAIN);
             }
@@ -533,9 +570,7 @@ impl Dispatcher {
             worker: Mutex::new(None),
         });
         let actor = Actor { overlay, shared, gate, pool };
-        let handle = std::thread::Builder::new()
-            .name("rootyard-fuse-actor".into())
-            .spawn(move || actor.run())?;
+        let handle = std::thread::Builder::new().name("rootyard-fuse-actor".into()).spawn(move || actor.run())?;
         *dispatcher.worker.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
         Ok(dispatcher)
     }
@@ -558,7 +593,8 @@ impl Dispatcher {
         let (mount_ops, mount_bytes) = self.mount_budget.used();
         let (global_ops, global_bytes) = self.global_budget.used();
         let (ready, frozen) = self.shared.lens();
-        QueueUsage { mount_ops, mount_bytes, global_ops, global_bytes, ready, frozen }
+        let pending_reads = self.shared.pending_deferred();
+        QueueUsage { mount_ops, mount_bytes, global_ops, global_bytes, ready, frozen, pending_reads }
     }
 
     pub(super) fn shutdown(&self) {
@@ -608,7 +644,6 @@ impl Drop for MountFs {
         self.dispatcher.shutdown();
     }
 }
-
 
 #[cfg(test)]
 mod tests {

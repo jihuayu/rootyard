@@ -3,10 +3,13 @@
 //! Nothing here executes overlay work, asks the mutation gate or waits for a
 //! queue slot. The shim owns no overlay; the per-mount actor does. Replies are
 //! moved into the [`OwnedOp`] and sent by whichever thread ends up executing it.
-use super::*;
 use super::fuse_dispatch::MountFs;
-use fuser::{Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow};
 use super::owned_ops::OwnedOp;
+use super::*;
+use fuser::{
+    Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite,
+    Request, TimeOrNow,
+};
 
 impl Filesystem for MountFs {
     fn lookup(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {

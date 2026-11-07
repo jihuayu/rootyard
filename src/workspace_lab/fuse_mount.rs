@@ -63,8 +63,8 @@ mod inner_ops;
 #[path = "owned_ops.rs"]
 mod owned_ops;
 
-use fuse_io::{Entry, safe_link_at, walk_dir};
 use fuse_dispatch::MountFs;
+use fuse_io::{Entry, safe_link_at, walk_dir};
 
 pub use self::fuse_dispatch::QueueUsage as DispatchQueueUsage;
 

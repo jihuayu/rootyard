@@ -64,7 +64,10 @@ the thaw succeeds; it does not turn editor writes into `EAGAIN`.
 Every enqueued `OwnedOp` acquires an RAII `Permit` charged against both budgets
 before it enters the ready queue; the charge is released exactly once when the
 reply is sent (including reply-error, fence-drain, shutdown and deferred-read
-paths). The accounting therefore covers operations already sitting in the
+paths). A read reserves its reply size in the same byte budget, and
+`QueueUsage::pending_reads` exposes deferred replies that still own an unsent
+reply. Mount shutdown drains those slots and replies `EIO`; a pool worker that
+later finds the slot empty does not reply twice. The accounting therefore covers operations already sitting in the
 channel/ready queue, parked frozen operations and delayed read replies — not
 just the frozen FIFO. A rejected enqueue releases its partial charge
 immediately.
