@@ -135,8 +135,8 @@ class UpgradeHarness(Harness):
     def constraint_defs(self, names):
         quoted = ",".join("'" + name + "'" for name in names)
         raw = self.sql(
-            "SELECT k.conname || '|' || k.convalidated || '|' || k.contype "
-            "|| '|' || k.confdeltype || '|' || pg_get_constraintdef(k.oid) "
+            "SELECT k.conname::text || '|' || k.convalidated::text || '|' || k.contype::text "
+            "|| '|' || k.confdeltype::text || '|' || pg_get_constraintdef(k.oid) "
             "FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid "
             "JOIN pg_namespace n ON n.oid=c.relnamespace "
             "WHERE n.nspname=current_schema() AND k.conname IN (" + quoted + ")"

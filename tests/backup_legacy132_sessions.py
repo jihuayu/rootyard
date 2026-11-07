@@ -367,7 +367,7 @@ class LegacyArchiveHarness(BackupHarness):
             self.contract.indexes), names
         constraints = self.query(
             self.restore_db,
-            "SELECT string_agg(conname || ':' || contype || ':' || "
+            "SELECT string_agg(conname::text || ':' || contype::text || ':' || "
             "convalidated::text, ',' ORDER BY conname) FROM pg_constraint k "
             "JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n "
             "ON n.oid=c.relnamespace WHERE n.nspname='public' AND conname IN ('" +

@@ -238,17 +238,17 @@ class OrganizationPaginationHarness(Harness):
         assert bob_cursor and bob_cursor != acme_cursor
 
         status, _, _ = self.http(
-            "/api/orgs/other/members?limit=1&cursor=" + urllib.parse.quote(acme_cursor, safe=""))
+            "/api/orgs/other/members?limit=1&cursor=" + urllib.parse.quote(acme_cursor, safe=""), token=self.alice)
         assert status == 400, f"cursor crossed organizations: {status}"
         status, _, _ = self.http(
-            "/api/orgs/acme/teams?limit=1&cursor=" + urllib.parse.quote(acme_cursor, safe=""))
+            "/api/orgs/acme/teams?limit=1&cursor=" + urllib.parse.quote(acme_cursor, safe=""), token=self.alice)
         assert status == 400, f"member cursor accepted on teams: {status}"
         team_cursor = self.page("acme", "teams", "limit=1")[0]["next_cursor"]
         status, _, _ = self.http(
-            "/api/orgs/acme/members?limit=1&cursor=" + urllib.parse.quote(team_cursor, safe=""))
+            "/api/orgs/acme/members?limit=1&cursor=" + urllib.parse.quote(team_cursor, safe=""), token=self.alice)
         assert status == 400, f"team cursor accepted on members: {status}"
         status, _, _ = self.http(
-            "/api/orgs/acme/members?limit=1&cursor=" + urllib.parse.quote(bob_cursor, safe=""))
+            "/api/orgs/acme/members?limit=1&cursor=" + urllib.parse.quote(bob_cursor, safe=""), token=self.alice)
         assert status == 400, f"bob cursor accepted for alice: {status}"
 
         self.doc("/api/orgs/acme/members/bob", 200, method="DELETE")
