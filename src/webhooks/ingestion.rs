@@ -382,7 +382,7 @@ pub(crate) async fn ci_callback(
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(StatusCode::SERVICE_UNAVAILABLE, "Git capacity exhausted; retry later")
     })?;
-    let exists = verify_commit_exists(&state, repo_id, &input.commit_oid).await?;
+    let exists = verify_commit_exists(state, repo_id, &input.commit_oid).await?;
     drop(_slot);
     if !exists {
         return Err(Error(StatusCode::CONFLICT, "commit object not found"));

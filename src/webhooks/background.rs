@@ -47,6 +47,7 @@ impl ScanWindow {
     }
 
     /// Time after the work window that remains for one in-flight delivery.
+    #[cfg(test)]
     fn tail(&self) -> Duration {
         self.scan_deadline.saturating_duration_since(self.work_deadline)
     }
