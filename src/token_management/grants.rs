@@ -117,7 +117,7 @@ pub async fn validate_repository_grant(
         .ok_or_else(Error::not_found)?;
     let owner_id: Uuid = row.get(0);
     let state: String = row.get(1);
-    let Some(role) = rbac::resolve_effective_role(&**tx, repository_id, owner_id, actor.id).await? else {
+    let Some((role, _, _)) = rbac::resolve_effective_role(&**tx, repository_id, owner_id, actor.id).await? else {
         return Err(Error::not_found());
     };
     for action in actions {

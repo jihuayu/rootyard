@@ -31,7 +31,7 @@ use axum::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-type App = State<Arc<AppState>>;
+type App = Arc<AppState>;
 type Res = Result<Response, Error>;
 
 /// Re-check that a cookie session's parent API token is still active and

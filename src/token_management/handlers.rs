@@ -20,7 +20,7 @@ use super::{
     service,
 };
 
-type App = State<Arc<AppState>>;
+type App = Arc<AppState>;
 type Res = Result<Response, Error>;
 
 pub async fn list_tokens(State(state): State<App>, headers: HeaderMap, Query(query): Query<PageQuery>) -> Res {

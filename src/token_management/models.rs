@@ -344,7 +344,7 @@ mod tests {
     fn subset_never_widens() {
         let mut current: BTreeMap<Uuid, BTreeSet<RepoAction>> = BTreeMap::new();
         current.entry(Uuid::nil()).or_default().insert(RepoAction::ContentsRead);
-        let mut narrower = BTreeMap::new();
+        let mut narrower: BTreeMap<Uuid, BTreeSet<RepoAction>> = BTreeMap::new();
         narrower.entry(Uuid::nil()).or_default().insert(RepoAction::ContentsRead);
         assert!(is_repository_subset(&narrower, &current));
         let mut wider = narrower.clone();
