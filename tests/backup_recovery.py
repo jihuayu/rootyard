@@ -77,6 +77,22 @@ class BackupRecoveryHarness(BackupHarness):
         assert new[0]['rotated_at'] > old[0]['rotated_at']
         for field in ('incarnation', 'rotated_at'):
             old[0][field] = new[0][field]
+        # Paired restore also rotates the remote-storage authority, including
+        # GitFS-only archives. These fixtures have no Pando object closure;
+        # populated artifact re-registration has its own native restore drill.
+        old_pando = expected['pando_storage_authorities']
+        new_pando = restored['pando_storage_authorities']
+        assert len(old_pando) == len(new_pando) == 1
+        assert old_pando[0]['singleton'] is new_pando[0]['singleton'] is True
+        assert new_pando[0]['authority_id'] != old_pando[0]['authority_id']
+        assert uuid.UUID(new_pando[0]['authority_id']).version == 4
+        assert new_pando[0]['generation'] == 1
+        assert new_pando[0]['created_at'] > old_pando[0]['created_at']
+        assert new_pando[0]['rotated_at'] >= new_pando[0]['created_at']
+        for table in ('pando_remote_artifacts', 'pando_manifest_artifacts', 'pando_publication_fences'):
+            assert expected[table] == restored[table] == [], 'Unexpected populated Pando fixture: ' + table
+        for field in ('authority_id', 'generation', 'created_at', 'rotated_at'):
+            old_pando[0][field] = new_pando[0][field]
         different = [table for table in set(expected) | set(restored)
                      if expected.get(table) != restored.get(table)]
         assert not different, 'Restored durable rows differ: ' + ', '.join(sorted(different))
