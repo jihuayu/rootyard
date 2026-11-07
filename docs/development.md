@@ -56,13 +56,18 @@ the diff uniform. `cargo fmt` uses the repository `rustfmt.toml`
 changed rather than across the whole tree while other work is in flight.
 
 Because `rust-version` is now truthfully 1.88, Clippy's MSRV-aware
-`collapsible_if` proposes let-chain rewrites for nested `if` sites that predate
-this rule. The current tree still contains those sites in modules whose owners
-are mid-change (`src/web/{handlers,models,sanitize}.rs`, `src/webhooks`,
-`src/workspaces`, `src/workspace_lab`, `src/browse`, `src/sandbox` and others),
-so a full `-D warnings` run is expected to report them until that migration
-lands. Do not silence them with `#[allow]` or by lowering `rust-version`; fix
-the files you own and leave the rest to a coordinated change.
+`collapsible_if` fires on nested `if` sites that predate let-chains. The gate is
+**not green on this tree**: `cargo fmt --all -- --check` passes, but
+`cargo clippy --locked --all-targets --features pando-lab -- -D warnings`
+reports 64 `collapsible_if` diagnostics in the library target and 65 in the
+library test target (one test-only site) and exits non-zero. The remaining
+sites live in modules owned by concurrent work
+(`src/web/{handlers,models,sanitize}.rs`, `src/webhooks`, `src/workspaces`,
+`src/workspace_lab`, `src/browse`, `src/sandbox` and others), so they need one
+coordinated let-chain rewrite rather than per-file edits from this change. Do
+not mark the gate passing, add `#[allow(clippy::collapsible_if)]`, or lower
+`rust-version` to hide the diagnostics. Issue #75 stays open until that
+migration lands and the full Clippy gate exits zero.
 
 ## End-to-end tests
 
