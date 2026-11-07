@@ -143,6 +143,8 @@ class RetentionHarness(LfsHarness):
             time.sleep(.05)
         assert state == "pending", state
         assert not fresh_path.exists()
+        assert list(fresh_path.parent.glob(".tmp-*")) == [], \
+            "interrupted first upload left staging temp files"
         self.lfs_get(f"/git/alice/demo.git/info/lfs/objects/{fresh_oid}/{len(fresh)}",
                      token=self.alice, code=404)
         self.lfs_put(f"/git/alice/demo.git/info/lfs/objects/{fresh_oid}/{len(fresh)}",
@@ -208,29 +210,75 @@ class RetentionHarness(LfsHarness):
         # readers hold. The maintenance worker claims a job and waits in
         # `running` for the exclusive lease until this reader releases, which
         # happens only after the real native pointer publication finishes.
-        key = ("hashtextextended('rootyard-data-v1:' || '" + str(repo_id)
-               + "'::uuid::text, 0)")
-        reader = None
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and reader is None:
-            candidate = subprocess.Popen(
-                ["psql", "--dbname", self.db, "-X", "-q", "-A", "-t",
-                 "-v", "ON_ERROR_STOP=1"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, env=self.env)
-            candidate.stdin.write(("SELECT pg_try_advisory_lock_shared(" + key + ");\n").encode())
-            candidate.stdin.flush()
-            answer = candidate.stdout.readline().decode().strip()
-            if answer == "t":
-                reader = candidate
-            else:
-                candidate.stdin.close()
-                candidate.wait(timeout=15)
-                time.sleep(.05)
-        assert reader is not None, "could not acquire the repository reader lease"
+        # NATIVE LEASE BARRIER (test-only fault injection on the synthetic data
+        # dir): the fixture holds ONLY the product ref-publication key. The real
+        # native HTTP push acquires its own read_leases::shared lease on
+        # rootyard-data-v1 (application_name=rootyard) and blocks in
+        # ref_publication::acquire waiting for this ref key, so the data lease
+        # holder is the application backend, never this fixture session.
+        data_key = ("hashtextextended('rootyard-data-v1:' || '" + str(repo_id)
+                    + "'::uuid::text, 0)")
+        ref_name = "refs/heads/gc-race-native"
+        ref_key = ("hashtextextended('rootyard-ref-v1:' || '" + str(repo_id)
+                   + "'::uuid::text || ':" + ref_name + "', 0)")
+        blocker = subprocess.Popen(
+            ["psql", "--dbname", self.db, "-X", "-q", "-A", "-t",
+             "-v", "ON_ERROR_STOP=1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=self.env)
+        blocker.stdin.write(b"SELECT pg_backend_pid();\n")
+        blocker.stdin.flush()
+        fixture_pid = blocker.stdout.readline().decode().strip()
+        blocker.stdin.write(("SELECT pg_try_advisory_lock(" + ref_key + ");\n").encode())
+        blocker.stdin.flush()
+        assert blocker.stdout.readline().decode().strip() == "t", \
+            "ref publication barrier not acquired"
+        pushes = {}
+        def push():
+            start = time.time()
+            result = self.git("push", "origin", "HEAD:" + ref_name, cwd=self.work,
+                              token=self.alice, check=False)
+            pushes.update(rc=result.returncode, start=start, end=time.time())
+        thread = threading.Thread(target=push)
+        thread.start()
+        thread_started = True
+        lease_sql = (
+            "SELECT l.pid||'|'||a.application_name||'|'||l.mode FROM pg_locks l "
+            "JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' "
+            "AND l.granted AND l.mode='ShareLock' AND l.objsubid=1 "
+            "AND l.classid=(((" + data_key + ")::bigint >> 32) & 4294967295)::oid "
+            "AND l.objid=(((" + data_key + ")::bigint) & 4294967295)::oid "
+            "AND a.application_name='rootyard'")
+        native_pid = None
+        lease_app = lease_mode = None
+        streak = {}
+        deadline = time.monotonic() + 20
         try:
-            # 4,000 stale worker-owned staging files must be physically deleted
-            # by the real gitfs_stage_cleanup job, never by the test.
+            while time.monotonic() < deadline:
+                rows = [row for row in self.sql(lease_sql).splitlines() if row]
+                current = {}
+                for row in rows:
+                    pid, app, mode = row.split("|")
+                    if pid != fixture_pid:
+                        current[pid] = (app, mode)
+                for pid in list(streak):
+                    if pid not in current:
+                        streak[pid] = 0
+                for pid in current:
+                    streak[pid] = streak.get(pid, 0) + 1
+                if streak and max(streak.values()) >= 5:
+                    native_pid = max(streak, key=streak.get)
+                    lease_app, lease_mode = current[native_pid]
+                    break
+                time.sleep(.05)
+            assert native_pid is not None, "native push never held the data read lease"
+            rows = [row for row in self.sql(lease_sql).splitlines() if row]
+            current = {row.split("|")[0]: row.split("|")[1:] for row in rows}
+            assert native_pid in current, {"pid": native_pid, "current": current}
+            assert native_pid != fixture_pid, (native_pid, fixture_pid)
+            assert current[native_pid][0] == "rootyard"
+            # 4,000 stale staging files are created only after the native lease
+            # is provably held, so the real cleanup cannot delete them early.
             stale = time.time() - 30
             owned = []
             for _ in range(4000):
@@ -238,55 +286,40 @@ class RetentionHarness(LfsHarness):
                 path.write_bytes(b"stale")
                 os.utime(path, (stale, stale))
                 owned.append(path)
-            # A real maintenance claim must already be blocked in `running` on
-            # the exclusive advisory lease before the push starts.
-            blocked = None
-            deadline = time.monotonic() + 20
-            while time.monotonic() < deadline and blocked is None:
-                page = json.loads(self.expect(jobs_path, 200, token=self.alice))
-                for item in page["items"]:
-                    if item["state"] == "running":
-                        blocked = item
-                        break
-                if blocked is None:
-                    time.sleep(.05)
-            assert blocked is not None, "no maintenance job entered running on the reader barrier"
-            # The stage-cleanup job that must complete after the publication.
+            assert list(lfs_dir.glob(".tmp-*"))
             cleanup = None
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline and cleanup is None:
                 page = json.loads(self.expect(jobs_path, 200, token=self.alice))
                 for item in page["items"]:
-                    if item["kind"] == "gitfs_stage_cleanup" \
-                            and item["state"] in ("queued", "running"):
+                    if item["kind"] == "gitfs_stage_cleanup" and item["state"] == "running":
                         cleanup = item
                         break
                 if cleanup is None:
                     time.sleep(.05)
-            assert cleanup is not None, "no gitfs_stage_cleanup job was scheduled"
-            pushes = {}
-            def push():
-                start = time.time()
-                result = self.git("push", "origin", "HEAD:refs/heads/gc-race",
-                                  cwd=self.work, token=self.alice, check=False)
-                pushes.update(rc=result.returncode, start=start, end=time.time())
-            thread = threading.Thread(target=push)
-            thread.start()
-            observed_running = []
-            while thread.is_alive():
-                live = json.loads(self.expect(jobs_path, 200, token=self.alice))
-                for item in live["items"]:
-                    if item["state"] == "running":
-                        observed_running.append(item["kind"])
-                time.sleep(.01)
-            thread.join(60)
-            assert pushes.get("rc") == 0, pushes
-            window = {"start": pushes["start"], "end": pushes["end"]}
-            assert observed_running, "no maintenance job stayed running during the push"
+            assert cleanup is not None, "stage cleanup was not claimed during the native lease"
+            assert all(path.exists() for path in owned), \
+                "cleanup deleted staging files while the native lease was held"
+            assert any(row.split("|")[0] == native_pid
+                       for row in self.sql(lease_sql).splitlines()), \
+                "native lease was released before the leak check"
+            exclusive = self.sql("SELECT pg_try_advisory_lock(" + data_key + ");")
+            assert exclusive == "f", \
+                "exclusive cleanup lease was not denied by the native shared lease"
+            untouched = sum(1 for path in owned if path.exists())
+            blocker.stdin.close()
+            blocker.wait(timeout=15)
+            thread.join(90)
         finally:
-            reader.stdin.close()
-            reader.wait(timeout=15)
-        # Once the reader releases, the blocked claim executes the real cleanup.
+            try:
+                blocker.stdin.close()
+            except Exception:
+                pass
+            blocker.wait(timeout=15)
+            if thread_started and thread.is_alive():
+                thread.join(15)
+        assert pushes.get("rc") == 0, pushes
+        window = {"start": pushes["start"], "end": pushes["end"]}
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
             detail = json.loads(self.expect(jobs_path + "/" + cleanup["id"], 200,
@@ -299,7 +332,8 @@ class RetentionHarness(LfsHarness):
             detail["completed_at"].replace("Z", "+00:00")).timestamp()
         assert completed >= window["end"], {"completed": completed, "push": window}
         result = detail.get("result") or {}
-        assert result.get("staging_files_deleted", 0) >= 4000, result
+        deleted = result.get("staging_files_deleted", 0)
+        assert deleted >= 4000, result
         assert not any(path.exists() for path in owned)
         self.stop()
         for name in policy:
@@ -308,7 +342,7 @@ class RetentionHarness(LfsHarness):
         assert self.sql("SELECT state FROM lfs_objects WHERE repository_id='"
                         f"{repo_id}' AND oid='{oid}'") == "ready"
         refs = self.git("ls-remote", self.remote, token=self.alice).stdout
-        assert b"refs/heads/gc-race" in refs, refs
+        assert ref_name.encode() in refs, refs
         assert hashlib.sha256(object_file.read_bytes()).hexdigest() == oid
         assert object_file.stat().st_size == len(payload)
         _, body, _ = self.lfs_get(
@@ -319,12 +353,21 @@ class RetentionHarness(LfsHarness):
         return {"job_kind": detail["kind"], "job_state": detail["state"],
                 "job_result": result,
                 "job_observed_running_during_push": True,
-                "cleanup_observed_running_during_push": "gitfs_stage_cleanup" in observed_running,
-                "running_kinds_during_push": sorted(set(observed_running)),
+                "cleanup_observed_running_during_push": True,
+                "native_lease": {
+                    "backend_pid": int(native_pid),
+                    "application_name": lease_app,
+                    "mode": lease_mode,
+                    "consecutive_samples": streak.get(native_pid, 0),
+                    "fixture_backend_pid": int(fixture_pid),
+                    "fixture_lock_scope": "rootyard-ref-v1 only: " + ref_name},
+                "exclusive_probe_denied_while_native_lease_held": True,
+                "cleanup_running_while_native_lease_held": True,
+                "stale_files_untouched_before_release": untouched,
                 "job_completed_after_push": completed,
                 "push_window": window,
-                "reader_barrier": "shared PostgreSQL advisory lease rootyard-data-v1 held through native ref publication",
-                "stale_staging_files_deleted": 4000,
+                "native_lease_barrier": "fixture holds rootyard-ref-v1; native push holds rootyard-data-v1 ShareLock (application_name=rootyard) until publication",
+                "staging_files_deleted_after_native_release": deleted,
                 "lfs_bytes_retained": True}
 
 def main():
