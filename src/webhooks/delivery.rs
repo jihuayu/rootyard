@@ -179,6 +179,91 @@ pub async fn sync_outbox_events(
     Ok(enqueued)
 }
 
+/// Bounded background backfill for missing `(outbox event, active push hook)`
+/// pairs. Unlike the manual `LIMIT 200` event scan above, this selects pairs in
+/// one anti-join, so memory follows `pair_limit` instead of the number of active
+/// hooks. Each call inserts at most one page; inserted pairs disappear from the
+/// next anti-join, so durable replay advances through a backlog. The pool's
+/// 5 s statement timeout bounds the SELECT and each INSERT, while `deadline`
+/// stops the loop between pairs.
+#[rustfmt::skip]
+pub(crate) async fn sync_outbox_events_bounded(
+    state: &AppState,
+    tenant_id: Uuid,
+    repository_id: Uuid,
+    pair_limit: i64,
+    deadline: tokio::time::Instant,
+) -> Result<usize, Error> {
+    if tokio::time::Instant::now() >= deadline {
+        return Ok(0);
+    }
+    ensure_schema(&state.pool).await?;
+    if tokio::time::Instant::now() >= deadline {
+        return Ok(0);
+    }
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let pairs = client
+        .query(
+            "SELECT e.event_id, e.operation_id, e.storage_generation, e.ref_name, e.old_oid, e.new_oid, \
+                    w.id AS webhook_id, w.secret, w.max_attempts \
+             FROM outbox_events e \
+             JOIN git_operations o ON o.id = e.operation_id \
+             JOIN forge_webhooks w ON w.repository_id = e.repository_id \
+               AND w.tenant_id = $1 AND w.active = true AND w.events ? 'push' \
+             WHERE e.repository_id = $2 AND o.outcome <> 'unknown' \
+               AND e.ref_name <> 'refs/rootyard-ci' \
+               AND e.ref_name NOT LIKE 'refs/rootyard-ci/%' \
+               AND NOT EXISTS (SELECT 1 FROM forge_webhook_deliveries d \
+                               WHERE d.webhook_id = w.id AND d.event_id = 'outbox:' || e.event_id) \
+             ORDER BY e.operation_sequence ASC, e.transaction_sequence ASC, w.created_at ASC, w.id ASC \
+             LIMIT $3",
+            &[&tenant_id, &repository_id, &pair_limit],
+        )
+        .await
+        .map_err(Error::internal)?;
+
+    let mut enqueued = 0usize;
+    let mut first_error: Option<Error> = None;
+    for ev in &pairs {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let raw_event_id: String = ev.get("event_id");
+        let ref_name: String = ev.get("ref_name");
+        if ci_pins::reserved(&ref_name) {
+            continue;
+        }
+        let delivery_event_id = format!("outbox:{raw_event_id}");
+        let payload = json!({
+            "event": "push", "event_id": raw_event_id,
+            "operation_id": ev.get::<_, Uuid>("operation_id"), "repository_id": repository_id,
+            "storage_generation": ev.get::<_, i64>("storage_generation"), "ref_name": ref_name,
+            "old_oid": ev.get::<_, String>("old_oid"), "new_oid": ev.get::<_, String>("new_oid"),
+        });
+        match enqueue_webhook_delivery(
+            &client, tenant_id, repository_id, ev.get("webhook_id"),
+            &ev.get::<_, String>("secret"), ev.get("max_attempts"),
+            &delivery_event_id, "push", &payload,
+        )
+        .await
+        {
+            Ok(Some(_)) => enqueued += 1,
+            Ok(None) => {}
+            // One bad pair must not discard the rest of the bounded page. It
+            // stays selected for a later round, while successful pairs advance.
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(enqueued),
+    }
+}
+
 #[rustfmt::skip]
 pub(crate) async fn ensure_pull_ci_pin(
     state: &AppState,
@@ -611,6 +696,9 @@ async fn dispatch_due_deliveries_with(
     clock: DeliveryClock,
     work_deadline: tokio::time::Instant,
 ) -> Result<Vec<WebhookDelivery>, Error> {
+    if tokio::time::Instant::now() >= work_deadline {
+        return Ok(Vec::new());
+    }
     let ids = due_delivery_ids(state, tenant_id, repository_id, limit, select_now_unix).await?;
     let mut out = Vec::with_capacity(ids.len());
     for delivery_id in ids {

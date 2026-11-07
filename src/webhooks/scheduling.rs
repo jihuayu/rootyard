@@ -37,6 +37,21 @@ pub(crate) const PULL_REPAIR_LIMIT: i64 = 16;
 /// Sends per hook-bearing repository per round. Sends remain serial inside a
 /// repository so observable per-hook sequence order is not inverted.
 pub(crate) const DELIVERY_LIMIT: i64 = 8;
+/// One bounded backfill page selects missing (outbox event, active push hook)
+/// pairs. The limit caps both work and memory independently of hook count.
+pub(crate) const OUTBOX_BACKFILL_LIMIT: i64 = 128;
+/// Backfill stops before this per-repository budget and is separately wrapped
+/// in a timeout, so it can never delay the HTTP phase indefinitely.
+pub(crate) const OUTBOX_BACKFILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// Phase two stops *starting* work at this point in a round. The remaining 60 s
+/// of `SCAN_TIMEOUT` covers one 30 s hook transport already in flight plus
+/// scheduling/DB overhead, so the outer timeout never drops a valid send.
+pub(crate) const SCAN_WORK_BUDGET: std::time::Duration = std::time::Duration::from_secs(240);
+/// In-process pull cursors are pruned by age and bounded by capacity. They are
+/// touched whenever a repository is examined, so an active multi-page prefix is
+/// not reset, while closed/deleted/backend-changed repositories age out.
+pub(crate) const PULL_CURSOR_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+pub(crate) const PULL_CURSOR_CAPACITY: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct RepositoryKey {
@@ -74,24 +89,55 @@ pub(crate) struct RunOutcome {
 /// In-process fair cursor for Pull Requests inside one repository. Absence of a
 /// value means the next page starts at the first open pull. The cursor only
 /// advances after a successfully examined page, so cancellation replays it.
+///
+/// Entries are bounded by age and capacity rather than being pruned against the
+/// current candidate window, so a repository outside this round's 16-row page
+/// keeps its progress. Every use refreshes the entry; this prevents an active
+/// multi-page prefix from being reset on the next page.
+#[derive(Clone, Copy)]
+struct PullCursor {
+    after: i64,
+    touched: std::time::Instant,
+}
+
 #[derive(Clone, Default)]
-pub(crate) struct PullCursors(Arc<Mutex<HashMap<Uuid, i64>>>);
+pub(crate) struct PullCursors(Arc<Mutex<HashMap<Uuid, PullCursor>>>);
+
+fn prune_pull_cursors(cursors: &mut HashMap<Uuid, PullCursor>, now: std::time::Instant) {
+    cursors.retain(|_, cursor| now.saturating_duration_since(cursor.touched) <= PULL_CURSOR_TTL);
+    if cursors.len() <= PULL_CURSOR_CAPACITY {
+        return;
+    }
+    let mut oldest: Vec<(Uuid, std::time::Instant)> =
+        cursors.iter().map(|(repository_id, cursor)| (*repository_id, cursor.touched)).collect();
+    oldest.sort_by_key(|(_, touched)| *touched);
+    for (repository_id, _) in oldest.into_iter().take(cursors.len() - PULL_CURSOR_CAPACITY) {
+        cursors.remove(&repository_id);
+    }
+}
 
 impl PullCursors {
     pub(crate) fn after(&self, repository_id: Uuid) -> Option<i64> {
-        self.0.lock().expect("pull cursor poisoned").get(&repository_id).copied()
+        let now = std::time::Instant::now();
+        let mut cursors = self.0.lock().expect("pull cursor poisoned");
+        prune_pull_cursors(&mut cursors, now);
+        let cursor = cursors.get_mut(&repository_id)?;
+        cursor.touched = now;
+        Some(cursor.after)
     }
 
     pub(crate) fn set(&self, repository_id: Uuid, after: Option<i64>) {
+        let now = std::time::Instant::now();
         let mut cursors = self.0.lock().expect("pull cursor poisoned");
         match after {
             Some(number) => {
-                cursors.insert(repository_id, number);
+                cursors.insert(repository_id, PullCursor { after: number, touched: now });
             }
             None => {
                 cursors.remove(&repository_id);
             }
         }
+        prune_pull_cursors(&mut cursors, now);
     }
 }
 

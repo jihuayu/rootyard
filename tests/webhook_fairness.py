@@ -20,12 +20,18 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from webhooks import WebhooksHarness  # noqa: E402
 
 SECRET = "fairness-native-secret-0123456789"
+
+
+def request_key(body):
+    """Ping events carry ``zen``; push backfill events carry ``ref_name``."""
+    return body.get("zen") or body.get("ref_name")
 
 
 class Receiver:
@@ -48,7 +54,7 @@ class Receiver:
                     body = json.loads(raw.decode("utf-8")) if raw else {}
                 except Exception:
                     body = {}
-                marker = body.get("zen")
+                marker = request_key(body)
                 with outer.lock:
                     outer.requests.append({
                         "delivery": self.headers.get("X-Rootyard-Delivery"),
@@ -100,7 +106,7 @@ class Receiver:
 
     def matching(self, marker):
         with self.lock:
-            return [r for r in self.requests if r["body"].get("zen") == marker]
+            return [r for r in self.requests if request_key(r["body"]) == marker]
 
     def attempts(self, marker):
         return [r["attempt"] for r in self.matching(marker)]
@@ -189,9 +195,16 @@ def main():
             "SELECT state || ',' || attempts FROM forge_webhook_deliveries "
             f"WHERE id='{delivery_id}'")
 
+    def db_delivery(delivery_id):
+        row = row_state(delivery_id)
+        assert row, f"missing delivery row {delivery_id}"
+        state, attempts = row.split(",")
+        return {"state": state, "attempts": int(attempts)}
+
     def two_sorted_repositories():
         worker(False)
-        harness.init_repo_branches("/git/alice/other.git", harness.root / "fair-other", harness.alice)
+        # WebhooksHarness.setup already seeds both repositories (including
+        # alice/other), so only their IDs are needed to fix the sorted order.
         repos = sorted([("forge", harness.repo["id"]), ("other", harness.other["id"])], key=lambda pair: pair[1])
         early_name, later_name = repos[0][0], repos[1][0]
         early_hook = hook(early_name, ["ping"])
@@ -230,6 +243,100 @@ def main():
             "early_state_while_held": early_now["state"],
             "early_final_attempts": early_done["attempts"],
             "later_final_attempts": receiver.attempts(later_marker),
+        }
+
+    def large_outbox_fanout_keeps_later_repo_live():
+        worker(False)
+        # Five fresh repositories; sort by UUID to match the scheduler's
+        # (tenant_id,repository_id) order. The first four get a large
+        # outbox x hook fanout, the last is a healthy repository behind them.
+        created = []
+        for index in range(5):
+            name = f"fairfan{index}"
+            created.append((name, harness.document(
+                "/api/repos", 201, method="POST", body={"name": name})))
+        created.sort(key=lambda item: item[1]["id"])
+        fanout, (healthy_name, _healthy_repo) = created[:4], created[4]
+        fanout_ids = [repo["id"] for _, repo in fanout]
+        hook_count = 512
+        event_count = 200
+        for index, (_name, repo) in enumerate(fanout):
+            operation = uuid.uuid4()
+            storage = int(harness.sql(
+                f"SELECT storage_generation FROM repositories WHERE id='{repo['id']}'"))
+            harness.sql(
+                "INSERT INTO git_operations(id,repository_id,actor_id,token_id,"
+                "actor_name,sequence,storage_generation,evidence,outcome) "
+                f"VALUES('{operation}','{repo['id']}','{harness.alice['user_id']}',"
+                f"'{harness.alice['token_id']}','alice',1000,{storage},'{{}}','recorded')")
+            harness.sql(
+                "INSERT INTO outbox_events(event_id,operation_id,repository_id,"
+                "storage_generation,operation_sequence,transaction_sequence,"
+                "ref_name,old_oid,new_oid) "
+                f"SELECT md5('fairfan-{index}-'||g::text)||md5('event-'||g::text),"
+                f"'{operation}','{repo['id']}',{storage},1000,g,"
+                f"'refs/heads/fanout-{index}-'||g,repeat('0',40),repeat('a',40) "
+                f"FROM generate_series(1,{event_count}) g")
+            harness.sql(
+                "INSERT INTO forge_webhooks(id,tenant_id,repository_id,url,secret,"
+                "secret_sha256,events,ci_contexts,auto_ci_pin,active,max_attempts,"
+                "timeout_ms) "
+                f"SELECT gen_random_uuid(),'{harness.alice['user_id']}',"
+                f"'{repo['id']}','{receiver.url}','fairfan-secret-{index}',"
+                "repeat('a',64),jsonb_build_array('push'),jsonb_build_array('ci/default'),"
+                f"false,true,2,30000 FROM generate_series(1,{hook_count})")
+
+        # Only the first fanout repository's first ref is held. Array ordering
+        # makes that ref the first events x hook page, so exactly one
+        # legitimate in-flight request is parked while the backlog persists.
+        held_ref = "refs/heads/fanout-0-1"
+        gate = receiver.hold(held_ref)
+        healthy_hook = hook(healthy_name, ["ping"], timeout_ms=3000, max_attempts=3)
+        healthy_marker = "healthy-while-fanout-backlog"
+        healthy_delivery = ping(healthy_name, healthy_hook["id"], healthy_marker, "healthy-fanout-1")
+        worker(True)
+
+        held = wait_for("held fanout receiver", lambda: receiver.matching(held_ref), timeout=30)
+        held_id = held[0]["delivery"]
+        assert gate["hit"], "held fanout receiver was never entered"
+        leased = db_delivery(held_id)
+        assert leased["state"] == "leased" and leased["attempts"] == 1, leased
+
+        started = time.monotonic()
+        healthy_done = wait_for("healthy repository delivery while fanout backlog exists", lambda: (
+            lambda row: row if row["state"] == "delivered" else None
+        )(db_delivery(healthy_delivery["id"])), timeout=25)
+        elapsed = round(time.monotonic() - started, 3)
+        assert healthy_done["attempts"] == 1, healthy_done
+        assert receiver.attempts(healthy_marker) == [1], receiver.attempts(healthy_marker)
+        assert not gate["event"].is_set(), "held fanout receiver released before the fairness assertion"
+
+        fanout_rows = int(harness.sql(
+            "SELECT count(*) FROM forge_webhook_deliveries WHERE event_type='push' "
+            "AND repository_id IN (" + ",".join(f"'{repo_id}'" for repo_id in fanout_ids) + ")"))
+        total_pairs = len(fanout_ids) * hook_count * event_count
+        assert 0 < fanout_rows < total_pairs, (fanout_rows, total_pairs)
+        held_still = db_delivery(held_id)
+        assert held_still["state"] == "leased" and held_still["attempts"] == 1, held_still
+
+        gate["event"].set()
+        held_done = wait_for("held fanout delivery after release", lambda: (
+            lambda row: row if row["state"] == "delivered" else None
+        )(db_delivery(held_id)), timeout=40)
+        assert held_done["attempts"] == 1, held_done
+        held_attempts = [request["attempt"] for request in receiver.matching(held_ref)
+                         if request["delivery"] == held_id]
+        assert held_attempts == [1], held_attempts
+        return {
+            "fanout_repositories": len(fanout_ids),
+            "hooks_per_fanout_repository": hook_count,
+            "outbox_events_per_fanout_repository": event_count,
+            "hook_event_pairs_available": total_pairs,
+            "push_delivery_rows_while_healthy_delivered": fanout_rows,
+            "healthy_delivery_seconds_while_fanout_held": elapsed,
+            "healthy_attempts": healthy_done["attempts"],
+            "held_delivery_attempts": held_done["attempts"],
+            "held_delivery_id": held_id,
         }
 
     def backlog_failure_restart():
@@ -398,6 +505,7 @@ def main():
         harness.env["ROOTYARD_OUTBOX_WORKER"] = "false"
         harness.setup()
         case("two_sorted_repositories_early_slow_does_not_starve_later", two_sorted_repositories)
+        case("large_outbox_hook_fanout_keeps_later_repo_live", large_outbox_fanout_keeps_later_repo_live)
         case("large_backlog_failure_and_hard_restart", backlog_failure_restart)
         case("graceful_cancel_leaves_durable_claim", graceful_cancel_restart)
         case("valid_12s_receiver_respects_hook_timeout", valid_twelve_second_receiver_is_not_phase_cancelled)

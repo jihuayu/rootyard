@@ -277,10 +277,13 @@ def main():
 
     try:
         h.setup()
-        other_work = h.root / "pr-sync-other"
-        other_base, other_feat = h.init_repo_branches("/git/alice/other.git", other_work, h.alice)
-        bob_work = h.root / "pr-sync-bob"
-        bob_base, bob_feat = h.init_repo_branches("/git/bob/forge.git", bob_work, h.bob)
+        # PullsHarness.setup already seeded alice/other and bob/forge with
+        # their initial main + feature branches; re-running init_repo_branches
+        # would try to commit an unchanged README and fail before assertions.
+        other_work = h.root / "work-alice-other"
+        other_base, other_feat = h.other_base_oid, h.other_feat_oid
+        bob_work = h.root / "work-bob-forge"
+        bob_base, bob_feat = h.bob_base_oid, h.bob_feat_oid
         cursor_repo = h.document("/api/repos", 201, method="POST", body={"name": "cursor"})
         cursor_work = h.root / "pr-sync-cursor"
         cursor_base, cursor_feat = h.init_repo_branches("/git/alice/cursor.git", cursor_work, h.alice)

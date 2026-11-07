@@ -8,10 +8,13 @@ use crate::{
     AppState, Error,
     pulls::models::{PULL_FIELDS, PullRequest, resolve_ref_oid},
     webhooks::{
-        delivery::{current_unix_seconds, dispatch_due_deliveries_until, on_pull_synchronized, sync_outbox_events},
+        delivery::{
+            current_unix_seconds, dispatch_due_deliveries_until, on_pull_synchronized, sync_outbox_events_bounded,
+        },
         scheduling::{
-            Candidate, DELIVERY_LIMIT, DELIVERY_REPOSITORY_BUDGET, PULL_RECONCILE_LIMIT, PULL_REPAIR_LIMIT,
-            PullCursors, REPOSITORY_PHASE_TIMEOUT, RoundSummary, SCAN_TIMEOUT, Scheduler, run_bounded,
+            Candidate, DELIVERY_LIMIT, DELIVERY_REPOSITORY_BUDGET, OUTBOX_BACKFILL_BUDGET, OUTBOX_BACKFILL_LIMIT,
+            PULL_RECONCILE_LIMIT, PULL_REPAIR_LIMIT, PullCursors, REPOSITORY_PHASE_TIMEOUT, RoundSummary, SCAN_TIMEOUT,
+            SCAN_WORK_BUDGET, Scheduler, run_bounded,
         },
     },
 };
@@ -53,6 +56,10 @@ async fn scan_round(
 ) -> Result<RoundSummary, Error> {
     let candidates = scheduler.next_page(state).await?;
     let mut summary = RoundSummary::default();
+    // Stop starting network work early enough that an already-started request
+    // can use its full hook timeout before the outer SCAN_TIMEOUT fires. Phase
+    // one is independently bounded far below this point.
+    let round_deadline = Instant::now() + SCAN_WORK_BUDGET;
 
     // Phase one is PostgreSQL/native-Git only. No webhook receive socket is
     // touched here, so a slow receiver on an earlier repository cannot delay a
@@ -95,8 +102,9 @@ async fn scan_round(
         let outcome = run_bounded(stop, &deliveries, move |candidate| {
             let state = Arc::clone(&state);
             // No whole-repository timeout here: a legitimate in-flight request
-            // may use up to the hook's declared 30 s transport timeout.
-            Box::pin(async move { deliver_candidate(&state, candidate).await })
+            // may use up to the hook's declared 30 s transport timeout. The
+            // shared round deadline only stops starting new sends.
+            Box::pin(async move { deliver_candidate(&state, candidate, round_deadline).await })
         })
         .await;
         summary.merge(outcome);
@@ -118,24 +126,44 @@ async fn reconcile_candidate(
     repair_pull_orchestration(state, candidate.key.tenant_id, candidate.key.repository_id).await
 }
 
-async fn deliver_candidate(state: &AppState, candidate: Candidate) -> Result<(), Error> {
+async fn deliver_candidate(state: &AppState, candidate: Candidate, round_deadline: Instant) -> Result<(), Error> {
     if !candidate.has_webhooks {
         return Ok(());
     }
-    // Exactly one bounded (LIMIT 200 inside) backfill call per repository per
-    // round. A backlog drains over later rounds instead of monopolising a scan.
-    sync_outbox_events(state, candidate.key.tenant_id, candidate.key.repository_id).await?;
-    let work_deadline = tokio::time::Instant::now() + DELIVERY_REPOSITORY_BUDGET;
-    dispatch_due_deliveries_until(
+    let tenant_id = candidate.key.tenant_id;
+    let repository_id = candidate.key.repository_id;
+    // Backfill is a separate, bounded phase before any HTTP starts. Selection
+    // is LIMITed to missing (event, hook) pairs and the pool's 5 s statement
+    // timeout caps the statement; the outer timeout caps the whole page. Memory
+    // follows OUTBOX_BACKFILL_LIMIT, not the repository's active hook count.
+    let backfill_deadline = (Instant::now() + OUTBOX_BACKFILL_BUDGET).min(round_deadline);
+    let backfill_error = match tokio::time::timeout_at(
+        backfill_deadline,
+        sync_outbox_events_bounded(state, tenant_id, repository_id, OUTBOX_BACKFILL_LIMIT, backfill_deadline),
+    )
+    .await
+    {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => Some(error),
+        // A bounded backfill skip starts no HTTP and leaves pairs durable for
+        // the next round, so it must not mark the repository failed.
+        Err(_) => None,
+    };
+    let work_deadline = (Instant::now() + DELIVERY_REPOSITORY_BUDGET).min(round_deadline);
+    let dispatched = dispatch_due_deliveries_until(
         state,
-        candidate.key.tenant_id,
-        candidate.key.repository_id,
+        tenant_id,
+        repository_id,
         DELIVERY_LIMIT,
         current_unix_seconds(),
         work_deadline,
     )
-    .await?;
-    Ok(())
+    .await;
+    match (dispatched, backfill_error) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Some(error)) => Err(error),
+        (Ok(_), None) => Ok(()),
+    }
 }
 
 /// Recover a PR whose row advanced but whose pin, runs, or deliveries did not
