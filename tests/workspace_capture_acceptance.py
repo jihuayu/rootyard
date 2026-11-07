@@ -476,8 +476,19 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             # scanner and database logic under test are unchanged.
             h.stop()
             target = repo(h, workspace) / "capture-gated.bin"
+            gate_names = ("LD_PRELOAD", "ROOTYARD_TEST_CAPTURE_GATE", "ROOTYARD_TEST_CAPTURE_TARGET")
+            prior_env = {name: h.env.get(name) for name in gate_names}
             gate = install_capture_read_gate(h, target)
-            h.start()
+            try:
+                h.start()
+            finally:
+                # Popen copied the environment; later psql/CLI children should
+                # use the original environment without the service read gate.
+                for name, value in prior_env.items():
+                    if value is None:
+                        h.env.pop(name, None)
+                    else:
+                        h.env[name] = value
             base_revision = json.loads(
                 h.expect(f"/api/workspaces/{workspace['id']}", 200, token=h.alice)
             )["revision"]
@@ -492,6 +503,7 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             # real read, before its fingerprint can be committed.
             target.write_bytes(b"revision race\n" * 64)
             wait_capture_gate(hit)
+            self.assertFalse(gate.with_suffix(".timeout").exists(), "read gate expired before observation")
             _GATE_FACTS["hit"] = True
             # The scan owns no workspace row lock while its real read is held.
             row_lock_nowait(h, workspace)
@@ -519,6 +531,7 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             )
             self.assertGreaterEqual(watermark, base_revision + 100)
             self.assertFalse(gate.with_suffix(".timeout").exists(), "read gate expired before the fence")
+            _GATE_FACTS["held_through_revision_fence"] = True
             release.touch()
             _GATE_FACTS["released"] = True
             # Releasing lets the stale first scan finish; the following small
