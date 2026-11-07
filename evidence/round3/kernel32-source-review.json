@@ -1,0 +1,41 @@
+{
+  "review": "final independent DeepSeek source review (round3 kernel32)",
+  "decision": "APPROVE_MANUAL_NATIVE_VERIFICATION_ENTRY",
+  "reviewed_ref": "ef250f54d7fe9aab0948bb333f6a051251921243",
+  "base_ref": "d10627d",
+  "changed_files_exact": [".github/workflows/native-kernel-acceptance.yml", "docs/sandbox-runner.md", "scripts/native_kernel_cgroup_setup.sh", "tests/test_sandbox_cgroup_native.py"],
+  "scope_note": "HEAD ef250f5 touches exactly these 4 files; src/ and Cargo.* are byte-unchanged since 4c28c39, so the qualified cgroup validator fix (bare cpu memory pids read tokens) is carried unmodified.",
+  "p1_findings": [],
+  "p1_count": 0,
+  "positive_native_kernel_status_locally": "BLOCKED - no delegated cgroup v2 subtree on this host; only the dispatched GitHub VM run can produce a pass",
+  "critical_verifications": {
+    "root_bootstrap_placement_only": "OK - supervisor writes only its own $$ into run/supervisor/cgroup.procs, re-reads it with grep -qx and confirms /proc/self/cgroup 0:: equals the leaf, then execs (never a helper child); exec makes the supervised PID and the test PID identical.",
+    "private_root_stays_empty": "OK - setup and supervisor read cgroup.procs content (tr) never test -s, and abort if the run root has internal processes; controllers are enabled before mkdir so job children get limit files.",
+    "uid_gid_derivation_and_setpriv_drop": "OK - owner uid/gid via stat -c %u/%g of the private run root, refused if 0, cross-checked against SUDO_UID, then exec setpriv --reuid --regid --init-groups --no-new-privs --inh-caps=-all --ambient-caps=-all -- before Python starts.",
+    "no_global_or_parent_chown": "OK - chown list is exactly run root, its cgroup.procs, its cgroup.subtree_control, the supervisor leaf and that leaf cgroup.procs; root/parent cgroups are never chowned and no parent cgroup.procs is written.",
+    "workflow_root_call": "OK - one privileged step: sudo -E env PATH=$PATH PYTHONPATH=$PYTHONPATH ... native_kernel_cgroup_setup.sh supervisor RUN_ID -- python3 tests/test_sandbox_cgroup_native.py; PATH carries toolcache Python 3.12 (asserted 3.12.x) and /usr/lib/postgresql/17/bin (asserted pg_dump 17.x) via GITHUB_PATH.",
+    "receipt_identity_matches_execution": "OK - receipt runner {uid,euid,gid,groups} from the dropped process; workflow validation asserts runner.uid == os.getuid() of the ordinary runner step and rejects uid 0 for passed; test preflight independently rejects euid 0 and a self cgroup outside the run root.",
+    "userns_image": "OK - runs-on ubuntu-22.04 keeps rootless bwrap usable without weakening AppArmor on the managed host; bubblewrap installed and version printed.",
+    "database_and_credentials": "OK - postgres:17 service with ephemeral trust auth (no repo secret), per-dispatch DB rootyard_native_cgroup_RUNID_ATTEMPT created/dropped with PG 17 clients; permissions contents: read; checkout persist-credentials false; receipt/evidence outside the checkout.",
+    "trigger_and_source_pin": "OK - on: workflow_dispatch only (YAML parsed: [workflow_dispatch]); build step requires git rev-parse HEAD == GITHUB_SHA and clean tree, cargo build --locked, receipt records source_commit + binary_sha256 + test_file_sha256 + workflow_file_sha256 and re-hashes the test file during validation.",
+    "native_not_dev": "OK - ROOTYARD_SANDBOX_MODE=cgroup enforced in workflow env and re-checked in the test (dev => failed receipt exit 1; profile != cgroup => failed); required proof set covers live controls, cancel/timeout reclaim, memory OOM, pids.max, aggregate cpu quota, workspace ENOSPC, bounded pool, two concurrent builds, credential absence, logs/artifact authorization, artifact+cgroup reclaim, crash descendant teardown, supervised membership, two CI checkout builds and a fenced new attempt; a pass is written only when every required proof is present.",
+    "failure_classification": "OK - setup unavailable => blocked fallback receipt; setup success + no receipt => failed; assertion failure or missing proof => failed; enforce step requires status == passed; upload uses if-no-files-found: error.",
+    "bounded_pool_and_cleanup": "OK - tmpfs size=64m,mode=0700,nodev,nosuid,noexec at RUNNER_TEMP path, chowned to runner uid:gid with owner/mode 700 asserted, statvfs capacity asserted >0 and <=67108864 and re-measured by the test; cleanup is scoped to /sys/fs/cgroup/rootyard-native-RUNID with cgroup.kill plus bounded rmdir/sleep loops (100 x 0.1s, 3 min step timeout), then umount+rm of that path only and dropdb."
+  },
+  "non_blocking_observations": [
+    "Receipt carries assertion names (assertions/required_assertions) but not unittest testsRun counts; the gate is complete, only counts are absent.",
+    "Preflight BLOCKED after a successful setup (e.g. test outside the run root) is labelled blocked, not failed, though the job still fails because only passed is accepted; documented in docs/sandbox-runner.md.",
+    "A GitHub re-run of the same run_id would refuse to reuse an existing rootyard-native-RUNID subtree; retry-only, loudly messaged, no effect on a first dispatch."
+  ],
+  "verification_performed": [
+    "git log/show --name-only: HEAD ef250f5 = 4 files, base d10627d",
+    "reviewed diffs of all 5 relevant files (workflow, script, src/sandbox/cgroup.rs, native test, docs)",
+    "grep cgroup.controllers|cgroup.subtree_control over src,tests,scripts,.github: no existing fixture builds a delegated root lacking subtree_control tokens, so the stricter validate_delegation does not regress other suites",
+    "yaml.safe_load(workflow) OK, triggers == [workflow_dispatch]",
+    "sh -n scripts/native_kernel_cgroup_setup.sh -> 0",
+    "python3 -m py_compile tests/test_sandbox_cgroup_native.py -> 0",
+    "git ls-tree: script mode 100755 (executable after checkout, sudo invocation valid)"
+  ],
+  "not_performed": ["no cargo build/test, no native cgroup writes, no repo edits, no GitHub dispatch; positive native kernel verification stays BLOCKED until the VM run"],
+  "remaining_limitation": "The native lane has not executed here: assertion-level behaviour (OOM, pids, cpu quota, ENOSPC, crash teardown, CI checkouts) is reviewed at source level only and must be proven by the dispatched ubuntu-22.04 VM run that emits the receipt."
+}
