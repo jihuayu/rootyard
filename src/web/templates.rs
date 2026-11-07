@@ -68,8 +68,7 @@ pub fn attach_next_page_nav(html: String, next_cursor: Option<&str>, label: &str
     let href = escape_html(&format!("?cursor={cursor}"));
     let label = escape_html(label);
     let nav = format!(
-        "<nav class="detail-pagination" data-page-next="true"><a rel="next" href="{href}">{label}</a></nav>
-"
+        r#"<nav class="detail-pagination" data-page-next="true"><a rel="next" href="{href}">{label}</a></nav>"#
     );
     match html.rfind("</body>") {
         Some(idx) => {
