@@ -298,8 +298,8 @@ def main():
         "limitations": [
             "One owned synthetic SQLSTATE 23503 trigger and one owned pg_sleep(6) trigger cancelled by statement_timeout=5000; not a forged application principal or a real user data fault.",
             "The remote-outage typed event is covered separately by tests/lfs_hydration_concurrency.py against owned Garage; this script does not certify it.",
-            "The 80-request full-backlog case, per-worker coverage, remote repair metrics and other metrics remain open.",
-            "Acceptance is limited to the reported request/error cases and the attested executable; native execution was not performed in the implementation branch.",
+            "Worker backlog, capture freshness and remote repair metrics are verified separately; this script covers request errors.",
+            "Acceptance is limited to the cases executed by this invocation and the attested executable named by its binary hash and compiled receipt.",
         ],
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
