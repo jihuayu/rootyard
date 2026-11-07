@@ -216,6 +216,13 @@ def pin_at(h, url, name, job, oid, generation):
     return json.loads(raw)
 
 
+def refresh_lease(h, node_id):
+    status, raw, _ = h.http("/api/shards/nodes/" + node_id + "/lease",
+                            token=h.alice, method="POST",
+                            body={"lease_ttl_seconds": 120, "bump_epoch": False})
+    assert status == 200, (status, raw[:200])
+
+
 def issue_checkout(h, url, name, job, oid, generation, audience, token=None):
     return request(url, "/api/repos/alice/" + name + "/ci-checkouts", token or h.alice,
                    "POST", {"job_id": job, "target_oid": oid,
@@ -262,7 +269,7 @@ def main():
         node0 = h.base
         status, _ = request(node0, "/api/shards/nodes", h.alice, "POST", {
             "node_id": "shard-primary-0", "endpoint": node0, "role": "primary",
-            "status": "healthy"})
+            "status": "healthy", "lease_ttl_seconds": 120})
         assert status in (200, 201), status
         h.api()
         h.roundtrip()
@@ -304,6 +311,12 @@ def main():
         recover_route = json.loads(h.expect("/api/repos/alice/recoverharness/shard-route",
                                             200, token=h.alice))
         assert recover_route["primary_node_id"] == "shard-primary-0", recover_route
+        multihop, multihop_work, _, multihop_tip = create_repo(h, "multihop")
+        multihop_route = json.loads(h.expect("/api/repos/alice/multihop/shard-route",
+                                              200, token=h.alice))
+        assert multihop_route["primary_node_id"] == "shard-primary-0", multihop_route
+        multihop_job1 = str(uuid.uuid4())
+        pin(h, "multihop", multihop_job1, multihop_tip, 1)
 
         port = free_port()
         node1 = "http://127.0.0.1:" + str(port)
@@ -694,6 +707,81 @@ def main():
             h, node0, recover_old, node1, recover_dest, recover_work,
             recover["clone_path"], "fresh commit after recovered cutover\n")
 
+        # Two-hop real migration with retained CI evidence: gen1 pin, move
+        # 0->1, fresh gen2 pin and write, move 1->0, then gen3 authorization.
+        refresh_lease(h, "shard-primary-0")
+        refresh_lease(h, "node1")
+        multihop_op1 = str(uuid.uuid4())
+        status, raw, _ = h.http("/api/repos/alice/multihop/shard-migrate", token=h.alice,
+                                method="POST",
+                                body={"target_node_id": "node1",
+                                      "expected_route_epoch": multihop_route["route_epoch"],
+                                      "operation_id": multihop_op1})
+        assert status == 200, (status, raw[:400])
+        assert json.loads(raw)["state"] == "completed"
+        mid_route = json.loads(h.expect("/api/repos/alice/multihop/shard-route", 200,
+                                        token=h.alice))
+        assert mid_route["primary_node_id"] == "node1"
+        assert int(h.sql("SELECT storage_generation FROM repositories WHERE id='"
+                         + multihop["id"] + "'")) == 2
+        (multihop_work / "state.txt").write_text("second generation write\n")
+        h.git("commit", "-am", "second generation", cwd=multihop_work)
+        multihop_tip2 = h.git("rev-parse", "HEAD", cwd=multihop_work).stdout.decode().strip()
+        h.git("push", node1 + multihop["clone_path"], "HEAD:main",
+              cwd=multihop_work, token=h.alice)
+        multihop_job2 = str(uuid.uuid4())
+        pin_at(h, node1, "multihop", multihop_job2, multihop_tip2, 2)
+        assert (node1_data / "ci-pins" / multihop["id"] / (multihop_job1 + ".json")).is_file()
+        stale_target = h.root / "data" / "repos" / (multihop["id"] + ".git")
+        assert (h.git("--git-dir=" + str(stale_target), "rev-parse", "refs/heads/main"
+                      ).stdout.decode().strip() == multihop_tip), \
+            "old target volume bytes were incorrectly treated as current"
+        refresh_lease(h, "shard-primary-0")
+        refresh_lease(h, "node1")
+        second_route = json.loads(h.expect("/api/repos/alice/multihop/shard-route", 200,
+                                           token=h.alice))
+        multihop_op2 = str(uuid.uuid4())
+        status, raw = request(node1, "/api/repos/alice/multihop/shard-migrate", h.alice,
+                              "POST", {"target_node_id": "shard-primary-0",
+                                       "expected_route_epoch": second_route["route_epoch"],
+                                       "operation_id": multihop_op2})
+        assert status == 200, (status, raw[:500])
+        assert json.loads(raw)["state"] == "completed"
+        final_route = json.loads(h.expect("/api/repos/alice/multihop/shard-route", 200,
+                                          token=h.alice))
+        assert final_route["primary_node_id"] == "shard-primary-0"
+        assert int(h.sql("SELECT storage_generation FROM repositories WHERE id='"
+                         + multihop["id"] + "'")) == 3
+        multihop_dest = h.root / "data" / "repos" / (multihop["id"] + ".git")
+        git_ok(h, multihop_dest)
+        assert h.git("--git-dir=" + str(multihop_dest), "rev-parse", "refs/heads/main"
+                     ).stdout.decode().strip() == multihop_tip2
+        assert h.git("--git-dir=" + str(multihop_dest), "rev-parse",
+                     "refs/rootyard-ci/jobs/" + multihop_job1
+                     ).stdout.decode().strip() == multihop_tip
+        assert h.git("--git-dir=" + str(multihop_dest), "rev-parse",
+                     "refs/rootyard-ci/jobs/" + multihop_job2
+                     ).stdout.decode().strip() == multihop_tip2
+        multihop_sidecars = h.root / "data" / "ci-pins" / multihop["id"]
+        old_intent = json.loads((multihop_sidecars / (multihop_job1 + ".json")).read_bytes())
+        mid_intent = json.loads((multihop_sidecars / (multihop_job2 + ".json")).read_bytes())
+        assert old_intent["storage_generation"] == 1
+        assert mid_intent["storage_generation"] == 2
+        assert (multihop_sidecars / (multihop_job1 + ".pinned.json")).is_file()
+        assert (multihop_sidecars / (multihop_job2 + ".pinned.json")).is_file()
+        status, _ = issue_checkout(h, node0, "multihop", multihop_job1,
+                                   multihop_tip, 3, audience)
+        assert status == 409, "gen1 evidence was regranted at gen3"
+        status, _ = issue_checkout(h, node0, "multihop", multihop_job2,
+                                   multihop_tip2, 3, audience)
+        assert status == 409, "gen2 evidence was regranted at gen3"
+        multihop_job3 = str(uuid.uuid4())
+        pin(h, "multihop", multihop_job3, multihop_tip2, 3)
+        status, raw = issue_checkout(h, node0, "multihop", multihop_job3,
+                                     multihop_tip2, 3, audience)
+        assert status in (200, 201), (status, raw[:400])
+        assert json.loads(raw)["plan"]["storage_generation"] == 3
+
         # Focused reconcile-window fixture (metadata/staging only, not a claim
         # of 34 whole migrations): completed and verified staged bundles beyond
         # the previous LIMIT 32 window must survive a target restart.
@@ -753,6 +841,9 @@ def main():
             "fresh_pin_accepted_during_finalize_survives": True,
             "pre_finalize_pin_bounded_503_then_retry": True,
             "zero_preexisting_root_fresh_pin_merged_by_finalize": True,
+            "two_hop_historical_generation_retention": True,
+            "two_hop_old_generation_grants_denied": True,
+            "two_hop_fresh_generation_authorized": True,
             "verified_staged_sidecar_survives_target_restart": True,
             "reconcile_window_fixture_34_retained": surviving,
             "reconcile_window_fixture_is_metadata_only": True,

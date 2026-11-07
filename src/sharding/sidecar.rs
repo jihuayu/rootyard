@@ -172,9 +172,9 @@ fn read_sidecar_directory(
             serde_json::from_slice(&content).map_err(|_| conflict("corrupt CI sidecar descriptor"))?;
         intent.validate().map_err(|_| conflict("invalid CI sidecar descriptor"))?;
         if let Some(generation) = expected_generation
-            && intent.storage_generation != generation
+            && (intent.storage_generation <= 0 || intent.storage_generation > generation)
         {
-            return Err(conflict("CI sidecar generation differs from its directory image"));
+            return Err(conflict("CI sidecar has a future or invalid historical generation"));
         }
         if name.ends_with(".pinned.json") {
             let job = canonical_job(&name, ".pinned.json")?;
@@ -362,7 +362,8 @@ fn bundle_intents(
             || intent.repository_id != repo_id
             || intent.owner_id != owner_id
             || intent.object_format != object_format
-            || intent.storage_generation != source_generation
+            || intent.storage_generation <= 0
+            || intent.storage_generation > source_generation
             || intent.retention_ref != format!("{CI_PREFIX}{job}")
         {
             return Err(conflict("transferred CI descriptor differs from its tenant or generation"));
@@ -550,7 +551,9 @@ fn scan_live_new_generation(
     let roots = manifest_ci_roots(manifest)?;
     let mut values = BTreeMap::new();
     for (job, (intent, content)) in &scanned.intents {
-        if intent.storage_generation == source_generation {
+        if intent.storage_generation <= source_generation {
+            // Historical retention evidence is carried verbatim by the
+            // bundle and must not be reclassified as a fresh target pin.
             continue;
         }
         if intent.storage_generation != target_generation {
