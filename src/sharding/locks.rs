@@ -17,6 +17,27 @@ impl MutationGuard {
     }
 }
 
+/// Serialize migration handlers for one repository without blocking ordinary
+/// writes. A dedicated session connection is dropped (and the advisory lock is
+/// released) when the handler returns or the process exits.
+pub(crate) struct MigrationLock {
+    _client: tokio_postgres::Client,
+}
+
+pub(crate) async fn migration(state: &AppState, repo: Uuid) -> Result<MigrationLock, Error> {
+    let client = crate::db::connect_url(&state.config.database_url).await.map_err(Error::internal)?;
+    let key = format!("rootyard-migration-v1:{repo}");
+    let acquired: bool = client
+        .query_one("SELECT pg_try_advisory_lock(hashtextextended($1,0))", &[&key])
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    if !acquired {
+        return Err(crate::sharding::models::conflict("repository already has an active migration"));
+    }
+    Ok(MigrationLock { _client: client })
+}
+
 /// PostgreSQL exclusive data barrier -> local maintenance gate -> cross-process
 /// publication fence -> local writer mutex. Callers keep all four until their
 /// native-data/route mutation is finished.

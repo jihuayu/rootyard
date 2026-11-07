@@ -78,9 +78,12 @@ async fn publish(state: &AppState, marker: &VolumeFenceMarker, id: Uuid) -> Resu
 
 pub async fn reject_pending(state: &AppState, repo_id: Uuid) -> Result<(), Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
+    // A pending marker is owned by one volume. A promoted target must not be
+    // blocked forever by an unpublished retired marker on a dead source volume;
+    // the target's own marker transition still fails closed.
     let pending = client.query_opt(
-        "SELECT id FROM shard_marker_transitions WHERE repository_id = $1 AND state = 'pending' LIMIT 1",
-        &[&repo_id],
+        "SELECT id FROM shard_marker_transitions WHERE repository_id = $1          AND volume_id = $2 AND state = 'pending' LIMIT 1",
+        &[&repo_id, &state.storage.volume_id],
     ).await.map_err(Error::internal)?.is_some();
     if pending {
         return Err(conflict("shard marker transition pending; writes blocked until reconciliation"));

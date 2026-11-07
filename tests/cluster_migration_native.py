@@ -40,6 +40,15 @@ def main():
         assert status in (200, 201), status
         h.api()
         h.roundtrip()
+        retention_job = str(uuid.uuid4())
+        generation = h.sql("SELECT storage_generation::text FROM repositories WHERE id='" + h.repo["id"] + "'")
+        status, raw = request(node0, "/api/repos/alice/demo/ci-pins", h.alice, "POST", {
+            "job_id": retention_job, "target_oid": h.second, "storage_generation": int(generation)})
+        assert status in (200, 201), (status, raw[:300])
+        assert h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/rootyard-ci/jobs/" + retention_job
+                     ).stdout.decode().strip() == h.second
+        for root in ("refs/rootyard-snapshots/backup-1", "refs/rootyard-backup/snapshot-1"):
+            h.git("--git-dir=" + str(h.bare), "update-ref", root, h.second)
         second_repo = json.loads(h.expect("/api/repos", 201, method="POST", token=h.alice,
                                           body={"name": "independent"}))
         source_sequence_file = h.root / "data" / "journal" / h.repo["id"] / "sequence"
@@ -120,23 +129,34 @@ def main():
         assert sentinel.read_bytes() == b"preserve old target on rejected transfer\n"
         unchanged = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
         assert unchanged["primary_node_id"] == "shard-primary-0"
+        # A delta failure after the drain must stay fail-closed. The durable
+        # abort operation is the explicit recovery path; it may advance the
+        # epoch, so a fresh operation is used for the later full migration.
+        if unchanged["draining"]:
+            aborted = json.loads(h.expect("/api/repos/alice/demo/shard-migrate/abort", 200, token=h.alice,
+                                          method="POST", body={"operation_id": operation_id,
+                                                               "expected_route_epoch": route["route_epoch"]}))
+            assert aborted["state"] == "aborted"
+            unchanged = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
+        assert unchanged["primary_node_id"] == "shard-primary-0"
+        assert unchanged["draining"] is False, "failed online transfer left the source write-drained"
         sequence.unlink()
         journal_dir.rmdir()
-        assert unchanged["draining"] is True, "failed transfer released its durable write drain"
         advert_status, advert_body = request(node0, h.repo["clone_path"] +
                                               "/info/refs?service=git-receive-pack", h.alice)
-        assert advert_status == 409, ("drained source advertised receive-pack", advert_status, advert_body[:150])
+        assert advert_status == 200, ("online source did not advertise receive-pack", advert_status, advert_body[:150])
         journal_before = int((h.root / "data" / "journal" / h.repo["id"] / "sequence").read_text())
-        (h.work / "hello.txt").write_text("commit held until safe cutover\n")
-        h.git("commit", "-am", "blocked by migration drain", cwd=h.work)
-        blocked_push = h.git("push", "origin", "HEAD:main", cwd=h.work, token=h.alice, check=False)
-        assert blocked_push.returncode != 0, "source accepted a write during failed migration drain"
+        (h.work / "hello.txt").write_text("commit accepted while an online snapshot failed\n")
+        h.git("commit", "-am", "write during failed online transfer", cwd=h.work)
+        concurrent_tip = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
+        h.git("push", "origin", "HEAD:main", cwd=h.work, token=h.alice)
         journal_after = int((h.root / "data" / "journal" / h.repo["id"] / "sequence").read_text())
-        assert journal_after == journal_before, ("drained push allocated journal operation", journal_before,
-                                                 journal_after, blocked_push.stderr.decode(errors="replace")[-250:])
+        assert journal_after > journal_before, "source write during online copy was not journaled"
         repo_state = h.sql("SELECT state || ':' || COALESCE(recovery_reason,'') FROM repositories WHERE id='" + h.repo["id"] + "'")
-        assert repo_state == "ready:", "failed drained push poisoned repository state: " + repo_state
-        assert h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == h.second
+        assert repo_state == "ready:", "online write poisoned repository state: " + repo_state
+        assert h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/heads/main").stdout.decode().strip() == concurrent_tip
+        operation_id = str(uuid.uuid4())
+        route = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
         # Pause the real target process so source can finish its exclusive
         # drain/snapshot and release that lease. Then acquire a native PG
         # reader before resuming the target. The target's exclusive install
@@ -159,7 +179,8 @@ def main():
         started = time.monotonic_ns()
         with ThreadPoolExecutor(max_workers=1) as pool:
             pending = pool.submit(h.http, "/api/repos/alice/demo/shard-migrate", token=h.alice,
-                                  method="POST", body={"target_node_id": "node1", "expected_route_epoch": route["route_epoch"], "operation_id": operation_id})
+                                  method="POST", body={"target_node_id": "node1", "expected_route_epoch": route["route_epoch"],
+                                                        "operation_id": operation_id, "replicate_only": True})
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and not source_bundle.exists():
                 assert not pending.done(), "migration failed before source bundle"
@@ -196,13 +217,32 @@ def main():
         receipt = json.loads(raw)
         duration_ms = round((time.monotonic_ns() - started) / 1e6, 3)
         assert duration_ms >= 1000, "migration did not wait on native PostgreSQL reader"
-        assert receipt["state"] == "completed" and receipt["target_node_id"] == "node1" and receipt["operation_id"] == operation_id
-        new_route = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
-        assert new_route["primary_node_id"] == "node1" and new_route["route_epoch"] > route["route_epoch"]
+        assert receipt["state"] == "verified" and receipt["operation_id"] == operation_id
+        replicated_route = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
+        assert replicated_route["primary_node_id"] == "shard-primary-0"
+        assert replicated_route["draining"] is False, "online replica snapshot drained source writes"
         assert dest_repo.is_dir() and dest_repo.resolve() != h.bare.resolve()
         h.git("--git-dir=" + str(dest_repo), "fsck", "--full", "--strict")
+        assert h.git("--git-dir=" + str(dest_repo), "rev-parse", "refs/heads/main"
+                     ).stdout.decode().strip() == concurrent_tip
+        # A write after the measured standby snapshot is admitted and must be
+        # transferred as a final delta before fenced cutover.
+        (h.work / "hello.txt").write_text("acknowledged between snapshot and cutover\n")
+        h.git("commit", "-am", "delta before cutover", cwd=h.work)
+        delta_tip = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
+        h.git("push", "origin", "HEAD:main", cwd=h.work, token=h.alice)
+        status, raw, _ = h.http("/api/repos/alice/demo/shard-migrate", token=h.alice,
+                                method="POST", body={"target_node_id": "node1", "expected_route_epoch": route["route_epoch"],
+                                                     "operation_id": operation_id})
+        assert status == 200, (status, raw[:500])
+        receipt = json.loads(raw)
+        assert receipt["state"] == "completed" and receipt["target_node_id"] == "node1"
+        new_route = json.loads(h.expect("/api/repos/alice/demo/shard-route", 200, token=h.alice))
+        assert new_route["primary_node_id"] == "node1" and new_route["route_epoch"] > route["route_epoch"]
+        assert new_route["draining"] is False
+        h.git("--git-dir=" + str(dest_repo), "fsck", "--full", "--strict")
         initial = h.git("--git-dir=" + str(dest_repo), "rev-parse", "refs/heads/main").stdout.decode().strip()
-        assert initial == h.second
+        assert initial == delta_tip
         (h.work / "hello.txt").write_text("commit after migration\n")
         h.git("commit", "-am", "post migration", cwd=h.work)
         final_tip = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
@@ -220,6 +260,14 @@ def main():
         retired = json.loads((h.bare / "rootyard-shard-fence.json").read_text())
         assert retired["primary_node_id"] == "shard-primary-0" and retired["read_only_degraded"] is True
         assert retired["route_epoch"] == new_route["route_epoch"]
+        assert h.git("--git-dir=" + str(dest_repo), "rev-parse",
+                     "refs/rootyard-ci/jobs/" + retention_job).stdout.decode().strip() == h.second
+        for root in ("refs/rootyard-snapshots/backup-1", "refs/rootyard-backup/snapshot-1"):
+            assert h.git("--git-dir=" + str(dest_repo), "rev-parse", root).stdout.decode().strip() == h.second
+        assert int(h.sql("SELECT COUNT(*) FROM outbox_events WHERE repository_id='" + h.repo["id"]
+                         + "' AND ref_name='refs/rootyard-ci/jobs/" + retention_job
+                         + "' AND new_oid='" + h.second + "'")) >= 1
+        h.git("--git-dir=" + str(dest_repo), "fsck", "--full", "--strict")
         report = {"kind": "native_cluster_staged_migration", "result": "passed",
                           "binary_sha256": hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                           "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -227,7 +275,11 @@ def main():
                           "operation_id": receipt["operation_id"], "transfer_ms": duration_ms,
                           "partial_copy_rejected_before_cutover": True, "same_operation_resumed_after_target_restart": True,
                           "ahead_journal_rejected_without_replacing_target": True,
-                          "failed_transfer_drained_source_writes": True,
+                          "failed_online_transfer_preserved_source_writes": True,
+                          "online_initial_copy_while_writes_admitted": True,
+                          "delta_after_concurrent_write_applied_before_cutover": True,
+                          "retained_ci_pin_and_backup_snapshot_roots_survived": True,
+                          "retained_ci_pin_sql_outbox_survived": True,
                           "target_exclusive_barrier_waited_for_native_reader": True,
                           "target_process_paused_until_source_barrier_released": True,
                           "foreign_repository_operation_uuid_rejected_without_drain": True,

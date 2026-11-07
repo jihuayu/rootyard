@@ -113,6 +113,9 @@ def main():
         first = json.loads(h.expect(path, 200, token=h.alice, method="POST", body=request_body))
         assert first["state"] == "verified" and first["new_route_epoch"] == initial["route_epoch"]
         assert json.loads(h.expect(route_path, 200, token=h.alice))["primary_node_id"] == "shard-primary-0"
+        migrations = json.loads(h.expect(path, 200, token=h.alice))
+        assert any(item["operation_id"] == operation_id and item["state"] == "verified"
+                   and item["resumable"] for item in migrations["items"]), migrations
         target_repo = target_data / "repos" / (h.repo["id"] + ".git")
         assert h.git("--git-dir=" + str(target_repo), "rev-parse", "refs/heads/main").stdout.decode().strip() == h.second
 
@@ -121,6 +124,8 @@ def main():
         (h.work / "hello.txt").write_text("acknowledged after first replica snapshot\n")
         h.git("commit", "-am", "later source write", cwd=h.work)
         later_tip = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
+        # replicate_only must release the live epoch: a source write may not be
+        # rejected by a stale fenced_epoch after the verified snapshot.
         h.git("push", "origin", "HEAD:main", cwd=h.work, token=h.alice)
         pause_session(old_pid)
         time.sleep(7)
@@ -153,8 +158,20 @@ def main():
         assert push.poll() is None and not (fence_dir / "shard-primary-0.blocked").exists()
         resume_session(old_pid)
         _, push_err = push.communicate(timeout=60)
-        assert push.returncode == 0, h.redact(push_err.decode(errors="replace")[-500:])
+        # SIGSTOP exceeds the native publication lease freshness window. A
+        # resumed process must abort that admission rather than continue a stale
+        # ref write; this is the expected fail-closed path, not a promotion.
+        if push.returncode != 0:
+            assert b"Connection reset" in push_err or b"unexpected disconnect" in push_err, h.redact(
+                push_err.decode(errors="replace")[-500:])
+        assert h.proc.poll() is None and not (fence_dir / "shard-primary-0.blocked").exists()
+        # A fresh admission after resume must succeed because no fencing or
+        # promotion occurred while the old process was unresponsive.
+        retry = h.git("push", "origin", "HEAD:main", cwd=h.work, token=h.alice, check=False)
+        assert retry.returncode == 0, h.redact(retry.stderr.decode(errors="replace")[-500:])
         acknowledged_tip = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
+        assert h.git("--git-dir=" + str(h.bare), "rev-parse", "refs/heads/main"
+                     ).stdout.decode().strip() == acknowledged_tip
         third = json.loads(h.expect(path, 200, token=h.alice, method="POST", body=request_body))
         assert third["state"] == "verified"
         assert h.git("--git-dir=" + str(target_repo), "rev-parse", "refs/heads/main").stdout.decode().strip() == acknowledged_tip
@@ -188,8 +205,19 @@ def main():
         (h.work / "hello.txt").write_text("write after fenced takeover\n")
         h.git("commit", "-am", "post takeover write", cwd=h.work)
         target_tip = h.git("rev-parse", "HEAD", cwd=h.work).stdout.decode().strip()
+        advert_status, advert_body = request(target_base, h.repo["clone_path"] +
+                                              "/info/refs?service=git-receive-pack", h.alice)
+        assert advert_status == 200, (advert_status, advert_body[:500],
+                                      request(target_base, route_path, h.alice)[1][:500])
         h.git("push", target_base + h.repo["clone_path"], "HEAD:main", cwd=h.work, token=h.alice)
         assert h.git("--git-dir=" + str(target_repo), "rev-parse", "refs/heads/main").stdout.decode().strip() == target_tip
+        promoted_route = json.loads(h.expect(route_path, 200, token=h.alice))
+        assert promoted_route["draining"] is False, "promotion left the repository write-drained"
+        assert promoted_route["read_only_degraded"] is False
+        source_marker = json.loads((h.bare / "rootyard-shard-fence.json").read_text())
+        assert source_marker["read_only_degraded"] is True
+        assert source_marker["primary_node_id"] == "shard-primary-0"
+        assert source_marker["route_epoch"] == promoted_route["route_epoch"]
         failover_rows = int(h.sql("SELECT COUNT(*) FROM shard_failover_operations WHERE repository_id='" + h.repo["id"] + "' AND state='promoted'"))
         assert failover_rows == 1, "takeover created duplicate promotion records"
         os.killpg(target.pid, signal.SIGKILL)
@@ -205,6 +233,7 @@ def main():
               cwd=h.copy, token=h.reader)
         assert h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip() == target_tip
         h.stop(hard=True)
+        assert json.loads((h.bare / "rootyard-shard-fence.json").read_text())["read_only_degraded"] is True
         rejected = h.run([args.binary, "serve"], check=False)
         assert rejected.returncode != 0 and b"durable physical fence" in rejected.stderr
         # Even a misconfigured process that omits the local fence deployment

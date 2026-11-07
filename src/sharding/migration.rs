@@ -1,15 +1,36 @@
-//! Source-locked Git bundle transfer and verified, resumable repository placement.
-use crate::{AppState, Error, auth::{self, Role}, db, journal, members::audit::record_audit_event,
-    sharding::{fencing::read_volume_marker_at, models::{self, REPO_ROUTE_FIELDS, RepoShardRoute, VolumeFenceMarker, conflict, json},
-        router::{fetch_node, load_or_init_repo_route}, security::require_operator, transitions,
-        transport::{self, DELEGATION_HEADER, ENVELOPE_LIFETIME_SECONDS, Envelope}}};
-use axum::{Json, body::Body, extract::{OriginalUri, Path, Query, State}, http::{HeaderMap, StatusCode}, response::Response};
+//! Online repository migration: pinned initial snapshot, drained delta and
+//! fenced cutover. Operation rows make every phase resumable; an operator can
+//! abort a drained operation and keep the old primary writable.
+use crate::{
+    AppState, Error,
+    auth::{self, Role, finish_tx as finish},
+    members::audit::record_audit_event,
+    sharding::{
+        fencing::read_volume_marker_at,
+        locks,
+        models::{
+            self, REPO_ROUTE_FIELDS, RepoShardRoute, VolumeFenceMarker, conflict, json,
+            unix_now,
+        },
+        replication::{self, TransferMeta},
+        replication_target::{self, SnapshotReceipt},
+        router::{fetch_node, load_or_init_repo_route},
+        security::require_operator,
+        transitions,
+        transport::{self, DELEGATION_HEADER, ENVELOPE_LIFETIME_SECONDS, Envelope},
+    },
+};
+use bytes::Bytes;
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::Response,
+};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::{fs::{self, File, OpenOptions}, os::unix::fs::OpenOptionsExt,
-    path::{Path as FsPath, PathBuf}, sync::Arc, time::Duration};
-use tokio::{io::AsyncWriteExt, process::Command};
+use serde_json::json as sjson;
+use std::{path::Path as FsPath, sync::Arc};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -25,7 +46,10 @@ pub struct MigrationInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SnapshotQuery { refs_sha256: String, journal_sequence: i64 }
+pub struct AbortInput {
+    operation_id: Uuid,
+    expected_route_epoch: Option<i64>,
+}
 
 #[derive(Serialize)]
 pub struct MigrationReceipt {
@@ -39,411 +63,745 @@ pub struct MigrationReceipt {
     state: &'static str,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SnapshotReceipt { operation_id: Uuid, refs_sha256: String, state: String }
-
-pub(crate) async fn git_output(state: &AppState, args: &[&str], timeout: Duration) -> Result<Vec<u8>, Error> {
-    let mut command: Command = state.storage.git(&state.config);
-    command.args(args);
-    crate::git_http::collect_git_output(command, 16 * 1024 * 1024, timeout).await
-        .map_err(|_| conflict("Git bundle or verification failed"))
-}
-
-/// The lease is polled while Git runs. The shared process wrapper's Drop
-/// synchronously kills and reaps the native process group on cancellation.
-pub(crate) async fn git_output_lease(state: &AppState, args: &[&str], timeout: Duration,
-    lease: &crate::storage::read_leases::Lease) -> Result<Vec<u8>, Error> {
-    let mut command = state.storage.git(&state.config);
-    command.args(args);
-    lease.guard(crate::git_http::collect_git_output(
-        command, 16 * 1024 * 1024, timeout)).await?
-        .map_err(|_| conflict("Git bundle or verification failed"))
-}
-
-pub(crate) async fn refs_digest_lease(state: &AppState, repo: &FsPath,
-    lease: &crate::storage::read_leases::Lease) -> Result<String, Error> {
-    let path = repo.to_str().ok_or_else(Error::bad_request)?;
-    let refs = git_output_lease(state, &["--git-dir", path, "for-each-ref",
-        "--format=%(refname) %(objectname)"], state.config.git_timeout, lease).await?;
-    if refs.is_empty() { return Err(conflict("empty repository cannot be replicated as ready")); }
-    let head = git_output_lease(state, &["--git-dir", path, "symbolic-ref", "HEAD"],
-        state.config.git_timeout, lease).await?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"rootyard-shard-refs-v1\0");
-    hasher.update(&refs);
-    hasher.update(b"HEAD\0");
-    hasher.update(&head);
-    Ok(hex::encode(hasher.finalize()))
-}
-
-async fn configure_target(state: &AppState, repo: &FsPath, repo_id: Uuid) -> Result<(), Error> {
-    let path = repo.to_str().ok_or_else(Error::bad_request)?;
-    git_output(state, &["--git-dir", path, "config", "--remove-section", "remote.origin"], state.config.git_timeout).await?;
-    let max_request = state.config.max_request_bytes.to_string();
-    let settings = [
-        ("rootyard.repositoryId", repo_id.to_string()),
-        ("http.receivepack", "true".into()),
-        ("http.getanyfile", "false".into()),
-        ("receive.denyNonFastForwards", "true".into()),
-        ("receive.denyDeleteCurrent", "true".into()),
-        ("receive.fsckObjects", "true".into()),
-        ("transfer.fsckObjects", "true".into()),
-        ("receive.maxInputSize", max_request),
-        ("uploadpack.allowFilter", "false".into()),
-        ("uploadpack.allowAnySHA1InWant", "false".into()),
-        ("uploadpack.allowTipSHA1InWant", "false".into()),
-        ("uploadpack.allowReachableSHA1InWant", "false".into()),
-        ("core.logAllRefUpdates", "true".into()),
-        ("core.fsync", "committed".into()),
-        ("core.fsyncMethod", "fsync".into()),
-        ("gc.auto", "0".into()),
-        ("maintenance.auto", "false".into()),
-        ("pack.threads", "1".into()),
-        ("pack.windowMemory", "32m".into()),
-        ("pack.deltaCacheSize", "32m".into()),
-    ];
-    for (name, value) in settings {
-        git_output(state, &["--git-dir", path, "config", name, &value], state.config.git_timeout).await?;
+async fn send_transfer(
+    state: &AppState,
+    target_url: &str,
+    envelope: &Envelope,
+    path_and_query: &str,
+    meta: &TransferMeta,
+    bundle: Option<&FsPath>,
+) -> Result<SnapshotReceipt, Error> {
+    let mut url = transport::validate_endpoint(target_url)?;
+    let (path, query) = path_and_query.split_once('?').ok_or_else(Error::bad_request)?;
+    url.set_path(path);
+    url.set_query(Some(query));
+    let prefix = futures_util::stream::once({
+        let bytes = replication::encode_meta(meta)?;
+        async move { Ok::<_, std::io::Error>(Bytes::from(bytes)) }
+    });
+    let reader: Box<dyn tokio::io::AsyncRead + Send + Unpin> = match bundle {
+        Some(path) => Box::new(tokio::fs::File::open(path).await.map_err(Error::internal)?),
+        None => Box::new(tokio::io::empty()),
+    };
+    let body = reqwest::Body::wrap_stream(prefix.chain(ReaderStream::new(reader)));
+    let http = transport::cluster_client(state.config.git_timeout)?;
+    let upstream = http
+        .post(url)
+        .header(DELEGATION_HEADER, transport::sign(envelope)?)
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| Error(StatusCode::BAD_GATEWAY, "replica transfer interrupted"))?;
+    if upstream.status() != StatusCode::OK {
+        return Err(conflict("replica rejected snapshot transfer"));
     }
-    Ok(())
+    upstream.json::<SnapshotReceipt>().await.map_err(Error::internal)
 }
 
-fn staging_root(state: &AppState) -> Result<PathBuf, Error> {
-    let root = state.storage.root.join("shard-staging");
-    fs::create_dir_all(&root).map_err(Error::internal)?;
-    let meta = fs::symlink_metadata(&root).map_err(Error::internal)?;
-    if !meta.is_dir() || meta.file_type().is_symlink() { return Err(conflict("unsafe shard staging directory")); }
-    Ok(root)
-}
-
-fn clean_staging(path: &FsPath) -> Result<(), Error> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => fs::remove_dir_all(path).map_err(Error::internal),
-        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => fs::remove_file(path).map_err(Error::internal),
-        Ok(_) => Err(conflict("unsafe existing shard staging path")),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(Error::internal(err)),
+fn envelope(
+    authority_incarnation: Uuid,
+    actor: &crate::db::Identity,
+    repository_id: Uuid,
+    target_node_id: &str,
+    route_epoch: i64,
+    fencing_token: i64,
+    storage_generation: i64,
+    path_and_query: String,
+) -> Envelope {
+    Envelope {
+        version: 1,
+        authority_incarnation,
+        nonce: Uuid::new_v4(),
+        expires_unix: unix_now() + ENVELOPE_LIFETIME_SECONDS,
+        actor_id: actor.id,
+        token_id: actor.token_id,
+        repository_id,
+        target_node_id: target_node_id.to_owned(),
+        route_epoch,
+        fencing_token,
+        storage_generation,
+        method: "POST".into(),
+        path_and_query,
     }
 }
 
-fn sync_parent(path: &FsPath) -> Result<(), Error> {
-    File::open(path).and_then(|f| f.sync_all()).map_err(Error::internal)
+async fn operation_state(
+    state: &AppState,
+    repo_id: Uuid,
+    operation_id: Uuid,
+) -> Result<(String, Option<String>, Option<i64>), Error> {
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let row = client
+        .query_one(
+            "SELECT state, refs_sha256, journal_sequence FROM shard_replication_operations \
+             WHERE id=$1 AND repository_id=$2",
+            &[&operation_id, &repo_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    Ok((row.get(0), row.get(1), row.get(2)))
 }
 
 pub async fn migrate_repository(
-    State(state): State<Arc<AppState>>, Path((owner, name)): Path<(String, String)>,
-    headers: HeaderMap, Json(input): Json<MigrationInput>,
+    State(state): State<Arc<AppState>>,
+    Path((owner, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<MigrationInput>,
 ) -> Result<Response, Error> {
-    if !models::valid_node_id(&input.target_node_id) { return Err(Error::bad_request()); }
+    if !models::valid_node_id(&input.target_node_id) {
+        return Err(Error::bad_request());
+    }
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
     require_operator(&tx, &actor).await?;
     let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
-    let authority_incarnation: Uuid = tx.query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
-        .await.map_err(Error::internal)?.get(0);
-    auth::finish_tx(tx, &actor, false).await?;
+    let authority_incarnation: Uuid = tx
+        .query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    let target = fetch_node(&tx, &input.target_node_id).await?.ok_or_else(Error::not_found)?;
+    finish(tx, &actor, false).await?;
     if transport::node_id()?.as_deref() != Some(route.primary_node_id.as_str()) {
         return Err(conflict("migration must run on source storage node"));
     }
-    // Stage the durable drain only after admitted writers and publication
-    // windows have finished, in the same ordered exclusive barrier used for
-    // native replacement and final cutover.
-    let source = super::locks::exclusive(&state, access.repo_id).await?;
-    source.ensure_active()?;
-    let mut client = state.pool.get().await.map_err(Error::internal)?;
-    let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::verify_token(&tx, &actor, true).await?;
-    require_operator(&tx, &actor).await?;
-    // Lock repository before route so this order matches events::publish
-    // (repository -> route -> admission) and takeover never deadlocks it.
-    let generation: i64 = tx.query_one("SELECT storage_generation FROM repositories WHERE id = $1 FOR UPDATE", &[&access.repo_id]).await.map_err(Error::internal)?.get(0);
-    let route_sql = format!("SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id = $1 FOR UPDATE");
-    let route = RepoShardRoute::row(&tx.query_one(&route_sql, &[&access.repo_id]).await.map_err(Error::internal)?);
-    if route.primary_node_id == input.target_node_id || route.primary_node_id != transport::node_id()?.unwrap_or_default()
-        || input.expected_route_epoch.is_some_and(|e| e != route.route_epoch) || route.read_only_degraded {
-        return Err(conflict("migration source or route epoch changed"));
+    if route.primary_node_id == input.target_node_id {
+        return Err(conflict("migration target is already the source primary"));
     }
-    if route.read_replica_nodes.contains(&input.target_node_id) && route.replica_watermarks.get(&input.target_node_id).is_some_and(|w| w.verified) {
-        return Err(conflict("target is currently serving reads; drain replica first"));
+    if route.read_only_degraded {
+        return Err(conflict("migration source is read-only degraded"));
     }
-    let target = fetch_node(&tx, &input.target_node_id).await?.ok_or_else(Error::not_found)?;
-    if target.status != "healthy" || !target.is_lease_active(models::unix_now()) { return Err(conflict("target storage node unavailable")); }
+    if target.status != "healthy" || !target.is_lease_active(unix_now()) {
+        return Err(conflict("target storage node unavailable"));
+    }
     transport::validate_endpoint(&target.endpoint)?;
     let repo = state.storage.verify_path(access.repo_id).map_err(Error::internal)?;
     let existing_marker = read_volume_marker_at(&repo)?;
-    if existing_marker.as_ref().is_some_and(|m| m.read_only_degraded || m.fenced_epoch >= m.route_epoch) {
+    if existing_marker.as_ref().is_some_and(|marker| marker.read_only_degraded
+        || marker.fenced_epoch >= marker.route_epoch)
+    {
         return Err(conflict("source volume is fenced or degraded"));
     }
     transitions::reject_pending(&state, access.repo_id).await?;
-    let journal_sequence = journal::sequence(&state.storage.root, access.repo_id).map_err(Error::internal)?;
+    let _migration = locks::migration(&state, access.repo_id).await?;
     let operation_id = input.operation_id.unwrap_or_else(Uuid::new_v4);
-    let prior = tx.query_opt("SELECT repository_id, source_node_id, target_node_id, source_route_epoch, source_generation, state FROM shard_replication_operations WHERE id = $1", &[&operation_id]).await.map_err(Error::internal)?;
-    if let Some(row) = prior {
-        let prior_repo: Uuid = row.get(0);
-        let source: String = row.get(1);
-        let destination: String = row.get(2);
-        let epoch: i64 = row.get(3);
-        let prior_generation: i64 = row.get(4);
-        let state: String = row.get(5);
-        if prior_repo != access.repo_id || source != route.primary_node_id || destination != input.target_node_id || epoch != route.route_epoch
-            || prior_generation != generation || state == "completed" || state == "aborted" {
-            return Err(conflict("replication operation cannot resume against changed placement"));
-        }
-    } else {
-        if route.draining { return Err(conflict("repository is drained by another migration")); }
-        tx.execute("INSERT INTO shard_replication_operations(id, repository_id, source_node_id, target_node_id, source_route_epoch, source_generation, state) VALUES ($1,$2,$3,$4,$5,$6,'copying')",
-            &[&operation_id, &access.repo_id, &route.primary_node_id, &input.target_node_id, &route.route_epoch, &generation]).await.map_err(Error::internal)?;
-    }
-    // Fence the old shard epoch before inspecting admitted writers. The route
-    // row update blocks new admission and settlement transactions; already
-    // ADMITTED writers are either drained by the bounded window or marked
-    // FENCED_ABORTED so their later SQL settlement cannot publish.
-    tx.execute("UPDATE repository_shard_routes SET draining=true, fenced_epoch=GREATEST(fenced_epoch,$3), version=version+1 WHERE repository_id=$1 AND route_epoch=$2",
-        &[&access.repo_id, &route.route_epoch, &route.route_epoch]).await.map_err(Error::internal)?;
-    crate::storage::ref_admission::fence_epoch(&tx, access.repo_id, route.route_epoch,
-        crate::storage::ref_admission::DRAIN_WINDOW).await?;
-    tx.commit().await.map_err(Error::internal)?;
-    // The source lock remains held. Restore any refs a fenced, quiescent
-    // writer advanced locally before the bundle/digest is measured.
-    crate::storage::ref_admission::cleanup_fenced(&state, access.repo_id).await.map_err(Error::internal)?;
-    if !journal::pending(&state.storage.root, access.repo_id).map_err(Error::internal)?.is_empty() {
-        return Err(conflict("source has pending Git journal operations; reconcile before migration"));
-    }
-    // No database transaction remains open while native Git and network IO run.
-    let stage = staging_root(&state)?;
-    let bundle = stage.join(format!("{operation_id}.bundle"));
-    clean_staging(&bundle)?;
-    source.ensure_active()?;
-    git_output_lease(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout, &source.lease).await?;
-    source.ensure_active()?;
-    git_output_lease(&state, &["--git-dir", repo.to_str().ok_or_else(Error::bad_request)?, "bundle", "create", bundle.to_str().ok_or_else(Error::bad_request)?, "--all"], state.config.git_timeout, &source.lease).await?;
-    source.ensure_active()?;
-    File::open(&bundle).and_then(|f| f.sync_all()).map_err(Error::internal)?;
-    sync_parent(&stage)?;
-    let digest = refs_digest_lease(&state, &repo, &source.lease).await?;
-    source.ensure_active()?;
-    // The bundle is now immutable in private staging. The target must acquire
-    // the exclusive PG data barrier before replacing its native repository;
-    // holding the source's exclusive barrier across HTTP would deadlock it.
-    drop(source);
-    let path = format!("/internal/shards/{}/snapshot/{}?refs_sha256={digest}&journal_sequence={journal_sequence}", access.repo_id, operation_id);
-    let envelope = Envelope {
-        version: 1, authority_incarnation, nonce: Uuid::new_v4(), expires_unix: models::unix_now() + ENVELOPE_LIFETIME_SECONDS,
-        actor_id: actor.id, token_id: actor.token_id, repository_id: access.repo_id,
-        target_node_id: input.target_node_id.clone(), route_epoch: route.route_epoch,
-        fencing_token: route.fencing_token, storage_generation: generation,
-        method: "POST".into(), path_and_query: path.clone(),
-    };
-    let mut url = transport::validate_endpoint(&target.endpoint)?;
-    url.set_path(path.split('?').next().unwrap_or("/"));
-    url.set_query(Some(&format!("refs_sha256={digest}&journal_sequence={journal_sequence}")));
-    let file = tokio::fs::File::open(&bundle).await.map_err(Error::internal)?;
-    let http = transport::cluster_client(state.config.git_timeout)?;
-    let upstream = http.post(url).header(DELEGATION_HEADER, transport::sign(&envelope)?)
-        .body(reqwest::Body::wrap_stream(ReaderStream::new(file))).send().await
-        .map_err(|_| Error(StatusCode::BAD_GATEWAY, "replica transfer interrupted"))?;
-    if upstream.status() != StatusCode::OK { return Err(conflict("replica rejected snapshot transfer")); }
-    let receipt: SnapshotReceipt = upstream.json().await.map_err(Error::internal)?;
-    if receipt.operation_id != operation_id || receipt.refs_sha256 != digest || receipt.state != "verified" {
-        return Err(conflict("target snapshot verification receipt mismatch"));
-    }
-    clean_staging(&bundle)?;
 
-    let cutover = super::locks::exclusive(&state, access.repo_id).await?;
-    cutover.ensure_active()?;
-    if journal::sequence(&state.storage.root, access.repo_id).map_err(Error::internal)? != journal_sequence {
-        return Err(conflict("source journal advanced after migration drain"));
-    }
-
+    // Persist the operation before moving bytes. A prior attempt can resume
+    // only against the exact same source, target, epoch and generation.
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let current_incarnation: Uuid = tx.query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
-        .await.map_err(Error::internal)?.get(0);
-    if current_incarnation != authority_incarnation { return Err(conflict("metadata authority changed during transfer")); }
     auth::verify_token(&tx, &actor, true).await?;
     require_operator(&tx, &actor).await?;
-    let confirmed = tx.query_opt("SELECT refs_sha256 FROM shard_replication_operations WHERE id = $1 AND repository_id = $2 AND state = 'verified' FOR UPDATE",
-        &[&operation_id, &access.repo_id]).await.map_err(Error::internal)?;
-    if confirmed.as_ref().map(|r| r.get::<_, String>(0)) != Some(digest.clone()) { return Err(conflict("replica verification state missing")); }
-    let route = RepoShardRoute::row(&tx.query_one(&route_sql, &[&access.repo_id]).await.map_err(Error::internal)?);
-    if route.primary_node_id != transport::node_id()?.unwrap_or_default() {
+    let generation: i64 = tx
+        .query_one("SELECT storage_generation FROM repositories WHERE id=$1 FOR UPDATE", &[&access.repo_id])
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    let route_sql = format!(
+        "SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id=$1 FOR UPDATE"
+    );
+    let route = RepoShardRoute::row(
+        &tx.query_one(&route_sql, &[&access.repo_id]).await.map_err(Error::internal)?,
+    );
+    if route.primary_node_id != transport::node_id()?.unwrap_or_default()
+        || input.expected_route_epoch.is_some_and(|epoch| epoch != route.route_epoch)
+        || route.read_only_degraded
+    {
+        return Err(conflict("migration source or route epoch changed"));
+    }
+    if route.read_replica_nodes.contains(&input.target_node_id)
+        && route.replica_watermarks.get(&input.target_node_id).is_some_and(|watermark| watermark.verified)
+    {
+        return Err(conflict("target is currently serving reads; drain replica first"));
+    }
+    let prior = tx
+        .query_opt(
+            "SELECT source_node_id,target_node_id,source_route_epoch,source_generation,state \
+             FROM shard_replication_operations WHERE id=$1",
+            &[&operation_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    let mut op_state = if let Some(row) = prior {
+        let prior_repo: Uuid = tx
+            .query_one(
+                "SELECT repository_id FROM shard_replication_operations WHERE id=$1",
+                &[&operation_id],
+            )
+            .await
+            .map_err(Error::internal)?
+            .get(0);
+        let source: String = row.get(0);
+        let destination: String = row.get(1);
+        let epoch: i64 = row.get(2);
+        let prior_generation: i64 = row.get(3);
+        let state: String = row.get(4);
+        if prior_repo != access.repo_id || source != route.primary_node_id
+            || destination != input.target_node_id || epoch != route.route_epoch
+            || prior_generation != generation
+        {
+            return Err(conflict("replication operation cannot resume against changed placement"));
+        }
+        if matches!(state.as_str(), "completed" | "aborted") {
+            return Err(conflict("replication operation is already terminal"));
+        }
+        state
+    } else {
+        if route.draining {
+            return Err(conflict("repository is drained by another migration"));
+        }
+        tx.execute(
+            "INSERT INTO shard_replication_operations(id, repository_id, source_node_id, target_node_id, \
+             source_route_epoch, source_generation, state) VALUES ($1,$2,$3,$4,$5,$6,'copying')",
+            &[
+                &operation_id,
+                &access.repo_id,
+                &route.primary_node_id,
+                &input.target_node_id,
+                &route.route_epoch,
+                &generation,
+            ],
+        )
+        .await
+        .map_err(Error::internal)?;
+        "copying".to_owned()
+    };
+    finish(tx, &actor, true).await?;
+
+    // Phase 1: an initial snapshot can be taken while clients keep writing.
+    // Resume from a durable verified copy only when its recorded manifest is
+    // present; otherwise replace the standby with a fresh measured snapshot.
+    let mut base = replication::read_base(&state, operation_id, access.repo_id)?;
+    let (op_digest, _) = {
+        let (state_name, digest, _) = operation_state(&state, access.repo_id, operation_id).await?;
+        op_state = state_name;
+        (digest, ())
+    };
+    let initial_done = !input.replicate_only
+        && op_state == "verified"
+        && base.as_ref().is_some_and(|base| {
+            op_digest.as_deref() == Some(base.refs_sha256.as_str())
+                && base.source_route_epoch == route.route_epoch
+                && base.source_generation == generation
+        });
+    if input.replicate_only && route.draining {
+        return Err(conflict("replicate-only requires a writable source route"));
+    }
+    if !initial_done {
+        let snapshot = replication::capture_source_snapshot(
+            &state,
+            access.repo_id,
+            operation_id,
+            route.route_epoch,
+            generation,
+        )
+        .await?;
+        let path = format!(
+            "/internal/shards/{}/snapshot/{}?refs_sha256={}&journal_sequence={}",
+            access.repo_id, operation_id, snapshot.refs_sha256, snapshot.journal_sequence
+        );
+        let meta = TransferMeta { base: snapshot.manifest.clone(), final_refs: None };
+        let envelope = envelope(
+            authority_incarnation,
+            &actor,
+            access.repo_id,
+            &input.target_node_id,
+            route.route_epoch,
+            route.fencing_token,
+            generation,
+            path.clone(),
+        );
+        let bundle = replication::staging_root(&state)?.join(format!("{operation_id}.bundle"));
+        let receipt = send_transfer(&state, &target.endpoint, &envelope, &path, &meta, Some(&bundle)).await?;
+        if receipt.operation_id != operation_id
+            || receipt.refs_sha256 != snapshot.refs_sha256
+            || receipt.state != "verified"
+        {
+            return Err(conflict("target snapshot verification receipt mismatch"));
+        }
+        let _ = replication::clean_staging(&bundle);
+        base = Some(snapshot);
+    }
+    let base = base.ok_or_else(|| conflict("source snapshot manifest is missing"))?;
+    let (state_name, digest, _sequence) = operation_state(&state, access.repo_id, operation_id).await?;
+    op_state = state_name;
+    if op_state != "verified" {
+        return Err(conflict("target snapshot was not durably verified"));
+    }
+    if input.replicate_only {
+        return Ok(json(
+            StatusCode::OK,
+            MigrationReceipt {
+                operation_id,
+                repository_id: access.repo_id,
+                source_node_id: route.primary_node_id.clone(),
+                target_node_id: input.target_node_id.clone(),
+                refs_sha256: digest.or_else(|| Some(base.refs_sha256.clone())).unwrap_or_default(),
+                old_route_epoch: route.route_epoch,
+                new_route_epoch: route.route_epoch,
+                state: "verified",
+            },
+        ));
+    }
+
+    // Phase 2: briefly drain admitted writers, capture the exact final manifest,
+    // then build only the object delta while the source stays fenced.
+    let cutover = locks::exclusive(&state, access.repo_id).await?;
+    cutover.ensure_active()?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    auth::verify_token(&tx, &actor, true).await?;
+    require_operator(&tx, &actor).await?;
+    let current_incarnation: Uuid = tx
+        .query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    if current_incarnation != authority_incarnation {
+        return Err(conflict("metadata authority changed during transfer"));
+    }
+    let locked_generation: i64 = tx
+        .query_one("SELECT storage_generation FROM repositories WHERE id=$1 FOR UPDATE", &[&access.repo_id])
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    let route = RepoShardRoute::row(
+        &tx.query_one(&route_sql, &[&access.repo_id]).await.map_err(Error::internal)?,
+    );
+    if route.primary_node_id != transport::node_id()?.unwrap_or_default()
+        || route.route_epoch != base.source_route_epoch
+        || locked_generation != generation
+        || base.source_generation != generation
+    {
         return Err(conflict("source placement changed during replication"));
     }
-    if route.route_epoch != envelope.route_epoch || route.fencing_token != envelope.fencing_token {
-        return Err(conflict("route changed during replication"));
+    if !route.draining {
+        tx.execute(
+            "UPDATE repository_shard_routes SET draining=true, fenced_epoch=GREATEST(fenced_epoch,$3), \
+             version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 AND route_epoch=$2",
+            &[&access.repo_id, &route.route_epoch, &route.route_epoch],
+        )
+        .await
+        .map_err(Error::internal)?;
+    } else if route.fenced_epoch < route.route_epoch {
+        return Err(conflict("repository drain does not fence the previous epoch"));
     }
-    if !route.draining { return Err(conflict("migration drain was released before cutover")); }
-    // Re-fence the old epoch while its route row is locked. A settlement that
-    // committed between the drain and cutover must be visible here before the
-    // target can claim the repository.
-    crate::storage::ref_admission::fence_epoch(&tx, access.repo_id, route.route_epoch,
-        crate::storage::ref_admission::DRAIN_WINDOW).await?;
-    let settled_max: i64 = tx.query_one(
-        "SELECT COALESCE(MAX(sequence),0) FROM git_operations WHERE repository_id=$1",
-        &[&access.repo_id]).await.map_err(Error::internal)?.get(0);
-    if settled_max > journal_sequence {
+    crate::storage::ref_admission::fence_epoch(
+        &tx,
+        access.repo_id,
+        route.route_epoch,
+        crate::storage::ref_admission::DRAIN_WINDOW,
+    )
+    .await?;
+    finish(tx, &actor, true).await?;
+    let _ = crate::storage::ref_admission::cleanup_fenced(&state, access.repo_id).await;
+    if !crate::journal::pending(&state.storage.root, access.repo_id).map_err(Error::internal)?.is_empty() {
+        return Err(conflict("source has pending Git journal operations; reconcile before cutover"));
+    }
+    let final_manifest = replication::read_manifest_lease(&state, &repo, &cutover.lease).await?;
+    let final_digest = final_manifest.digest();
+    let final_sequence = crate::journal::sequence(&state.storage.root, access.repo_id)
+        .map_err(Error::internal)?;
+    let delta = replication::create_delta_bundle(
+        &state,
+        access.repo_id,
+        operation_id,
+        &base.manifest,
+        &final_manifest,
+    )
+    .await?;
+    drop(cutover);
+
+    let path = format!(
+        "/internal/shards/{}/delta/{}?base_refs_sha256={}&refs_sha256={}&journal_sequence={}",
+        access.repo_id, operation_id, base.refs_sha256, final_digest, final_sequence
+    );
+    let meta = TransferMeta { base: base.manifest.clone(), final_refs: Some(final_manifest.clone()) };
+    let envelope = envelope(
+        authority_incarnation,
+        &actor,
+        access.repo_id,
+        &input.target_node_id,
+        route.route_epoch,
+        route.fencing_token,
+        generation,
+        path.clone(),
+    );
+    let receipt = send_transfer(
+        &state,
+        &target.endpoint,
+        &envelope,
+        &path,
+        &meta,
+        delta.as_deref(),
+    )
+    .await?;
+    if receipt.operation_id != operation_id
+        || receipt.refs_sha256 != final_digest
+        || receipt.state != "verified"
+    {
+        return Err(conflict("target delta verification receipt mismatch"));
+    }
+    if let Some(delta) = delta {
+        let _ = replication::clean_staging(&delta);
+    }
+
+    // Phase 3: re-acquire the source barrier and cut over only if the target
+    // verified the exact manifest measured under the drain.
+    let cutover = locks::exclusive(&state, access.repo_id).await?;
+    cutover.ensure_active()?;
+    let source_manifest = replication::read_manifest_lease(&state, &repo, &cutover.lease).await?;
+    if source_manifest != final_manifest || source_manifest.digest() != receipt.refs_sha256 {
+        return Err(conflict("source refs advanced after the verified delta"));
+    }
+    if crate::journal::sequence(&state.storage.root, access.repo_id).map_err(Error::internal)?
+        != final_sequence
+    {
+        return Err(conflict("source journal advanced after migration drain"));
+    }
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    auth::verify_token(&tx, &actor, true).await?;
+    require_operator(&tx, &actor).await?;
+    let current_incarnation: Uuid = tx
+        .query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    if current_incarnation != authority_incarnation {
+        return Err(conflict("metadata authority changed during transfer"));
+    }
+    let confirmed = tx
+        .query_opt(
+            "SELECT refs_sha256,journal_sequence,source_generation,source_route_epoch \
+             FROM shard_replication_operations WHERE id=$1 AND repository_id=$2 AND state='verified' FOR UPDATE",
+            &[&operation_id, &access.repo_id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(|| conflict("replica verification state missing"))?;
+    let confirmed_digest: String = confirmed.get(0);
+    let confirmed_sequence: i64 = confirmed.get(1);
+    let confirmed_generation: i64 = confirmed.get(2);
+    let confirmed_epoch: i64 = confirmed.get(3);
+    if confirmed_digest != receipt.refs_sha256 || confirmed_sequence != final_sequence
+        || confirmed_generation != generation || confirmed_epoch != route.route_epoch
+    {
+        return Err(conflict("replica verification state changed before cutover"));
+    }
+    let route = RepoShardRoute::row(
+        &tx.query_one(&route_sql, &[&access.repo_id]).await.map_err(Error::internal)?,
+    );
+    if route.primary_node_id != transport::node_id()?.unwrap_or_default()
+        || route.route_epoch != confirmed_epoch || route.fencing_token != envelope.fencing_token
+        || !route.draining
+    {
+        return Err(conflict("source placement changed during replication"));
+    }
+    crate::storage::ref_admission::fence_epoch(
+        &tx,
+        access.repo_id,
+        route.route_epoch,
+        crate::storage::ref_admission::DRAIN_WINDOW,
+    )
+    .await?;
+    let settled_max: i64 = tx
+        .query_one(
+            "SELECT COALESCE(MAX(sequence),0) FROM git_operations WHERE repository_id=$1",
+            &[&access.repo_id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    if settled_max > final_sequence {
         return Err(conflict("source settled a Git operation after the verified snapshot"));
     }
     cutover.ensure_active()?;
-    if input.replicate_only {
-        let mut watermarks = route.replica_watermarks.clone();
-        watermarks.insert(input.target_node_id.clone(), models::ReplicaWatermark {
-            storage_generation: generation, op_sequence: journal_sequence, verified: true,
-            updated_unix: models::unix_now(),
-        });
-        tx.execute("UPDATE repository_shard_routes SET replica_watermarks=$2, required_op_sequence=GREATEST(required_op_sequence,$3), draining=false, version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 AND route_epoch=$4",
-            &[&access.repo_id, &serde_json::json!(watermarks), &journal_sequence, &route.route_epoch]).await.map_err(Error::internal)?;
-        record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.replica_verified", "shard_replication", &input.target_node_id,
-            serde_json::json!({"operation_id":operation_id,"refs_sha256":digest,"journal_sequence":journal_sequence})).await?;
-        cutover.ensure_active()?;
-        auth::finish_tx(tx, &actor, true).await?;
-        return Ok(json(StatusCode::OK, MigrationReceipt { operation_id, repository_id: access.repo_id,
-            source_node_id: route.primary_node_id, target_node_id: input.target_node_id,
-            refs_sha256: digest, old_route_epoch: route.route_epoch, new_route_epoch: route.route_epoch, state: "verified" }));
-    }
     let new_epoch = route.route_epoch + 1;
     let new_token = route.fencing_token.max(new_epoch) + 1;
     let new_generation = generation + 1;
     auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
-    let updated = tx.execute("UPDATE repositories SET storage_generation = $2 WHERE id = $1 AND storage_generation = $3", &[&access.repo_id, &new_generation, &generation]).await.map_err(Error::internal)?;
-    if updated != 1 { return Err(conflict("repository generation changed during transfer")); }
-    tx.execute("UPDATE shard_nodes SET role='primary', lease_epoch=GREATEST(lease_epoch,$2), version=version+1 WHERE node_id=$1", &[&input.target_node_id, &new_epoch]).await.map_err(Error::internal)?;
-    let upd = format!("UPDATE repository_shard_routes SET primary_node_id=$2, route_epoch=$3, fencing_token=$4, fenced_epoch=$5, required_generation=$6, draining=false, explicit_override=true, read_replica_nodes='[]'::jsonb, replica_watermarks='{{}}'::jsonb, version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 RETURNING {REPO_ROUTE_FIELDS}");
-    let moved = RepoShardRoute::row(&tx.query_one(&upd, &[&access.repo_id, &input.target_node_id, &new_epoch, &new_token, &route.route_epoch, &new_generation]).await.map_err(Error::internal)?);
-    tx.execute("UPDATE shard_replication_operations SET state='completed', updated_at=clock_timestamp() WHERE id=$1 AND state='verified'", &[&operation_id]).await.map_err(Error::internal)?;
-    // Publish a retired marker on the *source* volume. The target process may
-    // publish its own active marker, but the source must never describe itself
-    // as the new writable target after cutover.
-    let mut marker = VolumeFenceMarker::from_route(&moved, new_generation, Some(route.primary_node_id.clone()), models::unix_now());
+    let updated = tx
+        .execute(
+            "UPDATE repositories SET storage_generation=$2 WHERE id=$1 AND storage_generation=$3",
+            &[&access.repo_id, &new_generation, &generation],
+        )
+        .await
+        .map_err(Error::internal)?;
+    if updated != 1 {
+        return Err(conflict("repository generation changed during transfer"));
+    }
+    tx.execute(
+        "UPDATE shard_nodes SET role='primary', lease_epoch=GREATEST(lease_epoch,$2), version=version+1 \
+         WHERE node_id=$1",
+        &[&input.target_node_id, &new_epoch],
+    )
+    .await
+    .map_err(Error::internal)?;
+    let upd = format!(
+        "UPDATE repository_shard_routes SET primary_node_id=$2, route_epoch=$3, fencing_token=$4, \
+         fenced_epoch=$5, required_generation=$6, required_op_sequence=GREATEST(required_op_sequence,$7), \
+         draining=false, explicit_override=true, read_replica_nodes='[]'::jsonb, \
+         replica_watermarks='{{}}'::jsonb, version=version+1, updated_at=clock_timestamp() \
+         WHERE repository_id=$1 RETURNING {REPO_ROUTE_FIELDS}"
+    );
+    let moved = RepoShardRoute::row(
+        &tx.query_one(
+            &upd,
+            &[
+                &access.repo_id,
+                &input.target_node_id,
+                &new_epoch,
+                &new_token,
+                &route.route_epoch,
+                &new_generation,
+                &final_sequence,
+            ],
+        )
+        .await
+        .map_err(Error::internal)?,
+    );
+    tx.execute(
+        "UPDATE shard_replication_operations SET state='completed', updated_at=clock_timestamp() \
+         WHERE id=$1 AND state='verified'",
+        &[&operation_id],
+    )
+    .await
+    .map_err(Error::internal)?;
+    let mut marker = VolumeFenceMarker::from_route(
+        &moved,
+        new_generation,
+        Some(route.primary_node_id.clone()),
+        unix_now(),
+    );
     marker.primary_node_id = route.primary_node_id.clone();
     marker.read_only_degraded = true;
-    record_audit_event(&tx, access.owner_id, access.repo_id, &actor, "shard.migrated", "shard_replication", &input.target_node_id,
-        serde_json::json!({"operation_id": operation_id, "refs_sha256": digest, "source": route.primary_node_id, "target": input.target_node_id})).await?;
+    record_audit_event(
+        &tx,
+        access.owner_id,
+        access.repo_id,
+        &actor,
+        "shard.migrated",
+        "shard_replication",
+        &input.target_node_id,
+        sjson!({
+            "operation_id": operation_id,
+            "refs_sha256": receipt.refs_sha256,
+            "source": route.primary_node_id,
+            "target": input.target_node_id,
+            "online_initial_copy": true,
+            "delta_applied": base.refs_sha256 != receipt.refs_sha256,
+        }),
+    )
+    .await?;
     let transition_id = transitions::stage(&tx, &state, &marker).await?;
     cutover.ensure_active()?;
     transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
-    Ok(json(StatusCode::OK, MigrationReceipt { operation_id, repository_id: access.repo_id, source_node_id: route.primary_node_id,
-        target_node_id: input.target_node_id, refs_sha256: digest, old_route_epoch: route.route_epoch, new_route_epoch: new_epoch, state: "completed" }))
+    let _ = replication::clean_staging(&replication::base_path(&state, operation_id)?);
+    Ok(json(
+        StatusCode::OK,
+        MigrationReceipt {
+            operation_id,
+            repository_id: access.repo_id,
+            source_node_id: route.primary_node_id,
+            target_node_id: input.target_node_id,
+            refs_sha256: receipt.refs_sha256,
+            old_route_epoch: route.route_epoch,
+            new_route_epoch: new_epoch,
+            state: "completed",
+        },
+    ))
 }
 
-pub async fn receive_snapshot(
-    State(state): State<Arc<AppState>>, Path((repo_id, op_id)): Path<(Uuid, Uuid)>,
-    Query(query): Query<SnapshotQuery>, OriginalUri(uri): OriginalUri, headers: HeaderMap, body: Body,
+pub async fn abort_migration(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<AbortInput>,
 ) -> Result<Response, Error> {
-    if query.refs_sha256.len() != 64 || query.journal_sequence < 0
-        || !query.refs_sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
-        return Err(Error::bad_request());
-    }
-    if headers.contains_key(axum::http::header::AUTHORIZATION) { return Err(Error::unauthorized()); }
-    let raw = headers.get(DELEGATION_HEADER).and_then(|v| v.to_str().ok()).ok_or_else(Error::unauthorized)?;
-    let env = transport::verify(raw)?;
-    let now = models::unix_now();
-    if env.version != 1 || env.nonce.is_nil() || env.expires_unix < now || env.expires_unix > now + ENVELOPE_LIFETIME_SECONDS
-        || env.method != "POST" || env.path_and_query != uri.path_and_query().map_or(uri.path(), |p| p.as_str())
-        || env.repository_id != repo_id || transport::node_id()?.as_deref() != Some(env.target_node_id.as_str()) {
-        return Err(Error::unauthorized());
-    }
+    let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let current_incarnation: Uuid = tx.query_one("SELECT incarnation FROM cluster_authority WHERE singleton=true", &[])
-        .await.map_err(Error::internal)?.get(0);
-    if current_incarnation != env.authority_incarnation { return Err(Error::unauthorized()); }
-    let nonce_inserted = tx.execute("INSERT INTO cluster_transport_nonces(nonce,expires_at) VALUES($1,to_timestamp($2::bigint::double precision)) ON CONFLICT DO NOTHING", &[&env.nonce, &env.expires_unix]).await.map_err(Error::internal)?;
-    if nonce_inserted != 1 { return Err(Error::unauthorized()); }
-    let row = tx.query_opt("SELECT u.username,t.read_only,t.digest FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp())",
-        &[&env.token_id, &env.actor_id]).await.map_err(Error::internal)?.ok_or_else(Error::unauthorized)?;
-    let actor = db::Identity { id: env.actor_id, token_id: env.token_id, username: row.get(0), read_only: row.get(1), token_digest: row.get(2) };
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
     require_operator(&tx, &actor).await?;
-    let repo = tx.query_one("SELECT u.slug,r.name,r.storage_generation,r.owner_id FROM repositories r JOIN namespaces u ON u.id=r.owner_id WHERE r.id=$1", &[&repo_id]).await.map_err(Error::internal)?;
-    let owner: String = repo.get(0);
-    let name: String = repo.get(1);
-    let generation: i64 = repo.get(2);
-    let owner_id: Uuid = repo.get(3);
-    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin).await?;
-    let op = tx.query_opt("SELECT source_node_id,target_node_id,source_route_epoch,source_generation,state FROM shard_replication_operations WHERE id=$1 AND repository_id=$2",
-        &[&op_id, &repo_id]).await.map_err(Error::internal)?.ok_or_else(Error::not_found)?;
-    let target: String = op.get(1);
+    let route = load_or_init_repo_route(&tx, access.owner_id, access.repo_id).await?;
+    finish(tx, &actor, false).await?;
+    if transport::node_id()?.as_deref() != Some(route.primary_node_id.as_str()) {
+        return Err(conflict("migration abort must run on the source storage node"));
+    }
+    let _migration = locks::migration(&state, access.repo_id).await?;
+    let mutation = locks::exclusive(&state, access.repo_id).await?;
+    mutation.ensure_active()?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    auth::verify_token(&tx, &actor, true).await?;
+    require_operator(&tx, &actor).await?;
+    let generation: i64 = tx
+        .query_one("SELECT storage_generation FROM repositories WHERE id=$1 FOR UPDATE", &[&access.repo_id])
+        .await
+        .map_err(Error::internal)?
+        .get(0);
+    let route_sql = format!(
+        "SELECT {REPO_ROUTE_FIELDS} FROM repository_shard_routes WHERE repository_id=$1 FOR UPDATE"
+    );
+    let route = RepoShardRoute::row(
+        &tx.query_one(&route_sql, &[&access.repo_id]).await.map_err(Error::internal)?,
+    );
+    if input.expected_route_epoch.is_some_and(|epoch| epoch != route.route_epoch) {
+        return Err(conflict("migration abort route epoch mismatch"));
+    }
+    let op = tx
+        .query_opt(
+            "SELECT source_node_id,state,source_route_epoch FROM shard_replication_operations \
+             WHERE id=$1 AND repository_id=$2 FOR UPDATE",
+            &[&input.operation_id, &access.repo_id],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(Error::not_found)?;
     let source: String = op.get(0);
-    let epoch: i64 = op.get(2);
-    let source_gen: i64 = op.get(3);
-    let op_state: String = op.get(4);
-    if target != env.target_node_id || epoch != env.route_epoch || source_gen != env.storage_generation || generation != source_gen
-        || !matches!(op_state.as_str(), "copying" | "verified") { return Err(conflict("snapshot operation or generation changed")); }
-    let route = load_or_init_repo_route(&tx, owner_id, repo_id).await?;
-    if route.route_epoch != env.route_epoch || route.fencing_token != env.fencing_token || route.primary_node_id != source {
-        return Err(conflict("source placement changed before snapshot transfer"));
+    let op_state: String = op.get(1);
+    let op_epoch: i64 = op.get(2);
+    if source != route.primary_node_id {
+        return Err(conflict("migration abort source mismatch"));
     }
-    let maximum: i64 = tx.query_one("SELECT COALESCE(MAX(sequence),0) FROM git_operations WHERE repository_id=$1", &[&repo_id]).await.map_err(Error::internal)?.get(0);
-    if query.journal_sequence < maximum { return Err(conflict("source journal sequence is behind recorded Git operations")); }
-    tx.commit().await.map_err(Error::internal)?;
-    let target = super::locks::exclusive(&state, repo_id).await?;
-    target.ensure_active()?;
-    let root = staging_root(&state)?;
-    let bundle = root.join(format!("{op_id}.incoming.bundle"));
-    let staging = root.join(format!("{op_id}.git"));
-    clean_staging(&bundle)?;
-    clean_staging(&staging)?;
-    let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&bundle).map_err(Error::internal)?;
-    let mut file = tokio::fs::File::from_std(file);
-    let mut total = 0_u64;
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(Error::internal)?;
-        total = total.saturating_add(chunk.len() as u64);
-        if total > state.config.max_repo_bytes { return Err(conflict("snapshot bundle exceeds configured repository size")); }
-        file.write_all(&chunk).await.map_err(Error::internal)?;
+    if op_state == "aborted" {
+        finish(tx, &actor, false).await?;
+        return Ok(json(StatusCode::OK, sjson!({
+            "operation_id": input.operation_id,
+            "repository_id": access.repo_id,
+            "state": "aborted",
+        })));
     }
-    file.sync_all().await.map_err(Error::internal)?;
-    drop(file);
-    if total == 0 { return Err(conflict("empty snapshot bundle")); }
-    git_output_lease(&state, &["-c", "core.hooksPath=/dev/null", "clone", "--mirror", "--", bundle.to_str().ok_or_else(Error::bad_request)?, staging.to_str().ok_or_else(Error::bad_request)?], state.config.git_timeout, &target.lease).await?;
-    target.ensure_active()?;
-    git_output_lease(&state, &["--git-dir", staging.to_str().ok_or_else(Error::bad_request)?, "fsck", "--full", "--strict"], state.config.git_timeout, &target.lease).await?;
-    target.ensure_active()?;
-    let measured = refs_digest_lease(&state, &staging, &target.lease).await?;
-    if measured != query.refs_sha256 { return Err(conflict("target refs differ from source snapshot")); }
-    configure_target(&state, &staging, repo_id).await?;
-    let stage_sync = staging.clone();
-    tokio::task::spawn_blocking(move || crate::storage::sync_tree(&stage_sync)).await.map_err(Error::internal)?.map_err(Error::internal)?;
-    let journal_root = state.storage.root.join("journal");
-    journal::mkdir(&journal_root).map_err(Error::internal)?;
-    let journal_repo = journal_root.join(repo_id.to_string());
-    journal::mkdir(&journal_repo).map_err(Error::internal)?;
-    let current_sequence = journal::sequence(&state.storage.root, repo_id).map_err(Error::internal)?;
-    if current_sequence > query.journal_sequence { return Err(conflict("destination journal sequence is ahead of transferred snapshot")); }
-    target.ensure_active()?;
-    journal::atomic(&journal_repo.join("sequence"), query.journal_sequence.to_string().as_bytes(), true).map_err(Error::internal)?;
-    let client = state.pool.get().await.map_err(Error::internal)?;
-    let updated = client.execute("UPDATE shard_replication_operations SET state='verified', refs_sha256=$2, journal_sequence=$3, updated_at=clock_timestamp() WHERE id=$1 AND state IN ('copying','verified')",
-        &[&op_id, &measured, &query.journal_sequence]).await.map_err(Error::internal)?;
-    if updated != 1 { return Err(conflict("snapshot operation changed before publication")); }
-    target.ensure_active()?;
-    let final_path = state.storage.repo_path(repo_id);
-    let backup = root.join(format!("{op_id}.previous-{}.git", Uuid::new_v4()));
-    let had_previous = match fs::symlink_metadata(&final_path) {
-        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => true,
-        Ok(_) => return Err(conflict("unsafe existing target repository")),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-        Err(err) => return Err(Error::internal(err)),
-    };
-    if had_previous { fs::rename(&final_path, &backup).map_err(Error::internal)?; }
-    if let Err(error) = fs::rename(&staging, &final_path) {
-        if had_previous { fs::rename(&backup, &final_path).map_err(Error::internal)?; }
-        return Err(Error::internal(error));
+    if op_state == "completed" {
+        return Err(conflict("migration operation is already terminal"));
     }
-    if let Err(error) = sync_parent(final_path.parent().ok_or_else(Error::bad_request)?)
-        .and_then(|_| target.ensure_active()) {
-        let failed = root.join(format!("{op_id}.failed-{}.git", Uuid::new_v4()));
-        fs::rename(&final_path, &failed).map_err(Error::internal)?;
-        if had_previous { fs::rename(&backup, &final_path).map_err(Error::internal)?; }
-        let _ = clean_staging(&failed);
-        return Err(error);
+    if route.draining && op_epoch != route.route_epoch {
+        return Err(conflict("migration operation epoch differs from the drained route"));
     }
-    // A failed cleanup leaves a private staging copy, never a false transfer failure.
-    let _ = clean_staging(&backup);
-    let _ = clean_staging(&bundle);
-    Ok(json(StatusCode::OK, SnapshotReceipt { operation_id: op_id, refs_sha256: measured, state: "verified".into() }))
+    if route.draining {
+        let new_epoch = route.route_epoch + 1;
+        let new_token = route.fencing_token.max(new_epoch) + 1;
+        let upd = format!(
+            "UPDATE repository_shard_routes SET route_epoch=$2, fencing_token=$3, fenced_epoch=$4, \
+             required_generation=$5, draining=false, read_only_degraded=false, degraded_reason='', \
+             version=version+1, updated_at=clock_timestamp() WHERE repository_id=$1 \
+             RETURNING {REPO_ROUTE_FIELDS}"
+        );
+        let updated = RepoShardRoute::row(
+            &tx.query_one(
+                &upd,
+                &[&access.repo_id, &new_epoch, &new_token, &route.route_epoch, &generation],
+            )
+            .await
+            .map_err(Error::internal)?,
+        );
+        crate::storage::ref_admission::fence_epoch(
+            &tx,
+            access.repo_id,
+            route.route_epoch,
+            std::time::Duration::ZERO,
+        )
+        .await?;
+        let marker = VolumeFenceMarker::from_route(&updated, generation, None, unix_now());
+        tx.execute(
+            "UPDATE shard_replication_operations SET state='aborted', updated_at=clock_timestamp() WHERE id=$1",
+            &[&input.operation_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+        record_audit_event(
+            &tx,
+            access.owner_id,
+            access.repo_id,
+            &actor,
+            "shard.migration_aborted",
+            "shard_replication",
+            &route.primary_node_id,
+            sjson!({"operation_id": input.operation_id, "released_drain": true, "route_epoch": new_epoch}),
+        )
+        .await?;
+        let transition_id = transitions::stage(&tx, &state, &marker).await?;
+        mutation.ensure_active()?;
+        transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
+        let _ = replication::clean_staging(&replication::base_path(&state, input.operation_id)?);
+        return Ok(json(StatusCode::OK, sjson!({
+            "operation_id": input.operation_id,
+            "repository_id": access.repo_id,
+            "state": "aborted",
+            "route_epoch": new_epoch,
+        })));
+    }
+    tx.execute(
+        "UPDATE shard_replication_operations SET state='aborted', updated_at=clock_timestamp() WHERE id=$1",
+        &[&input.operation_id],
+    )
+    .await
+    .map_err(Error::internal)?;
+    record_audit_event(
+        &tx,
+        access.owner_id,
+        access.repo_id,
+        &actor,
+        "shard.migration_aborted",
+        "shard_replication",
+        &route.primary_node_id,
+        sjson!({"operation_id": input.operation_id, "released_drain": false}),
+    )
+    .await?;
+    finish(tx, &actor, true).await?;
+    let _ = replication::clean_staging(&replication::base_path(&state, input.operation_id)?);
+    Ok(json(StatusCode::OK, sjson!({
+        "operation_id": input.operation_id,
+        "repository_id": access.repo_id,
+        "state": "aborted",
+        "route_epoch": route.route_epoch,
+    })))
+}
+
+/// List durable migration operations so an operator can resume a
+/// server-generated operation id or abort a drained transfer after a crash.
+/// Listing never resumes or promotes on its own.
+pub async fn list_migrations(
+    State(state): State<Arc<AppState>>,
+    Path((owner, name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, Error> {
+    let actor = auth::authenticate(&state.pool, &headers).await?;
+    let mut client = state.pool.get().await.map_err(Error::internal)?;
+    let tx = client.transaction().await.map_err(Error::internal)?;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Read).await?;
+    require_operator(&tx, &actor).await?;
+    let rows = tx
+        .query(
+            "SELECT id,target_node_id,state,source_route_epoch,source_generation, \
+             refs_sha256,journal_sequence,created_at::text,updated_at::text \
+             FROM shard_replication_operations WHERE repository_id=$1 \
+             ORDER BY created_at DESC, id DESC LIMIT 100",
+            &[&access.repo_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let state_name: String = row.get(2);
+            sjson!({
+                "operation_id": row.get::<_, Uuid>(0),
+                "target_node_id": row.get::<_, String>(1),
+                "state": state_name,
+                "source_route_epoch": row.get::<_, i64>(3),
+                "source_generation": row.get::<_, i64>(4),
+                "refs_sha256": row.get::<_, Option<String>>(5),
+                "journal_sequence": row.get::<_, Option<i64>>(6),
+                "created_at": row.get::<_, String>(7),
+                "updated_at": row.get::<_, String>(8),
+                "resumable": matches!(state_name.as_str(), "copying" | "verified"),
+            })
+        })
+        .collect();
+    finish(tx, &actor, false).await?;
+    Ok(json(StatusCode::OK, sjson!({"items": items})))
 }
