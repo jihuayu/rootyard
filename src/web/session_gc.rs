@@ -10,16 +10,26 @@
 //! cleanup never invents one. After parent revocation, each child expires
 //! within 12 hours and is then eligible for another retention period, which
 //! bounds cleanup after a parent revocation without touching admission checks.
+//!
+//! The token pass is bounded in *inspected* rows as well as deleted rows: one
+//! `MATERIALIZED` candidate window of at most 128 expired `browser` tokens is
+//! taken in `(expires_at, id)` index order and locked, and only those 128 rows
+//! are probed against the six durable reference roots. A bounded keyset cursor
+//! over that same index order walks the remaining candidates on later cycles
+//! and wraps back to the head once the scan reaches the end, so a large
+//! permanently referenced prefix can never pin a cycle on the same rows.
 use deadpool_postgres::Pool;
 use std::{
     env,
-    sync::{Arc, OnceLock, atomic::Ordering},
+    sync::{atomic::Ordering, Arc, OnceLock},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
-/// Fixed maximum rows deleted per statement per cycle. The bound is not
-/// configurable so a hostile or mistaken deployment cannot widen one lock scope.
+/// Fixed maximum rows deleted (and inspected) per statement per cycle. The
+/// bound is not configurable so a hostile or mistaken deployment cannot widen
+/// one lock scope.
 pub const BATCH_LIMIT: i64 = 128;
 /// Default cadence of one full GC cycle; overridable for bounded local drills.
 pub const DEFAULT_INTERVAL_SECONDS: u64 = 60;
@@ -126,12 +136,25 @@ pub fn counters() -> Arc<Counters> {
     COUNTERS.get_or_init(|| Arc::new(Counters::default())).clone()
 }
 
+/// Bounded keyset position over the `(expires_at, id)` order of the
+/// `tokens_browser_expiry_idx` browser index. It holds two scalars only — never
+/// a global row set — and is advanced only after a batch commits, so a failed
+/// or rolled-back cycle retries the same position and a process restart simply
+/// begins again at the head.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TokenCursor {
+    position: Option<(String, Uuid)>,
+}
+
 /// Run one cycle every fixed interval until cancellation, then return. The
-/// caller awaits this task, so scoped work never outlives shutdown.
+/// caller awaits this task, so scoped work never outlives shutdown. The keyset
+/// cursor lives here, so the background loop walks forward across cycles
+/// instead of restating the oldest window on every cycle.
 pub async fn run(pool: Pool, stop: CancellationToken) {
     let policy = match Policy::from_env() {
         Ok(policy) => policy,
         Err(error) => {
+            // Configuration messages name only the fixed environment variables.
             eprintln!("rootyard: browser-session GC disabled: {error}");
             return;
         }
@@ -144,15 +167,20 @@ pub async fn run(pool: Pool, stop: CancellationToken) {
         "rootyard: browser-session GC every {}s with {}s retention (batch {BATCH_LIMIT})",
         policy.interval_seconds, policy.retention_seconds
     );
+    let mut cursor = TokenCursor::default();
     loop {
         if stop.is_cancelled() {
             return;
         }
-        match purge_once(&pool, policy.retention_seconds).await {
+        match purge_cycle(&pool, policy.retention_seconds, &mut cursor).await {
             Ok(purged) => counters().add(purged),
             Err(error) => {
                 counters().failed();
-                eprintln!("rootyard: browser-session GC cycle failed: {error:#}");
+                // Route through the shared classification surface: only a fixed
+                // kind, the validated SQLSTATE and request correlation are
+                // recorded, never database text, URLs or row content.
+                let classified = crate::Error::internal(error);
+                eprintln!("rootyard: browser-session GC cycle failed: {} {}", classified.0.as_u16(), classified.1);
             }
         }
         tokio::select! {
@@ -162,14 +190,21 @@ pub async fn run(pool: Pool, stop: CancellationToken) {
     }
 }
 
-/// One bounded cycle: expired session rows, then unreferenced expired tokens.
+/// One bounded cycle from the head of the expiry order: expired session rows,
+/// then unreferenced expired tokens. Kept as a single-batch entry point; the
+/// background loop uses the same internals with its own advancing cursor.
 pub async fn purge_once(pool: &Pool, retention_seconds: i64) -> anyhow::Result<Purged> {
+    let mut cursor = TokenCursor::default();
+    purge_cycle(pool, retention_seconds, &mut cursor).await
+}
+
+async fn purge_cycle(pool: &Pool, retention_seconds: i64, cursor: &mut TokenCursor) -> anyhow::Result<Purged> {
     anyhow::ensure!(
         retention_seconds >= 0,
         "retention_seconds must not be negative; a negative retention would move the expiry cutoff into the future"
     );
     let sessions = purge_sessions(pool, retention_seconds).await?;
-    let tokens = purge_tokens(pool, retention_seconds).await?;
+    let tokens = purge_tokens(pool, retention_seconds, cursor).await?;
     Ok(Purged { sessions, tokens })
 }
 
@@ -187,28 +222,89 @@ WITH expired AS (\
 ) \
 DELETE FROM web_sessions w USING expired e WHERE w.token_id = e.token_id";
 
-const TOKEN_DELETE: &str = "\
-WITH expired AS (\
-    SELECT t.id FROM tokens t \
-    WHERE t.kind = 'browser' AND t.expires_at IS NOT NULL \
-      AND t.expires_at < clock_timestamp() - ($1::bigint * interval '1 second') \
-      AND NOT EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id = t.id) \
-      AND NOT EXISTS (SELECT 1 FROM git_operations o WHERE o.token_id = t.id) \
-      AND NOT EXISTS (SELECT 1 FROM git_ref_admissions a WHERE a.token_id = t.id) \
-      AND NOT EXISTS (SELECT 1 FROM ci_checkout_jobs j WHERE j.issuer_token_id = t.id) \
-      AND NOT EXISTS (SELECT 1 FROM ci_checkout_delegations d WHERE d.issuer_token_id = t.id) \
-      AND NOT EXISTS (SELECT 1 FROM cluster_operator_tokens c WHERE c.token_id = t.id) \
-    ORDER BY t.expires_at, t.id LIMIT $2 FOR UPDATE SKIP LOCKED\
-) \
-DELETE FROM tokens t USING expired e \
-WHERE t.id = e.id AND t.kind = 'browser' AND t.expires_at IS NOT NULL \
-  AND t.expires_at < clock_timestamp() - ($1::bigint * interval '1 second') \
-  AND NOT EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id = t.id) \
-  AND NOT EXISTS (SELECT 1 FROM git_operations o WHERE o.token_id = t.id) \
-  AND NOT EXISTS (SELECT 1 FROM git_ref_admissions a WHERE a.token_id = t.id) \
-  AND NOT EXISTS (SELECT 1 FROM ci_checkout_jobs j WHERE j.issuer_token_id = t.id) \
-  AND NOT EXISTS (SELECT 1 FROM ci_checkout_delegations d WHERE d.issuer_token_id = t.id) \
-  AND NOT EXISTS (SELECT 1 FROM cluster_operator_tokens c WHERE c.token_id = t.id)";
+/// Fixed first-window branch: no keyset bound, so the partial browser index on
+/// `(expires_at, id)` serves the ordered `LIMIT`. `LIMIT` sits inside the
+/// `MATERIALIZED` candidate CTE, ahead of every reference probe, so one cycle
+/// never scans more than `BATCH_LIMIT` expired tokens.
+const TOKEN_DELETE_FIRST: &str = r#"WITH candidates AS MATERIALIZED (
+    SELECT t.id, t.expires_at, t.expires_at::text AS expires_at_text
+    FROM tokens t
+    WHERE t.kind = 'browser' AND t.expires_at IS NOT NULL
+      AND t.expires_at < statement_timestamp() - ($1::bigint * interval '1 second')
+    ORDER BY t.expires_at, t.id
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+),
+purged AS (
+    DELETE FROM tokens t
+    USING (
+        SELECT c.id FROM candidates c
+        WHERE NOT EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM git_operations o WHERE o.token_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM git_ref_admissions a WHERE a.token_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM ci_checkout_jobs j WHERE j.issuer_token_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM ci_checkout_delegations d WHERE d.issuer_token_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM cluster_operator_tokens k WHERE k.token_id = c.id)
+    ) e
+    WHERE t.id = e.id
+      AND t.kind = 'browser' AND t.expires_at IS NOT NULL
+      AND t.expires_at < statement_timestamp() - ($1::bigint * interval '1 second')
+      AND NOT EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id = t.id)
+      AND NOT EXISTS (SELECT 1 FROM git_operations o WHERE o.token_id = t.id)
+      AND NOT EXISTS (SELECT 1 FROM git_ref_admissions a WHERE a.token_id = t.id)
+      AND NOT EXISTS (SELECT 1 FROM ci_checkout_jobs j WHERE j.issuer_token_id = t.id)
+      AND NOT EXISTS (SELECT 1 FROM ci_checkout_delegations d WHERE d.issuer_token_id = t.id)
+      AND NOT EXISTS (SELECT 1 FROM cluster_operator_tokens k WHERE k.token_id = t.id)
+    RETURNING t.id
+)
+SELECT (SELECT count(*) FROM candidates)::bigint AS scanned,
+       (SELECT count(*) FROM purged)::bigint AS purged,
+       (SELECT expires_at_text FROM candidates ORDER BY expires_at DESC, id DESC LIMIT 1),
+       (SELECT id FROM candidates ORDER BY expires_at DESC, id DESC LIMIT 1)"#;
+
+/// The single fixed keyset predicate for the after-cursor branch. It is a
+/// strict row comparison (never `cursor IS NULL OR ...`), so the planner keeps
+/// the `(expires_at, id)` index range instead of re-filtering a large prefix.
+const TOKEN_CURSOR_BOUND_AFTER: &str = "    AND (t.expires_at, t.id) > ($3::text::timestamptz, $4::uuid)\n";
+
+/// Fixed after-cursor branch: identical shape to the first window except for
+/// the keyset bound, so both statements have one stable, index-usable plan.
+const TOKEN_DELETE_AFTER: &str = r#"WITH candidates AS MATERIALIZED (
+    SELECT t.id, t.expires_at, t.expires_at::text AS expires_at_text
+    FROM tokens t
+    WHERE t.kind = 'browser' AND t.expires_at IS NOT NULL
+      AND t.expires_at < statement_timestamp() - ($1::bigint * interval '1 second')
+    AND (t.expires_at, t.id) > ($3::text::timestamptz, $4::uuid)
+    ORDER BY t.expires_at, t.id
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+),
+purged AS (
+    DELETE FROM tokens t
+    USING (
+        SELECT c.id FROM candidates c
+        WHERE NOT EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM git_operations o WHERE o.token_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM git_ref_admissions a WHERE a.token_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM ci_checkout_jobs j WHERE j.issuer_token_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM ci_checkout_delegations d WHERE d.issuer_token_id = c.id)
+          AND NOT EXISTS (SELECT 1 FROM cluster_operator_tokens k WHERE k.token_id = c.id)
+    ) e
+    WHERE t.id = e.id
+      AND t.kind = 'browser' AND t.expires_at IS NOT NULL
+      AND t.expires_at < statement_timestamp() - ($1::bigint * interval '1 second')
+      AND NOT EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id = t.id)
+      AND NOT EXISTS (SELECT 1 FROM git_operations o WHERE o.token_id = t.id)
+      AND NOT EXISTS (SELECT 1 FROM git_ref_admissions a WHERE a.token_id = t.id)
+      AND NOT EXISTS (SELECT 1 FROM ci_checkout_jobs j WHERE j.issuer_token_id = t.id)
+      AND NOT EXISTS (SELECT 1 FROM ci_checkout_delegations d WHERE d.issuer_token_id = t.id)
+      AND NOT EXISTS (SELECT 1 FROM cluster_operator_tokens k WHERE k.token_id = t.id)
+    RETURNING t.id
+)
+SELECT (SELECT count(*) FROM candidates)::bigint AS scanned,
+       (SELECT count(*) FROM purged)::bigint AS purged,
+       (SELECT expires_at_text FROM candidates ORDER BY expires_at DESC, id DESC LIMIT 1),
+       (SELECT id FROM candidates ORDER BY expires_at DESC, id DESC LIMIT 1)"#;
 
 async fn purge_sessions(pool: &Pool, retention_seconds: i64) -> anyhow::Result<u64> {
     let mut client = pool.get().await?;
@@ -219,23 +315,49 @@ async fn purge_sessions(pool: &Pool, retention_seconds: i64) -> anyhow::Result<u
     Ok(affected)
 }
 
-async fn purge_tokens(pool: &Pool, retention_seconds: i64) -> anyhow::Result<u64> {
+/// Fixed context per failure class. The typed `tokio_postgres::Error` (and its
+/// validated SQLSTATE) stays in the source chain; nothing from the database
+/// message is formatted into the text.
+fn token_statement_error(error: tokio_postgres::Error) -> anyhow::Error {
+    let context = if error.code() == Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION) {
+        "unexpected foreign-key reference blocks expired browser-token GC; extend the \
+         reference-preservation probe and its index instead of widening a cascading delete"
+    } else {
+        "expired browser-token GC batch failed"
+    };
+    anyhow::Error::new(error).context(context)
+}
+
+async fn purge_tokens(pool: &Pool, retention_seconds: i64, cursor: &mut TokenCursor) -> anyhow::Result<u64> {
     let mut client = pool.get().await?;
     let transaction = client.transaction().await?;
     transaction.batch_execute(&timeout_sql()).await?;
-    let affected = transaction.execute(TOKEN_DELETE, &[&retention_seconds, &BATCH_LIMIT]).await.map_err(|error| {
-        if error.code() == Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION) {
-            anyhow::anyhow!(
-                "unexpected foreign-key reference blocks expired browser-token GC; \
-                     extend the reference-preservation probe and its index instead of \
-                     widening a cascading delete: {error}"
-            )
-        } else {
-            anyhow::anyhow!(error)
+    let row = match &cursor.position {
+        Some((expires_at, id)) => {
+            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 4] =
+                [&retention_seconds, &BATCH_LIMIT, expires_at, id];
+            transaction.query_one(TOKEN_DELETE_AFTER, &params).await.map_err(token_statement_error)?
         }
-    })?;
+        None => {
+            let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&retention_seconds, &BATCH_LIMIT];
+            transaction.query_one(TOKEN_DELETE_FIRST, &params).await.map_err(token_statement_error)?
+        }
+    };
+    let scanned: i64 = row.get(0);
+    let purged: i64 = row.get(1);
+    // Advance past the scanned window even when every candidate is referenced:
+    // the keyset position is the last *candidate*, not the last deleted row.
+    // Reaching the end (a window shorter than the limit, including an empty one)
+    // returns to the head after commit so newly expired rows are seen again.
+    let next = match (scanned >= BATCH_LIMIT, row.get::<_, Option<String>>(2), row.get::<_, Option<Uuid>>(3)) {
+        (true, Some(expires_at), Some(id)) => Some((expires_at, id)),
+        _ => None,
+    };
     transaction.commit().await?;
-    Ok(affected)
+    // Only a committed batch moves the cursor; a failed or rolled-back cycle
+    // retries from exactly the same position.
+    cursor.position = next;
+    Ok(u64::try_from(purged).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -266,6 +388,23 @@ mod tests {
             counters.snapshot(),
             CounterSnapshot { cycles: 2, session_rows_deleted: 4, tokens_deleted: 2, failures: 1 }
         );
+    }
+
+    #[test]
+    fn token_batches_bound_candidates_before_reference_probes() {
+        for sql in [TOKEN_DELETE_FIRST, TOKEN_DELETE_AFTER] {
+            assert!(sql.contains("AS MATERIALIZED"), "candidates must be materialized: {sql}");
+            assert_eq!(sql.matches("NOT EXISTS").count(), 12, "six probes for candidates and six rechecks");
+            let limit = sql.find("LIMIT $2").expect("bounded candidate window");
+            let first_probe = sql.find("NOT EXISTS").expect("reference probes");
+            assert!(limit < first_probe, "LIMIT must precede every reference probe");
+            assert!(sql.contains("FOR UPDATE SKIP LOCKED"));
+            assert!(sql.contains("statement_timestamp()"), "stable, indexable cutoff");
+            assert!(sql.contains("count(*) FROM candidates"), "scanned-window count drives cursor advance");
+        }
+        assert!(TOKEN_DELETE_AFTER.contains(TOKEN_CURSOR_BOUND_AFTER.trim_end()));
+        assert_eq!(TOKEN_DELETE_AFTER.replace(TOKEN_CURSOR_BOUND_AFTER, ""), TOKEN_DELETE_FIRST);
+        assert!(!TOKEN_DELETE_FIRST.contains("$3"), "the first window takes no cursor parameters");
     }
 
     #[test]

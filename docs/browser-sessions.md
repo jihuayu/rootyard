@@ -46,12 +46,19 @@ Web mutations.
 ## Expired-session retention and bounded garbage collection
 
 Both the serving process and the PostgreSQL-only `worker` process run the same
-background cleanup loop for expired browser sessions. Its duration and the rows
-it deletes per statement are bounded; the number of rows it inspects is not:
+background cleanup loop for expired browser sessions. The batch caps and SQL deadline are fixed; cadence and retention are
+operator-configurable:
 
-- one fixed-size batch of at most 128 session rows and at most 128 child tokens
-  deleted per cycle, oldest expiry first, with `FOR UPDATE SKIP LOCKED` so an
-  in-flight authorization or commit lock is honored instead of waited on;
+- **at most 128 selected token candidates and at most 128 rows deleted** per
+  statement per cycle. The session pass locks and deletes one oldest-first
+  window of `web_sessions` rows. The token pass first materialises one window of
+  at most 128 expired `browser` tokens in `(expires_at, id)` index order with
+  `LIMIT` before any reference probe, and only then probes those 128 rows
+  against the durable foreign-key roots. A large population of permanently
+  retained expired tokens therefore can no longer make a cycle scan an unbounded
+  candidate prefix;
+- **oldest expiry first** with `FOR UPDATE SKIP LOCKED`, so an in-flight
+  authorization or commit lock is honored instead of waited on;
 - the default cycle interval is 60 seconds and the default retention after a
   session's expiry is 7 days. `ROOTYARD_SESSION_GC=false`,
   `ROOTYARD_SESSION_GC_INTERVAL_SECONDS` and
@@ -60,15 +67,38 @@ it deletes per statement are bounded; the number of rows it inspects is not:
   `purge_once` entry point rejects a negative retention before any SQL, so a
   future caller cannot move the cutoff into the future and delete active rows;
 - each statement runs in its own transaction with a server-side
-  `statement_timeout` of at most 5 seconds. The deletion re-reads
-  `clock_timestamp()` inside the deleting transaction, so a database clock that
-  moved, a concurrent cleanup process, a restart, or a rolled-back cycle cannot
-  turn into an early delete. The `NOT EXISTS` foreign-key probes run before
-  `ORDER BY`/`LIMIT`, so one cycle may inspect many referenced expired tokens;
-  only the statement timeout bounds its duration, and no scan-row bound is
-  claimed;
+  `statement_timeout` of at most 5 seconds. The token cutoff uses
+  `statement_timestamp()`, which is stable within a statement and remains
+  indexable on `(expires_at, id)`;
 - a hard cancellation stops the loop between cycles and the shutdown path
   awaits the task, so no GC task is orphaned.
+
+The token pass walks forward with a small keyset cursor held only in process
+memory. The cursor is the `(expires_at, id)` position of the last *candidate
+window* — not the last deleted row — so a window whose 128 candidates are all
+retained still advances the scan: later, deletable children are reached instead
+of the loop retrying the same first 128 rows forever. The cursor is written only
+after a batch commits; a failed or rolled-back cycle retries from the same
+position. When a window is shorter than the limit (including an empty one) the
+scan has reached the end of the eligible range and the cursor returns to the
+head, so newly expired rows are seen again. A process restart simply starts at
+the head, and `SKIP LOCKED` rows skipped past by another worker are picked up by
+a later pass; repeated re-scanning of already-retained rows is expected and is
+bounded by the per-statement 128-candidate limit and the statement timeout. The
+cursor is not persisted, exactly like the rest of this best-effort loop, and no
+migration or global in-memory map is involved.
+
+The candidate window is one of two fixed statements — a first window and an
+after-cursor window whose only difference is a strict row comparison
+`(expires_at, id) > ($cursor)::text::timestamptz, $id::uuid`. The cursor expiry
+is returned from SQL as `timestamptz::text` and re-parsed by PostgreSQL, so
+microsecond precision and the session time zone survive the round trip. Both
+branches keep the partial `tokens (expires_at, id) WHERE kind = 'browser'` index
+usable; there is no `cursor IS NULL OR ...` predicate that would re-filter a
+large prefix on every cycle. The delete stage rechecks `kind = 'browser'`, a
+non-null expiry, the retention cutoff and all six reference roots, so a
+reference that appeared between the candidate read and the delete still retains
+the row.
 
 Order matters. Expired `web_sessions` rows whose token kind is `browser` and
 whose expiry is already past retention are purged first; they only ever hold
@@ -79,13 +109,18 @@ foreign-key root still references it: `git_operations`, `git_ref_admissions`,
 while its `web_sessions` row still exists. Migration 133 adds the index-only
 support for those reference probes. Nothing is deleted by broadening a foreign
 key to `ON DELETE CASCADE`, and no audit or Git history metadata is removed to
-make cleanup succeed.
+make cleanup succeed. The session-row deletion statement is unchanged.
 
 `api` tokens — including operator-granted cluster tokens — are never GC input,
 revoked or not. A browser token that is merely revoked or merely expired is not
 early-deleted either; it becomes eligible only after its expiry plus the
 retention window. If a token is retained by a reference root, only its expired
 session row is removed, so every later authorization attempt still fails closed.
+
+Failures are reported through the shared application error classification: the
+loop logs a fixed status and message plus the validated SQLSTATE classification,
+never PostgreSQL's message text, connection strings, row content or tokens.
+Configuration errors name only the fixed `ROOTYARD_SESSION_GC*` variables.
 
 The parent API token id is encoded only in the cookie-held session secret; there
 is deliberately no parent/child SQL mapping to garbage collect. After a parent
@@ -96,3 +131,12 @@ without changing the admission-time parent validation described above.
 Bounded monotonic counters (`cycles`, `session_rows_deleted`, `tokens_deleted`,
 `failures`) live in the GC module for a later metrics surface; they carry no
 per-session labels.
+
+No `EXPLAIN` output is captured by the regression suite, so no claim is made
+about measured scanned rows or about which plan the planner picks; the index
+shapes are asserted from the migration source and `pg_indexes` only.
+
+The candidate limit bounds the number of reference probes, not physical
+PostgreSQL row or index-page visits. No physical scan-count or EXPLAIN
+measurement is claimed here. Rows skipped while locked are revisited on a
+later wrap; there is no fixed latency guarantee under an endlessly growing queue.

@@ -250,6 +250,67 @@ class SessionGcHarness(BrowserHarness):
             "default_retention": DEFAULT_RETENTION,
         }
 
+    def durable_reference_prefix_does_not_stall_the_token_cursor(self):
+        # Runs against the server still running from the first case, so the
+        # seven-day retention window is untouched here.
+        self.expect("/health/ready", 200)
+        user = self.alice["user_id"]
+        batch_local = BATCH_LIMIT
+        prefix = 140  # strictly more than one 128-candidate window
+        # The oldest expired browser tokens in the (expires_at, id) order are
+        # all pinned by a durable cluster_operator_tokens row, so a whole GC
+        # candidate window is undeletable. They carry no web_sessions row, so
+        # only the foreign-key probe can retain them.
+        self.sql(
+            "WITH seeded AS (SELECT i FROM generate_series(1," + str(prefix) + ") i), "
+            "inserted AS (INSERT INTO tokens(id,user_id,digest,read_only,revoked,expires_at,kind) "
+            f"SELECT gen_random_uuid(),'{user}',"
+            "decode(md5('prefix-token-'||i),'hex')||decode(md5('prefix-nonce-'||i),'hex'),"
+            "false,false,clock_timestamp()-interval '30 days','browser' FROM seeded RETURNING id) "
+            "INSERT INTO cluster_operator_tokens(token_id,granted_by) "
+            "SELECT id,'gc-prefix' FROM inserted"
+        )
+        # Ordinary expired children with a *later* expiry, i.e. strictly behind
+        # the whole retained prefix in the GC order.
+        ordinary = [self.seed_browser_token(age="8 days", with_session=False) for _ in range(3)]
+        ordinary_ids = ",".join("'" + token_id + "'" for token_id in ordinary)
+        assert self.sql(f"SELECT count(*) FROM tokens WHERE id IN ({ordinary_ids})") == "3"
+        assert self.sql(
+            "SELECT count(*) FROM tokens t JOIN cluster_operator_tokens k ON k.token_id=t.id "
+            "WHERE k.granted_by='gc-prefix' AND t.kind='browser' "
+            "AND t.expires_at < clock_timestamp() - interval '" + DEFAULT_RETENTION + "'"
+        ) == str(prefix)
+        self.wait_for(
+            lambda: self.sql(f"SELECT count(*) FROM tokens WHERE id IN ({ordinary_ids})") == "0",
+            "the token cursor to pass a fully referenced candidate window and purge later "
+            "ordinary expired children",
+        )
+        # Every retained token and its durable root survived the pass.
+        retained = int(
+            self.sql(
+                "SELECT count(*) FROM tokens t JOIN cluster_operator_tokens k ON k.token_id=t.id "
+                "WHERE k.granted_by='gc-prefix' AND t.kind='browser'"
+            )
+        )
+        assert retained == prefix, retained
+        assert self.sql("SELECT count(*) FROM cluster_operator_tokens WHERE granted_by='gc-prefix'") == str(prefix)
+        assert self.sql(
+            "SELECT count(*) FROM web_sessions s JOIN cluster_operator_tokens k ON k.token_id=s.token_id "
+            "WHERE k.granted_by='gc-prefix'"
+        ) == "0"
+        assert self.sql(f"SELECT count(*) FROM tokens WHERE id='{self.alice['token_id']}' AND kind='api'") == "1"
+        status, _, _ = self.request("/api/repos", headers={"Authorization": "Bearer " + self.alice["token"]})
+        assert status == 200, status
+        return {
+            "referenced_prefix_tokens": prefix,
+            "batch_limit": batch_local,
+            "windows_needed_for_prefix": (prefix + batch_local - 1) // batch_local,
+            "ordinary_later_expiry_children_deleted": len(ordinary),
+            "durable_root": "cluster_operator_tokens",
+            "cursor_advanced_past_fully_referenced_window": True,
+            "explain_evidence": "none; no scanned-row count or plan is claimed",
+        }
+
     def two_workers_restart_and_concurrent_auth(self):
         held_cookies, _, _ = self.sign_in()
         held_headers = self.cookie_headers(held_cookies)
@@ -402,6 +463,7 @@ def main():
     failure_traceback = None
     try:
         harness.case("expired_history_purged_in_bounded_batches", harness.expired_history_is_purged_in_bounded_batches)
+        harness.case("durable_reference_prefix_does_not_stall_token_cursor", harness.durable_reference_prefix_does_not_stall_the_token_cursor)
         harness.case("gc_indexes_and_schema_contract", harness.gc_indexes_and_schema_contract)
         harness.case("two_workers_restart_and_concurrent_auth", harness.two_workers_restart_and_concurrent_auth)
         harness.case("legacy_schema132_restore_gate", harness.legacy_schema132_restore_gate)
