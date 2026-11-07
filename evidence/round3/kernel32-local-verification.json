@@ -1,0 +1,89 @@
+{
+  "kind": "component_native_verification",
+  "compiled_source_commit": "4c28c3917272d92d02ce1fe05f47e4b03948de35",
+  "source_review_commit": "ef250f54d7fe9aab0948bb333f6a051251921243",
+  "production_inputs_sha256": "bfa66b5d8b396c17dcb4b05dab1c4323b391d09ab6fdd2e4cd7323ceeb1b963c",
+  "binary_sha256": "fe8046c8086d8b4af33281511be5370d7c882c9f63cd567133c1f0222b00b6f3",
+  "source_inputs_identical_after_workflow_test_and_doc_changes": true,
+  "rust_cgroup_unit_tests": {
+    "passed": 4,
+    "failed": 0,
+    "native_kernel_proof": false
+  },
+  "dev_native_service_and_ci_tests": {
+    "passed": 6,
+    "failed": 0,
+    "native_kernel_proof": false
+  },
+  "positive_kernel_acceptance": {
+    "status": "BLOCKED",
+    "reason": "Managed host has no delegated cgroup v2 subtree; manual GitHub VM dispatch pending."
+  },
+  "ordinary_ci": "not awaited per user preference",
+  "pipeline_status": {
+    "schema": "rootyard/kernel32-local-pipeline/v1",
+    "stages": [
+      {
+        "detail": "commit=4c28c3917272d92d02ce1fe05f47e4b03948de35",
+        "stage": "init",
+        "status": "info",
+        "unix": 1794017521
+      },
+      {
+        "detail": "binary present",
+        "stage": "build",
+        "status": "success",
+        "unix": 1794017531
+      },
+      {
+        "detail": "{\"role\": \"kernel32\", \"source_commit\": \"4c28c3917272d92d02ce1fe05f47e4b03948de35\", \"built_commit\": \"4c28c3917272d92d02ce1fe05f47e4b03948de35\", \"production_inputs_sha256\": \"bfa66b5d8b396c17dcb4b05dab1c4323b391d09ab6fdd2e4cd7323ceeb1b963c\", \"binary_sha256\": \"fe8046c8086d8b4af33281511be5370d7c882c9f63cd567133c1f0222b00b6f3\", \"valid\": true}",
+        "stage": "verify",
+        "status": "success",
+        "unix": 1794017531
+      },
+      {
+        "detail": "/workspace/scratch/rootyard-round3/kernel32/artifacts/4c28c3917272d92d02ce1fe05f47e4b03948de35/rootyard",
+        "stage": "artifact",
+        "status": "success",
+        "unix": 1794017531
+      },
+      {
+        "detail": "rootyard_kernel32_service_4c28c3917272_1794017531 rootyard_kernel32_ci_4c28c3917272_1794017531 rootyard_kernel32_native_4c28c3917272_1794017531",
+        "stage": "database",
+        "status": "success",
+        "unix": 1794017531
+      },
+      {
+        "detail": "exit=0 log=/workspace/scratch/rootyard-round3/kernel32/dev-sandbox-service.log",
+        "stage": "dev-sandbox-service",
+        "status": "success",
+        "unix": 1794017547
+      },
+      {
+        "detail": "exit=0 log=/workspace/scratch/rootyard-round3/kernel32/dev-ci-sandbox.log",
+        "stage": "dev-ci-sandbox",
+        "status": "success",
+        "unix": 1794017570
+      },
+      {
+        "detail": "exit=3 receipt=/workspace/scratch/rootyard-round3/kernel32/native-cgroup-receipt.json",
+        "stage": "native-preflight",
+        "status": "blocked",
+        "unix": 1794017570
+      },
+      {
+        "detail": "blocked receipt pinned to 4c28c3917272d92d02ce1fe05f47e4b03948de35",
+        "stage": "native-preflight",
+        "status": "success",
+        "unix": 1794017570
+      },
+      {
+        "detail": "dev tests passed; positive kernel cgroup remains BLOCKED",
+        "stage": "overall",
+        "status": "local-complete-native-blocked",
+        "unix": 1794017570
+      }
+    ],
+    "updated_unix": 1794017570
+  }
+}
