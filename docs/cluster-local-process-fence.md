@@ -150,3 +150,89 @@ and publishes another wake after the broker restarts. This verifies the local
 encrypted dependency and reconnect path, but not a multi-broker Kafka cluster
 or a remote Kafka failover. The test distribution can be obtained from
 `https://archive.apache.org/dist/kafka/3.9.1/kafka_2.13-3.9.1.tgz`.
+
+## CI pin sidecar handoff during online migration
+
+The supported native migration mode moves the Git repository, its journal
+sequence *and* the repository's `ci-pins/<repo>` sidecars. The sidecar image is
+captured together with the drained ref manifest and journal sequence, then
+transferred inside the authenticated snapshot/delta frame. The target validates
+the exact tenant (`owner_id`), repository, job id, target object id, object
+format, source storage generation, operation id, ref digest and journal
+sequence. It also verifies every `refs/rootyard-ci/jobs/*`, backup and snapshot
+root accounted for by the bundle, rejects symbolic/unmanaged CI roots, and
+requires that a `.pinned.json` receipt is byte-identical to its intent.
+Symlinked, non-canonical, foreign-tenant or mismatched descriptors fail the
+migration before any operation row or drain is created.
+
+Sidecar files are written with `O_NOFOLLOW`, fsynced and staged in a private
+directory. They are published only after the cutover transaction commits and
+the target holds the new route epoch, fencing token and storage generation.
+Publication takes the same repository exclusive lease/publication/maintenance
+guard as a normal pin, revalidates the committed operation manifest and route
+before and after the swap, and merges every legitimate new-generation intent
+and receipt accepted on the new primary instead of replacing the live
+directory with the old source image. The source releases its cutover guard
+immediately after the cutover transaction and retired-source marker commit,
+before the finalize RPC, because holding the same database advisory key across
+the request would self-deadlock the target's exclusive finalize. Until a
+non-empty source image has actually published, fresh pin issuance for that
+repository returns a bounded `503` retryable handoff response rather than
+reporting the staged old roots as unmanaged corruption; a repository with no
+pre-existing CI roots may accept a fresh pin, which finalize must merge. A pending marker transition is not a
+reason to bypass that guard: the internal finalize path may complete only the
+exact committed operation while ordinary new writes are blocked by the same
+fence, so it cannot deadlock its own recovery. The directory swap uses
+`RENAME_EXCHANGE` on Linux with a journaled fallback and startup reconciliation
+of interrupted `.stage-`/`.retired-` names. A master/standby still verifies the
+whole transferred repository and sidecar closure before the replication
+operation becomes `verified`; a stale, corrupt, empty or partial target can
+never satisfy that condition. If the source dies after committing the cutover,
+both the pending marker transition and the staged sidecars are republished by
+startup reconciliation on their respective volumes. A durable per-operation
+publication receipt makes a lost finalize response idempotent instead of a
+permanent conflict. A retry tolerates files legitimately released after
+publication only when their retained CI root is also gone; it never recreates
+released intents or receipts. Startup staging cleanup retains uninspected
+orphans and removes only staging whose exact operation row proves it aborted or
+belongs to another target. The sidecar threat model is a trusted single host:
+repository owners and the service UID are trusted, and intent/receipt/publish
+files are opened with `O_NOFOLLOW` inside service-owned directories; untrusted
+shared-volume writers are not supported.
+
+Released pins and cancelled checkout jobs are tombstones. An intent whose
+retained CI root is not in the measured manifest is omitted instead of being
+resurrected, and a receipt without its root fails closed. The old-generation
+intent and receipt are preserved verbatim on the new primary only as retention
+evidence and cannot authorize a checkout under the new generation: a fresh
+job/attempt must issue a fresh pin, and cancelled or released jobs stay denied. Retained historical generations share the existing
+fixed admission and sidecar caps (at most 1024 pin intents and 2 MiB of sidecar
+bytes per repository, including all generations). That is a deliberate
+fail-closed operational limit, not a multi-hop capacity or scalability claim;
+reaching it blocks new pins or migration rather than discarding evidence.
+Startup reconciliation enumerates every operation
+for the target node instead of a small completion window; it retains staged
+bundles for copying, verified and completed operations, resolves an exact
+operation row before cleanup, and deletes only staging proven aborted or
+foreign. It never treats absence from a bounded query as permission to delete
+the only surviving copy of a committed sidecar image.
+
+## Opt-in native crash-phase hooks
+
+The test binary supports bounded fault markers at transfer-copy, target
+receive/verify, final drain/delta, cutover commit/publish, sidecar publish,
+startup reconciliation and controller takeover boundaries. They are inert
+unless both `ROOTYARD_TEST_FAULT_ALLOW=1` and `ROOTYARD_TEST_FAULT=<phase>` are
+set. A hook only writes a diagnostic marker under `<data>/.native-test-faults`
+and can then self-deliver SIGKILL (`ROOTYARD_TEST_FAULT_ACTION=kill`) or pause a
+bounded time (`pause`). It does not accept caller-supplied receipts, does not
+write route, repository, journal or sidecar state, and cannot forge a
+production outcome. The native matrix in
+`tests/cluster_migration_sidecar_native.py` creates its own disposable
+PostgreSQL database, kills real source and target processes at those durable
+boundaries, restarts them, resumes duplicate requests, and verifies every
+acknowledged commit and retained root with stock `git push`, `git fetch` and
+`git fsck --full --strict`, exactly one writer after cutover, and a non-writer
+old source after the true drain fence. This remains a one-host, one-
+PostgreSQL-authority deployment; it does not establish physical cross-host
+fencing, power-loss durability or multi-host leader election.
