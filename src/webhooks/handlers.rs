@@ -25,7 +25,7 @@ use axum::{
     response::Response,
 };
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json as sjson};
+use serde_json::json as sjson;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -511,7 +511,7 @@ pub async fn ci_callback(
     body: Bytes,
 ) -> Result<Response, Error> {
     tokio::spawn(
-        async move { crate::webhooks::ingestion::ci_callback(state, owner, name, hook_id, headers, body).await },
+        async move { crate::webhooks::ingestion::ci_callback(&state, owner, name, hook_id, headers, body).await },
     )
     .await
     .map_err(Error::internal)?

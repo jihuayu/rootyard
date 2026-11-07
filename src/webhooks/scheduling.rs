@@ -177,8 +177,8 @@ impl PullCursors {
                 candidates.push((repository_id, cursor.generation));
             }
             if candidates.len() < limit {
-                for (&repository_id, cursor) in cursors.entries.range(..) {
-                    if candidates.len() == limit || Some(repository_id) == after {
+                for (&repository_id, cursor) in cursors.entries.range(..=after) {
+                    if candidates.len() == limit {
                         break;
                     }
                     candidates.push((repository_id, cursor.generation));

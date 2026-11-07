@@ -43,7 +43,7 @@ pub async fn enqueue_webhook_delivery(
     event_type: &str,
     payload: &Value,
 ) -> Result<Option<WebhookDelivery>, Error> {
-    let mut tx = client
+    let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::ReadCommitted)
         .start()
