@@ -105,9 +105,11 @@ The workspace gauges are **host-scoped**: they use this process's
 `state.storage.volume_id` as `workspaces.host_id` and the same predicate as the
 capture loop (`state='ready' AND lease_until > clock_timestamp()`). A host-scoped
 series is exported once per process, so two replicas serving the same volume
-UUID export identical label sets with no replica label. Do not `sum` them: use
-`max`/`min`/`avg` by the existing labels, or scrape one exporter per volume.
-The recommended deployment is one metrics exporter per volume. Capture does
+UUID export identical label sets with no replica label. Add an external
+`volume` target label containing that volume UUID. Deduplicate replicas with
+`max by (volume)` and retain separate series for distinct volumes. Alternatively,
+scrape one exporter per volume and keep its target labels. Do not sum replicas
+or aggregate away the volume identity. Capture does
 not have a fixed scan interval: `capture::reconcile_one` and the workspace
 create/API baseline path both upsert `scanned_at`, even when file content is
 unchanged. `rootyard_workspace_capture_oldest_age_seconds` therefore measures
@@ -159,7 +161,7 @@ SQL-derived series, so alert on the scrape itself as well.
 
 ```promql
 # Capture verification is older than 16 minutes on one host.
-max by () (rootyard_workspace_capture_oldest_age_seconds) > 960
+max by (volume) (rootyard_workspace_capture_oldest_age_seconds) > 960
 
 # Workspaces that never recorded any baseline: investigate creation/API paths,
 # not background-scan throughput.
@@ -171,7 +173,7 @@ max by (backend, kind) (rootyard_storage_maintenance_jobs{state="due_queued"}) >
 # Retained terminal-failure history; not an unresolved-fault or retryable
 # backlog. Investigate the referenced jobs, and do not alert on it forever just
 # because old failed rows remain.
-max by (backend, kind) (rootyard_storage_maintenance_jobs{state="failed"}) > 0
+max by (backend, kind) (rootyard_storage_maintenance_jobs{state="failed"})
 
 # A lease that expired while a worker still owned the job (crash or stall).
 max by (backend, kind) (rootyard_storage_maintenance_jobs{state="expired_running_lease"}) > 0

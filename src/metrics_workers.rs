@@ -276,10 +276,12 @@ mod tests {
 
     #[test]
     fn values_are_rendered_per_fixed_state() {
-        let mut snapshot = Snapshot::default();
-        snapshot.capture_oldest_age = 10_800.0;
-        snapshot.capture_never_sampled = 1;
-        snapshot.lease_expired = 2;
+        let mut snapshot = Snapshot {
+            capture_oldest_age: 10_800.0,
+            capture_never_sampled: 1,
+            lease_expired: 2,
+            ..Snapshot::default()
+        };
         snapshot.jobs[1] = [3, 2, 1, 4, 5, 6];
         snapshot.oldest_queued_age[1] = 600.0;
         snapshot.scan[0] = [1, 2, 3];

@@ -178,8 +178,14 @@ async fn scrape(State(state): State<MetricsState>) -> Response {
         .ok()
         .and_then(Result::ok);
     let status = if snapshot.is_some() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    let body =
-        render(state.capacity, state.git_slots.available_permits(), &state.counters, &gc, &pool, snapshot.as_ref());
+    let body = render(
+        state.capacity,
+        state.git_slots.available_permits(),
+        &state.counters,
+        &gc,
+        &pool,
+        snapshot.as_ref().map(|(core, workers)| (core, workers)),
+    );
     (
         status,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (header::CACHE_CONTROL, "no-store")],
