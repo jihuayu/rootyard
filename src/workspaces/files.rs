@@ -75,8 +75,8 @@ pub async fn get(
                 if error.kind() == std::io::ErrorKind::NotFound { Error::not_found() } else { Error::internal(error) }
             })?
         }
-        "head" => service::git(&repo, &["show", &format!("HEAD:{}", rel.display())])?,
-        "index" => service::git(&repo, &["show", &format!(":{}", rel.display())])?,
+        "head" => service::git(&state, &repo, &["show", &format!("HEAD:{}", rel.display())], 4 * 1024 * 1024).await?,
+        "index" => service::git(&state, &repo, &["show", &format!(":{}", rel.display())], 4 * 1024 * 1024).await?,
         _ => return Err(Error::bad_request()),
     };
     if raw.len() > 4 * 1024 * 1024 {
@@ -249,7 +249,7 @@ pub async fn git(
         _ => return Err(Error::bad_request()),
     };
     args.extend(paths.iter().map(String::as_str));
-    let output = service::git(&service::workspace_repo(&state, id), &args)?;
+    let output = service::git(&state, &service::workspace_repo(&state, id), &args, 64 * 1024).await?;
     let revision = ws.revision + 1;
     let generation = ws.git_generation + 1;
     let result = json!({"action":input.action,"workspace_revision":revision,"git_generation":generation,"output_base64":STANDARD.encode(output)});

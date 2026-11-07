@@ -21,6 +21,47 @@ tree and native `.git` state. This makes the copy one filesystem-operation
 boundary, including editor rename-overwrite and Git index updates, but does not
 turn a multi-file application edit into one atomic transaction. Mandatory scans
 capture external changes every two seconds; event replay exposes revisions.
+
+## Capture and native Git bounds
+
+Background capture runs in three phases: a lock-free eligibility read, one
+full-tree fingerprint on a bounded blocking worker (entered inside the FUSE
+mutation gate, so a freeze snapshot stays stable and a cancelled caller never
+releases the gate early), and a short `FOR UPDATE` transaction that re-reads
+`host_id`, `state`, the live lease, `revision` and `lease_epoch`. A scan is
+discarded unless the row still matches the values read before the scan, so a
+stale scan can never overwrite a newer API edit, checkpoint or lease handoff.
+The fingerprint row, the revision bump and the `external_capture` event commit
+in that one transaction; an unchanged fingerprint writes no revision and no
+event.
+
+Eligible workspaces are paged by `id` (`id > cursor ORDER BY id LIMIT 100`), so
+every local workspace is visited each round instead of rescanning one fixed
+prefix. A workspace that is slow, errors, or exceeds the scan budget occupies at
+most its own worker and is retried on a later round. `ROOTYARD_WORKSPACE_SCAN_WORKERS`
+(1-16, default 3) and `ROOTYARD_WORKSPACE_SCAN_QUEUE` (1-64 per worker, default
+4) bound concurrency and queueing; `ROOTYARD_WORKSPACE_SCAN_TIMEOUT_MS` (default
+30000) bounds how long a caller waits for a result. A timed-out or cancelled
+scan keeps its worker slot and the FUSE gate until the filesystem closure
+really returns, so shutdown or lease loss never unfreezes a workspace while a
+scan is still running.
+
+API mutations (file PUT, `git add`/`reset`, checkpoint, restore) still compute
+their post-write fingerprint synchronously inside their existing workspace-lock
+transaction. That preserves the historical revision/event contract: an API
+write is never reported as an external capture, a later native edit still is,
+and a failed baseline cannot silently adopt native changes. It is the remaining
+per-request full-tree read on a locked row; removing it is follow-up work, not
+part of this change. Checkpoint capture copies the tree on the same bounded
+worker and revalidates revision, lease epoch and host under the row lock
+afterwards, so the copy itself holds no database lock.
+
+Workspace repository inspection and mutation commands run through one bounded
+native Git wrapper that reuses the GitFS collector: stdout is capped per call
+(4 MiB for file views, 64 KiB for `add`/`reset`), stderr is drained and
+discarded, the command runs in its own process group, and the shared Git
+timeout applies. A timed-out or cancelled command kills the whole process group
+before the caller continues, so no descendant outlives the request.
 Lease handoff rejects active sandbox jobs, and sandbox admission and execution
 are bound to a persisted lease epoch. A running job is cancelled when its lease
 or database authority disappears. Database lease changes are reflected in the

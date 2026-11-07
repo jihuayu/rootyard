@@ -8,7 +8,6 @@ use axum::{
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path as FsPath, PathBuf},
-    process::Command,
     sync::Arc,
 };
 use uuid::Uuid;
@@ -40,24 +39,10 @@ pub(crate) async fn creation_lock(
     Ok(())
 }
 
-pub fn git(repo: &FsPath, args: &[&str]) -> Result<Vec<u8>, Error> {
-    let output = Command::new("git")
-        .arg("-c")
-        .arg("core.hooksPath=/dev/null")
-        .arg("--no-replace-objects")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .map_err(Error::internal)?;
-    if !output.status.success() {
-        return Err(conflict());
-    }
-    Ok(output.stdout)
+/// Bounded native Git command. Output and lifetime are capped by the shared
+/// GitFS collector; the process group is cleaned up on timeout or cancellation.
+pub async fn git(state: &AppState, repo: &FsPath, args: &[&str], limit: usize) -> Result<Vec<u8>, Error> {
+    super::git::run(state, repo, args, limit).await
 }
 
 pub async fn authorized(state: &AppState, headers: &HeaderMap, id: Uuid, role: Role) -> Result<Workspace, Error> {
@@ -310,7 +295,7 @@ pub async fn create(
     source_lease.ensure_active()?;
     drop(_local);
     drop(source_lease);
-    let head = String::from_utf8(git(&dest, &["rev-parse", "HEAD"]).unwrap_or_default())
+    let head = String::from_utf8(git(&state, &dest, &["rev-parse", "HEAD"], 4096).await.unwrap_or_default())
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| crate::browse::models::valid_non_zero_oid(value));

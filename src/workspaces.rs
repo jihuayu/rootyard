@@ -7,6 +7,8 @@ mod checkpoints;
 mod events;
 #[path = "workspaces/files.rs"]
 mod files;
+#[path = "workspaces/git.rs"]
+mod git;
 #[path = "workspaces/lazy.rs"]
 pub(crate) mod lazy;
 #[path = "workspaces/models.rs"]
@@ -17,6 +19,8 @@ pub mod mounts;
 mod remote;
 #[path = "workspaces/remote_gc.rs"]
 mod remote_gc;
+#[path = "workspaces/scan.rs"]
+mod scan;
 #[path = "workspaces/service.rs"]
 pub(crate) mod service;
 
