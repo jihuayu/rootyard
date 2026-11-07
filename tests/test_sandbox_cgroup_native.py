@@ -148,8 +148,24 @@ def bwrap_capability():
     instead of parsing a version string.
     """
     version = command_output(["bwrap", "--version"], limit=200)
+    # Bubblewrap starts from an empty root, so the probe must bind the host
+    # root read-only for /bin/true to exist. Probe-only argv: the real job
+    # mounts are unchanged, /tmp stays size-bounded and the network unshared.
     probe = command_output(
-        ["bwrap", "--unshare-all", "--die-with-parent", "--size", "1048576", "--tmpfs", "/tmp", "--", "/bin/true"],
+        [
+            "bwrap",
+            "--unshare-all",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--size",
+            "1048576",
+            "--tmpfs",
+            "/tmp",
+            "--",
+            "/bin/true",
+        ],
         limit=400,
     )
     binary = shutil.which("bwrap")

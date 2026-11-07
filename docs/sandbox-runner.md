@@ -215,10 +215,15 @@ runs when an operator dispatches it.
   predates `--size`; the first hosted run therefore failed every job before the
   start gate. The workflow builds the source Ubuntu 24.04 ships from the signed
   Ubuntu archive source index (`deb-src ... noble`, verified by the archive key
-  already trusted on the runner), installs it to `/usr/local/bin` ahead of
-  `/usr/bin`, and requires the capability functionally with
-  `bwrap --unshare-all --die-with-parent --size 1048576 --tmpfs /tmp --
-  /bin/true`. AppArmor and the rest of the runner policy are untouched. The
+  already trusted on the runner) pinned to the exact release `0.9.0-1build1`,
+  which is asserted against `apt-cache showsrc` before the download (a missing
+  pin fails with the available versions instead of building another release),
+  installs it to `/usr/local/bin` ahead of `/usr/bin`, and requires the
+  capability functionally with `bwrap --unshare-all --die-with-parent
+  --ro-bind / / --size 1048576 --tmpfs /tmp -- /bin/true`. Bubblewrap starts
+  from an empty root, so the host root is bound read-only in every probe argv;
+  that argv is setup-only and never changes the untrusted job mounts, and the
+  probe still runs with a size-bounded `/tmp` and an unshared network. AppArmor and the rest of the runner policy are untouched. The
   service probes the same capability once (`bwrap_supports_size`) and fails
   closed with a static, secret-free `rootyard: bubblewrap does not support
   --size` diagnostic instead of starting an unbounded job; the native preflight

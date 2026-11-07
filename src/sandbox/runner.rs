@@ -41,7 +41,23 @@ fn bwrap_supports_size(binary: &str) -> bool {
         _ => return false,
     }
     std::process::Command::new(binary)
-        .args(["--unshare-all", "--die-with-parent", "--size", "1048576", "--tmpfs", "/tmp", "--", "/bin/true"])
+        // Bubblewrap builds an empty root, so /bin/true must come from a
+        // read-only host root bind. This argv is probe-only and never changes
+        // the untrusted job mounts; /tmp is still size-bounded and the network
+        // is still unshared.
+        .args([
+            "--unshare-all",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--size",
+            "1048576",
+            "--tmpfs",
+            "/tmp",
+            "--",
+            "/bin/true",
+        ])
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
@@ -844,5 +860,18 @@ mod tests {
     fn bubblewrap_probe_rejects_unusable_binaries() {
         assert!(!bwrap_supports_size("rootyard-no-such-bubblewrap-binary"));
         assert!(!bwrap_supports_size("/bin/false"));
+    }
+
+    /// Positive check: when the host has bubblewrap, the probe must actually
+    /// succeed. Bubblewrap creates an empty root, so a probe without
+    /// `--ro-bind / /` fails even on a capable binary; this test catches that
+    /// mistake. A host whose bubblewrap lacks `--size` fails here by design,
+    /// because the runtime does require the capability.
+    #[test]
+    fn bubblewrap_probe_accepts_a_capable_host_binary() {
+        if std::process::Command::new("bwrap").arg("--version").output().is_err() {
+            return;
+        }
+        assert!(bwrap_supports_size("bwrap"), "host bubblewrap must satisfy the --size runtime probe");
     }
 }

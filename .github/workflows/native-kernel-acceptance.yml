@@ -107,23 +107,38 @@ jobs:
           echo "deb-src [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://archive.ubuntu.com/ubuntu noble main universe" \
             | sudo tee /etc/apt/sources.list.d/ubuntu-noble-src.list >/dev/null
           sudo apt-get update
+          # Reproducible pin: the exact source release offered by the signed
+          # archive. If that exact version is no longer published, fail with
+          # the available versions instead of silently building a different one.
+          pin=0.9.0-1build1
+          available=$(apt-cache showsrc bubblewrap | sed -n 's/^Version: //p' | sort -u | tr '\n' ' ')
+          echo "available noble bubblewrap source versions: $available"
+          case " $available " in
+            *" $pin "*) ;;
+            *)
+              echo "pinned bubblewrap source $pin is not offered by the signed archive; available: $available" >&2
+              exit 1
+              ;;
+          esac
           work=$(mktemp -d)
-          (cd "$work" && apt-get source bubblewrap)
+          (cd "$work" && apt-get source "bubblewrap=$pin")
           src=$(find "$work" -maxdepth 1 -mindepth 1 -type d -name 'bubblewrap-*' | head -1)
           test -n "$src"
           version=$(dpkg-parsechangelog -l "$src/debian/changelog" -SVersion)
           echo "bubblewrap source version: $version"
-          # Pin the minimum upstream version that implements --size. The signed
-          # Ubuntu archive provides provenance for the source; the functional
-          # probe below proves the built binary really has the capability.
-          dpkg --compare-versions "${version%%-*}" ge 0.9.0
+          # Exact pin only: the signed Ubuntu archive provides provenance for
+          # this release, and the functional probe below proves the built binary
+          # really has --size.
+          test "$version" = "$pin"
           (cd "$src" && meson setup _build --prefix=/usr/local && ninja -C _build && sudo ninja -C _build install)
           hash -r
           command -v bwrap
           bwrap --version
           # Functional capability probe: no version parsing, the mount path is
-          # the only thing that matters.
-          bwrap --unshare-all --die-with-parent --size 1048576 --tmpfs /tmp -- /bin/true
+          # the only thing that matters. Bubblewrap starts from an empty root,
+          # so bind the host root read-only for /bin/true; probe-only, the job
+          # mounts are unchanged.
+          bwrap --unshare-all --die-with-parent --ro-bind / / --size 1048576 --tmpfs /tmp -- /bin/true
           echo "bubblewrap with --size support: $(bwrap --version)"
           sha256sum "$(command -v bwrap)"
 
