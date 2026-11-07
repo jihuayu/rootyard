@@ -875,6 +875,10 @@ def main():
         clone = root / "restored-clone"
         restored.git("clone", restored.remote, str(clone), token=h.reader)
         restored.git("fsck", "--full", "--strict", cwd=clone)
+        # Per-repository identity only (Harness runs with system/global Git
+        # config disabled); the restored clone is the only clone that commits.
+        restored.git("config", "user.name", "HA restored authority", cwd=clone)
+        restored.git("config", "user.email", "ha-restored@example.invalid", cwd=clone)
         clone_tip = restored.git("rev-parse", "HEAD", cwd=clone).stdout.decode().strip()
         assert clone_tip in set(pre_backup_oids)
         clone_history = set(restored.git("rev-list", "HEAD", cwd=clone).stdout.decode().splitlines())
