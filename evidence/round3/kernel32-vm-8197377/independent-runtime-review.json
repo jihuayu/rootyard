@@ -1,0 +1,72 @@
+{
+  "review": "DeepSeek follow-up runtime review, delta ef250f5 -> 9bad208",
+  "verdict": "APPROVE_DELTA (0 P1)",
+  "source_commit_reviewed": "9bad208",
+  "previous_approved": "ef250f5",
+  "native_status": "PENDING - second VM run on branch ref 9bad208 not finished; no native pass claimed",
+  "first_vm_receipt": {
+    "status": "failed",
+    "profile": "cgroup",
+    "assertions": {
+      "supervised_cgroup_membership": true
+    },
+    "detail": "__main__.CgroupSandboxTest.test_fenced_attempt_uses_cgroup_backend; __main__.CgroupSandboxTest.test_real_kernel_enforcement_and_reclaim",
+    "self_cgroup": "/rootyard-native-42333141623/supervisor",
+    "pool": 67108864,
+    "reading": "delegation, supervisor membership, unprivileged identity and bounded tmpfs all held; only supervised_cgroup_membership proven; both test methods errored => failure inside job launch"
+  },
+  "root_cause_confirmed": {
+    "claim": "bwrap 0.6.1 lacks --size",
+    "source_proof": "runner.rs passes --size for the shared /tmp mount (~557, before the Mode match) and for /workspace in the cgroup arm (~599); dev mode also needs --size, so the global precondition is accurate"
+  },
+  "ok": {
+    "fail_closed_ordering": "require_bubblewrap is first in isolation_mode (runner.rs:81), called at 412 before cgroup::create, pool verify, job root and snapshot",
+    "single_probe_argv": "identical argv at three sites (runner.rs:47-63, workflow:141, native test bwrap_capability)",
+    "probe_only": "runner.rs job mount argv unchanged; probe is read-only root + 1MiB /tmp + unshared net + /bin/true only",
+    "redaction": "Harness.redact (tests/e2e.py:65) + Bearer/key=value/URL substitution, 4096B tails, <=10 jobs, no env dump, written before cleanup, uploaded with receipt",
+    "classification": "missing/incapable bwrap => blocked with version+probe stderr; assertion failure stays failed; never passed",
+    "workflow_pin": "signed noble deb-src, apt-cache showsrc must offer 0.9.0-1build1 else fail with available versions, dpkg-parsechangelog re-assert, /usr/local/bin install, functional unprivileged probe, step precedes cargo test --lib sandbox",
+    "path_reaches_service": "PATH passed via sudo -E env; Harness.env=os.environ.copy() (tests/e2e.py:48) so the service resolves /usr/local/bin/bwrap",
+    "unit_coverage": "cargo test --lib sandbox now covers the new negative+positive probe tests",
+    "docs": ""
+  },
+  "p1_findings": [],
+  "p2_findings": [
+    {
+      "id": "P2-1",
+      "where": "src/sandbox/runner.rs:866-876",
+      "trigger": "positive host test fails (not skips) when bwrap resolves but is <0.8 or userns-confined (22.04 0.6.1, 24.04 AppArmor, restricted container); skips only when bwrap absent",
+      "exposure_today": "not red: ci.yml rust:1-trixie container installs no bubblewrap; pando-lab no bubblewrap; native lane installs 0.9.0 first",
+      "fix": "skip on namespace-permission stderr, keep assert for clean capability error"
+    },
+    {
+      "id": "P2-2",
+      "where": "src/sandbox/runner.rs:47-77",
+      "trigger": "bwrap capable but userns denied => stderr discarded, message claims --size missing, all jobs 503",
+      "fix": "bounded stderr tail in the same static line"
+    },
+    {
+      "id": "P2-3",
+      "where": "src/sandbox/runner.rs:66-69",
+      "trigger": "OnceLock caches a transient first-probe failure => permanently fails closed until restart (availability only)",
+      "fix": "cache only success or re-probe negatives"
+    },
+    {
+      "id": "P2-4",
+      "where": "workflow bubblewrap build step",
+      "trigger": "depends on archive.ubuntu.com still serving 0.9.0-1build1 and jammy meson building it; fails loudly",
+      "assessment": "version->capability assumption backstopped by three functional probes"
+    },
+    {
+      "id": "P2-5",
+      "where": "native test sanitize()",
+      "trigger": "pattern-based redaction misses unrecognised secret shapes; only secret is the webhook HMAC covered by Harness.redact",
+      "assessment": "accepted as-is"
+    }
+  ],
+  "not_claimed": [
+    "no native pass",
+    "no local Rust build/test",
+    "no cgroup delegation re-audit"
+  ]
+}

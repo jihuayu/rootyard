@@ -1,0 +1,109 @@
+{
+  "acceptance": {
+    "all_required_assertions_true": true,
+    "host": {
+      "kernel": "6.8.0-1070-azure",
+      "python": "3.12.16"
+    },
+    "pool_capacity_bytes_measured": 67108864,
+    "profile": "cgroup",
+    "required_assertions": [
+      "artifact_cgroup_reclaim",
+      "artifacts_pool_bounded",
+      "bubblewrap_capabilities",
+      "cancel_cgroup_removed",
+      "ci_checkout_builds",
+      "cpu_quota_aggregate",
+      "crash_descendants_reaped",
+      "fenced_attempt_new_attempt",
+      "isolated_concurrent_builds",
+      "live_controls",
+      "logs_artifact_auth",
+      "memory_oom",
+      "pids_enforced",
+      "platform_credentials_absent",
+      "supervised_cgroup_membership",
+      "timeout_terminal_reclaim",
+      "workspace_disk_enospc"
+    ],
+    "runner": {
+      "euid": 1001,
+      "gid": 1001,
+      "groups": [
+        4,
+        100,
+        101,
+        127,
+        1001
+      ],
+      "uid": 1001
+    },
+    "status": "passed",
+    "tmpfs_fstype": "tmpfs"
+  },
+  "files": {
+    "README.md": {
+      "bytes": 2625,
+      "sha256": "fc94647eb8263eaa03538fa1ca0ceaba1a54d47e2425501e20769f0c54e8f06c"
+    },
+    "binary.sha256": {
+      "bytes": 124,
+      "sha256": "f6865c198a48918b870593c2cac65fb1fa3ac524793a1928a6eed7e624ed952e"
+    },
+    "evidence/native-cgroup-receipt.json": {
+      "bytes": 3278,
+      "sha256": "1ab1ae054fd63a2dcdcd6caedbb204b9770b727cf35d3bf74abce14580eb2c74"
+    },
+    "failed-attempts/ledger.json": {
+      "bytes": 1474,
+      "sha256": "fd318829701af0db89c5edebfd288ca9c0a89a1db32fe251cd09f0dc297bbc9b"
+    },
+    "failed-attempts/receipt-42333141623.json": {
+      "bytes": 2525,
+      "sha256": "c0dd221de69217c1094b897f354741e99b1e0c3dcd6fab071d825f53e5e0cfa6"
+    },
+    "failed-attempts/receipt-42334691759.json": {
+      "bytes": 3102,
+      "sha256": "6e605c952c251191e4bba72e29de8a7fbb8ebdaca65e4b2b092faedf0d4742bf"
+    },
+    "independent-runtime-review.json": {
+      "bytes": 4140,
+      "sha256": "4d32b2c6a6936f347889e24f85bd1b0f7818c47051967af41a4f9d54e2d7a149"
+    },
+    "receipt.json": {
+      "bytes": 3278,
+      "sha256": "1ab1ae054fd63a2dcdcd6caedbb204b9770b727cf35d3bf74abce14580eb2c74"
+    },
+    "source-inputs.json": {
+      "bytes": 33070,
+      "sha256": "c96ccd1f41d0f4a85d6e8cf5b363ce3a8cc418a9ce84851f847ff01806f4c188"
+    }
+  },
+  "run": {
+    "artifact_id": 13559178383,
+    "artifact_members": [
+      "binary.sha256",
+      "evidence/native-cgroup-receipt.json",
+      "receipt.json"
+    ],
+    "artifact_zip_bytes": 2811,
+    "artifact_zip_sha256": "4107dfdfd0cd96cb3f1c5a85c5cf5f1ea0586e93efbfb4e08a34be018232bc73",
+    "conclusion": "success",
+    "id": 42335322441,
+    "job_id": 128290838175,
+    "url": "https://github.com/jihuayu/rootyard/actions/runs/42335322441"
+  },
+  "schema": "rootyard/kernel32-vm-artifact-manifest/v1",
+  "source": {
+    "compiled_binary_sha256": "e4deb3e032ee138376c1b277be7bdaf6476599099a66f130aed2d122b8b17bd7",
+    "compiled_commit": "8197377e6d85c3b80082331d7b86cab8c84070f5",
+    "delta_compiled_vs_reviewed": [
+      "tests/test_sandbox_cgroup_native.py"
+    ],
+    "production_inputs_sha256": "3358234a361d4ac9b8c69a6a25d384963187c1f7fbce44b2b8531a4568c56dca",
+    "production_review_verdict": "APPROVE_DELTA (0 P1)",
+    "reviewed_commit": "9bad208",
+    "tests_file_sha256": "8034085817aaee74b1644a54c8b098cfc82f33925b97aba0c36ec9539e496f56",
+    "workflow_file_sha256": "2feddf8079609e9bf62955e70bdaafb05ce08f9e7ed81c94f05b41760a43cc13"
+  }
+}

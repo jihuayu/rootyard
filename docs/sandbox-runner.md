@@ -313,15 +313,29 @@ database; it never kills or removes the parent runner cgroup. The parent runner
 cgroup is never written by `setup` beyond `rootyard-native-<run-id>` creation
 and the root `cgroup.subtree_control` enable that cgroup v2 requires.
 
-On the current managed development host there is no delegated cgroup v2
-subtree (rootless Docker cgroup driver `none`, cgroupfs writes denied), so
-positive local acceptance remains BLOCKED until the coordinator dispatches this
-workflow on the supported VM. Local verification of this change is limited to shell syntax, `actionlint` YAML
-parsing and Python byte-compilation; this implementation host has no Rust
-toolchain, so the `src/sandbox/runner.rs` capability change is compiled and
-unit-tested by the hosted workflow step (`cargo test --locked --lib sandbox`)
-and is not claimed as locally verified. None of this is a substitute for the
-hosted run. The runtime capability check was added after the
-first hosted run failed with opaque job failures; until a hosted run passes with
-the capability present and sanitized diagnostics recorded, positive native
-acceptance remains unproven and this host stays BLOCKED.
+## Verified native acceptance (hosted VM)
+
+Production kernel resource acceptance is **verified** for the supported profile
+(`workflow_dispatch` on a GitHub-hosted Ubuntu 22.04 VM, unprivileged uid 1001,
+delegated cgroup v2 subtree, rebuilt bubblewrap implementing `--size`) by run
+[42335322441](https://github.com/jihuayu/rootyard/actions/runs/42335322441),
+job `128290838175`, artifact `13559178383` (ZIP SHA-256
+`4107dfdfd0cd96cb3f1c5a85c5cf5f1ea0586e93efbfb4e08a34be018232bc73`), compiled
+source `8197377e6d85c3b80082331d7b86cab8c84070f5` and binary
+`e4deb3e032ee138376c1b277be7bdaf6476599099a66f130aed2d122b8b17bd7`. The receipt is
+`passed` with profile `cgroup`, 17/17 required assertions true, a real 64 MiB
+artifact tmpfs and a non-root runner identity. Permanent evidence (the exact
+receipt, the `source_digest.py` input map, an artifact manifest with every stored
+file hash, the unchanged independent runtime review for production source
+`9bad208`, and the two earlier failed attempts recorded as failures) is in
+[`evidence/round3/kernel32-vm-8197377/`](../evidence/round3/kernel32-vm-8197377/README.md).
+Compiled source `8197377` differs from reviewed production source `9bad208` only
+in `tests/test_sandbox_cgroup_native.py` (the ENOSPC fixture), so that runtime
+review applies unchanged to the production code.
+
+This closes the kernel resource gap only for the profile recorded above. The
+managed development host still cannot execute native cgroup acceptance (no
+delegated cgroup v2 subtree; rootless Docker cgroup driver `none`), which is an
+execution-environment fact rather than a product regression. This evidence is
+not a physical cross-host HA qualification and is not a completion claim for any
+other feature or profile.
