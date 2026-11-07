@@ -363,7 +363,7 @@ class CiMirrorTrack3Test(unittest.TestCase):
         env["PATH"] = search_path
         for target in ("mirror", "ci_pins", "ci_checkouts"):
             proc = subprocess.run(
-                [cargo, "test", "--lib", target],
+                [cargo, "test", "--locked", "--features", "pando-lab", "--lib", target],
                 cwd=ROOT,
                 env=env,
                 capture_output=True,
