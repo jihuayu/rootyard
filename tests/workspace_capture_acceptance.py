@@ -16,6 +16,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import threading
 import time
@@ -34,6 +35,7 @@ SCAN_IO_DELTA = 5_000_000
 
 _TEST_BINARY = None
 _TEST_KEEP = False
+_GATE_FACTS = {}
 
 
 def harness():
@@ -59,6 +61,51 @@ def create(h, index):
 
 def repo(h, workspace):
     return h.root / "data/workspace-service/workspaces" / workspace["id"]
+
+
+def install_capture_read_gate(h, target):
+    """Compile the real-read gate and configure only this harness child.
+
+    The library is inert unless both gate variables are set. The exact target
+    path is only known after the API-created workspace exists, so the durable
+    service is restarted once with the preload already in place. It is
+    compiled in this harness's owned temp root before that process starts.
+    """
+    if not sys.platform.startswith("linux") or not Path("/proc/self/fd").is_dir():
+        raise RuntimeError("capture read gate requires Linux /proc/self/fd support")
+    compiler = shutil.which("gcc")
+    if compiler is None:
+        raise RuntimeError("capture read gate requires gcc on PATH")
+    source = TESTS_DIR / "fixtures" / "capture_read_gate.c"
+    if not source.is_file():
+        raise RuntimeError(f"capture read gate fixture is missing: {source}")
+    build = h.root / "capture-read-gate"
+    build.mkdir(parents=True, exist_ok=True)
+    library = build / "capture_read_gate.so"
+    build_env = dict(h.env)
+    build_env.pop("LD_PRELOAD", None)
+    h.run(
+        [compiler, "-shared", "-fPIC", "-O2", "-pthread", "-o", str(library), str(source), "-ldl"],
+        env=build_env,
+    )
+    if not library.is_file():
+        raise RuntimeError(f"capture read gate did not produce {library}")
+    prefix = h.root / "capture-gate"
+    h.env.update(
+        LD_PRELOAD=str(library),
+        ROOTYARD_TEST_CAPTURE_GATE=str(prefix),
+        ROOTYARD_TEST_CAPTURE_TARGET=str(target),
+    )
+    return prefix
+
+
+def wait_capture_gate(hit, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if hit.exists():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"real capture read was not paused at {hit} within {timeout}s")
 
 
 def events(h, workspace, after=0):
@@ -182,7 +229,7 @@ def selected_suite(loader, names, module):
                 loader.loadTestsFromName(f"{WorkspaceCaptureAcceptance.__name__}.{short}", module)
             )
         else:
-            suite.addTests(loader.loadTestsFromName(name))
+            suite.addTests(loader.loadTestsFromName(name, module))
     return suite
 
 
@@ -238,7 +285,7 @@ def build_report(result, scheduled_ids, binary, binary_sha256):
         and result.testsRun == total_scheduled
         and counts["skipped"] == 0
     )
-    return {
+    report = {
         "passed": passed,
         "binary": str(binary),
         "binary_sha256": binary_sha256,
@@ -258,6 +305,9 @@ def build_report(result, scheduled_ids, binary, binary_sha256):
             "Loopback functional timings are not a scalability benchmark.",
         ],
     }
+    if _GATE_FACTS:
+        report["capture_read_gate"] = dict(_GATE_FACTS)
+    return report
 
 
 class _SyntheticReportTests(unittest.TestCase):
@@ -414,27 +464,42 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
             ROOTYARD_WORKSPACE_SCAN_WORKERS="2",
             ROOTYARD_WORKSPACE_SCAN_TIMEOUT_MS="60000",
         )
+        gate = None
         try:
             h.setup()
             h.api()
             h.roundtrip()
             workspace = create(h, "race")
-            bulk(repo(h, workspace), BULK_COUNT, BULK_SIZE)
-            base_revision = json.loads(h.expect(f"/api/workspaces/{workspace['id']}", 200, token=h.alice))["revision"]
-            baseline = io_read_bytes(h)
-            (repo(h, workspace) / "race.txt").write_bytes(b"revision race\n")
-            wait_scan_io(h, baseline, SCAN_IO_DELTA)
-            # The scan owns no workspace row lock: both probes must succeed while
-            # the bounded reader is still hashing the large inventory.
+            # The gate names one exact file, and the workspace id only exists
+            # after the API call. Workspace rows and repositories are durable,
+            # so restart the service once with the preload configured. The
+            # scanner and database logic under test are unchanged.
+            h.stop()
+            target = repo(h, workspace) / "capture-gated.bin"
+            gate = install_capture_read_gate(h, target)
+            h.start()
+            base_revision = json.loads(
+                h.expect(f"/api/workspaces/{workspace['id']}", 200, token=h.alice)
+            )["revision"]
+            _GATE_FACTS.clear()
+            hit = gate.with_suffix(".hit")
+            release = gate.with_suffix(".release")
+            _GATE_FACTS.update(
+                target=str(target), marker=str(hit), hit=False, released=False
+            )
+            # The external file appears only after the API baseline was read.
+            # The next scanner pass opens this exact file and pauses inside the
+            # real read, before its fingerprint can be committed.
+            target.write_bytes(b"revision race\n" * 64)
+            wait_capture_gate(hit)
+            _GATE_FACTS["hit"] = True
+            # The scan owns no workspace row lock while its real read is held.
             row_lock_nowait(h, workspace)
             idle = h.sql(
                 "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
                 "AND state='idle in transaction' AND query LIKE '%FROM workspaces%FOR UPDATE%'"
             )
             self.assertEqual(idle, "0", "capture left a workspace row locked while scanning")
-            # The bounded scan must still be in flight; a capture committed
-            # before the fence would make the revision jump legal instead of a
-            # stale-scan test.
             self.assertEqual(
                 h.sql(
                     "SELECT count(*) FROM workspace_events WHERE workspace_id='%s' "
@@ -443,9 +508,9 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
                 "0",
                 "the bounded scan finished before the revision fence was injected",
             )
-            # Jump the revision without matching event rows: an artificial,
-            # illegal gap that shadows the race. Metadata-only jumps like this
-            # are reported to public readers as RESYNC_REQUIRED, never hidden.
+            # Jump the revision while the real read is still held. The scan
+            # captured base_revision before the gate, so its guarded commit
+            # must now be discarded as stale.
             h.sql(
                 "UPDATE workspaces SET revision=revision+100 WHERE id='%s'" % workspace["id"]
             )
@@ -453,8 +518,11 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
                 h.sql("SELECT revision FROM workspaces WHERE id='%s'" % workspace["id"])
             )
             self.assertGreaterEqual(watermark, base_revision + 100)
-            # The API cannot page across the injected gap, so the scan's guarded
-            # commit is asserted against the durable event log.
+            self.assertFalse(gate.with_suffix(".timeout").exists(), "read gate expired before the fence")
+            release.touch()
+            _GATE_FACTS["released"] = True
+            # Releasing lets the stale first scan finish; the following small
+            # scan can commit a new capture within the existing 30s bound.
             event = wait_durable_capture(h, workspace, after=base_revision, timeout=30)
             self.assertEqual(event["kind"], "external_capture")
             self.assertGreaterEqual(
@@ -483,7 +551,13 @@ class WorkspaceCaptureAcceptance(unittest.TestCase):
                 "an artificial revision gap was not reported as RESYNC_REQUIRED",
             )
             self.assertGreaterEqual(resync.get("snapshot_revision", 0), watermark)
+            self.assertFalse(gate.with_suffix(".timeout").exists(), "read gate released without test authorization")
         finally:
+            if gate is not None:
+                # Never leave the service child blocked in the gate.
+                gate.with_suffix(".release").touch()
+                if _GATE_FACTS:
+                    _GATE_FACTS["released"] = True
             h.cleanup()
 
     def test_scan_revalidates_lease_epoch_before_committing(self):
