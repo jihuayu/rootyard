@@ -2,18 +2,18 @@
 
 历史基线：2026-11-04，main [`1fd05a393fe24653687fa3e868f9dca2fb0c9a67`](https://github.com/jihuayu/rootyard/commit/1fd05a393fe24653687fa3e868f9dca2fb0c9a67)。本页历史快照说明该代码具有什么边界，不承诺后续 main，也不把既有测试报告当作本次重新执行的结果。
 
-当前交付候选：2026-11-07，round-2 `340e6681aef3b78a440dc1b0fc8a13ce497621ea`（合并主线 `5fa4854`，PR #56 已合并）。逐条状态、qualified chunk 与 PENDING 证据见 [round-2 交付表](../acceptance/round2-delivery.md) 与 [46 项任务台账](../registered-task-delivery.md)。最终 NativeCore+Ops 组合验证仍为 **PENDING**，本页不宣称组合 PASS。
+最终生产源：`f31910086acbaa87d9e98df440ca8c28c7bb7e08`（format-7 版本 `<=131` 冻结），certified input `fdfbbfc…`，immutable binary `35d01c5f…`，合并主线 `5fa4854`（PR #56 已合并）。除一个 physical-GC 组合 receipt 外，最终 NativeCore+Ops 结果已验证；逐条证据见 [round-2 交付表](../acceptance/round2-delivery.md) 与 [46 项任务台账](../registered-task-delivery.md)。
 
-历史中间基线：`6d2f0b8`（PR #49–#55 合并点）及其 [验收审计](../acceptance/main-6d2f0b8-audit.md) 保留为历史记录，不是当前候选的验收结论。
+历史中间基线：`6d2f0b8`（PR #49–#55）与 `340e668` 的中间记录只作历史，不是最终验收结论；[6d2f0b8 审计](../acceptance/main-6d2f0b8-audit.md) 保持 historical。
 
-## 当前候选（340e668）能力与未验收边界
+## 最终源（f319100）能力与未验收边界
 
-- #38：SHA-931 + `d8540fc` 已完成 format 7/schema 131、不可变 format 6/schema 130、显式 `--allow-legacy-schema130` 升级；3 个真实 legacy-130、无 flag 拒绝+opt-in、SHA-256 clone/pin/gen/grant revocation 已单独通过。关闭需同时满足 6 SHA-256 + 2 restore + 3 legacy + schema 131 + 15 CI checkout 的组合矩阵，当前 PENDING。
-- #23：`7cc01d0`/`d9eb6d9`/`7118521`/`32dfea8` 实现自动 Pando compaction、cache anti-tamper、non-ref rollback；生产同构 `FCC/bf6` 的两个自动 Pando 用例及 GitFS lifecycle 3 + API 7 + physical 8 已在 qualified chunk 通过。远端 Pando mark/delete/pruning 仍禁用，需全局 retention 基础。
-- #25/#26：`66abaf0`/`bcede68`/`73a673c` 实现 draining reset、旧卷 retirement、online copy+delta、retained SQL roots、list/abort 与 promoted-owner 检查；同机迁移/分区/接管已通过（certified source `6831`），跨主机物理 fencing 未认证。
-- #43/#44：`7a77c83` 已提交真实 TLS/SCRAM、Kafka SASL_SSL、手工本地 PG promotion、PITR、ENOSPC 与本地 1/2/4 workload；gate 仅 `passed_local_single_host` / `production_scope=not_certified`。外部自动 PG HA/DCS、跨主机 source fence、全新部署 restore 与物理跨主机/硬件资格仍缺失。
-- #32：`960d615` 的真实 dev namespace 6 例、tmpfs-only artifact pool 与 launch-failure cleanup 已通过；正向 kernel cgroup 执行因缺少 delegated cgroup v2 subtree（rootless Docker cgroup driver `none`、cgroupfs EPERM）而 BLOCKED。
-- #48：umbrella 保持 OPEN；#30 已通过 PR #50 CLOSED，不能把所有子项都描述为未关闭或未合并；#2–#19 的实现与当前验收需逐项核对，不做批量关闭。
+- #38：service 2/2、matrix 6/6（stock Git Forge pull/review/check/merge、64-hex mirror plan/receipt、SHA-1 与 mixed/abbreviated/zero-width negatives）、restore 2/2、真实 legacy format-6 3/3（旧 `6135` archive）、schema contract 8 checks（含 public/custom）、CI checkout 15/15 均在 `35d01` 通过。满足验收，PR 合并后关闭。
+- #23：GitFS lifecycle 3/3 + API 7/7；automatic Pando 2/2（cache tamper、non-ref rollback）；同仓 format-7 paired backup/restore 通过。远端 Pando mark/delete/pruning 仍 DISABLED，需 foundational global-retention；GitFS physical GC 仅在已证明模式内完成，唯一组合 receipt 仍 **PENDING**（test-only `47a93ed` fixture fix 已获 APPROVE，生产 input digest 未变）。
+- #25/#26：draining reset、retired-source fencing before commit、online copy+delta、retained SQL roots、list/abort、migration/partition/full takeover 均通过。**#25** 仍缺 per-phase crash matrix 与 CI-sidecar intent/directory handoff；**#26** 同机 session fencing 已证明，physical cross-host fencing 未认证。
+- #43/#44：真实 TLS/SCRAM、Kafka SASL_SSL、手工本地 PG promotion、PITR、ENOSPC 与本地 1/2/4 workload 通过；aggregate 为 #44 `passed_local_single_host`、#43 `blocked_external_ha_and_source_fence`、`production_scope=not_certified`。外部自动 PG HA/DCS、跨主机 source fence、全新部署 restore、物理跨主机/硬件资格仍缺失。
+- #32：真实 dev/CI 6/6（own-DB retry）、tmpfs-only artifact pool、launch-failure cleanup 通过。正向 kernel cgroup 因无 delegated cgroup v2 subtree（rootless Docker cgroup driver `none`、cgroupfs EPERM）而 BLOCKED。
+- #48：umbrella 保持 OPEN，roadmap 可勾选已关闭的 #30（PR #50）和待合并的 #38；#2–#19 不批量关闭（PR #49 历史代码不等于新验收）。
 
 ## 历史中间基线（6d2f0b8）已合并能力与未验收边界
 

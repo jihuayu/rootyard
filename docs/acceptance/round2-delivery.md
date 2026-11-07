@@ -1,87 +1,73 @@
-# Round-2 final integration delivery (candidate `340e668`)
+# Round-2 final integrated delivery (`f319100`)
 
-Status: **FINAL INTEGRATION VERIFICATION PENDING.** This page records the
-delivery boundary reached by the round-2 candidate on top of merged main
-`5fa48544b2830423d25ae3087d0be6b7ab14867f`. It does not claim a combined final
-PASS; cells marked PENDING are placeholders for reports the coordinator will
-supply after the `verify_final_core` / `verify_final_ops` pipelines finish.
+Status: **FINAL for all cells except the single physical-GC receipt marked
+PENDING below.** Final production source is
+`f31910086acbaa87d9e98df440ca8c28c7bb7e08` (one-line freeze of format-7
+versions `<=131` beyond `340e668`), certified input digest
+`fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b`, immutable
+binary SHA-256
+`35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153`.
 
-- Candidate source: `340e6681aef3b78a440dc1b0fc8a13ce497621ea`.
-- Merged main before candidate: `5fa4854` (PR #56 already merged).
-- Historical prior audit: [`main-6d2f0b8-audit.md`](main-6d2f0b8-audit.md)
-  remains the record for `6d2f0b8`; it is not the current candidate status.
-- Environment limits: one Linux host, local loopback, local PostgreSQL/Kafka,
-  no external cloud identity, no second physical host, no delegated cgroup v2
+- Merged main: `5fa48544b2830423d25ae3087d0be6b7ab14867f`; [PR #56](https://github.com/jihuayu/rootyard/pull/56) is already merged.
+- Historical `6d2f0b8` audit: [`main-6d2f0b8-audit.md`](main-6d2f0b8-audit.md). It is history, not current status.
+- Final report set (the coordinator commits the exact report bytes):
+  [`evidence/round2/integration-f319100/`](../../evidence/round2/integration-f319100/).
+  Planned files are `core-verification.json`, `operations-verification.json`,
+  `artifact.json`, `manifest.json`, `core/*.json` (canonical native names),
+  `operations/cluster-*.json` and `reviews/*.json`.
+- Environment limits: one Linux host, loopback, local PostgreSQL/Kafka, no
+  external cloud identity, no second physical host, no delegated cgroup v2
   subtree.
 
-## Candidate contents
+## Actual verified results on binary `35d01`
 
-| Area | Candidate commits | Boundary |
-| --- | --- | --- |
-| SHA-256 / backup | SHA-931, `d8540fc` | Format 7 / schema 131, immutable format 6 / schema 130, explicit `--allow-legacy-schema130` real upgrade and public/custom bootstrap. |
-| Maintenance | `7cc01d0`, `d9eb6d9`, `7118521`, `32dfea8` | All-OID-preserving automatic Pando compaction, cache verification/anti-tamper, non-ref rollback; GitFS lifecycle/API/physical acceptance. |
-| Cluster | `66abaf0`, `bcede68`, `73a673c` | Real draining reset, retired-volume fencing before takeover commit, online initial copy + delta, retained SQL roots, migration list/abort, promoted-owner inspection. |
+| Area | Result |
+| --- | --- |
+| Rust unit/integration | 139 library tests + 1 Rust Pando test passed. |
+| SHA-256 service | 2/2 passed. |
+| SHA-256 matrix | 6/6 passed, including stock Git Forge pull/review/check/merge, 64-hex OID mirror plan/receipt, SHA-1 regression and mixed/abbreviated/zero-width negatives. |
+| SHA-256 restore | 2/2 passed. |
+| True legacy migration | 3/3 passed from a genuine format-6 archive produced by the old `6135` binary. |
+| Schema contract | 8 checks passed, including public and custom bootstrap paths. |
+| CI checkout | 15/15 passed. A retry with a new own database also passed 15/15; the initial shared-database migration/advisory-lock collision is preserved in the record as an environment artifact, not a product pass. |
+| Sandbox | Real dev/CI 6/6 passed on a retry with its own database. The initial shared-database attempt is unqualified due to `information_schema` count 3-vs-1 and lock timeout, and is not counted. |
+| GitFS maintenance | Lifecycle 3/3 and API 7/7 passed. |
+| Pando maintenance | Automatic 2/2 passed, including cache tamper and non-ref OID survival across compaction rollback. |
+| Pando backup | Optional paired active backup/restore in format 7 passed on the same Garage/Vault; not a cross-store disaster-recovery claim. |
+| Operations | All ten scripts passed; 9 gate-valid, migration extra passed, and 5 fake-evidence negatives were rejected. Aggregate gate: #44 `passed_local_single_host`, #43 `blocked_external_ha_and_source_fence`, `production_scope=not_certified`. |
+| Physical GitFS GC | **PENDING.** The original combined eight-case run stopped at the ENOSPC projection wait with the first four cases passed. Test-only fix `47a93ed` (maint23) synchronizes live projection/ref-index delivery before stop and bounds namespace-view 503 retries to 20; reviewer APPROVE with no P1/P2 at `review_data/physical-fixture47-review.json`. The full patched eight-case native run is in progress. This is the only remaining PENDING cell. The patch changes tests only; production input digest is unchanged, so the `f319`/`35d01` certificate remains valid. |
 
-PR #56 (`5fa4854`) already merged the certified runtime/operations source
-`7a77c83`.
-
-## Qualified individual evidence (not a combined final gate)
-
-- **Runtime/operations (source `7a77c83`)**: committed reports under
-  `evidence/round2/runtime-ops-7a77c83/` (`cluster-local-profile`,
-  `cluster-tls`, `cluster-kafka-tls`, `cluster-pg-streaming`,
-  `cluster-pg-pitr`, `cluster-disk-pressure`, `cluster-workload-integration`,
-  `verification`) plus `evidence/round2/runtime-and-operations-review.json`
-  (APPROVE). The gate reports `passed_local_single_host` and
-  `production_scope=not_certified`.
-- **Sandbox (source `960d615`)**: six real dev/CI native cases passed on
-  certified inputs; committed summary is `evidence/round2/runner32-960d615.json`.
-  Kernel cgroup enforcement remains blocked.
-- **SHA-256 legacy restore (`d8540fc`, certified binary `8ef18…`, input
-  `65c42…`)**: three real legacy schema-130 cases passed from an old archive
-  produced at `6135`, without rewriting its manifest; no-flag rejection plus
-  opt-in upgrade to 131; SHA-256 clone + pin/generation/grant revocation.
-- **Maintenance (production-identical `FCC/bf6`)**: two automatic Pando cases
-  passed, including cache tamper and non-ref OID survival across compaction
-  rollback; GitFS lifecycle 3 + API 7 and physical 8 cases passed across the
-  qualified chunks after the ENOSPC fixture fix.
-- **Cluster (certified source `6831`, input `ee02`)**: migration and partition
-  passed. Full takeover passed after the `73a673c` test corrected inspection
-  of the new target after the old source was killed; receipt
-  `cluster_finalizer/takeover-promoted-owner.json` is PENDING commit/citation.
+Raw final-core logs are under the coordinator scratch
+`verify_final_core/postprocess*` (original reports plus a new combined report
+pending only the physical case); `verify_final_ops/report.json` is final and
+completed.
 
 ## Selected issue mapping
 
-| Issue | Proposed state | Verified now | Remaining gap |
+| Issue | State | Verified | Remaining gap |
 | --- | --- | --- | --- |
-| #38 SHA-256 | **open** | Legacy schema-130 3 cases, no-flag/opt-in upgrade, SHA-256 clone/pin/gen/grant revocation chunk. | Close only after one-source combined matrix: 6 SHA-256 + 2 restore + 3 legacy + schema 131 + 15 CI checkout cases. PENDING. |
-| #23 maintenance | **open** | Automatic Pando compaction/cache/anti-tamper/non-ref cases; GitFS lifecycle 3, API 7, physical 8 within proven mode. | Remote Pando mark/delete/pruning remains disabled pending a global retention foundation. |
-| #25 migration | **open** | Certified migration/partition; online copy+delta, retained SQL roots, list/abort, draining reset. | Per-phase crash matrix and CI-sidecar intent transfer with retained roots unproven. |
-| #26 controller | **open** | Same-host session fencing: SIGSTOP/partition, ADMITTED fencing, old-writer denial, duplicate/restart single promotion. | Physical cross-host fencing unqualified. |
-| #43 deployment | **open** | Real TLS/SCRAM, Kafka SASL_SSL role profiles, manual local PG promotion, PITR. | External automatic PG HA/DCS, cross-host source fence, fresh-deployment restore production gate blocked. |
-| #44 measurements | **open** | Real local 1/2/4 workload and negative controls; gate only `passed_local_single_host`. | Physical cross-host/hardware qualification absent. |
-| #32 sandbox | **open** | Six real dev/namespace cases; tmpfs-only artifact pool; launch-failure cleanup. | Positive kernel cgroup enforcement blocked (no delegated subtree / rootless Docker cgroup driver `none` / EPERM). |
-| #48 roadmap | **open** | Umbrella tracking candidate progress. | Stays open while children are unfinished. Issue #30 is already CLOSED (PR #50); do not describe all children as open or unmerged. |
+| #38 SHA-256 | **CLOSE after final PR merge** | Service 2/2, matrix 6/6 (Forge pull/review/check/merge with stock Git, mirror plan/receipt 64-hex, SHA-1 and mixed negatives), restore 2/2, true legacy-130 3/3, schema contract 8 checks, CI checkout 15/15 on `35d01`. | None for the stated acceptance; close after the final PR merges. |
+| #23 maintenance | **OPEN** | GitFS lifecycle 3/3, API 7/7; automatic Pando 2/2 with cache tamper and non-ref rollback; paired format-7 backup/restore same-store. | Remote Pando mark/delete/pruning remains DISABLED pending a foundational global-retention design. GitFS physical GC is complete only within its proven mode; the exact combined receipt is the single PENDING cell. |
+| #25 migration | **OPEN** | Real draining reset, retired-source fencing before commit, online initial copy + delta, retained SQL roots, list/abort; migration, partition and full takeover passed. | Per-phase crash matrix and CI-sidecar intent/directory handoff with retained roots are unproven. |
+| #26 controller | **OPEN** | Same-host session fencing: SIGSTOP/partition, ADMITTED fencing, old-writer denial, duplicate/restart single promotion. | Physical cross-host fencing is unqualified. |
+| #43 deployment | **OPEN / blocked for production gate** | Real TLS/SCRAM, Kafka SASL_SSL role profiles, manual local PostgreSQL promotion, PITR and local workload passed; gate `blocked_external_ha_and_source_fence`. | External automatic PostgreSQL HA/DCS, cross-host source fence and fresh-deployment restore production gate remain unavailable. |
+| #44 measurements | **OPEN** | Real local 1/2/4-node workload, negative controls, ENOSPC, PG promotion/PITR; gate `passed_local_single_host`, `production_scope=not_certified`, no simulated claim. | Physical production hardware/cross-host qualification is not certified. |
+| #32 sandbox | **OPEN / blocked for kernel cgroup** | Six real dev/CI cases, tmpfs-only artifact pool, launch-failure cleanup. | Positive kernel cgroup enforcement is BLOCKED: no delegated cgroup v2 subtree, rootless Docker cgroup driver `none`, cgroupfs EPERM. |
+| #48 roadmap | **OPEN umbrella** | Tracks the above; #38 may close after merge. | #30 is already CLOSED via PR #50. Do not mass-close #2–#19: historical PR #49 code does not equal new acceptance. |
 
-## Pending final evidence
+## Evidence and non-claims
 
-The following are **not** existing files and must not be cited as results until
-the coordinator supplies them:
+Committed reports will live under the reserved directory
+`evidence/round2/integration-f319100/` with the layout above. Links here are
+relative and will resolve once the coordinator copies the exact report bytes;
+no file in that directory is claimed before then.
 
-- PENDING `verify_final_core` combined SHA-256/restore/legacy/CI matrix report.
-- PENDING final maintenance combined report (GitFS + Pando within proven mode).
-- PENDING final cluster crash/takeover reports and committed
-  `cluster_finalizer/takeover-promoted-owner.json`.
-- PENDING final sandbox dev/CI report and kernel-cgroup opt-in outcome.
-- PENDING `verify_final_ops` regenerated `evidence/round2/runtime-ops-*` gate
-  report with `passed_local_single_host` and `production_scope=not_certified`.
-
-## Non-claims
-
-- No issue is closed by this document. No combined final integration PASS is
-  claimed.
+- The certificate binds source `f319100`, input
+  `fdfbbfc…` and immutable binary `35d01…`. The later physical-fixture patch is
+  test-only and does not change the production input digest.
+- `6831` and `ee02` are old binary/input hashes, not source commits.
 - Cross-host physical fencing, external automatic PostgreSQL HA/DCS, cloud KMS,
-  cross-datacenter network partitions and production-scale endurance remain
-  outside the demonstrated environment.
-- The `6d2f0b8` audit and its committed per-binary reports remain historical
-  evidence, not current-candidate qualification.
+  cross-datacenter partitions and production-scale endurance remain outside
+  the demonstrated environment.
+- The `6d2f0b8` audit and earlier `340e668` report references are historical and
+  are not current final results.
