@@ -1,0 +1,11 @@
+   Compiling rootyard v0.1.0 (/workspace/scratch/round5-implementation/fuse-dispatch)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.21s
+     Running tests/fuse_freeze_queue.rs (/workspace/rootyard/target/debug/deps/fuse_freeze_queue-416929d88aa2093a)
+
+running 3 tests
+test fenced_mount_rejects_new_mutations_and_keeps_reads ... ok
+test frozen_readwrite_aliases_drain_in_fifo_order_and_other_mount_stays_live ... ok
+test rapid_freeze_fence_handoff_cannot_replay_the_old_epoch_when_fenced_is_missed ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+

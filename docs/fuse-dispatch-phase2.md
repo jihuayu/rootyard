@@ -44,6 +44,10 @@ is only valid on the admitting thread).
 | `Frozen` | parked in a bounded FIFO, reply held | executed |
 | `Fenced` | `EROFS` (parked entries drained with `EROFS`, new mutations rejected) | executed |
 
+The dispatcher leaves independent-inode reads available during a freeze.
+Linux may still serialize a read behind an unanswered write on the same FUSE
+inode; the native read probe deliberately uses another inode on the same mount.
+
 After a successful thaw the actor drains the parked FIFO in arrival order. The
 actor learns about the thaw from a bounded `recv_timeout` poll of **10 ms**
 (`ACTOR_POLL`) plus a condvar notification on every enqueue; it never needs a
