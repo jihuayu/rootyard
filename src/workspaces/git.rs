@@ -480,6 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_owned_job_releases_capacity_after_clean_cleanup() {
+        let _serial = job_test_lock().await;
         let slots = Arc::new(Semaphore::new(1));
         let permit = slot(&slots).unwrap();
         let (finished_tx, finished_rx) = oneshot::channel();
