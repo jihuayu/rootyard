@@ -11,6 +11,8 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::any::Any;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::task_local;
@@ -18,7 +20,12 @@ use uuid::Uuid;
 
 /// Bounded fixed-class rate limit for error events: one fixed global window.
 const LOG_LIMIT_PER_SECOND: u64 = 100;
+/// Fixed capacity of the stderr writer queue. Once full, new records are
+/// discarded instead of blocking a request or growing memory.
+const LOG_QUEUE_CAPACITY: usize = 128;
 static LOG_LIMITER: OnceLock<Mutex<LogLimiter>> = OnceLock::new();
+static LOG_SENDER: OnceLock<Option<SyncSender<String>>> = OnceLock::new();
+static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 struct LogLimiter {
     start: Instant,
@@ -36,6 +43,61 @@ impl LogLimiter {
         }
         self.count += 1;
         true
+    }
+}
+
+/// Number of accepted error events discarded because the bounded queue was full,
+/// the writer thread was gone, or output was disabled. Exposed as a fixed
+/// counter for later metric integration; this module publishes no metrics.
+#[allow(dead_code)]
+pub(crate) fn dropped_event_count() -> u64 {
+    LOG_DROPPED.load(Ordering::Relaxed)
+}
+
+fn saturating_increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| count.checked_add(1));
+}
+
+fn record_dropped() {
+    saturating_increment(&LOG_DROPPED);
+}
+
+/// Writes exactly one record plus its line terminator. The error is returned so
+/// the writer thread discards it best-effort; nothing here panics.
+fn write_record<W: std::io::Write>(writer: &mut W, record: &str) -> std::io::Result<()> {
+    writer.write_all(record.as_bytes())?;
+    writer.write_all(b"\n")
+}
+
+/// Dedicated writer thread body: takes the stderr lock for one complete record at
+/// a time, performs no other I/O and treats every write failure as best-effort.
+fn writer_loop(receiver: Receiver<String>) {
+    for record in receiver {
+        let _ = write_record(&mut std::io::stderr().lock(), &record);
+    }
+}
+
+/// Lazily starts the single named writer thread. A spawn failure disables output
+/// safely (records then count as dropped) instead of panicking.
+fn log_sender() -> Option<&'static SyncSender<String>> {
+    LOG_SENDER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::sync_channel::<String>(LOG_QUEUE_CAPACITY);
+            let builder = std::thread::Builder::new().name("rootyard-error-log".to_owned());
+            let spawned = builder.spawn(move || writer_loop(receiver));
+            match spawned {
+                Ok(_worker) => Some(sender),
+                Err(_) => None,
+            }
+        })
+        .as_ref()
+}
+
+/// Non-blocking handoff. A full or disconnected queue discards the record.
+fn offer_to(sender: &SyncSender<String>, record: String) -> bool {
+    match sender.try_send(record) {
+        Ok(()) => true,
+        Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -186,13 +248,21 @@ pub(crate) fn observe_internal(error: &dyn Any) {
     if !allow_event() {
         return;
     }
-    eprintln!("{}", event_json(error));
+    // The request path never awaits and never touches stderr: a full queue, a
+    // closed queue or disabled output drops the record and counts it.
+    let delivered = match log_sender() {
+        Some(sender) => offer_to(sender, event_json(error)),
+        None => false,
+    };
+    if !delivered {
+        record_dropped();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     const SENTINEL: &str = "SECRET-sqlstate-23503-token-https://user:pass@example.invalid/?q=leak";
     static FORMATTED: AtomicBool = AtomicBool::new(false);
@@ -282,5 +352,49 @@ mod tests {
         let expected = request_id.to_string();
         assert_eq!(value["request_id"].as_str(), Some(expected.as_str()));
         assert_eq!(value["route"].as_str(), Some("/api/repos/{owner}/{name}"));
+    }
+
+    #[test]
+    fn bounded_writer_queue_discards_immediately_when_full_or_closed() {
+        assert_eq!(LOG_QUEUE_CAPACITY, 128);
+        let (sender, receiver) = mpsc::sync_channel::<String>(LOG_QUEUE_CAPACITY);
+        for index in 0..LOG_QUEUE_CAPACITY {
+            assert!(offer_to(&sender, format!("record-{index}")));
+        }
+        let started = Instant::now();
+        assert!(!offer_to(&sender, "overflow".to_owned()), "full queue must discard the record");
+        assert!(started.elapsed() < Duration::from_secs(1), "full queue blocked the request path");
+        assert_eq!(receiver.try_recv().unwrap(), "record-0");
+        drop(sender);
+        let (sender, receiver) = mpsc::sync_channel::<String>(LOG_QUEUE_CAPACITY);
+        drop(receiver);
+        assert!(!offer_to(&sender, "closed".to_owned()), "closed queue must discard the record");
+    }
+
+    struct FailingSink;
+    impl std::io::Write for FailingSink {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, SENTINEL))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, SENTINEL))
+        }
+    }
+
+    #[test]
+    fn failing_stderr_sink_is_reported_and_never_panics() {
+        assert!(write_record(&mut FailingSink, "record").is_err());
+        let mut buffer = Vec::new();
+        write_record(&mut buffer, "record").unwrap();
+        assert_eq!(buffer, b"record\n".to_vec());
+    }
+
+    #[test]
+    fn dropped_counter_saturates_at_u64_max() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        saturating_increment(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        saturating_increment(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }

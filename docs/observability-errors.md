@@ -34,6 +34,18 @@ source strings are never formatted into the event. Logging uses a bounded global
 one-second monotonic window (100 events) serialized by one short mutex, with no
 per-request map. Wall-clock changes do not reset the allowance. A first fault in a quiet window is therefore never
 suppressed, while a storm cannot grow memory or log volume without bound.
+Accepted events are then handed to one dedicated, named `rootyard-error-log`
+thread through a bounded `std::sync::mpsc` channel of 128 records. The request path
+only calls non-blocking `try_send`: it never awaits and never takes the stderr lock.
+If the queue is full, output was disabled, or the writer is gone, the record is
+discarded and a saturating process-wide dropped counter is incremented (exposed as
+`dropped_event_count` for later metric wiring), so a slow or broken stderr can never
+block or fail a request. The writer thread holds the stderr lock only for one complete
+`write_all` plus newline, treats every `std::io::Error` as best-effort (no retry, no
+panic) and performs no other I/O or async work. If the thread cannot be spawned,
+logging is disabled safely and requests are unaffected. These events are best-effort
+operational logs, not durable receipts: records still queued when the process exits
+may be lost.
 
 Backlog/fault metrics, per-worker coverage and the native hostile-database test
 remain open for their later phases.
