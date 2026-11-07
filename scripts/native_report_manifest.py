@@ -201,6 +201,7 @@ def release_manifest(args):
     require(len(jobs) >= 2, "the candidate release gate requires at least two job manifests")
     required_reports = set(args.require_report or [])
     required_fixtures = pairs(args.require_fixture, "--require-fixture")
+    exact_fixtures = pairs(args.require_fixture_exact, "--require-fixture-exact")
 
     job_records, all_reports, all_fixtures, all_harnesses = {}, {}, {}, {}
     source_digests, commits = set(), set()
@@ -265,6 +266,13 @@ def release_manifest(args):
             substring in value,
             f"fixture {fixture_name}={value!r} does not contain the required pin {substring!r}",
         )
+    for fixture_name, expected in exact_fixtures.items():
+        value = all_fixtures.get(fixture_name)
+        require(value is not None, f"required fixture {fixture_name!r} was not recorded by any job")
+        require(
+            value == expected,
+            f"fixture {fixture_name}={value!r} is not the exact required value {expected!r}",
+        )
 
     return {
         "kind": RELEASE_KIND,
@@ -304,6 +312,7 @@ def main():
     parser.add_argument("--job-manifest", action="append", default=[])
     parser.add_argument("--require-report", action="append", default=[])
     parser.add_argument("--require-fixture", action="append", default=[])
+    parser.add_argument("--require-fixture-exact", action="append", default=[])
     args = parser.parse_args()
     try:
         if args.mode == "job":

@@ -20,22 +20,17 @@ name: Candidate release native acceptance
 # built here. See docs/ci-acceptance.md for the gate contract and limits.
 on:
   workflow_dispatch:
-    inputs:
-      garage_image:
-        description: Pinned Garage 2.1 container image
-        required: false
-        default: dxflrs/garage:v2.1.0
-      playwright_version:
-        description: Pinned Playwright Python client for the system Chromium
-        required: false
-        default: "1.49.0"
-      git_lfs_version:
-        description: Pinned Git LFS client used by the publication tests
-        required: false
-        default: "3.6.1"
 
 permissions:
   contents: read
+
+# Fixed, reviewed inputs only. workflow_dispatch accepts no version/image
+# overrides, so no dispatch value can reach a shell command or the fixture.
+env:
+  GARAGE_IMAGE: dxflrs/garage:v2.1.0@sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a
+  GARAGE_IMAGE_DIGEST: sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a
+  PLAYWRIGHT_VERSION: "1.49.0"
+  GIT_LFS_VERSION: "3.6.1"
 
 concurrency:
   group: candidate-release-${{ github.run_id }}
@@ -87,7 +82,7 @@ jobs:
         run: |
           python3 -m venv test-results/tools/playwright-venv
           test-results/tools/playwright-venv/bin/pip install --disable-pip-version-check \
-            playwright==${{ inputs.playwright_version }}
+            "playwright==${PLAYWRIGHT_VERSION}"
           test-results/tools/playwright-venv/bin/python -c 'import playwright; print("playwright client ready")'
       - name: Build the candidate binary once and record its receipt
         timeout-minutes: 25
@@ -118,9 +113,10 @@ jobs:
             --log browser_ui=test-results/candidate/browser/browser-ui.log \
             --harness tests/browser_ui.py \
             --harness tests/web_sessions.py \
-            --fixture "chromium=$(/usr/bin/chromium --version)" \
-            --fixture "playwright=${{ inputs.playwright_version }}" \
-            --fixture "postgres=postgres:17" \
+            --fixture "playwright_version=$(test-results/tools/playwright-venv/bin/python -c 'import importlib.metadata; print(importlib.metadata.version("playwright"))')" \
+            --fixture "chromium_version=$(/usr/bin/chromium --version)" \
+            --fixture "postgres_server_version=$(psql "$ROOTYARD_TEST_DATABASE_URL" -tAc 'show server_version')" \
+            --fixture "postgres_client_version=$(psql --version)" \
             --fixture "rust=$(rustc -V)"
       - name: Upload browser candidate evidence
         if: always()
@@ -178,21 +174,19 @@ jobs:
           git --version
           python3 --version
           docker --version
-      - name: Install pinned Git LFS client
+      - name: Install pinned Git LFS client with official checksum verification
         timeout-minutes: 8
-        env:
-          GIT_LFS_VERSION: ${{ inputs.git_lfs_version }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/git-lfs" "$RUNNER_TEMP/bin"
-          url="https://github.com/git-lfs/git-lfs/releases/download/v${GIT_LFS_VERSION}/git-lfs-linux-amd64-v${GIT_LFS_VERSION}.tar.gz"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/git-lfs.tar.gz" "$url"
-          tar -xzf "$RUNNER_TEMP/git-lfs.tar.gz" -C "$RUNNER_TEMP/git-lfs"
-          install -m 0755 "$RUNNER_TEMP/git-lfs/git-lfs" "$RUNNER_TEMP/bin/git-lfs"
+          scripts/install_git_lfs.sh \
+            --version "$GIT_LFS_VERSION" \
+            --destination "$RUNNER_TEMP/bin" \
+            --work "$RUNNER_TEMP/git-lfs" \
+            --sha-output "$RUNNER_TEMP/git-lfs-tarball.sha256"
           echo "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
           PATH="$RUNNER_TEMP/bin:$PATH" git lfs version | tee "$RUNNER_TEMP/git-lfs-version.txt"
           grep -F "git-lfs/${GIT_LFS_VERSION}" "$RUNNER_TEMP/git-lfs-version.txt"
-          sha256sum "$RUNNER_TEMP/git-lfs.tar.gz" | tee "$RUNNER_TEMP/git-lfs-tarball.sha256"
       - name: Install pinned Rust 1.99.1 gate tools
         run: |
           rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
@@ -210,8 +204,6 @@ jobs:
           cp target/debug/rootyard.build.json test-results/candidate/object-store/rootyard.build.json
       - name: Start the job-owned Garage 2.1 S3 fixture
         timeout-minutes: 12
-        env:
-          GARAGE_IMAGE: ${{ inputs.garage_image }}
         run: |
           set -euo pipefail
           : "${RUNNER_TEMP:?}"
@@ -223,10 +215,8 @@ jobs:
             --output-env "$RUNNER_TEMP/owned-garage/object-store.env" \
             --bucket-prefix rootyard-ci \
             --region garage
-          garage_name=$(cat "$RUNNER_TEMP/owned-garage/fixture/container-name")
-          docker exec "$garage_name" /garage --version >"$RUNNER_TEMP/owned-garage/garage-version.txt"
-          cat "$RUNNER_TEMP/owned-garage/garage-version.txt"
-          echo "OWNED_GARAGE_BUCKET=rootyard-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >>"$GITHUB_ENV"
+          python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version_line"])' \
+            "$RUNNER_TEMP/owned-garage/fixture/garage-image.json"
       - name: Exercise concurrent cold LFS hydration against the owned Garage
         timeout-minutes: 15
         run: |
@@ -267,6 +257,23 @@ jobs:
       - name: Bind object-store reports to the built binary
         if: always()
         run: |
+          set -euo pipefail
+          test -s "${OBJECT_STORE_ENV_FILE:?}"
+          # Source the private fixture file in THIS shell: the credential scanner
+          # needs the keys generated by this job, and env does not persist across
+          # actions steps. Nothing is echoed or uploaded.
+          set -a
+          . "$OBJECT_STORE_ENV_FILE"
+          set +a
+          garage_json="$RUNNER_TEMP/owned-garage/fixture/garage-image.json"
+          garage_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$garage_json")
+          garage_version_line=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version_line"])' "$garage_json")
+          garage_image=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"])' "$garage_json")
+          garage_image_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_id"])' "$garage_json")
+          garage_image_digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image_digest"])' "$garage_json")
+          git_lfs_version=$(sed -n 's#^git-lfs/\([0-9][0-9.]*\).*#\1#p' "$RUNNER_TEMP/git-lfs-version.txt")
+          git_lfs_sha256=$(cat "$RUNNER_TEMP/git-lfs-tarball.sha256")
+          postgres_server_version=$(psql "$ROOTYARD_TEST_DATABASE_URL" -tAc 'show server_version')
           python3 scripts/native_report_manifest.py --mode job \
             --manifest-out test-results/candidate/object-store/native-job-manifest.json \
             --build-receipt test-results/candidate/object-store/rootyard.build.json \
@@ -280,16 +287,27 @@ jobs:
             --harness tests/lfs_hydration_concurrency.py \
             --harness tests/lfs_remote.py \
             --harness tests/lfs_retention_acceptance.py \
-            --fixture "garage=$(cat "$RUNNER_TEMP/owned-garage/garage-version.txt")" \
-            --fixture "garage_image=${{ inputs.garage_image }}" \
-            --fixture "git_lfs=$(cat "$RUNNER_TEMP/git-lfs-version.txt")" \
-            --fixture postgres=postgres:17 \
+            --fixture "garage_version=$garage_version" \
+            --fixture "garage_version_output=$garage_version_line" \
+            --fixture "garage_image=$garage_image" \
+            --fixture "garage_image_id=$garage_image_id" \
+            --fixture "garage_image_digest=$garage_image_digest" \
+            --fixture "git_lfs_version=$git_lfs_version" \
+            --fixture "git_lfs_output=$(cat "$RUNNER_TEMP/git-lfs-version.txt")" \
+            --fixture "git_lfs_tarball_sha256=$git_lfs_sha256" \
+            --fixture "postgres_server_version=$postgres_server_version" \
+            --fixture "postgres_client_version=$(psql --version)" \
             --fixture "rust=$(rustc -V)"
       - name: Remove the owned fixture and private environment file
         if: always()
         run: |
           set -euo pipefail
-          rm -f "${OBJECT_STORE_ENV_FILE:-/nonexistent-object-store.env}"
+          if [ -n "${OBJECT_STORE_ENV_FILE:-}" ]; then
+            case "$OBJECT_STORE_ENV_FILE" in
+              "$GITHUB_WORKSPACE"/*) echo "refusing to remove an env file inside the checkout" >&2; exit 1 ;;
+            esac
+            rm -f -- "$OBJECT_STORE_ENV_FILE"
+          fi
           scripts/owned_garage_fixture.sh stop \
             --directory "$RUNNER_TEMP/owned-garage/fixture" || true
       - name: Upload object-store candidate evidence
@@ -335,9 +353,11 @@ jobs:
             --require-report lfs_hydration \
             --require-report lfs_remote \
             --require-report lfs_retention \
-            --require-fixture garage=2.1 \
-            --require-fixture git_lfs=3.6.1 \
-            --require-fixture chromium=Chromium
+            --require-fixture-exact garage_version=2.1.0 \
+            --require-fixture-exact garage_image_digest=sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78a93ee8da7cf6a \
+            --require-fixture-exact git_lfs_version=3.6.1 \
+            --require-fixture-exact playwright_version=1.49.0 \
+            --require-fixture chromium_version=Chromium
       - name: Upload candidate release gate manifest
         if: always()
         uses: actions/upload-artifact@v4

@@ -31,12 +31,14 @@ the candidate commit; the workflow records `github.sha` as the candidate commit
 and every job asserts `git rev-parse HEAD` equals it before building.
 
 * `browser-native` runs `tests/browser_ui.py` against the real system Chromium
-  at `/usr/bin/chromium` with a pinned Playwright client (`playwright_version`
-  input, default `1.49.0`). No downloaded Playwright browser is substituted for
-  the system package.
-* `object-store-native` starts an ephemeral, job-owned Garage 2.1 container
-  (`garage_image` input, default `dxflrs/garage:v2.1.0`; the script refuses any
-  image whose `/garage --version` is not `garage 2.1.x`) and runs:
+  at `/usr/bin/chromium` with a fixed Playwright client (`playwright==1.49.0`).
+  No downloaded Playwright browser is substituted for the system package. The
+  manifest records the version reported by `importlib.metadata` and the actual
+  `/usr/bin/chromium --version` and PostgreSQL server/client versions; the
+  `rust:1-trixie` container tag and apt packages are mutable inputs, not
+  immutable pins.
+* `object-store-native` starts an ephemeral, job-owned Garage container pinned
+  by tag and digest (`dxflrs/garage:v2.1.0@sha256:4c9b34c1...`) and runs:
   * `tests/lfs_hydration_concurrency.py` — concurrent cold hydration through the
     real S3 backend;
   * `tests/lfs_remote.py` — second-node recovery after source-volume loss;
@@ -44,15 +46,22 @@ and every job asserts `git rev-parse HEAD` equals it before building.
     retention with **no** object-store endpoint configured. The step clears and
     asserts `ROOTYARD_OBJECT_STORE_ENDPOINT`/`_BUCKET` empty, so it cannot
     accidentally inherit the Garage fixture.
-  Git LFS `git_lfs_version` (default `3.6.1`) is downloaded from the pinned
-  release and its `git-lfs/<version>` output is asserted before the tests run.
+  Git LFS 3.6.1 is downloaded and its tarball SHA-256 is compared with the
+  official release `sha256sums.txt`; the release tarball's real
+  `git-lfs-3.6.1/git-lfs` layout is stripped before install. If the checksum
+  asset is unavailable or ambiguous the step fails rather than installing an
+  unverified binary. The installed `git-lfs/<version>` output is asserted.
 * `release-gate` downloads both job manifests and runs
   `scripts/native_report_manifest.py --mode release`. It requires the two jobs to
   share the dispatched commit and one compiled source-input digest, re-verifies
   every harness SHA-256 against the dispatched checkout, requires the
   `browser_ui`, `lfs_hydration`, `lfs_remote` and `lfs_retention` reports, and
-  requires `garage=2.1`, `git_lfs=3.6.1` and a `Chromium` version in the fixture
-  record. Its output is `candidate-release-gate.json`.
+  requires the exact `garage_version=2.1.0`, the exact Garage image digest,
+  `git_lfs_version=3.6.1`, `playwright_version=1.49.0` and a Chromium version in
+  the fixture record. The Garage image's own version output is
+  `garage v2.1.0 [features: ...]`; the helper matches exactly 2.1.0 plus an
+  optional feature tail and obtains the node id from the first line of
+  `garage node id` (64 hex `@address`), never by grepping 16-hex `status` ids. Its output is `candidate-release-gate.json`.
 
 Reports, stdout logs, build receipts, evidence JSONL and the manifests are
 uploaded. A missing report, empty log, failed case, digest mismatch, foreign
@@ -61,16 +70,24 @@ reaching an artifact fails the gate closed — there is no "success skip".
 
 ### Fixture ownership and credentials
 
-`scripts/owned_garage_fixture.sh` creates a container, data directory, bucket
-and key namespaced to the current run. The S3 API is published only on
-`127.0.0.1`. `scripts/owned_object_store_env.py` refuses to run when
-`ROOTYARD_OBJECT_STORE_*` settings are already present in the environment
-(no inherited endpoint, user secret or cross-deployment bucket), refuses a
-non-loopback or non-HTTP endpoint, probes the endpoint until it answers with an
-S3 XML body (a stub web page fails), and writes the credential to a `0600`
-environment file in a `0700` directory outside the checkout. The cleanup step
-removes that file and the container; the file is never uploaded and values are
-never printed.
+`scripts/owned_garage_fixture.sh` creates a canonical private fixture
+directory, a `0600` ownership sentinel bound to the canonical path, uid, unique
+ nonce and container id, and a container labelled with the same kind/nonce/path/
+uid/name. Start refuses a preexisting non-empty, symlinked or dangerous path.
+Stop re-reads the sentinel, rejects empty/root/ancestor/symlink/foreign/
+non-owned paths, verifies the inspected container id and every ownership label
+against the sentinel, and only then removes the container by id and the owned
+directory. It never trusts a caller-supplied path or container name. The S3 API
+is published only on `127.0.0.1`. `scripts/owned_object_store_env.py` refuses to
+run when `ROOTYARD_OBJECT_STORE_*` settings are already present in the
+environment (no inherited endpoint, user secret or cross-deployment bucket),
+refuses a non-loopback or non-HTTP endpoint, probes the endpoint until it
+answers with an S3 XML body (a stub web page fails), and writes the credential
+to a `0600` environment file in a `0700` directory outside the checkout. The
+cleanup step removes that file and the owned fixture; the file is never
+uploaded and values are never printed. The object-store manifest step sources
+the private file in its own shell so the credential scanner sees this job's
+generated keys; an actions-step environment is not inherited across steps.
 
 ## Reproduction and current status
 
@@ -87,17 +104,24 @@ Candidate jobs require Docker with the pinned Garage image, `/usr/bin/chromium`
 and a Playwright client. The coordinator verifies them against an owned fixture;
 the workflow was **not executed on GitHub by this change**, so no green
 candidate-release run or release certification is claimed here. The recorded
-state is: workflow and script syntax validated, manifest contract covered by
-`tests/test_native_report_manifest.py`, and native execution pending the
-candidate dispatch.
+state is: workflow/script YAML and bash syntax validated, the owned-fixture
+cleanup guards covered by `tests/test_owned_garage_fixture.py`, the Git LFS
+archive layout/checksum path covered by `tests/test_install_git_lfs.py`, and the
+manifest contract covered by `tests/test_native_report_manifest.py`. Those are
+local unit/syntax checks only; no Docker fixture, no real Git LFS download and
+no GitHub Actions run was executed.
 
 ## Limits
 
 * All candidate suites are single-host loopback runs; timings are functional,
   not scalability evidence.
 * Chromium and Playwright cannot prove cross-browser behaviour.
-* The Git LFS release tarball is pinned by immutable version URL and its
-  downloaded SHA-256 is recorded, but no digest is hard-coded in the workflow.
+* The Git LFS release tarball is pinned by version URL and verified against the
+  official release `sha256sums.txt` at run time. No expected digest was
+  fabricated or hard-coded in this change; the current environment had no
+  network access to fetch and confirm the official 3.6.1 checksum entry. The
+  step fails closed if the official checksum asset is missing, ambiguous or
+  does not match.
 * Kernel sandbox/cgroup acceptance remains in
   `.github/workflows/native-kernel-acceptance.yml`; Docker-backed Garage tests do
   not exercise it. No Vault dependency is introduced.
