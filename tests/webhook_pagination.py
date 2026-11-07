@@ -258,7 +258,8 @@ class PaginationHarness(WebhooksHarness):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             with self.held_transaction(f"DELETE FROM forge_webhooks WHERE id='{hook['id']}'"):
                 waiting = pool.submit(self.http, f"{self.webhookspath}/{hook['id']}/ping",
-                                      method="POST", body={"event_id": "deleted-race", "deliver_now": False})
+                                      token=self.alice, method="POST",
+                                      body={"event_id": "deleted-race", "deliver_now": False})
                 self.wait_for_allocator_lock()
             status, body, _ = waiting.result(timeout=10)
         assert status == 404, f"deleted hook returned {status}: {body[:200]!r}"
