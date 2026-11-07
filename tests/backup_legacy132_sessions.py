@@ -182,8 +182,9 @@ class Legacy132Harness(BackupHarness):
             condition = "repository_id='" + repo["id"] + "'"
             assert self.query(
                 self.source_db,
-                "SELECT storage_backend || '/' || cardinality(pack_ids)::text "
-                "|| '/' || head_ref FROM pando_repository_states WHERE " +
+                "SELECT r.storage_backend || '/' || cardinality(s.pack_ids)::text "
+                "|| '/' || s.head_ref FROM pando_repository_states s "
+                "JOIN repositories r ON r.id=s.repository_id WHERE s." +
                 condition) == "pando/1/refs/heads/main"
             refs = {}
             rows = self.query(
