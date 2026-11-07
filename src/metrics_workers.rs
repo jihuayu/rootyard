@@ -24,10 +24,12 @@ pub const JOB_KINDS: [(&str, &str); 7] = [
 ];
 
 /// `queued` and `running` are totals; `due_queued` and `retry_delayed` split
-/// `queued` on `not_before`, and `expired_running_lease` splits `running` on
-/// `lease_until`. A failed job is terminal: `jobs::finish` only re-queues a
-/// retryable error, so `state='failed'` already means the attempt budget is
-/// exhausted (or the lease expired at the maximum attempt).
+/// `queued` on `not_before`, and `expired_running_lease` is a subset of
+/// `running` selected by `lease_until`. A failed job is terminal: `jobs::finish`
+/// only re-queues a retryable error, so `state='failed'` means the attempt
+/// budget is exhausted (or the lease expired at the maximum attempt). Failed
+/// rows are retained terminal history, not an unresolved-fault or retryable
+/// backlog gauge, and this query never deletes history.
 pub const JOB_STATES: [&str; 6] =
     ["queued", "due_queued", "retry_delayed", "running", "expired_running_lease", "failed"];
 
@@ -72,22 +74,34 @@ impl Default for Snapshot {
     }
 }
 
-/// One row per fixed kind. `count(...) FILTER` keeps the whole aggregation in a
-/// single statement, and an absent kind still yields a zero row through the
-/// fixed `VALUES` list.
+/// One row per fixed kind. `count(j.kind) FILTER` keeps the whole aggregation in
+/// a single statement, and an absent kind still yields a zero row through the
+/// fixed `VALUES` list. The join restricts the scanned states to the three
+/// non-terminal/terminal states this exposition needs, so it never aggregates
+/// the retained `succeeded` history; migration 135 adds the matching partial
+/// covering index. The kind list is repeated as a constant join predicate (not
+/// a WHERE filter, which would drop unmatched LEFT JOIN rows) so the planner can
+/// prove the partial index predicate; the unit test below keeps it in sync with
+/// `JOB_KINDS`. `count(j.kind)` (not `count(*)`) ignores the unmatched LEFT JOIN
+/// row and stays inside that index's key columns.
 const JOBS_SQL: &str = r#"
 SELECT g.kind,
- count(j.id) FILTER (WHERE j.state='queued'),
- count(j.id) FILTER (WHERE j.state='queued' AND j.not_before<=statement_timestamp()),
- count(j.id) FILTER (WHERE j.state='queued' AND j.not_before>statement_timestamp()),
- count(j.id) FILTER (WHERE j.state='running' AND j.lease_until>statement_timestamp()),
- count(j.id) FILTER (WHERE j.state='running' AND j.lease_until<=statement_timestamp()),
- count(j.id) FILTER (WHERE j.state='failed'),
+ count(j.kind) FILTER (WHERE j.state='queued'),
+ count(j.kind) FILTER (WHERE j.state='queued' AND j.not_before<=statement_timestamp()),
+ count(j.kind) FILTER (WHERE j.state='queued' AND j.not_before>statement_timestamp()),
+ count(j.kind) FILTER (WHERE j.state='running'),
+ count(j.kind) FILTER (WHERE j.state='running' AND j.lease_until<=statement_timestamp()),
+ count(j.kind) FILTER (WHERE j.state='failed'),
  COALESCE(GREATEST(EXTRACT(EPOCH FROM (statement_timestamp()-min(j.created_at) FILTER (WHERE j.state='queued'))),0),0)::double precision
 FROM (VALUES ('gitfs_stage_cleanup'),('gitfs_repack'),('gitfs_cache_hydrate'),
              ('gitfs_cache_evict'),('pando_repack'),('pando_cache_hydrate'),
              ('pando_cache_evict')) AS g(kind)
-LEFT JOIN storage_maintenance_jobs j ON j.kind=g.kind
+LEFT JOIN storage_maintenance_jobs j
+  ON j.kind=g.kind
+ AND j.kind IN ('gitfs_stage_cleanup','gitfs_repack','gitfs_cache_hydrate',
+                'gitfs_cache_evict','pando_repack','pando_cache_hydrate',
+                'pando_cache_evict')
+ AND j.state IN ('queued','running','failed')
 GROUP BY g.kind
 "#;
 
@@ -192,7 +206,7 @@ pub fn render(output: &mut String, snapshot: &Snapshot) {
         snapshot.lease_expired,
     );
     output.push_str(
-        "# HELP rootyard_storage_maintenance_jobs Durable storage maintenance jobs by fixed backend, kind and state; queued and running are totals, due_queued and retry_delayed split queued on not_before, and expired_running_lease splits running on lease_until. failed is terminal.\n# TYPE rootyard_storage_maintenance_jobs gauge\n",
+        "# HELP rootyard_storage_maintenance_jobs Durable storage maintenance jobs by fixed backend, kind and state; queued and running are totals, due_queued and retry_delayed split queued on not_before, and expired_running_lease is a subset of running selected by lease_until. failed is retained terminal failure history, not an unresolved-fault or retryable backlog gauge; history is never deleted.\n# TYPE rootyard_storage_maintenance_jobs gauge\n",
     );
     for (index, (backend, kind)) in JOB_KINDS.iter().enumerate() {
         for (state, value) in JOB_STATES.iter().zip(snapshot.jobs[index]) {
@@ -257,9 +271,7 @@ mod tests {
             "rootyard_storage_maintenance_jobs{backend=\"pando\",kind=\"pando_cache_hydrate\",state=\"failed\"} 0\n"
         ));
         assert!(text.contains("rootyard_storage_maintenance_repos{backend=\"gitfs\",state=\"due_scan\"} 0\n"));
-        assert!(text.contains(
-            "rootyard_storage_maintenance_oldest_overdue_scan_age_seconds{backend=\"pando\"} 0\n"
-        ));
+        assert!(text.contains("rootyard_storage_maintenance_oldest_overdue_scan_age_seconds{backend=\"pando\"} 0\n"));
     }
 
     #[test]
@@ -306,5 +318,11 @@ mod tests {
         for (backend, kind) in JOB_KINDS {
             assert_eq!(backend, kind.split('_').next().unwrap(), "{kind}");
         }
+        // The partial index predicate is only provable when the query repeats the
+        // exact fixed kind list; keep the join and the index from drifting apart.
+        for (_, kind) in JOB_KINDS {
+            assert!(JOBS_SQL.contains(format!("'{kind}'").as_str()), "{kind}");
+        }
+        assert!(JOBS_SQL.contains("j.state IN ('queued','running','failed')"));
     }
 }

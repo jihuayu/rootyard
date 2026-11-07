@@ -18,7 +18,10 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-use crate::{metrics_workers, web::session_gc::{self, CounterSnapshot}};
+use crate::{
+    metrics_workers,
+    web::session_gc::{self, CounterSnapshot},
+};
 
 /// Validate before binding: wildcard, public and private LAN addresses are forbidden.
 pub fn validate_bind(address: SocketAddr) -> anyhow::Result<SocketAddr> {
@@ -76,9 +79,13 @@ pub fn router(
     counters: Arc<TransferCounters>,
     workers: metrics_workers::Config,
 ) -> Router {
-    Router::new()
-        .route("/metrics", get(scrape))
-        .with_state(MetricsState { pool, git_slots, capacity, counters, workers })
+    Router::new().route("/metrics", get(scrape)).with_state(MetricsState {
+        pool,
+        git_slots,
+        capacity,
+        counters,
+        workers,
+    })
 }
 
 // One SQL statement provides one consistent MVCC snapshot, without exposing any
@@ -171,14 +178,8 @@ async fn scrape(State(state): State<MetricsState>) -> Response {
         .ok()
         .and_then(Result::ok);
     let status = if snapshot.is_some() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    let body = render(
-        state.capacity,
-        state.git_slots.available_permits(),
-        &state.counters,
-        &gc,
-        &pool,
-        snapshot.as_ref(),
-    );
+    let body =
+        render(state.capacity, state.git_slots.available_permits(), &state.counters, &gc, &pool, snapshot.as_ref());
     (
         status,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"), (header::CACHE_CONTROL, "no-store")],
@@ -424,7 +425,7 @@ mod tests {
                     "state=\"ready\"}",
                     "state=\"recovering\"}",
                     "state=\"pending\"}",
-                    "state=\"leased\"}"
+                    "state=\"leased\"}",
                 ]
                 .into_iter()
                 .map(str::to_owned)

@@ -103,7 +103,11 @@ with SQL.
 
 The workspace gauges are **host-scoped**: they use this process's
 `state.storage.volume_id` as `workspaces.host_id` and the same predicate as the
-capture loop (`state='ready' AND lease_until > clock_timestamp()`). Capture does
+capture loop (`state='ready' AND lease_until > clock_timestamp()`). A host-scoped
+series is exported once per process, so two replicas serving the same volume
+UUID export identical label sets with no replica label. Do not `sum` them: use
+`max`/`min`/`avg` by the existing labels, or scrape one exporter per volume.
+The recommended deployment is one metrics exporter per volume. Capture does
 not have a fixed scan interval: `capture::reconcile_one` and the workspace
 create/API baseline path both upsert `scanned_at`, even when file content is
 unchanged. `rootyard_workspace_capture_oldest_age_seconds` therefore measures
@@ -119,7 +123,12 @@ capture failure.
 The maintenance gauges are **cluster-wide**: every ready repository the scheduler
 predicate would consider, including Pando repositories with a stable, serving
 authority state. The scheduler additionally filters by local shard primary; that
-routing is not reproduced, so these are not "this node's" repositories. Only
+routing is not reproduced, so these are not "this node's" repositories. Every
+API/worker instance that serves the metrics listener exports the same
+cluster-wide values, and there is no instance label, so summing them
+multiplies the real count. Use `max by (backend, kind)` / `max by (backend)`
+(or run a single exporter). The same rule applies to the other cluster-wide
+repository/operation gauges above. Only
 non-GC kinds are fixed in code: `gitfs_stage_cleanup`, `gitfs_repack`,
 `gitfs_cache_hydrate`, `gitfs_cache_evict`, `pando_repack`,
 `pando_cache_hydrate`, `pando_cache_evict`. The GC admission kinds
@@ -131,7 +140,13 @@ outage: it can be queued for locally incomplete packs.
 on `not_before`, and `expired_running_lease` splits `running` on `lease_until`.
 `failed` is terminal, not retryable: `jobs::finish` re-queues a failed attempt
 while `attempt < max_attempts`, so a `failed` row has exhausted its attempt
-budget (or its lease expired at the last attempt). `stale_generation` means a
+budget (or its lease expired at the last attempt). Failed rows are retained
+terminal failure **history**; the gauge is not an unresolved-fault count and not
+a retryable backlog, so do not keep an alert firing merely because it is
+greater than zero indefinitely. No job history is deleted to produce these
+gauges. `running` counts every `running` row, including one whose lease already
+expired; `expired_running_lease` is the subset with `lease_until` not in the
+future. `stale_generation` means a
 scan was recorded for a different repository storage generation; it does not
 change scheduler behaviour. `missing_scan` and `due_scan` use the scheduler's
 own time predicate; `oldest_overdue` reports how far past that due time the
@@ -151,20 +166,22 @@ max by () (rootyard_workspace_capture_oldest_age_seconds) > 960
 rootyard_workspace_capture_never_sampled > 0
 
 # Queued repair work that is due and not merely waiting for a retry delay.
-sum by (backend, kind) (rootyard_storage_maintenance_jobs{state="due_queued"}) > 0
+max by (backend, kind) (rootyard_storage_maintenance_jobs{state="due_queued"}) > 0
 
-# Terminal failures need an operator: inspect last_error and repository state.
-sum by (backend, kind) (rootyard_storage_maintenance_jobs{state="failed"}) > 0
+# Retained terminal-failure history; not an unresolved-fault or retryable
+# backlog. Investigate the referenced jobs, and do not alert on it forever just
+# because old failed rows remain.
+max by (backend, kind) (rootyard_storage_maintenance_jobs{state="failed"}) > 0
 
 # A lease that expired while a worker still owned the job (crash or stall).
-sum by (backend, kind) (rootyard_storage_maintenance_jobs{state="expired_running_lease"}) > 0
+max by (backend, kind) (rootyard_storage_maintenance_jobs{state="expired_running_lease"}) > 0
 
 # Repository scans are overdue for one backend, measured past the due time.
 rootyard_storage_maintenance_oldest_overdue_scan_age_seconds > 3600
 
 # Recorded scans for an older storage generation (informational; a scan will
 # refresh it, and the scheduler behaviour is unchanged).
-sum by (backend) (rootyard_storage_maintenance_repos{state="stale_generation"}) > 0
+max by (backend) (rootyard_storage_maintenance_repos{state="stale_generation"}) > 0
 
 # The scrape itself failed: every SQL gauge above disappears.
 absent(rootyard_postgres_up) or rootyard_postgres_up == 0
@@ -174,8 +191,9 @@ Do not alert uniformly on `missing_scan`: a repository whose maintenance scan
 was never recorded may be newly created, and the scheduler run is the recovery
 path. Do not alert uniformly on leases either: ready-but-expired workspace
 leases can be legitimate handoffs or finished sessions. Alert on sustained
-capture age, on due backlog growth, terminal failures and expired running
-leases, and on `rootyard_postgres_up == 0` / scrape failure.
+capture age, on due backlog growth and expired running leases, and on
+`rootyard_postgres_up == 0` / scrape failure. Treat terminal-failure history as
+an investigation input, not a permanent fault or retryable-backlog alert.
 
 ## Tests
 
@@ -211,7 +229,10 @@ HTTP-created repositories and workspace baselines plus controlled SQL fixtures
 (job states, a past `scanned_at`, a workspace with no capture row, an expired
 lease, scheduled-scan metadata and a serving Pando repository). It asserts exact
 values, non-negative ages, fixed labels only, and a renamed-table 503 that omits
-every SQL gauge while retaining process-local series. Those job and scan rows
+every SQL gauge while retaining process-local series. Its seeded rows are
+metadata only; the scheduler is disabled and no maintenance job executes. The
+`running` expectations count every running row, so the expired-lease fixture
+appears in both `running` and `expired_running_lease`. Those job and scan rows
 are metadata fixtures: they do not prove that a maintenance job executed or that
 a repository scan ran. With `ROOTYARD_TEST_WORKSPACE_FUSE=1` an extra case lets
 the real background capture loop refresh `scanned_at` after a filesystem scan
@@ -221,6 +242,22 @@ a binary from an earlier branch does not contain these series.
 
 ```
 ROOTYARD_TEST_DATABASE_URL=postgresql://... python3 tests/worker_metrics.py --binary target/debug/rootyard --report worker-metrics-report.json
+```
+
+`tests/worker_metrics_plan.py` is a SQL-only owned-PostgreSQL planner drill for
+the schema135 partial covering index. It installs the real migration DDL in a
+disposable schema, seeds 100,000 retained `succeeded` rows plus six counted jobs,
+runs `ANALYZE`, and checks the default planner (no `enable_seqscan` or other
+override) with `EXPLAIN (FORMAT JSON, ANALYZE, BUFFERS)` of the exact `JOBS_SQL`.
+The expected plan is an `Index Only Scan` on `storage_maintenance_metrics` with
+no sequential scan of `storage_maintenance_jobs`; the query also must return one
+row per fixed kind without counting successful history. This is a planner drill,
+not production load, latency, job-execution or deployment evidence. If a future
+run does not select the index naturally, report that as pending rather than
+claiming an optimization.
+
+```
+ROOTYARD_TEST_DATABASE_URL=postgresql://... python3 tests/worker_metrics_plan.py --report worker-metrics-plan-report.json
 ```
 
 `tests/pool_metrics.py` runs the actual service on an owned loopback metrics

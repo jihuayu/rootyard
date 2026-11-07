@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Shared real legacy-archive restore drill (format8/schema132 entry point).
 
-A trusted pre-schema134 binary creates genuine repositories, pushes real Git
+A trusted pre-schema135 binary creates genuine repositories, pushes real Git
 history through the stock server, and performs real CLI cutovers to Pando-backed
 repository authority.  The legacy binary writes an offline archive.  The
 candidate must reject that archive unless its explicit legacy schema opt-in is
 given, restore into a brand-new database/data directory under one newly minted
 Pando authority, apply the reviewed current migrations, and serve stock Git
-fetch/clone for both repositories.
+fetch/clone for both repositories.  The shared contract is reused by the
+format10/schema134 entry point, which upgrades to the current schema135 target.
 
 ``backup_legacy133_identity.py`` reuses this harness with the format9/schema133
-contract and asserts the same Pando/session/Git boundaries after the schema134
-identity-constraint upgrade.
+contract and ``backup_legacy134_metrics_index.py`` with format10/schema134; all
+assert the same Pando/session/Git boundaries after the reviewed later-migration
+upgrade to schema135.
 
 Only random task-owned databases and temporary storage are used.  Secrets, DSNs,
 raw HTTP logs and Garage/Vault credentials are never printed; recorded failures
@@ -28,7 +30,7 @@ import subprocess
 import sys
 import urllib.parse
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from backup import BackupHarness
 
@@ -51,6 +53,9 @@ INDEXES = (
     "web_sessions_expiry_token_idx",
     "tokens_browser_expiry_idx",
 )
+# schema135 adds the partial covering metrics index to the six GC indexes every
+# reviewed restore target must contain.
+TARGET_INDEXES = INDEXES + ("storage_maintenance_metrics",)
 
 SCHEMA134_FOREIGN_KEYS = (
     "pando_manifest_artifacts_manifest_identity_fkey",
@@ -77,9 +82,15 @@ class ArchiveContract:
 
 
 LEGACY132 = ArchiveContract(format=8, schema=132, flag="--allow-legacy-schema132",
-                            source_label="schema132")
+                            source_label="schema132", target_schema=135,
+                            indexes=TARGET_INDEXES)
 LEGACY133 = ArchiveContract(format=9, schema=133, flag="--allow-legacy-schema133",
-                            source_label="schema133")
+                            source_label="schema133", target_schema=135,
+                            indexes=TARGET_INDEXES)
+# Format10/schema134 is the immediately previous frozen contract.  Its archive
+# upgrades through the same reviewed path to the current schema135 target.
+LEGACY134 = replace(LEGACY132, format=10, schema=134,
+                    flag="--allow-legacy-schema134", source_label="schema134")
 
 
 class LegacyArchiveHarness(BackupHarness):
@@ -429,6 +440,7 @@ class LegacyArchiveHarness(BackupHarness):
         assert revoked_browser == "1", revoked_browser
         return dict(schema_version=int(last), indexes=len(self.contract.indexes),
                     schema134_identity_constraints=True,
+                    schema135_metrics_index=True,
                     target_authority_id=authority,
                     target_authority_differs_from_source=True,
                     target_manifest_artifacts=links,

@@ -111,7 +111,9 @@ class WorkerHarness(MetricsHarness):
                                                "expired_running_lease": 0, "failed": 0},
             ("gitfs", "gitfs_cache_hydrate"): {"queued": 0, "due_queued": 0, "retry_delayed": 0, "running": 1,
                                                "expired_running_lease": 0, "failed": 0},
-            ("gitfs", "gitfs_cache_evict"): {"queued": 0, "due_queued": 0, "retry_delayed": 0, "running": 0,
+            # `running` is the total of every running row; the expired lease is
+            # a subset, so this fixture contributes to both series.
+            ("gitfs", "gitfs_cache_evict"): {"queued": 0, "due_queued": 0, "retry_delayed": 0, "running": 1,
                                              "expired_running_lease": 1, "failed": 0},
             ("pando", "pando_cache_hydrate"): {"queued": 0, "due_queued": 0, "retry_delayed": 0, "running": 0,
                                                "expired_running_lease": 0, "failed": 1},
