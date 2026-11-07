@@ -33,5 +33,13 @@
     "Owned synthetic PostgreSQL/Garage/Vault on one host.",
     "The full unittest invocation did not capture a separate harness git revision; individual native reports record their own provenance.",
     "FUSE same-process crash architecture remains issue91; post-crash fixture reclaim is not its production fix."
-  ]
+  ],
+  "formatting": {
+    "passed": true,
+    "command": "cargo fmt --all -- --check"
+  },
+  "clippy": {
+    "passed": true,
+    "command": "cargo clippy --locked --all-targets --features pando-lab -- -D warnings"
+  }
 }
