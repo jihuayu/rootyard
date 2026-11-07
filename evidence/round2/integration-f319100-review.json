@@ -1,0 +1,104 @@
+{
+  "reviewer": "DeepSeek final evidence reviewer",
+  "reviewed_head": "36d0545",
+  "evidence_source": "evidence/round2/integration-f319100/",
+  "evidence_commit": "f31910086acbaa87d9e98df440ca8c28c7bb7e08",
+  "binary_sha256": "35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153",
+  "production_inputs_sha256": "fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b",
+  "verdict": "APPROVE_FINAL_LOCAL_EVIDENCE",
+  "findings": [
+    {
+      "id": "E1-integrity",
+      "status": "pass",
+      "detail": "All 40 manifest files exist; SHA256 and byte counts recomputed independently match 100% (0 mismatches)."
+    },
+    {
+      "id": "E2-provenance",
+      "status": "pass",
+      "detail": "source_digest.py current tree = fdfbbfc with same 323-file map as production-inputs.json/manifest; binary 35d01c5; source f319100; OV source_after_run clean; no_source_edits=true; production inputs unchanged after TEST/DOC/EVIDENCE."
+    },
+    {
+      "id": "E3-core",
+      "status": "pass",
+      "detail": "core-verification 11/11 jobs, Rust 139 lib + 1 pando = 140 checks, passed=true; fresh_migrate and native receipts use 35d01c5."
+    },
+    {
+      "id": "E4-issue38",
+      "status": "pass",
+      "detail": "Actual native cases: service 2/2, matrix 6/6, restore 2/2, legacy130 3/3, schema 8/8 booleans true (schema 131), CI 15/15 = 36/36 pass."
+    },
+    {
+      "id": "E5-physical",
+      "status": "pass",
+      "detail": "Final physical 8/8 pass using SAME immutable 35d01c5; reviewed test-only fixture ed8d074 (8d) over parent 47a93ed (47), assertions unchanged, no fabrication. Prior shared-DB and isolated-attempt failures preserved unaltered in history/ and not counted."
+    },
+    {
+      "id": "E6-pando-format7",
+      "status": "pass",
+      "detail": "Pando maintenance 2/2 native + 1 Rust pando check; format 7 expected (prior probe 6), paired restore to same real Garage bucket, same binary. Receipt notes authenticity_verified=false while checksums verified; no distinct DR bucket."
+    },
+    {
+      "id": "E7-sandbox-negatives",
+      "status": "pass",
+      "detail": "Isolated retry has CI 15 and sandbox 6 pass feeding valid aggregate; OV rejects all 5 negative controls; no source edits."
+    },
+    {
+      "id": "E8-ops",
+      "status": "pass-bounded",
+      "detail": "9/9 ops reports valid passed, extra migration actual pass, no domain failures, binary SHA match; local gate correctly BLOCKED (exit 1 expected) only by issue 43 external HA/fence and multi-broker Kafka."
+    },
+    {
+      "id": "E9-boundaries",
+      "status": "preserved-open",
+      "detail": "44=local single-host only; 43=blocked external HA/source fence; 23 remote Pando GC OPEN by design; 25 phase crash + sidecar pending; 26 cross-host physical fencing OPEN (same-host process+marker only); 48 umbrella OPEN. Production not certified."
+    },
+    {
+      "id": "E10-forgeflow",
+      "status": "pass",
+      "detail": "Forgeflow belongs to the 2 service flows (service_flow, pull_check_pin_flow) in the sha256 service receipt; no separate Forgeflow artifact claimed - labels are generic but case count matches."
+    },
+    {
+      "id": "E11-fidelity",
+      "status": "pass",
+      "detail": "No fabricated production/HA claims; scope consistently single-host disposable PG17/Git/Garage/Vault/one Kafka."
+    }
+  ],
+  "evidence_checked": [
+    "manifest.json (40 SHA+bytes)",
+    "production-inputs.json (323 files digest)",
+    "core-verification.json",
+    "operations-verification.json",
+    "core/sha256_service-output.json",
+    "core/schema_contract-output.json",
+    "core/physical-harness-provenance.json",
+    "core/pando-paired-backup.json",
+    "core case receipts (matrix, restore, legacy130, CI15, maintenance, sandbox, storage lifecycle)",
+    "history/core-shared-database-attempt.json (preserved failure)",
+    "history/core-isolated-attempt.json (preserved failure)",
+    "operations/cluster-operations-gate.json",
+    "reviews/physical-fixture-final-review.json (8d/47)",
+    "reviews/cluster-source-review.json (25/26)",
+    "reviews/data-compat-and-maintenance-review.json (#38/#23)"
+  ],
+  "closure_decision": {
+    "issue_38": "CLOSEABLE_AFTER_PR_MERGE",
+    "rationale": "All six final native groups pass with immutable 35d01c5 and unchanged fdf inputs, replacing earlier stale full-#38 reports: service 2, matrix 6, restore 2, legacy 3, schema 8, CI 15 all actual pass.",
+    "merge_state": "Main PR #56 already merged at 5fa; current candidate 36d0545 is not merged. Close #38 only after merge.",
+    "not_closeable": [
+      "#23 remote Pando GC disabled",
+      "#25 phase crash + sidecar pending",
+      "#26 cross-host fencing only",
+      "#43 external HA/source fence blocked",
+      "#44 local single-host only",
+      "#48 umbrella open"
+    ]
+  },
+  "limitations": [
+    "Single Linux host loopback only; no cross-host storage fencing/HA/multi-broker Kafka; local acceptance is not production certification.",
+    "Format7 proves closure transport to same Garage bucket; authenticity_verified=false and no distinct DR bucket.",
+    "Cluster harness retains known test-oracle line-214/503 disk-contention residuals, consistent with open #25/#26 and not counted as product pass.",
+    "Service receipts use generic labels, so no separately named Forgeflow artifact.",
+    "Docs worker final docs are in a separate pending branch and not reviewed as code.",
+    "Read-only review: no rebuilds, test reruns, GitHub writes, or production claims."
+  ]
+}

@@ -12,9 +12,9 @@ exactly `fdfbbfc…` from the `f319100` compiled source and `35d01` binary.
 
 - Merged main: `5fa48544b2830423d25ae3087d0be6b7ab14867f`; [PR #56](https://github.com/jihuayu/rootyard/pull/56) is already merged.
 - Historical `6d2f0b8` audit: [`main-6d2f0b8-audit.md`](main-6d2f0b8-audit.md). It is history, not current status.
-- Final report set (the coordinator commits the exact report bytes):
+- Committed final report set:
   [`evidence/round2/integration-f319100/`](../../evidence/round2/integration-f319100/).
-  Planned files are `core-verification.json`, `operations-verification.json`,
+  Files include `core-verification.json`, `operations-verification.json`,
   `artifact.json`, `manifest.json`, `core/*.json` (canonical native names),
   `operations/cluster-*.json` and `reviews/*.json`.
 - Environment limits: one Linux host, loopback, local PostgreSQL/Kafka, no

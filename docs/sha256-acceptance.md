@@ -109,9 +109,9 @@ binary SHA-256
 `35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153`.
 The reports are committed at
 [`evidence/round2/integration-f319100/`](../evidence/round2/integration-f319100/)
-(`core/sha256_service-output.json`, `core/sha256_matrix-output.json`,
-`core/sha256_restore-output.json`, `core/backup_sha256_legacy130-output.json`,
-`core/schema_contract-output.json`, `core/ci_job_checkouts-output.json`). Earlier pre-final-format executions are
+(`core/sha256_service-output.json`, `core/sha256_matrix.json`,
+`core/sha256_restore.json`, `core/backup_sha256_legacy130.json`,
+`core/schema_contract-output.json`, `core/ci_job_checkouts.json`). Earlier pre-final-format executions are
 historical and are not cited as the final run.
 
 | command | real outcome on binary `35d01` |

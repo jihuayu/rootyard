@@ -67,7 +67,7 @@ Use Bearer tokens for REST, or Basic authentication with username and token as p
 ./target/debug/rootyard revoke-token TOKEN_UUID
 ```
 
-The repository is the security boundary. A reader may obtain historical or unreachable objects; there is no branch-level confidentiality. Non-fast-forward branch pushes are rejected, including force pushes. New repositories use SHA-1 objects and default `HEAD` to `main`. Tags and non-default branch deletion use native Git semantics; deleting the branch named by `HEAD` is denied. Native Git manages ref locking, quarantine and push results. A disconnected push can have an unknown outcome: fetch/check refs before retrying.
+The repository is the security boundary. A reader may obtain historical or unreachable objects; there is no branch-level confidentiality. Non-fast-forward branch pushes are rejected, including force pushes. New repositories default to SHA-1 objects and `HEAD` to `main`; creation also accepts an explicit `object_format` of `sha256`. Tags and non-default branch deletion use native Git semantics; deleting the branch named by `HEAD` is denied. Native Git manages ref locking, quarantine and push results. A disconnected push can have an unknown outcome: fetch/check refs before retrying.
 
 ## Configuration
 
