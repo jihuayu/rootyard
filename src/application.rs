@@ -24,9 +24,12 @@ pub struct AppState {
 #[derive(Debug)]
 pub struct Error(pub StatusCode, pub &'static str);
 impl Error {
-    pub fn internal(_error: impl std::fmt::Display) -> Self {
-        // Do not print DB URLs, tokens, raw headers, Git stderr or client content.
-        eprintln!("rootyard: internal operation failed");
+    pub fn internal(_error: impl std::fmt::Display + std::any::Any) -> Self {
+        // Only a fixed type classification, validated SQLSTATE and request
+        // correlation are emitted. Never print DB URLs, tokens, raw headers,
+        // Git stderr, query strings, client content or Display/Debug text.
+        let error: &dyn std::any::Any = &_error;
+        crate::observability::observe_internal(error);
         Self(StatusCode::SERVICE_UNAVAILABLE, "service temporarily unavailable")
     }
     pub fn unauthorized() -> Self {
