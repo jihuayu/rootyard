@@ -5,7 +5,7 @@
 //! moved into the [`OwnedOp`] and sent by whichever thread ends up executing it.
 use super::*;
 use super::fuse_dispatch::MountFs;
-use fuser::{ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow};
+use fuser::{Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow};
 use super::owned_ops::OwnedOp;
 
 impl Filesystem for MountFs {

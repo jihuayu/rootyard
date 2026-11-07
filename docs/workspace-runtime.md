@@ -91,10 +91,19 @@ cannot publish a checkpoint or remote manifest after lease handoff.
 Workspace FUSE writes pass a process-local mutation gate with `Healthy`,
 `Frozen` and `Fenced` states. A freeze first stops new admissions and then waits
 for already admitted mutations to drain before running its closure; reads are
-not gated. Because FUSE dispatch is a single session thread, a new mutation on a
-frozen gate is rejected immediately with `EAGAIN` instead of sleeping behind the
-freeze, while a fenced or lease-expired gate returns `EROFS`; neither path
-changes content. A fence is terminal for the current lease epoch and does not
+not gated. Dispatch is bounded per mount: the kernel shim copies each request
+into an owned operation and a single actor per mount owns the overlay and asks
+the gate for admission exactly once. A frozen gate parks writes/creates/
+setattr/mkdir/unlink/rmdir/rename/write-open in a bounded FIFO with their
+replies held, while reads, lookup, readdir and read-only open continue. After a
+successful thaw the actor drains the FIFO in order; it notices the thaw with a
+bounded 10 ms poll and an enqueue notification, not a new kernel request. A
+fenced or lease-expired gate returns `EROFS` for parked and new mutations;
+neither path changes content. Only a queue-limit breach returns `EAGAIN`
+(per mount 128 operations/8 MiB, all mounts 1024/32 MiB, released exactly once
+when the reply is sent). Lazy reads use the global 4-worker/256-job pool and a
+saturated pool replies `EAGAIN` instead of running inline on the actor. See
+[fuse-dispatch-phase2](fuse-dispatch-phase2.md). A fence is terminal for the current lease epoch and does not
 wait for a freeze or for an in-flight mutation. It wakes blocked waiters with
 `EROFS`, ignores the legacy deadline-only lease update, and cannot be cleared by
 that update or by reusing the old epoch. Only a strictly higher epoch restores
@@ -121,9 +130,12 @@ This gate is only a prerequisite for an independent FUSE helper. The session is
 still a `BackgroundSession` in the API process, so an operator `SIGKILL` can
 still leave a thread in `request_wait_answer` holding the same-process FUSE
 descriptor; the helper and parent-loss lifecycle remain open and have no native
-acceptance. Rejected freeze/expiry writes are not queued: a bounded
-asynchronous mutation queue is future work if editors need retry-free behavior
-during checkpoint or scan freezes.
+acceptance. The bounded per-mount freeze queue described above is a prototype
+inside that same process, not the helper: it has no independent child, IPC or
+heartbeat, cannot fence a second process, and keeps queued work in memory only.
+Parked freeze writes do survive a normal thaw, but an operator `SIGKILL` still
+loses them and remains unhandled. The native freeze-queue test is written but
+executed by the coordinator; see [fuse-dispatch-phase2](fuse-dispatch-phase2.md).
 
 A new host can acquire an expired workspace lease only when its latest revision
 has a committed checkpoint. It verifies and materializes that checkpoint from

@@ -31,6 +31,7 @@ use super::inner_ops::{ReadPlan, read_at};
 use super::owned_ops::OwnedOp;
 use super::*;
 use fuser::ReplyData;
+use std::collections::VecDeque;
 use std::sync::{
     Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
     atomic::{AtomicBool, Ordering},
