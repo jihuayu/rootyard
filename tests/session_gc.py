@@ -346,8 +346,11 @@ class SessionGcHarness(BrowserHarness):
             assert not errors, errors
             assert self.request("/web/repos", headers=held_headers)[0] == 200
             self.wait_for(
-                lambda: self.counts()["expired_sessions"] <= baseline["expired_sessions"],
-                "both workers to drain the seeded batch",
+                lambda: (
+                    (current := self.counts())["expired_sessions"] <= baseline["expired_sessions"]
+                    and current["expired_browser_tokens"] <= baseline["expired_browser_tokens"]
+                ),
+                "both workers to drain the seeded session and token batches",
             )
             after = self.counts()
             assert after["expired_sessions"] <= baseline["expired_sessions"], (baseline, after)
