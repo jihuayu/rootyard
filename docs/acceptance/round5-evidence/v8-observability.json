@@ -1,0 +1,58 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "harness_setup_api_roundtrip",
+      "status": "passed",
+      "detail": "ok"
+    },
+    {
+      "name": "owned_sqlstate_23503_trigger_installed",
+      "status": "passed",
+      "detail": "sqlstate=23503"
+    },
+    {
+      "name": "fk_fault_http_503_generic_no_store_server_uuid",
+      "status": "passed",
+      "detail": "ok"
+    },
+    {
+      "name": "json_error_event_correlated",
+      "status": "passed",
+      "detail": "kind=database,sqlstate=23503,route=/api/repos"
+    },
+    {
+      "name": "log_privacy_no_secret_or_raw_request_content",
+      "status": "passed",
+      "detail": "checked fixed categories only"
+    },
+    {
+      "name": "owned_trigger_function_removed_before_good_request",
+      "status": "passed",
+      "detail": "ok"
+    },
+    {
+      "name": "valid_request_after_cleanup_201",
+      "status": "passed",
+      "detail": "ok"
+    },
+    {
+      "name": "authenticated_read_401_own_uuid",
+      "status": "passed",
+      "detail": "ok"
+    }
+  ],
+  "binary_sha256": "a3ced652e7b90edf1bb2d98ea050c95a4c859bffc4627eec4148c0ae070a052e",
+  "compiled_receipt": {
+    "path": "/workspace/scratch/round5-implementation/priority-v8/rootyard.build.json",
+    "sha256": "43525c323e7217e5910186818a012e6273eb91ab87a65a0b284e107005135c7b"
+  },
+  "harness_git_head": "a02e214a22e10b015736b58d533088bddaf2653e",
+  "harness_e2e_sha256": "7d24149a7115bd56e7bf72371935d51f595cde9dc93925639eaf5a15aa4bdfdd",
+  "head_label": "harness_git_head is repository HEAD at harness time, not independent build provenance",
+  "limitations": [
+    "One owned synthetic SQLSTATE 23503 trigger and one request; not a forged application principal.",
+    "DB timeout, remote outage and 80-request full-backlog cases remain open.",
+    "Acceptance is limited to the reported request/error cases and the attested executable; worker backlog and remote-outage qualification are separate."
+  ]
+}

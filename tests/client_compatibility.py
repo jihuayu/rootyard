@@ -132,7 +132,9 @@ def main():
     try:
         versions["build"] = build_record(args.binary)
         versions["git"] = h.git("--version").stdout.decode().strip()
-        versions["workspace_commit"] = h.git("rev-parse", "HEAD", cwd=Path(__file__).resolve().parents[1]).stdout.decode().strip()
+        checkout = Path(__file__).resolve().parents[1]
+        versions["workspace_commit"] = h.git("-c", "safe.directory=" + str(checkout),
+                                               "rev-parse", "HEAD", cwd=checkout).stdout.decode().strip()
         versions["libgit2"] = h.run([os.environ["ROOTYARD_PYGIT2_PYTHON"], "-c",
                                     "import pygit2; print(pygit2.__version__, pygit2.LIBGIT2_VERSION)"]).stdout.decode().strip()
         versions["jgit_jars"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()

@@ -40,7 +40,8 @@ thread through a bounded `std::sync::mpsc` channel of 128 records. The request p
 only calls non-blocking `try_send`: it never awaits and never takes the stderr lock.
 If the queue is full, output was disabled, or the writer is gone, the record is
 discarded and a saturating process-wide dropped counter is incremented (exposed as
-`dropped_event_count` for later metric wiring), so a slow or broken stderr can never
+`dropped_event_count` and exported on the private metrics listener as
+`rootyard_error_log_dropped_total`), so a slow or broken stderr can never
 block or fail a request. The writer thread holds the stderr lock only for one complete
 `write_all` plus newline, treats every `std::io::Error` as best-effort (no retry, no
 panic) and performs no other I/O or async work. If the thread cannot be spawned,
