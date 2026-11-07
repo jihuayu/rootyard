@@ -24,23 +24,15 @@ const PARENT_HEX_LEN: usize = 32;
 const DEFAULT_RETURN_TO: &str = "/web/repos";
 
 fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .find_map(|part| {
-            let (key, value) = part.trim().split_once('=')?;
-            (key == name).then(|| value.trim_matches('"').to_owned())
-        })
+    headers.get(header::COOKIE)?.to_str().ok()?.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then(|| value.trim_matches('"').to_owned())
+    })
 }
 
 pub fn session_token(headers: &HeaderMap) -> Option<String> {
-    cookie(headers, "rootyard_session").filter(|s| {
-        s.len() == 68
-            && s.starts_with(SESSION_PREFIX)
-            && s[4..].bytes().all(|b| b.is_ascii_hexdigit())
-    })
+    cookie(headers, "rootyard_session")
+        .filter(|s| s.len() == 68 && s.starts_with(SESSION_PREFIX) && s[4..].bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn session_parent(secret: &str) -> Option<Uuid> {
@@ -70,9 +62,7 @@ fn authorization_credential(headers: &HeaderMap) -> Option<String> {
         return Some(value.to_owned());
     }
     if scheme.eq_ignore_ascii_case("basic") {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(value)
-            .ok()?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(value).ok()?;
         let pair = String::from_utf8(bytes).ok()?;
         return pair.split_once(':').map(|(_, token)| token.to_owned());
     }
@@ -92,11 +82,7 @@ async fn web_auth_mode(
     session: Option<&str>,
 ) -> Result<WebAuthMode, Box<Response>> {
     if !headers.contains_key(header::AUTHORIZATION) {
-        return Ok(if session.is_some() {
-            WebAuthMode::CookieOnly
-        } else {
-            WebAuthMode::HeaderApiOrOther
-        });
+        return Ok(if session.is_some() { WebAuthMode::CookieOnly } else { WebAuthMode::HeaderApiOrOther });
     }
     let Some(credential) = authorization_credential(headers) else {
         return Ok(WebAuthMode::HeaderApiOrOther);
@@ -107,21 +93,13 @@ async fn web_auth_mode(
     {
         return Ok(WebAuthMode::HeaderApiOrOther);
     }
-    let client = state
-        .pool
-        .get()
-        .await
-        .map_err(|_| Box::new(Error::internal("database unavailable").into_response()))?;
+    let client =
+        state.pool.get().await.map_err(|_| Box::new(Error::internal("database unavailable").into_response()))?;
     let row = client
-        .query_opt(
-            "SELECT kind FROM tokens WHERE digest=$1",
-            &[&db::digest(&credential)],
-        )
+        .query_opt("SELECT kind FROM tokens WHERE digest=$1", &[&db::digest(&credential)])
         .await
         .map_err(|_| Box::new(Error::internal("database unavailable").into_response()))?;
-    let is_browser = row
-        .as_ref()
-        .is_some_and(|row| row.get::<_, String>(0) == "browser");
+    let is_browser = row.as_ref().is_some_and(|row| row.get::<_, String>(0) == "browser");
     if is_browser {
         if session == Some(credential.as_str()) {
             return Ok(WebAuthMode::BrowserSession);
@@ -144,15 +122,8 @@ fn browser_origin(headers: &HeaderMap) -> bool {
     if host.is_empty() || host.contains('/') || host.contains('@') {
         return false;
     }
-    let proto = if headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        == Some("https")
-    {
-        "https"
-    } else {
-        "http"
-    };
+    let proto =
+        if headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https") { "https" } else { "http" };
     let expected = format!("{proto}://{host}");
     if headers.get_all(header::ORIGIN).iter().count() != 1 {
         return false;
@@ -164,63 +135,33 @@ fn browser_origin(headers: &HeaderMap) -> bool {
 }
 
 fn browser_navigation(headers: &HeaderMap) -> bool {
-    headers
-        .get("sec-fetch-mode")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("navigate"))
-        || headers
-            .get(header::ACCEPT)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("text/html"))
+    headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("navigate"))
+        || headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("text/html"))
 }
 
 fn secure_cookie(headers: &HeaderMap) -> Result<bool, Error> {
-    if headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        == Some("https")
-    {
+    if headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) == Some("https") {
         return Ok(true);
     }
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if host.starts_with("127.0.0.1:")
-        || host.starts_with("localhost:")
-        || host == "localhost"
-        || host == "127.0.0.1"
-    {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    if host.starts_with("127.0.0.1:") || host.starts_with("localhost:") || host == "localhost" || host == "127.0.0.1" {
         return Ok(false);
     }
-    Err(Error(
-        StatusCode::FORBIDDEN,
-        "browser sign-in requires HTTPS",
-    ))
+    Err(Error(StatusCode::FORBIDDEN, "browser sign-in requires HTTPS"))
 }
 
-fn set_cookie(
-    res: &mut Response,
-    name: &str,
-    value: &str,
-    http_only: bool,
-    secure: bool,
-    max_age: i64,
-) {
+fn set_cookie(res: &mut Response, name: &str, value: &str, http_only: bool, secure: bool, max_age: i64) {
     let flag = if http_only { "; HttpOnly" } else { "" };
     let secure_flag = if secure { "; Secure" } else { "" };
-    let raw =
-        format!("{name}={value}; Path=/; Max-Age={max_age}; SameSite=Strict{flag}{secure_flag}");
-    res.headers_mut()
-        .append(header::SET_COOKIE, raw.parse().unwrap());
+    let raw = format!("{name}={value}; Path=/; Max-Age={max_age}; SameSite=Strict{flag}{secure_flag}");
+    res.headers_mut().append(header::SET_COOKIE, raw.parse().unwrap());
 }
 
 fn clear_cookies(res: &mut Response, headers: &HeaderMap) {
     let secure = secure_cookie(headers).unwrap_or(false);
     set_cookie(res, "rootyard_session", "", true, secure, 0);
     set_cookie(res, "rootyard_csrf", "", false, secure, 0);
-    res.headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    res.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -266,8 +207,26 @@ fn header_safe_ascii(value: &str) -> bool {
             byte.is_ascii_alphanumeric()
                 || matches!(
                     byte,
-                    b'-' | b'_' | b'.' | b'~' | b'/' | b'?' | b'&' | b'=' | b'%' | b':' | b'+'
-                        | b'!' | b'$' | b'\'' | b'(' | b')' | b'*' | b'@' | b',' | b';' | b'['
+                    b'-' | b'_'
+                        | b'.'
+                        | b'~'
+                        | b'/'
+                        | b'?'
+                        | b'&'
+                        | b'='
+                        | b'%'
+                        | b':'
+                        | b'+'
+                        | b'!'
+                        | b'$'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'@'
+                        | b','
+                        | b';'
+                        | b'['
                         | b']'
                 )
         })
@@ -278,10 +237,8 @@ fn is_safe_return_to(value: &str) -> bool {
         return false;
     }
     let raw_path = value.split('?').next().unwrap_or("");
-    let (Some(decoded_path), Some(decoded_whole)) = (
-        percent_decode_ascii(raw_path),
-        percent_decode_ascii(value),
-    ) else {
+    let (Some(decoded_path), Some(decoded_whole)) = (percent_decode_ascii(raw_path), percent_decode_ascii(value))
+    else {
         return false;
     };
     if !decoded_whole.is_ascii()
@@ -301,15 +258,11 @@ fn is_safe_return_to(value: &str) -> bool {
     {
         return false;
     }
-    !decoded_path
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
+    !decoded_path.split('/').any(|segment| segment == "." || segment == "..")
 }
 
 fn safe_return_to(value: Option<&str>) -> &str {
-    value
-        .filter(|candidate| is_safe_return_to(candidate))
-        .unwrap_or(DEFAULT_RETURN_TO)
+    value.filter(|candidate| is_safe_return_to(candidate)).unwrap_or(DEFAULT_RETURN_TO)
 }
 
 fn encode_query_value(value: &str) -> String {
@@ -346,18 +299,13 @@ fn login_redirect(path: &str, query: Option<&str>, headers: &HeaderMap) -> Respo
 
 fn error_page(status: StatusCode) -> Response {
     let (title, message) = match status {
-        StatusCode::FORBIDDEN => (
-            "Permission denied",
-            "Your account does not have access to this repository or action.",
-        ),
-        StatusCode::NOT_FOUND => (
-            "Not found",
-            "The requested repository or page was not found, or you do not have access to it.",
-        ),
-        _ => (
-            "Request failed",
-            "The request could not be completed. Refresh the page or sign in again.",
-        ),
+        StatusCode::FORBIDDEN => {
+            ("Permission denied", "Your account does not have access to this repository or action.")
+        }
+        StatusCode::NOT_FOUND => {
+            ("Not found", "The requested repository or page was not found, or you do not have access to it.")
+        }
+        _ => ("Request failed", "The request could not be completed. Refresh the page or sign in again."),
     };
     let body = format!(
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>{title}</title><h1>{title}</h1><p>{message}</p><p><a href=\"/web/repos\">My repositories</a> &middot; <a href=\"/web/login\">Sign in</a></p></html>"
@@ -365,19 +313,12 @@ fn error_page(status: StatusCode) -> Response {
     html_response(status, body)
 }
 
-async fn validate_session(
-    state: &Arc<AppState>,
-    secret: &str,
-    csrf: Option<&str>,
-) -> Result<(), Box<Response>> {
+async fn validate_session(state: &Arc<AppState>, secret: &str, csrf: Option<&str>) -> Result<(), Box<Response>> {
     let Some(parent) = session_parent(secret) else {
         return Err(Box::new(Error::unauthorized().into_response()));
     };
-    let client = state
-        .pool
-        .get()
-        .await
-        .map_err(|_| Box::new(Error::internal("database unavailable").into_response()))?;
+    let client =
+        state.pool.get().await.map_err(|_| Box::new(Error::internal("database unavailable").into_response()))?;
     let row = client
         .query_opt(
             "SELECT s.csrf_digest FROM web_sessions s \
@@ -411,39 +352,30 @@ pub async fn middleware(
     let path = request.uri().path().to_owned();
     let query = request.uri().query().map(str::to_owned);
     let session = session_token(&headers);
-    let mutation = matches!(
-        method,
-        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    );
+    let mutation = matches!(method, Method::POST | Method::PUT | Method::PATCH | Method::DELETE);
     let is_navigation = browser_navigation(&headers);
 
     let auth_mode = match web_auth_mode(&state, &headers, session.as_deref()).await {
         Ok(mode) => mode,
         Err(response) => return *response,
     };
-    let session_mode = matches!(
-        auth_mode,
-        WebAuthMode::CookieOnly | WebAuthMode::BrowserSession
-    );
+    let session_mode = matches!(auth_mode, WebAuthMode::CookieOnly | WebAuthMode::BrowserSession);
 
     if mutation {
         if path == "/web/logout" {
             if session_mode && !browser_origin(&headers) {
-                return Error(StatusCode::FORBIDDEN, "browser request origin rejected")
-                    .into_response();
+                return Error(StatusCode::FORBIDDEN, "browser request origin rejected").into_response();
             }
         } else if path == "/web/login" {
             if !browser_origin(&headers) {
-                return Error(StatusCode::FORBIDDEN, "browser request origin rejected")
-                    .into_response();
+                return Error(StatusCode::FORBIDDEN, "browser request origin rejected").into_response();
             }
         } else if session_mode {
             let Some(secret) = session.as_deref() else {
                 return Error::unauthorized().into_response();
             };
             if !browser_origin(&headers) {
-                return Error(StatusCode::FORBIDDEN, "browser request origin rejected")
-                    .into_response();
+                return Error(StatusCode::FORBIDDEN, "browser request origin rejected").into_response();
             }
             let Some(csrf) = headers.get("x-csrf-token").and_then(|v| v.to_str().ok()) else {
                 return Error(StatusCode::FORBIDDEN, "CSRF token required").into_response();
@@ -456,11 +388,7 @@ pub async fn middleware(
         && let Some(secret) = session.as_deref()
         && let Err(response) = validate_session(&state, secret, None).await
     {
-        return if is_navigation {
-            login_redirect(&path, query.as_deref(), &headers)
-        } else {
-            *response
-        };
+        return if is_navigation { login_redirect(&path, query.as_deref(), &headers) } else { *response };
     }
 
     let response = auth::web_scope(next.run(request)).await;
@@ -485,12 +413,7 @@ pub struct ReturnTo {
 fn render_login(target: &str, error: Option<&str>) -> Response {
     let hidden = super::sanitize::escape_html(target);
     let error_html = error
-        .map(|message| {
-            format!(
-                "<p class=\"form-error\" role=\"alert\">{}</p>",
-                super::sanitize::escape_html(message)
-            )
-        })
+        .map(|message| format!("<p class=\"form-error\" role=\"alert\">{}</p>", super::sanitize::escape_html(message)))
         .unwrap_or_default();
     let body = format!(
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Rootyard sign in</title><h1>Sign in</h1><p>Enter your username and API token to open a short browser session.</p>{error_html}<form method=\"post\" action=\"/web/login\"><input type=\"hidden\" name=\"return_to\" value=\"{hidden}\"><label>Username <input name=\"username\" autocomplete=\"username\" required></label><label>API token <input name=\"token\" type=\"password\" autocomplete=\"off\" required></label><button>Sign in</button></form></html>"
@@ -519,12 +442,8 @@ pub async fn login(
     let secure = secure_cookie(&headers)?;
     let target = safe_return_to(input.return_to.as_deref()).to_owned();
     let mut auth_headers = HeaderMap::new();
-    auth_headers.insert(
-        header::AUTHORIZATION,
-        format!("Bearer {}", input.token)
-            .parse()
-            .map_err(|_| Error::unauthorized())?,
-    );
+    auth_headers
+        .insert(header::AUTHORIZATION, format!("Bearer {}", input.token).parse().map_err(|_| Error::unauthorized())?);
     let actor = match auth::authenticate(&state.pool, &auth_headers).await {
         Ok(actor) => actor,
         Err(error) if error.0 == StatusCode::UNAUTHORIZED => {
@@ -544,18 +463,13 @@ pub async fn login(
     let token_id = Uuid::new_v4();
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let kind: Option<String> = client
-        .query_opt(
-            "SELECT kind FROM tokens WHERE id=$1 AND user_id=$2",
-            &[&actor.token_id, &actor.id],
-        )
+        .query_opt("SELECT kind FROM tokens WHERE id=$1 AND user_id=$2", &[&actor.token_id, &actor.id])
         .await
         .map_err(Error::internal)?
         .map(|row| row.get(0));
     if kind.as_deref() != Some("api") {
-        let mut response = render_login(
-            &target,
-            Some("API token sign-in is required; browser sessions cannot sign in again."),
-        );
+        let mut response =
+            render_login(&target, Some("API token sign-in is required; browser sessions cannot sign in again."));
         *response.status_mut() = StatusCode::UNAUTHORIZED;
         return Ok(response);
     }
@@ -588,40 +502,25 @@ pub async fn login(
     tx.commit().await.map_err(Error::internal)?;
     let mut res = Redirect::to(&target).into_response();
     *res.status_mut() = StatusCode::SEE_OTHER;
-    set_cookie(
-        &mut res,
-        "rootyard_session",
-        &secret,
-        true,
-        secure,
-        SESSION_LIFETIME_SECONDS,
-    );
-    set_cookie(
-        &mut res,
-        "rootyard_csrf",
-        &csrf,
-        false,
-        secure,
-        SESSION_LIFETIME_SECONDS,
-    );
-    res.headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    set_cookie(&mut res, "rootyard_session", &secret, true, secure, SESSION_LIFETIME_SECONDS);
+    set_cookie(&mut res, "rootyard_csrf", &csrf, false, secure, SESSION_LIFETIME_SECONDS);
+    res.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     Ok(res)
 }
 
-pub async fn logout(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Response, Error> {
+pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, Error> {
     let secure = secure_cookie(&headers)?;
     if let Some(secret) = session_token(&headers) {
         let client = state.pool.get().await.map_err(Error::internal)?;
-        client.execute("UPDATE web_sessions s SET revoked=true FROM tokens t WHERE t.id=s.token_id AND t.digest=$1", &[&db::digest(&secret)]).await.map_err(Error::internal)?;
         client
             .execute(
-                "UPDATE tokens SET revoked=true WHERE digest=$1 AND kind='browser'",
+                "UPDATE web_sessions s SET revoked=true FROM tokens t WHERE t.id=s.token_id AND t.digest=$1",
                 &[&db::digest(&secret)],
             )
+            .await
+            .map_err(Error::internal)?;
+        client
+            .execute("UPDATE tokens SET revoked=true WHERE digest=$1 AND kind='browser'", &[&db::digest(&secret)])
             .await
             .map_err(Error::internal)?;
     }
@@ -629,15 +528,11 @@ pub async fn logout(
     *res.status_mut() = StatusCode::SEE_OTHER;
     set_cookie(&mut res, "rootyard_session", "", true, secure, 0);
     set_cookie(&mut res, "rootyard_csrf", "", false, secure, 0);
-    res.headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    res.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     Ok(res)
 }
 
-pub async fn discover(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Response, Error> {
+pub async fn discover(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, Error> {
     let actor = super::handlers::authenticate_web(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
@@ -654,9 +549,7 @@ pub async fn discover(
             let name: String = row.get(1);
             let o = super::sanitize::escape_html(&owner);
             let n = super::sanitize::escape_html(&name);
-            html.push_str(&format!(
-                "<li><a href=\"/web/repos/{o}/{n}\">{o}/{n}</a></li>"
-            ));
+            html.push_str(&format!("<li><a href=\"/web/repos/{o}/{n}\">{o}/{n}</a></li>"));
         }
         html.push_str("</ul>");
     }
@@ -665,42 +558,6 @@ pub async fn discover(
     Ok(html_response(StatusCode::OK, html))
 }
 
-pub async fn app_js() -> Response {
-    const SCRIPT: &str = r#"'use strict';
-function cookie(name) {
-  const part = document.cookie.split('; ').find(p => p.startsWith(name + '='));
-  return part ? part.slice(name.length + 1) : '';
-}
-for (const form of document.querySelectorAll('form[data-web-action]')) {
-  form.addEventListener('submit', async event => {
-    event.preventDefault();
-    const action = form.dataset.webAction;
-    const fields = Object.fromEntries(new FormData(form));
-    let body = fields;
-    if (action === 'review' || action === 'merge') {
-      const pull = form.closest('.pull-detail');
-      if (action === 'review') body = {state:'approved', commit_oid:pull.dataset.headOid, body:fields.body || ''};
-      else body = {expected_version:Number(pull.dataset.pullVersion), expected_head_oid:pull.dataset.headOid, expected_base_oid:pull.dataset.baseOid};
-    }
-    const status = form.querySelector('.form-result');
-    status.textContent = 'Saving…';
-    try {
-      const result = await fetch(form.action, {method:'POST', credentials:'same-origin',
-        headers:{'Content-Type':'application/json', 'X-CSRF-Token':cookie('rootyard_csrf')},
-        body:JSON.stringify(body)});
-      if (result.status === 401) { location.assign('/web/login'); return; }
-      if (!result.ok) { status.textContent = `Request failed (${result.status}). Check your permission or refresh the page.`; return; }
-      location.reload();
-    } catch (_) { status.textContent = 'Connection failed. Try again.'; }
-  });
-}
-"#;
-    let mut res = (StatusCode::OK, SCRIPT).into_response();
-    res.headers_mut().insert(
-        header::CONTENT_TYPE,
-        "text/javascript; charset=utf-8".parse().unwrap(),
-    );
-    res.headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    res
-}
+#[path = "session_assets.rs"]
+mod assets;
+pub use assets::app_js;
