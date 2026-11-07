@@ -103,7 +103,7 @@ evidence and the new untrusted-CA negative, and does not re-implement a feature.
 
 ## Evidence
 
-[round4/webhooks33-cff5ddb](../evidence/round4/webhooks33-cff5ddb/README.md) —
+[round4/webhooks33-cff5ddb](../../evidence/round4/webhooks33-cff5ddb/README.md) —
 raw coordinator `status.json` and `certificate.json`, the 331-file
 `production-inputs.json`, raw `regressions.log`, `worker-recovery.log`,
 `worker-recovery-report.json`, the independent `source-review.json`/`.md`, and a
