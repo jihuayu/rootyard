@@ -696,12 +696,15 @@ def main():
                 "SELECT id::text FROM users WHERE username='alice'"), source_descriptor
         assert source_descriptor.get("target_oid") == ci_target, source_descriptor
         assert source_descriptor.get("storage_generation") == ci_generation, source_descriptor
-        assert source_descriptor.get("state") == "pinned", source_descriptor
+        assert source_descriptor.get("version") == 1, source_descriptor
         assert source_descriptor.get("object_format") == "sha1", source_descriptor
         retention_ref = source_descriptor.get("retention_ref")
         assert retention_ref == "refs/rootyard-ci/jobs/" + ci_job, source_descriptor
         source_descriptor_sha256 = canonical_sha256(source_descriptor)
-        for api_key in ("job_id", "target_oid", "retention_ref", "state"):
+        source_receipt = json.loads((ci_pin_file.parent / (ci_job + ".pinned.json")).read_text())
+        assert source_receipt == source_descriptor, "durable pin receipt differs from the issued Intent"
+        assert canonical_sha256(source_receipt) == source_descriptor_sha256
+        for api_key in ("job_id", "target_oid", "retention_ref"):
             if api_key in ci_pin:
                 assert ci_pin[api_key] == source_descriptor[api_key], (api_key, ci_pin, source_descriptor)
         assert h.git("--git-dir=" + str(h.bare), "rev-parse", retention_ref).stdout.decode().strip() == ci_target
@@ -728,10 +731,11 @@ def main():
         ci_before_backup = {"job_id": ci_job, "target_oid": ci_target,
                             "storage_generation": ci_generation,
                             "pin_descriptor_retained": True,
+                            "pin_receipt_matches_intent": True,
                             "pin_descriptor_sha256": source_descriptor_sha256,
                             "pin_descriptor_root_fields": {
                                 "repository_id": source_descriptor["repository_id"],
-                                "state": source_descriptor["state"],
+                                "version": source_descriptor["version"],
                                 "retention_ref": retention_ref,
                                 "retention_ref_points_to_target": True,
                                 "target_commit_present": True},
@@ -932,6 +936,9 @@ def main():
             "restored CI pin descriptor differs from the source closure; restore must not rebind pin evidence")
         restored_descriptor_sha256 = canonical_sha256(restored_descriptor)
         assert restored_descriptor_sha256 == source_descriptor_sha256
+        restored_receipt = json.loads((restored_pin_file.parent / (ci_job + ".pinned.json")).read_text())
+        assert restored_receipt == source_descriptor, "restored pin receipt differs from the source Intent"
+        assert canonical_sha256(restored_receipt) == source_descriptor_sha256
         restored_retention_ref = restored_descriptor["retention_ref"]
         restored_retention_oid = subprocess.run(
             ["git", f"--git-dir={restored_repo}", "rev-parse", restored_retention_ref],
@@ -989,13 +996,15 @@ def main():
                 "old_grant_audience_unchanged": True,
                 "old_token_http_status": old_status,
                 "historical_pin_descriptor_retained": True,
+                "source_pin_receipt_matches_intent": True,
+                "restored_pin_receipt_matches_source_intent": True,
                 "pin_descriptor_source_sha256": source_descriptor_sha256,
                 "pin_descriptor_restored_sha256": restored_descriptor_sha256,
                 "pin_descriptor_full_json_equal": restored_descriptor == source_descriptor,
                 "pin_descriptor_root_fields_equal": all(
                     restored_descriptor.get(key) == source_descriptor.get(key)
                     for key in ("job_id", "repository_id", "owner_id", "target_oid",
-                                "storage_generation", "state", "retention_ref", "object_format")),
+                                "storage_generation", "version", "retention_ref", "object_format")),
                 "restored_retention_ref_points_to_target": restored_retention_oid == ci_target,
                 "new_job_id": new_job, "new_grant_revoked": False,
                 "new_checkout_head": new_head, "new_checkout_fsck": "passed",
