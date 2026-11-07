@@ -51,6 +51,9 @@ class PhysicalHarness(LifecycleHarness):
             time.sleep(.2)
 
     def physical_loose_packed_and_pin(self):
+        # Fixture construction defers the scheduler; actual GC starts below.
+        self.stop()
+        self.env["ROOTYARD_STORAGE_MAINTENANCE"]="false"
         self.setup()
         repo,work,bare,base=self.new_repo("physical")
         self.git("checkout","-b","temporary",cwd=work)
@@ -59,11 +62,29 @@ class PhysicalHarness(LifecycleHarness):
         self.git("commit","-m","temporary",cwd=work)
         packed=self.git("rev-parse","HEAD",cwd=work).stdout.decode().strip()
         self.git("push","origin","HEAD:refs/heads/temporary",cwd=work,token=self.alice)
+        # Wait for the live create projection and its delivered ref-index event
+        # before packing, so no undelivered create is mistaken for a stale root.
+        self.wait_sql("SELECT COALESCE((SELECT deleted::text FROM repository_ref_projection WHERE repository_id='"
+                      +repo["id"]+"' AND ref_name='refs/heads/temporary'),'missing')","false",seconds=20)
+        self.wait_sql("SELECT count(*) FROM outbox_events e JOIN event_deliveries d USING(event_id) "
+                      "WHERE e.repository_id='"+repo["id"]+"' AND e.ref_name='refs/heads/temporary' "
+                      "AND d.consumer='ref-index' AND d.state<>'delivered'","0",seconds=20)
         self.stop()
         # Seed a genuinely packed unreachable object while the service is
         # offline. The production worker must unpack and remove only due OIDs.
         self.git("--git-dir",str(bare),"repack","-a","-d")
-        self.git("--git-dir",str(bare),"update-ref","-d","refs/heads/temporary")
+        # Delete through the supported Smart-HTTP path so the durable
+        # ref-index projection is tombstoned instead of left as a stale root.
+        self.start()
+        self.git("push","origin",":refs/heads/temporary",cwd=work,token=self.alice)
+        self.wait_sql("SELECT COALESCE((SELECT deleted::text FROM repository_ref_projection WHERE repository_id='"
+                      +repo["id"]+"' AND ref_name='refs/heads/temporary'),'missing')","true",seconds=20)
+        assert self.sql("SELECT count(*) FROM repository_ref_projection WHERE repository_id='"
+                        +repo["id"]+"' AND ref_name='refs/heads/temporary' AND NOT deleted AND oid IS NOT NULL") == "0"
+        self.wait_sql("SELECT count(*) FROM outbox_events e JOIN event_deliveries d USING(event_id) "
+                      "WHERE e.repository_id='"+repo["id"]+"' AND e.ref_name='refs/heads/temporary' "
+                      "AND d.consumer='ref-index' AND d.state<>'delivered'","0",seconds=20)
+        self.stop()
         self.git("--git-dir",str(bare),"reflog","expire","--expire=now","--all")
         assert not (bare/"objects"/packed[:2]/packed[2:]).exists()
         self.git("--git-dir",str(bare),"cat-file","-e",packed)
@@ -73,6 +94,8 @@ class PhysicalHarness(LifecycleHarness):
         retained=self.git("-c","user.name=Alice","-c","user.email=alice@rootyard.local",
             "--git-dir",str(bare),"commit-tree",tree,"-p",base,"-m","retained CI source").stdout.decode().strip()
         assert packed in self.git("--git-dir",str(bare),"fsck","--unreachable","--no-progress").stdout.decode()
+        # Re-enable the scheduler only for the acceptance phase below.
+        self.env["ROOTYARD_STORAGE_MAINTENANCE"]="true"
         self.start()
         pin_job=str(uuid.uuid4())
         self.expect("/api/repos/alice/physical/ci-pins",(200,201),token=self.alice,
