@@ -1,0 +1,220 @@
+{
+  "kind": "native_migration_residual_phase_crash_acceptance",
+  "result": "passed",
+  "source_base_commit": "9f85c5adb4e1cfef5c114adbaceb2e74213f34ac",
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "binary_size_bytes": 278933112,
+  "harness_sha256": "64dd92d717c68fe675deb73fd4857a52014d7ff59ed581bf8a1e33a1f411aac1",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "disposable_database": "rootyard_migration_phases_ea020024152b4715ab4351baeaa08539",
+  "topology": "one PostgreSQL authority and separate Rust storage processes on one Linux host",
+  "port_allocation": "OS-assigned ephemeral loopback free_port; fixed HA/infra ports not used",
+  "fault_hook_env_gated": true,
+  "hooks_registered": 5,
+  "hooks_exercised": [
+    "copy-before-transfer",
+    "copy-after-transfer",
+    "target-delta-before-verified",
+    "takeover-after-source-verify",
+    "takeover-before-promote"
+  ],
+  "phases_actual": [
+    "copy-before-transfer",
+    "copy-after-transfer",
+    "target-delta-before-verified",
+    "takeover-after-source-verify",
+    "takeover-before-promote"
+  ],
+  "hooks_unexercised": [],
+  "hook_registration_counted_as_pass": false,
+  "artificial_sql_route_or_replica_readiness": false,
+  "public_migration_or_takeover_flow_used": true,
+  "each_case_own_repo_and_durable_operation": true,
+  "cases": [
+    {
+      "phase": "copy-before-transfer",
+      "scope": "source Rust process in public migration API",
+      "fault_marker": {
+        "phase": "copy-before-transfer",
+        "pid": 358875,
+        "repository_bound": true,
+        "operation_bound": true
+      },
+      "fault_pid": 358875,
+      "process_returncode": -9,
+      "durable_state_after_fault": {
+        "operation_state": "copying",
+        "route": {
+          "primary_node_id": "shard-primary-0",
+          "route_epoch": 1,
+          "draining": false,
+          "read_only_degraded": false
+        },
+        "target_repo_present": false
+      },
+      "stale_target_not_promoted": true,
+      "recovery_ms": 3298.396,
+      "recovery_result": "completed",
+      "recovery_used_same_operation_id": true,
+      "new_route_epoch": 2,
+      "storage_generation": 2,
+      "acknowledged_oid": "d249d88fa69e100b42455f936df2ec1475211dfd",
+      "post_recovery_acknowledged_oid": "40f729c069c07730a4804bc190a19b9d0967bed7",
+      "target_fsck": "passed",
+      "retained_ci_backup_snapshot_roots": true,
+      "old_source_read_only_marker": true,
+      "old_source_volume_unchanged_after_new_push": true
+    },
+    {
+      "phase": "copy-after-transfer",
+      "scope": "source Rust process in public migration API",
+      "fault_marker": {
+        "phase": "copy-after-transfer",
+        "pid": 359111,
+        "repository_bound": true,
+        "operation_bound": true
+      },
+      "fault_pid": 359111,
+      "process_returncode": -9,
+      "durable_state_after_fault": {
+        "operation_state": "verified",
+        "route": {
+          "primary_node_id": "shard-primary-0",
+          "route_epoch": 1,
+          "draining": false,
+          "read_only_degraded": false
+        },
+        "target_repo_present": true
+      },
+      "verified_target_was_not_promoted_without_cutover": true,
+      "recovery_ms": 1223.897,
+      "recovery_result": "completed",
+      "recovery_used_same_operation_id": true,
+      "new_route_epoch": 2,
+      "storage_generation": 2,
+      "acknowledged_oid": "b96f880fae14227e6dcf1d12063b354bca410fb2",
+      "post_recovery_acknowledged_oid": "b3eb7f24e975411672e7f77094c0b53f445133ce",
+      "target_fsck": "passed",
+      "retained_ci_backup_snapshot_roots": true,
+      "old_source_read_only_marker": true,
+      "old_source_volume_unchanged_after_new_push": true
+    },
+    {
+      "phase": "target-delta-before-verified",
+      "scope": "target Rust process in public migration API",
+      "fault_marker": {
+        "phase": "target-delta-before-verified",
+        "pid": 359473,
+        "repository_bound": true,
+        "operation_bound": true
+      },
+      "fault_pid": 359473,
+      "process_returncode": -9,
+      "source_transfer_status": 502,
+      "durable_state_after_fault": {
+        "operation_state": "verified",
+        "route": {
+          "primary_node_id": "shard-primary-0",
+          "route_epoch": 1,
+          "draining": true,
+          "read_only_degraded": false
+        },
+        "target_repo_present": true,
+        "promotion_rows": 0
+      },
+      "drained_source_was_not_promoted_while_target_dead": true,
+      "recovery_ms": 1195.829,
+      "recovery_result": "completed",
+      "recovery_used_same_operation_id": true,
+      "new_route_epoch": 2,
+      "storage_generation": 2,
+      "acknowledged_oid": "1cd566c0680cf542e85c145f1f749fc36752cff7",
+      "post_recovery_acknowledged_oid": "7081eebeab6fc9b76db6500795177adf4c18347d",
+      "target_fsck": "passed",
+      "retained_ci_backup_snapshot_roots": true,
+      "old_source_read_only_marker": true,
+      "old_source_volume_unchanged_after_new_push": true
+    },
+    {
+      "phase": "takeover-after-source-verify",
+      "scope": "target controller Rust process in takeover",
+      "fault_marker": {
+        "phase": "takeover-after-source-verify",
+        "pid": 360101,
+        "repository_bound": true,
+        "operation_bound": true
+      },
+      "fault_pid": 360101,
+      "controller_pid": 360101,
+      "process_returncode": -9,
+      "durable_state_after_fault": {
+        "route": {
+          "primary_node_id": "shard-primary-0",
+          "route_epoch": 1,
+          "draining": false,
+          "read_only_degraded": false
+        },
+        "operation_state": "verified",
+        "promotion_rows": 0,
+        "old_process_alive": true,
+        "blocked_marker_present": false,
+        "source_volume_marker_present": false
+      },
+      "stale_target_not_promoted": true,
+      "old_writer_fenced_after_recovery": true,
+      "old_writer_restart_rejected": true,
+      "recovery_ms": 885.982,
+      "recovery_result": "promoted",
+      "new_route_epoch": 2,
+      "storage_generation": 2,
+      "acknowledged_oid": "ea69e931036718d85f639a012b40a1feac6b8ed8",
+      "post_recovery_acknowledged_oid": "72439f100cd5678f5d6a30c73ae9414d0f81105f",
+      "target_fsck": "passed",
+      "retained_ci_backup_snapshot_roots": true,
+      "old_source_volume_unchanged_after_new_push": true
+    },
+    {
+      "phase": "takeover-before-promote",
+      "scope": "target controller Rust process in takeover",
+      "fault_marker": {
+        "phase": "takeover-before-promote",
+        "pid": 360829,
+        "repository_bound": true,
+        "operation_bound": true
+      },
+      "fault_pid": 360829,
+      "controller_pid": 360829,
+      "process_returncode": -9,
+      "durable_state_after_fault": {
+        "route": {
+          "primary_node_id": "shard-primary-0",
+          "route_epoch": 1,
+          "draining": false,
+          "read_only_degraded": false
+        },
+        "operation_state": "verified",
+        "promotion_rows": 0,
+        "old_process_alive": false,
+        "blocked_marker_present": true,
+        "source_volume_marker_present": false
+      },
+      "stale_target_not_promoted": true,
+      "old_writer_fenced_after_recovery": true,
+      "old_writer_restart_rejected": true,
+      "recovery_ms": 796.441,
+      "recovery_result": "promoted",
+      "new_route_epoch": 2,
+      "storage_generation": 2,
+      "acknowledged_oid": "5c69d184658e89bb4cd4de589e276cf13cd48cd1",
+      "post_recovery_acknowledged_oid": "dc56f2f2bec70427037572b9c6557920cecab7e7",
+      "target_fsck": "passed",
+      "retained_ci_backup_snapshot_roots": true,
+      "old_source_volume_unchanged_after_new_push": true
+    }
+  ],
+  "limits": [
+    "single trusted Linux host; no cross-host storage fence or PostgreSQL HA",
+    "takeover cases use SIGSTOP to let the real node lease expire, then a real SIGKILL",
+    "old generic 409 takeover transient observed historically remains unclassified and is not claimed fixed"
+  ]
+}

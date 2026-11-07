@@ -1,0 +1,119 @@
+{
+  "task": "Narrow read-only review of 799d45bc against 351da69: bounded success receipts and removal of peer error text",
+  "reviewed_commit": "799d45bc124befb37eb1f55784dc2da8f2e2ea37",
+  "delta_from": "351da6929431966ee698ee0c56ab74de645b283c",
+  "reviewed_delta": {
+    "files": [
+      "src/sharding/migration.rs",
+      "docs/cluster-local-process-fence.md"
+    ],
+    "no_ddl": true
+  },
+  "combo": {
+    "root": "/workspace/rootyard-worktrees/round3-migration-integrated",
+    "commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+    "log_composition": "cb8d1b9 on top of 799d45b and 351da69 and 750ccce; integration commit 132 Pando + 799 range",
+    "clean": true,
+    "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+    "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+    "delta_preserved": true,
+    "evidence": "git diff 799d45b..cb8d1b9 touches no src/sharding files; src/sharding/migration.rs and src/sharding/sidecar.rs are byte-identical between the migration25 799 tree and the combo tree (diff --no-index empty)"
+  },
+  "verdict": {
+    "source": "bounded-approve",
+    "remaining_p1": 0,
+    "remaining_p2": 3,
+    "closable_25": false,
+    "summary": "799d45b fixes both open diagnostic P2s exactly as claimed. The non-200 peer branch now reads no response body at all: only the HTTP status is logged and callers receive the same static error classes, so untrusted text and the signed delegation can never reach logs or client messages (the previous truncate-before-redact defect is eliminated by deletion, not by reordering). Both 200 receipt paths use a shared collect_bounded/read_receipt helper with a hard 2048-byte cap and oversized chunks are rejected before append; the three unit tests cover unknown-length within cap, chunked overflow before append, and an oversized single chunk. The multi-hop capacity P2 is converted to a documented, deliberate fail-closed operational cap (docs: at most 1024 pin intents and 2 MiB per repository across generations; code unchanged, no quota or scalability claim). No new P1 or P2 found in the delta. Three prior P2s remain open but bounded and non-blocking. Native is only partially observed: migration25 4/4 passed on the 351 binary (so the prior 351-pending statement is historical), while the combo cb8d1b9 build is 3/4 with partition still running; the fe8 hook worker with 5 unexercised hooks is not qualified, the old takeover generic 409 remains unclassified, and physical cross-host is unqualified. #25 stays OPEN."
+  },
+  "closed_in_this_delta": [
+    {
+      "id": "prior P2-1",
+      "status": "fixed",
+      "evidence": "migration.rs:111-134: on non-200 the response body is never read or parsed; the only output is eprintln target_status=<StatusCode> and static class errors. No delegation variable, no peer text, no redaction dependency."
+    },
+    {
+      "id": "prior P2-2",
+      "status": "fixed",
+      "evidence": "migration.rs:64-88 collect_bounded/read_receipt; 137 SnapshotReceipt and 160 FinalizeReceipt both use read_receipt with MAX_RECEIPT_BYTES=2048; each chunk is rejected with replica receipt too large before append when it would exceed the remaining cap; stream errors map to static 502."
+    },
+    {
+      "id": "prior P2-3",
+      "status": "closed-as-documented-bound",
+      "evidence": "docs/cluster-local-process-fence.md states the fixed 1024-intent/2 MiB per-repository cap including historical generations is a deliberate fail-closed operational limit, not a capacity/scalability claim; code unchanged."
+    }
+  ],
+  "findings": [
+    {
+      "id": "P2-old-1",
+      "priority": "P2",
+      "status": "text",
+      "title": "handoff_pending checks only receipt existence; lost live evidence re-opens the old 409 unmanaged path and corrupt/missing staging becomes an indistinguishable permanent 503",
+      "file": "src/sharding/sidecar.rs, src/ci_pins/issue.rs",
+      "lines": "sidecar.rs:902-930 (unchanged by 799d45b); issue.rs:55-64",
+      "bound": "Non-blocking: fail-closed, no silent authorization or data loss; requires operator-visible stuck state only after live-directory loss or staging corruption.",
+      "trigger": "Delete/restore ci-pins/<repo> after a publication receipt exists -> fresh pin 409 unmanaged; or delete staging for a completed op with no receipt -> every pin gets permanent 503 CI sidecar handoff pending."
+    },
+    {
+      "id": "P2-old-2",
+      "priority": "P2",
+      "status": "text",
+      "title": "Receipt replay rejects a legitimate release followed by a re-pin of the same job id",
+      "file": "src/sharding/sidecar.rs",
+      "lines": "sidecar.rs:829-860 (unchanged by 799d45b)",
+      "bound": "Non-blocking: only affects replay/startup verification after release+re-pin; publication data is correct.",
+      "trigger": "Publish migration, release job J, re-pin job J with a new oid, restart target -> 409 published CI sidecar file is missing."
+    },
+    {
+      "id": "P2-old-3",
+      "priority": "P2",
+      "status": "text",
+      "title": "Orphan staging with no operation row is retained forever with no quarantine or audit signal",
+      "file": "src/sharding/sidecar.rs",
+      "lines": "sidecar.rs:1087-1095 (unchanged by 799d45b)",
+      "bound": "Non-blocking: deliberate retain-on-unknown (no data loss), causes unbounded disk growth and no operator signal.",
+      "trigger": "Copy a stale <uuid>.sidecar staging dir with no operation row into shard-staging and restart the target: retained forever, nothing reported."
+    }
+  ],
+  "new_observations_non_blocking": [
+    "read_receipt maps a malformed or empty 200 receipt body to Error::internal (500) rather than a peer-fault 502; same as the previous behavior, observability nit only (migration.rs:84-87).",
+    "The three unit tests validate collect_bounded only; they do not deserialize SnapshotReceipt/FinalizeReceipt nor exercise the non-200 no-read branch. Cargo check/unit pass is accepted as supplied, not reproduced here.",
+    "The non-200 branch returns without draining the peer body; the response is dropped, so a large error body cannot be accumulated, but the connection is not reused. No security or memory issue.",
+    "transport.rs:317 still streams forwarded Git output with the existing max_output_bytes accounting; it is outside this receipt-read delta and unchanged."
+  ],
+  "native_facts_as_observed": {
+    "migration25_351": {
+      "source_commit": "351da6929431966ee698ee0c56ab74de645b283c",
+      "binary_sha256": "74a50509e3580b210ab2b5ab5b35122613cafa9cae41a078b6f8fe79e0cacc40",
+      "state": "passed",
+      "jobs": {
+        "sidecar-crash": "passed exit 0",
+        "migration": "passed exit 0",
+        "takeover": "passed exit 0",
+        "partition": "passed exit 0"
+      },
+      "note": "All four matrix jobs passed on the 351 binary; the prior review statement that 351 native was pending is now historical."
+    },
+    "combo_cb8d1b9": {
+      "source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+      "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+      "state_at_read": "running",
+      "jobs": {
+        "sidecar-crash": "passed exit 0",
+        "migration": "passed exit 0",
+        "takeover": "passed exit 0",
+        "partition": "running, no exit_code yet"
+      },
+      "note": "No completed all-matrix result for the combo build at review time; pending until partition and the remaining hook matrix finish."
+    },
+    "hook_worker_fe8": "Isolated tests state 5 unexercised hooks; not qualified. 13 registered hooks is not 13 hooks passed. The later final evidence is expected to add 5 additional phase-actual results; close criteria must be checked against those results, not against registration count.",
+    "takeover_generic_409": "Remains unclassified. A passing new matrix does not prove the old takeover 16 MiB replicate 409 is fixed; the diagnostics change only affects send_transfer error classification/logging.",
+    "physical_cross_host": "Not qualified; stays open separately."
+  },
+  "verdict_scope_note": "This review covers only the 799d45b diagnostic/receipt delta and the fact that the combo build contains it unchanged. It does not re-audit the 132 Pando integration (including src/storage/admission.rs changes) or the new hook worker; those remain outside this narrow review and are not certified by it.",
+  "limitations": [
+    "Read-only; no edits, Cargo, native runs, network or GitHub calls. Cargo check/unit-test results are supplied, not reproduced.",
+    "Status facts were read from migration25 and migration-integrated coordinator-status.json at review time; the combo partition job was still running and may finish later.",
+    "No physical cross-host qualification and no claim that the old takeover 409 is resolved."
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "kind": "native_migration_sidecar_crash_matrix",
+  "result": "passed",
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "harness_sha256": "d69f7ffdd239d8de7ee4c32353a3ca9ac951191afe1b865f7d57029b9521408c",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "disposable_database": "rootyard_migration_sidecar_1cd4bbdca1474353a508b82483a3335f",
+  "hooks_registered": 13,
+  "phases_actual": [
+    "target-copy-after-receive",
+    "target-verify-before-publish",
+    "target-sidecar-before-publish+concurrent-fresh-pin",
+    "cutover-before-sidecar-finalize+pre-finalize-pin",
+    "verified-restart-with-staged-sidecar",
+    "final-delta-before-transfer",
+    "cutover-before-commit",
+    "cutover-after-commit",
+    "recover-before-reconcile",
+    "startup-sidecar-reconcile"
+  ],
+  "hooks_unexercised": [
+    "copy-before-transfer",
+    "copy-after-transfer",
+    "target-delta-before-verified",
+    "takeover-after-source-verify",
+    "takeover-before-promote"
+  ],
+  "sidecar_symlink_fail_closed": true,
+  "sidecar_foreign_tenant_fail_closed": true,
+  "cancelled_grant_denied_after_handoff": true,
+  "released_pin_tombstone_preserved": true,
+  "old_generation_pin_not_rebound": true,
+  "fresh_checkout_after_handoff": true,
+  "fresh_pin_accepted_during_finalize_survives": true,
+  "pre_finalize_pin_bounded_503_then_retry": true,
+  "zero_preexisting_root_fresh_pin_merged_by_finalize": true,
+  "two_hop_historical_generation_retention": true,
+  "two_hop_old_generation_grants_denied": true,
+  "two_hop_fresh_generation_authorized": true,
+  "verified_staged_sidecar_survives_target_restart": true,
+  "reconcile_window_fixture_34_retained": 34,
+  "reconcile_window_fixture_is_metadata_only": true,
+  "retained_ci_backup_snapshot_roots": true,
+  "stock_git_fsck_and_acknowledged_commits": true,
+  "old_source_nonwriter_after_true_fence": true,
+  "old_native_volume_unchanged_after_cutover_push": true,
+  "retired_source_push_directly_rejected": false,
+  "retired_source_push_supported_proxy_ack": true,
+  "limits": [
+    "one PostgreSQL authority; two Rust processes on one Linux host",
+    "physical cross-host fencing remains unqualified outside this role"
+  ]
+}

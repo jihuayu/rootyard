@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/workspace/rootyard-worktrees/round3-migration25/tests/cluster_takeover_native.py", line 308, in <module>
+    main()
+  File "/workspace/rootyard-worktrees/round3-migration25/tests/cluster_takeover_native.py", line 175, in main
+    third = json.loads(h.expect(path, 200, token=h.alice, method="POST", body=request_body))
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/rootyard-worktrees/round3-migration25/tests/e2e.py", line 172, in expect
+    assert status in (code if isinstance(code, tuple) else (code,)), f"{path}: expected {code}, got {status}: {body[:300]!r}"
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: /api/repos/alice/demo/shard-migrate: expected 200, got 409: b'{"error":"replica rejected snapshot transfer"}'

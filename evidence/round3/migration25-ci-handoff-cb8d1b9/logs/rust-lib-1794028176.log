@@ -1,0 +1,201 @@
+   Compiling rootyard v0.1.0 (/workspace/rootyard-worktrees/round3-migration-integrated)
+warning: value assigned to `op_state` is never read
+   --> src/sharding/migration.rs:323:9
+    |
+323 |         state
+    |         ^^^^^ this value is reassigned later and never used
+...
+409 |     op_state = state_name;
+    |     -------- `op_state` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `op_state` is never read
+   --> src/sharding/migration.rs:342:9
+    |
+342 |         "copying".to_owned()
+    |         ^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+409 |     op_state = state_name;
+    |     -------- `op_state` is overwritten here before the previous value is read
+
+warning: function `read_progress` is never used
+   --> src/sharding/sidecar.rs:449:15
+    |
+449 | pub(crate) fn read_progress(
+    |               ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `actor`, `owner`, `name`, `generation`, `op_sequence`, and `route` are never read
+  --> src/sharding/replication_target.rs:49:5
+   |
+48 | struct TransferAuth {
+   |        ------------ fields in this struct
+49 |     actor: db::Identity,
+   |     ^^^^^
+50 |     owner: String,
+   |     ^^^^^
+51 |     name: String,
+   |     ^^^^
+...
+54 |     generation: i64,
+   |     ^^^^^^^^^^
+...
+57 |     op_sequence: Option<i64>,
+   |     ^^^^^^^^^^^
+58 |     route: RepoShardRoute,
+   |     ^^^^^
+
+warning: `rootyard` (lib test) generated 4 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 35.41s
+     Running unittests src/lib.rs (/workspace/rootyard/target/debug/deps/rootyard-c512e8eeea7428b7)
+
+running 145 tests
+test auth::tests::rejects_malformed ... ok
+test backup::filesystem::tests::private_copy_preserves_bytes_and_modes ... ok
+test backup::filesystem::tests::publication_never_replaces_an_existing_directory ... ok
+test backup::filesystem::tests::restore_guard_blocks_nonexistent_target ... ok
+test backup::filesystem::tests::traversal_links_specials_and_overlap_fail_closed ... ok
+test browse::models::tests::ref_and_path_validation ... ok
+test browse::object_format::tests::dual_format_oid_detection_and_mixed_tx_rejection ... ok
+test ci_checkouts::leases::tests::active_lease_predicate_enforces_expiry_and_terminal_flags ... ok
+test ci_pins::tests::ci_pin_tests::exact_oid_and_reserved_namespace ... ok
+test ci_pins::tests::ci_pin_tests::format_aware_oid_and_zero_oid_validation ... ok
+test ci_pins::tests::ci_pin_tests::metadata_identity_and_receipt_are_immutable ... ok
+test db::tests::hashes_are_stable_and_distinct ... ok
+test db::tests::migrations_are_strictly_ordered_and_match_schema_versions ... ok
+test db::tests::names_are_paths_never ... ok
+test dispatch::tests::bounded_resp ... ok
+test dispatch::tests::coalesced_memory_hints ... ok
+test dispatch::tests::endpoint_and_channel_bounds ... ok
+test dispatch::tests::failed_adapter_is_cancellable ... ok
+test forge::tests::idempotency_header_boundaries ... ok
+test forge::tests::input_and_pagination_boundaries ... ok
+test forge::tests::issue_filter_query_contract ... ok
+test git_http::process::process_tests::cancellation_drop_waits_for_all_descendants ... ok
+test git_http::process::process_tests::maintenance_helpers_wait_for_descendant_quiescence ... ok
+test git_http::process::process_tests::successful_leader_does_not_leave_descendants ... ok
+test git_http::process::process_tests::timeout_cleans_term_ignoring_descendants_before_reaping ... ok
+test git_http::protocol::receive_tests::command_prefix_tracks_exact_refs_and_replays_pack ... ok
+test git_http::protocol::tests::job_refusal_prefix_is_bounded_complete_and_preserves_success ... ok
+test git_http::protocol::tests::rejects_unsafe_routes ... ok
+test git_http::publication::tests::native_hook_handshake_owns_cross_process_publication_window ... ok
+test journal::tests::active_admission_is_visible_before_other_recovery_scans ... ok
+test journal::tests::aggregate_event_cap_rejects_append_and_oversized_recovery ... ok
+test journal::tests::ci_service_journal_has_no_human_identity ... ok
+test journal::tests::concurrent_admission_reserves_unique_durable_sequences ... ok
+test journal::tests::detects_missing_events_and_blocking_marker ... ok
+test journal::tests::expanded_json_above_one_mib_round_trips ... ok
+test journal::tests::interrupted_admission_staging_preserves_sequence_gap ... ok
+test journal::tests::interruption_and_corruption_markers_are_durable_and_checked ... ok
+test journal::tests::invalid_inputs_and_truncated_receipt ... ok
+test journal::tests::lifecycle_and_monotonic_sequence ... ok
+test journal::tests::pre_receive_admits_4096_ordered_unique_refs ... ok
+test journal::tests::pre_receive_rejects_batch_limits_without_ambiguity ... ok
+test journal::tests::receipt_is_separate_and_preserves_order ... ok
+test journal::tests::ref_transaction_intent_precedes_receipt_and_accepts_sha256 ... ok
+test journal::tests::reference_name_byte_boundary ... ok
+test journal::tests::refuses_symlinks_and_corrupt_metadata ... ok
+test journal::tests::repeated_events_and_nested_noise_are_preserved ... ok
+test kafka_wake::tests::names_endpoints_and_payloads_are_closed ... ok
+test kafka_wake::tests::native_cleanup_does_not_block_application_runtime ... ok
+test lfs::models::tests::lfs_oid_and_pointer_parsing ... ok
+test members::audit::tests::audit_action_and_target_token_validation ... ok
+test members::models::tests::role_hierarchy_and_parsing ... ok
+test members::models::tests::team_and_audit_validators ... ok
+test metrics::tests::counters_saturate_instead_of_wrapping ... ok
+test metrics::tests::failed_snapshot_never_fabricates_backlog ... ok
+test metrics::tests::fixed_labels_and_counter_values ... ok
+test metrics::tests::only_loopback_can_bind ... ok
+test mirror::auto_origin::tests::cross_cluster_runner_queue_epochs_and_stale_heartbeat_rejection ... ok
+test mirror::eviction::tests::eviction_preserves_current_snapshot_and_protected_oids_while_evicting_lru ... ok
+test mirror::limiter::tests::per_repo_and_global_sync_limits_reject_contention ... ok
+test mirror::observability::tests::prometheus_rendering_is_fixed_cardinality_and_tracks_counters ... ok
+test mirror::views::tests::exact_oid_path_required ... ok
+test mirror::views::tests::metadata_and_pin_corruption_fail_closed ... ok
+test mirror::views::tests::native_git_views_keep_exact_pins_and_ignore_replacements ... ok
+test mirror::views::tests::primary_is_only_a_trusted_origin ... ok
+test mirror::views::tests::sha256_native_pins_use_declared_object_format ... ok
+test namespace_service::reverse::reverse_git::tests::cat_file_drains_more_than_pipe_capacity ... ok
+test pando_gateway::pack_store::tests::generation_update_fences_ready_manifest_insert ... ok
+test pando_gateway::publish::tests::advertised_head_cannot_be_deleted_but_other_branches_can ... ok
+test pando_gateway::transition::tests::exported_refs_cover_only_branches_and_tags ... ok
+test pando_gateway::transition::tests::head_must_be_an_authoritative_branch ... ok
+test pando_gateway::transition::tests::ref_parsing_rejects_reserved_and_malformed_refs ... ok
+test pando_gateway::transition::tests::rollback_plan_keeps_internal_refs_and_removes_stale_authority_refs ... ok
+test pulls::models::tests::branch_ref_normalization_and_validation ... ok
+test pulls::models::tests::oid_and_check_state_validators ... ok
+test pulls::models::tests::pull_filter_query_contract ... ok
+test reliability::tests::executable_access_checks_capability_not_just_file_presence ... ok
+test reliability::tests::interrupted_receive_is_certain_only_without_a_parent_grant ... ok
+test sandbox::cgroup::tests::cpu_limit_rejects_unbounded_or_malformed_values ... ok
+test sandbox::cgroup::tests::delegation_accepts_sysfs_read_tokens_and_rejects_incomplete_subtrees ... ok
+test sandbox::cgroup::tests::destroy_reports_unreclaimable_group ... ok
+test sandbox::cgroup::tests::limits_are_written_and_missing_controller_fails ... ok
+test sandbox::runner::tests::bubblewrap_probe_accepts_a_capable_host_binary ... ok
+test sandbox::runner::tests::bubblewrap_probe_rejects_unusable_binaries ... ok
+test sharding::benchmark::tests::percentiles_telemetry_markdown_and_receipt_persistence ... ok
+test sharding::failover::tests::failover_candidate_validation_checks_watermark_and_in_flight_writes ... ok
+test sharding::fencing::tests::dual_layer_barrier_rejects_stale_epoch_token_generation_and_marker ... ok
+test sharding::migration::tests::receipt_reader_accepts_unknown_length_within_cap ... ok
+test sharding::migration::tests::receipt_reader_rejects_chunked_overflow_before_appending_it ... ok
+test sharding::migration::tests::receipt_reader_rejects_oversized_single_chunk ... ok
+test sharding::models::tests::deterministic_bucket_id_and_validators ... ok
+test sharding::rebalance::tests::rebalance_target_and_dr_drill_sla_validation ... ok
+test sharding::router::tests::route_resolution_enforces_watermarks_and_lease_expiry ... ok
+test sharding::transitions::tests::committed_but_unpublished_marker_reconciles_only_on_own_volume ... ok
+test storage::admission::tests::active_gc_fence_rejects_new_writer_without_waiting ... ok
+test storage::admission::tests::heartbeat_loses_admission_when_gc_epoch_advances ... ok
+test storage::read_leases::tests::blackholed_postgres_heartbeat_fails_closed ... ok
+test storage::read_leases::tests::cancelled_acquisition_does_not_orphan_postgres_lock ... ok
+test storage::read_leases::tests::postgres_barrier_fences_other_pool_connections ... ok
+test storage::ref_admission::tests::admitted_writer_settles_once_and_replays_idempotently ... ok
+test storage::ref_admission::tests::fenced_epoch_prevents_outbox_settlement ... ok
+test storage::ref_admission::tests::revoked_token_cannot_settle_admitted_refs ... ok
+test storage::ref_publication::tests::postgres_exact_ref_contention_and_atomic_group_admission ... ok
+test storage_lifecycle::gc::tests::only_native_unreachable_objects_become_tombstones ... ok
+test storage_lifecycle::observability::tests::bounds_are_bounded_and_state_is_strict ... ok
+test storage_lifecycle::observability::tests::cursor_round_trip_is_canonical_only ... ok
+test storage_lifecycle::pando::tests::incomplete_cache_is_detected_without_trusting_remote_listing ... ok
+test storage_lifecycle::pando::tests::only_pando_write_kinds_are_admitted ... ok
+test storage_lifecycle::quarantine::tests::commit_unlinks_only_quarantined_objects ... ok
+test storage_lifecycle::quarantine::tests::crash_recovery_restores_manifest_entries ... ok
+test storage_lifecycle::quarantine::tests::relative_paths_cannot_escape_objects_directory ... ok
+test storage_lifecycle::quarantine::tests::rollback_restores_staged_objects ... ok
+test storage_lifecycle::retention::tests::ref_listing_rejects_truncated_or_unsafe_lines ... ok
+test storage_lifecycle::retention::tests::root_oids_are_canonical_and_keep_names_are_reserved ... ok
+test view_lab::namespace::tests::mount_paths_reject_overlap_and_traversal ... ok
+test web::models::tests::test_blob_query_max_bytes_bounds ... ok
+test web::models::tests::test_issue_and_pull_filter_validation ... ok
+test web::models::tests::test_new_issue_patch_and_comment_validators ... ok
+test web::models::tests::test_serde_deny_unknown_fields_on_web_models ... ok
+test web::sanitize::tests::test_blob_preview_multibyte_utf8_boundary_and_binary_hex_format ... ok
+test web::sanitize::tests::test_event_handlers_and_obfuscated_urls_rejected ... ok
+test web::sanitize::tests::test_xss_script_and_unclosed_tags_stripped ... ok
+test web::templates::tests::test_html_response_sets_all_mandatory_security_headers ... ok
+test web::templates::tests::test_views_escape_untrusted_fields_and_render_semantic_data_attributes ... ok
+test webhooks::delivery::tests::exponential_backoff_schedule_and_deterministic_ci_job_uuid ... ok
+test webhooks::models::tests::event_context_and_secret_validators ... ok
+test webhooks::models::tests::ssrf_webhook_url_validation_matrix ... ok
+test webhooks::signing::tests::delivery_headers_include_required_metadata ... ok
+test webhooks::signing::tests::rfc4231_hmac_sha256_test_vectors ... ok
+test webhooks::signing::tests::signature_header_and_constant_time_verification ... ok
+test workspace_lab::crash_recovery::tests::test_norm_overlay_rel_and_deny_unknown_fields ... ok
+test workspace_lab::fuse_mount::tests::read_pool_executes_distinct_jobs_concurrently ... ok
+test workspace_lab::fuse_mount::tests::unknown_lazy_path_fails_closed_but_git_is_eager ... ok
+test workspace_lab::ignore::tests::rootyardignore_patterns_negation_and_directory_rules ... ok
+test workspace_lab::vfs::tests::test_deny_unknown_fields_on_vfs_catalog_entry ... ok
+test workspace_lab::vfs::tests::test_matches_query_and_pattern_validation ... ok
+test workspaces::lazy::tests::failed_verification_never_publishes_final_path ... ok
+test workspaces::lazy::tests::follower_wait_is_bounded_when_leader_stalls ... ok
+test workspaces::lazy::tests::independent_blobs_hydrate_in_parallel ... ok
+test workspaces::lazy::tests::offline_fetch_times_out_with_eio_and_releases_flight ... ok
+test workspaces::lazy::tests::reader_rejects_corrupt_remote_blob_then_recovers ... ok
+test workspaces::lazy::tests::reader_rejects_truncated_remote_blob ... ok
+test workspaces::lazy::tests::remote_fetcher_publishes_verified_blob_and_cleans_staging ... ok
+test workspaces::lazy::tests::singleflight_shares_one_remote_fetch ... ok
+test workspaces::lazy::tests::staging_stays_private_until_verified_and_published ... ok
+test workspaces::lazy::tests::timed_out_fetch_cannot_resurrect_staging_file ... ok
+
+test result: ok. 145 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.70s

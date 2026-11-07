@@ -1,0 +1,215 @@
+{
+  "reviewer": "DeepSeek independent readonly acceptance reviewer",
+  "issue": 25,
+  "review_type": "final acceptance review (supersedes acceptance-review-pending, which recorded the single missing artifact)",
+  "reviewed_worktree": "/workspace/rootyard-worktrees/round3-migration-integrated",
+  "reviewed_head": "9f85c5adb4e1cfef5c114adbaceb2e74213f34ac",
+  "harness_commit": "9f85c5adb4e1cfef5c114adbaceb2e74213f34ac",
+  "head_clean": true,
+  "compiled_production_source": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+  "verdict": "ACCEPT_FOR_DOCUMENTED_MODE",
+  "closable_25": true,
+  "supported_mode": "single trusted Linux host, separate node volumes, one PostgreSQL authority; destructive migration/takeover between local Rust storage processes; physical cross-host fencing stays with issue 26 (open) and is not claimed",
+  "close_condition_met": "the previously missing artifact now exists: the exact 5-phase SIGKILL harness ran and passed on the current certified 157748add binary (migration-extra migration-phases job, exit 0)",
+  "p1": 0,
+  "p2": "3 inherited, documented, fail-closed (unchanged; not blockers for the documented single-host mode)",
+  "extra_run": {
+    "status_path": "/workspace/scratch/rootyard-round3/migration-extra/coordinator-status.json",
+    "state": "passed",
+    "stage": "complete",
+    "updated": 1794028347.7056456,
+    "certificate": {
+      "source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+      "built_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+      "valid": true,
+      "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+      "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90"
+    },
+    "jobs_all_exit_0": [
+      "rust-lib",
+      "rust-pando",
+      "schema",
+      "migration-phases"
+    ],
+    "rust_lib": "145 passed (real PostgreSQL, clean compile)",
+    "rust_pando": "1 passed (real S3/Vault)",
+    "schema": "132 contract passed",
+    "migration_phases_job": {
+      "state": "passed",
+      "exit_code": 0,
+      "report": "/workspace/scratch/rootyard-round3/migration-extra/logs/migration-phases-1794028302.json",
+      "report_sha256": "705d01f5178e9122f6e674a17f262c3887c43679680d9594d9a6da5c450956d8",
+      "harness_sha256": "64dd92d717c68fe675deb73fd4857a52014d7ff59ed581bf8a1e33a1f411aac1",
+      "database_cleanup": "dropped_after_success"
+    }
+  },
+  "artifact_verification": {
+    "report_file_sha256_recomputed": "705d01f5178e9122f6e674a17f262c3887c43679680d9594d9a6da5c450956d8",
+    "matches_status_report_sha256": true,
+    "harness_file_sha256_recomputed_at_head": "64dd92d717c68fe675deb73fd4857a52014d7ff59ed581bf8a1e33a1f411aac1",
+    "matches_report_and_status_harness_sha256": true,
+    "harness_absent_at_compiled_source_cb8d1b9": "the phases harness exists only above cb8d1b9 (git show cb8d1b9:... is an empty blob), so the tested 1e36 cherry helper is exactly the file selected at HEAD 9f85c5a",
+    "report_identity": {
+      "kind": "native_migration_residual_phase_crash_acceptance",
+      "result": "passed",
+      "source_base_commit": "9f85c5adb4e1cfef5c114adbaceb2e74213f34ac",
+      "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+      "binary_size_bytes": 278933112,
+      "postgres_version": "17.11 (Debian 17.11-0+deb13u1)"
+    },
+    "hook_accounting": {
+      "hooks_registered": 5,
+      "hooks_exercised": [
+        "copy-before-transfer",
+        "copy-after-transfer",
+        "target-delta-before-verified",
+        "takeover-after-source-verify",
+        "takeover-before-promote"
+      ],
+      "phases_actual": [
+        "copy-before-transfer",
+        "copy-after-transfer",
+        "target-delta-before-verified",
+        "takeover-after-source-verify",
+        "takeover-before-promote"
+      ],
+      "hooks_unexercised": [],
+      "hook_registration_counted_as_pass": false,
+      "artificial_sql_route_or_replica_readiness": false,
+      "public_migration_or_takeover_flow_used": true,
+      "each_case_own_repo_and_durable_operation": true
+    }
+  },
+  "five_cases": [
+    {
+      "phase": "copy-before-transfer",
+      "scope": "source Rust process in public migration API",
+      "process_returncode": -9,
+      "fault_pid": 358875,
+      "durable_state_after_fault": "operation copying, target repo absent",
+      "stale_target_not_promoted": true,
+      "recovery": "completed in 3298 ms on the same operation id",
+      "epoch": "1 to 2",
+      "storage_generation": 2,
+      "fsck": "passed",
+      "retained_ci_backup_snapshot_roots": true,
+      "old_source_read_only_marker": true,
+      "old_source_volume_unchanged_after_new_push": true
+    },
+    {
+      "phase": "copy-after-transfer",
+      "scope": "source Rust process in public migration API",
+      "process_returncode": -9,
+      "fault_pid": 359111,
+      "durable_state_after_fault": "operation verified, target repo present",
+      "verified_target_was_not_promoted_without_cutover": true,
+      "recovery": "completed in 1224 ms on the same operation id",
+      "epoch": "1 to 2",
+      "storage_generation": 2,
+      "fsck": "passed",
+      "retained_ci_backup_snapshot_roots": true
+    },
+    {
+      "phase": "target-delta-before-verified",
+      "scope": "target Rust process in public migration API",
+      "process_returncode": -9,
+      "fault_pid": 359473,
+      "source_transfer_status": 502,
+      "durable_state_after_fault": "draining, promotion_rows 0",
+      "drained_source_was_not_promoted_while_target_dead": true,
+      "recovery": "completed in 1196 ms",
+      "epoch": "1 to 2",
+      "storage_generation": 2,
+      "fsck": "passed",
+      "retained_ci_backup_snapshot_roots": true
+    },
+    {
+      "phase": "takeover-after-source-verify",
+      "scope": "target controller Rust process in takeover",
+      "process_returncode": -9,
+      "fault_pid": 360101,
+      "durable_state_after_fault": "route epoch 1, promotion_rows 0, old process alive, no blocked marker",
+      "stale_target_not_promoted": true,
+      "recovery": "promoted in 886 ms, epoch 2, generation 2, failover set",
+      "old_writer_fenced_after_recovery": true,
+      "old_writer_restart_rejected": true,
+      "fsck": "passed",
+      "retained_ci_backup_snapshot_roots": true
+    },
+    {
+      "phase": "takeover-before-promote",
+      "scope": "target controller Rust process in takeover",
+      "process_returncode": -9,
+      "fault_pid": 360829,
+      "durable_state_after_fault": "route epoch 1, promotion_rows 0, old process dead, blocked marker present",
+      "stale_target_not_promoted": true,
+      "recovery": "promoted in 796 ms, epoch 2, generation 2",
+      "old_writer_fenced_after_recovery": true,
+      "old_writer_restart_rejected": true,
+      "fsck": "passed",
+      "retained_ci_backup_snapshot_roots": true
+    }
+  ],
+  "criteria": [
+    {
+      "n": 1,
+      "text": "disjoint node volumes migration with client writes / ACK / fsck",
+      "status": "met",
+      "evidence": "migration-integrated coordinator-migration.json (157 binary, result passed): online copy while writes admitted, delta after concurrent write applied before cutover, failed online transfer preserved source writes, retained CI pin and backup snapshot roots survived, source SQL pin outbox survived, target barrier waited for native reader; takeover target_fsck passed; sidecar-crash stock_git_fsck_and_acknowledged_commits true"
+    },
+    {
+      "n": 2,
+      "text": "empty / corrupt / partial / stale target not ready and not promoted",
+      "status": "met",
+      "evidence": "partial_copy_rejected_before_cutover, ahead_journal_rejected_without_replacing_target, foreign_repository_operation_uuid_rejected_without_drain, sidecar symlink and foreign tenant fail closed, stale replica and duplicate live node identity rejected, unavailable fence directory blocks promotion; the new phases report adds promotion_rows 0 / stale_target_not_promoted on every crash"
+    },
+    {
+      "n": 3,
+      "text": "crash in each phase with durable recovery; CI / backup / snapshot roots survive",
+      "status": "met on the current 157 binary",
+      "evidence": "sidecar-crash matrix (10 phases actual, kill action for the crash hooks, restart-based staged-sidecar case, two-hop 0-1-0 fresh generation 3 authorized with historical generation 1/2 roots preserved and old grants denied, dynamic pin merged not lost, reconcile window fixture explicitly metadata-only) plus the new 5-phase SIGKILL report; every phase case reports target_fsck passed and retained_ci_backup_snapshot_roots true"
+    }
+  ],
+  "pause_vs_sigkill_accounting": {
+    "new_phases_report": "all five cases are real SIGKILL: process_returncode -9 for a distinct real Rust process pid per case; the two takeover cases additionally SIGSTOP the old source first so the real node lease expires (explicitly not a SQL heartbeat edit, declared in report limits) and then SIGKILL the target controller",
+    "sidecar_matrix": "the crash hooks use the kill action; the sidecar-publication-with-concurrent-fresh-pin and cutover-with-pre-finalize-pin hooks use PAUSE as a concurrency-intersection probe, with pause also used to observe the post-recovery phase. The report carries hook_registration_counted_as_pass=false and declares hooks_unexercised explicitly",
+    "no_all_13_kill_claim": "13 registered hooks in the sidecar matrix is never presented as 13 executed or 13 killed hooks; logical phases are counted only when their own report lists them in phases_actual"
+  },
+  "documented_limits_preserved": [
+    "single trusted Linux host with separate volumes and one PostgreSQL authority; physical cross-host fencing stays with issue 26 and remains open",
+    "old source after takeover is fenced read-only with old volume bytes unchanged, while the supported ingress may still proxy and ACK (retired_source_push_supported_proxy_ack=true, retired_source_push_directly_rejected=false) - no claim that every old URL denies",
+    "no SQL route or replica readiness is forged (artificial_sql_route_or_replica_readiness=false, simulated_fields=false)",
+    "the historical old 16 MiB takeover generic 409 stays UNCLASSIFIED and is not claimed fixed; later passes are not a fix claim",
+    "takeover cases use SIGSTOP for lease expiry then SIGKILL; declared in report limits",
+    "reconcile window fixture of 34 rows is metadata-only (declared)",
+    "no hardware power-loss, multi-zone, cross-host HA or production scaling claim"
+  ],
+  "p2_inherited": [
+    {
+      "id": "P2-old-1",
+      "summary": "handoff_pending checks only receipt existence: lost live ci-pins evidence re-opens the old 409 path and corrupted or missing staging becomes a permanent 503",
+      "bound": "fail-closed, no silent authorization or data loss; operator-visible stuck state only"
+    },
+    {
+      "id": "P2-old-2",
+      "summary": "receipt replay rejects a legitimate release followed by a re-pin of the same job id after restart (409 published CI sidecar file is missing)",
+      "bound": "publication data correct; replay and startup verification only"
+    },
+    {
+      "id": "P2-old-3",
+      "summary": "orphan sidecar staging with no operation row is retained forever with no quarantine or audit signal",
+      "bound": "deliberate retain-on-unknown, no data loss; unbounded disk growth and no operator signal"
+    }
+  ],
+  "p3_resolved_or_noted": [
+    "P3-1 from the pending review (phases report recorded a source_base_commit that was not the binary lineage) is resolved: this report records source_base_commit 9f85c5a with binary 157748add, and the harness sha matches the file at HEAD",
+    "P3-2 (no per-case action field) remains a presentation nit: the kill-vs-pause split is documented in the report limits and in this review, and every case in the new report is a real SIGKILL",
+    "P3-3 (partition report has no top-level result field; passed by exit code) remains, harmless"
+  ],
+  "not_performed": [
+    "read-only review: no edits, no Cargo, no native runs, no network, no GitHub actions; only file reads, git plumbing, sha256 computation and JSON inspection"
+  ],
+  "closure_note": "issue 25 may close after the primary publishes the docs/evidence and the final claims review and merges; this verdict covers only the documented single-host separate-volume functional mode and does not extend to issue 26 physical cross-host fencing"
+}

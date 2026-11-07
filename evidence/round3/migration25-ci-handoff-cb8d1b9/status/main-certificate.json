@@ -1,0 +1,16 @@
+{
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "certificate": {
+    "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+    "built_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+    "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+    "role": "migration-integrated",
+    "source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+    "valid": true
+  },
+  "compiled_source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "harness_source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "production_inputs_identical_to_certified_compile": true,
+  "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+  "source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f"
+}

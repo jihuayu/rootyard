@@ -1,0 +1,109 @@
+{
+  "certificate": {
+    "role": "migration-integrated",
+    "source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+    "built_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+    "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+    "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+    "valid": true
+  },
+  "binary": "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+  "jobs": {
+    "rust-lib": {
+      "state": "passed",
+      "database": "round3_pando_rust_lib_1b238fedfc",
+      "command": [
+        "flock",
+        "/workspace/scratch/rootyard-round2/cargo.lock",
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/migration-extra/logs/rust-lib-1794028176.log",
+      "report": "/workspace/scratch/rootyard-round3/migration-extra/logs/rust-lib-1794028176.json",
+      "started": 1794028176.1936944,
+      "harness_sha256": null,
+      "exit_code": 0,
+      "finished": 1794028230.3673325,
+      "database_cleanup": "dropped_after_success"
+    },
+    "rust-pando": {
+      "state": "passed",
+      "database": "round3_pando_rust_pando_c87e2923fd",
+      "command": [
+        "flock",
+        "/workspace/scratch/rootyard-round2/cargo.lock",
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "pando_maintenance",
+        "--",
+        "--test-threads=1"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/migration-extra/logs/rust-pando-1794028230.log",
+      "report": "/workspace/scratch/rootyard-round3/migration-extra/logs/rust-pando-1794028230.json",
+      "started": 1794028230.4387717,
+      "harness_sha256": "b33017868dd1b97238006c4b17a348caf9bd1878545cc97be2f713ba7959cc0c",
+      "exit_code": 0,
+      "finished": 1794028297.3700686,
+      "database_cleanup": "dropped_after_success"
+    },
+    "schema": {
+      "state": "passed",
+      "database": "round3_pando_schema_b5bee5af57",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/schema_contract.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/migration-extra/logs/schema-1794028297.log",
+      "report": "/workspace/scratch/rootyard-round3/migration-extra/logs/schema-1794028297.json",
+      "started": 1794028297.4394205,
+      "harness_sha256": "aa596da54cd49ecb5ccffdc6a7344b6ef15a4c4d5d545daeb0c076d3ca4f4a11",
+      "exit_code": 0,
+      "finished": 1794028302.1749594,
+      "database_cleanup": "dropped_after_success"
+    },
+    "migration-phases": {
+      "state": "passed",
+      "database": "round3_pando_migration_phases_1afd5e8959",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/cluster_migration_phases_native.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round3/migration-extra/logs/migration-phases-1794028302.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/migration-extra/logs/migration-phases-1794028302.log",
+      "report": "/workspace/scratch/rootyard-round3/migration-extra/logs/migration-phases-1794028302.json",
+      "started": 1794028302.2313318,
+      "harness_sha256": "64dd92d717c68fe675deb73fd4857a52014d7ff59ed581bf8a1e33a1f411aac1",
+      "exit_code": 0,
+      "finished": 1794028347.686912,
+      "report_sha256": "705d01f5178e9122f6e674a17f262c3887c43679680d9594d9a6da5c450956d8",
+      "database_cleanup": "dropped_after_success"
+    }
+  },
+  "state": "passed",
+  "pid": 354610,
+  "updated": 1794028347.7056456,
+  "attempt_started": 1794028175.8373048,
+  "source_commit": "9f85c5adb4e1cfef5c114adbaceb2e74213f34ac",
+  "harness_commit": "9f85c5adb4e1cfef5c114adbaceb2e74213f34ac",
+  "compiled_source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "production_inputs_unchanged_after_compile": true,
+  "stage": "complete",
+  "finished": 1794028347.7056441
+}
