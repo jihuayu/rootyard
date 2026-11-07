@@ -68,6 +68,14 @@ pub struct QueueUsage {
     pub ready: usize,
     pub frozen: usize,
     pub pending_reads: usize,
+    /// Actor-observed `Fenced` phases. Incremented only where the actor itself
+    /// reads the phase, never by `MutationGate::fence`, so a zero delta means
+    /// the actor's bounded poll skipped a transient fence. Fixed cardinality:
+    /// no user identity, request identity or metric label.
+    pub fence_observations: usize,
+    /// Parked mutations dropped because their enqueue epoch did not match the
+    /// epoch of the admitted guard (a handoff raced the queued operation).
+    pub epoch_mismatch_rejections: usize,
 }
 
 /// Why the shim could not enqueue. Saturation is the only `EAGAIN`; a closed
@@ -227,6 +235,9 @@ struct Shared {
     /// the worker re-checks the shutdown flag before replying.
     deferred: Mutex<Vec<(u64, Arc<Mutex<Option<DeferredRead>>>)>>,
     next_deferred: AtomicUsize,
+    /// Fixed-cardinality actor diagnostics; see [`QueueUsage`].
+    fence_observations: AtomicUsize,
+    epoch_mismatch_rejections: AtomicUsize,
 }
 
 impl Shared {
@@ -236,11 +247,28 @@ impl Shared {
             wake: Condvar::new(),
             deferred: Mutex::new(Vec::new()),
             next_deferred: AtomicUsize::new(0),
+            fence_observations: AtomicUsize::new(0),
+            epoch_mismatch_rejections: AtomicUsize::new(0),
         })
     }
 
     fn lock(&self) -> MutexGuard<'_, WorkQueue<Queued>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn observe_fenced(&self) {
+        self.fence_observations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reject_epoch_mismatch(&self) {
+        self.epoch_mismatch_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn diagnostics(&self) -> (usize, usize) {
+        (
+            self.fence_observations.load(Ordering::Relaxed),
+            self.epoch_mismatch_rejections.load(Ordering::Relaxed),
+        )
     }
 
     fn push_ready(&self, queued: Queued) -> Option<Queued> {
@@ -369,6 +397,18 @@ struct Actor {
 }
 
 impl Actor {
+    /// Read the gate phase for one actor decision and count a genuinely
+    /// observed `Fenced` phase. `MutationGate::fence` never increments this
+    /// counter, so a zero delta means the actor's 10 ms poll skipped the
+    /// transient fence entirely.
+    fn phase(&self) -> GatePhase {
+        let phase = self.gate.phase();
+        if phase == GatePhase::Fenced {
+            self.shared.observe_fenced();
+        }
+        phase
+    }
+
     fn run(mut self) {
         loop {
             // Shutdown wins over phase handling: a queued mutation must not be
@@ -379,7 +419,7 @@ impl Actor {
                 self.shared.drain_deferred(libc::EIO);
                 return;
             }
-            match self.gate.phase() {
+            match self.phase() {
                 GatePhase::Fenced => self.fail_frozen(libc::EROFS),
                 GatePhase::Healthy => self.drain_frozen(),
                 GatePhase::Frozen => {}
@@ -418,7 +458,7 @@ impl Actor {
     /// Drain the parked mutation FIFO in order once the gate is healthy again.
     fn drain_frozen(&mut self) {
         loop {
-            if self.gate.phase() != GatePhase::Healthy {
+            if self.phase() != GatePhase::Healthy {
                 return;
             }
             let Some(queued) = self.shared.take_frozen_front() else { return };
@@ -430,7 +470,7 @@ impl Actor {
 
     fn route(&mut self, queued: Queued) {
         let mutation = queued.op.is_mutation();
-        match self.gate.phase() {
+        match self.phase() {
             GatePhase::Fenced if mutation => queued.op.fail(libc::EROFS),
             GatePhase::Frozen if mutation => self.shared.push_frozen_back(queued),
             _ => {
@@ -451,6 +491,7 @@ impl Actor {
         match gate.mutation() {
             Ok(guard) => {
                 if !epoch_matches(epoch, guard.epoch()) {
+                    self.shared.reject_epoch_mismatch();
                     drop(guard);
                     op.fail(libc::EROFS);
                     return false;
@@ -633,7 +674,18 @@ impl Dispatcher {
         let (global_ops, global_bytes) = self.global_budget.used();
         let (ready, frozen) = self.shared.lens();
         let pending_reads = self.shared.pending_deferred();
-        QueueUsage { mount_ops, mount_bytes, global_ops, global_bytes, ready, frozen, pending_reads }
+        let (fence_observations, epoch_mismatch_rejections) = self.shared.diagnostics();
+        QueueUsage {
+            mount_ops,
+            mount_bytes,
+            global_ops,
+            global_bytes,
+            ready,
+            frozen,
+            pending_reads,
+            fence_observations,
+            epoch_mismatch_rejections,
+        }
     }
 
     pub(super) fn shutdown(&self) {
