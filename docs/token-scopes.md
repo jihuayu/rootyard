@@ -2,18 +2,13 @@
 
 > **Status:** the authorisation helpers, the discovery predicates, the common
 > repository/namespace action enforcement and the browser-login rejection are
-> wired in *this* integration branch. A private management API/UI for restricted
-> PATs is staged separately (`/api/tokens`, `/api/sessions`,
-> `/web/settings/tokens`, `/web/settings/sessions`; see
-> `docs/token-management.md`), but it is **not** released: the Git CAS
-> parent-token lock is still missing, exact browser-child inheritance for a
-> restricted parent remains unimplemented, and the native management suite has
-> not been executed by the implementation worker. The existing CLI
-> `create-token` continues to issue unrestricted tokens and is unchanged. The
-> schema/backup contract is now schema 136 / backup format 12 with real
-> SQL-generated fixtures; the native format12 legacy135 restore drill has not
-> been executed yet, so this remains a private integration branch and is not
-> evidence that schema136 is production ready. Do not publish or deploy it.
+> wired in this private integration branch. The management API/UI and the
+> parent-owned Git publication token lock are integrated. Real HTTP/DB/Git
+> acceptance of their combined implementation is pending; no release is claimed.
+> Restricted parent tokens are refused browser login, so this path cannot widen
+> their scope. Restricted browser-child inheritance remains unsupported.
+> The existing CLI still issues legacy unrestricted API tokens.
+
 
 ## Integration provenance
 
@@ -105,8 +100,8 @@ grants and increment `scope_version` in one transaction. `narrow_repository_scop
 and `revoke_repository_scope` implement this and can only remove rows; they
 never insert or widen. Grant insertion (`grant_repository_for_test`,
 `grant_namespace_for_test`) is `#[cfg(test)]`-only and lives in
-`src/token_scopes/tests.rs`: no production issuance helper exists while the
-API/CLI/UI is unwired.
+`src/token_scopes/tests.rs`: the shared token-management service now issues and updates restricted tokens
+under a per-user management lock and token row lock; its native acceptance is pending.
 
 ## Browser sessions
 
@@ -122,19 +117,17 @@ API/CLI/UI is unwired.
   as live for scope purposes. Exact parent binding/inheritance for restricted
   tokens remains unimplemented future work.
 
-## Release blockers (not claimed as done)
+## Publication boundary and remaining acceptance
 
-* No public issuer: no API, CLI flag or UI creates or edits restricted grants.
-  Seeding restricted authority requires SQL in a test schema. This issue cannot
-  be counted complete while that remains true.
-* The late repository scope check (`authorize_repository_late`) takes `FOR SHARE`
-  until commit **only when the caller supplies a real transaction**. A bare
-  auto-commit `GenericClient` — which the Git HTTP publication path still uses —
-  gets only the instantaneous statement check. The parent-token lock held across
-  the Git CAS is therefore still a release blocker for Git-backed writes with
-  restricted tokens; this branch does not claim it.
-* `ryj_` CI credentials are independent; scopes cannot grant trusted-check or
-  operator identity.
+After slow quota checks, the Git coordinator asks the existing publication owner
+transaction to lock and verify the token before the grant marker or ACK. Lock
+order is exact-ref advisory, repository advisory, local writer, token FOR SHARE,
+then native CAS. No extra pooled connection is acquired. If publication locks
+first, revocation/narrowing waits until child quiescence and journal settlement;
+if revocation commits first, late authorization denies publication. Closed
+receivers are checked before and after authorization. Native barrier acceptance
+of this new boundary is still pending, as is the management HTTP/rotation/CSRF
+suite. CI and operator/trusted-check authority remain independent.
 
 ## Verification
 
@@ -149,15 +142,13 @@ API/CLI/UI is unwired.
   `clock_timestamp()`, and a `FOR UPDATE` grant writer is observed blocked via
   `pg_blocking_pids` until the reader commits. `FOR SHARE` is only meaningful
   because those readers hold a real transaction until commit.
-* `tests/pat_scope_auth.py` is the native end-to-end harness. It has **not been
-  executed** in this branch (no cargo build, no native run): it needs
-  `ROOTYARD_TEST_DATABASE_URL` and a built binary. It asserts exact status codes
-  and shapes for: restricted list/metadata (200/403), empty grant set
-  (`200 []` + `403`), grant-scoped issue create (`201`) vs read-only issue create
-  (`403`), organisation-team RBAC + grant discovery, grant deletion (`403`), token
-  revocation (`401`), legacy unrestricted read/write, and restricted-parent
-  browser login (`POST /web/login`, form-urlencoded, `Origin` set → `403` with no
-  `Set-Cookie`).
+* The Git-native publication fence harness is pending. Its initial psql
+  termination, row-lock evidence and marker/SIGSTOP race defects are being fixed
+  before execution; it is not accepted native evidence.
+* Foundation executable SHA256
+  `38ad0ba7c445db156514a5650c408b59ac8feaabec33001167b7980e1d38334e`
+  from source `6a72c41` passed twelve scope HTTP cases and actual-binary schema136
+  checks. These results predate management/CAS and do not validate those additions.
 
 ## Contract status
 
@@ -170,9 +161,10 @@ genuine format11/schema135 archive only with
 `--allow-legacy-schema135`, upgrading it through migration 136 in the same
 restore session. The old format 4-10 contracts and their opt-ins are unchanged.
 
-Not yet verified: no cargo build, clippy run, native format12 restore drill or
-`tests/backup_legacy135_scopes.py` execution was performed in this task. The
-shared legacy runner now targets schema 136 for the 132/133/134/135 source
-profiles and checks the restored PAT columns, token-scope tables and legacy
-tokens' `is_restricted = false` default, but it still requires the coordinator's
-prebuilt legacy binary. Native execution remains the publish gate.
+That foundation executable also passed seven genuine format11/schema135 archive
+cases using previous executable SHA256
+`9faf71fd95691a358157be0442e2efc47b595a67d0aa3aa9d0404d5266c51a96`:
+strict opt-in, one new authority for two repositories, migrated scope defaults,
+revoked browser credentials, exact clone/fetch/fsck and intact source objects.
+The coordinator retains these attested reports. The combined management/CAS
+candidate still needs its own build receipt and native gates.
