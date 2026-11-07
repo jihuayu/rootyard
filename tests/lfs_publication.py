@@ -22,9 +22,26 @@ class PublicationHarness(LfsHarness):
             "missing": f"version https://git-lfs.github.com/spec/v1\noid sha256:{missing}\nsize 13\n",
             "wrong_size": f"version https://git-lfs.github.com/spec/v1\noid sha256:{self.oid}\nsize {self.size+1}\n",
             "invalid": "version https://git-lfs.github.com/spec/v1\noid sha256:not-hex\nsize 13\n",
+            "crlf_missing": f"version https://git-lfs.github.com/spec/v1\r\noid sha256:{missing}\r\nsize 13\r\n",
+            "crlf_wrong_size": f"version https://git-lfs.github.com/spec/v1\r\noid sha256:{self.oid}\r\nsize {self.size+1}\r\n",
             "ready_missing_bytes": f"version https://git-lfs.github.com/spec/v1\noid sha256:{self.oid}\nsize {self.size}\next-test missing\n",
             "ready_corrupt_bytes": f"version https://git-lfs.github.com/spec/v1\noid sha256:{self.oid}\nsize {self.size}\next-test corrupt\n",
         }
+        # The installed client accepts a CRLF pointer (non-strict check) while
+        # --strict rejects only its canonical encoding. Record both exits so the
+        # gateway normalization is justified by the client's actual behaviour.
+        crlf_fixture = self.root / "crlf-pointer.txt"
+        crlf_fixture.write_bytes(pointer_bodies["crlf_wrong_size"].encode())
+        client_check = {"available": False}
+        if self.run(["git", "lfs", "version"], check=False).returncode == 0:
+            nonstrict = self.run(["git", "lfs", "pointer", "--check", "--file",
+                                  str(crlf_fixture)], check=False)
+            strict = self.run(["git", "lfs", "pointer", "--check", "--strict", "--file",
+                               str(crlf_fixture)], check=False)
+            client_check = {"available": True, "nonstrict_exit": nonstrict.returncode,
+                            "strict_exit": strict.returncode}
+            assert nonstrict.returncode == 0, "installed git-lfs does not recognize the CRLF pointer"
+            assert strict.returncode != 0, "installed git-lfs --strict unexpectedly accepts CRLF"
         zero = "0" * 40
         for kind, pointer in pointer_bodies.items():
             held = self.obj_file.with_name(".held-" + self.oid)
@@ -85,10 +102,31 @@ class PublicationHarness(LfsHarness):
                 held.rename(self.obj_file)
             elif kind == "ready_corrupt_bytes":
                 self.obj_file.write_bytes(original)
+        # A CRLF pointer to this repository's ready, digest-verified object must
+        # still publish; line-ending normalization must not become over-rejection.
+        crlf_valid = (f"version https://git-lfs.github.com/spec/v1\r\n"
+                      f"oid sha256:{self.oid}\r\nsize {self.size}\r\n")
+        self.git("reset", "--hard", main, cwd=self.work)
+        (self.work / "pointer.dat").write_bytes(crlf_valid.encode())
+        self.git("add", "pointer.dat", cwd=self.work)
+        self.git("commit", "-m", "valid crlf pointer", cwd=self.work)
+        crlf_head = self.git("rev-parse", "HEAD", cwd=self.work).stdout.decode().strip()
+        crlf_ref = "refs/heads/crlf-valid"
+        crlf_push = self.git("push", "origin", f"HEAD:{crlf_ref}", cwd=self.work,
+                             token=self.alice, check=False)
+        assert crlf_push.returncode == 0, self.redact(
+            "valid CRLF pointer push rejected: "
+            + crlf_push.stderr.decode(errors="replace")[-1000:])
+        remote_head = self.git("ls-remote", self.remote, crlf_ref,
+                               token=self.alice).stdout.decode().split()
+        assert remote_head and remote_head[0] == crlf_head, remote_head
         return {"pointer_kinds": sorted(pointer_bodies),
                 "publication_paths": ["smart_http_receive", "atomic_smart_http_receive",
                                       "ref_transaction", "pull_merge"],
-                "rejected_before_ref_move": True}
+                "rejected_before_ref_move": True,
+                "crlf_client_pointer_check": client_check,
+                "crlf_valid_pointer_published": True,
+                "crlf_valid_ref": crlf_ref}
 
 
 def main():

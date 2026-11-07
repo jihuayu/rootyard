@@ -17,6 +17,38 @@ const MAX_SMALL_BLOBS: usize = 4_096;
 const MAX_LIST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_POINTER_BYTES: usize = 1024;
 
+/// The canonical Git LFS v1 pointer version line. Installed clients accept a
+/// CRLF terminator here (`git lfs pointer --check` exits 0 while `--strict`
+/// rejects it), so this gate must recognize it too; otherwise a CRLF pointer to
+/// missing or wrong-size bytes would be treated as ordinary content and skip
+/// verification.
+const POINTER_VERSION_LINE: &[u8] = b"version https://git-lfs.github.com/spec/v1";
+
+fn starts_lfs_pointer(bytes: &[u8]) -> bool {
+    let Some(rest) = bytes.strip_prefix(POINTER_VERSION_LINE) else {
+        return false;
+    };
+    rest.starts_with(b"\n") || rest.starts_with(b"\r\n")
+}
+
+/// Bounded CRLF -> LF normalization so the canonical v1 parser sees the same
+/// field lines regardless of the writer's line ending style. Only applied to
+/// blobs already recognized as pointer-shaped, so ordinary text is untouched.
+fn normalize_pointer_line_endings(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            out.push(b'\n');
+            index += 2;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
 pub(crate) async fn git_input(
     git_dir: &Path,
     git_bin: &Path,
@@ -283,10 +315,11 @@ pub async fn validate_new_refs_with_client<C: GenericClient + Sync>(
             .ok_or(Error(StatusCode::CONFLICT, "truncated Git blob batch"))?;
         let bytes = &payload[cursor..end];
         cursor = end + 1;
-        if !bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
+        if !starts_lfs_pointer(bytes) {
             continue;
         }
-        let spec = models::parse_pointer(bytes)
+        let normalized = normalize_pointer_line_endings(bytes);
+        let spec = models::parse_pointer(&normalized)
             .ok_or(Error(StatusCode::CONFLICT, "invalid LFS pointer"))?;
         if !inspected_lfs_oids.insert(spec.oid.clone()) {
             continue;

@@ -77,10 +77,51 @@ pub async fn ensure_readable(
     {
         return Ok(false);
     }
+    hydrate_verified_remote(&store, &key, data_root, repo_id, oid, size, deadline).await
+}
+
+/// Downloads a remote object into a unique staging file inside this repository's
+/// LFS directory, verifies digest, size, mode and link count, then atomically
+/// renames it over the immutable oid path. The final path therefore only ever
+/// holds complete, verified bytes, and concurrent cold readers stage
+/// independently. Only this request's own staging file is removed on failure.
+async fn hydrate_verified_remote(
+    store: &RemoteObjectStore,
+    key: &ObjectKey,
+    data_root: &Path,
+    repo_id: Uuid,
+    oid: &str,
+    size: u64,
+    deadline: Instant,
+) -> Result<bool> {
     let dir = ensure_repo_lfs_dir(data_root, repo_id)?;
-    let dest = dir.join(oid);
-    store.get_to_file(&key, &dest, size, deadline).await?;
-    tokio::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).await?;
+    let final_path = object_path(data_root, repo_id, oid)?;
+    let temp_path = dir.join(format!(".tmp-{}", Uuid::new_v4()));
+    let mut guard = StagingFileGuard::new(temp_path.clone());
+
+    store.get_to_file(key, &temp_path, size, deadline).await?;
+
+    let staged = temp_path.clone();
+    let staged_oid = oid.to_owned();
+    let staged_ok = tokio::task::spawn_blocking(move || -> Result<bool> {
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
+        File::open(&staged)?.sync_all()?;
+        verify_path_integrity_bounded(&staged, &staged_oid, size, deadline)
+    })
+    .await??;
+    if !staged_ok {
+        return Ok(false);
+    }
+
+    let rename_target = final_path;
+    let dir_for_sync = dir;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        fs::rename(&temp_path, &rename_target).context("failed to publish hydrated LFS object")?;
+        File::open(&dir_for_sync)?.sync_all()?;
+        Ok(())
+    })
+    .await??;
+    guard.disarm();
     verify_local_until(data_root, repo_id, oid, size, deadline).await
 }
 
@@ -192,13 +233,24 @@ fn verify_object_integrity_bounded(
     deadline: Instant,
 ) -> Result<bool> {
     let path = object_path(data_root, repo_id, oid)?;
-    if !journal::exists(&path)? {
+    verify_path_integrity_bounded(&path, oid, expected_size, deadline)
+}
+
+/// Verifies an object file (the immutable oid path or our own staging file)
+/// against the expected digest, size, mode and link count.
+fn verify_path_integrity_bounded(
+    path: &Path,
+    expected_oid: &str,
+    expected_size: u64,
+    deadline: Instant,
+) -> Result<bool> {
+    if !journal::exists(path)? {
         return Ok(false);
     }
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)?;
+        .open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file()
         || meta.nlink() != 1
@@ -229,7 +281,7 @@ fn verify_object_integrity_bounded(
         return Ok(false);
     }
     let digest = hex::encode(hasher.finalize());
-    Ok(digest == oid)
+    Ok(digest == expected_oid)
 }
 
 pub async fn check_repo_quota(
