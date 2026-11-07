@@ -649,9 +649,13 @@ class CgroupSandboxTest(unittest.TestCase):
                 [
                     "/bin/sh",
                     "-c",
-                    "mkdir -p /artifacts; "
-                    "dd if=/dev/zero of=/workspace/fill bs=1M count=128 2>/tmp/dd.err || printf 'disk-full\\n'; "
-                    "printf 'artifact-ok' > /artifacts/result.txt; tail -2 /tmp/dd.err",
+                    # LC_ALL=C keeps the kernel ENOSPC text deterministic, and
+                    # the whole (tiny, bounded) dd stderr is kept: coreutils dd
+                    # writes error + two summary lines, so `tail -2` would drop
+                    # the actual "No space left on device" line.
+                    "export LC_ALL=C; mkdir -p /artifacts; "
+                    "dd if=/dev/zero of=/workspace/fill bs=1M count=128 2>/tmp/dd.err || printf 'disk-full\n'; "
+                    "printf 'artifact-ok' > /artifacts/result.txt; cat /tmp/dd.err",
                 ],
                 60,
             )
