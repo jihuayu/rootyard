@@ -54,8 +54,6 @@ class CiMirrorTrack3Test(unittest.TestCase):
             self.assertLessEqual(sub_lines, 700, f"{submod} exceeds modular size bound ({sub_lines} lines)")
         auto_origin_lines = len((ROOT / "src" / "mirror" / "auto_origin.rs").read_text().splitlines())
         self.assertGreaterEqual(auto_origin_lines, 120)
-        # Bound intentionally kept at 450: auto_origin.rs is 452 lines and is pending
-        # extraction by the source-decomposition worker; never raise this bound.
         self.assertLess(auto_origin_lines, 450)
 
     def test_staged_migration_030_ci_mirror_sql_contract(self):
@@ -381,7 +379,6 @@ class CiMirrorTrack3Test(unittest.TestCase):
         auto_lines = len(auto_origin_path.read_text().splitlines())
         self.assertLess(mirror_lines, 140)
         self.assertGreaterEqual(auto_lines, 120)
-        # Same pending-extraction cap as the modular test above: never raised to mask size.
         self.assertLess(auto_lines, 450)
 
         mirror_src = mirror_rs_path.read_text()

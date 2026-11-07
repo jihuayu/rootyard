@@ -352,10 +352,6 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         self.assertEqual(schema_baseline.LATEST_VERSION, latest)
         self.assertEqual(schema_baseline.LATEST_PREFIX, f"{latest:03d}")
         self.assertGreaterEqual(latest, 60)
-        self.assertEqual(
-            (ROOT / f"schema/{schema_baseline.LATEST_PREFIX}_catalog.json").read_bytes(),
-            (ROOT / f"schema/{latest:03d}_catalog.json").read_bytes(),
-        )
 
         staged_pairs = [
             ("migrations/009_forge_pulls.sql", "src/pulls/009_forge_pulls.sql", 9),
@@ -455,7 +451,10 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         self.assertEqual(len(created_order), schema_baseline.TABLE_COUNT)
         self.assertEqual(set(created_order), schema_baseline.EXPECTED_TABLES)
         expected_composite = {
+            "ci_checkout_delegations",
             "ci_checkout_jobs",
+            "ci_integration_checkout_jobs",
+            "ci_runs",
             "forge_branch_rules",
             "forge_check_runs",
             "forge_creation_requests",
@@ -463,11 +462,15 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             "forge_issues",
             "forge_pull_counters",
             "forge_pulls",
+            "forge_trusted_check_contexts",
             "forge_webhook_callbacks",
             "forge_webhook_deliveries",
             "forge_webhooks",
             "git_operations",
+            "lfs_locks",
             "lfs_objects",
+            "pando_pack_manifests",
+            "pando_repository_states",
             "repository_audit_log",
             "repository_collaborators",
             "repository_shard_routes",
@@ -475,6 +478,30 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             "shard_failover_operations",
         }
         self.assertEqual(composite_tenant_tables, expected_composite)
+        # CREATE declarations include the historical actor/owner FK on
+        # git_operations. Later RBAC migrations separate its actor from the
+        # repository owner so collaborators can publish. Validate the current
+        # tenant FKs too, including constraints introduced through ALTER TABLE.
+        live = json.loads(schema_baseline.CATALOG_JSON_PATH.read_text())
+        current_composite = set()
+        for constraint in live["constraints"]:
+            definition = constraint["definition"].replace("public.", "").replace('"', "")
+            if re.search(
+                r"FOREIGN KEY \(repository_id, (?:tenant_id|owner_id)\) "
+                r"REFERENCES repositories\(id, owner_id\)", definition,
+            ):
+                current_composite.add(constraint["table"])
+        self.assertEqual(current_composite, expected_composite - {"git_operations"})
+        # Comments/reviews inherit tenant+repository identity through their
+        # composite issue/PR parent rather than a second direct repository FK.
+        for table, parent, number in (
+            ("forge_issue_comments", "forge_issues", "issue_number"),
+            ("forge_pull_reviews", "forge_pulls", "pull_number"),
+        ):
+            expected = (f"FOREIGN KEY (tenant_id, repository_id, {number}) "
+                        f"REFERENCES public.{parent}(tenant_id, repository_id, number)")
+            self.assertTrue(any(c["table"] == table and c["definition"] == expected
+                                for c in live["constraints"]), f"{table} lost its tenant-scoped parent FK")
 
     def test_backup_tables_lexicographical_lock_ordering_and_advisory_lock_barrier(self) -> None:
         info = e2e_tiers.SchemaBoundaryIntegrationFixture.verify_backup_tables_parity()
@@ -482,8 +509,8 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         self.assertEqual(info["tables"], sorted(schema_baseline.EXPECTED_TABLES))
         self.assertEqual(info["catalog"], f"schema/{schema_baseline.LATEST_PREFIX}_catalog.json")
         self.assertIsInstance(info["format"], int)
-        # Sequences stay in the locked relation list even though only ordinary
-        # tables are counted for parity.
+        # The full catalog includes non-table relations. The snapshot's LOCK
+        # TABLE list uses only the ordinary-table subset, not those views.
         self.assertTrue(set(info["tables"]) < set(info["relations"]))
         self.assertEqual(info["relations"], sorted(info["relations"]))
 

@@ -58,8 +58,6 @@ class BrowseAndLfsContractTest(unittest.TestCase):
             content = path.read_text()
             self.assertGreater(len(content.strip()), 0, f"Empty file: {path}")
             if path.suffix == ".rs":
-                # Cap intentionally kept at 550: src/browse/git_read.rs (591 lines) is pending
-                # extraction by the source-decomposition worker; never raise this bound.
                 self.assertLessEqual(
                     len(content.splitlines()),
                     550,
