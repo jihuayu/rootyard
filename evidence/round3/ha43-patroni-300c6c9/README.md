@@ -228,3 +228,7 @@ this bundle.
 Issue links: [#43](https://github.com/jihuayu/rootyard/issues/43),
 [#44](https://github.com/jihuayu/rootyard/issues/44); roadmap #48 stays open.
 Acceptance summary: [`docs/acceptance/round3-ha43.md`](../../../docs/acceptance/round3-ha43.md).
+
+## Publication provenance note
+
+The descriptive `scope` in the verbatim `source-equivalence.json` retains the initial be247 composition label. Its `deployment_commit` and the status harness SHA identify the actual 300c6c9 run at ac54f71. The manifest records publication-time cleanliness separately from the clean test run (`report.json: source_worktree_dirty=false`); generating evidence made the publication tree dirty before it was committed.
