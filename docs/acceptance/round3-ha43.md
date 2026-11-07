@@ -96,3 +96,5 @@ Source review of the current `300c6c9` delta: `source-review.json` (0 P1,
 result is the `passed` status/report above). Evidence only: no production,
 schema or test change in this delivery. See also
 [operations: HA profile](../operations-HA.md).
+
+The [final publication review](../../evidence/round3/ha43-publication-review.json) allows merge with zero P1/P2. Its two wording observations are clarified in the bundle publication-provenance note; the copied raw source-equivalence record is preserved.
