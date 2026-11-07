@@ -1,5 +1,5 @@
 //! Durable, fail-closed publication of shard volume markers.
-use crate::{AppState, Error, auth, db::Identity, sharding::{fencing::write_volume_marker_at, models::{VolumeFenceMarker, conflict}}};
+use crate::{AppState, Error, auth, db::Identity, sharding::{faults, fencing::write_volume_marker_at, models::{VolumeFenceMarker, conflict}}};
 use deadpool_postgres::Transaction;
 use uuid::Uuid;
 
@@ -28,6 +28,12 @@ pub async fn commit_and_publish(
     transition_id: Uuid,
 ) -> Result<(), Error> {
     auth::finish_tx(tx, actor, true).await?;
+    faults::hit(
+        &state.storage.root,
+        "cutover-after-commit",
+        serde_json::json!({"repository_id": marker.repository_id, "transition_id": transition_id,
+                          "route_epoch": marker.route_epoch, "storage_generation": marker.storage_generation}),
+    );
     publish(state, marker, transition_id).await
 }
 
@@ -105,6 +111,11 @@ pub async fn reconcile_pending(state: &AppState) -> Result<(), Error> {
         let marker: VolumeFenceMarker = serde_json::from_value(target).map_err(Error::internal)?;
         let mutation = super::locks::exclusive(state, marker.repository_id).await?;
         mutation.ensure_active()?;
+        faults::hit(
+            &state.storage.root,
+            "recover-before-reconcile",
+            serde_json::json!({"repository_id": marker.repository_id, "transition_id": id}),
+        );
         publish(state, &marker, id).await?;
     }
     Ok(())

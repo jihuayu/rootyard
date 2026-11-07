@@ -1,0 +1,86 @@
+{
+  "state": "failed",
+  "pid": 305126,
+  "started": 1794023570.113959,
+  "jobs": {
+    "sidecar-crash": {
+      "state": "passed",
+      "database": "round3_migration_sidecar_crash_d2fb7604b3",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "/workspace/rootyard-worktrees/round3-migration25/tests/cluster_migration_sidecar_native.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/migration25/artifacts/f9ea54f9a7281bb6cd72538ebb3b9c0a456ee0aa/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round3/migration25/logs/coordinator-sidecar-crash.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/migration25/logs/coordinator-sidecar-crash.log",
+      "report": "/workspace/scratch/rootyard-round3/migration25/logs/coordinator-sidecar-crash.json",
+      "started": 1794023570.8028886,
+      "harness_sha256": "29423ea3c0fc90303740c263f8e58b695a4fe4bcaa9070e28eca94010a7026b0",
+      "exit_code": 0,
+      "finished": 1794023788.4114513,
+      "report_sha256": "e0bfe3f4fcb6481f24ef51fde9876a96c9aece530a088cfa5023fc628c76a2e8",
+      "database_cleanup": "dropped_after_success"
+    },
+    "migration": {
+      "state": "passed",
+      "database": "round3_migration_migration_04075618bb",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "/workspace/rootyard-worktrees/round3-migration25/tests/cluster_migration_native.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/migration25/artifacts/f9ea54f9a7281bb6cd72538ebb3b9c0a456ee0aa/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round3/migration25/logs/coordinator-migration.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/migration25/logs/coordinator-migration.log",
+      "report": "/workspace/scratch/rootyard-round3/migration25/logs/coordinator-migration.json",
+      "started": 1794023788.4864192,
+      "harness_sha256": "fc812390917caf6e93827459e89c941526b52176fce3b48a266c503027ed7ef5",
+      "exit_code": 0,
+      "finished": 1794023804.4842842,
+      "report_sha256": "6df88eea355dc82d74771c5c8176f71274b9ae3edd647ce41aaacfc21dc6510f",
+      "database_cleanup": "dropped_after_success"
+    },
+    "takeover": {
+      "state": "failed",
+      "database": "round3_migration_takeover_d2b566e623",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "/workspace/rootyard-worktrees/round3-migration25/tests/cluster_takeover_native.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/migration25/artifacts/f9ea54f9a7281bb6cd72538ebb3b9c0a456ee0aa/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round3/migration25/logs/coordinator-takeover.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/migration25/logs/coordinator-takeover.log",
+      "report": "/workspace/scratch/rootyard-round3/migration25/logs/coordinator-takeover.json",
+      "started": 1794023804.5466783,
+      "harness_sha256": "72f9ca1c320566015d2db44c2b1fab3d91477c0c0e3b30b0b425d69deeed1039",
+      "exit_code": 1,
+      "finished": 1794023830.0731907
+    }
+  },
+  "updated": 1794023830.0736232,
+  "production_inputs_identical_to_certified_compile": true,
+  "compiled_source_commit": "f661e3f1ee42a22429954d8d897837f63c45e990",
+  "harness_source_commit": "f9ea54f9a7281bb6cd72538ebb3b9c0a456ee0aa",
+  "source_commit": "f9ea54f9a7281bb6cd72538ebb3b9c0a456ee0aa",
+  "certificate": {
+    "role": "migration25",
+    "source_commit": "f9ea54f9a7281bb6cd72538ebb3b9c0a456ee0aa",
+    "built_commit": "f661e3f1ee42a22429954d8d897837f63c45e990",
+    "production_inputs_sha256": "6d9421eb7457754b1d0272d7af594c15c32cc9ba98495dda4d44cf262ee4e536",
+    "binary_sha256": "c564ba147bddc7bac2be493cc84318888151dec40c3a13035f03966efea7172c",
+    "valid": false
+  },
+  "binary": "/workspace/scratch/rootyard-round3/migration25/artifacts/f9ea54f9a7281bb6cd72538ebb3b9c0a456ee0aa/rootyard",
+  "binary_sha256": "c564ba147bddc7bac2be493cc84318888151dec40c3a13035f03966efea7172c",
+  "production_inputs_sha256": "6d9421eb7457754b1d0272d7af594c15c32cc9ba98495dda4d44cf262ee4e536",
+  "failed_job": "takeover",
+  "finished": 1794023830.073612
+}

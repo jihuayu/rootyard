@@ -52,6 +52,15 @@ pub(super) async fn pin_inner(
             "repository not ready",
         ));
     }
+    if crate::sharding::sidecar::handoff_pending(&state, repo.id)
+        .await
+        .map_err(|_| Error(StatusCode::SERVICE_UNAVAILABLE, "CI sidecar handoff pending; retry"))?
+    {
+        return Err(Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CI sidecar handoff pending; retry",
+        ));
+    }
     let _slot = state.git_slots.clone().try_acquire_owned().map_err(|_| {
         Error(
             StatusCode::SERVICE_UNAVAILABLE,

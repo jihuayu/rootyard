@@ -1,0 +1,133 @@
+{
+  "acceptance": {
+    "closable_25": true,
+    "issue_closes_only_after_primary_final_publication_review_and_merge": true,
+    "source_review": "bounded-approve 0 P1 / 3 inherited P2",
+    "verdict": "ACCEPT_FOR_DOCUMENTED_MODE"
+  },
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "case_counts": {
+    "migration_phases_cases": 5,
+    "migration_phases_returncodes": [
+      -9,
+      -9,
+      -9,
+      -9,
+      -9
+    ],
+    "partition_coordinator_exit": 0,
+    "partition_has_top_level_result": false,
+    "rust_lib_stdout": "145 passed",
+    "rust_pando_stdout": "1 passed",
+    "schema_stdout_version": 132,
+    "sidecar_hooks_registered": 13,
+    "sidecar_hooks_unexercised": 5,
+    "sidecar_phases_actual": 10
+  },
+  "compiled_production_source": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "evidence_role": "permanent round-3 issue #25 CI handoff/migration acceptance handoff evidence",
+  "extra_jobs": {
+    "migration-phases": 0,
+    "rust-lib": 0,
+    "rust-pando": 0,
+    "schema": 0
+  },
+  "files": {
+    "README.md": {
+      "bytes": 9243,
+      "sha256": "79dce277b9852bc9f95f352546624b7d7b84187ba64c5e65762e793e60532e2d"
+    },
+    "attempts/pre-second-review-takeover-409/coordinator-status.json": {
+      "bytes": 4252,
+      "sha256": "f61af01e8369fb57ef670aeda02a2de3a38c0a9c552e0516e5ab5c75799e9651"
+    },
+    "attempts/pre-second-review-takeover-409/coordinator-takeover.log": {
+      "bytes": 867,
+      "sha256": "b9bbf449d76d1480cd07b7c6a6b5813fe4fc60d81d6517c81eaf1c0b3b978732"
+    },
+    "logs/rust-lib-1794028176.log": {
+      "bytes": 13772,
+      "sha256": "404141837bd90213e12937aa3e63671b84c15b9ab87c7d0c9fb3a34f35b48500"
+    },
+    "logs/rust-pando-1794028230.log": {
+      "bytes": 3837,
+      "sha256": "5300ffef67ac9c0f7f1ab3b3dcc038399d2f884d407c5e45bd886d5aa9542ab4"
+    },
+    "logs/schema-1794028297.log": {
+      "bytes": 299,
+      "sha256": "0da544241a2596a345f9bef7b921df89c21502dd33f6e5e89d8bca97e141a658"
+    },
+    "reports/migration-phases.json": {
+      "bytes": 8004,
+      "sha256": "705d01f5178e9122f6e674a17f262c3887c43679680d9594d9a6da5c450956d8"
+    },
+    "reports/migration.json": {
+      "bytes": 1574,
+      "sha256": "8224193fe0016198c09d1ac7736a0b78249f81509491b69867be91d31150e958"
+    },
+    "reports/partition.json": {
+      "bytes": 1875,
+      "sha256": "b68ab61cecbd92f4817192cc0b38610a557e7d7cf0709180159d0d044c4351de"
+    },
+    "reports/sidecar-crash.json": {
+      "bytes": 2213,
+      "sha256": "c6e83405182660024553be3872b19d9a4bd6b87517ad286b77245eec4d7ba7ab"
+    },
+    "reports/takeover.json": {
+      "bytes": 2273,
+      "sha256": "690cf3f023e8056e82e3bb74d163fecc1476548dccb86ede0b2e7a0986a0179c"
+    },
+    "reviews/acceptance-review.json": {
+      "bytes": 12599,
+      "sha256": "b2dcf1450663a7e2ac0396f79699a0b014e4aa2e55ebf758e0da8821cd56a9c3"
+    },
+    "reviews/source-review.json": {
+      "bytes": 8868,
+      "sha256": "d1f02778d3e75e4ddb1eeaaa0aefb2f522f9f8617f8b907059a7ee709f970430"
+    },
+    "source-inputs-after.json": {
+      "bytes": 32569,
+      "sha256": "1468d0f93ce3d1732881eca82f5d212d2f1dcce10d3c12b5f0a5dc2440bb165c"
+    },
+    "source-inputs.json": {
+      "bytes": 32569,
+      "sha256": "1468d0f93ce3d1732881eca82f5d212d2f1dcce10d3c12b5f0a5dc2440bb165c"
+    },
+    "status/extra-status.json": {
+      "bytes": 4642,
+      "sha256": "8021fd2022a66db90a3b1cf1197b3b8646be6a1d82481091a681b32501149841"
+    },
+    "status/main-binary.sha256": {
+      "bytes": 131,
+      "sha256": "047b0e3531f1a78cf80a3c01a043cfe67461e5b737cd0b1bf76428e26a58c404"
+    },
+    "status/main-build-native-state.json": {
+      "bytes": 181,
+      "sha256": "ba3d4c426876542ee04ff3cbe5f55238d4716d495ffde112c562b44931c1e1f3"
+    },
+    "status/main-built-commit.txt": {
+      "bytes": 41,
+      "sha256": "a1c6846d040915d7e96a00403f27d10215540857243d0c39f18a0b7fd681df43"
+    },
+    "status/main-certificate.json": {
+      "bytes": 850,
+      "sha256": "ac0fefde85d9ed9db54627d6c7ed07e91ff71fa1b8dc9221f2d245e9b8428b94"
+    },
+    "status/main-status.json": {
+      "bytes": 5637,
+      "sha256": "b4df209010c54e293d8c265fb816ab7648f4ab49566b47b682036a695a3155da"
+    }
+  },
+  "harness_source_commit": "9f85c5adb4e1cfef5c114adbaceb2e74213f34ac",
+  "issue": 25,
+  "main_jobs": {
+    "migration": 0,
+    "partition": 0,
+    "sidecar-crash": 0,
+    "takeover": 0
+  },
+  "notes": "Two stdout logs have one trailing blank line removed (for git diff --check); manifest hashes are post-normalization, all other bytes preserved.",
+  "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+  "source_input_file_count": 331,
+  "source_inputs_after_identical": true
+}

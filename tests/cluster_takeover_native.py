@@ -295,6 +295,15 @@ def main():
             args.report.parent.mkdir(parents=True, exist_ok=True)
             args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report))
+    except Exception:
+        # Preserve bounded, redacted native diagnostics when a migration or
+        # takeover assertion fails; never print credentials or raw argv.
+        for name in ("server.log", "target.log"):
+            path = h.root / name
+            if path.is_file():
+                tail = path.read_text(errors="replace")[-4000:]
+                print("native diagnostic " + name + ":\n" + h.redact(tail), flush=True)
+        raise
     finally:
         if target and target.poll() is None:
             os.killpg(target.pid, signal.SIGKILL)

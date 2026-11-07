@@ -1,0 +1,70 @@
+{
+  "reviewer": "DeepSeek independent readonly publication-claims/evidence reviewer",
+  "reviewed_commit": "99fe619f7d2c8320509a4195a5706c7e99043a55",
+  "reviewed_worktree": "/workspace/rootyard-worktrees/round3-migration-integrated",
+  "tree_clean": true,
+  "commit_scope": "docs/evidence only: README.md, docs/acceptance/round3-migration25.md, docs/registered-task-delivery.md, evidence/round3/migration25-ci-handoff-cb8d1b9/** (25 files changed, 1707 insertions, 7 deletions); no src, tests, migrations or schema change",
+  "verdict": "ACCEPT_PUBLICATION",
+  "merge_allowed": true,
+  "closable_25": true,
+  "closable_25_basis": "single trusted Linux host, separate Rust nodes with disjoint volumes, one PostgreSQL authority, local process-session fence; issue 25 closes after the primary final review and merge",
+  "prior_reviewed_state": "ACCEPT_FOR_DOCUMENTED_MODE / closable_25=true at harness/worktree 9f85c5a on compiled source cb8d1b9 (scratch migration-extra/acceptance-review.json, preserved)",
+  "evidence_bundle": {
+    "path": "evidence/round3/migration25-ci-handoff-cb8d1b9",
+    "manifest_entries": 21,
+    "files_on_disk_excluding_manifest": 21,
+    "missing": [],
+    "unlisted": [],
+    "hash_or_size_mismatches": 0,
+    "covered_bytes": 146296,
+    "manifest_meta": {
+      "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+      "compiled_production_source": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+      "harness_source_commit": "9f85c5adb4e1cfef5c114adbaceb2e74213f34ac",
+      "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+      "source_input_file_count": 331,
+      "source_inputs_after_identical": true,
+      "main_jobs_all_exit_0": true,
+      "extra_jobs_all_exit_0": true
+    },
+    "source_inputs": "source-inputs.json and source-inputs-after.json are byte-identical, both 331 files with digest 0f865a04... - the current production map is unchanged before and after the run",
+    "status_copies": "status/main-status.json and status/extra-status.json are copies of the two coordinator statuses: main 4/4 passed (sidecar-crash, migration, takeover, partition), extra 4/4 passed (rust-lib 145, rust-pando 1, schema 132, migration-phases), all exit 0, certificate source=built=cb8d1b9, binary 157748add, inputs 0f865a04, harness 9f85c5a",
+    "report_hashes": "all four main reports (sidecar-crash, migration, takeover, partition) and the extra migration-phases report match their status report_sha256 byte for byte; rust-lib/rust-pando/schema are stdout logs only (145 passed, 1 passed, version 132), declared as such",
+    "phase_evidence": "reports/migration-phases.json: result passed, source_base_commit 9f85c5a, binary 157748add, harness 64dd92d7 (equals the file at HEAD), 5 cases with process_returncode -9, phases_actual = the 5 residual phases, hooks_unexercised empty, hook_registration_counted_as_pass false",
+    "normalization_disclosed": "manifest notes state two stdout logs had one trailing blank line removed for git diff --check and that manifest hashes are post-normalization; all other bytes preserved",
+    "no_sensitive_payload": "bundle contains only json/log/txt/sha256 metadata (largest file 32 KB source map); no binaries, backup sets, PKI, private credentials or raw env"
+  },
+  "conflation_checks": {
+    "old_351_binary_not_reused": "the strings 74a505 and 4d24e1d appear nowhere in the bundle README, docs/acceptance/round3-migration25.md, docs/registered-task-delivery.md or README.md; 351da69 appears only as the historical source-review baseline recorded verbatim",
+    "harness_matches_head": "harness_sha256 64dd92d7 equals the sha256 of tests/cluster_migration_phases_native.py at the reviewed HEAD 9f85c5a",
+    "historical_source_review_kept": "reviews/source-review.json is stored as written, including the historical native-pending wording; the separate final acceptance review (current) is stored next to it and is the document that carries closable_25=true",
+    "no_all_13_kill_claim": "case_counts records sidecar_hooks_registered=13, sidecar_phases_actual=10, sidecar_hooks_unexercised=5 and the extra harness 5 SIGKILL returncodes -9; docs state 13 registered hooks is not 13 SIGKILLs and that PAUSE is used for concurrency-intersection probes"
+  },
+  "claims_checked": {
+    "docs_acceptance_round3_migration25": {
+      "verdict_line": "ACCEPT_FOR_DOCUMENTED_MODE / closable_25=true, 0 P1, 3 inherited non-blocking P2, closes after primary final publication review and merge",
+      "mode": "one trusted Linux host, separate Rust nodes with disjoint volumes, one PostgreSQL authority, local process-session fence; explicitly no physical cross-host storage fence, no PostgreSQL HA/promotion, no hardware power-loss, no scalability claim; #26 remains unqualified and open",
+      "run_facts": "main 4/4 exit 0 and extra 4/4 exit 0 with rust-lib 145, rust-pando 1 against real S3/Vault, schema 132, 5/5 SIGKILL cases returncode -9",
+      "bounds": "old source fenced read-only with unchanged old-volume bytes while supported ingress may proxy and ACK (directly rejected false); no forged SQL route or replica readiness; historical 16 MiB takeover generic 409 stays UNCLASSIFIED with the retained failed artifact attempts/pre-second-review-takeover-409 and no fix claim; 13 hooks not 13 SIGKILLs; 34-row reconcile fixture metadata-only; deliberate fail-closed 1024 intents / 2 MiB cap with no capacity claim",
+      "inherited_p2": "the three known items are listed (handoff_pending lost-live-evidence 409/permanent 503; release plus re-pin of the same job id 409 on replay; unknown orphan staging retained forever with no quarantine, audit signal or observability)",
+      "publication_statement": "the doc states this pass changes docs/evidence only with no runtime, schema, test, build or native re-run and that no issue is closed by this change alone"
+    },
+    "readme_current_paragraph": "matches the acceptance doc: compiled cb8d1b9, input 0f865a0, binary 157748add, harness 9f85c5a, 4 main + 4 extra jobs, accepted single-host/separate-volume mode, #26/#43/#44/#48 open, PR 62 closes nothing, 409 unclassified, 13 hooks not 13 kills, 34-row metadata-only, 1024/2MiB bound",
+    "registered_task_delivery": "row 25 records ROUND 3 accept / closable_25=true with the same source, harness, input, binary, job counts, fail-closed cap, three inherited P2, 409 UNCLASSIFIED and evidence link; row 26 stays OPEN with physical cross-host fencing unqualified and PR 62 closing no issue; round-3 gate paragraph repeats that #23 is completed via PR 61, #32 via PR 60, #38 via PR 57 and that #26/#43/#44/#48 remain open"
+  },
+  "remaining_p1": 0,
+  "remaining_p2": 3,
+  "remaining_p2_detail": [
+    "handoff_pending receipt-existence check can re-open a 409 path or become a permanent 503 (fail-closed, operator-visible)",
+    "release plus re-pin of the same job id after restart returns 409 published CI sidecar file is missing (replay/startup only)",
+    "unknown orphan sidecar staging is retained forever with no quarantine, audit signal or observability (disk growth)"
+  ],
+  "remaining_p3_notes": [
+    "docs/acceptance/round3-migration25.md names harness and reviewed worktree HEAD as 9f85c5a while the publication commit is 99fe619; both statements are true but a reader can confuse them - the doc does say this pass is docs/evidence only, so no correction is required before merge",
+    "status/main-status.json carries no stage field and the partition report has no top-level result field; the registry row already discloses the missing result field and the job passed by exit 0"
+  ],
+  "future_evidence_not_claimed": "the primary may later merge HA profile PR 62 into the B branch and run the profile on the SAME 157748add binary to verify fresh CI pin / restore compatibility; that would be additional transparent evidence and is NOT claimed in this review",
+  "not_performed": [
+    "read-only: no project edits, no Cargo, no native runs, no network, no GitHub actions; only git plumbing, file reads, sha256 recomputation and JSON inspection"
+  ]
+}

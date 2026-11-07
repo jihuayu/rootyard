@@ -97,4 +97,8 @@ result is the `passed` status/report above). Evidence only: no production,
 schema or test change in this delivery. See also
 [operations: HA profile](../operations-HA.md).
 
+## Final combined compatibility (current `157748add`)
+
+Final combined compatibility: after PR62 merged and main was merged into the accepted root, an additional actual native run on the **same current binary** `157748add` / production input `0f865a0…` (331 files) / harness-deployment `0d9f4821…` passed: 6 acknowledged commits with **0 lost** on automatic promotion, RTO read 19522.7 ms / write 20762.3 ms, a real pre-backup CI grant revoked to **401** while a fresh grant checked out the exact retained OID with `fsck=passed`, full intent/receipt/ref-OID compatibility and an offline format-8/schema-132 restore. This is additional current-binary proof, not the older `6f76d70` PR62 HA report; identities stay separate. See [final-combination-157748add](../../evidence/round3/final-combination-157748add/README.md). The older `6f76d70` HA metrics in this document and its bundle remain recorded and are not overwritten.
+
 The [final publication review](../../evidence/round3/ha43-publication-review.json) allows merge with zero P1/P2. Its two wording observations are clarified in the bundle publication-provenance note; the copied raw source-equivalence record is preserved.

@@ -1,0 +1,108 @@
+{
+  "state": "passed",
+  "pid": 341907,
+  "started": 1794027691.5372093,
+  "jobs": {
+    "sidecar-crash": {
+      "state": "passed",
+      "database": "round3_migration_sidecar_crash_8b1c63eeaa",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "/workspace/rootyard-worktrees/round3-migration-integrated/tests/cluster_migration_sidecar_native.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-sidecar-crash.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-sidecar-crash.log",
+      "report": "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-sidecar-crash.json",
+      "started": 1794027692.2159603,
+      "harness_sha256": "d69f7ffdd239d8de7ee4c32353a3ca9ac951191afe1b865f7d57029b9521408c",
+      "exit_code": 0,
+      "finished": 1794027917.6941764,
+      "report_sha256": "c6e83405182660024553be3872b19d9a4bd6b87517ad286b77245eec4d7ba7ab",
+      "database_cleanup": "dropped_after_success"
+    },
+    "migration": {
+      "state": "passed",
+      "database": "round3_migration_migration_ccb92ff1b4",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "/workspace/rootyard-worktrees/round3-migration-integrated/tests/cluster_migration_native.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-migration.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-migration.log",
+      "report": "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-migration.json",
+      "started": 1794027917.749956,
+      "harness_sha256": "fc812390917caf6e93827459e89c941526b52176fce3b48a266c503027ed7ef5",
+      "exit_code": 0,
+      "finished": 1794027933.4505162,
+      "report_sha256": "8224193fe0016198c09d1ac7736a0b78249f81509491b69867be91d31150e958",
+      "database_cleanup": "dropped_after_success"
+    },
+    "takeover": {
+      "state": "passed",
+      "database": "round3_migration_takeover_88dd1d6623",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "/workspace/rootyard-worktrees/round3-migration-integrated/tests/cluster_takeover_native.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-takeover.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-takeover.log",
+      "report": "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-takeover.json",
+      "started": 1794027933.5079224,
+      "harness_sha256": "b0222e89c88145c5177fb8412b1d55e0fda8bf689e9dc92b69d66532bd5f2773",
+      "exit_code": 0,
+      "finished": 1794027973.845339,
+      "report_sha256": "690cf3f023e8056e82e3bb74d163fecc1476548dccb86ede0b2e7a0986a0179c",
+      "database_cleanup": "dropped_after_success"
+    },
+    "partition": {
+      "state": "passed",
+      "database": "round3_migration_partition_c28dd7d340",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "/workspace/rootyard-worktrees/round3-migration-integrated/tests/cluster_partition_native.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-partition.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-partition.log",
+      "report": "/workspace/scratch/rootyard-round3/migration-integrated/logs/coordinator-partition.json",
+      "started": 1794027973.917907,
+      "harness_sha256": "b5c2c80c558c1932717beede395a6584a2f44afd3d60470063136e48e996dcbc",
+      "exit_code": 0,
+      "finished": 1794028008.056299,
+      "report_sha256": "b68ab61cecbd92f4817192cc0b38610a557e7d7cf0709180159d0d044c4351de",
+      "database_cleanup": "dropped_after_success"
+    }
+  },
+  "updated": 1794028008.2590456,
+  "production_inputs_identical_to_certified_compile": true,
+  "compiled_source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "harness_source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "certificate": {
+    "role": "migration-integrated",
+    "source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+    "built_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+    "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+    "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+    "valid": true
+  },
+  "binary": "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+  "finished": 1794028008.2590432
+}

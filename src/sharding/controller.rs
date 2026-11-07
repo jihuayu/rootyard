@@ -1,6 +1,6 @@
 //! Recoverable local-host takeover. The trusted process fence is a prerequisite,
 //! not a user-supplied receipt or a substitute for a verified Git snapshot.
-use crate::{AppState, journal, storage::read_leases::Lease, sharding::{local_fence, locks, replication,
+use crate::{AppState, journal, storage::read_leases::Lease, sharding::{faults, local_fence, locks, replication,
     models::{self, REPO_ROUTE_FIELDS, RepoShardRoute, VolumeFenceMarker}, transitions}};
 use anyhow::{Context, Result, ensure};
 use std::{path::PathBuf, sync::Arc};
@@ -227,11 +227,25 @@ pub async fn run(state: Arc<AppState>) {
                         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     verify_target(&state, &candidate, &mutation.lease).await?;
                     verify_source(&state, &candidate).await?;
+                    faults::hit(
+                        &state.storage.root,
+                        "takeover-after-source-verify",
+                        serde_json::json!({"repository_id": candidate.repo_id,
+                                          "operation_id": candidate.operation_id,
+                                          "old_node": candidate.old_node}),
+                    );
                     let proof = local_fence::fence_local_process(&candidate.old_node).await?;
                     // Re-read the now-quiescent source: a writer that raced the
                     // first check cannot leave promotion with a stale target.
                     verify_source(&state, &candidate).await?;
                     mutation.ensure_active().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    faults::hit(
+                        &state.storage.root,
+                        "takeover-before-promote",
+                        serde_json::json!({"repository_id": candidate.repo_id,
+                                          "operation_id": candidate.operation_id,
+                                          "old_node": candidate.old_node}),
+                    );
                     let promoted = promote(&state, &node_id, &candidate, &proof, &mutation.lease).await?;
                     if promoted && let Err(error) = crate::storage::ref_admission::cleanup_fenced(
                         &state, candidate.repo_id).await {
