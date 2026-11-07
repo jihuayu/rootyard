@@ -450,6 +450,12 @@ def main():
             except AssertionError as error:
                 return False, str(error)[:300]
 
+        # Prove this exact app-identity write is permitted before faulting DCS.
+        # Otherwise a schema/permission error could imitate a read-only result.
+        healthy_write_accepted, healthy_write_detail = durable_write_probe()
+        assert healthy_write_accepted and healthy_write_detail.strip() == "UPDATE 1", (
+            "healthy durable write probe failed before DCS loss: " + healthy_write_detail)
+
         stopped = [node["name"] for node in fx.spec["etcd"]["nodes"][:2]]
         dcs_loss_at = time.monotonic_ns()
         fx.stop_etcd(stopped)
@@ -576,6 +582,8 @@ def main():
                "post_demotion_write_probes": post_demotion_probes,
                "post_demotion_write_rejections": post_demotion_rejected,
                "valid_lease_write_probes_accepted": valid_lease_writes,
+               "healthy_write_probe": {"accepted": healthy_write_accepted,
+                                       "result": healthy_write_detail},
                "last_write_probe": {"accepted": last_probe["accepted"] if last_probe else None,
                                     "old_primary_pg": last_probe["old_primary_pg"] if last_probe else None,
                                     "result": (last_probe["detail"][:120] if last_probe else None)},
