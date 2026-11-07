@@ -66,6 +66,9 @@ def main():
     args = parser.parse_args()
     args.binary = str(Path(args.binary).resolve())
     h = Harness(args)
+    # Receivers are test-owned loopback listeners; the service default denies
+    # loopback targets, so this native harness opts in explicitly.
+    h.env["ROOTYARD_WEBHOOK_ALLOW_LOOPBACK"] = "true"
     h.env["ROOTYARD_OUTBOX_WORKER"] = "false"
     plain = delayed = tls = untrusted = None
     try:

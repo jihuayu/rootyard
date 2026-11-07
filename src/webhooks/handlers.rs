@@ -2,27 +2,25 @@
 //! ping, delivery inspection, manual retry, and HMAC-verified idempotent CI check-run callbacks.
 use crate::{
     AppState, Error,
-    auth::{self, authorize_repo as authorize, finish_tx as finish, idempotency_key},
+    auth::{self, authorize_repo_with_role, finish_tx as finish, idempotency_key},
     db,
     pulls::models::{
-        body_valid, context_valid, creation_replay, positive, record_creation,
-        valid_check_status_and_conclusion, valid_format, valid_oid_for_format,
-        verify_commit_exists,
+        body_valid, context_valid, creation_replay, positive, record_creation, valid_check_status_and_conclusion,
+        valid_format, valid_oid_for_format, verify_commit_exists,
     },
     webhooks::{
         delivery::{
-            DispatchSummary, current_unix_seconds, deliver_single, dispatch_due_deliveries,
-            enqueue_webhook_delivery, sync_outbox_events, sync_pull_events,
+            DispatchSummary, current_unix_seconds, deliver_single, dispatch_due_deliveries, enqueue_webhook_delivery,
+            sync_outbox_events, sync_pull_events,
         },
         models::{
-            CiCallbackInput, DELIVERY_FIELDS, DeliveriesQuery, DispatchInput, NewWebhook,
-            PingInput, RetryInput, WEBHOOK_FIELDS, Webhook, WebhookDelivery, WebhookPatch,
-            WebhooksQuery, ensure_schema, json, validate_attempts_and_timeout,
-            validate_ci_contexts, validate_events, validate_secret, validate_webhook_url,
+            CiCallbackInput, DELIVERY_FIELDS, DeliveriesQuery, DispatchInput, NewWebhook, PingInput, RetryInput,
+            WEBHOOK_FIELDS, Webhook, WebhookDelivery, WebhookPatch, WebhooksQuery, ensure_schema, json,
+            validate_attempts_and_timeout, validate_ci_contexts, validate_events, validate_secret,
+            validate_webhook_url,
         },
         signing::{
-            HEADER_SIGNATURE_256, resolve_callback_identity, upsert_callback_check_run,
-            verify_signature_header,
+            HEADER_SIGNATURE_256, resolve_callback_identity, upsert_callback_check_run, verify_signature_header,
         },
     },
 };
@@ -39,11 +37,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 fn parse_opt_body<T: Default + DeserializeOwned>(body: &Bytes) -> Result<T, Error> {
-    if body.is_empty() {
-        Ok(T::default())
-    } else {
-        serde_json::from_slice(body).map_err(|_| Error::bad_request())
-    }
+    if body.is_empty() { Ok(T::default()) } else { serde_json::from_slice(body).map_err(|_| Error::bad_request()) }
 }
 
 pub async fn list_webhooks(
@@ -57,9 +51,16 @@ pub async fn list_webhooks(
     let (after, limit) = query.bounds()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
-    let sql = format!("SELECT {WEBHOOK_FIELDS} FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND ($3::bool IS NULL OR active=$3) ORDER BY created_at ASC, id ASC OFFSET $4 LIMIT $5");
-    let rows = tx.query(&sql, &[&actor.id, &repo, &query.active, &after, &(limit + 1)]).await.map_err(Error::internal)?;
+    // The tenant column is the repository owner, never the acting user, so
+    // collaborators and organization administrators read the owner's rows.
+    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read).await?;
+    let sql = format!(
+        "SELECT {WEBHOOK_FIELDS} FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND ($3::bool IS NULL OR active=$3) ORDER BY created_at ASC, id ASC OFFSET $4 LIMIT $5"
+    );
+    let rows = tx
+        .query(&sql, &[&access.owner_id, &access.repo_id, &query.active, &after, &(limit + 1)])
+        .await
+        .map_err(Error::internal)?;
     let more = rows.len() > limit as usize;
     let mut items = Vec::with_capacity(rows.len().min(limit as usize));
     for row in rows.iter().take(limit as usize) {
@@ -98,7 +99,7 @@ pub async fn create_webhook(
         let key = idempotency_key(&headers)?.map(str::to_owned);
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
 
         if let Some(ref k) = key {
             let req_val = sjson!({
@@ -106,7 +107,7 @@ pub async fn create_webhook(
                 "events": events, "ci_contexts": ci_contexts, "auto_ci_pin": auto_ci_pin,
                 "active": active, "max_attempts": max_attempts, "timeout_ms": timeout_ms,
             });
-            if let Some(saved) = creation_replay(&tx, actor.id, repo, k, &req_val).await? {
+            if let Some(saved) = creation_replay(&tx, access.owner_id, access.repo_id, k, &req_val).await? {
                 finish(tx, &actor, true).await?;
                 return Ok(json(StatusCode::OK, saved));
             }
@@ -119,13 +120,13 @@ pub async fn create_webhook(
             "INSERT INTO forge_webhooks (id,tenant_id,repository_id,url,secret,secret_sha256,events,ci_contexts,auto_ci_pin,active,max_attempts,timeout_ms,version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1) RETURNING {WEBHOOK_FIELDS}"
         );
         let row = tx
-            .query_one(&sql, &[&hook_id, &actor.id, &repo, &input.url, &input.secret, &secret_sha256, &events_json, &contexts_json, &auto_ci_pin, &active, &max_attempts, &timeout_ms])
+            .query_one(&sql, &[&hook_id, &access.owner_id, &access.repo_id, &input.url, &input.secret, &secret_sha256, &events_json, &contexts_json, &auto_ci_pin, &active, &max_attempts, &timeout_ms])
             .await
             .map_err(Error::internal)?;
 
         let webhook = Webhook::row(&row)?;
         let val = serde_json::to_value(&webhook).map_err(Error::internal)?;
-        record_creation(&tx, actor.id, repo, key.as_deref(), &val).await?;
+        record_creation(&tx, access.owner_id, access.repo_id, key.as_deref(), &val).await?;
         finish(tx, &actor, true).await?;
         Ok(json(StatusCode::CREATED, val))
     })
@@ -142,9 +143,12 @@ pub async fn get_webhook(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read).await?;
     let row = tx
-        .query_opt(&format!("SELECT {WEBHOOK_FIELDS} FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3"), &[&actor.id, &repo, &hook_id])
+        .query_opt(
+            &format!("SELECT {WEBHOOK_FIELDS} FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3"),
+            &[&access.owner_id, &access.repo_id, &hook_id],
+        )
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
@@ -169,11 +173,11 @@ pub async fn update_webhook(
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
         crate::webhooks::trust::lock_policy_tx(&tx,policy_repo).await?;
-        let repo = authorize(&tx, &actor, &owner, &name, true).await?;
-        if repo!=policy_repo{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
+        if access.repo_id!=policy_repo{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
 
         let existing = tx
-            .query_opt(&format!("SELECT {WEBHOOK_FIELDS}, secret FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3 FOR UPDATE"), &[&actor.id, &repo, &hook_id])
+            .query_opt(&format!("SELECT {WEBHOOK_FIELDS}, secret FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3 FOR UPDATE"), &[&access.owner_id, &access.repo_id, &hook_id])
             .await
             .map_err(Error::internal)?
             .ok_or_else(Error::not_found)?;
@@ -210,7 +214,7 @@ pub async fn update_webhook(
             "UPDATE forge_webhooks SET url=$4, secret=$5, secret_sha256=$6, events=$7, ci_contexts=$8, auto_ci_pin=$9, active=$10, max_attempts=$11, timeout_ms=$12, version=version+1, updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND id=$3 RETURNING {WEBHOOK_FIELDS}"
         );
         let updated = tx
-            .query_one(&sql, &[&actor.id, &repo, &hook_id, &next_url, &next_secret, &next_secret_sha256, &events_json, &contexts_json, &next_auto_pin, &next_active, &next_max_attempts, &next_timeout_ms])
+            .query_one(&sql, &[&access.owner_id, &access.repo_id, &hook_id, &next_url, &next_secret, &next_secret_sha256, &events_json, &contexts_json, &next_auto_pin, &next_active, &next_max_attempts, &next_timeout_ms])
             .await
             .map_err(Error::internal)?;
         let webhook = Webhook::row(&updated)?;
@@ -229,14 +233,19 @@ pub async fn delete_webhook(
     tokio::spawn(async move {
         ensure_schema(&state.pool).await?;
         let actor = auth::authenticate(&state.pool, &headers).await?;
-        let policy_repo=crate::webhooks::trust::policy_repo_id(&state,&owner,&name).await?;
+        let policy_repo = crate::webhooks::trust::policy_repo_id(&state, &owner, &name).await?;
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        crate::webhooks::trust::lock_policy_tx(&tx,policy_repo).await?;
-        let repo = authorize(&tx, &actor, &owner, &name, true).await?;
-        if repo!=policy_repo{return Err(Error(StatusCode::CONFLICT,"repository changed"));}
+        crate::webhooks::trust::lock_policy_tx(&tx, policy_repo).await?;
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
+        if access.repo_id != policy_repo {
+            return Err(Error(StatusCode::CONFLICT, "repository changed"));
+        }
         let deleted = tx
-            .execute("DELETE FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3", &[&actor.id, &repo, &hook_id])
+            .execute(
+                "DELETE FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3",
+                &[&access.owner_id, &access.repo_id, &hook_id],
+            )
             .await
             .map_err(Error::internal)?;
         if deleted == 0 {
@@ -261,9 +270,12 @@ pub async fn ping_webhook(
         let input: PingInput = parse_opt_body(&body)?;
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
         let row = tx
-            .query_opt("SELECT secret, max_attempts FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3", &[&actor.id, &repo, &hook_id])
+            .query_opt(
+                "SELECT secret, max_attempts FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3",
+                &[&access.owner_id, &access.repo_id, &hook_id],
+            )
             .await
             .map_err(Error::internal)?
             .ok_or_else(Error::not_found)?;
@@ -276,14 +288,31 @@ pub async fn ping_webhook(
             return Err(Error::bad_request());
         }
         let zen = input.zen.unwrap_or_else(|| "Deterministic Git and Forge pipelines.".to_owned());
-        let payload = sjson!({ "event": "ping", "zen": zen, "hook_id": hook_id, "repository_id": repo });
+        let payload = sjson!({ "event": "ping", "zen": zen, "hook_id": hook_id, "repository_id": access.repo_id });
 
         let pool_client = state.pool.get().await.map_err(Error::internal)?;
-        let delivery = match enqueue_webhook_delivery(&pool_client, actor.id, repo, hook_id, &secret, max_attempts, &event_id, "ping", &payload).await? {
+        let delivery = match enqueue_webhook_delivery(
+            &pool_client,
+            access.owner_id,
+            access.repo_id,
+            hook_id,
+            &secret,
+            max_attempts,
+            &event_id,
+            "ping",
+            &payload,
+        )
+        .await?
+        {
             Some(d) => d,
             None => {
                 let existing = pool_client
-                    .query_one(&format!("SELECT {DELIVERY_FIELDS} FROM forge_webhook_deliveries WHERE webhook_id=$1 AND event_id=$2"), &[&hook_id, &event_id])
+                    .query_one(
+                        &format!(
+                            "SELECT {DELIVERY_FIELDS} FROM forge_webhook_deliveries WHERE webhook_id=$1 AND event_id=$2"
+                        ),
+                        &[&hook_id, &event_id],
+                    )
                     .await
                     .map_err(Error::internal)?;
                 WebhookDelivery::row(&existing)
@@ -292,7 +321,7 @@ pub async fn ping_webhook(
         drop(pool_client);
 
         let final_delivery = if input.deliver_now.unwrap_or(true) && delivery.state != "delivered" {
-            deliver_single(&state, actor.id, repo, delivery.id, current_unix_seconds()).await?
+            deliver_single(&state, access.owner_id, access.repo_id, delivery.id, current_unix_seconds()).await?
         } else {
             delivery
         };
@@ -319,21 +348,21 @@ pub async fn dispatch_webhooks(
 
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
         finish(tx, &actor, true).await?;
         drop(client);
 
         let orchestrated_pulls = if input.sync_pulls.unwrap_or(true) {
-            sync_pull_events(&state, actor.id, repo).await?.len()
+            sync_pull_events(&state, access.owner_id, access.repo_id).await?.len()
         } else {
             0
         };
         let synced_outbox_deliveries = if input.sync_outbox.unwrap_or(true) {
-            sync_outbox_events(&state, actor.id, repo).await?
+            sync_outbox_events(&state, access.owner_id, access.repo_id).await?
         } else {
             0
         };
-        let deliveries = dispatch_due_deliveries(&state, actor.id, repo, limit, now_unix).await?;
+        let deliveries = dispatch_due_deliveries(&state, access.owner_id, access.repo_id, limit, now_unix).await?;
         let delivered_count = deliveries.iter().filter(|d| d.state == "delivered").count();
         let failed_count = deliveries.iter().filter(|d| d.state == "failed").count();
         let dead_letter_count = deliveries.iter().filter(|d| d.state == "dead_letter").count();
@@ -341,8 +370,13 @@ pub async fn dispatch_webhooks(
         Ok(json(
             StatusCode::OK,
             DispatchSummary {
-                synced_outbox_deliveries, orchestrated_pulls, attempted_deliveries: deliveries.len(),
-                delivered_count, failed_count, dead_letter_count, deliveries,
+                synced_outbox_deliveries,
+                orchestrated_pulls,
+                attempted_deliveries: deliveries.len(),
+                delivered_count,
+                failed_count,
+                dead_letter_count,
+                deliveries,
             },
         ))
     })
@@ -361,18 +395,24 @@ pub async fn list_deliveries(
     let (after, limit) = query.bounds()?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read).await?;
 
-    tx.query_opt("SELECT id FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3", &[&actor.id, &repo, &hook_id])
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(Error::not_found)?;
+    tx.query_opt(
+        "SELECT id FROM forge_webhooks WHERE tenant_id=$1 AND repository_id=$2 AND id=$3",
+        &[&access.owner_id, &access.repo_id, &hook_id],
+    )
+    .await
+    .map_err(Error::internal)?
+    .ok_or_else(Error::not_found)?;
 
     let sql = format!(
         "SELECT {DELIVERY_FIELDS} FROM forge_webhook_deliveries WHERE tenant_id=$1 AND repository_id=$2 AND webhook_id=$3 AND sequence > $4 AND ($5::text IS NULL OR state = $5) AND ($6::text IS NULL OR event_type = $6) ORDER BY sequence ASC LIMIT $7"
     );
     let rows = tx
-        .query(&sql, &[&actor.id, &repo, &hook_id, &after, &query.state, &query.event_type, &(limit + 1)])
+        .query(
+            &sql,
+            &[&access.owner_id, &access.repo_id, &hook_id, &after, &query.state, &query.event_type, &(limit + 1)],
+        )
         .await
         .map_err(Error::internal)?;
     let more = rows.len() > limit as usize;
@@ -391,9 +431,9 @@ pub async fn get_delivery(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = authorize(&tx, &actor, &owner, &name, false).await?;
+    let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Read).await?;
     let row = tx
-        .query_opt(&format!("SELECT {DELIVERY_FIELDS} FROM forge_webhook_deliveries WHERE tenant_id=$1 AND repository_id=$2 AND webhook_id=$3 AND id=$4"), &[&actor.id, &repo, &hook_id, &delivery_id])
+        .query_opt(&format!("SELECT {DELIVERY_FIELDS} FROM forge_webhook_deliveries WHERE tenant_id=$1 AND repository_id=$2 AND webhook_id=$3 AND id=$4"), &[&access.owner_id, &access.repo_id, &hook_id, &delivery_id])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
@@ -416,13 +456,13 @@ pub async fn retry_delivery(
 
         let mut client = state.pool.get().await.map_err(Error::internal)?;
         let tx = client.transaction().await.map_err(Error::internal)?;
-        let repo = authorize(&tx, &actor, &owner, &name, true).await?;
+        let access = authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write).await?;
         let row = tx
             .query_opt(
                 &format!(
                     "UPDATE forge_webhook_deliveries SET state='pending', attempts = CASE WHEN $5 OR state='dead_letter' OR attempts >= max_attempts THEN 0 ELSE attempts END, lease_generation=lease_generation+1, next_attempt_unix=0, updated_at=clock_timestamp() WHERE tenant_id=$1 AND repository_id=$2 AND webhook_id=$3 AND id=$4 AND (state <> 'leased' OR next_attempt_unix <= extract(epoch FROM clock_timestamp())) RETURNING {DELIVERY_FIELDS}"
                 ),
-                &[&actor.id, &repo, &hook_id, &delivery_id, &reset_attempts],
+                &[&access.owner_id, &access.repo_id, &hook_id, &delivery_id, &reset_attempts],
             )
             .await
             .map_err(Error::internal)?
@@ -432,7 +472,7 @@ pub async fn retry_delivery(
         drop(client);
 
         let result = if input.deliver_now.unwrap_or(true) {
-            deliver_single(&state, actor.id, repo, delivery_id, now_unix).await?
+            deliver_single(&state, access.owner_id, access.repo_id, delivery_id, now_unix).await?
         } else {
             pending_delivery
         };

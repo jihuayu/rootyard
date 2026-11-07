@@ -39,6 +39,8 @@ def main():
     args=parser.parse_args();args.binary=str(Path(args.binary).resolve())
     h=JobCheckoutHarness(args)
     h.env["ROOTYARD_CI_ORIGIN_PUBLIC_URL"]=h.base
+    # The registered hook targets a test-owned loopback listener.
+    h.env["ROOTYARD_WEBHOOK_ALLOW_LOOPBACK"]="true"
     h.mirror_env["ROOTYARD_CI_MIRROR_PUBLIC_URL"]=h.mirror_base
     try:
         h.setup();h.api();h.roundtrip()

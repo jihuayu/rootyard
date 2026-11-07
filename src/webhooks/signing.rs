@@ -4,7 +4,10 @@ use crate::{
     Error,
     auth::idempotency_key,
     pulls::models::{CHECK_FIELDS, CheckRun},
-    webhooks::models::{CiCallbackInput, permitted_peer, validate_webhook_url},
+    webhooks::{
+        models::{CiCallbackInput, validate_webhook_url_with_policy},
+        policy,
+    },
 };
 use axum::http::{HeaderMap, StatusCode};
 use deadpool_postgres::Transaction;
@@ -93,11 +96,7 @@ pub fn verify_signature_header(secret: &str, payload: &[u8], header_value: &str)
     };
 
     let mut candidate_mac = [0u8; 32];
-    let hex_ok = if hex_part.len() == 64
-        && hex_part
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    let hex_ok = if hex_part.len() == 64 && hex_part.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         hex::decode_to_slice(hex_part, &mut candidate_mac).is_ok()
     } else {
         false
@@ -135,10 +134,7 @@ pub fn resolve_callback_identity(
     output: &str,
 ) -> Result<(String, String), Error> {
     let header_key = idempotency_key(headers)?.map(str::to_owned);
-    let delivery_hdr = headers
-        .get(HEADER_DELIVERY)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    let delivery_hdr = headers.get(HEADER_DELIVERY).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let event_id = header_key
         .or_else(|| input.event_id.clone())
         .or(delivery_hdr)
@@ -185,28 +181,37 @@ pub async fn send_http11_webhook(
     signature_256: &str,
     body_bytes: &[u8],
 ) -> Result<u16, String> {
-    let target =
-        validate_webhook_url(url).map_err(|_| "invalid or SSRF-blocked target URL".to_owned())?;
+    // Egress policy is re-evaluated for every attempt, so a hook persisted while the
+    // loopback opt-in was active stops delivering as soon as it is withdrawn.
+    let loopback_allowed = policy::loopback_targets_allowed();
+    let target = validate_webhook_url_with_policy(url, loopback_allowed)
+        .map_err(|_| "invalid or SSRF-blocked target URL".to_owned())?;
     let timeout_dur = Duration::from_millis(timeout_ms.clamp(100, 30_000) as u64);
-    let addresses: Vec<SocketAddr> = tokio::time::timeout(timeout_dur,
-        tokio::net::lookup_host((target.host.as_str(), target.port)))
-        .await.map_err(|_| "webhook DNS timed out".to_owned())?
-        .map_err(|e| format!("webhook DNS error: {e}"))?.collect();
-    if addresses.is_empty() || addresses.iter().any(|a| !permitted_peer(target.is_loopback, a.ip())) {
+    let addresses: Vec<SocketAddr> =
+        tokio::time::timeout(timeout_dur, tokio::net::lookup_host((target.host.as_str(), target.port)))
+            .await
+            .map_err(|_| "webhook DNS timed out".to_owned())?
+            .map_err(|e| format!("webhook DNS error: {e}"))?
+            .collect();
+    if addresses.is_empty()
+        || addresses.iter().any(|a| !policy::permitted_peer(target.is_loopback, a.ip(), loopback_allowed))
+    {
         return Err("webhook DNS resolved to a blocked address".to_owned());
     }
     let mut builder = reqwest::Client::builder()
-        .timeout(timeout_dur).connect_timeout(timeout_dur)
-        .redirect(reqwest::redirect::Policy::none()).no_proxy()
+        .timeout(timeout_dur)
+        .connect_timeout(timeout_dur)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .resolve(&target.host, addresses[0]);
     if let Ok(pem_path) = std::env::var("ROOTYARD_WEBHOOK_CA_FILE") {
         let pem = std::fs::read(pem_path).map_err(|_| "webhook CA file unreadable".to_owned())?;
-        let cert = reqwest::Certificate::from_pem(&pem)
-            .map_err(|_| "invalid webhook CA certificate".to_owned())?;
+        let cert = reqwest::Certificate::from_pem(&pem).map_err(|_| "invalid webhook CA certificate".to_owned())?;
         builder = builder.add_root_certificate(cert);
     }
     let client = builder.build().map_err(|e| format!("webhook client error: {e}"))?;
-    let response = client.post(url)
+    let response = client
+        .post(url)
         .header("User-Agent", "Rootyard-Hookshot/1.0")
         .header("Content-Type", "application/json")
         .header("X-Rootyard-Event", event_type)
@@ -214,7 +219,9 @@ pub async fn send_http11_webhook(
         .header("X-Rootyard-Hook-Id", hook_id.to_string())
         .header("X-Rootyard-Signature-256", signature_256)
         .header("X-Rootyard-Attempt", attempt.to_string())
-        .body(body_bytes.to_vec()).send().await
+        .body(body_bytes.to_vec())
+        .send()
+        .await
         .map_err(|e| format!("webhook transport error: {e:?}"))?;
     Ok(response.status().as_u16())
 }
@@ -272,13 +279,7 @@ pub async fn upsert_callback_check_run(
             let att = attempt_opt.unwrap_or(1);
             let seq = match sequence_opt {
                 Some(explicit_seq) => explicit_seq,
-                None if att == cur.attempt
-                    && cur.sequence == 1
-                    && cur.status == "queued"
-                    && status != "queued" =>
-                {
-                    2
-                }
+                None if att == cur.attempt && cur.sequence == 1 && cur.status == "queued" && status != "queued" => 2,
                 None if att == cur.attempt
                     && cur.status == status
                     && cur.conclusion.as_ref() == conclusion
@@ -310,22 +311,13 @@ pub async fn upsert_callback_check_run(
                     .map_err(Error::internal)?;
                 Ok(CheckRun::row(&updated))
             } else if (att, seq) == (cur.attempt, cur.sequence) {
-                if cur.status == status
-                    && cur.conclusion.as_ref() == conclusion
-                    && cur.output == output
-                {
+                if cur.status == status && cur.conclusion.as_ref() == conclusion && cur.output == output {
                     Ok(cur)
                 } else {
-                    Err(Error(
-                        StatusCode::CONFLICT,
-                        "conflicting check run state for same attempt and sequence",
-                    ))
+                    Err(Error(StatusCode::CONFLICT, "conflicting check run state for same attempt and sequence"))
                 }
             } else {
-                Err(Error(
-                    StatusCode::CONFLICT,
-                    "stale check run attempt or sequence",
-                ))
+                Err(Error(StatusCode::CONFLICT, "stale check run attempt or sequence"))
             }
         }
     }

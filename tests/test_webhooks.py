@@ -40,8 +40,12 @@ def _rust_hmac_sha256_bytes(secret: bytes, payload: bytes) -> bytes:
     return hashlib.sha256(opad + inner).digest()
 
 
-def _validate_webhook_url_py(raw: str) -> dict:
-    """Reference validator matching src/webhooks/models.rs::validate_webhook_url."""
+def _validate_webhook_url_py(raw: str, allow_loopback: bool = False) -> dict:
+    """Reference validator matching models.rs::validate_webhook_url_with_policy.
+
+    Loopback targets are denied unless the operator explicitly opted in through
+    ROOTYARD_WEBHOOK_ALLOW_LOOPBACK; the decision never comes from the request body.
+    """
     if not (8 <= len(raw) <= 1024) or "#" in raw or any(ord(c) <= 32 or ord(c) == 127 for c in raw):
         raise ValueError("invalid length, fragment, or control char")
     parsed = urllib.parse.urlsplit(raw)
@@ -54,9 +58,11 @@ def _validate_webhook_url_py(raw: str) -> dict:
     if port <= 0 or port > 65535:
         raise ValueError("invalid port")
 
-    is_loopback = host in ("127.0.0.1", "::1", "localhost")
+    is_loopback = host in ("127.0.0.1", "::1", "localhost") or host.endswith(".localhost")
     if parsed.scheme == "http" and not is_loopback:
         raise ValueError("non-loopback http forbidden")
+    if is_loopback and not allow_loopback:
+        raise ValueError("loopback target requires explicit operator opt-in")
 
     if not is_loopback:
         try:
@@ -232,7 +238,7 @@ class WebhooksTrackAContractTest(unittest.TestCase):
 
         for token in (
             "auth::authenticate",
-            "authorize(",
+            "authorize_repo_with_role(",
             "finish(",
             "idempotency_key",
             "tokio::spawn",
@@ -280,24 +286,41 @@ class WebhooksTrackAContractTest(unittest.TestCase):
         self.assertTrue(hdr.startswith("sha256="))
         self.assertEqual(len(hdr), 71)
 
-    def test_ssrf_url_validation_and_loopback_allowance(self):
+    def test_ssrf_url_validation_and_loopback_default_deny(self):
         valid_urls = [
             "https://ci.example.com/webhooks/rootyard",
             "https://hooks.example.org:8443/v1/events?env=prod",
+        ]
+        for u in valid_urls:
+            for allow_loopback in (False, True):
+                parsed = _validate_webhook_url_py(u, allow_loopback=allow_loopback)
+                self.assertIn(parsed["scheme"], ("http", "https"))
+                self.assertFalse(parsed["is_loopback"])
+
+        # Loopback targets are rejected by default and accepted only after the
+        # explicit operator opt-in.
+        loopback_urls = [
             "http://127.0.0.1:9000/hook",
             "http://[::1]:9001/callback",
             "http://localhost:8080/ci",
+            "https://127.0.0.1/hook",
+            "https://[::1]/hook",
+            "https://localhost/hook",
+            "https://ci.localhost/hook",
         ]
-        for u in valid_urls:
-            parsed = _validate_webhook_url_py(u)
-            self.assertIn(parsed["scheme"], ("http", "https"))
+        for u in loopback_urls:
+            with self.assertRaises(ValueError, msg=f"Expected loopback denial for {u}"):
+                _validate_webhook_url_py(u)
+            parsed = _validate_webhook_url_py(u, allow_loopback=True)
+            self.assertTrue(parsed["is_loopback"])
 
         blocked_urls = [
             "http://ci.example.com/webhooks",
+            "http://127.0.0.2/hook",
+            "https://127.0.0.2/hook",
             "https://0.0.0.0/hook",
             "https://10.0.0.1/hook",
             "https://100.64.0.1/hook",
-            "https://127.0.0.2/hook",
             "https://169.254.169.254/latest/meta-data/",
             "https://172.16.0.1/hook",
             "https://192.168.1.1/hook",
@@ -308,8 +331,39 @@ class WebhooksTrackAContractTest(unittest.TestCase):
             "https://metadata.google.internal/computeMetadata/v1/",
         ]
         for bad in blocked_urls:
-            with self.assertRaises(ValueError, msg=f"Expected SSRF rejection for {bad}"):
-                _validate_webhook_url_py(bad)
+            for allow_loopback in (False, True):
+                with self.assertRaises(ValueError, msg=f"Expected SSRF rejection for {bad}"):
+                    _validate_webhook_url_py(bad, allow_loopback=allow_loopback)
+
+    def test_loopback_policy_module_and_owner_tenant_binding_contract(self):
+        policy_src = (ROOT / "src/webhooks/policy.rs").read_text(encoding="utf-8")
+        self.assertIn(
+            'pub const ALLOW_LOOPBACK_ENV: &str = "ROOTYARD_WEBHOOK_ALLOW_LOOPBACK";', policy_src
+        )
+        self.assertIn("pub fn loopback_targets_allowed() -> bool", policy_src)
+        self.assertIn("pub fn permitted_peer(", policy_src)
+        # Anything except a case-insensitive `true` keeps the deny default.
+        self.assertIn('eq_ignore_ascii_case("true")', policy_src)
+        self.assertIn("pub mod policy;", (ROOT / "src/webhooks.rs").read_text(encoding="utf-8"))
+
+        # The send path re-validates against the live policy instead of trusting
+        # the URL accepted when the hook was created.
+        signing_src = (ROOT / "src/webhooks/signing.rs").read_text(encoding="utf-8")
+        self.assertIn("policy::loopback_targets_allowed()", signing_src)
+        self.assertIn("validate_webhook_url_with_policy(url, loopback_allowed)", signing_src)
+        self.assertIn(
+            "policy::permitted_peer(target.is_loopback, a.ip(), loopback_allowed)", signing_src
+        )
+
+        # Tenant scope is the repository owner, never the acting user.
+        handlers_src = (ROOT / "src/webhooks/handlers.rs").read_text(encoding="utf-8")
+        self.assertIn(
+            "authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::", handlers_src
+        )
+        self.assertNotIn("authorize_repo(&tx, &actor", handlers_src)
+        self.assertNotIn("&actor.id, &access.repo_id", handlers_src)
+        self.assertNotIn("&access.owner_id, &actor.id", handlers_src)
+        self.assertNotIn("&actor.id", handlers_src)
 
     def test_live_loopback_http_delivery_exponential_backoff_and_manual_retry(self):
         secret = "whsec_loopback_live_test_secret"
@@ -609,6 +663,8 @@ class WebhooksTrackAContractTest(unittest.TestCase):
             "idempotent_ci_callbacks_and_monotonic_check_runs",
             "outbox_push_and_pull_request_event_dispatch",
             "exponential_backoff_retry_and_dead_letter",
+            "webhook_loopback_default_deny_and_operator_opt_in",
+            "collaborator_team_and_organization_tenant_scope",
             "access_and_boundaries",
         )
         for method_name in expected_cases:
