@@ -172,7 +172,14 @@ Publication takes the same repository exclusive lease/publication/maintenance
 guard as a normal pin, revalidates the committed operation manifest and route
 before and after the swap, and merges every legitimate new-generation intent
 and receipt accepted on the new primary instead of replacing the live
-directory with the old source image. A pending marker transition is not a
+directory with the old source image. The source releases its cutover guard
+immediately after the cutover transaction and retired-source marker commit,
+before the finalize RPC, because holding the same database advisory key across
+the request would self-deadlock the target's exclusive finalize. Until a
+non-empty source image has actually published, fresh pin issuance for that
+repository returns a bounded `503` retryable handoff response rather than
+reporting the staged old roots as unmanaged corruption; a repository with no
+pre-existing CI roots may accept a fresh pin, which finalize must merge. A pending marker transition is not a
 reason to bypass that guard: the internal finalize path may complete only the
 exact committed operation while ordinary new writes are blocked by the same
 fence, so it cannot deadlock its own recovery. The directory swap uses
@@ -184,7 +191,14 @@ never satisfy that condition. If the source dies after committing the cutover,
 both the pending marker transition and the staged sidecars are republished by
 startup reconciliation on their respective volumes. A durable per-operation
 publication receipt makes a lost finalize response idempotent instead of a
-permanent conflict.
+permanent conflict. A retry tolerates files legitimately released after
+publication only when their retained CI root is also gone; it never recreates
+released intents or receipts. Startup staging cleanup retains uninspected
+orphans and removes only staging whose exact operation row proves it aborted or
+belongs to another target. The sidecar threat model is a trusted single host:
+repository owners and the service UID are trusted, and intent/receipt/publish
+files are opened with `O_NOFOLLOW` inside service-owned directories; untrusted
+shared-volume writers are not supported.
 
 Released pins and cancelled checkout jobs are tombstones. An intent whose
 retained CI root is not in the measured manifest is omitted instead of being

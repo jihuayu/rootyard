@@ -377,7 +377,7 @@ def main():
                 node1, "/api/repos/alice/demo/ci-pins", h.alice, "POST",
                 {"job_id": merged_job, "target_oid": concurrent_oid,
                  "storage_generation": demo_generation + 1})
-            assert merged_status in (200, 201), (merged_status, merged_raw[:300])
+            assert merged_status == 503, (merged_status, merged_raw[:300])
             marker(node1_data, "target-sidecar-before-publish")
             pin_status, pin_raw = request(
                 node1, "/api/repos/alice/demo/ci-pins", h.alice, "POST",
@@ -399,8 +399,13 @@ def main():
         assert h.git("--git-dir=" + str(dest_repo_id), "rev-parse",
                      "refs/rootyard-ci/jobs/" + concurrent_job
                      ).stdout.decode().strip() == concurrent_oid
+        merged_retry, merged_retry_raw = request(
+            node1, "/api/repos/alice/demo/ci-pins", h.alice, "POST",
+            {"job_id": merged_job, "target_oid": concurrent_oid,
+             "storage_generation": demo_generation + 1})
+        assert merged_retry in (200, 201), (merged_retry, merged_retry_raw[:300])
         merged_sidecar = concurrent_sidecar.parent / (merged_job + ".json")
-        assert merged_sidecar.is_file(), "pre-finalize accepted pin was overwritten"
+        assert merged_sidecar.is_file(), "pre-finalize bounded 503 retry was not honored"
         assert (merged_sidecar.parent / (merged_job + ".pinned.json")).is_file()
         assert h.git("--git-dir=" + str(dest_repo_id), "rev-parse",
                      "refs/rootyard-ci/jobs/" + merged_job
@@ -483,6 +488,54 @@ def main():
         h.env.pop("ROOTYARD_TEST_FAULT", None)
         h.stop(hard=True)
         h.start()
+
+        # A repository with zero pre-existing CI roots allows a fresh pin while
+        # the committed cutover is paused before the first finalize RPC. The
+        # empty source image has nothing to hand off, and finalize must merge
+        # the accepted fresh pin instead of replacing the live directory.
+        freshrace, freshrace_work, _, freshrace_tip = create_repo(h, "freshrace")
+        freshrace_route = json.loads(h.expect(
+            "/api/repos/alice/freshrace/shard-route", 200, token=h.alice))
+        freshrace_generation = int(h.sql(
+            "SELECT storage_generation FROM repositories WHERE id='" + freshrace["id"] + "'"))
+        pause_marker = h.root / "data" / ".native-test-faults" / "cutover-before-sidecar-finalize.json"
+        if pause_marker.exists():
+            pause_marker.unlink()
+        h.stop(hard=True)
+        h.env["ROOTYARD_TEST_FAULT"] = "cutover-before-sidecar-finalize"
+        h.env["ROOTYARD_TEST_FAULT_ACTION"] = "pause"
+        h.env["ROOTYARD_TEST_FAULT_PAUSE_MS"] = "4000"
+        h.start()
+        freshrace_op = str(uuid.uuid4())
+        freshrace_job = str(uuid.uuid4())
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(
+                h.http, "/api/repos/alice/freshrace/shard-migrate",
+                token=h.alice, method="POST",
+                body={"target_node_id": "node1",
+                      "expected_route_epoch": freshrace_route["route_epoch"],
+                      "operation_id": freshrace_op})
+            marker(h.root / "data", "cutover-before-sidecar-finalize")
+            fresh_status, fresh_raw = request(
+                node1, "/api/repos/alice/freshrace/ci-pins", h.alice, "POST",
+                {"job_id": freshrace_job, "target_oid": freshrace_tip,
+                 "storage_generation": freshrace_generation + 1})
+            assert fresh_status in (200, 201), (fresh_status, fresh_raw[:300])
+            status, raw, _ = pending.result(timeout=40)
+        assert status == 200, (status, raw[:400])
+        assert json.loads(raw)["state"] == "completed"
+        h.env.pop("ROOTYARD_TEST_FAULT", None)
+        h.env.pop("ROOTYARD_TEST_FAULT_ACTION", None)
+        h.env.pop("ROOTYARD_TEST_FAULT_PAUSE_MS", None)
+        h.stop(hard=True)
+        h.start()
+        freshrace_dest = node1_data / "repos" / (freshrace["id"] + ".git")
+        freshrace_sidecar = node1_data / "ci-pins" / freshrace["id"] / (freshrace_job + ".json")
+        assert freshrace_sidecar.is_file(), "zero-root fresh pin was lost by finalize"
+        assert h.git("--git-dir=" + str(freshrace_dest), "rev-parse",
+                     "refs/rootyard-ci/jobs/" + freshrace_job
+                     ).stdout.decode().strip() == freshrace_tip
+        git_ok(h, freshrace_dest)
 
         # Second repository: source SIGKILL at final drain, before cutover
         # commit, and immediately after the cutover commit. The old source is
@@ -648,9 +701,11 @@ def main():
             "old_generation_pin_not_rebound": True,
             "fresh_checkout_after_handoff": True,
             "fresh_pin_accepted_during_finalize_survives": True,
-            "pre_finalize_pin_merged_with_source_evidence": True,
+            "pre_finalize_pin_bounded_503_then_retry": True,
+            "zero_preexisting_root_fresh_pin_merged_by_finalize": True,
             "verified_staged_sidecar_survives_target_restart": True,
             "reconcile_window_fixture_34_retained": surviving,
+            "reconcile_window_fixture_is_metadata_only": True,
             "retained_ci_backup_snapshot_roots": True,
             "stock_git_fsck_and_acknowledged_commits": True,
             "old_source_nonwriter_after_true_fence": True,

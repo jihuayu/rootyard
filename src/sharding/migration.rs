@@ -638,6 +638,10 @@ pub async fn migrate_repository(
     let transition_id = transitions::stage(&tx, &state, &marker).await?;
     cutover.ensure_active()?;
     transitions::commit_and_publish(&state, tx, &actor, &marker, transition_id).await?;
+    // The SQL cutover and retired-source marker are durable; holding the
+    // source repository guard across the finalize RPC would self-deadlock with
+    // the target's exclusive finalize on the same database advisory key.
+    drop(cutover);
     faults::hit(
         &state.storage.root,
         "cutover-before-sidecar-finalize",

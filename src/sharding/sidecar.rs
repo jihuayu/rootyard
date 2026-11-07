@@ -816,26 +816,52 @@ async fn verify_published_receipt(
     {
         return Err(conflict("CI sidecar publication receipt differs from the committed operation"));
     }
-    let live = read_sidecar_directory(
-        &sidecar_directory(&state.storage.root, repo_id),
-        repo_id,
-        owner_id,
-        &object_format,
-        None,
-    )?;
-    let _ = source_generation;
-    let _ = live;
+    let guard = locks::exclusive(state, repo_id).await?;
+    guard.ensure_active()?;
+    let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
+    let manifest = replication::read_manifest_plain(state, &repo_path).await?;
+    let _ = (source_generation, object_format, owner_id);
     let directory = sidecar_directory(&state.storage.root, repo_id);
     if !safe_directory(&directory)? {
+        // Every receipt file may have been legitimately released already.
+        let all_released = receipt.files.iter().all(|file| {
+            let job = file
+                .name
+                .strip_suffix(".pinned.json")
+                .or_else(|| file.name.strip_suffix(".json"))
+                .and_then(|raw| raw.parse::<Uuid>().ok());
+            job.is_some_and(|job| !manifest.refs.contains_key(&format!("{CI_PREFIX}{job}")))
+        });
+        if all_released {
+            return Ok(true);
+        }
         return Err(conflict("CI sidecar publication receipt has no live directory"));
     }
     for file in &receipt.files {
         let path = directory.join(&file.name);
-        let content = journal::read(&path).map_err(|_| conflict("published CI sidecar file is missing"))?;
-        if digest(&content) != file.sha256 {
-            return Err(conflict("published CI sidecar file changed"));
+        match journal::read(&path) {
+            Ok(content) => {
+                if digest(&content) != file.sha256 {
+                    return Err(conflict("published CI sidecar file changed"));
+                }
+            }
+            Err(_) => {
+                // A legitimate post-publication release removes the intent,
+                // receipt and retained root together. Never re-publish it; a
+                // missing file whose retained root still exists is corruption.
+                let job = file
+                    .name
+                    .strip_suffix(".pinned.json")
+                    .or_else(|| file.name.strip_suffix(".json"))
+                    .and_then(|raw| raw.parse::<Uuid>().ok())
+                    .ok_or_else(|| conflict("publication receipt has a non-canonical file"))?;
+                if manifest.refs.contains_key(&format!("{CI_PREFIX}{job}")) {
+                    return Err(conflict("published CI sidecar file is missing"));
+                }
+            }
         }
     }
+    guard.ensure_active()?;
     Ok(true)
 }
 
@@ -866,6 +892,40 @@ fn write_receipt(
     };
     journal::atomic(&receipt_path(state, operation_id)?, &serde_json::to_vec(&receipt).map_err(Error::internal)?, true)
         .map_err(Error::internal)
+}
+
+/// True while a committed cutover has not yet published its non-empty source
+/// sidecar image. The new primary must return a bounded 503 to fresh pin
+/// issuance instead of reporting the staged old roots as unmanaged corruption.
+/// A repository whose staged image is empty has no old roots to hand off, so a
+/// fresh pin may be accepted and merged by the following finalize.
+pub(crate) async fn handoff_pending(state: &AppState, repo_id: Uuid) -> Result<bool, Error> {
+    let Some(node_id) = crate::sharding::transport::node_id()? else {
+        return Ok(false);
+    };
+    let client = state.pool.get().await.map_err(Error::internal)?;
+    let row = client
+        .query_opt(
+            "SELECT o.id FROM shard_replication_operations o              JOIN repositories p ON p.id=o.repository_id              JOIN repository_shard_routes r ON r.repository_id=o.repository_id              WHERE o.repository_id=$1 AND o.target_node_id=$2 AND o.state='completed'                AND r.primary_node_id=$2 AND p.storage_generation=o.source_generation+1              ORDER BY o.updated_at DESC,o.id DESC LIMIT 1",
+            &[&repo_id, &node_id],
+        )
+        .await
+        .map_err(Error::internal)?;
+    let Some(row) = row else { return Ok(false) };
+    let operation_id: Uuid = row.get(0);
+    if journal::exists(&receipt_path(state, operation_id)?).map_err(Error::internal)? {
+        return Ok(false);
+    }
+    let staged = staged_path(state, operation_id)?;
+    if !safe_directory(&staged)? || !journal::exists(&staged.join("bundle.json")).map_err(Error::internal)? {
+        // Completed cutover with no publication proof: block rather than let
+        // a new pin trip over unmanaged retained roots.
+        return Ok(true);
+    }
+    let bundle: SidecarBundle =
+        serde_json::from_slice(&journal::read(&staged.join("bundle.json")).map_err(Error::internal)?)
+            .map_err(|_| conflict("corrupt staged CI sidecar bundle"))?;
+    Ok(!bundle.files.is_empty())
 }
 
 /// Publish a committed operation's staged bundle under the repository exclusive
@@ -1024,7 +1084,9 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
             .await
             .map_err(Error::internal)?;
         let remove = match exact {
-            None => true,
+            // An uninspected orphan is retained; only exact aborted or foreign
+            // operation staging is removed.
+            None => false,
             Some(row) => {
                 let target: String = row.get(0);
                 let state_name: String = row.get(1);
