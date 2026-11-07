@@ -14,7 +14,7 @@ preflight diagnostic. The assertion is strict: SQLSTATE/error text must contain
 the fixed sentence and count-only numbers, must not contain any row, repository
 or owner UUID, version 134 must not be in the ledger, none of the new constraints
 may exist, the old single-column manifest link must still be there, and both
-seeded rows must be byte-for-byte unchanged (the migration transaction rolled
+seeded rows must be unchanged in the five identity/state columns checked below (the migration transaction rolled
 back). This is a refusal, not a silent repair.
 
 Only after the script explicitly deletes its own bad row does the candidate
