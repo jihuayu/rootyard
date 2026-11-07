@@ -1,0 +1,218 @@
+{
+ "role": "verify_pr1",
+ "generated_at_unix": 1794013051,
+ "certified_source": {
+  "commit": "7a77c83d549a2b855b56a496b0d304eff808fc0c",
+  "worktree": "/workspace/rootyard-worktrees/round2-integrated",
+  "dirty": false,
+  "head_verified_before_and_after_tests": true
+ },
+ "certified_inputs": {
+  "production_inputs_sha256": "56b09c53ca347b9e023f3efc14eb8518f982be80b7b1041c1088aa163859a73c",
+  "build_inputs_before_equals_after": true
+ },
+ "certified_binary": {
+  "path": "/workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard",
+  "sha256": "d04cbed891f997297dfad0a180773400db931d30f4cf8a9c6ac27d4123efab7d",
+  "size_bytes": 309474632,
+  "mode": "0500",
+  "immutable_not_overwritten": true
+ },
+ "build": {
+  "command": "/workspace/scratch/rootyard-round2/build verify_pr1 /workspace/rootyard-worktrees/round2-integrated",
+  "mechanism": "flock + cargo clean -p rootyard + cargo build --locked --bin rootyard; before/after production-input digest cmp; atomic chmod 700 copy",
+  "verification_command": "python3 /workspace/scratch/rootyard-round2/verify_build.py verify_pr1 /workspace/rootyard-worktrees/round2-integrated",
+  "verification_result": {
+   "valid": true,
+   "source_commit": "7a77c83d549a2b855b56a496b0d304eff808fc0c",
+   "binary_sha256": "d04cbed891f997297dfad0a180773400db931d30f4cf8a9c6ac27d4123efab7d"
+  }
+ },
+ "fresh_migration": {
+  "schema_version": 130,
+  "how": "isolated probe migrate with DATABASE_URL to round2_verify_pr1 then inspect public.schema_migrations",
+  "note": "each unittest/ops run also creates its own random schema and runs migrate"
+ },
+ "unit_tests": {
+  "command": "env ROOTYARD_TEST_DATABASE_URL=postgres://agent@127.0.0.1:55433/round2_verify_pr1 ROOTYARD_BINARY=<immutable> PYTHONPATH=.:tests /workspace/scratch/deepseek-rootyard/env-run python3 -m unittest -v tests.test_sandbox_service tests.test_ci_sandbox",
+  "result": "PASS",
+  "tests_run": 6,
+  "duration_s": 35.346,
+  "cases": [
+   "test_sandbox_service.test_isolated_jobs_logs_artifacts_cancel_and_timeout",
+   "test_sandbox_service.test_quota_cancel_crash_cleanup_and_retention",
+   "test_sandbox_service.test_artifact_pool_is_bounded_and_validated",
+   "test_ci_sandbox.test_claimed_origin_checkout_build_and_cancel",
+   "test_ci_sandbox.test_fenced_retry_requires_new_attempt",
+   "test_ci_sandbox.test_two_concurrent_claims_isolated_build_and_export"
+  ],
+  "log": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/unit-tests.log",
+  "sandbox_mode": "dev (bwrap)",
+  "cgroup_kernel_positive": "NOT AVAILABLE in this environment (no delegated cgroup v2 subtree; rootless Docker cgroup driver none); positive cgroup test NOT claimed and not faked"
+ },
+ "ops_checks": [
+  {
+   "name": "cluster-tls",
+   "command": "env ROOTYARD_TEST_DATABASE_URL=postgres://agent@127.0.0.1:55433/round2_verify_pr1 ROOTYARD_BINARY=/workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard PYTHONPATH=.:tests TMPDIR=/tmp/verify_pr1-cluster-tls /workspace/scratch/deepseek-rootyard/env-run python3 tests/cluster_tls_native.py --binary /workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard --report /workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-tls.json",
+   "report": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-tls.json",
+   "report_sha256": "da39740295729fa33422dc424499c4460f0841015505164d288c7d3beffe8bfd",
+   "log": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-tls.tmpdir-rerun.log",
+   "exit_code": 0,
+   "status": "PASS",
+   "assertions": {
+    "encrypted": true,
+    "scram_sha256_authenticated": true,
+    "ca_validation_rejected_wrong_root": true,
+    "hostname_validation_rejected_ip_mismatch": true,
+    "wrong_password_rejected": true,
+    "explicit_downgrade_rejected": true,
+    "postgres_version": "17.11"
+   },
+   "notes": "ran on /tmp from the start; not affected by the ENOSPC incident"
+  },
+  {
+   "name": "cluster-kafka-tls",
+   "command": "env ROOTYARD_TEST_DATABASE_URL=postgres://agent@127.0.0.1:55433/round2_verify_pr1 ROOTYARD_BINARY=/workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard PYTHONPATH=.:tests TMPDIR=/tmp/verify_pr1-cluster-kafka-tls /workspace/scratch/deepseek-rootyard/env-run python3 tests/cluster_kafka_tls_native.py --binary /workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard --kafka-home /workspace/scratch/rootyard-round2/ops43_44/kafka-home --report /workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-kafka-tls.json",
+   "report": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-kafka-tls.json",
+   "report_sha256": "a1f7e5e60552b2c4b7a90687f4110e0da005b1a6048492409a2369264f003331",
+   "log": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-kafka-tls.tmpdir-rerun.log",
+   "exit_code": 0,
+   "status": "PASS",
+   "assertions": {
+    "sasl_mechanism": "PLAIN over TLS",
+    "broker_restart_reconnected": true,
+    "initial_wake_offset": 2,
+    "post_restart_wake_offset": 3,
+    "kafka_version": "3.9.1",
+    "push_during_outage_oid_differs_from_after_reconnect": true
+   },
+   "notes": "attempt1 failed with host ENOSPC (log preserved as cluster-kafka-tls.attempt1-ENOSPC.log); final receipt is the post-cleanup /tmp run"
+  },
+  {
+   "name": "cluster-local-profile",
+   "command": "env ROOTYARD_TEST_DATABASE_URL=postgres://agent@127.0.0.1:55433/round2_verify_pr1 ROOTYARD_BINARY=/workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard PYTHONPATH=.:tests TMPDIR=/tmp/verify_pr1-cluster-local-profile /workspace/scratch/deepseek-rootyard/env-run python3 tests/cluster_local_profile_native.py --binary /workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard --kafka-home /workspace/scratch/rootyard-round2/ops43_44/kafka-home --report /workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-local-profile.json",
+   "report": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-local-profile.json",
+   "report_sha256": "e33fd1a3a154ea666fd62872416190f78ca41aa08c74809cbead07012ee3caa3",
+   "log": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-local-profile.tmpdir-rerun.log",
+   "exit_code": 0,
+   "status": "PASS",
+   "assertions": {
+    "node_count": 2,
+    "acknowledged_oid_equals_owner_clone_and_routed_browse": true,
+    "kafka_offset_incremented": true,
+    "failed_preflight_secrets_cleaned": true,
+    "kafka_auth": "SASL/PLAIN over TLS"
+   }
+  },
+  {
+   "name": "cluster-workload-integration",
+   "command": "env ROOTYARD_TEST_DATABASE_URL=postgres://agent@127.0.0.1:55433/round2_verify_pr1 ROOTYARD_BINARY=/workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard PYTHONPATH=.:tests TMPDIR=/tmp/verify_pr1-cluster-workload-integration /workspace/scratch/deepseek-rootyard/env-run python3 tests/cluster_workload_native.py --binary /workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard --report /workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-workload-integration.json",
+   "report": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-workload-integration.json",
+   "report_sha256": "01f9c94326ed1be17dcdef5e4d9c1d2b9fb98d878e8666a99f9c64c2fac9d2d8",
+   "log": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-workload-integration.tmpdir-rerun.log",
+   "exit_code": 0,
+   "status": "PASS",
+   "assertions": {
+    "tiers": [
+     1,
+     2,
+     4
+    ],
+    "pushes_per_tier": 8,
+    "fetches_per_tier": 8
+   },
+   "notes": "measurements on a single Linux host / loopback; functional sharding only"
+  },
+  {
+   "name": "cluster-pg-streaming",
+   "command": "env ROOTYARD_TEST_DATABASE_URL=postgres://agent@127.0.0.1:55433/round2_verify_pr1 ROOTYARD_BINARY=/workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard PYTHONPATH=.:tests TMPDIR=/tmp/verify_pr1-cluster-pg-streaming /workspace/scratch/deepseek-rootyard/env-run python3 tests/cluster_pg_streaming_native.py --binary /workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard --report /workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-pg-streaming.json",
+   "report": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-pg-streaming.json",
+   "report_sha256": "d915948fd0a0dc599430378eab5beda5366db660c98c2609b556a33a76578e05",
+   "log": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-pg-streaming.tmpdir-rerun.log",
+   "exit_code": 0,
+   "status": "PASS",
+   "assertions": {
+    "full_ack_set_captured_after_writer_join": true,
+    "acknowledged_commits": 3,
+    "acknowledged_oids": 3,
+    "acknowledged_after_fault": 0,
+    "writer_terminated_before_accounting": true,
+    "standby_sync_state_before_failure": "sync",
+    "synchronous_commit": "remote_apply",
+    "standby_promoted": true,
+    "rpo_lost_acknowledged_commits": 0,
+    "rto_write_ms": 3722.574,
+    "rto_read_ms": 1719.275,
+    "recovery": "manual local-host promote + restart, repository ready"
+   },
+   "notes": "attempt1 (cluster-pg-streaming.attempt1-ENOSPC-contaminated.json) was discarded: its outage window included host ENOSPC git failures rather than only primary loss; final receipt is the clean /tmp rerun"
+  },
+  {
+   "name": "cluster-pg-pitr",
+   "command": "env ROOTYARD_TEST_DATABASE_URL=postgres://agent@127.0.0.1:55433/round2_verify_pr1 ROOTYARD_BINARY=/workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard PYTHONPATH=.:tests TMPDIR=/tmp/verify_pr1-cluster-pg-pitr /workspace/scratch/deepseek-rootyard/env-run python3 tests/cluster_pg_pitr_native.py --binary /workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard --report /workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-pg-pitr.json",
+   "report": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-pg-pitr.json",
+   "report_sha256": "31e3c32a5f028c1f9a39366ec506610a9048a853e696e5a2ae7ce85769b816cb",
+   "log": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-pg-pitr.tmpdir-rerun.log",
+   "exit_code": 0,
+   "status": "PASS",
+   "assertions": {
+    "retained_ref_and_objects_fsck": "passed",
+    "later_write_intentionally_lost_at_point_in_time": true,
+    "archived_segment_count": 6,
+    "delegation_authority_rotated_before_reopening": true,
+    "worker_outbox_drain_before_reopening": true
+   },
+   "notes": "post_restore_acknowledged_oid is a new commit made after restore; retained pre-boundary oid is preserved and verified by fsck"
+  },
+  {
+   "name": "cluster-disk-pressure",
+   "command": "env ROOTYARD_TEST_DATABASE_URL=postgres://agent@127.0.0.1:55433/round2_verify_pr1 ROOTYARD_BINARY=/workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard PYTHONPATH=.:tests TMPDIR=/tmp/verify_pr1-cluster-disk-pressure /workspace/scratch/deepseek-rootyard/env-run python3 tests/cluster_disk_pressure_native.py --binary /workspace/scratch/rootyard-round2/verify_pr1/artifacts/7a77c83d549a2b855b56a496b0d304eff808fc0c-56b09c53ca347b9e/rootyard --report /workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-disk-pressure.json",
+   "report": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-disk-pressure.json",
+   "report_sha256": "550fcff238a90915f761ec6ff7167252e2485b65fdbcd71294be4617da839084",
+   "log": "/workspace/scratch/rootyard-round2/verify_pr1/evidence/cluster-disk-pressure.tmpdir-rerun.log",
+   "exit_code": 0,
+   "status": "PASS",
+   "assertions": {
+    "free_kib_at_push": 0,
+    "post_pressure_retry_acked": true,
+    "mount_size_mib": 360
+   },
+   "notes": "rootless Docker private tmpfs, not a physical disk"
+  }
+ ],
+ "provenance_validation": {
+  "method": "programmatic read of all 7 evidence JSON receipts",
+  "all_reports_source_base_commit_7a77": true,
+  "all_reports_source_worktree_dirty_false": true,
+  "all_reports_binary_sha256_equals_immutable": true,
+  "all_reports_measurement_kind_native_execution": true,
+  "all_reports_simulated_fields_false": true,
+  "no_report_contains_enospc_marker": true
+ },
+ "gate": {
+  "full_9_gate": "BLOCKED - NOT RUN HERE",
+  "reason": "baseline cluster takeover/partition/migration paths are known broken at this source and are being fixed in other worktrees; task scope is the 7 core OPS receipts plus 6 native sandbox/CI tests",
+  "receipts_claimed": 7,
+  "receipts_fabricated": 0,
+  "missing_receipts_presented_as_pass": false
+ },
+ "scope_and_environment_limitations": [
+  "single Linux host, single-kernel containers; no independent physical hosts or network failure domains",
+  "rootless managed Docker (29.9.2) used only for the disk-pressure container; cgroup driver reported none",
+  "cgroup v2 kernel-positive sandbox test UNAVAILABLE (no delegated subtree); the 6 sandbox/CI tests ran in dev/bwrap mode and no cgroup enforcement is claimed",
+  "PostgreSQL promotion is manual and local; no DCS, no automatic leader election, no automatic client reconfiguration, no cross-host fencing",
+  "Kafka is a single task-owned KRaft broker; no multi-broker failover claimed",
+  "clean final pg-streaming run reached repository state ready with no unknown push outcome, so the explicit unknown-operation/audit-gap resolution path was not re-exercised by the certified receipt (it was exercised only in the discarded ENOSPC-contaminated attempt1, where audit_gap_acknowledged=true and a new generation was issued)",
+  "workload timings are operational samples taken while an unrelated certified-cluster test suite was running on the same host; not a capacity plan",
+  "TLS/proxy inheritance preserved; no key or password material written to logs or this report"
+ ],
+ "environment_incidents": [
+  {
+   "what": "root overlay reached 98% (free ~0.8GiB) during the first OPS batch",
+   "symptom": "cluster-kafka-tls attempt1 failed at e2e git clone with ENOSPC; cluster-pg-streaming attempt1 completed but its outage-window workload was ENOSPC-contaminated",
+   "action": "failed/contaminated attempt logs and receipts preserved under evidence/*attempt1*; coordinator archived inactive logs/temp dirs; all final receipts rerun on the healthy overlay with TMPDIR=/tmp",
+   "effect_on_verdict": "none for final receipts; contaminated attempt1 evidence is explicitly excluded"
+  }
+ ],
+ "conclusion": "Certified immutable binary d04cbed8 (source 7a77c83d, production inputs 56b09c53) passes the 6 native sandbox/CI tests and all 7 core OPS native receipts with correct provenance. Full 9-receipt cluster gate remains blocked on the known-broken baseline cluster paths and is not claimed."
+}

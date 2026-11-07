@@ -1,0 +1,57 @@
+{
+  "measurement_kind": "native_execution",
+  "simulated_fields": false,
+  "source_base_commit": "7a77c83d549a2b855b56a496b0d304eff808fc0c",
+  "source_worktree_dirty": false,
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "python": "3.12.14",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)"
+  },
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "mem_total_kb": 18440100
+  },
+  "topology": "new Rootyard data volume and new loopback endpoint against a PITR-restored PostgreSQL 17 cluster; source archive/base backup on one host",
+  "dataset": "one private repository with two acknowledged commits before the restore point and one acknowledged commit afterwards",
+  "workload": "native Git push/fetch/browse, token revocation, permission denial, PostgreSQL WAL archive/base backup/PITR, offline matching GitFS snapshot, and delivery-worker drain before reopening ingress",
+  "limits": [
+    "single-host local unencrypted archive and offline matching GitFS snapshot",
+    "manual recovery, new endpoint/volume and traffic restart",
+    "not a remote-retained encrypted backup",
+    "not zero-RPO failover or a supported multi-host PostgreSQL HA deployment"
+  ],
+  "binary_sha256": "d04cbed891f997297dfad0a180773400db931d30f4cf8a9c6ac27d4123efab7d",
+  "binary_size_bytes": 309474632,
+  "harness_sha256": "8362c98215785700348cd526de3a438dea09aec3ce80cd9c18f483630258810c",
+  "kind": "native_postgresql_wal_archive_pitr_and_gitfs_snapshot",
+  "pg_basebackup_version": "pg_basebackup (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)",
+  "postgres_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "archive_mode": "on",
+  "restore_point_lsn": "0/3000090",
+  "archived_segment_after_later_ack": "000000010000000000000004",
+  "archive_segment_count": 6,
+  "retained_acknowledged_oid": "4e16d8cbf5df00c2198a2faa0a7f34105051d86b",
+  "later_acknowledged_oid_outside_recovery_point": "b564b1972bf1fab2086eac5d9dd45366809e51aa",
+  "post_restore_acknowledged_oid": "e0108944981dcd6e5d150f7a404c1fd75c288c02",
+  "restored_git_operation_rows": 2,
+  "restored_deployment": {
+    "data_volume": "new directory copied from the matched offline GitFS snapshot",
+    "endpoint": "new loopback port",
+    "metadata": "PITR-restored PostgreSQL cluster"
+  },
+  "worker_restore": {
+    "worker_once_processed": 4,
+    "outbox_events_before_boundary": 2,
+    "outbox_events_after_restore": 2,
+    "pending_deliveries_before_boundary": 4,
+    "pending_deliveries_after_worker": 0
+  },
+  "retained_ref_and_objects_fsck": "passed",
+  "reader_access_unrelated_tenant_denial_and_token_revocation": "passed",
+  "delegation_authority_rotated_before_reopening": true,
+  "later_write_intentionally_lost_at_point_in_time": true
+}
