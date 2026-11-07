@@ -169,6 +169,27 @@ async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
             version=version+1,updated_at=clock_timestamp() WHERE repository_id=$1 RETURNING {REPO_ROUTE_FIELDS}"),
         &[&candidate.repo_id,&node_id,&new_epoch,&new_token,&route.route_epoch,&new_generation,&sequence],
     ).await?);
+    // Retire the old source volume before this promotion commits. The physical
+    // process fence and the post-fence source re-verification already proved the
+    // old session is gone and its refs still match the measured snapshot, so the
+    // marker can only land on a quiescent source. It is built from the new route
+    // and generation and marked read-only, so a process that mounts the old
+    // volume and claims the new node id without a fence driver is still rejected
+    // by the on-disk barrier. The helper fsyncs and verifies the marker before
+    // returning: a failed or unverifiable write returns Err and rolls this
+    // transaction back, so promotion never commits without a durable retired
+    // marker. If the rollback happens after the marker was published, the old
+    // volume stays read-only (fail-closed availability loss), never a split
+    // brain, until an operator completes recovery.
+    let retired_source = VolumeFenceMarker {
+        primary_node_id: candidate.old_node.clone(),
+        read_only_degraded: true,
+        ..VolumeFenceMarker::from_route(&moved, new_generation,
+            Some(candidate.old_node.clone()), models::unix_now())
+    };
+    local_fence::retire_volume_repository(
+        &candidate.old_node, candidate.repo_id, &retired_source,
+    ).map_err(|error| anyhow::anyhow!("retired source marker is not durable: {error:#}"))?;
     tx.execute("UPDATE shard_replication_operations SET state='completed',updated_at=clock_timestamp() WHERE id=$1 AND state='verified'",
         &[&candidate.operation_id]).await?;
     tx.execute(
