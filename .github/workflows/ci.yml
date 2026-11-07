@@ -6,12 +6,13 @@ permissions:
   contents: read
 jobs:
   verify:
-    runs-on: ubuntu-24.04
-    container:
-      image: rust:1-trixie
-      # Match compose.yaml: orphaned Git grandchildren need an init reaper.
-      options: --init
-    timeout-minutes: 45
+    # Plain Ubuntu 22.04 host profile, matching the target on which the manual
+    # native-kernel-acceptance workflow passed its 17 assertions. There is no
+    # container init process: PID 1 is the runner host's init, which adopts and
+    # reaps orphaned Git grandchildren. Do not introduce a global child
+    # subreaper or relax AppArmor/LSM policy to compensate for a missing init.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:17
@@ -19,27 +20,42 @@ jobs:
           POSTGRES_USER: rootyard
           POSTGRES_PASSWORD: rootyard-ci-only
           POSTGRES_DB: rootyard_test
+        # Publish the service on the host at a fixed loopback port. The
+        # container service itself is ephemeral and uses a CI-only password.
+        ports:
+          - 127.0.0.1:55432:5432
         options: >-
           --health-cmd "pg_isready -U rootyard -d rootyard_test"
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
-      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard:rootyard-ci-only@postgres:5432/rootyard_test
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard:rootyard-ci-only@127.0.0.1:55432/rootyard_test
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Trust the owned checkout in the container Git environment
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Use the project Python version
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install native CI toolchain (postgresql-17 postgresql-client-17, Git 2.43, bubblewrap --size, FUSE, LFS)
+        timeout-minutes: 20
+        run: |
+          scripts/install_ci_native_tools.sh install \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/ci-native-tools/provenance.json
+      - name: Verify native CI tool profile
+        timeout-minutes: 5
+        run: |
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
+          scripts/install_ci_native_tools.sh preflight \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/ci-native-tools/provenance.json
       - name: Install pinned Rust 1.99.1 gate tools
         run: |
           rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
           rustup default 1.99.1
           rustc -V && cargo -V && rustfmt -V && cargo clippy -V
-      - name: Install matching PostgreSQL client and test tools
-        run: |
-          apt-get update && apt-get install -y --no-install-recommends git python3 python3-venv postgresql-17 postgresql-client-17 redis-server gcc g++ make pkg-config openjdk-21-jre-headless curl ca-certificates openssl
-          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
-          echo "PG_SHARE=/usr/share/postgresql/17" >> "$GITHUB_ENV"
       - name: Test bounded Kafka download helper
         run: python3 -m unittest discover -s tests -p 'test_download_ci_kafka.py'
       - name: Prepare verified isolated Kafka distribution
@@ -52,6 +68,10 @@ jobs:
           rustc --version
           cargo --version
           git --version
+          git lfs version
+          bwrap --version
+          unshare --version
+          fusermount3 --version
           python3 --version
           psql --version
           pg_dump --version
@@ -165,12 +185,12 @@ jobs:
         run: python3 tests/git_views.py --binary target/debug/rootyard-view-lab --report test-results/git-views.json
       - name: Exercise Pando object store delta resolution, graph traversal, and differential export
         run: |
-          chmod -R a+rX "$GITHUB_WORKSPACE" && runuser -u postgres -- env PATH="/usr/lib/postgresql/17/bin:$PATH" PG_SHARE="/usr/share/postgresql/17" python3 tests/pando_lab.py --binary target/debug/rootyard-pando-lab
+          python3 tests/pando_lab.py --binary target/debug/rootyard-pando-lab
           mkdir -p test-results
           latest_pando=$(ls -td /tmp/rootyard-pando-lab-* 2>/dev/null | head -1 || true)
-          if [ -n "$latest_pando" ] && [ -f "$latest_pando/results.json" ]; then
-            cp "$latest_pando/results.json" test-results/pando-lab.json
-          fi
+          test -n "$latest_pando"
+          test -f "$latest_pando/results.json"
+          cp "$latest_pando/results.json" test-results/pando-lab.json
       - name: Exercise external CI webhooks, HMAC-SHA256 delivery, and auto PR CI pins
         run: python3 tests/webhooks.py --binary target/debug/rootyard --report test-results/webhooks.json
       - name: Exercise webhook batching, lease and TLS regressions
@@ -218,7 +238,12 @@ jobs:
             --harness tests/webhook_worker_recovery.py \
             --harness tests/ci_webhook_regressions.py \
             --fixture postgres=postgres:17 \
-            --fixture rust="$(rustc -V)"
+            --fixture rust="$(rustc -V)" \
+            --fixture git="$(git --version)" \
+            --fixture git_lfs="$(git lfs version)" \
+            --fixture bubblewrap="$(bwrap --version)" \
+            --fixture fuse_device="$(stat -Lc '%F mode=%a' /dev/fuse)" \
+            --fixture ci_native_tools_provenance_sha256="$(sha256sum test-results/ci-native-tools/provenance.json | awk '{print $1}')"
       - name: Upload end-to-end report
         if: always()
         uses: actions/upload-artifact@v4
@@ -228,6 +253,7 @@ jobs:
             test-results/*.json
             test-results/ci-webhook-regressions.log
             test-results/evidence/*.jsonl
+            test-results/ci-native-tools/provenance.json
           if-no-files-found: ignore
 
   container:
