@@ -108,10 +108,10 @@ where
     // keeps it from growing with request count. Panics are logged without the
     // payload; the lost oneshot sender already tells the client "no result".
     while let Some(finished) = jobs.try_join_next() {
-        if let Err(error) = finished {
-            if !error.is_cancelled() {
-                eprintln!("rootyard: owned workspace Git job failed");
-            }
+        if let Err(error) = finished
+            && !error.is_cancelled()
+        {
+            eprintln!("rootyard: owned workspace Git job failed");
         }
     }
     jobs.spawn(async move {
@@ -487,7 +487,7 @@ mod tests {
         let response = spawn_job(async move {
             let _permit = permit;
             let result = collect(shell("sleep 100", None), 4096, Duration::from_millis(200)).await;
-            let _ = finished_tx.send(());
+            let _ = finished_tx.send(result.as_ref().map(|_| ()).map_err(|error| error.0));
             result
         });
         drop(response);
@@ -495,7 +495,7 @@ mod tests {
             .await
             .expect("timed-out owned job did not finish")
             .unwrap();
-        assert_eq!(result.unwrap_err().0, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(result.unwrap_err(), StatusCode::GATEWAY_TIMEOUT);
         assert!(slot(&slots).is_ok(), "a timed-out job retained Git capacity");
     }
 }
