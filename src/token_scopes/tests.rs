@@ -62,7 +62,7 @@ async fn grant_namespace_for_test(
     Ok(())
 }
 
-mod tests {
+mod authority_cases {
     use super::*;
 
     fn authority(restricted: bool, read_only: bool) -> TokenAuthority {
@@ -105,10 +105,10 @@ mod tests {
                     )
             );
         }
-        assert!(RepoAction::ContentsRead.is_mutating() == false);
-        assert!(RepoAction::CiRead.is_mutating() == false);
-        assert!(RepoAction::ChecksRead.is_mutating() == false);
-        assert!(NamespaceAction::OrgRead.is_mutating() == false);
+        assert!(!RepoAction::ContentsRead.is_mutating());
+        assert!(!RepoAction::CiRead.is_mutating());
+        assert!(!RepoAction::ChecksRead.is_mutating());
+        assert!(!NamespaceAction::OrgRead.is_mutating());
         assert!(NamespaceAction::OrgMembersWrite.is_mutating());
         assert!(NamespaceAction::OrgTeamsWrite.is_mutating());
     }
@@ -208,7 +208,7 @@ mod postgres_tests {
     async fn connect_in(schema: &str) -> tokio_postgres::Client {
         let mut config: tokio_postgres::Config =
             base_url().parse().expect("ROOTYARD_TEST_DATABASE_URL must be a PostgreSQL URL");
-        config.options(&format!("-csearch_path={schema}"));
+        config.options(format!("-csearch_path={schema}"));
         let (client, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
         tokio::spawn(connection);
         client

@@ -145,7 +145,7 @@ pub async fn authorize_repo_with_role(
     // Scopes only narrow the RBAC result above and are read in the same
     // transaction, so a token narrowing cannot race this authorisation.
     crate::token_scopes::authorize_repository_for_request(
-        &**tx,
+        tx,
         actor.token_id,
         actor.id,
         repo_id,
@@ -180,7 +180,7 @@ pub async fn authorize_repo_action_by_id(
 ) -> Result<(), Error> {
     verify_token(tx, actor, action.is_mutating()).await?;
     crate::token_scopes::authorize_repository_for_request(
-        &**tx,
+        tx,
         actor.token_id,
         actor.id,
         repo_id,
@@ -201,7 +201,7 @@ pub async fn authorize_namespace_action(
 ) -> Result<(), Error> {
     verify_token(tx, actor, action.is_mutating()).await?;
     crate::token_scopes::authorize_namespace_for_request(
-        &**tx,
+        tx,
         actor.token_id,
         actor.id,
         organization_id,
