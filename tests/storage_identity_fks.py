@@ -166,8 +166,10 @@ class IdentityHarness(Harness):
         )
         definitions = {}
         raw = self.sql(
-            "SELECT conname || '|' || pg_get_constraintdef(oid) || '|' || convalidated "
-            "FROM pg_constraint WHERE conname IN ("
+            "SELECT k.conname || '|' || pg_get_constraintdef(k.oid) || '|' || k.convalidated "
+            "FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid "
+            "JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE n.nspname=current_schema() AND k.conname IN ("
             "'pando_manifest_artifacts_manifest_identity_fkey',"
             "'pando_manifest_artifacts_manifest_id_fkey',"
             "'pando_manifest_artifacts_authority_id_tenant_id_namespace__fkey',"
@@ -178,7 +180,9 @@ class IdentityHarness(Harness):
         )
         for line in raw.splitlines():
             name, definition, validated = line.split("|", 2)
-            definitions[name] = (definition, validated)
+            # pg_get_constraintdef may qualify same-schema targets; normalise so
+            # the shape assertions below do not depend on search_path.
+            definitions[name] = (definition.replace("public.", ""), validated)
         composite = {
             "pando_manifest_artifacts_manifest_identity_fkey": (
                 "FOREIGN KEY (manifest_id, repository_id, tenant_id)",
@@ -281,6 +285,21 @@ class IdentityHarness(Harness):
             "storage_maintenance_tombstones_repository_owner_fkey",
         )
 
+        # The refused inserts must have rolled back completely: nothing with the
+        # wrong tenant may exist, otherwise the probes proved nothing.
+        assert self.sql(
+            "SELECT count(*) FROM storage_maintenance_jobs WHERE repository_id='"
+            + repo_a["id"] + "' AND tenant_id='" + owner_b + "'"
+        ) == "0"
+        assert self.sql(
+            "SELECT count(*) FROM storage_maintenance_repo_state WHERE repository_id='"
+            + state_repo + "'"
+        ) == "0"
+        assert self.sql(
+            "SELECT count(*) FROM storage_maintenance_tombstones WHERE repository_id='"
+            + repo_a["id"] + "' AND oid='" + oid_wrong + "'"
+        ) == "0"
+
         # The legal pair still inserts for every table; each row is this run's own
         # fixture and is removed again before the case returns.
         own_job = str(uuid.uuid4())
@@ -301,7 +320,7 @@ class IdentityHarness(Harness):
             "SELECT tenant_id::text FROM storage_maintenance_repo_state WHERE repository_id='"
             + state_repo + "'"
         ) == owner_a
-        oid_legal = "e" * 40
+        oid_legal = os.urandom(20).hex()
         self.sql(
             "INSERT INTO storage_maintenance_tombstones"
             "(repository_id,tenant_id,oid,object_kind,repository_generation,delete_after,state) "

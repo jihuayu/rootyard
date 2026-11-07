@@ -110,20 +110,26 @@ DECLARE
     installed INT;
 BEGIN
     SELECT count(*) INTO installed
-      FROM pg_constraint
-     WHERE conname IN (
+      FROM pg_constraint k
+      JOIN pg_class c ON c.oid = k.conrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = current_schema()
+       AND k.conname IN (
                'pando_manifest_artifacts_manifest_identity_fkey',
                'storage_maintenance_repo_state_repository_owner_fkey',
                'storage_maintenance_jobs_repository_owner_fkey',
                'storage_maintenance_tombstones_repository_owner_fkey')
-       AND contype = 'f'
-       AND convalidated
-       AND confdeltype = 'c';
+       AND k.contype = 'f'
+       AND k.convalidated
+       AND k.confdeltype = 'c';
     IF installed <> 4 THEN
         RAISE EXCEPTION 'schema134 installed % of 4 validated composite identity foreign keys', installed;
     END IF;
-    IF EXISTS (SELECT 1 FROM pg_constraint
-                WHERE conname = 'pando_manifest_artifacts_manifest_id_fkey') THEN
+    IF EXISTS (SELECT 1 FROM pg_constraint k
+                 JOIN pg_class c ON c.oid = k.conrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = current_schema()
+                  AND k.conname = 'pando_manifest_artifacts_manifest_id_fkey') THEN
         RAISE EXCEPTION 'schema134 left the single-column manifest link in place';
     END IF;
 END
