@@ -2,7 +2,10 @@
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-pub(super) const FORMAT: u32 = 6;
+/// New archives use format 7 / schema 131. Format 6 remains frozen at schema
+/// 130 so backups produced before the checkout-plan correction stay verifiable
+/// and restorable through the explicit schema-130 upgrade path.
+pub(super) const FORMAT: u32 = 7;
 
 pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
     let raw = match format {
@@ -17,6 +20,11 @@ pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
             include_str!("../../schema/060_upgraded_catalog.json"),
         ],
         6 => [
+            include_str!("../../schema/130_catalog.json"),
+            include_str!("../../schema/130_restored_catalog.json"),
+            include_str!("../../schema/130_upgraded_catalog.json"),
+        ],
+        7 => [
             include_str!("../../schema/131_catalog.json"),
             include_str!("../../schema/131_restored_catalog.json"),
             include_str!("../../schema/131_upgraded_catalog.json"),
@@ -30,7 +38,8 @@ pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
     match format {
         4 => Ok(vec![1, 2, 3, 6, 7]),
         5 => Ok(vec![1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60]),
-        6 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
+        6 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 130).collect()),
+        7 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
         _ => bail!("unsupported backup format"),
     }
 }

@@ -180,9 +180,28 @@ pub async fn prepare_runtime_schema(pool: &Pool) -> Result<()> {
 
 pub async fn migrate(pool: &Pool) -> Result<()> {
     let mut client = pool.get().await?;
+    migrate_client(&mut client).await
+}
+
+/// Apply pending migrations on an existing session, preserving the caller's
+/// session-level backup lock. The caller still owns transaction boundaries and
+/// must verify the resulting schema before exposing the database.
+pub(crate) async fn migrate_client(client: &mut tokio_postgres::Client) -> Result<()> {
     let tx = client.transaction().await?;
     tx.execute("SELECT pg_advisory_xact_lock(738390103)", &[]).await?;
-    tx.batch_execute(include_str!("../migrations/001_initial.sql")).await?;
+    // A restored schema already contains migration 001's tables and ledger in
+    // the caller's effective schema. Skipping the bootstrap avoids reapplying
+    // its table/index definitions; incremental migrations then upgrade in place.
+    let initialized: bool = tx
+        .query_one(
+            "SELECT to_regclass(format('%I.schema_migrations', current_schema())) IS NOT NULL",
+            &[],
+        )
+        .await?
+        .get(0);
+    if !initialized {
+        tx.batch_execute(include_str!("../migrations/001_initial.sql")).await?;
+    }
     for &(version, sql) in MIGRATIONS {
         if tx.query_opt("SELECT version FROM schema_migrations WHERE version=$1", &[&version]).await?.is_none() {
             tx.batch_execute(sql).await?;

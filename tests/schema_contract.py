@@ -13,7 +13,7 @@ import tempfile
 import urllib.parse
 import uuid
 
-from schema_baseline import CATALOG_SQL_PATH, LATEST_PREFIX
+from schema_baseline import CATALOG_SQL_PATH, LATEST_PREFIX, SCHEMA_VERSIONS
 
 
 def main():
@@ -107,6 +107,35 @@ def main():
             roundtrip(upgraded_db, upgraded_restored_db, temporary / 'upgraded008.dump')
             assert catalog(upgraded_restored_db) == restored, 'Upgraded schema did not converge on the full restore contract'
 
+            # A database may already have an initialized public schema and a
+            # fresh custom search_path schema. Migrate must use the effective
+            # schema for its ledger check, bootstrap the custom schema, and
+            # never mutate the initialized public schema.
+            custom = database('custom')
+            migrate(custom)
+            public_tables = run(['psql', '--dbname', custom, '-X', '-qAt', '-c',
+                                 "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                                 "WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S')"], custom).strip()
+            run(['psql', '--dbname', custom, '-X', '-qAt', '-v', 'ON_ERROR_STOP=1',
+                 '-c', 'CREATE SCHEMA tenant'], custom)
+            tenant_url = urllib.parse.urlunsplit(
+                urllib.parse.urlsplit(custom)._replace(
+                    query=urllib.parse.urlencode({'options': '-csearch_path=tenant'})))
+            run([binary, 'migrate'], tenant_url)
+            tenant_versions = run(['psql', '--dbname', custom, '-X', '-qAt', '-c',
+                                   "SELECT string_agg(version::text,',' ORDER BY version) FROM tenant.schema_migrations"], custom).strip()
+            assert tenant_versions == ",".join(str(v) for v in sorted(SCHEMA_VERSIONS)), tenant_versions
+            public_after = run(['psql', '--dbname', custom, '-X', '-qAt', '-c',
+                                "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                                "WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S')"], custom).strip()
+            assert public_after == public_tables, (public_tables, public_after)
+            run([binary, 'migrate'], tenant_url)
+            assert run(['psql', '--dbname', custom, '-X', '-qAt', '-c',
+                        "SELECT count(*) FROM tenant.schema_migrations"], custom).strip() == str(len(SCHEMA_VERSIONS))
+            assert run(['psql', '--dbname', custom, '-X', '-qAt', '-c',
+                        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                        "WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S')"], custom).strip() == public_tables
+
         for filename, value in [(f'{LATEST_PREFIX}_catalog.json', actual),
                                 (f'{LATEST_PREFIX}_restored_catalog.json', restored),
                                 (f'{LATEST_PREFIX}_upgraded_catalog.json', upgraded)]:
@@ -132,6 +161,7 @@ def main():
                 assert value == expected, 'Canonical schema fixture differs: ' + filename
         print(json.dumps(dict(schema_version=LATEST_PREFIX, canonical=True, roundtrip=True,
                               restored003_upgrade=True, restored006_upgrade=True, restored007_upgrade=True, upgraded_roundtrip=True,
+                              custom_search_path_bootstrap=True, custom_migrate_idempotent=True,
                               tables=len(actual['tables']), functions=len(actual['functions']), triggers=len(actual['triggers']))))
     finally:
         for name in reversed(created):

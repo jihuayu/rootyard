@@ -52,8 +52,9 @@ Migration `131_ci_checkout_plan_shape.sql`:
 
 The canonical schema fixtures are `schema/131_catalog.json`,
 `schema/131_restored_catalog.json` and `schema/131_upgraded_catalog.json`, with
-`schema/131_catalog.sql` used by the backup catalog projection. Backup format 6
-now embeds the 131 catalogs.
+`schema/131_catalog.sql` used by the backup catalog projection. New backups use
+format 7 and embed the 131 catalogs; format 6 remains frozen at the schema130
+catalogs so archives made before migration 131 stay verifiable.
 
 ## Reproducible native tests
 
@@ -87,6 +88,12 @@ ref CAS and Forge pull/review/check/check-run/CI-pin/merge format admission.
 | `mixed_format_rejections` | valid OIDs from the other format rejected by pin/prepare/checkout and a native cross-format fetch |
 | `policy_and_storage_bounds` | one durable intent per job, exact receipt digest, wrong storage generation rejected |
 | `plan_constraint_shapes` | PostgreSQL accepts valid SHA-1/SHA-256 plan shapes and rejects mismatched width, uppercase, all-zero, malformed receipt and null-plan rows |
+
+`tests/backup_sha256_legacy130.py` creates a real format6/schema130 archive with
+a trusted baseline binary, proves the current binary rejects it without opt-in,
+then restores it with `--allow-legacy-schema130`, verifies the frozen format6
+catalog and applies migration 131 while preserving SHA-256 objects, refs, pin,
+generation and checkout-revocation/tombstone semantics.
 
 `tests/sha256_restore.py` creates a SHA-256 repository plus a retained CI pin,
 takes an offline paired backup, restores into a fresh database and volume with
