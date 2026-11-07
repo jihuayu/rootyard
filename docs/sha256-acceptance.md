@@ -83,7 +83,7 @@ ref CAS and Forge pull/review/check/check-run/CI-pin/merge format admission.
 | case | real assertion |
 | --- | --- |
 | `setup_matrix` | primary and real `serve-mirror` process, shared audience, isolated schema |
-| `sha256_full_flow` | create SHA-256 repo, stock push/fetch/fsck, mirror sync/prepare, source pin, complete plan/receipt with 64-hex target, checkout clone with exact OID, uppercase/abbreviated/zero-width negatives |
+| `sha256_full_flow` | create SHA-256 repo, stock push/fetch/fsck, mirror sync/prepare, source pin, complete plan/receipt with 64-hex target, checkout clone with exact OID, uppercase/abbreviated/zero-OID negatives |
 | `sha1_regression` | the same mirror/pin/checkout matrix on a SHA-1 repository with exact 40-hex target |
 | `mixed_format_rejections` | valid OIDs from the other format rejected by pin/prepare/checkout and a native cross-format fetch |
 | `policy_and_storage_bounds` | one durable intent per job, exact receipt digest, wrong storage generation rejected |
@@ -102,25 +102,33 @@ takes an offline paired backup, restores into a fresh database and volume with
 
 ## Actual results
 
-Baseline source: `6d2f0b845525921339fa045868c2029d6dc42923`. Delivery commit:
-the commit on `codex/deepseek-round2-sha38` containing this document. Private
-binary used for the final run:
-`/workspace/scratch/rootyard-round2/sha38/rootyard`, SHA-256
-`7c8c0e60d4a262794e006f93f607a30f9d0a3634662526bab88d55f0860bcdbb`.
+Final production source: `f31910086acbaa87d9e98df440ca8c28c7bb7e08`
+(format-7 version freeze `<=131`); certified input digest
+`fdfbbfcfe3acc36e5315e7dcc679d39709856c8c8fddf9aa32f8822b90c2ef5b`; immutable
+binary SHA-256
+`35d01c5f454bd8ea505a639e6a85ad5b90193f996451daa1a4d598c8e5dd0153`.
+The reports are committed at
+[`evidence/round2/integration-f319100/`](../evidence/round2/integration-f319100/)
+(`core/sha256_service-output.json`, `core/sha256_matrix-output.json`,
+`core/sha256_restore-output.json`, `core/backup_sha256_legacy130-output.json`,
+`core/schema_contract-output.json`, `core/ci_job_checkouts-output.json`). Earlier pre-final-format executions are
+historical and are not cited as the final run.
 
-| command | real outcome |
+| command | real outcome on binary `35d01` |
 | --- | --- |
-| `tests/sha256_service.py` | `service_flow` and `pull_check_pin_flow` passed |
-| `tests/sha256_matrix.py` | 6/6 cases passed (`setup_matrix`, `sha256_full_flow`, `sha1_regression`, `mixed_format_rejections`, `policy_and_storage_bounds`, `plan_constraint_shapes`) |
-| `tests/sha256_restore.py` | 2/2 cases passed (`source_setup_and_backup`, `restore_and_clone`) |
-| `tests/schema_contract.py` | schema 131 canonical and restored, legacy 003/006/007 upgrades and upgraded roundtrip all true |
-| `tests/ci_job_checkouts.py` | full existing SHA-1 checkout suite passed |
-| `cargo test --lib db::tests` | 3/3 passed, including migration/schema-version ordering |
+| `tests/sha256_service.py` | 2/2 passed. |
+| `tests/sha256_matrix.py` | 6/6 passed: mirror/pin/checkout, 64-hex plan/receipt, SHA-1 regression, mixed/abbreviated/zero-OID negatives. (Forge pull/review/check/merge is covered by `sha256_service`.) |
+| `tests/sha256_restore.py` | 2/2 passed. |
+| `tests/backup_sha256_legacy130.py` | 3/3 passed from a genuine format-6 archive produced by the old `6135` binary. |
+| `tests/schema_contract.py` | 8 checks passed, including public and custom bootstrap paths. |
+| `tests/ci_job_checkouts.py` | 15/15 passed on an isolated own database; the failed first attempt (9 cases, shared-database migration/advisory-lock collision) is preserved unchanged. |
+| Rust | 139 library tests + 1 Rust Pando test passed. |
 
 All tests used real PostgreSQL 17, real processes and stock Git. No test was
-skipped or replaced by a simulated receipt. Raw logs and JSON reports are in
-`/workspace/scratch/rootyard-round2/sha38/`; the final role report records the
-same source/binary/command evidence.
+skipped or replaced by a simulated receipt. Final raw logs are under the
+coordinator scratch `verify_final_core/postprocess*`; the committed report set
+is the committed evidence directory linked above. The exact source/input/binary
+digests above are the certificate for this issue.
 
 ## Explicit boundaries
 
