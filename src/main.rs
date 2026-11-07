@@ -72,12 +72,21 @@ async fn run() -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("backup failed; requires stopped writers, supported dedicated database and safe new destination; partial files may remain"))?;
         }
         "restore"
-            if (args.len() == 4 || (args.len() == 5 && args[4] == "--allow-legacy-schema007"))
+            if (args.len() == 4
+                || (args.len() == 5
+                    && matches!(args[4].as_str(), "--allow-legacy-schema007" | "--allow-legacy-schema130")))
                 && args[2] == "--isolated"
                 && args[3] == "--trust-backup" =>
         {
-            rootyard::backup::restore(&config, std::path::Path::new(&args[1]), args.len() == 5).await
-                .map_err(|_| anyhow::anyhow!("restore failed; keep target isolated and inspect or discard the fresh targets; database commit may have completed; never retry over existing state"))?;
+            let legacy = args.get(4).map(String::as_str);
+            rootyard::backup::restore(
+                &config,
+                std::path::Path::new(&args[1]),
+                legacy == Some("--allow-legacy-schema007"),
+                legacy == Some("--allow-legacy-schema130"),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("restore failed; keep target isolated and inspect or discard the fresh targets; database commit may have completed; never retry over existing state"))?;
         }
         "migrate" if args.len() == 1 => {
             db::migrate(&pool).await?;
