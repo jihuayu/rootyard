@@ -4,7 +4,8 @@ Phase 80 adds a central, privacy-preserving classification path for internal
 errors. `Error` remains the two-field tuple `Error(pub StatusCode, pub &'static str)`;
 its status, fixed body and auth/security headers are unchanged.
 
-On every `Error::internal(error)` a single-line JSON event is written to stderr:
+Each `Error::internal(error)` attempts to enqueue one safe JSON event for
+best-effort stderr delivery, subject to the rate and queue limits below:
 
 ```json
 {"event":"rootyard_error","event_id":"<uuid>","kind":"database","status":503,"scope":"request","request_id":"<uuid>","route":"/api/repos/{owner}/{name}","sqlstate":"23503"}
@@ -47,5 +48,12 @@ logging is disabled safely and requests are unaffected. These events are best-ef
 operational logs, not durable receipts: records still queued when the process exits
 may be lost.
 
-Backlog/fault metrics, per-worker coverage and the native hostile-database test
-remain open for their later phases.
+The initial real PostgreSQL SQLSTATE 23503 drill passed on the recorded v6
+binary, including HTTP correlation, fixed error responses and log privacy.
+Backlog/fault metrics, per-worker coverage, database timeout and remote-outage
+probes remain open for later phases.
+
+The private metric `rootyard_error_log_dropped_total` counts accepted records
+lost to a full/disconnected queue, writer startup failure, or incomplete stderr
+write. It excludes rate-limited faults and records still queued at process exit.
+Alert on increases when diagnosing missing logs; it does not count every error.

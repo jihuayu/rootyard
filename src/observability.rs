@@ -47,9 +47,8 @@ impl LogLimiter {
 }
 
 /// Number of accepted error events discarded because the bounded queue was full,
-/// the writer thread was gone, or output was disabled. Exposed as a fixed
-/// counter for later metric integration; this module publishes no metrics.
-#[allow(dead_code)]
+/// the writer thread was gone, output was disabled, or a record could not be
+/// completely written. Rate-limited faults and queued records at exit are excluded.
 pub(crate) fn dropped_event_count() -> u64 {
     LOG_DROPPED.load(Ordering::Relaxed)
 }
@@ -75,11 +74,17 @@ fn write_record<W: std::io::Write>(writer: &mut W, record: &str) -> std::io::Res
     writer.write_all(b"\n")
 }
 
+fn deliver_record<W: std::io::Write>(writer: &mut W, record: &str, dropped: &AtomicU64) {
+    if write_record(writer, record).is_err() {
+        saturating_increment(dropped);
+    }
+}
+
 /// Dedicated writer thread body: takes the stderr lock for one complete record at
 /// a time, performs no other I/O and treats every write failure as best-effort.
 fn writer_loop(receiver: Receiver<String>) {
     for record in receiver {
-        let _ = write_record(&mut std::io::stderr().lock(), &record);
+        deliver_record(&mut std::io::stderr().lock(), &record, &LOG_DROPPED);
     }
 }
 
@@ -389,10 +394,13 @@ mod tests {
 
     #[test]
     fn failing_stderr_sink_is_reported_and_never_panics() {
-        assert!(write_record(&mut FailingSink, "record").is_err());
+        let dropped = AtomicU64::new(0);
+        deliver_record(&mut FailingSink, "record", &dropped);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
         let mut buffer = Vec::new();
-        write_record(&mut buffer, "record").unwrap();
+        deliver_record(&mut buffer, "record", &dropped);
         assert_eq!(buffer, b"record\n".to_vec());
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 
     #[test]

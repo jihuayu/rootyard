@@ -144,6 +144,8 @@ fn render(
     snapshot: Option<&Snapshot>,
 ) -> String {
     let mut output = String::new();
+    output.push_str("# HELP rootyard_error_log_dropped_total Accepted error records lost to queue or writer failure; excludes rate limiting and shutdown.\n# TYPE rootyard_error_log_dropped_total counter\n");
+    let _ = writeln!(output, "rootyard_error_log_dropped_total {}", crate::observability::dropped_event_count());
     gauge(
         &mut output,
         "rootyard_postgres_up",
@@ -311,7 +313,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), 22);
+        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), 23);
     }
     #[test]
     fn counters_saturate_instead_of_wrapping() {

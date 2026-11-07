@@ -15,6 +15,7 @@ labels. Database strings are never interpolated into exposition.
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
+| `rootyard_error_log_dropped_total` | counter | Accepted safe error records lost to queue/startup/write failure; excludes rate limiting and queued records at exit |
 | `rootyard_postgres_up` | gauge | 1 only when the complete authoritative SQL snapshot succeeds |
 | `rootyard_git_capacity` | gauge | Configured native Git concurrency limit |
 | `rootyard_git_in_flight` | gauge | Occupied Git slots, including provisioning and process cleanup |
@@ -34,7 +35,7 @@ labels. Database strings are never interpolated into exposition.
 | `rootyard_provisioning_oldest_age_seconds` | gauge | Age of oldest provisioning row |
 
 The `|` notation in this table enumerates distinct label values; it is not a
-literal label value. A healthy scrape always exports all 22 time series,
+literal label value. A healthy scrape always exports all 23 time series,
 including zero-valued states. Delivery age includes leased entries (including
 expired leases) and delayed retries. Counts represent delivery rows, so one
 event assigned to two consumers contributes two outstanding deliveries.
