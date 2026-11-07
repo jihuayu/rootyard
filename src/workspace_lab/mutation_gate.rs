@@ -328,7 +328,8 @@ impl MutationGate {
 
     /// Move the gate to the lease epoch the database just committed.
     ///
-    /// A same-epoch call only renews the deadline, exactly like [`MutationGate::renew`].
+    /// A same-epoch call only folds the deadline (`max`, never a shortening),
+    /// exactly like [`MutationGate::renew`]; a frozen gate stays frozen.
     /// Otherwise the epoch must be strictly higher than the epoch this gate still
     /// serves and not older than the highest observed epoch, and it must exceed
     /// the epoch a fence invalidated; the old epoch is fenced
@@ -342,14 +343,21 @@ impl MutationGate {
     /// handoff to the observed epoch itself still succeeds. This never waits.
     pub fn handoff(&self, epoch: i64, until: i64) -> io::Result<()> {
         let mut state = self.lock_state();
-        if epoch < state.epoch || epoch < state.highest_observed_epoch || epoch <= state.fence_floor {
+        if epoch < state.epoch || epoch < state.highest_observed_epoch {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
+        // A same-epoch call only folds the deadline, up to and including the
+        // epoch the constructor already fenced. A frozen gate stays frozen.
         if epoch == state.epoch && state.phase != GatePhase::Fenced {
-            state.writable_until = until;
+            state.writable_until = state.writable_until.max(until);
             drop(state);
             self.changed.notify_all();
             return Ok(());
+        }
+        // A fenced epoch, including the same epoch the fence invalidated, is
+        // never revived here: only a strictly higher authorized epoch is.
+        if epoch <= state.fence_floor {
+            return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
         state.phase = GatePhase::Fenced;
         state.fence_floor = state.fence_floor.max(state.epoch);
