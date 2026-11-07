@@ -256,7 +256,8 @@ class Harness:
         root, source, _, base = self.fixture("preflight-index-gitlink")
         self.git("update-index", "--add", "--cacheinfo",
                  f"160000,{base},vendor/library", cwd=source)
-        require(self.git("ls-files", "--stage", cwd=source).stdout.startswith(b"160000 "),
+        require(any(line.startswith(b"160000 ") and line.endswith(b"\tvendor/library")
+                    for line in self.git("ls-files", "--stage", cwd=source).stdout.splitlines()),
                 "index gitlink fixture has no 160000 index entry")
         require(not (source / ".gitmodules").exists(),
                 "index gitlink fixture unexpectedly has .gitmodules")

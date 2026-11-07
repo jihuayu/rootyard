@@ -339,7 +339,7 @@ class IdentityHarness(Harness):
             assert columns in definition, (name, definition)
             assert target in definition, (name, definition)
             assert "ON DELETE CASCADE" in definition, (name, definition)
-            assert validated == "t", (name, validated)
+            assert validated == "true", (name, validated)
         assert "pando_manifest_artifacts_manifest_id_fkey" not in definitions, definitions
         assert ARTIFACT_AUTHORITY_FK in definitions, (
             "independent artifact authority/tenant FK was removed"
