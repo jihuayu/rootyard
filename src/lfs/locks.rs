@@ -131,14 +131,13 @@ pub async fn create_lock(
     let tx = client.transaction().await.map_err(Error::internal)?;
     let access = auth::authorize_repo_with_role(&tx, &actor, &owner, repo, Role::Write).await?;
     let request = json!({"operation":"lfs_lock","path":input.path});
-    if let Some(key) = key {
-        if let Some(saved) =
+    if let Some(key) = key
+        && let Some(saved) =
             creation_replay(&tx, access.owner_id, access.repo_id, key, &request).await?
         {
             auth::finish_tx(tx, &actor, true).await?;
             return Ok(response(StatusCode::CREATED, saved));
         }
-    }
     let id = Uuid::new_v4();
     let inserted = tx.query_opt("INSERT INTO lfs_locks(id,tenant_id,repository_id,path,owner_user_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT(repository_id,path) DO NOTHING RETURNING id, path, to_char(locked_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS locked_at",
         &[&id,&access.owner_id,&access.repo_id,&input.path,&actor.id]).await.map_err(Error::internal)?;

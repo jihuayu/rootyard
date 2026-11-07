@@ -232,10 +232,10 @@ mod tests {
     async fn wait_for_pid(path: &Path) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok(raw) = std::fs::read_to_string(path) {
-                if let Ok(pid) = raw.trim().parse() {
-                    return pid;
-                }
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Ok(pid) = raw.trim().parse()
+            {
+                return pid;
             }
             assert!(Instant::now() < deadline, "test child did not start");
             tokio::time::sleep(Duration::from_millis(10)).await;

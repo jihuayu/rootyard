@@ -123,10 +123,10 @@ async fn acquire(pool: &Pool, repo_id: Uuid, deadline: Instant, write: bool) -> 
             }
         }
         .await;
-        if result.is_err() {
-            if let Some(sender) = ready_send.take() {
-                let _ = sender.send(Err(()));
-            }
+        if result.is_err()
+            && let Some(sender) = ready_send.take()
+        {
+            let _ = sender.send(Err(()));
         }
         active_send.send_replace(None);
     })));

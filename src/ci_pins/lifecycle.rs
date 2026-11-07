@@ -266,14 +266,13 @@ pub(super) async fn release_pin_inner(
                 "pin target or generation mismatch",
             ));
         }
-        if let Some(actual_oid) = native.get(&retention_ref) {
-            if actual_oid != &intent.target_oid {
+        if let Some(actual_oid) = native.get(&retention_ref)
+            && actual_oid != &intent.target_oid {
                 return Err(Error(
                     StatusCode::CONFLICT,
                     "unmanaged or changed CI retention ref; operator investigation required",
                 ));
             }
-        }
         // Step 1: Remove <job>.pinned.json first so <job>.pinned.json never outlives <job>.json.
         let dir = directory(&state.storage.root, repo.id);
         let pinned_file = dir.join(format!("{job}.pinned.json"));

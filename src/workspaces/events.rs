@@ -55,12 +55,11 @@ pub async fn stream(
             if service::authorized(&state,&headers,id,Role::Read).await.is_err() { break; }
             match batch(&state,id,after).await {
                 Ok(events) => {
-                    if let Some(first) = events.first().and_then(|v|v["revision"].as_i64()) {
-                        if first>after+1 {
+                    if let Some(first) = events.first().and_then(|v|v["revision"].as_i64())
+                        && first>after+1 {
                             yield Ok(Event::default().event("RESYNC_REQUIRED").data(json!({"snapshot_revision":first}).to_string()));
                             break;
                         }
-                    }
                     for item in events {
                         if let Some(rev)=item["revision"].as_i64() { after=rev; }
                         yield Ok(Event::default().id(after.to_string()).event("workspace").data(item.to_string()));

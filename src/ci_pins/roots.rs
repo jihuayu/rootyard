@@ -89,10 +89,10 @@ pub async fn active_pinned_oids(
     } else {
         let repo_root = state.storage.root.join("repos").join(repo_id.to_string());
         let current_path = repo_root.join("current.json");
-        if let Ok(bytes) = std::fs::read(&current_path) {
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if val.get("storage_generation").and_then(|v| v.as_i64()) == Some(generation) {
-                    if let Some(snap) = val.get("snapshot").and_then(|v| v.as_str()) {
+        if let Ok(bytes) = std::fs::read(&current_path)
+            && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && val.get("storage_generation").and_then(|v| v.as_i64()) == Some(generation)
+                    && let Some(snap) = val.get("snapshot").and_then(|v| v.as_str()) {
                         let bare = repo_root.join(snap).join("repository.git");
                         if let Ok(native) = git_dir_pinned_roots(state, &bare).await {
                             for (ref_name, oid) in native {
@@ -102,9 +102,6 @@ pub async fn active_pinned_oids(
                             }
                         }
                     }
-                }
-            }
-        }
     }
 
     Ok(oids)

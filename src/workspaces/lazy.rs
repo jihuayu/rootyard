@@ -271,10 +271,10 @@ impl Reader {
                 continue;
             }
             let key = remote::key(manifest.tenant_id, &entry.sha256)?;
-            if let Some(prior) = sizes.insert(key.sha256.clone(), entry.size) {
-                if prior != entry.size {
-                    return Err(Error::bad_request());
-                }
+            if let Some(prior) = sizes.insert(key.sha256.clone(), entry.size)
+                && prior != entry.size
+            {
+                return Err(Error::bad_request());
             }
             entries.insert(rel, (key, entry.size));
         }

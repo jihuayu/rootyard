@@ -237,15 +237,15 @@ impl DeliveriesQuery {
         if after < 0 || !(1..=100).contains(&limit) {
             return Err(Error::bad_request());
         }
-        if let Some(ref st) = self.state {
-            if !matches!(st.as_str(), "pending" | "leased" | "delivered" | "failed" | "dead_letter") {
-                return Err(Error::bad_request());
-            }
+        if let Some(ref st) = self.state
+            && !matches!(st.as_str(), "pending" | "leased" | "delivered" | "failed" | "dead_letter")
+        {
+            return Err(Error::bad_request());
         }
-        if let Some(ref et) = self.event_type {
-            if !SUPPORTED_EVENTS.contains(&et.as_str()) {
-                return Err(Error::bad_request());
-            }
+        if let Some(ref et) = self.event_type
+            && !SUPPORTED_EVENTS.contains(&et.as_str())
+        {
+            return Err(Error::bad_request());
         }
         Ok((after, limit))
     }

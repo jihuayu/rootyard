@@ -55,19 +55,16 @@ the diff uniform. `cargo fmt` uses the repository `rustfmt.toml`
 (`max_width = 120`, `use_small_heuristics = "Max"`); run it on the files you
 changed rather than across the whole tree while other work is in flight.
 
-Because `rust-version` is now truthfully 1.88, Clippy's MSRV-aware
-`collapsible_if` fires on nested `if` sites that predate let-chains. The gate is
-**not green on this tree**: `cargo fmt --all -- --check` passes, but
-`cargo clippy --locked --all-targets --features pando-lab -- -D warnings`
-reports 64 `collapsible_if` diagnostics in the library target and 65 in the
-library test target (one test-only site) and exits non-zero. The remaining
-sites live in modules owned by concurrent work
-(`src/web/{handlers,models,sanitize}.rs`, `src/webhooks`, `src/workspaces`,
-`src/workspace_lab`, `src/browse`, `src/sandbox` and others), so they need one
-coordinated let-chain rewrite rather than per-file edits from this change. Do
-not mark the gate passing, add `#[allow(clippy::collapsible_if)]`, or lower
-`rust-version` to hide the diagnostics. Issue #75 stays open until that
-migration lands and the full Clippy gate exits zero.
+Because `rust-version` is truthfully 1.88, Clippy's MSRV-aware
+`collapsible_if` fires on nested `if` sites that predate let-chains. Those sites
+were migrated mechanically to let-chains: no `#[allow(...)]`, no lowered
+`rust-version` and no semantic change. On this tree both gates are green:
+`cargo fmt --all -- --check` and
+`cargo clippy --locked --all-targets --features pando-lab -- -D warnings` exit
+zero. The LFS verification tests now serialize on a Tokio `Mutex`, so their
+guards may be held across `await` points without `await_holding_lock`. Issue #75
+stays open until the same full Clippy gate passes on the integrated tree after
+the remaining concurrent work merges.
 
 ## End-to-end tests
 

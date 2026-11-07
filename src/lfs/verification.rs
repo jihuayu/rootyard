@@ -567,10 +567,10 @@ mod tests {
     use super::*;
     use std::{fs, os::unix::fs::PermissionsExt, sync::atomic::Ordering};
 
-    static TEST_SERIAL: Mutex<()> = Mutex::new(());
+    static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        TEST_SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        TEST_SERIAL.lock().await
     }
 
     fn fixture(payload: &[u8]) -> (PathBuf, PathBuf, String) {
@@ -614,9 +614,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cache_is_jointly_bounded_across_expiry_reinsert_and_pressure() {
-        let _serial = serial();
+    #[tokio::test]
+    async fn cache_is_jointly_bounded_across_expiry_reinsert_and_pressure() {
+        let _serial = serial().await;
         let mut state = CacheState::default();
         let base = Instant::now();
         let identity = identity_record(1);
@@ -657,7 +657,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_verification_keeps_slots_until_blocking_work_finishes() {
-        let _serial = serial();
+        let _serial = serial().await;
         // Distinct identities: same-identity callers now coalesce onto one hash
         // pass, and this test needs three independently running hash workers.
         let fixtures: Vec<_> = (0..3u8).map(|n| fixture(&vec![3u8 + n; 128 * 1024])).collect();
@@ -708,9 +708,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn identity_cache_avoids_rehash_but_detects_tamper_truncate_and_replace() {
-        let _serial = serial();
+    #[tokio::test]
+    async fn identity_cache_avoids_rehash_but_detects_tamper_truncate_and_replace() {
+        let _serial = serial().await;
         let payload = vec![7u8; 256 * 1024];
         let (root, path, oid) = fixture(&payload);
         let size = payload.len() as u64;
@@ -766,7 +766,7 @@ mod tests {
     /// request can participate. A genuinely missing path stays a distinct miss.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_cache_empty_existing_file_shares_one_hash_pass() {
-        let _serial = serial();
+        let _serial = serial().await;
         let payload = vec![13u8; 1024 * 1024];
         let (root, path, oid) = fixture(&payload);
         let size = payload.len() as u64;
@@ -843,7 +843,7 @@ mod tests {
     /// explicitly and cannot free or steal the leader's work.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn follower_wait_is_deadline_bounded() {
-        let _serial = serial();
+        let _serial = serial().await;
         let payload = vec![17u8; 512 * 1024];
         let (root, path, oid) = fixture(&payload);
         let size = payload.len() as u64;

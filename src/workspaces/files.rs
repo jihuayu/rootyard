@@ -33,10 +33,10 @@ fn safe_file(repo: &FsPath, raw: &str) -> Result<PathBuf, Error> {
     let mut cur = repo.to_path_buf();
     for seg in path.strip_prefix(repo).map_err(Error::internal)?.components() {
         cur.push(seg);
-        if let Ok(meta) = fs::symlink_metadata(&cur) {
-            if meta.file_type().is_symlink() {
-                return Err(Error::bad_request());
-            }
+        if let Ok(meta) = fs::symlink_metadata(&cur)
+            && meta.file_type().is_symlink()
+        {
+            return Err(Error::bad_request());
         }
     }
     Ok(path)

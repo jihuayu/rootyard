@@ -402,15 +402,13 @@ pub async fn on_pull_synchronized(
         .query_opt("SELECT required_checks FROM forge_branch_rules WHERE tenant_id=$1 AND repository_id=$2 AND branch_ref=$3", &[&tenant_id, &repository_id, &pull.base_ref])
         .await
         .map_err(Error::internal)?
-    {
-        if let Some(arr) = rule_row.get::<_, Value>("required_checks").as_array() {
+        && let Some(arr) = rule_row.get::<_, Value>("required_checks").as_array() {
             for ctx in arr.iter().filter_map(Value::as_str) {
                 if !contexts.iter().any(|c| c == ctx) {
                     contexts.push(ctx.to_owned());
                 }
             }
         }
-    }
 
     let hooks = client
         .query(
@@ -421,15 +419,14 @@ pub async fn on_pull_synchronized(
         .map_err(Error::internal)?;
 
     for hook in &hooks {
-        if hook.get::<_, bool>("auto_ci_pin") {
-            if let Some(arr) = hook.get::<_, Value>("ci_contexts").as_array() {
+        if hook.get::<_, bool>("auto_ci_pin")
+            && let Some(arr) = hook.get::<_, Value>("ci_contexts").as_array() {
                 for ctx in arr.iter().filter_map(Value::as_str) {
                     if !contexts.iter().any(|c| c == ctx) {
                         contexts.push(ctx.to_owned());
                     }
                 }
             }
-        }
     }
     if contexts.is_empty() {
         contexts.push("ci/default".to_owned());

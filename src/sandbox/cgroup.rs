@@ -293,10 +293,10 @@ pub(super) async fn reap_stale(base: &Path, live: &HashSet<Uuid>) -> Result<(), 
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Ok(id) = name.to_string_lossy().parse::<Uuid>() else { continue };
-        if !live.contains(&id) {
-            if let Err(error) = destroy(&entry.path()).await {
-                failure.get_or_insert(error);
-            }
+        if !live.contains(&id)
+            && let Err(error) = destroy(&entry.path()).await
+        {
+            failure.get_or_insert(error);
         }
     }
     match failure {

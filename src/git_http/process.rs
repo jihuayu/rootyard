@@ -287,10 +287,10 @@ mod process_tests {
         let process = Process { child, input: None, stderr: tokio::spawn(async {}), pid };
         let started = Instant::now();
         let child_pid = loop {
-            if let Ok(text) = std::fs::read_to_string(&pid_file) {
-                if let Ok(pid) = text.trim().parse::<i32>() {
-                    break pid;
-                }
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
             }
             assert!(started.elapsed().as_secs() < 5, "test child failed to start");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

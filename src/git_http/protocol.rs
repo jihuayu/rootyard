@@ -171,10 +171,12 @@ pub(super) fn route<'a>(
     }
 }
 pub(super) fn validate_headers(headers: &HeaderMap, method: &Method, service: &str, limit: u64) -> Result<(), Error> {
-    if let Some(value) = headers.get(header::CONTENT_ENCODING) {
-        if value != "identity" && value != "gzip" && value != "x-gzip" {
-            return Err(Error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported request encoding"));
-        }
+    if let Some(value) = headers.get(header::CONTENT_ENCODING)
+        && value != "identity"
+        && value != "gzip"
+        && value != "x-gzip"
+    {
+        return Err(Error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported request encoding"));
     }
     if let Some(value) = headers.get(header::CONTENT_LENGTH) {
         let size = value.to_str().ok().and_then(|v| v.parse::<u64>().ok()).ok_or_else(Error::bad_request)?;
@@ -182,10 +184,10 @@ pub(super) fn validate_headers(headers: &HeaderMap, method: &Method, service: &s
             return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "request size limit exceeded"));
         }
     }
-    if let Some(value) = headers.get("git-protocol") {
-        if !matches!(value.to_str(), Ok("version=0" | "version=1" | "version=2")) {
-            return Err(Error::bad_request());
-        }
+    if let Some(value) = headers.get("git-protocol")
+        && !matches!(value.to_str(), Ok("version=0" | "version=1" | "version=2"))
+    {
+        return Err(Error::bad_request());
     }
     if method == Method::POST {
         let expected = format!("application/x-{service}-request");

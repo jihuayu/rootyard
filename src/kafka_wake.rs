@@ -275,14 +275,14 @@ impl WakeTransport for KafkaWake {
                     Ok(consumer) => {
                         if consumer.subscribe(&[&options.topic]).is_ok() {
                             while !thread_stop.is_cancelled() {
-                                if let Some(Ok(message)) = consumer.poll(Duration::from_millis(100)) {
-                                    if valid_hint(
+                                if let Some(Ok(message)) = consumer.poll(Duration::from_millis(100))
+                                    && valid_hint(
                                         message.payload(),
                                         message.key(),
                                         message.headers().map_or(0, Headers::count),
-                                    ) {
-                                        signal.notify_one();
-                                    }
+                                    )
+                                {
+                                    signal.notify_one();
                                 }
                             }
                             consumer.unsubscribe();

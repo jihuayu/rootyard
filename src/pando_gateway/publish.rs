@@ -59,14 +59,13 @@ pub async fn publish(
     {
         return Err(conflict());
     }
-    if let Some(pack) = &prepared.pack {
-        if pack.repository_id != repo.id
+    if let Some(pack) = &prepared.pack
+        && (pack.repository_id != repo.id
             || pack.tenant_id != tenant_id
             || pack.storage_generation != repo.storage_generation
-            || pack.object_format != repo.object_format
-        {
-            return Err(conflict());
-        }
+            || pack.object_format != repo.object_format)
+    {
+        return Err(conflict());
     }
     guard.ensure_active()?;
     crate::sharding::fencing::check_before_push(state, repo).await?;
