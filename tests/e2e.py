@@ -151,7 +151,13 @@ class Harness:
                     self.proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     os.killpg(self.proc.pid, signal.SIGKILL)
-                    self.proc.wait()
+                    try:
+                        self.proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired as error:
+                        raise RuntimeError(
+                            "Owned test service did not exit after SIGKILL; "
+                            "kernel I/O may remain blocked. Preserve the fixture for diagnosis."
+                        ) from error
             self.proc = None
         if self.log:
             self.log.close()
