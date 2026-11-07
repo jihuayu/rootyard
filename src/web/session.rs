@@ -343,23 +343,20 @@ async fn validate_session(state: &Arc<AppState>, secret: &str, csrf: Option<&str
     Ok(())
 }
 
-/// True for a single Basic `Authorization` header. Browsers attach this
+/// True when any `Authorization` value uses Basic. Browsers attach this
 /// ambient credential after a `WWW-Authenticate` challenge, so it cannot be
 /// treated like an explicit non-browser Bearer/API credential on a mutating
 /// web route.
 fn basic_authorization(headers: &HeaderMap) -> bool {
-    let mut values = headers.get_all(header::AUTHORIZATION).iter();
-    let Some(value) = values.next() else {
-        return false;
-    };
-    if values.next().is_some() {
-        return false;
-    }
-    value
-        .to_str()
-        .ok()
-        .and_then(|raw| raw.split_once(' '))
-        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+    // Treat *any* Basic Authorization value as ambient. Duplicate or mixed
+    // headers must not smuggle a Basic credential past this gate.
+    headers.get_all(header::AUTHORIZATION).iter().any(|value| {
+        value
+            .to_str()
+            .ok()
+            .and_then(|raw| raw.split_once(' '))
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
+    })
 }
 
 pub async fn middleware(
