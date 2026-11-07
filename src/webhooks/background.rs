@@ -86,7 +86,13 @@ pub async fn worker(state: Arc<AppState>, stop: CancellationToken) {
             ) => result,
         };
         if result.is_err() {
-            observability::observe_timeout();
+            // The outer deadline fires after the scoped future has been
+            // dropped, so re-enter the same operation for the fixed Round
+            // phase instead of emitting a detached event.
+            observability::worker::run(&operation, Phase::Round, async {
+                observability::observe_timeout()
+            })
+            .await;
         }
         let failed = !matches!(result, Ok(Ok(ref summary)) if summary.failures == 0);
         if failed && !unavailable {
@@ -142,7 +148,12 @@ async fn scan_round(
                             // Cancellation drops live local Git children and leases. The
                             // durable pull/outbox/progress rows make the next round safe,
                             // and an uncompleted pull page keeps its old cursor.
-                            Err(_) => Ok(()),
+                            Err(_) => {
+                                // Reconcile scope is still active here, so the
+                                // timeout keeps the repository phase label.
+                                observability::observe_timeout();
+                                Ok(())
+                            }
                         }
                     },
                 )

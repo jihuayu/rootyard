@@ -19,14 +19,24 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub async fn run_once(
+pub(crate) async fn run_once(
     state: &Arc<AppState>,
     policy: &Policy,
     owner: Uuid,
     operation: &OperationContext,
 ) -> Result<Option<JobOutcome>> {
-    let Some(job) =
-        observability::worker::run(operation, Phase::Claim, jobs::claim(&state.pool, owner, policy)).await?
+    // Observe a claim failure inside the Claim scope before `?` drops it, so
+    // the event keeps the worker, the fixed phase and any SQLSTATE.
+    let Some(job) = observability::worker::run(operation, Phase::Claim, async {
+        match jobs::claim(&state.pool, owner, policy).await {
+            Ok(job) => Ok(job),
+            Err(error) => {
+                observability::observe_internal(&error);
+                Err(error)
+            }
+        }
+    })
+    .await?
     else {
         return Ok(None);
     };
@@ -39,7 +49,12 @@ pub async fn run_once(
             Ok(outcome) => Ok(Some(outcome)),
             Err(error) => {
                 observability::observe_internal(&error);
-                let accepted = jobs::finish(&state.pool, &job, json!({}), Some(&error.to_string()), policy).await?;
+                let accepted = jobs::finish(&state.pool, &job, json!({}), Some(&error.to_string()), policy)
+                    .await
+                    .map_err(|finish_error| {
+                        observability::observe_internal(&finish_error);
+                        finish_error
+                    })?;
                 let status = if !accepted {
                     "superseded"
                 } else if job.attempt < policy.max_attempts {

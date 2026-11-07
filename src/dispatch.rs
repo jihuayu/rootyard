@@ -151,7 +151,12 @@ pub async fn worker(pool: Pool, settings: Settings, signal: Arc<Notify>, stop: C
             result=tokio::time::timeout(Duration::from_secs(30), observability::worker::run(&operation, Phase::Dispatch, scan))=>result,
         };
         if result.is_err() {
-            observability::observe_timeout();
+            // Re-attribute the outer deadline to the same operation instead of
+            // letting it fall through to a detached scope.
+            observability::worker::run(&operation, Phase::Dispatch, async {
+                observability::observe_timeout()
+            })
+            .await;
         }
         let (count, failed) = result.unwrap_or((0, true));
         if count > 0 {

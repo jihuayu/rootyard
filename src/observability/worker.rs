@@ -166,7 +166,7 @@ mod tests {
     use serde_json::Value;
 
     fn io_error() -> std::io::Error {
-        std::io::Error::new(std::io::ErrorKind::Other, "SECRET-worker-display-never-formatted")
+        std::io::Error::other("SECRET-worker-display-never-formatted")
     }
 
     fn parse(text: &str) -> Value {

@@ -62,8 +62,13 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) -> Result<()> {
         if let Err(error) =
             error_observability::worker::run(&operation, Phase::Scan, scheduler::schedule_once(&state, &policy)).await
         {
-            error_observability::observe_internal(&error);
-            eprintln!("rootyard: storage maintenance scheduler deferred: {error:#}");
+            // The future returned and its scope is gone; re-enter the same
+            // fixed Scan phase so the cause keeps worker + SQLSTATE context.
+            error_observability::worker::run(&operation, Phase::Scan, async {
+                error_observability::observe_internal(&error);
+            })
+            .await;
+            eprintln!("rootyard: storage maintenance scheduler deferred");
         }
         // Drain a bounded batch; no maintenance command consumes the online
         // Git request semaphore. Repository locks still serialize mutations.
@@ -80,8 +85,10 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) -> Result<()> {
             {
                 Ok(Some(_)) => {}
                 Ok(None) => break,
-                Err(error) => {
-                    eprintln!("rootyard: storage maintenance worker deferred: {error:#}");
+                Err(_) => {
+                    // Claim/execute/finish observe the cause inside their own
+                    // scoped future; the outer loop only reports a fixed line.
+                    eprintln!("rootyard: storage maintenance worker deferred");
                     break;
                 }
             }
