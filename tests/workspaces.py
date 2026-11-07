@@ -274,7 +274,7 @@ class Harness:
         self.git("commit", "-m", "gitlink without submodule metadata", cwd=source)
         base = self.oid(source)
         self.git("update-index", "--force-remove", "vendor/library", cwd=source)
-        require(b"160000 commit" in self.git("ls-tree", "-r", "--full-tree", "HEAD").stdout,
+        require(b"160000 commit" in self.git("ls-tree", "-r", "--full-tree", "HEAD", cwd=source).stdout,
                 "HEAD gitlink fixture has no 160000 tree entry")
         require(b"160000 " not in self.git("ls-files", "--stage", cwd=source).stdout,
                 "HEAD gitlink fixture still has a 160000 index entry")
