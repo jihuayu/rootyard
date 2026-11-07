@@ -43,10 +43,25 @@ pub struct DispatchSummary {
 }
 
 pub fn current_unix_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Clock source for one delivery attempt. The manual API keeps `Fixed` so an
+/// explicit `now_unix` remains a deterministic virtual clock. The background
+/// worker uses `Wall` so a long batch cannot lease or back off from its start.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DeliveryClock {
+    Fixed(i64),
+    Wall,
+}
+
+impl DeliveryClock {
+    fn now(self) -> i64 {
+        match self {
+            Self::Fixed(now) => now,
+            Self::Wall => current_unix_seconds(),
+        }
+    }
 }
 
 /// Computes exponential backoff delay `base_seconds * 2^(attempt - 1)` capped at `max_seconds`.
@@ -54,17 +69,11 @@ pub fn backoff_delay_seconds(attempt: i64, base_seconds: i64, max_seconds: i64) 
     let base = base_seconds.max(1);
     let cap = max_seconds.max(base);
     let shift = attempt.saturating_sub(1).clamp(0, 30) as u32;
-    base.saturating_mul(1i64.checked_shl(shift).unwrap_or(i64::MAX))
-        .min(cap)
+    base.saturating_mul(1i64.checked_shl(shift).unwrap_or(i64::MAX)).min(cap)
 }
 
 /// Derives a deterministic RFC 4122 UUID for a PR CI Source Pin.
-pub fn pull_ci_job_id(
-    repository_id: Uuid,
-    pull_number: i64,
-    head_oid: &str,
-    storage_generation: i64,
-) -> Uuid {
+pub fn pull_ci_job_id(repository_id: Uuid, pull_number: i64, head_oid: &str, storage_generation: i64) -> Uuid {
     let mut hasher = Sha256::new();
     hasher.update(b"rootyard-pull-ci-pin-v1\0");
     hasher.update(repository_id.as_bytes());
@@ -445,8 +454,26 @@ pub async fn deliver_single(
     delivery_id: Uuid,
     now_unix: i64,
 ) -> Result<WebhookDelivery, Error> {
+    deliver_single_with_clock(
+        state,
+        tenant_id,
+        repository_id,
+        delivery_id,
+        DeliveryClock::Fixed(now_unix),
+    )
+    .await
+}
+
+async fn deliver_single_with_clock(
+    state: &AppState,
+    tenant_id: Uuid,
+    repository_id: Uuid,
+    delivery_id: Uuid,
+    clock: DeliveryClock,
+) -> Result<WebhookDelivery, Error> {
+    let attempt_now = clock.now();
     let client = state.pool.get().await.map_err(Error::internal)?;
-    let Some(claim) = claims::claim(&client, tenant_id, repository_id, delivery_id, now_unix).await? else {
+    let Some(claim) = claims::claim(&client, tenant_id, repository_id, delivery_id, attempt_now).await? else {
         return claims::current(&client, tenant_id, repository_id, delivery_id).await;
     };
     let webhook_id = claim.webhook_id;
@@ -462,14 +489,25 @@ pub async fn deliver_single(
     let sig = signature_header(&secret, &body_bytes);
     let req_headers = build_delivery_headers(&event_type, delivery_id, webhook_id, attempt, &sig);
 
-    let outcome = send_http11_webhook(&url, timeout_ms, &event_type, delivery_id, webhook_id, attempt, &sig, &body_bytes).await;
+    let outcome =
+        send_http11_webhook(&url, timeout_ms, &event_type, delivery_id, webhook_id, attempt, &sig, &body_bytes).await;
+    // The transport may consume the whole timeout. Schedule from completion,
+    // never from the batch timestamp that selected this delivery.
+    let completed_now = clock.now();
     let (next_state, status_opt, err_opt, next_unix, delivered) = match outcome {
         Ok(code) if (200..=299).contains(&code) => ("delivered", Some(code as i32), None, 0i64, true),
         Ok(code) => {
             let (st, nu) = if attempt >= max_attempts {
                 ("dead_letter", 0i64)
             } else {
-                ("failed", now_unix.saturating_add(backoff_delay_seconds(attempt, DEFAULT_BACKOFF_BASE_SECS, DEFAULT_BACKOFF_MAX_SECS)))
+                (
+                    "failed",
+                    completed_now.saturating_add(backoff_delay_seconds(
+                        attempt,
+                        DEFAULT_BACKOFF_BASE_SECS,
+                        DEFAULT_BACKOFF_MAX_SECS,
+                    )),
+                )
             };
             (st, Some(code as i32), Some(format!("HTTP {code}")), nu, false)
         }
@@ -477,26 +515,46 @@ pub async fn deliver_single(
             let (st, nu) = if attempt >= max_attempts {
                 ("dead_letter", 0i64)
             } else {
-                ("failed", now_unix.saturating_add(backoff_delay_seconds(attempt, DEFAULT_BACKOFF_BASE_SECS, DEFAULT_BACKOFF_MAX_SECS)))
+                (
+                    "failed",
+                    completed_now.saturating_add(backoff_delay_seconds(
+                        attempt,
+                        DEFAULT_BACKOFF_BASE_SECS,
+                        DEFAULT_BACKOFF_MAX_SECS,
+                    )),
+                )
             };
             (st, None, Some(err_msg), nu, false)
         }
     };
 
-    claims::complete(&client, tenant_id, repository_id, delivery_id, claim.generation,
-        next_state, &req_headers, &sig, status_opt, err_opt, next_unix, delivered).await
+    claims::complete(
+        &client,
+        tenant_id,
+        repository_id,
+        delivery_id,
+        claim.generation,
+        next_state,
+        &req_headers,
+        &sig,
+        status_opt,
+        err_opt,
+        next_unix,
+        delivered,
+    )
+    .await
 }
 
 #[rustfmt::skip]
-pub async fn dispatch_due_deliveries(
+async fn due_delivery_ids(
     state: &AppState,
     tenant_id: Uuid,
     repository_id: Uuid,
     limit: i64,
     now_unix: i64,
-) -> Result<Vec<WebhookDelivery>, Error> {
+) -> Result<Vec<Uuid>, Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
-    let due_rows = client
+    let rows = client
         .query(
             "SELECT d.id FROM forge_webhook_deliveries d JOIN forge_webhooks w ON w.id = d.webhook_id \
              WHERE d.tenant_id=$1 AND d.repository_id=$2 AND w.active=true \
@@ -506,11 +564,60 @@ pub async fn dispatch_due_deliveries(
         )
         .await
         .map_err(Error::internal)?;
-    drop(client);
+    Ok(rows.iter().map(|row| row.get("id")).collect())
+}
 
-    let mut out = Vec::with_capacity(due_rows.len());
-    for row in due_rows {
-        out.push(deliver_single(state, tenant_id, repository_id, row.get("id"), now_unix).await?);
+/// Manual and compatibility path. `now_unix` is a caller-supplied virtual
+/// clock used for both selection and each attempt, preserving deterministic
+/// tests and the documented dispatch contract.
+#[rustfmt::skip]
+pub async fn dispatch_due_deliveries(
+    state: &AppState,
+    tenant_id: Uuid,
+    repository_id: Uuid,
+    limit: i64,
+    now_unix: i64,
+) -> Result<Vec<WebhookDelivery>, Error> {
+    dispatch_due_deliveries_with(state, tenant_id, repository_id, limit, now_unix,
+        DeliveryClock::Fixed(now_unix),
+        tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)).await
+}
+
+/// Background path. Selection uses `select_now_unix`, but every claim and
+/// completion reads the wall clock independently, so an old batch timestamp
+/// cannot grant a stale lease or schedule a retry in the past. Stop starting new
+/// sends after `work_deadline`; never cancel one that has already started, so
+/// the hook's declared transport timeout governs the in-flight request.
+#[rustfmt::skip]
+pub(crate) async fn dispatch_due_deliveries_until(
+    state: &AppState,
+    tenant_id: Uuid,
+    repository_id: Uuid,
+    limit: i64,
+    select_now_unix: i64,
+    work_deadline: tokio::time::Instant,
+) -> Result<Vec<WebhookDelivery>, Error> {
+    dispatch_due_deliveries_with(state, tenant_id, repository_id, limit, select_now_unix,
+        DeliveryClock::Wall, work_deadline).await
+}
+
+#[rustfmt::skip]
+async fn dispatch_due_deliveries_with(
+    state: &AppState,
+    tenant_id: Uuid,
+    repository_id: Uuid,
+    limit: i64,
+    select_now_unix: i64,
+    clock: DeliveryClock,
+    work_deadline: tokio::time::Instant,
+) -> Result<Vec<WebhookDelivery>, Error> {
+    let ids = due_delivery_ids(state, tenant_id, repository_id, limit, select_now_unix).await?;
+    let mut out = Vec::with_capacity(ids.len());
+    for delivery_id in ids {
+        if tokio::time::Instant::now() >= work_deadline {
+            break;
+        }
+        out.push(deliver_single_with_clock(state, tenant_id, repository_id, delivery_id, clock).await?);
     }
     Ok(out)
 }
@@ -530,13 +637,7 @@ mod tests {
         let repo_id = Uuid::new_v4();
         let oid1 = "1111111111111111111111111111111111111111";
         let oid2 = "2222222222222222222222222222222222222222";
-        assert_eq!(
-            pull_ci_job_id(repo_id, 1, oid1, 1),
-            pull_ci_job_id(repo_id, 1, oid1, 1)
-        );
-        assert_ne!(
-            pull_ci_job_id(repo_id, 1, oid1, 1),
-            pull_ci_job_id(repo_id, 1, oid2, 1)
-        );
+        assert_eq!(pull_ci_job_id(repo_id, 1, oid1, 1), pull_ci_job_id(repo_id, 1, oid1, 1));
+        assert_ne!(pull_ci_job_id(repo_id, 1, oid1, 1), pull_ci_job_id(repo_id, 1, oid2, 1));
     }
 }

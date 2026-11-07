@@ -2,6 +2,7 @@
 pub mod delivery;
 pub mod claims;
 pub mod background;
+pub(crate) mod scheduling;
 pub mod trust;
 pub mod runs;
 pub(crate) mod claimed;
