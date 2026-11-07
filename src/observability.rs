@@ -55,7 +55,13 @@ pub(crate) fn dropped_event_count() -> u64 {
 }
 
 fn saturating_increment(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| count.checked_add(1));
+    let mut current = counter.load(Ordering::Relaxed);
+    while current != u64::MAX {
+        match counter.compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn record_dropped() {
