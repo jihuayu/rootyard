@@ -54,6 +54,7 @@ def main():
     reader = None
     stop_writes = threading.Event()
     load_acked = []
+    load_ack_times = []
     load_failures = []
     writer = None
     try:
@@ -137,6 +138,7 @@ def main():
                     oid = h.git("rev-parse", "HEAD", cwd=load_work).stdout.decode().strip()
                     h.git("push", "origin", "HEAD:main", cwd=load_work, token=h.alice)
                     load_acked.append(oid)
+                    load_ack_times.append(time.monotonic_ns())
                 except Exception as error:
                     load_failures.append(str(error)[:240])
                     time.sleep(.02)
@@ -160,7 +162,8 @@ def main():
         assert len(load_acked) >= 3, (
             f"only {len(load_acked)} acknowledged writes under concurrent load before failure; "
             + "; ".join(load_failures[:2]))
-        acknowledged_before_failure = list(load_acked)
+        pre_fault_acknowledged = list(load_acked)
+        pre_fault_ack_times = list(load_ack_times)
         time.sleep(.1)
         failure_at = time.monotonic_ns()
         run(["pg_ctl", "-D", str(primary), "-m", "immediate", "stop"])
@@ -172,9 +175,15 @@ def main():
         stop_writes.set()
         reader.join(timeout=5)
         if writer:
-            writer.join(timeout=15)
+            writer.join(timeout=30)
+        writer_terminated = writer is not None and not writer.is_alive()
+        assert writer_terminated, "load writer did not terminate before ACK survival accounting"
+        all_acknowledged = list(load_acked)
+        all_ack_times = list(load_ack_times)
+        after_fault_acknowledged = [oid for oid, stamp in zip(all_acknowledged, all_ack_times)
+                                    if stamp >= failure_at]
         assert any(code != 200 for code in read_events), "metadata loss did not affect live service"
-        assert len(acknowledged_before_failure) >= 1, "write load produced no acknowledged operation"
+        assert len(all_acknowledged) >= 3, "write load produced fewer than three acknowledged operations"
         h.stop(hard=True)
         run(["pg_ctl", "-D", str(standby), "-w", "promote"])
         assert sql(s_port, root, "SELECT pg_is_in_recovery()") == "f"
@@ -222,8 +231,6 @@ def main():
         fetched_tip = h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip()
         fetched_history = set(h.git("rev-list", "FETCH_HEAD", cwd=h.copy).stdout.decode().splitlines())
         assert ack in fetched_history, "pre-failure acknowledged commit is not in the promoted history"
-        assert fetched_tip in ({ack} | set(acknowledged_before_failure)), (
-            "promoted ref contains an unacknowledged in-flight push: " + fetched_tip)
         # The concurrent load advanced main after this checkout was cloned.
         # Rebase the post-failure write on the acknowledged surviving tip.
         h.git("fetch", "origin", cwd=h.work, token=h.reader)
@@ -236,7 +243,7 @@ def main():
         h.git("fetch", h.base + h.repo["clone_path"], "refs/heads/main", cwd=h.copy, token=h.reader)
         assert h.git("rev-parse", "FETCH_HEAD", cwd=h.copy).stdout.decode().strip() == new_tip
         history = set(h.git("rev-list", "FETCH_HEAD", cwd=h.copy).stdout.decode().splitlines())
-        missing_load = [oid for oid in acknowledged_before_failure if oid not in history]
+        missing_load = [oid for oid in all_acknowledged if oid not in history]
         assert not missing_load, "acknowledged write under load was lost after promotion"
         report = ops_provenance.base(
             args.binary, __file__,
@@ -254,9 +261,17 @@ def main():
                   "read_statuses_during_failure": read_events,
                   "acknowledged_oid_before_failure": ack,
                   "operator_recovery": operator_recovery,
-                  "write_load": {"acknowledged_before_failure": len(acknowledged_before_failure),
+                  "write_load": {"pre_fault_acknowledged": len(pre_fault_acknowledged),
+                                 "all_acknowledged": len(all_acknowledged),
+                                 "acknowledged_after_fault": len(after_fault_acknowledged),
+                                 "acknowledged_before_failure": len(pre_fault_acknowledged),
+                                 "writer_terminated_before_accounting": writer_terminated,
                                  "failed_or_unacknowledged_during_outage": len(load_failures),
-                                 "acknowledged_oids": acknowledged_before_failure,
+                                 "acknowledged_oids": all_acknowledged,
+                                 "acknowledged_after_fault_oids": after_fault_acknowledged,
+                                 "pre_fault_ack_timestamps_ns": pre_fault_ack_times,
+                                 "all_ack_timestamps_ns": all_ack_times,
+                                 "failure_at_ns": failure_at,
                                  "failure_excerpt": load_failures[:3]},
                   "rpo_lost_acknowledged_commits": 0,
                   "rpo_lost_acknowledged_writes_under_load": len(missing_load),

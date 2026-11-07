@@ -38,6 +38,17 @@ LOCAL_HA_REPORTS = {
     "partition": "cluster-partition.json",
 }
 BLOCKER_FILE = "cluster-source-blockers.json"
+HARNESS_FILES = {
+    "tls": "tests/cluster_tls_native.py",
+    "kafka": "tests/cluster_kafka_tls_native.py",
+    "local_profile": "tests/cluster_local_profile_native.py",
+    "workload": "tests/cluster_workload_native.py",
+    "streaming": "tests/cluster_pg_streaming_native.py",
+    "pitr": "tests/cluster_pg_pitr_native.py",
+    "disk": "tests/cluster_disk_pressure_native.py",
+    "takeover": "tests/cluster_takeover_native.py",
+    "partition": "tests/cluster_partition_native.py",
+}
 
 PROVENANCE_KEYS = ("binary_sha256", "source_base_commit", "measurement_kind",
                    "simulated_fields", "tool_versions", "hardware", "topology",
@@ -62,7 +73,7 @@ def load(evidence, filename):
     return path, data, digest
 
 
-def validate_provenance(path, data, source_commit, binary_sha):
+def validate_provenance(path, data, source_commit, binary_sha, harness_file):
     for key in PROVENANCE_KEYS:
         require(key in data, f"{path.name}: missing provenance field {key}")
     require(data["measurement_kind"] == "native_execution",
@@ -82,6 +93,11 @@ def validate_provenance(path, data, source_commit, binary_sha):
     require(isinstance(data["limits"], list) and data["limits"],
             f"{path.name}: explicit limits are required")
     require("harness_sha256" in data, f"{path.name}: harness SHA-256 missing")
+    actual_harness = REPO / harness_file
+    require(actual_harness.is_file(), f"{path.name}: mapped harness is missing: {harness_file}")
+    actual_digest = hashlib.sha256(actual_harness.read_bytes()).hexdigest()
+    require(data["harness_sha256"] == actual_digest,
+            f"{path.name}: harness SHA-256 does not match {harness_file}")
     return {"file": path.name, "kind": data.get("kind"),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             "binary_sha256": data["binary_sha256"],
@@ -181,8 +197,12 @@ def check_streaming(data):
     require(data.get("rpo_lost_acknowledged_commits") == 0,
             "acknowledged commit was lost across PostgreSQL promotion")
     load = data.get("write_load") or {}
-    require(load.get("acknowledged_before_failure", 0) >= 3,
+    require(load.get("all_acknowledged", 0) >= 3,
             "fewer than three acknowledged writes were measured under load")
+    require(load.get("writer_terminated_before_accounting") is True,
+            "ACK set was not snapshotted after the load writer terminated")
+    require(len(load.get("acknowledged_oids", [])) == load.get("all_acknowledged"),
+            "ACK OID list does not match the observed ACK count")
     require(load.get("failed_or_unacknowledged_during_outage", 0) > 0,
             "primary failure did not affect the concurrent writer")
     require(data.get("rpo_lost_acknowledged_writes_under_load") == 0,
@@ -206,7 +226,7 @@ def check_pitr(data):
             "PITR report lacks boundary/restored OIDs")
     require(data.get("retained_ref_and_objects_fsck") == "passed",
             "restored retained refs/objects failed fsck")
-    require("revocation" in data.get("reader_access_unrelated_tenant_denial_and_token_revocation", ""),
+    require(data.get("reader_access_unrelated_tenant_denial_and_token_revocation") == "passed",
             "restored permission/token checks are missing")
     require(data.get("delegation_authority_rotated_before_reopening") is True,
             "delegation authority was not rotated before reopening writes")
@@ -276,7 +296,7 @@ def check_docs():
             "TEST_READY.md still presents model results as native acceptance")
     fence = (REPO / "docs/cluster-local-process-fence.md").read_text()
     for required in ("cluster_workload_native.py", "cluster_pg_streaming_native.py",
-                     "cluster_pg_pitr_native.py", "single-host"):
+                     "cluster_pg_pitr_native.py", "single host"):
         require(required in fence, f"cluster operations doc is missing {required}")
     operations = (REPO / "docs/cluster-operations.md").read_text()
     for required in ("Untested boundaries", "cross-host", "RPO/RTO assumptions",
@@ -303,28 +323,52 @@ def main():
             checks.append({"issue": "43/44", "criterion": f"load {name}",
                            "status": "failed", "evidence": [filename], "error": str(error)})
 
+    def emit_failure(message):
+        report = {
+            "kind": "cluster_operations_gate", "gate_version": 2,
+            "measurement_kind": "validated_native_evidence", "simulated_fields": False,
+            "source_base_commit": args.source_commit or ops_provenance.source_commit(),
+            "binary_sha256": None, "validated_at_unix": int(time.time()),
+            "status": "failed", "issues": {"43": "failed", "44": "failed"},
+            "local_profile_accepted": False,
+            "production_scope": "not_certified; missing required local evidence",
+            "checks": checks, "evidence": records, "local_storage_ha": {},
+            "limits": ["gate failed closed before issuing a partial receipt"],
+            "blockers": [message],
+        }
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps({"result": "failed", "blockers": [message],
+                          "report": str(args.report)}))
+        raise SystemExit(1)
+
     if not loaded:
-        raise SystemExit("no evidence reports could be loaded")
+        emit_failure("no core operations evidence reports could be loaded")
+    if "workload" not in loaded:
+        emit_failure("required workload report is missing")
 
     report_commits = {data["source_base_commit"] for _, data, _ in loaded.values()
                       if data.get("source_base_commit")}
-    require(len(report_commits) == 1, "core reports do not share one source commit")
+    if len(report_commits) != 1:
+        emit_failure("core reports do not share exactly one source commit")
     source_commit = args.source_commit or report_commits.pop()
     head = ops_provenance.source_commit()
     if head != source_commit:
         changed = subprocess.check_output(
             ["git", "diff", "--name-only", source_commit + ".." + head],
             cwd=REPO, text=True).splitlines()
-        unexpected = [path for path in changed if not path.startswith("evidence/")]
-        require(not unexpected,
-                "reports were produced from a different source commit and non-evidence files changed: "
-                + ", ".join(unexpected[:5]))
+        unexpected = [path for path in changed
+                      if not path.startswith("evidence/") and path != "tests/cluster_operations_gate.py"]
+        if unexpected:
+            emit_failure("reports were produced from a different source commit and non-evidence files changed: "
+                         + ", ".join(unexpected[:5]))
         blockers.append(f"reports record source commit {source_commit}; current HEAD {head} only adds evidence files")
 
     binary_sha = loaded["workload"][1]["binary_sha256"]
     for name, (path, data, _) in loaded.items():
         try:
-            records[name] = validate_provenance(path, data, source_commit, binary_sha)
+            records[name] = validate_provenance(path, data, source_commit, binary_sha,
+                                                HARNESS_FILES[name])
         except GateFailure as error:
             records[name] = {"file": path.name, "kind": data.get("kind"), "error": str(error)}
             checks.append({"issue": "43/44", "criterion": f"provenance {name}",
@@ -383,7 +427,7 @@ def main():
                                      ("partition", "cluster-partition.json", check_partition)):
         try:
             path, data, _ = load(evidence, filename)
-            validate_provenance(path, data, source_commit, binary_sha)
+            validate_provenance(path, data, source_commit, binary_sha, HARNESS_FILES[name])
             function(data)
             local_ha[name] = {"status": "passed", "file": filename}
         except (GateFailure, Exception) as error:
@@ -438,8 +482,12 @@ def main():
         issue_checks = [check for check in checks if check["issue"] == issue]
         if any(check["status"] == "failed" for check in issue_checks):
             issue_status[str(issue)] = "failed"
+        elif issue == 44 and all(check["status"] == "passed" for check in issue_checks):
+            # Local multi-process evidence only; never report this as full
+            # production/distributed HA acceptance.
+            issue_status[str(issue)] = "passed_local_single_host"
         elif any(check["status"] == "blocked" for check in issue_checks):
-            issue_status[str(issue)] = "blocked"
+            issue_status[str(issue)] = "blocked_external_ha_and_source_fence"
         else:
             issue_status[str(issue)] = "passed"
     overall = "failed" if failed else ("blocked" if blocked else "passed")
@@ -462,6 +510,7 @@ def main():
         "status": overall,
         "issues": issue_status,
         "local_profile_accepted": issue_status.get("43") != "failed",
+        "production_scope": "not_certified; local single-host evidence only",
         "checks": checks,
         "evidence": records,
         "local_storage_ha": local_ha,

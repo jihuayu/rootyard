@@ -42,8 +42,7 @@ def source_commit():
 
 def source_dirty():
     try:
-        changed = subprocess.check_output(["git", "status", "--porcelain",
-                                           "--untracked-files=no"],
+        changed = subprocess.check_output(["git", "status", "--porcelain"],
                                           cwd=REPO, text=True, timeout=15)
         return bool(changed.strip())
     except (OSError, subprocess.SubprocessError):
