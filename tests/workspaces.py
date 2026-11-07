@@ -248,6 +248,44 @@ class Harness:
         self.reject_init_before_store("submodule", source, base)
         checked.append("submodule-git-modules")
 
+        # Uninitialized gitlink fixtures: a submodule entry created directly with
+        # update-index --cacheinfo, so there is no .gitmodules file, no
+        # .git/modules checkout and no submodule transport or network access.
+        # HEAD and index are examined independently because a name-only listing
+        # hides the 160000 mode.
+        root, source, _, base = self.fixture("preflight-index-gitlink")
+        self.git("update-index", "--add", "--cacheinfo",
+                 f"160000,{base},vendor/library", cwd=source)
+        require(self.git("ls-files", "--stage", cwd=source).stdout.startswith(b"160000 "),
+                "index gitlink fixture has no 160000 index entry")
+        require(not (source / ".gitmodules").exists(),
+                "index gitlink fixture unexpectedly has .gitmodules")
+        require(not (source / ".git/modules").exists(),
+                "index gitlink fixture unexpectedly has .git/modules")
+        require(not (source / "vendor").exists(),
+                "index gitlink fixture unexpectedly has a checkout")
+        self.reject_init_before_store("index-gitlink", source, base)
+
+        root, source, _, _ = self.fixture("preflight-head-gitlink")
+        gitlink_oid = self.oid(source)
+        self.git("update-index", "--add", "--cacheinfo",
+                 f"160000,{gitlink_oid},vendor/library", cwd=source)
+        self.git("commit", "-m", "gitlink without submodule metadata", cwd=source)
+        base = self.oid(source)
+        self.git("update-index", "--force-remove", "vendor/library", cwd=source)
+        require(b"160000 commit" in self.git("ls-tree", "-r", "--full-tree", "HEAD").stdout,
+                "HEAD gitlink fixture has no 160000 tree entry")
+        require(b"160000 " not in self.git("ls-files", "--stage", cwd=source).stdout,
+                "HEAD gitlink fixture still has a 160000 index entry")
+        require(not (source / ".gitmodules").exists(),
+                "HEAD gitlink fixture unexpectedly has .gitmodules")
+        require(not (source / ".git/modules").exists(),
+                "HEAD gitlink fixture unexpectedly has .git/modules")
+        require(not (source / "vendor").exists(),
+                "HEAD gitlink fixture unexpectedly has a checkout")
+        self.reject_init_before_store("head-gitlink", source, base)
+        checked.extend(["index-gitlink-without-gitmodules", "head-gitlink-without-gitmodules"])
+
         # Tracked .gitattributes requesting an LFS filter. The fixture configures a
         # trivial filter only to create the commit, then removes it so the tracked
         # attribute file itself is the sole reason for rejection.

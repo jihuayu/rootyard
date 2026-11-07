@@ -13,18 +13,29 @@
 //!
 //! The Git-state and repository-structure checks are *not* re-implemented here: they
 //! are the same shared `validate_repo_with` used by `Store::validate_repo` and by the
-//! later post-open re-validation. This module only adds the two worktree checks that
+//! later post-open re-validation. This module only adds the worktree checks that
 //! previously happened much later, inside `capture`:
 //!
 //! * managed `.gitattributes` files requesting a filter/LFS attribute;
 //! * managed symlinks that are absolute, escape the repository, point into `.git`
-//!   or reach such a target indirectly.
+//!   or reach such a target indirectly;
+//! * gitlinks (`mode 160000`) in the HEAD tree or in the index, because a submodule
+//!   entry without `.gitmodules` and without an initialized `.git/modules` checkout
+//!   would otherwise pass the repository-structure checks and only fail in capture.
 //!
 //! The candidate set mirrors `ignore::classify_workspace` without needing an open
-//! store: HEAD tree paths, index paths and untracked paths that Git does not ignore
-//! and `.rootyardignore` does not ignore. A path ignored by `.rootyardignore` is
-//! therefore *not* preflight-rejected, matching the capture semantics that treat it
-//! as unmanaged.
+//! store: mode-aware HEAD tree records, mode-aware index records and untracked paths
+//! that Git does not ignore and `.rootyardignore` does not ignore. The mode-aware
+//! records use the same `<mode> ... TAB <path>` shape `classify_workspace` parses, so
+//! the shared gitlink refusal cannot be hidden by a name-only listing. A path ignored
+//! by `.rootyardignore` is therefore *not* preflight-rejected, matching the capture
+//! semantics that treat it as unmanaged.
+//!
+//! Every listing is admitted only after the native Git process has exited and its
+//! complete stdout is buffered. A listing larger than `MAX_LISTING_BYTES` is refused,
+//! never truncated into a valid list. That is a post-buffer admission bound on the
+//! bytes this module parses, not a limit on Git child time, CPU or RSS; a capped
+//! streaming runner is separate work.
 //!
 //! This is an early-rejection boundary only. It does not add SHA-256 support, does
 //! not implement submodule, LFS or linked-worktree support, and does not replace the
@@ -41,10 +52,13 @@ use std::{
 
 use super::{core, ignore::IgnoreMatcher};
 
-/// Bound on a single Git path listing, so a hostile tree cannot drive unbounded work.
+/// Post-buffer admission bound on a single Git path listing. The native Git
+/// subprocess has already exited and its complete stdout is buffered before this
+/// bound is checked, so it limits what this module parses and never authorizes
+/// truncating output. It is not a bound on Git child time, CPU or RSS.
 const MAX_LISTING_BYTES: usize = 64 * 1024 * 1024;
 
-/// Check managed worktree `.gitattributes` filters and managed symlink targets.
+/// Check managed gitlinks, `.gitattributes` filters and managed symlink targets.
 pub fn worktree_checks(git: &OsStr, repo: &Path) -> Result<()> {
     let managed = managed_candidates(git, repo)?;
     attribute_filters(repo, &managed)?;
@@ -54,12 +68,11 @@ pub fn worktree_checks(git: &OsStr, repo: &Path) -> Result<()> {
 /// Approximate `classify_workspace().managed_paths` without an open store.
 fn managed_candidates(git: &OsStr, repo: &Path) -> Result<BTreeSet<PathBuf>> {
     let mut candidates = BTreeSet::new();
-    collect(&mut candidates, &core::git_bytes(git, repo, &["ls-files", "-z", "--cached"])?)?;
-    let head = core::git_bytes(git, repo, &["ls-tree", "-r", "-z", "--name-only", "HEAD"])?;
-    ensure!(head.len() <= MAX_LISTING_BYTES, "tracked path listing exceeds the init preflight limit");
-    collect(&mut candidates, &head)?;
-    let untracked = core::git_bytes(git, repo, &["ls-files", "-z", "--others", "--exclude-standard"])?;
-    ensure!(untracked.len() <= MAX_LISTING_BYTES, "untracked path listing exceeds the init preflight limit");
+    let index = listing(git, repo, &["ls-files", "--stage", "-z"], "index")?;
+    add_tracked(&mut candidates, &index, "index")?;
+    let head = listing(git, repo, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"], "HEAD")?;
+    add_tracked(&mut candidates, &head, "HEAD")?;
+    let untracked = listing(git, repo, &["ls-files", "-z", "--others", "--exclude-standard"], "untracked")?;
     let rootyard = IgnoreMatcher::from_worktree(repo)?;
     for record in untracked.split(|byte| *byte == 0).filter(|record| !record.is_empty()) {
         let path = core::relative_path(record)?;
@@ -73,9 +86,38 @@ fn managed_candidates(git: &OsStr, repo: &Path) -> Result<BTreeSet<PathBuf>> {
     Ok(candidates)
 }
 
-fn collect(candidates: &mut BTreeSet<PathBuf>, listing: &[u8]) -> Result<()> {
+/// Run one read-only listing and admit it only after Git has exited. The complete
+/// stdout is already buffered here; an over-limit listing is rejected, never
+/// shortened into a partial path list.
+fn listing(git: &OsStr, repo: &Path, args: &[&str], label: &str) -> Result<Vec<u8>> {
+    let bytes = core::git_bytes(git, repo, args)?;
+    ensure!(
+        bytes.len() <= MAX_LISTING_BYTES,
+        "{label} path listing exceeds the init preflight post-buffer admission bound"
+    );
+    Ok(bytes)
+}
+
+/// Parse mode-aware `<mode> ... TAB <path>` records (`ls-tree -r -z --full-tree` and
+/// `ls-files --stage -z`). A gitlink is refused from either listing: it is a
+/// submodule entry even when the repository has no `.gitmodules` file and no
+/// initialized `.git/modules` checkout, so the mode must be checked rather than a
+/// name-only path list or the presence of `.git/modules`.
+fn add_tracked(candidates: &mut BTreeSet<PathBuf>, listing: &[u8], source: &str) -> Result<()> {
     for record in listing.split(|byte| *byte == 0).filter(|record| !record.is_empty()) {
-        candidates.insert(core::relative_path(record)?);
+        let split = record.iter().position(|byte| *byte == b'\t').context("invalid Git mode listing record")?;
+        let header = &record[..split];
+        let space = header.iter().position(|byte| *byte == b' ').context("invalid Git mode listing record")?;
+        let mode = &header[..space];
+        ensure!(
+            mode.len() == 6 && mode.iter().all(|byte| (b'0'..=b'7').contains(byte)),
+            "unexpected Git mode in {source} listing"
+        );
+        ensure!(
+            mode != &b"160000"[..],
+            "submodules/gitlinks are unsupported ({source} listing without initialized .git/modules)"
+        );
+        candidates.insert(core::relative_path(&record[split + 1..])?);
         ensure!(candidates.len() <= core::MAX_ENTRIES, "managed path count exceeds the init preflight limit");
     }
     Ok(())
