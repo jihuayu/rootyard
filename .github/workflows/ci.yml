@@ -185,6 +185,7 @@ jobs:
         run: python3 tests/git_views.py --binary target/debug/rootyard-view-lab --report test-results/git-views.json
       - name: Exercise Pando object store delta resolution, graph traversal, and differential export
         run: |
+          test "$(id -u)" -ne 0
           python3 tests/pando_lab.py --binary target/debug/rootyard-pando-lab
           mkdir -p test-results
           latest_pando=$(ls -td /tmp/rootyard-pando-lab-* 2>/dev/null | head -1 || true)
