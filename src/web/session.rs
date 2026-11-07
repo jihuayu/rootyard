@@ -277,25 +277,31 @@ fn is_safe_return_to(value: &str) -> bool {
     if !header_safe_ascii(value) || value.starts_with("//") || value.contains("//") {
         return false;
     }
-    let Some(decoded) = percent_decode_ascii(value) else {
+    let raw_path = value.split('?').next().unwrap_or("");
+    let (Some(decoded_path), Some(decoded_whole)) = (
+        percent_decode_ascii(raw_path),
+        percent_decode_ascii(value),
+    ) else {
         return false;
     };
-    if !decoded.is_ascii()
-        || decoded.contains('\\')
-        || decoded.contains("//")
-        || decoded.contains('%')
-        || decoded.contains('#')
-        || decoded.chars().any(char::is_control)
+    if !decoded_whole.is_ascii()
+        || decoded_whole.contains('\\')
+        || decoded_whole.contains('%')
+        || decoded_whole.contains('#')
+        || decoded_whole.chars().any(char::is_control)
     {
         return false;
     }
-    let path = decoded.split('?').next().unwrap_or("");
-    if !(path.starts_with("/web/") || path.starts_with("/ui/"))
-        || path.starts_with("/web/login")
+    if !(decoded_path.starts_with("/web/") || decoded_path.starts_with("/ui/"))
+        || decoded_path.starts_with("/web/login")
+        || decoded_path.contains("//")
+        || decoded_path.contains('\\')
+        || decoded_path.contains('%')
+        || decoded_path.chars().any(char::is_control)
     {
         return false;
     }
-    !path
+    !decoded_path
         .split('/')
         .any(|segment| segment == "." || segment == "..")
 }

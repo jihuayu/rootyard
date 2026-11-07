@@ -274,6 +274,8 @@ class BrowserHarness(Harness):
             "/web/é",
             "/web/repos x",
             "/web/repos?q=%0a",
+            "/web/repos%3F/../api/repos",
+            "/web/%3F/../api/repos",
         )
         for bad in bad_returns:
             status, _, headers = self.login(return_to=bad)
