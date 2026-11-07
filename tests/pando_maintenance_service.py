@@ -89,12 +89,27 @@ class PandoMaintenanceHarness(Harness):
         report = json.loads(self.cli("pando-transition", "cutover", "--repository", repo["id"]))
         assert report["direction"] == "gitfs_to_pando", report
         self.start()
-        # Three full Pando pushes create three additional immutable packs; the
+        # A commit removed through the supported gateway is not reachable from
+        # any ref. Its object must still survive automatic pack compaction.
+        self.git("checkout", "-b", "retained", cwd=work)
+        (work / "retained-only.txt").write_text("retained only before ref deletion")
+        self.git("add", "retained-only.txt", cwd=work)
+        self.git("commit", "-m", "retained only", cwd=work)
+        retained_oid = self.git("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
+        self.git("push", "origin", "HEAD:refs/heads/retained", cwd=work, token=self.alice)
+        self.git("push", "origin", ":refs/heads/retained", cwd=work, token=self.alice)
+        self.git("checkout", "main", cwd=work)
+        base = "repository_id='" + repo["id"] + "'"
+        self.wait_sql("SELECT COALESCE((SELECT deleted::text FROM repository_ref_projection WHERE " + base
+                      + " AND ref_name='refs/heads/retained'),'missing')", lambda value: value == "true", 30,
+                      "retained ref projection deletion")
+        assert self.sql("SELECT count(*) FROM pando_refs WHERE " + base
+                        + " AND ref_name='refs/heads/retained'") == "0"
+        # Three full Pando pushes create additional immutable packs; the
         # configured pack threshold must schedule compaction without any API call.
         latest = None
         for index in (1, 2, 3):
             latest = self.pando_push(work, index)
-        base = "repository_id='" + repo["id"] + "'"
         self.wait_count(
             "SELECT count(*) FROM storage_maintenance_jobs WHERE " + base
             + " AND kind='pando_repack' AND state='succeeded'", seconds=90,
@@ -126,6 +141,29 @@ class PandoMaintenanceHarness(Harness):
             time.sleep(.2)
         assert cached.exists() and cached_idx.exists(), "automatic cache hydration did not materialize the compacted pack"
         assert cached_idx.is_file(), cached
+
+        # Disable the background worker while corrupting both cache files so an
+        # automatic hydration cannot hide the read-path integrity check. A
+        # same-length pair must be rejected and recovered from real remote bytes.
+        good_pack = cached.read_bytes()
+        good_idx = cached_idx.read_bytes()
+        self.stop()
+        self.env["ROOTYARD_STORAGE_MAINTENANCE"] = "false"
+        self.start()
+        for path in (cached, cached_idx):
+            corrupt = bytearray(path.read_bytes())
+            corrupt[len(corrupt) // 2] ^= 0xFF
+            path.write_bytes(bytes(corrupt))
+        tampered_clone = self.root / "pando-maint-tamper-clone"
+        self.git("clone", self.base + repo["clone_path"], str(tampered_clone), token=self.alice)
+        assert self.git("rev-parse", "HEAD", cwd=tampered_clone).stdout.decode().strip() == latest
+        self.git("fsck", "--full", "--strict", cwd=tampered_clone)
+        assert cached.read_bytes() == good_pack, "corrupt cache pack was not rebuilt from remote storage"
+        assert cached_idx.read_bytes() == good_idx, "corrupt cache index was not rebuilt from remote storage"
+        self.stop()
+        self.env["ROOTYARD_STORAGE_MAINTENANCE"] = "true"
+        self.start()
+
         old = time.time() - 7200
         os.utime(cached, (old, old))
         os.utime(cached_idx, (old, old))
@@ -178,12 +216,29 @@ class PandoMaintenanceHarness(Harness):
             "SELECT count(*) FROM storage_maintenance_jobs WHERE id='" + job + "' AND state='succeeded'",
             seconds=90, label="Pando job after backup barrier release")
         assert self.sql("SELECT cardinality(pack_ids) FROM pando_repository_states WHERE " + base) == "1"
+
+        # Rollback reconstructs GitFS exclusively from the current Pando serving
+        # pack set. The deleted-ref object is absent from all refs but must still
+        # be present because compaction copied every old packed object.
+        self.stop()
+        rollback = json.loads(self.cli("pando-transition", "rollback", "--repository", repo["id"]))
+        assert rollback["direction"] == "pando_to_gitfs", rollback
+        bare = self.root / "data" / "repos" / (repo["id"] + ".git")
+        self.git("--git-dir", str(bare), "cat-file", "-e", retained_oid)
+        self.git("--git-dir", str(bare), "fsck", "--full", "--strict")
+        self.start()
+        final_clone = self.root / "pando-maint-final-clone"
+        self.git("clone", self.base + repo["clone_path"], str(final_clone), token=self.alice)
+        assert self.git("rev-parse", "HEAD", cwd=final_clone).stdout.decode().strip() == latest
+        self.git("fsck", "--full", "--strict", cwd=final_clone)
         return {
             "automatic_compaction": True,
             "serving_packs": 1,
             "old_pack_manifests_retained": manifests,
             "cache_hydrated_evicted_rehydrated": True,
+            "cache_tamper_recovered": True,
             "backup_barrier_retried": True,
+            "non_ref_oid_survived_compaction_and_rollback": retained_oid,
             "latest_oid": latest,
             "remote_deleted": False,
         }

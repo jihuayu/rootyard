@@ -226,8 +226,18 @@ class PhysicalHarness(LifecycleHarness):
         packed=self.git("rev-parse","HEAD",cwd=work).stdout.decode().strip()
         self.git("push","origin","HEAD:refs/heads/temporary",cwd=work,token=self.alice)
         self.stop()
+        # Pack the temporary commit while its ref still exists, then remove the
+        # ref through the supported Smart-HTTP path. An offline update-ref would
+        # leave a stale durable ref-projection root and correctly prevent GC.
         self.git("--git-dir",str(bare),"repack","-a","-d")
-        self.git("--git-dir",str(bare),"update-ref","-d","refs/heads/temporary")
+        self.start()
+        self.git("checkout","main",cwd=work)
+        self.git("push","origin",":refs/heads/temporary",cwd=work,token=self.alice)
+        self.wait_sql("SELECT COALESCE((SELECT deleted::text FROM repository_ref_projection WHERE repository_id='"
+                      +repo["id"]+"' AND ref_name='refs/heads/temporary'),'missing')","true",seconds=20)
+        assert self.sql("SELECT count(*) FROM repository_ref_projection WHERE repository_id='"
+                        +repo["id"]+"' AND ref_name='refs/heads/temporary' AND NOT deleted AND oid IS NOT NULL") == "0"
+        self.stop()
         self.git("--git-dir",str(bare),"reflog","expire","--expire=now","--all")
         assert not (bare/"objects"/packed[:2]/packed[2:]).exists()
         shim=self.root/"enospc.so"
