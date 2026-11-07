@@ -217,7 +217,7 @@ def main():
         "limitations": [
             "One owned synthetic SQLSTATE 23503 trigger and one request; not a forged application principal.",
             "DB timeout, remote outage and 80-request full-backlog cases remain open.",
-            "No acceptance claim until the coordinator compiles and runs this file with the new binary.",
+            "Acceptance is limited to the reported request/error cases and the attested executable; worker backlog and remote-outage qualification are separate.",
         ],
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
