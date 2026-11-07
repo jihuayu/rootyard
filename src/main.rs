@@ -8,6 +8,17 @@ fn main() -> Result<()> {
         println!("rootyard-hook-v1");
         return Ok(());
     }
+    if args.len() == 2 && args[1] == rootyard::workspace_lab::fuse_helper::HELPER_ARG {
+        // The independent workspace FUSE helper branches before Config, the DB
+        // pool, `Store` and the volume lock exist: the child must never open
+        // PostgreSQL, the API router or the service storage lock. It receives
+        // only the two inherited sockets and a scrubbed environment.
+        if !cfg!(target_os = "linux") {
+            bail!("workspace FUSE helper requires Linux");
+        }
+        return rootyard::workspace_lab::fuse_helper::run_child()
+            .context("workspace FUSE helper stopped");
+    }
     let name = std::path::Path::new(&args[0]).file_name().and_then(|v| v.to_str()).unwrap_or("");
     match name {
         "reference-transaction" => {
@@ -291,6 +302,12 @@ async fn run() -> Result<()> {
             let git_shutdown_grace = state.config.git_timeout + std::time::Duration::from_secs(30);
             axum::serve(listener, rootyard::router(state)).with_graceful_shutdown(shutdown()).await?;
             rootyard::workspaces::drain_git_jobs(git_shutdown_grace).await;
+            // The helper is a real child process: normal shutdown fences and
+            // unmounts inside it, then reaps it within a bounded grace. A helper
+            // that does not exit is reported as a failed shutdown.
+            rootyard::workspaces::mounts::shutdown_helper()
+                .await
+                .map_err(|_| anyhow::anyhow!("workspace FUSE helper shutdown failed"))?;
             worker.abort();
             maintenance_stop.cancel();
             workspace_capture_stop.cancel();

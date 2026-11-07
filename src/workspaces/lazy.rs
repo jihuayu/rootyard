@@ -259,8 +259,19 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
+    /// Service facade kept for the in-process path. The independent helper uses
+    /// [`Reader::open_root`], which needs no `AppState` and no PostgreSQL.
     pub(super) fn open(state: &AppState, id: Uuid) -> Result<Option<Arc<Self>>, Error> {
-        let Some(manifest) = fingerprint_manifest(&state.storage.root, id)? else {
+        Self::open_root(&state.storage.root, id)
+    }
+
+    /// Open the lazily hydrated baseline from a storage root and a workspace id
+    /// only. The committed sidecar manifest and the forwarded object-store
+    /// environment are the complete input, so the FUSE helper child can hydrate
+    /// blob over a store it never gained by asking the control plane for a path.
+    /// `prepare` still runs in the parent and keeps its database authorization.
+    pub(crate) fn open_root(root: &Path, id: Uuid) -> Result<Option<Arc<Self>>, Error> {
+        let Some(manifest) = fingerprint_manifest(root, id)? else {
             return Ok(None);
         };
         let mut entries = BTreeMap::new();
@@ -278,8 +289,8 @@ impl Reader {
             }
             entries.insert(rel, (key, entry.size));
         }
-        let cache_root = state.storage.root.join("workspace-service/lazy-cache").join(id.to_string());
-        let fetcher = Arc::new(RemoteFetcher { store: Arc::new(remote::remote_store(state)?) });
+        let cache_root = root.join("workspace-service/lazy-cache").join(id.to_string());
+        let fetcher = Arc::new(RemoteFetcher { store: Arc::new(remote::store_at(root)?) });
         let hydrator = Hydrator::new(cache_root, fetcher, configured_timeout()).map_err(Error::internal)?;
         Ok(Some(Arc::new(Self { entries, hydrator })))
     }
@@ -291,7 +302,7 @@ impl Reader {
         self.hydrator.ensure(key, *size).map(Some)
     }
 
-    pub(super) fn prewarm(&self, paths: &[PathBuf]) -> io::Result<(usize, u64)> {
+    pub(crate) fn prewarm(&self, paths: &[PathBuf]) -> io::Result<(usize, u64)> {
         let mut count = 0;
         let mut bytes = 0;
         for path in paths {

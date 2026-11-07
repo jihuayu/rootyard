@@ -1,9 +1,31 @@
 //! Service-owned FUSE sessions for ordinary workspace filesystem access.
+//!
+//! Two backends share this registry:
+//!
+//! * `ROOTYARD_WORKSPACE_MOUNT_MODE=fuse-helper` (production, issue #91 phase 3)
+//!   - the API process talks to an independent helper child over the protocol
+//!   in [`crate::workspace_lab::fuse_helper`]. The registry only stores the
+//!   helper client registration per workspace: no `BackgroundSession`, no
+//!   `Overlay`, no `Reader` lives in the API process. The gate, the dispatcher
+//!   and the lazily hydrated reader all live in the child.
+//! * `ROOTYARD_WORKSPACE_MOUNT_MODE=fuse` - the older same-process prototype.
+//!   It keeps a `fuser::BackgroundSession` in the API process, so an operator
+//!   `SIGKILL` can still leave a blocked session owning the FUSE descriptor. It
+//!   is retained for the existing in-process native tests and is *not* the
+//!   phase-3 delivery; only `fuse-helper` closes that lifecycle.
+//!
+//! Parent-side authorization and lease handling stay here: `ensure` is called
+//! after the lease transaction committed a new `lease_epoch`, `prepare` ran with
+//! database authorization, and `with_frozen*` still classifies a proven
+//! pre-COMMIT rollback as the only case that may thaw the old epoch.
 use super::lazy;
 use crate::{
     AppState, Error,
     members::models::Role,
-    workspace_lab::fuse_mount::{FreezeDecision, LazySource, MountHandle, MutationGate, Overlay},
+    workspace_lab::{
+        fuse_helper::{HelperClient, HelperError},
+        fuse_mount::{FreezeDecision, LazySource, MountHandle, MutationGate, Overlay},
+    },
 };
 use axum::{
     Json,
@@ -19,53 +41,150 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use uuid::Uuid;
 
-struct Mounted {
-    _session: MountHandle,
-    gate: Arc<MutationGate>,
-    lazy: Option<Arc<lazy::Reader>>,
+/// Where a mounted workspace is actually served.
+enum Mounted {
+    /// Same-process prototype backend; holds the live session and gate.
+    InProcess { _session: MountHandle, gate: Arc<MutationGate>, lazy: Option<Arc<lazy::Reader>> },
+    /// Production backend: only the helper client registration is kept.
+    Helper { client: Arc<HelperClient> },
 }
+
+struct Observer {
+    gate: Option<(Arc<MutationGate>, (i64, u64))>,
+    client: Option<Arc<HelperClient>>,
+}
+
 static MOUNTS: OnceLock<Mutex<HashMap<Uuid, Mounted>>> = OnceLock::new();
 fn registry() -> &'static Mutex<HashMap<Uuid, Mounted>> {
     MOUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
+static HELPER: OnceLock<Mutex<Option<Arc<HelperClient>>>> = OnceLock::new();
+static NEXT_FREEZE_OP: AtomicU64 = AtomicU64::new(1);
+
+fn helper_slot() -> &'static Mutex<Option<Arc<HelperClient>>> {
+    HELPER.get_or_init(|| Mutex::new(None))
+}
+
+fn mode() -> String {
+    std::env::var("ROOTYARD_WORKSPACE_MOUNT_MODE").unwrap_or_else(|_| "direct".into())
+}
 
 pub fn enabled() -> bool {
-    std::env::var("ROOTYARD_WORKSPACE_MOUNT_MODE").as_deref() == Ok("fuse")
+    matches!(mode().as_str(), "fuse" | "fuse-helper")
 }
+
+fn helper_mode() -> bool {
+    mode() == "fuse-helper"
+}
+
 pub fn lower_path(state: &AppState, id: Uuid) -> PathBuf {
     state.storage.root.join("workspace-service/workspaces").join(id.to_string())
 }
 pub fn mount_path(state: &AppState, id: Uuid) -> PathBuf {
     state.storage.root.join("workspace-service/mounts").join(id.to_string())
 }
+
+/// A workspace is mounted only while its backend is actually serving it.
 pub fn mounted(id: Uuid) -> bool {
-    !enabled() || registry().lock().unwrap().contains_key(&id)
-}
-pub fn update_lease(id: Uuid, db_epoch: i64, until: i64) {
-    let gate = registry().lock().unwrap().get(&id).map(|mount| mount.gate.clone());
-    if let Some(gate) = gate {
-        // Epoch-ordered observe: a late SELECT result cannot fence a newer
-        // handoff, shorten its deadline, or re-authorize an old epoch.
-        let _ = gate.observe_lease(db_epoch, until);
+    if !enabled() {
+        return true;
+    }
+    let registry = registry().lock().unwrap();
+    match registry.get(&id) {
+        Some(Mounted::InProcess { .. }) => true,
+        Some(Mounted::Helper { client }) => client.alive(),
+        None => false,
     }
 }
+
+fn helper_client() -> Result<Arc<HelperClient>, Error> {
+    let mut slot = helper_slot().lock().unwrap();
+    // Clone the registration so the match never holds a borrow of the slot.
+    let current = slot.clone();
+    match current {
+        Some(client) if client.alive() => Ok(client),
+        Some(_) => {
+            // A helper that died cannot be revived silently: every mount it held
+            // is gone, and re-attaching would pretend the other workspaces
+            // survived. A restart of the API generation is required.
+            *slot = None;
+            Err(Error::internal("workspace FUSE helper is unavailable after a control failure"))
+        }
+        None => {
+            let client = HelperClient::spawn().map_err(Error::internal)?;
+            let client = Arc::new(client);
+            *slot = Some(client.clone());
+            Ok(client)
+        }
+    }
+}
+
+fn helper_error(error: HelperError) -> Error {
+    match error.code {
+        libc::EBUSY | libc::EWOULDBLOCK => {
+            Error(StatusCode::CONFLICT, "workspace mount is busy with a freeze or lease handoff")
+        }
+        libc::ESTALE => Error(StatusCode::CONFLICT, "workspace lease epoch moved on; retry on the new epoch"),
+        libc::ENOENT => Error(StatusCode::CONFLICT, "workspace is not mounted in the FUSE helper"),
+        _ => Error::internal(error),
+    }
+}
+
+fn next_op() -> u64 {
+    NEXT_FREEZE_OP.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Ordered lease observation from a periodic or page-based refresh.
+pub fn update_lease(id: Uuid, db_epoch: i64, until: i64) {
+    let observer = {
+        let registry = registry().lock().unwrap();
+        match registry.get(&id) {
+            Some(Mounted::InProcess { gate, .. }) => {
+                // Epoch-ordered observe: a late SELECT result cannot fence a
+                // newer handoff, shorten its deadline, or re-authorize an old epoch.
+                let _ = gate.observe_lease(db_epoch, until);
+                return;
+            }
+            Some(Mounted::Helper { client }) => client.clone(),
+            None => return,
+        }
+    };
+    // The child orders the observation under its own gate lock; sending it from
+    // a detached thread keeps the caller's runtime free of a blocking RPC.
+    let _ = std::thread::Builder::new().name("fuse-helper-observe".into()).spawn(move || {
+        let _ = observer.observe(id, db_epoch, until);
+    });
+}
+
 pub async fn refresh_leases(state: &AppState) -> Result<(), Error> {
     if !enabled() {
         return Ok(());
     }
-    let (ids, observed): (Vec<Uuid>, Vec<(i64, u64)>) = {
+    let observers: Vec<(Uuid, Observer)> = {
         let mounts = registry().lock().unwrap();
-        mounts.iter().map(|(id, mount)| (*id, mount.gate.lease_marker())).unzip()
+        mounts
+            .iter()
+            .map(|(id, mount)| {
+                let observer = match mount {
+                    Mounted::InProcess { gate, .. } => {
+                        Observer { gate: Some((gate.clone(), gate.lease_marker())), client: None }
+                    }
+                    Mounted::Helper { client } => Observer { gate: None, client: Some(client.clone()) },
+                };
+                (*id, observer)
+            })
+            .collect()
     };
-    let markers: HashMap<Uuid, (i64, u64)> = ids.iter().copied().zip(observed).collect();
-    if ids.is_empty() {
+    if observers.is_empty() {
         return Ok(());
     }
+    let ids: Vec<Uuid> = observers.iter().map(|(id, _)| *id).collect();
     let client = state.pool.get().await.map_err(Error::internal)?;
     let rows = client
         .query(
@@ -76,47 +195,84 @@ pub async fn refresh_leases(state: &AppState) -> Result<(), Error> {
         .await
         .map_err(Error::internal)?;
     let leases: HashMap<Uuid, (i64, i64)> = rows.iter().map(|r| (r.get(0), (r.get(1), r.get(2)))).collect();
-    let mounts = registry().lock().unwrap();
-    for (id, mount) in mounts.iter() {
-        match leases.get(id) {
+    tokio::task::spawn_blocking(move || {
+        for (id, observer) in observers {
+            apply_refresh(id, observer, leases.get(&id).copied());
+        }
+    })
+    .await
+    .map_err(Error::internal)?;
+    Ok(())
+}
+
+fn apply_refresh(id: Uuid, observer: Observer, lease: Option<(i64, i64)>) {
+    if let Some((gate, marker)) = observer.gate {
+        match lease {
             Some((epoch, until)) => {
-                let _ = mount.gate.observe_lease(*epoch, *until);
+                let _ = gate.observe_lease(epoch, until);
             }
             None => {
                 // A missing row may be an old snapshot. Only fence when this gate
                 // still matches the marker captured before the query.
-                if let Some(marker) = markers.get(id) {
-                    let _ = mount.gate.fence_if_unchanged(*marker);
-                }
+                let _ = gate.fence_if_unchanged(marker);
+            }
+        }
+        return;
+    }
+    let Some(client) = observer.client else { return };
+    match lease {
+        Some((epoch, until)) => {
+            let _ = client.observe(id, epoch, until);
+        }
+        None => {
+            // The child must resolve marker and conditional fence synchronously,
+            // otherwise a stale query could fence a newer handoff.
+            if let Ok(state) = client.marker(id) {
+                let _ = client.fence_if_unchanged(id, state.epoch, state.generation);
             }
         }
     }
-    Ok(())
 }
+
+fn freeze_grant(
+    id: Uuid,
+    client: &Arc<HelperClient>,
+    epoch: i64,
+) -> Result<crate::workspace_lab::fuse_helper::RemoteFreezeToken, Error> {
+    let op_id = next_op();
+    client.freeze_begin(id, epoch, op_id).map_err(helper_error)
+}
+
 pub fn with_frozen<T>(id: Uuid, work: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
     if !enabled() {
         return work();
     }
-    let gate = registry()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .map(|m| m.gate.clone())
-        .ok_or_else(|| Error::internal("workspace FUSE mount missing"))?;
-    gate.freeze(work)
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Release {
-    KnownRollback,
-    Fence,
-}
-
-fn release_after<T>(outcome: &Result<T, Error>, commit_started: bool) -> Release {
-    match outcome {
-        Ok(_) => Release::Fence,
-        Err(_) if !commit_started => Release::KnownRollback,
-        Err(_) => Release::Fence,
+    let (gate, client) = {
+        let registry = registry().lock().unwrap();
+        match registry.get(&id) {
+            Some(Mounted::InProcess { gate, .. }) => (Some(gate.clone()), None),
+            Some(Mounted::Helper { client }) => (None, Some(client.clone())),
+            None => (None, None),
+        }
+    };
+    if let Some(gate) = gate {
+        return gate.freeze(work);
     }
+    let Some(client) = client else {
+        return Err(Error::internal("workspace FUSE mount missing"));
+    };
+    if !client.alive() {
+        return Err(Error::internal("workspace FUSE helper is unavailable"));
+    }
+    let epoch = client.marker(id).map_err(helper_error)?.epoch;
+    let token = freeze_grant(id, &client, epoch)?;
+    let outcome = work();
+    // Capture and scan freezes never authorize a lease commit, so the old epoch
+    // is still the only authority and a thaw is correct. If the gate was fenced
+    // while frozen (a newer epoch was observed) the child keeps it fenced: a
+    // thaw decision never revives a superseded epoch.
+    token.finish(FreezeDecision::Thaw).map_err(helper_error)?;
+    outcome
 }
 
 pub async fn with_frozen_async<T>(
@@ -127,46 +283,76 @@ pub async fn with_frozen_async<T>(
     if !enabled() {
         return work.await;
     }
-    let gate = registry()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .map(|m| m.gate.clone())
-        .ok_or_else(|| Error::internal("workspace FUSE mount missing"))?;
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<Release>();
-    let guard = tokio::task::spawn_blocking(move || {
-        // Hold the exclusive gate until the caller reaches a decision. Only an
-        // explicit pre-COMMIT rollback thaws the old epoch; commit success,
-        // transport errors, caller cancellation and a lost channel fence it.
-        gate.freeze_with_decision(|| {
-            let _ = ready_tx.send(());
-            let decision = match release_rx.blocking_recv() {
-                Ok(Release::KnownRollback) => FreezeDecision::Thaw,
-                Ok(Release::Fence) | Err(_) => FreezeDecision::Fence,
-            };
-            ((), decision)
+    let (gate, client) = {
+        let registry = registry().lock().unwrap();
+        match registry.get(&id) {
+            Some(Mounted::InProcess { gate, .. }) => (Some(gate.clone()), None),
+            Some(Mounted::Helper { client }) => (None, Some(client.clone())),
+            None => (None, None),
+        }
+    };
+    if let Some(gate) = gate {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<Release>();
+        let guard = tokio::task::spawn_blocking(move || {
+            // Hold the exclusive gate until the caller reaches a decision. Only an
+            // explicit pre-COMMIT rollback thaws the old epoch; commit success,
+            // transport errors, caller cancellation and a lost channel fence it.
+            gate.freeze_with_decision(|| {
+                let _ = ready_tx.send(());
+                let decision = match release_rx.blocking_recv() {
+                    Ok(Release::KnownRollback) => FreezeDecision::Thaw,
+                    Ok(Release::Fence) | Err(_) => FreezeDecision::Fence,
+                };
+                ((), decision)
+            });
         });
-    });
-    ready_rx.await.map_err(Error::internal)?;
+        ready_rx.await.map_err(Error::internal)?;
+        let outcome = work.await;
+        let release = release_after(&outcome, commit_started.load(Ordering::Acquire));
+        let _ = release_tx.send(release);
+        guard.await.map_err(Error::internal)?;
+        return outcome;
+    }
+    let Some(client) = client else {
+        return Err(Error::internal("workspace FUSE mount missing"));
+    };
+    if !client.alive() {
+        return Err(Error::internal("workspace FUSE helper is unavailable"));
+    }
+    let (marker_client, marker_id) = (client.clone(), id);
+    let epoch = tokio::task::spawn_blocking(move || marker_client.marker(marker_id))
+        .await
+        .map_err(Error::internal)?
+        .map_err(helper_error)?
+        .epoch;
+    let (grant_client, grant_id) = (client.clone(), id);
+    let token = tokio::task::spawn_blocking(move || freeze_grant(grant_id, &grant_client, epoch))
+        .await
+        .map_err(Error::internal)??;
+    // The token owns the one-shot finish. If the caller is cancelled here, the
+    // token is dropped and the child receives an explicit fence, never a thaw.
     let outcome = work.await;
     let release = release_after(&outcome, commit_started.load(Ordering::Acquire));
-    let _ = release_tx.send(release);
-    guard.await.map_err(Error::internal)?;
+    tokio::task::spawn_blocking(move || token.finish(release)).await.map_err(Error::internal)?.map_err(helper_error)?;
     outcome
 }
+
 pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(), Error> {
     if !enabled() {
         return Ok(());
     }
+    if helper_mode() {
+        return ensure_helper(state, id, db_epoch, until);
+    }
     let mut registry = registry().lock().unwrap();
-    if let Some(existing) = registry.get(&id) {
+    if let Some(Mounted::InProcess { gate, .. }) = registry.get(&id) {
         // The lease handler commits a new database epoch before calling this.
         // A same-epoch call only renews the deadline. A new epoch is authorized
         // through the fence-then-authorize handoff, so a concurrent freeze or a
         // guard admitted under the old epoch leaves the gate fenced and surfaces
         // an error instead of keeping the superseded epoch writable.
-        existing.gate.handoff(db_epoch, until).map_err(Error::internal)?;
+        gate.handoff(db_epoch, until).map_err(Error::internal)?;
         return Ok(());
     }
     let lower = lower_path(state, id);
@@ -182,7 +368,35 @@ pub fn ensure(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(
     let source: Option<Arc<dyn LazySource>> = lazy.clone().map(|reader| reader as Arc<dyn LazySource>);
     let overlay = Overlay::new_with_gate_and_lazy(lower, upper, gate.clone(), source).map_err(Error::internal)?;
     let session = crate::workspace_lab::fuse_mount::spawn(overlay, &mountpoint).map_err(Error::internal)?;
-    registry.insert(id, Mounted { _session: session, gate, lazy });
+    registry.insert(id, Mounted::InProcess { _session: session, gate, lazy });
+    Ok(())
+}
+
+fn ensure_helper(state: &AppState, id: Uuid, db_epoch: i64, until: i64) -> Result<(), Error> {
+    let client = helper_client()?;
+    let registered = {
+        let registry = registry().lock().unwrap();
+        match registry.get(&id) {
+            Some(Mounted::Helper { client }) => Some(client.clone()),
+            _ => None,
+        }
+    };
+    if let Some(registered) = registered {
+        // The RPC is issued with the registry lock released so one mount's
+        // handoff cannot stall every other workspace.
+        if registered.alive() {
+            return registered.handoff(id, db_epoch, until).map_err(helper_error);
+        }
+        registry().lock().unwrap().remove(&id);
+        return Err(Error::internal("workspace FUSE helper is unavailable after a control failure"));
+    }
+    // The lower tree was prepared by `prepare` under database authorization;
+    // the helper only ever receives the root and this UUID.
+    if !lower_path(state, id).join(".git").is_dir() {
+        return Err(Error::internal("workspace lower Git state missing"));
+    }
+    client.mount(&state.storage.root, id, db_epoch, until, true).map_err(helper_error)?;
+    registry().lock().unwrap().insert(id, Mounted::Helper { client });
     Ok(())
 }
 
@@ -210,17 +424,37 @@ pub async fn prewarm(
     if !live {
         return Err(super::service::conflict());
     }
-    let reader = registry()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .and_then(|m| m.lazy.clone())
-        .ok_or(Error(StatusCode::CONFLICT, "workspace has no remote lazy baseline"))?;
+    let server = {
+        let registry = registry().lock().unwrap();
+        match registry.get(&id) {
+            Some(Mounted::Helper { client }) => Some(client.clone()),
+            _ => None,
+        }
+    };
     let paths: Vec<PathBuf> = input
         .paths
         .iter()
         .map(|p| crate::browse::models::normalize_rel_path(Some(p)).map(PathBuf::from))
         .collect::<Result<_, _>>()?;
+    if let Some(server) = server {
+        // The child runs this as a blocking job beside the FUSE actor, so a slow
+        // hydration cannot delay the control loop or another mount.
+        let request: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let (count, bytes) = tokio::task::spawn_blocking(move || server.prewarm(id, request))
+            .await
+            .map_err(Error::internal)?
+            .map_err(helper_error)?;
+        return Ok(Json(json!({"hydrated_files":count,"hydrated_bytes":bytes})));
+    }
+    let reader = registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .and_then(|m| match m {
+            Mounted::InProcess { lazy, .. } => lazy.clone(),
+            Mounted::Helper { .. } => None,
+        })
+        .ok_or(Error(StatusCode::CONFLICT, "workspace has no remote lazy baseline"))?;
     let (count, bytes) = tokio::task::spawn_blocking(move || reader.prewarm(&paths))
         .await
         .map_err(Error::internal)?
@@ -243,11 +477,11 @@ pub async fn ensure_from_database(state: &AppState, id: Uuid) -> Result<(), Erro
     ensure(state, id, row.get(0), row.get(1))
 }
 pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
-    let mode = std::env::var("ROOTYARD_WORKSPACE_MOUNT_MODE").unwrap_or_else(|_| "direct".into());
+    let mode = mode();
     if mode == "direct" {
         return Ok(());
     }
-    if mode != "fuse" {
+    if mode != "fuse" && mode != "fuse-helper" {
         return Err(Error::internal("invalid workspace mount mode"));
     }
     let client = state.pool.get().await.map_err(Error::internal)?;
@@ -258,6 +492,34 @@ pub async fn reconcile_startup(state: &AppState) -> Result<(), Error> {
         ensure(state, row.get(0), row.get(1), row.get(2))?;
     }
     Ok(())
+}
+
+/// Normal shutdown: fence, unmount and reap the helper within a real deadline.
+///
+/// The caller must treat an error as a failed shutdown. A helper that does not
+/// exit is killed by the client and reported, never silently ignored.
+pub async fn shutdown_helper() -> Result<(), Error> {
+    let client = helper_slot().lock().unwrap().take();
+    registry().lock().unwrap().clear();
+    let Some(client) = client else { return Ok(()) };
+    tokio::task::spawn_blocking(move || client.shutdown(Duration::from_secs(10)))
+        .await
+        .map_err(Error::internal)?
+        .map_err(Error::internal)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    KnownRollback,
+    Fence,
+}
+
+fn release_after<T>(outcome: &Result<T, Error>, commit_started: bool) -> Release {
+    match outcome {
+        Ok(_) => Release::Fence,
+        Err(_) if !commit_started => Release::KnownRollback,
+        Err(_) => Release::Fence,
+    }
 }
 
 #[cfg(test)]

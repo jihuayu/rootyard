@@ -1,10 +1,12 @@
 //! Process-local mutation gate for the workspace FUSE overlay.
 //!
-//! This gate is a *prerequisite* for an independent FUSE helper, not the helper
-//! itself. The session still runs as a `fuser::BackgroundSession` inside the
-//! service process, so an operator `SIGKILL` can still leave a thread blocked in
-//! `request_wait_answer` while it owns the same-process FUSE descriptor. The
-//! helper/parent-loss lifecycle remains open.
+//! In the phase-3 runtime this gate lives inside the independent FUSE helper
+//! child (`ROOTYARD_WORKSPACE_MOUNT_MODE=fuse-helper`), which the parent drives
+//! over the control protocol in [`crate::workspace_lab::fuse_helper`]. The
+//! gate semantics are synchronous and local; the helper is what survives an API
+//! `SIGKILL`, fences the gate on a missed heartbeat and unmounts on exit. The
+//! same-process `fuse` mode still runs this gate inside the service process as a
+//! prototype and does not provide that lifecycle.
 //!
 //! Design constraints:
 //!
@@ -31,8 +33,8 @@
 //! the transaction never reached COMMIT can explicitly thaw the old epoch, while
 //! success, an unknown commit outcome, a panic or a cancelled caller stays fenced.
 //!
-//! This is still not the native FUSE helper. Nothing here survives process death
-//! or fences a second process, and the parent-loss lifecycle remains open.
+//! This type itself survives nothing: process death drops it, and only the
+//! helper watchdog turns parent loss into a fence before the child exits.
 use std::{
     cell::RefCell,
     io,
