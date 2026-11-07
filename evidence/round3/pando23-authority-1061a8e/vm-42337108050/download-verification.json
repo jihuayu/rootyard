@@ -1,0 +1,10 @@
+{
+  "run_id": 42337108050,
+  "job_id": 128296401784,
+  "source_commit": "1061a8ee9d1ecc783189d33949980eac6b3bd6ea",
+  "conclusion": "success",
+  "artifact_id": 13559528645,
+  "artifact_zip_sha256": "692d86087ccfeeb1815d35d891926241f4e3b0c2d6d1cddac7183b5ba7f3d168",
+  "binary_sha256": "f0061754a2ccb4678db272cfc3662cc106945ee2819838b5a4868fde9d413046",
+  "assertions_verified": 17
+}

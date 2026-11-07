@@ -1,0 +1,67 @@
+# Pando final review - commit 89ba6a8 (prev approval 3cf37b9)
+
+**Code verdict: APPROVE_SCOPED_MODE** (P1 0, P2 0, P3 4)
+**Runtime: PENDING - coordinator-status.json shows state=running, stage=rust-lib for 89ba6a8bad9fd709bdf39f16e828bb8459f34bd2 with a valid certified build (binary sha256 eb1e4a09bf1a9c244272a88e300fbf011cb017243313214f0ab359898515d9da). No test result exists yet, so no native pass is claimed.**
+
+## Escalation answers
+### lease_expiry_renewal - verified
+src/pando_gateway/pack_store.rs publish tx2: only after all four retention::activate() calls returned true does it call retention::renew_publication(&*tx, manifest.id) before insert_ready_manifest_in/record_manifest/commit. renew_publication sets lease_until=now+3600 for every fence row of that manifest inside the activation tx, so the protected window starts at activation rather than at reservation.
+Residual: P3-1/P3-3 below (no proof that renew touched 4 rows; proof failure surfaces as a generic conflict).
+
+### serving_cas_proof_all_callsites - verified
+retention::verify_publication_ready joins pando_manifest_artifacts to pando_remote_artifacts AND pando_publication_fences on (authority,tenant,namespace,sha), filters a.state='active' AND p.lease_until>clock_timestamp(), takes FOR SHARE OF a,p, and requires rows.len()==4. Called in the same transaction as the serving mutation at three sites: src/pando_gateway/publish.rs before pack_ids.push(pack.id) and before DELETE pando_publication_fences; src/pando_gateway/transition/fence.rs complete_cutover before the pando_repository_states upsert that sets pack_ids=ARRAY[pack.id]; src/storage_lifecycle/pando.rs repack before the pack_ids CAS. FOR SHARE blocks a concurrent mark UPDATE ... WHERE state='active' until the CAS transaction ends, so no retire can slip between proof and commit.
+
+### publisher_paused_past_fence - verified_fail_closed
+If a publisher is stopped past the 1h lease, GC may mark and (after grace) delete; when it resumes, verify_publication_ready returns false because either the join yields fewer than 4 rows (fence gone/expired) or a.state is no longer 'active' (retired/deleting/deleted). publish.rs then returns conflict BEFORE pack_ids.push and BEFORE the fence delete, so no ref CAS can commit against deleted ciphertext; the pg tx rolls back leaving the manifest an orphan. A retry through reserve() also cannot reuse the path: reserve now computes fence_live for (manifest,namespace,sha) and only reuses an active artifact when fence_live != Some(false), so an expired fence forces a generation bump, a new g path and a fresh fence (asserted in tests/pando_maintenance.rs late section: path differs, verify false while un-uploaded, artifact state reserved).
+
+### fresh_generation_on_retired_deleting - verified_unchanged
+reserve() bumps pando_storage_authorities.generation and writes a new remote_path for any existing non-active row, or when the fence for that manifest is expired; claim/still/finalize CAS are all scoped to the frozen remote_path + claim_generation, so a stale deleter can only remove the abandoned old path. The resurrection assertion (stale finalize == 0) is unchanged in tests/pando_maintenance.rs.
+
+### repack_fence_clear_atomic - verified
+src/storage_lifecycle/pando.rs repack: within one tx it rows-locks repositories+pando_repository_states FOR UPDATE, re-checks the exact serving snapshot, calls verify_publication_ready, runs the pack_ids CAS (changed==1), then DELETE FROM pando_publication_fences WHERE manifest_id=$1, then the storage_maintenance_repo_state update, then commit. No commit point exists between the CAS and the fence delete.
+
+### retained_link_paren_fix - verified
+Programmatic count of const RETAINED_LINK in src/storage_lifecycle/pando.rs: 6 opens, 6 closes, balance 0 (was unbalanced at 3cf37b9, which is consistent with the reported native failure: every mark/claim statement was a SQL parse error, so mark jobs requeued rather than deleting). The only change to the predicate is the added parenthesis; no clause was dropped.
+
+### test_fixture_not_hiding_destructive_work - verified
+tests/pando_maintenance.rs still asserts: fenced pending publication keeps all four artifacts active across a real mark+drain pass (fenced_active==4); expired fence fails verify and renew restores it; the earlier retirement list is non-empty; destructive stage reports deleted>=1 and every retired key must be absent via remote.head()==None; the serving pack ciphertext must survive; the unregistered legacy tenant-only object must survive; the paired backup bytes must be unchanged. The retired-manifest selection change only adds preconditions (manifest must own a retired artifact; the row query filters state='retired') so the resurrection block is deterministic; it removes no destructive assertion.
+
+### frozen_131_and_catalogs - verified
+89ba6a8 touches no migrations and no schema/*.json: schema/131_* and tests/backup_sha256_legacy131.py are untouched, so nothing is re-frozen and no catalog regeneration was needed for this commit. tests/backup_sha256_legacy130.py only renames the expected upgrade target (max(version) 131->132) for the legacy130 harness, which is correct under format8.
+
+### migration_132_amendment - accepted_by_owner_attestation
+Previous P2-DEPLOY-1 asked for migration 133 if d55a6a3-era 132 had ever been applied. Owner attests 132 was never pushed, merged or deployed and only disposable test databases ever ran it; on that condition the in-place amendment is valid and no 133 is required. This cannot be verified from source and is recorded as an attestation, not a proof.
+
+## Findings
+### P3-1 (P3 (unreachable in practice)) - Serving proof counts joined rows instead of distinct artifacts
+Source: src/pando_gateway/retention.rs verify_publication_ready: SELECT 1 ... then Ok(rows.len() == 4)
+Repro: If two of the four artifact_role links ever pointed at the same (namespace,sha256) - only possible if pack and index ciphertext were byte-identical, which random per-object nonces prevent - the join would emit two rows for one fence and rows.len() could still reach 4 with only three distinct objects verified.
+Fix: Use SELECT count(DISTINCT (l.namespace,l.sha256)) ... = 4 (and keep FOR SHARE) for an exact cardinality proof.
+
+### P3-2 (P3 (liveness/UX, fail-closed)) - Proof failure surfaces as a generic conflict and requires a full republish
+Source: src/pando_gateway/publish.rs returns conflict() on verify failure; src/pando_gateway/transition/fence.rs returns conflict(); src/storage_lifecycle/pando.rs bails with republish.
+Repro: A push paused longer than PENDING_PUBLICATION_SECONDS (3600s) is rejected with Pando refs changed; retry from current refs, which does not tell the operator that the publication window expired and a republish is needed. For cutover the retry path must re-run PackStore::publish to mint a new manifest and fences (verified for the repack job retry by inspection, not verified for the cutover retry in this pass).
+Fix: Return a distinct expired-publication error (e.g. 409 reason publication_expired) and document that cutover retries republish; or extend the fence at each CAS attempt.
+
+### P3-3 (P3) - renew_publication does not verify it touched four fence rows
+Source: src/pando_gateway/retention.rs renew_publication: UPDATE pando_publication_fences SET lease_until=... WHERE manifest_id=$1 and ignore the row count
+Repro: If a manifest ever reaches activation without fence rows (restore-imported manifests pass publication=None), renew silently updates 0 rows and the later serving proof fails closed with a generic conflict instead of a clear diagnostic.
+Fix: Compare the returned row count with the expected 4 (or with the number of manifest_artifacts rows) and error out.
+
+### P3-4 (P3 (test-only)) - Fixture simulates the serving CAS with two separate statements
+Source: tests/pando_maintenance.rs: UPDATE pando_publication_fences SET lease_until=now-1s; later DELETE FROM pando_publication_fences; then UPDATE pando_repository_states pack_ids=array_append(...) outside a shared transaction
+Repro: A regression that made the production fence delete and pack_ids update non-atomic would not be caught by the fixture, because the fixture never exercises the atomic pairing.
+Fix: Drive the fixture through the production serving path (or wrap fence delete + pack_ids append in one transaction) after retention::verify_publication_ready succeeds.
+
+## Closed since followup
+- P3-1 fence lease not refreshed at activation -> renew_publication in the activation tx after all four activations.
+- Serving CAS now proves all four artifacts active with nonexpired fences under FOR SHARE in the same tx for push, cutover and repack.
+- Expired-fence reuse -> reserve refuses reuse when fence_live == Some(false) and forces a fresh generation.
+- Unbalanced RETAINED_LINK SQL (the 3cf37b9 native failure) -> balance verified 6/6.
+
+## Runtime bounds
+- coordinator-status.json: state=running, stage=rust-lib, updated during this review; no rust-lib report file yet, so no native test result for 89ba6a8.
+- The certified build (built_commit == source_commit == 89ba6a8..., valid=true, binary sha256 eb1e4a09...) exists; a certified build is not a test pass.
+- Implementer-reported psql PREPARE/EXECUTE and cargo check --tests are SQL-plan/compile evidence only and are not counted as runtime GC or lease tests.
+- The 3cf37b9 native failure mode (RETAINED_LINK parse error, mark jobs requeued) is consistent with the imbalance found here; no successful destructive GC run has been observed by this reviewer.
+- Migration-132 amendment legitimacy rests on the owner attestation (never pushed/merged/deployed); it is not verifiable from source.

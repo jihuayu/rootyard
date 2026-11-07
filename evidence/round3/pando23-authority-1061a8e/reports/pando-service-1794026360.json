@@ -1,0 +1,32 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "seconds": 0.7143,
+      "detail": null
+    },
+    {
+      "name": "automatic_compaction_and_cache",
+      "status": "passed",
+      "seconds": 25.7621,
+      "detail": {
+        "automatic_compaction": true,
+        "serving_packs": 1,
+        "old_pack_manifests_retained": 8,
+        "cache_hydrated_evicted_rehydrated": true,
+        "cache_tamper_recovered": true,
+        "backup_barrier_retried": true,
+        "non_ref_oid_survived_compaction_and_rollback": "53d72b5748c55637b43360bb0924c6aec576caeb",
+        "latest_oid": "a26b7d247a0f191b5ef3884d1f4dc3f7a56ae584",
+        "remote_deleted": false
+      }
+    }
+  ],
+  "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+  "failure_snapshot": null,
+  "limitations": [
+    "Loopback single-node fixture; no remote-delete qualification."
+  ]
+}

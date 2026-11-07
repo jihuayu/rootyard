@@ -1,0 +1,116 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "setup_matrix",
+      "status": "passed",
+      "seconds": 0.8645,
+      "detail": {
+        "primary_and_mirror_started": true,
+        "audience": "e5d79526-3deb-4b5a-a36c-7f6d3e7c1cca"
+      }
+    },
+    {
+      "name": "sha256_full_flow",
+      "status": "passed",
+      "seconds": 4.8034,
+      "detail": {
+        "object_format": "sha256",
+        "target_oid": "898db9ff51c0792b20e403258ee275dd7d76d046fd26bf77db636f325b102061",
+        "plan": {
+          "dependencies": {
+            "history": "full",
+            "lfs": [],
+            "submodules": [],
+            "tags": [],
+            "version": 1
+          },
+          "expires_unix": 1794028371,
+          "job_id": "e9f7c554-0ef2-4939-afa0-aa03f218e7f1",
+          "mirror_audience": "e5d79526-3deb-4b5a-a36c-7f6d3e7c1cca",
+          "object_format": "sha256",
+          "owner_id": "e79b042e-3276-4653-b6e9-803de5c35ad2",
+          "repository_id": "cd3c301a-db40-4cf7-a250-d59a81b17894",
+          "source_receipt_sha256": "9bd60119667652561f032cb9e54ae120d9e12bc3976ded6099e9393e42b694be",
+          "storage_generation": 1,
+          "target_oid": "898db9ff51c0792b20e403258ee275dd7d76d046fd26bf77db636f325b102061",
+          "version": 1
+        },
+        "mirror_snapshot": "b72a31bf-bc0b-4bc3-ae86-33d3533b4724",
+        "clone_object_format": "sha256",
+        "abbreviated_oid_rejected": true,
+        "uppercase_oid_rejected": true,
+        "zero_oid_wrong_width_rejected": true
+      }
+    },
+    {
+      "name": "sha1_regression",
+      "status": "passed",
+      "seconds": 4.6522,
+      "detail": {
+        "object_format": "sha1",
+        "target_oid": "6c51f05410edced4e579713986cc0e012bad5271",
+        "plan": {
+          "dependencies": {
+            "history": "full",
+            "lfs": [],
+            "submodules": [],
+            "tags": [],
+            "version": 1
+          },
+          "expires_unix": 1794028376,
+          "job_id": "bdf15ea7-ec78-4b47-932a-6e4a0daba827",
+          "mirror_audience": "e5d79526-3deb-4b5a-a36c-7f6d3e7c1cca",
+          "object_format": "sha1",
+          "owner_id": "e79b042e-3276-4653-b6e9-803de5c35ad2",
+          "repository_id": "db96503f-bbda-40cf-b7b6-d7149cdb9b8a",
+          "source_receipt_sha256": "6d649fb191d923e5714e14d3c9bc594cec6ef2e3bffae51ae80bca8286df950b",
+          "storage_generation": 1,
+          "target_oid": "6c51f05410edced4e579713986cc0e012bad5271",
+          "version": 1
+        },
+        "mirror_snapshot": "4bc9ca31-cc4f-4513-aac5-fa6f4c3a1b13",
+        "clone_object_format": "sha1",
+        "abbreviated_oid_rejected": true,
+        "uppercase_oid_rejected": true,
+        "zero_oid_wrong_width_rejected": true
+      }
+    },
+    {
+      "name": "mixed_format_rejections",
+      "status": "passed",
+      "seconds": 0.0388,
+      "detail": {
+        "cross_format_oid_rejected": true,
+        "cross_format_fetch_rejected": true
+      }
+    },
+    {
+      "name": "policy_and_storage_bounds",
+      "status": "passed",
+      "seconds": 0.4167,
+      "detail": {
+        "single_durable_intent": true,
+        "snapshot": "de3a3720-fce0-4f41-9679-9128aeb6d23d",
+        "wrong_generation_rejected": true
+      }
+    },
+    {
+      "name": "plan_constraint_shapes",
+      "status": "passed",
+      "seconds": 0.1001,
+      "detail": {
+        "valid_sha1_and_sha256_shapes_accepted": true,
+        "mismatched_format_width_rejected": true,
+        "uppercase_zero_and_bad_receipt_rejected": true,
+        "null_plan_without_cancellation_rejected": true
+      }
+    }
+  ],
+  "binary_sha256": "6f76d70966473cd4bc956bc6a6cff792191664dba3516736b5d50cb92e156eba",
+  "limitations": [
+    "Synthetic loopback processes and isolated schema, not a production scaling benchmark.",
+    "SHA-1 regression and SHA-256 flow use the same stock Git 2.52 binary.",
+    "Cross-format rejection is exercised through service APIs and one native fetch, not every Git transport."
+  ]
+}

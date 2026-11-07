@@ -1,0 +1,108 @@
+   Compiling rootyard v0.1.0 (/workspace/rootyard-worktrees/round3-pando23)
+warning: unused import: `self`
+  --> src/sharding/migration.rs:16:30
+   |
+16 |         replication_target::{self, SnapshotReceipt},
+   |                              ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `bytes::Bytes`
+ --> src/sharding/replication.rs:9:5
+  |
+9 | use bytes::Bytes;
+  |     ^^^^^^^^^^^^
+
+warning: unused imports: `Envelope` and `REPO_ROUTE_FIELDS`
+  --> src/sharding/replication_target.rs:7:24
+   |
+ 7 |         models::{self, REPO_ROUTE_FIELDS, RepoShardRoute, conflict, json},
+   |                        ^^^^^^^^^^^^^^^^^
+...
+11 |         transport::{self, DELEGATION_HEADER, ENVELOPE_LIFETIME_SECONDS, Envelope},
+   |                                                                         ^^^^^^^^
+
+warning: value assigned to `op_state` is never read
+   --> src/sharding/migration.rs:250:9
+    |
+250 |         state
+    |         ^^^^^ this value is reassigned later and never used
+...
+329 |     op_state = state_name;
+    |     -------- `op_state` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `op_state` is never read
+   --> src/sharding/migration.rs:269:9
+    |
+269 |         "copying".to_owned()
+    |         ^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+329 |     op_state = state_name;
+    |     -------- `op_state` is overwritten here before the previous value is read
+
+warning: multiple fields are never read
+  --> src/sharding/replication_target.rs:47:5
+   |
+46 | struct TransferAuth {
+   |        ------------ fields in this struct
+47 |     actor: db::Identity,
+   |     ^^^^^
+48 |     owner: String,
+   |     ^^^^^
+49 |     name: String,
+   |     ^^^^
+50 |     owner_id: Uuid,
+   |     ^^^^^^^^
+51 |     generation: i64,
+   |     ^^^^^^^^^^
+...
+54 |     op_sequence: Option<i64>,
+   |     ^^^^^^^^^^^
+55 |     route: RepoShardRoute,
+   |     ^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `rootyard` (lib) generated 6 warnings (run `cargo fix --lib -p rootyard` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 56.71s
+     Running tests/pando_maintenance.rs (/workspace/rootyard/target/debug/deps/pando_maintenance-dd51d53190ebd9fd)
+
+running 1 test
+test automatic_pando_compaction_preserves_all_packed_objects ... hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /workspace/scratch/rootyard-round3/pando23/pando-test-root/maintenance-0179cea2-407c-42f9-a2f8-689d5017fc23/server-data/repos/395b1695-57ec-48ce-9ac7-168d30a3543a.git/
+hint: Using 'master' as the name for the initial branch. This default branch name
+hint: will change to "main" in Git 3.0. To configure the initial branch name
+hint: to use in all of your new repositories, which will suppress this warning,
+hint: call:
+hint:
+hint: 	git config --global init.defaultBranch <name>
+hint:
+hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+hint: 'development'. The just-created branch can be renamed via this command:
+hint:
+hint: 	git branch -m <name>
+hint:
+hint: Disable this message with "git config set advice.defaultBranchName false"
+Initialized empty Git repository in /workspace/scratch/rootyard-round3/pando23/pando-test-root/maintenance-0179cea2-407c-42f9-a2f8-689d5017fc23/work/.git/
+[master (root-commit) f20f482] root
+ 1 file changed, 1 insertion(+)
+ create mode 100644 README.md
+To /workspace/scratch/rootyard-round3/pando23/pando-test-root/maintenance-0179cea2-407c-42f9-a2f8-689d5017fc23/server-data/repos/395b1695-57ec-48ce-9ac7-168d30a3543a.git
+ * [new branch]      HEAD -> main
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.86s
