@@ -413,30 +413,40 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         info = e2e_tiers.SchemaBoundaryIntegrationFixture.verify_backup_tables_parity()
         self.assertEqual(info["count"], schema_baseline.TABLE_COUNT)
         self.assertEqual(info["tables"], sorted(schema_baseline.EXPECTED_TABLES))
+        self.assertEqual(info["catalog"], f"schema/{schema_baseline.LATEST_PREFIX}_catalog.json")
+        self.assertIsInstance(info["format"], int)
+        # Sequences stay in the locked relation list even though only ordinary
+        # tables are counted for parity.
+        self.assertTrue(set(info["tables"]) < set(info["relations"]))
+        self.assertEqual(info["relations"], sorted(info["relations"]))
 
+        # The root module must delegate to the frozen catalog instead of
+        # carrying its own copy of the relation list.
         backup_src = (ROOT / "src/backup.rs").read_text(encoding="utf-8")
-        adv_pos = backup_src.find("pg_advisory_lock(738390103)")
-        lock_pos = backup_src.find("LOCK TABLE {list} IN SHARE MODE")
-        self.assertGreater(adv_pos, 0)
-        self.assertGreater(lock_pos, adv_pos, "pg_advisory_lock must precede LOCK TABLE in src/backup.rs")
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_catalog.sql")', backup_src)
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_catalog.json")', backup_src)
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_restored_catalog.json")', backup_src)
-        self.assertIn(f'include_str!("../schema/{schema_baseline.LATEST_PREFIX}_upgraded_catalog.json")', backup_src)
-        for tbl in (
-            "forge_webhook_callbacks",
-            "forge_webhook_deliveries",
-            "forge_webhooks",
-            "repository_audit_log",
-            "repository_collaborators",
-            "repository_shard_routes",
-            "repository_team_members",
-            "repository_teams",
-            "shard_failover_operations",
-            "shard_nodes",
-            "shard_virtual_buckets",
-        ):
-            self.assertIn(f'"{tbl}"', backup_src)
+        self.assertNotIn("const TABLES", backup_src)
+        self.assertIn("use catalog::{", backup_src)
+        self.assertIn("FORMAT", backup_src)
+
+        catalog_src = (ROOT / "src/backup/catalog.rs").read_text(encoding="utf-8")
+        for suffix in ("catalog.json", "restored_catalog.json", "upgraded_catalog.json"):
+            self.assertIn(
+                f'include_str!("../../schema/{schema_baseline.LATEST_PREFIX}_{suffix}")',
+                catalog_src,
+            )
+        self.assertIn('entry["kind"] == "r"', catalog_src)
+        self.assertIn("names.sort();", catalog_src)
+
+        snapshot_src = (ROOT / "src/backup/snapshot.rs").read_text(encoding="utf-8")
+        adv_pos = snapshot_src.find("pg_advisory_lock(738390103)")
+        rel_pos = snapshot_src.find("catalog::relations(FORMAT, true)")
+        lock_pos = snapshot_src.find("LOCK TABLE {list} IN SHARE MODE")
+        self.assertGreater(adv_pos, 0, "advisory lock must be taken in src/backup/snapshot.rs")
+        self.assertGreater(rel_pos, adv_pos, "catalog relations must be read after the advisory lock")
+        self.assertGreater(lock_pos, rel_pos, "pg_advisory_lock and the catalog relation list must precede LOCK TABLE")
+
+        postgres_src = (ROOT / "src/backup/postgres.rs").read_text(encoding="utf-8")
+        self.assertIn("catalog::relations(format, false)", postgres_src)
+        self.assertIn("backup supports only the exact Rootyard public schema", postgres_src)
 
     def test_schema_030_catalog_json_structural_invariants_and_contract_digest(self) -> None:
         self.assertEqual(

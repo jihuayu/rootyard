@@ -6927,16 +6927,125 @@ class SchemaBoundaryIntegrationFixture:
 
     @classmethod
     def verify_backup_tables_parity(cls, backup_rs_text: Optional[str] = None) -> dict[str, Any]:
-        text = backup_rs_text if backup_rs_text is not None else (ROOT / "src/backup.rs").read_text(encoding="utf-8")
-        m = re.search(r"const TABLES:\s*&\[&str\]\s*=\s*&\[(.*?)\];", text, re.DOTALL)
-        if not m:
-            raise AssertionError("TABLES missing in src/backup.rs")
-        tables_list = re.findall(r'"([^"]+)"', m.group(1))
-        if tables_list != sorted(tables_list) or len(set(tables_list)) != len(tables_list):
-            raise AssertionError("src/backup.rs TABLES must be lexicographically sorted without duplicates")
-        if set(tables_list) != schema_baseline.EXPECTED_TABLES:
-            raise AssertionError(f"backup.rs TABLES {set(tables_list)} != schema_baseline {schema_baseline.EXPECTED_TABLES}")
-        return {"tables": tables_list, "count": len(tables_list)}
+        """Verify the backup relation allow-list against the live backup layout.
+
+        ``src/backup.rs`` no longer owns a ``const TABLES`` array: the frozen
+        relation list moved to ``src/backup/catalog.rs`` (``FORMAT`` -> the
+        newest ``schema/<latest>_catalog.json`` triplet), and ``snapshot.rs``
+        locks ``catalog::relations(FORMAT, true)`` inside ``LOCK TABLE ... IN
+        SHARE MODE`` after taking the advisory lock.  Simulated/malicious
+        sources are still injected through the historical constant, which must
+        stay lexicographically sorted, duplicate-free and complete, so a
+        degraded source can never silently pass.
+        """
+        if backup_rs_text is not None:
+            m = re.search(r"const TABLES:\s*&\[&str\]\s*=\s*&\[(.*?)\];", backup_rs_text, re.DOTALL)
+            if not m:
+                raise AssertionError("TABLES missing in simulated backup source")
+            tables_list = re.findall(r'"([^"]+)"', m.group(1))
+            if tables_list != sorted(tables_list) or len(set(tables_list)) != len(tables_list):
+                raise AssertionError("simulated backup TABLES must be lexicographically sorted without duplicates")
+            if set(tables_list) != schema_baseline.EXPECTED_TABLES:
+                raise AssertionError(
+                    f"simulated backup TABLES {set(tables_list)} != schema_baseline {schema_baseline.EXPECTED_TABLES}"
+                )
+            return {"tables": tables_list, "count": len(tables_list)}
+
+        catalog_path = ROOT / "src/backup/catalog.rs"
+        snapshot_path = ROOT / "src/backup/snapshot.rs"
+        postgres_path = ROOT / "src/backup/postgres.rs"
+        for required in (catalog_path, snapshot_path, postgres_path):
+            if not required.is_file():
+                raise AssertionError(f"Missing live backup module {required}")
+        catalog_src = catalog_path.read_text(encoding="utf-8")
+        snapshot_src = snapshot_path.read_text(encoding="utf-8")
+        postgres_src = postgres_path.read_text(encoding="utf-8")
+
+        fmt_match = re.search(r"const FORMAT: u32 = (\d+);", catalog_src)
+        if fmt_match is None:
+            raise AssertionError("src/backup/catalog.rs FORMAT constant missing")
+        fmt = int(fmt_match.group(1))
+
+        # The current format must consume the newest frozen catalog triplet.
+        arm_match = re.search(rf"\b{fmt}\s*=>\s*\[(.*?)\n\s*\],", catalog_src, re.DOTALL)
+        if arm_match is None:
+            raise AssertionError(f"src/backup/catalog.rs has no catalog mapping for format {fmt}")
+        includes = re.findall(r'include_str!\("([^"]+)"\)', arm_match.group(1))
+        suffixes = ("catalog.json", "restored_catalog.json", "upgraded_catalog.json")
+        expected_includes = [f"../../schema/{schema_baseline.LATEST_PREFIX}_{s}" for s in suffixes]
+        if includes != expected_includes:
+            raise AssertionError(
+                f"backup format {fmt} must consume the latest frozen catalogs {expected_includes}, got {includes}"
+            )
+        if not re.search(rf"\b{fmt}\s*=>\s*Ok\(crate::db::SCHEMA_VERSIONS\.to_vec\(\)\)", catalog_src):
+            raise AssertionError(f"backup format {fmt} must accept every SCHEMA_VERSIONS migration")
+
+        # catalog::relations() is the single source of the locked relation list:
+        # ordinary tables only, returned in lexicographic order.
+        rel_match = re.search(
+            r"fn relations\(format: u32, only_tables: bool\) -> Result<Vec<String>> \{(.*?)\n\}",
+            catalog_src,
+            re.DOTALL,
+        )
+        if rel_match is None:
+            raise AssertionError("catalog::relations(format, only_tables) missing in src/backup/catalog.rs")
+        rel_body = rel_match.group(1)
+        if 'entry["kind"] == "r"' not in rel_body:
+            raise AssertionError("catalog::relations must restrict only_tables mode to relkind 'r'")
+        if "names.sort();" not in rel_body:
+            raise AssertionError("catalog::relations must return names in lexicographic order")
+
+        # snapshot.rs: advisory lock, then the catalog relation list, then the lock.
+        adv_pos = snapshot_src.find("pg_advisory_lock(738390103)")
+        rel_pos = snapshot_src.find("catalog::relations(FORMAT, true)")
+        lock_pos = snapshot_src.find("LOCK TABLE {list} IN SHARE MODE")
+        if adv_pos < 0:
+            raise AssertionError("snapshot.rs must take pg_advisory_lock(738390103)")
+        if rel_pos < 0:
+            raise AssertionError("snapshot.rs must build the lock list from catalog::relations(FORMAT, true)")
+        if lock_pos < 0:
+            raise AssertionError("snapshot.rs must LOCK TABLE {list} IN SHARE MODE")
+        if not adv_pos < rel_pos < lock_pos:
+            raise AssertionError("snapshot.rs order must be advisory lock -> relations -> LOCK TABLE")
+        rel_segment = snapshot_src[rel_pos:lock_pos]
+        if r'format!("public.\"{}' not in rel_segment:
+            raise AssertionError("snapshot.rs must schema-qualify and quote every locked relation")
+        if '.join(",")' not in rel_segment:
+            raise AssertionError("snapshot.rs must join the relation list without reordering it")
+        if "schema(&tx, FORMAT)" not in snapshot_src or "schema_contract_digest(FORMAT)" not in snapshot_src:
+            raise AssertionError("snapshot.rs must validate and digest the same backup FORMAT")
+
+        # postgres.rs proves the live catalog equals the reviewed schema.
+        for needle in (
+            "catalog::relations(format, true)",
+            "catalog::relations(format, false)",
+            "backup supports only the exact Rootyard public schema",
+            "only permanent Rootyard tables supported",
+        ):
+            if needle not in postgres_src:
+                raise AssertionError(f"src/backup/postgres.rs must verify catalog relation parity ({needle})")
+
+        catalog_file = (catalog_path.parent / includes[0]).resolve()
+        if not catalog_file.is_file():
+            raise AssertionError(f"backup consumes missing catalog fixture {catalog_file}")
+        catalog_json = json.loads(catalog_file.read_text(encoding="utf-8"))
+        all_relations = sorted(entry["name"] for entry in catalog_json["tables"])
+        tables = sorted(entry["name"] for entry in catalog_json["tables"] if entry["kind"] == "r")
+        if tables != sorted(schema_baseline.EXPECTED_TABLES):
+            raise AssertionError(
+                f"backup catalog tables {tables} != schema_baseline {sorted(schema_baseline.EXPECTED_TABLES)}"
+            )
+        if len(tables) != schema_baseline.TABLE_COUNT:
+            raise AssertionError(f"backup catalog table count {len(tables)} != {schema_baseline.TABLE_COUNT}")
+        if not set(tables) < set(all_relations):
+            raise AssertionError("backup catalog must lock ordinary tables as a strict subset of all relations")
+        return {
+            "tables": tables,
+            "count": len(tables),
+            "format": fmt,
+            "catalog": str(catalog_file.relative_to(ROOT)),
+            "relations": all_relations,
+        }
 
     @classmethod
     def verify_domain_routers_and_modularity(
