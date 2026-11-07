@@ -122,6 +122,34 @@ def push_commit(h, work, text):
     return tip
 
 
+def commit_only(h, work, text):
+    (work / "state.txt").write_text(text)
+    h.git("add", "state.txt", cwd=work)
+    h.git("commit", "-m", text.strip(), cwd=work)
+    return h.git("rev-parse", "HEAD", cwd=work).stdout.decode().strip()
+
+
+def fenced_source_push(h, source_url, old_bare, target_url, target_bare,
+                       work, clone_path, text):
+    tip = commit_only(h, work, text)
+    old_before = h.git("--git-dir=" + str(old_bare), "rev-parse",
+                       "refs/heads/main").stdout.decode().strip()
+    result = h.git("push", source_url + clone_path, "HEAD:main", cwd=work,
+                   token=h.alice, check=False)
+    old_after = h.git("--git-dir=" + str(old_bare), "rev-parse",
+                      "refs/heads/main").stdout.decode().strip()
+    assert old_after == old_before, "retired source native volume changed"
+    proxied = result.returncode == 0
+    if not proxied:
+        h.git("push", target_url + clone_path, "HEAD:main", cwd=work,
+              token=h.alice, check=True)
+    target_tip = h.git("--git-dir=" + str(target_bare), "rev-parse",
+                       "refs/heads/main").stdout.decode().strip()
+    assert target_tip == tip, "new owner did not hold the fresh acknowledged commit"
+    git_ok(h, target_bare)
+    return tip, proxied
+
+
 def pin(h, name, job, oid, generation):
     return json.loads(h.expect("/api/repos/alice/" + name + "/ci-pins", 200,
                                token=h.alice, method="POST",
@@ -373,10 +401,11 @@ def main():
                             {"operation_id": op,
                              "expected_route_epoch": new_route["route_epoch"]})
         assert status == 409, "committed cutover was reopened by abort"
-        assert h.git("push", node0 + h.repo["clone_path"], "HEAD:main", cwd=h.work,
-                     token=h.alice, check=False).returncode != 0
-        assert h.git("push", node1 + h.repo["clone_path"], "HEAD:main", cwd=h.work,
-                     token=h.alice, check=False).returncode == 0
+        fresh_tip, old_proxied = fenced_source_push(
+            h, node0, h.bare, node1, dest, h.work, h.repo["clone_path"],
+            "fresh acknowledged commit after cutover\n")
+        acknowledged.append(fresh_tip)
+        old_volume_unchanged = True
 
         # Second repository: source SIGKILL at final drain, before cutover
         # commit, and immediately after the cutover commit. The old source is
@@ -425,8 +454,11 @@ def main():
         source_killed("final-delta-before-transfer", body)
         assert h.sql("SELECT draining::text FROM repository_shard_routes WHERE repository_id='"
                      + chaos["id"] + "'") == "true"
-        assert h.git("push", node0 + chaos["clone_path"], "HEAD:main",
-                     cwd=chaos_work, token=h.alice, check=False).returncode != 0
+        chaos_old = h.root / "data" / "repos" / (chaos["id"] + ".git")
+        chaos_fresh, chaos_proxied = fenced_source_push(
+            h, node0, chaos_old, node1, chaos_dest, chaos_work,
+            chaos["clone_path"], "fresh commit after chaos cutover\n")
+        acknowledged.append(chaos_fresh)
         replicate_body = dict(body, replicate_only=True)
         status, raw, _ = h.http("/api/repos/alice/chaosharness/shard-migrate",
                                 token=h.alice, method="POST", body=replicate_body)
@@ -478,8 +510,10 @@ def main():
                  token=h.alice, method="POST",
                  body={"operation_id": recover_op,
                        "expected_route_epoch": recover_route["route_epoch"] + 1})
-        assert h.git("push", node0 + recover["clone_path"], "HEAD:main",
-                     cwd=recover_work, token=h.alice, check=False).returncode != 0
+        recover_old = h.root / "data" / "repos" / (recover["id"] + ".git")
+        _, recover_proxied = fenced_source_push(
+            h, node0, recover_old, node1, recover_dest, recover_work,
+            recover["clone_path"], "fresh commit after recovered cutover\n")
 
         report = {
             "kind": "native_migration_sidecar_crash_matrix",
@@ -501,6 +535,9 @@ def main():
             "retained_ci_backup_snapshot_roots": True,
             "stock_git_fsck_and_acknowledged_commits": True,
             "old_source_nonwriter_after_true_fence": True,
+            "old_native_volume_unchanged_after_cutover_push": old_volume_unchanged,
+            "retired_source_push_directly_rejected": not old_proxied,
+            "retired_source_push_supported_proxy_ack": old_proxied,
             "limits": ["one PostgreSQL authority; two Rust processes on one Linux host",
                        "physical cross-host fencing remains unqualified outside this role"]}
         if args.report:
