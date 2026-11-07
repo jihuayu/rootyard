@@ -34,6 +34,20 @@ fn queued_mutation_epoch_must_match_the_admitted_guard_epoch() {
 }
 
 #[test]
+fn diagnostic_counters_are_actor_observations_not_fence_calls() {
+    let shared = Shared::new();
+    let gate = MutationGate::new_with_lease(1, i64::MAX).unwrap();
+    gate.fence();
+    assert_eq!(shared.diagnostics(), (0, 0), "MutationGate::fence itself is not an actor observation");
+    shared.observe_fenced();
+    shared.observe_fenced();
+    shared.reject_epoch_mismatch();
+    assert_eq!(shared.diagnostics(), (2, 1));
+    assert_eq!(QueueUsage::default().fence_observations, 0);
+    assert_eq!(QueueUsage::default().epoch_mismatch_rejections, 0);
+}
+
+#[test]
 fn closed_work_queue_refuses_pops_but_drain_paths_still_clean_up() {
     let mut queue = WorkQueue::<u32>::new();
     assert_eq!(queue.push_ready(1), None);

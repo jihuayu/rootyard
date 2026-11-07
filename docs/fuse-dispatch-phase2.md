@@ -114,25 +114,56 @@ and are lost on process death.
 
 ## Verification
 
-`tests/fuse_freeze_queue.rs` is a real kernel FUSE test (not a unit mirror). It
-mounts an overlay through the new dispatcher and asserts, with blocking
-syscalls and channels rather than sleeps:
+`tests/fuse_freeze_queue.rs` contains strict native kernel FUSE acceptance tests,
+not unit mirrors. Every test is marked
+`#[ignore = "requires ROOTYARD_FUSE_NATIVE=1 and a working /dev/fuse"]`. A default
+run therefore does not execute it, and an explicit `--ignored` run without
+`ROOTYARD_FUSE_NATIVE=1` fails its first assertion instead of passing. The tests
+use blocking syscalls, bounded channel waits and owned temporary directories:
 
-1. a frozen create parks (the writer stays blocked, not `EAGAIN`);
-2. an independent read of another file completes while the create is parked;
-3. a second create also parks, in FIFO order;
-4. the thaw drains both creates in arrival order into the upper CoW layer;
-5. a fenced create returns `EROFS` while reads still work;
-6. per-mount and global queue budgets return to zero.
+1. **Same-offset FIFO with two aliases.** A private-upper file and a second
+   path hardlinked to the same host inode (`MetadataExt::ino` equality) are
+   opened read-write before the freeze, so no `Open` is queued. The overlay
+   allocates a different FUSE inode per path, so the two aliases avoid the VFS
+   same-inode lock. The first `FileExt::write_at` parks; the test waits for
+   `frozen == 1`, starts the second write and waits for `frozen == 2`. Only the
+   thaw's arrival order makes both writes return 6 and the second payload win at
+   host offset 0; a reversed drain would fail. While frozen, a read-only read on
+   that mount still returns the original six bytes, and a second real mount with
+   its own gate/actor/queue creates, writes and reads successfully. The hardlink
+   pair is an owned artificial fixture; this does not claim production hardlink
+   semantics are complete.
+2. **Direct fence.** A new create returns `EROFS`, the upper layer has no such
+   file, reads still work, and the actor-observed fence counter increases.
+3. **Rapid freeze/fence/handoff.** The gate is frozen with an old-epoch write
+   parked, `freeze_then_fence` returns, and the same freezer thread immediately
+   hands off the next epoch, so the actor's 10 ms poll may observe only the new
+   `Healthy` epoch. Two fixed-cardinality, process-local counters are exposed:
+   `fence_observations` is incremented only where the actor itself reads a
+   `Fenced` phase (never by `MutationGate::fence`), and
+   `epoch_mismatch_rejections` counts parked mutations dropped because their
+   enqueue epoch no longer matches admission. Every round must return `EROFS`
+   with unchanged upper bytes. A round whose fence-observation delta is nonzero
+   only proves the direct fence path and is retried; at most 32 rounds are
+   tried and at least one must have a zero fence-observation delta together with
+   a positive epoch-mismatch delta. That zero-delta round is the missed-fence
+   coverage, and a subsequent new-epoch write must succeed. Code without the
+   enqueue epoch stamp would have executed the stale write in that round.
+4. **Budgets.** Once replies drain, mount/global ops and bytes, `ready`,
+   `frozen` and `pending_reads` are zero. The diagnostic counters are cumulative
+   observations, so they are deliberately excluded from that leak check.
 
 Run on a host/user namespace with a working `/dev/fuse` (coordinator only):
 
 ```text
-ROOTYARD_FUSE_NATIVE=1 cargo test --test fuse_freeze_queue
+ROOTYARD_FUSE_NATIVE=1 cargo test --test fuse_freeze_queue -- --ignored --test-threads=1
 ```
 
-Without `ROOTYARD_FUSE_NATIVE=1` the test prints a skip notice and returns; it
-must not be reported as passed evidence.
+`--test-threads=1` keeps the process-wide helper budget and read pool
+single-owner for these mounts. Without `ROOTYARD_FUSE_NATIVE=1` an explicit
+`--ignored` run fails; a default run skips the ignored tests. Neither result may
+be reported as passed native evidence. The optional shutdown-with-queued-work
+case is **not** covered yet and remains pending.
 
 ## Still open (next phase)
 

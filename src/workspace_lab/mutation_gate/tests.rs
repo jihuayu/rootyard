@@ -41,19 +41,20 @@ fn freeze_drains_existing_mutator_before_running_and_rejects_new_ones() {
         scope.spawn(move || {
             let guard = mutator_gate.mutation().expect("healthy gate admits");
             admitted_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             drop(guard);
             dropped_tx.send(()).unwrap();
         });
+        // Confirm the old mutation owns its permit before the freezer races it.
+        admitted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let freeze_gate = gate.clone();
         scope.spawn(move || {
             freeze_gate.freeze(|| {
                 entered_tx.send(()).unwrap();
-                freeze_release_rx.recv().unwrap();
+                freeze_release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             });
             done_tx.send(()).unwrap();
         });
-        admitted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         wait_until(|| gate.is_frozen());
         assert_eq!(mutation_error(&gate), Some(libc::EAGAIN));
         assert!(entered_rx.try_recv().is_err(), "freeze closure ran before the admitted mutation drained");
@@ -81,7 +82,7 @@ fn fence_is_immediate_during_freeze_and_only_a_higher_epoch_restores() {
         scope.spawn(move || {
             freeze_gate.freeze(|| {
                 entered_tx.send(()).unwrap();
-                freeze_release_rx.recv().unwrap();
+                freeze_release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             });
             done_tx.send(()).unwrap();
         });
@@ -129,7 +130,7 @@ fn fence_wakes_a_frozen_waiter_with_erofs() {
         scope.spawn(move || {
             freeze_gate.freeze(|| {
                 entered_tx.send(()).unwrap();
-                freeze_release_rx.recv().unwrap();
+                freeze_release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             });
         });
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -200,7 +201,7 @@ fn concurrent_freezes_are_serialized_until_the_first_closure_releases() {
         scope.spawn(move || {
             first_gate.freeze(|| {
                 first_entered_tx.send(()).unwrap();
-                first_release_rx.recv().unwrap();
+                first_release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             });
             first_done_tx.send(()).unwrap();
         });
@@ -244,7 +245,7 @@ fn re_authorize_is_busy_until_the_old_active_guard_is_dropped() {
         scope.spawn(move || {
             let guard = mutator_gate.mutation().expect("initial epoch admits");
             admitted_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             drop(guard);
             dropped_tx.send(()).unwrap();
         });
@@ -287,7 +288,7 @@ fn lease_handoff_fences_the_old_epoch_before_authorizing_the_new_one() {
             let guard = old.mutation().expect("epoch 1 admits a mutation before the commit");
             assert_eq!(guard.epoch(), 1);
             admitted_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             drop(guard);
             dropped_tx.send(()).unwrap();
         });

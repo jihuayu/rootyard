@@ -153,8 +153,10 @@ acceptance. The bounded per-mount freeze queue described above is a prototype
 inside that same process, not the helper: it has no independent child, IPC or
 heartbeat, cannot fence a second process, and keeps queued work in memory only.
 Parked freeze writes do survive a normal thaw, but an operator `SIGKILL` still
-loses them and remains unhandled. The native freeze-queue test is written but
-executed by the coordinator; see [fuse-dispatch-phase2](fuse-dispatch-phase2.md).
+loses them and remains unhandled. The native freeze-queue tests are `#[ignore]`d
+and executed by the coordinator; an explicit `--ignored` run without
+`ROOTYARD_FUSE_NATIVE=1` fails instead of passing. See
+[fuse-dispatch-phase2](fuse-dispatch-phase2.md).
 
 A new host can acquire an expired workspace lease only when its latest revision
 has a committed checkpoint. It verifies and materializes that checkpoint from

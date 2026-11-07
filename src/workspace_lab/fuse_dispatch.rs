@@ -41,13 +41,16 @@ use super::inner_ops::{ReadPlan, read_at};
 use super::owned_ops::OwnedOp;
 use super::*;
 use fuser::ReplyData;
+use budget::{Budget, Permit, global_budget};
 use read_pool::{ReadJob, ReadPool, global as global_read_pool};
 use std::collections::VecDeque;
 use std::sync::{
-    Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
+    Condvar, Mutex, MutexGuard, PoisonError,
     atomic::{AtomicUsize, Ordering},
 };
 
+#[path = "fuse_dispatch/budget.rs"]
+mod budget;
 #[path = "fuse_dispatch/read_pool.rs"]
 mod read_pool;
 
@@ -68,6 +71,14 @@ pub struct QueueUsage {
     pub ready: usize,
     pub frozen: usize,
     pub pending_reads: usize,
+    /// Actor-observed `Fenced` phases. Incremented only where the actor itself
+    /// reads the phase, never by `MutationGate::fence`, so a zero delta means
+    /// the actor's bounded poll skipped a transient fence. Fixed cardinality:
+    /// no user identity, request identity or metric label.
+    pub fence_observations: usize,
+    /// Parked mutations dropped because their enqueue epoch did not match the
+    /// epoch of the admitted guard (a handoff raced the queued operation).
+    pub epoch_mismatch_rejections: usize,
 }
 
 /// Why the shim could not enqueue. Saturation is the only `EAGAIN`; a closed
@@ -75,76 +86,6 @@ pub struct QueueUsage {
 pub(super) enum Reject {
     Saturated(OwnedOp),
     Closed(OwnedOp),
-}
-
-struct Budget {
-    limit_ops: usize,
-    limit_bytes: usize,
-    used: Mutex<(usize, usize)>,
-}
-
-impl Budget {
-    fn new(limit_ops: usize, limit_bytes: usize) -> Self {
-        Self { limit_ops, limit_bytes, used: Mutex::new((0, 0)) }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, (usize, usize)> {
-        self.used.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn try_acquire(&self, bytes: usize) -> bool {
-        let mut used = self.lock();
-        let Some(ops) = used.0.checked_add(1) else { return false };
-        let Some(total) = used.1.checked_add(bytes) else { return false };
-        if ops > self.limit_ops || total > self.limit_bytes {
-            return false;
-        }
-        *used = (ops, total);
-        true
-    }
-
-    fn release(&self, bytes: usize) {
-        let mut used = self.lock();
-        used.0 = used.0.saturating_sub(1);
-        used.1 = used.1.saturating_sub(bytes);
-    }
-
-    fn used(&self) -> (usize, usize) {
-        *self.lock()
-    }
-}
-
-fn global_budget() -> Arc<Budget> {
-    static GLOBAL: OnceLock<Arc<Budget>> = OnceLock::new();
-    GLOBAL.get_or_init(|| Arc::new(Budget::new(GLOBAL_QUEUE_OPS, GLOBAL_QUEUE_BYTES))).clone()
-}
-
-/// RAII charge against the per-mount budget and the process-wide helper budget.
-/// Released exactly once, on every path, when the operation's reply is sent.
-struct Permit {
-    mount: Arc<Budget>,
-    global: Arc<Budget>,
-    bytes: usize,
-}
-
-impl Permit {
-    fn acquire(mount: &Arc<Budget>, global: &Arc<Budget>, bytes: usize) -> Option<Self> {
-        if !mount.try_acquire(bytes) {
-            return None;
-        }
-        if !global.try_acquire(bytes) {
-            mount.release(bytes);
-            return None;
-        }
-        Some(Self { mount: mount.clone(), global: global.clone(), bytes })
-    }
-}
-
-impl Drop for Permit {
-    fn drop(&mut self) {
-        self.global.release(self.bytes);
-        self.mount.release(self.bytes);
-    }
 }
 
 struct Queued {
@@ -227,6 +168,9 @@ struct Shared {
     /// the worker re-checks the shutdown flag before replying.
     deferred: Mutex<Vec<(u64, Arc<Mutex<Option<DeferredRead>>>)>>,
     next_deferred: AtomicUsize,
+    /// Fixed-cardinality actor diagnostics; see [`QueueUsage`].
+    fence_observations: AtomicUsize,
+    epoch_mismatch_rejections: AtomicUsize,
 }
 
 impl Shared {
@@ -236,11 +180,28 @@ impl Shared {
             wake: Condvar::new(),
             deferred: Mutex::new(Vec::new()),
             next_deferred: AtomicUsize::new(0),
+            fence_observations: AtomicUsize::new(0),
+            epoch_mismatch_rejections: AtomicUsize::new(0),
         })
     }
 
     fn lock(&self) -> MutexGuard<'_, WorkQueue<Queued>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn observe_fenced(&self) {
+        self.fence_observations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reject_epoch_mismatch(&self) {
+        self.epoch_mismatch_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn diagnostics(&self) -> (usize, usize) {
+        (
+            self.fence_observations.load(Ordering::Relaxed),
+            self.epoch_mismatch_rejections.load(Ordering::Relaxed),
+        )
     }
 
     fn push_ready(&self, queued: Queued) -> Option<Queued> {
@@ -369,6 +330,18 @@ struct Actor {
 }
 
 impl Actor {
+    /// Read the gate phase for one actor decision and count a genuinely
+    /// observed `Fenced` phase. `MutationGate::fence` never increments this
+    /// counter, so a zero delta means the actor's 10 ms poll skipped the
+    /// transient fence entirely.
+    fn phase(&self) -> GatePhase {
+        let phase = self.gate.phase();
+        if phase == GatePhase::Fenced {
+            self.shared.observe_fenced();
+        }
+        phase
+    }
+
     fn run(mut self) {
         loop {
             // Shutdown wins over phase handling: a queued mutation must not be
@@ -379,7 +352,7 @@ impl Actor {
                 self.shared.drain_deferred(libc::EIO);
                 return;
             }
-            match self.gate.phase() {
+            match self.phase() {
                 GatePhase::Fenced => self.fail_frozen(libc::EROFS),
                 GatePhase::Healthy => self.drain_frozen(),
                 GatePhase::Frozen => {}
@@ -418,7 +391,7 @@ impl Actor {
     /// Drain the parked mutation FIFO in order once the gate is healthy again.
     fn drain_frozen(&mut self) {
         loop {
-            if self.gate.phase() != GatePhase::Healthy {
+            if self.phase() != GatePhase::Healthy {
                 return;
             }
             let Some(queued) = self.shared.take_frozen_front() else { return };
@@ -430,7 +403,7 @@ impl Actor {
 
     fn route(&mut self, queued: Queued) {
         let mutation = queued.op.is_mutation();
-        match self.gate.phase() {
+        match self.phase() {
             GatePhase::Fenced if mutation => queued.op.fail(libc::EROFS),
             GatePhase::Frozen if mutation => self.shared.push_frozen_back(queued),
             _ => {
@@ -451,6 +424,7 @@ impl Actor {
         match gate.mutation() {
             Ok(guard) => {
                 if !epoch_matches(epoch, guard.epoch()) {
+                    self.shared.reject_epoch_mismatch();
                     drop(guard);
                     op.fail(libc::EROFS);
                     return false;
@@ -633,7 +607,18 @@ impl Dispatcher {
         let (global_ops, global_bytes) = self.global_budget.used();
         let (ready, frozen) = self.shared.lens();
         let pending_reads = self.shared.pending_deferred();
-        QueueUsage { mount_ops, mount_bytes, global_ops, global_bytes, ready, frozen, pending_reads }
+        let (fence_observations, epoch_mismatch_rejections) = self.shared.diagnostics();
+        QueueUsage {
+            mount_ops,
+            mount_bytes,
+            global_ops,
+            global_bytes,
+            ready,
+            frozen,
+            pending_reads,
+            fence_observations,
+            epoch_mismatch_rejections,
+        }
     }
 
     pub(super) fn shutdown(&self) {
