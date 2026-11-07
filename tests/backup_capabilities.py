@@ -64,6 +64,10 @@ class CapabilityBackupHarness(BackupHarness, BrowserHarness):
             self.env.pop('ROOTYARD_OBJECT_STORE_ENDPOINT')
         self.cli('backup-verify', str(self.backup))
         self.restore_command()
+        restored_versions = [int(value) for value in self.query(
+            self.target_db, "SELECT version FROM schema_migrations ORDER BY version").splitlines()]
+        assert restored_versions == manifest["schema_versions"], (
+            restored_versions, manifest["schema_versions"])
         assert self.query(self.target_db, 'SELECT incarnation FROM cluster_authority') != before_authority
         assert self.query(self.target_db, 'SELECT count(*) FROM web_sessions WHERE NOT revoked') == '0'
         assert self.query(self.target_db, "SELECT count(*) FROM tokens WHERE kind='browser' AND NOT revoked") == '0'
@@ -99,7 +103,8 @@ class CapabilityBackupHarness(BackupHarness, BrowserHarness):
                 'backup_manifest_format': manifest['format'],
                 'backup_manifest_schema_versions': manifest['schema_versions'],
                 'backup_schema_contract_sha256': manifest['schema_contract_sha256'],
-                'restored_schema_versions_verified': True}
+                'restored_schema_versions': restored_versions,
+                'restored_schema_versions_verified': restored_versions == manifest['schema_versions']}
 
 
 def main():
