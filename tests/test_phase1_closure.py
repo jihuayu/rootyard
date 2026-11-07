@@ -56,13 +56,16 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
             "command = ['cargo', 'build', '--locked']",
             "['--bins'] if args.bins",
             "command += ['--features', args.features]",
-            "subprocess.run(command, cwd=ROOT, check=True)",
+            "with build_lock(target)",
+            "['cargo', 'clean', '--package', DEFAULT_BIN]",
+            "artifacts = fresh_artifacts(events, binary)",
+            "'package_rebuilt': True",
             "before = source_digest()",
             "after = source_digest()",
             "if before != after:",
             "'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest()",
             "'source_inputs_sha256': before",
-            "temporary.replace(destination)",
+            "temporary.replace(receipt)",
         ):
             self.assertIn(required, build_script, f"native build wrapper lost {required}")
         self.assertRegex(
