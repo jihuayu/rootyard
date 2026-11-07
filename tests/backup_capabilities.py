@@ -12,10 +12,7 @@ from backup import BackupHarness
 from web_sessions import BrowserHarness
 
 
-class CapabilityBackupHarness(BackupHarness):
-    request = BrowserHarness.request
-    sign_in = BrowserHarness.sign_in
-    cookie_header = BrowserHarness.cookie_header
+class CapabilityBackupHarness(BackupHarness, BrowserHarness):
 
     def populated_restore(self):
         self.setup()
@@ -47,7 +44,7 @@ class CapabilityBackupHarness(BackupHarness):
                    'lease_epoch': workspace['lease_epoch']}
         self.expect(file_path, 200, token=self.alice, method='PUT', body=payload,
                     extra_headers={'Idempotency-Key': 'restore-edit'})
-        cookies = self.sign_in()
+        cookies, _, _ = self.sign_in()
         headers = {'Cookie': self.cookie_header(cookies)}
         assert self.request('/web/repos', headers=headers)[0] == 200
         before_authority = self.query(self.db, 'SELECT incarnation FROM cluster_authority')
