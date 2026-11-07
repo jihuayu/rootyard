@@ -28,6 +28,7 @@ pub mod members;
 pub mod metrics;
 pub mod namespace_service;
 pub mod organizations;
+pub mod pagination;
 #[rustfmt::skip]
 pub mod mirror;
 #[rustfmt::skip]
