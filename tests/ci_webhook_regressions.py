@@ -67,7 +67,7 @@ def main():
     args.binary = str(Path(args.binary).resolve())
     h = Harness(args)
     h.env["ROOTYARD_OUTBOX_WORKER"] = "false"
-    plain = delayed = tls = None
+    plain = delayed = tls = untrusted = None
     try:
         # A local CA is installed only for this isolated service process.
         ca = h.root / "ca.pem"
@@ -134,9 +134,33 @@ def main():
         bad = api(h, base+"/"+plaintext_as_tls["id"]+"/ping", method="POST", body={})
         assert bad["state"]=="dead_letter" and len(plain.requests)==201, bad
         print("verified TLS and plaintext rejection: passed", flush=True)
+
+        # A real TLS receiver whose certificate chains to an unrelated CA must be rejected
+        # by certificate verification and must never see the signed payload.
+        other_ca = h.root / "other-ca.pem"
+        other_ca_key = h.root / "other-ca.key"
+        other_cert = h.root / "other-cert.pem"
+        other_leaf_key = h.root / "other-leaf.key"
+        other_csr = h.root / "other-leaf.csr"
+        subprocess.run(["openssl","req","-x509","-newkey","rsa:2048","-nodes","-keyout",str(other_ca_key),
+            "-out",str(other_ca),"-days","1","-subj","/CN=Unrelated test CA","-addext","basicConstraints=critical,CA:TRUE"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["openssl","req","-newkey","rsa:2048","-nodes","-keyout",str(other_leaf_key),
+            "-out",str(other_csr),"-subj","/CN=127.0.0.1"],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["openssl","x509","-req","-in",str(other_csr),"-CA",str(other_ca),"-CAkey",str(other_ca_key),
+            "-CAcreateserial","-out",str(other_cert),"-days","1","-extfile",str(ext)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        untrusted = Receiver(other_cert, other_leaf_key)
+        untrusted_hook = api(h, base, 201, method="POST", body={"url":untrusted.url("https"),
+            "secret":"synthetic-webhook-secret-def", "events":["ping"],
+            "auto_ci_pin":False,"max_attempts":1})
+        rejected = api(h, base+"/"+untrusted_hook["id"]+"/ping", method="POST", body={})
+        assert rejected["state"]=="dead_letter" and rejected["last_error"] and len(untrusted.requests)==0, rejected
+        print("untrusted certificate rejected:", rejected["last_error"][:90], flush=True)
         return 0
     finally:
-        for receiver in (plain,delayed,tls):
+        for receiver in (plain,delayed,tls,untrusted):
             if receiver: receiver.close()
         h.cleanup()
 

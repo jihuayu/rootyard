@@ -1,0 +1,65 @@
+{
+  "state": "passed",
+  "pid": 391353,
+  "started": 1794037728.6799028,
+  "jobs": {
+    "regressions": {
+      "state": "passed",
+      "database": "round4_webhooks33_regressions_6d265770",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/ci_webhook_regressions.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/webhooks33/logs/regressions.log",
+      "report": null,
+      "harness_sha256": "ec86c09f5e70c8e40d2d6cbda9fe3144cdf3b46aa919987dca2c175d25f332cd",
+      "started": 1794037729.6822166,
+      "exit_code": 0,
+      "finished": 1794037733.5110056,
+      "database_cleanup": "dropped_after_success"
+    },
+    "worker-recovery": {
+      "state": "passed",
+      "database": "round4_webhooks33_worker_recovery_263b01ff",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/webhook_worker_recovery.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round4/webhooks33/logs/worker-recovery.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/webhooks33/logs/worker-recovery.log",
+      "report": "/workspace/scratch/rootyard-round4/webhooks33/logs/worker-recovery.json",
+      "harness_sha256": "f3f2cffae85d63660ee285037a1a7a324aa7f9a592260650b29297b63be99bd2",
+      "started": 1794037734.4814487,
+      "exit_code": 0,
+      "finished": 1794037758.886306,
+      "report_sha256": "75ddfcc95475f313830b1adaf44a9f2fe5c541533b35c649e9c31646df9e7452",
+      "database_cleanup": "dropped_after_success"
+    }
+  },
+  "updated": 1794037759.1533053,
+  "certificate": {
+    "main": "53e77762a80a2fc28d4d3dcd8ca8c271eb687d47",
+    "compiled_source": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+    "binary": "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+    "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+    "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+    "source_equivalence": "all production file paths/digests equal the certified baseline",
+    "harness_source_commit": "cff5ddb0e15558c1300d5d8f239df5653f20411a",
+    "valid": true,
+    "reused_baseline": true
+  },
+  "binary": "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+  "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+  "source_commit": "cff5ddb0e15558c1300d5d8f239df5653f20411a",
+  "compiled_source_commit": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+  "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+  "stage": "complete",
+  "finished": 1794037759.1533031
+}
