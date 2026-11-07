@@ -1,0 +1,72 @@
+{
+  "review_type": "final followup review of previously approved source (followup diffs only)",
+  "scope": "Only runner32 25975a2..960d615 and ops43_44 957180f..3dc86bb; no broad re-read, no test execution, no edits.",
+  "commits": {
+    "runner32": {
+      "head": "960d615e59fcc0b345aca36f0fde510cad680f8c",
+      "intermediate": "e5bd176",
+      "previous_approved": "25975a2982af40cff5ece3c8831880bb6a478db4",
+      "followup_subjects": [
+        "Fix sandbox launch-failure cleanup, tmpfs-only export pool, and native test harness",
+        "Reclaim partial artifact export directory on failed sandbox launch"
+      ]
+    },
+    "ops43_44": {
+      "head": "3dc86bb53eb51bdecfa71f909782d3e8d7220077",
+      "previous_approved": "957180f2d0ebdf88939530f3480be1039f975f1c",
+      "followup_subject": "Account for every acknowledged write after failover and harden evidence gate"
+    }
+  },
+  "verdicts": {
+    "runner32": {
+      "verdict": "APPROVE",
+      "prior_findings": "RUN-P2-1 fixed; RUN-P2-2 fixed; RUN-P2-3 documented. No P1 source blocker found in the followup diff.",
+      "evidence": {
+        "RUN-P2-1": "isolation_mode(job,limits)? now runs BEFORE any job-owned copy (runner.rs launch_source); pool verify failure and production-without-pool retire the just-created cgroup; root/artifacts/workspace creation and copy_all run in a prepared closure whose error calls cleanup_failed_setup (workspace, checkout, artifacts/pool dir, cgroup retire); launch_inner error uses the same cleanup. New native dev test deletes a workspace source after creating the workspace row, expects 503, and asserts no failed job workspace/artifacts/pool dir remains (test_sandbox_service.py new block).",
+        "production_tmpfs_only": "verify_pool now accepts only fstype tmpfs, rejects ramfs explicitly with its own message, and reports zero capacity separately from too-large (export.rs verify_pool). docs/sandbox-runner.md updated to tmpfs-only and explains ramfs has no accounting.",
+        "one_instance_per_root": "docs/sandbox-runner.md now states exactly one active service instance may own a delegated cgroup root; startup reaps every child so it must not be shared.",
+        "native_harness": "test_ci_sandbox.py now carries runner_id from the claim response and uses ci_attempt/ci_lease_generation columns; test_sandbox_service.py process_alive treats Z/X as dead, removing zombie false positives. Changed test files py_compile clean.",
+        "positive_cgroup": "Still ENV-BLOCKED: opt-in test exits 3 without delegated cgroup v2; cannot close #32. No positive kernel enforcement claimed."
+      },
+      "acceptance_env_gaps": [
+        "No delegated cgroup v2 / rootless Docker cgroup driver none / cgroupfs EPERM; #32 remains open.",
+        "Followup dev/CI native results cited by coordinator (runner 6 native dev/CI cases PASSED at 960d615 with private binary affa4935..., source inputs 56b09c53...) were not re-run by this reviewer; only the coordinator verify_build.py valid=true is recorded as provided."
+      ]
+    },
+    "ops43_44": {
+      "verdict": "APPROVE followup logic; one concrete small workflow blocker before final evidence generation (not a source-code defect)",
+      "prior_findings": "OPS-P2-1 fixed; OPS-P2-2 fixed; OPS-P2-3 fixed. No P1 production-code bug (tests/docs only).",
+      "evidence": {
+        "OPS-P2-1": "Streaming now records ack timestamps, joins the writer (timeout 30s), asserts writer_terminated_before_accounting, snapshots all_acknowledged AFTER join, computes missing_load over all acknowledged OIDs, and reports pre_fault/all/after_fault counts plus timestamps (cluster_pg_streaming_native.py). Gate requires all_acknowledged>=3, writer_terminated_before_accounting true, and ack OID list length equal to all_acknowledged (cluster_operations_gate.py check_streaming). The old pre-fault-only denominator is gone.",
+        "OPS-P2-2": "Gate maps every report to its harness file (HARNESS_FILES) and compares harness_sha256 to the actual file digest; missing core reports, missing workload, and non-single source commit emit a structured failed gate report via emit_failure instead of crashing; ops_provenance.source_dirty now includes untracked files.",
+        "OPS-P2-3": "Issue 44 status becomes passed_local_single_host when all local checks pass; #43 blocked status is renamed blocked_external_ha_and_source_fence; gate report adds production_scope=not_certified; local single-host evidence only. No automatic HA claim.",
+        "same_host_manual": "Still explicit: single Linux host/loopback, manual local PG promotion, no DCS, single Kafka broker, local unencrypted PITR, container tmpfs; #43 criteria 2c/2d blocked.",
+        "changed_tests": "cluster_operations_gate.py, cluster_pg_streaming_native.py, ops_provenance.py py_compile clean."
+      },
+      "acceptance_env_gaps": [
+        "No physical multi-host, cross-host storage fencing, or external automatic PostgreSQL HA; #43 stays blocked and #44 remains local/single-host evidence only.",
+        "Fresh ops reports are being regenerated by the coordinator; certificate not independently verified here."
+      ]
+    }
+  },
+  "blocker": {
+    "id": "OPS-FU-1",
+    "severity": "P1-workflow (small, pre-evidence)",
+    "commit": "3dc86bb",
+    "location": "tests/ops_provenance.py:43-47; tests/cluster_operations_gate.py:74-75; docs/cluster-operations.md:45-55",
+    "scenario": "source_dirty now includes untracked files, while the documented commands write reports into the tracked evidence/ directory. The first report run sees a clean tree, but it then creates/modifies evidence/cluster-tls.json and every later report records source_worktree_dirty=true; validate_provenance requires false, so the documented in-repo sequence cannot produce a passing set. If reports are generated in an out-of-worktree evidence dir (as the certified tests2 flow does), the blocker disappears.",
+    "recommendation": "Generate reports into the certified external/scratch evidence dir and pass --evidence-dir to the gate, or exclude evidence/ (and other generated outputs) from source_dirty; document the chosen path. No other followup change needed."
+  },
+  "verification": {
+    "method": "git diff base..head for the two chains; full changed files via git show; py_compile of changed Python tests",
+    "tests_executed_by_reviewer": false,
+    "source_edits": false,
+    "git_mutations": false,
+    "limitations": "Native test outcomes and binary/input digests are coordinator-provided, not reproduced; positive cgroup and physical multi-host/auto-PG-HA remain unavailable."
+  },
+  "recommended_actions": [
+    "runner32: APPROVE merge; keep #32 open until opt-in cgroup test exits 0 in a delegated-cgroup environment.",
+    "ops43_44: APPROVE the followup; resolve OPS-FU-1 by using the external certified evidence dir (or excluding evidence/ from source_dirty) before running the final gate; keep #43 blocked and #44 labelled local/single-host.",
+    "Final integrated fresh build required after source merges; do not reuse pre-certificate reports."
+  ]
+}

@@ -43,17 +43,25 @@ explicit `sslmode=disable`, and wrong Kafka CA/hostname/password.
 ## Reproducible acceptance commands
 
 ```sh
-python3 tests/cluster_tls_native.py --binary <binary> --report evidence/cluster-tls.json
-python3 tests/cluster_kafka_tls_native.py --binary <binary> --kafka-home <kafka> --report evidence/cluster-kafka-tls.json
-python3 tests/cluster_local_profile_native.py --binary <binary> --kafka-home <kafka> --report evidence/cluster-local-profile.json
-python3 tests/cluster_workload_native.py --binary <binary> --report evidence/cluster-workload-integration.json
-python3 tests/cluster_pg_streaming_native.py --binary <binary> --report evidence/cluster-pg-streaming.json
-python3 tests/cluster_pg_pitr_native.py --binary <binary> --report evidence/cluster-pg-pitr.json
-python3 tests/cluster_takeover_native.py --binary <binary> --report evidence/cluster-takeover-run.json
-python3 tests/cluster_partition_native.py --binary <binary> --report evidence/cluster-partition.json
-python3 tests/cluster_disk_pressure_native.py --binary <binary> --report evidence/cluster-disk-pressure.json
-python3 tests/cluster_operations_gate.py --evidence-dir evidence --report evidence/cluster-operations-gate.json
+BIN=/absolute/path/to/rootyard
+KAFKA_HOME=/absolute/path/to/kafka
+EVIDENCE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rootyard-ops-evidence.XXXXXX")"
+python3 tests/cluster_tls_native.py --binary "$BIN" --report "$EVIDENCE_DIR/cluster-tls.json"
+python3 tests/cluster_kafka_tls_native.py --binary "$BIN" --kafka-home "$KAFKA_HOME" --report "$EVIDENCE_DIR/cluster-kafka-tls.json"
+python3 tests/cluster_local_profile_native.py --binary "$BIN" --kafka-home "$KAFKA_HOME" --report "$EVIDENCE_DIR/cluster-local-profile.json"
+python3 tests/cluster_workload_native.py --binary "$BIN" --report "$EVIDENCE_DIR/cluster-workload-integration.json"
+python3 tests/cluster_pg_streaming_native.py --binary "$BIN" --report "$EVIDENCE_DIR/cluster-pg-streaming.json"
+python3 tests/cluster_pg_pitr_native.py --binary "$BIN" --report "$EVIDENCE_DIR/cluster-pg-pitr.json"
+python3 tests/cluster_takeover_native.py --binary "$BIN" --report "$EVIDENCE_DIR/cluster-takeover-run.json"
+python3 tests/cluster_partition_native.py --binary "$BIN" --report "$EVIDENCE_DIR/cluster-partition.json"
+python3 tests/cluster_disk_pressure_native.py --binary "$BIN" --report "$EVIDENCE_DIR/cluster-disk-pressure.json"
+python3 tests/cluster_operations_gate.py --evidence-dir "$EVIDENCE_DIR" --report "$EVIDENCE_DIR/cluster-operations-gate.json"
 ```
+
+Start from a clean checkout and keep generated reports outside it until all
+runs finish. Writing into the repository's `evidence/` directory during a run
+changes its dirty state and correctly prevents the later reports from passing
+the clean-source gate. Commit the completed evidence afterward.
 
 Every report produced by these tests carries `measurement_kind:
 native_execution`, `simulated_fields: false`, the source commit, binary and
