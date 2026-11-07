@@ -89,6 +89,24 @@ class WebTrack1ContractTest(unittest.TestCase):
             self.assertEqual(len(routes), 19)
             repository_pairs.append(routes)
         self.assertEqual(*repository_pairs, "Web/UI repository routes and methods must agree")
+        base = "/repos/{owner}/{name}"
+        expected_repository_routes = {
+            base: {"GET"},
+            base + "/tree": {"GET"}, base + "/tree/{oid}": {"GET"},
+            base + "/blob": {"GET"}, base + "/blob/{oid}": {"GET"},
+            base + "/commits": {"GET"}, base + "/commits/{oid}": {"GET"},
+            base + "/commits/{oid}/checks": {"GET"}, base + "/compare": {"GET"},
+            base + "/issues": {"GET", "POST"},
+            base + "/issues/{number}": {"GET", "POST", "PATCH"},
+            base + "/issues/{number}/comments": {"POST"},
+            base + "/pulls": {"GET", "POST"},
+            base + "/pulls/{number}": {"GET", "POST", "PATCH"},
+            base + "/pulls/{number}/diff": {"GET"},
+            base + "/pulls/{number}/reviews": {"GET", "POST"},
+            base + "/pulls/{number}/checks": {"GET"},
+            base + "/pulls/{number}/merge": {"POST"}, base + "/audit": {"GET"},
+        }
+        self.assertEqual(repository_pairs[0], expected_repository_routes)
 
         # Verify e2e_tiers route_block_re matches every route in src/web.rs
         route_block_re = re.compile(

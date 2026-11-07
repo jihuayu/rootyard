@@ -6878,10 +6878,19 @@ class SchemaBoundaryIntegrationFixture:
     def is_m17_integrated() -> bool:
         lib_rs = (ROOT / "src/lib.rs").read_text(encoding="utf-8")
         return (
-            ".merge(web::routes())" in lib_rs
+            ".merge(web::routes(state.clone()))" in lib_rs
             and ".merge(sharding::routes())" in lib_rs
             and (ROOT / "migrations" / "060_sharding_fencing.sql").is_file()
         )
+
+    @staticmethod
+    def directly_delegates_routes(source: str) -> bool:
+        source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+        source = re.sub(r"//[^\n]*", "", source)
+        return re.search(
+            r"\bpub\s+fn\s+routes\s*\(\s*\)\s*->\s*Router<Arc<AppState>>\s*"
+            r"\{\s*routes::routes\s*\(\s*\)\s*\}", source,
+        ) is not None
 
     @staticmethod
     def get_migration_sql_text(filename: str, staged_relpath: str, fallback_sql: str) -> tuple[str, Optional[Path]]:
@@ -7088,7 +7097,7 @@ class SchemaBoundaryIntegrationFixture:
                 raise AssertionError(f"src/lib.rs does not mount {dom} via {expected_mount}")
             delegation = delegated_route_tables.get(dom)
             if delegation is not None or "routes::routes()" in src:
-                if delegation is None or "mod routes;" not in src or "routes::routes()" not in src:
+                if delegation is None or "mod routes;" not in src or not cls.directly_delegates_routes(src):
                     raise AssertionError(f"src/{dom}.rs delegates to an undeclared route table")
                 if ".route(" in src:
                     raise AssertionError(f"src/{dom}.rs both delegates and registers routes")

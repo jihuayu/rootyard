@@ -164,10 +164,15 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
                 )
             else:
                 self.assertIn("mod routes;", root_src, f"src/{domain}.rs must declare `mod routes;`")
-                self.assertIn(
-                    "routes::routes()",
-                    root_src,
+                self.assertTrue(
+                    e2e_tiers.SchemaBoundaryIntegrationFixture.directly_delegates_routes(root_src),
                     f"src/{domain}.rs must delegate to routes::routes()",
+                )
+                empty_root = root_src.replace("routes::routes()", "Router::new()", 1)
+                empty_root += "\nfn unused() { let _ = routes::routes(); }\n"
+                self.assertFalse(
+                    e2e_tiers.SchemaBoundaryIntegrationFixture.directly_delegates_routes(empty_root),
+                    "an unused call must not disguise an empty exported router",
                 )
                 delegated_src = (ROOT / delegated).read_text(encoding="utf-8")
                 self.assertIn(
@@ -535,6 +540,8 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         rel_pos = snapshot_src.find("catalog::relations(FORMAT, true)")
         lock_pos = snapshot_src.find("LOCK TABLE {list} IN SHARE MODE")
         self.assertGreater(adv_pos, 0, "advisory lock must be taken in src/backup/snapshot.rs")
+        transaction_pos = snapshot_src.find("client.build_transaction()")
+        self.assertGreater(transaction_pos, adv_pos, "backup must take the barrier before opening its snapshot transaction")
         self.assertGreater(rel_pos, adv_pos, "catalog relations must be read after the advisory lock")
         self.assertGreater(lock_pos, rel_pos, "pg_advisory_lock and the catalog relation list must precede LOCK TABLE")
 
