@@ -70,8 +70,8 @@ def s3_get_bytes(host, port, bucket, key, region, access_key, secret_key,
     must never print the key, headers, credentials or response body; only the
     returned bytes (whose SHA-256 is safe to report) leave this helper.
     """
-    date, timestamp = (datetime.now(timezone.utc).strftime("%Y%m%d"),
-                       datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+    now = datetime.now(timezone.utc)
+    date, timestamp = now.strftime("%Y%m%d"), now.strftime("%Y%m%dT%H%M%SZ")
     host_header = "[" + host + "]" if ":" in host else host
     if port:
         host_header += ":" + str(port)
