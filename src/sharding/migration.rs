@@ -90,8 +90,34 @@ async fn send_transfer(
         .send()
         .await
         .map_err(|_| Error(StatusCode::BAD_GATEWAY, "replica transfer interrupted"))?;
-    if upstream.status() != StatusCode::OK {
-        return Err(conflict("replica rejected snapshot transfer"));
+    let status = upstream.status();
+    if status != StatusCode::OK {
+        // Preserve a bounded, sanitized target error for operators. Target
+        // rejections are static JSON application errors, never credentials or
+        // raw request bodies; do not collapse every cause into one message.
+        let body = upstream.bytes().await.unwrap_or_default();
+        let bounded = &body[..body.len().min(512)];
+        let message = String::from_utf8_lossy(bounded)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(512)
+            .collect::<String>();
+        eprintln!("rootyard: replica transfer rejected target_status={status} target_error={message}");
+        return match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                Err(conflict("replica rejected snapshot transfer: unauthorized"))
+            }
+            StatusCode::CONFLICT => Err(conflict("replica rejected snapshot transfer: conflict")),
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY => {
+                Err(conflict("replica rejected snapshot transfer: invalid body"))
+            }
+            status if status.is_server_error() => {
+                Err(Error(StatusCode::BAD_GATEWAY, "replica transfer failed on target"))
+            }
+            _ => Err(conflict("replica rejected snapshot transfer")),
+        };
     }
     upstream.json::<SnapshotReceipt>().await.map_err(Error::internal)
 }
