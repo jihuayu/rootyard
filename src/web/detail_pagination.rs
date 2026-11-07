@@ -84,14 +84,7 @@ pub struct DetailPager {
 
 impl DetailPager {
     pub fn new(actor_id: Uuid, repo_id: Uuid, parent_number: i64, kind: Kind) -> Self {
-        Self {
-            scope: Scope {
-                actor_id,
-                repo_id,
-                parent_number,
-                kind,
-            },
-        }
+        Self { scope: Scope { actor_id, repo_id, parent_number, kind } }
     }
 
     /// Resume position for this request. A missing cursor starts at the first
@@ -125,8 +118,7 @@ impl DetailPager {
             return Err(bad_cursor());
         }
         let bytes = URL_SAFE_NO_PAD.decode(raw).map_err(|_| bad_cursor())?;
-        let payload: CursorPayload =
-            serde_json::from_slice(&bytes).map_err(|_| bad_cursor())?;
+        let payload: CursorPayload = serde_json::from_slice(&bytes).map_err(|_| bad_cursor())?;
         let kind_matches = Kind::parse(&payload.kind) == Some(self.scope.kind);
         if payload.v != CURSOR_VERSION
             || !kind_matches
@@ -150,12 +142,7 @@ mod tests {
     use super::*;
 
     fn pager() -> DetailPager {
-        DetailPager::new(
-            Uuid::from_u128(1),
-            Uuid::from_u128(2),
-            7,
-            Kind::IssueComments,
-        )
+        DetailPager::new(Uuid::from_u128(1), Uuid::from_u128(2), 7, Kind::IssueComments)
     }
 
     #[test]
