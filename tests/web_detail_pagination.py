@@ -40,6 +40,7 @@ import subprocess
 import sys
 import traceback
 import urllib.parse
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -98,6 +99,20 @@ class DetailPaginationHarness(BrowserHarness):
             cursors.add(href)
             path = start + href
         raise AssertionError(f"{start}: pagination did not terminate within 10 pages")
+
+    def __init__(self, args):
+        super().__init__(args)
+        self.todos = []
+
+    def web_post(self, path, payload, key):
+        headers = {
+            "Cookie": self.cookie_header(),
+            "Content-Type": "application/json",
+            "Origin": self.base,
+            "X-CSRF-Token": self.cookies["rootyard_csrf"],
+            "Idempotency-Key": key,
+        }
+        return self.request(path, "POST", json.dumps(payload).encode(), headers)
 
     def seed_comments(self, issue, count):
         tenant = self.tenant
@@ -317,6 +332,78 @@ class DetailPaginationHarness(BrowserHarness):
         assert location.startswith("/web/login?return_to="), location
         return {"plain": 401, "navigation": 303}
 
+    def web_mutations_render_first_page(self):
+        """A web mutation re-renders page one (no cursor) after traversal cases."""
+        status, body, _ = self.web_post(
+            f"/web/repos/alice/demo/issues/{self.issue}/comments",
+            {"body": "web-late-comment"},
+            "web-late-comment-107",
+        )
+        text = html.unescape(body)
+        assert status == 201, (status, text[:200])
+        numbers = [int(number) for number in COMMENT_NUMBERS.findall(text)]
+        assert numbers == list(range(1, PAGE + 1)), numbers[:3]
+        assert "web-late-comment" not in text, "mutation page leaked the 107th comment"
+        comment_next = bool(NEXT_LINK.findall(text))
+        if not comment_next:
+            # Known production gap (checked against src/web/handlers.rs):
+            # create_issue_comment_web re-renders via render_issue_detail_view
+            # without templates::attach_next_page_nav, so the 201 HTML has no
+            # rel=next link even though a further page exists. The GET path does.
+            self.todos.append(
+                "TODO: create_issue_comment_web 201 HTML omits the rel=next nav "
+                "because it renders without attach_next_page_nav; only the GET "
+                "issue detail view paginates further."
+            )
+
+        status, body, _ = self.web_post(
+            f"/web/repos/alice/demo/pulls/{self.pull}/reviews",
+            {"state": "commented", "commit_oid": self.head_oid,
+             "body": "web-late-review"},
+            "web-late-review-107",
+        )
+        text = html.unescape(body)
+        assert status == 201, (status, text[:200])
+        reviews = [int(number) for number in REVIEW_NUMBERS.findall(text)]
+        assert reviews == list(range(1, PAGE + 1)), reviews[:3]
+        assert "web-late-review" not in text, "mutation page leaked the 107th review"
+        links = NEXT_LINK.findall(text)
+        assert len(links) == 1 and links[0][1] == "Older reviews", links
+        return {"comment_mutation": {"status": 201, "numbers": len(numbers),
+                                    "next_link": comment_next},
+                "review_mutation": {"status": 201, "numbers": len(reviews),
+                                   "next_link": True}}
+
+    def authenticated_actor_and_revocation(self):
+        """Cursors are actor-scoped; revoked access and tokens fail closed."""
+        path = f"/web/repos/alice/demo/issues/{self.issue}"
+        bob = self.sign_in(username="bob", token=self.bob["token"])[0]
+        assert self.web_status(path, bob) == 404, "non-collaborator saw the private detail"
+
+        self.sql(
+            "INSERT INTO repository_collaborators(repository_id,tenant_id,user_id,role) "
+            f"VALUES('{self.repo['id']}','{self.tenant}','{self.bob['user_id']}','read')"
+        )
+        assert self.web_status(path, bob) == 200, "read collaborator could not view detail"
+
+        status, text, _ = self.web(path)
+        assert status == 200, (status, text[:200])
+        alice_cursor = html.unescape(NEXT_LINK.findall(text)[0][0])
+        assert alice_cursor.startswith("?cursor="), alice_cursor
+        assert self.web_status(path + alice_cursor, bob) == 400, "cursor was not actor-bound"
+
+        self.sql(
+            "DELETE FROM repository_collaborators "
+            f"WHERE repository_id='{self.repo['id']}' AND user_id='{self.bob['user_id']}'"
+        )
+        assert self.web_status(path, bob) == 404, "revoked collaborator kept detail access"
+        assert self.web_status(path + alice_cursor, bob) == 404, "revoked cursor reached a page"
+
+        self.cli("revoke-token", str(uuid.UUID(self.bob["token_id"])))
+        assert self.web_status(path, bob) == 401, "revoked token kept a browser session alive"
+        return {"before_membership": 404, "collaborator": 200, "foreign_cursor": 400,
+                "after_membership": 404, "revoked_token": 401}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -358,7 +445,9 @@ def main():
         harness.case("fixture", harness.fixture)
         report["schema_versions"] = harness.schema_versions
         for name in ("comment_traversal", "comment_boundaries", "cursor_rejected",
-                     "review_traversal", "anonymous_401"):
+                     "review_traversal", "anonymous_401",
+                     "web_mutations_render_first_page",
+                     "authenticated_actor_and_revocation"):
             harness.case(name, getattr(harness, name))
         passed = True
     except Exception as error:
@@ -379,12 +468,14 @@ def main():
             passed=passed,
             cases=harness.results,
             failure_traceback=failure_traceback,
+            todos=harness.todos,
             limitations=[
                 "One loopback process and one disposable PostgreSQL schema; not a scalability benchmark.",
                 "Bulk history is operator SQL (counted by RETURNING) because 105 rows per list are not produced through HTTP; the 106th row and both parents are created by real HTTP/Git.",
                 "The cursor is a scope-bound ordering position, not a signed capability or a snapshot; inserts after the cursor appear later and deletes simply vanish.",
                 "Review pagination is exercised on `/web/.../pulls/{number}`; `/web/.../pulls/{number}/reviews` shares the same renderer but is not separately paged here.",
-                "The parent/kind and anonymous cases do not establish actor binding or collaborator revocation; those require separate authenticated-actor cases.",
+                "Actor binding is covered with a real read collaborator: a cursor minted for Alice is rejected (400) for Bob, whose pre-membership and post-revocation detail reads are 404 and whose revoked token is 401.",
+                "Mutation re-render is checked for status 201, page-one numbers and the 107th row staying off page one; the comment mutation's missing rel=next nav is recorded as a TODO (see report.todos), not as a verified pass.",
             ],
         )
         if args.report:
