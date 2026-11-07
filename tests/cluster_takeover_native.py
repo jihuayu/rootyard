@@ -211,7 +211,9 @@ def main():
                                       request(target_base, route_path, h.alice)[1][:500])
         h.git("push", target_base + h.repo["clone_path"], "HEAD:main", cwd=h.work, token=h.alice)
         assert h.git("--git-dir=" + str(target_repo), "rev-parse", "refs/heads/main").stdout.decode().strip() == target_tip
-        promoted_route = json.loads(h.expect(route_path, 200, token=h.alice))
+        promoted_status, promoted_body = request(target_base, route_path, h.alice)
+        assert promoted_status == 200, (promoted_status, promoted_body[:300])
+        promoted_route = json.loads(promoted_body)
         assert promoted_route["draining"] is False, "promotion left the repository write-drained"
         assert promoted_route["read_only_degraded"] is False
         source_marker = json.loads((h.bare / "rootyard-shard-fence.json").read_text())
