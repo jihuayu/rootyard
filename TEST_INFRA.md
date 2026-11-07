@@ -1,5 +1,7 @@
 # Rootyard Requirement-Driven 4-Tier E2E Test Infrastructure (`TEST_INFRA.md`)
 
+**Current round-4 native runs**: the round-4 acceptance used 11 native jobs with per-job disposable PostgreSQL databases dropped after success and byte-exact logs/reports in [evidence/round4/browser-lfs-4c5bcfe](evidence/round4/browser-lfs-4c5bcfe/README.md); commands and results are recorded in the [round-4 acceptance](docs/acceptance/round4-browser-lfs.md). Ordinary CI is intentionally not a merge gate for that round.
+
 ## 1. Test Philosophy
 
 ### 1.1 Requirement-Driven Opaque-Box Design

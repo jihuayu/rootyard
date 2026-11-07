@@ -1,0 +1,146 @@
+concurrent_cold_hydration: passed
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "concurrent_cold_hydration",
+      "status": "passed",
+      "seconds": 4.742,
+      "detail": {
+        "s3_backend": {
+          "host": "127.0.0.1",
+          "port": 19000,
+          "kind": "garage"
+        },
+        "oid": "6929a4b9e4f36cf033245d5c8ccce1d2ddd7af284eabecc588894b469e291f50",
+        "size": 8388608,
+        "cold_start_local_missing": true,
+        "backend_get_count": 2,
+        "first_download": {
+          "status": 200,
+          "bytes": 8388608,
+          "sha256": "6929a4b9e4f36cf033245d5c8ccce1d2ddd7af284eabecc588894b469e291f50"
+        },
+        "second_download": {
+          "status": 200,
+          "bytes": 8388608,
+          "sha256": "6929a4b9e4f36cf033245d5c8ccce1d2ddd7af284eabecc588894b469e291f50"
+        },
+        "second_hydration_overlapped_first_body": true,
+        "local_final_sha256": "6929a4b9e4f36cf033245d5c8ccce1d2ddd7af284eabecc588894b469e291f50",
+        "local_final_mode": "0o600",
+        "local_final_nlink": 1,
+        "staging_leftovers": [],
+        "rehydration_after_disarm_sha256": "6929a4b9e4f36cf033245d5c8ccce1d2ddd7af284eabecc588894b469e291f50",
+        "proxy_events": [
+          {
+            "kind": "pass_through",
+            "monotonic": 34311.878974,
+            "method": "HEAD",
+            "status": 404,
+            "bytes": 0
+          },
+          {
+            "kind": "pass_through",
+            "monotonic": 34311.971263,
+            "method": "PUT",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "pass_through",
+            "monotonic": 34311.975452,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "pass_through",
+            "monotonic": 34312.112618,
+            "method": "GET",
+            "status": 200,
+            "bytes": 8388608
+          },
+          {
+            "kind": "pass_through",
+            "monotonic": 34312.512643,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "pass_through",
+            "monotonic": 34312.543499,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "first_backend_get_received",
+            "monotonic": 34312.544895
+          },
+          {
+            "kind": "target_backend_response",
+            "monotonic": 34312.546844,
+            "number": 1,
+            "status": 200
+          },
+          {
+            "kind": "first_backend_first_chunk",
+            "monotonic": 34312.549866,
+            "chunk": 16384
+          },
+          {
+            "kind": "pass_through",
+            "monotonic": 34312.554146,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "second_backend_get_received",
+            "monotonic": 34312.557005,
+            "local_final_exists": false
+          },
+          {
+            "kind": "target_backend_response",
+            "monotonic": 34312.559053,
+            "number": 2,
+            "status": 200
+          },
+          {
+            "kind": "first_backend_body_complete",
+            "monotonic": 34312.683076,
+            "bytes": 8388608
+          },
+          {
+            "kind": "second_backend_first_chunk_while_first_reading",
+            "monotonic": 34313.359207,
+            "chunk": 16384,
+            "first_client_done": false
+          },
+          {
+            "kind": "second_backend_body_complete",
+            "monotonic": 34313.531802,
+            "bytes": 8388608
+          },
+          {
+            "kind": "pass_through",
+            "monotonic": 34314.24962,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "pass_through",
+            "monotonic": 34314.385261,
+            "method": "GET",
+            "status": 200,
+            "bytes": 8388608
+          }
+        ]
+      }
+    }
+  ],
+  "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45"
+}

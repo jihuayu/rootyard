@@ -1,5 +1,11 @@
 # Rootyard 实现状态
 
+## 当前：round-4 浏览器与 LFS（above 为历史快照）
+
+集成源 `4c5bcfe56516434ea5b42985e9af90a8c1efe51f`（基线 main `a91c93f`，不可变二进制 `c0049c3a…`，生产输入 `8f399a06…`/331）通过全部 11 个 native coordinator job，独立终审 `APPROVED`（0 P1）：真实 Chromium 登录/发现/Issue+PR/合并/登出并拒绝旧 cookie；可撤销浏览器会话（CSRF/Origin/过期/父令牌撤销准入检查）；真实 stock `git-lfs` + 真实 Garage，删除源 `DATA_DIR` 后由第二进程/新 `DATA_DIR` 经共享 PostgreSQL 取回精确字节；pointer 规范化覆盖官方客户端 LF/CRLF、前导 Unicode 空白/NBSP 与两个 legacy 头，12 类坏 pointer 在 4 条发布路径上共 48 组合全部在 ref 移动前拒绝，18 个官方客户端探针全部匹配；4000 个真实 staging 清理在 native 数据 `ShareLock` 释放前无法删除；离线 format-8/schema-132 恢复撤销旧浏览器会话并在无目标 endpoint 下提供 LFS 字节。生产改动 4 个文件（浏览器与 LFS），**无 DDL**，schema 仍为 132。计数不混用：145 个 Rust 单元测试与 9 份 JSON 报告中的 25 个 case。水化 `0600` 属于加固——旧 `157748a` 适配器本已原子并通过 8 MiB 并发用例，本轮**不是**截断修复；旧二进制真实失败是 CRLF pointer 绕过（保留为标注的旧证据）。单物理主机、loopback 服务与一次性 PostgreSQL/Garage/Chromium，无生产 HA、厂商、云或跨主机声明；#26/#43/#44 与 umbrella #48 保持 OPEN。证据：[round-4 验收](../acceptance/round4-browser-lfs.md)、[evidence bundle](../../evidence/round4/browser-lfs-4c5bcfe/README.md)。
+
+以下为历史快照，保持原样。
+
 历史基线：2026-11-04，main [`1fd05a393fe24653687fa3e868f9dca2fb0c9a67`](https://github.com/jihuayu/rootyard/commit/1fd05a393fe24653687fa3e868f9dca2fb0c9a67)。本页历史快照说明该代码具有什么边界，不承诺后续 main，也不把既有测试报告当作本次重新执行的结果。
 
 最终生产源：`f31910086acbaa87d9e98df440ca8c28c7bb7e08`（format-7 版本 `<=131` 冻结），certified input `fdfbbfc…`，immutable binary `35d01c5f…`，合并主线 `5fa4854`（PR #56 已合并）。除一个 physical-GC 组合 receipt 外，最终 NativeCore+Ops 结果已验证；逐条证据见 [round-2 交付表](../acceptance/round2-delivery.md) 与 [46 项任务台账](../registered-task-delivery.md)。

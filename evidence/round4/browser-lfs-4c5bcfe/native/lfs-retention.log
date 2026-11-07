@@ -1,0 +1,77 @@
+valid_and_compatible_publication: passed
+committed_bytes_survive_failures: passed
+gitfs_maintenance_during_pointer_publication: passed
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "valid_and_compatible_publication",
+      "status": "passed",
+      "seconds": 5.5718,
+      "detail": {
+        "stock_lfs_push": true,
+        "ready_row": true,
+        "non_lfs_files": 300,
+        "non_lfs_plain_push": true,
+        "atomic_multi_ref_push": true,
+        "retained_history_tag": "refs/tags/lfs-v1",
+        "retained_history_advance": "refs/heads/advance",
+        "pointer_object_still_downloadable": true
+      }
+    },
+    {
+      "name": "committed_bytes_survive_failures",
+      "status": "passed",
+      "seconds": 0.1355,
+      "detail": {
+        "duplicate_corrupt_upload_idempotent_200_or_rejected_422": true,
+        "interrupted_duplicate": true,
+        "interrupted_first_upload_stayed_pending": true,
+        "interrupted_first_upload_retry_became_ready": true,
+        "committed_digest_preserved": true,
+        "permission_removal_denied_new_read": true,
+        "bytes_retained_after_regrant": true
+      }
+    },
+    {
+      "name": "gitfs_maintenance_during_pointer_publication",
+      "status": "passed",
+      "seconds": 3.8526,
+      "detail": {
+        "job_kind": "gitfs_stage_cleanup",
+        "job_state": "succeeded",
+        "job_result": {
+          "staging_files_deleted": 4000
+        },
+        "job_observed_running_during_push": true,
+        "cleanup_observed_running_during_push": true,
+        "native_lease": {
+          "backend_pid": 415184,
+          "application_name": "rootyard",
+          "mode": "ShareLock",
+          "consecutive_samples": 5,
+          "fixture_backend_pid": 415373,
+          "fixture_lock_scope": "rootyard-ref-v1 only: refs/heads/gc-race-native"
+        },
+        "exclusive_probe_denied_while_native_lease_held": true,
+        "cleanup_running_while_native_lease_held": true,
+        "stale_files_untouched_before_release": 4000,
+        "job_completed_after_push": 1794040998.499723,
+        "push_window": {
+          "start": 1794040996.307424,
+          "end": 1794040998.404217
+        },
+        "native_lease_barrier": "fixture holds rootyard-ref-v1; native push holds rootyard-data-v1 ShareLock (application_name=rootyard) until publication",
+        "staging_files_deleted_after_native_release": 4000,
+        "lfs_bytes_retained": true
+      }
+    }
+  ],
+  "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45",
+  "limitations": [
+    "Loopback single node, local data volume; S3/Garage recovery is covered by lfs_remote.py.",
+    "Non-LFS push uses 300 small files; publication.rs bounds are MAX_SMALL_BLOBS=4096 and MAX_OBJECTS=20000.",
+    "No LFS delete/GC API exists; committed-object retention is asserted against failed uploads and role removal.",
+    "Interrupted duplicate uses a truncated HTTP body; exhaustive transport fault injection is not covered."
+  ]
+}

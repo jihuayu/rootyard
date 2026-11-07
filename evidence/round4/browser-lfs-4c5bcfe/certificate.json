@@ -1,0 +1,12 @@
+{
+  "role": "integrated",
+  "source_commit": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+  "built_commit": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+  "production_inputs_sha256": "8f399a064af9701de018bad5d527cd652767f03131a96affde8582fb6aac0034",
+  "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45",
+  "valid": true,
+  "compiled_source": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+  "binary": "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+  "harness_source_commit": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+  "reused_baseline": false
+}

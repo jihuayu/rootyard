@@ -1,0 +1,225 @@
+{
+  "role": "independent-delta-reviewer-issue47",
+  "reviewed_head": "b849a07fc2f872c36877080d150ce0344da4b410",
+  "base_accepted_head": "0a7c8b83afe9ae291f25373dba2e0f6edfbc5dbb",
+  "delta": "0a7c8b8..b849a07",
+  "scope": "FINAL delta review only: issue47 return_to, web credential selection, docs, and acceptance tests; no repository-wide re-audit.",
+  "verdict": "ACCEPT_ISSUE47_FINAL_DELTA_CLOSABLE_47_WITH_KNOWN_BOUNDED_PARENT_TOCTOU_P2",
+  "closable_issue47": true,
+  "closable_scope": "Issue47 web sign-in/session credential separation and return-target hardening, with both native HTTP and actual-Chromium runs on b849.",
+  "p1": [],
+  "blockers": [],
+  "new_p2": [],
+  "p2": [
+    {
+      "id": "P2-PARENT-REVOKE-TOCTOU",
+      "severity": "P2",
+      "status": "known-accepted-bounded-not-fixed-by-design",
+      "detail": "Parent API token is checked at HTTP admission and for new requests. An already-admitted web write can finish after parent API revocation/expiry because commit-time verification rechecks the child browser token/web_sessions row and normal repository write checks, not the parent row across the whole request.",
+      "bound": "Narrow in-flight window only; no steady-state/new-request bypass. Direct child-session revocation is still observed by the existing commit-time session check. This is the separately tracked #37 concern, not an issue47 regression.",
+      "docs_declared": "docs/browser-sessions.md states parent revocation is checked on request admission, that the parent token is not held/rechecked for the whole in-flight request, that a narrow in-progress write may finish after parent revocation, and that immediate interruption is a separate concern.",
+      "non_blocking": true
+    }
+  ],
+  "delta_verification": {
+    "return_to": {
+      "status": "fixed",
+      "evidence": "src/web/session.rs is_safe_return_to/percent_decode_ascii/header_safe_ascii: validates both raw path and percent-decoded whole/path, rejects malformed/double-encoded %, non-ASCII, controls, backslash, #, //, dot segments (. and ..), /web/login prefix, oversized/non-header-safe input; safe_return_to returns the original validated value or /web/repos.",
+      "cases_covered": [
+        "/web/../api/repos",
+        "/web/%2e%2e/api/repos",
+        "/web/%2E%2E/web/login",
+        "/web/%252e%252e/api/repos",
+        "/web/%C3%A9",
+        "/web/\u00e9",
+        "/web/repos x",
+        "/web/repos?q=%0a",
+        "/web/repos%3F/../api/repos",
+        "/web/%3F/../api/repos"
+      ],
+      "observed": "HTTP test asserts every bad target gets 303 Location /web/repos with no 500; login page probe maps encoded traversal to value=/web/repos."
+    },
+    "credential_selection": {
+      "status": "fixed",
+      "evidence": "src/web/session.rs WebAuthMode/web_auth_mode: explicit Authorization is authoritative; only a browser-kind credential matching the session cookie selects BrowserSession; a browser credential without a matching cookie is 401; API/other headers select HeaderApiOrOther so stale cookie validation cannot shadow them.",
+      "handler_no_fallback": "src/web/handlers.rs normalize_web_headers returns the original headers unchanged whenever Authorization is present, so auth::authenticate never falls back to the cookie on malformed/invalid headers.",
+      "tests": [
+        "valid API Bearer + stale cookie GET 200",
+        "valid API Bearer + stale cookie POST 201 without cookie CSRF",
+        "mismatched CookieA/headerBrowserB 401",
+        "browser Bearer/Basic without cookie 401",
+        "cookie + matching browser header mutation without CSRF 403"
+      ],
+      "csrf_origin": "Cookie-only and matching BrowserSession mutations still require Origin and X-CSRF-Token; API Authorization mutations intentionally do not use cookie CSRF."
+    },
+    "browser_kind_scope": {
+      "status": "verified",
+      "evidence": "Browser tokens remain rejected by /api and /git (tests), while API Authorization remains usable on /web. Distinct browser-kind lookup is used only for browser credential matching; handler authentication still restricts non-web-scope credentials to API tokens."
+    },
+    "tests": {
+      "status": "added-and-passing-on-b849",
+      "http_cases": [
+        "parent API token expired while child browser token/web_sessions expiry still future -> 401; navigation -> /web/login; parent login -> 401",
+        "collaborator grant -> bob discovery/sign-in -> repository access -> membership DELETE -> 403/404 and repository removed from discovery",
+        "legacy Cookie: token=<api token> rejected 401 (alongside rootyard_token/X-Rootyard-Token)",
+        "API Bearer + stale cookie GET/POST; browser cookie/header mismatch"
+      ],
+      "chromium_cases": [
+        "fresh profile login redirect/flow",
+        "real discovery link role=link name=alice/demo wait+click+URL assert",
+        "same-origin issue create",
+        "PR create/merge",
+        "logout clears cookies and revokes session",
+        "expired/revoked session and revoked parent API re-login denial"
+      ]
+    },
+    "docs": {
+      "status": "updated",
+      "files": [
+        "docs/browser-sessions.md",
+        "docs/design/implementation-status.md",
+        "TEST_INFRA.md",
+        "TEST_READY.md"
+      ],
+      "content": "Raw rootyard_token/token/X-Rootyard-Token web credentials removed; login-form exchange to HttpOnly rootyard_session; parent API UUID binding via SHA-256; parent revocation/expiry checked on new requests; pre-upgrade unparented cookies fail closed/re-sign-in; explicit API Authorization wins over stale cookie; bounded parent TOCTOU truthfully declared."
+    },
+    "schema": {
+      "status": "no DDL/schema/IdP/new feature",
+      "evidence": "delta touches only src/web/session.rs, docs, TEST_INFRA/TEST_READY, and two Python test harnesses; no migrations/schema changes."
+    }
+  },
+  "credential_matrix": [
+    {
+      "credentials": "no Authorization, no cookie",
+      "expected": "401",
+      "observed": "handler authentication 401; no session_mode validation",
+      "test": "implicit/negative"
+    },
+    {
+      "credentials": "valid cookie only",
+      "expected": "200/CSRF+Origin for mutations",
+      "observed": "CookieOnly -> validate_session; parent enforced at admission",
+      "test": "browser_session_workflow"
+    },
+    {
+      "credentials": "valid API Bearer + stale/invalid cookie",
+      "expected": "API header wins; GET 200; POST allowed without cookie CSRF",
+      "observed": "HeaderApiOrOther; handler uses header; stale cookie ignored",
+      "test": "stale cookie + API header GET 200, POST 201"
+    },
+    {
+      "credentials": "invalid Authorization + valid cookie",
+      "expected": "401; no cookie fallback",
+      "observed": "normalize_web_headers returns header clone when Authorization present; auth fails",
+      "test": "code inspection; not separately asserted"
+    },
+    {
+      "credentials": "browser Bearer/Basic only (no matching cookie)",
+      "expected": "401",
+      "observed": "browser kind not found/mismatch -> 401",
+      "test": "HTTP bearer/basic negative"
+    },
+    {
+      "credentials": "browser Bearer/Basic + matching cookie",
+      "expected": "accepted with CSRF/Origin for mutations",
+      "observed": "BrowserSession; validate_session/CSRF enforced",
+      "test": "cookie + matching browser header no-CSRF 403"
+    },
+    {
+      "credentials": "CookieA browser token + headerBrowserB",
+      "expected": "401",
+      "observed": "mismatch -> 401",
+      "test": "HTTP mismatch"
+    },
+    {
+      "credentials": "browser token on /api or /git",
+      "expected": "401",
+      "observed": "non-web scope rejects browser kind",
+      "test": "HTTP /api and /git"
+    },
+    {
+      "credentials": "legacy rootyard_token/token/X-Rootyard-Token",
+      "expected": "401",
+      "observed": "not read as web auth",
+      "test": "HTTP legacy cookies/xheader"
+    }
+  ],
+  "native_evidence": {
+    "coordinator_status": "/workspace/scratch/rootyard-round4/web47/coordinator-status.json: state=passed, stage=complete; sessions and chromium both state=passed, exit_code=0.",
+    "certificate": "valid=true; source_commit=built_commit=compiled_source=b849a07...; production_inputs_sha256=ceb29d9ff4937c736dc8c4d904a1b2ff793e47f955f236e9796bae1d12b7f5f4; binary_sha256=def04d53a360c255b6f56d3bab8df04bfa965fb6f3e17cd2005b87ee40648f66; harness_source_commit=b849a07...; reused_baseline=false.",
+    "binary_sha256_actual": "def04d53a360c255b6f56d3bab8df04bfa965fb6f3e17cd2005b87ee40648f66 (sha256sum of artifacts/b849.../rootyard)",
+    "sessions_report": {
+      "passed": true,
+      "case": "browser_session_workflow",
+      "status": "passed",
+      "seconds": 4.7325,
+      "binary_sha256": "def04d53a360c255b6f56d3bab8df04bfa965fb6f3e17cd2005b87ee40648f66",
+      "report_sha256": "33f0a14faa9d1dd1977c0194919d580c928787fe4f0cc26d4508f47dc432b9c5"
+    },
+    "chromium_report": {
+      "passed": true,
+      "case": "chromium_browser_workflow",
+      "status": "passed",
+      "seconds": 8.3325,
+      "binary_sha256": "def04d53a360c255b6f56d3bab8df04bfa965fb6f3e17cd2005b87ee40648f66",
+      "report_sha256": "4d35675ba36bd9f39522195c069530e39a14cd910dec9732702d428c9cadaea2",
+      "browser": "155.0.8059.79",
+      "git_head": "b849a07fc2f872c36877080d150ce0344da4b410"
+    },
+    "harness_sha256_match": {
+      "tests/web_sessions.py": "d93cecb09519cbc5ecc333dd9f7f3b028d23f605c3be8d8de9ae887100ce37fb",
+      "tests/browser_ui.py": "0186124fdfc8bc15b645e37749fe6daf854a9211eccb4e550b339cbcc3d70b73",
+      "coordinator_match": true
+    },
+    "build_inputs_stable": "build-inputs-before.json and build-inputs-after.json are byte-identical (sha256 1f11ef4da20a50db0ca1dddde6271d43ee74bfa75e7e07995782ef1ccea97f9d); build log compiled b849 and finished successfully."
+  },
+  "criteria_47": {
+    "return_target_traversal_encoded_unicode_control_no_500_or_escape": "met (code + HTTP tests)",
+    "direct_api_authorization_priority_get_post_no_cookie_csrf": "met (code + HTTP tests)",
+    "browser_bearer_basic_require_matching_cookie_and_csrf_origin": "met (code + HTTP negative/positive tests)",
+    "api_git_browser_kind_scope_separation": "met (code + HTTP tests)",
+    "parent_expiry_child_still_valid": "met (HTTP test + passed native)",
+    "member_grant_discovery_remove_and_post_remove_denial": "met (HTTP test)",
+    "legacy_token_cookie_denial": "met (HTTP test)",
+    "mixed_credentials": "met (HTTP tests)",
+    "chromium_discovery_link_assert_click_and_issue_pr_logout": "met (actual Chromium passed)",
+    "docs_legacy_resignin_raw_api_cookie_xheader_parent_new_requests": "met (docs updated; bounded TOCTOU declared)",
+    "no_ddl_schema_idp_new_feature": "met (delta file scope)",
+    "new_request_parent_revocation": "met; admitted in-flight write can still finish by documented bound",
+    "native_two_jobs": "met: HTTP sessions + actual Chromium both passed on b849 binary def04d53a360c..."
+  },
+  "residuals": [
+    {
+      "id": "R1",
+      "severity": "accepted-P2",
+      "text": "Parent TOCTOU for an already-admitted in-flight write remains; documented and bounded. Immediate commit-time parent revocation is explicitly out of issue47 scope (#37)."
+    },
+    {
+      "id": "R2",
+      "severity": "non-blocking-coverage-note",
+      "text": "No separate HTTP assertion for invalid Authorization plus a valid cookie; the no-fallback behavior is structurally guaranteed by normalize_web_headers returning the header clone whenever Authorization is present and is confirmed by inspection."
+    },
+    {
+      "id": "R3",
+      "severity": "non-blocking-coverage-note",
+      "text": "Collaborator block covers grant, sign-in/discovery, removal, post-removal denial and discovery removal; it does not separately re-grant after removal. This is not a product defect in the issue47 delta."
+    },
+    {
+      "id": "R4",
+      "severity": "integration-dependency-not-product-defect",
+      "text": "tests/backup_capabilities.py still has the old BrowserHarness.sign_in dict-return alias; a different LFS worker owns that file. Primary will reconcile CapabilityHarness inheritance/aliases and run actual backup after merge. Not a b849 product/DDL defect and not part of isolated issue47 qualification."
+    }
+  ],
+  "integration_dependency": {
+    "file": "tests/backup_capabilities.py",
+    "owner": "different LFS worker",
+    "issue": "old alias BrowserHarness.sign_in expecting dict; sign_in now takes username/token and returns tuple",
+    "disposition": "primary fixes combined CapabilityHarness after merge; not a new product defect/DDL; keep as note, do not block isolated issue47 qualification once the two native jobs pass (they did on b849)."
+  },
+  "notes": [
+    "Reviewed only summary/findings from original source-review plus 0a7..b849 delta and supporting evidence; no repository-wide re-audit.",
+    "Both required native jobs completed and passed on b849 before review end; actual report case results and binary hash were read, not assumed from source alone.",
+    "No secrets, config, SKILL, env, network, GitHub, or deployment actions were used."
+  ],
+  "exact_head": "b849a07fc2f872c36877080d150ce0344da4b410"
+}

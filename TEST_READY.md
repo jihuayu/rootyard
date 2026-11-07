@@ -1,5 +1,7 @@
 # Rootyard 4-Tier E2E Test Readiness Report (`TEST_READY.md`)
 
+**Current round-4 native runs**: see [round-4 acceptance](docs/acceptance/round4-browser-lfs.md) and [evidence](evidence/round4/browser-lfs-4c5bcfe/README.md) for the 11 native coordinator jobs on binary `c0049c3a…` (145 Rust unit tests; 25 cases across 9 JSON reports, counted separately). Those native reports supersede the historical reference-model counts below for round-4 scope only.
+
 **Status**: `HISTORICAL REFERENCE-MODEL RESULTS — NOT NATIVE ACCEPTANCE`
 **Current delivery**: [Registered issues and evidence gates](docs/registered-task-delivery.md).
 The counts below describe historical Python/reference-model runs. They do not

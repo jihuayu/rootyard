@@ -1,0 +1,108 @@
+enqueue_boundary_lost_wakeup_recovers: passed
+kill_after_receiver_2xx_before_ack_recovers_at_least_once: passed
+retry_cannot_steal_a_live_worker_lease: passed
+automatic_backoff_retry_and_dead_letter: passed
+stock_push_updates_open_pull_automatically: passed
+{
+  "issue": 33,
+  "binary": "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+  "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45",
+  "source_head": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+  "production_inputs_sha256": "8f399a064af9701de018bad5d527cd652767f03131a96affde8582fb6aac0034",
+  "production_file_count": 331,
+  "manual_dispatch_calls": 0,
+  "cases": [
+    {
+      "name": "enqueue_boundary_lost_wakeup_recovers",
+      "status": "passed",
+      "seconds": 2.945,
+      "detail": {
+        "delivery_id": "97cb0f45-b790-4a5b-bc1f-ee3a1c8372e5",
+        "state_after_enqueue_without_worker": "pending",
+        "recovered_state": "delivered",
+        "attempts": 1,
+        "receiver_attempts": [
+          1
+        ],
+        "manual_dispatch_calls": 0
+      }
+    },
+    {
+      "name": "kill_after_receiver_2xx_before_ack_recovers_at_least_once",
+      "status": "passed",
+      "seconds": 9.297,
+      "detail": {
+        "delivery_id": "ef266cb9-87e9-4eba-8353-bba74740b49f",
+        "killed_worker_pid": 417733,
+        "state_before_kill": "leased",
+        "durable_state_after_kill": "leased,1",
+        "dead_worker_backends_terminated": "1",
+        "receiver_status_first_attempt": 204,
+        "receiver_attempts": [
+          1,
+          2
+        ],
+        "duplicate_delivery_id": "ef266cb9-87e9-4eba-8353-bba74740b49f",
+        "attempts": 2,
+        "recovered_state": "delivered",
+        "manual_dispatch_calls": 0
+      }
+    },
+    {
+      "name": "retry_cannot_steal_a_live_worker_lease",
+      "status": "passed",
+      "seconds": 2.033,
+      "detail": {
+        "delivery_id": "9318db11-2441-444a-94d8-a5fa87c66663",
+        "retry_while_leased_http": 409,
+        "receiver_attempts": [
+          1
+        ],
+        "final_attempts": 1,
+        "final_state": "delivered",
+        "manual_dispatch_calls": 0
+      }
+    },
+    {
+      "name": "automatic_backoff_retry_and_dead_letter",
+      "status": "passed",
+      "seconds": 3.977,
+      "detail": {
+        "delivery_id": "2ded7b53-61ad-44c7-acd7-9ef783e9a537",
+        "state_after_first_attempt": "failed",
+        "attempts_after_first_attempt": 1,
+        "scheduled_backoff_seconds": 2,
+        "real_dead_letter_delay_seconds": 1.869,
+        "dead_letter_state": "dead_letter",
+        "final_attempts": 2,
+        "receiver_attempts": [
+          1,
+          2
+        ],
+        "observable_via": "/deliveries?state=dead_letter",
+        "manual_dispatch_calls": 0
+      }
+    },
+    {
+      "name": "stock_push_updates_open_pull_automatically",
+      "status": "passed",
+      "seconds": 1.207,
+      "detail": {
+        "repository_id": "9ff3e82f-4b56-4579-991c-47a94f665b83",
+        "old_pin_oid": "c94f2c0340f7d02861f499fcb2929ac59004c21f",
+        "push_head_oid": "1f5f32892fff97caf52fd9e22387b98d2df3188c",
+        "new_pin_job_id": "db7d7c7e-cf33-4d79-867e-86409e95d3b1",
+        "new_pin_ref": "refs/rootyard-ci/jobs/db7d7c7e-cf33-4d79-867e-86409e95d3b1",
+        "new_pin_oid": "1f5f32892fff97caf52fd9e22387b98d2df3188c",
+        "pull_version_before": 1,
+        "pull_version_after": 2,
+        "queued_check_context": "ci/test",
+        "receiver_event": "pull_request",
+        "receiver_action": "synchronize",
+        "receiver_delivery_id": "5bdc1f6d-ee28-4181-a2cd-813888d5ab8d",
+        "manual_dispatch_calls": 0
+      }
+    }
+  ],
+  "passed": true
+}

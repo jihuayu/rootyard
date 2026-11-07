@@ -1,0 +1,84 @@
+{
+  "scope": {
+    "reviewer": "independent deepseek review",
+    "delta": "79987b4..869be7d42398ec301387883cb678cf4752007821",
+    "files": [
+      "src/lfs/storage.rs",
+      "src/lfs/publication.rs",
+      "tests/lfs_publication.py",
+      "tests/lfs_hydration_concurrency.py"
+    ],
+    "diffstat": "4 files changed, 547 insertions(+), 9 deletions(-)",
+    "method": "source reading of the 4 changed files plus the cited call sites (remote_objects::get_to_file, journal::exists/safe_path, storage_lifecycle::clean_staging, models::parse_pointer, publication call sites); no build, no native test run, no network, no edits performed by reviewer"
+  },
+  "verdict": {
+    "blockers": 0,
+    "p1": 0,
+    "p2": 4,
+    "overall": "NO BLOCKER in the 4-file delta. Publication change fixes a real server-side fail-open for CRLF pointers. Storage change is defensible hardening, NOT a truncation bugfix: the earlier truncation hypothesis is disproved (callee get_to_file is already atomic+verified). New-code behaviour is UNVERIFIED here (no fresh build/native run by this reviewer) and both new suites are outside CI, so 39/40 must not be closed before the primary fresh integrated build plus native runs."
+  },
+  "primary_correction_confirmed": {
+    "claim": "RemoteObjectStore::get_to_file already stages/verifies/fsyncs/renames, and old 157 binary passes the real Garage 8 MiB cold-read concurrency test",
+    "evidence": "src/storage/remote_objects.rs get_to_file writes .rootyard-object-<uuid> in the destination parent, caps size at expected_size, verifies sha256+size, sync_all(), renames to destination, fsyncs parent, removes temp on error; TempObject guard removes temp. source-ready.json records old binary sha256 157748a PASS on tests/lfs_hydration_concurrency.py (real Garage 127.0.0.1:19000 via loopback proxy, 2 backend GETs, both bodies 8388608 bytes sha256 9ad7ed07.., final mode 0o600 nlink 1, no staging leftovers).",
+    "conclusion": "Do NOT describe the storage delta as a truncation/short-body fix. No direct-truncate race exists at the oid path on the certified baseline."
+  },
+  "caller_staging_assessment": {
+    "classification": "hardening (defensible), not required for data integrity",
+    "real_defect_removed": "old code called get_to_file(final oid path) then chmod 0600 AFTER the rename, so between the callee rename and the chmod a concurrent verify_path_integrity_bounded sees mode != 0600 and returns false: a concurrent reader gets a spurious failure and/or a second full remote hydration, and the tenant-addressable path transiently carries the umask default mode (0644) for the object bytes",
+    "safety_review": [
+      "rename-to-final happens before guard.disarm() with no intervening await, so no cancellation point exists between a verified rename and disarm; an armed guard only ever removes this request own random .tmp-<uuid>",
+      "any cancellation before the rename leaves at most a removed staging file (guard drop) and, if the spawn_blocking rename still runs, an ENOENT error nobody observes; unverified bytes can never reach the final path",
+      "deadline is checked inside both bounded hash loops and passed to get_to_file, so staging verify and final verify are deadline-bounded",
+      "staging verify enforces size, sha256==oid, mode==0600, nlink==1 with O_NOFOLLOW open; chmod is by path on a self-generated uuid name (no attacker-controllable name), minor stylistic only"
+    ],
+    "cost": "one extra full local SHA-256 pass per cold hydration (callee stream hash + staging hash + final verify_local_until hash = 3 digest passes, formerly 2), two extra spawn_blocking tasks; no second download and no byte copy because the callee rename target and the final path are in the same directory",
+    "gc_temp_interaction": ".tmp-<uuid> exactly matches the pre-existing upload-staging convention (stream_to_staging_and_publish uses the same name and StagingFileGuard) and is swept by storage_lifecycle gitfs_stage_cleanup -> clean_staging, which deletes regular nlink==1 .tmp-<uuid> files in repo_lfs_dir older than policy.stage_age_seconds (default 3600). In-flight downloads advance mtime so only the post-completion window is exposed; if a sweep did hit a stalled staging file the hydration fails closed (rename ENOENT) with no unverified publish.",
+    "residual_gaps": [
+      "clean_staging does NOT sweep .rootyard-object-<uuid>, so a kill/crash mid-download can leave an orphan temp that nothing reclaims (pre-existing, also affects backup hydration)",
+      "repo quota accounting (check_repo_quota/disk_bytes over repo_lfs_dir) transiently counts staging bytes (pre-existing)",
+      "the same post-rename chmod window still exists at src/backup/lfs_inventory.rs hydrate (get_to_file straight to the final oid path, then chmod), so the always-0600-at-final-path invariant holds only for the LFS read path; ci_checkouts mirror_prepare uses an unswept .ci-<uuid> stage"
+    ]
+  },
+  "crlf_bug": {
+    "status": "CONFIRMED real server-side fail-open, not client-side artefact",
+    "mechanism": "old gate required the exact byte prefix version https://git-lfs.github.com/spec/v1 + LF; a CRLF pointer therefore hit continue and was treated as ordinary content, skipping object existence and size verification",
+    "client_behaviour": "git-lfs 3.6.1 --check exit 0 and --check --strict exit 2 on the CRLF fixture: Decode accepts CRLF (Go line scanning drops the trailing CR) while strict canonical re-encode fails, so git lfs clean passes the CRLF pointer bytes through verbatim and the raw pointer reaches the server",
+    "empirical": "source-ready.json records old binary (sha256 157748a) RED on tests/lfs_publication.py: direct Git push accepted crlf_missing, while missing/wrong_size/invalid were rejected in the same run",
+    "fix": "starts_lfs_pointer accepts LF or CRLF after the v1 version line before the bounded canonical parse; new code path applies it for every publication gate call site"
+  },
+  "normalizer_bounded_correction": {
+    "observation": "models::parse_pointer already tokenizes with str::lines(), which strips one trailing CR per line, so parse_pointer alone would accept the tested CRLF shapes once recognition is fixed; normalize_pointer_line_endings is therefore redundant for the tested forms",
+    "not_incorrect": "it is not a pure no-op: folding every CRLF also turns size 13\r\r\n style variants into a parseable line, i.e. it accepts a slightly wider pointer-shape set than parse_pointer alone. The consequence is only fail-closed over-rejection (a shape is then forced through object availability/digest verification), never a bypass",
+    "bounds": "allocation is bounded by MAX_POINTER_BYTES (1024) per blob and the batch by MAX_SMALL_BLOBS (4096), and normalization runs only on pointer-recognised blobs so ordinary text is untouched; canonical LF pointers contain no CRLF sequence, so no false rejection of previously valid LF pointers",
+    "out_of_delta": "the impl worker is currently expanding the pointer normalizer (leading whitespace, legacy URI) in a later delta; those shapes are NOT accepted by 869be7d and require a separate narrow follow-up review"
+  },
+  "publication_test_material": {
+    "covered": "7 pointer kinds (missing, wrong_size, invalid, crlf_missing, crlf_wrong_size, ready_missing_bytes, ready_corrupt_bytes) x 4 asserted paths (direct smart-HTTP push, --atomic push with a good ref that must also not move, ref transaction 409, pull/merge 409), each with ref-not-visible ls-remote assertions and object-byte hold/corrupt/restore; plus a valid CRLF pointer that must publish and must appear at the pushed head",
+    "bounded_gaps": [
+      "no assertion that the committed Git blob bytes equal the CRLF pointer (cat-file -p), so the suite itself does not pin the client pass-through premise that explains the RED",
+      "parse_pointer ignores unrecognised lines, so the ready_* kinds do reach availability/ensure_readable (intended path); the crlf_* kinds are rejected as size/unavailable but the suite does not distinguish which guard fired",
+      "pando_gateway/publish.rs is a fifth validate_new_refs_with_client call site not exercised by this suite (4 paths tested)",
+      "neither tests/lfs_publication.py nor the new tests/lfs_hydration_concurrency.py is wired into .github/workflows/ci.yml (only tests/lfs.py runs among LFS suites), so these regression gates are manual-only"
+    ]
+  },
+  "hydration_test_material": {
+    "covered": "deterministic proxy gating of exactly 2 backend GETs for one 8 MiB object: cold start asserted (local final absent), second backend GET observed before first body completion, first client not done when the second hydration emits its first 16 KiB, both response bodies exact size+sha256 over header-declared length, final mode 0600/nlink 1/size, no .tmp- or .rootyard-object- leftovers, and a rehydration after disarm",
+    "bounded_gaps": [
+      "the same scenario PASSES the pre-delta binary, so it is a concurrency/compatibility regression test and cannot demonstrate the new caller staging hardening",
+      "no case drives the pre-fix mode window (reader verifying during rename->chmod) and no cancellation/kill case asserts staging cleanup or interaction with gitfs_stage_cleanup",
+      "single object, 8 MiB, loopback proxy: backend streaming timing is proxy-gated, not Garage-artefact-gated"
+    ]
+  },
+  "unverified_by_this_review": [
+    "fresh build of 869be7d (reviewer ran no cargo build)",
+    "native run of tests/lfs_publication.py on new code: 7 kinds x 4 paths rejection + valid CRLF publish",
+    "native run of tests/lfs_hydration_concurrency.py on new code",
+    "full LFS/retention/backup suites"
+  ],
+  "required_before_closure": [
+    "primary fresh integrated build of 869be7d",
+    "native lfs_publication run with ROOTYARD_OBJECT_STORE_* unset showing 7x4 rejection and crlf-valid publication",
+    "native lfs_hydration_concurrency run against real Garage showing 2 backend GETs, exact digests, 0600/nlink1, no leftovers",
+    "do not mark 39/40 closable on this review alone"
+  ]
+}

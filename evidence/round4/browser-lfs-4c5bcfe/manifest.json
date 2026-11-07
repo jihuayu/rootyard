@@ -1,0 +1,193 @@
+{
+  "backup_manifest_format": 8,
+  "base_main": "a91c93f3a63914c8416fa96c653f5d28212af785",
+  "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45",
+  "candidate_head": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+  "changed_production_files": [
+    "src/web/handlers.rs",
+    "src/web/session.rs",
+    "src/lfs/publication.rs",
+    "src/lfs/storage.rs"
+  ],
+  "compiled_source": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+  "coordinator_stage": "complete",
+  "coordinator_state": "passed",
+  "evidence_role": "round-4 browser #47 and LFS #39/#40: 11 native coordinator jobs plus independent final acceptance (docs/evidence only, no compile)",
+  "files": {
+    "README.md": {
+      "bytes": 11678,
+      "sha256": "bbcee4b1af7c8436fdd377096f360fe2b888952bf771934d0ce241e223e854d2"
+    },
+    "acceptance-review.json": {
+      "bytes": 13011,
+      "sha256": "ceb1d112da19a031af8097a90e5c0e30ea5549b43b6fc4709c5888a768f8c9bd"
+    },
+    "acceptance-review.md": {
+      "bytes": 7366,
+      "sha256": "4fc44caa916f92a93642ce8fd6af3017a08c11020066720e69ad90fcf6ab9493"
+    },
+    "certificate.json": {
+      "bytes": 652,
+      "sha256": "f4dd883499495d72debbfeecaae330553a52a09caa306e98b20dea06966f5359"
+    },
+    "historical/hyd-old.json": {
+      "bytes": 4167,
+      "sha256": "371492df7bb64e52919c44e70bcead8300d426fc6e16cea9cecdef8fca7a5976"
+    },
+    "historical/non-utf8-client-probe.json": {
+      "bytes": 1855,
+      "sha256": "999b264e9b39e14551342f2ee101d1d36be59dbea545da172d5a93a944dd2155"
+    },
+    "historical/pub-old-red.json": {
+      "bytes": 297,
+      "sha256": "8141a43499ea426d28ffa83f3a9f6ef0bbaa1067bcb31ecc25a569dd36e959f7"
+    },
+    "native/backup-capabilities.json": {
+      "bytes": 2709,
+      "sha256": "b16def062adb08e21f7fec4dc95f584e38959594a4c8700b96e645ee196bc873"
+    },
+    "native/backup-capabilities.log": {
+      "bytes": 2746,
+      "sha256": "042823cca1584fdd69c7640869e1be286dbb33bd20950b453f5fbe9c59305cb9"
+    },
+    "native/chromium.json": {
+      "bytes": 401,
+      "sha256": "70a56d1316ce0c365cdb5aa7fc4914cc88bde17d164418ab51d527bf33216c0b"
+    },
+    "native/chromium.log": {
+      "bytes": 435,
+      "sha256": "1610e679b56d953d60ccb0e2e60fc3a4df74ba5e72e13b9b0f02cd974d14f35e"
+    },
+    "native/lfs-hydration.json": {
+      "bytes": 4168,
+      "sha256": "bfa68cc8f2d3014c1df68858ce2ead39fa019f2fb9a537f0254026a746d3d098"
+    },
+    "native/lfs-hydration.log": {
+      "bytes": 4202,
+      "sha256": "a1390b51e9de6292f5f0c655d035da6947e64ab6338d12c0927b82ad573babc5"
+    },
+    "native/lfs-publication.json": {
+      "bytes": 4140,
+      "sha256": "3c4e975b2ca20029f6bb932eb091eb874c5bfd00134370edb50d16774ce5f0d8"
+    },
+    "native/lfs-publication.log": {
+      "bytes": 4206,
+      "sha256": "33e01aa4d0bb79be4dfd7f93457f93c461fe51b52d1b3177aacad901f65c06fb"
+    },
+    "native/lfs-remote.json": {
+      "bytes": 382,
+      "sha256": "24b26018bb47aff2f46f134df2727f218b3fd4aa9b48178cf38ed3c8f83c6f78"
+    },
+    "native/lfs-remote.log": {
+      "bytes": 421,
+      "sha256": "8de78ee6f52baa90967329610a0758d40d2d22189e473aee6abd9abc9e8a80d8"
+    },
+    "native/lfs-retention.json": {
+      "bytes": 2858,
+      "sha256": "e2381582049c8b8e90e16b783ad8be627d29a9aa5422641efdd3446f33994cff"
+    },
+    "native/lfs-retention.log": {
+      "bytes": 2993,
+      "sha256": "9c4919f7a68afb76250ec4842d4c3cbc23f45b9deb29bcdebb34d214d7e6b14a"
+    },
+    "native/lfs.json": {
+      "bytes": 2255,
+      "sha256": "23b95c9deea9a5ac299d0d27d2bee5ea4267b7406879740c198b69aefde16065"
+    },
+    "native/lfs.log": {
+      "bytes": 2606,
+      "sha256": "f1d91a89091e9058f8dd85759de77e972c60b39b57124b7f7344978ae555bb72"
+    },
+    "native/rust-lib.log": {
+      "bytes": 13800,
+      "sha256": "f0fca4478f163190dc1aa401b83b18066284b800b42c4f1c93c3348a186f447e"
+    },
+    "native/sessions.json": {
+      "bytes": 281,
+      "sha256": "bcc875d2cfba1ca23995417428836c735a19f95efa98869b9c202731fc22b86c"
+    },
+    "native/sessions.log": {
+      "bytes": 314,
+      "sha256": "849188938a5b13c3af8173903be29d529a7ba5b7848e3068b5a547867406862c"
+    },
+    "native/webhook-regressions.log": {
+      "bytes": 225,
+      "sha256": "02a14ecae0f5e34b8c9312b7643265f9170739c8ba91384f0cc0ee52bafc005e"
+    },
+    "native/webhook-worker.json": {
+      "bytes": 3487,
+      "sha256": "86ed9a75f063a6856963989718e8c9384db0fcb0a138470e8879f1d1f008718a"
+    },
+    "native/webhook-worker.log": {
+      "bytes": 3745,
+      "sha256": "dfd6db6f56ad2547e66423edd8abffc5dfa8b90c63476d3d15c0a69f13def98d"
+    },
+    "primary-consistency.json": {
+      "bytes": 2801,
+      "sha256": "1aaa091ae32bfaea989569267eef0471a86bc1c7a153c2077f9366b50b1f2189"
+    },
+    "production-inputs.json": {
+      "bytes": 32569,
+      "sha256": "e67ed362bbc8d621d9e92ae34e92fc20c16096674bed0b39cf60d65871aea7db"
+    },
+    "reviews/browser-delta-review.json": {
+      "bytes": 13212,
+      "sha256": "8d79918b9c2638546c33cb725fc311c1ea35b4b2195f1d347aaaa9082869300e"
+    },
+    "reviews/browser-delta-review.md": {
+      "bytes": 5057,
+      "sha256": "29d2e6a7483a6a79c1a7d1f768d3dcd6b098a3abc8b5c7f69536ecd84f5de99d"
+    },
+    "reviews/hydration-source-review.json": {
+      "bytes": 10089,
+      "sha256": "d2f306a9259923c20970150135bd1c7358ff04f9af178ce62247e2e7aa4d43bc"
+    },
+    "reviews/hydration-source-review.md": {
+      "bytes": 8284,
+      "sha256": "d25f3eae42927772996fdfaca6ecbce7e6d4e7bff78d0b5322acc0b770836f63"
+    },
+    "reviews/native-lease-review.json": {
+      "bytes": 8050,
+      "sha256": "69bf6ea47d5a7138687b1061a912adb757d121f4e7437cedfc862381487b0249"
+    },
+    "reviews/native-lease-review.md": {
+      "bytes": 7249,
+      "sha256": "aa1e5af109209f5dbd310b848814effde419e150834e1dacd89b15ac10ff34ab"
+    },
+    "reviews/pointer-delta-review.json": {
+      "bytes": 8321,
+      "sha256": "8b97cf03b44ced6a9e20402c32519ce49600eeb482640a7279de4d5c64659e1a"
+    },
+    "reviews/pointer-delta-review.md": {
+      "bytes": 7739,
+      "sha256": "32d1feaf4a63b8148bca940e2bd94006a43e98ab807ad0a06c49fe7b3b92bd6a"
+    },
+    "status.json": {
+      "bytes": 11725,
+      "sha256": "c5920396cf563605397cb36f8d749dd61db42d1e626f942e7210960a9bddc027"
+    }
+  },
+  "historical_evidence_labeled": [
+    "historical/pub-old-red.json",
+    "historical/hyd-old.json",
+    "historical/non-utf8-client-probe.json"
+  ],
+  "jobs_exit_zero": 11,
+  "jobs_passed": 11,
+  "jobs_total": 11,
+  "json_reports": 9,
+  "manifest_excludes_self": true,
+  "new_ddl": false,
+  "p1_count": 0,
+  "production_inputs_sha256": "8f399a064af9701de018bad5d527cd652767f03131a96affde8582fb6aac0034",
+  "report_cases": 25,
+  "review_criteria_closable": [
+    39,
+    40,
+    47
+  ],
+  "review_verdict": "APPROVED",
+  "rust_lib_tests_passed": 145,
+  "schema_max_version": 132,
+  "source_input_file_count": 331
+}

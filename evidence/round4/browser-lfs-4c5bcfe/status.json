@@ -1,0 +1,255 @@
+{
+  "state": "passed",
+  "pid": 410537,
+  "started": 1794040878.335263,
+  "jobs": {
+    "sessions": {
+      "state": "passed",
+      "database": "round4_integrated_sessions_fc266e2d",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/web_sessions.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round4/integrated/logs/sessions.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/integrated/logs/sessions.log",
+      "report": "/workspace/scratch/rootyard-round4/integrated/logs/sessions.json",
+      "harness_sha256": "d93cecb09519cbc5ecc333dd9f7f3b028d23f605c3be8d8de9ae887100ce37fb",
+      "started": 1794040936.5839648,
+      "exit_code": 0,
+      "finished": 1794040941.9218514,
+      "report_sha256": "bcc875d2cfba1ca23995417428836c735a19f95efa98869b9c202731fc22b86c",
+      "database_cleanup": "dropped_after_success"
+    },
+    "chromium": {
+      "state": "passed",
+      "database": "round4_integrated_chromium_65b2745e",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/browser_ui.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round4/integrated/logs/chromium.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/integrated/logs/chromium.log",
+      "report": "/workspace/scratch/rootyard-round4/integrated/logs/chromium.json",
+      "harness_sha256": "0186124fdfc8bc15b645e37749fe6daf854a9211eccb4e550b339cbcc3d70b73",
+      "started": 1794040942.468034,
+      "exit_code": 0,
+      "finished": 1794040950.7208476,
+      "report_sha256": "70a56d1316ce0c365cdb5aa7fc4914cc88bde17d164418ab51d527bf33216c0b",
+      "database_cleanup": "dropped_after_success"
+    },
+    "lfs": {
+      "state": "passed",
+      "database": "round4_integrated_lfs_925e89ff",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/lfs.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round4/integrated/logs/lfs.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/integrated/logs/lfs.log",
+      "report": "/workspace/scratch/rootyard-round4/integrated/logs/lfs.json",
+      "harness_sha256": "45f360c0a7725d6d29fb44256fdb9a4becf8a3979b8fa371fa5f8348ce8c544f",
+      "started": 1794040951.268509,
+      "exit_code": 0,
+      "finished": 1794040960.4321842,
+      "report_sha256": "23b95c9deea9a5ac299d0d27d2bee5ea4267b7406879740c198b69aefde16065",
+      "database_cleanup": "dropped_after_success"
+    },
+    "lfs-publication": {
+      "state": "passed",
+      "database": "round4_integrated_lfs_publication_1a3c172e",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/lfs_publication.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round4/integrated/logs/lfs-publication.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-publication.log",
+      "report": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-publication.json",
+      "harness_sha256": "060beb3c816c9e1300bd5d9c49d1c119a75e505f73b276796b92fcbd146e23c1",
+      "started": 1794040961.0967643,
+      "exit_code": 0,
+      "finished": 1794040989.0352495,
+      "report_sha256": "3c4e975b2ca20029f6bb932eb091eb874c5bfd00134370edb50d16774ce5f0d8",
+      "database_cleanup": "dropped_after_success"
+    },
+    "lfs-retention": {
+      "state": "passed",
+      "database": "round4_integrated_lfs_retention_0d41060b",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/lfs_retention_acceptance.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round4/integrated/logs/lfs-retention.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-retention.log",
+      "report": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-retention.json",
+      "harness_sha256": "05f9a71f499be683c0c03e70661471442e91731a7e591acbca5bf3a7d7196f2f",
+      "started": 1794040989.629046,
+      "exit_code": 0,
+      "finished": 1794040999.6994112,
+      "report_sha256": "e2381582049c8b8e90e16b783ad8be627d29a9aa5422641efdd3446f33994cff",
+      "database_cleanup": "dropped_after_success"
+    },
+    "lfs-remote": {
+      "state": "passed",
+      "database": "round4_integrated_lfs_remote_ba75c624",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/lfs_remote.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round4/integrated/logs/lfs-remote.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-remote.log",
+      "report": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-remote.json",
+      "harness_sha256": "ced30c258d1d96a878179083bbb98d4a33d772fa341dc0ec47ec137cf69dd95e",
+      "started": 1794041000.2462523,
+      "exit_code": 0,
+      "finished": 1794041005.8449833,
+      "report_sha256": "24b26018bb47aff2f46f134df2727f218b3fd4aa9b48178cf38ed3c8f83c6f78",
+      "database_cleanup": "dropped_after_success"
+    },
+    "lfs-hydration": {
+      "state": "passed",
+      "database": "round4_integrated_lfs_hydration_f1076af3",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/lfs_hydration_concurrency.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round4/integrated/logs/lfs-hydration.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-hydration.log",
+      "report": "/workspace/scratch/rootyard-round4/integrated/logs/lfs-hydration.json",
+      "harness_sha256": "8a9834874a4b75188d2c3239a640eaba4f627f649272bb51d97e6f1e234e0b15",
+      "started": 1794041006.4191175,
+      "exit_code": 0,
+      "finished": 1794041011.7027738,
+      "report_sha256": "bfa68cc8f2d3014c1df68858ce2ead39fa019f2fb9a537f0254026a746d3d098",
+      "database_cleanup": "dropped_after_success"
+    },
+    "backup-capabilities": {
+      "state": "passed",
+      "database": "round4_integrated_backup_capabilities_7192d38b",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/backup_capabilities.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+        "--remote-lfs",
+        "--report",
+        "/workspace/scratch/rootyard-round4/integrated/logs/backup-capabilities.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/integrated/logs/backup-capabilities.log",
+      "report": "/workspace/scratch/rootyard-round4/integrated/logs/backup-capabilities.json",
+      "harness_sha256": "f27b364252e435f16b51fc639ffb895b4eb455cd85ca1dfe35160236aa6ba956",
+      "started": 1794041012.2612975,
+      "exit_code": 0,
+      "finished": 1794041086.86115,
+      "report_sha256": "b16def062adb08e21f7fec4dc95f584e38959594a4c8700b96e645ee196bc873",
+      "database_cleanup": "dropped_after_success"
+    },
+    "webhook-regressions": {
+      "state": "passed",
+      "database": "round4_integrated_webhook_regressions_275d269d",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/ci_webhook_regressions.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/integrated/logs/webhook-regressions.log",
+      "report": null,
+      "harness_sha256": "ec86c09f5e70c8e40d2d6cbda9fe3144cdf3b46aa919987dca2c175d25f332cd",
+      "started": 1794041087.4436362,
+      "exit_code": 0,
+      "finished": 1794041091.521861,
+      "database_cleanup": "dropped_after_success"
+    },
+    "webhook-worker": {
+      "state": "passed",
+      "database": "round4_integrated_webhook_worker_361f3e84",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "python3",
+        "tests/webhook_worker_recovery.py",
+        "--binary",
+        "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+        "--report",
+        "/workspace/scratch/rootyard-round4/integrated/logs/webhook-worker.json"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/integrated/logs/webhook-worker.log",
+      "report": "/workspace/scratch/rootyard-round4/integrated/logs/webhook-worker.json",
+      "harness_sha256": "f3f2cffae85d63660ee285037a1a7a324aa7f9a592260650b29297b63be99bd2",
+      "started": 1794041092.1324315,
+      "exit_code": 0,
+      "finished": 1794041116.8030236,
+      "report_sha256": "86ed9a75f063a6856963989718e8c9384db0fcb0a138470e8879f1d1f008718a",
+      "database_cleanup": "dropped_after_success"
+    },
+    "rust-lib": {
+      "state": "passed",
+      "database": "round4_integrated_rust_lib_46190659",
+      "command": [
+        "/workspace/scratch/deepseek-rootyard/env-run",
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "--",
+        "--test-threads=3"
+      ],
+      "log": "/workspace/scratch/rootyard-round4/integrated/logs/rust-lib.log",
+      "report": null,
+      "harness_sha256": null,
+      "started": 1794041117.3518496,
+      "exit_code": 0,
+      "finished": 1794041162.135485,
+      "database_cleanup": "dropped_after_success"
+    }
+  },
+  "updated": 1794041162.4279025,
+  "stage": "complete",
+  "certificate": {
+    "role": "integrated",
+    "source_commit": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+    "built_commit": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+    "production_inputs_sha256": "8f399a064af9701de018bad5d527cd652767f03131a96affde8582fb6aac0034",
+    "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45",
+    "valid": true,
+    "compiled_source": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+    "binary": "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+    "harness_source_commit": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+    "reused_baseline": false
+  },
+  "binary": "/workspace/scratch/rootyard-round4/integrated/artifacts/4c5bcfe56516434ea5b42985e9af90a8c1efe51f-c0049c3a4a97/rootyard",
+  "binary_sha256": "c0049c3a4a97543cfe95a5deccc80b1404cc3b7f5a3eff2ad54acb9be0de1f45",
+  "source_commit": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+  "compiled_source_commit": "4c5bcfe56516434ea5b42985e9af90a8c1efe51f",
+  "production_inputs_sha256": "8f399a064af9701de018bad5d527cd652767f03131a96affde8582fb6aac0034",
+  "finished": 1794041162.4278996
+}
