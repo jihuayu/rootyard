@@ -362,13 +362,17 @@ pub async fn verify_repo_write_access<C: GenericClient + Sync>(
 ///
 /// The coordinator derives `actor` from the request it already authenticated
 /// and from the admitted operation; a native hook can never supply an identity,
-/// action or digest here. The token row is locked `FOR SHARE` first so grant
-/// writers using the documented `FOR UPDATE` protocol serialize behind native
-/// CAS, and the lock is released only when the owner transaction ends after the
-/// native child is quiescent, durable evidence is settled and the guard dropped.
-/// Repository, role and live-grant checks run after that lock, under a second
-/// statement that observes the real database clock, so a revocation or
-/// narrowing that waited on the lock is still rejected.
+/// action or digest here.
+///
+/// Lock order is exact ref -> repository advisory -> local writer -> token
+/// `FOR SHARE` -> native CAS. When this authorisation takes the `FOR SHARE`
+/// lock before a revocation/narrowing writer arrives, that `FOR UPDATE` writer
+/// waits until the native CAS, journal settlement and guard drop finish. When
+/// the revoker commits first, the second statement below re-reads the live row
+/// with the real database clock after the lock wait and denies the
+/// authorisation, so no grant marker is written and the push is refused.
+/// Repository, role and live-grant checks run after that lock under the same
+/// real-clock re-read.
 pub async fn authorize_publication_window(
     tx: &Transaction<'_>,
     actor: &Identity,

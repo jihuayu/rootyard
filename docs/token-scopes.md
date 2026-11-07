@@ -3,9 +3,12 @@
 > **Status:** the authorisation helpers, the discovery predicates, the common
 > repository/namespace action enforcement and the browser-login rejection are
 > wired in *this* integration branch. Restricted PAT issuance is **not**
-> released: there is no public API, CLI or UI to create or edit grants, the Git
-> CAS parent-token lock is still missing, and exact browser-child inheritance
-> for a restricted parent remains unimplemented. The schema/backup contract is
+> released: there is no public API, CLI or UI to create or edit grants. The Git
+> CAS parent-token lock is now carried by the publication owner's own
+> PostgreSQL transaction (`Coordinator` -> `PublicationWindow::authorize_git_write
+> -> auth::authorize_publication_window`), but its native proof
+> (`tests/pat_git_publication_fence.py`) has not been executed yet, and exact
+> browser-child inheritance for a restricted parent remains unimplemented. The schema/backup contract is
 > now schema 136 / backup format 12 with real SQL-generated fixtures; the native
 > format12 legacy135 restore drill has not been executed yet, so this remains a
 > private integration branch and is not evidence that schema136 is production
@@ -123,12 +126,25 @@ API/CLI/UI is unwired.
 * No public issuer: no API, CLI flag or UI creates or edits restricted grants.
   Seeding restricted authority requires SQL in a test schema. This issue cannot
   be counted complete while that remains true.
-* The late repository scope check (`authorize_repository_late`) takes `FOR SHARE`
-  until commit **only when the caller supplies a real transaction**. A bare
-  auto-commit `GenericClient` — which the Git HTTP publication path still uses —
-  gets only the instantaneous statement check. The parent-token lock held across
-  the Git CAS is therefore still a release blocker for Git-backed writes with
-  restricted tokens; this branch does not claim it.
+* The Git HTTP publication path no longer authorises on a bare auto-commit
+  client. After `enter_window` has the repository advisory lock and the local
+  writer, `Coordinator::start` runs the slow path checks and then sends
+  `WindowRequest::AuthorizeGitWrite` (identity, repository id, storage
+  generation, reply) to the existing publication owner task. That owner locks
+  the admitted token `FOR SHARE` **on its own transaction** — the one already
+  holding the exact-ref and repository advisory locks, so no extra pooled
+  session — and then re-reads the live token/read-only/restricted grants, the
+  repository state/generation and the current effective `Write` role in a
+  second `clock_timestamp()` statement under the held lock. Documented lock
+  order: exact ref -> repository advisory -> local writer -> token `FOR SHARE`
+  -> native CAS. If this check takes the share lock first, a revocation or grant
+  narrowing (`FOR UPDATE`) waits until the native CAS, journal settlement and
+  guard drop finish; if the revoker commits first, this authorisation denies the
+  push. A failed, timed-out or canceled authorisation (closed reply, checked
+  before and after the SQL) makes the owner abandon the transaction, so no
+  `publication.grant` marker and no first ACK can be written. The remaining
+  release blocker is native evidence: the end-to-end Git HTTP fence has not been
+  executed in this task, so this branch does not claim the blocker cleared.
 * `ryj_` CI credentials are independent; scopes cannot grant trusted-check or
   operator identity.
 
@@ -145,6 +161,20 @@ API/CLI/UI is unwired.
   `clock_timestamp()`, and a `FOR UPDATE` grant writer is observed blocked via
   `pg_blocking_pids` until the reader commits. `FOR SHARE` is only meaningful
   because those readers hold a real transaction until commit.
+* `tests/pat_git_publication_fence.py` (`--binary`, `--report`) is the Git-native
+  fence harness for exactly this lock: (A) a revoker session holds `FOR UPDATE`
+  on the push token and the owner's real `FOR SHARE` wait is read from
+  `pg_stat_activity`/`pg_locks`; committing the revocation refuses the push with
+  no ref, outbox event, committed operation or grant marker, and a different
+  valid token then publishes; (B) with the owner already holding the token lock
+  the native Git process group is stopped at the CAS boundary and both
+  `UPDATE tokens SET read_only` and the grant-writer `SELECT ... FOR UPDATE` step
+  fail with SQLSTATE `55P03` under `lock_timeout=100ms`, succeeding only after
+  journal settlement; (C) killing the HTTP client during the wait leaves no
+  publication, the lock re-acquirable and a fresh push working. Restricted
+  authority in case B is SQL-seeded; the public issuer is a separate branch.
+  It has **not been executed** here (no cargo build, no native run in this
+  task).
 * `tests/pat_scope_auth.py` is the native end-to-end harness. It has **not been
   executed** in this branch (no cargo build, no native run): it needs
   `ROOTYARD_TEST_DATABASE_URL` and a built binary. It asserts exact status codes

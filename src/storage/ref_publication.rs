@@ -389,6 +389,11 @@ pub async fn acquire(
                                     // Lock order: exact ref -> repository advisory -> local writer ->
                                     // token FOR SHARE -> native CAS. The token lock stays on this
                                     // transaction until the child is quiescent and the guard drops.
+                                    if reply.is_closed() {
+                                        // The caller canceled before the SQL ran: skip the lock
+                                        // wait and end the transaction instead of granting.
+                                        return Err(unavailable());
+                                    }
                                     if requested != repository_id || storage_generation != generation {
                                         let _ = reply.send(Err(Error(StatusCode::CONFLICT,
                                             "publication identity differs from admitted operation")));
