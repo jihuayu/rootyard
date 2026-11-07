@@ -10,6 +10,7 @@ pub mod sanitize;
 pub mod session;
 pub mod session_gc;
 pub mod templates;
+pub mod tokens;
 
 use crate::AppState;
 use axum::{
@@ -80,5 +81,11 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/ui/repos/{owner}/{name}/pulls/{number}/checks", get(handlers::pull_checks_view))
         .route("/ui/repos/{owner}/{name}/pulls/{number}/merge", post(handlers::merge_pull_web))
         .route("/ui/repos/{owner}/{name}/audit", get(handlers::audit_view))
+        .route("/web/settings/tokens", get(tokens::tokens_page).post(tokens::create_token_web))
+        .route("/web/settings/tokens/{id}/rotate", post(tokens::rotate_token_web))
+        .route("/web/settings/tokens/{id}/revoke", post(tokens::revoke_token_web))
+        .route("/web/settings/tokens/{id}/scope", post(tokens::update_token_web))
+        .route("/web/settings/sessions", get(tokens::sessions_page))
+        .route("/web/settings/sessions/{id}/revoke", post(tokens::revoke_session_web))
         .layer(axum::middleware::from_fn_with_state(state, session::middleware))
 }

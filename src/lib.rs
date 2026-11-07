@@ -42,6 +42,8 @@ pub mod sharding;
 pub mod storage;
 pub mod storage_lifecycle;
 #[rustfmt::skip]
+pub mod token_management;
+#[rustfmt::skip]
 pub mod token_scopes;
 pub mod view_lab;
 pub mod workspace_lab;
@@ -78,6 +80,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(webhooks::routes())
         .merge(members::routes())
         .merge(organizations::routes())
+        .merge(token_management::routes())
         .merge(web::routes(state.clone()))
         .merge(sharding::routes())
         .merge(workspaces::routes())
