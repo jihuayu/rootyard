@@ -1,0 +1,165 @@
+{
+  "schema": "rootyard-source-review-v1",
+  "reviewer": "IndependentDeepSeek",
+  "review_type": "source plus native acceptance review",
+  "scope": {
+    "issues": [
+      33,
+      3,
+      16,
+      19
+    ],
+    "worktree": "/workspace/rootyard-worktrees/round4-webhooks33",
+    "candidate_head": "cff5ddb0e15558c1300d5d8f239df5653f20411a",
+    "base_main": "53e77762a80a2fc28d4d3dcd8ca8c271eb687d47",
+    "production_source_changed": false,
+    "candidate_diff": "tests/webhook_worker_recovery.py (new) and tests/ci_webhook_regressions.py (untrusted-CA negative); no runtime/source edits"
+  },
+  "commits": {
+    "candidate": "cff5ddb0e15558c1300d5d8f239df5653f20411a",
+    "base": "53e77762a80a2fc28d4d3dcd8ca8c271eb687d47",
+    "compiled_source": "cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f",
+    "harness_source_commit": "cff5ddb0e15558c1300d5d8f239df5653f20411a",
+    "compiled_source_is_baseline": true,
+    "harness_is_test_only": true
+  },
+  "artifacts": {
+    "binary": "/workspace/scratch/rootyard-round3/migration-integrated/artifacts/cb8d1b915a3c1e12990c038b7a43e2b7e891ff5f/rootyard",
+    "binary_sha256": "157748addd3ad1cc67e9aa5fc2c60b76b524de4f6a09ae65bedfdea26f17958f",
+    "production_inputs_sha256": "0f865a04763c5be077e15151143554b191f8ad8a84462f6746d045eabea3bc90",
+    "production_file_count": 331,
+    "production_digest_verified_by_reviewer": true,
+    "binary_hash_verified_by_reviewer": true,
+    "harness_sha256": {
+      "tests/ci_webhook_regressions.py": "ec86c09f5e70c8e40d2d6cbda9fe3144cdf3b46aa919987dca2c175d25f332cd",
+      "tests/webhook_worker_recovery.py": "f3f2cffae85d63660ee285037a1a7a324aa7f9a592260650b29297b63be99bd2"
+    },
+    "coordinator_status": "/workspace/scratch/rootyard-round4/webhooks33/coordinator-status.json",
+    "worker_recovery_report_final": "/workspace/scratch/rootyard-round4/webhooks33/logs/worker-recovery.json",
+    "worker_recovery_report_earlier": "/workspace/scratch/rootyard-round4/webhooks33/reports/webhook_worker_recovery.json",
+    "regressions_log": "/workspace/scratch/rootyard-round4/webhooks33/logs/regressions.log",
+    "worker_recovery_log": "/workspace/scratch/rootyard-round4/webhooks33/logs/worker-recovery.log"
+  },
+  "coordinated_rerun": {
+    "state": "passed",
+    "stage": "complete",
+    "jobs": {
+      "regressions": {
+        "state": "passed",
+        "exit_code": 0,
+        "command": "env-run python3 tests/ci_webhook_regressions.py --binary baseline157",
+        "stdout": [
+          "201 event batches: passed",
+          "concurrent claim fence: passed",
+          "verified TLS and plaintext rejection: passed",
+          "untrusted certificate rejected: reqwest transport error and 0 receiver requests"
+        ]
+      },
+      "worker_recovery": {
+        "state": "passed",
+        "exit_code": 0,
+        "command": "env-run python3 tests/webhook_worker_recovery.py --binary baseline157 --report logs/worker-recovery.json",
+        "report_sha256": "75ddfcc95475f313830b1adaf44a9f2fe5c541533b35c649e9c31646df9e7452",
+        "source_head_in_report": "cff5ddb0e15558c1300d5d8f239df5653f20411a"
+      }
+    },
+    "certificate": "main 53e7776, compiled cb8d1b9, binary 157748a, inputs 0f865a0, 331 files, source_equivalence all production paths/digests equal"
+  },
+  "source_findings": {
+    "worker_wiring": "src/main.rs:253-265 spawns rootyard::webhooks::background::worker only when ROOTYARD_OUTBOX_WORKER is true.",
+    "durable_scan": "src/webhooks/background.rs:15-46 scans every 2s, also wakes on local notification, and loops sync_outbox_events until zero so a 200-row LIMIT cannot permanently skip later events.",
+    "pull_repair": "src/webhooks/background.rs:50-72 repair_pull_orchestration selects open PRs missing ci_pull_sync_progress for current version/head/base/storage; on_pull_synchronized is idempotent and writes the progress marker last. The scan also calls sync_pull_events and reconcile_pull_refs.",
+    "outbox_fanout": "src/webhooks/delivery.rs:111-168 selects outbox events only when an active subscribed hook lacks a per-hook delivery, inserts ON CONFLICT(webhook_id,event_id) DO NOTHING, and orders by operation/transaction sequence.",
+    "claim_fence": "src/webhooks/claims.rs:19-51 atomically UPDATEs pending/due-failed/due-leased rows to leased, increments attempts and lease_generation, and sets next_attempt_unix = now + ceil(timeout_ms/1000) + 5. src/webhooks/claims.rs:53-73 completion requires state=leased AND lease_generation=claim generation; mismatch returns current row instead of overwriting.",
+    "retry_lease": "src/webhooks/handlers.rs:416-438 manual retry is conditional on state <> leased OR lease due, else HTTP 409; reset starts a new generation. deliver_now is optional.",
+    "backoff_dead_letter": "src/webhooks/delivery.rs:46-54 and 424-456 use base 2s exponential backoff capped at 300s; attempt >= max_attempts becomes dead_letter; failed/dead_letter rows remain listable through /deliveries.",
+    "pr_pin_and_checks": "src/webhooks/delivery.rs:337-493 creates deterministic pull CI job UUID, immutable refs/rootyard-ci/jobs/{job_id}, ci_runs queued row, forge_check_runs queued row, signed pull_request delivery, then ci_pull_sync_progress. Existing old-head queued/leased runs are cancelled by the head/base/storage predicate.",
+    "tls_ssrf": "src/webhooks/signing.rs:177-242 validates URL, resolves all addresses and rejects any non-permitted peer, pins the selected address with reqwest .resolve, sets redirect Policy::none and no_proxy, uses default roots plus optional ROOTYARD_WEBHOOK_CA_FILE, and sends only HTTPS except loopback HTTP. src/webhooks/models.rs:322-412 blocks private/loopback/non-global targets and permits loopback only for explicit loopback hostnames.",
+    "trust_runs": "src/webhooks/trust.rs binds contexts to an active webhook and requires a current successful ci_run attempt/lease_generation; src/webhooks/runs.rs report requires leased state, exact attempt/lease_generation, live head/base/version, and an unexpired lease, with completed idempotent replay only for identical digest."
+  },
+  "verdicts": {
+    "source_approval": "approved",
+    "native_status": "passed",
+    "issue33": {
+      "closable": true,
+      "confidence": "high",
+      "acceptance": {
+        "stock_git_push_auto_pin_queued_check_delivery": {
+          "status": "passed",
+          "evidence": "worker-recovery case stock_push_updates_open_pull_automatically: pull version 1 to 2, old pin != new OID, new refs/rootyard-ci/jobs/{job}, queued ci_runs/forge_check_runs, receiver pull_request synchronize, zero manual dispatch"
+        },
+        "kill_between_enqueue_send_ack": {
+          "status": "passed",
+          "evidence": "enqueue_boundary_lost_wakeup_recovers: pending row survives hard stop and is delivered after restart without dispatch; ack_boundary case holds a real PostgreSQL row lock after receiver 204, observes the completion UPDATE blocked, SIGKILLs the whole process group, terminates its blocked backend, observes durable leased,1, waits real lease expiry, retries attempt 2 with the same delivery id, terminal delivered"
+        },
+        "automatic_retry_and_dead_letter": {
+          "status": "passed",
+          "evidence": "automatic_backoff_retry_and_dead_letter: first HTTP 500 becomes failed with 2s scheduled backoff, second real-time automatic attempt exhausts at attempt 2 into dead_letter with last_error HTTP 500, observable through /deliveries?state=dead_letter"
+        }
+      },
+      "residual": "See P2-1: post-PR-version-commit repair path is source-inspected but not crash-injected in this run."
+    },
+    "issue3": {
+      "closable": true,
+      "confidence": "high",
+      "evidence": "ci_webhook_regressions creates 201 valid outbox events for one push hook and two manual dispatch calls: first enqueued 200, second enqueued 1, all 201 delivered. Source query selects missing deliveries per hook and background worker loops until zero.",
+      "residual": "Manual regression qualifies the original dispatch bug; >200 automatic worker scanning and multi-hook/new-subscription semantics are not separately runtime-tested (P2-3)."
+    },
+    "issue16": {
+      "closable": true,
+      "confidence": "high",
+      "evidence": "Concurrent two-dispatch regression sends exactly one receiver request and leaves delivered. Source claim/complete uses state=leased plus lease_generation fence, so a stale completion cannot overwrite a newer state. Worker ack test proves real lease expiry and same delivery id retry; retry-overlap test proves manual retry returns 409 while the worker owns a live lease.",
+      "residual": "The exact runtime ordering delivered-then-stale-HTTP-500 is not directly reproduced (P2-2); generation fence is source-verified."
+    },
+    "issue19": {
+      "closable": true,
+      "confidence": "high",
+      "evidence": "Real TLS loopback receiver with leaf issued by test CA and SAN IP 127.0.0.1 is delivered once; the same plaintext receiver addressed as https is not contacted and ends dead_letter; unrelated-CA TLS receiver is rejected with zero HTTP requests. Source uses default roots plus optional private CA, hostname verification through reqwest, explicit redirect Policy::none, no proxy, all-resolved-address SSRF checks, and no HTTPS downgrade.",
+      "residual": "No external/public-CA endpoint, redirect-to-private, or DNS-rebinding runtime case; loopback functional proof plus source inspection only (P2-5)."
+    },
+    "supported_mode": "Native compiled Rust service, disposable PostgreSQL 17, owned loopback HTTP/TLS receivers, real Git push and real process-group SIGKILL. No external endpoint, cloud, hardware, credentials, or production data."
+  },
+  "p1": [],
+  "p2": [
+    {
+      "id": "P2-1",
+      "issue": 33,
+      "type": "runtime fault-injection gap",
+      "summary": "No SIGKILL after the open-PR version/head/base UPDATE commits but before the new pin, queued ci_run/check, pull delivery, and ci_pull_sync_progress marker complete. repair_pull_orchestration exists and the marker is last, and sync_pull_events rescans all open PRs, so the durable guarantee is source-inspected rather than directly demonstrated by a crash in that exact phase.",
+      "impact": "Does not invalidate the three acceptance tests; limits runtime proof of post-commit orchestration repair."
+    },
+    {
+      "id": "P2-2",
+      "issue": 16,
+      "type": "runtime ordering gap",
+      "summary": "No direct two-attempt race where attempt 1 commits delivered and a stale attempt 2 HTTP 500 completion is attempted. The concurrent regression proves only one sender claims; the ack test proves same-id retry after crash. claims::complete generation predicate is the source guarantee that stale results return current instead of overwriting.",
+      "impact": "Generation fence is clear in source; the exact stale-success-vs-failure ordering remains test-residual."
+    },
+    {
+      "id": "P2-3",
+      "issue": 3,
+      "type": "fanout semantics gap",
+      "summary": "The 201-event regression uses one push hook and manual dispatch. It does not runtime-test multiple hooks, per-hook isolation, or a newly created subscription receiving eligible historical outbox events (the implementation defines this behavior via missing-per-hook-delivery selection; no explicit regression asserts it).",
+      "impact": "Original permanent-skip bug is fixed and tested; multi-hook/new-subscription semantics are defined by source but not independently pinned by a test."
+    },
+    {
+      "id": "P2-4",
+      "issue": 33,
+      "type": "assertion-strength gap",
+      "summary": "The backoff case records scheduled_backoff_seconds=2 and receiver attempts [1,2], but the wall-clock lower bound assertion is only >=1.0s rather than >= the scheduled 2s. Observed real dead-letter delays were about 1.90s after the first failed completion.",
+      "impact": "Evidence is consistent with real-time 2s backoff, but the assertion could pass a shorter delay."
+    },
+    {
+      "id": "P2-5",
+      "issue": 19,
+      "type": "runtime negative coverage gap",
+      "summary": "Redirect/DNS-rebinding and private-address resolution are covered by source policy (Policy::none, all-address permitted_peer, pinned resolution) and unit URL tests, not by a native redirect or rebinding receiver in this run. TLS proof is loopback with a local CA, not a public external endpoint.",
+      "impact": "No production defect identified; scope explicitly allows owned loopback functional proof."
+    }
+  ],
+  "limits": [
+    "The final combined round-4 composition is later: browser production source 3cc and new browser binary 37e9/source4eba are independent of this worktree. This approval is valid only for candidate cff5ddb / base 53e7776 / compiled source cb8d1b9 / binary 157748a, and the final combined pipeline must rerun all cases on the actual final browser binary/source.",
+    "ci_webhook_regressions uses manual /webhooks/dispatch and must not be cited as automatic-worker proof; webhook_worker_recovery.py never calls /webhooks/dispatch.",
+    "The earlier reports/webhook_worker_recovery.json records source_head 53e7776 because it predates the test-only commit; the authoritative coordinated rerun logs/worker-recovery.json records source_head cff5ddb. Both have production digest 0f865a0 and 331 files."
+  ]
+}
