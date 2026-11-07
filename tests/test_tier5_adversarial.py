@@ -496,7 +496,19 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
                 r"REFERENCES repositories\(id, owner_id\)", definition,
             ):
                 current_composite.add(constraint["table"])
-        self.assertEqual(current_composite, expected_composite - {"git_operations"})
+        self.assertEqual(current_composite, (expected_composite - {"git_operations"}) | {
+            "storage_maintenance_repo_state", "storage_maintenance_jobs", "storage_maintenance_tombstones",
+        })
+        manifest_constraints = {
+            entry["name"]: entry["definition"].replace("public.", "").replace('"', "")
+            for entry in live["constraints"] if entry["table"] == "pando_manifest_artifacts"
+        }
+        self.assertEqual(
+            manifest_constraints["pando_manifest_artifacts_manifest_identity_fkey"],
+            "FOREIGN KEY (manifest_id, repository_id, tenant_id) "
+            "REFERENCES pando_pack_manifests(id, repository_id, tenant_id) ON DELETE CASCADE",
+        )
+        self.assertNotIn("pando_manifest_artifacts_manifest_id_fkey", manifest_constraints)
         # Comments/reviews inherit tenant+repository identity through their
         # composite issue/PR parent rather than a second direct repository FK.
         for table, parent, number in (
