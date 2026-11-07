@@ -26,6 +26,7 @@ pub mod maintenance;
 #[rustfmt::skip]
 pub mod members;
 pub mod metrics;
+pub mod metrics_workers;
 pub mod namespace_service;
 pub mod observability;
 pub mod organizations;

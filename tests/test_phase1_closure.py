@@ -97,13 +97,17 @@ class TestPhase1CiWorkflowWiring(unittest.TestCase):
         for cmd in expected_commands:
             self.assertIn(cmd, ci_text, f"Missing CI step command in .github/workflows/ci.yml: {cmd}")
 
-        # Pando lab harness must be wired with rootyard-pando-lab and non-root execution (initdb refuses root)
+        # initdb requires non-root. Container jobs switch user; the qualified
+        # plain-host profile executes as runner and verifies its uid at runtime.
         self.assertIn("tests/pando_lab.py", ci_text)
         self.assertIn("rootyard-pando-lab", ci_text)
-        self.assertTrue(
-            "runuser -u postgres" in ci_text or "su -s /bin/bash postgres" in ci_text or "su postgres" in ci_text,
-            "tests/pando_lab.py in ci.yml must run as non-root (postgres) user so initdb/pg_ctl succeed in container",
-        )
+        verify = ci_text.split("\n  container:\n", 1)[0]
+        switches_user = any(command in verify for command in (
+            "runuser -u postgres", "su -s /bin/bash postgres", "su postgres"))
+        host_runner = ("runs-on: ubuntu-22.04" in verify and "container:" not in verify
+                       and 'test "$(id -u)" -ne 0\n          python3 tests/pando_lab.py' in verify)
+        self.assertTrue(switches_user or host_runner,
+                        "Pando initdb must execute with a verified non-root user")
         self.assertIn("/usr/lib/postgresql/17/bin", ci_text)
 
     def test_ci_workflow_wires_design_docs_gate_unit_discovery_and_e2e_tiers(self) -> None:

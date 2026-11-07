@@ -14,6 +14,44 @@ import uuid
 
 from web_sessions import BrowserHarness
 
+# Fixed enumerations mirrored from src/metrics_workers.rs. Database strings are
+# never interpolated into a label: only these constant combinations are legal.
+JOB_KINDS = [
+    ("gitfs", "gitfs_stage_cleanup"),
+    ("gitfs", "gitfs_repack"),
+    ("gitfs", "gitfs_cache_hydrate"),
+    ("gitfs", "gitfs_cache_evict"),
+    ("pando", "pando_repack"),
+    ("pando", "pando_cache_hydrate"),
+    ("pando", "pando_cache_evict"),
+]
+JOB_STATES = ["queued", "due_queued", "retry_delayed", "running", "expired_running_lease", "failed"]
+SCAN_STATES = ["missing_scan", "due_scan", "stale_generation"]
+BACKENDS = ["gitfs", "pando"]
+
+
+def fixed_labels():
+    labels = {
+        'state="provisioning"',
+        'state="ready"',
+        'state="recovering"',
+        'state="pending"',
+        'state="leased"',
+        'outcome="success"',
+        'outcome="failure"',
+        'direction="received"',
+        'direction="sent"',
+    }
+    for backend, kind in JOB_KINDS:
+        for state in JOB_STATES:
+            labels.add(f'backend="{backend}",kind="{kind}",state="{state}"')
+        labels.add(f'backend="{backend}",kind="{kind}"')
+    for backend in BACKENDS:
+        for state in SCAN_STATES:
+            labels.add(f'backend="{backend}",state="{state}"')
+        labels.add(f'backend="{backend}"')
+    return labels
+
 
 class MetricsHarness(BrowserHarness):
     def __init__(self, args):
@@ -42,7 +80,7 @@ class MetricsHarness(BrowserHarness):
         assert headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
         assert headers["cache-control"] == "no-store"
         values = dict(line.split(" ", 1) for line in text.splitlines() if not line.startswith("#"))
-        assert len(values) == 31, values
+        assert len(values) == 91, values
         for name in ("max_size", "size", "available", "busy", "waiting"):
             assert "rootyard_db_pool_" + name in values
         assert "rootyard_error_log_dropped_total" in values
@@ -56,10 +94,33 @@ class MetricsHarness(BrowserHarness):
             assert name in values, (name, sorted(values))
             assert not any(metric.startswith(name + "{") for metric in values), name
             assert float(values[name]) >= 0, (name, values)
+        # Every fixed worker/maintenance series is exported even before any
+        # workspace, job or repository scan exists, so dashboards never drift.
+        for backend, kind in JOB_KINDS:
+            for state in JOB_STATES:
+                series = f'rootyard_storage_maintenance_jobs{{backend="{backend}",kind="{kind}",state="{state}"}}'
+                assert series in values, (series, sorted(values))
+            assert f'rootyard_storage_maintenance_oldest_queued_age_seconds{{backend="{backend}",kind="{kind}"}}' in values
+        for backend in BACKENDS:
+            for state in SCAN_STATES:
+                assert f'rootyard_storage_maintenance_repos{{backend="{backend}",state="{state}"}}' in values
+            assert f'rootyard_storage_maintenance_oldest_overdue_scan_age_seconds{{backend="{backend}"}}' in values
+        for name in ("rootyard_workspace_capture_oldest_age_seconds", "rootyard_workspace_capture_never_sampled",
+                     "rootyard_workspace_lease_expired"):
+            assert name in values, (name, sorted(values))
+            assert not any(metric.startswith(name + "{") for metric in values), name
+            assert float(values[name]) >= 0, (name, values)
         assert self.http("/metrics")[0] != 200, "Metrics leaked onto application listener"
+        allowed = fixed_labels()
         for name, value in values.items():
-            assert re.fullmatch(r"rootyard_[a-z_]+(?:\{(?:state|outcome|direction)=\"(?:ready|recovering|provisioning|pending|leased|success|failure|received|sent)\"\})?", name), name
-            assert float(value) >= 0
+            assert float(value) >= 0, (name, value)
+            if "{" in name:
+                base, label = name.split("{", 1)
+                assert label.endswith("}"), name
+                assert re.fullmatch(r"rootyard_[a-z_]+", base), name
+                assert label[:-1] in allowed, name
+            else:
+                assert re.fullmatch(r"rootyard_[a-z_]+", name), name
         for secret in self.secrets + [self.alice["username"], str(self.root), self.db]:
             assert secret not in text
         return values
@@ -175,7 +236,8 @@ class MetricsHarness(BrowserHarness):
             assert "rootyard_postgres_up 0\n" in text
             for name in ("repositories", "operations_unresolved", "event_deliveries", "event_delivery_oldest",
                          "provisioning", "browser_web_sessions", "browser_tokens",
-                         "expired_browser_session_oldest_age", "expired_browser_token_oldest_age"):
+                         "expired_browser_session_oldest_age", "expired_browser_token_oldest_age",
+                         "workspace_capture", "workspace_lease", "storage_maintenance"):
                 assert "rootyard_" + name not in text
             # The process-local GC counters are retained, not reset or hidden.
             for name in ("rootyard_session_gc_cycles_total", "rootyard_session_gc_session_rows_deleted_total",

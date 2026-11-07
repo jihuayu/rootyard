@@ -1,5 +1,56 @@
 use anyhow::{Context, Result, bail};
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, sync::OnceLock, time::Duration};
+
+const WORKSPACE_UNSAFE_REMOTE_DELETE: &str = "ROOTYARD_WORKSPACE_UNSAFE_REMOTE_DELETE";
+static WORKSPACE_UNSAFE_REMOTE_DELETE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Startup-validated switch for the legacy physical delete of workspace
+/// checkpoint objects. The name is intentionally unsafe: this is not a
+/// substitute for a PITR-aware external delete broker.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkspaceRemoteDeletePolicy {
+    unsafe_remote_delete: bool,
+}
+
+impl WorkspaceRemoteDeletePolicy {
+    pub fn from_env() -> Result<Self> {
+        let value = match env::var(WORKSPACE_UNSAFE_REMOTE_DELETE) {
+            Ok(value) => Some(value),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => bail!("{WORKSPACE_UNSAFE_REMOTE_DELETE} must be true or false"),
+        };
+        Self::from_value(value.as_deref())
+    }
+
+    fn from_value(value: Option<&str>) -> Result<Self> {
+        let unsafe_remote_delete = match value {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(_) => bail!("{WORKSPACE_UNSAFE_REMOTE_DELETE} must be true or false"),
+        };
+        Ok(Self { unsafe_remote_delete })
+    }
+
+    pub fn enabled(self) -> bool {
+        self.unsafe_remote_delete
+    }
+
+    fn install(self) {
+        let _ = WORKSPACE_UNSAFE_REMOTE_DELETE_ENABLED.set(self.unsafe_remote_delete);
+    }
+}
+
+/// Validate the workspace remote-delete switch once, before serving starts.
+/// Invalid values fail startup; a missing value keeps the safe default off.
+pub fn init_workspace_remote_delete_policy() -> Result<()> {
+    WorkspaceRemoteDeletePolicy::from_env()?.install();
+    Ok(())
+}
+
+/// Fail closed until startup installed an explicit unsafe opt-in.
+pub fn workspace_unsafe_remote_delete() -> bool {
+    *WORKSPACE_UNSAFE_REMOTE_DELETE_ENABLED.get().unwrap_or(&false)
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -66,4 +117,26 @@ fn number(name: &str, default: u64) -> Result<u64> {
         bail!("{name} must be positive");
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkspaceRemoteDeletePolicy;
+
+    #[test]
+    fn workspace_remote_delete_defaults_to_disabled() {
+        assert!(!WorkspaceRemoteDeletePolicy::from_value(None).unwrap().enabled());
+        assert!(!WorkspaceRemoteDeletePolicy::from_value(Some("false")).unwrap().enabled());
+    }
+
+    #[test]
+    fn workspace_remote_delete_accepts_only_explicit_true() {
+        assert!(WorkspaceRemoteDeletePolicy::from_value(Some("true")).unwrap().enabled());
+        for invalid in ["", "TRUE", "True", "1", "yes", "on", " true", "true "] {
+            assert!(
+                WorkspaceRemoteDeletePolicy::from_value(Some(invalid)).is_err(),
+                "accepted invalid value {invalid:?}"
+            );
+        }
+    }
 }

@@ -9,14 +9,14 @@ use super::{
     storage::{StagingFileGuard, ensure_repo_lfs_dir, object_path},
     verification,
 };
-use crate::storage::remote_objects::{ObjectKey, RemoteObjectStore, StoredObject};
+use crate::storage::remote_objects::{ObjectKey, RemoteObjectStore, RemoteStoreError, StoredObject};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 use tokio::{sync::watch, time::Instant};
 use uuid::Uuid;
@@ -44,11 +44,54 @@ struct FlightEntry {
     receiver: watch::Receiver<Option<FlightOutcome>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum FlightOutcome {
     Published,
     Missing,
-    Failed(String),
+    /// Carries the typed failure across the shared single-flight result without
+    /// formatting it. Waiters reconstruct a source chain so the central
+    /// classifier can downcast to the finite remote-store error.
+    Failed(Arc<FlightFailure>),
+}
+
+impl std::fmt::Debug for FlightOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never derive over the retained error: its transport source may carry
+        // request details that must not appear in diagnostic text.
+        formatter.write_str(match self {
+            Self::Published => "Published",
+            Self::Missing => "Missing",
+            Self::Failed(_) => "Failed",
+        })
+    }
+}
+
+struct FlightFailure {
+    /// Present only when the underlying cause was the bounded remote-store
+    /// error. It is retained unformatted for classification.
+    remote: Option<RemoteStoreError>,
+}
+
+/// Rebuilds an `anyhow` source chain for a shared flight failure. Display is a
+/// fixed message; only the typed remote error is exposed as the source.
+struct SharedFlightError(Arc<FlightFailure>);
+
+impl std::fmt::Display for SharedFlightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LFS hydration failed")
+    }
+}
+
+impl std::fmt::Debug for SharedFlightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for SharedFlightError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.remote.as_ref().map(|error| error as &(dyn std::error::Error + 'static))
+    }
 }
 
 pub(super) fn remote_store(data_root: &Path) -> Result<Option<RemoteObjectStore>> {
@@ -81,7 +124,7 @@ pub(super) async fn ensure_readable(
     match outcome {
         FlightOutcome::Published => Ok(true),
         FlightOutcome::Missing => Ok(false),
-        FlightOutcome::Failed(message) => Err(anyhow::anyhow!(message)),
+        FlightOutcome::Failed(failure) => Err(anyhow::Error::new(SharedFlightError(failure))),
     }
 }
 
@@ -145,7 +188,12 @@ async fn run_hydration(key: &HydrationKey, deadline: Instant) -> FlightOutcome {
     .await;
     match result {
         Ok(outcome) => outcome,
-        Err(error) => FlightOutcome::Failed(format!("LFS hydration failed: {error:#}")),
+        Err(error) => {
+            // Keep only the bounded typed cause; never flatten error Display
+            // or its transport source into text stored on the shared flight.
+            let remote = error.downcast::<RemoteStoreError>().ok();
+            FlightOutcome::Failed(Arc::new(FlightFailure { remote }))
+        }
     }
 }
 
@@ -239,7 +287,9 @@ pub(super) fn schedule_repair(
         if let Err(error) = result {
             // Observable but intentionally non-fatal: local verified bytes and
             // the paired backup remain authoritative until a later repair.
-            eprintln!("rootyard: deferred LFS remote repair failed: {error:#}");
+            // Fixed text only; never format the error or its source chain.
+            let _ = error;
+            eprintln!("rootyard: deferred LFS remote repair failed");
         }
     });
 }
