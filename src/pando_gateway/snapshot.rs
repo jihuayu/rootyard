@@ -154,11 +154,19 @@ pub async fn materialize(
         run_git(state, snapshot.path(), &["init", "--bare", &format_arg], lease, deadline).await?;
         let store = PackStore::from_env(state.storage.root.join("pando-pack-work"), state.config.git.clone())?;
         let pack_dir = snapshot.path.join("objects/pack");
+        let cache_dir = PackStore::cache_dir(&state.storage.root, repo.id);
         let mut total_bytes = 0u64;
         for pack_id in pack_ids {
             active(lease)?;
             let manifest = lease
-                .guard(Box::pin(store.recover(&state.pool, repo.id, pack_id, &pack_dir, deadline)))
+                .guard(Box::pin(store.recover_cached(
+                    &state.pool,
+                    repo.id,
+                    pack_id,
+                    &pack_dir,
+                    &cache_dir,
+                    deadline,
+                )))
                 .await
                 .map_err(|error| anyhow::anyhow!(error.1))??;
             ensure!(
