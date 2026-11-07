@@ -56,6 +56,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Use the project Python version
+        uses: actions/setup-python@v5
+        with:
+          # Ubuntu 22.04's system Python is 3.10; the acceptance harness targets
+          # the project's 3.12. setup-python prepends its bin directory to PATH
+          # for every later step, and that PATH is handed to the test unchanged.
+          python-version: "3.12"
+
       - name: Install native sandbox toolchain and PostgreSQL 17 clients
         timeout-minutes: 8
         run: |
@@ -85,6 +93,9 @@ jobs:
         timeout-minutes: 20
         run: |
           mkdir -p "$RECEIPT_DIR" "$EVIDENCE_DIR"
+          command -v python3
+          python3 --version
+          python3 --version | grep -Eq '^Python 3\.12\.'
           command -v pg_dump
           pg_dump --version
           pg_dump --version | grep -Eq '^pg_dump \(PostgreSQL\) 17\.'
@@ -147,13 +158,30 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          # The helper writes its own PID into the supervisor leaf, proves
-          # /proc/self/cgroup membership and then execs this command in that
-          # same process. The service and every sandbox job inherit the leaf
-          # while the run root stays free of internal processes. No sudo: the
-          # whole acceptance runs as the ordinary runner account.
-          scripts/native_kernel_cgroup_setup.sh supervisor "$GITHUB_RUN_ID" -- \
-            python3 tests/test_sandbox_cgroup_native.py --receipt "$RECEIPT"
+          # Root places the supervisor only. Moving a GHA job process into a
+          # private subtree is authorised at the nearest common ancestor (the
+          # root cgroup.procs, root-owned), so this one step is privileged; the
+          # helper then drops to the account that owns the private run root with
+          # setpriv and execs the test in the same PID. PATH (PG 17 clients and
+          # Python 3.12) and PYTHONPATH are passed explicitly for that exec.
+          sudo -E env \
+            "PATH=$PATH" \
+            "PYTHONPATH=$PYTHONPATH" \
+            "HOME=$HOME" \
+            "TMPDIR=$TMPDIR" \
+            "ROOTYARD_BINARY=$ROOTYARD_BINARY" \
+            "ROOTYARD_SOURCE_COMMIT=$ROOTYARD_SOURCE_COMMIT" \
+            "ROOTYARD_SANDBOX_MODE=$ROOTYARD_SANDBOX_MODE" \
+            "ROOTYARD_TEST_CGROUP_ROOT=$ROOTYARD_TEST_CGROUP_ROOT" \
+            "ROOTYARD_TEST_TMPFS_ROOT=$ROOTYARD_TEST_TMPFS_ROOT" \
+            "ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES=$ROOTYARD_TEST_ARTIFACTS_POOL_MAX_BYTES" \
+            "ROOTYARD_TEST_DATABASE_URL=$ROOTYARD_TEST_DATABASE_URL" \
+            "ROOTYARD_NATIVE_RECEIPT=$ROOTYARD_NATIVE_RECEIPT" \
+            "ROOTYARD_EVIDENCE_DIR=$ROOTYARD_EVIDENCE_DIR" \
+            "GITHUB_SHA=$GITHUB_SHA" \
+            "GITHUB_RUN_ID=$GITHUB_RUN_ID" \
+            scripts/native_kernel_cgroup_setup.sh supervisor "$GITHUB_RUN_ID" -- \
+              python3 tests/test_sandbox_cgroup_native.py --receipt "$RECEIPT"
 
       - name: Write or validate sanitized native receipt
         if: always()

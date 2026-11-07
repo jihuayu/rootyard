@@ -60,11 +60,19 @@ for it, and `chown`s just the run root, its `cgroup.procs`,
 `cgroup.procs`) to the ordinary runner UID/GID. The supervisor and the service
 then run as that ordinary account, create their own job cgroups and move
 themselves into the supervisor leaf; nothing above the run root is handed over
-and no step runs the service as root. `supervisor <run-id> -- <command>` writes
-its own `$$` into the leaf, proves the `/proc/self/cgroup` path equals the leaf,
-checks that the run root still has no internal processes, and then `exec`s the
-command in that same process, so the service and every sandbox job inherit the
-leaf. A helper that moves a short-lived child and returns leaves the real test
+and no step runs the service as root. Moving a process that starts in the
+runner's own job cgroup into the private run root is authorised by the kernel at
+the nearest common ancestor (the root cgroup's `cgroup.procs`, which stays
+root-owned), so `supervisor <run-id> -- <command>` may be started with root for
+that placement only. It derives the unprivileged owner UID/GID from the private
+run root (and fails if that owner is 0 or does not match `SUDO_UID`), writes its
+own `$$` into the leaf, proves the `/proc/self/cgroup` path equals the leaf,
+checks that the run root still has no internal processes, and then `exec`s
+`setpriv --reuid/--regid --init-groups --no-new-privs --inh-caps=-all
+--ambient-caps=-all -- <command>` in that same PID. The pre-exec root bootstrap
+is placement only; the acceptance, the service and every sandbox job run as the
+ordinary account, and the receipt records the actual `runner.uid`/`groups` of
+the process that executed the assertions. A helper that moves a short-lived child and returns leaves the real test
 process outside the cgroup; the native acceptance preflight rejects that (see
 below). `cgroup.procs` is a pseudo file with `st_size` 0, so every emptiness
 check reads the file content instead of using a size test.
@@ -191,8 +199,9 @@ runs when an operator dispatches it.
   hosted VM or a dedicated ephemeral VM prepared for rootless `bwrap`; AppArmor
   is never weakened on the current managed cloud host, and that host is never
   modified by this repository.
-- Toolchain: `bubblewrap`, `gcc`, `libc6-dev`, `git`, `python3`, `util-linux`
-  plus `postgresql-client-17` installed from the official signed PGDG
+- Toolchain: `bubblewrap`, `gcc`, `libc6-dev`, `git`, `util-linux`,
+  `actions/setup-python@v5` Python 3.12 (Ubuntu 22.04 only ships 3.10) plus
+  `postgresql-client-17` installed from the official signed PGDG
   repository (`apt.postgresql.org`, key
   `/etc/apt/keyrings/postgresql.gpg`, suite `${VERSION_CODENAME}-pgdg`). The
   service is `postgres:17`, so the distributed clients (14/16) are not enough:
@@ -224,16 +233,22 @@ runs when an operator dispatches it.
   logical quota pretending to be the physical bound. The test re-measures the
   mount, records `pool_capacity_bytes_measured` and configures the service with
   the measured value.
-- Test execution (unprivileged): `scripts/native_kernel_cgroup_setup.sh
+- Test execution (unprivileged): `sudo -E env "PATH=$PATH"
+  "PYTHONPATH=$PYTHONPATH" ... scripts/native_kernel_cgroup_setup.sh
   supervisor "$GITHUB_RUN_ID" -- python3 tests/test_sandbox_cgroup_native.py
-  --receipt "$RECEIPT"` runs as the ordinary runner account. The supervisor
-  writes its own PID into the leaf, proves `/proc/self/cgroup` membership and
-  `exec`s the test, so the service, Bubblewrap and every sandbox job are charged
-  to the delegated subtree while the run root stays empty. The earlier
-  dev-mode regression step was removed from this VM lane because the dev
+  --receipt "$RECEIPT"`. Root is used only for the placement move; the helper
+  then drops to the private run root's owner UID/GID with `setpriv` and `exec`s
+  the test in the same PID, so the service, Bubblewrap and every sandbox job are
+  charged to the delegated subtree while the run root stays empty. `PATH`
+  (PG 17 clients, `setup-python` 3.12) and `PYTHONPATH` are passed explicitly to
+  that exec. The helper fails closed if the run root owner is 0, and the test
+  preflight rejects `euid 0` directly, so no root-only mode is claimed. The
+  earlier dev-mode regression step was removed from this VM lane because the dev
   profile is already qualified locally; the native lane must execute the
   production `cgroup` profile, and the receipt validation rejects a passing
-  receipt whose `profile` is not `cgroup` or whose actual `runner.uid` is 0.
+  receipt whose `profile` is not `cgroup` or whose actual `runner.uid` is 0. The
+  global root `cgroup.procs` and the parent runner cgroup are never chowned or
+  written to work around placement.
 - Database: one fresh database per dispatch
   (`rootyard_native_cgroup_<run_id>_<run_attempt>`), created and dropped with
   the PostgreSQL 17 client. Schemas are not shared with any other script.

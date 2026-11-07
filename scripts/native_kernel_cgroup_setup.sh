@@ -14,8 +14,14 @@
 #
 # `setup` also hands only the run root and its supervisor leaf to an
 # unprivileged runner account (chown of the run root, cgroup.procs,
-# cgroup.subtree_control and the supervisor leaf). The supervisor and the
-# production service then run as that ordinary account, not as root.
+# cgroup.subtree_control and the supervisor leaf). The supervisor may be started
+# with root only to *place* itself: kernel permission for the move is checked at
+# the nearest common ancestor of the source and destination cgroup (the root
+# cgroup's cgroup.procs), which stays root-owned and is never chowned. After the
+# placement and membership proof the supervisor drops to the account that owns
+# the private run root with setpriv --reuid/--regid/--init-groups and execs the
+# test in that same PID. It fails closed if that owner is uid 0: acceptance is
+# never executed as root.
 #
 # Cleanup only removes /sys/fs/cgroup/rootyard-native-<run-id> and only signals
 # processes charged to that run-specific subtree (cgroup.kill is recursive
@@ -132,6 +138,27 @@ supervisor)
     [ "$#" -ge 1 ] && [ "$1" = "--" ] || usage
     shift
     [ "$#" -ge 1 ] || usage
+    # Placement is the only privileged step. The private run root was chowned to
+    # the runner during setup; the parent/root cgroup.procs stays root-owned and
+    # is never touched by this helper.
+    drop=""
+    if [ "$(id -u)" = 0 ]; then
+        owner_uid=$(stat -c %u "$run")
+        owner_gid=$(stat -c %g "$run")
+        case "$owner_uid$owner_gid" in
+            ''|*[!0-9]*) echo "cannot derive delegated owner of $run" >&2; exit 1 ;;
+        esac
+        if [ "$owner_uid" = 0 ]; then
+            echo "run root $run is not delegated to an unprivileged account; refusing to run acceptance as root" >&2
+            exit 1
+        fi
+        if [ -n "${SUDO_UID:-}" ] && [ "$SUDO_UID" != "$owner_uid" ]; then
+            echo "SUDO_UID $SUDO_UID does not own delegated run root (owner $owner_uid)" >&2
+            exit 1
+        fi
+        drop="setpriv --reuid=$owner_uid --regid=$owner_gid --init-groups --no-new-privs --inh-caps=-all --ambient-caps=-all --"
+        echo "placing supervisor as root, then dropping to $owner_uid:$owner_gid" >&2
+    fi
     printf '%s' "$$" >"$leaf/cgroup.procs"
     grep -qx "$$" "$leaf/cgroup.procs" || {
         echo "failed to move supervisor $$ into the delegated leaf" >&2
@@ -151,6 +178,12 @@ supervisor)
         exit 1
     fi
     echo "supervisor $$ in $self" >&2
+    # setpriv execs in place, so the PID that was proven to be charged to the
+    # leaf is the PID that runs the acceptance test as the unprivileged owner.
+    if [ -n "$drop" ]; then
+        # shellcheck disable=SC2086
+        exec $drop "$@"
+    fi
     exec "$@"
     ;;
 cleanup)

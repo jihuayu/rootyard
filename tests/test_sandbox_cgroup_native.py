@@ -134,6 +134,12 @@ def preflight():
     if not base:
         data["reason"] = "ROOTYARD_TEST_CGROUP_ROOT is not set"
         return False, data
+    if os.geteuid() == 0:
+        # Direct runtime proof, not a PID flag: the assertions must run as an
+        # unprivileged account after the supervisor's setpriv drop.
+        data["preflight_status"] = "failed"
+        data["reason"] = "native acceptance must run as the unprivileged delegated owner, not euid 0"
+        return False, data
     path = Path(base)
     data["exists"] = path.is_dir()
     if not data["exists"]:
