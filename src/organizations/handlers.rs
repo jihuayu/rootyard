@@ -63,7 +63,8 @@ pub async fn transfer_ownership(
     }
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin).await?;
+    auth::authorize_repo_with_role(&tx, &actor, &owner, &name, Role::Admin, crate::token_scopes::RepoAction::RepoAdmin)
+        .await?;
     auth::finish_tx(tx, &actor, true).await?;
     Err(Error(StatusCode::CONFLICT, "repository ownership transfer is unsupported"))
 }

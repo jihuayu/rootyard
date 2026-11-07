@@ -66,7 +66,8 @@ pub async fn get(
     Path(id): Path<Uuid>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<Value>, Error> {
-    let ws = service::authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?;
+    let ws =
+        service::authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?;
     let repo = service::workspace_repo(&state, id);
     let rel = safe_path(&query.path)?;
     let raw = match query.view.as_deref().unwrap_or("working") {

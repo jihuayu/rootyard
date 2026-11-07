@@ -60,11 +60,15 @@ async fn transfer_authorized(
             &state.pool,
             user,
             repo.id,
-            if write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead },
+            if write {
+                crate::token_scopes::RepoAction::ContentsWrite
+            } else {
+                crate::token_scopes::RepoAction::ContentsRead
+            },
             if write { auth::Role::Write } else { auth::Role::Read },
         )
         .await
-            .map_err(|_| io::Error::other("Git authority revoked"))
+        .map_err(|_| io::Error::other("Git authority revoked"))
     }
 }
 
@@ -154,7 +158,11 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
             owner,
             name,
             if write { auth::Role::Write } else { auth::Role::Read },
-            if write { crate::token_scopes::RepoAction::ContentsWrite } else { crate::token_scopes::RepoAction::ContentsRead },
+            if write {
+                crate::token_scopes::RepoAction::ContentsWrite
+            } else {
+                crate::token_scopes::RepoAction::ContentsRead
+            },
         )
         .await
         .map_err(|error| {

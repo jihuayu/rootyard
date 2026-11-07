@@ -25,7 +25,8 @@ pub async fn list(
     Path(id): Path<Uuid>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<Value>, Error> {
-    let ws = service::authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?;
+    let ws =
+        service::authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?;
     let after = query.after_revision.unwrap_or(0);
     if after < 0 || after > ws.revision {
         return Err(Error::bad_request());
@@ -45,7 +46,8 @@ pub async fn stream(
     Path(id): Path<Uuid>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, Error> {
-    let ws = service::authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?;
+    let ws =
+        service::authorized(&state, &headers, id, Role::Read, crate::token_scopes::RepoAction::WorkspacesRead).await?;
     let mut after = query.after_revision.unwrap_or(0);
     if after < 0 || after > ws.revision {
         return Err(Error::bad_request());

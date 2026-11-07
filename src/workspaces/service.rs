@@ -134,7 +134,8 @@ pub async fn lease(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let ws = locked_inner(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite, false).await?;
+    let ws =
+        locked_inner(&tx, &actor, id, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite, false).await?;
     if ws.lease_epoch != input.expected_lease_epoch {
         return Err(conflict());
     }
@@ -263,7 +264,15 @@ pub async fn create(
     ));
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo = auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
+    let repo = auth::authorize_repo_with_role(
+        &tx,
+        &actor,
+        &input.owner,
+        &input.repository,
+        Role::Write,
+        crate::token_scopes::RepoAction::WorkspacesWrite,
+    )
+    .await?;
     creation_lock(&tx, actor.id, &key).await?;
     if let Some(row) = tx.query_opt("SELECT request_sha256,workspace_id FROM workspace_creations WHERE actor_id=$1 AND idempotency_key=$2 FOR UPDATE", &[&actor.id,&key]).await.map_err(Error::internal)? {
         let existing: String = row.get(0);
@@ -282,7 +291,15 @@ pub async fn create(
         .await
         .map_err(|_| Error::timeout())?;
     source_lease.ensure_active()?;
-    let refreshed = auth::authorize_repo_with_role(&tx, &actor, &input.owner, &input.repository, Role::Write, crate::token_scopes::RepoAction::WorkspacesWrite).await?;
+    let refreshed = auth::authorize_repo_with_role(
+        &tx,
+        &actor,
+        &input.owner,
+        &input.repository,
+        Role::Write,
+        crate::token_scopes::RepoAction::WorkspacesWrite,
+    )
+    .await?;
     if refreshed.repo_id != repo.repo_id {
         return Err(Error::not_found());
     }

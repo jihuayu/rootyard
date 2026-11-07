@@ -46,17 +46,11 @@ fn credentials(headers: &HeaderMap) -> Result<(Option<String>, String), Error> {
     credentials_for(headers, "ryt_")
 }
 
-pub(crate) fn credentials_for(
-    headers: &HeaderMap,
-    prefix: &str,
-) -> Result<(Option<String>, String), Error> {
+pub(crate) fn credentials_for(headers: &HeaderMap, prefix: &str) -> Result<(Option<String>, String), Error> {
     if headers.get_all(header::AUTHORIZATION).iter().count() != 1 {
         return Err(Error::unauthorized());
     }
-    let raw = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(Error::unauthorized)?;
+    let raw = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or_else(Error::unauthorized)?;
     if raw.len() > 512 {
         return Err(Error::unauthorized());
     }
@@ -64,30 +58,21 @@ pub(crate) fn credentials_for(
     let (user, token) = if scheme.eq_ignore_ascii_case("bearer") {
         (None, value.to_owned())
     } else if scheme.eq_ignore_ascii_case("basic") {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(value)
-            .map_err(|_| Error::unauthorized())?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(value).map_err(|_| Error::unauthorized())?;
         let pair = String::from_utf8(bytes).map_err(|_| Error::unauthorized())?;
         let (user, token) = pair.split_once(':').ok_or_else(Error::unauthorized)?;
         (Some(user.to_owned()), token.to_owned())
     } else {
         return Err(Error::unauthorized());
     };
-    if token.len() != 68
-        || !token.starts_with(prefix)
-        || !token[4..].bytes().all(|b| b.is_ascii_hexdigit())
-    {
+    if token.len() != 68 || !token.starts_with(prefix) || !token[4..].bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::unauthorized());
     }
     Ok((user, token))
 }
 
 pub fn writable(identity: &Identity) -> Result<(), Error> {
-    if identity.read_only {
-        Err(Error(StatusCode::FORBIDDEN, "write permission required"))
-    } else {
-        Ok(())
-    }
+    if identity.read_only { Err(Error(StatusCode::FORBIDDEN, "write permission required")) } else { Ok(()) }
 }
 
 // Keys are opaque client operation identifiers, never authentication credentials.
@@ -102,9 +87,7 @@ pub fn idempotency_key(headers: &HeaderMap) -> Result<Option<&str>, Error> {
     }
     let key = value.to_str().map_err(|_| Error::bad_request())?;
     if !(1..=128).contains(&key.len())
-        || !key
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b':' | b'-'))
+        || !key.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b':' | b'-'))
     {
         return Err(Error::bad_request());
     }
@@ -171,11 +154,7 @@ pub async fn authorize_repo_with_role(
     )
     .await
     .map_err(scope_error)?;
-    Ok(RepoAccess {
-        repo_id,
-        owner_id,
-        role: effective_role,
-    })
+    Ok(RepoAccess { repo_id, owner_id, role: effective_role })
 }
 
 fn scope_error(denial: crate::token_scopes::ScopeDenial) -> Error {
@@ -184,9 +163,7 @@ fn scope_error(denial: crate::token_scopes::ScopeDenial) -> Error {
         crate::token_scopes::ScopeDenial::Forbidden => {
             Error(StatusCode::FORBIDDEN, "token scope does not permit this action")
         }
-        crate::token_scopes::ScopeDenial::Unavailable => {
-            Error::internal("token scope store unavailable")
-        }
+        crate::token_scopes::ScopeDenial::Unavailable => Error::internal("token scope store unavailable"),
     }
 }
 
@@ -238,10 +215,7 @@ pub async fn authorize_namespace_action(
 /// Refuse repository/organisation creation for restricted tokens until an
 /// explicit create scope exists. Legacy unrestricted tokens keep their
 /// historical behaviour; no other repository grant is treated as create.
-pub async fn reject_restricted_create(
-    tx: &Transaction<'_>,
-    actor: &Identity,
-) -> Result<(), Error> {
+pub async fn reject_restricted_create(tx: &Transaction<'_>, actor: &Identity) -> Result<(), Error> {
     let restricted = token_is_restricted(tx, actor).await?;
     if restricted {
         return Err(Error(
@@ -268,11 +242,7 @@ pub async fn token_is_restricted(tx: &Transaction<'_>, actor: &Identity) -> Resu
     Ok(row.get(0))
 }
 
-pub async fn verify_token(
-    tx: &Transaction<'_>,
-    actor: &Identity,
-    write: bool,
-) -> Result<(), Error> {
+pub async fn verify_token(tx: &Transaction<'_>, actor: &Identity, write: bool) -> Result<(), Error> {
     // A separate statement observes the real database clock *after* lock waits.
     let row = tx.query_opt(
         "SELECT t.read_only FROM tokens t WHERE t.id=$1 AND t.user_id=$2 AND t.digest=$3 AND NOT t.revoked AND (t.expires_at IS NULL OR t.expires_at > clock_timestamp()) AND (t.kind='api' OR ($4 AND t.kind='browser' AND EXISTS (SELECT 1 FROM web_sessions s WHERE s.token_id=t.id AND NOT s.revoked AND s.expires_at>clock_timestamp())))",
@@ -298,10 +268,7 @@ pub async fn verify_active(
     let tx = client.transaction().await.map_err(Error::internal)?;
     verify_token(&tx, actor, action.is_mutating()).await?;
     let row = tx
-        .query_opt(
-            "SELECT owner_id, state FROM repositories WHERE id=$1",
-            &[&repo_id],
-        )
+        .query_opt("SELECT owner_id, state FROM repositories WHERE id=$1", &[&repo_id])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
@@ -310,8 +277,7 @@ pub async fn verify_active(
     if state != "ready" {
         return Err(Error(StatusCode::CONFLICT, "repository is not ready"));
     }
-    let Some((eff, _, _)) =
-        crate::members::rbac::resolve_effective_role(&*tx, repo_id, owner_id, actor.id).await?
+    let Some((eff, _, _)) = crate::members::rbac::resolve_effective_role(&*tx, repo_id, owner_id, actor.id).await?
     else {
         return Err(Error::not_found());
     };
@@ -336,7 +302,6 @@ pub async fn finish_tx(tx: Transaction<'_>, actor: &Identity, write: bool) -> Re
     verify_token(&tx, actor, write).await?;
     tx.commit().await.map_err(Error::internal)
 }
-
 
 /// Re-verify the exact token, repository generation/state and effective write
 /// role for an already authenticated identity. Native receive hooks and the
@@ -366,10 +331,7 @@ pub async fn verify_repo_write_access<C: GenericClient + Sync>(
         return Err(Error(StatusCode::FORBIDDEN, "write permission required"));
     }
     let repo = client
-        .query_opt(
-            "SELECT owner_id,state FROM repositories WHERE id=$1",
-            &[&repo_id],
-        )
+        .query_opt("SELECT owner_id,state FROM repositories WHERE id=$1", &[&repo_id])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;

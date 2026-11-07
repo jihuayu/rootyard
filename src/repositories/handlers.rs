@@ -176,9 +176,7 @@ pub(super) async fn list_repos(
             .await
             .map_err(Error::internal)?
     } else {
-        tx.query(&sql, &[&identity.id, &cursor.0, &cursor.1, &cursor.2, &(limit + 1)])
-            .await
-            .map_err(Error::internal)?
+        tx.query(&sql, &[&identity.id, &cursor.0, &cursor.1, &cursor.2, &(limit + 1)]).await.map_err(Error::internal)?
     };
     auth::finish_tx(tx, &identity, false).await?;
     let more = rows.len() > limit as usize;
@@ -239,8 +237,7 @@ pub(super) async fn get_repo(
             .get("id");
         // Personal ownership bypasses the member-role lookup, never the token
         // scope gate: a restricted token still needs its exact repo grant.
-        auth::authorize_repo_action_by_id(&tx, &identity, repo_id, crate::token_scopes::RepoAction::RepoRead)
-            .await?;
+        auth::authorize_repo_action_by_id(&tx, &identity, repo_id, crate::token_scopes::RepoAction::RepoRead).await?;
         repo_id
     } else {
         auth::authorize_repo_with_role(

@@ -107,11 +107,27 @@ pub async fn create(
     let actor = auth::authenticate(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let access = auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
+    let access = auth::authorize_repo_with_role(
+        &tx,
+        &actor,
+        &mount.owner,
+        &mount.repository,
+        Role::Read,
+        crate::token_scopes::RepoAction::ContentsRead,
+    )
+    .await?;
     let source_lease =
         read_leases::shared(&state.pool, access.repo_id, tokio::time::Instant::now() + state.config.git_timeout)
             .await?;
-    let refreshed = auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Read, crate::token_scopes::RepoAction::ContentsRead).await?;
+    let refreshed = auth::authorize_repo_with_role(
+        &tx,
+        &actor,
+        &mount.owner,
+        &mount.repository,
+        Role::Read,
+        crate::token_scopes::RepoAction::ContentsRead,
+    )
+    .await?;
     if refreshed.repo_id != access.repo_id {
         return Err(Error::not_found());
     }

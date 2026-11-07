@@ -111,7 +111,15 @@ pub async fn create(
     let mut targets = HashSet::new();
     for (ordinal, step) in input.steps.iter().enumerate() {
         let mount = ns.mounts.iter().find(|m| m.path == step.mount_path).ok_or_else(Error::not_found)?;
-        let access = auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
+        let access = auth::authorize_repo_with_role(
+            &tx,
+            &actor,
+            &mount.owner,
+            &mount.repository,
+            Role::Write,
+            crate::token_scopes::RepoAction::ContentsWrite,
+        )
+        .await?;
         if !targets.insert((access.repo_id, step.ref_name.as_str())) {
             return Err(Error::bad_request());
         }
@@ -130,8 +138,15 @@ pub async fn create(
             .await
             .map_err(|_| Error::timeout())?;
         source_lease.ensure_active()?;
-        let refreshed =
-            auth::authorize_repo_with_role(&tx, &actor, &mount.owner, &mount.repository, Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
+        let refreshed = auth::authorize_repo_with_role(
+            &tx,
+            &actor,
+            &mount.owner,
+            &mount.repository,
+            Role::Write,
+            crate::token_scopes::RepoAction::ContentsWrite,
+        )
+        .await?;
         if refreshed.repo_id != access.repo_id {
             return Err(Error::not_found());
         }
@@ -171,7 +186,15 @@ pub async fn review(
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     for step in &cs.steps {
-        let access = auth::authorize_repo_with_role(&tx, &actor, &step.owner, &step.repository, Role::Maintain, crate::token_scopes::RepoAction::ContentsWrite).await?;
+        let access = auth::authorize_repo_with_role(
+            &tx,
+            &actor,
+            &step.owner,
+            &step.repository,
+            Role::Maintain,
+            crate::token_scopes::RepoAction::ContentsWrite,
+        )
+        .await?;
         if access.repo_id != step.repository_id {
             return Err(Error::not_found());
         }
@@ -222,7 +245,15 @@ async fn run(state: Arc<AppState>, headers: HeaderMap, id: Uuid, recovery: bool)
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     for step in &cs.steps {
-        let access = auth::authorize_repo_with_role(&tx, &actor, &step.owner, &step.repository, Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
+        let access = auth::authorize_repo_with_role(
+            &tx,
+            &actor,
+            &step.owner,
+            &step.repository,
+            Role::Write,
+            crate::token_scopes::RepoAction::ContentsWrite,
+        )
+        .await?;
         if access.repo_id != step.repository_id {
             return Err(Error::not_found());
         }
@@ -273,7 +304,14 @@ async fn run(state: Arc<AppState>, headers: HeaderMap, id: Uuid, recovery: bool)
                 .await
                 .map_err(|_| Error::timeout())?;
         source_lease.ensure_active()?;
-        auth::verify_active(&state.pool, &actor, step.repository_id, crate::token_scopes::RepoAction::ContentsWrite, Role::Write).await?;
+        auth::verify_active(
+            &state.pool,
+            &actor,
+            step.repository_id,
+            crate::token_scopes::RepoAction::ContentsWrite,
+            Role::Write,
+        )
+        .await?;
         let repo = state.storage.verify_path(step.repository_id).map_err(Error::internal)?;
         let mut git = state.storage.git(&state.config);
         git.arg("--git-dir").arg(&repo).args(["rev-parse", "--verify", &step.ref_name]);

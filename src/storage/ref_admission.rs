@@ -152,7 +152,15 @@ pub async fn admit(
     if row.get::<_, i64>(0) != generation || row.get::<_, String>(1) != "ready" {
         return Err(conflict("repository generation or state changed during ref admission"));
     }
-    auth::verify_repo_write_access(&*tx, actor.id, actor.token_id, repository_id, auth::web_scope_enabled(), crate::token_scopes::RepoAction::ContentsWrite).await?;
+    auth::verify_repo_write_access(
+        &*tx,
+        actor.id,
+        actor.token_id,
+        repository_id,
+        auth::web_scope_enabled(),
+        crate::token_scopes::RepoAction::ContentsWrite,
+    )
+    .await?;
     let writer_id = Uuid::new_v4();
     let node_id = crate::sharding::transport::node_id()?;
     tx.execute(
@@ -285,9 +293,16 @@ pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
             anyhow::bail!("ref admission writer is not the current repository primary");
         }
     }
-    auth::verify_repo_write_access(tx, actor_id, token_id, repository_id, false, crate::token_scopes::RepoAction::ContentsWrite)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.1))?;
+    auth::verify_repo_write_access(
+        tx,
+        actor_id,
+        token_id,
+        repository_id,
+        false,
+        crate::token_scopes::RepoAction::ContentsWrite,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.1))?;
     let terminal = match outcome {
         "no_ref_changes" => State::Aborted,
         _ => State::Committed,
@@ -466,9 +481,16 @@ pub async fn ensure_hook_admitted<C: tokio_postgres::GenericClient + Sync>(
     if actor_id != operation.actor_id || token_id != operation.token_id {
         anyhow::bail!("native ref admission identity changed");
     }
-    auth::verify_repo_write_access(client, actor_id, token_id, operation.repository_id, false, crate::token_scopes::RepoAction::ContentsWrite)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.1))?;
+    auth::verify_repo_write_access(
+        client,
+        actor_id,
+        token_id,
+        operation.repository_id,
+        false,
+        crate::token_scopes::RepoAction::ContentsWrite,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.1))?;
     Ok(())
 }
 

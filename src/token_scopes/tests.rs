@@ -62,7 +62,6 @@ async fn grant_namespace_for_test(
     Ok(())
 }
 
-
 mod tests {
     use super::*;
 
