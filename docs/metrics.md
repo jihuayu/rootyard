@@ -99,3 +99,9 @@ positive `busy`/`waiting` gauges and full capacity recovery after unlock.
 ```
 ROOTYARD_TEST_DATABASE_URL=postgresql://... python3 tests/pool_metrics.py --binary target/debug/rootyard --report pool-metrics-report.json
 ```
+
+Deadpool 0.13.1 reports approximate pool snapshots under concurrent load.
+`size` counts tracked established pool objects, excluding creation in progress;
+it is not a live-socket probe. `available` and `waiting` are derived from pool
+users, so `waiting` can include connection creation. `busy = size - available`
+is a derived observation, not a coherent transaction across these counters.

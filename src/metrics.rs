@@ -161,25 +161,25 @@ fn render(
     gauge(
         &mut output,
         "rootyard_db_pool_size",
-        "Physical PostgreSQL pool connections currently established.",
+        "Tracked established pool objects; excludes connection creation and is not a socket liveness probe.",
         pool.size,
     );
     gauge(
         &mut output,
         "rootyard_db_pool_available",
-        "Idle PostgreSQL pool connections ready for immediate checkout.",
+        "Approximate idle pool objects reported by Deadpool before this scrape.",
         pool.available,
     );
     gauge(
         &mut output,
         "rootyard_db_pool_busy",
-        "PostgreSQL pool connections checked out by callers (size minus available).",
+        "Approximate checked-out pool objects (tracked size minus reported available).",
         pool.size.saturating_sub(pool.available),
     );
     gauge(
         &mut output,
         "rootyard_db_pool_waiting",
-        "Callers waiting for a PostgreSQL pool connection when the scrape started.",
+        "Estimated excess pool users; can include callers waiting for connection creation.",
         pool.waiting,
     );
     output.push_str("# HELP rootyard_git_transfers_total Completed Git HTTP transfers by transport outcome.\n# TYPE rootyard_git_transfers_total counter\n");

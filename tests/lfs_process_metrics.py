@@ -1,5 +1,5 @@
 """Coordinator-owned real process metrics; no product implementation or secret output."""
-import argparse, concurrent.futures, hashlib, json, math, os, statistics, sys, threading, time, urllib.parse
+import argparse, concurrent.futures, hashlib, json, math, os, statistics, sys, threading, time, socket, urllib.parse, urllib.request, urllib.error
 from collections import Counter
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -11,6 +11,23 @@ assert e.scheme == 'http' and e.hostname in ('127.0.0.1', 'localhost', '::1'), '
 proxy=S3ControlProxy(e.hostname,e.port);proxy.start()
 h=LfsHarness(argparse.Namespace(binary=str(Path(a.binary).resolve()),keep=False))
 h.env.update(ROOTYARD_OBJECT_STORE_ENDPOINT=f'http://127.0.0.1:{proxy.port}',ROOTYARD_OUTBOX_WORKER='false')
+with socket.socket() as metrics_socket:
+ metrics_socket.bind(('127.0.0.1',0)); metrics_port=metrics_socket.getsockname()[1]
+h.env['ROOTYARD_METRICS_BIND']=f'127.0.0.1:{metrics_port}'
+def pool_sample():
+ requested=time.monotonic()
+ try:
+  response=urllib.request.urlopen(f'http://127.0.0.1:{metrics_port}/metrics',timeout=6)
+ except urllib.error.HTTPError as error:
+  response=error
+ with response:
+  body=response.read().decode()
+ values={}
+ for line in body.splitlines():
+  if line.startswith('rootyard_db_pool_'):
+   key,value=line.split(); values[key]=int(value)
+ return {'requested_monotonic':requested,'completed_monotonic':time.monotonic(),'values':values}
+
 hz=os.sysconf('SC_CLK_TCK')
 db_port=urllib.parse.urlsplit(h.base_db).port or 5432
 def snap():
@@ -44,7 +61,7 @@ def measure(label,n,waves):
     ps=ports()
     if ps:
      value=h.sql("SELECT count(*) || '|' || count(*) FILTER(WHERE state='active') FROM pg_stat_activity WHERE application_name='rootyard' AND client_port IN ("+','.join(map(str,ps))+")")
-     total,active=map(int,value.split('|')); samples.append({'monotonic':time.monotonic(),'connections':total,'active_sql':active})
+     total,active=map(int,value.split('|')); samples.append({'monotonic':time.monotonic(),'connections':total,'active_sql':active,'pool_status':pool_sample()})
    except Exception as exc:errors.append(type(exc).__name__)
    stopped.wait(.1)
  t=threading.Thread(target=sampler,daemon=True);t.start();before=snap();counts=count();started=time.monotonic();times=[]
@@ -74,6 +91,6 @@ try:
   results.append(measure('warm_batch_get',clients,max(2,32//clients)))
   final.unlink();results.append(measure('remote_cold_batch_get',clients,1))
  assert not proxy.errors,proxy.errors
- report={'binary_sha256':hashlib.sha256(Path(a.binary).read_bytes()).hexdigest(),'object_bytes':size,'results':results,'scope':'Actual native Rust service / configured PostgreSQL and owned S3-compatible fixture through counting proxy, one host, random8MiB object; endpoints and tokens excluded.','limitations':['Debug build; timings under shared host load, no production throughput/SLA inference. Small cold samples give empirical order statistics only.','rchar counts all process read syscalls; read_bytes/write_bytes kernel storage accounting can be zero due pagecache; no direct disk device busy measurement.','PostgreSQL samples match service-owned TCP client ports: active_sql counts executing/waiting SQL, total counts physical pooled connections. Checked-out idle clients/pool waiter counts are not directly instrumented; these are not exact busy pool occupancy.','CPU ticks are service process CPU including internal worker threads; excludes PostgreSQL/Garage CPU.']}
+ report={'binary_sha256':hashlib.sha256(Path(a.binary).read_bytes()).hexdigest(),'object_bytes':size,'results':results,'scope':'Actual native Rust service / configured PostgreSQL and owned S3-compatible fixture through counting proxy, one host, random8MiB object; endpoints and tokens excluded.','limitations':['Debug build; timings under shared host load, no production throughput/SLA inference. Small cold samples give empirical order statistics only.','rchar counts all process read syscalls; read_bytes/write_bytes kernel storage accounting can be zero due pagecache; no direct disk device busy measurement.','PostgreSQL active_sql/connection samples match service-owned TCP client ports. pool_status contains the private metrics listener pre-scrape Deadpool counters when available; older binaries return an empty values map. These are approximate concurrent snapshots, not a coherent live-socket or exact queue probe. The sampler itself issues a bounded database metrics snapshot, adding a small observer workload.','CPU ticks are service process CPU including internal worker threads; excludes PostgreSQL/Garage CPU.']}
  Path(a.report).write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps({'binary_sha256':report['binary_sha256'],'phases':len(results),'report':a.report}),flush=True)
 finally:h.cleanup();proxy.stop()
