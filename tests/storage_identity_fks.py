@@ -149,9 +149,13 @@ class IdentityHarness(Harness):
             "END\n"
             "$$"
         )
-        raw = self.sql("SELECT constraint_name || '|' || sqlstate FROM schema134_probe")
+        raw = self.sql(
+            "SELECT COALESCE(constraint_name,'-') || '|' || COALESCE(sqlstate,'-') "
+            "FROM schema134_probe"
+        )
         assert raw, "statement was accepted but should violate " + expected_constraint
         observed, state = raw.split("|", 1)
+        # A syntax error or another error class is not an FK proof.
         assert state == "23503", (observed, state, expected_constraint)
         assert observed == expected_constraint, (observed, expected_constraint)
         return {"sqlstate": state, "constraint": observed}
