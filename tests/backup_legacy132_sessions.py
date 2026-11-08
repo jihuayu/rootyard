@@ -78,6 +78,12 @@ SCHEMA139_CORE_TABLES = ("ref_store_core_gates", "ref_store_core_refs",
                          "ref_store_core_events")
 SCHEMA139_CORE_TRIGGER = "ref_store_core_event_immutable"
 SCHEMA139_CORE_TRIGGER_FUNCTION = "rootyard_ref_store_core_event_immutable"
+# schema142 adds the one-way metadata_only -> pack_verified gate fence. A
+# genuine historical producer keeps its frozen source schema, but the
+# current reviewed restore target is schema142 and legitimately carries
+# both the immutable-event trigger and this mode fence.
+SCHEMA142_CORE_TRIGGER = "ref_store_core_gate_pack_mode_fence"
+SCHEMA142_CORE_TRIGGER_FUNCTION = "rootyard_ref_store_core_gate_pack_mode_fence"
 
 SCHEMA134_FOREIGN_KEYS = (
     "pando_manifest_artifacts_manifest_identity_fkey",
@@ -534,10 +540,22 @@ class LegacyArchiveHarness(BackupHarness):
             "JOIN pg_proc p ON p.oid=t.tgfoid WHERE n.nspname='public' "
             "AND NOT t.tgisinternal AND c.relname IN ('" +
             "','".join(SCHEMA139_CORE_TABLES) + "')")
+        mode_fence = self.contract.target_schema >= 142
         expected_trigger = (SCHEMA139_CORE_TRIGGER +
                             ":ref_store_core_events:19:before:" +
                             SCHEMA139_CORE_TRIGGER_FUNCTION)
+        if mode_fence:
+            # Only the current schema142 target adds this guard; it is part of
+            # the exact expected set, so any other extra trigger still fails.
+            expected_trigger += ("," + SCHEMA142_CORE_TRIGGER +
+                                 ":ref_store_core_gates:19:before:" +
+                                 SCHEMA142_CORE_TRIGGER_FUNCTION)
         assert triggers == expected_trigger, triggers
+        mode_fence_enabled = self.query(
+            self.restore_db,
+            "SELECT count(*) FROM pg_trigger WHERE tgname='" +
+            SCHEMA142_CORE_TRIGGER + "' AND tgenabled='O'")
+        assert mode_fence_enabled == ("1" if mode_fence else "0"), mode_fence_enabled
         rows = self.query(
             self.restore_db,
             "SELECT (SELECT count(*) FROM ref_store_core_gates)::text || '/' || "
@@ -548,6 +566,8 @@ class LegacyArchiveHarness(BackupHarness):
                     schema139_core_refs_key=refs_key,
                     schema139_core_event_operation_fkey=True,
                     schema139_core_event_immutable_trigger=True,
+                    schema142_core_gate_pack_mode_fence=mode_fence,
+                    schema142_core_gate_pack_mode_fence_enabled=mode_fence_enabled == "1",
                     schema139_core_rows=rows,
                     genuine_legacy_source_had_core_rows=False)
 

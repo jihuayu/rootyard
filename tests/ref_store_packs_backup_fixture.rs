@@ -767,7 +767,11 @@ async fn seed(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()> {
             "lane": LANE,
             "sequence": 1,
             "operation_id": operation_id.to_string(),
-            "operation_digest": operation_digest.as_hex(),
+            // PackCommitPlan::new normalizes identity.digest() to the canonical
+            // parent digest, and that normalized value is the one the 138 row
+            // stores. Record the actual plan identity digest, never the
+            // pre-plan placeholder input.
+            "operation_digest": plan.identity().digest().as_hex(),
         },
         "parent_digest": plan.parent_digest().as_hex(),
         "old_membership_digest": plan.old_membership_digest().as_hex(),
