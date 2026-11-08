@@ -5,25 +5,27 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import tempfile
 import time
 import unittest
 
 from tests.e2e import Harness
+from tests.test_workspace_fuse_service import MOUNT_MODE
 
 
 @unittest.skipUnless(os.environ.get("ROOTYARD_OBJECT_STORE_ENDPOINT"),"live S3 fixture required")
 class WorkspaceHandoffTest(unittest.TestCase):
     def test_expired_host_reattach_from_remote_checkpoint(self):
-        binary=Path("target/debug/rootyard").resolve()
+        binary=Path(os.environ.get("ROOTYARD_TEST_BINARY", "target/debug/rootyard")).resolve()
         with tempfile.TemporaryDirectory(prefix="rootyard-handoff-wrapper-") as wrapper_dir:
             wrapper=Path(wrapper_dir)/"rootyard-userns"
-            wrapper.write_text(f"#!/bin/sh\nexec unshare -Urm {binary} \"$@\"\n")
+            wrapper.write_text(f"#!/bin/sh\nexec unshare -Urm {shlex.quote(str(binary))} \"$@\"\n")
             wrapper.chmod(0o700)
             h=Harness(argparse.Namespace(binary=str(wrapper),keep=os.environ.get("ROOTYARD_KEEP_TEST")=="1"))
             try:
-                h.env["ROOTYARD_WORKSPACE_MOUNT_MODE"]="fuse"
+                h.env["ROOTYARD_WORKSPACE_MOUNT_MODE"]=MOUNT_MODE
                 h.env["ROOTYARD_SANDBOX_MODE"]="dev"
                 h.setup();h.api();h.roundtrip()
                 ws=json.loads(h.expect("/api/workspaces",201,token=h.alice,method="POST",

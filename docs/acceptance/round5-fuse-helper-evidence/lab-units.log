@@ -1,0 +1,75 @@
+   Compiling rootyard v0.1.0 (/workspace/scratch/round5-implementation/fuse-helper)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 59.72s
+     Running unittests src/lib.rs (/workspace/rootyard/target/debug/deps/rootyard-c512e8eeea7428b7)
+
+running 67 tests
+test workspace_lab::fuse_helper::client::child_lifecycle::tests::a_missing_handle_is_never_an_exit ... ok
+test workspace_lab::fuse_helper::client::child_lifecycle::tests::a_recorded_exit_blocks_a_second_reap_and_stays_observable ... ok
+test workspace_lab::fuse_helper::client::child_lifecycle::tests::a_recorded_nonzero_exit_is_preserved_for_the_waiter ... ok
+test workspace_lab::crash_recovery::tests::test_norm_overlay_rel_and_deny_unknown_fields ... ok
+test workspace_lab::fuse_helper::client::child_lifecycle::tests::a_taken_handle_is_reaping_and_never_a_successful_exit ... ok
+test workspace_lab::fuse_helper::protocol::tests::control_work_deadlines_are_bounded ... ok
+test workspace_lab::fuse_helper::protocol::tests::abort_frames_carry_the_operation_they_cancel ... ok
+test workspace_lab::fuse_helper::protocol::tests::frames_roundtrip_and_keep_the_nonce ... ok
+test workspace_lab::fuse_helper::protocol::tests::unknown_operation_and_extra_fields_are_rejected ... ok
+test workspace_lab::fuse_helper::server::ops::tests::cancelled_or_expired_work_is_never_completed ... ok
+test workspace_lab::fuse_helper::server::ops::tests::duplicate_unmount_and_pending_build_are_busy ... ok
+test workspace_lab::fuse_helper::server::ops::tests::foreign_publish_owner_is_never_released ... ok
+test workspace_lab::fuse_helper::server::ops::tests::prewarm_paths_must_stay_inside_the_workspace ... ok
+test workspace_lab::fuse_helper::server::retired::tests::far_more_than_the_old_tombstone_bound_keeps_the_oldest_id_retired ... ok
+test workspace_lab::fuse_helper::server::retired::tests::retire_cannot_lower_the_floor_or_retire_id_zero ... ok
+test workspace_lab::fuse_helper::protocol::tests::oversized_and_mismatched_frames_are_rejected ... ok
+test workspace_lab::fuse_helper::server::tests::cancel_fences_a_pending_mount_before_the_slow_join ... ok
+test workspace_lab::fuse_helper::server::tests::cancelled_admission_is_refused_after_the_retired_floor ... ok
+test workspace_lab::fuse_helper::server::tests::cancelled_or_expired_existing_mount_cannot_be_reused ... ok
+test workspace_lab::fuse_helper::client::child_lifecycle::tests::a_real_taken_child_is_reaping_until_its_actual_exit_is_recorded ... ok
+test workspace_lab::fuse_helper::server::tests::freeze_release_never_blocks_on_a_full_decision_slot ... ok
+test workspace_lab::fuse_helper::server::tests::freeze_release_records_the_finishing_request_and_epoch ... ok
+test workspace_lab::fuse_helper::server::tests::pending_deadline_inspection_detects_an_expired_reservation ... ok
+test workspace_lab::fuse_helper::server::tests::freeze_release_rejects_a_foreign_frame_epoch ... ok
+test workspace_lab::fuse_helper::server::tests::pending_mount_gate_is_fenced_without_being_published ... ok
+test workspace_lab::fuse_helper::server::tests::retired_floor_survives_more_than_64_cancellations_and_refuses_an_old_retry ... ok
+test workspace_lab::fuse_helper::server::tests::teardown_policy_can_only_fence ... ok
+test workspace_lab::fuse_helper::server::tests::watchdog_expiry_does_not_block_on_a_full_decision_slot ... ok
+test workspace_lab::fuse_helper::tests::only_whitelisted_environment_reaches_the_child ... ok
+test workspace_lab::fuse_helper::tests::workspace_paths_are_uuid_only_and_stay_under_the_root ... ok
+test workspace_lab::fuse_mount::fuse_dispatch::tests::budget_caps_ops_and_bytes_and_releases_exactly ... ok
+test workspace_lab::fuse_helper::tests::root_validation_rejects_relative_and_symlinked_roots ... ok
+test workspace_lab::fuse_mount::fuse_dispatch::tests::closed_work_queue_refuses_pops_but_drain_paths_still_clean_up ... ok
+test workspace_lab::fuse_mount::fuse_dispatch::tests::diagnostic_counters_are_actor_observations_not_fence_calls ... ok
+test workspace_lab::fuse_mount::fuse_dispatch::tests::permit_charges_both_budgets_and_releases_on_drop ... ok
+test workspace_lab::fuse_mount::fuse_dispatch::tests::queued_mutation_epoch_must_match_the_admitted_guard_epoch ... ok
+test workspace_lab::fuse_mount::tests::helper_mount_options_add_auto_unmount_without_widening_the_owner_acl ... ok
+test workspace_lab::fuse_mount::tests::mount_handle_offers_a_consuming_joined_teardown_and_a_borrowable_stop ... ok
+test workspace_lab::fuse_mount::tests::mountinfo_identity_is_the_single_exact_mount_at_the_owned_path ... ok
+test workspace_lab::fuse_mount::tests::owned_unmount_requires_the_captured_mount_id ... ok
+test workspace_lab::fuse_mount::tests::freeze_rejects_mutations_without_blocking_reads ... ok
+test workspace_lab::fuse_mount::tests::unknown_lazy_path_fails_closed_but_git_is_eager ... ok
+test workspace_lab::ignore::tests::rootyardignore_patterns_negation_and_directory_rules ... ok
+test workspace_lab::mutation_gate::tests::a_delayed_handoff_below_the_observed_epoch_stays_fenced ... ok
+test workspace_lab::mutation_gate::tests::a_missing_row_fences_only_when_the_gate_did_not_advance ... ok
+test workspace_lab::mutation_gate::tests::a_higher_observation_advances_the_marker_even_while_fenced ... ok
+test workspace_lab::mutation_gate::tests::a_newer_lease_observation_fences_but_does_not_authorize ... ok
+test workspace_lab::mutation_gate::tests::cancelled_frozen_commit_defaults_to_fence ... ok
+test workspace_lab::fuse_helper::server::tests::graceful_barrier_waits_for_owned_pending_cleanup ... ok
+test workspace_lab::mutation_gate::tests::a_stale_lease_observation_after_handoff_keeps_the_new_epoch_healthy ... ok
+test workspace_lab::mutation_gate::tests::committed_success_fences_until_the_next_handoff ... ok
+test workspace_lab::fuse_helper::server::ops::tests::queue_delay_is_charged_to_the_admission_deadline ... ok
+test workspace_lab::mutation_gate::tests::fence_wakes_a_frozen_waiter_with_erofs ... ok
+test workspace_lab::mutation_gate::tests::concurrent_freezes_are_serialized_until_the_first_closure_releases ... ok
+test workspace_lab::mutation_gate::tests::fence_is_immediate_during_freeze_and_only_a_higher_epoch_restores ... ok
+test workspace_lab::mutation_gate::tests::handoff_renews_the_same_epoch_without_fencing ... ok
+test workspace_lab::mutation_gate::tests::known_precommit_rollback_thaws_the_original_epoch ... ok
+test workspace_lab::mutation_gate::tests::freeze_drains_existing_mutator_before_running_and_rejects_new_ones ... ok
+test workspace_lab::mutation_gate::tests::lease_handoff_fences_the_old_epoch_before_authorizing_the_new_one ... ok
+test workspace_lab::mutation_gate::tests::nested_freeze_on_one_thread_fails_fast_instead_of_deadlocking ... ok
+test workspace_lab::mutation_gate::tests::freeze_from_an_admitted_mutation_fails_fast_instead_of_deadlocking ... ok
+test workspace_lab::mutation_gate::tests::panic_and_error_paths_release_admission_and_preserve_fence ... ok
+test workspace_lab::mutation_gate::tests::re_authorize_is_busy_until_the_old_active_guard_is_dropped ... ok
+test workspace_lab::mutation_gate::tests::unknown_commit_outcome_fences_until_the_next_handoff ... ok
+test workspace_lab::vfs::tests::test_matches_query_and_pattern_validation ... ok
+test workspace_lab::vfs::tests::test_deny_unknown_fields_on_vfs_catalog_entry ... ok
+test workspace_lab::mutation_gate::tests::frozen_handoff_stays_fenced_when_the_commit_fails_panics_or_is_cancelled ... ok
+
+test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 236 filtered out; finished in 0.02s
+

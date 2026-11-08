@@ -1,0 +1,558 @@
+{
+  "cases": [
+    {
+      "detail": "",
+      "evidence": {
+        "bad_version_exit": 1,
+        "bad_version_reply": "EPROTO",
+        "hello": "ok"
+      },
+      "name": "hello_handshake_and_frame_version",
+      "seconds": 0.063,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "duplicate_op_id": "EEXIST",
+        "second_freeze": "EBUSY",
+        "stale_generation": "ESTALE",
+        "unknown_op": "EPROTO"
+      },
+      "name": "generation_and_operation_id_validation",
+      "seconds": 0.119,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "envelope_mismatch": "EINVAL",
+        "mount_epoch_zero": "EINVAL",
+        "mount_without_workspace": "EINVAL",
+        "wrong_epoch_freeze": "ESTALE",
+        "wrong_epoch_handoff": "ESTALE"
+      },
+      "name": "workspace_and_db_epoch_rejection",
+      "seconds": 0.062,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "invalid-json": {
+          "declared_bytes": 28,
+          "eof_after_prefix": false,
+          "exit": 1,
+          "sent_bytes": 28
+        },
+        "oversize": {
+          "declared_bytes": 16387,
+          "eof_after_prefix": false,
+          "exit": 1,
+          "sent_bytes": 16387
+        },
+        "protocol-field": 1,
+        "truncated-frame": {
+          "declared_bytes": 120,
+          "eof_after_prefix": true,
+          "exit": 1,
+          "sent_bytes": 56
+        },
+        "unknown-field": {
+          "declared_bytes": 129,
+          "eof_after_prefix": false,
+          "exit": 1,
+          "sent_bytes": 129
+        },
+        "zero-length": {
+          "declared_bytes": 0,
+          "eof_after_prefix": false,
+          "exit": 1,
+          "sent_bytes": 0
+        }
+      },
+      "name": "unknown_fields_oversize_and_truncated_frames",
+      "seconds": 0.166,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "b_write_while_a_frozen": true,
+        "completed_bytes": 917504,
+        "parked_bytes": 196608,
+        "thaw_seconds": 0.001,
+        "workspace_a": "f2919018-0172-4f31-87ab-079bcc5b1c51",
+        "workspace_b": "fb7146a2-4800-4d19-a44d-2c24d2da6bf4"
+      },
+      "name": "two_native_mounts_a_freeze_thaw_and_b_progress",
+      "seconds": 0.575,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "fence_seconds": 0.003,
+        "new_epoch": 2,
+        "new_write_after_handoff": true,
+        "parked_bytes": 196608,
+        "queue_errno": 30
+      },
+      "name": "finish_fence_timely_ok_queued_write_erofs_and_handoff",
+      "seconds": 0.564,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "a_stayed_frozen": true,
+        "b_released_only_by_b": true,
+        "foreign_finish": "ESTALE",
+        "wrong_epoch_finish": "ESTALE"
+      },
+      "name": "stale_and_wrong_epoch_finish_cannot_release_other_freeze",
+      "seconds": 1.313,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "abort_before_begin": "ok",
+        "late_begin": "ESTALE",
+        "orphan_freeze": false,
+        "write_after": true
+      },
+      "name": "abort_freeze_before_begin_tombstone",
+      "seconds": 0.061,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "abort_reply": "ok",
+        "first_mount_errno": 125,
+        "first_mount_op": "error",
+        "pending_cancel_observed": true,
+        "retry": "mounted",
+        "retry_write": true
+      },
+      "name": "mount_cancel_and_retry",
+      "seconds": 0.059,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "exit": 0,
+        "mounts_gone": true,
+        "reaped": true,
+        "reply": "shutting_down"
+      },
+      "name": "normal_shutdown_exit_zero_and_mounts_gone",
+      "seconds": 0.082,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "control": "[Errno 32] Broken pipe",
+        "owned_mounts_before_release": [
+          "/tmp/rootyard-fuse-helper-6oa3l8nc/workspace-service/mounts/029043bb-3f8e-4c5d-88f0-07683b07c9f4",
+          "/tmp/rootyard-fuse-helper-6oa3l8nc/workspace-service/mounts/137d5a76-53b2-4d05-b0bf-535a7f1bb5fa"
+        ],
+        "parked_bytes": 262144,
+        "queue_errno": 103,
+        "watchdog_exit": 1
+      },
+      "name": "heartbeat_eof_watchdog_fences_and_exits",
+      "seconds": 0.521,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "auto_unmount": "owned mount IDs gone before the cleanup backstop",
+        "control_a": "[Errno 32] Broken pipe",
+        "control_b": "[Errno 32] Broken pipe",
+        "exit": -9,
+        "explicit_cleanup": "normal non-lazy umount remains the release backstop only",
+        "fresh_same_uuid_mount": {
+          "mountpoint": "/tmp/rootyard-fuse-helper-wb5xg_vm/workspace-service/mounts/7597c2d4-c2f2-4761-a805-2d60d4a85e57",
+          "workspace": "7597c2d4-c2f2-4761-a805-2d60d4a85e57",
+          "write_read": "fresh mount after auto-unmount\n"
+        },
+        "mount_ids_after_kill": [],
+        "mount_ids_before_kill": [
+          328,
+          329
+        ],
+        "parked_bytes": 131072,
+        "post_kill_write": "error",
+        "queue_errno": 103
+      },
+      "name": "child_sigkill_auto_unmount_and_queued_writes_fail",
+      "seconds": 0.593,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "api_client_sigkill": "not claimed: this is an external RPC parent stub, not the production API client",
+        "api_harness_case": "not_executed",
+        "auto_unmount": "orphaned helper's owned mount ID gone before the cleanup backstop",
+        "coverage": "external RPC parent stub (not production API client)",
+        "fresh_same_uuid_mount": {
+          "mountpoint": "/tmp/rootyard-fuse-helper-w11bxzqe/workspace-service/mounts/5e6c31af-dbfa-4b75-b849-23c3a279faae",
+          "workspace": "5e6c31af-dbfa-4b75-b849-23c3a279faae",
+          "write_read": "fresh mount after auto-unmount\n"
+        },
+        "hello_mount_asserted": true,
+        "helper_pid": 355084,
+        "mount_ids_after_kill": [],
+        "mount_ids_before_kill": [
+          328
+        ],
+        "orphan_exited": true,
+        "parent_stub": "SIGKILL",
+        "real_mount_read_write": true
+      },
+      "name": "independent_parent_sigkill_orphans_helper",
+      "seconds": 0.159,
+      "status": "passed"
+    },
+    {
+      "detail": "",
+      "evidence": {
+        "child_exit": 0,
+        "kernel_mount_ids": [
+          328
+        ],
+        "mounted_replies": 1,
+        "owned_mounts_after_exit": 0,
+        "phase_after_admission": "healthy",
+        "reply_count": 5,
+        "request_ids": [
+          1002,
+          1003,
+          1004,
+          1005,
+          1006
+        ],
+        "requests": [
+          {
+            "errno": 16,
+            "op": "error",
+            "request_id": 1002
+          },
+          {
+            "epoch": 1,
+            "op": "mounted",
+            "request_id": 1003
+          },
+          {
+            "errno": 16,
+            "op": "error",
+            "request_id": 1004
+          },
+          {
+            "errno": 16,
+            "op": "error",
+            "request_id": 1005
+          },
+          {
+            "errno": 16,
+            "op": "error",
+            "request_id": 1006
+          }
+        ],
+        "single_kernel_mount": true,
+        "unmount": "unmounted",
+        "write_read": "concurrent admission write"
+      },
+      "name": "concurrent_same_workspace_mount_admission_single_kernel_mount",
+      "seconds": 0.061,
+      "status": "passed"
+    }
+  ],
+  "executed_cases": [
+    "hello_handshake_and_frame_version",
+    "generation_and_operation_id_validation",
+    "workspace_and_db_epoch_rejection",
+    "unknown_fields_oversize_and_truncated_frames",
+    "two_native_mounts_a_freeze_thaw_and_b_progress",
+    "finish_fence_timely_ok_queued_write_erofs_and_handoff",
+    "stale_and_wrong_epoch_finish_cannot_release_other_freeze",
+    "abort_freeze_before_begin_tombstone",
+    "mount_cancel_and_retry",
+    "normal_shutdown_exit_zero_and_mounts_gone",
+    "heartbeat_eof_watchdog_fences_and_exits",
+    "child_sigkill_auto_unmount_and_queued_writes_fail",
+    "independent_parent_sigkill_orphans_helper",
+    "concurrent_same_workspace_mount_admission_single_kernel_mount"
+  ],
+  "final_cleanup": {
+    "errors": [],
+    "fixture_cleanup": [
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      },
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      },
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      },
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      },
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      },
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      },
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      },
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      },
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      },
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      },
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      },
+      {
+        "mounts_after": [],
+        "mounts_before": [],
+        "remove_requested": true,
+        "temp_root_removed": true
+      }
+    ],
+    "helpers": [
+      {
+        "exit": -9,
+        "pid": 354401
+      },
+      {
+        "exit": 1,
+        "pid": 354414
+      },
+      {
+        "exit": -9,
+        "pid": 354431
+      },
+      {
+        "exit": -9,
+        "pid": 354479
+      },
+      {
+        "exit": 1,
+        "pid": 354517
+      },
+      {
+        "exit": 1,
+        "pid": 354535
+      },
+      {
+        "exit": 1,
+        "pid": 354551
+      },
+      {
+        "exit": 1,
+        "pid": 354564
+      },
+      {
+        "exit": 1,
+        "pid": 354577
+      },
+      {
+        "exit": 1,
+        "pid": 354590
+      },
+      {
+        "exit": -9,
+        "pid": 354603
+      },
+      {
+        "exit": -9,
+        "pid": 354701
+      },
+      {
+        "exit": -9,
+        "pid": 354774
+      },
+      {
+        "exit": -9,
+        "pid": 354857
+      },
+      {
+        "exit": -9,
+        "pid": 354887
+      },
+      {
+        "exit": 0,
+        "pid": 354916
+      },
+      {
+        "exit": 1,
+        "pid": 354955
+      },
+      {
+        "exit": -9,
+        "pid": 355002
+      },
+      {
+        "exit": -9,
+        "pid": 355054
+      },
+      {
+        "exit": -9,
+        "pid": 355108
+      },
+      {
+        "exit": 0,
+        "pid": 355132
+      }
+    ],
+    "helpers_dead": true,
+    "owned_mounts": [],
+    "umount_backstop": [],
+    "writers": [],
+    "writers_gone": true
+  },
+  "limitations": [
+    "The API-level Harness(mode='fuse-helper') SIGKILL case is NOT executed: tests/e2e.py has no such harness mode in this candidate. The independent-helper abrupt-parent-loss scenario is covered by an external RPC parent stub, NOT by the production API client.",
+    "External RPC waits in this harness are not proof of production client deadlines or RAII. No Python test can establish the API client's signal/cleanup guarantees; that API SIGKILL limitation remains.",
+    "Mount-cancel pending cancellation depends on the real mount/abort race; if the mount is published before abort is processed the case is reported partial and NOT claimed as pending cancel.",
+    "Queued writes are parked by the production freeze dispatch (FIFO reply hold), not by a sleep in the harness; no lazy unmount or global FUSE abort is used.",
+    "Every FUSE mount lives under the owned temporary root in a private mount namespace; no host mount is touched, no LSM policy is changed and no other mount is accessed.",
+    "The SIGKILL cases assert the qualified AutoUnmount contract: the exact owned mount IDs captured before the kill must disappear in bounded time after the owner is confirmed dead and the queued writer has terminated, BEFORE the normal owned cleanup backstop, and a fresh helper must then mount and use the same workspace UUID path again. This is the fuse-helper deployment contract on a qualified host; it is NOT an assumption that any killed FUSE mount disappears, and the backstop is never used as evidence for it.",
+    "Qualification is host policy, not harness capability: AutoUnmount needs fusermount3 and a caller allowed to use auto_unmount/allow_other, so the supported shape is a private user and mount namespace entered as namespace root (unshare -Urm). This harness targets that namespace-root shape; native qualification of a conventional non-root host is pending and may need user_allow_other in the host fuse.conf. Nothing here edits a global fuse.conf or an LSM policy, the session ACL stays owner-only (no explicit AllowOther/AllowRoot), and no unsupported rootless guarantee is implied.",
+    "Compilation and native execution are owned by the root workflow; this harness only executes an already built --binary and never runs Cargo."
+  ],
+  "matched": {
+    "binary_sha256": true,
+    "candidate_input_digest": true,
+    "receipt_stable": true,
+    "source_digest_stable": true
+  },
+  "namespace": {
+    "baseline_mounts": 11,
+    "caller_mount_ns": 4026532210,
+    "changed_from_caller": true,
+    "entry": "unshare -Urm --propagation private",
+    "helper_harness_mount_ns": 4026532752
+  },
+  "partial_failures": [],
+  "passed": true,
+  "preconditions": {
+    "binary": "/tmp/rootyard-fuse-logs-354304/snapshots/f901cbc58e1bd6af2e1e079d8d43e6a1a349c9f433ac739503f4cfc8fdc1a23b/rootyard",
+    "binary_executable": true,
+    "binary_exists": true,
+    "build_receipt_exists": true,
+    "build_receipt_matches_binary": true,
+    "build_receipt_path": "/tmp/rootyard-fuse-logs-354304/snapshots/f901cbc58e1bd6af2e1e079d8d43e6a1a349c9f433ac739503f4cfc8fdc1a23b/rootyard.build.json",
+    "fuse_device": true,
+    "fuse_device_char": true,
+    "git": true,
+    "missing": [],
+    "mount_ns": "4026532752",
+    "pid_ns": "4026532209",
+    "source_digest": "0809c16904246bc3f17621a03798de806496275a1c774b2c92b9a7898a53f88e",
+    "source_digest_matches_build": true,
+    "unshare": true
+  },
+  "receipt": {
+    "binary": {
+      "executable": true,
+      "mtime_ns": 1794107696321984265,
+      "path": "/tmp/rootyard-fuse-logs-354304/snapshots/f901cbc58e1bd6af2e1e079d8d43e6a1a349c9f433ac739503f4cfc8fdc1a23b/rootyard",
+      "sha256": "f901cbc58e1bd6af2e1e079d8d43e6a1a349c9f433ac739503f4cfc8fdc1a23b",
+      "size": 303846856
+    },
+    "binary_now": {
+      "executable": true,
+      "mtime_ns": 1794107696321984265,
+      "path": "/tmp/rootyard-fuse-logs-354304/snapshots/f901cbc58e1bd6af2e1e079d8d43e6a1a349c9f433ac739503f4cfc8fdc1a23b/rootyard",
+      "sha256": "f901cbc58e1bd6af2e1e079d8d43e6a1a349c9f433ac739503f4cfc8fdc1a23b",
+      "size": 303846856
+    },
+    "build_source_digest_after": "0809c16904246bc3f17621a03798de806496275a1c774b2c92b9a7898a53f88e",
+    "build_source_digest_before": "0809c16904246bc3f17621a03798de806496275a1c774b2c92b9a7898a53f88e",
+    "candidate_input_digest_at_end": "d7d7223fbbb2689cfa0b6e39ca7c2bf3c6e7e77dc1774b6e83094f16e392f108",
+    "candidate_inputs": [
+      {
+        "bytes": 70290,
+        "path": "/workspace/scratch/round5-implementation/fuse-helper/tests/fuse_helper_lifecycle.py",
+        "sha256": "538da2e77a93bfa9c3a0f9237eb83b505638529dc6a48fa19716ab65c078ce0e"
+      },
+      {
+        "bytes": 29474,
+        "path": "/workspace/scratch/round5-implementation/fuse-helper/tests/fuse_helper_native_support.py",
+        "sha256": "d36e4c58ddb67f06452b070a7356b4c5994c27f8107fbc51ace08b8fefea9f6a"
+      }
+    ]
+  },
+  "required": {
+    "binary_sha256": "f901cbc58e1bd6af2e1e079d8d43e6a1a349c9f433ac739503f4cfc8fdc1a23b",
+    "build_source_digest": "0809c16904246bc3f17621a03798de806496275a1c774b2c92b9a7898a53f88e",
+    "executed_cases": [
+      "hello_handshake_and_frame_version",
+      "generation_and_operation_id_validation",
+      "workspace_and_db_epoch_rejection",
+      "unknown_fields_oversize_and_truncated_frames",
+      "two_native_mounts_a_freeze_thaw_and_b_progress",
+      "finish_fence_timely_ok_queued_write_erofs_and_handoff",
+      "stale_and_wrong_epoch_finish_cannot_release_other_freeze",
+      "abort_freeze_before_begin_tombstone",
+      "mount_cancel_and_retry",
+      "normal_shutdown_exit_zero_and_mounts_gone",
+      "heartbeat_eof_watchdog_fences_and_exits",
+      "child_sigkill_auto_unmount_and_queued_writes_fail",
+      "independent_parent_sigkill_orphans_helper",
+      "concurrent_same_workspace_mount_admission_single_kernel_mount"
+    ],
+    "immutable_binary": "/tmp/rootyard-fuse-logs-354304/snapshots/f901cbc58e1bd6af2e1e079d8d43e6a1a349c9f433ac739503f4cfc8fdc1a23b/rootyard",
+    "native_fuse_mounts": 2,
+    "tests_input_digest": "d7d7223fbbb2689cfa0b6e39ca7c2bf3c6e7e77dc1774b6e83094f16e392f108"
+  },
+  "status": "passed"
+}
