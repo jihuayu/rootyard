@@ -24,14 +24,16 @@
 //!
 //! External ownership (the verified-read fix): [`BlobStore::get_to_file_with_owner`]
 //! attaches one opaque `Arc<T: Send + Sync>` keepalive to the **actual** owned
-//! transfer task, not to an outer waiter. It is cloned into the staging object and
-//! moved, with the `ReadLease`, into the deferred unlink task and stays owned until
-//! the OS unlink returns; a caller timeout or cancellation only detaches the
-//! owned task. If a runtime abort or panic drops it while local filesystem work
-//! may still run, its drop guard `mem::forget`s the keepalive: bounded capacity
-//! is retained until process exit. Normal success or typed-error completion only
-//! releases it after every local await returned and cleanup ownership moved. The
-//! owner stays type-erased, so this module has no caller-crate dependency.
+//! transfer task, not to an outer waiter. Task entry creates one
+//! `Arc<TransferResources>` holding that keepalive and the `ReadLease`; the guard,
+//! staging object and deferred unlink task clone that same `Arc` and stay charged
+//! until the OS unlink returns. A caller timeout or cancellation only detaches the
+//! owned task. If a runtime abort or panic drops an unsettled guard while local
+//! filesystem work may still run, it `mem::forget`s its clone: read quota and the
+//! external owner are retained until process exit. Normal completion settles only
+//! after every local await returned and staging cleanup ownership moved; an
+//! unknown unlink error quarantines the shared `Arc` as well. The owner stays
+//! type-erased, so this module has no caller-crate dependency.
 
 use std::{
     path::{Path, PathBuf},
@@ -53,34 +55,34 @@ use super::{
     budget::ReadLease,
     opendal::{BlobStore, DOWNLOAD_CHUNK_BYTES, DOWNLOAD_CONCURRENCY, MAX_RANGE_BYTES, map_provider_error},
 };
+use ownership::{Keepalive, TransferGuard, TransferResources};
 
-/// Opaque external keepalive. Nothing in `blob_store` can interpret it; it is
-/// only ever moved and dropped.
-type Keepalive = Arc<dyn Send + Sync + 'static>;
-
-/// One deferred staging unlink plus the capacity it keeps charged.
+/// One deferred staging unlink plus the shared capacity it keeps charged.
 ///
-/// The owner is deliberately type-erased. It must stay alive until the OS
+/// The shared cell is deliberately type-erased. It must stay alive until the OS
 /// `unlink` has actually returned, so the blocking task takes this value by
-/// value and releases the read lease and the owner only after the call returns.
+/// value and releases the shared cell only on a settled unlink.
 struct StagingCleanup {
     path: PathBuf,
-    lease: Option<ReadLease>,
-    owner: Option<Keepalive>,
+    shared: Option<Arc<TransferResources>>,
 }
 
 impl StagingCleanup {
-    /// Run the unlink to completion, then release the read lease and the
-    /// external owner. Reaching the end of this function is the only way either
-    /// is released on this path.
+    /// Run the unlink to completion. Only success or confirmed absence lets the
+    /// shared read lease and external owner go back to the process; any other
+    /// error is an unknown filesystem outcome and is quarantined fail-closed.
     fn run(mut self) {
         #[cfg(test)]
         stall_cleanup(&self.path);
-        let _ = std::fs::remove_file(&self.path);
-        // Only after the unlink returned do the reader slot and the caller's
-        // keepalive go back.
-        drop(self.lease.take());
-        drop(self.owner.take());
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => self.shared = None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.shared = None,
+            Err(_) => {
+                if self.shared.is_some() {
+                    std::mem::forget(self.shared.take());
+                }
+            }
+        }
     }
 }
 
@@ -88,35 +90,26 @@ impl Drop for StagingCleanup {
     fn drop(&mut self) {
         // This runs only when the cleanup task never ran (for example a runtime
         // abort dropped its queued closure). The unlink is unknown, so retain
-        // both the read lease and the external owner for the life of the process
+        // the shared read lease and external owner for the life of the process
         // rather than reporting capacity that may still be in use.
-        if self.lease.is_some() {
-            std::mem::forget(self.lease.take());
-        }
-        if self.owner.is_some() {
-            std::mem::forget(self.owner.take());
+        if self.shared.is_some() {
+            std::mem::forget(self.shared.take());
         }
     }
 }
 
-/// This call's own staging file plus the verified-read lease covering it and an
-/// optional external keepalive.
+/// This call's own staging file plus a clone of the transfer's shared resources.
 ///
 /// The guard is created only after `create_new` succeeded, so the path it may
 /// unlink is always one this call created.
 struct StagingObject {
     path: Option<PathBuf>,
-    lease: Option<ReadLease>,
-    owner: Option<Keepalive>,
+    shared: Option<Arc<TransferResources>>,
 }
 
 impl StagingObject {
-    fn new(path: PathBuf, lease: ReadLease) -> Self {
-        Self { path: Some(path), lease: Some(lease), owner: None }
-    }
-
-    fn with_owner(path: PathBuf, lease: ReadLease, owner: Option<Keepalive>) -> Self {
-        Self { path: Some(path), lease: Some(lease), owner }
+    fn with_resources(path: PathBuf, shared: Arc<TransferResources>) -> Self {
+        Self { path: Some(path), shared: Some(shared) }
     }
 
     fn path(&self) -> &Path {
@@ -124,38 +117,33 @@ impl StagingObject {
     }
 
     /// The temp path was renamed to its final destination: nothing to unlink and
-    /// the verified-read lease and external keepalive can go back to the process.
+    /// this clone of the shared read lease and external keepalive can go back.
     fn commit(mut self) {
         self.path = None;
-        self.lease = None;
-        self.owner = None;
+        self.shared = None;
     }
 }
 
 impl Drop for StagingObject {
     fn drop(&mut self) {
         let Some(path) = self.path.take() else { return };
-        let cleanup = StagingCleanup { path, lease: self.lease.take(), owner: self.owner.take() };
+        let cleanup = StagingCleanup { path, shared: self.shared.take() };
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             // No runtime context: this only happens while the runtime itself is
             // being torn down, when a Tokio filesystem blocking operation may
-            // still be running. Unlink best-effort, but retain both the read
-            // lease and the caller's owner for the life of the process instead
+            // still be running. Unlink best-effort, but quarantine the shared
+            // read lease and caller's owner for the life of the process instead
             // of claiming capacity against an uncertain local filesystem.
-            let mut cleanup = cleanup;
             let _ = std::fs::remove_file(&cleanup.path);
-            if cleanup.lease.is_some() {
-                std::mem::forget(cleanup.lease.take());
-            }
-            if cleanup.owner.is_some() {
-                std::mem::forget(cleanup.owner.take());
+            let mut cleanup = cleanup;
+            if let Some(shared) = cleanup.shared.take() {
+                std::mem::forget(shared);
             }
             return;
         };
         // One pending cleanup per reader slot, so at most `active_readers` are
-        // ever in flight process-wide. The blocking task owns the lease and the
-        // external keepalive until the unlink returned; if it never runs, its
-        // `Drop` retains both fail-closed.
+        // ever in flight process-wide. The blocking task owns the shared cell
+        // until the unlink returned; if it never runs, its `Drop` retains it.
         drop(handle.spawn_blocking(move || cleanup.run()));
     }
 }
@@ -270,49 +258,6 @@ fn stall_cleanup(path: &Path) {
     }
 }
 
-/// Owned drop guard for the caller's opaque keepalive inside the **actual**
-/// transfer task.
-///
-/// It is settled exactly once, after the future ran to normal completion (Ok or
-/// typed error) and the staging-cleanup hand-off happened. If the owned task is
-/// dropped early — runtime abort or a panic while a local `tokio::fs` operation
-/// may still be running — the guard deliberately `mem::forget`s the keepalive:
-/// bounded capacity stays owned until process exit instead of being released
-/// against a directory that may still be used. This mirrors the fail-closed
-/// `Retained` reaper in the native verifier.
-struct TransferGuard {
-    owner: Option<Keepalive>,
-    settled: bool,
-}
-
-impl TransferGuard {
-    fn new(owner: Option<Keepalive>) -> Self {
-        Self { owner, settled: false }
-    }
-
-    fn owner_clone(&self) -> Option<Keepalive> {
-        self.owner.as_ref().map(Arc::clone)
-    }
-
-    /// Normal completion: every local await has returned and the staging object
-    /// either committed or handed its owner to the deferred cleanup task.
-    fn settle(&mut self) {
-        self.settled = true;
-        drop(self.owner.take());
-    }
-}
-
-impl Drop for TransferGuard {
-    fn drop(&mut self) {
-        if self.settled {
-            return;
-        }
-        if let Some(owner) = self.owner.take() {
-            std::mem::forget(owner);
-        }
-    }
-}
-
 impl BlobStore {
     /// Stream provider bytes into `destination`, verifying SHA-256 and length
     /// before the atomic rename. Only this call's own staging file is removed.
@@ -383,12 +328,18 @@ impl BlobStore {
         owner: Option<Keepalive>,
         deadline: Instant,
     ) -> Result<(), BlobError> {
-        let mut guard = TransferGuard::new(owner);
-        let result = self.transfer_to_destination(locator, destination, lease, &guard, deadline).await;
+        // One shared ownership cell is created at the actual task entry, before
+        // `create_dir_all`/`open`, so the read lease and external owner survive
+        // an abort at any later local await.
+        let shared = Arc::new(TransferResources::new(lease, owner));
+        let mut guard = TransferGuard::new(Arc::clone(&shared));
+        let result = self.transfer_to_destination(locator, destination, shared, deadline).await;
         // Reaching this point means the future polled to completion (Ok or a
         // typed error): every local await returned and the staging object either
-        // committed or handed its keepalive to the deferred unlink task.
+        // committed or handed its shared resources to the deferred unlink task.
         guard.settle();
+        #[cfg(test)]
+        ownership::signal_transfer_completed(destination);
         result
     }
 
@@ -396,8 +347,7 @@ impl BlobStore {
         &self,
         locator: &BlobLocator,
         destination: &Path,
-        lease: ReadLease,
-        guard: &TransferGuard,
+        resources: Arc<TransferResources>,
         deadline: Instant,
     ) -> Result<(), BlobError> {
         let parent = destination.parent().ok_or_else(|| BlobError::Config("blob destination parent missing".into()))?;
@@ -415,9 +365,10 @@ impl BlobStore {
             .open(&temp)
             .await
             .map_err(|_| BlobError::Provider("blob staging file creation failed".into()))?;
-        // The staging object owns its own keepalive clone, so even if this task
-        // is aborted mid-stream the deferred unlink keeps the caller's owner.
-        let staging = StagingObject::with_owner(temp, lease, guard.owner_clone());
+        // The staging object gets a clone of the same shared cell, so even if
+        // this task is aborted mid-stream the deferred unlink keeps both the
+        // read lease and the caller's owner.
+        let staging = StagingObject::with_resources(temp, resources);
         self.stream_verified_to(locator, &mut output, deadline).await?;
         output.sync_all().await.map_err(|_| BlobError::Provider("blob staging fsync failed".into()))?;
         drop(output);
@@ -485,6 +436,25 @@ impl BlobStore {
         lease: ReadLease,
         deadline: Instant,
     ) -> Result<Vec<u8>, BlobError> {
+        // Same task-entry ownership as `get_to_file_owned`: an abort during the
+        // pre-staging open or a later range read must not release read capacity.
+        let shared = Arc::new(TransferResources::new(lease, None));
+        let mut guard = TransferGuard::new(Arc::clone(&shared));
+        let result = self.get_range_shared(locator, start, len, shared, deadline).await;
+        // Reaching here means every local await returned; staging cleanup holds
+        // the last shared clone until its unlink settled.
+        guard.settle();
+        result
+    }
+
+    async fn get_range_shared(
+        &self,
+        locator: &BlobLocator,
+        start: u64,
+        len: u64,
+        shared: Arc<TransferResources>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, BlobError> {
         let temp = std::env::temp_dir().join(format!(".rootyard-range-{}", Uuid::new_v4()));
         check_deadline(deadline)?;
         let mut output = fs::OpenOptions::new()
@@ -494,7 +464,7 @@ impl BlobStore {
             .open(&temp)
             .await
             .map_err(|_| BlobError::Provider("blob staging file creation failed".into()))?;
-        let staging = StagingObject::new(temp, lease);
+        let staging = StagingObject::with_resources(temp, shared);
         self.stream_verified_to(locator, &mut output, deadline).await?;
         drop(output);
         check_deadline(deadline)?;
@@ -584,5 +554,6 @@ impl BlobStore {
     }
 }
 
+mod ownership;
 #[cfg(test)]
 mod retained_tests;
