@@ -97,11 +97,16 @@ class ParallelBoundariesTest(unittest.TestCase):
         for signature in (
             "pub fn idempotency_key(",
             "pub async fn authorize_repo_with_role(",
-            "pub async fn authorize_repo(",
+            "pub async fn authorize_repo_action_by_id(",
             "pub async fn verify_token(",
             "pub async fn finish_tx(",
         ):
             self.assertIn(signature, auth_rs)
+
+        # Repository authorization must carry the explicit PAT action; the
+        # former untyped convenience wrapper was removed by scope hardening.
+        self.assertNotIn("pub async fn authorize_repo(", auth_rs)
+        self.assertRegex(auth_rs, r"pub async fn authorize_repo_with_role\([^)]*action: crate::token_scopes::RepoAction")
 
         events_rs = (ROOT / "src/events.rs").read_text()
         dispatch_rs = (ROOT / "src/dispatch.rs").read_text()
