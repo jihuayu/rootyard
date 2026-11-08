@@ -1340,7 +1340,7 @@ async fn queued_begin_deadline_leaves_no_open_transaction_or_partial_gate() -> R
             )
             .await
             .expect_err("queued core BEGIN must hit its absolute deadline");
-        assert!(matches!(error, RefStoreError::Timeout), "unexpected queued BEGIN error: {error}");
+        assert!(matches!(&error, RefStoreError::Timeout), "unexpected queued BEGIN error: {error}");
         assert!(started.elapsed() < Duration::from_secs(5), "queued BEGIN deadline returned too late");
 
         // Release the server-side barrier. The SDK rollback guard queued
