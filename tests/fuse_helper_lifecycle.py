@@ -57,6 +57,9 @@ class Suite:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.cases: list[dict] = []
         self.helpers: list[support.HelperProcess] = []
+        self.writers: list[support.ParkedWriter] = []
+        self.fixtures: list[support.WorkFixture] = []
+        self.cleanup_errors: list[dict] = []
         self.notes: list[str] = []
         self.entry_ns = support.ns_inode("mnt")
         self.caller_ns = int(os.environ.get("ROOTYARD_FUSE_HELPER_CALLER_NS", "0") or 0)
@@ -66,6 +69,18 @@ class Suite:
         helper = support.HelperProcess(self.binary, self.log_dir, label)
         self.helpers.append(helper)
         return helper
+
+    def fixture(self) -> support.WorkFixture:
+        fixture = support.WorkFixture()
+        self.fixtures.append(fixture)
+        return fixture
+
+    def track_writer(self, writer: support.ParkedWriter,
+                     helper: support.HelperProcess | None = None) -> support.ParkedWriter:
+        writer.owner_helper = helper
+        writer.owner_pid = helper.proc.pid if helper is not None else None
+        self.writers.append(writer)
+        return writer
 
     def require(self, condition, message: str) -> None:
         if not condition:
@@ -84,9 +99,32 @@ class Suite:
         return reply
 
     def expect_ok(self, reply: support.Reply, helper: support.HelperProcess,
-                  op: str = "ok") -> support.Reply:
+                  op: str = "ok", workspace: str | None = None,
+                  epoch: int | None = None) -> support.Reply:
         self.expect_protocol(reply, helper, op)
         self.require(reply.ok, f"expected ok, got error {reply.code}: {reply.message}")
+        if workspace is not None:
+            self.require(reply.workspace == workspace,
+                         f"successful reply workspace {reply.workspace!r} != {workspace!r}")
+        if epoch is not None:
+            self.require(reply.db_epoch == epoch,
+                         f"successful reply epoch {reply.db_epoch!r} != {epoch!r}")
+        return reply
+
+    def expect_pre_handshake_error(self, reply: support.Reply, helper: support.HelperProcess,
+                                   code: int) -> support.Reply:
+        """Pre-handshake errors have generation 0 and are validated field by field."""
+        frame = reply.frame
+        self.require(frame.get("protocol") == support.PROTOCOL_VERSION,
+                     f"pre-handshake error protocol {frame.get('protocol')} != {support.PROTOCOL_VERSION}")
+        self.require(reply.request_id == frame.get("request_id"),
+                     "pre-handshake error request id drifted")
+        self.require(frame.get("generation") == 0,
+                     f"pre-handshake error generation {frame.get('generation')} != 0")
+        self.require(reply.op == "error",
+                     f"pre-handshake expected error, got {reply.op} args={reply.args}")
+        self.require(reply.code == code,
+                     f"pre-handshake expected errno {code}, got {reply.code}: {reply.message}")
         return reply
 
     def expect_error(self, reply: support.Reply, helper: support.HelperProcess,
@@ -117,33 +155,125 @@ class Suite:
         self.require(not rows, f"{label}: owned mountpoints still mounted after helper death: "
                                f"{[r['mountpoint'] for r in rows]}")
 
+    def _cleanup_error(self, step: str, error: BaseException, evidence: dict) -> None:
+        row = {"step": step, "error": support.redact(f"{type(error).__name__}: {error}")}
+        self.cleanup_errors.append(row)
+        evidence.setdefault("errors", []).append(row)
+
     def release(self, helper: support.HelperProcess | None, fixture: support.WorkFixture | None,
-                label: str) -> dict:
-        evidence: dict = {"helper": label}
+                label: str, *, helper_pid: int | None = None,
+                helper_confirmed_dead: bool = False) -> dict:
+        """Release only resources owned by this helper, in safety order.
+
+        Writers are associated with their helper and historical/finished
+        writers are never re-joined by a later case.  A live fixture is never
+        walked or removed unless the FD owner is confirmed dead, owned writers
+        have terminated and mountinfo is empty.
+        """
+        evidence: dict = {"helper": label, "owner_pid": helper.proc.pid if helper else helper_pid}
+        if helper is None:
+            if helper_pid is None:
+                owned_writers = [w for w in self.writers if getattr(w, "owner_helper", None) is None]
+            else:
+                owned_writers = [w for w in self.writers if getattr(w, "owner_pid", None) == helper_pid]
+        else:
+            owned_writers = [w for w in self.writers if getattr(w, "owner_helper", None) is helper]
+        for writer in owned_writers:
+            try:
+                writer.request_stop()
+            except Exception as error:  # noqa: BLE001
+                self._cleanup_error(f"writer-stop:{writer.path}", error, evidence)
+        evidence["writers_signalled"] = len(owned_writers)
+        owner_dead = False
         if helper is not None:
             if helper.proc.poll() is None:
-                helper.kill()
+                try:
+                    helper.kill()
+                except Exception as error:  # noqa: BLE001
+                    self._cleanup_error("helper-kill", error, evidence)
             try:
-                evidence["exit_code"] = helper.wait_exit(2.0)
-            except support.HarnessError:
+                evidence["exit_code"] = helper.wait_exit(support.EXIT_DEADLINE)
+                owner_dead = True
+            except Exception as error:  # noqa: BLE001
                 evidence["exit_code"] = helper.proc.poll()
-            helper.stop()
-            evidence["helper_log_tail"] = helper.log_tail() if evidence["exit_code"] not in (None, 0) else ""
-        if fixture is not None:
-            self.assert_no_owned_mount(fixture.root, label)
+                self._cleanup_error("helper-reap", error, evidence)
+            try:
+                helper.stop()
+            except Exception as error:  # noqa: BLE001
+                self._cleanup_error("helper-stop", error, evidence)
+            evidence["helper_log_tail"] = (
+                helper.log_tail() if evidence.get("exit_code") not in (None, 0) else "")
+        else:
+            owner_dead = bool(helper_confirmed_dead)
+            if helper_pid is not None:
+                owner_dead = owner_dead or support.process_state(helper_pid) in (None, "Z")
+        evidence["owner_confirmed_dead"] = owner_dead
+        if not owner_dead:
+            self._cleanup_error("owner-dead", support.HarnessError(
+                "helper FD owner not confirmed dead; refusing writer join and mount cleanup"), evidence)
+            evidence["cleanup_skipped"] = "owner-not-confirmed-dead"
+            return evidence
+        joined = []
+        for writer in owned_writers:
+            try:
+                writer.join(support.THREAD_DEADLINE)
+            except Exception as error:  # noqa: BLE001
+                self._cleanup_error(f"writer-join:{writer.path}", error, evidence)
+            joined.append({"path": str(writer.path), "alive": writer.is_alive(),
+                           "bytes": writer.bytes, "error": support.redact(writer.error)
+                           if writer.error else None})
+            if writer.is_alive():
+                self._cleanup_error(f"writer-join:{writer.path}",
+                                    support.HarnessError("writer did not terminate after owner death"),
+                                    evidence)
+        evidence["writers_joined"] = joined
+        writers_gone = not any(writer.is_alive() for writer in owned_writers)
+        evidence["writers_gone"] = writers_gone
+        if fixture is None:
+            return evidence
+        if not writers_gone:
+            self._cleanup_error("fixture-retained", support.HarnessError(
+                "writers still alive; refusing to unmount/remove a possibly live FUSE mount"), evidence)
+            evidence["cleanup_skipped"] = "writers-alive"
+            return evidence
+        try:
             evidence["umount_backstop"] = support.umount_owned(fixture.root)
-            self.assert_no_owned_mount(fixture.root, label)
-            evidence["mountinfo"] = [row["mountpoint"] for row in support.owned_mounts(fixture.root)]
+        except Exception as error:  # noqa: BLE001
+            self._cleanup_error("umount", error, evidence)
+            evidence["umount_backstop"] = []
+        try:
+            remaining = [row["mountpoint"] for row in support.owned_mounts(fixture.root)]
+            evidence["mountinfo"] = remaining
+            if remaining:
+                self._cleanup_error("mountinfo", support.HarnessError(
+                    f"owned mounts remain: {remaining}"), evidence)
+        except Exception as error:  # noqa: BLE001
+            self._cleanup_error("mountinfo-read", error, evidence)
+            remaining = None
+        remove = remaining == []
+        try:
             evidence["fixture_cleanup"] = fixture.cleanup(
-                lambda: self.assert_no_owned_mount(fixture.root, label))
+                lambda: evidence.setdefault("mountinfo_before_temp",
+                                            [row["mountpoint"] for row in support.owned_mounts(fixture.root)]),
+                remove=remove)
+        except Exception as error:  # noqa: BLE001
+            self._cleanup_error("fixture-cleanup", error, evidence)
         return evidence
 
     def run_case(self, name: str, fn) -> None:
         started = time.monotonic()
         outcome = {"name": name, "status": "failed", "detail": "", "evidence": {}, "seconds": 0.0}
+        self.cleanup_errors = []
         try:
-            result = fn()
-            if isinstance(result, dict) and result.pop("_partial_reason", None):
+            result = fn(self)
+            cleanup = list(self.cleanup_errors)
+            if cleanup:
+                outcome["status"] = "failed"
+                outcome["detail"] = "cleanup failed: " + "; ".join(
+                    f"{row['step']}: {row['error']}" for row in cleanup)
+                outcome["evidence"] = result if isinstance(result, dict) else {}
+                outcome["evidence"]["cleanup_errors"] = cleanup
+            elif isinstance(result, dict) and result.pop("_partial_reason", None):
                 outcome["status"] = "partial"
                 outcome["detail"] = support.redact(result.pop("_partial_detail", ""))
                 outcome["evidence"] = result
@@ -153,6 +283,7 @@ class Suite:
         except Exception as error:  # noqa: BLE001 - every failure belongs in the report
             outcome["status"] = "failed"
             outcome["detail"] = support.redact(f"{type(error).__name__}: {error}")
+            outcome["cleanup_errors"] = list(self.cleanup_errors)
             outcome["traceback"] = support.redact(traceback.format_exc())
         finally:
             outcome["seconds"] = round(time.monotonic() - started, 3)
@@ -161,17 +292,78 @@ class Suite:
                   file=sys.stderr, flush=True)
 
     def final_cleanup(self) -> dict:
-        evidence = {"helpers_killed": [], "umount_backstop": []}
+        evidence: dict = {"helpers": [], "writers": [], "umount_backstop": [],
+                          "fixture_cleanup": [], "errors": []}
+
+        def record(step: str, error: BaseException) -> None:
+            evidence["errors"].append({"step": step,
+                                      "error": support.redact(f"{type(error).__name__}: {error}")})
+
+        live_writers = [writer for writer in self.writers if writer.is_alive()]
+        for writer in live_writers:
+            try:
+                writer.request_stop()
+            except Exception as error:  # noqa: BLE001
+                record(f"writer-stop:{writer.path}", error)
+        helpers_dead = True
         for helper in self.helpers:
+            row = {"pid": helper.proc.pid}
             if helper.proc.poll() is None:
-                helper.kill()
-                evidence["helpers_killed"].append({"pid": helper.proc.pid, "exit": helper.proc.poll()})
-            helper.stop()
-        # No fixture roots are retained by design; only owned mountpoints are
-        # checked again here to prove the whole run left the namespace clean.
-        final = support.parse_mountinfo()
-        owned = support.owned_mounts(self.repo, final)
-        evidence["owned_repo_mounts"] = owned
+                try:
+                    helper.kill()
+                except Exception as error:  # noqa: BLE001
+                    record(f"helper-kill:{helper.label}", error)
+            try:
+                row["exit"] = helper.wait_exit(support.EXIT_DEADLINE)
+            except Exception as error:  # noqa: BLE001
+                row["exit"] = helper.proc.poll()
+                helpers_dead = False
+                record(f"helper-reap:{helper.label}", error)
+            try:
+                helper.stop()
+            except Exception as error:  # noqa: BLE001
+                record(f"helper-stop:{helper.label}", error)
+            evidence["helpers"].append(row)
+        evidence["helpers_dead"] = helpers_dead
+        if helpers_dead:
+            for writer in live_writers:
+                try:
+                    writer.join(support.THREAD_DEADLINE)
+                except Exception as error:  # noqa: BLE001
+                    record(f"writer-join:{writer.path}", error)
+                evidence["writers"].append({"path": str(writer.path), "alive": writer.is_alive(),
+                                            "bytes": writer.bytes})
+                if writer.is_alive():
+                    record(f"writer-join:{writer.path}", support.HarnessError(
+                        "writer did not terminate after all helper owners died"))
+        writers_gone = not any(writer.is_alive() for writer in self.writers)
+        evidence["writers_gone"] = writers_gone
+        if not helpers_dead or not writers_gone:
+            record("fixture-retained", support.HarnessError(
+                "helper owner or writer termination was not confirmed; refusing to walk/remove FUSE fixtures"))
+            evidence["cleanup_skipped"] = "owner-or-writer-not-confirmed"
+        else:
+            for fixture in self.fixtures:
+                try:
+                    evidence["umount_backstop"].extend(support.umount_owned(fixture.root))
+                    remaining = [row["mountpoint"] for row in support.owned_mounts(fixture.root)]
+                    if remaining:
+                        record(f"mountinfo:{fixture.root}", support.HarnessError(
+                            f"owned mounts remain: {remaining}"))
+                    evidence["fixture_cleanup"].append(
+                        fixture.cleanup(lambda: None, remove=not remaining))
+                except Exception as error:  # noqa: BLE001
+                    record(f"fixture-cleanup:{fixture.root}", error)
+        roots = [self.repo, *(fixture.root for fixture in self.fixtures)]
+        try:
+            evidence["owned_mounts"] = [row["mountpoint"] for root in roots
+                                        for row in support.owned_mounts(root)]
+        except Exception as error:  # noqa: BLE001
+            record("mountinfo-final-read", error)
+            evidence["owned_mounts"] = []
+        if evidence["owned_mounts"]:
+            record("mountinfo-final", support.HarnessError(
+                f"owned mounts remain after cleanup: {evidence['owned_mounts']}"))
         return evidence
 
 
@@ -179,9 +371,9 @@ def mount_pair(suite: Suite, helper: support.HelperProcess, fixture: support.Wor
     a = fixture.workspace("a")
     b = fixture.workspace("b")
     ra = helper.mount(fixture.root, a, 1)
-    suite.expect_ok(ra, helper, "mounted")
+    suite.expect_ok(ra, helper, "mounted", workspace=a, epoch=1)
     rb = helper.mount(fixture.root, b, 1)
-    suite.expect_ok(rb, helper, "mounted")
+    suite.expect_ok(rb, helper, "mounted", workspace=b, epoch=1)
     suite.require(ra.args.get("epoch") == 1 and rb.args.get("epoch") == 1,
                   f"mount epoch replies were {ra.args} / {rb.args}")
     suite.require((fixture.mounts[a] / "a.txt").read_text() == "lower-a\n",
@@ -210,9 +402,7 @@ def case_hello(suite: Suite) -> dict:
         bad = suite.spawn("bad-version")
         try:
             reply = bad.hello(version=2)
-            suite.expect_protocol(reply, bad)
-            suite.require(reply.op == "error" and reply.code == errno.EPROTO,
-                          f"hello version 2 was not rejected with EPROTO: {reply.op}/{reply.code}")
+            suite.expect_pre_handshake_error(reply, bad, errno.EPROTO)
         finally:
             code = bad.wait_exit(8.0)
             suite.require(code != 0, f"bad-version helper exited 0 ({code})")
@@ -224,7 +414,7 @@ def case_hello(suite: Suite) -> dict:
 
 def case_generation_opid(suite: Suite) -> dict:
     helper = suite.spawn("generation")
-    fixture = support.WorkFixture()
+    fixture = suite.fixture()
     try:
         suite.expect_ok(helper.hello(), helper)
         a, b = mount_pair(suite, helper, fixture)
@@ -238,12 +428,12 @@ def case_generation_opid(suite: Suite) -> dict:
         unknown = helper.call("not_a_helper_operation", None, workspace=a, db_epoch=1)
         suite.expect_error(unknown, helper, errno.EPROTO)
         op_id = 7001
-        suite.expect_ok(helper.freeze_begin(a, 1, op_id), helper)
+        suite.expect_ok(helper.freeze_begin(a, 1, op_id), helper, workspace=a, epoch=1)
         busy = helper.freeze_begin(b, 1, op_id)
         suite.expect_error(busy, helper, errno.EEXIST)
         again = helper.freeze_begin(a, 1, 7002)
         suite.expect_error(again, helper, errno.EBUSY)
-        suite.expect_ok(helper.freeze_finish(a, 1, op_id, True)[0], helper)
+        suite.expect_ok(helper.freeze_finish(a, 1, op_id, True)[0], helper, workspace=a, epoch=1)
         return {"stale_generation": "ESTALE", "unknown_op": "EPROTO",
                 "duplicate_op_id": "EEXIST", "second_freeze": "EBUSY"}
     finally:
@@ -252,7 +442,7 @@ def case_generation_opid(suite: Suite) -> dict:
 
 def case_workspace_epoch(suite: Suite) -> dict:
     helper = suite.spawn("workspace-epoch")
-    fixture = support.WorkFixture()
+    fixture = suite.fixture()
     try:
         suite.expect_ok(helper.hello(), helper)
         a = fixture.workspace("a")
@@ -268,14 +458,14 @@ def case_workspace_epoch(suite: Suite) -> dict:
                                     "lease_until": int(time.time()) + 3600, "lazy": False},
                            workspace=a, db_epoch=0)
         suite.expect_error(zero, helper, errno.EINVAL)
-        suite.expect_ok(helper.mount(fixture.root, a, 1), helper, "mounted")
+        suite.expect_ok(helper.mount(fixture.root, a, 1), helper, "mounted", workspace=a, epoch=1)
         wrong_freeze = helper.freeze_begin(a, 999, 8001)
         suite.expect_error(wrong_freeze, helper, errno.ESTALE)
         wrong_finish = helper.freeze_finish(a, 999, 8001, True)[0]
         suite.expect_error(wrong_finish, helper, errno.ESTALE)
         # A trusted parent may explicitly authorize a newer epoch. A stale
         # epoch after that handoff must be rejected.
-        suite.expect_ok(helper.handoff(a, 2), helper)
+        suite.expect_ok(helper.handoff(a, 2), helper, workspace=a, epoch=2)
         wrong_handoff = helper.handoff(a, 1)
         suite.expect_error(wrong_handoff, helper, errno.ESTALE)
         return {"mount_without_workspace": "EINVAL", "envelope_mismatch": "EINVAL",
@@ -289,26 +479,31 @@ def case_malformed_frames(suite: Suite) -> dict:
     evidence = {}
     cases = [
         ("unknown-field", b'{"protocol":1,"generation":5,"request_id":1,"workspace":null,'
-                          b'"db_epoch":0,"op":"hello","args":{"pid":1,"version":1},"extra":true}'),
-        ("oversize", b"{" + b"x" * (support.MAX_FRAME_BYTES + 1) + b"}"),
-        ("zero-length", b""),
-        ("truncated-json", b'{"protocol":1,"generation":5'),
+                          b'"db_epoch":0,"op":"hello","args":{"pid":1,"version":1},"extra":true}',
+         "exact"),
+        ("oversize", b"{" + b"x" * (support.MAX_FRAME_BYTES + 1) + b"}", "exact"),
+        ("zero-length", b"", "exact"),
+        # Complete frame prefix followed by bytes that are not valid JSON.
+        ("invalid-json", b'{"protocol":1,"generation":5', "exact"),
+        # True truncation: the length prefix promises 72 more bytes than are
+        # sent, then the write side is closed so the helper sees EOF mid-frame.
+        ("truncated-frame", b'{"protocol":1,"generation":5,"request_id":2,"op":"hello"',
+         "truncated"),
     ]
-    for label, payload in cases:
+    for label, payload, kind in cases:
         helper = suite.spawn(f"malformed-{label}")
         try:
             helper.hello()
-            if label == "truncated-json":
-                helper.send_frame(support.Frame(helper.generation, helper.request_id(), "hello",
-                                                {"pid": 1, "version": 1}))
-                with helper.lock:
-                    helper.control.sendall(support.struct.pack(">I", len(payload)) + payload)
-            else:
-                with helper.lock:
-                    helper.control.sendall(support.struct.pack(">I", len(payload)) + payload)
+            declared = len(payload) + 64 if kind == "truncated" else len(payload)
+            with helper.lock:
+                helper.control.sendall(support.raw_frame(payload, declared))
+                if kind == "truncated":
+                    helper.control.shutdown(support.socket.SHUT_WR)
             code = helper.wait_exit(8.0)
             suite.require(code != 0, f"{label}: helper survived a malformed frame with exit 0")
-            evidence[label] = code
+            evidence[label] = {"exit": code, "declared_bytes": declared,
+                               "sent_bytes": len(payload),
+                               "eof_after_prefix": kind == "truncated"}
         finally:
             if helper.proc.poll() is None:
                 helper.kill()
@@ -329,14 +524,14 @@ def case_malformed_frames(suite: Suite) -> dict:
     return evidence
 
 
-def _park(helper: support.HelperProcess, workspace: str, epoch: int, op_id: int,
+def _park(suite: Suite, helper: support.HelperProcess, workspace: str, epoch: int, op_id: int,
           mountpoint: Path, name: str) -> tuple[support.ParkedWriter, int]:
-    writer = support.ParkedWriter(mountpoint / name)
+    writer = suite.track_writer(support.ParkedWriter(mountpoint / name), helper)
     writer.start()
     writer.wait_started()
     reply = helper.freeze_begin(workspace, epoch, op_id)
     if not reply.ok:
-        writer.finish(2.0)
+        writer.request_stop()
         raise AssertionError(f"freeze_begin failed: {reply.code} {reply.message}")
     before = writer.quiesce(0.15)
     time.sleep(0.30)
@@ -351,13 +546,13 @@ def _park(helper: support.HelperProcess, workspace: str, epoch: int, op_id: int,
 
 def case_two_mounts_thaw(suite: Suite) -> dict:
     helper = suite.spawn("thaw")
-    fixture = support.WorkFixture()
+    fixture = suite.fixture()
     try:
         suite.expect_ok(helper.hello(), helper)
         a, b = mount_pair(suite, helper, fixture)
         suite.require(helper.state_phase(a, 1) in ("healthy", "frozen"),
                       f"unexpected A phase {helper.state_phase(a, 1)}")
-        writer, parked_bytes = _park(helper, a, 1, 9001, fixture.mounts[a], "a-parked.bin")
+        writer, parked_bytes = _park(suite, helper, a, 1, 9001, fixture.mounts[a], "a-parked.bin")
         try:
             with open(fixture.mounts[b] / "from-b.txt", "wb") as handle:
                 handle.write(b"B continues during A freeze\n")
@@ -368,7 +563,7 @@ def case_two_mounts_thaw(suite: Suite) -> dict:
             suite.require((fixture.mounts[b] / "b.txt").read_text() == "lower-b\n",
                           "B lower read failed during A freeze")
             reply, elapsed = helper.freeze_finish(a, 1, 9001, True)
-            suite.expect_ok(reply, helper)
+            suite.expect_ok(reply, helper, workspace=a, epoch=1)
             suite.require(elapsed < 6.0, f"finish_thaw took {elapsed:.2f}s")
             deadline = time.monotonic() + 8.0
             while writer.bytes <= parked_bytes and time.monotonic() < deadline and writer.is_alive():
@@ -383,22 +578,21 @@ def case_two_mounts_thaw(suite: Suite) -> dict:
                     "completed_bytes": writer.bytes, "thaw_seconds": round(elapsed, 3),
                     "b_write_while_a_frozen": True}
         finally:
-            if writer.is_alive():
-                writer.finish(3.0)
+            writer.request_stop()
     finally:
         suite.release(helper, fixture, "thaw")
 
 
 def case_fence_handoff(suite: Suite) -> dict:
     helper = suite.spawn("fence")
-    fixture = support.WorkFixture()
+    fixture = suite.fixture()
     try:
         suite.expect_ok(helper.hello(), helper)
         a, b = mount_pair(suite, helper, fixture)
-        writer, parked = _park(helper, a, 1, 9101, fixture.mounts[a], "a-fenced.bin")
+        writer, parked = _park(suite, helper, a, 1, 9101, fixture.mounts[a], "a-fenced.bin")
         try:
             reply, elapsed = helper.freeze_finish(a, 1, 9101, False)
-            suite.expect_ok(reply, helper)
+            suite.expect_ok(reply, helper, workspace=a, epoch=1)
             suite.require(elapsed < 6.0, f"finish_fence reply took {elapsed:.2f}s")
             writer.finished.wait(8.0)
             suite.require(writer.error is not None,
@@ -407,8 +601,9 @@ def case_fence_handoff(suite: Suite) -> dict:
                           f"parked write errno {writer.error.errno}, expected EROFS")
             suite.require(helper.state_phase(a, 1).startswith("fenced"),
                           f"gate phase after fence is {helper.state_phase(a, 1)!r}")
-            attempt = open(fixture.mounts[a] / "new-after-fence.txt", "wb")
+            attempt = None
             try:
+                attempt = open(fixture.mounts[a] / "new-after-fence.txt", "wb")
                 attempt.write(b"must fail\n")
                 attempt.flush()
                 os.fsync(attempt.fileno())
@@ -417,10 +612,11 @@ def case_fence_handoff(suite: Suite) -> dict:
                 suite.require(error.errno in (errno.EROFS, errno.EAGAIN, errno.EIO),
                               f"new fenced write errno {error.errno}")
             finally:
-                attempt.close()
+                if attempt is not None:
+                    attempt.close()
             until = int(time.time()) + 3600
             handoff = helper.handoff(a, 2, until)
-            suite.expect_ok(handoff, helper)
+            suite.expect_ok(handoff, helper, workspace=a, epoch=2)
             suite.require(handoff.db_epoch == 2, f"handoff reply epoch {handoff.db_epoch}")
             suite.require(write_read(fixture.mounts[a] / "epoch2.txt", b"epoch two\n") == b"epoch two\n",
                           "next-epoch write did not succeed after handoff")
@@ -432,20 +628,19 @@ def case_fence_handoff(suite: Suite) -> dict:
                     "new_epoch": 2, "parked_bytes": parked,
                     "new_write_after_handoff": True}
         finally:
-            if writer.is_alive():
-                writer.finish(3.0)
+            writer.request_stop()
     finally:
         suite.release(helper, fixture, "fence")
 
 
 def case_stale_finish_isolated(suite: Suite) -> dict:
     helper = suite.spawn("stale-finish")
-    fixture = support.WorkFixture()
+    fixture = suite.fixture()
     try:
         suite.expect_ok(helper.hello(), helper)
         a, b = mount_pair(suite, helper, fixture)
-        wa, _ = _park(helper, a, 1, 9201, fixture.mounts[a], "a-stale.bin")
-        wb, _ = _park(helper, b, 1, 9202, fixture.mounts[b], "b-stale.bin")
+        wa, _ = _park(suite, helper, a, 1, 9201, fixture.mounts[a], "a-stale.bin")
+        wb, _ = _park(suite, helper, b, 1, 9202, fixture.mounts[b], "b-stale.bin")
         try:
             foreign = helper.freeze_finish(b, 1, 9201, True)[0]
             suite.expect_error(foreign, helper, errno.ESTALE)
@@ -458,44 +653,43 @@ def case_stale_finish_isolated(suite: Suite) -> dict:
             suite.expect_error(wrong_epoch, helper, errno.ESTALE)
             suite.require(helper.state_phase(a, 1).startswith("frozen"),
                           "wrong op epoch released A")
-            suite.expect_ok(helper.freeze_finish(b, 1, 9202, True)[0], helper)
+            suite.expect_ok(helper.freeze_finish(b, 1, 9202, True)[0], helper, workspace=b, epoch=1)
             wb.finish()
             suite.require(wb.error is None, f"B writer failed on legitimate thaw: {wb.error}")
             suite.require(wa.is_alive() and wa.bytes == wa.quiesce(0.3),
                           "A write resumed although A freeze was never finished")
             suite.require(helper.state_phase(a, 1).startswith("frozen"),
                           "A was released by B's thaw")
-            suite.expect_ok(helper.freeze_finish(a, 1, 9201, True)[0], helper)
+            suite.expect_ok(helper.freeze_finish(a, 1, 9201, True)[0], helper, workspace=a, epoch=1)
             wa.finish()
             suite.require(wa.error is None, f"A writer failed on its own thaw: {wa.error}")
             return {"foreign_finish": "ESTALE", "wrong_epoch_finish": "ESTALE",
                     "b_released_only_by_b": True, "a_stayed_frozen": True}
         finally:
             for writer in (wa, wb):
-                if writer.is_alive():
-                    writer.finish(3.0)
+                writer.request_stop()
     finally:
         suite.release(helper, fixture, "stale-finish")
 
 
 def case_abort_tombstone(suite: Suite) -> dict:
     helper = suite.spawn("abort-freeze")
-    fixture = support.WorkFixture()
+    fixture = suite.fixture()
     try:
         suite.expect_ok(helper.hello(), helper)
         a = fixture.workspace("a")
-        suite.expect_ok(helper.mount(fixture.root, a, 1), helper, "mounted")
+        suite.expect_ok(helper.mount(fixture.root, a, 1), helper, "mounted", workspace=a, epoch=1)
         suite.require(helper.state_phase(a, 1).startswith("healthy"), "mount is not healthy")
         abort = helper.call("abort_freeze", {"op_id": 9301}, workspace=a, db_epoch=1)
-        suite.expect_ok(abort, helper)
+        suite.expect_ok(abort, helper, workspace=a, epoch=1)
         late = helper.freeze_begin(a, 1, 9301)
         suite.expect_error(late, helper, errno.ESTALE)
         suite.require(helper.state_phase(a, 1).startswith("healthy"),
                       "tombstoned begin left the gate frozen/fenced")
         suite.require(write_read(fixture.mounts[a] / "after-tombstone.txt", b"still writable\n") ==
                       b"still writable\n", "gate was orphaned after tombstoned begin")
-        suite.expect_ok(helper.freeze_begin(a, 1, 9302), helper)
-        suite.expect_ok(helper.freeze_finish(a, 1, 9302, True)[0], helper)
+        suite.expect_ok(helper.freeze_begin(a, 1, 9302), helper, workspace=a, epoch=1)
+        suite.expect_ok(helper.freeze_finish(a, 1, 9302, True)[0], helper, workspace=a, epoch=1)
         return {"abort_before_begin": "ok", "late_begin": "ESTALE",
                 "orphan_freeze": False, "write_after": True}
     finally:
@@ -504,7 +698,7 @@ def case_abort_tombstone(suite: Suite) -> dict:
 
 def case_mount_cancel(suite: Suite) -> dict:
     helper = suite.spawn("mount-cancel")
-    fixture = support.WorkFixture()
+    fixture = suite.fixture()
     try:
         suite.expect_ok(helper.hello(), helper)
         a = fixture.workspace("a")
@@ -522,10 +716,10 @@ def case_mount_cancel(suite: Suite) -> dict:
         suite.require(first in replies and abort in replies,
                       f"missing mount/abort replies: {sorted(replies)}")
         mount_reply, abort_reply = replies[first], replies[abort]
-        suite.expect_ok(abort_reply, helper)
+        suite.expect_ok(abort_reply, helper, workspace=a, epoch=1)
         pending_cancel = mount_reply.op == "error" and mount_reply.code in (errno.ECANCELED, errno.ESTALE)
         retry = helper.mount(fixture.root, a, 1)
-        suite.expect_ok(retry, helper, "mounted")
+        suite.expect_ok(retry, helper, "mounted", workspace=a, epoch=1)
         suite.require(write_read(fixture.mounts[a] / "retry.txt", b"retry\n") == b"retry\n",
                       "retry mount is not writable")
         result = {"first_mount_op": mount_reply.op, "first_mount_errno": mount_reply.code,
@@ -544,7 +738,7 @@ def case_mount_cancel(suite: Suite) -> dict:
 
 def case_shutdown(suite: Suite) -> dict:
     helper = suite.spawn("shutdown")
-    fixture = support.WorkFixture()
+    fixture = suite.fixture()
     try:
         suite.expect_ok(helper.hello(), helper)
         a, b = mount_pair(suite, helper, fixture)
@@ -563,11 +757,11 @@ def case_shutdown(suite: Suite) -> dict:
 
 def case_heartbeat_eof(suite: Suite) -> dict:
     helper = suite.spawn("heartbeat-eof")
-    fixture = support.WorkFixture()
+    fixture = suite.fixture()
     try:
         suite.expect_ok(helper.hello(), helper)
         a, b = mount_pair(suite, helper, fixture)
-        writer, parked = _park(helper, a, 1, 9401, fixture.mounts[a], "a-hb.bin")
+        writer, parked = _park(suite, helper, a, 1, 9401, fixture.mounts[a], "a-hb.bin")
         try:
             helper.close_heartbeat()
             writer.finished.wait(support.EXIT_DEADLINE)
@@ -577,24 +771,24 @@ def case_heartbeat_eof(suite: Suite) -> dict:
                           f"pending write errno after heartbeat EOF: {writer.error.errno}")
             code = helper.wait_exit(support.EXIT_DEADLINE)
             suite.require(code != 0, f"heartbeat EOF exited 0 ({code})")
-            suite.assert_no_owned_mount(fixture.root, "heartbeat-eof")
+            owned = [row["mountpoint"] for row in support.owned_mounts(fixture.root)]
             dead = suite.expect_dead_control(helper, b, "heartbeat-eof")
             return {"watchdog_exit": code, "queue_errno": writer.error.errno,
-                    "parked_bytes": parked, "control": dead, "mounts_gone": True}
+                    "parked_bytes": parked, "control": dead,
+                    "owned_mounts_before_release": owned}
         finally:
-            if writer.is_alive():
-                writer.finish(3.0)
+            writer.request_stop()
     finally:
         suite.release(helper, fixture, "heartbeat-eof")
 
 
 def case_child_sigkill(suite: Suite) -> dict:
     helper = suite.spawn("sigkill")
-    fixture = support.WorkFixture()
+    fixture = suite.fixture()
     try:
         suite.expect_ok(helper.hello(), helper)
         a, b = mount_pair(suite, helper, fixture)
-        writer, parked = _park(helper, a, 1, 9501, fixture.mounts[a], "a-kill.bin")
+        writer, parked = _park(suite, helper, a, 1, 9501, fixture.mounts[a], "a-kill.bin")
         try:
             helper.signal(signal.SIGKILL)
             code = helper.wait_exit(support.EXIT_DEADLINE)
@@ -611,67 +805,122 @@ def case_child_sigkill(suite: Suite) -> dict:
                 except OSError as error:
                     suite.require(error.errno in (errno.EIO, errno.ENOTCONN, errno.ENOENT),
                                   f"post-SIGKILL write errno {error.errno} on {ws}")
-            suite.assert_no_owned_mount(fixture.root, "sigkill")
+            # SIGKILL does not request an unmount; a disconnected owned mount
+            # may remain.  Do not assume automatic cleanup: record it and let
+            # the owning release perform a normal non-lazy unmount afterwards.
+            still_owned = [row["mountpoint"] for row in support.owned_mounts(fixture.root)]
             dead_a = suite.expect_dead_control(helper, a, "sigkill-a")
             dead_b = suite.expect_dead_control(helper, b, "sigkill-b")
             return {"exit": code, "queue_errno": writer.error.errno, "parked_bytes": parked,
                     "post_kill_write": "error", "control_a": dead_a, "control_b": dead_b,
-                    "mounts_gone": True}
+                    "owned_mounts_before_cleanup": still_owned,
+                    "explicit_cleanup": "owned normal non-lazy umount in release"}
         finally:
-            if writer.is_alive():
-                writer.finish(3.0)
+            writer.request_stop()
     finally:
         suite.release(helper, fixture, "sigkill")
 
 
 def case_parent_sigkill(suite: Suite) -> dict:
-    """A real parent stub is SIGKILLed while the helper serves a mounted workspace.
+    """A real RPC parent stub is SIGKILLed while the helper serves a mount.
 
-    This is the RPC-level abrupt-parent-loss scenario.  The API-level
-    ``Harness(mode="fuse-helper")`` variant is not executed here because that
-    harness mode does not exist in this tree; the report states that limitation.
+    This exercises an external RPC parent process, not the production API
+    client and not the API-level ``Harness(mode="fuse-helper")`` path (that
+    harness mode does not exist in this tree).  Consequently it cannot prove
+    production client deadline or RAII behaviour; that remains a limitation.
     """
-    fixture = support.WorkFixture()
+    fixture = suite.fixture()
     ready = fixture.root / "stub-ready.json"
+    pid_path = fixture.root / "stub-helper-pid.json"
     a = fixture.workspace("a")
+    helper_pid: int | None = None
     stub_pid = os.fork()
     if stub_pid == 0:  # pragma: no cover - child stub process
+        child_helper = None
         try:
-            helper = support.HelperProcess(suite.binary, suite.log_dir, "parent-stub")
-            helper.hello()
-            helper.mount(fixture.root, a, 1)
-            ready.write_text(json.dumps({"helper_pid": helper.proc.pid, "workspace": a,
-                                         "mountpoint": str(fixture.mounts[a])}))
+            child_helper = support.HelperProcess(suite.binary, suite.log_dir, "parent-stub")
+            pid_path.write_text(json.dumps({"helper_pid": child_helper.proc.pid}))
+            hello = child_helper.hello()
+            suite.expect_ok(hello, child_helper, workspace=None, epoch=0)
+            mount = child_helper.mount(fixture.root, a, 1)
+            suite.expect_ok(mount, child_helper, "mounted", workspace=a, epoch=1)
+            owned = [row["mountpoint"] for row in support.owned_mounts(fixture.root)]
+            suite.require(str(fixture.mounts[a]) in owned,
+                          f"stub mountpoint not in owned mountinfo: {owned}")
+            lower = (fixture.mounts[a] / "a.txt").read_text()
+            suite.require(lower == "lower-a\n", f"stub lower read {lower!r}")
+            written = write_read(fixture.mounts[a] / "stub-probe.txt", b"stub alive\n")
+            suite.require(written == b"stub alive\n", "stub real mount write/read failed")
+            ready.write_text(json.dumps({
+                "helper_pid": child_helper.proc.pid, "workspace": a,
+                "mountpoint": str(fixture.mounts[a]), "hello": hello.op,
+                "mount_reply": mount.op, "owned_mounts": owned,
+                "lower_read": lower, "probe_read": written.decode(),
+            }))
             while True:
                 time.sleep(1)
-        except BaseException:
+        except BaseException as error:  # noqa: BLE001 - report setup failure to parent
+            ready.write_text(json.dumps({
+                "setup_error": support.redact(f"{type(error).__name__}: {error}"),
+                "helper_pid": child_helper.proc.pid if child_helper is not None else None,
+            }))
+            if child_helper is not None:
+                try:
+                    child_helper.kill()
+                except Exception:  # noqa: BLE001
+                    pass
             os._exit(3)
     try:
         deadline = time.monotonic() + 20.0
         while not ready.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
-        suite.require(ready.exists(), "parent stub did not finish handshake+mount")
+        suite.require(ready.exists(), "parent RPC stub did not finish handshake+mount")
         info = json.loads(ready.read_text())
-        suite.require(os.path.exists(info["mountpoint"]), "stub mountpoint is absent")
+        helper_pid = info.get("helper_pid")
+        suite.require(not info.get("setup_error"),
+                      f"parent RPC stub setup failed: {info.get('setup_error')}")
+        suite.require(info.get("hello") == "ok" and info.get("mount_reply") == "mounted",
+                      f"stub did not assert successful hello/mount replies: {info}")
+        suite.require(str(fixture.mounts[a]) in info.get("owned_mounts", []),
+                      "stub did not prove an actual owned FUSE mount")
+        suite.require(info.get("lower_read") == "lower-a\n"
+                      and info.get("probe_read") == "stub alive\n",
+                      "stub did not prove real mount read/write before readiness")
         os.kill(stub_pid, signal.SIGKILL)
         os.waitpid(stub_pid, 0)
+        stub_pid = 0
         helper_pid = int(info["helper_pid"])
         exited = support.wait_pid_gone(helper_pid, support.EXIT_DEADLINE)
         suite.require(exited, f"orphaned helper pid {helper_pid} stayed alive after parent SIGKILL")
-        suite.assert_no_owned_mount(fixture.root, "parent-sigkill")
         return {"parent_stub": "SIGKILL", "helper_pid": helper_pid,
-                "orphan_exited": exited, "mounts_gone": True,
-                "api_harness_case": "not_executed"}
+                "orphan_exited": exited, "hello_mount_asserted": True,
+                "real_mount_read_write": True,
+                "api_harness_case": "not_executed",
+                "coverage": "external RPC parent stub (not production API client)"}
     finally:
-        try:
-            os.kill(stub_pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            os.waitpid(stub_pid, os.WNOHANG)
-        except ChildProcessError:
-            pass
-        suite.release(None, fixture, "parent-sigkill")
+        if stub_pid:
+            try:
+                os.kill(stub_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(stub_pid, 0)
+            except ChildProcessError:
+                pass
+        if helper_pid is None and pid_path.exists():
+            try:
+                helper_pid = int(json.loads(pid_path.read_text()).get("helper_pid"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                helper_pid = None
+        if helper_pid is not None and support.process_state(helper_pid) not in (None, "Z"):
+            try:
+                os.kill(helper_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            support.wait_pid_gone(helper_pid, support.EXIT_DEADLINE)
+        owner_dead = bool(helper_pid is not None and support.process_state(helper_pid) in (None, "Z"))
+        suite.release(None, fixture, "parent-sigkill", helper_pid=helper_pid,
+                      helper_confirmed_dead=owner_dead)
 
 
 def main() -> int:
@@ -704,25 +953,42 @@ def main() -> int:
         return 1
 
     suite = Suite(args)
-    receipt_start = support.binary_receipt(suite.binary) if suite.binary.is_file() else {"sha256": None}
+    source_digest_before = ""
+    try:
+        source_digest_before = support.source_digest(suite.repo)
+        original_receipt = support.read_build_receipt(suite.binary)
+        suite.binary = support.snapshot_binary(
+            suite.binary, suite.binary.with_suffix(".build.json"),
+            suite.log_dir / "snapshots",
+            expected_sha256=original_receipt.get("binary_sha256"),
+            expected_source_digest=source_digest_before)
+    except (OSError, support.HarnessError) as error:
+        detail = support.redact(f"{type(error).__name__}: {error}")
+        print(f"immutable binary snapshot failed: {detail}", file=sys.stderr)
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps({
+            "status": "blocked", "passed": False, "executed_cases": [],
+            "partial_failures": [{"name": "immutable_binary_snapshot", "status": "blocked",
+                                  "detail": detail}],
+            "limitations": ["No helper child was executed because the build receipt/source digest "
+                            "did not verify or the binary could not be snapshotted."],
+        }, indent=2) + "\n")
+        return 1
+    receipt_start = support.binary_receipt(suite.binary)
+    # Tests digest is deliberately separate from the build source digest.  The
+    # build receipt source manifest comes from scripts/build_native.source_digest
+    # (exact src/migrations/schema/vendor trees plus required Cargo/build files),
+    # never a whole-repo rglob that could ingest target/.
     candidate_paths = [Path(__file__).resolve(), Path(__file__).with_name("fuse_helper_native_support.py")]
-    candidate_paths += [
-        suite.repo / "src/main.rs",
-        suite.repo / "src/workspace_lab/fuse_helper.rs",
-        suite.repo / "src/workspace_lab/fuse_helper/protocol.rs",
-        suite.repo / "src/workspace_lab/fuse_helper/client.rs",
-        suite.repo / "src/workspace_lab/fuse_helper/server.rs",
-        suite.repo / "src/workspace_lab/fuse_helper/server_ops.rs",
-        suite.repo / "src/workspace_lab/fuse_mount.rs",
-        suite.repo / "src/workspace_lab/mutation_gate.rs",
-        suite.repo / "src/workspace_lab/fuse_dispatch.rs",
-    ]
     input_digest, input_rows = support.digest_files(candidate_paths)
-    pre = support.preconditions(suite.binary)
+    pre = support.preconditions(suite.binary, suite.repo)
     limitations = [
         "The API-level Harness(mode='fuse-helper') SIGKILL case is NOT executed: tests/e2e.py has no "
         "such harness mode in this candidate. The independent-helper abrupt-parent-loss scenario is "
-        "covered at RPC level by SIGKILLing a real parent stub process.",
+        "covered by an external RPC parent stub, NOT by the production API client.",
+        "External RPC waits in this harness are not proof of production client deadlines or RAII. "
+        "No Python test can establish the API client's signal/cleanup guarantees; that API SIGKILL "
+        "limitation remains.",
         "Mount-cancel pending cancellation depends on the real mount/abort race; if the mount is "
         "published before abort is processed the case is reported partial and NOT claimed as pending cancel.",
         "Queued writes are parked by the production freeze dispatch (FIFO reply hold), not by a sleep "
@@ -770,12 +1036,25 @@ def main() -> int:
             suite.cases.append({"name": "final_cleanup", "status": "failed",
                                 "detail": final["error"], "evidence": {}, "seconds": 0.0})
 
+    final_errors = final.get("errors") or ([{"step": "final_cleanup", "error": final["error"]}]
+                                           if final.get("error") else [])
+    if final_errors:
+        suite.cases.append({"name": "final_cleanup", "status": "failed",
+                            "detail": "; ".join(f"{row.get('step')}: {row.get('error')}"
+                                                for row in final_errors),
+                            "evidence": {"final_cleanup": final}, "seconds": 0.0})
     receipt_end = support.binary_receipt(suite.binary) if suite.binary.is_file() else {"sha256": None}
     digest_end, _ = support.digest_files(candidate_paths)
+    try:
+        source_digest_after = support.source_digest(suite.repo)
+    except support.HarnessError as error:
+        source_digest_after = None
+        final_errors.append({"step": "source-digest-after", "error": support.redact(error)})
     matched = {
         "binary_sha256": receipt_start.get("sha256") == receipt_end.get("sha256"),
         "candidate_input_digest": input_digest == digest_end,
         "receipt_stable": receipt_start == receipt_end,
+        "source_digest_stable": source_digest_after == source_digest_before,
     }
     by_name = {case["name"]: case for case in suite.cases}
     executed = [case["name"] for case in suite.cases if case["status"] in ("passed", "failed", "partial")]
@@ -789,13 +1068,17 @@ def main() -> int:
         "passed": passed,
         "required": {
             "binary_sha256": receipt_start.get("sha256"),
-            "candidate_input_digest": input_digest,
+            "immutable_binary": str(suite.binary),
+            "build_source_digest": source_digest_before,
+            "tests_input_digest": input_digest,
             "executed_cases": REQUIRED_CASES,
             "native_fuse_mounts": 2,
         },
         "receipt": {
             "binary": receipt_start,
             "binary_now": receipt_end,
+            "build_source_digest_before": source_digest_before,
+            "build_source_digest_after": source_digest_after,
             "candidate_inputs": input_rows,
             "candidate_input_digest_at_end": digest_end,
         },

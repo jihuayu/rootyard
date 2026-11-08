@@ -15,6 +15,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import hashlib
+import importlib.util
 import json
 import os
 import random
@@ -44,6 +45,10 @@ FREEZE_DEADLINE = 12.0
 EXIT_DEADLINE = 12.0
 THREAD_DEADLINE = 15.0
 
+# Snapshot storage is supplied by the caller (a private temp/suite directory).
+# No candidate worktree or binary path is hardcoded, so ``--binary`` may point
+# at any independently verified build.
+
 _HEX = re.compile(r"[0-9a-f]{32,}", re.I)
 _SECRET_HINT = re.compile(r"(?i)(postgres(?:ql)?://[^\s]+|password=\S+|secret=\S+|token=\S+)")
 
@@ -69,13 +74,28 @@ def redact(text: object) -> str:
     return value[-4000:]
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    return sha256_bytes(Path(path).read_bytes())
+
+
 def digest_files(paths: list[Path]) -> tuple[str, list[dict]]:
-    """Deterministic digest over candidate inputs (path + bytes)."""
+    """Deterministic digest over candidate inputs (path + bytes).
+
+    Missing paths are a harness error, not an empty row.  A silently skipped
+    manifest entry would make the build receipt claim less than it verified.
+    """
+    unique = sorted({Path(p).resolve() for p in paths}, key=str)
+    missing = [str(path) for path in unique if not path.is_file()]
+    if missing:
+        raise HarnessError("source manifest contains missing paths: " + ", ".join(missing))
     rows = []
-    for path in sorted({p.resolve() for p in paths}, key=str):
-        if path.is_file():
-            data = path.read_bytes()
-            rows.append({"path": str(path), "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    for path in unique:
+        data = path.read_bytes()
+        rows.append({"path": str(path), "bytes": len(data), "sha256": sha256_bytes(data)})
     h = hashlib.sha256()
     for row in rows:
         h.update(row["path"].encode())
@@ -85,12 +105,91 @@ def digest_files(paths: list[Path]) -> tuple[str, list[dict]]:
     return h.hexdigest(), rows
 
 
+def load_build_native(repo: Path):
+    """Load the canonical build script so source_digest is not reimplemented."""
+    script = Path(repo).resolve() / "scripts" / "build_native.py"
+    if not script.is_file():
+        raise HarnessError(f"build script is missing: {script}")
+    spec = importlib.util.spec_from_file_location("rootyard_build_native", script)
+    if spec is None or spec.loader is None:
+        raise HarnessError(f"cannot load build script: {script}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def source_digest(repo: Path) -> str:
+    return str(load_build_native(repo).source_digest())
+
+
+def read_build_receipt(binary: Path) -> dict:
+    receipt = Path(binary).with_suffix(".build.json")
+    if not receipt.is_file():
+        raise HarnessError(f"build receipt is missing: {receipt}")
+    try:
+        data = json.loads(receipt.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise HarnessError(f"cannot read build receipt {receipt}: {error}") from None
+    if not isinstance(data, dict):
+        raise HarnessError(f"build receipt {receipt} is not an object")
+    return data
+
+
+def snapshot_binary(binary: Path, receipt_path: Path, root: Path,
+                    expected_sha256: str | None = None,
+                    expected_source_digest: str | None = None) -> Path:
+    """Copy a verified binary and its matching build receipt to a private root.
+
+    The snapshot is content-addressed by the binary hash.  The receipt must
+    name the same binary and, when supplied, the same source digest.  An
+    existing snapshot is never overwritten; the caller executes only from it.
+    """
+    source = Path(binary)
+    if not source.is_file():
+        raise HarnessError(f"candidate binary is missing: {source}")
+    data = source.read_bytes()
+    digest = sha256_bytes(data)
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise HarnessError(
+            f"candidate binary hash {digest} does not match verified receipt {expected_sha256}")
+    receipt = Path(receipt_path)
+    receipt_data = read_build_receipt(source)
+    if receipt_data.get("binary_sha256") != digest:
+        raise HarnessError(f"build receipt {receipt} does not match binary hash {digest}")
+    if expected_source_digest is not None and receipt_data.get("source_inputs_sha256") != expected_source_digest:
+        raise HarnessError(
+            f"build receipt source digest {receipt_data.get('source_inputs_sha256')} != "
+            f"current source digest {expected_source_digest}")
+    root = Path(root) / digest
+    target = root / "rootyard"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if sha256_file(target) != digest:
+                raise HarnessError(f"immutable snapshot {target} has unexpected content")
+        else:
+            tmp = root / f".rootyard-{os.getpid()}.tmp"
+            tmp.write_bytes(data)
+            os.chmod(tmp, 0o500)
+            os.replace(tmp, target)
+        if sha256_file(target) != digest:
+            raise HarnessError(f"immutable snapshot {target} failed hash verification")
+        snap_receipt = target.with_suffix(".build.json")
+        if not snap_receipt.exists():
+            snap_receipt.write_text(json.dumps(receipt_data, indent=2, sort_keys=True) + "\n")
+        if read_build_receipt(target) != receipt_data:
+            raise HarnessError(f"snapshot receipt {snap_receipt} does not match the verified build receipt")
+    except OSError as error:
+        raise HarnessError(f"cannot create immutable binary snapshot {target}: {error}") from None
+    return target
+
+
 def binary_receipt(binary: Path) -> dict:
     st = binary.stat()
     data = binary.read_bytes()
     return {
         "path": str(binary),
-        "sha256": hashlib.sha256(data).hexdigest(),
+        "sha256": sha256_bytes(data),
         "size": st.st_size,
         "mtime_ns": st.st_mtime_ns,
         "executable": os.access(binary, os.X_OK),
@@ -484,6 +583,15 @@ class ParkedWriter(threading.Thread):
                     pass
             self.finished.set()
 
+    def request_stop(self) -> None:
+        """Signal intent to stop without waiting for a possibly frozen write.
+
+        The owning cleanup must kill the helper (releasing the FUSE device
+        descriptors) before it joins this thread.  Calling ``finish`` while the
+        mount gate is still frozen can block forever.
+        """
+        self.stop.set()
+
     def wait_started(self, timeout: float = 5.0) -> None:
         if not self.started.wait(timeout):
             raise HarnessError(f"writer for {self.path} did not start")
@@ -541,14 +649,18 @@ class WorkFixture:
         self.mounts[wid] = self.service / "mounts" / wid
         return wid
 
-    def cleanup(self, mount_check) -> dict:
+    def cleanup(self, mount_check, remove: bool = True) -> dict:
         evidence = {"mounts_before": [row["mountpoint"] for row in owned_mounts(self.root)]}
         mount_check()
         evidence["mounts_after"] = [row["mountpoint"] for row in owned_mounts(self.root)]
         evidence["temp_root_removed"] = False
-        if not evidence["mounts_after"]:
+        evidence["remove_requested"] = bool(remove)
+        # Never walk/remove a fixture while an owned mount still exists or the
+        # FD owner/writers are unconfirmed.  The caller passes remove=False in
+        # that case and the private temp root is intentionally left for triage.
+        if remove and not evidence["mounts_after"]:
             shutil.rmtree(self.root, ignore_errors=True)
-            evidence["temp_root_removed"] = not self.root.exists()
+        evidence["temp_root_removed"] = not self.root.exists()
         return evidence
 
 
@@ -558,10 +670,13 @@ def umount_owned(root: Path) -> list[dict]:
     The helper is SIGKILLed first so its FUSE descriptors are gone; a normal
     umount is used only if the kernel still shows an owned mountpoint.  Lazy
     detach is deliberately never used: it could leave a blocked request in D.
+    Deepest mountpoints are unmounted first so nested owned mounts cannot pin
+    a parent.
     """
     results = []
     libc = ctypes.CDLL(None, use_errno=True)
-    for row in owned_mounts(root):
+    rows = sorted(owned_mounts(root), key=lambda row: row["mountpoint"].count("/"), reverse=True)
+    for row in rows:
         point = row["mountpoint"]
         rc = libc.umount2(point.encode(), 0)
         results.append({"mountpoint": point, "rc": rc, "errno": ctypes.get_errno() if rc else 0})
@@ -610,10 +725,16 @@ def wait_pid_gone(pid: int, timeout: float) -> bool:
     return False
 
 
-def preconditions(binary: Path) -> dict:
+def preconditions(binary: Path, repo: Path) -> dict:
     facts = {
+        "binary": str(binary),
         "binary_exists": binary.is_file(),
         "binary_executable": os.access(binary, os.X_OK),
+        "build_receipt_path": str(binary.with_suffix(".build.json")),
+        "build_receipt_exists": binary.with_suffix(".build.json").is_file(),
+        "build_receipt_matches_binary": False,
+        "source_digest": None,
+        "source_digest_matches_build": False,
         "fuse_device": Path("/dev/fuse").exists(),
         "fuse_device_char": False,
         "unshare": shutil.which("unshare") is not None,
@@ -625,7 +746,23 @@ def preconditions(binary: Path) -> dict:
         facts["fuse_device_char"] = stat.S_ISCHR(Path("/dev/fuse").stat().st_mode)
     except OSError:
         pass
-    missing = [name for name in ("binary_exists", "binary_executable", "fuse_device",
-                                 "fuse_device_char", "unshare", "git") if not facts[name]]
+    try:
+        receipt = read_build_receipt(binary)
+        facts["build_receipt_matches_binary"] = (
+            facts["binary_exists"] and
+            receipt.get("binary_sha256") == sha256_file(binary))
+    except HarnessError as error:
+        facts["build_receipt_error"] = redact(error)
+    try:
+        facts["source_digest"] = source_digest(repo)
+        receipt = read_build_receipt(binary)
+        facts["source_digest_matches_build"] = (
+            receipt.get("source_inputs_sha256") == facts["source_digest"])
+    except HarnessError as error:
+        facts["source_digest_error"] = redact(error)
+    missing = [name for name in ("binary_exists", "binary_executable", "build_receipt_exists",
+                                 "build_receipt_matches_binary", "source_digest_matches_build",
+                                 "fuse_device", "fuse_device_char", "unshare", "git")
+               if not facts[name]]
     facts["missing"] = missing
     return facts
