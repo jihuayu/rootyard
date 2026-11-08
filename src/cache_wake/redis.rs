@@ -272,10 +272,7 @@ impl RedisCache {
     async fn verify_contract_before_mutation(&self, connection: &mut ConnectionManager) -> Result<()> {
         let expected = self.contract()?;
         let observed = self.inspect_server_contract(connection).await?;
-        ensure!(
-            observed == expected,
-            "Redis cache server resource contract changed; reconnect required"
-        );
+        ensure!(observed == expected, "Redis cache server resource contract changed; reconnect required");
         Ok(())
     }
 
