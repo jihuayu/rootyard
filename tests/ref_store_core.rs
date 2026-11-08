@@ -421,10 +421,7 @@ async fn cancel_before_register_prevents_ref_changes() -> Result<()> {
         let error = commit(&pool, &attempt).await.expect_err("cancel tombstone was ignored");
         assert!(matches!(error, RefStoreError::Cancelled { .. }), "unexpected {error}");
         assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_refs WHERE repository_id=$1", repo).await?, 0);
-        assert_eq!(
-            count(&pool, "SELECT count(*) FROM ref_store_cancellations WHERE repository_id=$1", repo).await?,
-            1
-        );
+        assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_cancellations WHERE repository_id=$1", repo).await?, 1);
         assert!(matches!(
             check_version(&pool, repo, tenant, None).await?,
             VersionCheck::Changed(version) if version.revision() == 1
