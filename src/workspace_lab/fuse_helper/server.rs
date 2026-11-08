@@ -481,9 +481,14 @@ fn heartbeat_reader(state: Arc<State>, mut stream: UnixStream) {
             }
             failstop(&state, "unexpected heartbeat frame", 1);
         }
-        let generation = state.generation.load(Ordering::Acquire);
-        if state.hello.load(Ordering::Acquire) && frame.generation != generation {
-            failstop(&state, "heartbeat generation mismatch", 1);
+        // Read the ready flag first, then the generation it publishes. The
+        // Acquire on `hello` makes the generation store visible; never cache the
+        // generation before observing `hello == true` or a pre-hello 0 can race.
+        if state.hello.load(Ordering::Acquire) {
+            let generation = state.generation.load(Ordering::Acquire);
+            if frame.generation != generation {
+                failstop(&state, "heartbeat generation mismatch", 1);
+            }
         }
         state.touch_heartbeat();
     }
