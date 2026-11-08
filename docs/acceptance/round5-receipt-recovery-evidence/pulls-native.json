@@ -4,67 +4,67 @@
     {
       "name": "setup",
       "status": "passed",
-      "seconds": 7.4259,
+      "seconds": 5.6492,
       "detail": null
     },
     {
       "name": "migration",
       "status": "passed",
-      "seconds": 1.9493,
+      "seconds": 1.5126,
       "detail": null
     },
     {
       "name": "lifecycle_and_diff",
       "status": "passed",
-      "seconds": 0.3445,
+      "seconds": 0.3656,
       "detail": null
     },
     {
       "name": "reviews_and_head_binding",
       "status": "passed",
-      "seconds": 0.0949,
+      "seconds": 0.0924,
       "detail": null
     },
     {
       "name": "checks_and_monotonic_ordering",
       "status": "passed",
-      "seconds": 1.7042,
+      "seconds": 1.8612,
       "detail": null
     },
     {
       "name": "branch_rules_and_stale_invalidation",
       "status": "passed",
-      "seconds": 1.8825,
+      "seconds": 1.9577,
       "detail": null
     },
     {
       "name": "atomic_merge_and_idempotency",
       "status": "passed",
-      "seconds": 2.374,
+      "seconds": 2.0822,
       "detail": null
     },
     {
       "name": "access_and_boundaries",
       "status": "passed",
-      "seconds": 0.7623,
+      "seconds": 0.6806,
       "detail": null
     },
     {
       "name": "concurrency_and_pagination",
       "status": "passed",
-      "seconds": 0.7964,
+      "seconds": 0.7948,
       "detail": null
     },
     {
       "name": "database_boundaries_and_rollback",
       "status": "passed",
-      "seconds": 0.2458,
+      "seconds": 0.2369,
       "detail": null
     },
     {
       "name": "restart",
       "status": "passed",
-      "seconds": 1.7427,
+      "seconds": 1.6868,
       "detail": null
     }
   ],
@@ -72,5 +72,7 @@
   "limitations": [
     "Personal owner-only tenancy, not organization/collaborator ACLs.",
     "Same-generation atomic merge covers local bare repositories and PostgreSQL outbox."
-  ]
+  ],
+  "harness_input_sha256": "488ee7aec6f61c9ffa05a879661230f9322ec871b8996458060e85197e0f973d",
+  "harness_commit": "97a325b6d2ec3c2308a24a749e6e0aafec6ff753"
 }
