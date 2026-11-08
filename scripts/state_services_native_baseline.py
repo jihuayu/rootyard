@@ -277,10 +277,17 @@ class PhaseMetricsCapture:
         if self.status != 'ready':
             return None
         begin = time.monotonic()
-        with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
+        identity = process_identity(pid)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(self.url, timeout=self.timeout) as response:
             if response.status != 200:
                 raise ValueError('metrics endpoint returned status ' + str(response.status))
-            text = response.read().decode('utf-8')
+            raw = response.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise ValueError('metrics exposition exceeds fixture bound')
+            text = raw.decode('utf-8')
+        if process_identity(pid) != identity:
+            raise MetricsRestart('application process changed during scrape')
         self.scrape_seconds.append(time.monotonic() - begin)
         self.scrapes += 1
         sample = parse_phase_metrics(text)
@@ -289,7 +296,7 @@ class PhaseMetricsCapture:
             self.reason = ('exporter answered but exported no ' + BASELINE_PREFIX + '* series; '
                            'the binary was built without the state-baseline-metrics feature')
             return None
-        return {'identity': process_identity(pid), 'sample': sample}
+        return {'identity': identity, 'sample': sample}
 
     def _failed(self, error):
         self.status = 'unavailable'

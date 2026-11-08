@@ -14,7 +14,7 @@ measurement can promote a failing operation to a successful one.
   recorded, allocated, formatted or exported, and the awaited futures are polled
   exactly as before. Behaviour and decisions are identical in both builds.
 * ON: recording is a handful of saturating `AtomicU64` increments. Memory is
-  constant: 12 phases x (3 outcomes + 11 histogram buckets + 2 scalars) per
+  constant: 12 phases x (3 outcomes + 11 histogram buckets + 3 scalars) per
   process. Nothing is written to PostgreSQL or to the object store.
 * Exposition is appended by the **existing private loopback listener** in
   `src/metrics.rs` (`ROOTYARD_METRICS_BIND=127.0.0.1:<port>`, path `/metrics`).
@@ -85,7 +85,7 @@ its previous behaviour and error handling.
 a deadline signal: a deadline that fires normally returns `Err(Elapsed)` inside
 the future and is counted as `error`. A timer only starts when its future is
 first polled, so a future dropped before it is polled records nothing at all.
-Observations per phase always equal `ok + error + cancelled`, and each timer
+After all recorded timers have drained, observations per phase equal `ok + error + cancelled`, and each timer
 records at most once because an explicit finish marks it as recorded before the
 `Drop` fallback runs.
 
@@ -95,7 +95,7 @@ records at most once because an explicit finish marks it as recorded before the
 same wall-clock spans, with fixed cumulative bounds in seconds:
 `0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 5, 30, +Inf`.
 
-* The overflow bucket is `+Inf`, and it always equals
+* The overflow bucket is `+Inf`, and, after timers drain, it equals
   `rootyard_baseline_phase_duration_seconds_count`.
 * Buckets mix outcomes; use the outcome counters to separate them. A histogram
   per outcome would multiply cardinality, so it is deliberately not exported.
@@ -219,7 +219,7 @@ This module supplies phase instrumentation plus metric semantics only. #106
 remains open until the root-owned measurement of real whole push/cold/warm runs,
 frozen budgets and full coverage of the intended phases exist. Nothing here is a
 performance claim, and the legacy
-`evidence/services/w0-native-legacy-pando-v4.json` baseline is unchanged.
+`evidence/state-services/w0-native-legacy-pando-v5.json` baseline is unchanged.
 
 ## Tests
 
@@ -233,3 +233,5 @@ future, exact concurrent counter totals after thread join, fixed
 label/series cardinality, histogram bucket boundaries including the overflow
 bucket, and bytes only on completion. The feature-OFF build is exercised by the
 existing `metrics` tests, which assert the legacy 17 series are unchanged.
+
+Live exposition reads independent relaxed atomic counters. A scrape racing a completed timer may contain a temporarily inconsistent observation/outcome/histogram snapshot. Equalities and per-case deltas require quiescent case boundaries; the strict runner rejects an inconsistent scrape rather than fabricating zero values. Histogram spans remain nested, and SQL timings include the complete query round trip.
