@@ -99,9 +99,11 @@ full-backlog drill, and per-worker coverage beyond the bounded operation scope
 described in `docs/worker-diagnostics.md`. That document lists exactly which
 workers are wrapped, which are only unit-covered, and which remain entirely
 outside operation scope; it does not claim all issue-80 work is complete. The
-fault metrics on the private listener are unchanged. The new scenarios were not
-executed natively in this implementation branch; the reports in `evidence/`
-remain the authority for what was actually run.
+fault metrics on the private listener are unchanged. The storage maintenance
+57014 timeout and separate HTTP 23503 privacy drill passed natively; see
+[the attested native report](acceptance/round5-worker-diagnostics-evidence/native.json).
+Other newly scoped workers have no native fault evidence in that report. The
+acceptance reports remain the authority for what was actually run.
 
 The private metric `rootyard_error_log_dropped_total` counts accepted records
 lost to a full/disconnected queue, writer startup failure, or incomplete stderr
