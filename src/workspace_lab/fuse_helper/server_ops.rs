@@ -166,9 +166,7 @@ pub(super) fn reuse_verdict(
             libc::EEXIST,
             "workspace is already mounted at another epoch or root; reconcile the lease first".into(),
         ))),
-        ExistingMount::Fenced => {
-            Some(Err((libc::EROFS, "existing mount is fenced; reconcile the lease first".into())))
-        }
+        ExistingMount::Fenced => Some(Err((libc::EROFS, "existing mount is fenced; reconcile the lease first".into()))),
     }
 }
 
@@ -211,10 +209,10 @@ fn reuse_existing(
         pending.contains_key(&ws),
         existing,
     );
-    if matches!(&verdict, Some(Ok(_))) {
-        if let Some(mount) = mounts.get_mut(&ws) {
-            mount.request = request;
-        }
+    if matches!(&verdict, Some(Ok(_)))
+        && let Some(mount) = mounts.get_mut(&ws)
+    {
+        mount.request = request;
     }
     verdict
 }
@@ -522,12 +520,7 @@ pub(super) fn freeze_release(
                         (Err((libc::ESTALE, "freeze operation already has a finishing request")), true, None, None)
                     } else {
                         *done = Some(request);
-                        (
-                            Ok(op.workspace),
-                            true,
-                            Some(op.decision.clone()),
-                            Some(op.done.clone()),
-                        )
+                        (Ok(op.workspace), true, Some(op.decision.clone()), Some(op.done.clone()))
                     }
                 }
             }

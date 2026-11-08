@@ -543,7 +543,11 @@ fn copy_never_replaces_or_deletes_a_preexisting_destination() {
     let committed = workspace.root.path().join("committed");
     snapshot::copy_into(&raw, &committed, &mut no_lazy).expect("copy").keep();
     assert_eq!(fs::read(committed.join("keep.txt")).expect("copied"), b"keep");
-    assert_eq!(fs::read(dest.join("sentinel")).expect("sentinel bytes"), b"sentinel", "the sentinel is still untouched");
+    assert_eq!(
+        fs::read(dest.join("sentinel")).expect("sentinel bytes"),
+        b"sentinel",
+        "the sentinel is still untouched"
+    );
 }
 
 #[test]
@@ -579,8 +583,11 @@ fn raw_file_refuses_a_symlink_ancestor() {
     let workspace = Workspace::new();
     let upper = workspace.upper();
     write(&upper, ".git/index", b"upper-index");
-    let raw =
-        Raw::fixture(workspace.lower(), upper.clone(), vec![(Origin::Upper, file(".git/index", 0o644, b"upper-index"))]);
+    let raw = Raw::fixture(
+        workspace.lower(),
+        upper.clone(),
+        vec![(Origin::Upper, file(".git/index", 0o644, b"upper-index"))],
+    );
     assert_eq!(raw.raw_file(Path::new(".git/index")).expect("visible index"), b"upper-index");
     // A `.git` symlink on disk is refused instead of followed out of the layer.
     fs::remove_dir_all(upper.join(".git")).expect("remove git dir");
@@ -595,10 +602,7 @@ fn raw_file_refuses_a_symlink_ancestor() {
     let raw = Raw::fixture(
         workspace.lower(),
         upper,
-        vec![
-            (Origin::Upper, link("link", "sub")),
-            (Origin::Upper, file("link/index", 0o644, b"index")),
-        ],
+        vec![(Origin::Upper, link("link", "sub")), (Origin::Upper, file("link/index", 0o644, b"index"))],
     );
     assert!(raw.raw_file(Path::new("link/index")).is_err(), "a merged symlink ancestor is never traversed");
 }

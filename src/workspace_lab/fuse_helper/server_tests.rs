@@ -40,14 +40,8 @@ fn retired_floor_survives_more_than_64_cancellations_and_refuses_an_old_retry() 
     assert!(!ops::mount_is_retired(&state, 97), "a genuinely newer id is not retired");
 
     let cancel = Arc::new(AtomicBool::new(false));
-    let refused = ops::register_pending(
-        &state,
-        workspace,
-        1,
-        Instant::now() + Duration::from_secs(1),
-        cancel,
-    )
-    .unwrap_err();
+    let refused =
+        ops::register_pending(&state, workspace, 1, Instant::now() + Duration::from_secs(1), cancel).unwrap_err();
     assert_eq!(refused.0, libc::ECANCELED, "a late old request must not be admitted");
     assert!(lock(&state.pending).is_empty());
 }
@@ -67,23 +61,11 @@ fn cancelled_admission_is_refused_after_the_retired_floor() {
 #[test]
 fn cancelled_or_expired_existing_mount_cannot_be_reused() {
     let same = ops::ExistingMount::Same { epoch: 5 };
-    assert!(matches!(
-        ops::reuse_verdict(true, false, false, same),
-        Some(Err((libc::ECANCELED, _)))
-    ));
-    assert!(matches!(
-        ops::reuse_verdict(false, true, false, same),
-        Some(Err((libc::ETIMEDOUT, _)))
-    ));
-    assert!(matches!(
-        ops::reuse_verdict(false, false, true, same),
-        Some(Err((libc::EBUSY, _)))
-    ));
+    assert!(matches!(ops::reuse_verdict(true, false, false, same), Some(Err((libc::ECANCELED, _)))));
+    assert!(matches!(ops::reuse_verdict(false, true, false, same), Some(Err((libc::ETIMEDOUT, _)))));
+    assert!(matches!(ops::reuse_verdict(false, false, true, same), Some(Err((libc::EBUSY, _)))));
     assert!(matches!(ops::reuse_verdict(false, false, false, same), Some(Ok(5))));
-    assert!(matches!(
-        ops::reuse_verdict(false, false, false, ops::ExistingMount::Fenced),
-        Some(Err((libc::EROFS, _)))
-    ));
+    assert!(matches!(ops::reuse_verdict(false, false, false, ops::ExistingMount::Fenced), Some(Err((libc::EROFS, _)))));
 }
 
 #[test]

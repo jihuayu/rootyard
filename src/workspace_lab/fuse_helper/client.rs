@@ -21,10 +21,7 @@ use std::{
     net::Shutdown,
     os::{
         fd::OwnedFd,
-        unix::{
-            net::UnixStream,
-            process::CommandExt,
-        },
+        unix::{net::UnixStream, process::CommandExt},
     },
     path::Path,
     process::{Child, Command, Stdio},
@@ -343,7 +340,7 @@ impl Drop for Inner {
         // Stop and reap without joining: a thread handle cycle or blocked
         // reader must never keep the generation alive.
         self.stop.store(true, Ordering::Release);
-        self.dead.store(true, Ordering::AcqRel);
+        self.dead.store(true, Ordering::Release);
         let _ = self.control_shutdown.shutdown(Shutdown::Both);
         let _ = self.heartbeat_shutdown.shutdown(Shutdown::Both);
         let _ = self.reaper.try_send(ReapRequest::GenerationDead);
@@ -434,9 +431,7 @@ impl HelperClient {
             .name("fuse-helper-control-reader".into())
             .spawn(move || control_reader(reader_inner, reader_stream))?;
         let heartbeat_inner = inner.clone();
-        thread::Builder::new()
-            .name("fuse-helper-heartbeat".into())
-            .spawn(move || heartbeat_writer(heartbeat_inner))?;
+        thread::Builder::new().name("fuse-helper-heartbeat".into()).spawn(move || heartbeat_writer(heartbeat_inner))?;
         let abort_inner = inner.clone();
         thread::Builder::new()
             .name("fuse-helper-freeze-abort".into())
@@ -444,9 +439,7 @@ impl HelperClient {
         // Exactly one dedicated reaper; its handle is detached so `Inner`
         // never owns a join handle whose closure owns another `Inner` Arc.
         let reap_inner = inner.clone();
-        thread::Builder::new()
-            .name("fuse-helper-reaper".into())
-            .spawn(move || reap_child(reap_inner, reap_jobs))?;
+        thread::Builder::new().name("fuse-helper-reaper".into()).spawn(move || reap_child(reap_inner, reap_jobs))?;
         Ok(Self { inner })
     }
 
@@ -594,7 +587,10 @@ fn control_reader(inner: Arc<Inner>, mut stream: UnixStream) {
                 // EOF or a protocol error: the child is gone. Every pending
                 // request fails closed, the heartbeat stops and the reaper
                 // kills/reaps the child; this reader never joins itself.
-                inner.fail_generation(libc::ECONNRESET, format!("workspace FUSE helper control channel closed: {error}"));
+                inner.fail_generation(
+                    libc::ECONNRESET,
+                    format!("workspace FUSE helper control channel closed: {error}"),
+                );
                 return;
             }
         }

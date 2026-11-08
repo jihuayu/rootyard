@@ -226,8 +226,9 @@ impl Raw {
             }
         }
         let digest = hash_entries(&entries)?;
-        let hydrates =
-            merged.iter().any(|(path, (origin, entry))| *origin == Origin::Lazy && entry.kind == "file" && !path.starts_with(".git"));
+        let hydrates = merged.iter().any(|(path, (origin, entry))| {
+            *origin == Origin::Lazy && entry.kind == "file" && !path.starts_with(".git")
+        });
         Ok(Self { id: layout.id, lower: layout.lower, upper: layout.upper, merged, hydrates, digest })
     }
 
@@ -380,7 +381,8 @@ fn resolve_target(
     if let Some(parent) = path.parent() {
         resolved.extend(parent.components().map(|component| component.as_os_str().to_owned()));
     }
-    let mut pending: VecDeque<OsString> = target.components().map(|component| component.as_os_str().to_owned()).collect();
+    let mut pending: VecDeque<OsString> =
+        target.components().map(|component| component.as_os_str().to_owned()).collect();
     let mut hops = 0_usize;
     while let Some(component) = pending.pop_front() {
         if component.as_os_str() == OsStr::new(".") {
@@ -541,12 +543,12 @@ fn rename_no_replace(from: &Path, to: &Path) -> Result<(), Error> {
         // a free name and the second rename then replaces the first tree, which
         // may already be a confirmed checkpoint. No such fallback exists here.
         Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP) => {
-            return Err(Error::internal("workspace snapshot publication needs RENAME_NOREPLACE support"))
+            Err(Error::internal("workspace snapshot publication needs RENAME_NOREPLACE support"))
         }
         Some(libc::EEXIST) | Some(libc::ENOTEMPTY) => {
-            return Err(Error::internal("workspace snapshot destination already exists"))
+            Err(Error::internal("workspace snapshot destination already exists"))
         }
-        _ => return Err(Error::internal(error)),
+        _ => Err(Error::internal(error)),
     }
 }
 
