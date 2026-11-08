@@ -34,6 +34,7 @@
 //!   Session revocation uses `UPDATE ... SET revoked = true` and never deletes
 //!   audit/GC references.
 
+use super::cursors::{decode as decode_cursor, encode as cursor};
 use crate::{
     Error, auth,
     db::{self, Identity},
@@ -42,7 +43,6 @@ use crate::{
         models::{self, *},
     },
 };
-use super::cursors::{decode as decode_cursor, encode as cursor};
 use axum::http::StatusCode;
 use deadpool_postgres::{Pool, Transaction};
 use rand::RngCore;
@@ -254,11 +254,7 @@ pub async fn list_tokens(pool: &Pool, actor: &Identity, after: Option<String>, l
     };
     let more = rows.len() as i64 > limit;
     let rows = &rows[..rows.len().min(limit as usize)];
-    let next_after = if more {
-        rows.last().map(|row| cursor(&scope, row)).transpose()?
-    } else {
-        None
-    };
+    let next_after = if more { rows.last().map(|row| cursor(&scope, row)).transpose()? } else { None };
     let items = token_views(&tx, rows).await?;
     auth::finish_tx(tx, actor, false).await?;
     Ok(TokenPage { items, next_after })
@@ -496,11 +492,7 @@ pub async fn list_sessions(
     };
     let more = rows.len() as i64 > limit;
     let rows = &rows[..rows.len().min(limit as usize)];
-    let next_after = if more {
-        rows.last().map(|row| cursor(&scope, row)).transpose()?
-    } else {
-        None
-    };
+    let next_after = if more { rows.last().map(|row| cursor(&scope, row)).transpose()? } else { None };
     let items = rows
         .iter()
         .map(|row| SessionView {
