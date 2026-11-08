@@ -352,7 +352,7 @@ async fn foreign_lane_begin_and_cancel_cannot_both_win() -> Result<()> {
         });
         let begin_won = begin_task.await??;
         let cancel_won = cancel_task.await??;
-        assert_ne!(begin_won, cancel_won, "begin and foreign cancel both committed");
+        assert_ne!(begin_won, cancel_won, "exactly one cross-lane identity must win");
 
         let mut client = pool.get().await?;
         let tx = client.transaction().await?;

@@ -323,7 +323,7 @@ async fn lock_operation_key(
     operation_id: Uuid,
 ) -> Result<(), RefStoreError> {
     tx.query_one(
-        "SELECT pg_advisory_xact_lock(hashtext($1),hashtext($2::text || '/' || $3::text))",
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text || '/' || $2::uuid::text || '/' || $3::uuid::text,0))",
         &[&OPERATION_LOCK_DOMAIN, &repository_id, &operation_id],
     )
     .await
