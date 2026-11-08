@@ -417,9 +417,20 @@ fn resolve_target(
 /// The directory one publication created, and nothing else.
 ///
 /// Publication is no-replace, so a directory this guard owns cannot have existed
-/// before the call. Until [`Published::keep`] confirms the durable commit, a
-/// dropped guard removes exactly that directory; a pre-existing destination is
-/// never touched because it is never published over.
+/// before the call; a pre-existing destination is never touched because it is
+/// never published over. A dropped guard removes exactly that directory.
+///
+/// Ownership and durability are separate concerns: callers must [`keep`] the
+/// tree *before* awaiting a COMMIT, not after. A dropped connection at COMMIT
+/// cannot distinguish "rolled back" from "committed but the response was lost",
+/// so deleting on a commit error would delete a tree the database already
+/// references. A tree kept before an ambiguous COMMIT is either referenced or
+/// left orphaned under the service-owned checkpoint/lower directory; orphaned
+/// trees are unreferenced single-call directories and must be reconciled by
+/// maintenance, never by the request path. SQL errors *before* COMMIT are a
+/// definite rollback; those keep the guard armed and clean the tree up.
+///
+/// [`keep`]: Published::keep
 pub(super) struct Published {
     dest: PathBuf,
     kept: bool,
@@ -430,7 +441,9 @@ impl Published {
         Self { dest, kept: false }
     }
 
-    /// The checkpoint (or restored workspace row) is committed: keep the tree.
+    /// Disarm the guard: retain the tree from here on. Call this immediately
+    /// before the COMMIT is sent, so an ambiguous commit outcome retains a tree
+    /// that may already be referenced by a committed row.
     pub(super) fn keep(mut self) {
         self.kept = true;
     }
@@ -523,19 +536,18 @@ fn rename_no_replace(from: &Path, to: &Path) -> Result<(), Error> {
     }
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
-        // A filesystem without `RENAME_NOREPLACE` falls back to a checked
-        // rename: still no replacement, but not atomic against a concurrent
-        // publisher. Every filesystem this service ships on supports the flag.
-        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP) => {}
+        // Fail closed. A stat followed by an ordinary rename is not a
+        // replacement check under concurrency: two publishers can both observe
+        // a free name and the second rename then replaces the first tree, which
+        // may already be a confirmed checkpoint. No such fallback exists here.
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP) => {
+            return Err(Error::internal("workspace snapshot publication needs RENAME_NOREPLACE support"))
+        }
         Some(libc::EEXIST) | Some(libc::ENOTEMPTY) => {
             return Err(Error::internal("workspace snapshot destination already exists"))
         }
         _ => return Err(Error::internal(error)),
     }
-    if present(to)? {
-        return Err(Error::internal("workspace snapshot destination already exists"));
-    }
-    fs::rename(from, to).map_err(Error::internal)
 }
 
 /// Copy every selected entry from its origin. `hydrate` is injected so unit

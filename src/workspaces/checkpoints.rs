@@ -13,29 +13,26 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::Path as FsPath, sync::Arc};
 use uuid::Uuid;
 
-/// Copy a checkpoint tree into a new workspace lower tree.
+/// Copy a checkpoint tree into a new workspace lower tree and hand back the
+/// guard that owns the published tree.
 ///
-/// The copy is staged beside the destination and published with a no-replace
-/// rename, so a lower tree that already exists is never overwritten or removed;
-/// only a staging directory and a directory this call published are cleaned up.
-fn copy_snapshot(source: &FsPath, dest: &FsPath) -> Result<(), Error> {
+/// `core::copy_all` creates the staging root itself, so the caller must not
+/// pre-create it; the tree is then published with a no-replace rename, so a
+/// lower tree that already exists is never overwritten or removed. The caller
+/// holds the guard through its own pre-COMMIT work and disarms it immediately
+/// before COMMIT: a definite pre-COMMIT failure drops the guard and removes
+/// exactly the directory this call published.
+fn copy_snapshot(source: &FsPath, dest: &FsPath) -> Result<super::snapshot::Published, Error> {
     let parent = dest.parent().ok_or_else(Error::bad_request)?;
     fs::create_dir_all(parent).map_err(Error::internal)?;
     let staging = parent.join(format!(".restore-{}", Uuid::new_v4()));
-    core::private_dir(&staging).map_err(Error::internal)?;
     let outcome = core::copy_all(source, &staging)
         .map_err(Error::internal)
         .and_then(|()| super::snapshot::publish(&staging, dest));
-    match outcome {
-        Ok(published) => {
-            published.keep();
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::remove_dir_all(&staging);
-            Err(error)
-        }
+    if outcome.is_err() {
+        let _ = fs::remove_dir_all(&staging);
     }
+    outcome
 }
 fn valid_agent(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
@@ -97,12 +94,10 @@ pub async fn create(
         let before_raw = super::snapshot::Raw::load(&source)?
             .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
         let before_index = before_raw.raw_file(FsPath::new(".git/index"))?;
-        // The guard owns the directory this call publishes. Until the database
-        // commit succeeds it is dropped on every failure path: a thaw error, a
-        // re-read of the raw layers, a failed fingerprint, a SQL error and a
-        // failed commit all remove exactly the tree this call created, and a
-        // preexisting destination is never removed because publication is
-        // no-replace.
+        // The guard owns the directory this call publishes. Every failure up to
+        // and including the last SQL statement before COMMIT drops it and
+        // removes exactly the tree this call created; a preexisting destination
+        // is never touched because publication is no-replace.
         let published = super::snapshot::copy(&state, &before_raw, &dest)?;
         let captured = super::snapshot::fingerprint(&dest)?;
         let after_raw = super::snapshot::Raw::load(&source)?
@@ -130,10 +125,16 @@ pub async fn create(
     .await
     .map_err(Error::internal)?;
     tx.execute("INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) VALUES($1,$2,$3,$4,'checkpoint','committed',$5)", &[&Uuid::new_v4(),&id,&key,&hash,&result]).await.map_err(Error::internal)?;
-    tx.commit().await.map_err(Error::internal)?;
-    // Only the database commit disarms the guard: the checkpoint tree is now
-    // referenced by `workspace_checkpoints`.
+    // Arm the tree before the COMMIT is sent, not after it returns. A transport
+    // failure at COMMIT cannot distinguish "rolled back" from "committed but
+    // the response was lost", and deleting a checkpoint tree a committed row
+    // already references is data loss. Every SQL error above this line is a
+    // definite rollback, so the guard is still armed there and cleans up on
+    // drop; a tree kept for a rolled-back row stays behind as an unreferenced
+    // `workspace-service/checkpoints/<uuid>` directory that maintenance must
+    // reconcile (the request path must not guess a commit outcome).
     published.keep();
+    tx.commit().await.map_err(Error::internal)?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -171,12 +172,16 @@ async fn restore_inner(
         }
     }
     let id = Uuid::new_v4();
-    if super::mounts::enabled() && row.get::<_, String>("checkpoint_state") == "committed" {
+    let lower = super::mounts::lower_path(&state, id);
+    // The guard owns only a lower tree this call published; an existing
+    // destination is refused by no-replace publication and stays unowned.
+    let published = if super::mounts::enabled() && row.get::<_, String>("checkpoint_state") == "committed" {
         super::lazy::prepare(&state, id, cp, parent.repository_id, access.owner_id).await?;
+        None
     } else {
         super::remote::ensure_local(&state, cp, parent.repository_id, access.owner_id).await?;
-        copy_snapshot(&service::checkpoint_repo(&state, cp), &super::mounts::lower_path(&state, id))?;
-    }
+        Some(copy_snapshot(&service::checkpoint_repo(&state, cp), &lower)?)
+    };
     let base_oid: Option<String> = tx
         .query_opt("SELECT base_oid FROM workspace_checkpoints WHERE id=$1", &[&cp])
         .await
@@ -192,11 +197,21 @@ async fn restore_inner(
         .await
         .map_err(Error::internal)?;
     }
-    super::capture::record_current_at(&tx, id, &super::mounts::lower_path(&state, id)).await?;
+    super::capture::record_current_at(&tx, id, &lower).await?;
     let row = tx
         .query_one(&format!("SELECT {WS_COLUMNS} FROM workspaces WHERE id=$1"), &[&id])
         .await
         .map_err(Error::internal)?;
+    // Same rule as a checkpoint: retain the lower tree before COMMIT so an
+    // ambiguous commit outcome can never delete a tree a committed `workspaces`
+    // row references. Every failure above this line is a definite rollback and
+    // drops the guard, removing exactly the tree this call published; a tree
+    // kept for a row that never committed is an unreferenced
+    // `workspace-service/workspaces/<uuid>` directory for maintenance to
+    // reconcile.
+    if let Some(published) = published {
+        published.keep();
+    }
     tx.commit().await.map_err(Error::internal)?;
     super::mounts::ensure_from_database(&state, id).await?;
     Ok((StatusCode::CREATED, Json(Workspace::from_row(&row))))
@@ -262,8 +277,31 @@ mod tests {
 
         // A free destination is published with the checkpoint tree.
         let fresh = root.path().join("workspaces/fresh");
-        copy_snapshot(&source, &fresh).expect("restore copy");
+        copy_snapshot(&source, &fresh).expect("restore copy").keep();
         assert_eq!(fs::read(fresh.join("a.txt")).expect("copied a.txt"), b"a");
         assert_eq!(fs::read(dest.join("sentinel")).expect("sentinel bytes"), b"sentinel");
+    }
+
+    #[test]
+    fn restore_copy_guard_cleans_up_only_before_commit() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let source = root.path().join("checkpoint");
+        fs::create_dir(&source).expect("source");
+        write(&source, "a.txt", b"a");
+        let workspaces = root.path().join("workspaces");
+        fs::create_dir_all(&workspaces).expect("workspaces dir");
+
+        // A definite pre-COMMIT failure drops the guard and removes the tree.
+        let failed = workspaces.join("failed");
+        let guard = copy_snapshot(&source, &failed).expect("restore copy");
+        assert_eq!(fs::read(failed.join("a.txt")).expect("copied"), b"a");
+        drop(guard);
+        assert!(!failed.exists(), "a definite pre-COMMIT failure cleans up the published tree");
+
+        // Disarming before COMMIT retains the tree: the row may have committed
+        // even when the COMMIT response was lost.
+        let retained = workspaces.join("retained");
+        copy_snapshot(&source, &retained).expect("restore copy").keep();
+        assert_eq!(fs::read(retained.join("a.txt")).expect("copied"), b"a");
     }
 }
