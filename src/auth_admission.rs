@@ -16,7 +16,9 @@
 //!   requests. Permits are RAII (`OwnedSemaphorePermit`), so cancellation or a
 //!   dropped request releases capacity immediately.
 //! * The source table is bounded by entry count and TTL, and is pruned/evicted
-//!   without unbounded growth.
+//!   without unbounded growth or an unbounded per-request scan: hot sources are
+//!   repositioned in an ordered index in `O(log n)`, and at most a fixed number
+//!   of expired entries is removed per admission check.
 //! * Rejections use a fixed generic body and a fixed `Retry-After`; neither the
 //!   body nor a metric label contains a token, username, address or digest.
 //!
@@ -36,7 +38,7 @@ use axum::{
 };
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, LazyLock, Mutex, MutexGuard,
@@ -47,12 +49,13 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
-/// Conservative default concurrent authentication budget. The PostgreSQL pool
-/// is 16 connections, so four admitted authentication lookups leave at least
-/// twelve connections available for normal repository traffic.
+/// Conservative default concurrent authentication budget. It caps how much
+/// pool pressure this module can add (at most four concurrent lookups against a
+/// 16-connection pool); it does not reserve connections, because other,
+/// unbounded API routes can consume the pool concurrently.
 pub const DEFAULT_MAX_INFLIGHT: usize = 4;
 /// Maximum admitted concurrent authentication lookups. Keeping this well below
-/// the pool size is what reserves database capacity for unrelated requests.
+/// the pool size limits this module's contribution to pool saturation.
 pub const MAX_INFLIGHT_CAP: usize = 8;
 pub const DEFAULT_ATTEMPTS_PER_SOURCE: u32 = 10;
 pub const DEFAULT_SOURCE_WINDOW_SECONDS: u64 = 60;
@@ -62,6 +65,10 @@ pub const DEFAULT_SOURCE_TTL_SECONDS: u64 = 300;
 /// per-source bucket state, so it cannot become an identity/timing oracle.
 pub const RETRY_AFTER_SECONDS: u64 = 60;
 const RETRY_AFTER_HEADER: &str = "60";
+/// Hard per-request bound on expired source entries evicted in one admission
+/// check. TTL cleanup is amortised: a large cold table drains over several
+/// requests instead of scanning the whole map under the mutex.
+const MAX_EXPIRY_POPS_PER_ACCESS: usize = 64;
 
 /// Validated, startup-loaded authentication admission settings.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,17 +178,48 @@ struct SourceEntry {
 #[derive(Debug, Default)]
 struct SourceTable {
     entries: HashMap<IpAddr, SourceEntry>,
+    /// Access counter used only to schedule amortised TTL cleanup.
     admissions: u64,
+    /// `(last_seen, source)` for every live entry, so the oldest and the most
+    /// stale buckets are found in `O(log n)` without scanning the map.
+    by_last_seen: BTreeSet<(Instant, IpAddr)>,
 }
 
 impl SourceTable {
-    fn prune_expired(&mut self, now: Instant, ttl: Duration) {
-        self.entries.retain(|_, entry| now.saturating_duration_since(entry.last_seen) < ttl);
+    /// Reposition a live entry after its `last_seen` changes. Removes the old
+    /// order tuple first so the index never accumulates stale duplicates.
+    fn touch(&mut self, source: IpAddr, entry: &mut SourceEntry, now: Instant) {
+        self.by_last_seen.remove(&(entry.last_seen, source));
+        entry.last_seen = entry.last_seen.max(now);
+        self.by_last_seen.insert((entry.last_seen, source));
     }
 
+    /// Evict at most `budget` expired entries. Work per admission check stays
+    /// constant even when a cold table holds up to `max_sources` entries.
+    fn expire_oldest(&mut self, now: Instant, ttl: Duration, budget: usize) -> usize {
+        let mut expired = 0;
+        while expired < budget {
+            let Some(&(last_seen, source)) = self.by_last_seen.first() else {
+                break;
+            };
+            if now.saturating_duration_since(last_seen) < ttl {
+                break;
+            }
+            self.by_last_seen.pop_first();
+            if self.entries.get(&source).is_some_and(|entry| entry.last_seen == last_seen) {
+                self.entries.remove(&source);
+                expired += 1;
+            }
+        }
+        expired
+    }
+
+    /// Drop the least-recently-seen live bucket, if any. `O(log n)`.
     fn evict_oldest(&mut self) {
-        if let Some(source) = self.entries.iter().min_by_key(|(_, entry)| entry.last_seen).map(|(source, _)| *source) {
-            self.entries.remove(&source);
+        while let Some((_, source)) = self.by_last_seen.pop_first() {
+            if self.entries.remove(&source).is_some() {
+                return;
+            }
         }
     }
 }
@@ -191,6 +229,26 @@ impl SourceTable {
 #[derive(Debug)]
 pub struct AdmissionPermit {
     _permit: OwnedSemaphorePermit,
+}
+
+/// Why admission refused an attempt. Deliberately small so
+/// `Result<AdmissionPermit, _>` stays cheap; it becomes a fixed HTTP response
+/// only at the middleware/route boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmissionRejection {
+    /// Per-source window or in-flight capacity exhausted (fixed `429`).
+    Overloaded,
+    /// No trusted transport peer for this route (fixed `503`, fail closed).
+    MissingPeer,
+}
+
+impl IntoResponse for AdmissionRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Overloaded => overloaded_response(),
+            Self::MissingPeer => missing_peer_response(),
+        }
+    }
 }
 
 /// Process-local bounded authentication admission state.
@@ -237,23 +295,30 @@ impl AuthAdmission {
 
     /// Consume one per-source attempt. Returns `false` when this source has used
     /// its fixed-window budget. No username or credential participates.
+    ///
+    /// Every access, admitted or rate-denied, refreshes the source's last-seen
+    /// position in both indexes. Work is `O(log n)` plus the fixed TTL-cleanup
+    /// budget, independent of how many sources the table holds.
     fn consume_source(&self, source: IpAddr, now: Instant) -> bool {
         let mut table = self.source_table();
         table.admissions = table.admissions.wrapping_add(1);
-        if table.entries.len() >= self.config.max_sources || table.admissions % 64 == 0 {
-            table.prune_expired(now, self.config.source_ttl);
+        // Amortised, bounded cleanup: every 64th admission and whenever the
+        // table is at its hard capacity bound. Never a full-map scan.
+        if table.admissions.is_multiple_of(64) || table.entries.len() >= self.config.max_sources {
+            table.expire_oldest(now, self.config.source_ttl, MAX_EXPIRY_POPS_PER_ACCESS);
         }
-        if let Some(entry) = table.entries.get_mut(&source) {
+        if let Some(mut entry) = table.entries.remove(&source) {
             if now.saturating_duration_since(entry.window_start) >= self.config.source_window {
                 entry.window_start = now;
                 entry.attempts = 0;
             }
-            entry.last_seen = now;
-            if entry.attempts >= self.config.attempts_per_source {
-                return false;
+            let admitted = entry.attempts < self.config.attempts_per_source;
+            if admitted {
+                entry.attempts += 1;
             }
-            entry.attempts += 1;
-            return true;
+            table.touch(source, &mut entry, now);
+            table.entries.insert(source, entry);
+            return admitted;
         }
         if table.entries.len() >= self.config.max_sources {
             table.evict_oldest();
@@ -263,20 +328,25 @@ impl AuthAdmission {
                 return false;
             }
         }
+        table.by_last_seen.insert((now, source));
         table.entries.insert(source, SourceEntry { window_start: now, attempts: 1, last_seen: now });
         true
     }
 
     /// Admit one authentication attempt for a known peer. The returned permit
     /// must be held until the database work and response construction finish.
-    pub(crate) fn try_admit(&self, source: IpAddr) -> Result<AdmissionPermit, Response> {
+    pub(crate) fn try_admit(&self, source: IpAddr) -> Result<AdmissionPermit, AdmissionRejection> {
         self.try_admit_at(source, Instant::now())
     }
 
-    pub(crate) fn try_admit_at(&self, source: IpAddr, now: Instant) -> Result<AdmissionPermit, Response> {
+    pub(crate) fn try_admit_at(
+        &self,
+        source: IpAddr,
+        now: Instant,
+    ) -> Result<AdmissionPermit, AdmissionRejection> {
         if !self.consume_source(source, now) {
             self.rejected_rate.fetch_add(1, Ordering::Relaxed);
-            return Err(overloaded_response());
+            return Err(AdmissionRejection::Overloaded);
         }
         match self.inflight.clone().try_acquire_owned() {
             Ok(permit) => {
@@ -287,7 +357,7 @@ impl AuthAdmission {
                 // Queueing here would let a login flood consume memory and then
                 // hit the database in a burst; fail fast before any query.
                 self.rejected_capacity.fetch_add(1, Ordering::Relaxed);
-                Err(overloaded_response())
+                Err(AdmissionRejection::Overloaded)
             }
         }
     }
@@ -295,10 +365,13 @@ impl AuthAdmission {
     /// Admit an attempt that requires a transport peer. Used by the explicit
     /// auth lookup route: missing `ConnectInfo` is refused instead of silently
     /// trusting a caller-supplied header or invented identity.
-    pub(crate) fn try_admit_required(&self, source: Option<IpAddr>) -> Result<AdmissionPermit, Response> {
+    pub(crate) fn try_admit_required(
+        &self,
+        source: Option<IpAddr>,
+    ) -> Result<AdmissionPermit, AdmissionRejection> {
         let Some(source) = source else {
             self.rejected_missing_peer.fetch_add(1, Ordering::Relaxed);
-            return Err(missing_peer_response());
+            return Err(AdmissionRejection::MissingPeer);
         };
         self.try_admit(source)
     }
@@ -330,27 +403,45 @@ fn missing_peer_response() -> Response {
     fixed_response(StatusCode::SERVICE_UNAVAILABLE, "authentication admission unavailable")
 }
 
+/// Whether this request is the browser login/token-exchange POST guarded by the
+/// login middleware.
+fn is_login_attempt(request: &Request<Body>) -> bool {
+    request.method() == Method::POST && request.uri().path() == "/web/login"
+}
+
+/// Admission gate for a confirmed login POST. A request without a transport
+/// peer is rejected (fail closed); otherwise the same bounded budget as
+/// `whoami` applies.
+///
+/// It is separated from [`login_middleware`] so the route's peer behaviour can
+/// be unit-tested without a database-backed `AppState` or an axum `Next` value;
+/// the full middleware path also runs in the native harness.
+pub(crate) fn admit_login_attempt(
+    admission: &AuthAdmission,
+    request: &Request<Body>,
+) -> Result<AdmissionPermit, AdmissionRejection> {
+    admission.try_admit_required(request_peer(request))
+}
+
 /// Route-level admission for the browser login/token-exchange POST.
 ///
 /// The middleware runs outside the web session middleware so a rejected attempt
 /// never reaches the session/credential database lookups. Missing `ConnectInfo`
-/// is refused, including when an embedding server forgets to supply it. The
-/// main listener installs transport-derived `ConnectInfo` for every request.
+/// is refused with a fixed `503` (fail closed), including when an embedding
+/// server forgets to supply it. The main listener installs transport-derived
+/// `ConnectInfo` for every request.
 pub async fn login_middleware(State(state): State<Arc<AppState>>, request: Request<Body>, next: Next) -> Response {
-    if request.method() == Method::POST && request.uri().path() == "/web/login" {
-        let Some(source) = request_peer(&request) else {
-            return missing_peer_response();
-        };
-        let admission = for_state(&state);
-        let permit = match admission.try_admit(source) {
-            Ok(permit) => permit,
-            Err(response) => return response,
-        };
-        let response = next.run(request).await;
-        drop(permit);
-        return response;
+    if !is_login_attempt(&request) {
+        return next.run(request).await;
     }
-    next.run(request).await
+    let admission = for_state(&state);
+    let permit = match admit_login_attempt(&admission, &request) {
+        Ok(permit) => permit,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    response
 }
 
 /// Authenticated identity probe used by the bounded-admission slice and its
@@ -367,7 +458,7 @@ async fn whoami(
     let admission = for_state(&state);
     let permit = match admission.try_admit_required(extension_peer(peer)) {
         Ok(permit) => permit,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     let identity = match auth::authenticate(&state.pool, &headers).await {
         Ok(identity) => identity,
@@ -439,9 +530,11 @@ mod tests {
         let now = Instant::now();
         assert!(admission.try_admit_at(peer(1), now).is_ok());
         assert!(admission.try_admit_at(peer(1), now).is_ok());
-        let Err(response) = admission.try_admit_at(peer(1), now) else {
+        let Err(rejection) = admission.try_admit_at(peer(1), now) else {
             panic!("third attempt was admitted");
         };
+        assert_eq!(rejection, AdmissionRejection::Overloaded);
+        let response = rejection.into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap().to_str().unwrap(), RETRY_AFTER_HEADER);
         assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap().to_str().unwrap(), "no-store");
@@ -476,11 +569,11 @@ mod tests {
     fn dropping_permit_releases_capacity_without_waiting() {
         let admission = AuthAdmission::new(config(1, 10, 16));
         let now = Instant::now();
-        let first = admission.try_admit_at(peer(1), now).ok().expect("first permit");
+        let first = admission.try_admit_at(peer(1), now).expect("first permit");
         let Err(overloaded) = admission.try_admit_at(peer(1), now) else {
             panic!("capacity bound did not reject the second attempt");
         };
-        assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(overloaded.into_response().status(), StatusCode::TOO_MANY_REQUESTS);
         drop(first);
         // Cancellation and explicit drop both run the same RAII release.
         assert!(admission.try_admit_at(peer(1), now).is_ok());
@@ -521,9 +614,11 @@ mod tests {
     #[tokio::test]
     async fn missing_peer_is_refused_on_the_new_auth_route() {
         let admission = AuthAdmission::new(config(4, 10, 16));
-        let Err(response) = admission.try_admit_required(None) else {
+        let Err(rejection) = admission.try_admit_required(None) else {
             panic!("missing peer was admitted");
         };
+        assert_eq!(rejection, AdmissionRejection::MissingPeer);
+        let response = rejection.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(response.headers().get(header::RETRY_AFTER).is_none());
         let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
@@ -531,5 +626,115 @@ mod tests {
         assert!(text.contains("authentication admission unavailable"));
         assert!(admission.try_admit_required(Some(peer(3))).is_ok());
         assert_eq!(admission.counters().rejected_missing_peer, 1);
+    }
+
+    #[tokio::test]
+    async fn aborting_a_spawned_request_releases_the_permit() {
+        let admission = Arc::new(AuthAdmission::new(config(1, 10, 16)));
+        let now = Instant::now();
+        let (holding_tx, holding_rx) = tokio::sync::oneshot::channel();
+        let task = {
+            let admission = Arc::clone(&admission);
+            tokio::spawn(async move {
+                let _permit = admission.try_admit_at(peer(1), now).expect("spawned permit");
+                let _ = holding_tx.send(());
+                std::future::pending::<()>().await;
+            })
+        };
+        holding_rx.await.expect("task should acquire the only permit");
+        // The held permit is still live inside the spawned (pending) future.
+        assert_eq!(admission.try_admit_at(peer(1), now).err(), Some(AdmissionRejection::Overloaded));
+        task.abort();
+        let error = task.await.expect_err("aborted task must not complete");
+        assert!(error.is_cancelled());
+        // No explicit drop ran: aborting the future is what released the slot.
+        assert!(admission.try_admit_at(peer(1), now).is_ok());
+        assert_eq!(admission.counters().rejected_capacity, 1);
+    }
+
+    #[tokio::test]
+    async fn login_route_requires_a_transport_peer() {
+        let admission = AuthAdmission::new(config(4, 10, 16));
+        let login = Request::builder()
+            .method(Method::POST)
+            .uri("/web/login")
+            .body(Body::empty())
+            .unwrap();
+        assert!(is_login_attempt(&login));
+        // No ConnectInfo: the login gate fails closed instead of admitting.
+        let Err(rejection) = admit_login_attempt(&admission, &login) else {
+            panic!("login without a transport peer was admitted");
+        };
+        assert_eq!(rejection, AdmissionRejection::MissingPeer);
+        let response = rejection.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
+        assert_eq!(admission.counters().rejected_missing_peer, 1);
+        // The same route is admitted when a real transport peer is present.
+        let login_with_peer = Request::builder()
+            .method(Method::POST)
+            .uri("/web/login")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4100))))
+            .body(Body::empty())
+            .unwrap();
+        assert!(admit_login_attempt(&admission, &login_with_peer).is_ok());
+        // Other routes and methods do not enter the login gate.
+        let whoami = Request::builder()
+            .method(Method::GET)
+            .uri("/api/auth/whoami")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_login_attempt(&whoami));
+        let other_post = Request::builder()
+            .method(Method::POST)
+            .uri("/api/repos")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_login_attempt(&other_post));
+    }
+
+    #[test]
+    fn hot_updates_and_rotation_keep_both_indexes_bounded() {
+        let admission = AuthAdmission::new(config(8, 10, 4));
+        let start = Instant::now();
+        // Repeated access to one hot source, including rate-denied attempts,
+        // must keep exactly one order tuple rather than growing the index.
+        for step in 0..500u64 {
+            let now = start + Duration::from_millis(step);
+            let _ = admission.try_admit_at(peer(1), now);
+        }
+        {
+            let table = admission.source_table();
+            assert_eq!(table.entries.len(), 1);
+            assert_eq!(table.by_last_seen.len(), 1);
+        }
+        // Source rotation with a hard cap never exceeds capacity and never
+        // desynchronises the order index from the entry map.
+        for last in 2..=200u8 {
+            let now = start + Duration::from_secs(1) + Duration::from_millis(u64::from(last));
+            assert!(admission.try_admit_at(IpAddr::from([127, 0, 0, last]), now).is_ok());
+            let table = admission.source_table();
+            assert!(table.entries.len() <= 4);
+            assert!(table.by_last_seen.len() <= 4);
+            assert_eq!(table.entries.len(), table.by_last_seen.len());
+        }
+    }
+
+    #[test]
+    fn expiration_cleanup_is_bounded_per_access() {
+        // Fill the table to its hard cap with entries that all expire together.
+        let admission = AuthAdmission::new(config(8, 10, 200));
+        let start = Instant::now();
+        for last in 1..=200u8 {
+            assert!(admission.try_admit_at(peer(last), start).is_ok());
+        }
+        assert_eq!(admission.source_table().entries.len(), 200);
+        let later = start + Duration::from_secs(301);
+        // Capacity-triggered cleanup removes at most the fixed budget of
+        // expired entries, then the new bucket is inserted: no full-table scan.
+        assert!(admission.try_admit_at(peer(250), later).is_ok());
+        let table = admission.source_table();
+        assert_eq!(table.entries.len(), 200 - MAX_EXPIRY_POPS_PER_ACCESS + 1);
+        assert_eq!(table.entries.len(), table.by_last_seen.len());
     }
 }

@@ -30,12 +30,14 @@ The only source identity is the real TCP peer address supplied by Axum
 consulted for admission. An attacker therefore cannot mint a fresh limiter bucket
 by spoofing a proxy header.
 
-`GET /api/auth/whoami` is the new auth-protected route for this slice. It refuses
-a missing peer with a fixed `503` instead of inventing an identity or trusting a
-header. The existing login route is also admitted when a peer exists; in-process
-router construction without `ConnectInfo` keeps the historical compatibility path
-so unrelated internal router tests are not required to fabricate a socket. A
-served listener always supplies `ConnectInfo`.
+Both protected routes — the browser `POST /web/login` credential exchange and
+the explicit `GET /api/auth/whoami` identity lookup — **fail closed** when the
+transport peer is missing. Each returns the same fixed `503` body
+(`authentication admission unavailable`) and performs no session, credential or
+identity work. Neither route falls back to a forwarding header, a default
+address or an invented identity. A served listener always installs
+`ConnectInfo`; this path only matters for embedded or in-process routers that
+omit it, and those requests are rejected rather than silently admitted.
 
 ## Configuration
 
@@ -44,7 +46,7 @@ listener starts.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ROOTYARD_AUTH_ADMISSION_MAX_INFLIGHT` | `4` | Concurrent admitted auth lookups, `1..=8`. Must stay well below the PostgreSQL pool size of 16 so ordinary repository traffic keeps database capacity. |
+| `ROOTYARD_AUTH_ADMISSION_MAX_INFLIGHT` | `4` | Concurrent admitted auth lookups, `1..=8`. Caps how many concurrent lookups this module can add to the shared pool; it does **not** reserve connections for anyone, because other, unbounded API routes can fill the 16-connection pool at the same time. |
 | `ROOTYARD_AUTH_ADMISSION_ATTEMPTS_PER_SOURCE` | `10` | Attempts per peer address in a fixed window, `1..=1000`. |
 | `ROOTYARD_AUTH_ADMISSION_SOURCE_WINDOW_SECONDS` | `60` | Fixed per-source window, `1..=3600`. |
 | `ROOTYARD_AUTH_ADMISSION_MAX_SOURCES` | `4096` | Hard source-table entry bound, `1..=1000000`. |
@@ -60,21 +62,26 @@ status/body, so an unauthenticated caller cannot distinguish them.
 
 - **Before the database:** admission checks the per-source fixed window and then
   tries to acquire an owned semaphore permit without queueing. Rate exhaustion or
-  capacity overload returns `429` immediately; no connection is checked out and
-  no token digest or username query runs.
+  capacity overload returns `429` immediately; this request performs no pool
+  checkout and no token-digest or username query.
 - **Global budget:** at most `ROOTYARD_AUTH_ADMISSION_MAX_INFLIGHT` admissions are
-  in flight in one process. The semaphore is deliberately small relative to the
-  16-connection pool. Permits are RAII: an explicit drop, an early return, a
-  cancelled request future or a dropped connection releases capacity immediately.
+  in flight in one process. The semaphore is deliberately small, which bounds
+  this module's own contribution to pool pressure; it is not a reservation and
+  does not shield the pool from unrelated routes. Permits are RAII: an explicit
+  drop, an early return, a cancelled request future, an aborted task or a
+  dropped connection releases capacity immediately.
 - **Per-source budget:** a fixed window of
   `ROOTYARD_AUTH_ADMISSION_ATTEMPTS_PER_SOURCE` attempts keyed only by peer IP.
   Other sources keep independent budgets. There is no username key, so an
   attacker cannot lock a victim account out by generating failures.
 - **Memory/TTL:** the source table never exceeds
-  `ROOTYARD_AUTH_ADMISSION_MAX_SOURCES` entries. Expired entries are pruned and,
-  at the bound, the least-recently-seen entry is evicted. This bounds process
-  memory but also means a distributed source rotation can displace old buckets;
-  the global in-flight semaphore remains the hard database-protection bound.
+  `ROOTYARD_AUTH_ADMISSION_MAX_SOURCES` entries in either index. Each live entry
+  also has one `(last_seen, peer)` position in an ordered set, so refreshing a
+  hot source is `O(log n)` and never accumulates stale positions. Expired
+  entries are removed lazily with a fixed budget of at most 64 removals per
+  admission check, and at the bound the least-recently-seen entry is evicted in
+  `O(log n)`. No admission check scans the whole table, so per-request work does
+  not grow with `max_sources`.
 - **No secret/identity telemetry:** rejections carry fixed generic text. Counters
   are aggregate process counters with no labels and are not exported with peer,
   username or credential dimensions.
@@ -93,18 +100,29 @@ status/body, so an unauthenticated caller cannot distinguish them.
 - **No account lockout:** this is intentional. Per-username lockout would let an
   attacker deny service to a victim and is not part of this slice.
 - **Not a total request bound:** only the login/token-exchange and whoami paths
-  are guarded. Other authenticated APIs keep their existing database and Git
-  concurrency controls; this module does not claim a global authentication or
-  application capacity bound.
+  are guarded. Every other existing API route remains unbounded by this module
+  and keeps only its pre-existing database and Git concurrency controls; this
+  module does not claim a global authentication or application capacity bound.
 - **Not MFA/OIDC:** see explicit non-goals above.
 
 ## Verification
 
 Deterministic Rust unit tests in `src/auth_admission.rs` cover fixed-window
 limits, `429` + `Retry-After`, spoofed-header disregard, unrelated-source
-isolation, semaphore RAII/cancellation release, source-count/TTL bounds, missing
-peer refusal, configuration validation and non-leaking rejection bodies. They
-use injected `Instant` values and do not sleep.
+isolation, semaphore RAII release (explicit drop, and a `tokio::spawn`ed task
+that is aborted while holding the only permit), source-count/TTL bounds, the
+bounded cleanup budget and index/map consistency under hot updates and source
+rotation, missing-peer refusal, configuration validation and non-leaking
+rejection bodies. They use injected `Instant` values and do not sleep.
+
+The login route's fail-closed admission is unit-tested through the extracted
+middleware gate helper (`is_login_attempt` + `admit_login_attempt`), which is
+the exact code `login_middleware` runs before `Next::run`; the full middleware
+path is exercised only by the native harness, because constructing `AppState`
+requires a database pool and an axum `Next` cannot be built in a unit test. This
+unit test asserts the `503` and `rejected_missing_peer` counter for a POST to
+`/web/login` without `ConnectInfo`, admission with a real peer, and that other
+routes/methods do not enter the gate.
 
 `tests/auth_admission.py` is a native loopback harness. It runs the real binary
 against a disposable PostgreSQL schema and real loopback TCP peers:
@@ -114,8 +132,11 @@ ROOTYARD_TEST_DATABASE_URL=postgres://... cargo test auth_admission # unit
 ROOTYARD_TEST_DATABASE_URL=postgres://... python3 tests/auth_admission.py --binary target/debug/rootyard
 ```
 
-It checks `429` rejection before credential verification (valid and invalid
-tokens get the same body), spoofed `X-Forwarded-For`/`Forwarded` ignored,
-`127.0.0.2` isolated from a limited `127.0.0.1`, window recovery, the login POST
-sharing the same gate, fixed `Retry-After`, and no bearer token in rejection
-bodies or the server log.
+It verifies response ordering and body equivalence (valid and invalid tokens
+receive the same fixed `429` body), spoofed `X-Forwarded-For`/`Forwarded`
+ignored, `127.0.0.2` isolated from a limited `127.0.0.1`, window recovery, the
+login POST sharing the same gate, fixed `Retry-After`, and no bearer token in
+rejection bodies or the server log. It does **not** inject database faults, so
+it does not independently prove that a PostgreSQL query was skipped; it observes
+the admission response and the pre-query code ordering, while the "no query on
+rejection" property follows from that ordering and the admission unit tests.
