@@ -683,7 +683,7 @@ async fn check_pages(
     match kind.as_str() {
         "active" => {
             let refs = read_all_refs(pool, scope, snapshot_id, pin_id, generation, CURSOR_PAGE_LIMIT).await?;
-            if &refs != captured {
+            if refs != captured {
                 bail!("the restored active pin page does not equal the refs captured before the backup");
             }
             Ok(json!({"kind": kind, "snapshot_id": snapshot_id, "refs": refs.len(), "typed_state": "live"}))
