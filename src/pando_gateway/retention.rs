@@ -72,7 +72,9 @@ async fn reserve<C: GenericClient + Sync>(
     sha256: &str,
 ) -> Result<Slot> {
     // Serialize reservations for this authority for the duration of the tx.
-    // The observation is the row-lock wait alone, not the rest of the tx.
+    // Spans the whole client round trip of this statement (submission, PostgreSQL
+    // execution plus the row-lock wait, row return), not the rest of the tx and
+    // not a pure server-side lock wait.
     let auth = timed_result(
         Phase::AuthorityLock,
         client.query_one(

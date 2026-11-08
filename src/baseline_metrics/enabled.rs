@@ -62,7 +62,8 @@ impl Default for Registry {
 static GLOBAL: LazyLock<Registry> = LazyLock::new(Registry::default);
 
 impl Registry {
-    fn record(&self, phase: Phase, outcome: Outcome, elapsed: Duration, bytes: u64) {
+    /// The single recording path shared by the RAII timer and the timed helpers.
+    pub(super) fn record(&self, phase: Phase, outcome: Outcome, elapsed: Duration, bytes: u64) {
         let stats = &self.phases[phase.index()];
         add(&stats.observations, 1);
         add(&stats.outcomes[outcome.index()], 1);
@@ -86,22 +87,22 @@ pub struct Timer<'a> {
 
 impl<'a> Timer<'a> {
     pub fn start(phase: Phase) -> Timer<'static> {
-        Self::start_in(&GLOBAL, phase)
+        Timer::<'static>::start_in(&GLOBAL, phase)
     }
 
     pub fn start_in(registry: &'a Registry, phase: Phase) -> Self {
         Self { registry, phase, started: Instant::now(), recorded: false }
     }
 
-    pub fn finish(self, outcome: Outcome) {
+    pub fn finish(mut self, outcome: Outcome) {
         self.record(outcome, 0);
     }
 
-    pub fn finish_with_bytes(self, outcome: Outcome, bytes: u64) {
+    pub fn finish_with_bytes(mut self, outcome: Outcome, bytes: u64) {
         self.record(outcome, bytes);
     }
 
-    fn record(mut self, outcome: Outcome, bytes: u64) {
+    fn record(&mut self, outcome: Outcome, bytes: u64) {
         if !self.recorded {
             self.recorded = true;
             self.registry.record(self.phase, outcome, self.started.elapsed(), bytes);
@@ -115,18 +116,36 @@ impl Drop for Timer<'_> {
     }
 }
 
-/// Time an awaited operation that has no error channel; dropping the timer still
-/// records `cancelled`.
+/// Time an awaited operation that has no error channel; if this future is
+/// dropped before it completes, the timer records `cancelled`.
 pub async fn timed<F: Future>(phase: Phase, future: F) -> F::Output {
-    let timer = Timer::start(phase);
+    timed_in(&GLOBAL, phase, future).await
+}
+
+/// Time an awaited operation whose `Result` distinguishes success from failure.
+/// An `Err` returned by the awaited operation is an explicit `error` completion,
+/// including a nested `tokio::time::timeout_at` that expired; only dropping this
+/// future before it resumes counts as `cancelled`.
+pub async fn timed_result<T, E, F: Future<Output = Result<T, E>>>(phase: Phase, future: F) -> Result<T, E> {
+    timed_result_in(&GLOBAL, phase, future).await
+}
+
+/// Registry-parameterised form of [`timed`]; the only difference is the target, so
+/// tests measure the same recording path without touching process-global state.
+pub(super) async fn timed_in<F: Future>(registry: &Registry, phase: Phase, future: F) -> F::Output {
+    let timer = Timer::start_in(registry, phase);
     let output = future.await;
     timer.finish(Outcome::Ok);
     output
 }
 
-/// Time an awaited operation whose `Result` distinguishes success from failure.
-pub async fn timed_result<T, E, F: Future<Output = Result<T, E>>>(phase: Phase, future: F) -> Result<T, E> {
-    let timer = Timer::start(phase);
+/// Registry-parameterised form of [`timed_result`].
+pub(super) async fn timed_result_in<T, E, F: Future<Output = Result<T, E>>>(
+    registry: &Registry,
+    phase: Phase,
+    future: F,
+) -> Result<T, E> {
+    let timer = Timer::start_in(registry, phase);
     match future.await {
         Ok(value) => {
             timer.finish(Outcome::Ok);
@@ -227,11 +246,5 @@ impl Registry {
     }
     pub(super) fn bytes(&self, phase: Phase) -> u64 {
         self.phases[phase.index()].bytes.load(Ordering::Relaxed)
-    }
-    pub(super) fn record_for_test(&self, phase: Phase, outcome: Outcome, elapsed: Duration, bytes: u64) {
-        self.record(phase, outcome, elapsed, bytes);
-    }
-    pub(super) fn global_for_test() -> &'static Registry {
-        &GLOBAL
     }
 }

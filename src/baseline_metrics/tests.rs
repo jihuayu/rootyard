@@ -1,7 +1,11 @@
-//! Behavioural tests for the opt-in recorder. They use private registries so
-//! assertions are independent of test scheduling; only the `timed*` helpers use
-//! the process-global registry and assert relative deltas.
-use super::{BUCKET_LABELS, BUCKETS, Outcome, Phase, Registry, Timer, render_registry, timed};
+//! Behavioural tests for the opt-in recorder.
+//!
+//! Every assertion uses a private `Registry`: other library tests instrument real
+//! operations concurrently against the process-global registry, so exact values
+//! there are racy by construction. The private registry is driven through the
+//! same helpers and RAII timer used in production, never through a reimplementation.
+use super::enabled::{timed_in, timed_result_in};
+use super::{BUCKET_LABELS, BUCKETS, Outcome, Phase, Registry, Timer, render_registry};
 use std::{collections::BTreeSet, time::Duration};
 
 fn rendered(registry: &Registry) -> String {
@@ -38,21 +42,53 @@ fn finishing_then_dropping_records_exactly_once() {
     timer.finish(Outcome::Ok);
     assert_eq!(registry.observations(Phase::StateRow), 1);
     assert_eq!(registry.outcome_count(Phase::StateRow, Outcome::Cancelled), 0);
+    assert!(registry.nanos(Phase::StateRow) > 0, "the completed span recorded a duration");
 }
 
 #[tokio::test]
-async fn abandoned_await_is_recorded_as_cancelled_not_success() {
-    let before = Registry::global_for_test().outcome_count(Phase::RemoteGet, Outcome::Cancelled);
-    let before_ok = Registry::global_for_test().outcome_count(Phase::RemoteGet, Outcome::Ok);
-    let expired = tokio::time::timeout(
-        Duration::from_millis(5),
-        timed(Phase::RemoteGet, std::future::pending::<()>()),
+async fn helper_records_success_once_and_returns_the_value() {
+    let registry = Registry::default();
+    let value = timed_result_in(&registry, Phase::PoolCheckout, async { Ok::<u8, &'static str>(7) }).await;
+    assert_eq!(value, Ok(7));
+    assert_eq!(registry.observations(Phase::PoolCheckout), 1);
+    assert_eq!(registry.outcome_count(Phase::PoolCheckout, Outcome::Ok), 1);
+}
+
+#[tokio::test]
+async fn returned_elapsed_is_an_explicit_error_not_a_cancellation() {
+    let registry = Registry::default();
+    let expired = timed_result_in(
+        &registry,
+        Phase::PublicationSlot,
+        tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>()),
     )
     .await;
-    assert!(expired.is_err(), "pending future must not complete");
-    let registry = Registry::global_for_test();
-    assert_eq!(registry.outcome_count(Phase::RemoteGet, Outcome::Cancelled), before + 1);
-    assert_eq!(registry.outcome_count(Phase::RemoteGet, Outcome::Ok), before_ok);
+    assert!(expired.is_err(), "an inner deadline must surface as Err");
+    assert_eq!(registry.observations(Phase::PublicationSlot), 1);
+    assert_eq!(registry.outcome_count(Phase::PublicationSlot, Outcome::Error), 1);
+    assert_eq!(registry.outcome_count(Phase::PublicationSlot, Outcome::Cancelled), 0);
+}
+
+#[tokio::test]
+async fn dropping_the_instrumented_future_is_the_only_cancellation() {
+    let registry = Registry::default();
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(1),
+        timed_in(&registry, Phase::RemoteGet, std::future::pending::<()>()),
+    )
+    .await;
+    assert!(abandoned.is_err(), "outer deadline must drop the instrumented future");
+    assert_eq!(registry.observations(Phase::RemoteGet), 1);
+    assert_eq!(registry.outcome_count(Phase::RemoteGet, Outcome::Cancelled), 1);
+    assert_eq!(registry.outcome_count(Phase::RemoteGet, Outcome::Ok), 0);
+    assert_eq!(registry.outcome_count(Phase::RemoteGet, Outcome::Error), 0);
+}
+
+#[tokio::test]
+async fn an_never_polled_future_records_nothing() {
+    let registry = Registry::default();
+    drop(timed_in(&registry, Phase::StateRow, std::future::ready(())));
+    assert_eq!(registry.observations(Phase::StateRow), 0);
 }
 
 #[test]
@@ -76,9 +112,11 @@ fn concurrent_recording_is_exact() {
 #[test]
 fn histogram_buckets_are_cumulative_and_bounded() {
     let registry = Registry::default();
-    registry.record_for_test(Phase::RefAdvisory, Outcome::Ok, Duration::from_micros(1_000), 0);
-    registry.record_for_test(Phase::RefAdvisory, Outcome::Error, Duration::from_millis(60), 0);
-    registry.record_for_test(Phase::RefAdvisory, Outcome::Cancelled, Duration::from_secs(300), 0);
+    // Same recording path the timer uses, with exact durations so bucket edges are
+    // deterministic rather than dependent on scheduler jitter.
+    registry.record(Phase::RefAdvisory, Outcome::Ok, Duration::from_micros(1_000), 0);
+    registry.record(Phase::RefAdvisory, Outcome::Error, Duration::from_millis(60), 0);
+    registry.record(Phase::RefAdvisory, Outcome::Cancelled, Duration::from_secs(300), 0);
     let raw = registry.buckets(Phase::RefAdvisory);
     assert_eq!(raw.len(), BUCKETS.len() + 1);
     // 1ms -> first bound, 60ms -> 0.1s bound, 300s -> overflow bucket outside every bound.
@@ -101,14 +139,13 @@ fn labels_are_fixed_and_series_cardinality_never_grows() {
     let fresh = rendered(&Registry::default());
     let registry = Registry::default();
     for phase in Phase::ALL {
-        registry.record_for_test(phase, Outcome::Ok, Duration::from_millis(3), 11);
-        registry.record_for_test(phase, Outcome::Error, Duration::from_secs(1), 0);
+        registry.record(phase, Outcome::Ok, Duration::from_millis(3), 11);
+        registry.record(phase, Outcome::Error, Duration::from_secs(1), 0);
     }
     let used = rendered(&registry);
     assert_eq!(series(&fresh).len(), series(&used).len());
 
-    let mut allowed: BTreeSet<String> =
-        Phase::ALL.iter().map(|phase| phase.label().to_string()).collect();
+    let mut allowed: BTreeSet<String> = Phase::ALL.iter().map(|phase| phase.label().to_string()).collect();
     allowed.extend(["ok", "error", "cancelled"].map(str::to_string));
     allowed.extend(BUCKET_LABELS.iter().map(|label| label.to_string()));
     for (name, value) in series(&used) {

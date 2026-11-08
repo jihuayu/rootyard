@@ -203,9 +203,11 @@ Building with `--features state-baseline-metrics` (default OFF, no dependency)
 additionally appends the fixed `rootyard_baseline_phase_*` counter, histogram and
 byte series described in
 [state-services-baseline-metrics.md](state-services-baseline-metrics.md). They
-report phase wait spans and moved bytes for the Pando state services, are not
-additive, and are never exposed on the application listener. A default build
-emits exactly the series above.
+report bounded wall-clock spans of awaited Pando state-service operations, plus
+logical bytes for S3-backed transfers only (the local filesystem object store
+produces none). Spans nest and are not additive, they are client round trips
+rather than pure server lock waits, and they are never exposed on the
+application listener. A default build emits exactly the series above.
 
 ## Tests
 

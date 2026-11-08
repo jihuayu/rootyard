@@ -87,7 +87,9 @@ pub async fn publish(
     if access.repo_id != repo.id || access.owner_id != tenant_id {
         return Err(conflict());
     }
-    // Spans the authoritative state row lock wait itself, not the later work.
+    // Spans the whole client round trip of this statement: submission, PostgreSQL
+    // execution plus the `FOR UPDATE OF s` row-lock wait, and the row coming back.
+    // It is not a pure server-side lock wait and not the later work in this tx.
     let current = timed_result(
         Phase::StateRow,
         tx.query_one(

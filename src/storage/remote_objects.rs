@@ -206,18 +206,20 @@ impl RemoteObjectStore {
     ) -> Result<StoredObject> {
         let actual = hash_file(source, deadline).await?;
         ensure!(actual.size == expected_size && actual.sha256 == key.sha256, "object source digest or size mismatch");
-        // Bytes are this process's source stream length, counted only after the
-        // upload reports success. Client-internal retries are unknown here.
-        let upload = Timer::start(Phase::RemotePut);
-        let uploaded = match self {
-            Self::Local(root) => local_put(root, key, source, deadline).await,
-            Self::S3(s3) => s3.put(key, source, expected_size, deadline).await,
-        };
-        match uploaded {
-            Ok(()) => upload.finish_with_bytes(Outcome::Ok, expected_size),
-            Err(error) => {
-                upload.finish(Outcome::Error);
-                return Err(error);
+        // Only the S3-backed store has remote time and bytes to report: the local
+        // filesystem fallback must never appear as remote transport. Bytes are the
+        // known source length, counted only after the upload reports success.
+        match self {
+            Self::Local(root) => local_put(root, key, source, deadline).await?,
+            Self::S3(s3) => {
+                let upload = Timer::start(Phase::RemotePut);
+                match s3.put(key, source, expected_size, deadline).await {
+                    Ok(()) => upload.finish_with_bytes(Outcome::Ok, expected_size),
+                    Err(error) => {
+                        upload.finish(Outcome::Error);
+                        return Err(error);
+                    }
+                }
             }
         }
         let head = self.head(key, deadline).await?.context("uploaded object is missing")?;
@@ -272,7 +274,11 @@ impl RemoteObjectStore {
         fs::create_dir_all(parent).await?;
         let temp = parent.join(format!(".rootyard-object-{}", Uuid::new_v4()));
         let _temp_guard = TempObject { path: temp.clone() };
-        let transfer = Timer::start(phase);
+        // Local filesystem reads carry no remote observation at all.
+        let transfer = match self {
+            Self::Local(_) => None,
+            Self::S3(_) => Some(Timer::start(phase)),
+        };
         let result = async {
             let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
             let mut hash = Sha256::new();
@@ -316,9 +322,10 @@ impl RemoteObjectStore {
             Ok::<u64, anyhow::Error>(size)
         }
         .await;
-        match &result {
-            Ok(bytes) => transfer.finish_with_bytes(Outcome::Ok, *bytes),
-            Err(_) => transfer.finish(Outcome::Error),
+        match (&result, transfer) {
+            (Ok(bytes), Some(transfer)) => transfer.finish_with_bytes(Outcome::Ok, *bytes),
+            (Err(_), Some(transfer)) => transfer.finish(Outcome::Error),
+            _ => {}
         }
         if result.is_err() {
             let _ = fs::remove_file(&temp).await;
