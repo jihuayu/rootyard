@@ -297,7 +297,7 @@ def same_ref_rejection_diagnostic(result):
                       'connection refused', 'connection timed out', 'proxy', 'ssl'):
         if forbidden in text:
             raise AssertionError('non-winning contender failed for a non-ref reason: ' + forbidden)
-    for expected in ('[remote rejected]', '[rejected]', 'failed to update ref',
+    for expected in ('failed to update ref', 'fetch first',
                      'non-fast-forward', 'cannot lock ref', 'stale info'):
         if expected in text:
             return expected
@@ -443,7 +443,7 @@ def main():
               'limits': ['One physical host, loopback PostgreSQL/Garage/Vault; no throughput or HA qualification.',
                          'Small fixed workload; no production latency objective inferred.',
                          'PG sampling every 250ms can miss short waits; observed peak is a lower bound.',
-                         'Git materialization, internal lock wait, and Blob costs are not separately instrumented.'],
+                         'Phase spans and successful payload bytes require --phase-metrics; exact CPU/lock-wait costs remain unmeasured.'],
               'unmeasured': {'git_materialization_ms': None, 'blob_io_bytes': None,
                              'exact_lock_wait_ms': None, 'artifact_authority_contention_ms': None,
                              'native_git_cpu_seconds': None, 'peak_temp_disk_bytes': None}}

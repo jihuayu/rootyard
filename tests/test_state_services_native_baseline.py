@@ -265,11 +265,17 @@ class SameRefRejectionTest(unittest.TestCase):
         self.assertEqual(baseline.same_ref_rejection_diagnostic(self.result(1, (
             b' ! [remote rejected] main -> main (failed to update ref)\n'
             b'error: failed to push some refs to http://127.0.0.1/git/alice/x.git\n'))),
-            '[remote rejected]')
+            'failed to update ref')
         self.assertEqual(baseline.same_ref_rejection_diagnostic(self.result(1, (
-            b' ! [rejected]        main -> main (non-fast-forward)\n'))), '[rejected]')
+            b' ! [rejected]        main -> main (non-fast-forward)\n'))), 'non-fast-forward')
         self.assertEqual(baseline.same_ref_rejection_diagnostic(self.result(1, (
-            b' ! [rejected]        main -> main (stale info)\n'))), '[rejected]')
+            b' ! [rejected]        main -> main (stale info)\n'))), 'stale info')
+
+    def test_generic_remote_hook_failure_is_not_a_ref_race(self):
+        for reason in (b" ! [remote rejected] main -> main (pre-receive hook declined)\n",
+                       b" ! [rejected] main -> main (unclassified failure)\n"):
+            with self.assertRaises(AssertionError):
+                baseline.same_ref_rejection_diagnostic(self.result(1, reason))
 
     def test_loser_auth_or_transport_failures_are_not_ref_rejections(self):
         for stderr in (b'fatal: Authentication failed for http://127.0.0.1/\n',
