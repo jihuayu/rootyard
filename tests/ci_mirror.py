@@ -452,6 +452,7 @@ class MirrorHarness(Harness):
                 source_receipt_sha256="a" * 64,
                 mirror_audience=str(uuid.uuid4()),
                 expires_unix=expires_unix,
+                dependencies=dict(version=1, history="full", tags=[], lfs=[], submodules=[]),
             )
         )
         self.sql(
