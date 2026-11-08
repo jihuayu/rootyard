@@ -1727,6 +1727,11 @@ async fn no_refunds_or_ledger_release_after_cancel_and_owner_tenant_deletion() -
         assert_eq!(tenant_usage(&pool, tenant).await?, tenant_before);
         assert_eq!(shard_usage(&pool, ShardId::of(req.request_id())).await?, shard_before);
 
+        // Migration 120 creates one personal namespace for each fixture user.
+        // Remove that owned business row before deleting the user, so this
+        // assertion reaches the global ledger retention boundary rather than
+        // stopping at the unrelated namespaces_user_id foreign key.
+        assert_eq!(pool.get().await?.execute("DELETE FROM namespaces WHERE user_id=$1", &[&tenant]).await?, 1);
         assert_eq!(pool.get().await?.execute("DELETE FROM users WHERE id=$1", &[&tenant]).await?, 1);
         assert_eq!(ledger_counts(&pool, req.request_id()).await?, (1, 2, 2));
         assert_eq!(repo_usage(&pool, repo).await?, repo_before);
