@@ -153,11 +153,11 @@ async fn token_views(tx: &Transaction<'_>, rows: &[Row]) -> Result<Vec<TokenView
     let mut namespaces: BTreeMap<Uuid, BTreeMap<Uuid, (String, BTreeSet<String>)>> = BTreeMap::new();
     let namespace_rows = tx
         .query(
-            "SELECT ts.token_id, ts.organization_id, o.slug, ts.action \
+            "SELECT ts.token_id, ts.organization_id, ns.slug, ts.action \
                FROM token_namespace_scopes ts \
-               JOIN organizations o ON o.id = ts.organization_id \
+               JOIN namespaces ns ON ns.organization_id = ts.organization_id AND ns.kind = 'organization' \
               WHERE ts.token_id = ANY($1::uuid[]) \
-              ORDER BY o.slug, ts.action",
+              ORDER BY ns.slug, ts.action",
             &[&ids],
         )
         .await
