@@ -759,7 +759,18 @@ class TestTier5AntiMonolithAndRust2024Architecture(unittest.TestCase):
     def test_all_track_submodules_exist_and_satisfy_single_responsibility_line_bounds(self) -> None:
         expected_submodules = {
             "pulls": (["models.rs", "handlers.rs", "checks.rs", "rules.rs", "merge.rs"], 600),
-            "browse": (["models.rs", "git_read.rs", "handlers.rs", "transactions.rs", "object_format.rs"], 550),
+            "browse": (
+                [
+                    "models.rs",
+                    "git_read.rs",
+                    "git_read/command.rs",
+                    "git_read/paging.rs",
+                    "handlers.rs",
+                    "transactions.rs",
+                    "object_format.rs",
+                ],
+                550,
+            ),
             "lfs": (["models.rs", "storage.rs", "handlers.rs"], 550),
             "webhooks": (["models.rs", "signing.rs", "delivery.rs", "handlers.rs"], 550),
             "members": (["models.rs", "rbac.rs", "audit.rs"], 550),

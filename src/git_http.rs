@@ -30,8 +30,8 @@ pub(crate) mod publication;
 mod receive;
 use process::Process;
 pub(crate) use process::{
-    collect_git_output, collect_git_output_input, finish_group_child, group_quiescent, kill_group_child,
-    stop_group_child,
+    GitCommandFailed, StreamLimits, collect_git_output, collect_git_output_input, finish_group_child,
+    group_quiescent, kill_group_child, stop_group_child, stream_git_lines,
 };
 use protocol::{job_response_prefix, read_headers, route, validate_headers};
 
