@@ -98,26 +98,39 @@ async fn real_provider_publish_verify_range_delete_contract() {
     let size = payload.len() as u64;
     let tenant = Uuid::new_v4();
     let authority = Uuid::new_v4();
-    let first = BlobLocator::new(tenant, authority, 1, Uuid::new_v4(), "contract", &digest, size).unwrap();
-    let second = BlobLocator::new(tenant, authority, 1, Uuid::new_v4(), "contract", &digest, size).unwrap();
+
+    // Fresh one-use intents: the attempt id is minted inside the byte layer.
+    let first_intent =
+        store.new_upload(tenant, authority, 1, "contract", &digest, size).expect("first intent must be minted");
+    // A read-only locator may be cloned from stored metadata before the write
+    // capability is consumed; it cannot be converted back into an intent.
+    let first = first_intent.locator().clone();
+    let second_intent =
+        store.new_upload(tenant, authority, 1, "contract", &digest, size).expect("second intent must be minted");
+    let second = second_intent.locator().clone();
+    assert_ne!(first.attempt_id(), second.attempt_id());
+    assert_ne!(first.path(), second.path(), "fresh intents must never share an attempt path");
 
     let mut owned_keys = vec![first.path(), second.path()];
     let outcome = AssertUnwindSafe(async {
-        let receipt = store.put_file(&first, &source, deadline()).await.expect("first attempt publish");
+        let receipt = store.put_file(first_intent, &source, deadline()).await.expect("first attempt publish");
         assert!(receipt.matches(&first));
         assert_eq!(receipt.verified_sha256(), digest);
         assert_eq!(receipt.verified_length(), size);
-        let repeated = store.put_file(&first, &source, deadline()).await;
-        assert!(matches!(repeated, Err(BlobError::AlreadyExists)), "duplicate immutable locator result: {repeated:?}");
-        independent.verify(&first, deadline()).await.expect("duplicate write must leave the first bytes intact");
-        store.put_file(&second, &source, deadline()).await.expect("second attempt publish same bytes");
 
-        // Another client can re-present the receipt and require a provider read-back.
+        // A second, independently opened client re-reads the object from the
+        // provider. Metadata equality alone is never accepted as proof.
         let reverified = independent
             .verify_receipt(&first, receipt.verified_sha256(), receipt.verified_length(), deadline())
             .await
             .expect("cross-client receipt re-verification");
         assert!(reverified.matches(&first));
+
+        // Publishing the same bytes under a fresh intent allocates a distinct
+        // address; the old single-locator retry API no longer exists.
+        let second_receipt = store.put_file(second_intent, &source, deadline()).await.expect("second attempt publish");
+        assert!(second_receipt.matches(&second));
+        independent.verify(&second, deadline()).await.expect("second attempt is independently readable");
 
         let roundtrip = dir.path().join("roundtrip");
         store.get_to_file(&first, &roundtrip, deadline()).await.expect("download");
@@ -130,7 +143,8 @@ async fn real_provider_publish_verify_range_delete_contract() {
         ));
         assert_eq!(store.head(&first, deadline()).await.unwrap(), Some(size));
 
-        // A short expectation must fail length verification and publish no destination.
+        // A read-only locator reconstructed from metadata with a short length
+        // must fail verification against the existing key and publish nothing.
         let short = BlobLocator::new(tenant, authority, 1, first.attempt_id(), "contract", &digest, size - 1).unwrap();
         let bad_destination = dir.path().join("bad");
         assert!(matches!(
@@ -139,18 +153,46 @@ async fn real_provider_publish_verify_range_delete_contract() {
         ));
         assert!(!bad_destination.exists());
 
-        // A locator whose length disagrees with the source is rejected before upload.
-        let oversized = BlobLocator::new(tenant, authority, 1, Uuid::new_v4(), "contract", &digest, size + 1).unwrap();
+        // A wrong source length is refused before the write; no object/ACK.
+        let oversized_intent =
+            store.new_upload(tenant, authority, 1, "contract", &digest, size + 1).expect("oversized intent");
+        let oversized = oversized_intent.locator().clone();
         owned_keys.push(oversized.path());
-        assert!(matches!(store.put_file(&oversized, &source, deadline()).await, Err(BlobError::LengthMismatch { .. })));
+        assert!(matches!(
+            store.put_file(oversized_intent, &source, deadline()).await,
+            Err(BlobError::LengthMismatch { .. })
+        ));
         assert_eq!(store.head(&oversized, deadline()).await.unwrap(), None);
 
+        // A wrong expected digest is detected while streaming; the attempt is
+        // aborted and yields neither ACK nor a readable object.
+        let wrong_digest = "b".repeat(64);
+        let wrong_digest_intent = store
+            .new_upload(tenant, authority, 1, "contract", &wrong_digest, size)
+            .expect("wrong digest intent");
+        let wrong_digest_locator = wrong_digest_intent.locator().clone();
+        owned_keys.push(wrong_digest_locator.path());
+        assert!(matches!(
+            store.put_file(wrong_digest_intent, &source, deadline()).await,
+            Err(BlobError::DigestMismatch { .. })
+        ));
+        assert_eq!(
+            store.head(&wrong_digest_locator, deadline()).await.unwrap(),
+            None,
+            "digest mismatch must not ACK"
+        );
+
         assert!(matches!(store.delete(&first, deadline()).await, Err(BlobError::DeleteDisabled)));
+
         // Only the test operator mutates its own exact, random fixture identities.
         raw.write(&first.path(), payload[..payload.len() - 1].to_vec())
             .await
             .unwrap_or_else(|e| panic!("fixture truncate failed ({})", e.kind()));
-        assert!(independent.verify(&first, deadline()).await.is_err());
+        assert!(matches!(independent.verify(&first, deadline()).await, Err(BlobError::LengthMismatch { .. })));
+        assert!(matches!(
+            independent.get_range(&first, 100, 4096, deadline()).await,
+            Err(BlobError::LengthMismatch { .. })
+        ));
         let mut corrupt = payload.clone();
         corrupt[0] ^= 0xff; // Outside the requested range: whole-object verification must catch it.
         raw.write(&first.path(), corrupt).await.unwrap_or_else(|e| panic!("fixture corruption failed ({})", e.kind()));

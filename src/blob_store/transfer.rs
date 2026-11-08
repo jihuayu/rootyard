@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tokio::{fs::File, io::AsyncReadExt};
 
 use super::{
-    BlobError, BlobLocator, BlobReceipt,
+    BlobError, BlobLocator, BlobReceipt, UploadIntent,
     opendal::{BlobStore, DOWNLOAD_CHUNK_BYTES, map_provider_error},
     upload::UploadGuard,
 };
@@ -25,16 +25,20 @@ fn tokio_deadline(deadline: Instant) -> tokio::time::Instant {
 }
 
 impl BlobStore {
-    /// Stream a local file into a fresh attempt-unique locator. The caller must
-    /// already know the SHA-256 and length; a mismatch aborts the provider write
-    /// and yields no receipt.
+    /// Stream a local file into the intent's fresh attempt-unique locator. The
+    /// intent is consumed by value, so one attempt can never be published twice
+    /// and a caller cannot replay a stored locator. The caller must already know
+    /// the SHA-256 and length; a mismatch aborts the provider write and yields
+    /// no receipt.
     pub async fn put_file(
         &self,
-        locator: &BlobLocator,
+        intent: UploadIntent,
         source: &Path,
         deadline: Instant,
     ) -> Result<BlobReceipt, BlobError> {
-        self.validate_locator(locator)?;
+        // Moving the private field is allowed only inside blob_store descendants.
+        let UploadIntent { locator } = intent;
+        self.validate_locator(&locator)?;
         let expected = locator.length();
         let metadata = tokio::fs::metadata(source)
             .await
@@ -42,9 +46,10 @@ impl BlobStore {
         if !metadata.is_file() || metadata.len() != expected {
             return Err(BlobError::LengthMismatch { expected, actual: metadata.len() });
         }
-        let path = self.object_path(locator);
+        let path = self.object_path(&locator);
         let writer =
             self.operator().writer_with(&path).chunk(super::opendal::UPLOAD_CHUNK_BYTES).concurrent(UPLOAD_CONCURRENCY);
+        // Optional SDK defense only; address uniqueness comes from the intent.
         let writer = if self.capabilities().conditional_create { writer.if_not_exists(true) } else { writer };
         let writer = match tokio::time::timeout_at(tokio_deadline(deadline), async { writer.await }).await {
             Ok(Ok(writer)) => writer,
@@ -103,7 +108,7 @@ impl BlobStore {
         }
         guard.close(tokio_deadline(deadline)).await?;
         guard.disarm();
-        self.verify(locator, deadline).await
+        self.verify(&locator, deadline).await
     }
 
     /// Provider read-back verification used after publish and to re-present a

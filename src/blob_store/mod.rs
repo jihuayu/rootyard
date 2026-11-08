@@ -196,6 +196,56 @@ impl fmt::Debug for BlobLocator {
     }
 }
 
+/// Single-use publication capability for exactly one fresh attempt.
+///
+/// Only [`opendal::BlobStore::new_upload`] mints one, and it always
+/// allocates a random attempt id inside the byte layer. Callers cannot supply an
+/// attempt id, clone the intent, deserialize it or turn a readable
+/// [`BlobLocator`] back into write authority. A locator reconstructed from
+/// stored metadata/checkpoints is therefore read-only, and a trusted resume
+/// must verify that existing object or mint a completely new attempt rather
+/// than recovering a write capability after a restart.
+///
+/// [`opendal::BlobStore::put_file`] consumes the intent by value. A
+/// retry after an unknown outcome must verify the old read-only locator (no
+/// overwrite) or mint a fresh intent/path. A process crash may leave an orphan
+/// object, but its address can never be reused for a later publication.
+///
+/// ```compile_fail
+/// fn clone_cap(x: rootyard::blob_store::UploadIntent) -> rootyard::blob_store::UploadIntent {
+///     x.clone()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn forge(x: rootyard::blob_store::BlobLocator) -> rootyard::blob_store::UploadIntent {
+///     rootyard::blob_store::UploadIntent { locator: x }
+/// }
+/// ```
+pub struct UploadIntent {
+    locator: BlobLocator,
+}
+
+impl UploadIntent {
+    /// Read-only borrow of the attempt address before any bytes are written,
+    /// suitable for a hold reservation. Borrowing does not duplicate the
+    /// single-use write capability.
+    pub fn locator(&self) -> &BlobLocator {
+        &self.locator
+    }
+
+    /// Module-private mint point; `BlobStore::new_upload` is the only caller.
+    fn new(locator: BlobLocator) -> Self {
+        Self { locator }
+    }
+}
+
+impl fmt::Debug for UploadIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UploadIntent").field("locator", &self.locator).finish()
+    }
+}
+
 /// Durable acknowledgement of provider-held bytes. It is issued only after a
 /// fresh provider read-back (not a `stat`, not an ETag, not the local file)
 /// reproduced `sha256` and `length` exactly.

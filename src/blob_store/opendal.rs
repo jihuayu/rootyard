@@ -13,8 +13,10 @@ use opendal::services::Azblob;
 use opendal::services::S3;
 use opendal::{ErrorKind, Operator};
 
+use uuid::Uuid;
+
 use super::{
-    BlobError, BlobLocator, BlobProvider,
+    BlobError, BlobLocator, BlobProvider, UploadIntent,
     config::{BlobCredentials, BlobProfile},
 };
 
@@ -25,15 +27,22 @@ pub(crate) const UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// Download/hash window so read-back memory is bounded regardless of object size.
 pub(crate) const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Capability declaration reported by the provider. This is a startup gate,
-/// not proof of behaviour: every publish additionally performs a real
-/// provider read-back and contract tests must run against a real service.
+/// Capability declaration reported by the provider. stat/read/write are a
+/// startup gate, not proof of behaviour: every publish additionally performs a
+/// real provider read-back and contract tests must run against a real service.
+/// conditional_create is only an optional SDK defense hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobCapabilities {
     pub stat: bool,
     pub read: bool,
     pub write: bool,
     pub delete: bool,
+    /// SDK-declared `write_with_if_not_exists` support. This is optional
+    /// defense-in-depth only, never a provider guarantee and never a startup
+    /// requirement: a fresh one-use attempt address is the fundamental
+    /// publication contract. A true value does not prove conditional rejection
+    /// end-to-end (multipart probes have shown it can be declared without
+    /// being enforced).
     pub conditional_create: bool,
 }
 
@@ -63,11 +72,6 @@ impl BlobStore {
                 profile.provider().as_str()
             )));
         }
-        if !capabilities.conditional_create {
-            return Err(BlobError::Config(
-                "provider lacks conditional create; unique-key reservation fallback is not enabled".into(),
-            ));
-        }
         Ok(Self { profile, operator, capabilities })
     }
 
@@ -89,6 +93,32 @@ impl BlobStore {
 
     pub(crate) fn object_path(&self, locator: &BlobLocator) -> String {
         self.profile.object_path(locator)
+    }
+
+    /// Mint a fresh single-use publication intent. The random attempt id is
+    /// generated here, never supplied by the caller and never derived from
+    /// stored metadata. A reader locator cannot be converted into an intent,
+    /// so a restart cannot reconstruct write authority.
+    pub fn new_upload(
+        &self,
+        tenant_id: Uuid,
+        authority_id: Uuid,
+        generation: i64,
+        namespace: &str,
+        sha256: &str,
+        length: u64,
+    ) -> Result<UploadIntent, BlobError> {
+        let locator = BlobLocator::new(
+            tenant_id,
+            authority_id,
+            generation,
+            Uuid::new_v4(),
+            namespace,
+            sha256,
+            length,
+        )?;
+        self.validate_locator(&locator)?;
+        Ok(UploadIntent::new(locator))
     }
 
     /// Reject a locator whose digest/length pair exceeds the configured ceiling
