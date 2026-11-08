@@ -122,4 +122,80 @@ mod tests {
         slot.record_exit(Ok(failure.clone()));
         assert_eq!(slot.observe(), ExitObservation::Exited(Ok(failure)));
     }
+
+    #[test]
+    fn a_real_taken_child_is_reaping_until_its_actual_exit_is_recorded() {
+        use std::process::{Child, Command};
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::thread;
+        use std::time::Duration;
+
+        struct KillWait(Option<Child>);
+        impl Drop for KillWait {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        // If the test panics before the worker owns the handle, reclaim it from
+        // the slot and kill/wait it. If the worker already took it, its
+        // `KillWait` guard owns the cleanup instead.
+        struct SlotCleanup(Arc<Mutex<ChildSlot>>);
+        impl Drop for SlotCleanup {
+            fn drop(&mut self) {
+                let child = self.0.lock().ok().and_then(|mut slot| slot.take_for_reap());
+                if let Some(mut child) = child {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let child = Command::new("sleep").arg("30").spawn().expect("spawn controlled child");
+        let pid = child.id();
+        let slot = Arc::new(Mutex::new(ChildSlot::running(child)));
+        let _cleanup = SlotCleanup(slot.clone());
+        let (taken_tx, taken_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<ExitView>();
+        let worker_slot = slot.clone();
+        let worker = thread::spawn(move || {
+            let child = worker_slot.lock().expect("slot lock").take_for_reap();
+            let Some(child) = child else { panic!("test reaper did not receive the real child") };
+            let mut guard = KillWait(Some(child));
+            taken_tx.send(()).expect("announce taken child");
+            release_rx.recv_timeout(Duration::from_secs(5)).expect("bounded reaper barrier");
+            let status = {
+                let child = guard.0.as_mut().expect("guarded child");
+                let _ = child.kill();
+                child.wait().expect("wait real child")
+            };
+            guard.0 = None;
+            let view = ExitView::from(status);
+            worker_slot.lock().expect("slot lock").record_exit(Ok(view.clone()));
+            done_tx.send(view).expect("announce observed exit");
+        });
+
+        taken_rx.recv_timeout(Duration::from_secs(5)).expect("reaper barrier");
+        assert_eq!(
+            slot.lock().expect("slot lock").observe(),
+            ExitObservation::Reaping,
+            "a taken handle is not an exit even while the real process is alive"
+        );
+        // SAFETY: signal 0 only probes this test-owned child.
+        assert!(unsafe { libc::kill(pid as libc::pid_t, 0) } == 0, "the real child is still alive");
+        release_tx.send(()).expect("release reaper");
+        let observed = done_rx.recv_timeout(Duration::from_secs(5)).expect("observed real exit");
+        assert!(!observed.success, "SIGKILL must record a non-success exit");
+        worker.join().expect("reaper thread");
+        let first = slot.lock().expect("slot lock").observe();
+        assert_eq!(first, ExitObservation::Exited(Ok(observed.clone())));
+        assert_eq!(
+            slot.lock().expect("slot lock").observe(),
+            first,
+            "repeat observation preserves the real exit status"
+        );
+    }
 }
