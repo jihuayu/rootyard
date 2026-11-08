@@ -1,0 +1,98 @@
+setup_repos: passed
+refs_and_pagination: passed
+commits_and_pagination: passed
+tree_and_blob: passed
+compare_revisions: passed
+ref_transactions_atomic_cas: passed
+idempotency_and_concurrency: passed
+access_and_fences: passed
+object_format_and_negotiation: passed
+bounded_ref_and_commit_pages: passed
+selective_ref_prefix: passed
+protected_writes_and_ref_ack_failure: passed
+{
+  "passed": true,
+  "case_count": 12,
+  "cases_run": 12,
+  "cases_passed": 12,
+  "cases_failed": 0,
+  "cases": [
+    {
+      "name": "setup_repos",
+      "status": "passed",
+      "seconds": 6.6574,
+      "detail": null
+    },
+    {
+      "name": "refs_and_pagination",
+      "status": "passed",
+      "seconds": 3.3514,
+      "detail": null
+    },
+    {
+      "name": "commits_and_pagination",
+      "status": "passed",
+      "seconds": 1.8514,
+      "detail": null
+    },
+    {
+      "name": "tree_and_blob",
+      "status": "passed",
+      "seconds": 7.4452,
+      "detail": null
+    },
+    {
+      "name": "compare_revisions",
+      "status": "passed",
+      "seconds": 2.6313,
+      "detail": null
+    },
+    {
+      "name": "ref_transactions_atomic_cas",
+      "status": "passed",
+      "seconds": 4.2035,
+      "detail": null
+    },
+    {
+      "name": "idempotency_and_concurrency",
+      "status": "passed",
+      "seconds": 3.6215,
+      "detail": null
+    },
+    {
+      "name": "access_and_fences",
+      "status": "passed",
+      "seconds": 3.7906,
+      "detail": null
+    },
+    {
+      "name": "object_format_and_negotiation",
+      "status": "passed",
+      "seconds": 2.7944,
+      "detail": null
+    },
+    {
+      "name": "bounded_ref_and_commit_pages",
+      "status": "passed",
+      "seconds": 4.993,
+      "detail": null
+    },
+    {
+      "name": "selective_ref_prefix",
+      "status": "passed",
+      "seconds": 10.1805,
+      "detail": null
+    },
+    {
+      "name": "protected_writes_and_ref_ack_failure",
+      "status": "passed",
+      "seconds": 4.2503,
+      "detail": null
+    }
+  ],
+  "binary_sha256": "09916cb69762d808ec1f7aa21c47fe7ce206ba5f1f6e83080a54fff3de326968",
+  "limitations": [
+    "Browse blob endpoint enforces a 4 MiB maximum object size cap.",
+    "Ref transactions support up to 128 atomic ref updates per request."
+  ]
+}
