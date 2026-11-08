@@ -29,6 +29,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -6974,6 +6975,11 @@ class SchemaBoundaryIntegrationFixture:
         if fmt_match is None:
             raise AssertionError("src/backup/catalog.rs FORMAT constant missing")
         fmt = int(fmt_match.group(1))
+        if fmt != schema_baseline.CURRENT_BACKUP_FORMAT:
+            raise AssertionError(
+                f"src/backup/catalog.rs FORMAT {fmt} != "
+                f"CURRENT_BACKUP_FORMAT {schema_baseline.CURRENT_BACKUP_FORMAT}"
+            )
 
         # The current format must consume the newest frozen catalog triplet.
         arm_match = re.search(rf"\b{fmt}\s*=>\s*\[(.*?)\n\s*\],", catalog_src, re.DOTALL)
@@ -7338,13 +7344,33 @@ class SchemaBoundaryIntegrationFixture:
             cls.validate_sql_no_between(s_txt)
             cls.validate_sql_no_bigserial(s_txt)
 
-        # Verify explicit COALESCE(MAX(...), 0) + 1 in delivery.rs and audit.rs (no sequence objects)
-        deliv_rs = (ROOT / "src/webhooks/delivery.rs").read_text(encoding="utf-8")
+        # Webhook delivery sequencing lives with the enqueue helper, not the
+        # delivery worker. It explicitly allocates the next per-webhook value
+        # (no pg sequence object); audit IDs are reserved by migration 110's
+        # sequence-backed default, so neither path can collide.
+        ingest_rs = (ROOT / "src/webhooks/ingestion.rs").read_text(encoding="utf-8")
+        webhook_seq = re.search(
+            r"SELECT COALESCE\(\s*\(SELECT sequence FROM forge_webhook_deliveries"
+            r".*?ORDER BY sequence DESC LIMIT 1\)\s*,\s*0\)",
+            ingest_rs,
+            re.DOTALL,
+        )
+        if webhook_seq is None or "checked_add(1)" not in ingest_rs:
+            raise AssertionError(
+                "src/webhooks/ingestion.rs missing explicit per-webhook next-sequence allocation"
+            )
+        if re.search(r"\bnextval\s*\(|\bCREATE\s+SEQUENCE\b", ingest_rs, re.IGNORECASE):
+            raise AssertionError("src/webhooks/ingestion.rs must not use pg sequences")
+        audit_seq = (ROOT / "migrations/110_audit_sequence.sql").read_text(encoding="utf-8")
+        for needle in (
+            "CREATE SEQUENCE IF NOT EXISTS repository_audit_log_id_seq",
+            "ALTER TABLE repository_audit_log ALTER COLUMN id SET DEFAULT nextval('repository_audit_log_id_seq')",
+        ):
+            if needle not in audit_seq:
+                raise AssertionError("migrations/110_audit_sequence.sql missing audit id allocation sequence")
         audit_rs = (ROOT / "src/members/audit.rs").read_text(encoding="utf-8")
-        if "SELECT COALESCE(MAX(sequence), 0) + 1 FROM forge_webhook_deliveries" not in deliv_rs:
-            raise AssertionError("src/webhooks/delivery.rs missing explicit sequence allocation query")
-        if "SELECT COALESCE(MAX(id), 0) + 1 FROM repository_audit_log" not in audit_rs:
-            raise AssertionError("src/members/audit.rs missing explicit id allocation query")
+        if "(tenant_id, repository_id, actor_id, actor_name, action, target_type, target_name, details, created_unix)" not in audit_rs:
+            raise AssertionError("src/members/audit.rs must let migration 110 allocate repository_audit_log.id")
 
         # Verify schema/050_* catalog snapshots
         cat_sql = ROOT / "schema/050_catalog.sql"
@@ -7522,12 +7548,45 @@ class SchemaBoundaryIntegrationFixture:
         if cls.is_m17_integrated() or os.environ.get("ROOTYARD_E2E_REQUIRE_P3") == "1":
             if sharding_sql_path is None or not (ROOT / "migrations/060_sharding_fencing.sql").is_file():
                 raise AssertionError("migrations/060_sharding_fencing.sql missing in M17/P3 mode")
+            historical_m17_versions = [1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60]
             db_info = cls.verify_db_rs_and_migrations()
-            if db_info["versions"] != [1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60]:
-                raise AssertionError(f"Expected SCHEMA_VERSIONS up to 60 in M17 mode, got {db_info['versions']}")
+            versions = db_info["versions"]
+            if versions[: len(historical_m17_versions)] != historical_m17_versions:
+                raise AssertionError(
+                    "Historical M17 SCHEMA_VERSIONS prefix must remain "
+                    f"{historical_m17_versions}, got {versions}"
+                )
+            if versions != schema_baseline.SCHEMA_VERSIONS:
+                raise AssertionError(
+                    f"SCHEMA_VERSIONS {versions} != actual migration/schema baseline "
+                    f"{schema_baseline.SCHEMA_VERSIONS}"
+                )
+            if len(versions) <= len(historical_m17_versions) or versions[-1] != schema_baseline.LATEST_VERSION:
+                raise AssertionError(
+                    "Current schema must extend the frozen M17 prefix through "
+                    f"migration {schema_baseline.LATEST_VERSION}, got {versions}"
+                )
             bk_info = cls.verify_backup_tables_parity()
-            if bk_info["tables"] != expected_34:
-                raise AssertionError(f"backup.rs TABLES {bk_info['tables']} != expected 34 tables {expected_34}")
+            expected_current_catalog = f"schema/{schema_baseline.LATEST_PREFIX}_catalog.json"
+            if bk_info["format"] != schema_baseline.CURRENT_BACKUP_FORMAT:
+                raise AssertionError(
+                    f"Current backup FORMAT {bk_info['format']} != "
+                    f"CURRENT_BACKUP_FORMAT {schema_baseline.CURRENT_BACKUP_FORMAT}"
+                )
+            if bk_info["catalog"] != expected_current_catalog:
+                raise AssertionError(
+                    f"Current backup must consume {expected_current_catalog}, got {bk_info['catalog']}"
+                )
+            if bk_info["tables"] != sorted(schema_baseline.EXPECTED_TABLES):
+                raise AssertionError(
+                    "backup.rs TABLES must match the current catalog "
+                    f"{sorted(schema_baseline.EXPECTED_TABLES)}, got {bk_info['tables']}"
+                )
+            if not set(expected_34).issubset(bk_info["tables"]):
+                raise AssertionError(
+                    "Current backup TABLES are missing frozen 050+060 tables: "
+                    f"{sorted(set(expected_34) - set(bk_info['tables']))}"
+                )
             rel_rs = (ROOT / "src/reliability.rs").read_text(encoding="utf-8")
             if "sharding" not in rel_rs and "check_before_push" not in rel_rs:
                 raise AssertionError("src/reliability.rs does not invoke sharding write barrier in M17 mode")
@@ -7586,6 +7645,70 @@ class Phase1ClosureAndDocsFixture:
         "tests/e2e_tiers.py",
     )
 
+    @staticmethod
+    def live_ci_command_tokens(line: str) -> list[str]:
+        """Tokenize an executable YAML/shell line, dropping full-line and inline comments."""
+        command = line.strip()
+        if not command or command.startswith("#"):
+            return []
+        if command.startswith("- "):
+            command = command[2:].strip()
+        if command.startswith("run:"):
+            command = command[len("run:") :].strip()
+            if command in ("|", ">", "|-", ">-", "|+", ">+"):
+                return []
+        if not command or command.startswith("#"):
+            return []
+        try:
+            return shlex.split(command, comments=True, posix=True)
+        except ValueError:
+            return []
+
+    @staticmethod
+    def pando_runs_behind_nonroot_guard(text: str) -> bool:
+        """True when the live Pando invocation is protected by a same-run-block non-root guard."""
+        pando_tokens = [
+            "python3",
+            "tests/pando_lab.py",
+            "--binary",
+            "target/debug/rootyard-pando-lab",
+        ]
+        guard_tokens = ["test", "$(id -u)", "-ne", "0"]
+        # Full-line YAML and shell comments are not executable and must never
+        # satisfy (or hide) the Pando/non-root requirement.
+        lines = [
+            line
+            for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        for idx, line in enumerate(lines):
+            tokens = Phase1ClosureAndDocsFixture.live_ci_command_tokens(line)
+            direct_pando = tokens[: len(pando_tokens)] == pando_tokens
+            legacy_pando = False
+            if tokens[:4] == ["runuser", "-u", "postgres", "--"]:
+                legacy_command = tokens[4:]
+                if legacy_command[:1] == ["env"]:
+                    legacy_command = legacy_command[1:]
+                while legacy_command and re.match(
+                    r"^[A-Za-z_][A-Za-z0-9_]*=", legacy_command[0]
+                ):
+                    legacy_command = legacy_command[1:]
+                legacy_pando = legacy_command[: len(pando_tokens)] == pando_tokens
+            if not direct_pando and not legacy_pando:
+                continue
+            if legacy_pando:
+                return True
+            start = idx - 1
+            while start >= 0 and not re.match(r"^\s*(?:-\s*)?run:", lines[start]):
+                start -= 1
+            if start >= 0 and any(
+                Phase1ClosureAndDocsFixture.live_ci_command_tokens(prefix)[: len(guard_tokens)]
+                == guard_tokens
+                for prefix in lines[start:idx]
+            ):
+                return True
+        return False
+
     @classmethod
     def validate_ci_workflow(cls, ci_text: Optional[str] = None, root_dir: Path = ROOT) -> dict[str, Any]:
         text = ci_text if ci_text is not None else (root_dir / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -7599,11 +7722,23 @@ class Phase1ClosureAndDocsFixture:
             raise AssertionError("CI workflow missing cargo clippy with --features pando-lab")
         if not re.search(r"cargo\s+test\s+[^\n]*--features\s+pando-lab", text):
             raise AssertionError("CI workflow missing cargo test with --features pando-lab")
-        if not (
-            re.search(r"cargo\s+build\s+[^\n]*--features\s+pando-lab\s+--bins", text)
-            or re.search(r"cargo\s+build\s+[^\n]*--bins\s+--features\s+pando-lab", text)
-        ):
-            raise AssertionError("CI workflow missing cargo build with --features pando-lab --bins")
+        native_tokens = None
+        for line in text.splitlines():
+            tokens = cls.live_ci_command_tokens(line)
+            if tokens[:2] == ["python3", "scripts/build_native.py"]:
+                native_tokens = tokens
+                break
+        if native_tokens is None:
+            raise AssertionError("CI workflow missing scripts/build_native.py native build")
+        native_args = native_tokens[2:]
+        has_feature = any(
+            native_args[i] == "--features" and native_args[i + 1] == "pando-lab"
+            for i in range(len(native_args) - 1)
+        )
+        if not has_feature or "--bins" not in native_args:
+            raise AssertionError("CI workflow build_native.py must build --bins with --features pando-lab")
+        if not re.search(r"python3\s+tests/e2e_tiers\.py\s+--reference-only\s+--tier\s+all\s+--report\b", text):
+            raise AssertionError("CI workflow must invoke tests/e2e_tiers.py with explicit --reference-only --tier all --report")
         if "Verify schema-008 catalog" in text:
             raise AssertionError("CI workflow still contains stale schema-008 step name")
         if "Verify schema-030 catalog and dump round trip" not in text:
@@ -7617,8 +7752,11 @@ class Phase1ClosureAndDocsFixture:
             if suite_rel not in text:
                 raise AssertionError(f"CI workflow missing required suite: {suite_rel}")
 
-        if not re.search(r"runuser\s+-u\s+postgres\s+--[^\n]*python3\s+tests/pando_lab\.py\s+--binary\s+target/debug/rootyard-pando-lab", text):
-            raise AssertionError("CI workflow must run tests/pando_lab.py as non-root postgres user via runuser -u postgres")
+        if not cls.pando_runs_behind_nonroot_guard(text):
+            raise AssertionError(
+                "CI workflow must run tests/pando_lab.py only after an explicit non-root guard "
+                '(test "$(id -u)" -ne 0) or via legacy runuser -u postgres'
+            )
 
         script_refs = sorted(set(re.findall(r"((?:tests|scripts)/[a-zA-Z0-9_]+\.py)", text)))
         for rel in script_refs:
@@ -14257,7 +14395,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
         self.assertEqual(r1["operation_id"], r2["operation_id"])
         browse_rs = ROOT / "src/browse.rs"
         self.assertTrue(browse_rs.is_file())
-        self.assertIn("pub fn routes() -> Router<Arc<AppState>>", browse_rs.read_text(encoding="utf-8"))
+        self.assertIn("pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>>", browse_rs.read_text(encoding="utf-8"))
 
     # =========================================================================
     # Feature F11: Git LFS Batch API (5 Tests)
@@ -14864,7 +15002,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
 
     def test_t1_f19_04_shared_auth_events_and_migration_range_contracts(self) -> None:
         auth_rs = (ROOT / "src/auth.rs").read_text(encoding="utf-8")
-        for sig in ("pub fn idempotency_key(", "pub async fn authorize_repo(", "pub async fn verify_token(", "pub async fn finish_tx("):
+        for sig in ("pub fn idempotency_key(", "pub async fn authorize_repo_with_role(", "pub async fn verify_token(", "pub async fn finish_tx("):
             self.assertIn(sig, auth_rs)
         events_rs = (ROOT / "src/events.rs").read_text(encoding="utf-8")
         dispatch_rs = (ROOT / "src/dispatch.rs").read_text(encoding="utf-8")
@@ -14896,7 +15034,14 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertRegex(ci_text, r"cargo\s+clippy\s+(?:--locked\s+)?--all-targets\s+--features\s+pando-lab\s+--\s+-D\s+warnings")
         self.assertRegex(ci_text, r"cargo\s+test\s+--locked\s+(?:--all-targets\s+)?--features\s+pando-lab")
-        self.assertIn("cargo build --locked --features pando-lab --bins", ci_text)
+        live_commands = [
+            Phase1ClosureAndDocsFixture.live_ci_command_tokens(line)
+            for line in ci_text.splitlines()
+        ]
+        self.assertIn(
+            ["python3", "scripts/build_native.py", "--features", "pando-lab", "--bins"],
+            live_commands,
+        )
 
     def test_t1_f20_03_ci_workflow_verifies_schema_030_catalog_and_design_docs_gates(self) -> None:
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -14909,13 +15054,21 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         for suite in Phase1ClosureAndDocsFixture.REQUIRED_CI_SUITES:
             self.assertIn(suite, ci_text)
-        self.assertIn("python3 tests/e2e_tiers.py --tier all --binary target/debug/rootyard", ci_text)
+        self.assertRegex(ci_text, r"python3\s+tests/e2e_tiers\.py\s+--reference-only\s+--tier\s+all\s+--report\b")
 
     def test_t1_f20_05_ci_workflow_runs_pando_lab_as_non_root_postgres_and_all_scripts_parse(self) -> None:
         info = Phase1ClosureAndDocsFixture.validate_ci_workflow()
         self.assertGreaterEqual(len(info["script_refs"]), 10)
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        self.assertRegex(ci_text, r"runuser\s+-u\s+postgres\s+--\s+env\b[^\n]*python3\s+tests/pando_lab\.py\s+--binary\s+target/debug/rootyard-pando-lab")
+        live_commands = [
+            Phase1ClosureAndDocsFixture.live_ci_command_tokens(line)
+            for line in ci_text.splitlines()
+        ]
+        self.assertIn(["test", "$(id -u)", "-ne", "0"], live_commands)
+        self.assertIn(
+            ["python3", "tests/pando_lab.py", "--binary", "target/debug/rootyard-pando-lab"],
+            live_commands,
+        )
 
     # =========================================================================
     # Feature F21: Phase 1 Closure — Implementation Status & Docs Sync (5 Tests)
@@ -15679,7 +15832,12 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
     def test_t1_f30_03_domain_root_router_files_export_pub_fn_routes_without_inline_sql(self) -> None:
         for dom in ("pulls", "browse", "lfs", "webhooks", "members"):
             text = (ROOT / "src" / f"{dom}.rs").read_text(encoding="utf-8")
-            self.assertIn("pub fn routes() -> Router<Arc<AppState>>", text)
+            expected_sig = (
+                "pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>>"
+                if dom == "browse"
+                else "pub fn routes() -> Router<Arc<AppState>>"
+            )
+            self.assertIn(expected_sig, text)
             SchemaBoundaryIntegrationFixture.verify_tier2_modularity_and_line_caps(simulated_inline_sql_in_root=(dom, text))
 
     def test_t1_f30_04_workspace_lab_and_pando_lab_cli_dispatchers_stay_modular(self) -> None:
@@ -18029,9 +18187,30 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
         no_clippy_feat = re.sub(r"cargo\s+clippy[^\n]*", "cargo clippy --all-targets -- -D warnings", ci_text)
         with self.assertRaisesRegex(AssertionError, "cargo clippy"):
             Phase1ClosureAndDocsFixture.validate_ci_workflow(no_clippy_feat)
-        no_build_feat = ci_text.replace("cargo build --locked --features pando-lab --bins", "cargo build --locked --bins")
-        with self.assertRaisesRegex(AssertionError, "cargo build"):
+        no_build_feat = re.sub(
+            r"python3\s+scripts/build_native\.py[^\n]*",
+            "python3 scripts/build_native.py --bins",
+            ci_text,
+        )
+        with self.assertRaisesRegex(AssertionError, "build_native"):
             Phase1ClosureAndDocsFixture.validate_ci_workflow(no_build_feat)
+        commented_build = re.sub(
+            r"^(\s*-\s*run:\s*)(python3\s+scripts/build_native\.py[^\n]*)$",
+            r"# \1\2",
+            ci_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        self.assertNotEqual(commented_build, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(commented_build)
+        inline_comment_build = ci_text.replace(
+            "python3 scripts/build_native.py --features pando-lab --bins",
+            "python3 scripts/build_native.py --bins # --features pando-lab",
+        )
+        self.assertNotEqual(inline_comment_build, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(inline_comment_build)
 
     def test_t2_f20_03_ci_validator_rejects_stale_schema_008_or_missing_design_docs_gate(self) -> None:
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -18044,8 +18223,45 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         with self.assertRaisesRegex(AssertionError, "tests/ci_mirror.py"):
             Phase1ClosureAndDocsFixture.validate_ci_workflow(ci_text.replace("tests/ci_mirror.py", "tests/pulls.py"))
-        with self.assertRaisesRegex(AssertionError, "runuser -u postgres"):
-            Phase1ClosureAndDocsFixture.validate_ci_workflow(ci_text.replace("runuser -u postgres --", "sudo --"))
+        no_pando_guard = re.sub(
+            r'^[ \t]*test\s+"\$\(id -u\)"\s+-ne\s+0[ \t]*\n',
+            "",
+            ci_text,
+            flags=re.MULTILINE,
+        )
+        self.assertNotEqual(no_pando_guard, ci_text)
+        with self.assertRaisesRegex(AssertionError, "non-root guard"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(no_pando_guard)
+        commented_guard = re.sub(
+            r'^(\s*)test\s+"\$\(id -u\)"\s+-ne\s+0\s*$',
+            r'\1# test "$(id -u)" -ne 0',
+            ci_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        self.assertNotEqual(commented_guard, ci_text)
+        with self.assertRaisesRegex(AssertionError, "non-root guard"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(commented_guard)
+        echo_guard = re.sub(
+            r'^(\s*)test\s+"\$\(id -u\)"\s+-ne\s+0\s*$',
+            r'\1echo noop # test "$(id -u)" -ne 0',
+            ci_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        self.assertNotEqual(echo_guard, ci_text)
+        with self.assertRaisesRegex(AssertionError, "non-root guard"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(echo_guard)
+        commented_pando = re.sub(
+            r"^(\s*)(python3\s+tests/pando_lab\.py\s+--binary\s+target/debug/rootyard-pando-lab[^\n]*)$",
+            r"\1# \2",
+            ci_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        self.assertNotEqual(commented_pando, ci_text)
+        with self.assertRaisesRegex(AssertionError, "non-root guard"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(commented_pando)
 
     def test_t2_f20_05_ci_validator_rejects_nonexistent_script_reference(self) -> None:
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
