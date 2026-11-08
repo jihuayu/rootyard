@@ -8,7 +8,8 @@
 //! timeout. There is intentionally no router or unauthenticated public query.
 use super::contract::{
     BeginReceipt, CancelReceipt, Capabilities, CommitReceipt, IssuerLane, OperationIdentity, OperationLookup,
-    OperationRecord, OperationState, RefStoreError, RequestDigest, SequenceReservation, TerminalOutcome, TerminalResult,
+    OperationRecord, OperationState, RefStoreError, RequestDigest, SequenceReservation, TerminalOutcome,
+    TerminalResult,
 };
 use std::{future::Future, time::Duration};
 use tokio::time::{Instant, timeout_at};
@@ -132,7 +133,7 @@ impl PgRefStore {
             let record = OperationRecord::new(identity.clone(), OperationState::Cancelled, Some(result))?;
             return Ok(BeginReceipt { created: true, record });
         }
-        if let Some(cancelled) = cancellation_by_operation(tx, identity.repository_id(), identity.operation_id(), true).await? {
+        if cancellation_by_operation(tx, identity.repository_id(), identity.operation_id(), true).await?.is_some() {
             return Err(RefStoreError::CancellationConflict);
         }
         insert_operation(tx, identity, OperationState::Pending, None).await?;
@@ -190,7 +191,10 @@ impl PgRefStore {
                 false
             }
             None => {
-                if cancellation_by_operation(tx, identity.repository_id(), identity.operation_id(), true).await?.is_some() {
+                if cancellation_by_operation(tx, identity.repository_id(), identity.operation_id(), true)
+                    .await?
+                    .is_some()
+                {
                     return Err(RefStoreError::CancellationConflict);
                 }
                 insert_cancellation(tx, identity).await?;
@@ -339,8 +343,8 @@ async fn lock_operation_key(
     operation_id: Uuid,
 ) -> Result<(), RefStoreError> {
     tx.query_one(OPERATION_LOCK_SQL, &[&OPERATION_LOCK_DOMAIN, &repository_id, &operation_id])
-    .await
-    .map_err(db_error)?;
+        .await
+        .map_err(db_error)?;
     Ok(())
 }
 
@@ -350,11 +354,9 @@ async fn bound(tx: &Transaction<'_>, deadline: Instant) -> Result<(), RefStoreEr
         return Err(RefStoreError::Timeout);
     }
     let millis = remaining.min(MAX_QUERY_WINDOW).as_millis().max(1);
-    tx.batch_execute(&format!(
-        "SET LOCAL statement_timeout = {millis}; SET LOCAL lock_timeout = {millis};"
-    ))
-    .await
-    .map_err(db_error)?;
+    tx.batch_execute(&format!("SET LOCAL statement_timeout = {millis}; SET LOCAL lock_timeout = {millis};"))
+        .await
+        .map_err(db_error)?;
     Ok(())
 }
 
@@ -413,12 +415,7 @@ async fn operation_by_lane(
     );
     tx.query_opt(
         &query,
-        &[
-            &identity.repository_id(),
-            &identity.issuer_id(),
-            &identity.lane().as_str(),
-            &identity.sequence(),
-        ],
+        &[&identity.repository_id(), &identity.issuer_id(), &identity.lane().as_str(), &identity.sequence()],
     )
     .await
     .map_err(db_error)
@@ -437,12 +434,7 @@ async fn cancellation_by_key(
     let row = tx
         .query_opt(
             &query,
-            &[
-                &identity.repository_id(),
-                &identity.issuer_id(),
-                &identity.lane().as_str(),
-                &identity.sequence(),
-            ],
+            &[&identity.repository_id(), &identity.issuer_id(), &identity.lane().as_str(), &identity.sequence()],
         )
         .await
         .map_err(db_error)?;
