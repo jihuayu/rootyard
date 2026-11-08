@@ -814,16 +814,18 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
         binding = rows["ref_store_core_snapshot_packs"][0]
         repo = uuid_literal(marker["scope"]["repository_id"])
         tenant = uuid_literal(marker["scope"]["tenant_id"])
-        immutable = "ref-store core pack snapshot"
+        ledger_immutable = "ref-store core pack ledger is immutable"
+        binding_immutable = "ref-store core pack snapshot binding is immutable"
+        binding_delete = "ref-store core pack snapshot binding cannot be deleted while its repository exists"
         monotone = "pack snapshot usage counters are monotone and cannot be refunded"
         self.reject_guard("UPDATE public.ref_store_core_pack_snapshot_history SET body='{}' "
-                          "WHERE history_id='" + history[0]["history_id"] + "'", immutable)
+                          "WHERE history_id='" + history[0]["history_id"] + "'", ledger_immutable)
         self.reject_guard("DELETE FROM public.ref_store_core_pack_snapshot_history "
-                          "WHERE history_id='" + history[0]["history_id"] + "'", immutable)
+                          "WHERE history_id='" + history[0]["history_id"] + "'", ledger_immutable)
         self.reject_guard("UPDATE public.ref_store_core_snapshot_packs SET joined_revision=1 "
-                          "WHERE snapshot_id='" + binding["snapshot_id"] + "'", immutable)
+                          "WHERE snapshot_id='" + binding["snapshot_id"] + "'", binding_immutable)
         self.reject_guard("DELETE FROM public.ref_store_core_snapshot_packs "
-                          "WHERE snapshot_id='" + binding["snapshot_id"] + "'", immutable)
+                          "WHERE snapshot_id='" + binding["snapshot_id"] + "'", binding_delete)
         self.reject_guard("UPDATE public.ref_store_core_pack_snapshot_repo_usage "
                           "SET history_count=history_count-1 WHERE repository_id='" + repo + "'", monotone)
         self.reject_guard("UPDATE public.ref_store_core_pack_snapshot_tenant_usage "
@@ -832,15 +834,16 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
                           "SET repository_id=gen_random_uuid() WHERE repository_id='" + repo + "'",
                           "pack snapshot usage row identity is immutable")
         self.reject_guard("DELETE FROM public.ref_store_core_pack_snapshot_repo_usage "
-                          "WHERE repository_id='" + repo + "'", immutable)
+                          "WHERE repository_id='" + repo + "'", ledger_immutable)
         self.reject_guard("UPDATE public.ref_store_core_gates SET pack_mode='metadata_only' "
                           "WHERE repository_id='" + repo + "'",
                           "ref-store core pack mode is one-way and cannot be downgraded")
-        triggers = int(self.sql("SELECT count(*) FROM pg_trigger WHERE tgname LIKE "
-                                "'ref_store_core_pack_snapshot%'"))
-        assert triggers >= 10, "the migration-143 history/usage/binding guards are missing"
-        assert self.sql("SELECT count(*) FROM pg_trigger WHERE tgname LIKE "
-                        "'ref_store_core_pack_snapshot%' AND tgenabled <> 'O'") == "0", (
+        guard_names = ("(tgname LIKE 'ref_store_core_pack_snapshot%' OR "
+                       "tgname LIKE 'ref_store_core_snapshot_packs%')")
+        triggers = int(self.sql("SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND " + guard_names))
+        assert triggers == 11, "the eleven migration-143 history/usage/binding guards are missing"
+        assert self.sql("SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND " +
+                        guard_names + " AND tgenabled <> 'O'") == "0", (
             "a migration-143 guard was disabled")
         assert self.snapshot_rows() == self.source_snapshot_rows
         assert self.snapshot_rows(scoped=False) == self.source_snapshot_rows_global
