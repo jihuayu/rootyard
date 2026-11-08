@@ -33,6 +33,12 @@
 //! * Revocation is idempotent (204) for the owner and always 404 across users.
 //!   Session revocation uses `UPDATE ... SET revoked = true` and never deletes
 //!   audit/GC references.
+//! * The credential that authenticates a management request may rotate or
+//!   revoke itself (and a browser child may revoke its current session).
+//!   `begin` proves that acting row under the per-user advisory lock and holds
+//!   it `FOR SHARE`; only the row this transaction itself revoked may skip the
+//!   final re-verification, so the owner is not answered 401 for its own
+//!   successful action while every other target keeps the full check.
 
 use super::cursors::{decode as decode_cursor, encode as cursor};
 use crate::{
@@ -113,6 +119,42 @@ async fn verify_issuer(tx: &Transaction<'_>, actor: &Identity, mutation: bool) -
 async fn begin(tx: &Transaction<'_>, actor: &Identity, mutation: bool) -> Result<(), Error> {
     lock_user(tx, actor).await?;
     verify_issuer(tx, actor, mutation).await
+}
+
+/// Commit a management transaction that intentionally revoked the credential
+/// that authenticated it.
+///
+/// `revoked_id` is the row this transaction just revoked. When it is the acting
+/// token itself (self rotation, self revocation, revoking the current browser
+/// session), `auth::finish_tx` would observe our own `revoked = true` and answer
+/// 401 after rolling the owner's successful action back. `begin` already proved
+/// that exact row — user, digest, kind, API/browser-session liveness, expiry,
+/// `read_only` and `is_restricted` — after the per-user advisory lock and still
+/// holds it `FOR SHARE` until commit, and the only statement that can change it
+/// afterwards is this transaction's own revocation. The relaxation is therefore
+/// derived from the authenticated identity (`revoked_id == actor.token_id`), not
+/// a caller flag: every other target, and every transaction that leaves the
+/// actor intact, keeps the full final re-verification, and a restricted or
+/// read-only issuer is still rejected by `begin` before any mutation.
+async fn finish_revocation(tx: Transaction<'_>, actor: &Identity, revoked_id: Uuid) -> Result<(), Error> {
+    if revoked_id == actor.token_id {
+        tx.commit().await.map_err(Error::internal)
+    } else {
+        auth::finish_tx(tx, actor, true).await
+    }
+}
+
+/// Fresh liveness/writeability proof for the acting credential immediately
+/// before the statement that revokes it. `begin`'s check happens before the
+/// target-row lock waits and grant/role lookups, so it cannot see a token that
+/// expired while this transaction was queued; this one runs after every wait,
+/// immediately before the intentional self mutation, and the row locks are held
+/// until commit so nothing can invalidate it afterwards.
+async fn verify_self_revocation(tx: &Transaction<'_>, actor: &Identity, revoked_id: Uuid) -> Result<(), Error> {
+    if revoked_id == actor.token_id {
+        auth::verify_token(tx, actor, true).await?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -425,11 +467,15 @@ pub async fn rotate_token(pool: &Pool, actor: &Identity, token_id: Uuid) -> Resu
     .await
     .map_err(Error::internal)?;
     insert_grants(&tx, new_id, &kept_repositories, &kept_namespaces).await?;
+    // Every clock-bearing wait of this rotation (target row lock, role/grant
+    // validation, insertion) is done: prove the acting token once more before
+    // revoking it, which is the only reason the final check is relaxed.
+    verify_self_revocation(&tx, actor, token_id).await?;
     tx.execute("UPDATE tokens SET revoked = true, scope_version = scope_version + 1 WHERE id = $1", &[&token_id])
         .await
         .map_err(Error::internal)?;
     let view = load_token_view(&tx, new_id).await?;
-    auth::finish_tx(tx, actor, true).await?;
+    finish_revocation(tx, actor, token_id).await?;
     Ok(IssuedToken { token: view, secret })
 }
 
@@ -447,12 +493,15 @@ pub async fn revoke_token(pool: &Pool, actor: &Identity, token_id: Uuid) -> Resu
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
+    // The target row is `FOR UPDATE` locked; re-prove the actor now, before the
+    // intentional self mutation and with no lock wait left in between.
+    verify_self_revocation(&tx, actor, token_id).await?;
     if !row.get::<_, bool>(0) {
         tx.execute("UPDATE tokens SET revoked = true, scope_version = scope_version + 1 WHERE id = $1", &[&token_id])
             .await
             .map_err(Error::internal)?;
     }
-    auth::finish_tx(tx, actor, true).await
+    finish_revocation(tx, actor, token_id).await
 }
 
 /// List the actor's live browser sessions (never their secrets or CSRF value).
@@ -511,19 +560,35 @@ pub async fn revoke_session(pool: &Pool, actor: &Identity, session_token_id: Uui
     let mut client = pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     begin(&tx, actor, true).await?;
-    let updated = tx
-        .execute(
-            "UPDATE tokens SET revoked = true, scope_version = scope_version + 1 \
-              WHERE id = $1 AND user_id = $2 AND kind = 'browser'",
+    // Lock the target browser token row, then its session row, in the same
+    // order as the mutations below and before any clock-bearing work: the fresh
+    // actor proof must come after the last wait, and both rows stay locked until
+    // commit. A cross-user, non-browser or unknown id is 404 before that proof.
+    let locked = tx
+        .query_opt(
+            "SELECT t.id FROM tokens t \
+              WHERE t.id = $1 AND t.user_id = $2 AND t.kind = 'browser' FOR UPDATE OF t",
             &[&session_token_id, &actor.id],
         )
         .await
         .map_err(Error::internal)?;
-    if updated == 0 {
+    if locked.is_none() {
         return Err(Error::not_found());
     }
+    let _session_row = tx
+        .query_opt("SELECT 1 FROM web_sessions WHERE token_id = $1 FOR UPDATE", &[&session_token_id])
+        .await
+        .map_err(Error::internal)?;
+    verify_self_revocation(&tx, actor, session_token_id).await?;
+    tx.execute(
+        "UPDATE tokens SET revoked = true, scope_version = scope_version + 1 \
+          WHERE id = $1 AND user_id = $2 AND kind = 'browser'",
+        &[&session_token_id, &actor.id],
+    )
+    .await
+    .map_err(Error::internal)?;
     tx.execute("UPDATE web_sessions SET revoked = true WHERE token_id = $1", &[&session_token_id])
         .await
         .map_err(Error::internal)?;
-    auth::finish_tx(tx, actor, true).await
+    finish_revocation(tx, actor, session_token_id).await
 }
