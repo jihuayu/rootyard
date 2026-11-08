@@ -23,12 +23,12 @@
 //! staging lease charged until the OS call actually returns. Runtime exit can
 //! still orphan a temp file, and these limits are not restart-durable.
 
+#[cfg(test)]
+use std::sync::Arc;
 use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-#[cfg(test)]
-use std::sync::Arc;
 
 use futures_util::TryStreamExt;
 use opendal::ErrorKind;
@@ -96,11 +96,7 @@ fn tokio_deadline(deadline: Instant) -> tokio::time::Instant {
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), BlobError> {
-    if Instant::now() >= deadline {
-        Err(BlobError::DeadlineExceeded)
-    } else {
-        Ok(())
-    }
+    if Instant::now() >= deadline { Err(BlobError::DeadlineExceeded) } else { Ok(()) }
 }
 
 /// Test-only deterministic gate between acquiring read capacity and opening the
@@ -122,11 +118,7 @@ pub(crate) fn install_readback_stall(
 ) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
-    let stall = ReadbackStall {
-        destination,
-        entered: Arc::clone(&entered),
-        release: Arc::clone(&release),
-    };
+    let stall = ReadbackStall { destination, entered: Arc::clone(&entered), release: Arc::clone(&release) };
     let slot = READBACK_STALL.get_or_init(|| std::sync::Mutex::new(None));
     *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stall);
     (entered, release)
@@ -173,9 +165,8 @@ impl BlobStore {
         let store = self.clone();
         let locator = locator.clone();
         let destination = destination.to_path_buf();
-        let handle = tokio::spawn(async move {
-            store.get_to_file_owned(&locator, &destination, lease, deadline).await
-        });
+        let handle =
+            tokio::spawn(async move { store.get_to_file_owned(&locator, &destination, lease, deadline).await });
         match tokio::time::timeout_at(tokio_deadline(deadline), handle).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(BlobError::Provider("blob readback task failed".into())),
@@ -262,9 +253,7 @@ impl BlobStore {
         let lease = self.resources().acquire_read(locator.length(), deadline).await?;
         let store = self.clone();
         let locator = locator.clone();
-        let handle = tokio::spawn(async move {
-            store.get_range_owned(&locator, start, len, lease, deadline).await
-        });
+        let handle = tokio::spawn(async move { store.get_range_owned(&locator, start, len, lease, deadline).await });
         match tokio::time::timeout_at(tokio_deadline(deadline), handle).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(BlobError::Provider("blob readback task failed".into())),
@@ -293,8 +282,9 @@ impl BlobStore {
         self.stream_verified_to(locator, &mut output, deadline).await?;
         drop(output);
         check_deadline(deadline)?;
-        let mut file =
-            File::open(staging.path()).await.map_err(|_| BlobError::Provider("blob range staging open failed".into()))?;
+        let mut file = File::open(staging.path())
+            .await
+            .map_err(|_| BlobError::Provider("blob range staging open failed".into()))?;
         file.seek(std::io::SeekFrom::Start(start))
             .await
             .map_err(|_| BlobError::Provider("blob range seek failed".into()))?;

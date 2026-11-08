@@ -167,20 +167,15 @@ async fn real_provider_publish_verify_range_delete_contract() {
         // A wrong expected digest is detected while streaming; the attempt is
         // aborted and yields neither ACK nor a readable object.
         let wrong_digest = "b".repeat(64);
-        let wrong_digest_intent = store
-            .new_upload(tenant, authority, 1, "contract", &wrong_digest, size)
-            .expect("wrong digest intent");
+        let wrong_digest_intent =
+            store.new_upload(tenant, authority, 1, "contract", &wrong_digest, size).expect("wrong digest intent");
         let wrong_digest_locator = wrong_digest_intent.locator().clone();
         owned_keys.push(wrong_digest_locator.path());
         assert!(matches!(
             store.put_file(wrong_digest_intent, &source, deadline()).await,
             Err(BlobError::DigestMismatch { .. })
         ));
-        assert_eq!(
-            store.head(&wrong_digest_locator, deadline()).await.unwrap(),
-            None,
-            "digest mismatch must not ACK"
-        );
+        assert_eq!(store.head(&wrong_digest_locator, deadline()).await.unwrap(), None, "digest mismatch must not ACK");
 
         assert!(matches!(store.delete(&first, deadline()).await, Err(BlobError::DeleteDisabled)));
 

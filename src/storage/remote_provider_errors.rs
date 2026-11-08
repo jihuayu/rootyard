@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 // these are the exact request/response types of the `HttpFetch` trait.
 use axum::http::{Request, Response};
 use bytes::Bytes;
-use opendal::raw::{Buffer, HttpClient, HttpBody, HttpFetch};
+use opendal::raw::{Buffer, HttpBody, HttpClient, HttpFetch};
 use opendal::{ErrorKind, Result as SdkResult};
 
 use crate::blob_store::BlobError;

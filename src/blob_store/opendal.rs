@@ -105,9 +105,8 @@ impl BlobStore {
     #[cfg(test)]
     pub(crate) fn open_memory(profile: BlobProfile, resources: Arc<ResourceContext>) -> Self {
         ensure_crypto_provider();
-        let operator = Operator::new(opendal::services::Memory::default().root("/"))
-            .expect("in-memory test operator")
-            .finish();
+        let operator =
+            Operator::new(opendal::services::Memory::default().root("/")).expect("in-memory test operator").finish();
         let capability = operator.info().full_capability();
         let capabilities = BlobCapabilities {
             stat: capability.stat,
@@ -157,15 +156,7 @@ impl BlobStore {
         sha256: &str,
         length: u64,
     ) -> Result<UploadIntent, BlobError> {
-        let locator = BlobLocator::new(
-            tenant_id,
-            authority_id,
-            generation,
-            Uuid::new_v4(),
-            namespace,
-            sha256,
-            length,
-        )?;
+        let locator = BlobLocator::new(tenant_id, authority_id, generation, Uuid::new_v4(), namespace, sha256, length)?;
         self.validate_locator(&locator)?;
         Ok(UploadIntent::new(locator))
     }

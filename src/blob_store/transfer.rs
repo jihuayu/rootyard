@@ -20,13 +20,13 @@
 //! reader slot instead. Read-back verification holds one reader slot for the
 //! whole streamed download.
 
+#[cfg(test)]
+use std::sync::Arc;
 use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::Instant,
 };
-#[cfg(test)]
-use std::sync::Arc;
 
 use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
@@ -47,11 +47,7 @@ fn tokio_deadline(deadline: Instant) -> tokio::time::Instant {
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), BlobError> {
-    if Instant::now() >= deadline {
-        Err(BlobError::DeadlineExceeded)
-    } else {
-        Ok(())
-    }
+    if Instant::now() >= deadline { Err(BlobError::DeadlineExceeded) } else { Ok(()) }
 }
 
 /// Test-only deterministic gate in the owned upload task just before the first
@@ -69,9 +65,7 @@ pub(crate) struct UploadReadStall {
 static UPLOAD_READ_STALL: std::sync::OnceLock<std::sync::Mutex<Option<UploadReadStall>>> = std::sync::OnceLock::new();
 
 #[cfg(test)]
-pub(crate) fn install_upload_read_stall(
-    source: PathBuf,
-) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+pub(crate) fn install_upload_read_stall(source: PathBuf) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let stall = UploadReadStall { source, entered: Arc::clone(&entered), release: Arc::clone(&release) };
@@ -137,9 +131,7 @@ impl BlobStore {
         let lease = self.resources().acquire_upload(deadline).await?;
         let store = self.clone();
         let source = source.to_path_buf();
-        let handle = tokio::spawn(async move {
-            store.put_file_owned(&locator, &source, lease, deadline).await
-        });
+        let handle = tokio::spawn(async move { store.put_file_owned(&locator, &source, lease, deadline).await });
         match tokio::time::timeout_at(tokio_deadline(deadline), handle).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(BlobError::Provider("blob upload task failed".into())),

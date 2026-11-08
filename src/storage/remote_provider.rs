@@ -93,8 +93,7 @@ impl LegacyS3Store {
     }
 
     pub async fn head(&self, path: &str, deadline: Instant) -> Result<Option<u64>, BlobError> {
-        match tokio::time::timeout_at(tokio_deadline(deadline), observe(RemoteOp::Head, self.operator.stat(path)))
-            .await
+        match tokio::time::timeout_at(tokio_deadline(deadline), observe(RemoteOp::Head, self.operator.stat(path))).await
         {
             Ok(Ok(metadata)) => Ok(Some(metadata.content_length())),
             Ok(Err(failure)) if failure.is_not_found() => Ok(None),
@@ -127,17 +126,16 @@ impl LegacyS3Store {
     /// profile never treats a ranged response as digest verification.
     pub async fn read_range(&self, path: &str, start: u64, len: u64, deadline: Instant) -> Result<Vec<u8>, BlobError> {
         let end = start.checked_add(len).ok_or(BlobError::LengthMismatch { expected: u64::MAX, actual: len })?;
-        let buffer =
-            match tokio::time::timeout_at(
-                tokio_deadline(deadline),
-                observe(RemoteOp::Get, self.operator.read_with(path).range(start..end)),
-            )
-            .await
-            {
-                Ok(Ok(buffer)) => buffer,
-                Ok(Err(failure)) => return Err(BlobError::Remote(failure.into_error())),
-                Err(_) => return Err(deadline_error(RemoteOp::Get)),
-            };
+        let buffer = match tokio::time::timeout_at(
+            tokio_deadline(deadline),
+            observe(RemoteOp::Get, self.operator.read_with(path).range(start..end)),
+        )
+        .await
+        {
+            Ok(Ok(buffer)) => buffer,
+            Ok(Err(failure)) => return Err(BlobError::Remote(failure.into_error())),
+            Err(_) => return Err(deadline_error(RemoteOp::Get)),
+        };
         if buffer.len() as u64 != len {
             return Err(BlobError::LengthMismatch { expected: len, actual: buffer.len() as u64 });
         }

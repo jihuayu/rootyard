@@ -381,10 +381,9 @@ impl fmt::Display for BlobError {
                 write!(f, "verified range read needs a full {length}-byte download, above ceiling {limit}")
             }
             Self::DeadlineExceeded => write!(f, "blob operation deadline exceeded"),
-            Self::StagingBudgetExceeded { requested, limit } => write!(
-                f,
-                "blob staging lease of {requested} bytes exceeds the process staging budget {limit}"
-            ),
+            Self::StagingBudgetExceeded { requested, limit } => {
+                write!(f, "blob staging lease of {requested} bytes exceeds the process staging budget {limit}")
+            }
             Self::CapacityConflict => {
                 write!(f, "blob resource limits conflict with the initialized process-wide context")
             }

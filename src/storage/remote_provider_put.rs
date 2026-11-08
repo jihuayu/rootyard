@@ -11,9 +11,7 @@ use tokio::{fs::File, io::AsyncReadExt};
 use crate::blob_store::BlobError;
 use crate::storage::remote_errors::RemoteOp;
 use crate::storage::remote_provider::{LegacyS3Store, READ_CHUNK, UPLOAD_CHUNK, UPLOAD_CONCURRENCY, tokio_deadline};
-use crate::storage::remote_provider_errors::{
-    deadline_error, observe, observe_body_poll,
-};
+use crate::storage::remote_provider_errors::{deadline_error, observe, observe_body_poll};
 
 impl LegacyS3Store {
     pub async fn put(
@@ -90,13 +88,13 @@ impl LegacyS3Store {
             });
         }
         match guard.close(tokio_deadline(deadline)).await {
-            Ok(()) => {},
+            Ok(()) => {}
             Err(BlobError::AlreadyExists) => {
                 // Conditional PUT conflicts can arrive only at multipart
                 // completion. Legacy content-addressed retries remain
                 // idempotent only after an independent full verification.
                 return self.verify_content(path, expected_sha256, expected_size, deadline).await;
-            },
+            }
             Err(error) => return Err(error),
         }
         guard.disarm();

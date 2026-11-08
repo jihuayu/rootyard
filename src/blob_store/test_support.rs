@@ -47,15 +47,8 @@ pub(crate) fn digest(bytes: &[u8]) -> String {
 /// Mint a fresh one-use upload intent for a test payload. Every call gets a new
 /// random attempt address; callers capture `locator()` before consuming it.
 pub(crate) fn upload(blob: &BlobStore, namespace: &str, bytes: &[u8]) -> UploadIntent {
-    blob.new_upload(
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        1,
-        namespace,
-        &digest(bytes),
-        bytes.len() as u64,
-    )
-    .expect("test upload intent")
+    blob.new_upload(Uuid::new_v4(), Uuid::new_v4(), 1, namespace, &digest(bytes), bytes.len() as u64)
+        .expect("test upload intent")
 }
 
 pub(crate) fn write_source(dir: &Path, bytes: &[u8]) -> PathBuf {

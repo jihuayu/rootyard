@@ -125,11 +125,7 @@ impl ResourceContext {
         }
         let reader = take(&self.reader_slots, 1, deadline).await?;
         let units = staging_bytes.div_ceil(LEASE_UNIT_BYTES) as u32;
-        let staging = if units == 0 {
-            None
-        } else {
-            Some(take(&self.staging_units, units, deadline).await?)
-        };
+        let staging = if units == 0 { None } else { Some(take(&self.staging_units, units, deadline).await?) };
         Ok(ReadLease {
             reader: ReaderLease { permit: Some(reader), _private: () },
             staging: StagingLease { permit: staging, bytes: staging_bytes },

@@ -218,9 +218,8 @@ async fn outer_timeout_detaches_upload_and_keeps_slot_until_abort_finishes() {
     let source = write_source(dir.path(), &bytes);
     let intent = upload(&blob, "upload-stall", &bytes);
     let (entered, release) = transfer::install_upload_read_stall(source.clone());
-    let upload = tokio::spawn(async move {
-        blob.put_file(intent, &source, Instant::now() + Duration::from_millis(150)).await
-    });
+    let upload =
+        tokio::spawn(async move { blob.put_file(intent, &source, Instant::now() + Duration::from_millis(150)).await });
     tokio::time::timeout(Duration::from_secs(1), entered.acquire())
         .await
         .expect("owned upload must reach the local read gate")

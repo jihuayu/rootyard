@@ -23,10 +23,7 @@ impl RemoteObjectStore {
         deadline: Instant,
     ) -> Result<StoredObject> {
         let (digest, size) = hash_file(source, deadline).await?;
-        ensure!(
-            size == expected_size && digest == key.sha256,
-            "object source digest or size mismatch"
-        );
+        ensure!(size == expected_size && digest == key.sha256, "object source digest or size mismatch");
         let rel_path = key.path();
         match self {
             Self::Local(root) => local_put(root, &rel_path, source, deadline).await?,

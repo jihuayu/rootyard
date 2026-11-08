@@ -67,9 +67,7 @@ impl RemoteObjectStore {
                 } else if let Some(stream) = remote.as_mut() {
                     // Each poll opens its own observation scope: the lazy
                     // reader issues its HTTP request while being polled.
-                    match tokio::time::timeout_at(deadline, observe_body_poll(RemoteOp::Get, stream.try_next()))
-                        .await
-                    {
+                    match tokio::time::timeout_at(deadline, observe_body_poll(RemoteOp::Get, stream.try_next())).await {
                         Ok(Ok(chunk)) => chunk,
                         Ok(Err(error)) => return Err(object_error(error)),
                         Err(_) => return Err(object_error(deadline_error(RemoteOp::Get))),

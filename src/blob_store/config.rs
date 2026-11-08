@@ -166,12 +166,7 @@ impl BlobProfile {
         let resources = ResourceLimits::new(
             bounded_usize("ROOTYARD_BLOB_ACTIVE_UPLOADS", DEFAULT_ACTIVE_UPLOADS, 1, MAX_ACTIVE_SLOTS)?,
             bounded_usize("ROOTYARD_BLOB_ACTIVE_READERS", DEFAULT_ACTIVE_READERS, 1, MAX_ACTIVE_SLOTS)?,
-            bounded_u64(
-                "ROOTYARD_BLOB_STAGING_BYTES",
-                DEFAULT_STAGING_BYTES,
-                LEASE_UNIT_BYTES,
-                MAX_STAGING_BYTES,
-            )?,
+            bounded_u64("ROOTYARD_BLOB_STAGING_BYTES", DEFAULT_STAGING_BYTES, LEASE_UNIT_BYTES, MAX_STAGING_BYTES)?,
         )?;
         // The default object ceiling follows the staging budget: this contract
         // only acknowledges objects it can also fetch back for verification.
