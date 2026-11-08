@@ -87,16 +87,35 @@ fn context(namespace: &str, digest_byte: u8) -> WrapContext {
     .unwrap()
 }
 
-fn context_with_tenant(tenant: [u8; 16]) -> WrapContext {
+/// Context whose every fixed-width field is the ASCII byte `a`, so shifting one
+/// byte between the key id and the namespace leaves a naive concatenation of
+/// all fields byte-identical.
+fn collision_context(namespace: &str) -> WrapContext {
+    let fixed = [b'a'; 16];
     WrapContext::new(
-        Uuid::from_bytes(tenant),
-        Uuid::from_bytes([2; 16]),
-        7,
-        Uuid::from_bytes([3; 16]),
-        "lfs",
+        Uuid::from_bytes(fixed),
+        Uuid::from_bytes(fixed),
+        i64::from_be_bytes([b'a'; 8]),
+        Uuid::from_bytes(fixed),
+        namespace,
         &"ab".repeat(32),
     )
     .unwrap()
+}
+
+/// Deliberately length-blind transcript: key id, tenant, authority,
+/// generation, attempt, namespace and content digest concatenated without any
+/// field framing.
+fn naive_aad(key_id: &str, namespace: &str) -> Vec<u8> {
+    let fixed = [b'a'; 16];
+    let mut transcript = key_id.as_bytes().to_vec();
+    transcript.extend_from_slice(&fixed); // tenant
+    transcript.extend_from_slice(&fixed); // authority
+    transcript.extend_from_slice(&i64::from_be_bytes([b'a'; 8]).to_be_bytes()); // generation
+    transcript.extend_from_slice(&fixed); // attempt
+    transcript.extend_from_slice(namespace.as_bytes());
+    transcript.extend_from_slice("ab".repeat(32).as_bytes()); // content digest
+    transcript
 }
 
 fn metadata_value(wrapped: &WrappedKey) -> Value {
@@ -296,31 +315,36 @@ fn rotation_keeps_old_reads_rewraps_to_current_and_preserves_the_dek() {
 #[test]
 fn length_delimited_aad_prevents_adjacent_field_collisions() {
     let bytes = key(0x31);
-    let fixture = KeyRingFixture::new(&[(ID_V1, &bytes), ("v1x", &bytes)], ID_V1);
+    let fixture = KeyRingFixture::new(&[(ID_V1, &bytes), ("v1a", &bytes)], ID_V1);
     let provider = fixture.provider();
     let first_id = KeyId::parse(ID_V1).unwrap();
-    let second_id = KeyId::parse("v1x").unwrap();
-    let mut first_tenant = [0x11; 16];
-    first_tenant[0] = 0x78;
-    let second_tenant = [0x11; 16];
-    let first_context = context_with_tenant(first_tenant);
-    let second_context = context_with_tenant(second_tenant);
+    let second_id = KeyId::parse("v1a").unwrap();
+    let first_context = collision_context("aa");
+    let second_context = collision_context("a");
 
-    let mut naive_first = first_id.as_str().as_bytes().to_vec();
-    naive_first.extend_from_slice(&first_tenant);
-    let mut naive_second = second_id.as_str().as_bytes().to_vec();
-    naive_second.extend_from_slice(&second_tenant);
-    assert_eq!(naive_first, naive_second, "the fixture must collide without field lengths");
-    assert_ne!(first_context.aad(&first_id), second_context.aad(&second_id));
+    assert_eq!(
+        naive_aad(first_id.as_str(), "aa"),
+        naive_aad(second_id.as_str(), "a"),
+        "the fixture must collide when all fields are concatenated without lengths"
+    );
+    assert_ne!(
+        first_context.aad(&first_id),
+        second_context.aad(&second_id),
+        "length framing must separate the shifted key-id byte from the namespace"
+    );
     assert_ne!(first_context.aad_digest(&first_id), second_context.aad_digest(&second_id));
 
     let wrapped = provider.wrap_data_key(&key(0x99), &first_context).unwrap();
+    assert_eq!(wrapped.key_id().as_str(), ID_V1);
+    // Both ids are configured with the same KEK bytes, so only the AAD binding
+    // can reject a wrap that is replayed under the other id and context.
     let mut value = metadata_value(&wrapped);
-    value["key_id"] = json!("v1x");
+    value["key_id"] = json!("v1a");
+    value["aad_digest"] = json!(hex::encode(second_context.aad_digest(&second_id)));
     assert_eq!(
         provider.unwrap_data_key(&parse_metadata(&value), &second_context).unwrap_err(),
         KeyProviderError::AuthenticationFailed,
-        "ambiguous adjacent fields must still be cryptographically distinct"
+        "a forged consistent AAD digest must still fail AEAD authentication"
     );
 }
 
