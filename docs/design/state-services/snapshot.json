@@ -30,7 +30,10 @@
       "docs/design/09-workspace-git-research.md",
       "docs/design/10-distributed-storage-research.md",
       "docs/design/11-ci-read-mirrors.md"
-    ]
+    ],
+    "baseline_scope": "historical pre-evolution measurement/documentation point; NOT the rebased stack parent and NOT a new-backend qualification",
+    "current_stack_parent": "bcd391809c8b0d2a16409b6a28fe1147d7ed5c66",
+    "current_stack_parent_role": "security/token/membership recovery parent for this rebase; the native d689 receipt was not rerun on it"
   },
   "w0_artifacts": {
     "producer_inventory": "docs/design/state-services/producers.json",
@@ -50,13 +53,15 @@
     "native_baseline_input_tests": "tests/test_state_services_native_baseline.py"
   },
   "truth_boundary": {
-    "code_changed_by_w0": false,
     "service_binary_executed": true,
     "postgres_measured": true,
     "http_api_measured": true,
     "opendal_blob_measured": false,
     "raft_or_redis_measured": false,
     "local_git_measured": true,
-    "completion_claim": "W0 tooling plus bounded real legacy-Pando baseline; #106 remains open for internal phase costs, complete producer integration and frozen budgets"
+    "completion_claim": "W0 tooling plus a bounded historical d689 legacy-Pando baseline. It does not qualify the rebased parent, any new backend, or #106 completion; internal phase costs, complete producer integration, Blob bytes and frozen budgets remain open.",
+    "production_code_changed_by_w0": false,
+    "service_binary_execution_baseline": "d689bf8062a73cfadbc0a72abf3f1546d992e09c historical legacy Pando run; not the rebased parent",
+    "measurement_applies_to_current_stack_parent": false
   }
 }

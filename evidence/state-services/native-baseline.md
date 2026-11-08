@@ -1,6 +1,6 @@
 # Bounded native baseline: legacy Pando
 
-Status: **PASS within the workload below; #106 remains open.** DeepSeek implemented W0 contracts and inventory; the root agent integrated and ran this service baseline. Luna Max reviewed the runner and its evidence boundaries. No new backend or multi-host qualification is implied.
+Status: **PASS within the workload below; #106 remains open.** This receipt is bound to the historical pre-evolution `d689bf8` source/binary inputs. It is **not** a qualification of the rebased security/token/membership parent, a new RefStore/Blob backend, or a new deployment profile. DeepSeek implemented W0 contracts and inventory; the root agent integrated and ran this service baseline. Luna Max reviewed the runner and its evidence boundaries. No new backend or multi-host qualification is implied.
 
 | Binding | Value |
 | --- | --- |

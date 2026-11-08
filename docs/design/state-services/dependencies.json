@@ -25,14 +25,17 @@
       "uuid": "1.26.1"
     },
     "planned_rust_version": "1.88",
-    "planned_rust_version_reason": "A pending security PR #92 raises the MSRV to 1.88 because of the existing lock. This is a planned target, not the W0 baseline; no Cargo change was made here."
+    "planned_rust_version_reason": "A pending security PR #92 raises the MSRV to 1.88 because of the existing lock. This is a planned target, not the W0 baseline; no Cargo change was made here.",
+    "scope": "historical pre-evolution d689 measurement/documentation point; not the rebased stack parent",
+    "files_note": "Historical hashes recorded from d689; current files are verified separately under current_stack_parent."
   },
   "selection_policy": {
     "no_large_dependency_added_in_w0": true,
-    "cargo_toml_and_lock_unchanged": true,
     "verified_means": "Crates.io metadata checked by the root agent on 2026-11-08 for version, license and declared rust-version.",
     "candidate_means": "Selected direction only; build cost, transitive license set, feature set and runtime behavior remain unverified until a later Cargo-enabled work package.",
-    "must_not_be_reinterpreted_as": "A compiled dependency, a compatibility qualification, or a build-cost measurement."
+    "must_not_be_reinterpreted_as": "A compiled dependency, a compatibility qualification, or a build-cost measurement.",
+    "w0_does_not_modify_cargo": true,
+    "current_parent_cargo_changed_by_security_pr102": true
   },
   "candidates": [
     {
@@ -46,7 +49,7 @@
       "verification": "verified_crates_io_metadata",
       "selection": "primary_verified_compatible",
       "added_to_cargo_in_w0": false,
-      "notes": "0.57.0 is the latest observed release compatible with the declared 1.85 MSRV; 0.59.5 is not. Provider/layer behavior and transitive licenses still require later qualification."
+      "notes": "0.57.0 is the latest observed release compatible with the historical/current 1.85/1.88 border; 0.57.0 remains compatible with current 1.88; 0.59.5 is not. Provider/layer behavior and transitive licenses still require later qualification."
     },
     {
       "role": "raft",
@@ -66,9 +69,9 @@
       "license": "BSD-3-Clause",
       "rust_version": "1.88",
       "verification": "verified_crates_io_metadata",
-      "selection": "candidate_requires_planned_msrv",
+      "selection": "candidate_compatible_with_current_msrv",
       "added_to_cargo_in_w0": false,
-      "notes": "Requires Rust 1.88, so it is incompatible with the baseline 1.85 declaration and must wait for the planned MSRV bump/security review."
+      "notes": "Requires Rust 1.88; current parent declares 1.88, while historical d689 declared 1.85. Still not added by W0."
     },
     {
       "role": "memory_cache",
@@ -106,8 +109,20 @@
   ],
   "open_items_before_add": [
     "Compile OpenRaft 0.9.25 against the planned MSRV and prove its durable storage/network adapter contract.",
-    "Resolve the baseline 1.85 versus planned 1.88 decision explicitly with security PR #92; do not silently raise the MSRV in a feature commit.",
+    "Record historical 1.85 versus current-parent 1.88 explicitly (security PR #102); never silently bump Cargo in a W0 feature commit.",
     "Check complete transitive license sets and NOTICE obligations for OpenDAL/OpenRaft/redb and chosen providers.",
     "Measure build time, binary size and idle memory before calling any dependency lightweight."
-  ]
+  ],
+  "current_stack_parent": {
+    "commit": "bcd391809c8b0d2a16409b6a28fe1147d7ed5c66",
+    "role": "security/token/membership recovery parent used for this rebase",
+    "declared_rust_version": "1.88",
+    "declared_rust_version_reason": "Security PR #102 raised MSRV to 1.88; W0 did not modify Cargo.",
+    "files": {
+      "Cargo.toml": "f11958990599c8803322f3c51b88c167025e6ce786ae26c9fc2060d23612be72",
+      "Cargo.lock": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+      "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "measurement_note": "The historical d689 native receipt was not rerun against this parent and does not qualify it."
+  }
 }

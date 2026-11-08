@@ -249,11 +249,13 @@ def validate_dependencies():
     deps = load(STATE / "dependencies.json")
     require(deps["schema"] == "rootyard.state-services.dependencies/v1", "dependency schema drift")
     baseline = deps["baseline"]
-    require(baseline["declared_rust_version"] == "1.85", "baseline MSRV drift")
+    current = deps["current_stack_parent"]
+    require(baseline["declared_rust_version"] == "1.85", "historical baseline MSRV drift")
     require(baseline["planned_rust_version"] == "1.88", "planned MSRV must remain explicit")
-    require(sha256_file(ROOT / "Cargo.toml") == baseline["files"]["Cargo.toml"], "Cargo.toml hash drift")
-    require(sha256_file(ROOT / "Cargo.lock") == baseline["files"]["Cargo.lock"], "Cargo.lock hash drift")
-    require(sha256_file(ROOT / "LICENSE") == baseline["files"]["LICENSE"], "LICENSE hash drift")
+    require(current["declared_rust_version"] == "1.88", "current parent MSRV drift")
+    for filename, expected in current["files"].items():
+        require(sha256_file(ROOT / filename) == expected, f"current {filename} hash drift")
+    require(deps["selection_policy"]["w0_does_not_modify_cargo"], "W0 Cargo modification guard missing")
     lock = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
     for crate, version in baseline["verified_locked_versions"].items():
         require(re.search(rf'name = "{re.escape(crate)}"\nversion = "{re.escape(version)}"', lock), f"locked version mismatch for {crate}")

@@ -1,6 +1,6 @@
 # 状态服务 W0：设计、生产者清单、部署契约与基线
 
-> 状态：W0 文档/契约/工具交付。**设计提案，尚未实现或生产验收。** issue #106 仍为 OPEN；本目录不得被读作 RefStore/OpenDAL Blob/Target 架构已完成，也不得把本地 Git smoke 结果当作 #106 runtime baseline。
+> 状态：W0 文档/契约/工具交付。本分支已 rebase 到 security/token/membership parent `bcd3918`；历史 `d689bf8` 原生回执未在该 parent 重跑，不构成新资格。**设计提案，尚未实现或生产验收。** issue #106 仍为 OPEN；本目录不得被读作 RefStore/OpenDAL Blob/Target 架构已完成，也不得把本地 Git smoke 结果当作 #106 runtime baseline。
 
 ## 先读
 
@@ -20,7 +20,7 @@
 | [`budgets.json`](budgets.json) | 10 个 provisional 预算；全部 `not_frozen`/bound null；未测量不得 pass |
 | [`dependencies.json`](dependencies.json) | baseline 1.85 与计划 1.88 分开记录；crates.io verified 版本/许可证与 candidate 未验证项分开；W0 未添加依赖 |
 | [`workloads/w0-bounded.json`](workloads/w0-bounded.json) | 有限本地 Git workload；PG/API/Blob 明确 disabled |
-| [`native-baseline.md`](../../../evidence/state-services/native-baseline.md) | 真实 legacy Pando 原生基线、可重跑命令和未验收项 |
+| [`native-baseline.md`](../../../evidence/state-services/native-baseline.md) | 历史 `d689bf8` legacy Pando 原生基线回执、可重跑命令和未验收项；不qualify rebased parent 或新后端 |
 | [`w0-local-git-smoke.json`](../../../evidence/state-services/w0-local-git-smoke.json) | 本仓库生成的有限本地 Git smoke；身份/provenance 证据，**不是** #106 runtime baseline |
 
 ## 验证

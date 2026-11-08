@@ -708,11 +708,9 @@
         {
           "file": "src/webhooks/delivery.rs",
           "symbols": [
-            "enqueue_webhook_delivery",
-            "sync_outbox_events",
+            "on_pull_synchronized",
             "deliver_single",
-            "dispatch_due_deliveries",
-            "on_pull_synchronized"
+            "dispatch_due_deliveries"
           ]
         }
       ],
@@ -782,11 +780,8 @@
         {
           "file": "src/lfs/storage.rs",
           "symbols": [
-            "remote_store",
             "publish_remote",
-            "stream_to_staging_and_publish",
-            "verify_object_integrity",
-            "ensure_readable"
+            "schedule_remote_repair"
           ]
         },
         {
@@ -933,8 +928,8 @@
         {
           "file": "src/lfs/storage.rs",
           "symbols": [
-            "remote_store",
-            "publish_remote"
+            "publish_remote",
+            "schedule_remote_repair"
           ]
         }
       ],
