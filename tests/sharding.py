@@ -2893,7 +2893,7 @@ class ShardingHarness(PullsHarness):
         )
         assert renewed["lease_epoch"] == current["lease_epoch"] + 1
         # Expiry comes from the server clock plus the TTL; no caller wall clock.
-        assert abs(renewed["lease_expires_unix"] - (int(time.time()) + 60)) <= 120
+        assert abs(renewed["lease_expires_unix"] - (int(time.time()) + 60)) <= 5
         # A stale lease epoch stays fenced and cannot advance the node.
         self.refusal(
             leasepath,
@@ -2932,7 +2932,7 @@ class ShardingHarness(PullsHarness):
             method="POST",
             json_body={"lease_ttl_seconds": 300, "expected_lease_epoch": renewed["lease_epoch"]},
         )
-        assert revived["lease_expires_unix"] > int(time.time())
+        assert abs(revived["lease_expires_unix"] - (int(time.time()) + 300)) <= 5
         write = self.document(self.resolvepath + "?op=write", code=200)
         assert write["target_node_id"] == primary
 
