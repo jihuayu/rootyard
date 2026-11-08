@@ -525,9 +525,9 @@ async fn two_connections_same_old_oid_have_one_committer_and_one_terminal_reject
         drop(blocker);
 
         let left_result =
-            tokio::time::timeout(Duration::from_secs(10), left_task).await.context("left commit deadlocked")??;
+            tokio::time::timeout(Duration::from_secs(10), left_task).await.context("left commit deadlocked")???;
         let right_result =
-            tokio::time::timeout(Duration::from_secs(10), right_task).await.context("right commit deadlocked")??;
+            tokio::time::timeout(Duration::from_secs(10), right_task).await.context("right commit deadlocked")???;
         let receipts = [left_result, right_result];
         let committed = receipts.iter().filter(|receipt| receipt.is_committed()).count();
         let rejected = receipts.iter().filter(|receipt| !receipt.is_committed()).count();
