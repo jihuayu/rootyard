@@ -208,8 +208,22 @@ pub(super) struct SnapshotInsert<'a> {
     pub logical_bytes: i64,
 }
 
+/// The stored `ref_count` column is `INTEGER` (`int4`) in migration 140 while
+/// the retained receipt/count contract stays `i64`. PostgreSQL widens `int4` to
+/// `bigint` on request, but tokio-postgres never coerces Rust parameter or
+/// column types, so both boundaries convert explicitly and the write side is
+/// *checked*: an out-of-range count is a typed error, never a silent truncation.
+fn ref_count_param(ref_count: i64) -> Result<i32, RefStoreError> {
+    i32::try_from(ref_count).map_err(|_| {
+        RefStoreError::Database(format!(
+            "metadata snapshot ref_count {ref_count} does not fit the stored INTEGER ref_count column"
+        ))
+    })
+}
+
 pub(super) async fn insert_snapshot(tx: &Transaction<'_>, insert: &SnapshotInsert<'_>) -> Result<(), RefStoreError> {
     let scope = insert.scope;
+    let ref_count = ref_count_param(insert.ref_count)?;
     tx.execute(
         "INSERT INTO ref_store_core_snapshots(
              snapshot_id,repository_id,tenant_id,owner_id,purpose,object_format,history_incarnation,
@@ -230,7 +244,7 @@ pub(super) async fn insert_snapshot(tx: &Transaction<'_>, insert: &SnapshotInser
             &insert.gate_digest,
             &insert.head_ref,
             &insert.head_oid,
-            &insert.ref_count,
+            &ref_count,
             &insert.refs_digest,
             &insert.logical_bytes,
         ],
@@ -291,7 +305,10 @@ pub(super) async fn snapshot_header(
         gate_digest: row.get(10),
         head_ref: RefName::new(head_ref)?.as_str().to_owned(),
         head_oid: row.get(12),
-        ref_count: row.get(13),
+        // `ref_count` is `INTEGER` (migration 140) and the public count stays
+        // `i64`; decode the stored width explicitly instead of asking
+        // tokio-postgres to deserialize int4 straight into i64.
+        ref_count: i64::from(row.get::<_, i32>(13)),
         refs_digest: row.get(14),
         logical_bytes: row.get(15),
     }))
