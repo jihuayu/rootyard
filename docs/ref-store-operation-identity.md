@@ -2,7 +2,10 @@
 
 Status: **partial**. This change installs a typed, durable operation registry in
 the existing Pando PostgreSQL transaction. It does **not** close Rootyard #107
-or #105 and it does not make PostgreSQL a full Ref-CAS authority.
+or #105 and it does not make PostgreSQL a full Ref-CAS authority. The isolated
+gate/ref metadata core that consumes this registry in a short transaction is
+documented in [`ref-store-core-cas.md`](ref-store-core-cas.md); it likewise does
+not close #107, expose serving or implement pins/roots/holds/decisions/GC.
 
 ## What is implemented
 
@@ -72,9 +75,10 @@ The migration does not backfill old `git_operations` rows. An operation committe
 this migration has no registry row and `get` returns `Unknown`, not committed or aborted;
 retention of pre-migration history remains the existing event/audit boundary.
 
-Backup readiness is **not** claimed here. The root owner must first generate the
-format-14 backup/catalog artifacts and run their real-PG tests; this increment
-does not edit `src/backup` or canonical schema fixtures.
+Backup readiness was **not** claimed by this increment. The later core increment
+wires format 15 / schema 139 and leaves format 14 / schema 138 frozen; the root
+owner must still generate the `schema/139_*` catalogs with real PostgreSQL and run
+the native backup/restore drill before claiming backup qualification.
 
 This change preallocates the operation UUID and digest **before ref mutation**,
 registers the pending identity before the mutation statements, and records the

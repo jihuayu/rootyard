@@ -32,6 +32,7 @@
 - [仓库只读浏览、原子多引用 CAS 事务与 SHA-1/SHA-256 双对象格式协商 API](../src/browse.rs)（含 [object_format.rs](../src/browse/object_format.rs)）
 - [Git LFS Batch 与流式对象传输网关](../src/lfs.rs)
 - [RefStore 操作身份、取消墓碑与终态幂等增量（#107 部分）](ref-store-operation-identity.md)
+- [RefStore 显式 gate、短事务 ref CAS 与终态事件增量（#107-A1，部分、未接服务）](ref-store-core-cas.md)
 - [CI source pin、只读镜像、水位 LRU 淘汰、单飞自动回源与跨集群 Runner 队列](ci-mirror.md)（含 [auto_origin.rs](../src/mirror/auto_origin.rs)）
 - [服务端 HTML Web UI、Markdown XSS 净化与大文件 UTF-8 截断预览](../src/web.rs)
 - [多节点仓库分片、一致哈希路由、Epoch 写屏障、自动故障切换、在线重平衡、RPO/RTO 灾备演练与 1/2/4 节点并发压测基准](../src/sharding.rs)（含 [rebalance.rs](../src/sharding/rebalance.rs)、[benchmark.rs](../src/sharding/benchmark.rs)、[060_sharding_fencing.sql](../src/sharding/060_sharding_fencing.sql)）

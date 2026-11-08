@@ -21,7 +21,7 @@ pub const OPERATION_LOCK_DOMAIN: &str = "rootyard-ref-store-operation-v1";
 pub const OPERATION_LOCK_SQL: &str =
     "SELECT pg_advisory_xact_lock(hashtextextended($1::text || '/' || $2::uuid::text || '/' || $3::uuid::text,0))";
 
-async fn before_deadline<T, F>(deadline: Instant, future: F) -> Result<T, RefStoreError>
+pub(crate) async fn before_deadline<T, F>(deadline: Instant, future: F) -> Result<T, RefStoreError>
 where
     F: Future<Output = Result<T, RefStoreError>>,
 {
@@ -348,7 +348,7 @@ async fn lock_operation_key(
     Ok(())
 }
 
-async fn bound(tx: &Transaction<'_>, deadline: Instant) -> Result<(), RefStoreError> {
+pub(crate) async fn bound(tx: &Transaction<'_>, deadline: Instant) -> Result<(), RefStoreError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(RefStoreError::Timeout);
@@ -546,7 +546,7 @@ fn record_from_row(row: &Row, repository_id: Uuid) -> Result<OperationRecord, Re
     OperationRecord::new(identity, state, terminal_result)
 }
 
-fn db_error(error: tokio_postgres::Error) -> RefStoreError {
+pub(crate) fn db_error(error: tokio_postgres::Error) -> RefStoreError {
     match error.code() {
         Some(code) if *code == SqlState::UNIQUE_VIOLATION => RefStoreError::IdentityConflict,
         Some(code) if *code == SqlState::QUERY_CANCELED || *code == SqlState::LOCK_NOT_AVAILABLE => {

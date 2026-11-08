@@ -340,6 +340,20 @@ pub struct Capabilities {
     pub artifact_holds: bool,
     pub authority_epoch_checks: bool,
     pub automatic_dedup_trimming: bool,
+    /// A gate-locked short transaction performs exact old/new ref CAS and an
+    /// atomic multi-ref commit. This is a trusted internal metadata core, not
+    /// an exposed serving authority.
+    pub core_ref_cas: bool,
+    pub core_gate_epoch_checks: bool,
+    pub atomic_multi_ref_commit: bool,
+    /// `accepted_subset` is a typed mode but is rejected fail-closed until it
+    /// has deterministic per-ref terminal semantics.
+    pub accepted_subset_commit: bool,
+    pub core_commit_events: bool,
+    /// Initializing a gate never switches repository serving authority; no
+    /// caller may run legacy and core writes for one repository at once.
+    pub serving_cutover: bool,
+    pub dual_write_with_legacy: bool,
 }
 
 impl Capabilities {
@@ -360,6 +374,44 @@ impl Capabilities {
             artifact_holds: false,
             authority_epoch_checks: false,
             automatic_dedup_trimming: false,
+            core_ref_cas: false,
+            core_gate_epoch_checks: false,
+            atomic_multi_ref_commit: false,
+            accepted_subset_commit: false,
+            core_commit_events: false,
+            serving_cutover: false,
+            dual_write_with_legacy: false,
+        }
+    }
+
+    /// Capabilities of the isolated metadata core. Operation identity,
+    /// cancellation, replay and the gate/ref CAS are real; snapshot reads,
+    /// durable pins, GC observation, decisions, roots, holds, client retry
+    /// idempotency, automatic trimming and any serving cutover remain absent.
+    pub const fn pg_core_increment() -> Self {
+        Self {
+            stable_operation_identity: true,
+            request_digest_replay: true,
+            digest_conflict_detection: true,
+            cancel_before_register: true,
+            immutable_terminal_result: true,
+            internal_operation_lookup: true,
+            client_idempotent_publish: false,
+            atomic_read_snapshot: false,
+            durable_snapshot_pin: false,
+            gc_observes_pins: false,
+            publication_decisions: false,
+            logical_roots: false,
+            artifact_holds: false,
+            authority_epoch_checks: true,
+            automatic_dedup_trimming: false,
+            core_ref_cas: true,
+            core_gate_epoch_checks: true,
+            atomic_multi_ref_commit: true,
+            accepted_subset_commit: false,
+            core_commit_events: true,
+            serving_cutover: false,
+            dual_write_with_legacy: false,
         }
     }
 }
@@ -427,6 +479,14 @@ pub enum RefStoreError {
     UnknownOperation {
         operation_id: Uuid,
     },
+    /// A durable pending record exists but this transaction did not create it.
+    /// The outcome is unknown; callers must query/cancel and must not invent an
+    /// abort or replay ref side effects.
+    OperationPending {
+        operation_id: Uuid,
+    },
+    /// Gate initialization parameters differ from the durable gate.
+    GateConflict,
     /// A terminal operation/result is immutable and cannot be changed.
     TerminalImmutable,
     Unsupported(&'static str),
@@ -438,7 +498,11 @@ impl RefStoreError {
     pub fn is_conflict(&self) -> bool {
         matches!(
             self,
-            Self::DigestConflict | Self::IdentityConflict | Self::CancellationConflict | Self::TerminalImmutable
+            Self::DigestConflict
+                | Self::IdentityConflict
+                | Self::CancellationConflict
+                | Self::TerminalImmutable
+                | Self::GateConflict
         )
     }
 }
@@ -455,6 +519,10 @@ impl fmt::Display for RefStoreError {
             }
             Self::Cancelled { operation_id } => write!(formatter, "operation {operation_id} was cancelled"),
             Self::UnknownOperation { operation_id } => write!(formatter, "operation {operation_id} is not registered"),
+            Self::OperationPending { operation_id } => {
+                write!(formatter, "operation {operation_id} is durably pending; outcome is unknown")
+            }
+            Self::GateConflict => formatter.write_str("ref-store core gate parameters conflict with the durable gate"),
             Self::TerminalImmutable => formatter.write_str("terminal operation result is immutable"),
             Self::Unsupported(capability) => write!(formatter, "ref-store capability is unsupported: {capability}"),
             Self::Timeout => formatter.write_str("ref-store transaction deadline expired"),
@@ -570,5 +638,30 @@ mod tests {
         assert!(!capabilities.artifact_holds);
         assert!(!capabilities.authority_epoch_checks);
         assert!(!capabilities.automatic_dedup_trimming);
+        assert!(!capabilities.core_ref_cas);
+        assert!(!capabilities.atomic_multi_ref_commit);
+        assert!(!capabilities.serving_cutover);
+        assert!(!capabilities.dual_write_with_legacy);
+    }
+
+    #[test]
+    fn core_capabilities_enable_only_the_implemented_metadata_cas() {
+        let capabilities = Capabilities::pg_core_increment();
+        assert!(capabilities.core_ref_cas);
+        assert!(capabilities.core_gate_epoch_checks);
+        assert!(capabilities.atomic_multi_ref_commit);
+        assert!(capabilities.core_commit_events);
+        assert!(capabilities.authority_epoch_checks);
+        assert!(!capabilities.accepted_subset_commit);
+        assert!(!capabilities.atomic_read_snapshot);
+        assert!(!capabilities.durable_snapshot_pin);
+        assert!(!capabilities.gc_observes_pins);
+        assert!(!capabilities.publication_decisions);
+        assert!(!capabilities.logical_roots);
+        assert!(!capabilities.artifact_holds);
+        assert!(!capabilities.client_idempotent_publish);
+        assert!(!capabilities.automatic_dedup_trimming);
+        assert!(!capabilities.serving_cutover);
+        assert!(!capabilities.dual_write_with_legacy);
     }
 }
