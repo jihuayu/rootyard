@@ -4,7 +4,7 @@
 
 issue #105/#106 W0 已提交 [第 12 章设计快照](12-state-services.md)、[可执行生产者清单](state-services/producers.json)、[部署契约/配置 schema](state-services/deployment-contract.json)、[provisional 预算](state-services/budgets.json)、[依赖冻结证据](state-services/dependencies.json)与[有限基线工具](state-services/README.md)。设计仍为**提案**：RefStore、BlobStore/OpenDAL、Scope CLOSING/CancelDecision、W1–W9 均未实现；现有 GitFS/PG 与 Pando remote+Vault 路径仍是 legacy/既有边界，不是 target 新部署。
 
-root 侧 native baseline v2 回执（binary `f39838f…`、inputs `6225c08…`、harness SHA-256 `f6f3560…`、PASS Pando PG Garage Vault）记录于 [native-baseline](../../evidence/state-services/native-baseline.md)，runner 仍在审查且外部 harness 路径可移植性未确认；v1 因错误 PG selector 保留为 failed measurement。全阶段 waits、Blob bytes、完整 producer coverage 与目标 gates 仍未测量/未实现，**#106 保持 OPEN**。
+真实 legacy Pando 基线已通过并记录于 [native-baseline](../../evidence/state-services/native-baseline.md)：可重跑脚本、原生二进制/源码/锁文件绑定、stock Git、真实 PG/Garage/Vault、冷暖 clone、竞争写入与 atomic 成功路径。该结果限于单主机小负载；内部阶段等待、Blob bytes、精确 old-OID CAS 竞态、完整 producer coverage 与冻结预算仍待验收，**#106 保持 OPEN**。
 
 历史 round-4 以下内容保持原样。
 

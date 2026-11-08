@@ -5,59 +5,166 @@
   "description": "W0 contract. The profile enum contains only profiles that exist at the baseline. Proposed standalone/distributed profiles are documented in deployment-contract.json and are intentionally rejected here; this file is not read by the service at d689bf8.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "profile", "refs_authority", "content_store", "database_url_env", "data_dir", "limits"],
+  "required": [
+    "schema",
+    "profile",
+    "refs_authority",
+    "content_store",
+    "database_url_env",
+    "data_dir",
+    "limits"
+  ],
   "properties": {
-    "schema": {"const": "rootyard.deployment/v1"},
-    "profile": {"enum": ["legacy-gitfs-postgres", "pando-postgres-pack-store"]},
-    "refs_authority": {"enum": ["gitfs-bare", "pando-postgres"]},
-    "content_store": {"enum": ["gitfs-volume", "pando-remote-encrypted-pack-store"]},
-    "metadata_wal_store": {"enum": ["postgres", "raft-native-store"]},
-    "remote_delete_enabled": {"type": "boolean"},
-    "database_url_env": {"const": "DATABASE_URL"},
-    "data_dir": {"type": "string", "minLength": 1, "pattern": "^/"},
-    "bind": {"type": "string", "pattern": "^[0-9.:\\[\\]]+:[0-9]{1,5}$"},
-    "git": {"type": "string", "minLength": 1},
-    "object_store": {"$ref": "#/$defs/object_store"},
-    "kms": {"$ref": "#/$defs/kms"},
-    "limits": {"$ref": "#/$defs/limits"}
+    "schema": {
+      "const": "rootyard.deployment/v1"
+    },
+    "profile": {
+      "enum": [
+        "legacy-gitfs-postgres",
+        "pando-postgres-pack-store"
+      ]
+    },
+    "refs_authority": {
+      "enum": [
+        "gitfs-bare",
+        "pando-postgres"
+      ]
+    },
+    "content_store": {
+      "enum": [
+        "gitfs-volume",
+        "pando-remote-encrypted-pack-store"
+      ]
+    },
+    "metadata_wal_store": {
+      "const": "postgres",
+      "description": "Implemented legacy/Pando profiles use PostgreSQL metadata WAL. Raft-native WAL is a future distributed-profile contract."
+    },
+    "remote_delete_enabled": {
+      "type": "boolean"
+    },
+    "database_url_env": {
+      "const": "DATABASE_URL"
+    },
+    "data_dir": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^/"
+    },
+    "bind": {
+      "type": "string",
+      "pattern": "^[0-9.:\\[\\]]+:[0-9]{1,5}$"
+    },
+    "git": {
+      "type": "string",
+      "minLength": 1
+    },
+    "object_store": {
+      "$ref": "#/$defs/object_store"
+    },
+    "kms": {
+      "$ref": "#/$defs/kms"
+    },
+    "limits": {
+      "$ref": "#/$defs/limits"
+    }
   },
   "$defs": {
     "object_store": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["provider", "endpoint_env", "bucket_env", "region_env", "access_key_env", "secret_key_env"],
+      "required": [
+        "provider",
+        "endpoint_env",
+        "bucket_env",
+        "region_env",
+        "access_key_env",
+        "secret_key_env"
+      ],
       "properties": {
-        "provider": {"enum": ["s3-compatible"]},
-        "endpoint_env": {"const": "ROOTYARD_OBJECT_STORE_ENDPOINT"},
-        "bucket_env": {"const": "ROOTYARD_OBJECT_STORE_BUCKET"},
-        "region_env": {"const": "ROOTYARD_OBJECT_STORE_REGION"},
-        "access_key_env": {"const": "ROOTYARD_OBJECT_STORE_ACCESS_KEY"},
-        "secret_key_env": {"const": "ROOTYARD_OBJECT_STORE_SECRET_KEY"},
-        "session_token_env": {"const": "ROOTYARD_OBJECT_STORE_SESSION_TOKEN"}
+        "provider": {
+          "enum": [
+            "s3-compatible"
+          ]
+        },
+        "endpoint_env": {
+          "const": "ROOTYARD_OBJECT_STORE_ENDPOINT"
+        },
+        "bucket_env": {
+          "const": "ROOTYARD_OBJECT_STORE_BUCKET"
+        },
+        "region_env": {
+          "const": "ROOTYARD_OBJECT_STORE_REGION"
+        },
+        "access_key_env": {
+          "const": "ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+        },
+        "secret_key_env": {
+          "const": "ROOTYARD_OBJECT_STORE_SECRET_KEY"
+        },
+        "session_token_env": {
+          "const": "ROOTYARD_OBJECT_STORE_SESSION_TOKEN"
+        }
       }
     },
     "kms": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["provider", "url_env", "token_env", "key_env"],
+      "required": [
+        "provider",
+        "url_env",
+        "token_env",
+        "key_env"
+      ],
       "properties": {
-        "provider": {"const": "vault-transit"},
-        "url_env": {"const": "ROOTYARD_KMS_VAULT_URL"},
-        "token_env": {"const": "ROOTYARD_KMS_VAULT_TOKEN"},
-        "key_env": {"const": "ROOTYARD_KMS_VAULT_KEY"},
-        "mount_env": {"const": "ROOTYARD_KMS_VAULT_MOUNT"}
+        "provider": {
+          "const": "vault-transit"
+        },
+        "url_env": {
+          "const": "ROOTYARD_KMS_VAULT_URL"
+        },
+        "token_env": {
+          "const": "ROOTYARD_KMS_VAULT_TOKEN"
+        },
+        "key_env": {
+          "const": "ROOTYARD_KMS_VAULT_KEY"
+        },
+        "mount_env": {
+          "const": "ROOTYARD_KMS_VAULT_MOUNT"
+        }
       }
     },
     "limits": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["max_request_bytes", "max_output_bytes", "max_concurrent_git", "max_repo_bytes", "max_pending_deliveries"],
+      "required": [
+        "max_request_bytes",
+        "max_output_bytes",
+        "max_concurrent_git",
+        "max_repo_bytes",
+        "max_pending_deliveries"
+      ],
       "properties": {
-        "max_request_bytes": {"type": "integer", "minimum": 1},
-        "max_output_bytes": {"type": "integer", "minimum": 1},
-        "max_concurrent_git": {"type": "integer", "minimum": 1},
-        "max_repo_bytes": {"type": "integer", "minimum": 1},
-        "max_pending_deliveries": {"type": "integer", "minimum": 1}
+        "max_request_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_concurrent_git": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_repo_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_pending_deliveries": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     }
   }

@@ -20,7 +20,7 @@
 | [`budgets.json`](budgets.json) | 10 个 provisional 预算；全部 `not_frozen`/bound null；未测量不得 pass |
 | [`dependencies.json`](dependencies.json) | baseline 1.85 与计划 1.88 分开记录；crates.io verified 版本/许可证与 candidate 未验证项分开；W0 未添加依赖 |
 | [`workloads/w0-bounded.json`](workloads/w0-bounded.json) | 有限本地 Git workload；PG/API/Blob 明确 disabled |
-| [`native-baseline.md`](../../../evidence/state-services/native-baseline.md) | root 侧 native baseline 回执与未验收项；W0 不重跑 |
+| [`native-baseline.md`](../../../evidence/state-services/native-baseline.md) | 真实 legacy Pando 原生基线、可重跑命令和未验收项 |
 | [`w0-local-git-smoke.json`](../../../evidence/state-services/w0-local-git-smoke.json) | 本仓库生成的有限本地 Git smoke；身份/provenance 证据，**不是** #106 runtime baseline |
 
 ## 验证
@@ -42,12 +42,12 @@ python3 scripts/state_services_baseline.py \
   --out /tmp/rootyard-w0-smoke.json
 ```
 
-`--binary` 只计算 SHA-256，不执行。PostgreSQL 仅在显式 `--pg-dsn-file` 且本机有 `psql` 时测量；否则明确 `unavailable`/`null`。HTTP API、OpenDAL Blob、Raft、Redis 在 W0 中没有可用的真实服务，全部 `unavailable`，不得补造数值。
+`--binary` 只计算 SHA-256，不执行。PostgreSQL 仅在显式 `--pg-dsn-file` 且本机有 `psql` 时测量；否则明确 `unavailable`/`null`。此脚本的 HTTP API、OpenDAL Blob、Raft、Redis 测量全部 `unavailable`。独立的 [原生服务基线](../../../evidence/state-services/native-baseline.md) 使用真实 legacy Pando/PG/Garage/Vault，不与本地 Git smoke 混算。
 
 ## 明确未完成（#106 保持 OPEN）
 
-- root 侧 native baseline runner 仍在审查；外部 harness 路径可移植性未确认，本目录只记录已给回执，不重跑、不声称通过。
-- v1 因错误 PG selector 被拒绝并保留为 failed measurement；v2 的 109 samples、PG peak 15/16 conns、RSS 数据是 root 回执，不是本 W0 产生。
+- 已记录可重跑原生 legacy Pando v4 基线；它不代表新后端、精确 CAS 竞态、多故障域或完整 #106 验收。
+- v1 因错误 PG selector 被拒绝；v4 使用 API 自有 socket 的 client port 匹配 PG 连接，并替代 v2/v3 草稿测量。零采样锁等待不能证明无争用。
 - 全阶段 waits、Blob bytes、真实多主机/多故障域和完整 producer coverage 仍为 null/unmeasured。
 - 设计中的 Scope CLOSING/CancelDecision、RefStore、BlobStore/OpenDAL、W1–W9 均未实现。
 - 现有生产路径继续是 **legacy** GitFS/PG 或已存在的 Pando remote+Vault 路径；不得把两者标成 target/new deployment。

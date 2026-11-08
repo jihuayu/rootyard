@@ -44,6 +44,23 @@ class StateServicesDocumentsTest(unittest.TestCase):
             self.assertEqual(budget["decision"], "not_frozen")
             self.assertIsNone(budget["bound"])
 
+    def test_implemented_profiles_reject_other_wal_authorities(self):
+        contract = checks.load(checks.STATE / "deployment-contract.json")
+        schema = checks.load(checks.STATE / "config.schema.json")
+        for relative in contract["config_validation"]["accepted_examples"]:
+            document = checks.load(ROOT / relative)
+            for invalid in ("raft-native-store", "blob", "memory"):
+                with self.subTest(profile=document["profile"], wal=invalid):
+                    candidate = dict(document, metadata_wal_store=invalid)
+                    self.assertTrue(checks.validate_schema(candidate, schema, schema))
+
+    def test_table_inventory_rejects_mentions_without_ddl(self):
+        self.assertFalse(checks.declares_table('-- CREATE TABLE ghost(id int);', 'ghost'))
+        self.assertFalse(checks.declares_table('/* CREATE TABLE ghost(id int); */ SELECT 1;', 'ghost'))
+        self.assertFalse(checks.declares_table('SELECT * FROM ghost;', 'ghost'))
+        self.assertTrue(checks.declares_table('CREATE TABLE IF NOT EXISTS ghost(id int);', 'ghost'))
+        self.assertTrue(checks.declares_table('ALTER TABLE ghost ADD COLUMN v int;', 'ghost'))
+
     def test_dependency_selection_distinguishes_verified_and_candidate(self):
         dependencies = checks.validate_dependencies()
         opendal = next(c for c in dependencies["candidates"] if c["crate"] == "opendal")

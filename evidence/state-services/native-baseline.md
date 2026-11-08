@@ -1,34 +1,36 @@
-# Root native baseline receipt（root-provided; not re-run by W0）
+# Bounded native baseline: legacy Pando
 
-Status: **received for integration review; issue #106 remains OPEN.** The W0 worker did not execute Cargo, the native service, or this runner.
+Status: **PASS within the workload below; #106 remains open.** DeepSeek implemented W0 contracts and inventory; the root agent integrated and ran this service baseline. Luna Max reviewed the runner and its evidence boundaries. No new backend or multi-host qualification is implied.
 
-| Item | Value |
+| Binding | Value |
 | --- | --- |
-| Source commit | `d689bf8062a73cfadbc0a72abf3f1546d992e09c` |
-| Native binary | `/workspace/scratch/state-baseline-main-v1/rootyard` |
+| Compiled source | `d689bf8062a73cfadbc0a72abf3f1546d992e09c` |
 | Binary SHA-256 | `f39838f139e27d6f00a55a88c7ef98974c993f2da3139e0eb3b4e04b05ff8e0b` |
-| Inputs digest | `6225c08c28ace0bc45c4e6810e0e8642ee4215a9cb0bc930b87d5fa3eab7fb10` |
-| Root runner | `/workspace/scratch/state-native-baseline.py` |
-| Root runner SHA-256 | `f6f3560ca0ec730407c3b29a8db138c2bb1f0953afec4951a3a7c6f9900b3f04` |
-| Report v2 | `/workspace/scratch/state-native-baseline-v2.json` |
-| Report v2 result | `PASS true Pando PG Garage Vault` |
-| v2 samples | 109 |
-| v2 PostgreSQL peak | 15 connections of pool 16 |
-| v2 RSS | idle 29,876 KiB; final 39,920 KiB |
+| Source inputs SHA-256 | `6225c08c28ace0bc45c4e6810e0e8642ee4215a9cb0bc930b87d5fa3eab7fb10` |
+| Cargo.lock SHA-256 | `1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034` |
+| Runner SHA-256 | `cee5df14233144c751a61b99b4a35762034b904db270bd78f69a34278fb6bae6` |
+| Harness SHA-256 | `c5a2964e687b4c10b77f548defd0f25407e42c0a57a64ffaddc7bb7b2a128dbc` |
+| Versions | PostgreSQL 17.11 (Debian 17.11-0+deb13u1); git version 2.52.0 |
+| Owned PG sessions | 158 samples; peak 16 connections |
+| Idle Pando RSS | 31804 KiB |
+| Final RSS | 40228 KiB |
 
-## Measurement history / integrity
+[Raw report](w0-native-legacy-pando-v4.json) embeds the build receipt, host-visible resources, individual durations and small-sample nearest-rank percentiles. [Runner](../../scripts/state_services_native_baseline.py) uses the repository Harness by default; `ROOTYARD_BASELINE_HARNESS_ROOT` explicitly selects another checkout and its exact Harness hash is recorded. `--source-root` must match the binary receipt's compiled-input hash before and after the workload. Python optimization mode is rejected because it would remove acceptance assertions.
 
-- **v1 is not accepted.** It used the wrong PostgreSQL selector. It is retained as a failed measurement and must not be used as evidence.
-- v2 is the only accepted receipt reported by root. It binds the native binary, source commit and inputs digest above.
-- The root runner is currently under independent review. Its external harness path portability is **not yet verified**, and this W0 bundle does not claim that the runner is portable.
-- W0 records the exact runner hash so a later reviewer can verify the same harness; W0 does not execute it.
+The workload uses two repositories with deterministic 256 KiB initial payloads, legacy GitFS seed pushes and offline Pando cutover, six serial Pando pushes, eight different-ref pushes, two concurrent cross-repository new-pack pushes, two competing same-ref pushes, one successful atomic two-ref push with readback, cold/warm clones after deleting only owned disposable Pando caches, closure fsck and twelve API list requests. Competing same-ref pushes produced one accepted update and one rejection, with winner readback; their advertisements are **not synchronized to an identical old OID**, so this is not an exact-CAS race proof. Atomic push covers the successful case; rejection atomicity remains separate.
 
-## Still unmeasured / open
+This is one physical host using real loopback PostgreSQL, Garage and Vault. Provider versions remain null because executable inspection was unavailable to the test user. The 250 ms socket-scoped PG sampler can miss short waits; zero observed lock waiters does not establish zero contention. Internal pool/semaphore/ref/repository/singleton-lock phase times, Git CPU, Blob bytes/latency, peak temporary disk, maintenance contention and production budgets remain unmeasured. The peak connection count is an observation, not proof that the pool is the dominant bottleneck.
 
-- Full-phase waits are not measured.
-- Blob bytes/throughput and provider consistency are not measured (OpenDAL BlobStore does not exist at baseline).
-- Multi-host, multi-failure-domain, network-partition and long-steady-state results are absent.
-- Complete producer coverage and all W1–W9 gates remain open.
-- The bounded local Git smoke report produced by `scripts/state_services_baseline.py` is only a smoke/provenance artifact; it is not a #106 runtime baseline and must not be merged into the v2 receipt.
+## Reproduce
 
-**Conclusion:** v2 gives a real Pando/PG/Garage/Vault native baseline receipt for review, but #106 cannot be marked complete from it. Runtime baseline, complete producer coverage, phase instrumentation and the design gates remain outstanding.
+Use an isolated test database and real S3-compatible/Vault fixture. Supply the standard Harness variables: `ROOTYARD_TEST_DATABASE_URL`, `ROOTYARD_OBJECT_STORE_ENDPOINT/BUCKET/REGION/ACCESS_KEY/SECRET_KEY` and `ROOTYARD_KMS_VAULT_URL/TOKEN/KEY`. Do not put credentials in reports. Build with `python3 scripts/build_native.py`; copy the binary and its `.build.json` receipt to an immutable location before another Cargo command. Then run:
+
+```sh
+python3 scripts/state_services_native_baseline.py --binary /absolute/immutable/rootyard --source-root /absolute/compiled-checkout --report /absolute/report.json
+```
+
+The runner stops only its owned process group and drops only its random SQL schema. It retains its private temporary fixture directory for inspection; operators may remove that exact owned directory afterwards. It does not modify host FUSE, kernel, PostgreSQL or provider configuration.
+
+## Earlier measurements
+
+Local scratch v1 was rejected for PG measurements because it selected an application name overridden by the service. Scratch v2 corrected this by matching actual API-owned TCP socket client ports. Scratch v3 added source/lock/hardware binding and extra workloads. This v4 report supersedes those runs and binds the checked-in portable runner with its optimization guard and explicit same-ref limitation. The local Git smoke report is a separate tooling smoke test and does not qualify the service architecture.

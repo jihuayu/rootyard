@@ -115,10 +115,6 @@ def condition_matches(document, condition):
 
 
 def reject_rule_matches(document, rule):
-    conditions = rule["when_all"]
-    return all(condition_matches(document, c) for c in conditions)
-
-def reject_rule_matches(document, rule):
     return all(
         any(condition_matches(document, child) for child in condition["any"])
         if "any" in condition else condition_matches(document, condition)
@@ -141,7 +137,19 @@ def validate_snapshot():
     return snapshot
 
 
-def validate_producers():
+def declares_table(sql, name):
+    # Inventory references are table names in these checked-in migrations.
+    # Reject mere mentions/comments; this is a static DDL check, not SQL execution.
+    sql = re.sub(r"/\*.*?\*/|--[^\n]*", "", sql, flags=re.S)
+    pattern = (
+        r"\b(?:CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|"
+        r"ALTER\s+TABLE(?:\s+IF\s+EXISTS)?)\s+"
+        rf'(?:[a-z_]+\.)?"?{re.escape(name)}"?\b'
+    )
+    return bool(re.search(pattern, sql, re.I))
+
+
+def _validate_producer_entries():
     inventory = load(STATE / "producers.json")
     require(inventory["schema"] == "rootyard.state-services.producers/v1", "producer schema drift")
     require(set(inventory["categories"]) >= REQUIRED_CATEGORIES, "producer categories incomplete")
@@ -172,7 +180,7 @@ def validate_producers():
             require(path.is_file(), f"{entry_id}: missing {migration}")
             combined += path.read_text(encoding="utf-8")
         for name in entry.get("schema_objects", []):
-            require(name in combined, f"{entry_id}: schema object {name} not in referenced migrations")
+            require(declares_table(combined, name), f"{entry_id}: table {name} has no CREATE/ALTER definition in referenced migrations")
     for category, count in categories.items():
         require(count > 0, f"no implemented/partial producer for {category}")
     return inventory
@@ -265,11 +273,7 @@ def validate_all():
     dependencies = validate_dependencies()
     return snapshot, producers, contract, budgets, dependencies
 
-_base_validate_producers = validate_producers
-
-
-def validate_producers():
-    inventory = _base_validate_producers()
+def _validate_producer_families(inventory):
     families = inventory.get("producer_families", [])
     require(families, "producer families are missing")
     family_ids = set()
@@ -289,11 +293,9 @@ def validate_producers():
     require(inventory.get("unresolved_producer_coverage"), "unresolved producer coverage must be explicit")
     return inventory
 
-_base2_validate_producers = validate_producers
-
-
 def validate_producers():
-    inventory = _base2_validate_producers()
+    inventory = _validate_producer_entries()
+    _validate_producer_families(inventory)
     for key in ("logical_roots", "physical_holds", "auth_scopes"):
         require(inventory.get(key), f"{key} separation is missing")
         ids = [item["id"] for item in inventory[key]]

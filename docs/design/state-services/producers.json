@@ -45,7 +45,7 @@
       "id": "publish.gitfs.receive_pack",
       "category": "publish",
       "implementation": "existing",
-      "authority_current": "native receive-pack in a disposable snapshot; committed refs live in the persistent bare Git repository; PG stores metadata, journal and outbox projection",
+      "authority_current": "Native receive-pack writes the persistent bare Git repository directly; PostgreSQL stores admissions, operation metadata, journal reconciliation and outbox projection. Disposable materialized views belong to the separate Pando path.",
       "authority_target": "PgRefStore commit of refs/pack epochs; BlobStore durable pack receipt; no persistent bare Git authority",
       "entrypoints": [
         {
@@ -85,7 +85,7 @@
         "git_ref_admissions",
         "storage_write_admissions"
       ],
-      "durable_ack": "native receive-pack local success is not authoritative; before_push/complete plus a journal operation and PG events are the baseline evidence path",
+      "durable_ack": "Git success reflects the native persistent bare-repository ref update. Journal and PG reconciliation establish the operation/event outcome; Git filesystem and PG do not share a commit, and no Blob durable receipt is implied.",
       "notes": "Pando repositories are routed by repositories.storage_backend; this entry covers the default GitFS path.",
       "gaps": [
         "Git filesystem and PG do not share an atomic transaction",
@@ -143,7 +143,7 @@
       "id": "publish.pando.commit_refs",
       "category": "publish",
       "implementation": "existing",
-      "authority_current": "PG pando_repository_states row locked FOR UPDATE OF s updates refs, pack_ids, ref_generation and operation_sequence in one transaction",
+      "authority_current": "PG pando_repository_states row locked FOR UPDATE OF s updates refs, pack_ids, ref_generation and operation_sequence in one transaction; events::publish_in_tx writes the outbox before auth::finish_tx commits the same transaction",
       "authority_target": "PgRefStore/RaftRefStore CommitRefs with CAS, pack membership, operation result and commit event in one ordered command",
       "entrypoints": [
         {
@@ -176,12 +176,12 @@
         "pando_refs",
         "pando_pack_manifests"
       ],
-      "durable_ack": "HTTP publication success follows the PG transaction and snapshot generation update; pack bytes must already be staged",
+      "durable_ack": "Encrypted pack/index/envelope objects have been uploaded and read-back verified in the remote S3-compatible provider before refs, pack membership, operation and outbox commit in PG.",
       "notes": "This is the closest existing analogue of Ref-CAS but is not the proposed interface; it still serializes on one PG state row per repository.",
       "gaps": [
         "interface is not the proposed CommitRefs contract",
         "no stable cross-service operation result/cancel tombstone protocol",
-        "commit events are not produced atomically with refs in the target RefStore sense"
+        "Current PG refs/outbox atomicity exists; the proposed RefStore replayable event/cursor API is absent."
       ]
     },
     {
@@ -398,7 +398,7 @@
       "id": "root.ci_source_pins",
       "category": "root",
       "implementation": "existing",
-      "authority_current": "PG ci source pins and leases; native Git pinned roots are checked before mirror eviction",
+      "authority_current": "Independent retention sources: native refs/rootyard-ci/*, local filesystem pin intents/receipts, and PG outbox pin history. ci_checkout_jobs tracks checkout leases; there is no ci_source_pins table.",
       "authority_target": "PG business root + RefStore pin for exact OID closure",
       "entrypoints": [
         {
@@ -423,8 +423,8 @@
         "ci_checkout_jobs",
         "ci_mirror_evictions"
       ],
-      "durable_ack": "a pin must be visible in PG before CI may rely on the OID",
-      "notes": "Lease expiry must not release a Git closure without checking active checkout jobs.",
+      "durable_ack": "CI pin lifecycle writes its backend-specific native ref and filesystem intent/receipt, with PG event history; active_pinned_oids unions these roots before eviction.",
+      "notes": "Checkout leases and mirror eviction rows are distinct from source-pin roots. Migrations 008/030 define ci_checkout_jobs and ci_mirror_evictions, not a PG source-pin authority.",
       "gaps": [
         "pin lifecycle is backend-specific and not a RefStore root",
         "cross-group ChangeSet roots are not atomic"
@@ -887,7 +887,7 @@
       "id": "durable_ack.pando_publication",
       "category": "durable_ack",
       "implementation": "existing",
-      "authority_current": "PG pando_repository_states transaction plus local pack files staged by the gateway",
+      "authority_current": "PG refs/pack-membership/operation/outbox transaction plus independently verified remote encrypted pack/index/envelope objects. Vault Transit protects keys; local plaintext work/cache is disposable.",
       "authority_target": "BlobStore pack/idx receipt + PgRefStore CommitRefs token",
       "entrypoints": [
         {
@@ -910,11 +910,11 @@
       "schema_objects": [
         "pando_repository_states"
       ],
-      "durable_ack": "publication success returns the new ref generation after the PG transaction; pack bytes are staged locally before that",
+      "durable_ack": "Remote encrypted objects must be uploaded/read-back verified and protected by the existing retention ledger before the PG publication transaction succeeds.",
       "notes": "This path is not backed by OpenDAL Blob and does not provide a cross-service commit token.",
       "gaps": [
-        "pack durability depends on the local pack store",
-        "no operation receipt/cancel contract"
+        "Current remote protocol is handwritten S3-compatible, not OpenDAL; Vault remains required.",
+        "No stable caller operation receipt/cancel or new persistent-hold contract."
       ]
     },
     {
