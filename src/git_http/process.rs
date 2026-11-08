@@ -563,7 +563,7 @@ mod process_tests {
         })
         .await
         .unwrap();
-        assert_eq!(seen, b"abcdefg\\n".to_vec());
+        assert_eq!(seen, b"abcdefg\n".to_vec());
 
         let mut command = tokio::process::Command::new("/bin/sh");
         command.args(["-c", "printf 'abcdefgh\\n'"]);
@@ -626,8 +626,8 @@ mod process_tests {
         .expect("a satisfied sink must stop the producer, not wait for it")
         .expect("an intentional early stop is a success, not a failed Git command");
         assert_eq!(seen.len(), 2, "the sink must stop the stream after its second record");
-        assert_eq!(seen[0].as_slice(), &b"a\\n"[..]);
-        assert_eq!(seen[1].as_slice(), &b"b\\n"[..]);
+        assert_eq!(seen[0].as_slice(), &b"a\n"[..]);
+        assert_eq!(seen[1].as_slice(), &b"b\n"[..]);
         assert!(started.elapsed() < std::time::Duration::from_secs(20), "the producer was not stopped early");
         let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
         assert_not_running(pid).await;
