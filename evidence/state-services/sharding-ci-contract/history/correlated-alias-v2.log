@@ -1,0 +1,46 @@
+setup: passed
+migration: passed
+virtual_bucket_placement_and_occupied_route_refusal: failed
+Traceback (most recent call last):
+  File "/workspace/scratch/state-shared-contract-gates/tests/pulls.py", line 68, in case
+    detail = fn()
+             ^^^^
+  File "/workspace/scratch/state-shared-contract-gates/tests/sharding.py", line 2782, in virtual_bucket_placement_and_occupied_route_refusal
+    unused = int(
+             ^^^^
+ValueError: invalid literal for int() with base 10: ''
+
+invalid literal for int() with base 10: ''
+{
+  "passed": false,
+  "mode": "live_metadata_drill",
+  "scope": "sharded control-plane placement, lease/epoch fencing and explicit refusal of unsupported failover, simulated DR and unmeasured rebalance",
+  "production_validation": false,
+  "multi_node_ha_validation": false,
+  "data_plane_success_claimed": false,
+  "benchmark_receipts": "simulation_only",
+  "reference_only": false,
+  "data_plane_validation": "run cluster_workload_native.py and cluster_migration_native.py",
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "seconds": 4.1293,
+      "detail": null
+    },
+    {
+      "name": "migration",
+      "status": "passed",
+      "seconds": 0.026,
+      "detail": null
+    },
+    {
+      "name": "virtual_bucket_placement_and_occupied_route_refusal",
+      "status": "failed",
+      "seconds": 0.0467,
+      "error": "invalid literal for int() with base 10: ''",
+      "traceback": "Traceback (most recent call last):\n  File \"/workspace/scratch/state-shared-contract-gates/tests/pulls.py\", line 68, in case\n    detail = fn()\n             ^^^^\n  File \"/workspace/scratch/state-shared-contract-gates/tests/sharding.py\", line 2782, in virtual_bucket_placement_and_occupied_route_refusal\n    unused = int(\n             ^^^^\nValueError: invalid literal for int() with base 10: ''\n"
+    }
+  ],
+  "binary_sha256": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2"
+}
