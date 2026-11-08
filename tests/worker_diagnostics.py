@@ -24,8 +24,12 @@ import time
 import uuid
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(ROOT))
 import e2e  # noqa: E402  (narrow reuse of Harness setup/http/sql/cleanup)
+import native_evidence  # noqa: E402  (real build receipt attestation)
+from scripts.build_native import source_digest  # noqa: E402  (same candidate inputs as the build)
 
 
 def header(headers, wanted):
@@ -71,6 +75,34 @@ def wait_events(path, predicate, timeout=30.0):
     raise AssertionError("expected structured worker event was not written within the bounded wait")
 
 
+class PreflightError(Exception):
+    """Fixed, non-sensitive refusal text for an invalid build attestation."""
+
+
+def verify_build(binary):
+    """Require a real build receipt bound to this binary and this candidate.
+
+    Reusing the build's own ``source_digest`` means a later source edit, a
+    copied path hash, or the harness repository HEAD can never stand in for
+    compiled binary/source provenance.
+    """
+    try:
+        candidate_source = source_digest()
+    except Exception:
+        raise PreflightError("native preflight refused: candidate source digest is unavailable")
+    try:
+        build = native_evidence.build_record(binary)
+    except Exception:
+        build = {"attested": False, "reason": "build receipt is missing or does not match the executed binary"}
+    if build.get("attested") is not True:
+        raise PreflightError(
+            "native preflight refused: build receipt is missing, unreadable or does not attest the executed binary")
+    if build.get("source_inputs_sha256") != candidate_source:
+        raise PreflightError(
+            "native preflight refused: build receipt source inputs do not match the current candidate source digest")
+    return build, candidate_source
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
@@ -97,6 +129,8 @@ def main():
     cases = []
     passed = False
     h = None
+    build = {"attested": False, "reason": "preflight did not complete"}
+    candidate_source = None
 
     def record(name, detail="ok"):
         cases.append({"name": name, "status": "passed", "detail": detail})
@@ -132,6 +166,9 @@ def main():
         h.sql('DROP FUNCTION IF EXISTS "' + fn_name + '"()')
 
     try:
+        build, candidate_source = verify_build(binary)
+        record("build_receipt_and_source_attested",
+               "build receipt binary_sha256 matches the executable and source_inputs_sha256 matches the candidate")
         h = e2e.Harness(argparse.Namespace(binary=str(binary), keep=args.keep))
         # Real worker loop; short poll/scan intervals keep the drill bounded.
         h.env.update(
@@ -222,6 +259,9 @@ def main():
         valid_uuid(json.loads(body).get("id"))
         record("valid_request_after_cleanup_201")
         passed = True
+    except PreflightError as error:
+        passed = False
+        cases.append({"name": "build_receipt_preflight", "status": "failed", "error": str(error)})
     except Exception as error:
         cases.append({"name": "failure", "status": "failed",
                       "error": h.redact(error) if h is not None else "harness not initialized"})
@@ -240,11 +280,21 @@ def main():
                 cases.append({"name": "harness_cleanup", "status": "failed", "error": h.redact(error)})
                 passed = False
 
-    receipt = None
-    for candidate in (binary.with_suffix(".build.json"), binary.with_suffix(".receipt.json")):
-        if candidate.is_file():
-            receipt = {"path": str(candidate), "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest()}
-            break
+    receipt_path = binary.with_suffix(".build.json")
+    compiled_receipt = {
+        "path": str(receipt_path),
+        "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest() if receipt_path.is_file() else None,
+        "attested": build.get("attested") is True,
+    }
+    source_attested = (
+        candidate_source is not None
+        and build.get("attested") is True
+        and build.get("source_inputs_sha256") == candidate_source
+    )
+    # The gate is fail-closed: a missing/mismatched receipt or a changed
+    # candidate source digest can never leave passed true.
+    if build.get("attested") is not True or not source_attested:
+        passed = False
     try:
         harness_head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1],
@@ -256,11 +306,19 @@ def main():
         "passed": passed,
         "cases": cases,
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest() if binary.is_file() else None,
-        "compiled_receipt": receipt,
+        "compiled_receipt": compiled_receipt,
+        "build": build,
+        "build_attested": build.get("attested") is True,
+        "source_inputs_sha256": candidate_source,
+        "receipt_source_inputs_sha256": build.get("source_inputs_sha256"),
+        "source_attested": source_attested,
         "harness_git_head": harness_head,
+        "harness_git_head_role": "auxiliary repository HEAD at harness time; never binary or source provenance",
         "harness_e2e_sha256": hashlib.sha256(Path(e2e.__file__).read_bytes()).hexdigest(),
         "head_label": "harness_git_head is repository HEAD at harness time, not independent build provenance",
         "limitations": [
+            "A missing or mismatched build receipt, or a candidate source digest change, refuses the "
+            "report before the harness starts; harness_git_head is auxiliary context only.",
             "Native worker failure coverage is the storage_lifecycle scheduler's real PostgreSQL "
             "statement_timeout 57014. The synthetic trigger only induces the fault; the Rust error, "
             "classification and scope are not mocked.",
