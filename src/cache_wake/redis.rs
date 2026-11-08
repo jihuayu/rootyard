@@ -531,7 +531,7 @@ mod tests {
             .expect("ROOTYARD_TEST_REDIS_URL is required for real Redis contract tests")
     }
 
-    fn key(kind: CacheKind, version: u64, discriminator: &str) -> CacheKey {
+    fn test_key(kind: CacheKind, version: u64, discriminator: &str) -> CacheKey {
         CacheKey::new(CacheKeyParts {
             environment: "standalone",
             schema: 1,
@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn bounded_read_mismatch_is_a_miss_and_oversize_is_rejected_before_encode() {
-        let key = key(CacheKind::TreeListing, 5, "bounded-unit");
+        let key = test_key(CacheKind::TreeListing, 5, "bounded-unit");
         let value = CacheValue::new(CacheKind::TreeListing, 5, b"ok".to_vec());
         let encoded = value.encode();
         assert_eq!(decode_bounded(&key, &encoded, encoded.len() as u64), Some(value));
@@ -622,7 +622,7 @@ mod tests {
         assert!(result.is_err(), "whole-operation deadline did not cover permit wait");
         drop(held);
 
-        let key = key(CacheKind::TreeListing, 5, "unvalidated");
+        let key = test_key(CacheKind::TreeListing, 5, "unvalidated");
         assert!(cache.get(&key).await.is_err(), "cache operated without a validated server contract");
     }
 
@@ -632,7 +632,7 @@ mod tests {
         let url = live_url();
         let limits = RedisCacheLimits { request_timeout: Duration::from_secs(2), ..RedisCacheLimits::default() };
         let cache = RedisCache::connect(&url, limits).await.unwrap();
-        let key = key(CacheKind::TreeListing, 5, "contract");
+        let key = test_key(CacheKind::TreeListing, 5, "contract");
         let value = CacheValue::new(CacheKind::TreeListing, 5, b"bounded".to_vec());
         cache.put(&key, value.clone(), Some(Duration::from_secs(30))).await.unwrap();
         assert_eq!(cache.get(&key).await.unwrap(), Some(value));
@@ -643,7 +643,7 @@ mod tests {
 
         // Plant an oversized raw value outside the cache boundary. STRLEN must
         // reject it before GETRANGE can fetch the full body.
-        let oversized_key = key(CacheKind::TreeListing, 5, "oversized-raw");
+        let oversized_key = test_key(CacheKind::TreeListing, 5, "oversized-raw");
         let mut raw = ::redis::Client::open(url.as_str()).unwrap().get_connection_manager().await.unwrap();
         ::redis::cmd("SET")
             .arg(oversized_key.as_str())
