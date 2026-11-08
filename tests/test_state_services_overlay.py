@@ -2,7 +2,6 @@
 """Focused regression tests for the bounded feature-only implementation overlay."""
 import copy
 import hashlib
-import subprocess
 import sys
 import tomllib
 import unittest
@@ -64,10 +63,8 @@ class ImplementationOverlayTest(unittest.TestCase):
             dependencies["implementation_overlay"]["schema"], checks.OVERLAY_SCHEMA
         )
 
-    def test_parent_reference_is_the_git_blob_not_the_child_manifest(self):
-        parent_bytes = subprocess.check_output(
-            ["git", "-C", str(ROOT), "show", self.parent["commit"] + ":Cargo.toml"]
-        )
+    def test_parent_reference_is_the_frozen_archive_not_the_child_manifest(self):
+        parent_bytes = (checks.STATE / "stack-parent.Cargo.toml").read_bytes()
         self.assertEqual(
             hashlib.sha256(parent_bytes).hexdigest(), self.parent["files"]["Cargo.toml"]
         )

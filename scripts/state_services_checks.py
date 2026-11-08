@@ -266,6 +266,12 @@ def check_feature_only_overlay(overlay, parent, manifest_text, file_hashes):
     """
     require(overlay.get("schema") == OVERLAY_SCHEMA, "implementation overlay schema drift")
     require(overlay.get("stack_base") == parent.get("commit"), "overlay must name the frozen parent commit")
+    parent_bytes = (STATE / "stack-parent.Cargo.toml").read_bytes()
+    require(hashlib.sha256(parent_bytes).hexdigest() == parent["files"]["Cargo.toml"],
+            "archived parent manifest does not match its frozen hash")
+    require(canonical_manifest_digest(tomllib.loads(parent_bytes.decode("utf-8")))
+            == overlay.get("parent_manifest_semantic_sha256"),
+            "parent semantic hash does not describe the archived parent manifest")
     feature = overlay.get("feature") or {}
     name = feature.get("name")
     require(name == OVERLAY_FEATURE, f"an implementation overlay may only declare {OVERLAY_FEATURE}")
