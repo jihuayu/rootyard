@@ -192,7 +192,9 @@ fn build(
     // Register the gate before the slow work: the watchdog can fence a mount
     // that is still being built, and a watcher never sees an unfenced pending
     // mount as mounted.
-    lock(&state.pending).get_mut(&body.workspace).map(|entry| entry.gate = Some(gate.clone()));
+    if let Some(entry) = lock(&state.pending).get_mut(&body.workspace) {
+        entry.gate = Some(gate.clone());
+    }
     checkpoint(cancel, deadline)?;
     let reader = if body.lazy {
         match Reader::open_root(&root, body.workspace) {
@@ -400,14 +402,11 @@ fn freeze_thread(
     // independent deadline: a begin whose caller vanished releases the gate as
     // a fence instead of holding it (and the per-mount slot) forever.
     let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = gate.freeze_with_decision(|| {
+        gate.freeze_with_decision(|| {
             reply(&state, begin_request, Some(workspace), epoch, Body::Ok(OkReply { op_id: Some(op_id) }));
             let wait = deadline.saturating_duration_since(Instant::now());
-            let thaw = match waiter.recv_timeout(wait) {
-                Ok(thaw) => thaw,
-                // Timeout or a dropped sender: a fence, never a thaw.
-                Err(_) => false,
-            };
+            // Timeout or a dropped sender: false is a fence, never a thaw.
+            let thaw = waiter.recv_timeout(wait).unwrap_or_default();
             ((), if thaw { FreezeDecision::Thaw } else { FreezeDecision::Fence })
         });
     }));
@@ -487,10 +486,10 @@ pub(super) fn freeze_release(
             return reply_error(state, request, workspace, code, message);
         }
     };
-    if epoch < 0 {
-        if let Some(gate) = gate_for(state, op_workspace) {
-            gate.fence();
-        }
+    if epoch < 0
+        && let Some(gate) = gate_for(state, op_workspace)
+    {
+        gate.fence();
     }
     let sent = {
         let freezes = lock(&state.freezes);

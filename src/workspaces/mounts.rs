@@ -3,16 +3,16 @@
 //! Two backends share this registry:
 //!
 //! * `ROOTYARD_WORKSPACE_MOUNT_MODE=fuse-helper` (production, issue #91 phase 3)
-//!   - the API process talks to an independent helper child over the protocol
-//!   in [`crate::workspace_lab::fuse_helper`]. The registry only stores the
-//!   helper client registration per workspace: no `BackgroundSession`, no
-//!   `Overlay`, no `Reader` lives in the API process. The gate, the dispatcher
-//!   and the lazily hydrated reader all live in the child.
+//!     - the API process talks to an independent helper child over the protocol
+//!     in [`crate::workspace_lab::fuse_helper`]. The registry only stores the
+//!     helper client registration per workspace: no `BackgroundSession`, no
+//!     `Overlay`, no `Reader` lives in the API process. The gate, the dispatcher
+//!     and the lazily hydrated reader all live in the child.
 //! * `ROOTYARD_WORKSPACE_MOUNT_MODE=fuse` - the older same-process prototype.
-//!   It keeps a `fuser::BackgroundSession` in the API process, so an operator
-//!   `SIGKILL` can still leave a blocked session owning the FUSE descriptor. It
-//!   is retained for the existing in-process native tests and is *not* the
-//!   phase-3 delivery; only `fuse-helper` closes that lifecycle.
+//!     It keeps a `fuser::BackgroundSession` in the API process, so an operator
+//!     `SIGKILL` can still leave a blocked session owning the FUSE descriptor. It
+//!     is retained for the existing in-process native tests and is *not* the
+//!     phase-3 delivery; only `fuse-helper` closes that lifecycle.
 //!
 //! Parent-side authorization and lease handling stay here: `ensure` is called
 //! after the lease transaction committed a new `lease_epoch`, `prepare` ran with

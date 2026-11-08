@@ -280,7 +280,6 @@ pub fn run() -> io::Result<()> {
         Ok(Ok(LoopOutcome::Shutdown)) => loop {
             thread::park_timeout(Duration::from_secs(1));
         },
-        Ok(Ok(LoopOutcome::Closed)) => teardown(&state, "control loop closed", 1),
         Ok(Err(_)) => teardown(&state, "control loop failed", 1),
         Err(_) => teardown(&state, "control loop panicked", 1),
     }
@@ -411,7 +410,7 @@ fn enforce_freeze_deadlines(state: &State) {
         if now >= failstop_at {
             // The drain still did not release: bounded fail-stop, never a
             // healthy reply and never an unbounded wait for the IO.
-            failstop(&state, "freeze drain could not be released within its deadline", 1);
+            failstop(state, "freeze drain could not be released within its deadline", 1);
         }
     }
 }
@@ -453,8 +452,6 @@ fn teardown(state: &State, reason: &str, code: i32) -> ! {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoopOutcome {
-    /// The control socket closed or failed without an explicit shutdown.
-    Closed,
     /// A `shutdown` frame was acknowledged; a worker owns the teardown.
     Shutdown,
 }

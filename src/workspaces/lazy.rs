@@ -365,6 +365,7 @@ impl Flight {
         self.done.notify_all();
     }
 
+    #[cfg(test)]
     fn wait(&self) -> io::Result<()> {
         self.wait_until(self.deadline)
     }
