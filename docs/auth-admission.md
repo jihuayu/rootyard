@@ -68,8 +68,9 @@ status/body, so an unauthenticated caller cannot distinguish them.
   in flight in one process. The semaphore is deliberately small, which bounds
   this module's own contribution to pool pressure; it is not a reservation and
   does not shield the pool from unrelated routes. Permits are RAII: an explicit
-  drop, an early return, a cancelled request future, an aborted task or a
-  dropped connection releases capacity immediately.
+  drop, an early return, a cancelled request future or an aborted task releases
+  capacity. A transport disconnect alone need not cancel a running handler;
+  its permit remains held until that handler completes or is dropped.
 - **Per-source budget:** a fixed window of
   `ROOTYARD_AUTH_ADMISSION_ATTEMPTS_PER_SOURCE` attempts keyed only by peer IP.
   Other sources keep independent budgets. There is no username key, so an
@@ -140,3 +141,19 @@ rejection bodies or the server log. It does **not** inject database faults, so
 it does not independently prove that a PostgreSQL query was skipped; it observes
 the admission response and the pre-query code ordering, while the "no query on
 rejection" property follows from that ordering and the admission unit tests.
+
+## Native acceptance
+
+Candidate `4a1ca4d` passed all-target Clippy, twelve admission unit tests,
+two native limiter/privacy cases, the existing browser-session workflow, eight
+detail-pagination cases and eight organization web cases. Binary SHA-256:
+`7254781d8d56a6695561d4e242c8873f9f256574040a6f360bcc9295b977d610`;
+compiled-input SHA-256:
+`9169002cee3e4f1751abc75a964d7a412f1bb0636ab6161fcaab31cfd1614327`.
+Exact build and runtime receipts are in
+`docs/acceptance/round5-auth-admission-evidence/`. Luna Max reviewed the bounded
+index, fail-closed peer policy and task-cancellation correction with no remaining
+P1/P2 findings. Documentation-only clarifications followed this candidate.
+
+These functional loopback results do not add OIDC, MFA, trusted-proxy identity,
+distributed budgets or protection for unrelated authentication routes.

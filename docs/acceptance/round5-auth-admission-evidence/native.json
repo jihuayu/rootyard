@@ -1,0 +1,28 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "spoofed_forwarded_headers_and_429_before_db",
+      "status": "passed",
+      "seconds": 4.7453,
+      "detail": null
+    },
+    {
+      "name": "no_secret_response_leak",
+      "status": "passed",
+      "seconds": 0.0072,
+      "detail": null
+    }
+  ],
+  "limitations": [
+    "Loopback functional timings are not a scalability benchmark.",
+    "Crash tests kill the service process, not the kernel or PostgreSQL; no power-loss guarantee is inferred.",
+    "Interrupted upload uses a truncated HTTP body; exhaustive transport fault injection is not covered.",
+    "Admission state is per process; multi-replica aggregate budgets are not implemented.",
+    "Loopback peers are real TCP peers, but proxy/NAT aggregation and trusted-proxy identity are not modeled.",
+    "Missing ConnectInfo refusal is covered by Rust unit tests because a served socket always supplies a peer.",
+    "MFA, OIDC, identity providers, e-mail binding and distributed rate limiting are explicitly not implemented (partial issue #84)."
+  ],
+  "binary_sha256": "7254781d8d56a6695561d4e242c8873f9f256574040a6f360bcc9295b977d610",
+  "failure_traceback": null
+}

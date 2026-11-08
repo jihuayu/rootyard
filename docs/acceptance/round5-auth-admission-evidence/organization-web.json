@@ -1,0 +1,121 @@
+{
+  "binary_sha256": "7254781d8d56a6695561d4e242c8873f9f256574040a6f360bcc9295b977d610",
+  "source_head": "4a1ca4def9807d96057dff2e8b0970ab732724f7",
+  "passed": true,
+  "cases": [
+    {
+      "name": "fixture",
+      "status": "passed",
+      "seconds": 5.2061,
+      "detail": {
+        "api_created": [
+          "organizations acme/other/beta",
+          "carol read membership",
+          "engineers team with script-bearing name",
+          "12 read memberships",
+          "6 teams",
+          "4 team members"
+        ],
+        "members": 14,
+        "teams": 7,
+        "team_members": 5
+      }
+    },
+    {
+      "name": "cross_user_and_scope",
+      "status": "passed",
+      "seconds": 0.1225,
+      "detail": {
+        "browser_non_member": "404",
+        "restricted_without_grant": 403,
+        "restricted_list_filtered": [
+          "acme"
+        ],
+        "restricted_forms_hidden": true
+      }
+    },
+    {
+      "name": "read_only",
+      "status": "passed",
+      "seconds": 0.0657,
+      "detail": {
+        "page_without_forms": true,
+        "add_member": 403,
+        "remove_member": 403,
+        "existing_and_missing_target": 403
+      }
+    },
+    {
+      "name": "unauthorized_preflight_concealment",
+      "status": "passed",
+      "seconds": 0.0873,
+      "detail": {
+        "member_existing_missing_nonexistent": 403,
+        "team_existing_missing_target_and_team": 403,
+        "identical_error_bodies": true
+      }
+    },
+    {
+      "name": "csrf_and_origin",
+      "status": "passed",
+      "seconds": 0.0424,
+      "detail": {
+        "missing_csrf": 403,
+        "wrong_csrf": 403,
+        "cross_origin": 403,
+        "same_origin_valid_csrf": 303
+      }
+    },
+    {
+      "name": "escaping_and_headers",
+      "status": "passed",
+      "seconds": 0.0814,
+      "detail": {
+        "pages_checked": 5,
+        "escaped_team_name": true,
+        "credentials_absent": true,
+        "security_headers": true
+      }
+    },
+    {
+      "name": "pagination",
+      "status": "passed",
+      "seconds": 0.2771,
+      "detail": {
+        "member_pages_at_5": 3,
+        "team_pages_at_3": 3,
+        "team_member_pages_at_2": 3,
+        "organization_pages_at_2": 2,
+        "malformed_or_foreign_cursors": "400"
+      }
+    },
+    {
+      "name": "cas_and_mutations",
+      "status": "passed",
+      "seconds": 0.3517,
+      "detail": {
+        "stale_version": 409,
+        "versioned_update": 303,
+        "overwrite_without_version": 409,
+        "invalid_version": 400,
+        "blank_version": 400,
+        "stale_recreate_after_removal": 409,
+        "new_member": 303,
+        "team_create": 303,
+        "team_member_add": 303,
+        "duplicate_add_no_audit": 1,
+        "team_member_remove": 303,
+        "repeat_remove": 404,
+        "non_member_team_add": 409
+      }
+    }
+  ],
+  "limitations": [
+    "One loopback process and one disposable PostgreSQL schema; not a scalability or browser-engine test.",
+    "Issue #87 is PARTIAL: organization/member/team administration only; usage, recovery and integration UI are not implemented.",
+    "Cursors are ordered positions bound to actor/organization/team, not signed snapshots; renames and concurrent inserts change traversal semantics.",
+    "The web add form is create-only inside the same authorized backend transaction; a duplicate team-member add keeps the historic 200 NO-OP response and adds no audit event.",
+    "No organization creation/rename/delete or ownership-transfer UI; no team edit/delete UI because no such organization API mutation exists.",
+    "CSRF/Origin assertions cover cookie sessions; explicit Bearer API callers keep the documented non-browser /web contract."
+  ]
+}
