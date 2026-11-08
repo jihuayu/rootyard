@@ -132,11 +132,23 @@ class MembersTrackBContractTest(unittest.TestCase):
         for sig in (
             "pub fn idempotency_key(",
             "pub async fn authorize_repo_with_role(",
-            "pub async fn authorize_repo(",
+            "pub async fn authorize_repo_action_by_id(",
             "pub async fn verify_token(",
             "pub async fn finish_tx(",
         ):
             self.assertIn(sig, auth_src)
+
+        # Repository authorization must name the explicit PAT action. The old
+        # untyped wrapper is gone, so neither name may reappear.
+        self.assertNotIn("pub async fn authorize_repo(", auth_src)
+        self.assertRegex(
+            auth_src,
+            r"pub async fn authorize_repo_with_role\([^)]*action: crate::token_scopes::RepoAction",
+        )
+        self.assertRegex(
+            auth_src,
+            r"pub async fn authorize_repo_action_by_id\([^)]*action: crate::token_scopes::RepoAction",
+        )
 
         for module in ("handlers", "comments"):
             self.assertIn(f'#[path = "forge/{module}.rs"]', forge_src)

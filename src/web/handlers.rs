@@ -35,10 +35,10 @@ use crate::{
 };
 use axum::{
     Json, extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::Response,
 };
-use deadpool_postgres::{Pool, Transaction};
+use deadpool_postgres::Transaction;
 use serde_json::json as sjson;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -50,24 +50,12 @@ type OidPath = Path<(String, String, String)>;
 type NumPath = Path<(String, String, i64)>;
 type Res = Result<Response, Error>;
 
-pub fn normalize_web_headers(headers: &HeaderMap) -> HeaderMap {
-    // The browser credential is only the HttpOnly session cookie minted by
-    // /web/login. Long-lived API tokens must not be replayed as raw web
-    // cookies or headers; API clients can still use Authorization directly.
-    if headers.contains_key(header::AUTHORIZATION) {
-        return headers.clone();
-    }
-    let mut out = headers.clone();
-    if let Some(tok) = super::session::session_token(headers)
-        && let Ok(hv) = HeaderValue::from_str(&format!("Bearer {tok}")) {
-            out.insert(header::AUTHORIZATION, hv);
-        }
-    out
-}
-
-pub async fn authenticate_web(pool: &Pool, headers: &HeaderMap) -> Result<Identity, Error> {
-    auth::authenticate(pool, &normalize_web_headers(headers)).await
-}
+// Session-cookie normalisation and browser authentication live in
+// `session.rs`, the module that owns the cookie/CSRF/auth domain, so this
+// module stays inside the 550-line anti-monolith bound. Re-exported here so
+// every existing `web::handlers::{authenticate_web, normalize_web_headers}`
+// caller keeps its path.
+pub use super::session::{authenticate_web, normalize_web_headers};
 
 async fn load_header_ctx(tx: &Transaction<'_>, owner: &str, name: &str, actor: &Identity, access: RepoAccess) -> Result<RepoHeaderCtx, Error> {
     let row = tx.query_one("SELECT storage_backend, storage_generation, state FROM repositories WHERE id = $1", &[&access.repo_id]).await.map_err(Error::internal)?;
