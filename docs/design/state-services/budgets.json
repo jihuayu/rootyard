@@ -1,0 +1,104 @@
+{
+  "schema": "rootyard.state-services.budgets/v1",
+  "status": "provisional_unmeasured",
+  "baseline_evidence": null,
+  "freeze_gate": "W0 baseline report reviewed by the root implementer before W1/W5 dependency freezing and before any S1/S4 performance claim",
+  "rules": {
+    "bound_null_means_unfrozen": true,
+    "frozen_requires_numeric_bound_and_existing_baseline_evidence": true,
+    "unavailable_measurement_never_passes": true,
+    "no_cross_hardware_comparison": true
+  },
+  "budgets": [
+    {
+      "id": "git.receive_pack.small_pack.p95",
+      "metric": "git.receive_pack.small_pack.latency_ms",
+      "statistic": "p95",
+      "unit": "ms",
+      "decision": "not_frozen",
+      "bound": null,
+      "rationale": "Existing local Git receive-pack cost; measured by the W0 bounded runner. Not a production SLA."
+    },
+    {
+      "id": "git.update_ref.cas_conflict.p95",
+      "metric": "git.update_ref.cas_conflict.latency_ms",
+      "statistic": "p95",
+      "unit": "ms",
+      "decision": "not_frozen",
+      "bound": null,
+      "rationale": "Existing local ref lock/CAS behavior under bounded concurrency; proxy only for RefStore CAS design."
+    },
+    {
+      "id": "git.fsck.closure.p95",
+      "metric": "git.fsck.closure.duration_ms",
+      "statistic": "p95",
+      "unit": "ms",
+      "decision": "not_frozen",
+      "bound": null,
+      "rationale": "Existing native Git closure validation cost on the generated fixture."
+    },
+    {
+      "id": "pg.round_trip.p95",
+      "metric": "pg.round_trip.latency_ms",
+      "statistic": "p95",
+      "unit": "ms",
+      "decision": "not_frozen",
+      "bound": null,
+      "rationale": "Optional explicit PostgreSQL measurement; unavailable in the serialized W0 environment and therefore never passes."
+    },
+    {
+      "id": "pg.advisory_lock.acquire.p95",
+      "metric": "pg.advisory_lock.acquire_ms",
+      "statistic": "p95",
+      "unit": "ms",
+      "decision": "not_frozen",
+      "bound": null,
+      "rationale": "Uncontended advisory-lock acquisition only; contention remains a reviewed architecture cost, not a benchmark claim."
+    },
+    {
+      "id": "api.push.e2e.p95",
+      "metric": "api.push.e2e.latency_ms",
+      "statistic": "p95",
+      "unit": "ms",
+      "decision": "not_frozen",
+      "bound": null,
+      "rationale": "Requires the native service binary and PostgreSQL; not executed by W0."
+    },
+    {
+      "id": "blob.put.p95",
+      "metric": "blob.put.latency_ms",
+      "statistic": "p95",
+      "unit": "ms",
+      "decision": "not_frozen",
+      "bound": null,
+      "rationale": "Requires an OpenDAL BlobStore, which does not exist at the W0 baseline."
+    },
+    {
+      "id": "blob.get.p95",
+      "metric": "blob.get.latency_ms",
+      "statistic": "p95",
+      "unit": "ms",
+      "decision": "not_frozen",
+      "bound": null,
+      "rationale": "Requires an OpenDAL BlobStore, which does not exist at the W0 baseline."
+    },
+    {
+      "id": "runner.child_cpu_seconds",
+      "metric": "runner.child_cpu_seconds",
+      "statistic": "value",
+      "unit": "s",
+      "decision": "not_frozen",
+      "bound": null,
+      "rationale": "Measured child CPU for the bounded local workload; useful to detect fixture regressions, not a service capacity budget."
+    },
+    {
+      "id": "runner.peak_rss_bytes",
+      "metric": "runner.peak_rss_bytes",
+      "statistic": "value",
+      "unit": "bytes",
+      "decision": "not_frozen",
+      "bound": null,
+      "rationale": "Runner process peak RSS; not representative of an unmeasured Rootyard service process."
+    }
+  ]
+}

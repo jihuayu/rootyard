@@ -8,6 +8,7 @@
 - [round-2 最终集成交付表（全部 native scope 已验收）](acceptance/round2-delivery.md)
 - [架构图与 Mermaid 源文件](design/architecture-diagrams.md)
 - [最新分期路线与验收闸门](design/08-roadmap.md)
+- [状态服务设计提案（W0 快照/清单/契约/基线）](design/12-state-services.md)
 - [原始设计快照](design/source-page.md)
 - [ADR 001：当前 GitFS 权威边界](architecture.md)
 - [ADR 002：操作证据与可靠事件](reliability.md)

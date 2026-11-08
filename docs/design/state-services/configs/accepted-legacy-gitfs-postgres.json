@@ -1,0 +1,18 @@
+{
+  "schema": "rootyard.deployment/v1",
+  "profile": "legacy-gitfs-postgres",
+  "refs_authority": "gitfs-bare",
+  "content_store": "gitfs-volume",
+  "metadata_wal_store": "postgres",
+  "database_url_env": "DATABASE_URL",
+  "data_dir": "/srv/rootyard/data",
+  "bind": "127.0.0.1:8080",
+  "git": "/usr/bin/git",
+  "limits": {
+    "max_request_bytes": 134217728,
+    "max_output_bytes": 536870912,
+    "max_concurrent_git": 8,
+    "max_repo_bytes": 1073741824,
+    "max_pending_deliveries": 100000
+  }
+}

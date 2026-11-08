@@ -1,5 +1,13 @@
 # Rootyard 实现状态
 
+## 当前：状态服务 W0（提案，不是已实现能力）
+
+issue #105/#106 W0 已提交 [第 12 章设计快照](12-state-services.md)、[可执行生产者清单](state-services/producers.json)、[部署契约/配置 schema](state-services/deployment-contract.json)、[provisional 预算](state-services/budgets.json)、[依赖冻结证据](state-services/dependencies.json)与[有限基线工具](state-services/README.md)。设计仍为**提案**：RefStore、BlobStore/OpenDAL、Scope CLOSING/CancelDecision、W1–W9 均未实现；现有 GitFS/PG 与 Pando remote+Vault 路径仍是 legacy/既有边界，不是 target 新部署。
+
+root 侧 native baseline v2 回执（binary `f39838f…`、inputs `6225c08…`、harness SHA-256 `f6f3560…`、PASS Pando PG Garage Vault）记录于 [native-baseline](../../evidence/state-services/native-baseline.md)，runner 仍在审查且外部 harness 路径可移植性未确认；v1 因错误 PG selector 保留为 failed measurement。全阶段 waits、Blob bytes、完整 producer coverage 与目标 gates 仍未测量/未实现，**#106 保持 OPEN**。
+
+历史 round-4 以下内容保持原样。
+
 ## 当前：round-4 浏览器与 LFS（above 为历史快照）
 
 集成源 `4c5bcfe56516434ea5b42985e9af90a8c1efe51f`（基线 main `a91c93f`，不可变二进制 `c0049c3a…`，生产输入 `8f399a06…`/331）通过全部 11 个 native coordinator job，独立终审 `APPROVED`（0 P1）：真实 Chromium 登录/发现/Issue+PR/合并/登出并拒绝旧 cookie；可撤销浏览器会话（CSRF/Origin/过期/父令牌撤销准入检查）；真实 stock `git-lfs` + 真实 Garage，删除源 `DATA_DIR` 后由第二进程/新 `DATA_DIR` 经共享 PostgreSQL 取回精确字节；pointer 规范化覆盖官方客户端 LF/CRLF、前导 Unicode 空白/NBSP 与两个 legacy 头，12 类坏 pointer 在 4 条发布路径上共 48 组合全部在 ref 移动前拒绝，18 个官方客户端探针全部匹配；4000 个真实 staging 清理在 native 数据 `ShareLock` 释放前无法删除；离线 format-8/schema-132 恢复撤销旧浏览器会话并在无目标 endpoint 下提供 LFS 字节。生产改动 4 个文件（浏览器与 LFS），**无 DDL**，schema 仍为 132。计数不混用：145 个 Rust 单元测试与 9 份 JSON 报告中的 25 个 case。水化 `0600` 属于加固——旧 `157748a` 适配器本已原子并通过 8 MiB 并发用例，本轮**不是**截断修复；旧二进制真实失败是 CRLF pointer 绕过（保留为标注的旧证据）。单物理主机、loopback 服务与一次性 PostgreSQL/Garage/Chromium，无生产 HA、厂商、云或跨主机声明；#26/#43/#44 与 umbrella #48 保持 OPEN。证据：[round-4 验收](../acceptance/round4-browser-lfs.md)、[evidence bundle](../../evidence/round4/browser-lfs-4c5bcfe/README.md)。

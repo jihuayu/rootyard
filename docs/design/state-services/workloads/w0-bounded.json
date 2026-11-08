@@ -1,0 +1,39 @@
+{
+  "schema": "rootyard.state-services.workload/v1",
+  "id": "w0-bounded-v1",
+  "seed": 106,
+  "description": "Bounded local Git-only W0 workload. It deliberately does not start the Rootyard binary, PostgreSQL, Redis, Raft or a Blob provider.",
+  "bounds": {
+    "wall_clock_seconds": 60,
+    "max_git_push_ops": 30,
+    "max_cas_ops": 80,
+    "max_temp_bytes": 67108864
+  },
+  "git": {
+    "repo_count": 2,
+    "pushes_per_repo": 4,
+    "commits_per_push": 2,
+    "file_bytes": 2048,
+    "cas_rounds": 10,
+    "cas_concurrency": 4,
+    "fsck": true
+  },
+  "pg": {
+    "enabled": false,
+    "sample_count": 0
+  },
+  "api": {
+    "enabled": false,
+    "request_count": 0
+  },
+  "blob": {
+    "enabled": false,
+    "put_count": 0,
+    "get_count": 0
+  },
+  "notes": [
+    "repo_count * pushes_per_repo must not exceed bounds.max_git_push_ops",
+    "cas_rounds * cas_concurrency must not exceed bounds.max_cas_ops",
+    "PG, API and Blob sections are disabled for W0 and their metrics must be reported unavailable with null values"
+  ]
+}

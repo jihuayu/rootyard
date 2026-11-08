@@ -24,6 +24,7 @@ Rootyard 面向标准 Git 客户端、多 Agent 工作区和大型仓库。核�
 | [09 Workspace 与 Git 预研记录](09-workspace-git-research.md) | 2026-11-03 的本地容器及 PostgreSQL/Smart HTTP 实验和限制 |
 | [10 分布式存储故障预研](10-distributed-storage-research.md) | 2026-11-03 的多进程、本地对象模拟器、租约、晚到 PUT/DELETE、GC 和读取实验 |
 | [11 CI 只读镜像](11-ci-read-mirrors.md) | 固定目标、复制屏障、等待/回源、权限撤销、对象保护与性能验收 |
+| [12 状态服务设计（提案）](12-state-services.md) | PostgreSQL/Ref-CAS/Redis/OpenDAL Blob 目标；W0 为快照、生产者清单、部署契约与基线工具，**尚未实现** |
 
 ## 状态与优先级
 

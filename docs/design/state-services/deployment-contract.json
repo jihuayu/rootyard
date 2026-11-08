@@ -1,0 +1,270 @@
+{
+  "schema": "rootyard.state-services.deployment-contract/v1",
+  "baseline_commit": "d689bf8062a73cfadbc0a72abf3f1546d992e09c",
+  "contract_note": "Only profiles marked implemented/selectable may be accepted by config validation. Existing local/GitFS paths are legacy baselines, not the target or a new-deployment recommendation. Target profiles from docs/design/12-state-services.md are rejected until runtime acceptance gates pass.",
+  "profiles": [
+    {
+      "id": "legacy-gitfs-postgres",
+      "status": "implemented",
+      "selectable_now": true,
+      "scope": "existing production baseline; default GitFS backend, labelled legacy and not the target architecture",
+      "authority": {
+        "refs": "persistent bare Git repository under ROOTYARD_DATA_DIR (GitFS); native receive-pack writes the authoritative bare path, guarded by PG admission/fence",
+        "content": "local data volume (legacy); LFS may use the remote-object adapter when configured",
+        "cache_wake": "in-process bounded cache/wake; optional Kafka/Redis-loopback adapters are not correctness authorities",
+        "events": "PG outbox + GitFS operation journal + reconciliation",
+        "artifact_registry": "PG/storage lifecycle for the existing GitFS backend"
+      },
+      "config_binding": {
+        "profile": "legacy-gitfs-postgres",
+        "refs_authority": "gitfs-bare",
+        "content_store": "gitfs-volume"
+      },
+      "required_env": ["DATABASE_URL", "ROOTYARD_DATA_DIR", "ROOTYARD_GIT"],
+      "source_entrypoints": ["src/config.rs", "src/storage.rs", "src/reliability.rs", "src/journal/core.rs", "src/git_http.rs"],
+      "limitations": [
+        "legacy runtime, not the target state-services architecture",
+        "persistent bare Git is the refs authority; target profiles must not select it",
+        "Git filesystem and PG do not share an atomic commit",
+        "single data volume / single process authority; no multi-host production claim"
+      ],
+      "existing_evidence": ["docs/architecture.md", "docs/reliability.md", "docs/design/implementation-status.md"]
+    },
+    {
+      "id": "pando-postgres-pack-store",
+      "status": "implemented",
+      "selectable_now": true,
+      "scope": "existing optional Pando gateway path, selected per repository by repositories.storage_backend='pando'; requires a real remote object store and Vault for encrypted content",
+      "authority": {
+        "refs": "PG pando_repository_states/pando_refs transaction",
+        "content": "encrypted pack/idx/manifests via PackStore RemoteObjectStore plus VaultTransit-wrapped data keys; plaintext local staging is a disposable cache, not the durable pack authority",
+        "cache_wake": "existing service cache/wake; not a RefStore decision authority",
+        "events": "PG publication transaction + existing outbox/reliability paths",
+        "artifact_registry": "PG pando remote artifact/fence lease ledger; baseline DELETE behavior is governed by ROOTYARD_PANDO_REMOTE_DELETE and a default-deny hardening is pending PR #92, not claimed at this baseline"
+      },
+      "config_binding": {
+        "profile": "pando-postgres-pack-store",
+        "refs_authority": "pando-postgres",
+        "content_store": "pando-remote-encrypted-pack-store"
+      },
+      "required_env": [
+        "DATABASE_URL",
+        "ROOTYARD_DATA_DIR",
+        "ROOTYARD_GIT",
+        "ROOTYARD_OBJECT_STORE_ENDPOINT",
+        "ROOTYARD_OBJECT_STORE_BUCKET",
+        "ROOTYARD_OBJECT_STORE_REGION",
+        "ROOTYARD_KMS_VAULT_URL",
+        "ROOTYARD_KMS_VAULT_TOKEN",
+        "ROOTYARD_KMS_VAULT_KEY"
+      ],
+      "source_entrypoints": [
+        "src/pando_gateway/publish.rs",
+        "src/pando_gateway/pack_store.rs",
+        "src/storage/encrypted_objects.rs",
+        "src/storage/remote_objects.rs",
+        "src/pando_gateway/retention.rs",
+        "migrations/074_pando_authoritative_refs.sql",
+        "migrations/132_pando_remote_retention.sql"
+      ],
+      "limitations": [
+        "PG state row remains the publication hotspot",
+        "local plaintext pack files are a disposable cache; content durability requires the remote provider and Vault key availability",
+        "remote physical DELETE can be explicitly enabled by env at baseline; default-deny is pending PR #92 and must not be attributed to this baseline",
+        "does not provide the proposed stable CommitRefs/GetOperation/cancel contract"
+      ],
+      "existing_evidence": ["docs/acceptance/round3-pando23.md", "docs/pando-remote-retention.md", "evidence/round3/pando23-authority-1061a8e/README.md"]
+    },
+    {
+      "id": "s3-remote-object-mirror",
+      "status": "partial",
+      "selectable_now": false,
+      "scope": "existing storage/remote_objects.rs S3 adapter used by Pando/LFS/mirror/lab paths; not a service-wide OpenDAL Blob authority",
+      "authority": {
+        "refs": "unchanged: GitFS or pando-postgres",
+        "content": "remote object adapter with Local fallback when ROOTYARD_OBJECT_STORE_ENDPOINT is absent",
+        "cache_wake": "unchanged",
+        "events": "unchanged",
+        "artifact_registry": "unchanged; no unified hold receipt"
+      },
+      "config_binding": {
+        "profile": "s3-remote-object-mirror",
+        "refs_authority": "unchanged",
+        "content_store": "remote-object-adapter-with-local-fallback"
+      },
+      "required_env": [
+        "ROOTYARD_OBJECT_STORE_ENDPOINT",
+        "ROOTYARD_OBJECT_STORE_BUCKET",
+        "ROOTYARD_OBJECT_STORE_REGION",
+        "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
+        "ROOTYARD_OBJECT_STORE_SECRET_KEY"
+      ],
+      "reject_reason": "Not selectable as a deployment profile: no OpenDAL Operator, no unified durable receipt or capability gate, and it silently falls back to Local. Enabling it would misrepresent the target Blob contract.",
+      "limitations": [
+        "hand-written S3 request path rather than a reusable provider abstraction",
+        "local fallback on missing endpoint",
+        "no read-after-write/conditional-create capability contract",
+        "used only by limited Pando/LFS/mirror/lab paths"
+      ],
+      "source_entrypoints": ["src/storage/remote_objects.rs", "src/lfs/storage.rs"]
+    },
+    {
+      "id": "state-standalone",
+      "status": "proposed",
+      "selectable_now": false,
+      "scope": "target design: one Rootyard process + PostgreSQL + OpenDAL Blob, memory cache/wake, built-in workers",
+      "authority": {
+        "refs": "PgRefStore",
+        "content": "OpenDalBlobStore (production provider)",
+        "cache_wake": "bounded MemoryCache / MemoryWake",
+        "events": "PG + built-in workers; Git events from RefStore projection",
+        "artifact_registry": "PG artifact holds"
+      },
+      "target_config": {
+        "deployment.mode": "standalone",
+        "ref_store.driver": "postgres",
+        "cache.driver": "memory",
+        "wake.transport": "memory",
+        "blob.driver": "opendal",
+        "blob.service": "s3|azblob or separately certified provider",
+        "artifact_registry.driver": "postgres"
+      },
+      "reject_reason": "No PgRefStore, BlobStore, OpenDAL dependency, decision bridge, hold bridge or standalone wiring exists at d689bf8. Selecting this profile must fail config validation.",
+      "required_before_enable": [
+        "W1/W1-B/W1-C/W1-L implementation and acceptance",
+        "no persistent bare Git authority",
+        "no fs/memory Blob fallback",
+        "clear computation cache/session/temp directory recovery with PG+Blob only",
+        "V25 standalone acceptance"
+      ]
+    },
+    {
+      "id": "state-distributed",
+      "status": "proposed",
+      "selectable_now": false,
+      "scope": "target design: PG business metadata + Raft Ref-CAS + Redis cache/wake + same OpenDAL Blob",
+      "authority": {
+        "refs": "RaftRefStore / Ref-CAS service",
+        "content": "same OpenDalBlobStore provider class as standalone",
+        "cache_wake": "Redis cache + Redis wake",
+        "events": "RefStore commit events projected to PG + PG business outbox",
+        "artifact_registry": "PG artifact holds (V1)"
+      },
+      "target_config": {
+        "deployment.mode": "distributed",
+        "ref_store.driver": "raft",
+        "cache.driver": "redis",
+        "wake.transport": "redis",
+        "blob.driver": "opendal",
+        "blob.service": "same certified provider class",
+        "artifact_registry.driver": "postgres"
+      },
+      "reject_reason": "No RaftRefStore, Ref-CAS service, remote Redis client, decision bridge, hold bridge or distributed acceptance exists at d689bf8. Selecting this profile must fail config validation.",
+      "required_before_enable": [
+        "W5 Ref-CAS service with durable quorum and ReadIndex",
+        "W2 production Redis TLS/ACL client",
+        "W3/W4 bridge and hold protocol acceptance",
+        "V26 single-to-multi consistency and V09/V10/V11 distributed fault tests",
+        "three-voter, separate-failure-domain evidence"
+      ]
+    },
+    {
+      "id": "pando-lab-s3-kms-experiment",
+      "status": "experimental",
+      "selectable_now": false,
+      "scope": "separate pando-lab feature/binary and schema; not the main service deployment",
+      "authority": {
+        "refs": "PG pando_lab tables",
+        "content": "lab local/object-store simulation",
+        "cache_wake": "not applicable",
+        "events": "lab reports",
+        "artifact_registry": "lab-local"
+      },
+      "reject_reason": "Experimental binary/schema; cannot be selected as the main service deployment profile.",
+      "source_entrypoints": ["experimental/pando/README.md", "src/pando_lab/object_store.rs", "src/pando_lab/lifecycle.rs"]
+    }
+  ],
+  "cross_cutting_contracts": {
+    "immutable_locator": {
+      "required_components": ["tenant_id", "storage_authority_id", "positive_generation", "namespace", "attempt_id", "sha256", "length"],
+      "forbidden": ["ETag as content digest", "LIST as inventory", "attempt ID reuse", "mutable content key overwrite"],
+      "note": "A reused attempt UUID or a non-positive generation invalidates the locator."
+    },
+    "remote_gc_gate": {
+      "baseline": "Remote physical delete is governed by the existing retention ledger and ROOTYARD_PANDO_REMOTE_DELETE; default-deny hardening is pending PR #92.",
+      "target": "No destructive GC for a new RefStore/Blob authority until issues #113/#114 and the W4 hold/root bridge acceptance pass.",
+      "forbidden": "Treating LIST absence, ETag, a lease expiry, or a lagging PG projection as proof that bytes are unreferenced."
+    },
+    "auth_compatibility": {
+      "retained": "src/auth.rs finish_tx re-checks live token validity/expiry in the mutation transaction at commit time.",
+      "future_gate": "The RefStore admission-time expiry contract may not silently weaken or replace finish_tx commit-time validity; a compatibility gate from design section 9.5 must be accepted explicitly."
+    }
+  },
+  "reject_rules": [
+    {
+      "id": "unimplemented-profile",
+      "when_all": [{"path": "profile", "in": ["state-standalone", "state-distributed", "s3-remote-object-mirror", "pando-lab-s3-kms-experiment"]}],
+      "reason": "Profile is not implemented/selectable at the W0 baseline."
+    },
+    {
+      "id": "legacy-authority-mismatch",
+      "when_all": [
+        {"path": "profile", "equals": "legacy-gitfs-postgres"},
+        {"any": [{"path": "refs_authority", "not_equals": "gitfs-bare"}, {"path": "content_store", "not_equals": "gitfs-volume"}, {"path": "object_store", "present": true}, {"path": "kms", "present": true}]}
+      ],
+      "reason": "legacy-gitfs-postgres must use gitfs-bare refs and the GitFS data volume, without remote Blob/KMS profile wiring."
+    },
+    {
+      "id": "pando-authority-mismatch",
+      "when_all": [
+        {"path": "profile", "equals": "pando-postgres-pack-store"},
+        {"any": [
+          {"path": "refs_authority", "not_equals": "pando-postgres"},
+          {"path": "content_store", "not_equals": "pando-remote-encrypted-pack-store"},
+          {"path": "object_store", "present": false},
+          {"path": "kms", "present": false}
+        ]}
+      ],
+      "reason": "pando-postgres-pack-store requires PG Pando refs plus a real remote object store and Vault; local pack files are only a disposable cache."
+    },
+    {
+      "id": "forbidden-production-blob-driver",
+      "when_all": [{"path": "content_store", "in": ["memory", "fs", "opendal-fs", "opendal-memory"]}],
+      "reason": "Memory/fs Blob drivers are forbidden for production; they are test-isolation only."
+    },
+    {
+      "id": "metadata-wal-on-blob",
+      "when_all": [{"path": "metadata_wal_store", "in": ["blob", "opendal", "s3", "azblob"]}],
+      "reason": "PG/Raft WAL and vote/term state must use their database/embedded-store durability contract, not Blob objects."
+    },
+    {
+      "id": "persistent-bare-git-target",
+      "when_all": [
+        {"path": "profile", "in": ["state-standalone", "state-distributed"]},
+        {"path": "refs_authority", "equals": "gitfs-bare"}
+      ],
+      "reason": "Persistent bare Git is allowed only for the legacy runtime/import path, never as a target state-services authority."
+    }
+  ],
+  "permitted_legacy_import_exception": {
+    "allowed": "Explicit legacy GitFS import/source-read path and the existing legacy-gitfs-postgres runtime profile.",
+    "not_allowed": "New target profiles, new repositories, or fallback writes that create a persistent bare Git authority.",
+    "source": "src/pando_lab/migration.rs",
+    "note": "The experiment imports from GitFS into Pando; the target design additionally forbids persistent bare Git after import."
+  },
+  "config_validation": {
+    "schema": "docs/design/state-services/config.schema.json",
+    "accepted_examples": [
+      "docs/design/state-services/configs/accepted-legacy-gitfs-postgres.json",
+      "docs/design/state-services/configs/accepted-pando-postgres-pack-store.json"
+    ],
+    "rejected_examples": [
+      "docs/design/state-services/configs/rejected-target-standalone.json",
+      "docs/design/state-services/configs/rejected-target-distributed.json",
+      "docs/design/state-services/configs/rejected-blob-memory.json",
+      "docs/design/state-services/configs/rejected-bare-git-target.json",
+      "docs/design/state-services/configs/rejected-wal-on-blob.json",
+      "docs/design/state-services/configs/rejected-pando-local-only.json"
+    ]
+  }
+}
