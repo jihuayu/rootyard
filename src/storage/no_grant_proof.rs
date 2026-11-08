@@ -8,14 +8,21 @@
 //! request JSON and database rows can never construct this value, and
 //! settlement still re-checks the writer, repository, actor, token, generation
 //! and shard epoch it is bound to.
+//!
+//! The witness also pins the immutable audit identity of the operation
+//! (`actor_name`, `sequence`) and requires that the journal carries no CI
+//! service principal and no maintenance pin, so a proof minted for one record
+//! can never be replayed onto a different audit row of the same refs.
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct NoGrantAbort {
     operation_id: Uuid,
     repository_id: Uuid,
     actor_id: Uuid,
+    actor_name: String,
     token_id: Uuid,
+    sequence: i64,
     storage_generation: i64,
     shard_epoch: i64,
 }
@@ -40,6 +47,11 @@ impl NoGrantAbort {
             || operation.token_id.is_nil()
             || operation.storage_generation <= 0
             || operation.shard_epoch <= 0
+            // Only a human journal can be proven ungranted here: a CI service
+            // principal or a maintenance pin carries its own authority path
+            // that this witness never describes.
+            || operation.service_principal_id.is_some()
+            || operation.ci_pin.is_some()
         {
             return None;
         }
@@ -65,7 +77,9 @@ impl NoGrantAbort {
             operation_id: operation.id,
             repository_id: operation.repository_id,
             actor_id: operation.actor_id,
+            actor_name: operation.actor_name.clone(),
             token_id: operation.token_id,
+            sequence: operation.sequence,
             storage_generation: operation.storage_generation,
             shard_epoch: operation.shard_epoch,
         })
@@ -76,13 +90,18 @@ impl NoGrantAbort {
     }
 
     /// The proof must describe exactly the record being published, including
-    /// the admission identity the transaction will settle.
+    /// the immutable audit identity (`actor_name`, `sequence`) and the
+    /// admission identity the transaction will settle. A service-principal
+    /// record is never the record this witness was minted for.
     pub fn matches_operation(&self, operation: &crate::events::OperationRecord) -> bool {
         self.operation_id == operation.id
             && self.repository_id == operation.repository_id
             && self.actor_id == operation.actor_id
+            && self.actor_name == operation.actor_name
             && self.token_id == operation.token_id
+            && self.sequence == operation.sequence
             && self.storage_generation == operation.storage_generation
+            && operation.service_principal_id.is_none()
             && operation.admission.as_ref().is_some_and(|admission| {
                 admission.writer_id == self.operation_id && admission.shard_epoch == self.shard_epoch
             })
@@ -222,6 +241,21 @@ mod tests {
     }
 
     #[test]
+    fn a_service_principal_journal_never_mints_a_proof() {
+        let (_root, mut operation) = finished_journal();
+        operation.service_principal_id = Some(Uuid::new_v4());
+        assert!(
+            NoGrantAbort::from_journal(&operation, "no_ref_changes").is_none(),
+            "a CI service principal carries authority this witness does not describe"
+        );
+        // Control: the same journal mints the proof once the service identity
+        // is gone, so the rejection above is not a side effect of any other
+        // condition.
+        operation.service_principal_id = None;
+        assert!(NoGrantAbort::from_journal(&operation, "no_ref_changes").is_some());
+    }
+
+    #[test]
     fn proof_matches_exactly_one_operation_record() {
         let (_root, operation) = finished_journal();
         let proof = NoGrantAbort::from_journal(&operation, "no_ref_changes").expect("clean journal proof");
@@ -236,9 +270,11 @@ mod tests {
         differ(&|r| r.id = Uuid::new_v4());
         differ(&|r| r.repository_id = Uuid::new_v4());
         differ(&|r| r.actor_id = Uuid::new_v4());
+        differ(&|r| r.actor_name = "someone-else".into());
         differ(&|r| r.token_id = Uuid::new_v4());
-        differ(&|r| r.storage_generation += 1);
         differ(&|r| r.sequence += 1);
+        differ(&|r| r.storage_generation += 1);
+        differ(&|r| r.service_principal_id = Some(Uuid::new_v4()));
         differ(&|r| r.admission.as_mut().unwrap().shard_epoch += 1);
         differ(&|r| r.admission.as_mut().unwrap().writer_id = Uuid::new_v4());
         differ(&|r| r.admission = None);
