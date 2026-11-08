@@ -1,0 +1,9 @@
+{
+  "reviewer": "gpt-6-luna max",
+  "reviewed_head": "5a675f7",
+  "kind": "static-only",
+  "native_executed": false,
+  "findings13_14": "resolved: original canonical request_digest persisted and checked in all paths, retained A5 snapshot/pin identities reject fresh A2 creates before quotas",
+  "remaining_P1_P2": [],
+  "backup_review": "receipt count7 and exactfourbindings fixed; binding overhead accounting omission delegated8af634..."
+}

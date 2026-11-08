@@ -93,7 +93,7 @@ SNAPSHOT_COUNTS = {
 }
 A2_COUNTS = {
     "ref_store_core_snapshots": 5,
-    "ref_store_core_snapshot_refs": 5,
+    "ref_store_core_snapshot_refs": 4,
     "ref_store_core_pins": 5,
     "ref_store_core_receipts": 7,
     "ref_store_core_repo_usage": 1,
@@ -317,7 +317,8 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
 
     def snapshot_rows(self, db=None, scoped=True):
         return {table: self._json_rows(
-            table, self._scoped_where(table, "tenant", self.snapshot_scope) if scoped else None, db=db)
+            table, self._scoped_where(table, "tenant" if table.endswith("_tenant_usage") else "repo",
+                                      self.snapshot_scope) if scoped else None, db=db)
             for table in self.snapshot_tables()}
 
     def a2_rows(self, db=None, scoped=True):
@@ -330,7 +331,8 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
 
     def pack_rows(self, db=None, scoped=True):
         return {table: self._json_rows(
-            table, self._scoped_where(table, "tenant", self.snapshot_scope) if scoped else None, db=db)
+            table, self._scoped_where(table, "tenant" if table.endswith("_tenant_usage") else "repo",
+                                      self.snapshot_scope) if scoped else None, db=db)
             for table in self.pack_tables()}
 
     def hold_rows(self, db=None, scoped=True):
@@ -444,6 +446,7 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
             assert row["logical_bytes"] == entry["receipt"]["logical_bytes"] > 0
         old_row = snapshots_by_id[old["snapshot_id"]]
         assert old_row["pack_mode"] == "metadata_only" and old_row["pack_count"] == 0
+        assert old_row["ref_count"] == 0, "the old snapshot predates the first ref publication"
         assert old_row["pack_membership_state"] == "unavailable"
         assert old_row["membership_digest"] is None and old_row["snapshot_digest"] is None
         assert old_row["gate_revision"] == 1 and old_row["owner_id"] == scope["tenant_id"]
@@ -543,6 +546,8 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
         # helper, so this harness never guesses an implementation constant.
         assert accounting["a2_fixed_charge_bytes"] > 0
         assert accounting["lifecycle_charge_bytes"] > 0
+        # The typed create receipt already includes the pack-binding row charge.
+        # The fixed remainder is A2 pin/receipt overhead plus permanent history.
         assert accounting["create_fixed_charge_bytes"] == (
             accounting["a2_fixed_charge_bytes"] + accounting["lifecycle_charge_bytes"])
         expected_logical = (sum(create_logical) + 4 * accounting["create_fixed_charge_bytes"] +
@@ -554,7 +559,7 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
         assert a2_usage is not None
         assert [a2_usage[name] for name in
                 ("snapshot_count", "snapshot_ref_count", "logical_bytes", "receipt_count")] == marker["a2_usage"]
-        assert a2_usage["snapshot_count"] == 5 and a2_usage["snapshot_ref_count"] == 5
+        assert a2_usage["snapshot_count"] == 5 and a2_usage["snapshot_ref_count"] == 4
         assert a2_usage["receipt_count"] == 7 and a2_usage["logical_bytes"] > 0
 
         gate = core_rows["ref_store_core_gates"][0]
@@ -809,16 +814,18 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
         binding = rows["ref_store_core_snapshot_packs"][0]
         repo = uuid_literal(marker["scope"]["repository_id"])
         tenant = uuid_literal(marker["scope"]["tenant_id"])
-        immutable = "ref-store core pack snapshot"
+        ledger_immutable = "ref-store core pack ledger is immutable"
+        binding_immutable = "ref-store core pack snapshot binding is immutable"
+        binding_delete = "ref-store core pack snapshot binding cannot be deleted while its repository exists"
         monotone = "pack snapshot usage counters are monotone and cannot be refunded"
         self.reject_guard("UPDATE public.ref_store_core_pack_snapshot_history SET body='{}' "
-                          "WHERE history_id='" + history[0]["history_id"] + "'", immutable)
+                          "WHERE history_id='" + history[0]["history_id"] + "'", ledger_immutable)
         self.reject_guard("DELETE FROM public.ref_store_core_pack_snapshot_history "
-                          "WHERE history_id='" + history[0]["history_id"] + "'", immutable)
+                          "WHERE history_id='" + history[0]["history_id"] + "'", ledger_immutable)
         self.reject_guard("UPDATE public.ref_store_core_snapshot_packs SET joined_revision=1 "
-                          "WHERE snapshot_id='" + binding["snapshot_id"] + "'", immutable)
+                          "WHERE snapshot_id='" + binding["snapshot_id"] + "'", binding_immutable)
         self.reject_guard("DELETE FROM public.ref_store_core_snapshot_packs "
-                          "WHERE snapshot_id='" + binding["snapshot_id"] + "'", immutable)
+                          "WHERE snapshot_id='" + binding["snapshot_id"] + "'", binding_delete)
         self.reject_guard("UPDATE public.ref_store_core_pack_snapshot_repo_usage "
                           "SET history_count=history_count-1 WHERE repository_id='" + repo + "'", monotone)
         self.reject_guard("UPDATE public.ref_store_core_pack_snapshot_tenant_usage "
@@ -827,15 +834,16 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
                           "SET repository_id=gen_random_uuid() WHERE repository_id='" + repo + "'",
                           "pack snapshot usage row identity is immutable")
         self.reject_guard("DELETE FROM public.ref_store_core_pack_snapshot_repo_usage "
-                          "WHERE repository_id='" + repo + "'", immutable)
+                          "WHERE repository_id='" + repo + "'", ledger_immutable)
         self.reject_guard("UPDATE public.ref_store_core_gates SET pack_mode='metadata_only' "
                           "WHERE repository_id='" + repo + "'",
                           "ref-store core pack mode is one-way and cannot be downgraded")
-        triggers = int(self.sql("SELECT count(*) FROM pg_trigger WHERE tgname LIKE "
-                                "'ref_store_core_pack_snapshot%'"))
-        assert triggers >= 10, "the migration-143 history/usage/binding guards are missing"
-        assert self.sql("SELECT count(*) FROM pg_trigger WHERE tgname LIKE "
-                        "'ref_store_core_pack_snapshot%' AND tgenabled <> 'O'") == "0", (
+        guard_names = ("(tgname LIKE 'ref_store_core_pack_snapshot%' OR "
+                       "tgname LIKE 'ref_store_core_snapshot_packs%')")
+        triggers = int(self.sql("SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND " + guard_names))
+        assert triggers == 11, "the eleven migration-143 history/usage/binding guards are missing"
+        assert self.sql("SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND " +
+                        guard_names + " AND tgenabled <> 'O'") == "0", (
             "a migration-143 guard was disabled")
         assert self.snapshot_rows() == self.source_snapshot_rows
         assert self.snapshot_rows(scoped=False) == self.source_snapshot_rows_global

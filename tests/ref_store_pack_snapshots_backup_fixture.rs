@@ -910,6 +910,13 @@ async fn seed(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()> {
         old_page.complete() && old_page.packs() == rootyard::ref_store::core::PackMembershipDescriptor::unavailable(),
         "the pre-activation A2 page is not a complete metadata-only page"
     );
+    ensure!(
+        old_receipt.ref_count() == 0 && old_page.ref_count() == 0 && old_page.refs().is_empty(),
+        "the pre-activation A2 snapshot captured refs receipt={} page={} rows={} (expected none before the A4 commit)",
+        old_receipt.ref_count(),
+        old_page.ref_count(),
+        old_page.refs().len()
+    );
 
     // (2) Real typed A4 verified commit (A4a pipeline).
     let git = GitRepo::new(fixture.git.clone(), format).await?;
@@ -1255,8 +1262,8 @@ async fn seed(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()> {
     let a2 = a2_usage(pool, repository).await?;
     let row_counts = snapshot_counts(pool, repository).await?;
     ensure!(
-        row_counts == (5, 5, 5, 7, 4),
-        "A2/A5 row cardinalities differ from the drill shape (one old A2 receipt plus six A5 receipts)"
+        row_counts == (5, 4, 5, 7, 4),
+        "A2/A5 row cardinalities differ from the drill shape (one old A2 receipt, four A5 ref captures plus six A5 receipts): actual {row_counts:?}"
     );
 
     // Exact charge accounting from TYPED receipt bytes + the implementation's
@@ -1266,6 +1273,9 @@ async fn seed(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()> {
     ensure!(create_receipt_bytes.len() == 4, "not all four create receipts carry typed logical bytes");
     let a2_fixed_bytes = a2_after_old[2] - old_receipt.logical_bytes();
     ensure!(a2_fixed_bytes > 0, "the measured A2 fixed charge is not positive");
+    // PackSnapshotReceipt.logical_bytes already includes the captured binding
+    // rows (PgPackSnapshot::create adds them to snapshot_bytes). Adding that
+    // charge again here would double-count every binding.
     let create_fixed_bytes = a2_fixed_bytes + lifecycle_bytes;
     let expected_logical = create_receipt_bytes.iter().sum::<i64>() + 4 * create_fixed_bytes + 2 * lifecycle_bytes;
     ensure!(usage[6] == expected_logical, "permanent logical bytes do not equal the exact typed charge");
@@ -1286,7 +1296,7 @@ async fn seed(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()> {
     ensure!(table(&core_rows, "ref_store_core_gates")?.len() == 1, "core gate row count differs");
     ensure!(table(&core_rows, "ref_store_core_refs")?.len() == 1, "core ref row count differs");
     ensure!(table(&core_rows, "ref_store_core_events")?.len() == 1, "core event row count differs");
-    ensure!(table(&core_rows, "ref_store_core_cancellations")?.is_empty(), "a cancellation tombstone was written");
+    ensure!(table(&core_rows, "ref_store_cancellations")?.is_empty(), "a cancellation tombstone was written");
     ensure!(table(&snapshot_rows, "ref_store_core_snapshot_packs")?.len() == 4, "snapshot pack bindings differ");
     ensure!(table(&snapshot_rows, "ref_store_core_pack_snapshot_history")?.len() == 6, "history rows differ");
     ensure!(table(&snapshot_rows, "ref_store_core_pack_snapshot_repo_usage")?.len() == 1, "repo usage row missing");
@@ -1406,6 +1416,7 @@ async fn seed(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()> {
             "request_digest": old_request.digest().as_hex(),
             "snapshot_id": old_receipt.snapshot_id().to_string(),
             "pin_id": old_receipt.pin_id().to_string(),
+            "owner_id": old_scope.owner_id().to_string(),
             "pin_generation": old_receipt.pin_generation(),
             "gate_revision": old_receipt.gate_revision(),
             "gate_digest": old_receipt.gate_digest_hex(),
@@ -1670,9 +1681,40 @@ async fn verify(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()>
 
     // The genuine old A2 metadata-only snapshot is still readable and unchanged.
     let old = field(&manifest, "old_a2")?;
-    let old_page = a2_page(
+    // The A2 snapshot was captured under the repository owner (= tenant) before pack
+    // activation, while the A5 realm was captured under producer B. Rebuild the full old
+    // scope from the same captured realm/repository/tenant/format/history/authority/group/
+    // purpose with the old owner; reusing the A5 scope is the bug this asserts against.
+    let old_scope = MetadataSnapshotScope::new(
+        scope.repository_id(),
+        scope.tenant_id(),
+        uuid_field(old, "owner_id")?,
+        scope.purpose(),
+        scope.object_format(),
+        scope.history_incarnation(),
+        scope.authority_epoch(),
+        scope.group_epoch(),
+    )?;
+    ensure!(old_scope.owner_id() == tenant, "old A2 owner is not the captured tenant");
+    ensure!(old_scope.owner_id() != scope.owner_id(), "old A2 owner collides with the A5 producer B");
+    // The A5 producer scope must be refused with the typed owner mismatch: never served,
+    // and never an arbitrary error.
+    match a2_page(
         pool,
         scope,
+        uuid_field(old, "snapshot_id")?,
+        uuid_field(old, "pin_id")?,
+        int_field(old, "pin_generation")?,
+    )
+    .await
+    {
+        Err(RefStoreError::MetadataScopeMismatch("snapshot owner")) => {}
+        other => bail!("restored old A2 page under the A5 producer scope was not refused on its owner: {other:?}"),
+    }
+    // The authority check is preserved: only the correct old scope serves the page.
+    let old_page = a2_page(
+        pool,
+        old_scope,
         uuid_field(old, "snapshot_id")?,
         uuid_field(old, "pin_id")?,
         int_field(old, "pin_generation")?,

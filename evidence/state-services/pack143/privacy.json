@@ -1,0 +1,6 @@
+{
+  "passed": true,
+  "scanned_files": 59,
+  "matching_files": [],
+  "rule": "Exact inherited fixture DSN and secret values; values and private configuration are never retained."
+}

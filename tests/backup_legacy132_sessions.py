@@ -656,7 +656,17 @@ class LegacyArchiveHarness(BackupHarness):
         scope = marker["scope"]
         pack_tables = catalog_tables(142) - catalog_tables(141)
         hold_tables = catalog_tables(141) - catalog_tables(140)
-        core_tables = catalog_tables(139) - catalog_tables(138)
+        # The retained old A4 helper captured the complete schema138+139 core
+        # ledger, i.e. the exact 139-minus-137 delta (six tables), not only the
+        # three tables migration139 itself adds.
+        core_tables = catalog_tables(139) - catalog_tables(137)
+        marker_core = marker["rows"]["core"]
+        assert len(core_tables) == 6, (
+            "the retained schema138/139 core delta is not six tables: " +
+            repr(sorted(core_tables)))
+        assert set(marker_core) == core_tables, (
+            "the retained old A4 core marker keyset differs from schema139-schema137: " +
+            "marker=" + repr(sorted(marker_core)) + " expected=" + repr(sorted(core_tables)))
         pack = self.scoped_rows(
             self.restore_db, pack_tables,
             {name: ("tenant_id" if name.endswith("_tenant_usage") else "repository_id")
@@ -672,8 +682,13 @@ class LegacyArchiveHarness(BackupHarness):
             "the retained schema142 A4 ledger rows were not restored exactly")
         assert holds == marker["rows"]["holds"], (
             "the retained schema141 A3 hold ledger rows were not restored exactly")
-        assert core == marker["rows"]["core"], (
-            "the retained schema139 core rows were not restored exactly")
+        core_counts = {name: len(rows) for name, rows in core.items()}
+        marker_core_counts = {name: len(rows) for name, rows in marker_core.items()}
+        assert core_counts == marker_core_counts, (
+            "the retained schema138/139 core row counts differ after restore: " +
+            "restored=" + repr(core_counts) + " marker=" + repr(marker_core_counts))
+        assert core == marker_core, (
+            "the retained schema138/139 core rows were not restored exactly")
         repo = _uuid_text(scope["repository_id"])
         gate = json.loads(self.query(
             self.restore_db,

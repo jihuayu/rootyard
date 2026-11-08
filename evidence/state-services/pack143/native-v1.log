@@ -1,0 +1,24 @@
+
+running 10 tests
+test deadline_on_inflight_commit_returns_no_value_for_create_and_renew ... ok
+test gate_capture_race_serializes_with_a4_commit_on_distinct_backends ... ok
+test header_check_constraints_and_permanent_bounds_refuse_without_partial_charge ... FAILED
+test historical_scope_queries_survive_delete_and_ledger_corruption_is_never_an_ack ... ok
+test old_a2_fence_replay_and_pack_aware_lifecycle_charges ... ok
+test permanent_ledger_survives_delete_and_cross_ledger_request_reuse_is_refused ... ok
+test positive_producer_b_old_revision_survives_second_verified_commit ... ok
+test realm_expiry_generation_fences_and_cancelled_a4_publication ... ok
+test session_off_still_acknowledges_durably_and_gate_deadline_is_recoverable ... ok
+test unknown_release_commit_resolves_after_whole_repository_delete ... ok
+
+failures:
+
+---- header_check_constraints_and_permanent_bounds_refuse_without_partial_charge stdout ----
+Error: unexpected SQLSTATE: db error
+
+
+failures:
+    header_check_constraints_and_permanent_bounds_refuse_without_partial_charge
+
+test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.18s
+
