@@ -1,0 +1,78 @@
+{
+  "planner": "default (no enable_seqscan or other planner override)",
+  "rows_succeeded_history": 100000,
+  "rows_counted_jobs": 6,
+  "plan_json_analyze_buffers": true,
+  "index_only_scan": true,
+  "index": "storage_maintenance_metrics",
+  "node_type": "Index Only Scan",
+  "index_cond": null,
+  "heap_fetches": 6,
+  "actual_rows": 6,
+  "shared_hit_blocks": 2,
+  "sequence_scans_on_jobs": 0,
+  "state_fixture": {
+    "gitfs_cache_evict": [
+      0,
+      0,
+      0,
+      1,
+      1,
+      0
+    ],
+    "gitfs_cache_hydrate": [
+      0,
+      0,
+      0,
+      1,
+      0,
+      0
+    ],
+    "gitfs_repack": [
+      1,
+      1,
+      0,
+      0,
+      0,
+      0
+    ],
+    "gitfs_stage_cleanup": [
+      1,
+      0,
+      1,
+      0,
+      0,
+      0
+    ],
+    "pando_cache_evict": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "pando_cache_hydrate": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    "pando_repack": [
+      1,
+      1,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "state_fixture_running_includes_expired": true,
+  "limitations": [
+    "SQL-only planner drill on an owned disposable schema; it does not run the service or execute maintenance jobs.",
+    "It installs the real schema135 index DDL but does not prove migration 135 was applied to a deployment.",
+    "This is not production load, cardinality, latency or monitoring-integration evidence."
+  ]
+}

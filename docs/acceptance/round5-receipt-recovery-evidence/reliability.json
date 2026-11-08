@@ -1,0 +1,214 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "fresh_migration_accounts",
+      "status": "passed",
+      "seconds": 2.0755,
+      "detail": null
+    },
+    {
+      "name": "upgrade_001_preserves_data",
+      "status": "passed",
+      "seconds": 0.634,
+      "detail": {
+        "migration_001_data_preserved": true,
+        "repeated_migrate": true
+      }
+    },
+    {
+      "name": "repository_api",
+      "status": "passed",
+      "seconds": 0.1396,
+      "detail": null
+    },
+    {
+      "name": "real_git_recorded_and_no_ref_changes",
+      "status": "passed",
+      "seconds": 2.1609,
+      "detail": {
+        "recorded": "3bd35c87-7ba1-4c74-9b50-53a81ecf4579",
+        "no_ref_changes": "2ab8e887-3daf-401f-8c8c-e1ba1d66bdfe",
+        "native_ref_verified": true
+      }
+    },
+    {
+      "name": "non_atomic_partial_success_subset",
+      "status": "passed",
+      "seconds": 0.3848,
+      "detail": {
+        "successful_subset_only": true,
+        "rejected_ref": "refs/heads/main"
+      }
+    },
+    {
+      "name": "loose_and_packed_deletion",
+      "status": "passed",
+      "seconds": 2.6945,
+      "detail": {
+        "loose_and_packed_delete_receipts": true
+      }
+    },
+    {
+      "name": "owner_isolated_read_only_history",
+      "status": "passed",
+      "seconds": 0.0325,
+      "detail": {
+        "owner_and_read_only_token": true,
+        "other_owner_denied": true
+      }
+    },
+    {
+      "name": "real_receipt_sql_failure_restart_replay",
+      "status": "passed",
+      "seconds": 2.818,
+      "detail": {
+        "actual_post_receive_receipt": true,
+        "replayed_operation": "41201d34-5e2e-43e1-879f-e4fcafc331e2",
+        "restart_idempotent": true,
+        "unknown_with_real_receipt_recovers_to_ready": true
+      }
+    },
+    {
+      "name": "transient_sql_failure_background_replay",
+      "status": "passed",
+      "seconds": 4.5062,
+      "detail": {
+        "actual_receipt_replayed": true,
+        "service_restart": false,
+        "background_ingestion_seconds": 4.001,
+        "subsequent_push_recorded": true
+      }
+    },
+    {
+      "name": "outbox_idempotency_native_authority",
+      "status": "passed",
+      "seconds": 1.4625,
+      "detail": {
+        "idempotent_local_consumers": true,
+        "native_refs_authoritative": true
+      }
+    },
+    {
+      "name": "admission_and_background_delivery",
+      "status": "passed",
+      "seconds": 4.4891,
+      "detail": {
+        "backlog_blocks_before_git": true,
+        "drain_restores_admission": true,
+        "background_delivery": true
+      }
+    },
+    {
+      "name": "ambiguous_evidence_never_infers_success",
+      "status": "passed",
+      "seconds": 4.0191,
+      "detail": [
+        {
+          "fixture": "prepared-only",
+          "outcome": "unknown",
+          "push_blocked": true
+        },
+        {
+          "fixture": "repeated-evidence",
+          "outcome": "unknown",
+          "push_blocked": true
+        }
+      ]
+    },
+    {
+      "name": "duplicate_receipt_has_no_delivery_or_effect",
+      "status": "passed",
+      "seconds": 2.0557,
+      "detail": {
+        "synthetic_aba_receipt": true,
+        "outcome": "unknown",
+        "published_events": 0,
+        "deliveries": 0,
+        "consumer_effects": 0
+      }
+    },
+    {
+      "name": "oversized_ref_http_preflight_rejected",
+      "status": "passed",
+      "seconds": 0.1519,
+      "detail": {
+        "actual_native_push_attempt": false,
+        "controlled_pkt_line_request": true,
+        "ref_bytes": 1110,
+        "rejected_by_http_command_parser": true,
+        "http_status": 400,
+        "http_preflight_rejected": true,
+        "native_refs": 0,
+        "successful_events": 0,
+        "operations": 0,
+        "admissions": 0,
+        "journal_operations": 0,
+        "repository_ready": true
+      }
+    },
+    {
+      "name": "oversized_batch_http_preflight_rejected",
+      "status": "passed",
+      "seconds": 0.1469,
+      "detail": {
+        "actual_native_push_attempt": false,
+        "controlled_pkt_line_request": true,
+        "single_http_request": true,
+        "batch_commands_sent": 129,
+        "rejected_by_http_command_parser": true,
+        "http_status": 400,
+        "http_preflight_rejected": true,
+        "native_refs": 0,
+        "successful_events": 0,
+        "operations": 0,
+        "admissions": 0,
+        "journal_operations": 0,
+        "repository_ready": true
+      }
+    },
+    {
+      "name": "unrelated_recovery_block_is_preserved",
+      "status": "passed",
+      "seconds": 1.1738,
+      "detail": {
+        "unrelated_recovery_reason_preserved": true,
+        "new_push_blocked": true
+      }
+    },
+    {
+      "name": "real_stale_compare_swap_subset_and_repeat",
+      "status": "passed",
+      "seconds": 1.0631,
+      "detail": {
+        "real_pkt_line_receive_pack": true,
+        "stale_ref_rejected": true,
+        "successful_subset": [
+          "refs/heads/cas-good"
+        ],
+        "repeated_stale_outcome": "unknown",
+        "current_oid_not_used_as_evidence": true
+      }
+    },
+    {
+      "name": "durable_hook_runner_and_missing_hook_guard",
+      "status": "passed",
+      "seconds": 3.0256,
+      "detail": {
+        "removed_deployment_binary_push_recorded": true,
+        "missing_pre_receive_rejected_before_git": true,
+        "startup_reinstalled_hook": true
+      }
+    }
+  ],
+  "limitations": [
+    "Process restart and SQL publication faults do not emulate kernel/power loss.",
+    "Prepared/repeated-evidence recovery cases use explicit synthetic crash journals, not claims of actual push success.",
+    "Local transactional consumers are tested; no external exactly-once delivery is claimed."
+  ],
+  "runtime": {
+    "git_client": "git version 2.52.0",
+    "git_server": "git version 2.52.0",
+    "binary_sha256": "8826b82b3d4839e041074698cd81c3d44e9a862c291853184924a1757959da60"
+  }
+}
