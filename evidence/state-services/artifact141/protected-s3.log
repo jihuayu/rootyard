@@ -1,0 +1,6 @@
+
+running 1 test
+test postgres_s3_protected_upload_readback_is_real_and_holds_stay_permanent ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+

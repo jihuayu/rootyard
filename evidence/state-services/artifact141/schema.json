@@ -1,0 +1,98 @@
+{
+  "passed": true,
+  "kind": "schema",
+  "returncode": 0,
+  "command": [
+    "python3",
+    "/workspace/scratch/state-services-artifact-holds/tests/schema_contract.py",
+    "--binary",
+    "/workspace/scratch/state-artifact141-app-v1/rootyard"
+  ],
+  "seconds": 9.333,
+  "before": {
+    "source": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "binary": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+    "head": "4c039d142bd7b9615fd57152e00db3c25eac13a4",
+    "harness": {
+      "tests/schema_contract.py": "2d60de37e2fac8258a202396113c5452975f474c71b64811c80873faad054252",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "0db01b18e2da73d45a08efaa5df8920fe2ccbe984dac32594b2917c889f7ce7a"
+    }
+  },
+  "after": {
+    "source": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "binary": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+    "head": "4c039d142bd7b9615fd57152e00db3c25eac13a4",
+    "harness": {
+      "tests/schema_contract.py": "2d60de37e2fac8258a202396113c5452975f474c71b64811c80873faad054252",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "0db01b18e2da73d45a08efaa5df8920fe2ccbe984dac32594b2917c889f7ce7a"
+    }
+  },
+  "source_binary_harness_head_unchanged": true,
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+    "source_inputs_sha256": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "workspace_commit": "4c039d142bd7b9615fd57152e00db3c25eac13a4",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-artifact-holds#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-artifact-holds#rootyard@0.1.0"
+      }
+    ]
+  },
+  "helper_build_receipt": null,
+  "native": {
+    "schema_version": "141",
+    "migration_mode": "binary",
+    "canonical": true,
+    "roundtrip": true,
+    "restored003_upgrade": true,
+    "restored006_upgrade": true,
+    "restored007_upgrade": true,
+    "upgraded_roundtrip": true,
+    "custom_search_path_bootstrap": true,
+    "custom_migrate_idempotent": true,
+    "tables": 105,
+    "functions": 33,
+    "triggers": 69
+  },
+  "limits": [
+    "Real synthetic fixtures on one loopback host; no HA, power loss, production RPO/RTO, serving or physical GC qualification.",
+    "A1 core refs and parent operation are explicit SQL metadata fixtures; A3 holds/ACK/consume receipts/usage seeded through actual typed adapter APIs. No Blob bytes are included in this hold-metadata drill."
+  ]
+}

@@ -1,0 +1,37 @@
+
+running 19 tests
+test acquire_vs_cancel_two_client_barrier_keeps_hold_and_tombstone ... ok
+test cancel_before_register_blocks_acquire_without_rows_or_grant ... ok
+test consume_vs_cancel_barrier_then_cancelled_parent_blocks_second_grant ... ok
+test direct_update_delete_and_expiry_attempts_are_refused ... ok
+test foreign_backend_grants_are_refused_before_consume_pool_and_provider_io ... ok
+test fresh_batch_acquire_is_all_or_none_and_replay_returns_ack_without_grant_or_quota ... ok
+test full_scope_fences_and_unrepresentable_purpose_are_typed_refusals ... ok
+test global_request_identity_conflicts_across_repos_after_business_deletion ... ok
+test grant_consumes_once_and_receipt_queries_never_regrant ... ok
+test no_refunds_or_ledger_release_after_cancel_and_owner_tenant_deletion ... FAILED
+test pool_lease_and_consume_ack_are_visible_while_a_provider_write_is_parked ... ok
+test quota_boundaries_refuse_atomically_without_rows_or_refunds ... ok
+test quota_race_with_distinct_connections_has_exactly_one_winner ... ok
+test registered_operation_and_scope_fences_are_exact ... ok
+test stable_consume_id_recovery_and_corrupt_ledger_fixtures_are_typed ... ok
+test table_share_cut_parks_admission_and_exposes_only_acked_holds ... ok
+test truncate_of_every_new_ledger_table_is_denied_and_rows_survive ... ok
+test unknown_acquire_commit_returns_no_grant_and_replay_returns_old_ack ... ok
+test unknown_consume_commit_returns_no_token_and_receipt_lookup_is_readonly ... ok
+
+failures:
+
+---- no_refunds_or_ledger_release_after_cancel_and_owner_tenant_deletion stdout ----
+Error: db error
+
+Caused by:
+    ERROR: update or delete on table "users" violates foreign key constraint "namespaces_user_id_fkey" on table "namespaces"
+    DETAIL: Key (id)=(6b2fb3f6-d46f-4283-b297-85e710108aaf) is still referenced from table "namespaces".
+
+
+failures:
+    no_refunds_or_ledger_release_after_cancel_and_owner_tenant_deletion
+
+test result: FAILED. 18 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.68s
+

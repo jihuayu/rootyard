@@ -1,0 +1,53 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-artifact-holds)
+error: methods `scope` and `operation` are never used
+  --> src/ref_store/core/artifact_hold/grant.rs:89:19
+   |
+66 | impl ArtifactGrant {
+   | ------------------ methods in this implementation
+...
+89 |     pub(super) fn scope(&self) -> &HoldScope {
+   |                   ^^^^^
+...
+93 |     pub(super) fn operation(&self) -> &OperationIdentity {
+   |                   ^^^^^^^^^
+   |
+   = note: `-D dead-code` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+error: fields `operation_id`, `gate_revision`, `gate_digest`, and `consumed_at_unix_micros` are never read
+   --> src/ref_store/core/artifact_hold/sql_rows.rs:184:9
+    |
+175 | pub(super) struct StoredConsume {
+    |                   ------------- fields in this struct
+...
+184 |     pub operation_id: Uuid,
+    |         ^^^^^^^^^^^^
+185 |     pub gate_revision: i64,
+    |         ^^^^^^^^^^^^^
+186 |     pub gate_digest: String,
+    |         ^^^^^^^^^^^
+187 |     pub body: String,
+188 |     pub consumed_at_unix_micros: i64,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: large size difference between variants
+  --> src/ref_store/core/artifact_hold/pg.rs:43:1
+   |
+43 | / pub enum AcquireOutcome {
+44 | |     Granted { ack: AcquireAck, grant: ArtifactGrant },
+   | |     ------------------------------------------------- the largest variant contains at least 800 bytes
+45 | |     Replayed { ack: AcquireAck },
+   | |     ---------------------------- the second-largest variant contains at least 288 bytes
+46 | | }
+   | |_^ the entire enum is at least 800 bytes
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_enum_variant
+   = note: `-D clippy::large-enum-variant` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::large_enum_variant)]`
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+   |
+44 -     Granted { ack: AcquireAck, grant: ArtifactGrant },
+44 +     Granted { ack: AcquireAck, grant: Box<ArtifactGrant> },
+   |
+
+error: could not compile `rootyard` (lib) due to 3 previous errors

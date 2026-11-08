@@ -1,0 +1,30 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-artifact-holds)
+error: unused imports: `AcquireAck` and `ConsumeAck`
+  --> tests/ref_store_holds_provider.rs:24:5
+   |
+24 |     AcquireAck, AcquireArtifactHoldsRequest, AcquireLookup, AcquireOutcome, ArtifactHoldError,
+   |     ^^^^^^^^^^
+25 |     ArtifactHoldPurpose, ArtifactSpec, ConsumeAck, ConsumeLookup, HoldScope, PgArtifactHoldStore,
+   |                                        ^^^^^^^^^^
+   |
+   = note: `-D unused-imports` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error[E0277]: `std::result::Result<std::result::Result<(), anyhow::Error>, tokio::task::JoinError>` is not a future
+   --> tests/ref_store_holds_provider.rs:539:33
+    |
+539 |     let outcome = match outcome.await {
+    |                                 ^^^^^ `std::result::Result<std::result::Result<(), anyhow::Error>, tokio::task::JoinError>` is not a future
+    |
+    = help: the trait `std::future::Future` is not implemented for `std::result::Result<std::result::Result<(), anyhow::Error>, tokio::task::JoinError>`
+    = note: std::result::Result<std::result::Result<(), anyhow::Error>, tokio::task::JoinError> must be a future or must implement `IntoFuture` to be awaited
+    = note: required for `std::result::Result<std::result::Result<(), anyhow::Error>, tokio::task::JoinError>` to implement `std::future::IntoFuture`
+help: remove the `.await`
+    |
+539 -     let outcome = match outcome.await {
+539 +     let outcome = match outcome {
+    |
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `rootyard` (test "ref_store_holds_provider") due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...

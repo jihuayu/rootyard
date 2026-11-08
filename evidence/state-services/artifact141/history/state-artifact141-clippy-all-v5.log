@@ -1,0 +1,493 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-artifact-holds)
+error: expected `,`
+    --> tests/ref_store_artifact_holds.rs:1079:69
+     |
+1079 |         assert!(matches!(replay, AcquireOutcome::Replayed { ref ack => ack == &ack }));
+     |                                  ------------------------           ^^
+     |                                  |
+     |                                  while parsing the fields for this pattern
+
+error[E0596]: cannot borrow `client` as mutable, as it is not declared as mutable
+    --> tests/ref_store_artifact_holds.rs:1618:14
+     |
+1618 |     let tx = client.transaction().await?;
+     |              ^^^^^^ cannot borrow as mutable
+     |
+help: consider changing this to be mutable
+     |
+1617 |     let mut client = pool.get().await?;
+     |         +++
+
+error[E0596]: cannot borrow `client` as mutable, as it is not declared as mutable
+    --> tests/ref_store_artifact_holds.rs:2061:14
+     |
+2061 |     let tx = client.transaction().await?;
+     |              ^^^^^^ cannot borrow as mutable
+     |
+help: consider changing this to be mutable
+     |
+2060 |     let mut client = pool.get().await?;
+     |         +++
+
+error[E0308]: mismatched types
+   --> tests/ref_store_artifact_holds.rs:726:9
+    |
+725 |     let outcome = match outcome {
+    |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+726 |         Ok(result) => result,
+    |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+    |
+    = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                 found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+   --> tests/ref_store_artifact_holds.rs:727:9
+    |
+725 |     let outcome = match outcome {
+    |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+726 |         Ok(result) => result,
+727 |         Err(error) => Err(anyhow!("fresh batch test panicked: {error}")),
+    |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+    |
+    = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                 found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+   --> tests/ref_store_artifact_holds.rs:788:9
+    |
+787 |     let outcome = match outcome {
+    |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+788 |         Ok(result) => result,
+    |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+    |
+    = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                 found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+   --> tests/ref_store_artifact_holds.rs:789:9
+    |
+787 |     let outcome = match outcome {
+    |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+788 |         Ok(result) => result,
+789 |         Err(error) => Err(anyhow!("global identity test panicked: {error}")),
+    |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+    |
+    = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                 found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+   --> tests/ref_store_artifact_holds.rs:907:9
+    |
+906 |     let outcome = match outcome {
+    |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+907 |         Ok(result) => result,
+    |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+    |
+    = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                 found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+   --> tests/ref_store_artifact_holds.rs:908:9
+    |
+906 |     let outcome = match outcome {
+    |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+907 |         Ok(result) => result,
+908 |         Err(error) => Err(anyhow!("operation/scope fence test panicked: {error}")),
+    |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+    |
+    = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                 found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+   --> tests/ref_store_artifact_holds.rs:946:9
+    |
+945 |     let outcome = match outcome {
+    |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+946 |         Ok(result) => result,
+    |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+    |
+    = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                 found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+   --> tests/ref_store_artifact_holds.rs:947:9
+    |
+945 |     let outcome = match outcome {
+    |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+946 |         Ok(result) => result,
+947 |         Err(error) => Err(anyhow!("cancel-before-register test panicked: {error}")),
+    |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+    |
+    = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                 found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1035:9
+     |
+1034 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1035 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1036:9
+     |
+1034 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1035 |         Ok(result) => result,
+1036 |         Err(error) => Err(anyhow!("acquire-vs-cancel barrier test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1089:9
+     |
+1088 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1089 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1090:9
+     |
+1088 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1089 |         Ok(result) => result,
+1090 |         Err(error) => Err(anyhow!("consume-once test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1182:9
+     |
+1181 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1182 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1183:9
+     |
+1181 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1182 |         Ok(result) => result,
+1183 |         Err(error) => Err(anyhow!("consume-vs-cancel barrier test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1255:9
+     |
+1254 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1255 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1256:9
+     |
+1254 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1255 |         Ok(result) => result,
+1256 |         Err(error) => Err(anyhow!("unknown acquire test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1366:9
+     |
+1365 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1366 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1367:9
+     |
+1365 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1366 |         Ok(result) => result,
+1367 |         Err(error) => Err(anyhow!("unknown consume test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1476:9
+     |
+1475 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1476 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1477:9
+     |
+1475 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1476 |         Ok(result) => result,
+1477 |         Err(error) => Err(anyhow!("quota boundary test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1585:21
+     |
+1583 |               match outcome {
+     |                     ------- this expression has type `std::result::Result<rootyard::ref_store::artifact_hold::AcquireOutcome, anyhow::Error>`
+1584 |                   Ok(AcquireOutcome::Granted { .. }) => granted += 1,
+1585 |                   Err(ArtifactHoldError::QuotaExceeded {
+     |  _____________________^
+1586 | |                     scope: rootyard::ref_store::artifact_hold::HoldQuotaScope::Repository,
+1587 | |                     resource: rootyard::ref_store::artifact_hold::HoldQuotaResource::Holds,
+1588 | |                 }) => refused += 1,
+     | |_________________^ expected `Error`, found `ArtifactHoldError`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1605:9
+     |
+1604 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1605 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1606:9
+     |
+1604 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1605 |         Ok(result) => result,
+1606 |         Err(error) => Err(anyhow!("quota race test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1686:9
+     |
+1685 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1686 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1687:9
+     |
+1685 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1686 |         Ok(result) => result,
+1687 |         Err(error) => Err(anyhow!("no-refund/delete test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1823:9
+     |
+1822 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1823 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1824:9
+     |
+1822 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1823 |         Ok(result) => result,
+1824 |         Err(error) => Err(anyhow!("direct guard/expiry test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1932:9
+     |
+1931 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1932 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:1933:9
+     |
+1931 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+1932 |         Ok(result) => result,
+1933 |         Err(error) => Err(anyhow!("table SHARE cut test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:2375:9
+     |
+2374 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+2375 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:2376:9
+     |
+2374 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+2375 |         Ok(result) => result,
+2376 |         Err(error) => Err(anyhow!("foreign backend test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:2501:9
+     |
+2500 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+2501 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:2502:9
+     |
+2500 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+2501 |         Ok(result) => result,
+2502 |         Err(error) => Err(anyhow!("full scope fence test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:2587:9
+     |
+2586 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+2587 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:2588:9
+     |
+2586 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+2587 |         Ok(result) => result,
+2588 |         Err(error) => Err(anyhow!("pool lease / parked provider test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:2645:17
+     |
+2644 |         match result {
+     |               ------ this expression has type `std::result::Result<rootyard::ref_store::artifact_hold::ConsumedArtifacts, anyhow::Error>`
+2645 |             Err(ArtifactHoldError::ConsumeUnknown { consume_request_id, hold_ids }) => {
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Error`, found `ArtifactHoldError`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:2770:9
+     |
+2769 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+2770 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:2771:9
+     |
+2769 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+2770 |         Ok(result) => result,
+2771 |         Err(error) => Err(anyhow!("stable consume id / corrupt ledger test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:2896:9
+     |
+2895 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+2896 |         Ok(result) => result,
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+error[E0308]: mismatched types
+    --> tests/ref_store_artifact_holds.rs:2897:9
+     |
+2895 |     let outcome = match outcome {
+     |                         ------- this expression has type `tokio::task::JoinHandle<std::result::Result<(), anyhow::Error>>`
+2896 |         Ok(result) => result,
+2897 |         Err(error) => Err(anyhow!("TRUNCATE denial test panicked: {error}")),
+     |         ^^^^^^^^^^ expected `JoinHandle<Result<(), Error>>`, found `Result<_, _>`
+     |
+     = note: expected struct `tokio::task::JoinHandle<Result<(), anyhow::Error>>`
+                  found enum `Result<_, _>`
+
+Some errors have detailed explanations: E0308, E0596.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `rootyard` (test "ref_store_artifact_holds") due to 43 previous errors
+warning: build failed, waiting for other jobs to finish...

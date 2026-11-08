@@ -1,0 +1,6 @@
+{
+  "candidate": "/workspace/scratch/state-services-artifact-holds",
+  "isolated": "/workspace/scratch/state-holds-trust-check",
+  "source_inputs_sha256": "2ecf1ceded43decf0e769f95f1a46e03a0fceaf790fb5c297f132cdc84105820",
+  "equal": true
+}

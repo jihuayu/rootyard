@@ -1,0 +1,78 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-artifact-holds)
+error[E0004]: non-exhaustive patterns: `Ok(rootyard::ref_store::artifact_hold::AcquireOutcome::Replayed { .. })` not covered
+    --> tests/ref_store_artifact_holds.rs:1588:19
+     |
+1588 |             match outcome {
+     |                   ^^^^^^^ pattern `Ok(rootyard::ref_store::artifact_hold::AcquireOutcome::Replayed { .. })` not covered
+     |
+note: `std::result::Result<rootyard::ref_store::artifact_hold::AcquireOutcome, anyhow::Error>` defined here
+    --> /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/result.rs:558:0
+    ::: /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/result.rs:562:4
+     |
+     = note: not covered
+     = note: the matched value is of type `std::result::Result<rootyard::ref_store::artifact_hold::AcquireOutcome, anyhow::Error>`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+1599 ~                 },
+1600 ~                 Ok(rootyard::ref_store::artifact_hold::AcquireOutcome::Replayed { .. }) => todo!(),
+     |
+
+error: unused variable: `pool`
+    --> tests/ref_store_artifact_holds.rs:1490:17
+     |
+1490 |     let (admin, pool, schema, tenant, repo) = setup().await?;
+     |                 ^^^^ help: if this is intentional, prefix it with an underscore: `_pool`
+     |
+     = note: `-D unused-variables` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(unused_variables)]`
+
+error: unused variable: `tenant`
+    --> tests/ref_store_artifact_holds.rs:1490:31
+     |
+1490 |     let (admin, pool, schema, tenant, repo) = setup().await?;
+     |                               ^^^^^^ help: if this is intentional, prefix it with an underscore: `_tenant`
+
+error: unused variable: `repo`
+    --> tests/ref_store_artifact_holds.rs:1490:39
+     |
+1490 |     let (admin, pool, schema, tenant, repo) = setup().await?;
+     |                                       ^^^^ help: if this is intentional, prefix it with an underscore: `_repo`
+
+error[E0004]: non-exhaustive patterns: `Some(&rootyard::ref_store::artifact_hold::ArtifactHoldError::InvalidRequest(_))`, `Some(&rootyard::ref_store::artifact_hold::ArtifactHoldError::BatchTooLarge { .. })`, `Some(&rootyard::ref_store::artifact_hold::ArtifactHoldError::DigestConflict { .. })` and 18 more not covered
+    --> tests/ref_store_artifact_holds.rs:2657:33
+     |
+2657 |             Err(error) => match error.downcast_ref::<ArtifactHoldError>() {
+     |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ patterns `Some(&rootyard::ref_store::artifact_hold::ArtifactHoldError::InvalidRequest(_))`, `Some(&rootyard::ref_store::artifact_hold::ArtifactHoldError::BatchTooLarge { .. })`, `Some(&rootyard::ref_store::artifact_hold::ArtifactHoldError::DigestConflict { .. })` and 18 more not covered
+     |
+note: `std::option::Option<&rootyard::ref_store::artifact_hold::ArtifactHoldError>` defined here
+    --> /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/option.rs:598:0
+    ::: /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/option.rs:606:4
+     |
+     = note: not covered
+     = note: the matched value is of type `std::option::Option<&rootyard::ref_store::artifact_hold::ArtifactHoldError>`
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern as shown, or multiple match arms
+     |
+2662 ~                 None => return Err(anyhow!("a sent consume COMMIT without acknowledgement returned {error:?}")),
+2663 ~                 _ => todo!(),
+     |
+
+error: unused variable: `pool`
+    --> tests/ref_store_artifact_holds.rs:2606:17
+     |
+2606 |     let (admin, pool, schema, tenant, repo) = setup().await?;
+     |                 ^^^^ help: if this is intentional, prefix it with an underscore: `_pool`
+
+error: unused variable: `tenant`
+    --> tests/ref_store_artifact_holds.rs:2606:31
+     |
+2606 |     let (admin, pool, schema, tenant, repo) = setup().await?;
+     |                               ^^^^^^ help: if this is intentional, prefix it with an underscore: `_tenant`
+
+error: unused variable: `repo`
+    --> tests/ref_store_artifact_holds.rs:2606:39
+     |
+2606 |     let (admin, pool, schema, tenant, repo) = setup().await?;
+     |                                       ^^^^ help: if this is intentional, prefix it with an underscore: `_repo`
+
+For more information about this error, try `rustc --explain E0004`.
+error: could not compile `rootyard` (test "ref_store_artifact_holds") due to 8 previous errors

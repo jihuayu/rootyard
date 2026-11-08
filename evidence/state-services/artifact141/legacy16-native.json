@@ -1,0 +1,172 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "create_real_schema140_pando_source",
+      "status": "passed",
+      "seconds": 3.1642,
+      "detail": {
+        "source_heads": {
+          "alpha": "a1429e86825d54b75e9d2998bfbc44328c32d2b1",
+          "beta": "fe641b6a2ed9a91325342362807bd17bfaa1a0be"
+        },
+        "source_refs": {
+          "alpha": {
+            "refs/heads/main": "a1429e86825d54b75e9d2998bfbc44328c32d2b1"
+          },
+          "beta": {
+            "refs/heads/main": "fe641b6a2ed9a91325342362807bd17bfaa1a0be"
+          }
+        },
+        "source_authority_id": "c542d50a-a853-4d7d-8f1d-2cf9579f6cff",
+        "source_remote_paths_count": 8,
+        "source_remote_paths_sha256": "3648dc4b62900e793b8a50b8f1c558f20d9344bcc314550681da5647472b10e1",
+        "cutovers": {
+          "alpha": {
+            "refs": 1,
+            "packs": 1,
+            "objects_verified": 3
+          },
+          "beta": {
+            "refs": 1,
+            "packs": 1,
+            "objects_verified": 3
+          }
+        },
+        "web_session_created": true,
+        "browser_token_created": true
+      }
+    },
+    {
+      "name": "legacy_binary_writes_format16_schema140_archive",
+      "status": "passed",
+      "seconds": 12.246,
+      "detail": {
+        "format": 16,
+        "schema_last": 140,
+        "schema_contains_next": false,
+        "repository_count": 2,
+        "legacy_binary_sha256": "c11acf141750ab40e87ddbe65aa8c8cdecc5d8c069332450905dbc058bb5ad76",
+        "backup_verified": true
+      }
+    },
+    {
+      "name": "candidate_cli_usage_and_mixed_legacy_flags",
+      "status": "passed",
+      "seconds": 0.0268,
+      "detail": {
+        "missing_arguments_usage": true,
+        "missing_flags_usage": true,
+        "mixed_legacy_flags_usage": true,
+        "documented_opt_in": "--allow-legacy-schema140",
+        "documented_neighbour_opt_in": "--allow-legacy-schema139"
+      }
+    },
+    {
+      "name": "candidate_rejects_without_schema140_opt_in",
+      "status": "passed",
+      "seconds": 7.6405,
+      "detail": {
+        "explicit_schema_opt_in_required": true,
+        "mismatched_legacy_opt_in_rejected": true,
+        "target_data_published": false,
+        "target_database_empty": true
+      }
+    },
+    {
+      "name": "candidate_restores_schema141_one_new_authority",
+      "status": "passed",
+      "seconds": 6.0199,
+      "detail": {
+        "schema139_core_tables": 3,
+        "schema139_core_refs_key": "repository_id,ref_name",
+        "schema139_core_event_operation_fkey": true,
+        "schema139_core_event_immutable_trigger": true,
+        "schema139_core_rows": "0/0/0",
+        "genuine_legacy_source_had_core_rows": false,
+        "schema141_new_tables": [
+          "artifact_hold_consume_receipts",
+          "artifact_hold_repo_usage",
+          "artifact_hold_requests",
+          "artifact_hold_shards",
+          "artifact_hold_tenant_usage",
+          "artifact_holds"
+        ],
+        "schema141_hold_request_tables": [
+          "artifact_hold_requests"
+        ],
+        "schema141_hold_tables": [
+          "artifact_holds"
+        ],
+        "schema141_consumption_tables": [
+          "artifact_hold_consume_receipts"
+        ],
+        "schema141_seeded_rows": {
+          "artifact_hold_shards": 64
+        },
+        "schema141_new_tables_empty_except_migration_seed": true,
+        "schema141_hold_rows_fabricated": false,
+        "schema_version": 141,
+        "target_format": 17,
+        "indexes": 10,
+        "schema134_identity_constraints": true,
+        "schema135_metrics_index": true,
+        "schema136_token_scope_schema": true,
+        "schema138_operation_registry": true,
+        "legacy_tokens_default_unrestricted": true,
+        "target_authority_id": "698dabcf-f9a5-4143-b0a3-cff866b1751b",
+        "target_authority_differs_from_source": true,
+        "target_manifest_artifacts": 8,
+        "target_authority_singleton_unique": true,
+        "target_remote_paths_count": 8,
+        "source_and_target_remote_paths_disjoint": true,
+        "browser_session_revoked": true,
+        "browser_token_revoked": true
+      }
+    },
+    {
+      "name": "restored_service_git_and_session_boundaries",
+      "status": "passed",
+      "seconds": 2.0963,
+      "detail": {
+        "api_token_readable": true,
+        "old_browser_cookie_rejected": true,
+        "old_browser_bearer_rejected": true,
+        "git_clones": 2,
+        "clone_heads_exact": true,
+        "clone_contents_exact": true,
+        "fsck_clean": true,
+        "first_repo_refetch_after_second_ok": true,
+        "sole_target_authority_unchanged": true
+      }
+    },
+    {
+      "name": "source_authority_and_remote_objects_remain_available",
+      "status": "passed",
+      "seconds": 1.7745,
+      "detail": {
+        "source_authority_unchanged": true,
+        "source_remote_paths_unchanged": true,
+        "source_remote_paths_count": 8,
+        "source_remote_paths_sha256": "3648dc4b62900e793b8a50b8f1c558f20d9344bcc314550681da5647472b10e1",
+        "source_clone_heads_exact": true,
+        "source_clone_contents_exact": true,
+        "source_git_fsck_clean": true
+      }
+    }
+  ],
+  "reviewed_target_schema": 141,
+  "reviewed_target_format": 17,
+  "binary_sha256": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+  "legacy_binary_sha256": "c11acf141750ab40e87ddbe65aa8c8cdecc5d8c069332450905dbc058bb5ad76",
+  "harness_git_head": "4c039d142bd7b9615fd57152e00db3c25eac13a4",
+  "limitations": [
+    "Loopback functional drill; no production RPO/RTO or power-loss claim.",
+    "The legacy archive is produced by the trusted format16 binary and is never edited.",
+    "source_head values are repository heads, not binary build provenance.",
+    "Genuine format16/schema140 sources carry no ref-store core rows; the migrated schema139 core tables are verified present, constrained and empty, not round-tripped.",
+    "No schema140 snapshot/pin table or row assertion is made; that populated current-format qualification follows the primary migration-140 SQL.",
+    "The schema141 ledger tables are derived from the generated current-vs-140 catalogs and are verified present with only the exact fixed rows seeded by the settled migration141 SQL; this fixture inserts no hold, request or consumption row.",
+    "A format16 drill requires root to supply the genuine retained old schema140 producer and its archive; this harness never fabricates or relabels one."
+  ]
+}

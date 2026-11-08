@@ -1,0 +1,77 @@
+{
+  "runner_sha256": "b7d642f49865f961efc6c41038f64d9ad760e0e15fd8dc46a411aabff622e3c1",
+  "passed": true,
+  "returncode": 0,
+  "seconds": 0.684,
+  "summary": "test result: ok. 1 passed; 0 failed; 0 ignored;",
+  "command": [
+    "/workspace/scratch/state-artifact141-provider-build-v1/ref_store_holds_provider",
+    "--ignored",
+    "--test-threads=1"
+  ],
+  "before": {
+    "source": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "binary": "e19ae466b81103adb587ab0c65aa388d59fab7cd0c44ebba4c01173db11f707d",
+    "head": "4c039d142bd7b9615fd57152e00db3c25eac13a4",
+    "test": "5e0f93c0d229ac6620e70f59272bcb426de2dee34ebee4a504c6d81b05d701c5"
+  },
+  "after": {
+    "source": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "binary": "e19ae466b81103adb587ab0c65aa388d59fab7cd0c44ebba4c01173db11f707d",
+    "head": "4c039d142bd7b9615fd57152e00db3c25eac13a4",
+    "test": "5e0f93c0d229ac6620e70f59272bcb426de2dee34ebee4a504c6d81b05d701c5"
+  },
+  "source_binary_harness_head_unchanged": true,
+  "binary_sha256": "e19ae466b81103adb587ab0c65aa388d59fab7cd0c44ebba4c01173db11f707d",
+  "build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "e19ae466b81103adb587ab0c65aa388d59fab7cd0c44ebba4c01173db11f707d",
+    "workspace_commit": "4c039d142bd7b9615fd57152e00db3c25eac13a4",
+    "fresh": false,
+    "source_inputs_sha256": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "binary_sha256": "e19ae466b81103adb587ab0c65aa388d59fab7cd0c44ebba4c01173db11f707d",
+    "integration_test_source_sha256": "5e0f93c0d229ac6620e70f59272bcb426de2dee34ebee4a504c6d81b05d701c5",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_holds_provider",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_holds_provider",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_holds_provider-92c3292597861f90"
+      }
+    ]
+  },
+  "limits": [
+    "One loopback PostgreSQL17/Garage S3 fixture; no Azure, encryption, retirement, GC, serving or physical backup closure qualification."
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "passed": true,
+  "base_commit": "46b6e87f0c29dfc6b5440147bec9dd010baa8acf",
+  "command": [
+    "cargo",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "--config",
+    "profile.test.package.rootyard.debug=0",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "--config",
+    "profile.test.package.rootyard.strip=\"debuginfo\"",
+    "check",
+    "--locked",
+    "--lib",
+    "--features",
+    "pando-lab"
+  ],
+  "negative": {
+    "returncode": 101,
+    "seconds": 29.704
+  },
+  "negative_privacy_errors": 8,
+  "positive": {
+    "returncode": 0,
+    "seconds": 31.512
+  },
+  "exact_sources_restored": true,
+  "before": {
+    "src/lib.rs": "d19c3e909ba73f3f2939c3ac55222e700dc47c377c5b48538ed3a4d5b3d81d5c",
+    "src/blob_store/mod.rs": "21911b9a4290fbaace17851e12c017420b62949bd6a35d80be57609d47285111",
+    "src/blob_store/transfer.rs": "319da920a31509a9d2c4fd1daf35b150c1894fc062012ca2b4644a9260389cf5",
+    "src/blob_store/transfer/receipt.rs": "8649f434d68b7310f62a041ac9d5265989236a915f9cac3591e92663e21cc02e",
+    "src/blob_store/opendal.rs": "1f9334ed1b5e7fe05bf24fa4278c3222804ca3357aa11036f938dc3c78d099ce",
+    "src/blob_store/config.rs": "9f326b5789c10fffbb96d1320f8947c17c8cf8abfd692699ae0aff9641c4f2dd"
+  },
+  "after": {
+    "src/lib.rs": "d19c3e909ba73f3f2939c3ac55222e700dc47c377c5b48538ed3a4d5b3d81d5c",
+    "src/blob_store/mod.rs": "21911b9a4290fbaace17851e12c017420b62949bd6a35d80be57609d47285111",
+    "src/blob_store/transfer.rs": "319da920a31509a9d2c4fd1daf35b150c1894fc062012ca2b4644a9260389cf5",
+    "src/blob_store/transfer/receipt.rs": "8649f434d68b7310f62a041ac9d5265989236a915f9cac3591e92663e21cc02e",
+    "src/blob_store/opendal.rs": "1f9334ed1b5e7fe05bf24fa4278c3222804ca3357aa11036f938dc3c78d099ce",
+    "src/blob_store/config.rs": "9f326b5789c10fffbb96d1320f8947c17c8cf8abfd692699ae0aff9641c4f2dd"
+  },
+  "limits": [
+    "Isolated same-crate compile probes and permissive visibility mutation only; not a runtime hold/upload qualification.",
+    "All candidate production inputs were copied to the isolated checkout and their combined source digest verified before probes; no runtime/PG/byte success is qualified here."
+  ]
+}

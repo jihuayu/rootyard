@@ -1,0 +1,10 @@
+{
+  "probe_source_inputs_sha256": "2ecf1ceded43decf0e769f95f1a46e03a0fceaf790fb5c297f132cdc84105820",
+  "formatted_probe_source_inputs_sha256": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+  "qualified_candidate_source_inputs_sha256": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+  "rustfmt_equivalent": true,
+  "command": "cargo fmt --all",
+  "limits": [
+    "No runtime test is implied by this source transformation; eight rejection probes and permissive control were run before formatting, with their own retained input digest."
+  ]
+}

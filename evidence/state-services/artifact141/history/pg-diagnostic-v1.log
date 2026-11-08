@@ -1,0 +1,98 @@
+
+running 19 tests
+test acquire_vs_cancel_two_client_barrier_keeps_hold_and_tombstone ... ok
+test cancel_before_register_blocks_acquire_without_rows_or_grant ... ok
+test consume_vs_cancel_barrier_then_cancelled_parent_blocks_second_grant ... FAILED
+test direct_update_delete_and_expiry_attempts_are_refused ... ok
+test foreign_backend_grants_are_refused_before_consume_pool_and_provider_io ... ok
+test fresh_batch_acquire_is_all_or_none_and_replay_returns_ack_without_grant_or_quota ... FAILED
+test full_scope_fences_and_unrepresentable_purpose_are_typed_refusals ... ok
+test global_request_identity_conflicts_across_repos_after_business_deletion ... ok
+test grant_consumes_once_and_receipt_queries_never_regrant ... FAILED
+test no_refunds_or_ledger_release_after_cancel_and_owner_tenant_deletion ... FAILED
+test pool_lease_and_consume_ack_are_visible_while_a_provider_write_is_parked ... FAILED
+test quota_boundaries_refuse_atomically_without_rows_or_refunds ... ok
+test quota_race_with_distinct_connections_has_exactly_one_winner ... ok
+test registered_operation_and_scope_fences_are_exact ... ok
+test stable_consume_id_recovery_and_corrupt_ledger_fixtures_are_typed ... FAILED
+test table_share_cut_parks_admission_and_exposes_only_acked_holds ... ok
+test truncate_of_every_new_ledger_table_is_denied_and_rows_survive ... FAILED
+test unknown_acquire_commit_returns_no_grant_and_replay_returns_old_ack ... ok
+test unknown_consume_commit_returns_no_token_and_receipt_lookup_is_readonly ... FAILED
+
+failures:
+
+---- consume_vs_cancel_barrier_then_cancelled_parent_blocks_second_grant stdout ----
+
+thread 'consume_vs_cancel_barrier_then_cancelled_parent_blocks_second_grant' (54444) panicked at tests/ref_store_artifact_holds.rs:1179:9:
+assertion `left == right` failed
+  left: 3
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Error: consume-vs-cancel barrier test panicked: task 18 panicked with message "assertion `left == right` failed\n  left: 3\n right: 1"
+
+---- fresh_batch_acquire_is_all_or_none_and_replay_returns_ack_without_grant_or_quota stdout ----
+
+thread 'fresh_batch_acquire_is_all_or_none_and_replay_returns_ack_without_grant_or_quota' (54457) panicked at tests/ref_store_artifact_holds.rs:660:9:
+assertion `left == right` failed
+  left: (3, 60, 1)
+ right: (3, 60, 0)
+Error: fresh batch test panicked: task 37 panicked with message "assertion `left == right` failed\n  left: (3, 60, 1)\n right: (3, 60, 0)"
+
+---- grant_consumes_once_and_receipt_queries_never_regrant stdout ----
+
+thread 'grant_consumes_once_and_receipt_queries_never_regrant' (54468) panicked at tests/ref_store_artifact_holds.rs:1071:9:
+assertion `left == right` failed
+  left: 3
+ right: 2
+Error: consume-once test panicked: task 50 panicked with message "assertion `left == right` failed\n  left: 3\n right: 2"
+
+---- no_refunds_or_ledger_release_after_cancel_and_owner_tenant_deletion stdout ----
+
+thread 'no_refunds_or_ledger_release_after_cancel_and_owner_tenant_deletion' (54471) panicked at tests/ref_store_artifact_holds.rs:1662:9:
+assertion failed: repo_before.0 == 2 && repo_before.3 == 2
+Error: no-refund/delete test panicked: task 54 panicked with message "assertion failed: repo_before.0 == 2 && repo_before.3 == 2"
+
+---- pool_lease_and_consume_ack_are_visible_while_a_provider_write_is_parked stdout ----
+
+thread 'pool_lease_and_consume_ack_are_visible_while_a_provider_write_is_parked' (54474) panicked at tests/ref_store_artifact_holds.rs:2593:9:
+assertion `left == right` failed: one durable consume receipt, never a double charge
+  left: 2
+ right: 1
+Error: pool lease / parked provider test panicked: task 58 panicked with message "assertion `left == right` failed: one durable consume receipt, never a double charge\n  left: 2\n right: 1"
+
+---- stable_consume_id_recovery_and_corrupt_ledger_fixtures_are_typed stdout ----
+
+thread 'stable_consume_id_recovery_and_corrupt_ledger_fixtures_are_typed' (54492) panicked at tests/ref_store_artifact_holds.rs:2681:9:
+assertion `left == right` failed: one receipt per hold, never a double charge
+  left: 3
+ right: 2
+Error: stable consume id / corrupt ledger test panicked: task 89 panicked with message "assertion `left == right` failed: one receipt per hold, never a double charge\n  left: 3\n right: 2"
+
+---- truncate_of_every_new_ledger_table_is_denied_and_rows_survive stdout ----
+
+thread 'truncate_of_every_new_ledger_table_is_denied_and_rows_survive' (54502) panicked at tests/ref_store_artifact_holds.rs:612:5:
+unexpected SQLSTATE 0A000: cannot truncate a table referenced in a foreign key constraint
+Error: TRUNCATE denial test panicked: task 104 panicked with message "unexpected SQLSTATE 0A000: cannot truncate a table referenced in a foreign key constraint"
+
+---- unknown_consume_commit_returns_no_token_and_receipt_lookup_is_readonly stdout ----
+
+thread 'unknown_consume_commit_returns_no_token_and_receipt_lookup_is_readonly' (54519) panicked at tests/ref_store_artifact_holds.rs:1366:9:
+assertion `left == right` failed
+  left: 2
+ right: 1
+Error: unknown consume test panicked: task 116 panicked with message "assertion `left == right` failed\n  left: 2\n right: 1"
+
+
+failures:
+    consume_vs_cancel_barrier_then_cancelled_parent_blocks_second_grant
+    fresh_batch_acquire_is_all_or_none_and_replay_returns_ack_without_grant_or_quota
+    grant_consumes_once_and_receipt_queries_never_regrant
+    no_refunds_or_ledger_release_after_cancel_and_owner_tenant_deletion
+    pool_lease_and_consume_ack_are_visible_while_a_provider_write_is_parked
+    stable_consume_id_recovery_and_corrupt_ledger_fixtures_are_typed
+    truncate_of_every_new_ledger_table_is_denied_and_rows_survive
+    unknown_consume_commit_returns_no_token_and_receipt_lookup_is_readonly
+
+test result: FAILED. 11 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.79s
+

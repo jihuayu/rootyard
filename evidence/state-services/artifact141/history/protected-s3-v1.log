@@ -1,0 +1,19 @@
+
+running 1 test
+test postgres_s3_protected_upload_readback_is_real_and_holds_stay_permanent ... FAILED
+
+failures:
+
+---- postgres_s3_protected_upload_readback_is_real_and_holds_stay_permanent stdout ----
+
+thread 'postgres_s3_protected_upload_readback_is_real_and_holds_stay_permanent' (61779) panicked at tests/ref_store_holds_provider.rs:65:10:
+ROOTYARD_BLOB_* real S3 provider environment must be set; this suite never skips: blob configuration rejected: invalid blob root prefix segment
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Error: real provider acceptance test panicked: task 3 panicked with message "ROOTYARD_BLOB_* real S3 provider environment must be set; this suite never skips: blob configuration rejected: invalid blob root prefix segment"
+
+
+failures:
+    postgres_s3_protected_upload_readback_is_real_and_holds_stay_permanent
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+

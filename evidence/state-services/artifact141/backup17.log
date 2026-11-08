@@ -1,0 +1,188 @@
+synthetic_source_with_seeded_artifact_holds: passed
+offline_barriers_and_snapshot: passed
+unsafe_or_corrupt_inputs: passed
+backup_barrier_failures: passed
+interrupted_restore_guard: passed
+post_backup_write_not_in_snapshot: passed
+new_environment_restore_schema141_holds_clone_fsck: passed
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "synthetic_source_with_seeded_artifact_holds",
+      "status": "passed",
+      "seconds": 3.5959,
+      "detail": {
+        "fresh_databases": 2,
+        "live_server_backup_rejected": true,
+        "unknown_and_unfinished_journal": true,
+        "direct_sql_core_fixture_repository": "da6902ee-a283-4505-ab92-b26268db6c71",
+        "core_fixture_is_adapter_or_protocol_acknowledgement": false,
+        "populated_fixture_rows_by_table": {
+          "ref_store_issuer_lanes": 2,
+          "ref_store_operations": 3,
+          "ref_store_cancellations": 1,
+          "ref_store_core_gates": 1,
+          "ref_store_core_refs": 1,
+          "ref_store_core_events": 1
+        },
+        "adapter_seeded_schema141_tables": {
+          "artifact_hold_requests": 2,
+          "artifact_holds": 3,
+          "artifact_hold_consume_receipts": 2,
+          "artifact_hold_shards": 64,
+          "artifact_hold_repo_usage": 1,
+          "artifact_hold_tenant_usage": 1
+        },
+        "artifact_hold_acquire_labels": [
+          "consumed",
+          "dropped-grant"
+        ],
+        "stable_consume_ids_captured": true,
+        "dropped_grant_replay_returned_old_ack_without_remint": true,
+        "parent_operation_direct_sql_not_adapter_ack": true,
+        "full_parent_operation_tuple_bound_in_ack": true,
+        "all_64_shard_rows_present": true,
+        "restored_blob_bytes_qualified": false
+      }
+    },
+    {
+      "name": "offline_barriers_and_snapshot",
+      "status": "passed",
+      "seconds": 13.4324,
+      "detail": {
+        "snapshot_includes_commit_after_barrier_wait": true,
+        "inherited_volume_lock_rejected": true,
+        "backup_seconds": 10.803094133,
+        "backup_format": 17,
+        "archive_contains_schema_versions": [
+          138,
+          139
+        ],
+        "schema141_is_current": true,
+        "parent_snapshot_inspected_dynamic_schema141_tables": [
+          "artifact_hold_requests",
+          "artifact_holds",
+          "artifact_hold_consume_receipts",
+          "artifact_hold_shards",
+          "artifact_hold_repo_usage",
+          "artifact_hold_tenant_usage"
+        ]
+      }
+    },
+    {
+      "name": "unsafe_or_corrupt_inputs",
+      "status": "passed",
+      "seconds": 60.5118,
+      "detail": {
+        "corrupt_missing_extra_traversal_symlink_rejected_before_sql": true,
+        "existing_targets_and_overlap_refused": true,
+        "external_object_dependencies_refused": true
+      }
+    },
+    {
+      "name": "backup_barrier_failures",
+      "status": "passed",
+      "seconds": 10.581,
+      "detail": {
+        "exporter_connection_loss_no_publication": true,
+        "queued_ddl_bounded_safe_failure": true
+      }
+    },
+    {
+      "name": "interrupted_restore_guard",
+      "status": "passed",
+      "seconds": 8.8677,
+      "detail": {
+        "killed_parent_while_native_pg_restore_blocked": true,
+        "no_orphan_import_or_partial_sql": true,
+        "persistent_guard_blocks_startup": true
+      }
+    },
+    {
+      "name": "post_backup_write_not_in_snapshot",
+      "status": "passed",
+      "seconds": 1.0156,
+      "detail": {
+        "post_backup_acknowledged_commit": true,
+        "seconds_after_backup_boundary": 94.991
+      }
+    },
+    {
+      "name": "new_environment_restore_schema141_holds_clone_fsck",
+      "status": "passed",
+      "seconds": 10.3532,
+      "detail": {
+        "fresh_database_and_directory": true,
+        "separate_pg_server": false,
+        "standard_authenticated_clone_fsck_refs_content": true,
+        "revoked_and_read_only_auth_preserved": true,
+        "unknown_stays_blocked": true,
+        "restore_seconds": 8.198267793,
+        "backup_boundary_commits_missing": 0,
+        "post_backup_acknowledged_commits_not_recovered": 1,
+        "observed_backup_age_at_last_ack_seconds": 94.991,
+        "production_rpo_rto_guarantee": false,
+        "populated_core_rows_restored_exactly": true,
+        "gates_refs_events_operations_cancellations_issuer_lanes_nonempty": true,
+        "terminal_event_cancellation_updates_refused_without_row_changes": true,
+        "core_repository_stays_provisioning_gitfs_unserved": true,
+        "core_fixture_direct_sql_not_adapter_acknowledgement": true,
+        "all_six_schema141_tables_restored_exactly": true,
+        "hold_requests_holds_receipts_usage_nonempty_after_restore": true,
+        "all_64_shard_rows_and_monotone_quota_counters_restored": true,
+        "typed_replay_verify_helper_ran": true,
+        "exact_replay_returned_old_acks_and_receipts_without_writes": true,
+        "dropped_grant_replay_cannot_remint": true,
+        "unconsumed_consume_lookup_remains_unknown": true,
+        "scope_mismatch_denied_on_restored_ledger": true,
+        "direct_updates_deletes_truncate_refused_with_rows_unchanged": true,
+        "triggers_enabled_not_disabled_by_the_drill": true,
+        "restored_blob_bytes_explicitly_unqualified_and_denied": true,
+        "physical_backup_or_byte_protection_closure_claimed": false
+      }
+    }
+  ],
+  "skips": 0,
+  "binary": "/workspace/scratch/state-artifact141-app-v1/rootyard",
+  "binary_sha256": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+  "backup_format": 17,
+  "schema_version": 141,
+  "holds_fixture_helper": {
+    "binary": "/workspace/scratch/state-artifact141-backup-helper-v1/ref_store_holds_backup_fixture",
+    "binary_sha256": "7d59ed525e98a8c1abd5625c745b092f09e8bfe200df91a56fc8ad8942a6f2c3",
+    "build_receipt": "/workspace/scratch/state-artifact141-backup-helper-v1/ref_store_holds_backup_fixture.build.json",
+    "build_receipt_sha256": "80e936023141f74988226980cae710038cde16af2759e25884d6abbf8051a85b",
+    "build_kind": "rust-integration-test",
+    "package_rebuilt": true,
+    "fresh": false,
+    "fresh_false_artifact": {
+      "target": "ref_store_holds_backup_fixture",
+      "kind": "test",
+      "fresh": false
+    },
+    "test_profile": true,
+    "integration_test_source_sha256": "91d5df5cd0cfb2b5ac89ca8397aa45e7fb6804ab3785841fea7e8f3a15bf7ab0",
+    "integration_test_source_matches_source_file": true,
+    "source_inputs_sha256": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+    "candidate_application_receipt": "/workspace/scratch/state-artifact141-app-v1/rootyard.build.json",
+    "candidate_application_sha256": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+    "candidate_application_package_rebuilt": true,
+    "source_inputs_match_candidate_application": true,
+    "retained_binding_stages": [
+      "seed",
+      "verify"
+    ],
+    "helper_binary_sha256_after_run": "7d59ed525e98a8c1abd5625c745b092f09e8bfe200df91a56fc8ad8942a6f2c3",
+    "candidate_application_sha256_after_run": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+    "binaries_unchanged_after_run": true
+  },
+  "limitations": [
+    "The pending migration-138 parent operation/lane is a direct-SQL metadata fixture, not an adapter or Git ACK.",
+    "All migration-141 request/hold/consume ACK rows are produced by the real typed PgArtifactHoldStore.",
+    "Only a fixed non-secret synthetic S3 identity is used; there is no provider IO, raw upload or read-back.",
+    "Restored Blob bytes are explicitly unqualified/denied; no byte protection or physical backup closure is claimed.",
+    "The drill repository remains provisioning/gitfs/unserved; artifact holds are metadata rows only.",
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise."
+  ]
+}
