@@ -6,6 +6,9 @@
 pub mod handlers;
 pub mod models;
 pub mod native_reads;
+pub mod org_admin;
+pub mod org_admin_actions;
+pub mod org_admin_views;
 pub mod sanitize;
 pub mod session;
 pub mod session_gc;
@@ -87,5 +90,6 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/web/settings/tokens/{id}/scope", post(tokens::update_token_web))
         .route("/web/settings/sessions", get(tokens::sessions_page))
         .route("/web/settings/sessions/{id}/revoke", post(tokens::revoke_session_web))
+        .merge(org_admin::routes())
         .layer(axum::middleware::from_fn_with_state(state, session::middleware))
 }

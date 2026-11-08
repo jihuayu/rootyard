@@ -69,7 +69,7 @@ pub async fn transfer_ownership(
     Err(Error(StatusCode::CONFLICT, "repository ownership transfer is unsupported"))
 }
 
-async fn org_id(tx: &Transaction<'_>, slug: &str) -> Result<Uuid, Error> {
+pub(crate) async fn org_id(tx: &Transaction<'_>, slug: &str) -> Result<Uuid, Error> {
     if !db::valid_name(slug) {
         return Err(Error::not_found());
     }
@@ -79,13 +79,20 @@ async fn org_id(tx: &Transaction<'_>, slug: &str) -> Result<Uuid, Error> {
         .ok_or_else(Error::not_found)
         .map(|r| r.get(0))
 }
-async fn require_member(tx: &Transaction<'_>, org: Uuid, actor: Uuid, min: Role) -> Result<(), Error> {
+/// Direct membership role, or `404` when the caller is not a member. Shared by
+/// the JSON API and the `/web/organizations` pages so both resolve authority
+/// from the same row.
+pub(crate) async fn member_role(tx: &Transaction<'_>, org: Uuid, actor: Uuid) -> Result<Role, Error> {
     let row = tx
         .query_opt("SELECT role FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", &[&org, &actor])
         .await
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?;
-    if Role::parse(row.get::<_, &str>(0))? < min {
+    Role::parse(row.get::<_, &str>(0))
+}
+
+async fn require_member(tx: &Transaction<'_>, org: Uuid, actor: Uuid, min: Role) -> Result<(), Error> {
+    if member_role(tx, org, actor).await? < min {
         return Err(Error(StatusCode::FORBIDDEN, "insufficient organization role"));
     }
     Ok(())
