@@ -684,7 +684,13 @@ class LegacyArchiveHarness(BackupHarness):
             self.restore_db,
             "SELECT string_agg(DISTINCT pack_mode, ',' ORDER BY pack_mode) "
             "FROM ref_store_core_gates")
-        assert gate_modes == "metadata_only", gate_modes
+        # Genuine CLI producers have no unserved RefStore gates. The column
+        # contract above proves the new default even when this aggregate is
+        # empty; do not fabricate a gate to exercise an otherwise empty ledger.
+        if not gate_modes:
+            assert self.query(self.restore_db, "SELECT count(*) FROM ref_store_core_gates") == "0"
+        else:
+            assert gate_modes == "metadata_only", gate_modes
         shards = self.query(
             self.restore_db,
             "SELECT count(*) FROM artifact_hold_shards WHERE shard_id BETWEEN "
