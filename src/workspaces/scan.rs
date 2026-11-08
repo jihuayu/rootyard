@@ -4,8 +4,10 @@
 //! PostgreSQL row lock is held. Jobs here run on a fixed pool of ordinary
 //! threads, with one bounded queue per worker. A timed-out or cancelled caller
 //! only loses its result: the worker keeps the FUSE freeze and its capacity
-//! until the filesystem closure really returns.
-use crate::Error;
+//! until the filesystem closure really returns. Each job also carries the
+//! caller's selected worker operation scope, because a std thread inherits no
+//! task locals and would otherwise report its own failures as detached.
+use crate::{Error, observability::worker};
 use std::{
     collections::HashSet,
     panic::AssertUnwindSafe,
@@ -102,7 +104,11 @@ impl Drop for InflightGuard {
 /// Run one frozen filesystem operation on a bounded worker.
 ///
 /// `with_frozen` is entered *inside* the worker, so cancelling the caller never
-/// releases the mutation gate before the scan itself has finished.
+/// releases the mutation gate before the scan itself has finished. The caller's
+/// worker operation scope is captured here, on the async side, and reinstated on
+/// the pool thread so `Error::internal` inside the closure is attributed to the
+/// real worker and phase instead of a detached scope. Only that operation scope
+/// is carried: an HTTP request scope is never captured.
 pub(super) async fn frozen<T, F>(id: Uuid, timeout: Duration, work: F) -> Result<T, ScanFailure>
 where
     T: Send + 'static,
@@ -115,10 +121,11 @@ where
         }
     }
     let guard = InflightGuard(id);
+    let operation = worker::blocking_scope();
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let job: Job = Box::new(move || {
         let _guard = guard;
-        let outcome = super::mounts::with_frozen(id, work);
+        let outcome = worker::blocking(operation, move || super::mounts::with_frozen(id, work));
         let _ = sender.send(outcome);
     });
     let pool = pool()?;
@@ -221,5 +228,29 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "blocking closure never completed");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_scan_thread_runs_with_the_caller_worker_scope_only() {
+        let context = worker::OperationContext::new(worker::WorkerKind::WorkspaceCapture);
+        let (caller, on_thread) = worker::run(&context, worker::Phase::Reconcile, async {
+            let caller = worker::blocking_scope().expect("caller has a worker scope");
+            let on_thread = frozen(Uuid::new_v4(), Duration::from_secs(5), || {
+                (worker::current(), std::thread::current().name().map(str::to_owned), Ok(()))
+            })
+            .await;
+            (caller, on_thread)
+        })
+        .await;
+        let (observed, name, outcome) = on_thread.expect("scan completed");
+        let observed = observed.expect("scan thread lost its worker scope");
+        assert_eq!(observed.worker, worker::WorkerKind::WorkspaceCapture);
+        assert_eq!(observed.phase, worker::Phase::Reconcile);
+        assert_eq!(observed.operation_id, caller.operation_id);
+        assert!(name.is_some_and(|name| name.starts_with("rootyard-workspace-scan-")), "not a pool thread");
+        assert!(outcome.is_ok());
+        // A caller without an explicit worker scope never invents one.
+        let detached = frozen(Uuid::new_v4(), Duration::from_secs(5), || Ok(worker::current())).await;
+        assert!(detached.expect("scan completed").is_none(), "detached scan gained an operation scope");
     }
 }

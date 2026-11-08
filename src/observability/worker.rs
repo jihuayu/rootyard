@@ -157,6 +157,27 @@ where
     tokio::spawn(OPERATION_SCOPE.scope(scope_for(context, phase), future))
 }
 
+/// Capture the caller's selected operation scope on the async side so a
+/// dedicated blocking thread can carry it explicitly. A std thread has no task
+/// locals, so the same read performed there always yields `None`.
+pub(crate) fn blocking_scope() -> Option<OperationScope> {
+    current()
+}
+
+/// Run a blocking closure while reinstating exactly the captured operation
+/// scope. A plain `std::thread` inherits no task locals, so without this an
+/// error built inside the closure (`Error::internal`, including the FUSE-gated
+/// and lazy-baseline fingerprint passes) would be observed as `detached` with
+/// no worker, operation or phase. Only the worker scope is installed; request
+/// scope is never captured, so an HTTP request can never be attributed to
+/// background work. `None` runs the closure unchanged.
+pub(crate) fn blocking<R>(scope: Option<OperationScope>, closure: impl FnOnce() -> R) -> R {
+    match scope {
+        Some(scope) => OPERATION_SCOPE.sync_scope(scope, closure),
+        None => closure(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -251,6 +272,53 @@ mod tests {
         assert_eq!(outer.phase, Phase::Round);
         assert_eq!(inner.phase, Phase::Scan);
         assert_eq!(outer.operation_id, inner.operation_id);
+    }
+
+    #[test]
+    fn blocking_thread_carries_only_the_captured_worker_scope() {
+        let context = OperationContext::new(WorkerKind::WorkspaceCapture);
+        let request = RequestScope { request_id: Uuid::new_v4(), route: Some("/api/private".to_owned()) };
+        let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        let (captured, on_thread) = runtime.block_on(REQUEST_SCOPE.scope(request, async {
+            run(&context, Phase::Reconcile, async {
+                let captured = blocking_scope().expect("caller has a worker scope");
+                let on_thread = std::thread::scope(|threads| {
+                    threads
+                        .spawn(|| {
+                            blocking(Some(captured.clone()), || {
+                                (current(), REQUEST_SCOPE.try_with(Clone::clone).ok(), event_json(&io_error()))
+                            })
+                        })
+                        .join()
+                        .expect("blocking thread joined")
+                });
+                (captured, on_thread)
+            })
+            .await
+        }));
+        let (observed, request_on_thread, text) = on_thread;
+        assert_eq!(observed.as_ref().map(|scope| scope.worker), Some(WorkerKind::WorkspaceCapture));
+        assert_eq!(observed.as_ref().map(|scope| scope.phase), Some(Phase::Reconcile));
+        assert_eq!(observed.map(|scope| scope.operation_id), Some(captured.operation_id));
+        assert!(request_on_thread.is_none(), "HTTP request scope reached the blocking thread");
+        let value = parse(&text);
+        assert_eq!(value["scope"].as_str(), Some("worker"));
+        assert_eq!(value["worker"].as_str(), Some("workspace_capture"));
+        assert_eq!(value["phase"].as_str(), Some("reconcile"));
+        assert!(value.get("request_id").is_none());
+        assert!(value.get("route").is_none());
+    }
+
+    #[test]
+    fn blocking_without_a_captured_scope_stays_detached() {
+        let (scope, text) = std::thread::scope(|threads| {
+            threads
+                .spawn(|| blocking(None, || (current(), event_json(&io_error()))))
+                .join()
+                .expect("blocking thread joined")
+        });
+        assert!(scope.is_none());
+        assert_eq!(parse(&text)["scope"].as_str(), Some("detached"));
     }
 
     #[tokio::test]

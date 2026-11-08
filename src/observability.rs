@@ -329,6 +329,13 @@ pub(crate) fn observe_internal(error: &dyn Any) {
     enqueue_event(event_json(error));
 }
 
+/// Test-only view of the exact record `Error::internal` would enqueue, so scope
+/// attribution can be asserted without reading the process stderr writer.
+#[cfg(test)]
+pub(crate) fn event_for_test(error: &dyn Any) -> String {
+    event_json(error)
+}
+
 /// A worker's own outer deadline uses only the fixed `timeout` label; no
 /// elapsed value, task text or source error is attached.
 pub(crate) fn observe_timeout() {
