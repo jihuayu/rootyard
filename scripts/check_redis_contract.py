@@ -215,6 +215,10 @@ def parse_libtest(
         raise RunnerError("libtest summary does not match its case lines")
     if require_nonzero and counts["passed"] == 0:
         raise RunnerError("libtest reported zero passing cases")
+    if set(cases) != set(expected_cases):
+        missing = sorted(set(expected_cases) - set(cases))
+        extra = sorted(set(cases) - set(expected_cases))
+        raise RunnerError(f"libtest case set mismatch; missing={missing} extra={extra}")
     if counts["passed"] != expected_passed:
         raise RunnerError(f"expected {expected_passed} passed, observed {counts['passed']}")
     if counts["failed"] != expected_failed:
@@ -225,12 +229,8 @@ def parse_libtest(
         raise RunnerError("libtest summary was not ok despite zero expected failures")
     if expected_failed > 0 and status != "FAILED":
         raise RunnerError("libtest did not report the expected failure")
-    if set(cases) != set(expected_cases):
-        missing = sorted(set(expected_cases) - set(cases))
-        extra = sorted(set(cases) - set(expected_cases))
-        raise RunnerError(f"libtest case set mismatch; missing={missing} extra={extra}")
     failures = sorted(name for name, state in cases.items() if state == "FAILED")
-    if expected_failed and failures != sorted(expected_cases & set(failures)):
+    if expected_failed and set(failures) != set(expected_cases):
         raise RunnerError("unexpected failing case names")
     return {
         "status": status,
@@ -498,12 +498,15 @@ class OwnedRedisFixture:
         """Remove only this process's created container id, even after failure."""
         errors: list[str] = []
         removed = False
+        absent = False
         if self.cid:
             try:
                 result = self._raw_docker(
                     "inspect", "--type", "container", "--format", "{{.Id}}", self.cid, timeout=30)
                 if result.returncode != 0:
-                    if "no such container" not in result.stderr.lower():
+                    if "no such container" in result.stderr.lower():
+                        absent = True
+                    else:
                         errors.append("owned Redis container could not be inspected for cleanup")
                 else:
                     actual = result.stdout.strip()
@@ -533,7 +536,7 @@ class OwnedRedisFixture:
                             self.cid = None
             except RunnerError as error:
                 errors.append(f"owned Redis cleanup failed: {redact(error)}")
-        if not self.cid or removed:
+        if not self.cid or removed or absent:
             if self.directory.exists():
                 shutil.rmtree(self.directory, ignore_errors=True)
             if self.directory.exists():
