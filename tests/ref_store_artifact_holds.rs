@@ -468,10 +468,26 @@ async fn acquire_barrier(pool: &Pool, key: i64) -> Result<Barrier> {
 }
 
 async fn install_request_commit_barrier(pool: &Pool, key: i64) -> Result<()> {
+    // FIXTURE-ONLY FAULT INJECTION. `pg::bound` has already installed the
+    // caller's short 4s deadline as transaction-local timeouts. The BEFORE
+    // trigger below runs on the INSERT statement, before COMMIT, and raises
+    // both GUCs to 30s so the real deferred advisory park below can outlive the
+    // 4s client deadline plus the 10s observer window. That isolates a lost
+    // client COMMIT acknowledgement from a legitimate server timeout/abort.
+    // Neither this trigger nor these GUCs exist in production, and no
+    // production helper or pool timeout is widened.
     pool.get()
         .await?
         .batch_execute(&format!(
-            "CREATE FUNCTION artifact_hold_request_park() RETURNS trigger LANGUAGE plpgsql AS $$
+            "CREATE FUNCTION artifact_hold_request_commit_budget() RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN
+                 PERFORM set_config('statement_timeout','30000',true);
+                 PERFORM set_config('lock_timeout','30000',true);
+                 RETURN NEW;
+               END $$;
+             CREATE TRIGGER artifact_hold_request_commit_budget BEFORE INSERT ON artifact_hold_requests
+               FOR EACH ROW EXECUTE FUNCTION artifact_hold_request_commit_budget();
+             CREATE FUNCTION artifact_hold_request_park() RETURNS trigger LANGUAGE plpgsql AS $$
                BEGIN PERFORM pg_advisory_xact_lock({key}); RETURN NEW; END $$;
              CREATE CONSTRAINT TRIGGER artifact_hold_request_park AFTER INSERT ON artifact_hold_requests
                DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION artifact_hold_request_park();"
@@ -481,10 +497,22 @@ async fn install_request_commit_barrier(pool: &Pool, key: i64) -> Result<()> {
 }
 
 async fn install_consume_commit_barrier(pool: &Pool, key: i64) -> Result<()> {
+    // FIXTURE-ONLY FAULT INJECTION: same 30s server budget as the acquire
+    // barrier. The BEFORE INSERT trigger overrides `pg::bound`'s 4s
+    // transaction-local timeouts before COMMIT, while the real DEFERRED AFTER
+    // trigger still performs the actual advisory park. Production is unchanged.
     pool.get()
         .await?
         .batch_execute(&format!(
-            "CREATE FUNCTION artifact_hold_consume_park() RETURNS trigger LANGUAGE plpgsql AS $$
+            "CREATE FUNCTION artifact_hold_consume_commit_budget() RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN
+                 PERFORM set_config('statement_timeout','30000',true);
+                 PERFORM set_config('lock_timeout','30000',true);
+                 RETURN NEW;
+               END $$;
+             CREATE TRIGGER artifact_hold_consume_commit_budget BEFORE INSERT ON artifact_hold_consume_receipts
+               FOR EACH ROW EXECUTE FUNCTION artifact_hold_consume_commit_budget();
+             CREATE FUNCTION artifact_hold_consume_park() RETURNS trigger LANGUAGE plpgsql AS $$
                BEGIN PERFORM pg_advisory_xact_lock({key}); RETURN NEW; END $$;
              CREATE CONSTRAINT TRIGGER artifact_hold_consume_park AFTER INSERT ON artifact_hold_consume_receipts
                DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION artifact_hold_consume_park();"
@@ -1222,6 +1250,10 @@ async fn consume_vs_cancel_barrier_then_cancelled_parent_blocks_second_grant() -
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
 async fn unknown_acquire_commit_returns_no_grant_and_replay_returns_old_ack() -> Result<()> {
     let (admin, pool, schema, tenant, repo) = setup().await?;
+    // Dedicated max_size=1 writer pool, created before the outer spawn. The
+    // parked COMMIT connection belongs to this pool only; the main observer
+    // pool can never hand out that same blocked client.
+    let writer_pool = typed_pool(&schema, 1, "hold_unknown_acquire")?;
     let outcome = tokio::spawn(async move {
         let endpoint = CountingEndpoint::start().await?;
         let blob = store_for_endpoint(endpoint.endpoint())?;
@@ -1236,7 +1268,7 @@ async fn unknown_acquire_commit_returns_no_grant_and_replay_returns_old_ack() ->
         let barrier = acquire_barrier(&pool, key).await?;
         install_request_commit_barrier(&pool, key).await?;
         let (pid_tx, pid_rx) = oneshot::channel();
-        let acquire_pool = pool.clone();
+        let acquire_pool = writer_pool.clone();
         let acquire_blob = blob.clone();
         let acquire_req = req.clone();
         let acquire_task = tokio::spawn(async move {
@@ -1269,7 +1301,11 @@ async fn unknown_acquire_commit_returns_no_grant_and_replay_returns_old_ack() ->
             AcquireLookup::Unknown,
             "uncommitted row must not be visible before the parked COMMIT lands"
         );
-
+        // Re-check after the client returned Unknown and before releasing the
+        // barrier: the backend must still be COMMIT-parked. This proves the
+        // typed Unknown was a lost client ACK, not a server-side lock timeout
+        // abort. The observer uses the main pool, never the blocked writer.
+        wait_for_commit_parked(&pool, pid).await?;
         barrier.release().await?;
         let landed = poll_acquire_found(&pool, &scope, req.request_id()).await?;
         assert_eq!(landed.request_id, req.request_id());
@@ -1387,6 +1423,11 @@ async fn unknown_consume_commit_returns_no_token_and_receipt_lookup_is_readonly(
                 .await
                 .context("consume pool lease was not returned before provider IO")??,
         );
+        // ProtectedUploader already uses its own max_size=1 upload pool; the
+        // observer still uses the main pool. Re-assert by application_name that
+        // the writer backend is COMMIT-parked after the typed Unknown and before
+        // the barrier release, proving a lost ACK rather than a server abort.
+        wait_for_commit_parked_app(&pool, "hold_unknown_consume").await?;
 
         barrier.release().await?;
         let receipts = poll_consume_found(&pool, &scope, req.request_id(), consume_request_id).await?;
@@ -2680,6 +2721,9 @@ async fn pool_lease_and_consume_ack_are_visible_while_a_provider_write_is_parked
 #[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
 async fn stable_consume_id_recovery_and_corrupt_ledger_fixtures_are_typed() -> Result<()> {
     let (admin, pool, schema, tenant, repo) = setup().await?;
+    // Dedicated max_size=1 writer pool, created before the outer spawn. The
+    // blocked COMMIT lease stays out of the main observer pool.
+    let writer_pool = typed_pool(&schema, 1, "hold_stable_consume")?;
     let outcome = tokio::spawn(async move {
         let endpoint = CountingEndpoint::start().await?;
         let blob = store_for_endpoint(endpoint.endpoint())?;
@@ -2710,7 +2754,7 @@ async fn stable_consume_id_recovery_and_corrupt_ledger_fixtures_are_typed() -> R
         let barrier = acquire_barrier(&pool, key).await?;
         install_consume_commit_barrier(&pool, key).await?;
         let (pid_tx, pid_rx) = oneshot::channel();
-        let consume_pool = pool.clone();
+        let consume_pool = writer_pool.clone();
         let task = tokio::spawn(async move {
             let mut client = consume_pool.get().await?;
             let pid: i32 = client.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
@@ -2744,6 +2788,10 @@ async fn stable_consume_id_recovery_and_corrupt_ledger_fixtures_are_typed() -> R
             ConsumeLookup::Unknown,
             "an uncommitted receipt set is the only legitimate Unknown"
         );
+        // The stable-consume writer backend must still be COMMIT-parked after
+        // the client saw Unknown: a real lost ACK, not a server abort. The
+        // observer is on the main pool, separate from the writer lease.
+        wait_for_commit_parked(&pool, pid).await?;
         barrier.release().await?;
         let receipts = poll_consume_found(&pool, &scope, req.request_id(), stable_id).await?;
         assert_eq!(receipts.len(), 2, "the full acquire batch must be receipted, never a partial batch");
