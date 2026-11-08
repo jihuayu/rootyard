@@ -63,10 +63,10 @@ impl FromStr for RequestDigest {
         if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
             return Err(RefStoreError::InvalidIdentity("request digest must be lowercase sha256 hex".into()));
         }
-        let decoded = hex::decode(value).map_err(|_| RefStoreError::InvalidIdentity("invalid request digest hex".into()))?;
-        let bytes: [u8; 32] = decoded
-            .try_into()
-            .map_err(|_| RefStoreError::InvalidIdentity("invalid request digest length".into()))?;
+        let decoded =
+            hex::decode(value).map_err(|_| RefStoreError::InvalidIdentity("invalid request digest hex".into()))?;
+        let bytes: [u8; 32] =
+            decoded.try_into().map_err(|_| RefStoreError::InvalidIdentity("invalid request digest length".into()))?;
         Ok(Self(bytes))
     }
 }
@@ -81,9 +81,7 @@ impl IssuerLane {
         let value = value.into();
         if value.is_empty()
             || value.len() > MAX_LANE_BYTES
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+            || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
         {
             return Err(RefStoreError::InvalidIdentity(
                 "issuer lane must be 1..=64 ASCII alphanumeric, '.', '_', ':' or '-'".into(),
@@ -422,9 +420,13 @@ pub enum RefStoreError {
     /// operation id or digest.
     CancellationConflict,
     /// A durable cancellation won; no mutation may be recorded under it.
-    Cancelled { operation_id: Uuid },
+    Cancelled {
+        operation_id: Uuid,
+    },
     /// `record_terminal` requires a previously registered operation.
-    UnknownOperation { operation_id: Uuid },
+    UnknownOperation {
+        operation_id: Uuid,
+    },
     /// A terminal operation/result is immutable and cannot be changed.
     TerminalImmutable,
     Unsupported(&'static str),
@@ -448,7 +450,9 @@ impl fmt::Display for RefStoreError {
             Self::RepositoryNotFound => formatter.write_str("ref-store repository not found"),
             Self::DigestConflict => formatter.write_str("operation id was reused with a different request digest"),
             Self::IdentityConflict => formatter.write_str("operation identity fields conflict with a durable record"),
-            Self::CancellationConflict => formatter.write_str("cancellation tombstone conflicts with operation identity"),
+            Self::CancellationConflict => {
+                formatter.write_str("cancellation tombstone conflicts with operation identity")
+            }
             Self::Cancelled { operation_id } => write!(formatter, "operation {operation_id} was cancelled"),
             Self::UnknownOperation { operation_id } => write!(formatter, "operation {operation_id} is not registered"),
             Self::TerminalImmutable => formatter.write_str("terminal operation result is immutable"),
@@ -505,7 +509,7 @@ mod tests {
         assert_ne!(RequestDigest::of("a", &[b"x"]), RequestDigest::of("b", &[b"x"]));
         assert_eq!(one.as_hex().parse::<RequestDigest>().unwrap(), one);
         assert!("00".parse::<RequestDigest>().is_err());
-        assert!("0".repeat(64).to_uppercase().parse::<RequestDigest>().is_err());
+        assert!("a".repeat(64).to_uppercase().parse::<RequestDigest>().is_err());
     }
 
     #[test]
@@ -527,10 +531,14 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(OperationRecord::new(identity.clone(), OperationState::Pending, Some(
-            TerminalResult::json(serde_json::json!({})).unwrap()
-        ))
-        .is_err());
+        assert!(
+            OperationRecord::new(
+                identity.clone(),
+                OperationState::Pending,
+                Some(TerminalResult::json(serde_json::json!({})).unwrap())
+            )
+            .is_err()
+        );
         assert!(OperationRecord::new(identity, OperationState::Cancelled, None).is_err());
     }
 

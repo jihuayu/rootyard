@@ -11,7 +11,10 @@ use crate::{
     db::{Identity, Repository},
     events::{self, OperationRecord, RefEventInput},
     journal::RefChange,
-    ref_store::{IssuerLane, OperationIdentity, OperationState, PgRefStore, RefStoreError, RequestDigest, TerminalOutcome, TerminalResult},
+    ref_store::{
+        IssuerLane, OperationIdentity, OperationState, PgRefStore, RefStoreError, RequestDigest, TerminalOutcome,
+        TerminalResult,
+    },
     storage::ref_publication::PublicationGuard,
 };
 use axum::http::StatusCode;
