@@ -35,3 +35,14 @@ Luna Max closed the shared-manager cancellation leak after the exclusive idle
 pool/owned wake connection change. All-target Clippy with pando-lab,state-redis
 and warnings denied passed on17cfb6f; the subsequent Rust change only moved the
 test proxy notification after backend forwarding and was rebuilt/retested above.
+
+The checked-in CI runner was also executed locally on clean b0eb1a1 with an
+owned official redis:7.2.6-alpine container, immutable image digest
+redis@sha256:311acd7daf1c5ed17a8d275a3e3711be8081dbb89765c3524829b62b91ce1868.
+`docker-redis72-contract.json` binds its fresh library executable, source,
+Cargo.lock, rustc and command. Six cases passed over plaintext, six over
+private-CA TLS, one negative CA case failed as required, and restored trust
+passed. Zero cases were ignored in all four runs, no failure remained, and the
+runner removed only its owned container. Twenty focused runner unit tests also
+passed, including ambiguous-create cleanup and secret redaction. Full GitHub
+Actions results are still required; this is not the complete #111 profile.

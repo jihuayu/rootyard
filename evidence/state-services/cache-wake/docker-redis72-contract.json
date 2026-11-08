@@ -1,0 +1,309 @@
+{
+  "binary_still_matches": true,
+  "build": {
+    "artifact": {
+      "fresh": false,
+      "kind": "lib",
+      "profile": {
+        "debug_assertions": true,
+        "debuginfo": 0,
+        "opt_level": "0",
+        "overflow_checks": true,
+        "test": true
+      },
+      "target": "rootyard"
+    },
+    "binary_sha256": "d88598ddf85c8bb0f139f4dd94f57098718681046bbc1d6cbdc56f05ccfd3cd0",
+    "build_finished": [
+      {
+        "reason": "build-finished",
+        "success": true
+      }
+    ],
+    "cargo_lock_sha256": "25590e5ad6f21f81841a6c7573455709c214bc28c7321e2c8d96c68142db9506",
+    "cargo_returncode": 0,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "test",
+      "--locked",
+      "--lib",
+      "--features",
+      "state-redis",
+      "--no-run",
+      "--message-format=json-render-diagnostics"
+    ],
+    "executable": "/workspace/rootyard/target/debug/deps/rootyard-9e0bdac21d11274f",
+    "fresh": false,
+    "kind": "rust-library-test",
+    "profile_test": true,
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "source_after_build_sha256": "39d1e4eca6a8984ccf4860f146dea9129373da79834d292a371c8afaa397fee3",
+    "source_inputs_sha256": "39d1e4eca6a8984ccf4860f146dea9129373da79834d292a371c8afaa397fee3",
+    "workspace_commit": "b0eb1a176467debc16c353e19fc755a1ee162c08"
+  },
+  "case_counts": {
+    "plain": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 6
+    },
+    "tls": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 6
+    },
+    "trusted-ca-restored": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 1
+    },
+    "untrusted-ca-refused": {
+      "failed": 1,
+      "ignored": 0,
+      "passed": 0
+    }
+  },
+  "failures": [],
+  "fixture": {
+    "default_user_disabled": true,
+    "eviction": "allkeys-lru",
+    "image": "redis:7.2.6-alpine",
+    "image_digest": "redis@sha256:311acd7daf1c5ed17a8d275a3e3711be8081dbb89765c3524829b62b91ce1868",
+    "image_id": "sha256:d64d2edfc93b0ee9dc8b6452c53bbd66017a01b7f7ab60e3bb15408ee1ad34b7",
+    "loopback_only": true,
+    "maxmemory_bytes": 33554432,
+    "owned_container_id": "fe0df8623c0cb0fa88202e203e4ef6fdfed52c200194186f5cdbef1f1ab311e8",
+    "persistence": false,
+    "plain_port": 32768,
+    "provider": "Redis",
+    "scope": "disposable single-host fixture; task ACL user has full commands",
+    "tls_ephemeral_ca": true,
+    "tls_port": 32769,
+    "uid_gid": "1000:1000",
+    "version": "Redis server v=7.2.6 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=9056ca9e780b2502"
+  },
+  "gate": "optional-state-redis-real-contract",
+  "limits": [
+    "one disposable loopback container; no HA, Sentinel, Cluster or physical fault-domain claim",
+    "task ACL user permits CONFIG and destructive test commands; not a production ACL model",
+    "no serving-cache consumer integration; issue 111 remains incomplete"
+  ],
+  "receipt": {
+    "artifact": {
+      "fresh": false,
+      "kind": "lib",
+      "profile": {
+        "debug_assertions": true,
+        "debuginfo": 0,
+        "opt_level": "0",
+        "overflow_checks": true,
+        "test": true
+      },
+      "target": "rootyard"
+    },
+    "binary_sha256": "d88598ddf85c8bb0f139f4dd94f57098718681046bbc1d6cbdc56f05ccfd3cd0",
+    "build_finished": [
+      {
+        "reason": "build-finished",
+        "success": true
+      }
+    ],
+    "cargo_lock_sha256": "25590e5ad6f21f81841a6c7573455709c214bc28c7321e2c8d96c68142db9506",
+    "cargo_returncode": 0,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "test",
+      "--locked",
+      "--lib",
+      "--features",
+      "state-redis",
+      "--no-run",
+      "--message-format=json-render-diagnostics"
+    ],
+    "executable": "/workspace/rootyard/target/debug/deps/rootyard-9e0bdac21d11274f",
+    "fresh": false,
+    "kind": "rust-library-test",
+    "profile_test": true,
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "source_after_build_sha256": "39d1e4eca6a8984ccf4860f146dea9129373da79834d292a371c8afaa397fee3",
+    "source_inputs_sha256": "39d1e4eca6a8984ccf4860f146dea9129373da79834d292a371c8afaa397fee3",
+    "workspace_commit": "b0eb1a176467debc16c353e19fc755a1ee162c08"
+  },
+  "runs": [
+    {
+      "cases": {
+        "cache_wake::redis::cancel_tests::real_redis_cancelled_inflight_connections_are_closed": "ok",
+        "cache_wake::redis::tests::real_redis_bad_acl_credentials_are_rejected_bounded_and_redacted": "ok",
+        "cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read": "ok",
+        "cache_wake::redis::tests::real_redis_flushall_is_authoritative_cache_miss": "ok",
+        "cache_wake::redis::tests::real_redis_noeviction_policy_fails_connect_closed_and_restores": "ok",
+        "cache_wake::redis::tests::real_redis_wake_publishes_only_a_hint": "ok"
+      },
+      "command": [
+        "/workspace/rootyard/target/debug/deps/rootyard-9e0bdac21d11274f",
+        "real_redis_",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "failed": 0,
+      "failed_cases": [],
+      "filtered_out": 282,
+      "ignored": 0,
+      "log_sha256": "5be866d4b2a6dc7f915f2d9b757e290e7f00220e41d7daabdb660a02660c0597",
+      "measured": 0,
+      "name": "plain",
+      "observed_counts": [
+        6,
+        0,
+        0
+      ],
+      "passed": 6,
+      "required_counts": [
+        6,
+        0,
+        0
+      ],
+      "returncode": 0,
+      "seconds": 1.08,
+      "status": "ok"
+    },
+    {
+      "cases": {
+        "cache_wake::redis::cancel_tests::real_redis_cancelled_inflight_connections_are_closed": "ok",
+        "cache_wake::redis::tests::real_redis_bad_acl_credentials_are_rejected_bounded_and_redacted": "ok",
+        "cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read": "ok",
+        "cache_wake::redis::tests::real_redis_flushall_is_authoritative_cache_miss": "ok",
+        "cache_wake::redis::tests::real_redis_noeviction_policy_fails_connect_closed_and_restores": "ok",
+        "cache_wake::redis::tests::real_redis_wake_publishes_only_a_hint": "ok"
+      },
+      "command": [
+        "/workspace/rootyard/target/debug/deps/rootyard-9e0bdac21d11274f",
+        "real_redis_",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "failed": 0,
+      "failed_cases": [],
+      "filtered_out": 282,
+      "ignored": 0,
+      "log_sha256": "d95a337c8b758b3e09dce0944bea930a58372433e3534990e90401afcadee012",
+      "measured": 0,
+      "name": "tls",
+      "observed_counts": [
+        6,
+        0,
+        0
+      ],
+      "passed": 6,
+      "required_counts": [
+        6,
+        0,
+        0
+      ],
+      "returncode": 0,
+      "seconds": 1.12,
+      "status": "ok"
+    },
+    {
+      "cases": {
+        "cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read": "FAILED"
+      },
+      "command": [
+        "/workspace/rootyard/target/debug/deps/rootyard-9e0bdac21d11274f",
+        "--ignored",
+        "--exact",
+        "cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read",
+        "--test-threads=1"
+      ],
+      "failed": 1,
+      "failed_cases": [
+        "cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read"
+      ],
+      "filtered_out": 287,
+      "ignored": 0,
+      "log_sha256": "6da1678c6fdbf5b2e84d7035a8bbc07fcc98b73d2ad2c53e6fa0b88dc0f4711d",
+      "measured": 0,
+      "name": "untrusted-ca-refused",
+      "observed_counts": [
+        0,
+        1,
+        0
+      ],
+      "passed": 0,
+      "required_counts": [
+        0,
+        1,
+        0
+      ],
+      "returncode": 101,
+      "seconds": 0.01,
+      "status": "FAILED"
+    },
+    {
+      "cases": {
+        "cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read": "ok"
+      },
+      "command": [
+        "/workspace/rootyard/target/debug/deps/rootyard-9e0bdac21d11274f",
+        "--ignored",
+        "--exact",
+        "cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read",
+        "--test-threads=1"
+      ],
+      "failed": 0,
+      "failed_cases": [],
+      "filtered_out": 287,
+      "ignored": 0,
+      "log_sha256": "58bf4ec221f7bc98e59f089a358a521a8d02c88f48194485ce668fc92afc4d64",
+      "measured": 0,
+      "name": "trusted-ca-restored",
+      "observed_counts": [
+        1,
+        0,
+        0
+      ],
+      "passed": 1,
+      "required_counts": [
+        1,
+        0,
+        0
+      ],
+      "returncode": 0,
+      "seconds": 0.06,
+      "status": "ok"
+    }
+  ],
+  "source_after_all_sha256": "39d1e4eca6a8984ccf4860f146dea9129373da79834d292a371c8afaa397fee3",
+  "source_inputs_sha256": "39d1e4eca6a8984ccf4860f146dea9129373da79834d292a371c8afaa397fee3",
+  "source_still_matches": true,
+  "status": "passed",
+  "zero_skipped": true
+}
