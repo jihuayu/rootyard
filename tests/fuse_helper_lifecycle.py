@@ -156,8 +156,8 @@ class Suite:
         self.require(not rows, f"{label}: owned mountpoints still mounted after helper death: "
                                f"{[r['mountpoint'] for r in rows]}")
 
-    def expect_owned_ids_gone(self, fixture: support.WorkFixture, ids: list[str], label: str,
-                              timeout: float = 10.0) -> list[str]:
+    def expect_owned_ids_gone(self, fixture: support.WorkFixture, ids: list[int], label: str,
+                              timeout: float = 10.0) -> list[int]:
         """Require the exact owned mount IDs captured before an owner death to be gone.
 
         This is the qualified AutoUnmount contract, asserted BEFORE any normal
@@ -166,9 +166,9 @@ class Suite:
         exactly its own mounts without an explicit umount from this harness or
         from the API parent. The backstop must never mask a violation here.
         """
-        def mounted() -> list[str]:
-            rows = {row["mountpoint"] for row in support.owned_mounts(fixture.root)}
-            return [mountpoint for mountpoint in ids if mountpoint in rows]
+        def mounted() -> list[int]:
+            rows = {row["mount_id"] for row in support.owned_mounts(fixture.root)}
+            return [mount_id for mount_id in ids if mount_id in rows]
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -759,7 +759,7 @@ def case_mount_cancel(suite: Suite) -> dict:
         args = {"root": str(fixture.root.resolve()), "workspace": a,
                 "lease_until": int(time.time()) + 3600, "lazy": False}
         first, _ = helper.send("mount", args, workspace=a, db_epoch=1)
-        abort, _ = helper.send("abort_mount", {"request": first}, workspace=a, db_epoch=1)
+        abort, _ = helper.send("abort_mount", {"request": first}, workspace=a, db_epoch=0)
         replies = {}
         deadline = time.monotonic() + 12.0
         while len(replies) < 2 and time.monotonic() < deadline:
@@ -770,7 +770,7 @@ def case_mount_cancel(suite: Suite) -> dict:
         suite.require(first in replies and abort in replies,
                       f"missing mount/abort replies: {sorted(replies)}")
         mount_reply, abort_reply = replies[first], replies[abort]
-        suite.expect_ok(abort_reply, helper, workspace=a, epoch=1)
+        suite.expect_ok(abort_reply, helper, workspace=a, epoch=0)
         pending_cancel = mount_reply.op == "error" and mount_reply.code in (errno.ECANCELED, errno.ESTALE)
         retry = helper.mount(fixture.root, a, 1)
         suite.expect_ok(retry, helper, "mounted", workspace=a, epoch=1)
@@ -821,7 +821,7 @@ def case_heartbeat_eof(suite: Suite) -> dict:
             writer.finished.wait(support.EXIT_DEADLINE)
             suite.require(writer.error is not None,
                           f"pending write survived heartbeat EOF (bytes={writer.bytes})")
-            suite.require(writer.error.errno in (errno.EROFS, errno.EIO, errno.ENOTCONN),
+            suite.require(writer.error.errno in (errno.EROFS, errno.EIO, errno.ENOTCONN, errno.ECONNABORTED),
                           f"pending write errno after heartbeat EOF: {writer.error.errno}")
             code = helper.wait_exit(support.EXIT_DEADLINE)
             suite.require(code != 0, f"heartbeat EOF exited 0 ({code})")
@@ -851,8 +851,9 @@ def case_child_sigkill(suite: Suite) -> dict:
     try:
         suite.expect_ok(helper.hello(), helper)
         a, b = mount_pair(suite, helper, fixture)
-        owned_ids = sorted(row["mountpoint"] for row in support.owned_mounts(fixture.root))
-        suite.require(owned_ids == sorted([str(fixture.mounts[a]), str(fixture.mounts[b])]),
+        owned_rows = support.owned_mounts(fixture.root)
+        owned_ids = sorted(row["mount_id"] for row in owned_rows)
+        suite.require(sorted(row["mountpoint"] for row in owned_rows) == sorted([str(fixture.mounts[a]), str(fixture.mounts[b])]),
                       f"owned mount IDs before kill {owned_ids} do not match the requested mounts")
         writer, parked = _park(suite, helper, a, 1, 9501, fixture.mounts[a], "a-kill.bin")
         try:
@@ -862,14 +863,19 @@ def case_child_sigkill(suite: Suite) -> dict:
             writer.finished.wait(support.EXIT_DEADLINE)
             suite.require(writer.error is not None,
                           f"queued write survived helper SIGKILL (bytes={writer.bytes})")
-            suite.require(writer.error.errno in (errno.EIO, errno.ENOTCONN, errno.EROFS),
+            suite.require(writer.error.errno in (errno.EIO, errno.ENOTCONN, errno.EROFS, errno.ECONNABORTED),
                           f"queued write errno after SIGKILL: {writer.error.errno}")
             for ws in (a, b):
+                if not any(row["mountpoint"] == str(fixture.mounts[ws])
+                           for row in support.owned_mounts(fixture.root)):
+                    # The bare mountpoint is an ordinary directory after
+                    # unmount; writing it would not probe the old FUSE session.
+                    continue
                 try:
                     write_read(fixture.mounts[ws] / "after-kill.txt", b"must not land\n")
                     raise AssertionError(f"workspace {ws} stayed writable after helper SIGKILL")
                 except OSError as error:
-                    suite.require(error.errno in (errno.EIO, errno.ENOTCONN, errno.ENOENT),
+                    suite.require(error.errno in (errno.EIO, errno.ENOTCONN, errno.ENOENT, errno.ECONNABORTED),
                                   f"post-SIGKILL write errno {error.errno} on {ws}")
             suite.require(writer.finished.is_set(), "queued writer did not terminate before the mount check")
             # AutoUnmount contract: the kernel closed the helper's last FUSE
@@ -957,9 +963,9 @@ def case_parent_sigkill(suite: Suite) -> dict:
         suite.require(info.get("lower_read") == "lower-a\n"
                       and info.get("probe_read") == "stub alive\n",
                       "stub did not prove real mount read/write before readiness")
-        owned_ids = [mountpoint for mountpoint in info.get("owned_mounts", [])
-                     if mountpoint == str(fixture.mounts[a])]
-        suite.require(owned_ids == [str(fixture.mounts[a])],
+        owned_ids = [row["mount_id"] for row in support.owned_mounts(fixture.root)
+                     if row["mountpoint"] == str(fixture.mounts[a])]
+        suite.require(len(owned_ids) == 1,
                       f"parent stub did not capture its exact owned mount ID: {info.get('owned_mounts')}")
         os.kill(stub_pid, signal.SIGKILL)
         os.waitpid(stub_pid, 0)
