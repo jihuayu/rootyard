@@ -35,9 +35,9 @@ use rootyard::ref_store::artifact_hold::{
     AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldPurpose, ArtifactSpec, HoldScope, PgArtifactHoldStore,
 };
 use rootyard::ref_store::core::pack_commit::{
-    ContentDigest, PackArtifactRole, PackClosureContext, PackClosureProof, PackCommitExpectation, PackCommitPlan,
-    PackCommitReceipt, PackCommitScope, PackMembershipEntry, PackPendingToken, PackRegistrationRequest, PackVerifier,
-    PgPackCommit, PlannedArtifact, PlannedPack, RegisteredPack,
+    ContentDigest, PackArtifactRole, PackClosureContext, PackClosureProof, PackCommitError, PackCommitExpectation,
+    PackCommitPlan, PackCommitReceipt, PackCommitScope, PackMembershipEntry, PackPendingToken, PackRegistrationRequest,
+    PackVerifier, PgPackCommit, PlannedArtifact, PlannedPack, RegisteredPack,
 };
 use rootyard::ref_store::core::pack_snapshot::{MaterializedPackRead, PgPackSnapshotMaterializer};
 use rootyard::ref_store::core::{
@@ -688,6 +688,14 @@ impl GitGate {
         std::fs::write(self.dir.path().join("release"), b"go")?;
         Ok(())
     }
+    /// Exact marker path of the gated FIRST real Git invocation. Its absence
+    /// proves no native child was ever executed through this wrapper.
+    fn ready_marker(&self) -> PathBuf {
+        self.dir.path().join("ready")
+    }
+    fn is_ready(&self) -> bool {
+        self.ready_marker().exists()
+    }
 }
 /// Releases the fault gate on ANY exit path (including an early `?`), so a
 /// failing fixture mutation can never leave the gated real Git blocked.
@@ -695,6 +703,24 @@ struct GateRelease<'a>(&'a GitGate);
 impl Drop for GateRelease<'_> {
     fn drop(&mut self) {
         let _ = self.0.release();
+    }
+}
+/// Releases an async fixture hold (for example a pooled observer connection)
+/// on ANY exit path, so a failed assertion cannot leave a future waiting on it.
+struct OneshotRelease(Option<tokio::sync::oneshot::Sender<()>>);
+impl OneshotRelease {
+    fn new(sender: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self(Some(sender))
+    }
+    fn release(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+impl Drop for OneshotRelease {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 /// One materialized read of one exact snapshot reference.
@@ -1182,8 +1208,9 @@ async fn release_and_generation_change_between_t1_and_t2_refuse() -> Result<()> 
     db.finish(outcome).await
 }
 /// An expiry that lands during the native phase (fresh DB clock, not the initial
-/// pin flag) and a realm/group-epoch change both refuse; restoring the epoch
-/// makes the very same sealed snapshot readable again.
+/// pin flag) and a realm/group-epoch change both refuse. The realm change is not
+/// rolled back: the old pin stays refused, and only a fresh snapshot in the
+/// current epoch materializes positively.
 #[tokio::test]
 #[ignore = "requires real PG/S3/Git"]
 async fn expiry_and_realm_change_between_t1_and_t2_refuse() -> Result<()> {
@@ -1196,32 +1223,38 @@ async fn expiry_and_realm_change_between_t1_and_t2_refuse() -> Result<()> {
         let producer = Uuid::new_v4();
         let scope = scope_for(v.repo, v.tenant, producer, &v.gate, MetadataPinPurpose::Verification)?;
         let repo = v.repo;
-        // (1) expire the pin under the DB clock while the native phase is gated.
-        let (request, _, expired_snapshot, expired_pin) = a5_request(scope, &v.gate, 300)?;
+        // (1) A real short lease expires under the DB clock while the native
+        // phase is gated. The pin is NOT mutated and the production trigger is
+        // left enabled: only elapsed time can make this renewal/read invalid.
+        let (request, _, expired_snapshot, expired_pin) = a5_request(scope, &v.gate, 2)?;
         a5_create(&db.pool, &request).await?;
         let gate = GitGate::new(&git)?;
         let materializer = gate.materializer(&store)?;
-        let read = materialize(
-            &materializer,
-            &db.pool,
-            repo,
-            v.tenant,
-            expired_snapshot,
-            expired_pin,
-            1,
-            deadline(),
-        );
+        let read = materialize(&materializer, &db.pool, repo, v.tenant, expired_snapshot, expired_pin, 1, deadline());
         let mutate = async {
             let _gate_guard = GateRelease(&gate);
             gate.wait_ready().await?;
-            db.pool
-                .get()
-                .await?
-                .execute(
-                    "UPDATE ref_store_core_pins SET expires_at = clock_timestamp() - interval '1 second' WHERE pin_id=$1",
+            let client = db.pool.get().await?;
+            let expires: i64 = client
+                .query_one(
+                    "SELECT (extract(epoch FROM expires_at)*1000000)::bigint
+                       FROM ref_store_core_pins WHERE pin_id=$1",
                     &[&expired_pin],
                 )
-                .await?;
+                .await?
+                .get(0);
+            let started = StdInstant::now();
+            loop {
+                let now: i64 = client
+                    .query_one("SELECT (extract(epoch FROM clock_timestamp())*1000000)::bigint", &[])
+                    .await?
+                    .get(0);
+                if now >= expires {
+                    break;
+                }
+                ensure!(started.elapsed() < Duration::from_secs(15), "short pin lease did not expire under DB clock");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
             gate.release()?;
             Ok::<(), anyhow::Error>(())
         };
@@ -1230,15 +1263,17 @@ async fn expiry_and_realm_change_between_t1_and_t2_refuse() -> Result<()> {
         let refusal = expect_refusal(read_result)?;
         ensure!(
             matches!(&refusal, RefStoreError::MetadataPinExpired { pin_id, .. } if *pin_id == expired_pin),
-            "a pin expired during native materialization was not refused as expired: {refusal:?}"
+            "a pin whose actual lease expired during native materialization was not refused as expired: {refusal:?}"
         );
-        // (2) change the realm (group epoch) while the native phase is gated.
+        // (2) Advance the realm (group epoch) while the native phase is gated.
+        // This fixture-only gate change is intentionally NOT rolled back: the
+        // old pin remains stale under the new realm; the existing immutable
+        // pack publications are not re-admitted into a new authority here.
         let (realm_request, _, realm_snapshot, realm_pin) = a5_request(scope, &v.gate, 300)?;
         a5_create(&db.pool, &realm_request).await?;
         let gate = GitGate::new(&git)?;
         let materializer = gate.materializer(&store)?;
-        let read =
-            materialize(&materializer, &db.pool, repo, v.tenant, realm_snapshot, realm_pin, 1, deadline());
+        let read = materialize(&materializer, &db.pool, repo, v.tenant, realm_snapshot, realm_pin, 1, deadline());
         let mutate = async {
             let _gate_guard = GateRelease(&gate);
             gate.wait_ready().await?;
@@ -1260,22 +1295,21 @@ async fn expiry_and_realm_change_between_t1_and_t2_refuse() -> Result<()> {
             matches!(&refusal, RefStoreError::MetadataScopeMismatch(_)),
             "a realm change during native materialization was not refused as a scope mismatch: {refusal:?}"
         );
-        db.pool
-            .get()
-            .await?
-            .execute(
-                "UPDATE ref_store_core_gates SET group_epoch = $1 WHERE repository_id=$2",
-                &[&v.gate.group_epoch(), &repo],
-            )
-            .await?;
-        let restored = gate_version(&db.pool, repo, v.tenant).await?;
-        ensure!(restored.digest() == v.gate.digest(), "realm restore did not restore the gate digest");
-        let restored_view = PgPackSnapshotMaterializer::new(store.clone(), git.clone())?;
-        let view = materialize(&restored_view, &db.pool, repo, v.tenant, realm_snapshot, realm_pin, 1, deadline()).await?;
+        let next_gate = gate_version(&db.pool, repo, v.tenant).await?;
         ensure!(
-            view.complete_git_read_snapshot() && view.gate_revision() == v.gate.revision(),
-            "the same snapshot did not materialize after the realm was restored"
+            next_gate.group_epoch() == v.gate.group_epoch() + 1 && next_gate.revision() == v.gate.revision(),
+            "current gate is not the unchanged revision in the advanced realm"
         );
+        // The old pin remains refused: do not restore the old realm to resume it.
+        let old_again =
+            materialize(&materializer, &db.pool, repo, v.tenant, realm_snapshot, realm_pin, 1, deadline()).await;
+        let old_refusal = expect_refusal(old_again)?;
+        ensure!(
+            matches!(&old_refusal, RefStoreError::MetadataScopeMismatch(_)),
+            "the old-realm pin was unexpectedly usable after the realm advanced: {old_refusal:?}"
+        );
+        // Complete authority handoff/re-admission is outside this suite. The
+        // old epoch is never restored to reactivate a stale pin.
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -1319,7 +1353,10 @@ async fn both_pool_wait_deadlines_are_bounded() -> Result<()> {
         );
         ensure!(started.elapsed() < Duration::from_secs(5), "the T1 pool wait was not bounded");
         drop(held);
-        // (2) T2 pool wait: the only connection is taken during the native phase.
+        // (2) T2 pool wait: the only connection is held during the native phase.
+        // The read future's completion is measured INDEPENDENTLY of the gated
+        // observer: the mutation future must not finish (and therefore must not
+        // release the only connection) before the read reports `Timeout`.
         let gate = GitGate::new(&git)?;
         let gated = gate.materializer(&store)?;
         let read = materialize(
@@ -1332,6 +1369,10 @@ async fn both_pool_wait_deadlines_are_bounded() -> Result<()> {
             1,
             TokioInstant::now() + Duration::from_secs(5),
         );
+        tokio::pin!(read);
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut observer_release = OneshotRelease::new(release_tx);
         let mutate = async {
             let _gate_guard = GateRelease(&gate);
             gate.wait_ready().await?;
@@ -1339,12 +1380,36 @@ async fn both_pool_wait_deadlines_are_bounded() -> Result<()> {
             // the native phase runs, and then block the T2 acquisition.
             let observer = pool.get().await?;
             gate.release()?;
-            tokio::time::sleep(Duration::from_secs(7)).await;
+            let _ = held_tx.send(());
+            let _ = release_rx.await;
             drop(observer);
             Ok::<(), anyhow::Error>(())
         };
-        let (read_result, mutation) = tokio::join!(read, mutate);
-        mutation?;
+        tokio::pin!(mutate);
+        tokio::select! {
+            _ = &mut mutate => return Err(anyhow!("the T2 observer fixture finished before the read")),
+            result = &mut read => return Err(match result {
+                Ok(_) => anyhow!("the read completed before the observer held the only connection"),
+                Err(error) => anyhow!("the read failed before the observer held the only connection: {error:?}"),
+            }),
+            _ = held_rx => {},
+            _ = tokio::time::sleep(Duration::from_secs(6)) => {
+                return Err(anyhow!("the T2 observer fixture never acquired the only connection"));
+            }
+        }
+        let observer_held_at = StdInstant::now();
+        let read_result = tokio::select! {
+            result = &mut read => result,
+            _ = &mut mutate => return Err(anyhow!("the observer was released before the read completed")),
+            _ = tokio::time::sleep(Duration::from_secs(6)) => {
+                return Err(anyhow!("the T2 pool wait was not bounded while the observer still held the connection"));
+            }
+        };
+        // The read completed while the mutation future was still waiting on its
+        // separate release channel, i.e. before we release the held observer.
+        observer_release.release();
+        mutate.await?;
+        ensure!(observer_held_at.elapsed() < Duration::from_secs(6), "the T2 pool wait exceeded its independent bound");
         ensure!(
             matches!(read_result, Err(RefStoreError::Timeout)),
             "a blocked T2 pool acquisition was not refused as Timeout"
@@ -1429,8 +1494,13 @@ async fn two_idle_views_do_not_starve_a4_and_drop_reclaims_the_budget() -> Resul
         );
         // A4 verification must not be starved by two idle views.
         let a4 = verify_new(&db, &store, &git, GitObjectFormat::Sha1).await?;
+        // Bootstrap created revision 1; the real verified first-pack commit is
+        // revision 2. Assert the ACTUAL post-commit gate, not the pre-commit one.
         ensure!(
-            a4.gate.revision() == 1 && a4.new_packs.len() == 1,
+            a4.gate.revision() == 2
+                && a4.gate.object_format() == GitObjectFormat::Sha1
+                && a4.commit_oid.len() == 40
+                && a4.new_packs.len() == 1,
             "a real A4 verified commit did not complete beside two retained views"
         );
         // The separate materialized-view budget is exactly two.
@@ -1461,10 +1531,11 @@ async fn two_idle_views_do_not_starve_a4_and_drop_reclaims_the_budget() -> Resul
     .await;
     db.finish(outcome).await
 }
-/// The issue139 shape on real Git: 128 legal 52-byte ref names with 16 nested
-/// segments each. The shared engine must write one sorted packed-refs file in the
-/// owned view, re-read exactly these refs/HEAD and fsck the closure, so the public
-/// view carries the exact 128-ref closure instead of a directory explosion.
+/// The issue139 shape on real Git: 127 legal 52-byte ref names with 16 nested
+/// segments below `refs/heads/`, plus the real `refs/heads/main` HEAD ref. The
+/// shared engine must write one sorted packed-refs file in the owned view,
+/// re-read exactly these refs/HEAD and fsck the closure, so the public view
+/// carries the exact 128-ref closure instead of a directory explosion.
 #[tokio::test]
 #[ignore = "requires real PG/S3/Git"]
 async fn deep_nested_refs_issue139_packed_native_closure() -> Result<()> {
@@ -1478,14 +1549,16 @@ async fn deep_nested_refs_issue139_packed_native_closure() -> Result<()> {
         let gate = db.gate(repo, tenant, format).await?;
         let fixture = GitRepo::new(git.clone(), format).await?;
         let commit_oid = fixture.build_commit("deep.txt", b"deep ref fixture\n", "deep fixture").await?;
+        // All 128 fixture refs exist locally so the one real pack artifact
+        // contains the complete closure this case reads.
         let mut expected: Vec<(String, String)> = Vec::with_capacity(128);
-        let mut updates = Vec::with_capacity(128);
+        let mut deep_updates: Vec<RefUpdate> = Vec::with_capacity(127);
         for index in 0..127usize {
             let name = deep_ref_name(index);
             ensure!(name.len() == 52 && name.split('/').count() == 18, "deep ref name shape differs");
             ensure!(name.as_str() != "refs/heads/main", "a deep ref name collided with HEAD branch");
             fixture.update_ref(&name, &commit_oid).await?;
-            updates.push(RefUpdate::new(
+            deep_updates.push(RefUpdate::new(
                 RefName::new(&name)?,
                 RefPrecondition::Absent,
                 RefTarget::Oid(GitOid::parse(format, &commit_oid)?),
@@ -1495,20 +1568,18 @@ async fn deep_nested_refs_issue139_packed_native_closure() -> Result<()> {
         // The 128th ref is the real HEAD branch at the same actual commit, so the
         // materialized HEAD stays on refs/heads/main while 127 names are deep.
         fixture.update_ref("refs/heads/main", &commit_oid).await?;
-        updates.push(RefUpdate::new(
-            RefName::branch("refs/heads/main")?,
-            RefPrecondition::Absent,
-            RefTarget::Oid(GitOid::parse(format, &commit_oid)?),
-        ));
         expected.push(("refs/heads/main".to_owned(), commit_oid.clone()));
-        ensure!(updates.len() == 128 && expected.len() == 128, "fixture refs differ");
-        ensure!(
-            expected.iter().filter(|(name, _)| name.split('/').count() == 18).count() == 127,
-            "deep ref count differs"
-        );
+        ensure!(deep_updates.len() == 127 && expected.len() == 128, "fixture refs differ");
         expected.sort();
         let files = fixture.pack_all("deep").await?;
-        let verified = commit_first_pack(
+
+        // FIRST commit: only the real HEAD ref plus the one actual registered pack.
+        // `ensure_pack_terminal_budget` pads every planned name to 1024 bytes, so a
+        // single 128-ref plan would exceed the 64 KiB terminal bound. The actual
+        // contract is preserved by chunking the deep ref publication instead of
+        // shortening names, skipping refs or raising the production bound.
+        let main_ref = vec![main_update(format, None, &commit_oid)?];
+        let mut verified = commit_first_pack(
             &db,
             &store,
             tenant,
@@ -1516,12 +1587,46 @@ async fn deep_nested_refs_issue139_packed_native_closure() -> Result<()> {
             gate,
             format,
             &git,
-            updates,
+            main_ref,
             &files,
             commit_oid.clone(),
             fixture,
         )
         .await?;
+        ensure!(verified.new_packs.len() == 1, "first commit did not register exactly one pack");
+
+        // Publish the 127 deep refs through four ACTUAL typed A4 ref-only plans
+        // (<=32 names each), each with zero new packs, one old pack, a real
+        // PackVerifier proof over the already-registered pair, and a real commit.
+        // All OIDs are the same actual commit already present in that first pack.
+        let deep_count = deep_updates.len();
+        let mut chunk_index = 0usize;
+        while !deep_updates.is_empty() {
+            let take = deep_updates.len().min(32);
+            let chunk: Vec<RefUpdate> = deep_updates.drain(0..take).collect();
+            ensure!(!chunk.is_empty() && chunk.len() <= 32, "deep ref chunk is not bounded");
+            let sequence = 2 + i64::try_from(chunk_index)?;
+            let draft = draft(&db, repo, tenant, sequence, &verified.gate, chunk, &[]).await?;
+            ensure!(draft.plan.packs().is_empty(), "ref-only plan unexpectedly planned a new pack");
+            let context = closure(&db, &draft.plan).await?;
+            ensure!(
+                context.old_packs().len() == 1 && context.new_packs().is_empty(),
+                "ref-only closure is not exactly one old/zero new packs"
+            );
+            assert_pack_identity(&verified.new_packs[0], &context.old_packs()[0])?;
+            let proof = prove(&store, &git, &draft.plan, &context).await?;
+            let receipt = commit(&db, &draft.plan, &draft.token, &proof).await?;
+            ensure!(receipt.is_committed() && !receipt.replayed, "a deep-ref ref-only commit did not commit");
+            let next = gate_version(&db.pool, repo, tenant).await?;
+            ensure!(
+                next.revision() == receipt.terminal.revision && next.revision() == verified.gate.revision() + 1,
+                "deep-ref gate revision did not advance by exactly one real commit"
+            );
+            verified.gate = next;
+            chunk_index += 1;
+        }
+        ensure!(chunk_index == 4 && deep_count == 127, "deep refs were not published in four bounded chunks");
+
         let producer = Uuid::new_v4();
         let scope = scope_for(repo, tenant, producer, &verified.gate, MetadataPinPurpose::Verification)?;
         let (request, _, snapshot_id, pin_id) = a5_request(scope, &verified.gate, 300)?;
@@ -1534,7 +1639,13 @@ async fn deep_nested_refs_issue139_packed_native_closure() -> Result<()> {
             view.head_ref() == "refs/heads/main" && view.head_oid_hex() == Some(commit_oid.as_str()),
             "deep-ref HEAD differs"
         );
-        ensure!(view.packs().len() == 1 && view.verified_pairs() == 1, "deep-ref closure pack counts differ");
+        // The four ref-only commits added no pack: the original actual registered
+        // pack is still the complete pack membership and was re-verified natively.
+        ensure!(
+            view.packs().len() == 1 && view.pack_count() == 1 && view.verified_pairs() == 1,
+            "deep-ref closure pack counts differ"
+        );
+        assert_pack_identity(&verified.new_packs[0], &view.packs()[0])?;
         let actual = view
             .refs()
             .iter()
@@ -1565,4 +1676,193 @@ fn deep_ref_name(index: usize) -> String {
     segments.insert(0, "refs".to_owned());
     segments.insert(1, "heads".to_owned());
     segments.join("/")
+}
+
+/// Two actual A5b materializations hold the ONE process-wide native semaphore of
+/// two while their real Git children are gated. A third A4 verification must then
+/// wait for admission, refuse at its short deadline, and never execute a native
+/// child through its own gate. This distinguishes the shared global bound from a
+/// second A4/A5b pool or from a Git work timeout after admission.
+#[tokio::test]
+#[ignore = "requires real PG/S3/Git"]
+async fn third_a4_native_child_is_not_admitted_while_two_views_hold_global_slots() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let db = Db::setup().await?;
+    let store = open_store()?;
+    let git = git_binary()?;
+    let outcome = async {
+        let v = verify_new(&db, &store, &git, GitObjectFormat::Sha1).await?;
+        let producer = Uuid::new_v4();
+        let scope = scope_for(v.repo, v.tenant, producer, &v.gate, MetadataPinPurpose::Verification)?;
+        let (request, _, snapshot_id, pin_id) = a5_request(scope, &v.gate, 300)?;
+        a5_create(&db.pool, &request).await?;
+
+        // Valid typed A4 ref-only pending plan/context on the CURRENT revision and
+        // the one already-registered pack. A same-OID main CAS is a real valid
+        // update and needs NO new S3 upload; the old pack is re-verified natively.
+        let refs = vec![main_update(v.gate.object_format(), Some(&v.commit_oid), &v.commit_oid)?];
+        let draft = draft(&db, v.repo, v.tenant, 2, &v.gate, refs, &[]).await?;
+        ensure!(draft.plan.packs().is_empty(), "A4 admission fixture planned an unexpected new pack");
+        let context = closure(&db, &draft.plan).await?;
+        ensure!(
+            context.old_packs().len() == 1 && context.new_packs().is_empty(),
+            "A4 admission fixture closure is not one old/zero new packs"
+        );
+
+        let first_gate = GitGate::new(&git)?;
+        let second_gate = GitGate::new(&git)?;
+        let third_gate = GitGate::new(&git)?;
+        let first_materializer = first_gate.materializer(&store)?;
+        let second_materializer = second_gate.materializer(&store)?;
+        let first = materialize(&first_materializer, &db.pool, v.repo, v.tenant, snapshot_id, pin_id, 1, deadline());
+        let second = materialize(&second_materializer, &db.pool, v.repo, v.tenant, snapshot_id, pin_id, 1, deadline());
+        let control = async {
+            // All three wrappers release on every exit path. The first two gates
+            // are explicitly released after the A4 attempt; the third is never
+            // expected to have run at all.
+            let _first_release = GateRelease(&first_gate);
+            let _second_release = GateRelease(&second_gate);
+            let _third_release = GateRelease(&third_gate);
+            first_gate.wait_ready().await?;
+            second_gate.wait_ready().await?;
+            let verifier = PackVerifier::new(store.clone(), third_gate.binary())?;
+            let outcome = verifier.verify(&draft.plan, &context, StdInstant::now() + Duration::from_millis(400)).await;
+            // The absence of this marker is the proof that the error was admission
+            // backpressure, NOT a started Git child that merely hit its timeout.
+            ensure!(!third_gate.is_ready(), "A4 executed a native Git child outside the shared global admission");
+            match outcome {
+                Err(PackCommitError::ProofUnavailable(_)) => {}
+                other => return Err(anyhow!("A4 was expected to refuse without admission, got {other:?}")),
+            }
+            first_gate.release()?;
+            second_gate.release()?;
+            Ok::<(), anyhow::Error>(())
+        };
+        let (first_result, second_result, control_result) = tokio::join!(first, second, control);
+        control_result?;
+        let first_view = first_result?;
+        let second_view = second_result?;
+        ensure!(
+            first_view.complete_git_read_snapshot() && second_view.complete_git_read_snapshot(),
+            "the two originally admitted materializations did not both complete"
+        );
+        ensure!(
+            first_view.verified_pairs() == 1 && second_view.verified_pairs() == 1,
+            "the two admitted materializations did not verify the registered pack"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
+}
+
+/// End-of-T2 expiry against a REAL slow ledger read: the reader's exact backend
+/// is blocked on `ref_store_core_pack_publications` by another transaction after
+/// T1/native completed. The pin lease expires while that lock is held, so only a
+/// fresh DB-clock expiry check AFTER the ledger reads can refuse the view. A
+/// pre-ledger-only expiry check would return a public value here.
+#[tokio::test]
+#[ignore = "requires real PG/S3/Git"]
+async fn end_of_t2_expiry_after_blocked_pack_publication_ledger_read() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let db = Db::setup().await?;
+    let store = open_store()?;
+    let git = git_binary()?;
+    let outcome = async {
+        let v = verify_new(&db, &store, &git, GitObjectFormat::Sha1).await?;
+        let producer = Uuid::new_v4();
+        let scope = scope_for(v.repo, v.tenant, producer, &v.gate, MetadataPinPurpose::Verification)?;
+        // ~10 second lease: long enough for the native phase and the observer
+        // lock, short enough to expire deterministically inside one 30 s budget.
+        let (request, _, snapshot_id, pin_id) = a5_request(scope, &v.gate, 10)?;
+        a5_create(&db.pool, &request).await?;
+
+        let reader_pool = db.new_pool(1)?;
+        // Record the exact reader backend before the call and release the borrow;
+        // the max-1 pool reuses that same backend for T1 and T2.
+        let reader_pid: i32 = {
+            let client = reader_pool.get().await?;
+            let pid = client.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            drop(client);
+            pid
+        };
+        let observer_pool = db.new_pool(2)?;
+        let gate = GitGate::new(&git)?;
+        let materializer = gate.materializer(&store)?;
+        let read = materialize(&materializer, &reader_pool, v.repo, v.tenant, snapshot_id, pin_id, 1, deadline());
+        let control = async {
+            let _gate_guard = GateRelease(&gate);
+            gate.wait_ready().await?;
+            let mut observer = observer_pool.get().await?;
+            // Separate PG transaction (different pool/backend) holds an ACCESS
+            // EXCLUSIVE relation lock on the publication ledger. RAII/SDK rollback
+            // releases it on every non-success exit; no global pg cancel is used.
+            let tx = observer.transaction().await?;
+            tx.execute("LOCK TABLE ref_store_core_pack_publications IN ACCESS EXCLUSIVE MODE", &[]).await?;
+            gate.release()?;
+            let table = format!("{}.ref_store_core_pack_publications", db.schema);
+            let waited = StdInstant::now();
+            loop {
+                let blocked: bool = tx
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM pg_locks
+                           WHERE pid=$1 AND relation=to_regclass($2)
+                             AND mode='AccessShareLock' AND NOT granted)",
+                        &[&reader_pid, &table],
+                    )
+                    .await?
+                    .get(0);
+                if blocked {
+                    break;
+                }
+                ensure!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "T2 never waited on the exact blocked publication ledger relation"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let before_expiry: bool = tx
+                .query_one(
+                    "SELECT clock_timestamp() < expires_at FROM ref_store_core_pins
+                       WHERE pin_id=$1 AND repository_id=$2",
+                    &[&pin_id, &v.repo],
+                )
+                .await?
+                .get(0);
+            ensure!(before_expiry, "the pin had already expired before the T2 ledger wait");
+            let expires: i64 = tx
+                .query_one(
+                    "SELECT (extract(epoch FROM expires_at)*1000000)::bigint FROM ref_store_core_pins
+                       WHERE pin_id=$1 AND repository_id=$2",
+                    &[&pin_id, &v.repo],
+                )
+                .await?
+                .get(0);
+            let polled = StdInstant::now();
+            loop {
+                let now: i64 =
+                    tx.query_one("SELECT (extract(epoch FROM clock_timestamp())*1000000)::bigint", &[]).await?.get(0);
+                if now >= expires {
+                    break;
+                }
+                ensure!(
+                    polled.elapsed() < Duration::from_secs(20),
+                    "the DB clock did not pass the pin lease while the ledger lock was held"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tx.rollback().await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        let (read_result, control_result) = tokio::join!(read, control);
+        control_result?;
+        let refusal = expect_refusal(read_result)?;
+        ensure!(
+            matches!(&refusal, RefStoreError::MetadataPinExpired { pin_id: refused, .. } if *refused == pin_id),
+            "expiry after the blocked T2 ledger read was not refused as MetadataPinExpired: {refusal:?}"
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    db.finish(outcome).await
 }

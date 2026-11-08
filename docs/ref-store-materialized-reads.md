@@ -6,17 +6,17 @@ Callers first obtain an atomic registered-membership snapshot and durable pin th
 
 ## Read ordering
 
-The entire operation uses one effective monotonic deadline: the earlier of the caller deadline and entry plus30seconds. Both pool waits, SQL stages and transaction cleanup, Blob reads, independent SHA/length checks and native verification use that same budget.
+The entire operation uses one effective monotonic deadline: the earlier of the caller deadline and entry plus 30 seconds. Both pool waits, SQL stages and transaction cleanup, Blob reads, independent SHA/length checks and native verification use that same budget.
 
 1. T1 validates the complete captured metadata and live pin in a bounded short transaction. It requires successful bounded cleanup and releases every PostgreSQL client before Blob/native work.
-2. The private common engine verifies the live Blob backend and every exact registered locator, SHA256 and length, then runs native Git pair/index, exact refs/HEAD, branch-type and connectivity checks for SHA1 or SHA256. It writes validated sorted packed-refs rather than a loose user-shaped directory tree (#139). The private native result carries the full T1 scope, pin/generation/expiry, snapshot and artifact binding digest.
+2. The private common engine verifies the live Blob backend and every exact registered locator, SHA-256 and length, then runs native Git pair/index, exact refs/HEAD, branch-type and connectivity checks for SHA-1 or SHA-256. It writes validated sorted packed-refs rather than a loose user-shaped directory tree (#139). The private native result carries the full T1 scope, pin/generation/expiry, snapshot and artifact binding digest.
 3. T2 reacquires PostgreSQL under the same deadline, revalidates immutable metadata/registration ledgers and full binding, then checks generation/scope and a fresh database clock after all slow ledger reads. It constructs the sealed result while the pin lock remains held and returns only after successful bounded cleanup. That locked final check is the read linearization point. A mutation ordered later can finish before the caller receives its already-linearized local copy.
 
 An older pinned revision may remain readable after a newer commit in the same current realm. Release, expiry, generation change, deletion or a realm/epoch transition before the final check refuses the result. The returned copied data is disposable; it creates no new durable lease or authority.
 
 ## Resource ownership
 
-A4 and materialization share one process-wide native verification admission bound of2. A separate process-wide materialized-view budget of2 is acquired first and remains owned through each returned view lifetime. Native admission returns after every child is confirmed quiescent, so retained idle read views do not occupy A4 native capacity. Each workspace is conservatively checked against a160MiB aggregate logical bound around mutating native operations.
+A4 and materialization share one process-wide native verification admission bound of 2. A separate process-wide materialized-view budget of 2 is acquired first and remains owned through each returned view lifetime. Native admission returns after every child is confirmed quiescent, so retained idle read views do not occupy A4 native capacity. Each workspace is conservatively checked against a 160 MiB aggregate logical bound around mutating native operations.
 
 The actual Blob transfer, independent read-back and local artifact-read tasks retain workspace ownership even if their waiter times out or is cancelled. Blob task-entry ownership shares its reader/staging lease and opaque workspace keepalive with staging cleanup; only confirmed unlink success or absence permits normal release. Runtime abort/panic or unknown cleanup outcomes conservatively quarantine resources until process exit. These bounds are process-local; there is no new restart-durable cleanup or hard return-time promise for kernel-blocked filesystem/process cleanup.
 
