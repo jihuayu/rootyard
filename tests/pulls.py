@@ -18,6 +18,39 @@ from schema_baseline import SCHEMA_VERSION_CSV, SCHEMA_VERSIONS  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# `forge_check_runs` contract fields returned by the checks API (`CHECK_FIELDS`
+# in `src/pulls/models.rs`). Rows this harness writes must not move at all.
+CHECK_ROW_FIELDS = (
+    "repository_id",
+    "commit_oid",
+    "context",
+    "attempt",
+    "sequence",
+    "status",
+    "conclusion",
+    "output",
+    "created_at",
+    "updated_at",
+)
+# Only the always-on pull synchronizer writes `ci/default`
+# (`src/webhooks/delivery.rs`); `ci/test` and `ci/lint` are harness-written here.
+AUTOMATIC_CHECK_CONTEXT = "ci/default"
+MANUAL_CHECK_CONTEXTS = frozenset({"ci/lint", "ci/test"})
+AUTOMATIC_CHECK_OUTPUT = "queued by pull request synchronization"
+AUTOMATIC_CONFIG_SHA256 = hashlib.sha256(
+    b"rootyard-ci-config-v1\0ci/default"
+).hexdigest()
+CHECK_STATUSES = frozenset({"queued", "in_progress", "completed"})
+CHECK_CONCLUSIONS = frozenset(
+    {"success", "failure", "neutral", "cancelled", "timed_out", "skipped"}
+)
+CHECK_STATUS_TRANSITIONS = {
+    "queued": frozenset({"queued", "in_progress", "completed"}),
+    "in_progress": frozenset({"in_progress", "completed"}),
+    "completed": frozenset({"completed"}),
+}
+CHECK_DIAGNOSTIC_LIMIT = 8
+
 
 def migration_009_path() -> Path:
     promoted = ROOT / "migrations/009_forge_pulls.sql"
@@ -116,6 +149,180 @@ class PullsHarness(ForgeHarness):
                 assert item["conclusion"] is None, item
                 assert item["output"] == "queued by pull request synchronization", item
         return contexts
+
+    def split_check_rows(self, document: dict) -> tuple:
+        """Partition one `/checks` payload into manual and automatic rows.
+
+        Returns `(manual, automatic)`: `manual` maps context to the full API row
+        for the contexts this harness writes itself, and `automatic` is the
+        scheduler-owned `ci/default` row or `None`. Duplicate or unknown
+        contexts fail, and every item must be accounted for exactly once, so a
+        restart comparison cannot silently drop a row.
+        """
+        manual, automatic = {}, None
+        for item in document["items"]:
+            context = item["context"]
+            if context == AUTOMATIC_CHECK_CONTEXT:
+                assert automatic is None, self.redact(item)
+                automatic = item
+                continue
+            assert context in MANUAL_CHECK_CONTEXTS, self.redact(item)
+            assert context not in manual, self.redact(item)
+            manual[context] = item
+        assert len(document["items"]) == len(manual) + (automatic is not None), (
+            self.redact(document["items"])
+        )
+        return manual, automatic
+
+    def check_row_diff(self, manual_before: dict, manual_after: dict) -> str:
+        """Render a bounded, redacted per-field diff of two check-row maps."""
+        lines = []
+        for context in sorted(set(manual_before) | set(manual_after)):
+            left, right = manual_before.get(context), manual_after.get(context)
+            if left == right:
+                continue
+            if left is None or right is None:
+                label = "added" if left is None else "removed"
+                lines.append(f"{context}: {label} {right or left}")
+                continue
+            for field in CHECK_ROW_FIELDS:
+                if left.get(field) != right.get(field):
+                    lines.append(
+                        f"{context}.{field}: {left.get(field)!r} -> {right.get(field)!r}"
+                    )
+        if not lines:
+            lines.append("no field differences")
+        return self.redact(
+            "check rows changed across restart (bounded to "
+            f"{CHECK_DIAGNOSTIC_LIMIT} entries): " + "; ".join(
+                lines[:CHECK_DIAGNOSTIC_LIMIT]
+            )
+        )
+
+    def automatic_check_binding(self, head_oid: str, repository_id: str) -> dict:
+        """Read the scheduler's own job rows for one commit's `ci/default` row.
+
+        `src/webhooks/delivery.rs` writes the queued placeholder, the `ci_runs`
+        job and the `ci_pull_sync_progress` marker together for
+        `(pull, version, head, base)`. Those rows are the provenance that proves
+        a tolerated `ci/default` change belongs to the automatic pull
+        synchronizer, and `config_sha256` is its deterministic per-context CI
+        config digest, so an unrelated or hand-written row cannot masquerade.
+        """
+        runs = self.sql(
+            "SELECT count(*)::text || ':' || count(*) FILTER (WHERE config_sha256 = "
+            f"'{AUTOMATIC_CONFIG_SHA256}')::text || ':' || count(DISTINCT job_id)::text "
+            f"FROM ci_runs WHERE repository_id='{repository_id}' "
+            f"AND context='{AUTOMATIC_CHECK_CONTEXT}' AND head_oid='{head_oid}'"
+        ).split(":")
+        progress = self.sql(
+            "SELECT count(*) FROM ci_pull_sync_progress "
+            f"WHERE repository_id='{repository_id}' AND head_oid='{head_oid}'"
+        )
+        return dict(
+            runs=int(runs[0]),
+            expected_config=int(runs[1]),
+            jobs=int(runs[2]),
+            progress=int(progress),
+        )
+
+    def assert_automatic_check_advance(self, before: dict, after: dict) -> None:
+        """Bound the one legitimate restart change: the `ci/default` row.
+
+        Identity and head binding are immutable: same repository, same commit
+        (the pull's head), same context. `(attempt, sequence)` may only move
+        forward, exactly as `upsert_callback_check_run` in
+        `src/webhooks/signing.rs` enforces, and the row stays inside the API's
+        finite status/conclusion vocabulary. A row whose `(attempt, sequence)`
+        did not move must be byte-identical, so an unchanged scheduler row
+        cannot be rewritten underneath the restart.
+        """
+        diff = self.check_row_diff(
+            {AUTOMATIC_CHECK_CONTEXT: before}, {AUTOMATIC_CHECK_CONTEXT: after}
+        )
+        for field in ("repository_id", "commit_oid", "context"):
+            assert after[field] == before[field], diff
+        assert after["context"] == AUTOMATIC_CHECK_CONTEXT, diff
+        assert after["attempt"] >= 1 and after["sequence"] >= 1, diff
+        assert (after["attempt"], after["sequence"]) >= (
+            before["attempt"],
+            before["sequence"],
+        ), diff
+        if after["attempt"] == before["attempt"]:
+            assert after["sequence"] >= before["sequence"], diff
+        if (after["attempt"], after["sequence"]) == (
+            before["attempt"],
+            before["sequence"],
+        ):
+            assert after == before, diff
+        assert before["status"] in CHECK_STATUS_TRANSITIONS, diff
+        assert after["status"] in CHECK_STATUSES, diff
+        assert after["status"] in CHECK_STATUS_TRANSITIONS[before["status"]], diff
+        if before["status"] == "completed":
+            assert before["conclusion"] in CHECK_CONCLUSIONS, diff
+        if after["status"] == "completed":
+            assert after["conclusion"] in CHECK_CONCLUSIONS, diff
+        else:
+            assert after["conclusion"] is None, diff
+        if after["status"] == "queued":
+            # Only the synchronizer's initial placeholder is queued, and
+            # `delivery.rs` inserts it with exactly these values.
+            assert after["attempt"] == 1 and after["sequence"] == 1, diff
+            assert after["output"] == AUTOMATIC_CHECK_OUTPUT, diff
+
+    def assert_checks_survive_restart(self, before: dict, after: dict) -> tuple:
+        """Assert the pull checklist survives a hard restart with its contract.
+
+        Every `ci/test`/`ci/lint` row this harness wrote must be byte-identical,
+        including `created_at`/`updated_at`, and must not appear or disappear.
+
+        The only tolerated change is the scheduler-owned `ci/default` row, which
+        the always-on pull synchronizer may create for the pull's head while the
+        process is down or restarting (a queued placeholder is inserted with
+        `ON CONFLICT DO NOTHING`, so it can also arrive late for a commit other
+        open pulls share). That latitude stops at the API's real contract: the
+        row keeps its repository/commit/context identity, `(attempt, sequence)`
+        only move forward, status follows the documented queued -> in_progress
+        -> completed ladder, and the row must be backed by an actual `ci_runs`
+        job plus a `ci_pull_sync_progress` marker for the same head.
+        """
+        assert after["pull_number"] == before["pull_number"], (
+            before["pull_number"],
+            after["pull_number"],
+        )
+        assert after["head_oid"] == before["head_oid"], (
+            before["head_oid"],
+            after["head_oid"],
+        )
+        assert after["next_after"] == before["next_after"], (
+            before["next_after"],
+            after["next_after"],
+        )
+        manual_before, automatic_before = self.split_check_rows(before)
+        manual_after, automatic_after = self.split_check_rows(after)
+        diff = self.check_row_diff(manual_before, manual_after)
+        assert set(manual_after) == set(manual_before), diff
+        assert set(manual_before) == set(MANUAL_CHECK_CONTEXTS), diff
+        for context in sorted(manual_before):
+            assert manual_after[context] == manual_before[context], diff
+        if automatic_before is not None:
+            # No write path deletes a check row, so a present automatic row
+            # may advance but must never vanish across the restart.
+            assert automatic_after is not None, self.check_row_diff(
+                {AUTOMATIC_CHECK_CONTEXT: automatic_before}, {}
+            )
+            self.assert_automatic_check_advance(automatic_before, automatic_after)
+        if automatic_before is not None or automatic_after is not None:
+            binding = self.automatic_check_binding(
+                before["head_oid"], before["items"][0]["repository_id"]
+            )
+            assert binding["runs"] >= 1, binding
+            # At least one job row carries the deterministic per-context
+            # config digest of the pull synchronizer (`delivery.rs`).
+            assert binding["expected_config"] >= 1, binding
+            assert binding["jobs"] >= 1, binding
+            assert binding["progress"] >= 1, binding
+        return manual_after, automatic_after or automatic_before
 
     def merge_version(self) -> int:
         """Fence a mutation with the version the API currently reports."""
@@ -1286,7 +1493,11 @@ class PullsHarness(ForgeHarness):
         self.start()
         assert self.document(self.pr1_path) == pr1
         assert self.document(self.pr1_path + "/reviews") == reviews
-        assert self.document(self.pr1_path + "/checks") == checks
+        # Manual check rows stay byte-identical; only the scheduler-owned
+        # `ci/default` row may appear or advance across the restart.
+        self.assert_checks_survive_restart(
+            checks, self.document(self.pr1_path + "/checks")
+        )
         assert self.document(self.rulespath) == rules
 
 
