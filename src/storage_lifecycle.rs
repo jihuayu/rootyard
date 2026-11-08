@@ -79,7 +79,7 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) -> Result<()> {
             match error_observability::worker::run(
                 &operation,
                 Phase::Claim,
-                worker::run_once(&state, &policy, owner, &operation),
+                worker::run_once_scoped(&state, &policy, owner, &operation),
             )
             .await
             {

@@ -9,7 +9,7 @@ use crate::{
     AppState, db,
     observability::{
         self,
-        worker::{OperationContext, Phase},
+        worker::{OperationContext, Phase, WorkerKind},
     },
 };
 use anyhow::{Context, Result, bail};
@@ -19,7 +19,13 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub(crate) async fn run_once(
+/// Run one bounded claim with a fresh operation context for external callers.
+pub async fn run_once(state: &Arc<AppState>, policy: &Policy, owner: Uuid) -> Result<Option<JobOutcome>> {
+    let operation = OperationContext::new(WorkerKind::StorageLifecycle);
+    observability::worker::run(&operation, Phase::Claim, run_once_scoped(state, policy, owner, &operation)).await
+}
+
+pub(crate) async fn run_once_scoped(
     state: &Arc<AppState>,
     policy: &Policy,
     owner: Uuid,
