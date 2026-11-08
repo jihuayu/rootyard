@@ -1236,6 +1236,67 @@
       ],
       "fence": "baseline: PG admission/job lease + local process/volume fence; target: RefStore/authority epoch or hold generation",
       "durable_ack": "consumer must use the specific durable_ack entry for this family; no family currently has a Blob receipt"
+    },
+    {
+      "id": "view_history_changeset",
+      "status": "partial_coverage",
+      "create_update_delete": [
+        "namespace_service.views.create",
+        "namespace_service.views.get",
+        "namespace_service.views.bundle",
+        "namespace_service.changesets.create/review/integrate/recover"
+      ],
+      "sources": [
+        {
+          "file": "src/namespace_service/views.rs",
+          "symbols": [
+            "create",
+            "get",
+            "bundle"
+          ]
+        },
+        {
+          "file": "src/namespace_service/changesets.rs",
+          "symbols": [
+            "create",
+            "review",
+            "integrate",
+            "recover"
+          ]
+        },
+        {
+          "file": "src/view_lab.rs",
+          "symbols": [
+            "run"
+          ]
+        }
+      ],
+      "logical_roots": [
+        "namespace/BaseVector fixed OIDs",
+        "namespace revision/version",
+        "ChangeSet base/head OIDs"
+      ],
+      "scope_dimensions": [
+        "tenant_id",
+        "namespace_id",
+        "repository_id",
+        "OID/object format",
+        "revision"
+      ],
+      "authority_fields": [
+        "tenant_id",
+        "owner_id",
+        "repository_id",
+        "object_format",
+        "OID",
+        "generation/fence",
+        "durable_ack/receipt"
+      ],
+      "fence": "baseline: PG namespace version + ChangeSet state; target: RefStore root per fixed OID",
+      "durable_ack": "namespace/ChangeSet ACK is PG-backed; no Blob receipt; history projection remains lab-only",
+      "gc_consumer": "src/storage_lifecycle/retention.rs::collect_sql_roots",
+      "backup_consumer": "src/backup/snapshot.rs::create",
+      "gap": "deterministic long-history projection is lab-only; cross-group ChangeSet atomicity is not claimed"
     }
   ],
   "unresolved_producer_coverage": [
@@ -1243,7 +1304,8 @@
     "Webhook delivery/claims and event projection offsets are not yet mapped into the target Git-event projection",
     "History/view commit projection and cross-repository ChangeSet roots are not a service-level RefStore producer",
     "Backup roots for existing GitFS physical GC and Pando hold generations are separate contracts",
-    "Auth scope fan-out must cover token/parent session/user/org/team/repo access/PR/check/review/LFS lock/lifecycle/authority migration; only token/session/membership surfaces are enumerated here"
+    "Auth scope fan-out must cover token/parent session/user/org/team/repo access/PR/check/review/LFS lock/lifecycle/authority migration; only token/session/membership surfaces are enumerated here",
+    "Service-level namespace history projection is not implemented; view_lab projection is experimental and not a RefStore/Blob producer"
   ],
   "logical_roots": [
     {
