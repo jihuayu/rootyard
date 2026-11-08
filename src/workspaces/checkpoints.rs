@@ -13,12 +13,29 @@ use sha2::{Digest, Sha256};
 use std::{fs, path::Path as FsPath, sync::Arc};
 use uuid::Uuid;
 
+/// Copy a checkpoint tree into a new workspace lower tree.
+///
+/// The copy is staged beside the destination and published with a no-replace
+/// rename, so a lower tree that already exists is never overwritten or removed;
+/// only a staging directory and a directory this call published are cleaned up.
 fn copy_snapshot(source: &FsPath, dest: &FsPath) -> Result<(), Error> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(Error::internal)?;
+    let parent = dest.parent().ok_or_else(Error::bad_request)?;
+    fs::create_dir_all(parent).map_err(Error::internal)?;
+    let staging = parent.join(format!(".restore-{}", Uuid::new_v4()));
+    core::private_dir(&staging).map_err(Error::internal)?;
+    let outcome = core::copy_all(source, &staging)
+        .map_err(Error::internal)
+        .and_then(|()| super::snapshot::publish(&staging, dest));
+    match outcome {
+        Ok(published) => {
+            published.keep();
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(error)
+        }
     }
-    core::copy_all(source, dest).map_err(Error::internal)?;
-    core::sync_tree(dest).map_err(Error::internal)
 }
 fn valid_agent(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
@@ -76,20 +93,25 @@ pub async fn create(
     // lower tree, the upper tree, the lazy manifest and verified lazy-cache
     // bytes. Reading the FUSE mount here would queue behind the inode lock of a
     // parked write and deadlock the freezer (the process then parks in `D`).
-    let (before, before_index, captured, after, after_index) = super::mounts::with_frozen(id, || {
+    let (before, before_index, captured, after, after_index, published) = super::mounts::with_frozen(id, || {
         let before_raw = super::snapshot::Raw::load(&source)?
             .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
         let before_index = before_raw.raw_file(FsPath::new(".git/index"))?;
-        super::snapshot::copy(&state, &before_raw, &dest)?;
+        // The guard owns the directory this call publishes. Until the database
+        // commit succeeds it is dropped on every failure path: a thaw error, a
+        // re-read of the raw layers, a failed fingerprint, a SQL error and a
+        // failed commit all remove exactly the tree this call created, and a
+        // preexisting destination is never removed because publication is
+        // no-replace.
+        let published = super::snapshot::copy(&state, &before_raw, &dest)?;
         let captured = super::snapshot::fingerprint(&dest)?;
         let after_raw = super::snapshot::Raw::load(&source)?
             .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
         let after = after_raw.digest().to_owned();
         let after_index = after_raw.raw_file(FsPath::new(".git/index"))?;
-        Ok((before_raw.digest().to_owned(), before_index, captured, after, after_index))
+        Ok((before_raw.digest().to_owned(), before_index, captured, after, after_index, published))
     })?;
     if before != after || before != captured || before_index != after_index {
-        let _ = fs::remove_dir_all(&dest);
         return Err(service::conflict());
     }
     let revision = ws.revision + 1;
@@ -109,6 +131,9 @@ pub async fn create(
     .map_err(Error::internal)?;
     tx.execute("INSERT INTO workspace_operations(id,workspace_id,idempotency_key,request_sha256,kind,state,result) VALUES($1,$2,$3,$4,'checkpoint','committed',$5)", &[&Uuid::new_v4(),&id,&key,&hash,&result]).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
+    // Only the database commit disarms the guard: the checkpoint tree is now
+    // referenced by `workspace_checkpoints`.
+    published.keep();
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -202,4 +227,43 @@ pub async fn fork(
         return Err(Error::not_found());
     }
     restore_inner(state, headers, input.checkpoint_id, input.new_agent_id, "fork").await
+}
+#[cfg(test)]
+mod tests {
+    use super::copy_snapshot;
+    use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+
+    fn write(root: &Path, name: &str, bytes: &[u8]) {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, bytes).expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("mode");
+    }
+
+    #[test]
+    fn restore_copy_never_replaces_a_preexisting_lower_tree() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let source = root.path().join("checkpoint");
+        fs::create_dir(&source).expect("source");
+        write(&source, "a.txt", b"a");
+
+        // An existing lower tree is never overwritten or removed.
+        let dest = root.path().join("workspaces/id");
+        fs::create_dir_all(&dest).expect("dest");
+        fs::write(dest.join("sentinel"), b"sentinel").expect("sentinel");
+        assert!(copy_snapshot(&source, &dest).is_err(), "an existing lower tree is never replaced");
+        assert_eq!(fs::read(dest.join("sentinel")).expect("sentinel bytes"), b"sentinel");
+        assert!(!dest.join("a.txt").exists(), "nothing is copied into the existing tree");
+        let staged: Vec<String> = fs::read_dir(root.path().join("workspaces"))
+            .expect("workspaces dir")
+            .map(|child| child.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!staged.iter().any(|name| name.starts_with(".restore-")), "a refused restore leaves no staging tree");
+
+        // A free destination is published with the checkpoint tree.
+        let fresh = root.path().join("workspaces/fresh");
+        copy_snapshot(&source, &fresh).expect("restore copy");
+        assert_eq!(fs::read(fresh.join("a.txt")).expect("copied a.txt"), b"a");
+        assert_eq!(fs::read(dest.join("sentinel")).expect("sentinel bytes"), b"sentinel");
+    }
 }

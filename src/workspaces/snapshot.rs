@@ -27,6 +27,15 @@
 //! bounded by `MAX_ENTRIES`/`MAX_BYTES`) and a path that would traverse a
 //! symlink ancestor is rejected instead of followed.
 //!
+//! Symlink targets are resolved against the merged namespace, not per layer.
+//! `core::inventory` only proves that a target stays inside the layer that
+//! declares it, which is weaker than what the overlay exposes: a lower
+//! `a/b/link -> ../../d` turns an upper `a/b/link/../../../outside` from a
+//! harmless upper-relative path into a hop that leaves the workspace. Every
+//! merged target is therefore walked here with a bounded hop count and refused
+//! if it pops past the workspace root or enters native Git metadata, both when
+//! the fingerprint is built and again before a copy is published.
+//!
 //! Fingerprints stay byte-compatible with the previous implementations: the
 //! SHA-256 of the JSON encoding of the same path-ordered `core::Entry` list, so
 //! an unchanged workspace keeps its stored `workspace_capture_state` baseline.
@@ -34,8 +43,8 @@ use super::lazy;
 use crate::{AppState, Error, workspace_lab::core};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    ffi::{CString, OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::{
@@ -48,6 +57,11 @@ use uuid::Uuid;
 
 const WHITEOUTS: &str = ".rootyard-whiteouts.json";
 const INTERNAL_PREFIX: &[u8] = b".rootyard-whiteouts.";
+
+/// Hop bound for a merged symlink chain, matching the shared
+/// `workspace_lab::core` rule so a tree that passes one namespace check also
+/// passes the other.
+const MAX_SYMLINK_HOPS: usize = 40;
 
 /// Which service-owned layer one merged entry is copied from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,13 +113,14 @@ impl Layout {
     }
 }
 
-/// One raw snapshot of a workspace: the merged entry list plus where each entry
-/// lives, so a checkpoint can copy exactly the bytes the fingerprint hashed.
+/// One raw snapshot of a workspace: the merged entry list in path order plus
+/// where each entry lives, so a checkpoint can copy exactly the bytes the
+/// fingerprint hashed.
 pub(super) struct Raw {
     id: Uuid,
     lower: PathBuf,
     upper: PathBuf,
-    items: Vec<(Origin, core::Entry)>,
+    merged: BTreeMap<PathBuf, (Origin, core::Entry)>,
     hydrates: bool,
     digest: String,
 }
@@ -196,6 +211,11 @@ impl Raw {
             merged.insert(path, (Origin::Upper, entry));
         }
         reject_symlink_ancestors(&merged)?;
+        // A target only means something in the namespace the overlay exposes,
+        // so a per-layer check is not enough: resolve every target through the
+        // merged entry list with a bounded hop count before the fingerprint is
+        // published.
+        resolve_symlink_targets(&layout.lower, &layout.upper, &merged)?;
         let entries: Vec<core::Entry> = merged.values().map(|(_, entry)| entry.clone()).collect();
         core::validate_entries(&entries).map_err(Error::internal)?;
         let mut total = 0_u64;
@@ -206,17 +226,9 @@ impl Raw {
             }
         }
         let digest = hash_entries(&entries)?;
-        let hydrates = merged.iter().any(|(path, (origin, entry))| {
-            *origin == Origin::Lazy && entry.kind == "file" && !path.starts_with(".git")
-        });
-        Ok(Self {
-            id: layout.id,
-            lower: layout.lower,
-            upper: layout.upper,
-            items: merged.into_values().collect(),
-            hydrates,
-            digest,
-        })
+        let hydrates =
+            merged.iter().any(|(path, (origin, entry))| *origin == Origin::Lazy && entry.kind == "file" && !path.starts_with(".git"));
+        Ok(Self { id: layout.id, lower: layout.lower, upper: layout.upper, merged, hydrates, digest })
     }
 
     pub(super) fn digest(&self) -> &str {
@@ -224,20 +236,63 @@ impl Raw {
     }
 
     #[cfg(test)]
-    pub(super) fn items(&self) -> &[(Origin, core::Entry)] {
-        &self.items
+    pub(super) fn items(&self) -> Vec<(Origin, core::Entry)> {
+        self.merged.values().cloned().collect()
     }
 
-    /// Read a native Git file from raw state: upper first, then lower. Returns
-    /// empty bytes when neither layer has it, exactly like an absent file.
+    /// Raw fixture with an explicit merged namespace, for the cases a real
+    /// build already refuses (a file below a merged symlink).
+    #[cfg(test)]
+    pub(super) fn fixture(lower: PathBuf, upper: PathBuf, items: Vec<(Origin, core::Entry)>) -> Self {
+        let merged = items
+            .into_iter()
+            .map(|(origin, entry)| {
+                let path = core::decode_path(&entry.path_base64).expect("fixture path");
+                (path, (origin, entry))
+            })
+            .collect();
+        Self { id: Uuid::new_v4(), lower, upper, merged, hydrates: false, digest: String::new() }
+    }
+
+    /// Re-check the merged namespace before anything is published: no path
+    /// traverses a merged symlink and every symlink target resolves inside it.
+    pub(super) fn validate(&self) -> Result<(), Error> {
+        reject_symlink_ancestors(&self.merged)?;
+        resolve_symlink_targets(&self.lower, &self.upper, &self.merged)
+    }
+
+    /// Read a native Git file from the raw layer the merged namespace selects.
+    ///
+    /// Only a visible merged regular entry is readable. An entry hidden by a
+    /// whiteout, replaced by an upper directory, stored as a symlink or reachable
+    /// only through a symlink ancestor is refused instead of being read out of a
+    /// layer the overlay does not expose; the bytes must still match the length
+    /// and digest the fingerprint hashed. A path with no visible entry returns
+    /// empty bytes, exactly like an absent file.
     pub(super) fn raw_file(&self, relative: &Path) -> Result<Vec<u8>, Error> {
-        for root in [&self.upper, &self.lower] {
-            let path = root.join(relative);
-            if present(&path)? {
-                return core::read_regular(&path, core::MAX_MANIFEST).map_err(Error::internal);
+        let Some((origin, entry)) = self.merged.get(relative) else { return Ok(Vec::new()) };
+        if entry.kind != "file" {
+            return Err(Error::internal("workspace raw file is not a regular file"));
+        }
+        for ancestor in relative.ancestors().skip(1).take_while(|ancestor| !ancestor.as_os_str().is_empty()) {
+            if self.merged.get(ancestor).is_some_and(|(_, entry)| entry.kind == "symlink") {
+                return Err(Error::internal("workspace raw file traverses a symlink"));
             }
         }
-        Ok(Vec::new())
+        let root = layer(&self.lower, &self.upper, *origin);
+        let mut directory = root.to_path_buf();
+        if let Some(parent) = relative.parent() {
+            for component in parent.components() {
+                directory.push(component);
+                core::require_directory(&directory)
+                    .map_err(|_| Error::internal("workspace raw file traverses a symlink"))?;
+            }
+        }
+        let bytes = core::read_regular(&root.join(relative), core::MAX_MANIFEST).map_err(Error::internal)?;
+        if bytes.len() as u64 != entry.size || hex::encode(Sha256::digest(&bytes)) != entry.sha256 {
+            return Err(Error::internal("workspace raw file changed during capture"));
+        }
+        Ok(bytes)
     }
 }
 
@@ -253,6 +308,14 @@ pub(super) fn fingerprint(path: &Path) -> Result<String, Error> {
 fn hash_entries(entries: &[core::Entry]) -> Result<String, Error> {
     let raw = serde_json::to_vec(entries).map_err(Error::internal)?;
     Ok(hex::encode(Sha256::digest(&raw)))
+}
+
+/// The service-owned tree an entry of `origin` is copied from.
+fn layer<'a>(lower: &'a Path, upper: &'a Path, origin: Origin) -> &'a Path {
+    match origin {
+        Origin::Upper => upper,
+        Origin::Lower | Origin::Lazy => lower,
+    }
 }
 
 fn reject_symlink_ancestors(merged: &BTreeMap<PathBuf, (Origin, core::Entry)>) -> Result<(), Error> {
@@ -271,44 +334,208 @@ fn reject_symlink_ancestors(merged: &BTreeMap<PathBuf, (Origin, core::Entry)>) -
     Ok(())
 }
 
+/// Read one merged symlink's target from the layer that owns it, refusing an
+/// absolute or empty target and a target that no longer matches the entry the
+/// fingerprint hashed (the two views must never disagree).
+fn link_target(root: &Path, path: &Path, entry: &core::Entry) -> Result<PathBuf, Error> {
+    let target = fs::read_link(root.join(path)).map_err(Error::internal)?;
+    if target.as_os_str().is_empty() || target.is_absolute() {
+        return Err(Error::internal("workspace snapshot symlink escapes the workspace"));
+    }
+    let bytes = target.as_os_str().as_bytes();
+    if bytes.len() as u64 != entry.size || hex::encode(Sha256::digest(bytes)) != entry.sha256 {
+        return Err(Error::internal("workspace raw symlink changed during capture"));
+    }
+    Ok(target)
+}
+
+/// Resolve every merged symlink target inside the merged namespace.
+fn resolve_symlink_targets(
+    lower: &Path,
+    upper: &Path,
+    merged: &BTreeMap<PathBuf, (Origin, core::Entry)>,
+) -> Result<(), Error> {
+    for (path, (origin, entry)) in merged {
+        if entry.kind != "symlink" {
+            continue;
+        }
+        resolve_target(lower, upper, merged, path, *origin, entry)?;
+    }
+    Ok(())
+}
+
+/// Walk one target the way the overlay would: relative to the link's parent,
+/// following merged symlinks, never popping above the workspace root and never
+/// entering native Git metadata. `MAX_SYMLINK_HOPS` bounds the chain.
+fn resolve_target(
+    lower: &Path,
+    upper: &Path,
+    merged: &BTreeMap<PathBuf, (Origin, core::Entry)>,
+    path: &Path,
+    origin: Origin,
+    entry: &core::Entry,
+) -> Result<(), Error> {
+    let target = link_target(layer(lower, upper, origin), path, entry)?;
+    let mut resolved: Vec<OsString> = Vec::new();
+    if let Some(parent) = path.parent() {
+        resolved.extend(parent.components().map(|component| component.as_os_str().to_owned()));
+    }
+    let mut pending: VecDeque<OsString> = target.components().map(|component| component.as_os_str().to_owned()).collect();
+    let mut hops = 0_usize;
+    while let Some(component) = pending.pop_front() {
+        if component.as_os_str() == OsStr::new(".") {
+            continue;
+        }
+        if component.as_os_str() == OsStr::new("..") {
+            if resolved.pop().is_none() {
+                return Err(Error::internal("workspace snapshot symlink escapes the workspace"));
+            }
+            continue;
+        }
+        resolved.push(component);
+        if resolved.first().is_some_and(|first| first.as_os_str() == OsStr::new(".git")) {
+            return Err(Error::internal("workspace snapshot symlink into Git metadata"));
+        }
+        let location: PathBuf = resolved.iter().collect();
+        let Some((next_origin, next)) = merged.get(&location) else { continue };
+        if next.kind != "symlink" {
+            continue;
+        }
+        hops += 1;
+        if hops > MAX_SYMLINK_HOPS {
+            return Err(Error::internal("workspace snapshot symlink loop or excessive chain"));
+        }
+        let hop = link_target(layer(lower, upper, *next_origin), &location, next)?;
+        resolved.pop();
+        for part in hop.components().rev() {
+            pending.push_front(part.as_os_str().to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// The directory one publication created, and nothing else.
+///
+/// Publication is no-replace, so a directory this guard owns cannot have existed
+/// before the call. Until [`Published::keep`] confirms the durable commit, a
+/// dropped guard removes exactly that directory; a pre-existing destination is
+/// never touched because it is never published over.
+pub(super) struct Published {
+    dest: PathBuf,
+    kept: bool,
+}
+
+impl Published {
+    fn new(dest: PathBuf) -> Self {
+        Self { dest, kept: false }
+    }
+
+    /// The checkpoint (or restored workspace row) is committed: keep the tree.
+    pub(super) fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Published {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        let _ = fs::remove_dir_all(&self.dest);
+        if let Some(parent) = self.dest.parent() {
+            let _ = File::open(parent).and_then(|directory| directory.sync_all());
+        }
+    }
+}
+
 /// Copy a raw snapshot into a new private tree and publish it at `dest`.
 ///
-/// The tree is staged next to `dest`, synced and renamed, so a failure never
-/// leaves a directory that could be mistaken for a confirmed checkpoint. Only
-/// lower bytes, upper bytes and verified lazy-cache bytes are read; the mount
-/// is never opened.
-pub(super) fn copy(state: &AppState, raw: &Raw, dest: &Path) -> Result<(), Error> {
+/// The tree is staged next to `dest`, synced and published with a no-replace
+/// rename, so an existing `dest` is never overwritten, replaced or removed. On
+/// failure only the staging directory and a directory this very call published
+/// are cleaned up; the returned guard owns the published directory until it is
+/// kept. Only lower bytes, upper bytes and verified lazy-cache bytes are read;
+/// the mount is never opened.
+pub(super) fn copy(state: &AppState, raw: &Raw, dest: &Path) -> Result<Published, Error> {
     let reader = if raw.hydrates {
         Some(lazy::Reader::open(state, raw.id)?.ok_or_else(|| Error::internal("lazy baseline manifest missing"))?)
     } else {
         None
     };
-    let parent = dest.parent().ok_or_else(Error::bad_request)?;
-    fs::create_dir_all(parent).map_err(Error::internal)?;
-    let staging = parent.join(format!(".snapshot-{}", Uuid::new_v4()));
-    core::private_dir(&staging).map_err(Error::internal)?;
-    let mut hydrate = |relative: &Path, entry: &core::Entry, total: &mut u64| match &reader {
+    let mut hydrate = |dest: &Path, relative: &Path, entry: &core::Entry, total: &mut u64| match &reader {
         Some(reader) => {
             let source = reader
                 .file(relative)
                 .map_err(Error::internal)?
                 .ok_or_else(|| Error::internal("lazy baseline entry missing"))?;
-            copy_hydrated(&staging, relative, entry, source, total)
+            copy_hydrated(dest, relative, entry, source, total)
         }
         None => Err(Error::internal("lazy baseline reader missing")),
     };
-    let outcome = materialize(raw, &staging, &mut hydrate).and_then(|()| publish(&staging, parent, dest));
+    copy_into(raw, dest, &mut hydrate)
+}
+
+/// Stage and publish `raw` at `dest`, returning the guard that owns the
+/// directory this call created. `hydrate` is injected so unit tests can
+/// materialise lazy entries without a network or a live mount.
+pub(super) fn copy_into(
+    raw: &Raw,
+    dest: &Path,
+    hydrate: &mut dyn FnMut(&Path, &Path, &core::Entry, &mut u64) -> Result<(), Error>,
+) -> Result<Published, Error> {
+    raw.validate()?;
+    let parent = dest.parent().ok_or_else(Error::bad_request)?;
+    fs::create_dir_all(parent).map_err(Error::internal)?;
+    let staging = parent.join(format!(".snapshot-{}", Uuid::new_v4()));
+    core::private_dir(&staging).map_err(Error::internal)?;
+    let outcome = materialize(raw, &staging, hydrate).and_then(|()| publish(&staging, dest));
     if outcome.is_err() {
         let _ = fs::remove_dir_all(&staging);
-        let _ = fs::remove_dir_all(dest);
     }
     outcome
 }
 
-fn publish(staging: &Path, parent: &Path, dest: &Path) -> Result<(), Error> {
+/// Sync a fully staged tree and publish it at `dest` without replacing anything.
+pub(super) fn publish(staging: &Path, dest: &Path) -> Result<Published, Error> {
+    let parent = dest.parent().ok_or_else(Error::bad_request)?;
     core::sync_tree(staging).map_err(Error::internal)?;
-    fs::rename(staging, dest).map_err(Error::internal)?;
-    File::open(parent).and_then(|directory| directory.sync_all()).map_err(Error::internal)
+    rename_no_replace(staging, dest)?;
+    // The guard exists as soon as the rename succeeded, so even a failing
+    // parent sync removes the directory instead of leaving it behind.
+    let published = Published::new(dest.to_path_buf());
+    File::open(parent).and_then(|directory| directory.sync_all()).map_err(Error::internal)?;
+    Ok(published)
+}
+
+/// Atomically rename `from` to `to`, failing when `to` already exists.
+///
+/// `RENAME_NOREPLACE` is the only way to make "publish this directory only if
+/// the name is still free" atomic; a stat followed by `rename` would let another
+/// publisher replace a confirmed checkpoint in between.
+fn rename_no_replace(from: &Path, to: &Path) -> Result<(), Error> {
+    let from_c = CString::new(from.as_os_str().as_bytes()).map_err(Error::internal)?;
+    let to_c = CString::new(to.as_os_str().as_bytes()).map_err(Error::internal)?;
+    let result = unsafe {
+        libc::renameat2(libc::AT_FDCWD, from_c.as_ptr(), libc::AT_FDCWD, to_c.as_ptr(), libc::RENAME_NOREPLACE)
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        // A filesystem without `RENAME_NOREPLACE` falls back to a checked
+        // rename: still no replacement, but not atomic against a concurrent
+        // publisher. Every filesystem this service ships on supports the flag.
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP) => {}
+        Some(libc::EEXIST) | Some(libc::ENOTEMPTY) => {
+            return Err(Error::internal("workspace snapshot destination already exists"))
+        }
+        _ => return Err(Error::internal(error)),
+    }
+    if present(to)? {
+        return Err(Error::internal("workspace snapshot destination already exists"));
+    }
+    fs::rename(from, to).map_err(Error::internal)
 }
 
 /// Copy every selected entry from its origin. `hydrate` is injected so unit
@@ -316,24 +543,23 @@ fn publish(staging: &Path, parent: &Path, dest: &Path) -> Result<(), Error> {
 pub(super) fn materialize(
     raw: &Raw,
     dest: &Path,
-    hydrate: &mut dyn FnMut(&Path, &core::Entry, &mut u64) -> Result<(), Error>,
+    hydrate: &mut dyn FnMut(&Path, &Path, &core::Entry, &mut u64) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut total = 0_u64;
-    for (origin, entry) in &raw.items {
-        let relative = core::decode_path(&entry.path_base64).map_err(Error::internal)?;
+    for (relative, (origin, entry)) in &raw.merged {
         match origin {
             Origin::Upper => {
-                core::copy_single_entry(&raw.upper, dest, &relative, &mut total).map_err(Error::internal)?
+                core::copy_single_entry(&raw.upper, dest, relative, &mut total).map_err(Error::internal)?
             }
             Origin::Lower => {
-                core::copy_single_entry(&raw.lower, dest, &relative, &mut total).map_err(Error::internal)?
+                core::copy_single_entry(&raw.lower, dest, relative, &mut total).map_err(Error::internal)?
             }
             // Symlinks and native Git metadata are real bytes in the sparse
             // lower tree; only worktree files stay remote.
             Origin::Lazy if entry.kind != "file" || relative.starts_with(".git") => {
-                core::copy_single_entry(&raw.lower, dest, &relative, &mut total).map_err(Error::internal)?
+                core::copy_single_entry(&raw.lower, dest, relative, &mut total).map_err(Error::internal)?
             }
-            Origin::Lazy => hydrate(&relative, entry, &mut total)?,
+            Origin::Lazy => hydrate(dest, relative, entry, &mut total)?,
         }
     }
     // Empty .git directories are legal and need not be retained, but the root must exist.
