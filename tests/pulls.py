@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
+import traceback
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -25,6 +27,43 @@ def migration_009_path() -> Path:
 
 
 class PullsHarness(ForgeHarness):
+    def case(self, name, fn):
+        """Run one case, keeping a redacted traceback as failure evidence.
+
+        A bare ``assert x == y`` raises ``AssertionError`` with an empty message,
+        so recording only ``str(error)`` leaves a CI report that cannot name the
+        failing statement. The traceback stays fully redacted: harness secrets and
+        database URLs are substituted, and no environment is dumped.
+        """
+        started = time.monotonic()
+        try:
+            detail = fn()
+        except Exception as error:
+            self.results.append(
+                dict(
+                    name=name,
+                    status="failed",
+                    seconds=round(time.monotonic() - started, 4),
+                    error=self.redact(error),
+                    traceback=self.redact(traceback.format_exc()),
+                )
+            )
+            print(
+                f"{name}: failed\n{self.redact(traceback.format_exc())}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        self.results.append(
+            dict(
+                name=name,
+                status="passed",
+                seconds=round(time.monotonic() - started, 4),
+                detail=detail,
+            )
+        )
+        print(name + ": passed", flush=True)
+
     def issue_token(
         self, username: str, create_user: bool = False, read_only: bool = False
     ) -> dict:
@@ -1202,7 +1241,12 @@ def main():
             harness.cleanup()
         except Exception as error:
             harness.results.append(
-                dict(name="cleanup", status="failed", error=harness.redact(error))
+                dict(
+                    name="cleanup",
+                    status="failed",
+                    error=harness.redact(error),
+                    traceback=harness.redact(traceback.format_exc()),
+                )
             )
             success = False
         report = dict(
