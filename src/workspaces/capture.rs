@@ -360,7 +360,7 @@ mod tests {
                     let event = crate::observability::event_for_test(&error);
                     *observed.lock().expect("observation slot") =
                         Some((worker::current(), event, std::thread::current().id()));
-                    Err(Error::internal(error))
+                    Err::<(), _>(Error::internal(error))
                 })
                 .await;
                 (caller, outcome)
