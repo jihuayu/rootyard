@@ -13,7 +13,7 @@ use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, File},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt},
     time::Instant,
 };
 use uuid::Uuid;

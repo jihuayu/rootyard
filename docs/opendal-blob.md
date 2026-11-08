@@ -1,171 +1,37 @@
-# OpenDAL Blob layer (W1-B / #105 / #108)
+# OpenDAL Blob layer: #105 / #108
 
-Status: source implementation, not a provider qualification. The only evidence
-that counts for a provider is the contract suite below run against a real
-service on the stated version; this change does not claim any provider passed
-it, because no provider endpoint was available in this work environment.
+Status: implementation under acceptance. S3 and optional Azure targets compile; this is not yet a provider or Blob-only deployment qualification. Real provider results must identify the precise service/profile, source and executable. Azure currently has compilation evidence only.
 
-## What changed
+The custom S3 signer, XML multipart implementation and HTTP retry code are replaced by Apache OpenDAL 0.57.0. Minimal features select S3, Tokio execution, bounded concurrency/retry/timeout layers and `reqwest-rustls-no-provider-tls`; the application already supplies Rustls Ring. `blob-azblob` adds Azure. The project target is Rust 1.88, matching the pending security integration; OpenDAL 0.57 itself declares Rust 1.85. Cargo.lock is regenerated and reviewed, not left implicit.
 
-- The hand-written S3 SigV4 signer, XML multipart upload/abort and ad-hoc retry
-  in `src/storage/remote_objects.rs` are removed. Transport, signing, TLS,
-  multipart, abort, retry, timeout and concurrency are owned by Apache OpenDAL.
-- `RemoteObjectStore` keeps its public API, error surface and frozen
-  content-addressed paths for LFS, Workspace, backups and the Pando PG
-  retention path. `RemoteObjectStore::Local` remains available and is
-  explicitly marked legacy/local fixture mode.
-- A new standalone profile lives in `src/blob_store/`:
-  - `mod.rs`: strong typed `BlobLocator`, `BlobReceipt`, capability and delete
-    policy types.
-  - `config.rs`: strict `ROOTYARD_BLOB_*` profile parsing.
-  - `opendal.rs`: one shared OpenDAL `Operator` + layers and capability gate.
-  - `transfer.rs`: bounded streaming publish and provider read-back receipts.
-  - `readback.rs`: bounded download, range read, length-only head and
-    policy-gated exact-locator delete.
-- `src/storage/remote_provider.rs` is the legacy-layout OpenDAL adapter.
+## Boundaries
 
-Pinned dependency: `opendal = "=0.57.0"`, `default-features = false`, features
-`services-s3`, `rustls`, `layers-concurrent-limit`, `layers-retry`,
-`layers-timeout`. Azure Blob is optional via the Cargo feature `blob-azblob`.
-The crate MSRV stays `rust-version = "1.85"`; nothing silently bumps it.
+`RemoteObjectStore` retains legacy content-addressed paths and its explicit local mode for existing readers. Its S3 implementation now delegates to OpenDAL. Legacy identical-key uploads succeed only after full verification of existing content, including conditional conflicts at multipart completion. The old local durable ACK paths are not converted by this layer.
 
-## Two layouts, on purpose
+The separate `BlobStore` uses `v1/tenants/<tenant>/authorities/<authority>/g<generation>/attempts/<attempt>/<namespace>/<digest>` locators. Backup-volume locators retain the same identity fields. Locator fields are validated; receipts can be constructed only inside the verified Blob implementation and expose read-only accessors. Metadata equality is not a substitute for revalidating an untrusted receipt.
 
-| | Legacy adapter | New standalone profile |
-| --- | --- | --- |
-| Path | `tenants/<tenant>[/authorities/<id>/g<n>]/<ns>/<sha256>` | `v1/tenants/<tenant>/authorities/<id>/g<n>/attempts/<attempt>/<ns>/<sha256>` |
-| Attempt identity | absent; content-addressed key may outlive a cancelled attempt | always bound; paths are never reused |
-| Missing config | falls back to `RemoteObjectStore::Local` (legacy) | hard error |
-| `fs`/`memory` service | only the explicit `Local` fixture variant | rejected by name |
-| Receipt | returned `StoredObject` after full read-back | `BlobReceipt` with SHA-256 + length read-back |
-| Delete | existing Pando PG claim path, exact key, unchanged | disabled by default; exact-locator only when explicitly configured |
+Both profiles require complete upload plus provider read-back and independent SHA-256/length verification before a receipt. ETag, stat, and LIST are not content proofs. Conditional creation is required for the currently supported profiles; no stat-then-overwrite or unimplemented unique-reservation fallback is accepted. The configured prefix is applied once by the operator.
 
-Existing readers and manifests keep the legacy paths; the new profile's `v1/`
-prefix cannot collide with them. This change does **not** migrate any legacy
-object and does not change any durable ACK path.
+**New-profile deletion is unavailable.** `BlobStore::delete` always returns `DeleteDisabled`; `ROOTYARD_BLOB_DELETE=exact-locator` is rejected. A future deletion API requires the persistent hold/root and retirement protocols in #113/#114. The direct raw operator used by provider tests injects faults and removes only fresh test-owned identities; it does not enable product GC.
 
-## Configuration (new profile)
+## Configuration
 
-Required:
+Set `ROOTYARD_BLOB_DRIVER=opendal` (the only driver), `ROOTYARD_BLOB_SERVICE=s3|azblob`, and an explicit origin-only `ROOTYARD_BLOB_ENDPOINT`. Missing configuration, fs/memory, credentials in URLs, path/query/fragment endpoints and unknown drivers are rejected. TLS is required except HTTP loopback fixtures.
 
-- `ROOTYARD_BLOB_SERVICE=s3|azblob` (no default; `fs`, `memory` and unknown
-  services are rejected, as is `ROOTYARD_BLOB_DRIVER` other than `opendal`)
-- S3: `ROOTYARD_BLOB_BUCKET`, credentials `ROOTYARD_BLOB_ACCESS_KEY_ID` +
-  `ROOTYARD_BLOB_SECRET_ACCESS_KEY`, and either `ROOTYARD_BLOB_REGION` or
-  `ROOTYARD_BLOB_ENDPOINT`
-- azblob (feature `blob-azblob`): `ROOTYARD_BLOB_CONTAINER`,
-  `ROOTYARD_BLOB_ENDPOINT`, `ROOTYARD_BLOB_ACCOUNT_NAME`,
-  `ROOTYARD_BLOB_ACCOUNT_KEY`
+S3 requires `ROOTYARD_BLOB_BUCKET`, `ROOTYARD_BLOB_ACCESS_KEY_ID`, `ROOTYARD_BLOB_SECRET_ACCESS_KEY`; optional settings include `ROOTYARD_BLOB_REGION` and `ROOTYARD_BLOB_SESSION_TOKEN`. Azure requires its feature plus `ROOTYARD_BLOB_CONTAINER`, `ROOTYARD_BLOB_ACCOUNT_NAME`, and `ROOTYARD_BLOB_ACCOUNT_KEY`. Credentials and private locators are redacted in Debug and provider errors.
 
-Optional:
+Optional limits are `ROOTYARD_BLOB_ROOT`, `ROOTYARD_BLOB_TIMEOUT_MS` (30000), `ROOTYARD_BLOB_IO_TIMEOUT_MS` (60000), `ROOTYARD_BLOB_CONCURRENCY` (16, at most 256), `ROOTYARD_BLOB_RETRY_MAX_TIMES` (3, at most 10), `ROOTYARD_BLOB_MAX_OBJECT_BYTES` (at most 1 TiB), and `ROOTYARD_BLOB_RANGE_FULL_GET_MAX_BYTES` (64 MiB by default, at most 256 MiB). The root prefix is validated and not repeated in operation paths.
 
-- `ROOTYARD_BLOB_ENDPOINT`: origin URL only. HTTPS is mandatory; plain HTTP is
-  accepted only for `127.0.0.1`/`::1`/`localhost` fixtures. Userinfo, path,
-  query and fragment are rejected so a bearer URL cannot become storage config.
-- `ROOTYARD_BLOB_ROOT`: object prefix, path-segment validated.
-- `ROOTYARD_BLOB_TIMEOUT_MS` (default 30000), `ROOTYARD_BLOB_IO_TIMEOUT_MS`
-  (default 60000), `ROOTYARD_BLOB_CONCURRENCY` (default 16, max 256),
-  `ROOTYARD_BLOB_RETRY_MAX_TIMES` (default 3, max 10),
-  `ROOTYARD_BLOB_MAX_OBJECT_BYTES` (default 1 TiB, hard ceiling).
-- `ROOTYARD_BLOB_DELETE=disabled|exact-locator` (default `disabled`).
+Uploads hash 64 KiB source blocks and use compliant 8 MiB multipart chunks with bounded concurrency. Downloads verify before an atomic destination rename and use private mode-0600 staging files. A guard owns an unfinished writer throughout write, close and abort awaits. Errors attempt bounded cleanup with a separate budget; cancellation schedules a bounded best-effort abort. Process kill/runtime shutdown can leave an orphan, and no receipt is issued for unknown completion. There is no periodic orphan sweep yet.
 
-Credentials are never `Debug`-printed, logged or embedded in errors. Legacy
-`ROOTYARD_OBJECT_STORE_*` variables still drive `RemoteObjectStore`.
+Ranges are at most 1 MiB. Since a ranged GET cannot prove the whole-object SHA-256, v1 downloads and verifies the complete object to a private temporary file before seeking the slice. It rejects objects above the configured full-download ceiling until a chunk-hash manifest/cache proof exists. This deliberately has whole-object cold-read cost.
 
-## Semantics and guarantees
+Each long-lived BlobStore owns a shared operator with bounded layers. Legacy `RemoteObjectStore::from_env` still constructs its operator per call; application-wide reuse and workflow wiring are separate work. Provider-managed encryption is a future profile contract, not implemented or certified by these bytes-only methods. Existing encrypted Pando paths retain their Vault dependency.
 
-- **Receipt = content proof.** A receipt is issued only after re-reading the
-  object from the provider and recomputing SHA-256 and length. `stat`,
-  `Content-Length`, provider ETag and provider checksums alone never prove
-  content; ETag is never treated as SHA-256.
-- **Bounded IO.** Upload streams 64 KiB source chunks into an OpenDAL writer
-  (4 MiB write window; OpenDAL decides multipart). Download/read-back hashes
-  and length-checks 64 KiB chunks into a private staging file, fsyncs, then
-  renames atomically; only this call's staging file is removed on failure.
-  Range reads are capped at 1 MiB and must return exactly the requested length.
-- **Conditional create / no overwrite.** The new path already contains a fresh
-  attempt id, so a repeat publication never shares a key. When the provider
-  declares `write_with_if_none_match`, the write is additionally conditional.
-  The legacy adapter requires `if-none-match` support at startup and refuses to
-  publish otherwise; it never falls back to stat-then-overwrite.
-- **Delete.** No listing, prefix delete, rename or GC sweep exists. The new
-  profile returns `DeleteDisabled` unless `ROOTYARD_BLOB_DELETE=exact-locator`,
-  and even then only deletes one fully resolved versioned locator. Legacy
-  remote delete is still only the existing Pando PG claim path, unchanged.
-- **Errors and deadlines.** Missing objects map to `NotFound`, precondition
-  failures to `AlreadyExists`, deadline expiry to `DeadlineExceeded`; OpenDAL
-  retry is bounded and every provider await is wrapped in the caller deadline.
-- **Concurrency.** One shared operator per profile carries a single
-  `ConcurrentLimitLayer`; there is no per-call semaphore that forgets live
-  operations.
-- **No LIST inventory.** There is no list API in the driver: a provider listing
-  cannot be used as an authoritative inventory.
+## Qualification
 
-## Exact limitations (not implemented / not claimed)
+Normal `cargo test --test blob_provider_contract` runs local invariants and explicitly ignores the real provider case. To exercise a configured disposable provider, run `cargo test --test blob_provider_contract -- --ignored --nocapture`. Missing real configuration fails that case. The bucket/container must permit fixture-only overwrite/delete for deliberate corruption probes; all keys use fresh random identities.
 
-- **No provider qualification was run here.** No S3 or Azure endpoint was
-  reachable in this environment, so no real-service contract result is claimed.
-  Missing env means `SKIPPED`, never "passed".
-- **No destructive GC for the new authority.** Persistent hold/root protocols
-  (#113/#114) are prerequisites. `exact-locator` deletion is implemented but
-  must not be enabled in a deployment that has not adopted those protocols.
-- **No hold ledger, reconciliation or orphan GC.** Aborted/abandoned attempts
-  stay as unreferenced bytes under unique attempt paths; nothing reclaims them
-  automatically. Abandoned multipart uploads are aborted by OpenDAL on the
-  writer failure path, but no periodic orphan sweep exists.
-- **No key provider / envelope encryption.** The new profile relies on
-  provider-managed encryption. It does not implement application-layer keys,
-  KMS, rotation or migration of legacy encrypted Pando objects.
-- **No backup/restore integration.** `volume_path()` exists on the locator but
-  backup jobs, restore, event archives and CI artifacts are not yet wired to
-  the new profile.
-- **No presign, rename or POSIX semantics.** Private packs never get bearer
-  URLs from this layer.
-- **No paging/parallel range assembly.** Range reads are single bounded reads;
-  no random-access layout or chunk cache is claimed.
-- **Legacy adapter construction is per call.** `RemoteObjectStore::from_env`
-  builds an operator on each call (as the old code built a client per call);
-  the shared/ bounded operator requirement is met by the long-lived
-  `BlobStore`, not by the frozen legacy adapter.
-- **Legacy local ACKs remain unchanged.** Local LFS/Workspace checkpoint
-  durability is #109 and is not solved here. Legacy `RemoteObjectStore::Local`
-  still exists for fixtures/development and must not be considered production
-  storage.
-- **OpenDAL API/feature compatibility is compiled by the root integrator.**
-  `Cargo.lock` was intentionally not regenerated in this change, and no
-  `cargo build/check/test` was run. Provider-layer behaviour (retry semantics,
-  conditional-create support, timeouts) is declared at startup but only proven
-  by the contract suite below.
+The real case covers multipart publication, duplicate-locator rejection, two independent clients, verified download/range, wrong length against an existing object, refusal of wrong source length, fixture truncation and same-length corruption, global digest validation for a range outside the corrupt byte, deletion refusal and late old-attempt deletion isolation. Cleanup runs on caught assertion failure and targets only exact owned paths. These cases do not establish the cross-store hold/GC protocol, exhaustive cancellation/retry behavior, a different provider's contract or physical durability/HA.
 
-## Provider contract suite
-
-`tests/blob_provider_contract.rs` always checks strict config rejection and
-locator/legacy-path invariants locally. The real-provider contract covers:
-
-1. two publications of identical bytes under different attempts,
-2. receipt emission and cross-client receipt re-verification by provider
-   read-back,
-3. download hash equality and bounded range equality,
-4. length-short read failure with no destination left behind,
-5. locator length mismatch rejected before upload, and
-6. delete policy: disabled by default; with `exact-locator`, deleting one
-   locator leaves the sibling attempt object intact.
-
-Run it only against a real service:
-
-```sh
-ROOTYARD_BLOB_SERVICE=s3 \
-ROOTYARD_BLOB_BUCKET=... ROOTYARD_BLOB_REGION=... ROOTYARD_BLOB_ENDPOINT=https://... \
-ROOTYARD_BLOB_ACCESS_KEY_ID=... ROOTYARD_BLOB_SECRET_ACCESS_KEY=... \
-cargo test --test blob_provider_contract
-```
-
-Record the provider, endpoint type, OpenDAL version, date and exact command with
-the raw output before calling a provider qualified. A successful run against one
-S3-compatible endpoint does not qualify a different provider.
-
-## Follow-ups
-
-- #109: durable local-to-Blob ACK for LFS/Workspace.
-- #113/#114: persistent artifact holds and roots before any new-profile delete.
-- W1-C: move pack/LFS/Workspace/checkpoint/backup writers onto `BlobStore`.
+Follow-ups: #109 connects content ACKs and KeyProvider; #113/#114 own persistent retention; #120 owns Blob backup/restore. All-content Blob publication, removal of local authority, standalone defaults, real Azure service qualification and destructive GC remain unqualified.

@@ -5,6 +5,7 @@
 //! proof), fsync, then atomically rename. Failures remove only this call's file.
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
+use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use tokio::{
@@ -44,7 +45,7 @@ impl RemoteObjectStore {
         let temp = parent.join(format!(".rootyard-object-{}", Uuid::new_v4()));
         let _temp_guard = TempObject { path: temp.clone() };
         let result = async {
-            let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
+            let mut out = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp).await?;
             let rel_path = key.path();
             let mut local = match self {
                 Self::Local(root) => Some(local_file(root, &rel_path).await?),
@@ -52,7 +53,7 @@ impl RemoteObjectStore {
             };
             let mut remote = match self {
                 Self::Local(_) => None,
-                Self::OpenDal(store) => Some(store.reader(&rel_path, deadline).await?),
+                Self::OpenDal(store) => Some(store.read_stream(&rel_path, deadline).await?),
             };
             let mut buf = [0u8; READ_CHUNK];
             let mut hash = Sha256::new();
@@ -61,11 +62,10 @@ impl RemoteObjectStore {
                 let chunk: Option<Bytes> = if let Some(file) = local.as_mut() {
                     let read = tokio::time::timeout_at(deadline, file.read(&mut buf)).await??;
                     if read == 0 { None } else { Some(Bytes::copy_from_slice(&buf[..read])) }
-                } else if let Some(reader) = remote.as_mut() {
-                    match tokio::time::timeout_at(deadline, reader.next()).await {
-                        Ok(Some(Ok(chunk))) => Some(chunk),
-                        Ok(Some(Err(error))) => return Err(error.into()),
-                        Ok(None) => None,
+                } else if let Some(stream) = remote.as_mut() {
+                    match tokio::time::timeout_at(deadline, stream.try_next()).await {
+                        Ok(Ok(chunk)) => chunk,
+                        Ok(Err(error)) => return Err(crate::blob_store::opendal::map_stream_error(error).into()),
                         Err(_) => bail!("object store request timed out"),
                     }
                 } else {

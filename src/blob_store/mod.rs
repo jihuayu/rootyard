@@ -25,6 +25,7 @@ pub mod config;
 pub mod opendal;
 pub mod readback;
 pub mod transfer;
+pub mod upload;
 
 use std::fmt;
 
@@ -40,25 +41,25 @@ pub const MAX_OBJECT_BYTES: u64 = 1 << 40;
 /// and refuses every delete call. No listing, prefix delete or GC sweep exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlobDeletePolicy {
+    /// The only policy. Persistent hold/root retirement claims (#113/#114) do
+    /// not exist yet, so no environment value may enable deletion.
     Disabled,
-    /// Delete exactly one versioned locator. Still gated by the hold/root
-    /// protocol work in #113/#114 before an operator may enable it.
-    ExactLocator,
 }
 
 impl BlobDeletePolicy {
     pub fn parse(value: &str) -> Result<Self, BlobError> {
         match value {
             "disabled" | "" => Ok(Self::Disabled),
-            "exact-locator" => Ok(Self::ExactLocator),
-            other => Err(BlobError::Config(format!("unknown blob delete policy `{other}`"))),
+            "exact-locator" => Err(BlobError::Config(
+                "blob deletion stays disabled until persistent hold/root retirement claims (#113/#114) exist".into(),
+            )),
+            _ => Err(BlobError::Config("unknown blob delete policy; only `disabled` is accepted".into())),
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
-            Self::ExactLocator => "exact-locator",
         }
     }
 }
@@ -76,11 +77,12 @@ impl BlobProvider {
             #[cfg(feature = "blob-azblob")]
             "azblob" => Ok(Self::Azblob),
             #[cfg(not(feature = "blob-azblob"))]
-            "azblob" => Err(BlobError::Config(
-                "azblob provider was not compiled in (enable feature `blob-azblob`)".into(),
-            )),
-            "fs" | "memory" => Err(BlobError::UnsupportedService(value.into())),
-            other => Err(BlobError::UnsupportedService(other.into())),
+            "azblob" => {
+                Err(BlobError::Config("azblob provider was not compiled in (enable feature `blob-azblob`)".into()))
+            }
+            "fs" => Err(BlobError::UnsupportedService("fs".into())),
+            "memory" => Err(BlobError::UnsupportedService("memory".into())),
+            _ => Err(BlobError::UnsupportedService("<unrecognized service>".into())),
         }
     }
 
@@ -178,28 +180,18 @@ impl BlobLocator {
             self.tenant_id, self.authority_id, self.generation, self.attempt_id, self.namespace, self.sha256
         )
     }
-
-    /// Authority-free layout reserved for backup volumes that must stay
-    /// readable by a restore which mints a new authority. Still attempt-unique.
-    pub fn volume_path(&self) -> String {
-        format!(
-            "v1/volumes/tenants/{}/attempts/{}/{}/{}",
-            self.tenant_id, self.attempt_id, self.namespace, self.sha256
-        )
-    }
 }
 
 impl fmt::Debug for BlobLocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Identifiers, attempt path and digest stay out of Debug/log output.
         f.debug_struct("BlobLocator")
             .field("schema", &self.schema)
-            .field("tenant_id", &self.tenant_id)
-            .field("authority_id", &self.authority_id)
-            .field("generation", &self.generation)
-            .field("attempt_id", &self.attempt_id)
             .field("namespace", &self.namespace)
-            .field("sha256", &self.sha256)
             .field("length", &self.length)
+            .field("owner", &"<redacted>")
+            .field("attempt", &"<redacted>")
+            .field("sha256", &"<redacted>")
             .finish()
     }
 }
@@ -209,14 +201,45 @@ impl fmt::Debug for BlobLocator {
 /// reproduced `sha256` and `length` exactly.
 #[derive(Clone, PartialEq, Eq)]
 pub struct BlobReceipt {
-    pub schema: u32,
-    pub locator: BlobLocator,
-    pub provider: BlobProvider,
-    pub verified_sha256: String,
-    pub verified_length: u64,
+    schema: u32,
+    locator: BlobLocator,
+    provider: BlobProvider,
+    verified_sha256: String,
+    verified_length: u64,
 }
 
 impl BlobReceipt {
+    /// Only the blob_store driver can mint a receipt, and only after a provider
+    /// read-back. There is no `Deserialize`/public constructor, so an untrusted
+    /// receipt cannot be forged into verification.
+    pub(crate) fn new(
+        locator: BlobLocator,
+        provider: BlobProvider,
+        verified_sha256: String,
+        verified_length: u64,
+    ) -> Self {
+        Self { schema: BLOB_LOCATOR_SCHEMA, locator, provider, verified_sha256, verified_length }
+    }
+
+    pub fn schema(&self) -> u32 {
+        self.schema
+    }
+    pub fn locator(&self) -> &BlobLocator {
+        &self.locator
+    }
+    pub fn provider(&self) -> BlobProvider {
+        self.provider
+    }
+    pub fn verified_sha256(&self) -> &str {
+        &self.verified_sha256
+    }
+    pub fn verified_length(&self) -> u64 {
+        self.verified_length
+    }
+
+    /// Metadata equality only. A receipt reloaded from an untrusted store must
+    /// still pass [`BlobStore::verify_receipt`] against the provider before it
+    /// is treated as proof of content.
     pub fn matches(&self, locator: &BlobLocator) -> bool {
         self.schema == BLOB_LOCATOR_SCHEMA
             && &self.locator == locator
@@ -231,22 +254,37 @@ impl fmt::Debug for BlobReceipt {
             .field("schema", &self.schema)
             .field("locator", &self.locator)
             .field("provider", &self.provider)
-            .field("verified_sha256", &self.verified_sha256)
+            .field("verified_sha256", &"<redacted>")
             .field("verified_length", &self.verified_length)
             .finish()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum BlobError {
     Config(String),
     /// `fs`/`memory` and unknown services never qualify for production.
     UnsupportedService(String),
     NotFound,
     AlreadyExists,
-    LengthMismatch { expected: u64, actual: u64 },
-    DigestMismatch { expected: String, actual: String },
-    RangeExceedsLimit { requested: u64, limit: u64 },
+    LengthMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    DigestMismatch {
+        expected: String,
+        actual: String,
+    },
+    RangeExceedsLimit {
+        requested: u64,
+        limit: u64,
+    },
+    /// A range would require a full verified download larger than the strict
+    /// ceiling; no chunk-hash manifest/cache proof exists yet.
+    RangeUnsupported {
+        length: u64,
+        limit: u64,
+    },
     DeadlineExceeded,
     DeleteDisabled,
     Provider(String),
@@ -262,11 +300,12 @@ impl fmt::Display for BlobError {
             Self::LengthMismatch { expected, actual } => {
                 write!(f, "blob length mismatch: expected {expected}, got {actual}")
             }
-            Self::DigestMismatch { expected, actual } => {
-                write!(f, "blob digest mismatch: expected {expected}, got {actual}")
-            }
+            Self::DigestMismatch { .. } => write!(f, "blob digest mismatch"),
             Self::RangeExceedsLimit { requested, limit } => {
                 write!(f, "blob range read of {requested} bytes exceeds mount limit {limit}")
+            }
+            Self::RangeUnsupported { length, limit } => {
+                write!(f, "verified range read needs a full {length}-byte download, above ceiling {limit}")
             }
             Self::DeadlineExceeded => write!(f, "blob operation deadline exceeded"),
             Self::DeleteDisabled => write!(f, "blob deletion is disabled for this profile"),
@@ -276,3 +315,9 @@ impl fmt::Display for BlobError {
 }
 
 impl std::error::Error for BlobError {}
+
+impl fmt::Debug for BlobError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}

@@ -2,44 +2,32 @@
 //!
 //! A receipt is issued only after re-reading the object from the provider and
 //! hashing it locally: `stat`/ETag/provider checksum values are never accepted
-//! as proof of content. Failed uploads are aborted (multipart abort included)
-//! and the attempt-unique path is never reused.
+//! as proof of content. Failed uploads attempt an explicit bounded abort and
+//! the attempt-unique path is never reused.
 
 use std::{path::Path, time::Instant};
 
+use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
 use tokio::{fs::File, io::AsyncReadExt};
 
 use super::{
-    BLOB_LOCATOR_SCHEMA, BlobError, BlobLocator, BlobReceipt,
-    opendal::{BlobStore, DOWNLOAD_CHUNK_BYTES, bounded, map_provider_error},
+    BlobError, BlobLocator, BlobReceipt,
+    opendal::{BlobStore, DOWNLOAD_CHUNK_BYTES, map_provider_error},
+    upload::UploadGuard,
 };
 
-macro_rules! next_chunk {
-    ($deadline:expr, $reader:expr) => {
-        match tokio::time::timeout_at($deadline, $reader.next()).await {
-            Ok(Some(Ok(chunk))) => Some(chunk),
-            Ok(Some(Err(error))) => return Err(map_provider_error(error)),
-            Ok(None) => None,
-            Err(_) => return Err(BlobError::DeadlineExceeded),
-        }
-    };
-}
+/// S3 multipart requires >=5 MiB parts; 8 MiB keeps every part compliant.
+const UPLOAD_CONCURRENCY: usize = 4;
 
-macro_rules! source_read {
-    ($deadline:expr, $file:expr, $buf:expr) => {
-        match tokio::time::timeout_at($deadline, $file.read($buf)).await {
-            Ok(Ok(read)) => read,
-            Ok(Err(_)) => return Err(BlobError::Provider("local blob source read failed".into())),
-            Err(_) => return Err(BlobError::DeadlineExceeded),
-        }
-    };
+fn tokio_deadline(deadline: Instant) -> tokio::time::Instant {
+    tokio::time::Instant::from_std(deadline)
 }
 
 impl BlobStore {
     /// Stream a local file into a fresh attempt-unique locator. The caller must
-    /// already know the SHA-256 and length; mismatch after upload aborts the
-    /// provider write and yields no receipt.
+    /// already know the SHA-256 and length; a mismatch aborts the provider write
+    /// and yields no receipt.
     pub async fn put_file(
         &self,
         locator: &BlobLocator,
@@ -55,44 +43,71 @@ impl BlobStore {
             return Err(BlobError::LengthMismatch { expected, actual: metadata.len() });
         }
         let path = self.object_path(locator);
-        let writer = self.operator().writer_with(&path).chunk(super::opendal::UPLOAD_CHUNK_BYTES);
+        let writer =
+            self.operator().writer_with(&path).chunk(super::opendal::UPLOAD_CHUNK_BYTES).concurrent(UPLOAD_CONCURRENCY);
         let writer = if self.capabilities().conditional_create { writer.if_none_match("*") } else { writer };
-        let mut writer = bounded!(deadline, async { writer.await });
-        let mut file = File::open(source)
-            .await
-            .map_err(|_| BlobError::Provider("local blob source open failed".into()))?;
+        let writer = match tokio::time::timeout_at(tokio_deadline(deadline), async { writer.await }).await {
+            Ok(Ok(writer)) => writer,
+            Ok(Err(error)) => return Err(map_provider_error(error)),
+            Err(_) => return Err(BlobError::DeadlineExceeded),
+        };
+        let mut guard = UploadGuard::new(writer, self.profile().abort_timeout());
+        let mut file =
+            File::open(source).await.map_err(|_| BlobError::Provider("local blob source open failed".into()))?;
         let mut buffer = vec![0u8; DOWNLOAD_CHUNK_BYTES];
         let mut hasher = Sha256::new();
         let mut sent = 0u64;
         loop {
-            let read = source_read!(deadline, file, &mut buffer);
+            let read = match tokio::time::timeout_at(tokio_deadline(deadline), file.read(&mut buffer)).await {
+                Ok(Ok(read)) => read,
+                Ok(Err(_)) => {
+                    guard.abort_now().await;
+                    return Err(BlobError::Provider("local blob source read failed".into()));
+                }
+                Err(_) => {
+                    guard.abort_now().await;
+                    return Err(BlobError::DeadlineExceeded);
+                }
+            };
             if read == 0 {
                 break;
             }
             sent = sent.saturating_add(read as u64);
             if sent > expected {
-                let _ = tokio::time::timeout_at(deadline, writer.abort()).await;
+                guard.abort_now().await;
                 return Err(BlobError::LengthMismatch { expected, actual: sent });
             }
             hasher.update(&buffer[..read]);
             let chunk = bytes::Bytes::copy_from_slice(&buffer[..read]);
-            bounded!(deadline, writer.write(chunk));
+            match tokio::time::timeout_at(tokio_deadline(deadline), guard.writer().write(chunk)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let mapped = map_provider_error(error);
+                    guard.abort_now().await;
+                    return Err(mapped);
+                }
+                Err(_) => {
+                    guard.abort_now().await;
+                    return Err(BlobError::DeadlineExceeded);
+                }
+            }
         }
         let actual_sha256 = hex::encode(hasher.finalize());
-        if sent != expected {
-            let _ = tokio::time::timeout_at(deadline, writer.abort()).await;
-            return Err(BlobError::LengthMismatch { expected, actual: sent });
+        if sent != expected || actual_sha256 != locator.sha256() {
+            guard.abort_now().await;
+            return Err(if sent != expected {
+                BlobError::LengthMismatch { expected, actual: sent }
+            } else {
+                BlobError::DigestMismatch { expected: locator.sha256().to_owned(), actual: actual_sha256 }
+            });
         }
-        if actual_sha256 != locator.sha256() {
-            let _ = tokio::time::timeout_at(deadline, writer.abort()).await;
-            return Err(BlobError::DigestMismatch { expected: locator.sha256().to_owned(), actual: actual_sha256 });
-        }
-        bounded!(deadline, writer.close());
+        guard.close(tokio_deadline(deadline)).await?;
+        guard.disarm();
         self.verify(locator, deadline).await
     }
 
-    /// Provider read-back verification used both after publish and to validate a
-    /// receipt presented by another client.
+    /// Provider read-back verification used after publish and to re-present a
+    /// receipt minted by another client.
     pub async fn verify(&self, locator: &BlobLocator, deadline: Instant) -> Result<BlobReceipt, BlobError> {
         self.verify_receipt(locator, locator.sha256(), locator.length(), deadline).await
     }
@@ -106,28 +121,41 @@ impl BlobStore {
     ) -> Result<BlobReceipt, BlobError> {
         self.validate_locator(locator)?;
         if locator.sha256() != expected_sha256 || locator.length() != expected_length {
-            return Err(BlobError::DigestMismatch {
-                expected: locator.sha256().to_owned(),
-                actual: expected_sha256.to_owned(),
-            });
+            return Err(BlobError::LengthMismatch { expected: locator.length(), actual: expected_length });
         }
         let path = self.object_path(locator);
-        let metadata = bounded!(deadline, self.operator().stat(&path));
+        let metadata = match tokio::time::timeout_at(tokio_deadline(deadline), self.operator().stat(&path)).await {
+            Ok(Ok(metadata)) => metadata,
+            Ok(Err(error)) => return Err(map_provider_error(error)),
+            Err(_) => return Err(BlobError::DeadlineExceeded),
+        };
         if metadata.content_length() != expected_length {
-            return Err(BlobError::LengthMismatch {
-                expected: expected_length,
-                actual: metadata.content_length(),
-            });
+            return Err(BlobError::LengthMismatch { expected: expected_length, actual: metadata.content_length() });
         }
-        let mut reader = bounded!(deadline, self.operator().reader(&path));
+        let reader = match tokio::time::timeout_at(tokio_deadline(deadline), self.operator().reader(&path)).await {
+            Ok(Ok(reader)) => reader,
+            Ok(Err(error)) => return Err(map_provider_error(error)),
+            Err(_) => return Err(BlobError::DeadlineExceeded),
+        };
+        let mut stream = match tokio::time::timeout_at(tokio_deadline(deadline), reader.into_bytes_stream(..)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => return Err(map_provider_error(error)),
+            Err(_) => return Err(BlobError::DeadlineExceeded),
+        };
         let mut hasher = Sha256::new();
         let mut seen = 0u64;
-        while let Some(chunk) = next_chunk!(deadline, reader) {
+        loop {
+            let next = match tokio::time::timeout_at(tokio_deadline(deadline), stream.try_next()).await {
+                Ok(Ok(chunk)) => chunk,
+                Ok(Err(error)) => return Err(crate::blob_store::opendal::map_stream_error(error)),
+                Err(_) => return Err(BlobError::DeadlineExceeded),
+            };
+            let Some(chunk) = next else { break };
             seen = seen.saturating_add(chunk.len() as u64);
             if seen > expected_length {
                 return Err(BlobError::LengthMismatch { expected: expected_length, actual: seen });
             }
-            hasher.update(&*chunk);
+            hasher.update(&chunk);
         }
         let actual_sha256 = hex::encode(hasher.finalize());
         if seen != expected_length {
@@ -136,12 +164,6 @@ impl BlobStore {
         if actual_sha256 != expected_sha256 {
             return Err(BlobError::DigestMismatch { expected: expected_sha256.to_owned(), actual: actual_sha256 });
         }
-        Ok(BlobReceipt {
-            schema: BLOB_LOCATOR_SCHEMA,
-            locator: locator.clone(),
-            provider: self.provider(),
-            verified_sha256: actual_sha256,
-            verified_length: seen,
-        })
+        Ok(BlobReceipt::new(locator.clone(), self.provider(), actual_sha256, seen))
     }
 }

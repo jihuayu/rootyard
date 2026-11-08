@@ -7,21 +7,21 @@
 //! moved straight from configuration into the provider builder and are never
 //! formatted into errors or logs.
 
-use opendal::{ErrorKind, Operator};
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
-use opendal::services::S3;
 #[cfg(feature = "blob-azblob")]
 use opendal::services::Azblob;
+use opendal::services::S3;
+use opendal::{ErrorKind, Operator};
 
 use super::{
-    BlobDeletePolicy, BlobError, BlobLocator, BlobProvider,
+    BlobError, BlobLocator, BlobProvider,
     config::{BlobCredentials, BlobProfile},
 };
 
 /// Range reads stay small enough to be a bounded in-memory mount read.
 pub const MAX_RANGE_BYTES: u64 = 1024 * 1024;
 /// Upload window handed to OpenDAL; S3 multipart is decided by OpenDAL itself.
-pub(crate) const UPLOAD_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// Download/hash window so read-back memory is bounded regardless of object size.
 pub(crate) const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -48,7 +48,7 @@ impl BlobStore {
     /// cannot stat/read/write is rejected here, before any startup ACK.
     pub fn open(profile: BlobProfile) -> Result<Self, BlobError> {
         let operator = build_operator(&profile)?;
-        let capability = operator.info().capability();
+        let capability = operator.info().full_capability();
         let capabilities = BlobCapabilities {
             stat: capability.stat,
             read: capability.read,
@@ -62,9 +62,9 @@ impl BlobStore {
                 profile.provider().as_str()
             )));
         }
-        if profile.delete_policy() == BlobDeletePolicy::ExactLocator && !capabilities.delete {
+        if !capabilities.conditional_create {
             return Err(BlobError::Config(
-                "provider does not declare delete but blob delete policy is exact-locator".into(),
+                "provider lacks conditional create; unique-key reservation fallback is not enabled".into(),
             ));
         }
         Ok(Self { profile, operator, capabilities })
@@ -131,22 +131,22 @@ fn s3_operator(profile: &BlobProfile) -> Result<Operator, BlobError> {
     let BlobCredentials::S3 { access_key_id, secret_access_key, session_token } = profile.credentials() else {
         return Err(BlobError::Config("credential kind does not match the s3 provider".into()));
     };
-    let mut builder = S3::default();
-    builder.bucket(profile.bucket());
-    builder.root(profile.root());
-    // Featureless, deterministic auth: never load ~/.aws or instance metadata.
-    builder.disable_config_load();
-    builder.disable_ec2_metadata();
-    builder.access_key_id(access_key_id);
-    builder.secret_access_key(secret_access_key);
+    // Setters consume the builder in 0.57, so chain/reassign explicitly.
+    let mut builder = S3::default()
+        .bucket(profile.bucket())
+        .root(profile.root())
+        .disable_config_load()
+        .disable_ec2_metadata()
+        .access_key_id(access_key_id)
+        .secret_access_key(secret_access_key);
     if let Some(region) = profile.region() {
-        builder.region(region);
+        builder = builder.region(region);
     }
     if let Some(endpoint) = profile.endpoint() {
-        builder.endpoint(endpoint.as_str());
+        builder = builder.endpoint(endpoint.as_str());
     }
     if let Some(token) = session_token.as_deref() {
-        builder.session_token(token);
+        builder = builder.session_token(token);
     }
     let builder = Operator::new(builder).map_err(map_provider_error)?;
     Ok(finish_operator!(builder, profile))
@@ -157,37 +157,28 @@ fn azblob_operator(profile: &BlobProfile) -> Result<Operator, BlobError> {
     let BlobCredentials::Azblob { account_name, account_key } = profile.credentials() else {
         return Err(BlobError::Config("credential kind does not match the azblob provider".into()));
     };
-    let endpoint = profile
-        .endpoint()
-        .ok_or_else(|| BlobError::Config("azblob needs an explicit endpoint".into()))?;
-    let mut builder = Azblob::default();
-    builder.container(profile.bucket());
-    builder.root(profile.root());
-    builder.account_name(account_name);
-    builder.account_key(account_key);
-    builder.endpoint(endpoint.as_str());
+    let endpoint = profile.endpoint().ok_or_else(|| BlobError::Config("azblob needs an explicit endpoint".into()))?;
+    let builder = Azblob::default()
+        .container(profile.bucket())
+        .root(profile.root())
+        .account_name(account_name)
+        .account_key(account_key)
+        .endpoint(endpoint.as_str());
     let builder = Operator::new(builder).map_err(map_provider_error)?;
     Ok(finish_operator!(builder, profile))
 }
 
-
-/// Classify provider failures without ever embedding credentials. Only the
-/// error kind/context is surfaced; paths are immutable digests, not secrets.
+/// Classify provider failures by stable kind only. The full OpenDAL error
+/// Display/context can contain request URLs or key material, so it is never
+/// formatted into a returned error, log line or debug output.
 pub(crate) fn map_provider_error(error: opendal::Error) -> BlobError {
     match error.kind() {
         ErrorKind::NotFound => BlobError::NotFound,
         ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch => BlobError::AlreadyExists,
-        _ => BlobError::Provider(format!("{}: {}", error.kind(), error)),
+        other => BlobError::Provider(format!("provider error kind {other}")),
     }
 }
 
-macro_rules! bounded {
-    ($deadline:expr, $fut:expr) => {
-        match tokio::time::timeout_at($deadline, $fut).await {
-            Ok(Ok(value)) => value,
-            Ok(Err(error)) => return Err(crate::blob_store::opendal::map_provider_error(error)),
-            Err(_) => return Err(crate::blob_store::BlobError::DeadlineExceeded),
-        }
-    };
+pub(crate) fn map_stream_error(error: std::io::Error) -> BlobError {
+    BlobError::Provider(format!("provider byte stream error kind {:?}", error.kind()))
 }
-pub(crate) use bounded;

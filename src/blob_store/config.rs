@@ -9,7 +9,6 @@
 use std::{fmt, time::Duration};
 
 use reqwest::Url;
-use uuid::Uuid;
 
 use super::{BlobDeletePolicy, BlobError, BlobProvider, MAX_NAMESPACE_BYTES, MAX_OBJECT_BYTES};
 
@@ -17,6 +16,11 @@ pub const DEFAULT_OBJECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_CONCURRENCY: usize = 16;
 pub const DEFAULT_RETRY_MAX_TIMES: usize = 3;
+/// Verified range reads currently require a full download; keep it strictly bounded.
+pub const DEFAULT_RANGE_FULL_GET_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_RANGE_FULL_GET_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Independent budget for best-effort writer abort after a failed/aborted op.
+pub const DEFAULT_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENCY: usize = 256;
 const MAX_RETRY_TIMES: usize = 10;
 
@@ -24,9 +28,16 @@ const MAX_RETRY_TIMES: usize = 10;
 /// never formatted into an error, log line or error chain.
 #[derive(Clone)]
 pub enum BlobCredentials {
-    S3 { access_key_id: String, secret_access_key: String, session_token: Option<String> },
+    S3 {
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: Option<String>,
+    },
     #[cfg(feature = "blob-azblob")]
-    Azblob { account_name: String, account_key: String },
+    Azblob {
+        account_name: String,
+        account_key: String,
+    },
 }
 
 impl BlobCredentials {
@@ -58,6 +69,8 @@ pub struct BlobProfile {
     concurrency: usize,
     retry_max_times: usize,
     max_object_bytes: u64,
+    range_full_get_max_bytes: u64,
+    abort_timeout: Duration,
     delete_policy: BlobDeletePolicy,
 }
 
@@ -68,12 +81,14 @@ impl fmt::Debug for BlobProfile {
             .field("bucket", &self.bucket)
             .field("region", &self.region)
             .field("endpoint", &self.endpoint.as_ref().map(Url::origin).map(|o| o.ascii_serialization()))
-            .field("root", &self.root)
+            .field("root", &"<redacted>")
             .field("credentials", &self.credentials)
             .field("object_timeout", &self.object_timeout)
             .field("io_timeout", &self.io_timeout)
             .field("concurrency", &self.concurrency)
             .field("retry_max_times", &self.retry_max_times)
+            .field("range_full_get_max_bytes", &self.range_full_get_max_bytes)
+            .field("abort_timeout", &self.abort_timeout)
             .field("delete_policy", &self.delete_policy)
             .finish()
     }
@@ -88,19 +103,24 @@ impl BlobProfile {
             }
         }
         let provider = BlobProvider::parse(&env_required("ROOTYARD_BLOB_SERVICE")?)?;
-        let bucket = env_required(if provider == BlobProvider::S3 { "ROOTYARD_BLOB_BUCKET" } else { "ROOTYARD_BLOB_CONTAINER" })?;
+        let bucket = env_required(if provider == BlobProvider::S3 {
+            "ROOTYARD_BLOB_BUCKET"
+        } else {
+            "ROOTYARD_BLOB_CONTAINER"
+        })?;
         validate_bucket(&bucket)?;
         let root = env_optional("ROOTYARD_BLOB_ROOT")?.unwrap_or_default();
         validate_root(&root)?;
         let endpoint = env_optional("ROOTYARD_BLOB_ENDPOINT")?.map(|raw| parse_origin(&raw)).transpose()?;
         let region = env_optional("ROOTYARD_BLOB_REGION")?;
+        if endpoint.is_none() {
+            return Err(BlobError::Config(
+                "standalone blob profile needs an explicit remote ROOTYARD_BLOB_ENDPOINT".into(),
+            ));
+        }
         if provider == BlobProvider::S3 {
-            if endpoint.is_none() && region.is_none() {
-                return Err(BlobError::Config("s3 needs ROOTYARD_BLOB_REGION or an explicit endpoint".into()));
-            }
-            if let Some(region) = &region {
-                validate_token(region, 64, "region")?;
-            }
+            let region = region.as_deref().ok_or_else(|| BlobError::Config("s3 needs ROOTYARD_BLOB_REGION".into()))?;
+            validate_token(region, 64, "region")?;
         }
         let credentials = match provider {
             BlobProvider::S3 => {
@@ -150,7 +170,19 @@ impl BlobProfile {
             object_timeout: duration_ms("ROOTYARD_BLOB_TIMEOUT_MS", DEFAULT_OBJECT_TIMEOUT)?,
             io_timeout: duration_ms("ROOTYARD_BLOB_IO_TIMEOUT_MS", DEFAULT_IO_TIMEOUT)?,
             concurrency: bounded_usize("ROOTYARD_BLOB_CONCURRENCY", DEFAULT_CONCURRENCY, 1, MAX_CONCURRENCY)?,
-            retry_max_times: bounded_usize("ROOTYARD_BLOB_RETRY_MAX_TIMES", DEFAULT_RETRY_MAX_TIMES, 0, MAX_RETRY_TIMES)?,
+            retry_max_times: bounded_usize(
+                "ROOTYARD_BLOB_RETRY_MAX_TIMES",
+                DEFAULT_RETRY_MAX_TIMES,
+                0,
+                MAX_RETRY_TIMES,
+            )?,
+            range_full_get_max_bytes: bounded_u64(
+                "ROOTYARD_BLOB_RANGE_FULL_GET_MAX_BYTES",
+                DEFAULT_RANGE_FULL_GET_MAX_BYTES,
+                1024 * 1024,
+                MAX_RANGE_FULL_GET_MAX_BYTES,
+            )?,
+            abort_timeout: duration_ms("ROOTYARD_BLOB_ABORT_TIMEOUT_MS", DEFAULT_ABORT_TIMEOUT)?,
             max_object_bytes,
             delete_policy: BlobDeletePolicy::parse(&env_optional("ROOTYARD_BLOB_DELETE")?.unwrap_or_default())?,
         })
@@ -189,14 +221,20 @@ impl BlobProfile {
     pub fn max_object_bytes(&self) -> u64 {
         self.max_object_bytes
     }
+    pub fn range_full_get_max_bytes(&self) -> u64 {
+        self.range_full_get_max_bytes
+    }
+    pub fn abort_timeout(&self) -> Duration {
+        self.abort_timeout
+    }
     pub fn delete_policy(&self) -> BlobDeletePolicy {
         self.delete_policy
     }
 
-    /// Full locator path with the configured prefix. The prefix is a trusted
-    /// configuration value; the locator part is fixed-format ASCII.
+    /// Relative object path. `ROOTYARD_BLOB_ROOT` is applied exactly once by
+    /// the operator builder root, never duplicated here.
     pub(crate) fn object_path(&self, locator: &super::BlobLocator) -> String {
-        if self.root.is_empty() { locator.path() } else { format!("{}/{}", self.root, locator.path()) }
+        locator.path()
     }
 }
 
@@ -221,6 +259,17 @@ fn duration_ms(name: &str, default: Duration) -> Result<Duration, BlobError> {
         return Err(BlobError::Config(format!("{name} is out of range")));
     }
     Ok(Duration::from_millis(ms))
+}
+
+fn bounded_u64(name: &str, default: u64, min: u64, max: u64) -> Result<u64, BlobError> {
+    let Some(raw) = env_optional(name)? else {
+        return Ok(default);
+    };
+    let value = raw.parse::<u64>().map_err(|_| BlobError::Config(format!("{name} is not a byte count")))?;
+    if value < min || value > max {
+        return Err(BlobError::Config(format!("{name} is out of range {min}..={max}")));
+    }
+    Ok(value)
 }
 
 fn bounded_usize(name: &str, default: usize, min: usize, max: usize) -> Result<usize, BlobError> {
@@ -283,21 +332,15 @@ pub(crate) fn parse_origin(raw: &str) -> Result<Url, BlobError> {
     if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
         return Err(BlobError::Config("blob endpoint requires TLS (http only for loopback fixtures)".into()));
     }
-    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() || !url.username().is_empty() || url.password().is_some() {
-        return Err(BlobError::Config("blob endpoint must be an origin URL without credentials, path, query or fragment".into()));
+    if url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(BlobError::Config(
+            "blob endpoint must be an origin URL without credentials, path, query or fragment".into(),
+        ));
     }
     Ok(url)
-}
-
-/// Test/contract helper: parse a locator's attempt identity from explicit
-/// fields without accepting caller-built strings.
-pub fn attempt_locator(
-    tenant: Uuid,
-    authority: Uuid,
-    generation: i64,
-    namespace: &str,
-    sha256: &str,
-    length: u64,
-) -> Result<super::BlobLocator, BlobError> {
-    super::BlobLocator::new(tenant, authority, generation, Uuid::new_v4(), namespace, sha256, length)
 }

@@ -28,6 +28,7 @@ pub mod remote_io;
 pub mod remote_local;
 pub mod remote_objects;
 pub mod remote_provider;
+pub mod remote_provider_put;
 pub mod remote_publish;
 
 pub struct Storage {
