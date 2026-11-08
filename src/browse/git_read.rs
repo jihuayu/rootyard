@@ -411,6 +411,11 @@ pub(crate) async fn read_head(state: &AppState, repo_id: Uuid) -> Result<HeadInf
 /// `refs/tags/`, or a shorter cut of one of them), which every ref of the
 /// namespace matches. A selective prefix never reaches this function, because
 /// filtering the first `limit + 1` refs of a namespace would under-fill the page.
+///
+/// `--count` bounds Git records, while the parser drops non-public refs (reserved
+/// proposal refs, names past the public 1024-byte limit), so a full record batch
+/// that yields a short page is rerun through the bounded scan instead of being
+/// reported as a complete page.
 async fn namespace_page(
     state: &AppState,
     repo_id: Uuid,
@@ -433,10 +438,27 @@ async fn namespace_page(
         "--exclude=refs/rootyard-ci/*",
     ];
     match run_git_step(state, repo_id, GitStep::RefsPage, &args, 256 * 1024).await? {
-        GitOutcome::Output(raw) => Ok(parse_for_each_ref_output(&raw)
-            .into_iter()
-            .filter(|r| r.name.starts_with(namespace) && prefix.is_none_or(|p| r.name.starts_with(p)))
-            .collect()),
+        GitOutcome::Output(raw) => {
+            // `--count` bounds the ref records Git returns, not the public refs
+            // Browse may show: reserved proposal refs, names past the public
+            // 1024-byte limit and other non-public refs are dropped while
+            // parsing. Git only withholds later refs when it filled the batch,
+            // so a short parsed page out of a full batch means public refs may
+            // sit behind the rejected ones and the seek answer is truncated.
+            // Rerun this one namespace through the bounded scan, which counts
+            // public refs after filtering (and keeps its record, byte and time
+            // limits plus child cleanup). A short batch is the real end of the
+            // namespace, so fully public pages keep the seek path.
+            let records = raw.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).count();
+            let items: Vec<RefItem> = parse_for_each_ref_output(&raw)
+                .into_iter()
+                .filter(|r| r.name.starts_with(namespace) && prefix.is_none_or(|p| r.name.starts_with(p)))
+                .collect();
+            if records >= limit + 1 && items.len() < limit + 1 {
+                return scan_namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await;
+            }
+            Ok(items)
+        }
         GitOutcome::CommandFailed { exit: Some(129) } => {
             report_seek_fallback();
             scan_namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await

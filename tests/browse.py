@@ -376,14 +376,50 @@ class BrowseHarness(Harness):
             page = self.document(self.repo_api("/refs?" + query))
             return [item["name"] for item in page["items"]], page["next_after"]
 
+        def walk(limit=1):
+            collected, cursor = [], None
+            while len(collected) <= 4096:
+                query = "/refs?limit=" + str(limit)
+                if cursor is not None:
+                    query += "&after=" + urllib.parse.quote(cursor, safe="")
+                page = self.document(self.repo_api(query))
+                collected.extend(item["name"] for item in page["items"])
+                cursor = page["next_after"]
+                if cursor is None:
+                    return collected, None
+            return collected, cursor
+
         def write(ref_name, old_oid, new_oid):
             self.document(self.repo_api("/ref-transactions"), 200, method="POST", body={
                 "updates": [{"ref_name": ref_name, "old_oid": old_oid, "new_oid": new_oid}]})
 
+        def local(*args):
+            return self.git("--git-dir=" + str(self.bare), *args)
+
         created = ("refs/heads/a1", "refs/heads/a2", "refs/heads/z1", "refs/heads/z2")
+        # Refs Git returns but Browse must never show: reserve-managed proposal
+        # refs inside the public heads namespace, plus a valid Git name past the
+        # 1024-byte public limit.  They sort between a1 and z1, so a page that
+        # counts raw Git records instead of public refs is truncated here.
+        hidden = ("refs/heads/rootyard-proposals/one", "refs/heads/rootyard-proposals/two",
+                  "refs/heads/long/" + "/".join(["x" * 200] * 6))
         try:
             for name in created:
                 write(name, ZERO_OID, self.third)
+            for name in hidden:
+                local("update-ref", name, self.third)
+            # A limit-1 walk of the namespace-wide listing must deliver every
+            # public ref exactly once and hide the non-public ones.
+            expected = sorted(
+                name for name in local("for-each-ref", "--format=%(refname)").stdout.decode().splitlines()
+                if name.startswith(("refs/heads/", "refs/tags/"))
+                and len(name) <= 1024
+                and not name.startswith(("refs/heads/rootyard-proposals/", "refs/rootyard-ci/")))
+            collected, cursor = walk()
+            assert cursor is None, collected
+            assert collected == expected, (collected, expected)
+            assert len(set(collected)) == len(collected), collected
+            assert not [name for name in collected if name in hidden], collected
             names, cursor = refs("refs/heads/z", limit=1)
             assert names == ["refs/heads/z1"], names
             assert cursor == "refs/heads/z1", cursor
@@ -400,6 +436,8 @@ class BrowseHarness(Harness):
             # would match every branch, as a literal it matches none.
             assert refs("refs/heads/*")[0] == []
         finally:
+            for name in hidden:
+                local("update-ref", "-d", name)
             for name in created:
                 write(name, self.third, ZERO_OID)
         # The fixture is back to the refs the other cases assert.
