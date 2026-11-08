@@ -1,0 +1,21 @@
+{
+  "files": {
+    "README.md": "b553fa109c76308377d6e638a7267ac1ad822160d70d012ea73b2d32e49eeefd",
+    "app.build.json": "771783d8f39186d03f588ccb9c5cd3a94078fceade8e2de6c2b7fe9db2a10aad",
+    "benchmark-native.json": "d86000113e42e12896eb376f68b8067a80e8aeb2a0bdff92e17fc64db5d22dc8",
+    "benchmark-native.log": "6a6e888ec7b4db5b1238ea5995df588e8fd78688b67de58250f4285ce47ddf00",
+    "checks.json": "34b3147eace2a6c20e93bec84badb3e3fb80bda52aa7bd3a67137e3d123a8067",
+    "history/correlated-alias-v2.json": "d882b634300d413b988b212b5a942e55697c3a98c9fce58bdb9719e37f23db6f",
+    "history/correlated-alias-v2.log": "49809da14f4bedf820a93ae2cfc5625a2ed9cfbcf9f2009a383ee3890f0f65e2",
+    "history/occupied-bucket-v1.json": "c17813175c0e6f1f9dac0d39ff0f4d224aeb91f513d2b69320d44ed0241ca842",
+    "history/occupied-bucket-v1.log": "ab9650ad1125e0088e2774fb98ab7e09c282d9d24cb01748755667bdc2ce35d5",
+    "run-benchmark.py": "86ba33b1b03dbf5c7dcf07010a8100b42ebdbf9797bbb8177d0c7e294f417c13",
+    "run-sharding.py": "bff6f4f4fab7c47f0f8fd966e358344c7df9d2ad4bb38e3b7e2a4ee59ca8066d",
+    "run-source-units.py": "cb4977dc9788ba1704bcbc9333d7b019a40755b909be3edf3e95bfa300e77739",
+    "sharding-native.json": "9aafbe63710b5e4e509c13e3adbe0032be0622379eda9e0146a9a6d03a22fa89",
+    "sharding-native.log": "4ccffad9853b261a0f4e29fcb9090064b98786dd198285030a2d0d173689d0fe",
+    "source-units.json": "dad54bbd8d63d25fd2569571a6e4a4115c349d5609a13c665cccbe3ddcd50088",
+    "source-units.log": "ac3f18047bc04986c31641bd9b2e26203955be2eab8055946ef54bccc754e53e"
+  },
+  "manifest_excludes_self": true
+}
