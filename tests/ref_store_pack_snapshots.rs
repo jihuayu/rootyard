@@ -1863,7 +1863,7 @@ async fn permanent_ledger_survives_delete_and_cross_ledger_request_reuse_is_refu
 /// Bounded refusal diagnostics: actual SQLSTATE, the database message and the exact refused statement.
 /// Output is clipped and a client-side failure never echoes a connection URL (it may embed
 /// credentials), so a wrong guard expectation is debuggable without leaking the test profile.
-fn bounded_refusal(statement: &str, error: &tokio_postgres::Error) -> String {
+fn sql_refusal_diagnostic(statement: &str, error: &tokio_postgres::Error) -> String {
     fn clip(text: &str, limit: usize) -> String {
         let flat: String = text.chars().map(|character| if character.is_control() { ' ' } else { character }).collect();
         match flat.char_indices().nth(limit) {
@@ -1884,7 +1884,7 @@ fn bounded_refusal(statement: &str, error: &tokio_postgres::Error) -> String {
 async fn expect_client_sqlstate(client: &tokio_postgres::Client, statement: &str, expected: &str) -> Result<()> {
     let error = client.batch_execute(statement).await.expect_err("statement must be refused");
     let actual = error.code().map(|code| code.code());
-    ensure!(actual == Some(expected), "expected SQLSTATE {expected} but saw {}", bounded_refusal(statement, &error));
+    ensure!(actual == Some(expected), "expected SQLSTATE {expected} but saw {}", sql_refusal_diagnostic(statement, &error));
     Ok(())
 }
 #[tokio::test]

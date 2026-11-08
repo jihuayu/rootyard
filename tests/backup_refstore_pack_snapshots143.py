@@ -543,6 +543,8 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
         # helper, so this harness never guesses an implementation constant.
         assert accounting["a2_fixed_charge_bytes"] > 0
         assert accounting["lifecycle_charge_bytes"] > 0
+        # The typed create receipt already includes the pack-binding row charge.
+        # The fixed remainder is A2 pin/receipt overhead plus permanent history.
         assert accounting["create_fixed_charge_bytes"] == (
             accounting["a2_fixed_charge_bytes"] + accounting["lifecycle_charge_bytes"])
         expected_logical = (sum(create_logical) + 4 * accounting["create_fixed_charge_bytes"] +

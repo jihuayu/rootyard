@@ -1266,6 +1266,9 @@ async fn seed(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()> {
     ensure!(create_receipt_bytes.len() == 4, "not all four create receipts carry typed logical bytes");
     let a2_fixed_bytes = a2_after_old[2] - old_receipt.logical_bytes();
     ensure!(a2_fixed_bytes > 0, "the measured A2 fixed charge is not positive");
+    // PackSnapshotReceipt.logical_bytes already includes the captured binding
+    // rows (PgPackSnapshot::create adds them to snapshot_bytes). Adding that
+    // charge again here would double-count every binding.
     let create_fixed_bytes = a2_fixed_bytes + lifecycle_bytes;
     let expected_logical = create_receipt_bytes.iter().sum::<i64>() + 4 * create_fixed_bytes + 2 * lifecycle_bytes;
     ensure!(usage[6] == expected_logical, "permanent logical bytes do not equal the exact typed charge");
