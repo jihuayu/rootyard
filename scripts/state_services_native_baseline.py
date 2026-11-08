@@ -9,10 +9,12 @@ import math
 from pathlib import Path
 import random
 import shutil
+import socket
 import statistics
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -84,11 +86,268 @@ def postgres_ports(pid, pg_port):
                 ports.add(int(fields[1].rsplit(':', 1)[1], 16))
     return sorted(ports)
 
+# Fixed phase/outcome/bucket label sets mirrored from src/baseline_metrics.rs.
+# The parser accepts nothing outside these sets, so a scrape can never inject an
+# actor, repository, endpoint or error string into the report.
+PHASE_LABELS = ('publication_slot', 'ref_advisory', 'pool_checkout', 'repo_publication_window',
+                'state_row', 'authority_lock', 'native_git_prepare', 'native_git_fsck',
+                'native_git_hydration', 'remote_put', 'remote_verified_readback', 'remote_get')
+OUTCOME_LABELS = ('ok', 'error', 'cancelled')
+BUCKET_LABELS = ('0.005', '0.01', '0.025', '0.05', '0.1', '0.25', '0.5', '1', '5', '30', '+Inf')
+BASELINE_PREFIX = 'rootyard_baseline_'
+PHASE_LIMITS = [
+    'Exact SQL lock wait is still unmeasured: state_row and authority_lock are client round trips '
+    'and include statement submission, PostgreSQL execution and row return.',
+    'Values are per process. Counters reset across h.stop/h.start and are never differenced '
+    'across processes; a case spanning a restart reports process_restarted instead of a delta.',
+    'Phase spans nest (native_git_hydration contains remote GET and decrypt) and must not be summed.',
+    'Bytes are logical payload of successful S3-backed transfers only; local-filesystem object '
+    'storage emits no remote_* series, and retries, headers and TLS overhead are excluded.',
+]
+
+
+class MetricsRestart(ValueError):
+    """Two samples come from different application processes."""
+
+
+def _integral(number):
+    if number != int(number) or number > (2 ** 64 - 1):
+        raise ValueError('baseline counter must be an unsigned 64-bit integer')
+    return int(number)
+
+
+def _exact_labels(labels, expected):
+    if set(labels) != set(expected):
+        raise ValueError('unexpected label set for a baseline series')
+
+
+def _baseline_sample(line):
+    """Return (name, labels, value) for one baseline line, or None for a foreign line."""
+    line = line.strip()
+    if not line or line.startswith('#'):
+        return None
+    name, separator, value = line.partition(' ')
+    if not separator or not name:
+        raise ValueError('malformed exposition line')
+    if not name.startswith(BASELINE_PREFIX):
+        return None
+    labels = {}
+    if '{' in name:
+        name, _, tail = name.partition('{')
+        if not tail.endswith('}'):
+            raise ValueError('malformed baseline label set')
+        for pair in tail[:-1].split(','):
+            key, equals, raw = pair.partition('=')
+            if not equals or len(raw) < 2 or not raw.startswith('"') or not raw.endswith('"'):
+                raise ValueError('malformed baseline label pair')
+            if key in labels or key not in ('phase', 'outcome', 'le'):
+                raise ValueError('unexpected baseline label key')
+            labels[key] = raw[1:-1]
+    try:
+        number = float(value.strip())
+    except ValueError:
+        raise ValueError('non-numeric baseline sample value') from None
+    if not math.isfinite(number) or number < 0:
+        raise ValueError('baseline sample value must be finite and non-negative')
+    return name, labels, number
+
+
+def parse_phase_metrics(text):
+    """Parse only rootyard_baseline_* series; None means the feature is absent."""
+    observations, outcomes, buckets, sums, counts, byte_counts = {}, {}, {}, {}, {}, {}
+    seen = set()
+    for line in text.splitlines():
+        parsed = _baseline_sample(line)
+        if parsed is None:
+            continue
+        name, labels, number = parsed
+        key = (name, tuple(sorted(labels.items())))
+        if key in seen:
+            raise ValueError('duplicate baseline series')
+        seen.add(key)
+        phase = labels.get('phase')
+        if phase not in PHASE_LABELS:
+            raise ValueError('unexpected baseline phase label')
+        if name == 'rootyard_baseline_phase_observations_total':
+            _exact_labels(labels, ('phase',))
+            observations[phase] = _integral(number)
+        elif name == 'rootyard_baseline_phase_outcomes_total':
+            _exact_labels(labels, ('outcome', 'phase'))
+            if labels['outcome'] not in OUTCOME_LABELS:
+                raise ValueError('unexpected baseline outcome label')
+            outcomes.setdefault(phase, {})[labels['outcome']] = _integral(number)
+        elif name == 'rootyard_baseline_phase_duration_seconds_bucket':
+            _exact_labels(labels, ('le', 'phase'))
+            if labels['le'] not in BUCKET_LABELS:
+                raise ValueError('unexpected baseline histogram bucket')
+            buckets.setdefault(phase, {})[labels['le']] = _integral(number)
+        elif name == 'rootyard_baseline_phase_duration_seconds_sum':
+            _exact_labels(labels, ('phase',))
+            sums[phase] = number
+        elif name == 'rootyard_baseline_phase_duration_seconds_count':
+            _exact_labels(labels, ('phase',))
+            counts[phase] = _integral(number)
+        elif name == 'rootyard_baseline_phase_bytes_total':
+            _exact_labels(labels, ('phase',))
+            byte_counts[phase] = _integral(number)
+        else:
+            raise ValueError('unexpected baseline series name')
+    if not seen:
+        return None
+    phases = {}
+    for phase in PHASE_LABELS:
+        if (phase not in observations or phase not in sums or phase not in counts
+                or phase not in byte_counts or set(outcomes.get(phase, ())) != set(OUTCOME_LABELS)
+                or set(buckets.get(phase, ())) != set(BUCKET_LABELS)):
+            raise ValueError('baseline series incomplete for a fixed phase')
+        total = observations[phase]
+        if counts[phase] != total or sum(outcomes[phase].values()) != total:
+            raise ValueError('baseline observation count disagrees with outcomes/count')
+        previous = 0
+        for label in BUCKET_LABELS:
+            value = buckets[phase][label]
+            if value < previous:
+                raise ValueError('baseline histogram buckets are not cumulative')
+            previous = value
+        if previous != total:
+            raise ValueError('baseline +Inf bucket disagrees with the observation count')
+        phases[phase] = {'observations': total, 'outcomes': dict(outcomes[phase]),
+                         'buckets': dict(buckets[phase]), 'sum_seconds': sums[phase],
+                         'count': counts[phase], 'bytes': byte_counts[phase]}
+    return {'phases': phases}
+
+
+def sample_delta(before, after):
+    """Per-phase delta between two samples of the same process; rejects regressions."""
+    if before['identity'] != after['identity']:
+        raise MetricsRestart('application process changed; counters are not comparable')
+    delta = {}
+    for phase in PHASE_LABELS:
+        left, right = before['sample']['phases'][phase], after['sample']['phases'][phase]
+        entry = {
+            'observations': right['observations'] - left['observations'],
+            'outcomes': {name: right['outcomes'][name] - left['outcomes'][name] for name in OUTCOME_LABELS},
+            'bytes': right['bytes'] - left['bytes'],
+            'duration_seconds': {
+                'buckets': {label: right['buckets'][label] - left['buckets'][label] for label in BUCKET_LABELS},
+                'sum': round(right['sum_seconds'] - left['sum_seconds'], 9),
+                'count': right['count'] - left['count'],
+            },
+        }
+        values = [entry['observations'], entry['bytes'], entry['duration_seconds']['sum']]
+        values.extend(entry['outcomes'].values())
+        values.extend(entry['duration_seconds']['buckets'].values())
+        values.append(entry['duration_seconds']['count'])
+        if min(values) < 0:
+            raise ValueError('baseline counter regressed within one process')
+        delta[phase] = entry
+    return delta
+
+
+def loopback_metrics_port():
+    """Allocate one fixture-owned ephemeral loopback port; no external address."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    if not 1024 < port < 65536:
+        raise ValueError('fixture could not allocate an unprivileged loopback port')
+    return port
+
+
+def process_identity(pid):
+    """(pid, kernel start time) distinguishes a restarted process from the same pid."""
+    fields = Path(f'/proc/{pid}/stat').read_text().rpartition(')')[2].split()
+    return {'pid': pid, 'starttime': int(fields[19])}
+
+
+class PhaseMetricsCapture:
+    """Opt-in before/after scrape of the private loopback exporter, per process."""
+
+    def __init__(self, port, timeout=2.0):
+        self.port = port
+        self.url = 'http://127.0.0.1:' + str(port) + '/metrics'
+        self.timeout = timeout
+        self.status = 'ready'
+        self.reason = None
+        self.scrapes = 0
+        self.scrape_seconds = []
+        self.processes = []
+
+    def _scrape(self, pid):
+        if self.status != 'ready':
+            return None
+        begin = time.monotonic()
+        with urllib.request.urlopen(self.url, timeout=self.timeout) as response:
+            if response.status != 200:
+                raise ValueError('metrics endpoint returned status ' + str(response.status))
+            text = response.read().decode('utf-8')
+        self.scrape_seconds.append(time.monotonic() - begin)
+        self.scrapes += 1
+        sample = parse_phase_metrics(text)
+        if sample is None:
+            self.status = 'feature_disabled'
+            self.reason = ('exporter answered but exported no ' + BASELINE_PREFIX + '* series; '
+                           'the binary was built without the state-baseline-metrics feature')
+            return None
+        return {'identity': process_identity(pid), 'sample': sample}
+
+    def _failed(self, error):
+        self.status = 'unavailable'
+        self.reason = 'metrics scrape failed: ' + type(error).__name__
+        return {'status': self.status, 'reason': self.reason}
+
+    def observe_start(self, pid):
+        self.processes.append({'event': 'start', 'identity': process_identity(pid)})
+
+    def close_process(self, pid, event):
+        """Capture the process one last time before it is stopped or torn down."""
+        try:
+            sample = self._scrape(pid)
+        except Exception as error:
+            return self._failed(error)
+        if sample is None:
+            return {'status': self.status, 'reason': self.reason}
+        record = {'event': event, 'identity': sample['identity'],
+                  'observations': {phase: sample['sample']['phases'][phase]['observations'] for phase in PHASE_LABELS}}
+        self.processes.append(record)
+        return record
+
+    def open_case(self, pid):
+        if self.status != 'ready':
+            return {'status': self.status, 'reason': self.reason}
+        try:
+            sample = self._scrape(pid)
+        except Exception as error:
+            return self._failed(error)
+        if sample is None:
+            return {'status': self.status, 'reason': self.reason}
+        return {'status': 'sampled', 'sample': sample}
+
+    def close_case(self, pid, marker):
+        if marker.get('status') != 'sampled':
+            return marker
+        try:
+            after = self._scrape(pid)
+        except Exception as error:
+            return self._failed(error)
+        if after is None:
+            return {'status': self.status, 'reason': self.reason}
+        try:
+            delta = sample_delta(marker['sample'], after)
+        except MetricsRestart as error:
+            return {'status': 'process_restarted', 'reason': str(error)}
+        return {'status': 'captured', 'identity': after['identity'], 'phases': delta,
+                'note': 'phase spans nest and are not additive; the scrape adds one pooled SQL '
+                        'snapshot outside this case'}
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--binary', required=True)
     p.add_argument('--report', type=Path, required=True)
     p.add_argument('--source-root', type=Path, required=True)
+    p.add_argument('--phase-metrics', action='store_true',
+                   help='capture per-process phase metrics from the private loopback listener of a '
+                        'state-baseline-metrics build')
     args = p.parse_args()
     binary = Path(args.binary).resolve()
     receipt = json.loads(binary.with_suffix('.build.json').read_text())
@@ -106,6 +365,11 @@ def main():
     query = parse_qsl(parts.query) + [('application_name', app_name)]
     h.db = urlunsplit(parts._replace(query=urlencode(query)))
     h.env['DATABASE_URL'] = h.db
+    capture = None
+    if args.phase_metrics:
+        capture = PhaseMetricsCapture(loopback_metrics_port())
+        # Private loopback bind only; the fixture allocates the port, nothing external is contacted.
+        h.env['ROOTYARD_METRICS_BIND'] = '127.0.0.1:' + str(capture.port)
     report = {'version': 1, 'status': 'failed', 'profile': 'legacy-pando-s3-vault',
               'build_receipt': receipt, 'binary_bytes': binary.stat().st_size,
               'runner_sha256': digest(Path(__file__)), 'cases': [],
@@ -146,13 +410,44 @@ def main():
                 sampler_errors.append(h.redact(error))
                 return
             stop.wait(.25)
-    def measure(label, function):
+    def measure(label, function, phase_skip=None):
+        if capture is None:
+            marker = None
+        elif phase_skip is not None:
+            marker = {'status': phase_skip[0], 'reason': phase_skip[1]}
+        elif h.proc is None or h.proc.poll() is not None:
+            marker = {'status': 'service_stopped', 'reason': 'no running application process to scrape'}
+        else:
+            marker = capture.open_case(h.proc.pid)
         begin = time.monotonic()
         value = function()
-        report['cases'].append({'name': label, 'seconds': time.monotonic() - begin, 'status': 'passed'})
+        entry = {'name': label, 'seconds': time.monotonic() - begin, 'status': 'passed'}
+        if marker is not None:
+            if marker.get('status') == 'sampled' and (h.proc is None or h.proc.poll() is not None):
+                entry['phase_metrics'] = {'status': 'service_stopped',
+                    'reason': 'application process ended during the case; no comparable delta'}
+            else:
+                entry['phase_metrics'] = capture.close_case(h.proc.pid if h.proc is not None else None, marker)
+        report['cases'].append(entry)
         return value
+
+    def setup_app():
+        h.setup()
+        if capture is not None:
+            capture.observe_start(h.proc.pid)
+
+    def stop_app():
+        # Capture the running process before it is signalled, so no delta spans a restart.
+        if capture is not None and h.proc is not None and h.proc.poll() is None:
+            capture.close_process(h.proc.pid, 'stop')
+        h.stop()
+
+    def start_app():
+        h.start()
+        if capture is not None:
+            capture.observe_start(h.proc.pid)
     try:
-        measure('schema_accounts_server_ready', h.setup)
+        measure('schema_accounts_server_ready', setup_app)
         report['idle_after_setup'] = resources(h.proc.pid)
         report['pg_version'] = h.sql('SHOW server_version')
         report['git_version'] = h.git('--version').stdout.decode().strip()
@@ -181,12 +476,14 @@ def main():
             h.git('add', '.', cwd=work)
             h.git('commit', '-m', 'fixed initial payload', cwd=work)
             remote = h.base + repo['clone_path']
-            measure('gitfs_seed_push_' + str(idx), lambda: h.git('push', remote, 'HEAD:refs/heads/main', cwd=work, token=h.alice))
+            measure('gitfs_seed_push_' + str(idx), lambda: h.git('push', remote, 'HEAD:refs/heads/main', cwd=work, token=h.alice),
+                    phase_skip=('not_applicable', 'legacy GitFS backend; Pando phases are not exercised'))
             repos.append((repo, work, remote))
-        h.stop()
+        stop_app()
         for repo, work, remote in repos:
-            measure('offline_pando_cutover_' + repo['name'], lambda: h.cli('pando-transition', 'cutover', '--repository', repo['id']))
-        measure('pando_server_ready', h.start)
+            measure('offline_pando_cutover_' + repo['name'], lambda: h.cli('pando-transition', 'cutover', '--repository', repo['id']),
+                    phase_skip=('offline', 'service stopped for the offline cutover CLI; no process metrics'))
+        measure('pando_server_ready', start_app)
         report['idle_pando'] = resources(h.proc.pid)
         for idx, (repo, work, remote) in enumerate(repos):
             for n in range(3):
@@ -231,13 +528,13 @@ def main():
                 'HEAD:refs/heads/atomic-a', 'HEAD:refs/heads/atomic-b', cwd=work, token=h.alice))
         atomic_refs = h.git('ls-remote', remote, 'refs/heads/atomic-*', token=h.alice).stdout.decode().splitlines()
         assert len(atomic_refs) == 2 and all(line.split()[0] == current for line in atomic_refs)
-        h.stop()
+        stop_app()
         # Only the two exact, owned, documented disposable cache directories.
         for repo, _, _ in repos:
             cache = owned_cache_path(h.root, repo['id'])
             if cache.exists():
                 shutil.rmtree(cache)
-        h.start()
+        start_app()
         for idx, (repo, work, remote) in enumerate(repos):
             expected = h.git('rev-parse', 'HEAD', cwd=work).stdout.strip()
             for temperature in ('cold', 'warm'):
@@ -277,6 +574,25 @@ def main():
             report['pg_samples']['error'] = 'no owned API PostgreSQL sessions observed'
         if sampler_errors:
             report['status'] = 'failed'
+        if capture is not None:
+            if h.proc is not None and h.proc.poll() is None:
+                capture.close_process(h.proc.pid, 'final')
+            overhead = capture.scrape_seconds
+            report['phase_metrics'] = {
+                'enabled': True, 'feature': 'state-baseline-metrics',
+                'endpoint': {'bind': '127.0.0.1', 'port': capture.port, 'path': '/metrics',
+                             'scope': 'private loopback listener allocated by the fixture; never external'},
+                'status': capture.status, 'reason': capture.reason, 'scrapes': capture.scrapes,
+                'scrape_overhead_ms': {
+                    'median': round(statistics.median(overhead) * 1000, 3) if overhead else None,
+                    'max': round(max(overhead) * 1000, 3) if overhead else None,
+                    'note': 'each scrape takes one pooled PostgreSQL connection and runs one SQL '
+                            'snapshot statement outside the instrumented spans, so before/after '
+                            'scrapes perturb the case slightly'},
+                'phase_limits': PHASE_LIMITS, 'processes': capture.processes}
+            if capture.status != 'ready':
+                report['status'] = 'failed'
+                report['phase_metrics']['error'] = capture.reason
         report['fixture_root'] = str(h.root)
         try:
             h.cleanup()

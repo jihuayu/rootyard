@@ -173,6 +173,46 @@ equal the `ok + error + cancelled` deltas. Report the whole push and the whole
 cold/warm run alongside; phase deltas explain that number, they do not replace
 it, and they must never be added together.
 
+## Runner capture (`--phase-metrics`)
+
+`scripts/state_services_native_baseline.py` accepts an optional
+`--phase-metrics` flag. Without it the runner, the environment it passes to the
+binary and the report are byte-for-byte the previous behaviour: no exporter
+bind, no scrape and no extra report keys. With it:
+
+* the binary must be built with `--features state-baseline-metrics`; the runner
+  sets `ROOTYARD_METRICS_BIND=127.0.0.1:<port>` where the port is an ephemeral
+  loopback port allocated and released by the fixture. There is no endpoint
+  argument, nothing external is contacted, and no secret is read.
+* each **online** case is bracketed by one `/metrics` scrape before and one
+  after; the report stores per-phase deltas of `observations`, the three
+  outcomes, cumulative histogram buckets, `_sum`, `_count` and bytes.
+* every sample carries the process identity `(pid, kernel starttime)`. Deltas are
+  computed only within one identity: `h.stop()`/`h.start()` are wrapped to
+  scrape the running process one last time before it is signalled and to reset
+  the baseline afterwards, so a restart can never produce a negative or a
+  cross-process delta. A case that reports `process_restarted` has no delta.
+* the legacy GitFS seed pushes and the offline cutover CLI are recorded as
+  `not_applicable`/`offline` with a reason instead of a fabricated zero delta,
+  and no scrape is attempted while no application process is running.
+* an exporter that answers but exports no `rootyard_baseline_*` series marks the
+  report `feature_disabled`; an unreachable exporter marks it `unavailable`.
+  Both are explicit errors because the flag was requested, and in neither case
+  are zero values invented.
+* the report records the measured scrape cost (`scrape_overhead_ms` median/max)
+  because each scrape itself takes one pooled PostgreSQL connection and runs one
+  SQL snapshot statement outside the instrumented spans, plus `phase_limits`
+  and the per-process start/stop/final observation markers.
+
+Report interpretation stays as above: `state_row`/`authority_lock` are client
+round trips rather than exact SQL lock wait (still unmeasured), phase spans nest
+and must never be summed, and bytes are logical payload of successful S3-backed
+transfers only. `python3 -m unittest tests.test_state_services_native_baseline`
+checks the parser and delta logic (valid cumulative input, unexpected labels and
+series, non-finite/negative/fractional counters, inconsistent histograms,
+restart vs regression, and that skipped or unavailable cases never scrape)
+without running any native workload.
+
 ## Status
 
 This module supplies phase instrumentation plus metric semantics only. #106
