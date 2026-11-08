@@ -349,7 +349,7 @@ async fn execute_ref_transaction_inner(
         let mut all_old = true;
         let mut all_new = true;
         for change in &requested {
-            let observed = match git_read::run_git(&state, repo_id,
+            let observed = match git_read::run_git(&state, repo_id, git_read::GitStep::ShowRef,
                 &["show-ref", "--verify", "--hash", &change.ref_name], 128).await {
                 Ok(raw) => Some(String::from_utf8_lossy(&raw).trim().to_owned()),
                 Err(e) if e.0 == StatusCode::NOT_FOUND => Some(zero_oid.to_owned()),

@@ -13,6 +13,7 @@ use std::{
     io::{Seek, SeekFrom, Write},
     os::unix::fs::OpenOptionsExt,
     process::Stdio,
+    sync::atomic::{AtomicU32, Ordering},
 };
 use tokio::process::Command;
 use uuid::Uuid;
@@ -50,23 +51,220 @@ pub(crate) fn git_cmd(state: &AppState, repo_id: Uuid) -> Result<Command, Error>
     Ok(cmd)
 }
 
-pub(crate) async fn run_git(state: &AppState, repo_id: Uuid, args: &[&str], limit: usize) -> Result<Vec<u8>, Error> {
+/// Fixed label for one native read step.
+///
+/// A label is a compiled literal. It is never derived from argv, a ref name, an
+/// object id, Git stdout or Git stderr, so a step diagnostic cannot leak a
+/// credential or repository content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitStep {
+    ObjectType,
+    HeadVerify,
+    HeadRefs,
+    RefsPage,
+    RevParse,
+    CommitRead,
+    CommitBatch,
+    CommitDiff,
+    CommitList,
+    TreeList,
+    BlobSize,
+    BlobContent,
+    MergeBase,
+    CompareCount,
+    CompareCommits,
+    CompareDiff,
+    ObjectFormat,
+    ShowRef,
+}
+
+impl GitStep {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            GitStep::ObjectType => "object-type",
+            GitStep::HeadVerify => "head-verify",
+            GitStep::HeadRefs => "head-refs",
+            GitStep::RefsPage => "refs-page",
+            GitStep::RevParse => "rev-parse",
+            GitStep::CommitRead => "commit-read",
+            GitStep::CommitBatch => "commit-batch",
+            GitStep::CommitDiff => "commit-diff",
+            GitStep::CommitList => "commit-list",
+            GitStep::TreeList => "tree-list",
+            GitStep::BlobSize => "blob-size",
+            GitStep::BlobContent => "blob-content",
+            GitStep::MergeBase => "merge-base",
+            GitStep::CompareCount => "compare-count",
+            GitStep::CompareCommits => "compare-commits",
+            GitStep::CompareDiff => "compare-diff",
+            GitStep::ObjectFormat => "object-format",
+            GitStep::ShowRef => "show-ref",
+        }
+    }
+
+    /// Only these steps can legitimately fail because the named ref, object or
+    /// merge base is absent. Any other step runs on a repository that already
+    /// passed authorization and readiness checks, so a failure is a broken
+    /// native read and must never be reported as "not found".
+    pub(crate) fn absence_is_expected(self) -> bool {
+        matches!(
+            self,
+            GitStep::ObjectType
+                | GitStep::HeadVerify
+                | GitStep::RevParse
+                | GitStep::MergeBase
+                | GitStep::ObjectFormat
+                | GitStep::ShowRef
+        )
+    }
+
+    /// A probe may answer 404 only when Git really answered "no": exit 1 is the
+    /// quiet "no such ref/object/merge base" verdict and exit 128 is the fatal
+    /// "not a valid object name" verdict. A usage error (129) or a signal means
+    /// the native read itself broke and must never be reported as a real 404.
+    pub(crate) fn maps_to_not_found(self, exit: Option<i32>) -> bool {
+        self.absence_is_expected() && matches!(exit, Some(1) | Some(128))
+    }
+
+    /// Fixed exit-class label. Git reserves 129 for usage errors (for example an
+    /// option the configured Git does not implement) and 128 for fatal
+    /// repository errors; anything else is an unclassified non-zero exit.
+    pub(crate) fn failure_class(self, exit: Option<i32>) -> &'static str {
+        match exit {
+            Some(129) => "usage",
+            Some(128) => "fatal",
+            Some(_) => "nonzero",
+            None => "signal",
+        }
+    }
+}
+
+/// Record once per process that the configured Git lacks the paging option.
+fn report_seek_fallback() {
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    if REPORTED.fetch_add(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+    eprintln!(
+        "rootyard: browse git read step={} class=usage fallback=bounded-scan",
+        GitStep::RefsPage.label()
+    );
+}
+
+/// Emit one bounded, secret-free record for a failed required native read step.
+fn report_step_failure(step: GitStep, exit: Option<i32>) {
+    // A broken storage volume must not be able to flood stderr per request.
+    const BUDGET: u32 = 64;
+    static REPORTED: AtomicU32 = AtomicU32::new(0);
+    if REPORTED.fetch_add(1, Ordering::Relaxed) >= BUDGET {
+        return;
+    }
+    let code = match exit {
+        Some(code) => code.to_string(),
+        None => "signal".to_owned(),
+    };
+    eprintln!(
+        "rootyard: browse git read step={} class={} exit={}",
+        step.label(),
+        step.failure_class(exit),
+        code
+    );
+}
+
+/// Upper bounds for the bounded ref scan used by Git without `git
+/// for-each-ref --start-after`. Seeking costs one sequential scan up to the
+/// cursor; memory stays bounded by `limit + 1` parsed refs plus one line.
+const REF_SCAN_MAX_RECORDS: usize = 1 << 20;
+const REF_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
+const REF_SCAN_MAX_RECORD_BYTES: usize = 64 * 1024;
+
+/// Raw outcome of one native read step before HTTP mapping.
+///
+/// The typed exit code exists so a capability fallback is selected from Git's
+/// exit status, never by matching untrusted Git error text.
+enum GitOutcome {
+    Output(Vec<u8>),
+    CommandFailed { exit: Option<i32> },
+}
+
+fn exit_of(err: &anyhow::Error) -> Option<Option<i32>> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<crate::git_http::GitCommandFailed>())
+        .map(|failure| failure.exit)
+}
+
+/// Map a failed native read to the truthful HTTP result for its step.
+fn map_git_failure(err: anyhow::Error, step: GitStep) -> Error {
+    let msg = err.to_string();
+    if msg.contains("timed out") {
+        return Error::timeout();
+    }
+    if msg.contains("exceeds limit") {
+        return Error(StatusCode::PAYLOAD_TOO_LARGE, "Git output exceeds limit");
+    }
+    let failure = exit_of(&err);
+    let Some(exit) = failure else {
+        // Spawn, pipe or reaping failure: not a Git verdict, never a 404.
+        return Error::internal(err);
+    };
+    if step.maps_to_not_found(exit) {
+        return Error::not_found();
+    }
+    report_step_failure(step, exit);
+    Error::internal(crate::git_http::GitCommandFailed { exit })
+}
+
+async fn run_git_step(
+    state: &AppState,
+    repo_id: Uuid,
+    step: GitStep,
+    args: &[&str],
+    limit: usize,
+) -> Result<GitOutcome, Error> {
     let mut cmd = git_cmd(state, repo_id)?;
     cmd.args(args);
-    crate::git_http::collect_git_output(cmd, limit, state.config.git_timeout).await.map_err(|err| {
-        let msg = err.to_string();
-        if msg.contains("timed out") {
-            Error::timeout()
-        } else if msg.contains("exceeds limit") {
-            Error(StatusCode::PAYLOAD_TOO_LARGE, "Git output exceeds limit")
-        } else {
-            Error::not_found()
+    match crate::git_http::collect_git_output(cmd, limit, state.config.git_timeout).await {
+        Ok(bytes) => Ok(GitOutcome::Output(bytes)),
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("timed out") {
+                return Err(Error::timeout());
+            }
+            if msg.contains("exceeds limit") {
+                return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "Git output exceeds limit"));
+            }
+            let failure = exit_of(&err);
+            match failure {
+                Some(exit) => Ok(GitOutcome::CommandFailed { exit }),
+                None => Err(Error::internal(err)),
+            }
         }
-    })
+    }
+}
+
+pub(crate) async fn run_git(
+    state: &AppState,
+    repo_id: Uuid,
+    step: GitStep,
+    args: &[&str],
+    limit: usize,
+) -> Result<Vec<u8>, Error> {
+    match run_git_step(state, repo_id, step, args, limit).await? {
+        GitOutcome::Output(bytes) => Ok(bytes),
+        GitOutcome::CommandFailed { exit } => {
+            if step.maps_to_not_found(exit) {
+                // The probe asked Git whether a named ref/object exists and Git
+                // answered "no"; that answer is a genuine 404.
+                return Err(Error::not_found());
+            }
+            report_step_failure(step, exit);
+            Err(Error::internal(crate::git_http::GitCommandFailed { exit }))
+        }
+    }
 }
 
 pub(crate) async fn object_type(state: &AppState, repo_id: Uuid, spec: &str) -> Result<Option<String>, Error> {
-    match run_git(state, repo_id, &["cat-file", "-t", spec], 64).await {
+    match run_git(state, repo_id, GitStep::ObjectType, &["cat-file", "-t", spec], 64).await {
         Ok(out) => {
             let kind = String::from_utf8_lossy(&out).trim().to_owned();
             Ok((!kind.is_empty()).then_some(kind))
@@ -109,6 +307,7 @@ pub(crate) async fn read_head_and_refs(state: &AppState, repo_id: Uuid) -> Resul
     let raw_refs = run_git(
         state,
         repo_id,
+        GitStep::HeadRefs,
         &[
             "for-each-ref",
             "--sort=refname",
@@ -141,7 +340,15 @@ pub(crate) async fn read_head(state: &AppState, repo_id: Uuid) -> Result<HeadInf
         if !models::valid_public_ref(target) {
             return Err(Error::not_found());
         }
-        let oid = match run_git(state, repo_id, &["rev-parse", "--verify", "--quiet", "HEAD"], 128).await {
+        let oid = match run_git(
+            state,
+            repo_id,
+            GitStep::HeadVerify,
+            &["rev-parse", "--verify", "--quiet", "HEAD"],
+            128,
+        )
+        .await
+        {
             Ok(out) => {
                 let oid = String::from_utf8_lossy(&out).trim().to_owned();
                 models::valid_non_zero_oid(&oid).then_some(oid)
@@ -156,6 +363,96 @@ pub(crate) async fn read_head(state: &AppState, repo_id: Uuid) -> Result<HeadInf
     } else {
         Err(Error::not_found())
     }
+}
+
+/// One page of one public ref namespace.
+///
+/// Git 2.52 and newer seek directly with `for-each-ref --start-after`. A Git
+/// that does not implement that option fails it as a *usage* error (exit 129);
+/// only that typed verdict selects the bounded streaming scan, so an
+/// authorization, storage or transport failure can never silently downgrade
+/// into a scan. The project baseline stays Git 2.43: no minimum is raised.
+async fn namespace_page(
+    state: &AppState,
+    repo_id: Uuid,
+    namespace: &str,
+    excluded: &str,
+    marker: &str,
+    limit: usize,
+) -> Result<Vec<RefItem>, Error> {
+    let start_after = format!("--start-after={marker}");
+    let count = format!("--count={}", limit + 1);
+    // Git rejects --start-after together with ref patterns, so the namespace is
+    // selected by --exclude plus the Rust-side namespace filter below.
+    let args = [
+        "for-each-ref",
+        "--format=%(refname)%00%(objectname)%00%(*objectname)",
+        count.as_str(),
+        start_after.as_str(),
+        excluded,
+        "--exclude=refs/rootyard-ci/*",
+    ];
+    match run_git_step(state, repo_id, GitStep::RefsPage, &args, 256 * 1024).await? {
+        GitOutcome::Output(raw) => Ok(parse_for_each_ref_output(&raw)
+            .into_iter()
+            .filter(|r| r.name.starts_with(namespace))
+            .collect()),
+        GitOutcome::CommandFailed { exit: Some(129) } => {
+            report_seek_fallback();
+            scan_namespace_page(state, repo_id, namespace, excluded, marker, limit).await
+        }
+        GitOutcome::CommandFailed { exit } => {
+            report_step_failure(GitStep::RefsPage, exit);
+            Err(Error::internal(crate::git_http::GitCommandFailed { exit }))
+        }
+    }
+}
+
+/// Bounded replacement for the seek path on Git without `--start-after`.
+///
+/// Only the public namespace is enumerated, in `refname` order, one record at a
+/// time; every record at or before the cursor is discarded and the scan stops
+/// as soon as `limit + 1` refs are known, which is what tells the caller whether
+/// another page exists. Memory is `limit + 1` refs plus one line, the child is
+/// killed and reaped on early stop, and records/bytes/time are hard-bounded.
+async fn scan_namespace_page(
+    state: &AppState,
+    repo_id: Uuid,
+    namespace: &str,
+    excluded: &str,
+    marker: &str,
+    limit: usize,
+) -> Result<Vec<RefItem>, Error> {
+    let pattern = namespace.trim_end_matches('/');
+    let args = [
+        "for-each-ref",
+        "--sort=refname",
+        "--format=%(refname)%00%(objectname)%00%(*objectname)",
+        excluded,
+        "--exclude=refs/rootyard-ci/*",
+        pattern,
+    ];
+    let mut cmd = git_cmd(state, repo_id)?;
+    cmd.args(args);
+    let mut items: Vec<RefItem> = Vec::with_capacity(limit + 1);
+    let limits = crate::git_http::StreamLimits {
+        max_records: REF_SCAN_MAX_RECORDS,
+        max_bytes: REF_SCAN_MAX_BYTES,
+        max_record_bytes: REF_SCAN_MAX_RECORD_BYTES,
+    };
+    crate::git_http::stream_git_lines(cmd, limits, state.config.git_timeout, |line| {
+        for item in parse_for_each_ref_output(line) {
+            if item.name.starts_with(namespace) && item.name.as_str() > marker {
+                items.push(item);
+            }
+        }
+        // Stop as soon as the page plus the look-ahead ref is known.
+        items.len() <= limit
+    })
+    .await
+    .map_err(|err| map_git_failure(err, GitStep::RefsPage))?;
+    items.truncate(limit + 1);
+    Ok(items)
 }
 
 pub(crate) async fn page_refs(
@@ -177,18 +474,7 @@ pub(crate) async fn page_refs(
             continue;
         }
         let marker = after.filter(|cursor| cursor.starts_with(namespace)).unwrap_or(namespace);
-        let start_after = format!("--start-after={marker}");
-        let count = format!("--count={}", limit + 1);
-        let args = [
-            "for-each-ref",
-            "--format=%(refname)%00%(objectname)%00%(*objectname)",
-            count.as_str(),
-            start_after.as_str(),
-            excluded,
-            "--exclude=refs/rootyard-ci/*",
-        ];
-        let raw = run_git(state, repo_id, &args, 256 * 1024).await?;
-        items.extend(parse_for_each_ref_output(&raw).into_iter().filter(|r| r.name.starts_with(namespace)));
+        items.extend(namespace_page(state, repo_id, namespace, excluded, marker, limit).await?);
         if items.len() > limit {
             break;
         }
@@ -217,7 +503,7 @@ pub(crate) async fn resolve_commit_oid(state: &AppState, repo_id: Uuid, spec: &s
         return head.oid.ok_or_else(Error::not_found);
     }
     let query = format!("{spec}^{{commit}}");
-    let out = run_git(state, repo_id, &["rev-parse", "--verify", "--quiet", &query], 128).await?;
+    let out = run_git(state, repo_id, GitStep::RevParse, &["rev-parse", "--verify", "--quiet", &query], 128).await?;
     let oid = String::from_utf8_lossy(&out).trim().to_owned();
     if !models::valid_non_zero_oid(&oid) || object_type(state, repo_id, &oid).await?.as_deref() != Some("commit") {
         return Err(Error::not_found());
@@ -226,7 +512,7 @@ pub(crate) async fn resolve_commit_oid(state: &AppState, repo_id: Uuid, spec: &s
 }
 
 pub(crate) async fn read_commit_summary(state: &AppState, repo_id: Uuid, oid: &str) -> Result<CommitSummary, Error> {
-    let raw = run_git(state, repo_id, &["cat-file", "commit", oid], 256 * 1024).await?;
+    let raw = run_git(state, repo_id, GitStep::CommitRead, &["cat-file", "commit", oid], 256 * 1024).await?;
     parse_commit_raw(oid, &raw)
 }
 
@@ -275,9 +561,14 @@ pub(crate) async fn get_commit_detail(state: &AppState, repo_id: Uuid, oid: &str
         return Err(Error::not_found());
     }
     let summary = read_commit_summary(state, repo_id, oid).await?;
-    let diff_raw =
-        run_git(state, repo_id, &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", oid], 512 * 1024)
-            .await?;
+    let diff_raw = run_git(
+        state,
+        repo_id,
+        GitStep::CommitDiff,
+        &["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--root", oid],
+        512 * 1024,
+    )
+    .await?;
     let changed_paths = diff_raw
         .split(|&b| b == 0)
         .filter(|s| !s.is_empty())
@@ -297,7 +588,14 @@ pub(crate) async fn list_commits(
     let start_oid = resolve_commit_oid(state, repo_id, spec).await?;
     let max_arg = format!("--max-count={}", limit + 1);
     let skip_arg = format!("--skip={after}");
-    let out = run_git(state, repo_id, &["rev-list", &max_arg, &skip_arg, &start_oid, "--"], 64 * 1024).await?;
+    let out = run_git(
+        state,
+        repo_id,
+        GitStep::CommitList,
+        &["rev-list", &max_arg, &skip_arg, &start_oid, "--"],
+        64 * 1024,
+    )
+    .await?;
     let oids: Vec<String> = String::from_utf8_lossy(&out)
         .lines()
         .map(str::trim)
@@ -357,14 +655,28 @@ pub(crate) async fn read_tree(
 ) -> Result<TreeResponse, Error> {
     let root_oid = resolve_commit_or_tree_oid(state, repo_id, oid_or_spec).await?;
     let tree_spec = if rel_path.is_empty() { format!("{root_oid}^{{tree}}") } else { format!("{root_oid}:{rel_path}") };
-    let out = run_git(state, repo_id, &["rev-parse", "--verify", "--quiet", &tree_spec], 128).await?;
+    let out = run_git(
+        state,
+        repo_id,
+        GitStep::RevParse,
+        &["rev-parse", "--verify", "--quiet", &tree_spec],
+        128,
+    )
+    .await?;
     let tree_oid = String::from_utf8_lossy(&out).trim().to_owned();
     if !models::valid_non_zero_oid(&tree_oid)
         || object_type(state, repo_id, &tree_oid).await?.as_deref() != Some("tree")
     {
         return Err(Error::not_found());
     }
-    let ls_raw = run_git(state, repo_id, &["ls-tree", "-z", "-l", &tree_oid], 4 * 1024 * 1024).await?;
+    let ls_raw = run_git(
+        state,
+        repo_id,
+        GitStep::TreeList,
+        &["ls-tree", "-z", "-l", &tree_oid],
+        4 * 1024 * 1024,
+    )
+    .await?;
     let filtered: Vec<TreeEntry> = parse_ls_tree_output(&ls_raw, rel_path)?
         .into_iter()
         .filter(|e| after.is_none_or(|cursor| e.name.as_str() > cursor))
@@ -386,7 +698,14 @@ pub(crate) async fn read_blob(
     let blob_oid = if !clean_path.is_empty() {
         let root_oid = resolve_commit_or_tree_oid(state, repo_id, oid_or_spec).await?;
         let spec = format!("{root_oid}:{clean_path}");
-        let out = run_git(state, repo_id, &["rev-parse", "--verify", "--quiet", &spec], 128).await?;
+        let out = run_git(
+            state,
+            repo_id,
+            GitStep::RevParse,
+            &["rev-parse", "--verify", "--quiet", &spec],
+            128,
+        )
+        .await?;
         String::from_utf8_lossy(&out).trim().to_owned()
     } else {
         let raw_oid = oid_or_spec.ok_or_else(Error::bad_request)?;
@@ -400,12 +719,19 @@ pub(crate) async fn read_blob(
     {
         return Err(Error::not_found());
     }
-    let size_out = run_git(state, repo_id, &["cat-file", "-s", &blob_oid], 64).await?;
+    let size_out = run_git(state, repo_id, GitStep::BlobSize, &["cat-file", "-s", &blob_oid], 64).await?;
     let size: u64 = String::from_utf8_lossy(&size_out).trim().parse().map_err(|_| Error::not_found())?;
     if size as usize > MAX_BROWSE_BLOB_BYTES {
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "blob exceeds browse size limit"));
     }
-    let bytes = run_git(state, repo_id, &["cat-file", "blob", &blob_oid], MAX_BROWSE_BLOB_BYTES).await?;
+    let bytes = run_git(
+        state,
+        repo_id,
+        GitStep::BlobContent,
+        &["cat-file", "blob", &blob_oid],
+        MAX_BROWSE_BLOB_BYTES,
+    )
+    .await?;
     let is_binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
     let content = (!is_binary).then(|| std::str::from_utf8(&bytes).ok().map(str::to_owned)).flatten();
     let content_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -423,7 +749,15 @@ pub(crate) async fn compare_commits(
     }
     let base_oid = resolve_commit_oid(state, repo_id, base_spec).await?;
     let head_oid = resolve_commit_oid(state, repo_id, head_spec).await?;
-    let merge_base_oid = match run_git(state, repo_id, &["merge-base", &base_oid, &head_oid], 128).await {
+    let merge_base_oid = match run_git(
+        state,
+        repo_id,
+        GitStep::MergeBase,
+        &["merge-base", &base_oid, &head_oid],
+        128,
+    )
+    .await
+    {
         Ok(out) => {
             let s = String::from_utf8_lossy(&out).trim().to_owned();
             models::valid_non_zero_oid(&s).then_some(s)
@@ -433,13 +767,27 @@ pub(crate) async fn compare_commits(
     };
     let fast_forward = merge_base_oid.as_deref() == Some(base_oid.as_str());
     let sym_range = format!("{base_oid}...{head_oid}");
-    let count_out = run_git(state, repo_id, &["rev-list", "--left-right", "--count", &sym_range], 128).await?;
+    let count_out = run_git(
+        state,
+        repo_id,
+        GitStep::CompareCount,
+        &["rev-list", "--left-right", "--count", &sym_range],
+        128,
+    )
+    .await?;
     let count_text = String::from_utf8_lossy(&count_out);
     let mut parts = count_text.split_whitespace();
     let behind: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let ahead: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let log_range = format!("{base_oid}..{head_oid}");
-    let rev_out = run_git(state, repo_id, &["rev-list", "--max-count=100", &log_range, "--"], 64 * 1024).await?;
+    let rev_out = run_git(
+        state,
+        repo_id,
+        GitStep::CompareCommits,
+        &["rev-list", "--max-count=100", &log_range, "--"],
+        64 * 1024,
+    )
+    .await?;
     let commit_oids: Vec<String> = String::from_utf8_lossy(&rev_out)
         .lines()
         .map(str::trim)
@@ -450,6 +798,7 @@ pub(crate) async fn compare_commits(
     let diff_out = run_git(
         state,
         repo_id,
+        GitStep::CompareDiff,
         &["diff", "--no-ext-diff", "--no-textconv", &base_oid, &head_oid, "--"],
         MAX_DIFF_BYTES,
     )

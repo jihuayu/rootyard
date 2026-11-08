@@ -70,7 +70,14 @@ pub fn detect_git_dir_object_format(repo_path: &StdPath) -> Option<ObjectFormat>
 pub async fn detect_repo_object_format(state: &AppState, repo_id: Uuid) -> Result<ObjectFormat, Error> {
     let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
     if let Some(fmt) = detect_git_dir_object_format(&repo_path) { return Ok(fmt); }
-    if let Ok(out) = git_read::run_git(state, repo_id, &["rev-parse", "--show-object-format"], 64).await
+    if let Ok(out) = git_read::run_git(
+        state,
+        repo_id,
+        git_read::GitStep::ObjectFormat,
+        &["rev-parse", "--show-object-format"],
+        64,
+    )
+    .await
         && let Some(fmt) = ObjectFormat::from_str_name(&String::from_utf8_lossy(&out)) { return Ok(fmt); }
     Ok(ObjectFormat::Sha1)
 }
