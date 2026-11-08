@@ -198,3 +198,21 @@ were not run by the implementer; no real Redis/TLS/ACL service was available;
 HA/Sentinel/Cluster, PG failover, production performance and complete cache
 consumer wiring (#110) are out of scope for this increment. The Redis contract
 does not make Redis a hard quota or authority.
+
+The full ignored real-Redis suite includes destructive FLUSHALL and CONFIG SET
+checks. Run it only against a disposable, task-owned instance and explicitly set
+`ROOTYARD_TEST_REDIS_DESTRUCTIVE=owned-fixture` as well as
+`ROOTYARD_TEST_REDIS_URL`. This flag is an operator attestation, not automatic
+proof of ownership. The cancellation test also requires an IPv4 loopback
+endpoint; its byte-forwarding proxy changes only the port and uses the SDK for
+all Redis/TLS handling. A TLS fixture certificate must cover127.0.0.1.
+
+Redis cache connections are now exclusively checked out from a bounded idle
+pool. Only fully completed successful operations recycle their connection.
+Error, deadline and caller cancellation paths drop the canonical redis-rs
+connection, aborting its driver rather than retaining abandoned commands in a
+shared manager. Wake publication uses one owned canonical connection per hint
+behind a bounded permit. Physical teardown still requires runtime scheduling;
+there is no claim to synchronously cancel kernel I/O. The stall regression
+keeps the cache alive, blackholes real server replies and checks TCP closure
+after repeated deadlines and an explicit caller abort, followed by recovery.

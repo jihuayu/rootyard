@@ -15,11 +15,20 @@ use super::{AdvisoryCache, CacheKey, CacheTask, CacheValue, WAKE_PAYLOAD, valida
 use crate::dispatch::WakeTransport;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::StreamExt;
-use std::{fmt, future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
-use tokio::sync::{Notify, OnceCell, Semaphore};
+use std::{
+    fmt,
+    future::Future,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 type Task<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type MultiplexedConnection = ::redis::aio::MultiplexedConnection;
+#[cfg(test)]
 type ConnectionManager = ::redis::aio::ConnectionManager;
 
 /// Reject obvious accidental weak deployment choices. TLS is never inferred or
@@ -52,10 +61,7 @@ fn validate_redis_url(raw: &str) -> Result<()> {
         for pair in query.split('&').filter(|pair| !pair.is_empty()) {
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
             ensure!(name == "protocol", "unsupported Redis URL query parameter");
-            ensure!(
-                matches!(value, "2" | "3" | "resp2" | "resp3"),
-                "unsupported Redis protocol query value"
-            );
+            ensure!(matches!(value, "2" | "3" | "resp2" | "resp3"), "unsupported Redis protocol query value");
         }
     }
     Ok(())
@@ -187,14 +193,85 @@ fn encode_bounded(value: &CacheValue, max_value_bytes: usize) -> Result<Vec<u8>>
     Ok(value.encode())
 }
 
-/// Bounded Redis cache. A connection manager maintains one multiplexed
-/// connection with built-in reconnect; an in-flight semaphore bounds concurrent
-/// requests, and each `bounded` operation's deadline covers permit wait,
-/// connection-manager initialization and all commands. Reads use STRLEN then a
-/// capped GETRANGE so an oversized response is never fully fetched.
+/// Capacity-bounded LIFO pool of canonical multiplexed connections. Every
+/// entry is an owned `MultiplexedConnection`; no clone is shared between
+/// borrowers, so a borrower that errors or times out drops the last handle for
+/// its own canonical driver. redis-rs aborts that driver task on last drop,
+/// which closes the socket and discards commands already written to it instead
+/// of queueing them forever behind a manager that outlives the request.
+struct IdlePool {
+    capacity: usize,
+    connections: Mutex<Vec<MultiplexedConnection>>,
+}
+
+impl IdlePool {
+    fn new(capacity: usize) -> Self {
+        Self { capacity, connections: Mutex::new(Vec::with_capacity(capacity)) }
+    }
+
+    /// Pop an idle connection. The pool mutex is never held across I/O.
+    fn take(&self) -> Option<MultiplexedConnection> {
+        self.connections.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).pop()
+    }
+
+    /// Return a connection only after its whole operation completed
+    /// successfully. At capacity the caller's connection is dropped instead.
+    fn put(&self, connection: MultiplexedConnection) {
+        let mut connections = self.connections.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if connections.len() >= self.capacity {
+            drop(connections);
+            return;
+        }
+        connections.push(connection);
+    }
+}
+
+/// One checked-out connection for exactly one bounded operation. `finish` is
+/// called only after every command in the operation succeeded; all error,
+/// timeout and cancellation paths drop the owned connection, which shuts the
+/// canonical driver down instead of recycling an abandoned queue.
+struct CheckedOutConnection<'a> {
+    pool: &'a IdlePool,
+    connection: Option<MultiplexedConnection>,
+    completed: bool,
+}
+
+impl<'a> CheckedOutConnection<'a> {
+    fn new(pool: &'a IdlePool, connection: MultiplexedConnection) -> Self {
+        Self { pool, connection: Some(connection), completed: false }
+    }
+
+    fn connection(&mut self) -> &mut MultiplexedConnection {
+        self.connection.as_mut().expect("checked-out Redis connection is present")
+    }
+
+    fn finish(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for CheckedOutConnection<'_> {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        if self.completed {
+            self.pool.put(connection);
+        }
+    }
+}
+
+/// Bounded Redis cache. A capacity-bounded idle pool holds owned canonical
+/// `MultiplexedConnection`s, at most `max_inflight` of them; an in-flight
+/// semaphore bounds concurrent requests, and each `bounded` operation's
+/// deadline covers permit wait, checkout and all commands. A connection is
+/// checked out exclusively, recycled only after the whole operation succeeds,
+/// and dropped on error/timeout so its canonical driver cannot accumulate
+/// abandoned commands. Reads use STRLEN then a capped GETRANGE so an oversized
+/// response is never fully fetched.
 pub struct RedisCache {
     client: ::redis::Client,
-    manager: OnceCell<ConnectionManager>,
+    idle: IdlePool,
     limits: RedisCacheLimits,
     inflight: Semaphore,
     contract: Option<RedisServerContract>,
@@ -207,7 +284,7 @@ impl RedisCache {
         let client = ::redis::Client::open(url).map_err(|_| anyhow::anyhow!("invalid Redis cache URL"))?;
         Ok(Self {
             client,
-            manager: OnceCell::new(),
+            idle: IdlePool::new(limits.max_inflight),
             inflight: Semaphore::new(limits.max_inflight),
             limits,
             contract: None,
@@ -241,20 +318,21 @@ impl RedisCache {
             .map_err(|_| anyhow::anyhow!("Redis cache request timeout"))?
     }
 
-    async fn connection(&self) -> Result<ConnectionManager> {
-        let manager = self
-            .manager
-            .get_or_try_init(|| async {
-                self.client
-                    .get_connection_manager()
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Redis cache connection unavailable"))
-            })
-            .await?;
-        Ok(manager.clone())
+    /// Exclusive checkout: reuse an idle owned connection or create a canonical
+    /// one. No pool lock is held while connecting or running commands.
+    async fn checkout(&self) -> Result<CheckedOutConnection<'_>> {
+        let connection = match self.idle.take() {
+            Some(connection) => connection,
+            None => self
+                .client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|_| anyhow::anyhow!("Redis cache connection unavailable"))?,
+        };
+        Ok(CheckedOutConnection::new(&self.idle, connection))
     }
 
-    async fn inspect_server_contract(&self, connection: &mut ConnectionManager) -> Result<RedisServerContract> {
+    async fn inspect_server_contract(&self, connection: &mut MultiplexedConnection) -> Result<RedisServerContract> {
         let maxmemory: Vec<String> = ::redis::cmd("CONFIG")
             .arg("GET")
             .arg("maxmemory")
@@ -282,15 +360,17 @@ impl RedisCache {
     async fn read_server_contract(&self) -> Result<RedisServerContract> {
         self.bounded(|| async {
             let _permit = self.inflight.acquire().await.map_err(|_| anyhow::anyhow!("Redis cache unavailable"))?;
-            let mut connection = self.connection().await?;
-            self.inspect_server_contract(&mut connection).await
+            let mut connection = self.checkout().await?;
+            let contract = self.inspect_server_contract(connection.connection()).await?;
+            connection.finish();
+            Ok(contract)
         })
         .await
     }
 
     /// Re-check the cached proof before cache mutations. A changed maxmemory or
     /// eviction policy fails closed until an explicit reconnect revalidates it.
-    async fn verify_contract_before_mutation(&self, connection: &mut ConnectionManager) -> Result<()> {
+    async fn verify_contract_before_mutation(&self, connection: &mut MultiplexedConnection) -> Result<()> {
         let expected = self.contract()?;
         let observed = self.inspect_server_contract(connection).await?;
         ensure!(observed == expected, "Redis cache server resource contract changed; reconnect required");
@@ -307,13 +387,14 @@ impl RedisCache {
         let _contract = self.contract()?;
         self.bounded(|| async {
             let _permit = self.inflight.acquire().await.map_err(|_| anyhow::anyhow!("Redis cache unavailable"))?;
-            let mut connection = self.connection().await?;
+            let mut connection = self.checkout().await?;
             let length: u64 = ::redis::cmd("STRLEN")
                 .arg(key.as_str())
-                .query_async(&mut connection)
+                .query_async(connection.connection())
                 .await
                 .map_err(|_| anyhow::anyhow!("Redis cache request failed"))?;
             if length == 0 {
+                connection.finish();
                 return Ok(None);
             }
             ensure!(
@@ -324,10 +405,12 @@ impl RedisCache {
                 .arg(key.as_str())
                 .arg(0)
                 .arg((self.limits.max_value_bytes - 1) as i64)
-                .query_async(&mut connection)
+                .query_async(connection.connection())
                 .await
                 .map_err(|_| anyhow::anyhow!("Redis cache request failed"))?;
-            Ok(decode_bounded(key, &raw, length))
+            let value = decode_bounded(key, &raw, length);
+            connection.finish();
+            Ok(value)
         })
         .await
     }
@@ -344,16 +427,17 @@ impl RedisCache {
         ensure!(milliseconds <= u64::MAX as u128, "cache ttl too large");
         self.bounded(|| async {
             let _permit = self.inflight.acquire().await.map_err(|_| anyhow::anyhow!("Redis cache unavailable"))?;
-            let mut connection = self.connection().await?;
-            self.verify_contract_before_mutation(&mut connection).await?;
+            let mut connection = self.checkout().await?;
+            self.verify_contract_before_mutation(connection.connection()).await?;
             ::redis::cmd("SET")
                 .arg(key.as_str())
                 .arg(encoded)
                 .arg("PX")
                 .arg(milliseconds as u64)
-                .query_async::<()>(&mut connection)
+                .query_async::<()>(connection.connection())
                 .await
                 .map_err(|_| anyhow::anyhow!("Redis cache request failed"))?;
+            connection.finish();
             Ok(())
         })
         .await
@@ -363,13 +447,14 @@ impl RedisCache {
         self.contract()?;
         self.bounded(|| async {
             let _permit = self.inflight.acquire().await.map_err(|_| anyhow::anyhow!("Redis cache unavailable"))?;
-            let mut connection = self.connection().await?;
-            self.verify_contract_before_mutation(&mut connection).await?;
+            let mut connection = self.checkout().await?;
+            self.verify_contract_before_mutation(connection.connection()).await?;
             ::redis::cmd("DEL")
                 .arg(key.as_str())
-                .query_async::<i64>(&mut connection)
+                .query_async::<i64>(connection.connection())
                 .await
                 .map_err(|_| anyhow::anyhow!("Redis cache request failed"))?;
+            connection.finish();
             Ok(())
         })
         .await
@@ -409,7 +494,7 @@ impl fmt::Debug for RedisCache {
 pub struct RedisWake {
     client: ::redis::Client,
     channel: String,
-    manager: OnceCell<ConnectionManager>,
+    inflight: Semaphore,
 }
 
 impl RedisWake {
@@ -440,24 +525,21 @@ impl RedisWake {
         validate_redis_url(url)?;
         validate_wake_channel(&channel)?;
         let client = ::redis::Client::open(url).map_err(|_| anyhow::anyhow!("invalid Redis wake URL"))?;
-        Ok(Self { client, channel, manager: OnceCell::new() })
+        Ok(Self { client, channel, inflight: Semaphore::new(1) })
     }
 
-    async fn connection(&self) -> Result<ConnectionManager> {
-        let manager = self
-            .manager
-            .get_or_try_init(|| async {
-                self.client
-                    .get_connection_manager()
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Redis wake connection unavailable"))
-            })
-            .await?;
-        Ok(manager.clone())
-    }
-
+    /// Each hint uses its own owned canonical multiplexed connection behind a
+    /// bounded permit. A shared `ConnectionManager` kept its driver alive after
+    /// a cancelled publish, so commands already written to the socket stayed
+    /// queued for the next hint. Here every completion, error or timeout drop
+    /// closes that driver (redis-rs aborts the pipeline task on last drop).
     async fn publish_hint(&self) -> Result<()> {
-        let mut connection = self.connection().await?;
+        let _permit = self.inflight.acquire().await.map_err(|_| anyhow::anyhow!("Redis wake unavailable"))?;
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|_| anyhow::anyhow!("Redis wake connection unavailable"))?;
         let receivers: i64 = ::redis::cmd("PUBLISH")
             .arg(&self.channel)
             .arg(WAKE_PAYLOAD)
@@ -564,7 +646,7 @@ mod tests {
         );
     }
 
-    fn live_redis_serial() -> &'static tokio::sync::Mutex<()> {
+    pub(super) fn live_redis_serial() -> &'static tokio::sync::Mutex<()> {
         static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
     }
@@ -632,15 +714,17 @@ mod tests {
             let policy = self.policy.clone();
             // Best-effort RAII fallback for panic/cancellation paths. A small
             // standalone runtime keeps this independent of the test runtime.
-            let _ = std::thread::spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
-                    return;
-                };
-                let _ = runtime.block_on(async move {
-                    let _ = tokio::time::timeout(Duration::from_secs(2), set_maxmemory_policy(&url, &policy)).await;
-                });
-            })
-            .join();
+            drop(
+                std::thread::spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                        return;
+                    };
+                    runtime.block_on(async move {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), set_maxmemory_policy(&url, &policy)).await;
+                    });
+                })
+                .join(),
+            );
         }
     }
 
@@ -787,8 +871,7 @@ mod tests {
         let address = listener.local_addr().expect("loopback address unavailable");
         drop(listener);
         let url = format!("redis://{address}");
-        let limits =
-            RedisCacheLimits { request_timeout: Duration::from_millis(250), ..RedisCacheLimits::default() };
+        let limits = RedisCacheLimits { request_timeout: Duration::from_millis(250), ..RedisCacheLimits::default() };
         let started = Instant::now();
         assert!(RedisCache::connect(&url, limits).await.is_err(), "closed loopback port must fail cache connect");
         assert!(started.elapsed() <= Duration::from_secs(3), "closed-port cache connect was not bounded");
@@ -821,6 +904,8 @@ mod tests {
         ::redis::cmd("SET")
             .arg(oversized_key.as_str())
             .arg(vec![0u8; limits.max_value_bytes + 1])
+            .arg("PX")
+            .arg(30_000u64)
             .query_async::<()>(&mut raw)
             .await
             .unwrap();
@@ -896,9 +981,8 @@ mod tests {
         assert!(!cache_debug.contains(BAD_USER));
         assert!(!cache_debug.contains(BAD_PASSWORD));
         let started = Instant::now();
-        let error = RedisCache::connect(&bad_url, limits)
-            .await
-            .expect_err("wrong ACL credentials must reject cache connect");
+        let error =
+            RedisCache::connect(&bad_url, limits).await.expect_err("wrong ACL credentials must reject cache connect");
         assert!(started.elapsed() <= Duration::from_secs(3), "wrong ACL rejection was not bounded");
         let display = format!("{error}");
         let debug = format!("{error:?}");
@@ -906,10 +990,7 @@ mod tests {
         for text in [&display, &debug, &chain] {
             assert!(!text.contains(BAD_USER), "error leaked ACL username: {text}");
             assert!(!text.contains(BAD_PASSWORD), "error leaked ACL password: {text}");
-            assert!(
-                !text.contains("redis://") && !text.contains("rediss://"),
-                "error leaked the Redis URL: {text}"
-            );
+            assert!(!text.contains("redis://") && !text.contains("rediss://"), "error leaked the Redis URL: {text}");
         }
         let wake = RedisWake::from_url(&bad_url, "rootyard:test:bad-acl".into()).expect("bad-credential URL is valid");
         let wake_debug = format!("{wake:?}");
@@ -924,10 +1005,7 @@ mod tests {
         let url = live_url();
         let limits = RedisCacheLimits { request_timeout: Duration::from_secs(2), ..RedisCacheLimits::default() };
         let original = current_maxmemory_policy(&url).await;
-        assert!(
-            eviction_policy(&original).is_ok(),
-            "dedicated fixture must start with an accepted eviction policy"
-        );
+        assert!(eviction_policy(&original).is_ok(), "dedicated fixture must start with an accepted eviction policy");
         let mut restore = PolicyRestore::new(url.clone(), original.clone());
         owned_destructive_fixture();
         set_maxmemory_policy(&url, "noeviction")
@@ -944,11 +1022,11 @@ mod tests {
             error.as_deref().is_some_and(|text| text.contains("noeviction")),
             "unexpected noeviction connect error: {error:?}"
         );
-        assert_eq!(
-            current_maxmemory_policy(&url).await,
-            original,
-            "original maxmemory-policy was not restored"
-        );
+        assert_eq!(current_maxmemory_policy(&url).await, original, "original maxmemory-policy was not restored");
         RedisCache::connect(&url, limits).await.expect("cache must reconnect after policy restore");
     }
 }
+
+#[cfg(test)]
+#[path = "redis_cancel_tests.rs"]
+mod cancel_tests;
