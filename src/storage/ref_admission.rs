@@ -263,24 +263,12 @@ async fn ensure_terminal_replay<C: tokio_postgres::GenericClient + Sync>(
         .await?;
     let stored = rows
         .iter()
-        .map(|row| {
-            (
-                row.get::<_, i64>(0),
-                row.get::<_, String>(1),
-                row.get::<_, String>(2),
-                row.get::<_, String>(3),
-            )
-        })
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, String>(3)))
         .collect::<HashSet<_>>();
     let replayed = changes
         .iter()
         .map(|change| {
-            (
-                change.transaction_sequence,
-                change.ref_name.clone(),
-                change.old_oid.clone(),
-                change.new_oid.clone(),
-            )
+            (change.transaction_sequence, change.ref_name.clone(), change.old_oid.clone(), change.new_oid.clone())
         })
         .collect::<HashSet<_>>();
     if stored.len() != rows.len() || replayed.len() != changes.len() || stored != replayed {
