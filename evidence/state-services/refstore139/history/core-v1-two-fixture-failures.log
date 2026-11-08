@@ -1,0 +1,42 @@
+
+running 12 tests
+test atomic_rejection_writes_no_partial_refs_and_epochs_history_tenant_prefix_are_checked ... FAILED
+test bootstrap_requires_unserved_provisioning_repository ... ok
+test cancel_before_register_prevents_ref_changes ... FAILED
+test check_version_is_unknown_before_initialization ... ok
+test commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once ... ok
+test commit_replays_exact_terminal_and_digest_conflicts_do_not_mutate ... ok
+test core_error_rolls_back_partial_writes_and_a_client_commit_cannot_publish_them ... ok
+test head_retarget_and_deletion_policy_is_atomic ... ok
+test oversized_aggregate_terminal_is_rejected_before_any_write ... ok
+test queued_begin_deadline_leaves_no_open_transaction_or_partial_gate ... ok
+test repository_authority_change_rejects_new_mutations_but_replays_old_terminal ... ok
+test two_connections_same_old_oid_have_one_committer_and_one_terminal_rejection ... ok
+
+failures:
+
+---- atomic_rejection_writes_no_partial_refs_and_epochs_history_tenant_prefix_are_checked stdout ----
+
+thread 'atomic_rejection_writes_no_partial_refs_and_epochs_history_tenant_prefix_are_checked' (518381) panicked at tests/ref_store_core.rs:700:9:
+assertion `left == right` failed
+  left: 3
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Error: atomic rejection test panicked
+
+Caused by:
+    task 3 panicked with message "assertion `left == right` failed\n  left: 3\n right: 2"
+
+---- cancel_before_register_prevents_ref_changes stdout ----
+Error: db error
+
+Caused by:
+    ERROR: relation "ref_store_core_cancellations" does not exist
+
+
+failures:
+    atomic_rejection_writes_no_partial_refs_and_epochs_history_tenant_prefix_are_checked
+    cancel_before_register_prevents_ref_changes
+
+test result: FAILED. 10 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.01s
+

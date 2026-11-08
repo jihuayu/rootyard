@@ -1,0 +1,127 @@
+{
+  "passed": false,
+  "elapsed_seconds": 0.077,
+  "command": [
+    "/workspace/scratch/state-pg139-core-test-v2/ref_store_core",
+    "--ignored",
+    "--test-threads=1"
+  ],
+  "returncode": 101,
+  "summary": "test result: FAILED. 0 passed; 12 failed; 0 ignored;",
+  "cases": [
+    {
+      "name": "atomic_rejection_writes_no_partial_refs_and_epochs_history_tenant_prefix_are_checked",
+      "passed": false
+    },
+    {
+      "name": "bootstrap_requires_unserved_provisioning_repository",
+      "passed": false
+    },
+    {
+      "name": "cancel_before_register_prevents_ref_changes",
+      "passed": false
+    },
+    {
+      "name": "check_version_is_unknown_before_initialization",
+      "passed": false
+    },
+    {
+      "name": "commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once",
+      "passed": false
+    },
+    {
+      "name": "commit_replays_exact_terminal_and_digest_conflicts_do_not_mutate",
+      "passed": false
+    },
+    {
+      "name": "core_error_rolls_back_partial_writes_and_a_client_commit_cannot_publish_them",
+      "passed": false
+    },
+    {
+      "name": "head_retarget_and_deletion_policy_is_atomic",
+      "passed": false
+    },
+    {
+      "name": "oversized_aggregate_terminal_is_rejected_before_any_write",
+      "passed": false
+    },
+    {
+      "name": "queued_begin_deadline_leaves_no_open_transaction_or_partial_gate",
+      "passed": false
+    },
+    {
+      "name": "repository_authority_change_rejects_new_mutations_but_replays_old_terminal",
+      "passed": false
+    },
+    {
+      "name": "two_connections_same_old_oid_have_one_committer_and_one_terminal_rejection",
+      "passed": false
+    }
+  ],
+  "source_binary_test_head_unchanged": true,
+  "before": {
+    "source": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "binary": "6078da4cecfca970a26d3f1026e6ed993f924f1d72190b14ff1dec5d566ed147",
+    "test": "920c334f2b6cdcb6335647d1f103976cdfd0972a91fc6a5510c68647140bdd73",
+    "head": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1"
+  },
+  "after": {
+    "source": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "binary": "6078da4cecfca970a26d3f1026e6ed993f924f1d72190b14ff1dec5d566ed147",
+    "test": "920c334f2b6cdcb6335647d1f103976cdfd0972a91fc6a5510c68647140bdd73",
+    "head": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1"
+  },
+  "build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "6078da4cecfca970a26d3f1026e6ed993f924f1d72190b14ff1dec5d566ed147",
+    "workspace_commit": "58c22eae733dd31ed0788c4d1cbe4bc013a6ebd3",
+    "source_inputs_sha256": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "binary_sha256": "6078da4cecfca970a26d3f1026e6ed993f924f1d72190b14ff1dec5d566ed147",
+    "integration_test_source_sha256": "920c334f2b6cdcb6335647d1f103976cdfd0972a91fc6a5510c68647140bdd73",
+    "cargo_lock_sha256": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_core",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_core",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_core-eada3fdf5e139c15"
+      }
+    ]
+  },
+  "compiled_commit": "58c22eae733dd31ed0788c4d1cbe4bc013a6ebd3",
+  "tested_checkout_commit": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1",
+  "compiled_inputs_and_integration_test_match_receipt": true,
+  "limits": [
+    "Real PostgreSQL on one loopback host; no serving/cutover, pins, roots, holds, multi-host or power-loss qualification."
+  ]
+}

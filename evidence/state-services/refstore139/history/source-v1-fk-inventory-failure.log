@@ -1,0 +1,20 @@
+....................................................................................................s........................owned-fuse-cleanup: Refusing to open mountpoint outside the fixture-owned workspace-service/mounts UUID layout: '/tmp/rootyard-cleanup-out-1e9dgh5_/workspace-service/mounts/6c8b70e0-3a02-408c-95e2-88268e65da13'
+owned-fuse-cleanup: Refusing to open mountpoint outside the fixture-owned workspace-service/mounts UUID layout: '/tmp/rootyard-cleanup-out-1e9dgh5_/workspace-service/mounts/nope'
+.owned-fuse-cleanup: [Errno 20] Not a directory: '58283d5a-83f8-4520-b8fa-82969b546501'
+.owned-fuse-cleanup: FD for '/tmp/rootyard-cleanup-id-brnu4t6z/workspace-service/mounts/8ea799a9-25e5-4828-a0fa-7c1c94fd3ac5' has mnt_id 52, expected 53
+..owned-fuse-cleanup: [Errno 20] Not a directory: 'workspace-service'
+......................................................................................ss..............................F...................................sss
+======================================================================
+FAIL: test_foreign_key_topological_dag_and_composite_tenant_isolation_across_all_23_tables (test_tier5_adversarial.TestTier5Schema030AndBackupCatalogAdversarial.test_foreign_key_topological_dag_and_composite_tenant_isolation_across_all_23_tables)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/state-services-pg-core/tests/test_tier5_adversarial.py", line 485, in test_foreign_key_topological_dag_and_composite_tenant_isolation_across_all_23_tables
+    self.assertEqual(composite_tenant_tables, expected_composite)
+AssertionError: Items in the first set but not the second:
+'ref_store_core_gates'
+
+----------------------------------------------------------------------
+Ran 286 tests in 24.959s
+
+FAILED (failures=1, skipped=6)
+{"status": "failed", "run": 286, "failures": 1, "errors": 0, "skipped": 6, "exclusion_reason": "Requires dedicated native executables/services/kernel fixture; not qualified by this source/unit-only run. Full CI native suites remain required."}

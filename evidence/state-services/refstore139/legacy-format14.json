@@ -1,0 +1,236 @@
+{
+  "passed": true,
+  "kind": "legacy14",
+  "returncode": 0,
+  "command": [
+    "python3",
+    "/workspace/scratch/state-services-pg-core/tests/backup_legacy138_core.py",
+    "--binary",
+    "/workspace/scratch/state-pg139-app-v1/rootyard",
+    "--report",
+    "/workspace/scratch/state-pg139-legacy14-restore-v1/native.json",
+    "--legacy-binary",
+    "/workspace/scratch/state-refstore138-app-v6/rootyard"
+  ],
+  "seconds": 56.058,
+  "before": {
+    "source": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "binary": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+    "head": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1",
+    "harness": {
+      "tests/backup_legacy138_core.py": "5dc5cd9820746864cb2bb616640da48da3a65b3289a202e99f6c55e9491e1d25",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "e2492e33a7350754e7ae72c31d1f44684b670ed3d55ea2d90727fb8dbe0df286",
+      "tests/backup.py": "d120c2b3099284c9886e8969dd02e0847e739e85c5ccaf5379d56574c030ee4d",
+      "tests/backup_legacy132_sessions.py": "1bc45cf2c4bbf7b77f58a4c7d803d98671c37f032f5fa3a58934702ca7ea673d"
+    },
+    "legacy_binary": "9f861ff7b098836fc9b80bba945545c4e9b2fb1e78fe5136c76c316a91fda8db"
+  },
+  "after": {
+    "source": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "binary": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+    "head": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1",
+    "harness": {
+      "tests/backup_legacy138_core.py": "5dc5cd9820746864cb2bb616640da48da3a65b3289a202e99f6c55e9491e1d25",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "e2492e33a7350754e7ae72c31d1f44684b670ed3d55ea2d90727fb8dbe0df286",
+      "tests/backup.py": "d120c2b3099284c9886e8969dd02e0847e739e85c5ccaf5379d56574c030ee4d",
+      "tests/backup_legacy132_sessions.py": "1bc45cf2c4bbf7b77f58a4c7d803d98671c37f032f5fa3a58934702ca7ea673d"
+    },
+    "legacy_binary": "9f861ff7b098836fc9b80bba945545c4e9b2fb1e78fe5136c76c316a91fda8db"
+  },
+  "source_binary_harness_head_unchanged": true,
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+    "source_inputs_sha256": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "workspace_commit": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-pg-core#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-pg-core#rootyard@0.1.0"
+      }
+    ]
+  },
+  "native": {
+    "passed": true,
+    "cases": [
+      {
+        "name": "create_real_schema138_pando_source",
+        "status": "passed",
+        "seconds": 3.1636,
+        "detail": {
+          "source_heads": {
+            "alpha": "a6fff09bf6c983dbf022d5870badd6c6f0d8261c",
+            "beta": "8875146ea72501e363e816b2cef3820962fafd85"
+          },
+          "source_refs": {
+            "alpha": {
+              "refs/heads/main": "a6fff09bf6c983dbf022d5870badd6c6f0d8261c"
+            },
+            "beta": {
+              "refs/heads/main": "8875146ea72501e363e816b2cef3820962fafd85"
+            }
+          },
+          "source_authority_id": "73bfcc83-08ae-4d50-9d96-d73cfcb22506",
+          "source_remote_paths_count": 8,
+          "source_remote_paths_sha256": "c08e31c10d3942f951f9d74ab60f7757cf9b36572bc49e1f286dee02b9a81dab",
+          "cutovers": {
+            "alpha": {
+              "refs": 1,
+              "packs": 1,
+              "objects_verified": 3
+            },
+            "beta": {
+              "refs": 1,
+              "packs": 1,
+              "objects_verified": 3
+            }
+          },
+          "web_session_created": true,
+          "browser_token_created": true
+        }
+      },
+      {
+        "name": "legacy_binary_writes_format14_schema138_archive",
+        "status": "passed",
+        "seconds": 26.6583,
+        "detail": {
+          "format": 14,
+          "schema_last": 138,
+          "schema_contains_next": false,
+          "repository_count": 2,
+          "legacy_binary_sha256": "9f861ff7b098836fc9b80bba945545c4e9b2fb1e78fe5136c76c316a91fda8db",
+          "backup_verified": true
+        }
+      },
+      {
+        "name": "candidate_cli_usage_and_mixed_legacy_flags",
+        "status": "passed",
+        "seconds": 0.0332,
+        "detail": {
+          "missing_arguments_usage": true,
+          "missing_flags_usage": true,
+          "mixed_legacy_flags_usage": true,
+          "documented_opt_in": "--allow-legacy-schema138",
+          "documented_neighbour_opt_in": "--allow-legacy-schema137"
+        }
+      },
+      {
+        "name": "candidate_rejects_without_schema138_opt_in",
+        "status": "passed",
+        "seconds": 11.213,
+        "detail": {
+          "explicit_schema_opt_in_required": true,
+          "mismatched_legacy_opt_in_rejected": true,
+          "target_data_published": false,
+          "target_database_empty": true
+        }
+      },
+      {
+        "name": "candidate_restores_schema139_one_new_authority",
+        "status": "passed",
+        "seconds": 9.2342,
+        "detail": {
+          "schema139_core_tables": 3,
+          "schema139_core_refs_key": "repository_id,ref_name",
+          "schema139_core_event_operation_fkey": true,
+          "schema139_core_event_immutable_trigger": true,
+          "schema139_core_rows": "0/0/0",
+          "genuine_schema138_source_had_core_rows": false,
+          "schema_version": 139,
+          "indexes": 10,
+          "schema134_identity_constraints": true,
+          "schema135_metrics_index": true,
+          "schema136_token_scope_schema": true,
+          "schema138_operation_registry": true,
+          "legacy_tokens_default_unrestricted": true,
+          "target_authority_id": "de18665f-a193-43f3-a382-a36574d507af",
+          "target_authority_differs_from_source": true,
+          "target_manifest_artifacts": 8,
+          "target_authority_singleton_unique": true,
+          "target_remote_paths_count": 8,
+          "source_and_target_remote_paths_disjoint": true,
+          "browser_session_revoked": true,
+          "browser_token_revoked": true
+        }
+      },
+      {
+        "name": "restored_service_git_and_session_boundaries",
+        "status": "passed",
+        "seconds": 2.3279,
+        "detail": {
+          "api_token_readable": true,
+          "old_browser_cookie_rejected": true,
+          "old_browser_bearer_rejected": true,
+          "git_clones": 2,
+          "clone_heads_exact": true,
+          "clone_contents_exact": true,
+          "fsck_clean": true,
+          "first_repo_refetch_after_second_ok": true,
+          "sole_target_authority_unchanged": true
+        }
+      },
+      {
+        "name": "source_authority_and_remote_objects_remain_available",
+        "status": "passed",
+        "seconds": 1.5976,
+        "detail": {
+          "source_authority_unchanged": true,
+          "source_remote_paths_unchanged": true,
+          "source_remote_paths_count": 8,
+          "source_remote_paths_sha256": "c08e31c10d3942f951f9d74ab60f7757cf9b36572bc49e1f286dee02b9a81dab",
+          "source_clone_heads_exact": true,
+          "source_clone_contents_exact": true,
+          "source_git_fsck_clean": true
+        }
+      }
+    ],
+    "binary_sha256": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+    "legacy_binary_sha256": "9f861ff7b098836fc9b80bba945545c4e9b2fb1e78fe5136c76c316a91fda8db",
+    "harness_git_head": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1",
+    "limitations": [
+      "Loopback functional drill; no production RPO/RTO or power-loss claim.",
+      "The legacy archive is produced by the trusted format14 binary and is never edited.",
+      "source_head values are repository heads, not binary build provenance.",
+      "Genuine format14/schema138 sources carry no ref-store core rows; the migrated schema139 core tables are verified present, constrained and empty, not round-tripped."
+    ]
+  },
+  "limits": [
+    "Real loopback synthetic fixtures on one physical host; no power-loss, HA or production RPO/RTO qualification.",
+    "Backup15 rows are direct SQL metadata fixtures, not adapter ACK evidence; twelve PostgreSQL core cases separately test adapter semantics."
+  ]
+}

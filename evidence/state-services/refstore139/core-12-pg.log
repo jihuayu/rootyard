@@ -1,0 +1,17 @@
+
+running 12 tests
+test atomic_rejection_writes_no_partial_refs_and_epochs_history_tenant_prefix_are_checked ... ok
+test bootstrap_requires_unserved_provisioning_repository ... ok
+test cancel_before_register_prevents_ref_changes ... ok
+test check_version_is_unknown_before_initialization ... ok
+test commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once ... ok
+test commit_replays_exact_terminal_and_digest_conflicts_do_not_mutate ... ok
+test core_error_rolls_back_partial_writes_and_a_client_commit_cannot_publish_them ... ok
+test head_retarget_and_deletion_policy_is_atomic ... ok
+test oversized_aggregate_terminal_is_rejected_before_any_write ... ok
+test queued_begin_deadline_leaves_no_open_transaction_or_partial_gate ... ok
+test repository_authority_change_rejects_new_mutations_but_replays_old_terminal ... ok
+test two_connections_same_old_oid_have_one_committer_and_one_terminal_rejection ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.91s
+

@@ -1,0 +1,99 @@
+
+running 12 tests
+test atomic_rejection_writes_no_partial_refs_and_epochs_history_tenant_prefix_are_checked ... ok
+test bootstrap_requires_unserved_provisioning_repository ... FAILED
+test cancel_before_register_prevents_ref_changes ... FAILED
+test check_version_is_unknown_before_initialization ... FAILED
+test commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once ... FAILED
+test commit_replays_exact_terminal_and_digest_conflicts_do_not_mutate ... FAILED
+test core_error_rolls_back_partial_writes_and_a_client_commit_cannot_publish_them ... FAILED
+test head_retarget_and_deletion_policy_is_atomic ... FAILED
+test oversized_aggregate_terminal_is_rejected_before_any_write ... FAILED
+test queued_begin_deadline_leaves_no_open_transaction_or_partial_gate ... FAILED
+test repository_authority_change_rejects_new_mutations_but_replays_old_terminal ... FAILED
+test two_connections_same_old_oid_have_one_committer_and_one_terminal_rejection ... FAILED
+
+failures:
+
+---- bootstrap_requires_unserved_provisioning_repository stdout ----
+Error: db error
+
+Caused by:
+    ERROR: could not create file "base/5/1149505": No space left on device
+
+---- cancel_before_register_prevents_ref_changes stdout ----
+Error: db error
+
+Caused by:
+    ERROR: could not create file "base/5/1149580": No space left on device
+
+---- check_version_is_unknown_before_initialization stdout ----
+Error: db error
+
+Caused by:
+    ERROR: could not create file "base/5/1149599": No space left on device
+
+---- commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once stdout ----
+Error: db error
+
+Caused by:
+    ERROR: could not create file "base/5/1149787": No space left on device
+
+---- commit_replays_exact_terminal_and_digest_conflicts_do_not_mutate stdout ----
+Error: db error
+
+Caused by:
+    ERROR: could not create file "base/5/1149841": No space left on device
+
+---- core_error_rolls_back_partial_writes_and_a_client_commit_cannot_publish_them stdout ----
+Error: db error
+
+Caused by:
+    ERROR: could not create file "base/5/1150342": No space left on device
+
+---- head_retarget_and_deletion_policy_is_atomic stdout ----
+Error: db error
+
+Caused by:
+    ERROR: could not create file "base/5/1150394": No space left on device
+
+---- oversized_aggregate_terminal_is_rejected_before_any_write stdout ----
+Error: db error
+
+Caused by:
+    ERROR: could not create file "base/5/1150469": No space left on device
+
+---- queued_begin_deadline_leaves_no_open_transaction_or_partial_gate stdout ----
+Error: db error
+
+Caused by:
+    ERROR: could not create file "base/5/1150520": No space left on device
+
+---- repository_authority_change_rejects_new_mutations_but_replays_old_terminal stdout ----
+Error: db error
+
+Caused by:
+    ERROR: could not create file "base/5/1150994": No space left on device
+
+---- two_connections_same_old_oid_have_one_committer_and_one_terminal_rejection stdout ----
+Error: db error
+
+Caused by:
+    ERROR: could not create file "base/5/1151002": No space left on device
+
+
+failures:
+    bootstrap_requires_unserved_provisioning_repository
+    cancel_before_register_prevents_ref_changes
+    check_version_is_unknown_before_initialization
+    commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once
+    commit_replays_exact_terminal_and_digest_conflicts_do_not_mutate
+    core_error_rolls_back_partial_writes_and_a_client_commit_cannot_publish_them
+    head_retarget_and_deletion_policy_is_atomic
+    oversized_aggregate_terminal_is_rejected_before_any_write
+    queued_begin_deadline_leaves_no_open_transaction_or_partial_gate
+    repository_authority_change_rejects_new_mutations_but_replays_old_terminal
+    two_connections_same_old_oid_have_one_committer_and_one_terminal_rejection
+
+test result: FAILED. 1 passed; 11 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+

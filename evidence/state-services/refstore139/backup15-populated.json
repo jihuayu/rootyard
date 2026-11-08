@@ -1,0 +1,194 @@
+{
+  "passed": true,
+  "kind": "backup15",
+  "returncode": 0,
+  "command": [
+    "python3",
+    "/workspace/scratch/state-services-pg-core/tests/backup_refstore_core139.py",
+    "--binary",
+    "/workspace/scratch/state-pg139-app-v1/rootyard",
+    "--report",
+    "/workspace/scratch/state-pg139-populated-backup15-v1/native.json"
+  ],
+  "seconds": 91.498,
+  "before": {
+    "source": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "binary": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+    "head": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1",
+    "harness": {
+      "tests/backup_refstore_core139.py": "9189e0dfe98e8ca1302cc03a3a79512906f4dd5a8d658df2a5bc5b6c685b10fa",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "e2492e33a7350754e7ae72c31d1f44684b670ed3d55ea2d90727fb8dbe0df286",
+      "tests/backup.py": "d120c2b3099284c9886e8969dd02e0847e739e85c5ccaf5379d56574c030ee4d"
+    }
+  },
+  "after": {
+    "source": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "binary": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+    "head": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1",
+    "harness": {
+      "tests/backup_refstore_core139.py": "9189e0dfe98e8ca1302cc03a3a79512906f4dd5a8d658df2a5bc5b6c685b10fa",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "e2492e33a7350754e7ae72c31d1f44684b670ed3d55ea2d90727fb8dbe0df286",
+      "tests/backup.py": "d120c2b3099284c9886e8969dd02e0847e739e85c5ccaf5379d56574c030ee4d"
+    }
+  },
+  "source_binary_harness_head_unchanged": true,
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+    "source_inputs_sha256": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "workspace_commit": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-pg-core#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-pg-core#rootyard@0.1.0"
+      }
+    ]
+  },
+  "native": {
+    "passed": true,
+    "cases": [
+      {
+        "name": "synthetic_source_with_populated_refstore_core",
+        "status": "passed",
+        "seconds": 2.8439,
+        "detail": {
+          "fresh_databases": 2,
+          "live_server_backup_rejected": true,
+          "unknown_and_unfinished_journal": true,
+          "direct_sql_core_fixture_repository": "daee0ed9-156f-4e4e-8dd0-576791cf7299",
+          "core_fixture_is_adapter_or_protocol_acknowledgement": false,
+          "populated_fixture_rows_by_table": {
+            "ref_store_issuer_lanes": 1,
+            "ref_store_operations": 2,
+            "ref_store_cancellations": 1,
+            "ref_store_core_gates": 1,
+            "ref_store_core_refs": 1,
+            "ref_store_core_events": 1
+          }
+        }
+      },
+      {
+        "name": "offline_barriers_and_snapshot",
+        "status": "passed",
+        "seconds": 11.1302,
+        "detail": {
+          "snapshot_includes_commit_after_barrier_wait": true,
+          "inherited_volume_lock_rejected": true,
+          "backup_seconds": 8.876532864,
+          "backup_format": 15,
+          "archive_contains_schema_versions": [
+            138,
+            139
+          ]
+        }
+      },
+      {
+        "name": "unsafe_or_corrupt_inputs",
+        "status": "passed",
+        "seconds": 48.5907,
+        "detail": {
+          "corrupt_missing_extra_traversal_symlink_rejected_before_sql": true,
+          "existing_targets_and_overlap_refused": true,
+          "external_object_dependencies_refused": true
+        }
+      },
+      {
+        "name": "backup_barrier_failures",
+        "status": "passed",
+        "seconds": 9.7446,
+        "detail": {
+          "exporter_connection_loss_no_publication": true,
+          "queued_ddl_bounded_safe_failure": true
+        }
+      },
+      {
+        "name": "interrupted_restore_guard",
+        "status": "passed",
+        "seconds": 7.687,
+        "detail": {
+          "killed_parent_while_native_pg_restore_blocked": true,
+          "no_orphan_import_or_partial_sql": true,
+          "persistent_guard_blocks_startup": true
+        }
+      },
+      {
+        "name": "post_backup_write_not_in_snapshot",
+        "status": "passed",
+        "seconds": 0.9381,
+        "detail": {
+          "post_backup_acknowledged_commit": true,
+          "seconds_after_backup_boundary": 78.431
+        }
+      },
+      {
+        "name": "new_environment_restore_core_rows_clone_fsck",
+        "status": "passed",
+        "seconds": 8.9458,
+        "detail": {
+          "fresh_database_and_directory": true,
+          "separate_pg_server": false,
+          "standard_authenticated_clone_fsck_refs_content": true,
+          "revoked_and_read_only_auth_preserved": true,
+          "unknown_stays_blocked": true,
+          "restore_seconds": 7.6289532730000005,
+          "backup_boundary_commits_missing": 0,
+          "post_backup_acknowledged_commits_not_recovered": 1,
+          "observed_backup_age_at_last_ack_seconds": 78.431,
+          "production_rpo_rto_guarantee": false,
+          "populated_core_rows_restored_exactly": true,
+          "gates_refs_events_operations_cancellations_issuer_lanes_nonempty": true,
+          "terminal_event_cancellation_updates_refused_without_row_changes": true,
+          "core_repository_stays_provisioning_gitfs_unserved": true,
+          "core_fixture_direct_sql_not_adapter_acknowledgement": true
+        }
+      }
+    ],
+    "binary": "/workspace/scratch/state-pg139-app-v1/rootyard",
+    "binary_sha256": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+    "limitations": [
+      "RefStore core rows are direct SQL metadata fixtures, not adapter/protocol ACK evidence; Rust ref_store_* tests own that proof.",
+      "The unserved provisioning repository is never served or cut over; its core gate/ref rows are not native Git ref authority.",
+      "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise.",
+      "One committed operation/event and one cancelled tombstone/terminal are populated; batches, rejections and concurrency are covered by Rust tests."
+    ]
+  },
+  "limits": [
+    "Real loopback synthetic fixtures on one physical host; no power-loss, HA or production RPO/RTO qualification.",
+    "Backup15 rows are direct SQL metadata fixtures, not adapter ACK evidence; twelve PostgreSQL core cases separately test adapter semantics."
+  ]
+}
