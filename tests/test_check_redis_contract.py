@@ -216,7 +216,13 @@ class CleanupOwnershipTest(unittest.TestCase):
         self.assertTrue(self.fixture.directory.exists())
 
     def test_timeout_after_daemon_create_resolves_exact_name_and_removes(self):
-        self.fixture.create_attempted = True
+        def timed_out(*_args, **_kwargs):
+            raise gate.RunnerError("docker create timed out after daemon creation")
+        self.fixture.docker_runner = timed_out
+        with self.assertRaisesRegex(gate.RunnerError, "timed out"):
+            self.fixture._create_container()
+        self.assertTrue(self.fixture.create_attempted)
+        self.assertIsNone(self.fixture.cid)
         self.assertEqual([], self.fixture.stop())
         self.assertEqual([["docker", "rm", "-f", "--", self.cid]], self.rm_calls)
         self.assertFalse(self.fixture.directory.exists())
