@@ -386,13 +386,10 @@ async fn change_team_member(
     // non-member as an internal error. Check the precondition here, after the
     // admin and team checks, so an unauthorized caller still learns nothing.
     if add {
-        tx.query_opt(
-            "SELECT 1 FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",
-            &[&org, &user],
-        )
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(|| Error(StatusCode::CONFLICT, "user is not an organization member"))?;
+        tx.query_opt("SELECT 1 FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", &[&org, &user])
+            .await
+            .map_err(Error::internal)?
+            .ok_or(Error(StatusCode::CONFLICT, "user is not an organization member"))?;
     }
     let changed = if add {
         tx.execute("INSERT INTO organization_team_members(team_id,organization_id,user_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", &[&team,&org,&user]).await.map_err(Error::internal)?
