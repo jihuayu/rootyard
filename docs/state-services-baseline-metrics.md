@@ -222,6 +222,13 @@ bind, no scrape and no extra report keys. With it:
   including mixed diagnostics containing a 409 marker. HTTP409 is not proof of
   a particular application cause or synchronized old-OID CAS. Protocol handling
   is tracked in #126.
+* fixture cleanup is explicit. A passed run removes its owned temporary
+  directory by default; `--keep` retains it, and any failed run also retains it
+  for diagnosis. The report records `fixture_retention.requested`, `retained`,
+  `root` and `reason`. Only the harness-owned temporary directory and random SQL
+  schema are touched; no external object store, Vault, FUSE or host
+  configuration is cleaned or modified. Historical v1/v5 raw reports remain
+  immutable and the rebased head is still pending qualification.
 * the exporter is opened through a handler that **refuses redirects**: a 302/301
   raises instead of following a `Location` that could point outside loopback, so
   the private-origin claim holds even for a misbehaving listener.

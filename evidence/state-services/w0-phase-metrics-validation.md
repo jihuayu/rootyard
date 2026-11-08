@@ -7,7 +7,10 @@ this branch was stacked onto the rebased W0 security/token/membership parent
 **not** a qualification of the rebased stack: a freshly built feature-enabled
 binary with its own receipt plus a new 32-case native run are required (pending).
 The raw `w0-native-phase-metrics-v1.json` and `-v5.json` reports are immutable
-historical data and must not be edited.
+historical data and must not be edited. The runner cleanup change (default
+removal of the owned fixture after a passed run, automatic retention after a
+failure, explicit `--keep`) applies only to future invocations and does not
+alter these reports.
 
 Accepted report: `w0-native-phase-metrics-v5.json`. The default-disabled
 `state-baseline-metrics` feature records twelve fixed phases through the

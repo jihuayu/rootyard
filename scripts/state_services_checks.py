@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -245,6 +246,62 @@ def validate_budgets():
     return budgets
 
 
+OVERLAY_SCHEMA = "rootyard.state-services.implementation-overlay/v1"
+OVERLAY_FEATURE = "state-baseline-metrics"
+
+
+def canonical_manifest_digest(document):
+    """Stable digest of a parsed manifest, independent of formatting and comments."""
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def check_feature_only_overlay(overlay, parent, manifest_text, file_hashes):
+    """Validate a declared empty, default-OFF feature-only overlay on a frozen parent.
+
+    `parent` is the frozen `current_stack_parent` record: its hashes are never
+    relabelled with child hashes, so the only accepted delta is the one declared
+    empty feature in the manifest. The lockfile must stay the parent's, and any
+    dependency, feature or MSRV change fails.
+    """
+    require(overlay.get("schema") == OVERLAY_SCHEMA, "implementation overlay schema drift")
+    require(overlay.get("stack_base") == parent.get("commit"), "overlay must name the frozen parent commit")
+    feature = overlay.get("feature") or {}
+    name = feature.get("name")
+    require(name == OVERLAY_FEATURE, f"an implementation overlay may only declare {OVERLAY_FEATURE}")
+    require(feature.get("included") == [], "the overlay feature must be empty (no enabled sub-features)")
+    require(feature.get("default_enabled") is False, "the overlay feature must be default-OFF")
+    require(overlay.get("parent_manifest_sha256") == parent["files"]["Cargo.toml"],
+            "overlay must reference the frozen parent manifest hash, never a relabelled child hash")
+    require(overlay.get("parent_lock_sha256") == parent["files"]["Cargo.lock"],
+            "overlay must reference the frozen parent lockfile hash")
+    for filename, expected in parent["files"].items():
+        if filename in ("Cargo.toml", "Cargo.lock"):
+            continue
+        require(file_hashes.get(filename) == expected, f"current {filename} hash drift outside the declared overlay")
+    require(file_hashes.get("Cargo.lock") == parent["files"]["Cargo.lock"],
+            "lockfile must remain byte-identical to the frozen parent lockfile")
+    recorded = overlay.get("files") or {}
+    require(recorded.get("Cargo.lock") == parent["files"]["Cargo.lock"],
+            "the overlay record must keep the parent lockfile hash")
+    require(recorded.get("Cargo.toml") == file_hashes.get("Cargo.toml"),
+            "the overlay record must match the current manifest byte-for-byte")
+    manifest = tomllib.loads(manifest_text)
+    package = manifest.get("package") or {}
+    require(package.get("rust-version") == parent.get("declared_rust_version"),
+            "an implementation overlay must not change or relax the parent MSRV")
+    features = manifest.get("features") or {}
+    require(features.get(name) == [], "the overlay feature must stay empty")
+    require(name not in (features.get("default") or []), "the overlay feature must not be enabled by default")
+    reduced = json.loads(json.dumps(manifest))
+    del reduced["features"][name]
+    if not reduced["features"]:
+        del reduced["features"]
+    require(canonical_manifest_digest(reduced) == overlay.get("parent_manifest_semantic_sha256"),
+            "current manifest differs from the frozen parent beyond the declared empty feature")
+    return overlay
+
+
 def validate_dependencies():
     deps = load(STATE / "dependencies.json")
     require(deps["schema"] == "rootyard.state-services.dependencies/v1", "dependency schema drift")
@@ -253,8 +310,15 @@ def validate_dependencies():
     require(baseline["declared_rust_version"] == "1.85", "historical baseline MSRV drift")
     require(baseline["planned_rust_version"] == "1.88", "planned MSRV must remain explicit")
     require(current["declared_rust_version"] == "1.88", "current parent MSRV drift")
-    for filename, expected in current["files"].items():
-        require(sha256_file(ROOT / filename) == expected, f"current {filename} hash drift")
+    file_hashes = {filename: sha256_file(ROOT / filename) for filename in current["files"]}
+    overlay = deps.get("implementation_overlay")
+    if overlay is None:
+        # No declared overlay: the original strict parent-hash gate applies unchanged.
+        for filename, expected in current["files"].items():
+            require(file_hashes[filename] == expected, f"current {filename} hash drift")
+    else:
+        check_feature_only_overlay(
+            overlay, current, (ROOT / "Cargo.toml").read_text(encoding="utf-8"), file_hashes)
     require(deps["selection_policy"]["w0_does_not_modify_cargo"], "W0 Cargo modification guard missing")
     lock = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
     for crate, version in baseline["verified_locked_versions"].items():

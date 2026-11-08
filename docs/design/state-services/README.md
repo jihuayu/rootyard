@@ -18,10 +18,21 @@
 | [`config.schema.json`](config.schema.json) | 仅接受已实现 profile 的配置 schema；standalone/distributed 被枚举和拒绝规则双重拒绝 |
 | [`configs/`](configs/) | 2 个 accepted 示例 + 6 个 rejected 示例（目标 profile、memory Blob、bare Git target、WAL-on-Blob、Pando local-only） |
 | [`budgets.json`](budgets.json) | 10 个 provisional 预算；全部 `not_frozen`/bound null；未测量不得 pass |
-| [`dependencies.json`](dependencies.json) | baseline 1.85 与计划 1.88 分开记录；crates.io verified 版本/许可证与 candidate 未验证项分开；W0 未添加依赖 |
+| [`dependencies.json`](dependencies.json) | baseline 1.85 与计划 1.88 分开记录；crates.io verified 版本/许可证与 candidate 未验证项分开；W0 未添加依赖；`implementation_overlay` 只记录一个空、默认 OFF 的 feature |
 | [`workloads/w0-bounded.json`](workloads/w0-bounded.json) | 有限本地 Git workload；PG/API/Blob 明确 disabled |
 | [`native-baseline.md`](../../../evidence/state-services/native-baseline.md) | 历史 `d689bf8` legacy Pando 原生基线回执、可重跑命令和未验收项；不qualify rebased parent 或新后端 |
 | [`w0-local-git-smoke.json`](../../../evidence/state-services/w0-local-git-smoke.json) | 本仓库生成的有限本地 Git smoke；身份/provenance 证据，**不是** #106 runtime baseline |
+
+### Cargo feature-only overlay
+
+`current_stack_parent` 的 `Cargo.toml`/`Cargo.lock`/`LICENSE` 哈希仍是 frozen
+parent `bcd3918` 的引用，不得用子分支 manifest 哈希重标。当前分支唯一允许的
+偏差是 `implementation_overlay` 声明的空、默认 OFF `state-baseline-metrics`
+feature：validator 用标准库 `tomllib` 解析当前 manifest，只删除这一个已声明的
+空 feature 后与 parent 的 canonical（排序 JSON 化）语义 SHA-256 比较；
+`Cargo.lock` 必须保持 parent 哈希。依赖、版本、额外 feature、默认启用或 MSRV
+变更全部失败。没有 `implementation_overlay` 时恢复原始严格 parent-hash 检查。
+该 overlay 只是 provenance 记录，不是 W0 修改 Cargo 的许可，也没有新增依赖。
 
 ## 验证
 
@@ -29,6 +40,7 @@
 python3 scripts/check_state_services.py
 python3 -m py_compile scripts/state_services_baseline.py scripts/state_services_checks.py scripts/check_state_services.py
 python3 tests/test_state_services_w0.py
+python3 -m unittest tests.test_state_services_overlay tests.test_state_services_native_cleanup
 python3 scripts/check_design_docs.py
 ```
 

@@ -417,6 +417,15 @@ class PhaseMetricsCapture:
                 'note': 'phase spans nest and are not additive; the scrape adds one pooled SQL '
                         'snapshot outside this case'}
 
+def fixture_retention_decision(keep_requested, status):
+    """Retain the owned fixture on explicit --keep or after any failed run."""
+    if keep_requested:
+        return True, '--keep requested'
+    if status != 'passed':
+        return True, 'failed run retained for diagnosis'
+    return False, 'passed run removes its owned temporary fixture by default'
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--binary', required=True)
@@ -425,6 +434,9 @@ def main():
     p.add_argument('--phase-metrics', action='store_true',
                    help='capture per-process phase metrics from the private loopback listener of a '
                         'state-baseline-metrics build')
+    p.add_argument('--keep', action='store_true',
+                   help='retain the owned temporary fixture after the run (default: remove it; a '
+                        'failed run is retained for diagnosis and recorded in the report)')
     args = p.parse_args()
     binary = Path(args.binary).resolve()
     receipt = json.loads(binary.with_suffix('.build.json').read_text())
@@ -436,7 +448,7 @@ def main():
     spec.loader.exec_module(binding)
     binding.ROOT = source_root
     assert binding.source_digest() == receipt['source_inputs_sha256']
-    h = Harness(argparse.Namespace(binary=str(binary), keep=True))
+    h = Harness(argparse.Namespace(binary=str(binary), keep=args.keep))
     app_name = 'state_baseline_' + h.schema[-32:]
     parts = urlsplit(h.db)
     query = parse_qsl(parts.query) + [('application_name', app_name)]
@@ -737,18 +749,33 @@ def main():
             if capture.status != 'ready':
                 report['status'] = 'failed'
                 report['phase_metrics']['error'] = capture.reason
-        report['fixture_root'] = str(h.root)
-        try:
-            h.cleanup()
-        except Exception as error:
-            report['cleanup_error'] = h.redact(error)
-            report['status'] = 'failed'
         report['binary_still_matches'] = digest(binary) == receipt['binary_sha256']
         report['source_still_matches'] = binding.source_digest() == receipt['source_inputs_sha256']
         if not report['source_still_matches']:
             report['status'] = 'failed'
         if not report['binary_still_matches']:
             report['status'] = 'failed'
+        retain, retention_reason = fixture_retention_decision(args.keep, report['status'])
+        # Harness.cleanup always drops only its random SQL schema; keep controls
+        # only the private fixture directory. A failed run is retained so the
+        # operator can inspect it, and the decision is reported explicitly.
+        h.args.keep = retain
+        report['fixture_root'] = str(h.root)
+        report['fixture_retention'] = {
+            'keep_requested': args.keep,
+            'status_before_cleanup': report['status'],
+            'requested': retain,
+            'reason': retention_reason,
+        }
+        try:
+            h.cleanup()
+        except Exception as error:
+            report['cleanup_error'] = h.redact(error)
+            report['status'] = 'failed'
+        report['fixture_retention']['retained'] = h.root.exists()
+        report['fixture_retention']['root'] = str(h.root) if h.root.exists() else None
+        if not retain and h.root.exists() and 'cleanup_error' not in report:
+            report['fixture_retention']['warning'] = 'owned fixture directory survived default cleanup'
         args.report.write_text(json.dumps(report, indent=2) + '\n')
     return 0 if report['status'] == 'passed' else 1
 
