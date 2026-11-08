@@ -213,7 +213,7 @@ pub(in crate::browse::git_read) async fn run_git_step(
             let failure = exit_of(&err);
             match failure {
                 Some(exit) => Ok(GitOutcome::CommandFailed { exit }),
-                None => Err(Error::internal(err)),
+                None => Err(map_git_failure(err, step)),
             }
         }
     }

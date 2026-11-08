@@ -103,7 +103,7 @@ async fn namespace_page(
                 .into_iter()
                 .filter(|r| r.name.starts_with(namespace) && prefix.is_none_or(|p| r.name.starts_with(p)))
                 .collect();
-            if records >= limit + 1 && items.len() < limit + 1 {
+            if records > limit && items.len() <= limit {
                 return scan_namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await;
             }
             Ok(items)

@@ -196,15 +196,7 @@ async fn read_commit_batch(state: &AppState, repo_id: Uuid, oids: &[String]) -> 
     let raw =
         crate::git_http::collect_git_output_input(cmd, 4 * 1024 * 1024, state.config.git_timeout, Stdio::from(input))
             .await
-            .map_err(|err| {
-                if err.to_string().contains("timed out") {
-                    Error::timeout()
-                } else if err.to_string().contains("exceeds limit") {
-                    Error(StatusCode::PAYLOAD_TOO_LARGE, "Git output exceeds limit")
-                } else {
-                    Error::not_found()
-                }
-            })?;
+            .map_err(|err| command::map_git_failure(err, GitStep::CommitBatch))?;
     parse_batch_commits(&raw, oids)
 }
 
