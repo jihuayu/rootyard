@@ -47,7 +47,15 @@ impl CoreGateInit {
         if !head_ref.is_branch() {
             return Err(RefStoreError::InvalidIdentity("HEAD must name a refs/heads/ branch".into()));
         }
-        Ok(Self { repository_id, tenant_id, object_format, history_incarnation, authority_epoch, group_epoch, head_ref })
+        Ok(Self {
+            repository_id,
+            tenant_id,
+            object_format,
+            history_incarnation,
+            authority_epoch,
+            group_epoch,
+            head_ref,
+        })
     }
 
     pub fn repository_id(&self) -> Uuid {
@@ -298,12 +306,16 @@ impl CommitRefsRequest {
             }
             if let Some(oid) = update.precondition().oid() {
                 if oid.format() != object_format {
-                    return Err(RefStoreError::InvalidIdentity("old object id does not match the gate object format".into()));
+                    return Err(RefStoreError::InvalidIdentity(
+                        "old object id does not match the gate object format".into(),
+                    ));
                 }
             }
             if let Some(oid) = update.target().oid() {
                 if oid.format() != object_format {
-                    return Err(RefStoreError::InvalidIdentity("new object id does not match the gate object format".into()));
+                    return Err(RefStoreError::InvalidIdentity(
+                        "new object id does not match the gate object format".into(),
+                    ));
                 }
             }
         }
@@ -312,8 +324,14 @@ impl CommitRefsRequest {
                 return Err(RefStoreError::InvalidIdentity("HEAD must name a refs/heads/ branch".into()));
             }
         }
-        let identity =
-            OperationIdentity::new(repository_id, issuer_id, lane, sequence, operation_id, RequestDigest::from_bytes([0; 32]))?;
+        let identity = OperationIdentity::new(
+            repository_id,
+            issuer_id,
+            lane,
+            sequence,
+            operation_id,
+            RequestDigest::from_bytes([0; 32]),
+        )?;
         let digest = commit_digest(
             &identity,
             tenant_id,
@@ -730,6 +748,9 @@ mod tests {
             (0..128).map(|index| update(&long(index), None, Some(1))).collect(),
         )
         .unwrap();
-        assert!(matches!(oversized.validate(), Err(RefStoreError::InvalidIdentity(ref message)) if message.contains("64 KiB")));
+        assert!(matches!(
+            oversized.validate(),
+            Err(RefStoreError::InvalidIdentity(ref message)) if message.contains("64 KiB")
+        ));
     }
 }

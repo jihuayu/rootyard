@@ -4,6 +4,7 @@
 //! id: the wire form is converted explicitly into `Absent`/`Delete`, while a
 //! live `GitOid` can never be all zeros.
 use super::super::contract::RefStoreError;
+use super::terminal::CommitRejectCode;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
@@ -305,8 +306,7 @@ pub(crate) fn resolve_head(
     existing: &BTreeMap<String, String>,
     refs: &[RefUpdate],
     head: &HeadUpdate,
-) -> Result<String, (super::contract::CommitRejectCode, Option<String>)> {
-    use super::contract::CommitRejectCode;
+) -> Result<String, (CommitRejectCode, Option<String>)> {
     let final_oid = |name: &str| -> Option<String> {
         if let Some(update) = refs.iter().find(|update| update.name().as_str() == name) {
             return update.target().oid().map(|oid| oid.as_hex());
@@ -423,7 +423,7 @@ mod tests {
         )];
         assert_eq!(
             resolve_head("refs/heads/main", &existing, &delete_main, &HeadUpdate::Keep),
-            Err((super::super::contract::CommitRejectCode::HeadDeletedWithoutRetarget, Some("refs/heads/main".into())))
+            Err((super::super::terminal::CommitRejectCode::HeadDeletedWithoutRetarget, Some("refs/heads/main".into())))
         );
         assert_eq!(
             resolve_head(
@@ -442,7 +442,7 @@ mod tests {
                 &delete_main,
                 &HeadUpdate::Retarget(name("refs/heads/unborn"))
             ),
-            Err((super::super::contract::CommitRejectCode::HeadTargetMissing, Some("refs/heads/unborn".into())))
+            Err((super::super::terminal::CommitRejectCode::HeadTargetMissing, Some("refs/heads/unborn".into())))
         );
         let delete_next = vec![RefUpdate::new(
             name("refs/heads/next"),
@@ -456,7 +456,7 @@ mod tests {
                 &delete_next,
                 &HeadUpdate::Retarget(name("refs/heads/next"))
             ),
-            Err((super::super::contract::CommitRejectCode::HeadTargetMissing, Some("refs/heads/next".into())))
+            Err((super::super::terminal::CommitRejectCode::HeadTargetMissing, Some("refs/heads/next".into())))
         );
     }
 }

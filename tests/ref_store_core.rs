@@ -543,7 +543,10 @@ async fn two_connections_same_old_oid_have_one_committer_and_one_terminal_reject
                 // The winner advanced the gate revision while holding the row
                 // lock, so the second admission is a durable revision
                 // rejection; it can never apply the same old OID twice.
-                assert_eq!(receipt.terminal.rejection.as_ref().map(|rejection| rejection.code), Some(CommitRejectCode::RevisionMismatch));
+                assert_eq!(
+                    receipt.terminal.rejection.as_ref().map(|rejection| rejection.code),
+                    Some(CommitRejectCode::RevisionMismatch)
+                );
                 assert_eq!(receipt.terminal.kind, TerminalKind::Rejected);
                 assert!(receipt
                     .terminal
@@ -1198,7 +1201,10 @@ async fn repository_authority_change_rejects_new_mutations_but_replays_old_termi
         assert!(replay.is_committed());
         assert_eq!(replay.terminal, committed.terminal);
         assert_eq!(replay.record.terminal_result(), Some(&exact));
-        assert_eq!(operation_state(&pool, repo, seed.identity().operation_id()).await?, Some(OperationState::Committed));
+        assert_eq!(
+            operation_state(&pool, repo, seed.identity().operation_id()).await?,
+            Some(OperationState::Committed)
+        );
 
         // A Pando backend cannot carry new core mutations.
         client
