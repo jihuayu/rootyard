@@ -575,12 +575,35 @@ def publication_diagnostics(h, repository_id):
     }
 
 
-def assert_no_new_publication(h, repository_id, before, repo, ref, label):
-    after = counts(h, repository_id)
-    assert after["operations"] == before["operations"], (label, after, before)
+def assert_no_new_publication(h, repository_id, before, repo, ref, label, token_id):
+    # Rejection must close its admission and retain an honest no-ref-change
+    # audit row. It must never create a successful ref event or publication.
+    until = time.monotonic() + 30
+    while True:
+        after = counts(h, repository_id)
+        if after["outcomes"].get("no_ref_changes", 0) == before["outcomes"].get("no_ref_changes", 0) + 1:
+            break
+        assert time.monotonic() < until, ("rejected admission was not settled", label, after)
+        time.sleep(0.02)
+    expected_outcomes = dict(before["outcomes"])
+    expected_outcomes["no_ref_changes"] = expected_outcomes.get("no_ref_changes", 0) + 1
+    assert after["operations"] == before["operations"] + 1, (label, after, before)
+    assert after["outcomes"] == expected_outcomes, (label, after, before)
     assert after["outbox"] == before["outbox"], (label, after, before)
     assert after["committed_admissions"] == before["committed_admissions"], (label, after, before)
+    closed = json.loads(h.sql("SELECT coalesce(json_agg(t),'[]') FROM ("
+        "SELECT o.id, a.state, o.token_id=a.token_id AS token_matches, "
+        "o.actor_id=a.actor_id AS actor_matches, o.token_id=" + quote(token_id) + "::uuid AS expected_token "
+        "FROM git_operations o JOIN git_ref_admissions a ON a.writer_id=o.id "
+        "WHERE o.repository_id=" + quote(repository_id) + " AND o.outcome='no_ref_changes') t"))
+    assert len(closed) == 1, (label, closed)
+    assert closed[0]["state"] == "ABORTED" and closed[0]["token_matches"] and closed[0]["actor_matches"] and closed[0]["expected_token"], (label, closed)
     assert ref_oid(h, repo, ref) is None, label + ": ref was published"
+    journal = Path(h.env["ROOTYARD_DATA_DIR"]) / "journal" / repository_id
+    until = time.monotonic() + 10
+    while any(p.is_dir() and not p.name.startswith(".") for p in journal.iterdir()):
+        assert time.monotonic() < until, "settled no-ref-change journal was not retired"
+        time.sleep(0.02)
 
 
 def case_revoker_first(h, work):
@@ -610,7 +633,7 @@ def case_revoker_first(h, work):
         worker = None
         assert code != 0, "revoked token still published: " + err
         assert_no_new_publication(h, repository_id, before, repo, "refs/heads/fence-a",
-                                  "revoked push published")
+                                  "revoked push published", push_token["token_id"])
         assert not (set(markers(h)) - set(before_markers)), "an ACK marker survived the refused push"
         # A different valid token must publish the same ref. This is a hard
         # single-shot assertion: a stranded admission/journal would answer 503
@@ -737,7 +760,7 @@ def case_cancel_releases(h, work):
         wait_no_descendants(h, children)
         h.assert_no_live_descendants(children, "client cancel during late authorisation")
         assert_no_new_publication(h, repository_id, before, repo, "refs/heads/fence-c",
-                                  "canceled push published")
+                                  "canceled push published", push_token["token_id"])
         assert not (set(markers(h)) - set(before_markers)), "canceled push left an ACK marker"
         fresh = h.account("create-token", "alice")
         push_with_retry(h, remote(h, repo), "refs/heads/fence-c", fresh, work)

@@ -102,18 +102,18 @@ mod tests {
 
     fn finished_journal() -> (tempfile::TempDir, crate::journal::Operation) {
         let root = tempfile::tempdir().unwrap();
-        let (mut operation, active) = crate::journal::begin_active(
+        let (operation, active) = crate::journal::begin_active_with(
             root.path(),
             Uuid::new_v4(),
             Uuid::new_v4(),
             "actor".into(),
             Uuid::new_v4(),
             1,
+            Uuid::new_v4(),
+            7,
         )
         .unwrap();
         drop(active);
-        operation.requires_parent_publication = true;
-        operation.shard_epoch = 7;
         crate::journal::finish(&operation).unwrap();
         (root, operation)
     }
