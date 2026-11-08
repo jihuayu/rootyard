@@ -349,8 +349,13 @@ async fn execute_ref_transaction_inner(
         let mut all_old = true;
         let mut all_new = true;
         for change in &requested {
-            let observed = match git_read::run_git(&state, repo_id, git_read::GitStep::ShowRef,
-                &["show-ref", "--verify", "--hash", &change.ref_name], 128).await {
+            // `show-ref --verify` reports a missing ref as the generic fatal
+            // 128, which can also mean a damaged repository. The quiet
+            // `rev-parse --verify` probe answers exactly 1 for "this ref does
+            // not exist", which is the observation a create needs: a missing
+            // old ref is the zero id, not a broken read.
+            let observed = match git_read::run_git(&state, repo_id, git_read::GitStep::RefVerify,
+                &["rev-parse", "--verify", "--quiet", &change.ref_name], 128).await {
                 Ok(raw) => Some(String::from_utf8_lossy(&raw).trim().to_owned()),
                 Err(e) if e.0 == StatusCode::NOT_FOUND => Some(zero_oid.to_owned()),
                 Err(_) => None,

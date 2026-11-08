@@ -103,7 +103,14 @@ pub(crate) async fn read_web_blob_preview(state: &AppState, repo_id: Uuid, oid_o
     let blob_oid = if !clean_path.is_empty() {
         let root_oid = resolve_web_commit_or_tree_oid(state, repo_id, oid_or_spec).await?;
         let spec = format!("{root_oid}:{clean_path}");
-        let out = git_read::run_git(state, repo_id, &["rev-parse", "--verify", "--quiet", &spec], 128).await?;
+        let out = git_read::run_git(
+            state,
+            repo_id,
+            git_read::GitStep::RevParse,
+            &["rev-parse", "--verify", "--quiet", &spec],
+            128,
+        )
+        .await?;
         String::from_utf8_lossy(&out).trim().to_owned()
     } else {
         let raw_oid = oid_or_spec.ok_or_else(Error::bad_request)?;
@@ -115,7 +122,8 @@ pub(crate) async fn read_web_blob_preview(state: &AppState, repo_id: Uuid, oid_o
     if !browse_models::valid_non_zero_oid(&blob_oid) || git_read::object_type(state, repo_id, &blob_oid).await?.as_deref() != Some("blob") {
         return Err(Error::not_found());
     }
-    let size_out = git_read::run_git(state, repo_id, &["cat-file", "-s", &blob_oid], 64).await?;
+    let size_out =
+        git_read::run_git(state, repo_id, git_read::GitStep::BlobSize, &["cat-file", "-s", &blob_oid], 64).await?;
     let total_size: u64 = String::from_utf8_lossy(&size_out).trim().parse().map_err(|_| Error::not_found())?;
 
     let mut cmd = git_read::git_cmd(state, repo_id)?;
@@ -228,7 +236,15 @@ pub async fn commit_detail_view(State(state): App, Path((owner, name, oid)): Oid
     let source=native_reads::acquire(&state,&headers,&owner,&name,access.repo_id).await?;
     let (detail,diff_raw)=source.protect(async {
         let detail = git_read::get_commit_detail(&state, access.repo_id, &oid).await?;
-        let diff_raw = git_read::run_git(&state, access.repo_id, &["show", "--format=", "--patch", "--no-color", "--no-ext-diff", &oid], MAX_DIFF_BYTES).await.unwrap_or_default();
+        let diff_raw = git_read::run_git(
+            &state,
+            access.repo_id,
+            git_read::GitStep::CommitDiff,
+            &["show", "--format=", "--patch", "--no-color", "--no-ext-diff", &oid],
+            MAX_DIFF_BYTES,
+        )
+        .await
+        .unwrap_or_default();
         Ok::<_,Error>((detail,diff_raw))
     }).await?;
     let diff = String::from_utf8_lossy(&diff_raw).into_owned();
@@ -462,7 +478,15 @@ async fn render_pull_detail_for_number(state: &Arc<AppState>, owner: &str, name:
     let source=native_reads::acquire(state,headers,owner,name,access.repo_id).await?;
     let (merge_base_oid,diff_raw)=source.protect(async {
         let merge_base_oid = merge_base(state, access.repo_id, &pull.base_oid, &pull.head_oid).await.ok().flatten();
-        let diff_raw = git_read::run_git(state, access.repo_id, &["diff", "--no-color", "--no-ext-diff", &pull.base_oid, &pull.head_oid], MAX_DIFF_BYTES).await.unwrap_or_default();
+        let diff_raw = git_read::run_git(
+            state,
+            access.repo_id,
+            git_read::GitStep::CompareDiff,
+            &["diff", "--no-color", "--no-ext-diff", &pull.base_oid, &pull.head_oid],
+            MAX_DIFF_BYTES,
+        )
+        .await
+        .unwrap_or_default();
         Ok::<_,Error>((merge_base_oid,diff_raw))
     }).await?;
     let fast_forward = merge_base_oid.as_deref() == Some(pull.base_oid.as_str());

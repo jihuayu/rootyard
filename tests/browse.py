@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import sys
 import uuid
+import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e import Harness  # noqa: E402
@@ -32,6 +33,7 @@ CASE_NAMES = (
     "access_and_fences",
     "object_format_and_negotiation",
     "bounded_ref_and_commit_pages",
+    "selective_ref_prefix",
     "protected_writes_and_ref_ack_failure",
 )
 
@@ -361,6 +363,47 @@ class BrowseHarness(Harness):
             after = len(count_path.read_text().splitlines())
             assert after - before == 2, (size, after - before)
         packed.write_text("# pack-refs with: peeled fully-peeled sorted\n" + "\n".join(existing) + "\n")
+
+    def selective_ref_prefix(self):
+        # A literal prefix narrower than a whole namespace must count the page
+        # after the filter.  a1/a2 sort in front of the only z-matches, so
+        # asking Git for the first page of heads and filtering that page
+        # afterwards would have answered an empty page for refs/heads/z.
+        def refs(prefix, limit=20, after=None):
+            query = "limit=" + str(limit) + "&prefix=" + urllib.parse.quote(prefix, safe="")
+            if after is not None:
+                query += "&after=" + urllib.parse.quote(after, safe="")
+            page = self.document(self.repo_api("/refs?" + query))
+            return [item["name"] for item in page["items"]], page["next_after"]
+
+        def write(ref_name, old_oid, new_oid):
+            self.document(self.repo_api("/ref-transactions"), 200, method="POST", body={
+                "updates": [{"ref_name": ref_name, "old_oid": old_oid, "new_oid": new_oid}]})
+
+        created = ("refs/heads/a1", "refs/heads/a2", "refs/heads/z1", "refs/heads/z2")
+        try:
+            for name in created:
+                write(name, ZERO_OID, self.third)
+            names, cursor = refs("refs/heads/z", limit=1)
+            assert names == ["refs/heads/z1"], names
+            assert cursor == "refs/heads/z1", cursor
+            # The cursor page continues inside the same literal prefix.
+            names, cursor = refs("refs/heads/z", limit=1, after=cursor)
+            assert names == ["refs/heads/z2"], names
+            assert cursor is None, cursor
+            # The full exact ref name is still a one-item page.
+            assert refs("refs/heads/z2")[0] == ["refs/heads/z2"]
+            # A narrow tag prefix keeps the existing tag and nothing else.
+            assert refs("refs/tags/v1")[0] == ["refs/tags/v1.0"]
+            assert refs("refs/heads/zzz")[0] == []
+            # `*` is a literal byte here, never a Git pattern: as a pattern it
+            # would match every branch, as a literal it matches none.
+            assert refs("refs/heads/*")[0] == []
+        finally:
+            for name in created:
+                write(name, self.third, ZERO_OID)
+        # The fixture is back to the refs the other cases assert.
+        assert refs("refs/heads/z")[0] == [] and refs("refs/heads/a")[0] == []
 
     def protected_writes_and_ref_ack_failure(self):
         self.git("push", "origin", self.third + ":refs/heads/release", cwd=self.work, token=self.alice)

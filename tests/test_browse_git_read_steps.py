@@ -127,8 +127,15 @@ def seek_page(repo, namespace, marker, limit):
     return [name for name in names if name.startswith(namespace)][:limit + 1]
 
 
-def scan_page(repo, namespace, marker, limit):
-    """Mirror of the bounded streaming fallback in `scan_namespace_page`."""
+def selects_part_of_namespace(prefix):
+    """Mirror of the production routing decision in `page_refs`."""
+    if prefix is None:
+        return False
+    return not any(whole.startswith(prefix) for whole in ("refs/", "refs/heads/", "refs/tags/"))
+
+
+def scan_page(repo, namespace, marker, limit, prefix=None):
+    """Mirror of the bounded streaming scan in `scan_namespace_page`."""
     argv = [GIT, "--git-dir", str(repo), "for-each-ref", "--sort=refname", FORMAT,
             excluded_for(namespace), "--exclude=refs/rootyard-ci/*", namespace.rstrip("/")]
     proc = subprocess.Popen(argv, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -141,8 +148,14 @@ def scan_page(repo, namespace, marker, limit):
             read += 1
             consumed += len(line)
             name = line.split(b"\0", 1)[0].decode()
-            if name.startswith(namespace) and name > marker:
-                names.append(name)
+            if not name.startswith(namespace) or name <= marker:
+                continue
+            if prefix is not None and not name.startswith(prefix):
+                if name > prefix:
+                    # Ordered refnames: the literal prefix range is over.
+                    break
+                continue
+            names.append(name)
             if len(names) > limit:
                 # Satisfied: stop the producer instead of draining every ref.
                 break
@@ -153,6 +166,33 @@ def scan_page(repo, namespace, marker, limit):
         proc.wait(timeout=30)
         proc.stderr.close()
     return {"items": names[:limit + 1], "refs_read": read, "bytes_read": consumed}
+
+
+def page_names(repo, prefix, marker, limit):
+    """Mirror of `page_refs`: a selective literal prefix is counted after the
+    filter through the bounded scan, a namespace-wide prefix keeps the seek
+    path where the host Git implements `--start-after`."""
+    selective = selects_part_of_namespace(prefix)
+    items, stats = [], {"refs_read": 0, "bytes_read": 0}
+    for namespace in ("refs/heads/", "refs/tags/"):
+        if prefix is not None and not (namespace.startswith(prefix) or prefix.startswith(namespace)):
+            continue
+        if marker is not None and marker >= namespace and not marker.startswith(namespace):
+            continue
+        start = marker if marker and marker.startswith(namespace) else namespace
+        if selective or not seek_supported():
+            page = scan_page(repo, namespace, start, limit, prefix)
+            items.extend(page["items"])
+            stats["refs_read"] += page["refs_read"]
+            stats["bytes_read"] += page["bytes_read"]
+        else:
+            items.extend(seek_page(repo, namespace, start, limit))
+        if len(items) > limit:
+            break
+    names = sorted({name for name in items if prefix is None or name.startswith(prefix)})
+    if marker is not None:
+        names = [name for name in names if name > marker]
+    return {"items": names[:limit + 1], **stats}
 
 
 def large_packed_refs(repo, third):
@@ -201,15 +241,69 @@ class GitReadStepsSourceTest(unittest.TestCase):
                         self.read.index("GitOutcome::CommandFailed { exit: Some(129) }"))
 
     def test_absence_policy_keeps_real_not_found_and_rejects_usage(self):
-        self.assertIn("matches!(exit, Some(1) | Some(128))", self.read)
-        for probe in ("ObjectType", "HeadVerify", "RevParse", "MergeBase", "ObjectFormat", "ShowRef"):
-            self.assertIn(f"GitStep::{probe}", self.read)
+        # Only Git's precise quiet exit 1 proves that a name is absent.
+        self.assertIn("matches!(exit, Some(1))", self.read)
+        self.assertNotIn("Some(1) | Some(128)", self.read)
+        policy = self.read[self.read.index("pub(crate) fn maps_to_not_found("):]
+        policy = policy[:policy.index("\n    }\n")]
+        self.assertNotIn("Some(128)", policy)
+        self.assertNotIn("Some(129)", policy)
+        # Only the precise probes may answer 404; cat-file never can.
+        steps = self.read[self.read.index("pub(crate) fn absence_is_expected("):]
+        steps = steps[:steps.index("\n    }\n")]
+        for probe in ("HeadVerify", "RevParse", "MergeBase", "RefVerify"):
+            self.assertIn(f"GitStep::{probe}", steps)
+        for internal in ("ObjectType", "ObjectFormat"):
+            self.assertNotIn(f"GitStep::{internal}", steps)
         # A required step can never answer 404: the only not_found() inside
         # run_git is guarded by the absence policy.
         run_git = self.read[self.read.index("pub(crate) async fn run_git("):]
         run_git = run_git[:run_git.index("\n}\n")]
         self.assertEqual(run_git.count("Error::not_found()"), 1)
         self.assertIn("if step.maps_to_not_found(exit) {", run_git)
+
+    def test_object_type_absence_is_a_precise_probe(self):
+        """`cat-file -t` cannot distinguish absence from a damaged repository."""
+        obj = self.read[self.read.index("pub(crate) async fn object_type("):]
+        obj = obj[:obj.index("\n}\n")]
+        self.assertIn('let query = format!("{spec}^{{object}}");', obj)
+        self.assertIn('"rev-parse", "--verify", "--quiet", &query', obj)
+        self.assertLess(obj.index("--verify"), obj.index('"cat-file", "-t"'))
+        self.assertNotIn("Some(128)", obj)
+        # Only the probe's own quiet exit 1 is an absence verdict.
+        self.assertEqual(obj.count("return Ok(None)"), 1)
+        self.assertIn("err.0 == StatusCode::NOT_FOUND", obj)
+        # A type read after a successful probe is never an absent object.
+        tail = obj[obj.index('"cat-file", "-t"'):]
+        self.assertNotIn("NOT_FOUND", tail)
+        self.assertNotIn("Ok(None)", tail)
+
+    def test_selective_prefix_is_filtered_before_the_page_count(self):
+        """A narrow literal prefix must count the page after the filter."""
+        self.assertIn("fn selects_part_of_namespace(", self.read)
+        self.assertIn("let selective = selects_part_of_namespace(prefix);", self.read)
+        seek = self.read[self.read.index("async fn namespace_page("):]
+        seek = seek[:seek.index("\n}\n")]
+        self.assertIn("prefix: Option<&str>,", seek)
+        self.assertIn("prefix.is_none_or(|p| r.name.starts_with(p))", seek)
+        route = self.read[self.read.index("pub(crate) async fn page_refs("):]
+        route = route[:route.index("\n}\n")]
+        self.assertIn("items.extend(if selective {", route)
+        self.assertIn("scan_namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await?", route)
+        # The literal filter runs inside the sink, before a ref is counted.
+        scan = self.read[self.read.index("async fn scan_namespace_page("):]
+        scan = scan[:scan.index("\n}\n")]
+        self.assertIn("if !item.name.starts_with(prefix)", scan)
+        self.assertLess(scan.index("starts_with(prefix)"), scan.index("items.push(item)"))
+        self.assertLess(scan.index("items.push(item)"), scan.index("items.len() <= limit"))
+        # A ref past the literal range ends the scan instead of draining it.
+        after = scan[scan.index("!item.name.starts_with(prefix)"):]
+        self.assertIn("return false;", after)
+        # No user prefix ever becomes a Git pattern: argv stays namespace-only.
+        argv = scan[scan.index("let args = ["):scan.index("];", scan.index("let args = ["))]
+        self.assertNotIn("prefix", argv)
+        self.assertIn("REF_SCAN_MAX_RECORDS", scan)
+        self.assertIn("REF_SCAN_MAX_BYTES", scan)
 
     def test_step_diagnostics_are_fixed_and_secret_free(self):
         report = self.read[self.read.index("fn report_step_failure("):]
@@ -282,7 +376,8 @@ class GitReadStepsSourceTest(unittest.TestCase):
     def test_browse_contract_is_unchanged(self):
         browse = (TESTS / "browse.py").read_text()
         cases = re.search(r"CASE_NAMES = \((.*?)\n\)", browse, re.S).group(1)
-        self.assertEqual(len([line for line in cases.splitlines() if line.strip()]), 11)
+        self.assertEqual(len([line for line in cases.splitlines() if line.strip()]), 12)
+        self.assertIn('"selective_ref_prefix",', browse)
         self.assertIn('"kind": "symbolic",', browse)
         self.assertIn('"target": "refs/heads/main",', browse)
         self.assertIn('"oid": self.third,', browse)
@@ -317,8 +412,8 @@ class RealGitFixtureTest(unittest.TestCase):
                          f"unborn HEAD must answer 'absent' with exit 1 on {git_version()}")
         self.assertEqual(probe.stdout, b"")
         # That exit is a real "absent" verdict, so Browse reports unborn (200),
-        # never a 404: the production absence policy accepts exactly 1 and 128.
-        self.assertIn("matches!(exit, Some(1) | Some(128))",
+        # never a 404: the production absence policy accepts exactly exit 1.
+        self.assertIn("matches!(exit, Some(1))",
                       (ROOT / "src" / "browse" / "git_read.rs").read_text())
 
     def test_unknown_option_is_a_usage_exit(self):

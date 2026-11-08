@@ -75,7 +75,7 @@ pub(crate) enum GitStep {
     CompareCommits,
     CompareDiff,
     ObjectFormat,
-    ShowRef,
+    RefVerify,
 }
 
 impl GitStep {
@@ -98,32 +98,29 @@ impl GitStep {
             GitStep::CompareCommits => "compare-commits",
             GitStep::CompareDiff => "compare-diff",
             GitStep::ObjectFormat => "object-format",
-            GitStep::ShowRef => "show-ref",
+            GitStep::RefVerify => "ref-verify",
         }
     }
 
-    /// Only these steps can legitimately fail because the named ref, object or
-    /// merge base is absent. Any other step runs on a repository that already
-    /// passed authorization and readiness checks, so a failure is a broken
-    /// native read and must never be reported as "not found".
+    /// Only these steps run Git's precise quiet probes, whose exit 1 means "no
+    /// such name". Any other step runs on a repository that already passed
+    /// authorization and readiness checks, so a failure is a broken native read
+    /// and must never be reported as "not found". In particular `object-type`
+    /// is not here: it reads a type only after a probe proved the object exists.
     pub(crate) fn absence_is_expected(self) -> bool {
-        matches!(
-            self,
-            GitStep::ObjectType
-                | GitStep::HeadVerify
-                | GitStep::RevParse
-                | GitStep::MergeBase
-                | GitStep::ObjectFormat
-                | GitStep::ShowRef
-        )
+        matches!(self, GitStep::HeadVerify | GitStep::RevParse | GitStep::MergeBase | GitStep::RefVerify)
     }
 
-    /// A probe may answer 404 only when Git really answered "no": exit 1 is the
-    /// quiet "no such ref/object/merge base" verdict and exit 128 is the fatal
-    /// "not a valid object name" verdict. A usage error (129) or a signal means
-    /// the native read itself broke and must never be reported as a real 404.
+    /// A probe may answer 404 only when Git itself answered "no such name" with
+    /// its quiet verdict, which is exactly exit 1 for `rev-parse --verify
+    /// --quiet`, `merge-base` and the ref probe. Exit 128 is Git's generic fatal
+    /// class (damaged object database, missing repository path, a race on an
+    /// otherwise healthy repository) and cannot prove that a name is absent; a
+    /// usage error (129) or a signal likewise means the native read broke. All
+    /// of those stay internal failures, so corruption is never disguised as a
+    /// 404 and a real absence is never disguised as a 500.
     pub(crate) fn maps_to_not_found(self, exit: Option<i32>) -> bool {
-        self.absence_is_expected() && matches!(exit, Some(1) | Some(128))
+        self.absence_is_expected() && matches!(exit, Some(1))
     }
 
     /// Fixed exit-class label. Git reserves 129 for usage errors (for example an
@@ -263,13 +260,49 @@ pub(crate) async fn run_git(
     }
 }
 
+/// Type of one object, or `None` when Git does not know the name.
+///
+/// Absence is decided by the precise quiet probe only. `cat-file -t` answers
+/// 128 for a missing object, which is also its verdict for a damaged object
+/// database or a racing repository, so a 128 there cannot prove absence. The
+/// probe `rev-parse --verify --quiet <spec>^{object}` exits 1 for exactly "Git
+/// does not know this name" and resolves the name to a controlled object id;
+/// `^{object}` keeps the object itself, so an annotated tag still types as a
+/// tag while a full object id is really existence-checked. Once the probe has
+/// succeeded the object exists, so any `cat-file` failure is a broken read and
+/// never an absent object.
 pub(crate) async fn object_type(state: &AppState, repo_id: Uuid, spec: &str) -> Result<Option<String>, Error> {
-    match run_git(state, repo_id, GitStep::ObjectType, &["cat-file", "-t", spec], 64).await {
+    let query = format!("{spec}^{{object}}");
+    let resolved = match run_git(
+        state,
+        repo_id,
+        GitStep::RevParse,
+        &["rev-parse", "--verify", "--quiet", &query],
+        128,
+    )
+    .await
+    {
+        Ok(out) => String::from_utf8_lossy(&out).trim().to_owned(),
+        Err(err) if err.0 == StatusCode::NOT_FOUND => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if !models::valid_non_zero_oid(&resolved) {
+        // A verified name always prints the object id it resolved to. Anything
+        // else is a broken native read, not an absent object.
+        report_step_failure(GitStep::ObjectType, None);
+        return Err(Error::internal(crate::git_http::GitCommandFailed { exit: None }));
+    }
+    match run_git(state, repo_id, GitStep::ObjectType, &["cat-file", "-t", &resolved], 64).await {
         Ok(out) => {
             let kind = String::from_utf8_lossy(&out).trim().to_owned();
-            Ok((!kind.is_empty()).then_some(kind))
+            if kind.is_empty() {
+                report_step_failure(GitStep::ObjectType, None);
+                return Err(Error::internal(crate::git_http::GitCommandFailed { exit: None }));
+            }
+            Ok(Some(kind))
         }
-        Err(err) if err.0 == StatusCode::NOT_FOUND => Ok(None),
+        // The object exists, so a non-zero exit or a signal is corruption, a
+        // usage problem or a reaping failure: internal, never 404.
         Err(err) => Err(err),
     }
 }
@@ -365,19 +398,26 @@ pub(crate) async fn read_head(state: &AppState, repo_id: Uuid) -> Result<HeadInf
     }
 }
 
-/// One page of one public ref namespace.
+/// One namespace-wide page: the modern seek path, with the bounded scan as the
+/// typed fallback.
 ///
 /// Git 2.52 and newer seek directly with `for-each-ref --start-after`. A Git
 /// that does not implement that option fails it as a *usage* error (exit 129);
 /// only that typed verdict selects the bounded streaming scan, so an
 /// authorization, storage or transport failure can never silently downgrade
 /// into a scan. The project baseline stays Git 2.43: no minimum is raised.
+///
+/// `prefix` here is only ever the namespace-wide kind (`refs/`, `refs/heads/`,
+/// `refs/tags/`, or a shorter cut of one of them), which every ref of the
+/// namespace matches. A selective prefix never reaches this function, because
+/// filtering the first `limit + 1` refs of a namespace would under-fill the page.
 async fn namespace_page(
     state: &AppState,
     repo_id: Uuid,
     namespace: &str,
     excluded: &str,
     marker: &str,
+    prefix: Option<&str>,
     limit: usize,
 ) -> Result<Vec<RefItem>, Error> {
     let start_after = format!("--start-after={marker}");
@@ -395,11 +435,11 @@ async fn namespace_page(
     match run_git_step(state, repo_id, GitStep::RefsPage, &args, 256 * 1024).await? {
         GitOutcome::Output(raw) => Ok(parse_for_each_ref_output(&raw)
             .into_iter()
-            .filter(|r| r.name.starts_with(namespace))
+            .filter(|r| r.name.starts_with(namespace) && prefix.is_none_or(|p| r.name.starts_with(p)))
             .collect()),
         GitOutcome::CommandFailed { exit: Some(129) } => {
             report_seek_fallback();
-            scan_namespace_page(state, repo_id, namespace, excluded, marker, limit).await
+            scan_namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await
         }
         GitOutcome::CommandFailed { exit } => {
             report_step_failure(GitStep::RefsPage, exit);
@@ -408,21 +448,47 @@ async fn namespace_page(
     }
 }
 
-/// Bounded replacement for the seek path on Git without `--start-after`.
+/// True when a literal prefix selects only part of one public namespace.
+///
+/// A namespace-wide request (`refs/`, `refs/heads/`, `refs/tags/`, or a prefix
+/// that merely cuts one of them short, like `refs/h`) is answered by the seek
+/// path on a modern Git. Anything narrower (`refs/heads/z`, `refs/heads/z/topic`,
+/// or a literal byte string such as `refs/heads/*`) selects a *contiguous range*
+/// inside one namespace, so `limit + 1` must be counted after the filter.
+fn selects_part_of_namespace(prefix: Option<&str>) -> bool {
+    let Some(prefix) = prefix else {
+        return false;
+    };
+    !["refs/", "refs/heads/", "refs/tags/"].iter().any(|whole| whole.starts_with(prefix))
+}
+
+/// Bounded replacement for the seek path on Git without `--start-after`, and the
+/// only path for a selective literal prefix.
 ///
 /// Only the public namespace is enumerated, in `refname` order, one record at a
-/// time; every record at or before the cursor is discarded and the scan stops
-/// as soon as `limit + 1` refs are known, which is what tells the caller whether
-/// another page exists. Memory is `limit + 1` refs plus one line, the child is
-/// killed and reaped on early stop, and records/bytes/time are hard-bounded.
+/// time; every record at or before the cursor is discarded, `prefix` is applied
+/// as a literal Rust byte filter *before* a ref counts towards the page, and the
+/// scan stops as soon as `limit + 1` matching refs are known. Because refnames
+/// arrive in byte order, the first valid ref greater than `prefix` that does not
+/// start with it ends the prefix range, so a narrow prefix costs one linear scan
+/// from the namespace start to that range and never the rest of the namespace.
+/// Memory is `limit + 1` refs plus one line, the child is killed and reaped on
+/// early stop, and records (1M), bytes (64 MiB), record size and time are hard
+/// bounded. The Git argv carries only the compiled namespace pattern, never the
+/// caller's prefix, so a prefix that contains glob bytes stays a literal byte
+/// filter and can never become a Git pattern.
 async fn scan_namespace_page(
     state: &AppState,
     repo_id: Uuid,
     namespace: &str,
     excluded: &str,
     marker: &str,
+    prefix: Option<&str>,
     limit: usize,
 ) -> Result<Vec<RefItem>, Error> {
+    // The caller's literal byte filter; the empty string matches every ref,
+    // which is exactly the namespace-wide request.
+    let prefix = prefix.unwrap_or("");
     let pattern = namespace.trim_end_matches('/');
     let args = [
         "for-each-ref",
@@ -442,9 +508,19 @@ async fn scan_namespace_page(
     };
     crate::git_http::stream_git_lines(cmd, limits, state.config.git_timeout, |line| {
         for item in parse_for_each_ref_output(line) {
-            if item.name.starts_with(namespace) && item.name.as_str() > marker {
-                items.push(item);
+            if !item.name.starts_with(namespace) || item.name.as_str() <= marker {
+                continue;
             }
+            if !item.name.starts_with(prefix) {
+                if item.name.as_str() > prefix {
+                    // Ordered refnames: the literal prefix range is over, so no
+                    // later ref can match and the rest of the namespace is
+                    // never read.
+                    return false;
+                }
+                continue;
+            }
+            items.push(item);
         }
         // Stop as soon as the page plus the look-ahead ref is known.
         items.len() <= limit
@@ -463,6 +539,13 @@ pub(crate) async fn page_refs(
     limit: usize,
 ) -> Result<Vec<RefItem>, Error> {
     let mut items = Vec::with_capacity(limit + 1);
+    // A selective literal prefix must be filtered before a ref counts towards
+    // `limit + 1`: the seek path asks Git for the first `limit + 1` refs of the
+    // namespace, so filtering those afterwards would drop every match behind
+    // lower unrelated refs and answer an empty page. Such a prefix therefore
+    // always uses the bounded scan, on every Git version, while a namespace-wide
+    // request keeps the modern `--start-after` fast path.
+    let selective = selects_part_of_namespace(prefix);
     // Git forbids --start-after with include patterns, so query each public
     // namespace separately. Cursor traversal stays bounded even when another
     // namespace (including private CI refs) contains millions of entries.
@@ -474,7 +557,11 @@ pub(crate) async fn page_refs(
             continue;
         }
         let marker = after.filter(|cursor| cursor.starts_with(namespace)).unwrap_or(namespace);
-        items.extend(namespace_page(state, repo_id, namespace, excluded, marker, limit).await?);
+        items.extend(if selective {
+            scan_namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await?
+        } else {
+            namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await?
+        });
         if items.len() > limit {
             break;
         }
