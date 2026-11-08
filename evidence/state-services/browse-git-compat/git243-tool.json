@@ -1,0 +1,25 @@
+{
+  "source_url": "https://www.kernel.org/pub/software/scm/git/git-2.43.0.tar.xz",
+  "source_archive_sha256": "5446603e73d911781d259e565750dcd277a42836c8e392cac91cf137aa9b76ec",
+  "command": [
+    "make",
+    "-j2",
+    "prefix=/workspace/.rootyard-tools/git243",
+    "CFLAGS=-O1 -g0",
+    "NO_CURL=YesPlease",
+    "NO_EXPAT=YesPlease",
+    "NO_GETTEXT=YesPlease",
+    "NO_TCLTK=YesPlease",
+    "NO_PERL=YesPlease",
+    "NO_PYTHON=YesPlease",
+    "git",
+    "git-http-backend"
+  ],
+  "version": "git version 2.43.0",
+  "exec_path": "/workspace/.rootyard-tools/git243/libexec/git-core",
+  "compiler": "cc (Debian 14.2.0-19) 14.2.0",
+  "git_sha256": "5d26f62d4675ab5c187a1e2b1359a3b679525cffa3768bfa7ca83f1d2d7ccea1",
+  "http_backend_sha256": "694b39b8e5709dde6e48f38b9fc233c2a9d89cb449ca672ae6fcca6a4a69edce",
+  "scope": "Isolated upstream2.43 server fixture only. NO_CURL build does not qualify an HTTPS client; stock Git2.52 is the test client. No host Git is replaced.",
+  "source_authentication": "Official kernel.org HTTPS download; archive SHA recorded, no OpenPGP-signature qualification claimed."
+}
