@@ -376,8 +376,7 @@ mod tests {
         .unwrap()
     }
 
-    fn pin(state: PinState, generation: i64, expired: bool) -> PinRow {
-        let scope = scope();
+    fn pin(scope: &MetadataSnapshotScope, state: PinState, generation: i64, expired: bool) -> PinRow {
         PinRow {
             pin_id: Uuid::new_v4(),
             repository_id: scope.repository_id(),
@@ -396,8 +395,8 @@ mod tests {
 
     #[test]
     fn released_pin_is_terminal() {
-        let row = pin(PinState::Released, 2, false);
         let scope = scope();
+        let row = pin(&scope, PinState::Released, 2, false);
         assert!(matches!(row.ensure_live(2), Err(RefStoreError::MetadataPinReleased { .. })));
         assert!(matches!(row.ensure_renewable(2), Err(RefStoreError::MetadataPinReleased { .. })));
         assert!(matches!(row.ensure_releasable(2), Err(RefStoreError::MetadataPinReleased { .. })));
@@ -406,7 +405,8 @@ mod tests {
 
     #[test]
     fn expiry_denies_pages_and_renewals_but_allows_exact_release() {
-        let row = pin(PinState::Active, 4, true);
+        let scope = scope();
+        let row = pin(&scope, PinState::Active, 4, true);
         assert!(matches!(row.ensure_live(4), Err(RefStoreError::MetadataPinExpired { .. })));
         assert!(matches!(row.ensure_renewable(4), Err(RefStoreError::MetadataPinExpired { .. })));
         assert!(row.ensure_releasable(4).is_ok());
