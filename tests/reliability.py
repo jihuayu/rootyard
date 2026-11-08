@@ -333,50 +333,67 @@ class ReliabilityHarness(Harness):
         return {"synthetic_aba_receipt": True, "outcome": "unknown", "published_events": 0,
                 "deliveries": 0, "consumer_effects": 0}
 
+    @staticmethod
+    def _receive_packet(oid, ref):
+        line = (ZERO + " " + oid + " " + ref + "\n").encode()
+        return f"{len(line) + 4:04x}".encode() + line
+
+    def _raw_receive(self, repo, body):
+        endpoint = repo["clone_path"] + "/git-receive-pack"
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+        auth = base64.b64encode((self.alice["username"] + ":" + self.alice["token"]).encode()).decode()
+        try:
+            connection.request("POST", endpoint, body=body, headers={
+                "Authorization": "Basic " + auth,
+                "Content-Type": "application/x-git-receive-pack-request"})
+            result = connection.getresponse()
+            return result.status, result.read()
+        finally:
+            connection.close()
+
+    def _assert_http_preflight_rejected(self, repo, body):
+        status, response = self._raw_receive(repo, body)
+        assert status == 400, (status, response[:500])
+        bare = self.root / "data/repos" / (repo["id"] + ".git")
+        refs = self.git("--git-dir=" + str(bare), "for-each-ref", "--format=%(refname)").stdout.strip()
+        assert not refs, "HTTP preflight rejection changed native refs"
+        assert not self.events(repo), "HTTP preflight rejection published successful events"
+        assert not self.operations(repo), "HTTP preflight rejection created an operation"
+        admissions = int(self.sql("SELECT count(*) FROM git_ref_admissions WHERE repository_id='" + repo["id"] + "'"))
+        assert admissions == 0, admissions
+        journal = self.root / "data/journal" / repo["id"]
+        pending = [item for item in journal.iterdir() if item.is_dir() and not item.name.startswith(".")] if journal.exists() else []
+        assert not pending, pending
+        assert self.sql("SELECT state FROM repositories WHERE id='" + repo["id"] + "'") == "ready"
+        return {"http_status": status, "http_preflight_rejected": True,
+                "native_refs": 0, "successful_events": 0, "operations": 0,
+                "admissions": 0, "journal_operations": 0, "repository_ready": True}
+
     def oversized_ref(self):
         repo = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice,
                                     body={"name": "oversized-ref"}))
-        # Each filesystem component is short, so the controlled hook's total
-        # ref length bound, not NAME_MAX, is what this fixture exercises.
+        # Each filesystem component is short, so the server's total ref bound,
+        # not NAME_MAX, is exercised by one controlled receive-pack request.
         ref = "refs/heads/" + "/".join(["segment" + str(i).zfill(2) + "x" * 90 for i in range(11)])
         assert 1024 < len(ref.encode()) < 2048
         self.git("check-ref-format", ref)
-        result = self.git("push", self.base + repo["clone_path"], "HEAD:" + ref,
-                          cwd=self.work, token=self.alice, check=False)
-        assert result.returncode != 0, "Oversized ref escaped admission hook"
-        assert b"pre-receive hook declined" in result.stderr, self.redact(result.stderr.decode(errors="replace")[-2000:])
-        bare = self.root / "data/repos" / (repo["id"] + ".git")
-        assert self.git("--git-dir=" + str(bare), "show-ref", "--verify", ref, check=False).returncode != 0
-        assert not self.events(repo), "Rejected oversized ref published a successful event"
-        ops = self.operations(repo)
-        assert len(ops) == 1 and ops[0]["outcome"] == "no_ref_changes", ops
-        assert self.sql("SELECT state FROM repositories WHERE id='" + repo["id"] + "'") == "ready"
-        return {"actual_git_push": True, "ref_bytes": len(ref.encode()),
-                "native_ref_absent": True, "successful_events": 0}
+        body = self._receive_packet(self.second, ref) + b"0000"
+        detail = self._assert_http_preflight_rejected(repo, body)
+        return {"actual_native_push_attempt": False, "controlled_pkt_line_request": True,
+                "ref_bytes": len(ref.encode()), "rejected_by_http_command_parser": True, **detail}
 
     def oversized_batch(self):
         repo = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice,
                                     body={"name": "oversized-batch"}))
-        count = 4097
+        count = 129
         refs = ["refs/heads/batch-bound/branch-" + str(i).zfill(4) for i in range(count)]
-        # One local transaction creates the fixture efficiently. Every ref
-        # points to an existing commit so the test stresses admission, not pack
-        # volume or loose object creation.
-        commands = "".join("create " + ref + " " + self.second + "\n" for ref in refs)
-        self.run(["git", "update-ref", "--stdin"], cwd=self.work, data=commands.encode())
-        result = self.git("push", self.base + repo["clone_path"],
-                          "refs/heads/batch-bound/*:refs/heads/batch-bound/*",
-                          cwd=self.work, token=self.alice, check=False)
-        assert result.returncode != 0, "Oversized command batch unexpectedly succeeded"
-        assert b"pre-receive hook declined" in result.stderr, self.redact(result.stderr.decode(errors="replace")[-2000:])
-        bare = self.root / "data/repos" / (repo["id"] + ".git")
-        assert not self.git("--git-dir=" + str(bare), "for-each-ref", "--format=%(refname)").stdout.strip(), "Non-atomic oversized batch partially changed native refs"
-        assert not self.events(repo), "Rejected batch published successful-ref events"
-        ops = self.operations(repo)
-        assert ops and all(op["outcome"] == "no_ref_changes" for op in ops), ops
-        assert self.sql("SELECT state FROM repositories WHERE id='" + repo["id"] + "'") == "ready"
-        return {"actual_git_push": True, "batch_refs": count, "native_refs_created": 0,
-                "successful_events": 0, "outcome": "no_ref_changes", "http_operations": len(ops)}
+        # One controlled HTTP request exceeds the parser's 128-command bound.
+        # does not rely on a smart Git client choosing not to split the batch.
+        body = b"".join(self._receive_packet(self.second, ref) for ref in refs) + b"0000"
+        detail = self._assert_http_preflight_rejected(repo, body)
+        return {"actual_native_push_attempt": False, "controlled_pkt_line_request": True,
+                "single_http_request": True, "batch_commands_sent": count,
+                "rejected_by_http_command_parser": True, **detail}
 
     def unrelated_recovery_block(self):
         repo = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice,
@@ -473,7 +490,8 @@ class ReliabilityHarness(Harness):
             (hooks / "pre-receive").unlink()
             before_ops, before_events = self.operations(), self.events()
             self.expect(self.repo["clone_path"] + "/git-receive-pack", 503,
-                        token=self.alice, basic=True, method="POST", body=b"0000",
+                        token=self.alice, basic=True, method="POST",
+                        body=self._receive_packet(self.second, "refs/heads/runner-missing-hook-http") + b"0000",
                         content_type="application/x-git-receive-pack-request")
             denied = self.push("HEAD:runner-missing-hook", check=False)
             assert denied.returncode != 0
@@ -520,8 +538,8 @@ def main():
             ("admission_and_background_delivery", h.admission_and_background),
             ("ambiguous_evidence_never_infers_success", h.unknown_evidence),
             ("duplicate_receipt_has_no_delivery_or_effect", h.duplicate_receipt),
-            ("oversized_ref_rejected_before_native_write", h.oversized_ref),
-            ("oversized_batch_rejected_before_any_write", h.oversized_batch),
+            ("oversized_ref_http_preflight_rejected", h.oversized_ref),
+            ("oversized_batch_http_preflight_rejected", h.oversized_batch),
             ("unrelated_recovery_block_is_preserved", h.unrelated_recovery_block),
             ("real_stale_compare_swap_subset_and_repeat", h.stale_compare_swap),
             ("durable_hook_runner_and_missing_hook_guard", h.deployed_hook_runner),
