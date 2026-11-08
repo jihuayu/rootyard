@@ -1,0 +1,193 @@
+{
+  "status": "passed",
+  "build_receipt": {
+    "kind": "rust-library-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "70b9c912721e7762bc1730e5c239d908cbe0ad4752bce5e0cde22c0a644782aa",
+    "workspace_commit": "bb472216cf959a44fb05052df85ad74f27d49e88",
+    "source_inputs_sha256": "39d1e4eca6a8984ccf4860f146dea9129373da79834d292a371c8afaa397fee3",
+    "binary_sha256": "70b9c912721e7762bc1730e5c239d908cbe0ad4752bce5e0cde22c0a644782aa",
+    "cargo_lock_sha256": "25590e5ad6f21f81841a6c7573455709c214bc28c7321e2c8d96c68142db9506",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "test",
+      "--locked",
+      "--lib",
+      "--features",
+      "pando-lab,state-redis",
+      "--no-run",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/rootyard-800685a12a470ad1"
+      }
+    ]
+  },
+  "fixture_receipt": {
+    "provider": "Redis",
+    "version": "Redis server v=7.4.2 sha=a0a6f23d:0 malloc=libc bits=64 build=803cbe16a3592722",
+    "source_commit": "a0a6f23d997b024689ba157916837f493a593a34",
+    "source": "official Redis repository tag7.4.2",
+    "build_flags": [
+      "MALLOC=libc",
+      "BUILD_TLS=yes",
+      "OPTIMIZATION=-O2"
+    ],
+    "server_sha256": "9f547ee39d35f44cb819baa951965bc13ddc5b0be4059309fa7c99904f9ea601",
+    "pid": 432706,
+    "pid_starttime": "6560377",
+    "loopback_only": true,
+    "plain_port": 49165,
+    "tls_port": 51131,
+    "maxmemory_bytes": 33554432,
+    "eviction": "allkeys-lru",
+    "persistence": false,
+    "tls_ephemeral_ca": true,
+    "default_user_disabled": true,
+    "qualification_scope": "disposable single-host fixture; task user has full commands; no production ACL or durability claim"
+  },
+  "runs": [
+    {
+      "name": "unit",
+      "status": "passed",
+      "seconds": 1.2160168559930753,
+      "required_counts": [
+        21,
+        0,
+        6
+      ],
+      "observed_counts": [
+        21,
+        0,
+        6
+      ],
+      "returncode": 0,
+      "command": [
+        "/workspace/scratch/state-cache-redis-contract-v3/rootyard-lib-contract",
+        "cache_wake::",
+        "--test-threads=1"
+      ],
+      "log_sha256": "633e5eef923ff0d121203eb1070d2baa25ae0e7777551415503488240e090a4f"
+    },
+    {
+      "name": "plain",
+      "status": "passed",
+      "seconds": 1.0703521430114051,
+      "required_counts": [
+        6,
+        0,
+        0
+      ],
+      "observed_counts": [
+        6,
+        0,
+        0
+      ],
+      "returncode": 0,
+      "command": [
+        "/workspace/scratch/state-cache-redis-contract-v3/rootyard-lib-contract",
+        "real_redis_",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "log_sha256": "014d4bf24fd63948f737b90d1b7da723f2665dfc8793dd73e2c6fde5bf6b4f78"
+    },
+    {
+      "name": "tls",
+      "status": "passed",
+      "seconds": 1.1370117780024884,
+      "required_counts": [
+        6,
+        0,
+        0
+      ],
+      "observed_counts": [
+        6,
+        0,
+        0
+      ],
+      "returncode": 0,
+      "command": [
+        "/workspace/scratch/state-cache-redis-contract-v3/rootyard-lib-contract",
+        "real_redis_",
+        "--ignored",
+        "--test-threads=1"
+      ],
+      "log_sha256": "eba4b80da3977c5482a04d0e689509c360547be4fe69852090a073427bf3a7b0"
+    },
+    {
+      "name": "untrusted-ca-refused",
+      "status": "passed",
+      "seconds": 0.011210063996259123,
+      "required_counts": [
+        0,
+        1,
+        0
+      ],
+      "observed_counts": [
+        0,
+        1,
+        0
+      ],
+      "returncode": 101,
+      "command": [
+        "/workspace/scratch/state-cache-redis-contract-v3/rootyard-lib-contract",
+        "--ignored",
+        "--exact",
+        "cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read"
+      ],
+      "log_sha256": "20f4243dac8f4921cc078161e66c6b90decc7ff8d787dbc3ef5cd09fb501962f"
+    },
+    {
+      "name": "trusted-ca-restored",
+      "status": "passed",
+      "seconds": 0.022180069994647056,
+      "required_counts": [
+        1,
+        0,
+        0
+      ],
+      "observed_counts": [
+        1,
+        0,
+        0
+      ],
+      "returncode": 0,
+      "command": [
+        "/workspace/scratch/state-cache-redis-contract-v3/rootyard-lib-contract",
+        "--ignored",
+        "--exact",
+        "cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read"
+      ],
+      "log_sha256": "5c145a4eceb0a49bb47bc82766a014a59b564d3966fdf46a574697858c9fde41"
+    }
+  ],
+  "limits": [
+    "one disposable loopback server; no HA, failover or physical fault-domain qualification",
+    "task ACL user permits CONFIG inspection and destructive test commands; not production least-privilege ACL qualification",
+    "no production serving-cache consumers are wired; no full issue111 acceptance"
+  ],
+  "source_still_matches": true,
+  "binary_still_matches": true
+}
