@@ -39,7 +39,9 @@ compiled-input digest
 The later token-management parent merge at `985cb21` changed documentation only;
 its compiled-input digest was explicitly checked against the accepted binary
 and is identical. CI integration is a separate gate. The current-format full
-backup/restore drill is still running when this record is first written.
+backup/restore drill also passed all seven stages, including unsafe input
+rejection, backup barriers, interrupted restore protection, snapshot boundaries
+and authenticated clone/fsck after fresh restore.
 
 Receipts are in `round5-membership-recovery-evidence/`. These are functional
 loopback tests, not power-loss or production RPO/RTO qualification. No issue is
