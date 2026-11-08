@@ -12,7 +12,7 @@
 use fuser::{FileAttr, FileType, MountOption};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::{OsStr, OsString},
+    ffi::{CString, OsStr, OsString},
     fs::{self, File},
     io,
     os::{
@@ -71,11 +71,26 @@ use fuse_io::{Entry, safe_link_at, walk_dir};
 
 pub use self::fuse_dispatch::QueueUsage as DispatchQueueUsage;
 
+/// Identity of an owned mount, captured from `/proc/self/mountinfo`.
+///
+/// Mount IDs are unique in the kernel's mount-ID allocator, so comparing the
+/// captured ID proves that a path still carries the mount this handle created
+/// and not a newer mount stacked on top of it.
+type MountId = u64;
+
 /// Live kernel mount. Dropping the session unmounts and drops the shim, which
 /// stops the actor and drains every queued reply.
+///
+/// The handle also remembers the canonical mount point and the kernel mount ID
+/// captured when it mounted, so its owned teardown can unmount exactly this
+/// mount instead of whichever mount happens to sit at that path by then.
 pub struct MountHandle {
     session: fuser::BackgroundSession,
     dispatcher: Arc<fuse_dispatch::Dispatcher>,
+    /// Canonical mount point the kernel published for this handle.
+    mountpoint: PathBuf,
+    /// Kernel mount ID captured for this handle when it mounted.
+    mount_id: MountId,
 }
 
 impl MountHandle {
@@ -99,19 +114,35 @@ impl MountHandle {
     /// Consuming teardown with a completion barrier.
     ///
     /// Stops the dispatcher, then consumes the `fuser::BackgroundSession` and
-    /// calls its public `join()`: `join` drops the mount (requesting the
-    /// unmount and, for `AutoUnmount`, closing the fusermount monitor socket)
-    /// and blocks until the kernel session thread has actually ended. That is
-    /// the difference from `shutdown()` + drop, where the background session
-    /// detaches its join handle and a process exiting right afterwards can
-    /// terminate before the unmount completed and leave an owned mount behind.
+    /// calls its public `join()`: `join` drops the mount and blocks until
+    /// the kernel session thread has actually ended. That is the difference
+    /// from `shutdown()` + drop, where the background session detaches its join
+    /// handle and a process exiting right afterwards can terminate before the
+    /// unmount completed and leave an owned mount behind.
+    ///
+    /// The unmount itself is done here and is not delegated to `join`: on the
+    /// pure-Rust `AutoUnmount` path, dropping `fuser`'s `Mount` only closes the
+    /// fusermount monitor socket, while the session thread still owns its own
+    /// `/dev/fuse` clone and sits in `read`. Closing the monitor alone cannot
+    /// wake that read, so a join-first teardown would wait for a process exit
+    /// that is itself waiting for the join. Unmounting this handle's exact
+    /// mount with a normal (non-lazy) `umount2` while the session descriptor is
+    /// still open makes the kernel fail the parked read with `ENODEV`; `join`
+    /// is then a bounded completion barrier. `AutoUnmount` remains the crash
+    /// path (SIGKILL closes the last descriptor and the monitor socket).
+    ///
+    /// A refused unmount is never papered over: the session is still joined in
+    /// and the independent shutdown watchdog bounds and fails that exit with a
+    /// non-zero code instead of claiming a graceful teardown.
     ///
     /// Returns only after every owned session teardown has completed, so an
     /// owner may exit successfully after this call. A session thread that
     /// panicked propagates here (fail closed) instead of being ignored.
     pub fn shutdown_and_join(self) {
-        self.dispatcher.shutdown();
-        self.session.join();
+        let Self { session, dispatcher, mountpoint, mount_id } = self;
+        dispatcher.shutdown();
+        let _ = unmount_owned(&mountpoint, mount_id);
+        session.join();
     }
 }
 
@@ -370,10 +401,98 @@ fn mount_options(auto_unmount: bool) -> Vec<MountOption> {
 }
 
 fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> io::Result<MountHandle> {
+    // Canonicalize before mounting: `/proc/self/mountinfo` publishes the
+    // canonical path, and the teardown identity check compares it exactly.
+    let mountpoint = mountpoint.canonicalize()?;
     let fs = MountFs::new(overlay)?;
     let dispatcher = fs.dispatcher().clone();
-    let session = fuser::spawn_mount2(fs, mountpoint, &mount_options(auto_unmount))?;
-    Ok(MountHandle { session, dispatcher })
+    let session = fuser::spawn_mount2(fs, &mountpoint, &mount_options(auto_unmount))?;
+    // Capture the kernel mount identity before anyone else can observe the
+    // mount point. An unverifiable mount is not published: a later path-based
+    // unmount could otherwise hit a different mount stacked at the same path.
+    let Some(mount_id) = mount_id_at_path(&mountpoint)? else {
+        drop(session);
+        return Err(io::Error::other("owned FUSE mount is missing from /proc/self/mountinfo"));
+    };
+    Ok(MountHandle { session, dispatcher, mountpoint, mount_id })
+}
+
+/// Normal (non-lazy) unmount of exactly the mount this handle captured.
+///
+/// Fails closed in every other case: an unreadable mount table, a mount that is
+/// already gone and a path now owned by a newer mount are all reported instead
+/// of guessed at. `MNT_DETACH` and a `fusermount -u` fallback are deliberately
+/// not used: a lazy detach leaves the session thread parked on its descriptor,
+/// and a blind path unmount could remove a mount this handle does not own.
+fn unmount_owned(mountpoint: &Path, mount_id: MountId) -> io::Result<()> {
+    match mount_id_at_path(mountpoint)? {
+        Some(current) if owns_current_mount(mount_id, Some(current)) => {
+            let path = CString::new(mountpoint.as_os_str().as_bytes())
+                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+            // SAFETY: `path` is NUL-terminated, and flags 0 request a normal,
+            // non-lazy unmount of the identity verified above.
+            if unsafe { libc::umount2(path.as_ptr(), 0) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+        }
+        // Already unmounted: nothing to remove, `join` still reaps the session.
+        None => Ok(()),
+        // A different mount owns the path now; never unmount a foreign mount.
+        Some(_) => Err(io::Error::from_raw_os_error(libc::EBUSY)),
+    }
+}
+
+/// True only for the exact mount this handle created.
+fn owns_current_mount(captured: MountId, current: Option<MountId>) -> bool {
+    current == Some(captured)
+}
+
+fn mount_id_at_path(mountpoint: &Path) -> io::Result<Option<MountId>> {
+    Ok(mount_id_in(&fs::read_to_string("/proc/self/mountinfo")?, mountpoint))
+}
+
+/// Topmost (largest-ID) mount recorded at `mountpoint` in a `mountinfo` text.
+fn mount_id_in(mountinfo: &str, mountpoint: &Path) -> Option<MountId> {
+    let target = mountpoint.as_os_str().as_bytes();
+    let mut found: Option<MountId> = None;
+    for line in mountinfo.lines() {
+        let mut fields = line.split(' ');
+        let Some(id) = fields.next().and_then(|field| field.parse::<MountId>().ok()) else {
+            continue;
+        };
+        // Field 1 is the mount ID and field 5 the mount point. A short line is
+        // not an error, it just cannot describe the mount asked about.
+        let Some(point) = fields.nth(3) else { continue };
+        if unescape_mountinfo(point).as_slice() != target {
+            continue;
+        }
+        // A path may carry stacked mounts; the newest (largest ID) is visible.
+        found = Some(found.map_or(id, |current| current.max(id)));
+    }
+    found
+}
+
+/// Undo the octal escapes mountinfo uses for spaces, tabs, newlines and
+/// backslashes.
+fn unescape_mountinfo(field: &str) -> Vec<u8> {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let octal = index + 3 < bytes.len()
+            && bytes[index] == b'\\'
+            && bytes[index + 1..index + 4].iter().all(|byte| (b'0'..=b'7').contains(byte));
+        if octal {
+            // Widen to u32 so a maximal octal escape cannot overflow a byte.
+            let value = u32::from(bytes[index + 1] - b'0') * 64
+                + u32::from(bytes[index + 2] - b'0') * 8
+                + u32::from(bytes[index + 3] - b'0');
+            out.push(value as u8);
+            index += 4;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    out
 }
 
 /// Spawn the bounded per-mount dispatcher and mount `overlay` in the background.
@@ -512,5 +631,29 @@ mod tests {
         }
         let _: fn(MountHandle) = owning;
         let _: fn(&MountHandle) = borrowed;
+    }
+
+    #[test]
+    fn mountinfo_identity_is_the_exact_topmost_mount_at_the_owned_path() {
+        let mountinfo = "\
+36 35 0:32 / /srv/rootyard/workspaces/a/mnt rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0
+37 35 0:33 / /srv/rootyard/workspaces/a/mnt rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0
+38 35 0:34 / /srv/rootyard/workspaces/a/mnt-extra rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0
+39 35 0:35 / /srv/rootyard/workspaces/with\\040space/mnt rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0
+";
+        // The newest mount stacked at a path is the one a path lookup sees.
+        assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a/mnt")), Some(37));
+        // A longer path that shares the prefix is a different mount.
+        assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a/mnt-extra")), Some(38));
+        assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a")), None);
+        // mountinfo escapes whitespace octally; the comparison is on the path.
+        assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/with space/mnt")), Some(39));
+    }
+
+    #[test]
+    fn owned_unmount_requires_the_captured_mount_id() {
+        assert!(owns_current_mount(37, Some(37)));
+        assert!(!owns_current_mount(37, Some(38)), "a newer mount at the path is not owned");
+        assert!(!owns_current_mount(37, None), "an already unmounted path needs no unmount");
     }
 }

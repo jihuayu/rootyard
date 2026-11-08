@@ -382,22 +382,64 @@ pub(super) fn abort_mount_reply(state: &Arc<State>, request: u64, workspace: Opt
     reply(state, request, workspace, 0, Body::Ok(OkReply { op_id: None }));
 }
 
+/// Request id that reserves a workspace while its owner unmounts and joins the
+/// session. Parent-issued request ids are handed out far below the maximum and
+/// no cancel can name this value.
+const UNMOUNT_RESERVATION: u64 = u64::MAX;
+
+/// Take the published mount and reserve the workspace for the whole teardown.
+///
+/// The reservation replaces a half-built pending entry, exactly like the plain
+/// removal it supersedes: a build that has not published yet fails its
+/// `pending` ownership check and tears its own handle down instead of
+/// republishing onto the mountpoint this unmount is about to release. The
+/// reservation is bounded by the same mount deadline as any other pending
+/// operation, so a lost owner still times out instead of blocking forever.
+fn reserve_unmount(state: &State, ws: Uuid) -> Option<Mounted> {
+    {
+        let mut pending = lock(&state.pending);
+        pending.insert(
+            ws,
+            PendingMount {
+                request: UNMOUNT_RESERVATION,
+                deadline: Instant::now() + crate::workspace_lab::fuse_helper::protocol::MOUNT_OP_DEADLINE,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                gate: None,
+            },
+        );
+    }
+    lock(&state.mounts).remove(&ws)
+}
+
+fn release_unmount(state: &State, ws: Uuid) {
+    let mut pending = lock(&state.pending);
+    if pending.get(&ws).map(|entry| entry.request) == Some(UNMOUNT_RESERVATION) {
+        pending.remove(&ws);
+    }
+}
+
 pub(super) fn unmount(state: &Arc<State>, request: u64, workspace: Option<Uuid>) {
     let Some(ws) = workspace else {
         return reply_error(state, request, None, libc::EINVAL, "unmount requires a workspace id");
     };
-    // Take the pending entry first: a mount still building can no longer
-    // publish once its pending entry is gone, and its own deadline cleans it.
-    lock(&state.pending).remove(&ws);
-    let removed = lock(&state.mounts).remove(&ws);
+    // Keep the workspace reserved for the whole unmount+join: a concurrent
+    // mount must see the pending reservation (EBUSY) instead of rebuilding on a
+    // mountpoint that this owner is still unmounting.
+    let removed = reserve_unmount(state, ws);
     match removed {
         Some(mount) => {
             // Join the owned session before acknowledging: an unmounted reply
             // must not race a still-detached teardown of this mount.
             mount.handle.shutdown_and_join();
+            // Release only after unmount+join completed, so the reservation
+            // covers the whole teardown and no remount can race it.
+            release_unmount(state, ws);
             reply(state, request, workspace, 0, Body::Unmounted);
         }
-        None => reply_error(state, request, workspace, libc::ENOENT, "workspace is not mounted"),
+        None => {
+            release_unmount(state, ws);
+            reply_error(state, request, workspace, libc::ENOENT, "workspace is not mounted")
+        }
     }
 }
 
