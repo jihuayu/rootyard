@@ -97,11 +97,20 @@ impl ProtectedReceipt {
 /// database metadata alone.
 #[derive(Clone, Debug)]
 pub struct ProtectedPublication {
+    acquire_request_id: Uuid,
     consume_request_id: Uuid,
     receipts: Vec<ProtectedReceipt>,
 }
 
 impl ProtectedPublication {
+    /// Stable, non-secret acquire UUID of the durable A3 acquire row that
+    /// produced this publication. Passed straight through from the acquire ACK
+    /// (never derived from a Blob receipt), so a later pack registration can
+    /// bind the durable A3 rows directly.
+    pub fn acquire_request_id(&self) -> Uuid {
+        self.acquire_request_id
+    }
+
     pub fn consume_request_id(&self) -> Uuid {
         self.consume_request_id
     }
@@ -265,6 +274,8 @@ impl ProtectedUploader {
         sources: &[UploadSource],
         deadline: Instant,
     ) -> Result<ProtectedPublication, ProtectedUploadError> {
+        // Read both stable ids before the one-shot hand-over consumes the token.
+        let acquire_request_id = consumed.acquire_request_id();
         let consume_request_id = consumed.consume_request_id();
         let mut uploads: Vec<ConsumedUpload> = consumed.into_uploads();
         uploads.sort_by_key(|upload| upload.slot);
@@ -288,7 +299,7 @@ impl ProtectedUploader {
             }
             receipts.push(ProtectedReceipt { hold_id: upload.hold_id, slot: upload.slot, receipt });
         }
-        Ok(ProtectedPublication { consume_request_id, receipts })
+        Ok(ProtectedPublication { acquire_request_id, consume_request_id, receipts })
     }
 }
 

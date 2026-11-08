@@ -16,8 +16,9 @@
 //!   only after a positive consume `COMMIT` acknowledgement;
 //! * a replay/unknown acquire returns an immutable ACK, never a grant.
 //!
-//! `Debug` prints the request/consume ids and the artifact count only. It never
-//! prints an intent, an attempt path, a locator, a digest or a backend hex.
+//! `Debug` prints the acquire/consume request ids and the artifact count only.
+//! It never prints an intent, an attempt path, a locator, a digest or a backend
+//! hex.
 use crate::blob_store::UploadIntent;
 use crate::ref_store::contract::OperationIdentity;
 use crate::ref_store::core::artifact_hold::contract::{ArtifactHoldError, HoldScope, MAX_BATCH_ARTIFACTS};
@@ -173,6 +174,7 @@ pub(crate) struct ConsumedUpload {
 /// intents. It is deliberately not `Clone`, not `Debug`-printable in full,
 /// serializable or constructible outside this module.
 pub struct ConsumedArtifacts {
+    acquire_request_id: Uuid,
     consume_request_id: Uuid,
     acks: Vec<ConsumeAck>,
     uploads: Vec<ConsumedUpload>,
@@ -180,9 +182,23 @@ pub struct ConsumedArtifacts {
 
 impl ConsumedArtifacts {
     /// Mint point, reachable only inside `artifact_hold::pg` after a positive
-    /// consume `COMMIT` acknowledgement.
-    pub(super) fn new(consume_request_id: Uuid, acks: Vec<ConsumeAck>, uploads: Vec<ConsumedUpload>) -> Self {
-        Self { consume_request_id, acks, uploads }
+    /// consume `COMMIT` acknowledgement. Both ids are passed *directly* from the
+    /// durable acquire ACK and its stable consume id; neither is derived from a
+    /// Blob receipt nor accepted from a caller.
+    pub(super) fn new(
+        acquire_request_id: Uuid,
+        consume_request_id: Uuid,
+        acks: Vec<ConsumeAck>,
+        uploads: Vec<ConsumedUpload>,
+    ) -> Self {
+        Self { acquire_request_id, consume_request_id, acks, uploads }
+    }
+
+    /// Stable, non-secret acquire UUID of the durable A3 acquire row that
+    /// minted this consumption. Exposed so a later pack registration can bind
+    /// the durable A3 rows directly.
+    pub fn acquire_request_id(&self) -> Uuid {
+        self.acquire_request_id
     }
 
     pub fn consume_request_id(&self) -> Uuid {
@@ -211,6 +227,7 @@ impl fmt::Debug for ConsumedArtifacts {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ConsumedArtifacts")
+            .field("acquire_request_id", &self.acquire_request_id)
             .field("consume_request_id", &self.consume_request_id)
             .field("receipts", &self.acks.len())
             .field("artifacts", &self.uploads.len())

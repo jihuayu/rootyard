@@ -393,7 +393,10 @@ impl PgArtifactHoldStore {
                     .into_iter()
                     .map(|upload| ConsumedUpload { hold_id: upload.hold_id, slot: upload.slot, intent: upload.intent })
                     .collect();
-                Ok(ConsumedArtifacts::new(consume_request_id, receipts, consumed))
+                // Both ids come straight from the durable acquire ACK: the acquire id
+                // was persisted by the acquire transaction and the consume id is its
+                // stable, pre-allocated counterpart. Neither is derived here.
+                Ok(ConsumedArtifacts::new(ack.request_id, consume_request_id, receipts, consumed))
             }
             Err(RefStoreError::CommitUnknown { .. }) => {
                 Err(ArtifactHoldError::ConsumeUnknown { consume_request_id, hold_ids })
