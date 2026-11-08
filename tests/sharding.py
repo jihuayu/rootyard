@@ -2781,9 +2781,9 @@ class ShardingHarness(PullsHarness):
         # bucket is free: native Git traffic already created that route.
         unused = int(
             self.sql(
-                "SELECT bucket_id FROM generate_series(0, 1023) AS bucket_id "
+                "SELECT candidate.bucket_id FROM generate_series(0, 1023) AS candidate(bucket_id) "
                 "WHERE NOT EXISTS (SELECT 1 FROM repository_shard_routes route "
-                "WHERE route.bucket_id = bucket_id) ORDER BY bucket_id LIMIT 1"
+                "WHERE route.bucket_id = candidate.bucket_id) ORDER BY candidate.bucket_id LIMIT 1"
             )
         )
         assert unused != route_before["bucket_id"]
