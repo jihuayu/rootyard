@@ -366,32 +366,45 @@ impl Capabilities {
     }
 }
 /// A sequence durably reserved in an issuer lane before mutation. The caller
-/// mints the operation id and digest, then calls [`SequenceReservation::identity`].
-/// Reservation alone is not an operation and cannot be replayed as one.
+/// chooses the operation UUID before reservation, the reservation acquires the
+/// same common operation lock as begin/cancel, and [`SequenceReservation::identity`]
+/// can only use that bound UUID. Reservation alone is not an operation and
+/// cannot be replayed as one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SequenceReservation {
     repository_id: Uuid,
     issuer_id: Uuid,
     lane: IssuerLane,
     sequence: i64,
+    operation_id: Uuid,
 }
 
 impl SequenceReservation {
-    pub(crate) fn new(repository_id: Uuid, issuer_id: Uuid, lane: IssuerLane, sequence: i64) -> Self {
-        Self { repository_id, issuer_id, lane, sequence }
+    pub(crate) fn new(
+        repository_id: Uuid,
+        issuer_id: Uuid,
+        lane: IssuerLane,
+        sequence: i64,
+        operation_id: Uuid,
+    ) -> Self {
+        Self { repository_id, issuer_id, lane, sequence, operation_id }
     }
 
     pub fn sequence(&self) -> i64 {
         self.sequence
     }
 
-    pub fn identity(&self, operation_id: Uuid, digest: RequestDigest) -> Result<OperationIdentity, RefStoreError> {
+    pub fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    pub fn identity(&self, digest: RequestDigest) -> Result<OperationIdentity, RefStoreError> {
         OperationIdentity::new(
             self.repository_id,
             self.issuer_id,
             self.lane.clone(),
             self.sequence,
-            operation_id,
+            self.operation_id,
             digest,
         )
     }
@@ -519,6 +532,20 @@ mod tests {
         ))
         .is_err());
         assert!(OperationRecord::new(identity, OperationState::Cancelled, None).is_err());
+    }
+
+    #[test]
+    fn sequence_reservation_binds_the_prechosen_operation_uuid() {
+        let repository = Uuid::new_v4();
+        let issuer = Uuid::new_v4();
+        let operation = Uuid::new_v4();
+        let reservation = SequenceReservation::new(repository, issuer, lane(), 3, operation);
+        assert_eq!(reservation.operation_id(), operation);
+        let identity = reservation.identity(digest()).unwrap();
+        assert_eq!(identity.operation_id(), operation);
+        assert_eq!(identity.repository_id(), repository);
+        assert_eq!(identity.issuer_id(), issuer);
+        assert_eq!(identity.sequence(), 3);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Focused PostgreSQL tests for the transitional RefStore operation registry.
 //! Run with `ROOTYARD_TEST_DATABASE_URL=... cargo test --test ref_store_operations -- --ignored`.
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use deadpool_postgres::{Manager, Pool};
 use rootyard::ref_store::{
     IssuerLane, OperationIdentity, OperationLookup, OperationState, PgRefStore, RefStoreError, RequestDigest,
@@ -8,6 +8,7 @@ use rootyard::ref_store::{
 };
 use rootyard::db;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -29,6 +30,13 @@ fn identity(repo: Uuid, issuer: Uuid, sequence: i64, operation: Uuid, digest: u8
 
 fn result(marker: i64) -> TerminalResult {
     TerminalResult::json(serde_json::json!({"state": "committed", "marker": marker})).unwrap()
+}
+
+fn assert_immutable_trigger(error: tokio_postgres::Error) {
+    let database = error.as_db_error().expect("expected a PostgreSQL trigger/check error");
+    let code = database.code().code();
+    assert!(code == "23514" || code == "P0001", "unexpected SQLSTATE {code}: {}", database.message());
+    assert!(database.message().contains("immutable"), "unexpected trigger message: {}", database.message());
 }
 
 async fn setup(url: &str) -> Result<(Pool, Pool, String, Uuid, Uuid)> {
@@ -230,7 +238,7 @@ async fn cancel_races_and_terminal_results_are_immutable() -> Result<()> {
             )
             .await
             .expect_err("terminal result rewrite must be rejected by the database");
-        assert!(error.to_string().contains("immutable"), "unexpected trigger error: {error}");
+        assert_immutable_trigger(error);
         tx.rollback().await?;
 
         let tx = client.transaction().await?;
@@ -241,7 +249,7 @@ async fn cancel_races_and_terminal_results_are_immutable() -> Result<()> {
             )
             .await
             .expect_err("operation identity rewrite must be rejected by the database");
-        assert!(error.to_string().contains("immutable"), "unexpected trigger error: {error}");
+        assert_immutable_trigger(error);
         tx.rollback().await?;
         Ok::<(), anyhow::Error>(())
     })
@@ -263,19 +271,27 @@ async fn reserved_sequences_are_transactional_and_monotonic() -> Result<()> {
         let mut client = pool.get().await?;
 
         // Rollback does not consume the sequence.
+        let operation = Uuid::new_v4();
         let tx = client.transaction().await?;
-        assert_eq!(store.reserve_sequence(&tx, repo, actor, &lane, deadline()).await?.sequence(), 1);
+        assert_eq!(
+            store.reserve_sequence(&tx, repo, actor, operation, &lane, deadline()).await?.sequence(),
+            1
+        );
         tx.rollback().await?;
 
         let tx = client.transaction().await?;
-        let first = store.reserve_sequence(&tx, repo, actor, &lane, deadline()).await?;
+        let first = store.reserve_sequence(&tx, repo, actor, operation, &lane, deadline()).await?;
         assert_eq!(first.sequence(), 1);
-        let identity = first.identity(Uuid::new_v4(), RequestDigest::from_bytes([1; 32]))?;
+        assert_eq!(first.operation_id(), operation);
+        let identity = first.identity(RequestDigest::from_bytes([1; 32]))?;
         store.begin(&tx, &identity, deadline()).await?;
         tx.commit().await?;
 
         let tx = client.transaction().await?;
-        assert_eq!(store.reserve_sequence(&tx, repo, actor, &lane, deadline()).await?.sequence(), 2);
+        assert_eq!(
+            store.reserve_sequence(&tx, repo, actor, Uuid::new_v4(), &lane, deadline()).await?.sequence(),
+            2
+        );
         tx.rollback().await?;
         Ok::<(), anyhow::Error>(())
     })
@@ -421,7 +437,7 @@ async fn registry_methods_observe_absolute_deadline_while_lock_blocked() -> Resu
         let mut blocker = pool.get().await?;
         let hold = blocker.transaction().await?;
         hold.query_one(
-            "SELECT pg_advisory_xact_lock(hashtext($1),hashtext($2::text || '/' || $3::text))",
+            rootyard::ref_store::pg::OPERATION_LOCK_SQL,
             &[&rootyard::ref_store::pg::OPERATION_LOCK_DOMAIN, &repo, &operation],
         )
         .await?;
@@ -456,12 +472,13 @@ async fn registry_methods_observe_absolute_deadline_while_lock_blocked() -> Resu
         hold.rollback().await?;
         drop(blocker);
 
-        // reserve_sequence has no operation id; block its lane row and verify the
-        // same absolute-deadline wrapper protects the allocator too.
+        // Block reserve_sequence's lane row after it has acquired the same
+        // operation lock; verify the absolute-deadline wrapper protects it too.
         let lane = IssuerLane::new("reserve-blocked").unwrap();
+        let reserve_operation = Uuid::new_v4();
         let mut lane_client = pool.get().await?;
         let tx = lane_client.transaction().await?;
-        store.reserve_sequence(&tx, repo, actor, &lane, deadline()).await?;
+        store.reserve_sequence(&tx, repo, actor, reserve_operation, &lane, deadline()).await?;
         tx.commit().await?;
         let mut lane_blocker = pool.get().await?;
         let lane_hold = lane_blocker.transaction().await?;
@@ -473,7 +490,14 @@ async fn registry_methods_observe_absolute_deadline_while_lock_blocked() -> Resu
             .await?;
         let tx = blocked.transaction().await?;
         let error = store
-            .reserve_sequence(&tx, repo, actor, &lane, Instant::now() + Duration::from_millis(250))
+            .reserve_sequence(
+                &tx,
+                repo,
+                actor,
+                reserve_operation,
+                &lane,
+                Instant::now() + Duration::from_millis(250),
+            )
             .await
             .expect_err("blocked reservation must hit its absolute deadline");
         assert!(matches!(&error, RefStoreError::Timeout), "unexpected reserve error: {error}");
@@ -492,6 +516,105 @@ async fn registry_methods_observe_absolute_deadline_while_lock_blocked() -> Resu
     })
     .await
     .context("deadline probe test panicked");
+    teardown(&admin, &schema).await?;
+    result??;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn reservation_begin_and_cancel_share_operation_lock_without_deadlock() -> Result<()> {
+    let url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
+    let (admin, pool, schema, actor, repo) = setup(&url).await?;
+    let result = tokio::spawn(async move {
+        let operation = Uuid::new_v4();
+        let lane = IssuerLane::new("reservation-race").unwrap();
+        let digest = RequestDigest::from_bytes([31; 32]);
+
+        let (reserved_tx, reserved_rx) = oneshot::channel();
+        let (proceed_tx, proceed_rx) = oneshot::channel();
+        let (begun_tx, begun_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let owner_pool = pool.clone();
+        let owner = tokio::spawn(async move {
+            let store = PgRefStore;
+            let mut client = owner_pool.get().await?;
+            let tx = client.transaction().await?;
+            let reservation = store.reserve_sequence(&tx, repo, actor, operation, &lane, deadline()).await?;
+            let identity = reservation.identity(digest)?;
+            reserved_tx.send(()).map_err(|_| anyhow!("reserved receiver dropped"))?;
+            proceed_rx.await?;
+            store.begin(&tx, &identity, deadline()).await?;
+            begun_tx.send(()).map_err(|_| anyhow!("begun receiver dropped"))?;
+            release_rx.await?;
+            tx.commit().await?;
+            Ok::<(), anyhow::Error>(())
+        });
+        reserved_rx.await?;
+
+        let (cancel_started_tx, cancel_started_rx) = oneshot::channel();
+        let cancel_pool = pool.clone();
+        let cancel_identity = identity_with_lane(repo, actor, "reservation-race", 1, operation, 31);
+        let cancel_task = tokio::spawn(async move {
+            let store = PgRefStore;
+            let mut client = cancel_pool.get().await?;
+            let tx = client.transaction().await?;
+            cancel_started_tx.send(()).map_err(|_| anyhow!("cancel start receiver dropped"))?;
+            let outcome = match store.cancel(&tx, &cancel_identity, deadline()).await {
+                Ok(_) => {
+                    tx.commit().await?;
+                    None
+                }
+                Err(error) => {
+                    tx.rollback().await?;
+                    Some(error)
+                }
+            };
+            Ok::<Option<RefStoreError>, anyhow::Error>(outcome)
+        });
+        cancel_started_rx.await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!cancel_task.is_finished(), "cancel bypassed the reservation's operation lock");
+
+        // The owner can still enter begin while the cancel waits. Without the
+        // pre-reservation operation lock this would invert into a lane/operation
+        // deadlock. A database deadlock error fails this test below.
+        proceed_tx.send(()).map_err(|_| anyhow!("proceed receiver dropped"))?;
+        tokio::time::timeout(Duration::from_secs(5), begun_rx)
+            .await
+            .expect("begin deadlocked against reservation/cancel")?;
+        release_tx.send(()).map_err(|_| anyhow!("release receiver dropped"))?;
+        owner.await??;
+
+        let cancel_outcome = tokio::time::timeout(Duration::from_secs(5), cancel_task)
+            .await
+            .expect("cancel deadlocked after owner commit")??;
+        assert!(cancel_outcome.is_none(), "unexpected serialized cancel error: {cancel_outcome:?}");
+
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        let row = tx
+            .query_one(
+                "SELECT issuer_id,lane,state FROM ref_store_operations WHERE repository_id=$1 AND operation_id=$2",
+                &[&repo, &operation],
+            )
+            .await?;
+        assert_eq!(row.get::<_, Uuid>(0), actor);
+        assert_eq!(row.get::<_, String>(1), "reservation-race");
+        assert_eq!(row.get::<_, String>(2), "cancelled");
+        let tombstones: i64 = tx
+            .query_one(
+                "SELECT count(*) FROM ref_store_cancellations WHERE repository_id=$1 AND operation_id=$2",
+                &[&repo, &operation],
+            )
+            .await?
+            .get(0);
+        assert_eq!(tombstones, 1);
+        tx.rollback().await?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("reservation/begin/cancel race test panicked");
     teardown(&admin, &schema).await?;
     result??;
     Ok(())

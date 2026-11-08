@@ -19,7 +19,7 @@ or #105 and it does not make PostgreSQL a full Ref-CAS authority.
 
 `src/ref_store/pg.rs` implements, inside a caller-owned transaction:
 
-- `reserve_sequence`: transactional preallocation of a lane sequence.
+- `reserve_sequence`: transactional preallocation of a lane sequence for a caller-chosen operation UUID; the reservation is bound to that UUID and can only mint that identity.
 - `begin`: register pending or replay the exact durable record.
 - `cancel`: persistent tombstone even when the operation has not been
   registered; a later registration becomes terminal `cancelled`.
@@ -27,15 +27,17 @@ or #105 and it does not make PostgreSQL a full Ref-CAS authority.
   any different state/result is rejected.
 - `get`: repository-scoped internal lookup. Missing is `Unknown`, not aborted.
 
-Every mutation first takes a transaction advisory lock derived from the common
-repository + operation UUID, before any lane row is locked or read. It then
+Every mutation, including `reserve_sequence`, first takes a transaction advisory
+lock derived from the common repository + operation UUID, before any lane row is
+locked or read. The lock uses the production 64-bit `hashtextextended` expression
+with explicit `uuid` casts. It then
 locks the issuer lane and rechecks the full durable identity. This means a
 foreign issuer/lane cannot concurrently commit a pending operation and a
 cancellation tombstone for the same operation UUID; exactly one identity wins
 and different identity/digest is a conflict. Hash collisions in the advisory
-key only add serialization, not authority. One caller transaction must contain
-at most one operation mutation; a future multi-operation API must use sorted lock
-order.
+key only add serialization, not authority. One caller transaction must stay on
+one operation identity (reserve/begin/cancel/terminal for that same operation
+may share it); a future multi-operation API must use sorted lock order.
 
 The lane head row then serializes `begin`/`cancel`/`record_terminal` for one
 `(repository, issuer, lane)` and makes cancel-before-register deterministic.
@@ -81,6 +83,8 @@ ref CAS. The existing long PG read lease still protects reads.
 
 ### Important limitation: no client retry idempotency yet
 
+The operation UUID is trusted server state and must be chosen before sequence
+reservation; `SequenceReservation` cannot mint an identity with a different UUID.
 The current publish caller has no protocol field for a client-supplied stable
 operation id. The server therefore mints a new operation id inside each publish
 attempt. A client that retries after a lost reply creates a **new** operation;
@@ -129,6 +133,7 @@ runner (`ROOTYARD_TEST_DATABASE_URL`), covering:
 - replay of committed results and rejection of terminal rewrites;
 - database triggers rejecting direct terminal/identity rewrites;
 - cross-lane begin vs foreign cancel producing exactly one identity;
+- reserve/begin vs same-operation cancel serializing operation -> lane without deadlock;
 - lock-blocked begin/cancel/record_terminal/reserve_sequence returning a timely timeout;
 - transactional, monotonic sequence reservation;
 - cross-repository lookup returning `Unknown`.

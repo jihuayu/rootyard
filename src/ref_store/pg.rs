@@ -17,6 +17,8 @@ use uuid::Uuid;
 
 const MAX_QUERY_WINDOW: Duration = Duration::from_secs(30);
 pub const OPERATION_LOCK_DOMAIN: &str = "rootyard-ref-store-operation-v1";
+pub const OPERATION_LOCK_SQL: &str =
+    "SELECT pg_advisory_xact_lock(hashtextextended($1::text || '/' || $2::uuid::text || '/' || $3::uuid::text,0))";
 
 async fn before_deadline<T, F>(deadline: Instant, future: F) -> Result<T, RefStoreError>
 where
@@ -38,17 +40,26 @@ impl PgRefStore {
 
     /// Reserve the next sequence in one durable issuer lane. This is the
     /// preallocation primitive for trusted callers that can keep their own
-    /// operation id across a retry. Reservation is transactional; if the
-    /// caller rolls back, the sequence is not consumed.
+    /// operation id across a retry. The caller chooses `operation_id` before
+    /// this call; reservation acquires the same repository+operation advisory
+    /// lock as begin/cancel before touching the lane row, so the lock order is
+    /// operation -> lane everywhere. The reservation is bound to that UUID and
+    /// cannot mint an identity with a different one. Reservation is
+    /// transactional; if the caller rolls back, the sequence is not consumed.
     pub async fn reserve_sequence(
         &self,
         tx: &Transaction<'_>,
         repository_id: Uuid,
         issuer_id: Uuid,
+        operation_id: Uuid,
         lane: &IssuerLane,
         deadline: Instant,
     ) -> Result<SequenceReservation, RefStoreError> {
-        before_deadline(deadline, self.reserve_sequence_inner(tx, repository_id, issuer_id, lane, deadline)).await
+        before_deadline(
+            deadline,
+            self.reserve_sequence_inner(tx, repository_id, issuer_id, operation_id, lane, deadline),
+        )
+        .await
     }
 
     async fn reserve_sequence_inner(
@@ -56,11 +67,16 @@ impl PgRefStore {
         tx: &Transaction<'_>,
         repository_id: Uuid,
         issuer_id: Uuid,
+        operation_id: Uuid,
         lane: &IssuerLane,
         deadline: Instant,
     ) -> Result<SequenceReservation, RefStoreError> {
         validate_scope(repository_id, issuer_id)?;
+        if operation_id.is_nil() {
+            return Err(RefStoreError::InvalidIdentity("operation id must be non-nil".into()));
+        }
         bound(tx, deadline).await?;
+        lock_operation_key(tx, repository_id, operation_id).await?;
         ensure_repository(tx, repository_id).await?;
         let row = tx
             .query_one(
@@ -74,7 +90,7 @@ impl PgRefStore {
             .await
             .map_err(db_error)?;
         let sequence: i64 = row.get(0);
-        Ok(SequenceReservation::new(repository_id, issuer_id, lane.clone(), sequence))
+        Ok(SequenceReservation::new(repository_id, issuer_id, lane.clone(), sequence, operation_id))
     }
 
     /// Register a pending operation, or replay its existing durable state.
@@ -322,10 +338,7 @@ async fn lock_operation_key(
     repository_id: Uuid,
     operation_id: Uuid,
 ) -> Result<(), RefStoreError> {
-    tx.query_one(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1::text || '/' || $2::uuid::text || '/' || $3::uuid::text,0))",
-        &[&OPERATION_LOCK_DOMAIN, &repository_id, &operation_id],
-    )
+    tx.query_one(OPERATION_LOCK_SQL, &[&OPERATION_LOCK_DOMAIN, &repository_id, &operation_id])
     .await
     .map_err(db_error)?;
     Ok(())
