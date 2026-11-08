@@ -251,8 +251,11 @@ class GitReadStepsSourceTest(unittest.TestCase):
             self.assertIn(owned, paging)
         # The façade still exports the same API surface to the rest of the crate.
         facade = self.source("git_read.rs")
-        for reexport in ("pub(crate) use command::{GitStep, git_cmd, run_git};",
-                         "pub(crate) use paging::page_refs;",
+        exports = re.search(r"pub\(crate\) use command::\{([^}]+)\};", facade)
+        self.assertIsNotNone(exports)
+        self.assertTrue({"GitStep", "git_cmd", "run_git"}.issubset(
+            {name.strip() for name in exports.group(1).split(",")}))
+        for reexport in ("pub(crate) use paging::page_refs;",
                          "pub use paging::parse_for_each_ref_output;"):
             self.assertIn(reexport, facade)
 
@@ -346,7 +349,10 @@ class GitReadStepsSourceTest(unittest.TestCase):
         self.assertIn("REF_SCAN_MAX_BYTES", scan)
 
     def test_step_diagnostics_are_fixed_and_secret_free(self):
-        report = self.read[self.read.index("fn report_step_failure("):]
+        wrapper = self.read[self.read.index("fn report_step_failure("):]
+        wrapper = wrapper[:wrapper.index("\n}\n")]
+        self.assertIn("report_read_failure(step, step.failure_class(exit), &code);", wrapper)
+        report = self.read[self.read.index("fn report_read_failure("):]
         report = report[:report.index("\n}\n")]
         self.assertIn('"rootyard: browse git read step={} class={} exit={}"', report)
         self.assertIn("step.label()", report)
@@ -364,7 +370,7 @@ class GitReadStepsSourceTest(unittest.TestCase):
             self.assertNotIn(forbidden, fallback)
 
     def test_bounded_scan_argv_needs_no_exclude_and_seek_keeps_its_own(self):
-        """The scan argv is option-free; the modern seek path is retained."""
+        """The scan needs no exclusion flag; the modern seek path is retained."""
         scan = self.read[self.read.index("async fn scan_namespace_page("):]
         scan = scan[:scan.index("\n}\n")]
         argv = scan[scan.index("let args = ["):scan.index("];", scan.index("let args = ["))]
