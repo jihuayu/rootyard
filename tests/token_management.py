@@ -106,7 +106,7 @@ def repo_id(h, owner, name):
 
 
 def login_browser(h, username, token):
-    """Real form login; return cookies without following the 302."""
+    """Real form login; return cookies without following the 303."""
     connection = http.client.HTTPConnection("127.0.0.1", h.port, timeout=20)
     payload = urllib.parse.urlencode({"username": username, "token": token}).encode()
     connection.request(
@@ -129,7 +129,7 @@ def login_browser(h, username, token):
             key, _, cookie_value = pair.partition("=")
             cookies[key] = cookie_value
     connection.close()
-    assert status == 302, f"web login: expected 302, got {status}: {raw[:300]!r}"
+    assert status == 303, f"web login: expected 303, got {status}: {raw[:300]!r}"
     assert "rootyard_session" in cookies and "rootyard_csrf" in cookies, cookies
     return cookies
 

@@ -299,7 +299,7 @@ pub async fn get_token(pool: &Pool, actor: &Identity, token_id: Uuid) -> Result<
 /// Create an explicitly restricted token. The secret is returned once.
 pub async fn create_token(pool: &Pool, actor: &Identity, input: CreateTokenInput) -> Result<IssuedToken, Error> {
     let display_name = models::validate_display_name(&input.display_name)?;
-    let days = models::validate_expiry_days(input.expires_in_days)?;
+    let days = i32::try_from(models::validate_expiry_days(input.expires_in_days)?).map_err(|_| Error::bad_request())?;
     let repositories = models::normalize_repository_grants(input.repository_grants)?;
     let namespaces = models::normalize_namespace_grants(input.namespace_grants)?;
     models::validate_grant_count(&repositories, &namespaces)?;
