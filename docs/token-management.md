@@ -1,14 +1,10 @@
-# Token and browser-session management (private branch)
+# Token and browser-session management (candidate)
 
-> **Status:** implementation and review fixes are staged on a **private** branch
-> on top of schema 136 / backup format 12 (`6a72c41`). The shared service and
-> API are delivered, then the browser settings pages, then the native harness.
-> This branch is **not released or deployed**. The Git CAS parent-token lock and
-> restricted browser-child inheritance live on a parallel branch; removing this
-> blocker is required before any release claim. The implementation worker did
-> **not** build Cargo, run the native suite, or execute a real service; only
-> `py_compile` and `git diff --check` were run. Do not claim the native suite
-> passes until the coordinator runs it.
+The schema-136 / backup-format-12 candidate includes scoped PAT management, browser settings and the parent-token lock held through Git CAS. The coordinator ran all 12 [management native cases](acceptance/round5-token-management-evidence/management-native.json) successfully on source `728d948`, binary `aadde45b61644a2d5869daa2da93bdafffab72f33da7d98bee6469c9921f0391`; the [build receipt](acceptance/round5-token-management-evidence/management-build.json) binds compiled inputs. Later changes were test-only byte-body corrections.
+
+All three [native CAS race cases](acceptance/round5-token-management-evidence/cas-native.json) passed on the earlier source `ba9a443`, binary `17606cc7a61225069ba2194b56ae24e05e5919df9488c9d26cac6aa60b83ff2d`, with its [own build receipt](acceptance/round5-token-management-evidence/cas-build.json). The later Rust delta resolves organization slugs through namespaces in token metadata and Web settings queries. Six no-grant proof tests passed, including identity tampering and live-journal rejection.
+
+This is not deployed or a complete issue-82 acceptance. Restricted parent tokens are rejected at browser login so their authority cannot widen; exact restricted browser-child inheritance remains unsupported. CI/job/trusted-credential regressions, genuine legacy archive qualification on the combined manager and a final integrated review remain outstanding. The management suite does not exercise CAS; its retained older notes about a separate CAS branch are superseded by the separate race invocation above.
 
 ## API (Authorization header only)
 
