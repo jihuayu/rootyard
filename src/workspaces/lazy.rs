@@ -205,51 +205,14 @@ fn fingerprint_manifest(root: &Path, id: Uuid) -> Result<Option<LazyManifest>, E
     Ok(Some(read_manifest(&path)?))
 }
 
-/// Merge immutable baseline metadata with confined CoW entries. This avoids
-/// downloading every remote blob during the two-second capture scan.
-pub(super) fn fingerprint(path: &Path) -> Result<Option<String>, Error> {
-    let Some(id) = path.file_name().and_then(|name| name.to_str()).and_then(|name| Uuid::parse_str(name).ok()) else {
-        return Ok(None);
-    };
-    let Some(kind) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) else {
-        return Ok(None);
-    };
-    if kind != "mounts" && kind != "workspaces" {
-        return Ok(None);
-    }
-    let root = path.parent().and_then(Path::parent).and_then(Path::parent).ok_or_else(Error::bad_request)?;
-    let Some(manifest) = fingerprint_manifest(root, id)? else {
-        return Ok(None);
-    };
-    let upper = root.join("workspace-service/uppers").join(id.to_string());
-    let whiteout_file = upper.join(".rootyard-whiteouts.json");
-    let whiteouts: BTreeSet<PathBuf> = if whiteout_file.exists() {
-        serde_json::from_slice::<Vec<String>>(&fs::read(whiteout_file).map_err(Error::internal)?)
-            .map_err(Error::internal)?
-            .into_iter()
-            .map(PathBuf::from)
-            .collect()
-    } else {
-        BTreeSet::new()
-    };
-    let hidden = |path: &Path| whiteouts.iter().any(|w| path == w || path.starts_with(w));
-    let mut entries = BTreeMap::<PathBuf, core::Entry>::new();
-    for entry in manifest.entries {
-        let path = core::decode_path(&entry.path_base64).map_err(Error::internal)?;
-        if !hidden(&path) {
-            entries.insert(path, entry);
-        }
-    }
-    if upper.is_dir() {
-        for entry in core::inventory(&upper).map_err(Error::internal)? {
-            let rel = core::decode_path(&entry.path_base64).map_err(Error::internal)?;
-            if !rel.as_os_str().as_encoded_bytes().starts_with(b".rootyard-whiteouts.") && !hidden(&rel) {
-                entries.insert(rel, entry);
-            }
-        }
-    }
-    let raw = serde_json::to_vec(&entries.into_values().collect::<Vec<_>>()).map_err(Error::internal)?;
-    Ok(Some(hex::encode(Sha256::digest(raw))))
+/// Raw baseline metadata of a lazy workspace, revalidated by `read_manifest`.
+///
+/// Capture and checkpoint merge this manifest with the upper layer instead of
+/// walking the sparse lower tree, whose placeholder files still hash as zeroes.
+/// A fingerprint built from it stays byte-compatible with the former
+/// `lazy::fingerprint`: the same path-ordered `core::Entry` JSON list.
+pub(super) fn manifest_entries(root: &Path, id: Uuid) -> Result<Option<Vec<core::Entry>>, Error> {
+    Ok(fingerprint_manifest(root, id)?.map(|manifest| manifest.entries))
 }
 
 /// Blocking facade used by FUSE callbacks to obtain a verified local file.

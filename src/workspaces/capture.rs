@@ -15,23 +15,25 @@
 //! remaining API-side hash is a follow-up; the long background scan is already
 //! off-thread and out of the transaction.
 use super::{scan, service};
-use crate::{AppState, Error, workspace_lab::core};
+use crate::{AppState, Error};
 use futures_util::StreamExt;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const PAGE: i64 = 100;
 
+/// Fingerprint of the workspace as the overlay exposes it, built from raw
+/// service-owned layers.
+///
+/// This must not read the mount: inside a freeze a mount `stat`/`read` queues
+/// behind the kernel inode lock of a parked write, the freeze waits for this
+/// scan, the scan waits for that write and the write waits for the thaw. See
+/// [`super::snapshot`] for the raw merged inventory, upper overrides, whiteouts
+/// and the lazy manifest, and for the preserved byte format of the hash.
 pub(super) fn fingerprint(repo: &Path) -> Result<String, Error> {
-    if let Some(fingerprint) = super::lazy::fingerprint(repo)? {
-        return Ok(fingerprint);
-    }
-    let entries = core::inventory(repo).map_err(Error::internal)?;
-    let raw = serde_json::to_vec(&entries).map_err(Error::internal)?;
-    Ok(hex::encode(Sha256::digest(&raw)))
+    super::snapshot::fingerprint(repo)
 }
 
 /// A workspace with no stored baseline only records one; it never invents a
