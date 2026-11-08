@@ -194,6 +194,16 @@ fn pkt_line_payloads(stream: &[u8], max_packets: usize) -> Option<Vec<&[u8]>> {
     }
 }
 
+/// One report line: the payload must end with exactly one LF and carry no other
+/// control byte. An embedded LF/CR, a NUL or any other control byte is
+/// malformed, and a missing terminal LF is malformed too, so `ng <b> reason\nok
+/// <a>` can never be read as a rejection of `<b>` with an `ok` hidden inside its
+/// reason.
+fn status_line(payload: &[u8]) -> Option<&[u8]> {
+    let body = payload.strip_suffix(b"\n")?;
+    body.iter().all(|byte| !byte.is_ascii_control()).then_some(body)
+}
+
 /// True only when native receive-pack itself reported `ng` for every requested
 /// ref, in the exact status format the client negotiated. Callers invoke this
 /// after proving the disposable snapshot changed no ref, so a pass-through
@@ -246,19 +256,18 @@ pub(super) fn reports_rejection(report: &[u8], refs: &[String], capabilities: &R
         return false;
     };
     let mut statuses = packets.into_iter();
-    // The unpack status is mandatory and must be `ok`: an unpack failure is a
-    // transport-level error, never a proven per-ref refusal.
-    let unpack = statuses.next().unwrap_or_default();
-    if unpack.strip_suffix(b"\n").unwrap_or(unpack) != b"unpack ok" {
+    // The unpack status is mandatory, is exactly `unpack ok\n` and must carry
+    // its own terminal LF: an unpack failure is a transport-level error, never a
+    // proven per-ref refusal.
+    if status_line(statuses.next().unwrap_or_default()) != Some(b"unpack ok".as_slice()) {
         return false;
     }
     let mut rejected: Vec<&str> = Vec::new();
     let mut previous_was_status = false;
     for payload in statuses {
-        if payload.contains(&0u8) {
+        let Some(line) = status_line(payload) else {
             return false;
-        }
-        let line = payload.strip_suffix(b"\n").unwrap_or(payload);
+        };
         let mut fields = line.splitn(2, |byte| *byte == b' ');
         let kind = fields.next().unwrap_or_default();
         let rest = fields.next().unwrap_or_default();
@@ -703,6 +712,50 @@ mod tests {
         let mut trailing = refused.clone();
         trailing.extend_from_slice(b"0000");
         assert!(!reports_rejection(&trailing, &refs, &banded));
+    }
+
+    #[test]
+    fn status_lines_require_exactly_one_terminal_lf() {
+        let v1 = status_caps(true, false, false);
+        let refs = vec!["refs/heads/a".to_owned(), "refs/heads/b".to_owned()];
+        // An `ok` hidden after an embedded LF inside an `ng` reason must never be
+        // read as "ng b" plus a separately supplied "ng a".
+        let hidden_ok = report(&[
+            b"unpack ok\n",
+            b"ng refs/heads/b stale\nok refs/heads/a",
+            b"ng refs/heads/a stale\n",
+        ]);
+        assert!(!reports_rejection(&hidden_ok, &refs, &v1));
+        // A status line without its terminal LF is malformed, not a bare reason.
+        let no_terminal_lf = report(&[b"unpack ok\n", b"ng refs/heads/a stale", b"ng refs/heads/b stale\n"]);
+        assert!(!reports_rejection(&no_terminal_lf, &refs, &v1));
+        // The unpack status needs its terminal LF too.
+        let unpack_without_lf = report(&[b"unpack ok", b"ng refs/heads/a x\n", b"ng refs/heads/b y\n"]);
+        assert!(!reports_rejection(&unpack_without_lf, &refs, &v1));
+        // Embedded LF, CR, NUL or a second LF inside a status line is malformed.
+        for bad in [
+            b"ng refs/heads/a stale\nng refs/heads/b stale\n".as_slice(),
+            b"ng refs/heads/a stale\r\n".as_slice(),
+            b"ng refs/heads/a sta\0le\n".as_slice(),
+            b"ng refs/heads/a stale\n\n".as_slice(),
+        ] {
+            let bytes = report(&[b"unpack ok\n", bad, b"ng refs/heads/b stale\n"]);
+            assert!(!reports_rejection(&bytes, &refs, &v1));
+        }
+        // Normal native status lines (v1, v2 with options, and sideband) parse.
+        let plain = report(&[b"unpack ok\n", b"ng refs/heads/a stale\n", b"ng refs/heads/b stale\n"]);
+        assert!(reports_rejection(&plain, &refs, &v1));
+        let v2 = status_caps(false, true, false);
+        let with_options = report(&[
+            b"unpack ok\n",
+            b"ng refs/heads/a stale\n",
+            b"option old-oid 1111111111111111111111111111111111111111\n",
+            b"ng refs/heads/b stale\n",
+        ]);
+        assert!(reports_rejection(&with_options, &refs, &v2));
+        let banded = status_caps(true, false, true);
+        let sideband = report(&[b"\x01unpack ok\n", b"\x01ng refs/heads/a stale\n", b"\x01ng refs/heads/b stale\n"]);
+        assert!(reports_rejection(&sideband, &refs, &banded));
     }
 
     #[test]
