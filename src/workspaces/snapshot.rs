@@ -141,6 +141,7 @@ impl Raw {
             }
         }
         let mut upper = BTreeMap::new();
+        let mut upper_dirs = BTreeSet::new();
         if layout.merge_upper && directory(&layout.upper)? {
             for entry in core::inventory(&layout.upper).map_err(Error::internal)? {
                 let path = core::decode_path(&entry.path_base64).map_err(Error::internal)?;
@@ -151,6 +152,7 @@ impl Raw {
                     return Err(Error::internal("duplicate workspace upper entry"));
                 }
             }
+            upper_dirs = upper_directories(&layout.upper)?;
         }
         // A direct-mode workspace serves the lower tree itself; a stale upper
         // tree left by an earlier FUSE host must not hide or mask anything.
@@ -176,18 +178,12 @@ impl Raw {
             }
         }
         // The reverse type change: an upper directory hides a lower file or
-        // symlink with the same path. Upper directories appear as ancestors of
-        // upper entries, so an ancestor lookup is enough.
-        let masked: Vec<PathBuf> = lower
-            .keys()
-            .filter(|path| {
-                path.ancestors()
-                    .skip(1)
-                    .take_while(|ancestor| !ancestor.as_os_str().is_empty())
-                    .any(|ancestor| upper.contains_key(ancestor))
-            })
-            .cloned()
-            .collect();
+        // symlink with the same path, including an upper directory that holds no
+        // entries of its own. `upper_directories` collects every real upper
+        // directory once from the service-owned tree (no mount access, no
+        // symlink following), so this is one bounded tree lookup instead of a
+        // stat storm for every lower leaf.
+        let masked: Vec<PathBuf> = lower.keys().filter(|path| upper_dirs.contains(*path)).cloned().collect();
         for path in masked {
             lower.remove(&path);
         }
@@ -417,6 +413,35 @@ fn prepare(dest: &Path, relative: &Path) -> Result<PathBuf, Error> {
         return Err(Error::internal("duplicate workspace snapshot path"));
     }
     Ok(to)
+}
+
+/// Every real directory inside the service-owned upper tree, as repository
+/// relative paths. Symlinks are never followed and never treated as
+/// directories, so a lower entry below one is rejected by the ancestor rule
+/// instead of being silently masked. The walk is bounded by `MAX_ENTRIES` and
+/// ignores the internal whiteout bookkeeping.
+fn upper_directories(root: &Path) -> Result<BTreeSet<PathBuf>, Error> {
+    let mut found = BTreeSet::new();
+    let mut pending = vec![PathBuf::new()];
+    while let Some(relative) = pending.pop() {
+        for child in fs::read_dir(root.join(&relative)).map_err(Error::internal)? {
+            let child = child.map_err(Error::internal)?;
+            let path = relative.join(child.file_name());
+            core::relative_path(path.as_os_str().as_bytes()).map_err(Error::internal)?;
+            if internal(&path) {
+                continue;
+            }
+            if !fs::symlink_metadata(child.path()).map_err(Error::internal)?.file_type().is_dir() {
+                continue;
+            }
+            if found.len() >= core::MAX_ENTRIES {
+                return Err(Error::internal("workspace upper directory limit exceeded"));
+            }
+            found.insert(path.clone());
+            pending.push(path);
+        }
+    }
+    Ok(found)
 }
 
 /// `.rootyard-whiteouts.json` is `Vec<String>` of repository-relative paths.
