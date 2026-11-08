@@ -1,0 +1,17 @@
+
+running 12 tests
+test both_pool_wait_deadlines_are_bounded ... ok
+test deep_nested_refs_issue139_packed_native_closure ... ok
+test end_of_t2_expiry_after_blocked_pack_publication_ledger_read ... ok
+test expiry_and_realm_change_between_t1_and_t2_refuse ... ok
+test pinned_older_revision_survives_new_a4_commit ... ok
+test pool_max_one_observer_succeeds_during_blob_and_native ... ok
+test release_and_generation_change_between_t1_and_t2_refuse ... ok
+test sha1_complete_view_exact_local_bytes_and_pinned_older_revision ... ok
+test sha256_complete_view_and_unknown_pack_id_is_refused ... ok
+test third_a4_native_child_is_not_admitted_while_two_views_hold_global_slots ... ok
+test two_idle_views_do_not_starve_a4_and_drop_reclaims_the_budget ... ok
+test wrong_backend_missing_object_and_corrupt_bytes_fail_closed ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 54.54s
+

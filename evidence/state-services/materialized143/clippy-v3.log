@@ -1,0 +1,28 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-read-materialize)
+error: non-binding `let` on a future
+   --> src/blob_store/readback.rs:159:9
+    |
+159 |         let _ = handle.spawn_blocking(move || cleanup.run());
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: consider awaiting the future or dropping explicitly with `std::mem::drop`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#let_underscore_future
+    = note: `-D clippy::let-underscore-future` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::let_underscore_future)]`
+
+error: manual implementation of `Option::map`
+   --> src/blob_store/readback.rs:264:9
+    |
+264 | /         match slot.iter().position(|stall| Some(stall.parent.as_path()) == path.parent()) {
+265 | |             Some(index) => Some(slot.remove(index)),
+266 | |             None => None,
+267 | |         }
+    | |_________^ help: try: `slot.iter().position(|stall| Some(stall.parent.as_path()) == path.parent()).map(|index| slot.remove(index))`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_map
+    = note: `-D clippy::manual-map` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_map)]`
+
+error: could not compile `rootyard` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `rootyard` (lib test) due to 2 previous errors

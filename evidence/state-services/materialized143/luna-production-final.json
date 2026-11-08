@@ -1,0 +1,15 @@
+{
+  "reviewer": "gpt-6-luna max",
+  "kind": "static-only final review",
+  "root_production_checkpoint": "79044c8f4b7189aed9b5fe5a756cfca9238a3e86",
+  "new_P1_P2": [],
+  "resolved": [
+    "task-entry shared ReadLease+workspace ownership",
+    "unknown unlink/runtimeabort quarantine",
+    "actual inner completion and deferred unlink two-gate wiring",
+    "bounded T1/T2 transaction cleanup and in-lock read linearization",
+    "full native closure binding and global native/view budgets"
+  ],
+  "tests_executed_by_reviewer": false,
+  "limits": "Root must execute actual library plus PG/S3/nativeGit cases; static review is not acceptance."
+}

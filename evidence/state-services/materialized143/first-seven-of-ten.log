@@ -1,0 +1,35 @@
+
+running 10 tests
+test both_pool_wait_deadlines_are_bounded ... ok
+test deep_nested_refs_issue139_packed_native_closure ... FAILED
+test expiry_and_realm_change_between_t1_and_t2_refuse ... FAILED
+test pinned_older_revision_survives_new_a4_commit ... ok
+test pool_max_one_observer_succeeds_during_blob_and_native ... ok
+test release_and_generation_change_between_t1_and_t2_refuse ... ok
+test sha1_complete_view_exact_local_bytes_and_pinned_older_revision ... ok
+test sha256_complete_view_and_unknown_pack_id_is_refused ... ok
+test two_idle_views_do_not_starve_a4_and_drop_reclaims_the_budget ... FAILED
+test wrong_backend_missing_object_and_corrupt_bytes_fail_closed ... ok
+
+failures:
+
+---- deep_nested_refs_issue139_packed_native_closure stdout ----
+Error: ref store: invalid ref-store identity: terminal result exceeds 64 KiB
+
+---- expiry_and_realm_change_between_t1_and_t2_refuse stdout ----
+Error: db error
+
+Caused by:
+    ERROR: ref-store core pin active update is not a valid renewal
+
+---- two_idle_views_do_not_starve_a4_and_drop_reclaims_the_budget stdout ----
+Error: a real A4 verified commit did not complete beside two retained views
+
+
+failures:
+    deep_nested_refs_issue139_packed_native_closure
+    expiry_and_realm_change_between_t1_and_t2_refuse
+    two_idle_views_do_not_starve_a4_and_drop_reclaims_the_budget
+
+test result: FAILED. 7 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.77s
+

@@ -1,0 +1,21 @@
+{
+  "production_inputs_sha256": "f7d308c01899835c09dbee529676cd8f903a865ba3fd9aa3e17178588282ebca",
+  "source_unchanged_after_test_only_updates": true,
+  "first_native_failures": [
+    "single128-ref plan exceeded unchanged64KiB worst-case terminal budget; fixed realtypedA4 batches<=32 withoutnewpacks",
+    "illegal backward pin expiry mutation correctly rejected; fixed actual shortlease/DBclock",
+    "freshA4commit succeeded but fixture expectedpre-commit revision1 ratherthan2"
+  ],
+  "additional_real_cases": [
+    "same process-wide A4/A5 native2: third actual Git gate never starts while two reads holdnative slots",
+    "freshT2 expiry after exact backend waits on publication-ledger relationlock",
+    "T2pool deadline measured beforeobserverreleases its soleconnection"
+  ],
+  "final_fixture_tightening": "Final rebuilt native suite12/12PASS0ignored54.704sec. Third view uses1500ms, exact native refusal, noTimeout accepted, elapsedwait checked, trustedGit markerabsent; release/reclamation succeeds.",
+  "limits": [
+    "Library Blob gates are in-process memory lifecycle tests, not provider qualification.",
+    "RealPGobserver provesconnection releasedduringnative phase; noseparate blocked-provider-GET proxy was used.",
+    "RealS3/Git is loopback only; Azure compile only; noHA/powerloss/packetloss/serving/GC/encryption/physicalBlobbackup qualification.",
+    "Workspace bounds concern admitted in-flight work/live views; final tempdirectory removal remains best effort, no total physical orphan-disk quota or restart cleanup qualification."
+  ]
+}

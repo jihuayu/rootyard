@@ -1,0 +1,43 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-read-materialize)
+error[E0618]: expected function, found `rootyard::ref_store::RefStoreError`
+    --> tests/ref_store_materialized_reads.rs:1174:23
+     |
+1115 | fn refusal<T>(result: Result<T, RefStoreError>) -> Result<RefStoreError> {
+     | ------------------------------------------------------------------------ this function of the same name is available here, but it's shadowed by the local binding
+...
+1153 |         let refusal = refusal(read_result)?;
+     |             ------- `refusal` has type `rootyard::ref_store::RefStoreError`
+...
+1174 |         let refusal = refusal(read_result)?;
+     |                       ^^^^^^^-------------
+     |                       |
+     |                       call expression requires function
+
+error[E0618]: expected function, found `rootyard::ref_store::RefStoreError`
+    --> tests/ref_store_materialized_reads.rs:1258:23
+     |
+1115 | fn refusal<T>(result: Result<T, RefStoreError>) -> Result<RefStoreError> {
+     | ------------------------------------------------------------------------ this function of the same name is available here, but it's shadowed by the local binding
+...
+1230 |         let refusal = refusal(read_result)?;
+     |             ------- `refusal` has type `rootyard::ref_store::RefStoreError`
+...
+1258 |         let refusal = refusal(read_result)?;
+     |                       ^^^^^^^-------------
+     |                       |
+     |                       call expression requires function
+
+error: variable does not need to be mutable
+   --> tests/ref_store_materialized_reads.rs:888:13
+    |
+888 |         let mut v = verify_new(&db, &store, &git, GitObjectFormat::Sha1).await?;
+    |             ----^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `-D unused-mut` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(unused_mut)]`
+
+For more information about this error, try `rustc --explain E0618`.
+error: could not compile `rootyard` (test "ref_store_materialized_reads") due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...

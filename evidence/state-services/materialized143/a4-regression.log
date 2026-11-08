@@ -1,0 +1,13 @@
+
+running 8 tests
+test blocked_gate_capture_fails_on_bounded_deadline_and_client_recovers ... ok
+test caller_session_off_still_records_durable_on_and_never_leaks_setlocal ... ok
+test mismatched_idx_and_missing_closure_object_are_denied_without_writes ... ok
+test registration_and_cancel_serialize_on_the_138_prefix ... ok
+test sha1_native_pack_registers_publishes_commits_and_replays_terminal ... ok
+test sha256_native_pack_registers_publishes_and_commits ... ok
+test truncated_pack_header_and_wrong_object_format_are_denied ... ok
+test usage_counter_ddl_is_denied_and_historic_ack_query_needs_the_trusted_scope ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.84s
+
