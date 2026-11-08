@@ -11,11 +11,13 @@
 //! Only this capability may skip that current-authority recheck, and only to
 //! project the past, already-committed transaction. It never authorizes new
 //! refs. HTTP bodies, request JSON and database rows can never construct it:
-//! the constructor re-reads the real journal and requires a finished,
-//! parent-publication operation, a unique successful post-receive receipt, a
-//! matching pre-receive request and committed reference events that agree with
-//! both. Settlement additionally binds it to the exact operation record, the
-//! complete admitted ref-name set and the database actor/token identity.
+//! the constructor re-reads the real journal and requires a quiescent,
+//! finished, parent-publication operation with a valid 32-byte parent grant
+//! marker, a unique successful post-receive receipt, a matching pre-receive
+//! request and committed reference events that agree with both. Settlement
+//! additionally binds it to the exact operation record (including sequence and
+//! actor name, with no service principal), the complete admitted ref-name set
+//! and the database actor/token identity.
 use std::collections::BTreeSet;
 
 use uuid::Uuid;
@@ -27,7 +29,9 @@ pub struct RecordedReceiptProof {
     operation_id: Uuid,
     repository_id: Uuid,
     actor_id: Uuid,
+    actor_name: String,
     token_id: Uuid,
+    sequence: i64,
     storage_generation: i64,
     shard_epoch: i64,
     requested_refs: Vec<String>,
@@ -45,15 +49,18 @@ impl RecordedReceiptProof {
     ///
     /// `outcome` must be the exact terminal outcome reconciliation computed for
     /// this journal and `generation` the repository generation it reconciled
-    /// against. Anything weaker than a finished native transaction with a
-    /// matching request, successful receipt and committed hook set yields no
-    /// proof, so settlement keeps verifying current authority.
-    pub fn from_journal(operation: &journal::Operation, outcome: &str, generation: i64) -> Option<Self> {
+    /// against. Anything weaker than a quiescent, finished native transaction
+    /// with a valid parent grant marker, matching request, successful receipt
+    /// and committed hook set yields no proof, so settlement keeps verifying
+    /// current authority.
+    pub(crate) fn from_journal(operation: &journal::Operation, outcome: &str, generation: i64) -> Option<Self> {
         if outcome != "recorded"
             || generation <= 0
             || operation.storage_generation != generation
             || !operation.requires_parent_publication
             || operation.shard_epoch <= 0
+            || operation.sequence <= 0
+            || operation.actor_name.is_empty()
             || operation.id.is_nil()
             || operation.repository_id.is_nil()
             || operation.actor_id.is_nil()
@@ -63,7 +70,20 @@ impl RecordedReceiptProof {
         {
             return None;
         }
+        // A still-live child could acquire admission and run the native hook
+        // after any caller-side observation; terminal metadata alone is not
+        // quiescence.
+        if journal::ActiveGuard::operation_is_live(operation).ok()? {
+            return None;
+        }
         if !journal::is_finished(operation).ok()? {
+            return None;
+        }
+        // The parent's 32-byte grant marker is the only proof that the managed
+        // hook could publish. Read it with the journal's no-symlink/regular
+        // file convention; a missing, malformed or unsafe marker never mints
+        // this capability.
+        if journal::read(&operation.path.join("publication.grant")).ok()?.len() != 32 {
             return None;
         }
         // A whole-push admission request proves the exact ref set native Git
@@ -133,7 +153,9 @@ impl RecordedReceiptProof {
             operation_id: operation.id,
             repository_id: operation.repository_id,
             actor_id: operation.actor_id,
+            actor_name: operation.actor_name.clone(),
             token_id: operation.token_id,
+            sequence: operation.sequence,
             storage_generation: operation.storage_generation,
             shard_epoch: operation.shard_epoch,
             requested_refs,
@@ -156,8 +178,11 @@ impl RecordedReceiptProof {
         self.operation_id == operation.id
             && self.repository_id == operation.repository_id
             && self.actor_id == operation.actor_id
+            && self.actor_name == operation.actor_name
             && self.token_id == operation.token_id
+            && self.sequence == operation.sequence
             && self.storage_generation == operation.storage_generation
+            && operation.service_principal_id.is_none()
             && operation.admission.as_ref().is_some_and(|admission| {
                 admission.writer_id == self.operation_id && admission.shard_epoch == self.shard_epoch
             })
@@ -220,6 +245,12 @@ mod tests {
         operation
     }
 
+    const GRANT: [u8; 32] = *b"rootyard-publication-grant-32byt";
+
+    fn grant(operation: &journal::Operation) {
+        std::fs::write(operation.path.join("publication.grant"), GRANT).unwrap();
+    }
+
     fn change(name: &str, old: char, new: char) -> journal::RefChange {
         journal::RefChange {
             ref_name: name.into(),
@@ -235,6 +266,7 @@ mod tests {
         // Non-atomic push: `other` fails, so the successful subset is `main`.
         journal::record_ref_transaction_intent(&operation, &requested).unwrap();
         journal::record_ref_transaction_receipt(&operation, &[requested[0].clone()]).unwrap();
+        grant(&operation);
         journal::finish(&operation).unwrap();
         (root, operation)
     }
@@ -299,6 +331,7 @@ mod tests {
         let operation = operation(root.path(), Uuid::new_v4());
         // Receipt and committed event without the pre-receive request.
         journal::record_ref_transaction_receipt(&operation, &[change("refs/heads/main", '0', 'a')]).unwrap();
+        grant(&operation);
         journal::finish(&operation).unwrap();
         assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_none());
 
@@ -306,6 +339,7 @@ mod tests {
         let operation = operation(root.path(), Uuid::new_v4());
         // Request only: Git was admitted but never acknowledged a ref.
         journal::record_ref_transaction_intent(&operation, &[change("refs/heads/main", '0', 'a')]).unwrap();
+        grant(&operation);
         journal::finish(&operation).unwrap();
         assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_none());
 
@@ -316,6 +350,7 @@ mod tests {
         // A bare receipt file with no committed reference-transaction event.
         std::fs::write(operation.path.join("post-receive.json"), serde_json::to_vec(&requested).unwrap())
             .unwrap();
+        grant(&operation);
         journal::finish(&operation).unwrap();
         assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_none());
     }
@@ -334,8 +369,84 @@ mod tests {
             serde_json::to_vec(&[change("refs/heads/main", '0', 'a')]).unwrap(),
         )
         .unwrap();
+        grant(&operation);
         journal::finish(&operation).unwrap();
         assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_none());
+    }
+
+    #[test]
+    fn live_finished_journal_never_mints_a_recorded_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let (operation, active) = journal::begin_active_with(
+            root.path(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "alice".into(),
+            Uuid::new_v4(),
+            1,
+            Uuid::new_v4(),
+            7,
+        )
+        .unwrap();
+        let requested = [change("refs/heads/main", '0', 'a')];
+        journal::record_ref_transaction_intent(&operation, &requested).unwrap();
+        journal::record_ref_transaction_receipt(&operation, &requested).unwrap();
+        grant(&operation);
+        journal::finish(&operation).unwrap();
+        assert!(journal::ActiveGuard::operation_is_live(&operation).unwrap());
+        assert!(
+            RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_none(),
+            "a live child could publish after this observation"
+        );
+        drop(active);
+        assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_some());
+    }
+
+    #[test]
+    fn grant_marker_is_required_and_read_without_symlinks() {
+        let (_root, operation) = recorded_journal();
+        let marker = operation.path.join("publication.grant");
+        std::fs::remove_file(&marker).unwrap();
+        assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_none());
+        std::fs::write(&marker, b"short").unwrap();
+        assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_none());
+        std::fs::remove_file(&marker).unwrap();
+        let target = operation.path.parent().unwrap().join("outside-grant");
+        std::fs::write(&target, GRANT).unwrap();
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+        assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_none());
+        std::fs::remove_file(&marker).unwrap();
+        grant(&operation);
+        assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_some());
+    }
+
+    #[test]
+    fn binds_journal_sequence_actor_name_and_human_principal() {
+        let (_root, operation) = recorded_journal();
+        let derived = proof(&operation);
+        let record = record(&operation, "recorded");
+        let changes = vec![events::RefEventInput {
+            transaction_sequence: 1,
+            ref_name: "refs/heads/main".into(),
+            old_oid: "0".repeat(40),
+            new_oid: "a".repeat(40),
+        }];
+        assert!(derived.matches_record(&record, &changes));
+        let mut tampered = record.clone();
+        tampered.sequence += 1;
+        assert!(!derived.matches_record(&tampered, &changes));
+        let mut tampered = record.clone();
+        tampered.actor_name = "mallory".into();
+        assert!(!derived.matches_record(&tampered, &changes));
+        let mut tampered = record.clone();
+        tampered.service_principal_id = Some(Uuid::new_v4());
+        assert!(!derived.matches_record(&tampered, &changes));
+        let mut tampered = proof(&operation);
+        tampered.sequence += 1;
+        assert!(!tampered.matches_record(&record, &changes));
+        let mut tampered = proof(&operation);
+        tampered.actor_name.push('x');
+        assert!(!tampered.matches_record(&record, &changes));
     }
 
     #[test]
@@ -409,7 +520,7 @@ mod tests {
         // The recorded path needs the real grant, but the ref-free abort proof
         // must stay unavailable whenever the grant marker is present.
         assert!(crate::storage::no_grant_proof::NoGrantAbort::from_journal(&operation, "no_ref_changes").is_none());
-        std::fs::write(operation.path.join("publication.grant"), b"granted").unwrap();
+        grant(&operation);
         assert!(crate::storage::no_grant_proof::NoGrantAbort::from_journal(&operation, "no_ref_changes").is_none());
     }
 
@@ -511,6 +622,7 @@ mod tests {
         }];
         journal::record_ref_transaction_intent(&operation, &requested).unwrap();
         journal::record_ref_transaction_receipt(&operation, &requested).unwrap();
+        grant(&operation);
         journal::finish(&operation).unwrap();
         let changes = vec![events::RefEventInput {
             transaction_sequence: 1,

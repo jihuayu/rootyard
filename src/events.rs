@@ -184,6 +184,10 @@ async fn publish_in_tx_guarded(
         );
     }
     if let Some(admission) = &operation.admission {
+        // The operation identity is immutable. Replaying a terminal admission
+        // or settling a new one may only use the writer that was admitted; a
+        // different operation cannot borrow another row's writer id.
+        ensure!(admission.writer_id == operation.id, "ref admission writer differs from operation");
         crate::storage::ref_admission::settle_in_tx(
             tx,
             operation.repository_id,
