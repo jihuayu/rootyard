@@ -211,10 +211,45 @@ def large_packed_refs(repo, third):
 class GitReadStepsSourceTest(unittest.TestCase):
     """Static contract of the focused production fix."""
 
+    # The git_read module is split into a thin façade plus focused submodules:
+    # the typed command/exit/diagnostic/process runner in `command.rs` and the
+    # ref paging (seek path + bounded scan) in `paging.rs`. The static contract
+    # below pins the same production text across the whole module, never only
+    # the façade, and each part keeps its own anti-monolith bound.
+    MODULES = ("git_read.rs", "git_read/command.rs", "git_read/paging.rs")
+
+    @classmethod
+    def source(cls, relative: str) -> str:
+        return (ROOT / "src" / "browse" / relative).read_text()
+
     @classmethod
     def setUpClass(cls):
-        cls.read = (ROOT / "src" / "browse" / "git_read.rs").read_text()
+        cls.read = "\n".join(cls.source(name) for name in cls.MODULES)
         cls.process = (ROOT / "src" / "git_http" / "process.rs").read_text()
+
+    def test_split_submodules_exist_and_keep_their_line_bounds(self):
+        """Each focused submodule stays readable; the façade stays thin."""
+        for name in self.MODULES:
+            path = ROOT / "src" / "browse" / name
+            self.assertTrue(path.is_file(), f"Missing git_read submodule {path}")
+            lines = len(self.source(name).splitlines())
+            self.assertGreater(lines, 35, f"{path} looks like a stub ({lines} lines)")
+            self.assertLess(lines, 550, f"{path} exceeds the 550-line anti-monolith bound ({lines} lines)")
+        # The typed runner owns exit classification, diagnostics and the runner.
+        command = self.source("git_read/command.rs")
+        for owned in ("pub(crate) fn git_cmd(", "pub(crate) enum GitStep {", "async fn run_git("):
+            self.assertIn(owned, command)
+        # The paging module owns the seek path and the bounded scan.
+        paging = self.source("git_read/paging.rs")
+        for owned in ("async fn namespace_page(", "async fn scan_namespace_page(",
+                      "pub(crate) async fn page_refs(", "fn selects_part_of_namespace("):
+            self.assertIn(owned, paging)
+        # The façade still exports the same API surface to the rest of the crate.
+        facade = self.source("git_read.rs")
+        for reexport in ("pub(crate) use command::{GitStep, git_cmd, run_git};",
+                         "pub(crate) use paging::page_refs;",
+                         "pub use paging::parse_for_each_ref_output;"):
+            self.assertIn(reexport, facade)
 
     def test_fast_seek_path_is_retained(self):
         self.assertIn('let start_after = format!("--start-after={marker}");', self.read)
@@ -414,7 +449,7 @@ class RealGitFixtureTest(unittest.TestCase):
         # That exit is a real "absent" verdict, so Browse reports unborn (200),
         # never a 404: the production absence policy accepts exactly exit 1.
         self.assertIn("matches!(exit, Some(1))",
-                      (ROOT / "src" / "browse" / "git_read.rs").read_text())
+                      (ROOT / "src" / "browse" / "git_read" / "command.rs").read_text())
 
     def test_unknown_option_is_a_usage_exit(self):
         repo, _ = self.fixture()
