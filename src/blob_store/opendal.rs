@@ -104,6 +104,7 @@ impl BlobStore {
     /// rejects `memory` by name and this function is compiled under `cfg(test)`.
     #[cfg(test)]
     pub(crate) fn open_memory(profile: BlobProfile, resources: Arc<ResourceContext>) -> Self {
+        ensure_crypto_provider();
         let operator = Operator::new(opendal::services::Memory::default().root("/"))
             .expect("in-memory test operator")
             .finish();
