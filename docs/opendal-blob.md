@@ -1,6 +1,10 @@
 # OpenDAL Blob layer: #105 / #108
 
-Status: implementation under acceptance. Full unique-mode qualification is PENDING a root-run 21 MiB real-S3 contract test; no native conditional-create qualification is claimed. S3 and optional Azure targets compile, but this is not yet a provider, all-Blob, standalone-deployment or full #108 qualification. Real provider results must identify the precise service/profile, source and executable. Azure currently has compilation evidence only.
+Status: the new unique-attempt S3 component passed its source-bound21MiB
+provider contract at clean `eaab8cd`, including independent read-back/range
+verification, corruption rejection and disabled deletion. Optional Azure is
+compile-only. This does not complete #108 or qualify all-content Blob storage,
+standalone deployment, conditional creation, HA or physical durability.
 
 The custom S3 signer, XML multipart implementation and HTTP retry code are replaced by Apache OpenDAL 0.57.0. Minimal features select S3, Tokio execution, bounded concurrency/retry/timeout layers and `reqwest-rustls-no-provider-tls`; the application already supplies Rustls Ring. `blob-azblob` adds Azure. The project target is Rust 1.88, matching the pending security integration; OpenDAL 0.57 itself declares Rust 1.85. Cargo.lock is regenerated and reviewed, not left implicit.
 
@@ -58,31 +62,39 @@ The real case covers multipart publication through owned one-use intents, distin
 
 Follow-ups: #109 connects content ACKs and KeyProvider; #113/#114 own persistent retention; #120 owns Blob backup/restore. All-content Blob publication, removal of local authority, standalone defaults, real Azure service qualification and destructive GC remain unqualified.
 
-## Legacy adapter rebase and pending qualification
+## SDK error compatibility and current evidence
 
-The OpenDAL Blob work is now stacked on the ref-store integration head
-(schema 138 / backup format 14). The rebase keeps both parents rather than
-choosing one: the ref-store typed failure surface (`storage::remote_errors` with
-`RemoteOp`, `RemoteStoreError`, the numeric status and its fixed privacy-safe
-`Display`) is preserved and re-exported from `storage::remote_objects`, while the
-legacy `RemoteObjectStore` transport is the OpenDAL adapter.
+This branch is stacked on the RefStore operation-registry increment
+(schema138 / backup format14). The legacy content-addressed RemoteObjectStore
+paths remain stable while their S3 transport delegates to OpenDAL.
 
-The legacy adapter classifies provider failures through
-`storage::remote_provider_errors`: a passive `HttpFetch` wrapper around the
-SDK's own client records only numeric response statuses, so signing, TLS,
-retries, multipart and abort stay inside OpenDAL and no URL, header, body or
-credential is captured, formatted or logged. A failure carries the exact status
-of a `4xx`/`5xx` response observed by that operation; success statuses are never
-reported as a failure cause, two different failure statuses in one operation
-are reported as `None` instead of guessed, and an unobserved status falls back
-to a bounded provider kind (`RemoteSdkKind`). Body-stream failures carry no
-numeric status. Deadline exhaustion keeps the parent typed `timeout(op)`.
+The exact-request HttpFetch wrapper keeps signing, TLS, retry and multipart in
+the SDK. For non-2xx responses it accumulates at most64KiB of body, reuses the
+pinned Apache S3 parser, preserves its kind/retry classification, then drops
+all provider text/URL context and retains a finite status/stage marker.
+An oversized or unreadable body uses the same parser with an empty body,
+preserving status-only defaults. Successful responses pass through, including
+HTTP200 multipart provider-error documents. Concurrent parts carry their own
+error value; there is no task-local or global last-status correlation.
 
-Evidence status: the qualified numbers and native-fault evidence referenced
-above were collected on the pre-rebase head and are **not** valid for this
-rebuilt history. The rebased commits have not yet been compiled, run against a
-real S3 provider, or re-qualified against the legacy fault cases (429, 503,
-delayed response, truncated stream, local-I/O-only attribution). Those runs,
-plus a fresh check that numeric-status/transport/timeout classification still
-reaches worker diagnostics through the new bridge, are required before any
-qualification claim or PR is made for this head.
+OpenDAL0.57 has no public numeric-status/context getter. The280KiB vendored
+`opendal-service-s3` crate adds one documented public shim around its unchanged
+parser. LICENSE, NOTICE, upstream revision/archive SHA and per-file checksums
+are retained; it adds no custom S3 signing, XML parser, retry or multipart logic.
+Transport failures retain only finite SDK kind/temporary/stage values, not an
+opaque SDK source that can retain private URLs. Unknown decode/stream failures
+have no invented HTTP status. Deadline exhaustion retains typed timeout(op).
+
+283 Rust library tests passed (eight service-dependent tests explicitly ignored),
+and all-target Clippy passed with S3/Azure enabled. The provider executable from
+eaab8cd passed the one explicitly selected realS3 contract, with zero ignored
+cases; its receipt includes source/test/lock hashes and actual build flags.
+The observed multipart conditional-create weakness remains recorded above;
+fresh opaque upload intents, rather than a conditional-write claim, supply the
+new address-uniqueness contract.
+
+Legacy real-service application/fault qualification is tracked separately;
+helper/SDK-parser unit tests do not establish an actual429/503/disconnect
+fault-injection or production guarantee. Existing encrypted Pando still requires
+Vault. Serving-mode switch, KeyProvider replacement, durable roots/holds and GC
+remain #109/#110/#112-#123 work.
