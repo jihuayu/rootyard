@@ -44,11 +44,6 @@ CHECK_STATUSES = frozenset({"queued", "in_progress", "completed"})
 CHECK_CONCLUSIONS = frozenset(
     {"success", "failure", "neutral", "cancelled", "timed_out", "skipped"}
 )
-CHECK_STATUS_TRANSITIONS = {
-    "queued": frozenset({"queued", "in_progress", "completed"}),
-    "in_progress": frozenset({"in_progress", "completed"}),
-    "completed": frozenset({"completed"}),
-}
 CHECK_DIAGNOSTIC_LIMIT = 8
 
 
@@ -220,7 +215,8 @@ class PullsHarness(ForgeHarness):
             "SELECT count(*)::text || ':' || "
             + digest_filter
             + "::text || ':' || count(DISTINCT r.job_id)::text || ':' || "
-            + "count(*) FILTER (WHERE c.ci_run_id = r.id)::text "
+            + "count(*) FILTER (WHERE c.ci_run_id = r.id)::text || ':' || "
+            + "count(DISTINCT c.ci_run_id)::text "
             + "FROM ci_runs r JOIN ci_pull_sync_progress s "
             + "ON s.repository_id = r.repository_id AND s.pull_number = r.pull_number "
             + "AND s.pull_version = r.pull_version AND s.head_oid = r.head_oid "
@@ -238,6 +234,7 @@ class PullsHarness(ForgeHarness):
             matching_config=int(rows[1]),
             jobs=int(rows[2]),
             direct_links=int(rows[3]),
+            linked_ids=int(rows[4]),
         )
 
     def assert_automatic_check_row(
@@ -274,8 +271,9 @@ class PullsHarness(ForgeHarness):
         only when `(attempt, sequence)` moves forward, and a newer `attempt`
         starts a fresh status lifecycle for that same row: `completed` on
         attempt 1 may legitimately become `queued`/`in_progress` on attempt 2.
-        Status non-regression is therefore required only within one attempt; the
-        finite vocabulary and positive counters are checked for every row by
+        The API also permits another status with a later sequence in the same
+        attempt; it does not enforce a status ladder. The finite vocabulary
+        and positive counters are checked for every row by
         `assert_automatic_check_row`. When `(attempt, sequence)` did not move the
         row must be byte-identical (no silent rewrite).
         """
@@ -289,8 +287,6 @@ class PullsHarness(ForgeHarness):
         ), diff
         if after["attempt"] == before["attempt"]:
             assert after["sequence"] >= before["sequence"], diff
-            assert before["status"] in CHECK_STATUS_TRANSITIONS, diff
-            assert after["status"] in CHECK_STATUS_TRANSITIONS[before["status"]], diff
         else:
             assert after["attempt"] > before["attempt"], diff
         if (after["attempt"], after["sequence"]) == (
@@ -350,15 +346,17 @@ class PullsHarness(ForgeHarness):
             assert binding["synced_jobs"] >= 1, binding
             assert binding["matching_config"] >= 1, binding
             assert binding["jobs"] >= 1, binding
+            if binding["linked_ids"]:
+                assert binding["direct_links"] >= 1, binding
         return manual_after, automatic_after or automatic_before
 
     def restart_check_contract_selftest(self) -> None:
         """Prove the restart validators reject regressions and allow a retry.
 
         Synthetic rows only, no server or database: a legitimate retry on a
-        newer attempt must pass, while a same-attempt status regression, a
-        foreign identity, a rewritten row and a leaked/removed manual row must
-        fail. This pins the two restart bugs as fixed behaviour rather than
+        newer attempt or sequence must pass, while a foreign identity or a
+        rewritten row with unchanged counters must fail. This pins the two
+        restart bugs as fixed behaviour rather than
         mirroring the implementation in the acceptance path.
         """
         repository_id, head = self.repo["id"], "0" * 40
@@ -386,6 +384,9 @@ class PullsHarness(ForgeHarness):
         self.assert_automatic_check_row(base, repository_id, head)
         self.assert_automatic_check_row(retry, repository_id, head)
         self.assert_automatic_check_advance(base, retry)  # newer attempt, fresh lifecycle
+        sequenced = {**base, "sequence": 3, "status": "in_progress", "conclusion": None}
+        self.assert_automatic_check_row(sequenced, repository_id, head)
+        self.assert_automatic_check_advance(base, sequenced)
         rejected = (
             ({**base, "repository_id": str(uuid.uuid4())}, "foreign repository"),
             ({**base, "commit_oid": "f" * 40}, "foreign commit"),
@@ -406,15 +407,14 @@ class PullsHarness(ForgeHarness):
             raise AssertionError(
                 f"automatic check validator accepted a {label}: {self.redact(row)}"
             )
-        # A same-attempt status regression is only visible when comparing the
-        # two snapshots, so it belongs to the advance validator.
+        # Changing status without advancing the counters is still a rewrite.
         regressed = {**base, "status": "in_progress", "conclusion": None}
         try:
             self.assert_automatic_check_advance(base, regressed)
         except AssertionError:
             pass
         else:
-            raise AssertionError("a same-attempt status regression was accepted")
+            raise AssertionError("an unsequenced status rewrite was accepted")
         rewritten = {**base, "output": "rewritten", "updated_at": "2026-01-01 00:00:03+00"}
         try:
             self.assert_automatic_check_advance(base, rewritten)
