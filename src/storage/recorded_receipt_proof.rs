@@ -229,7 +229,7 @@ mod tests {
     use crate::{events, journal};
     use uuid::Uuid;
 
-    fn operation(root: &std::path::Path, writer: Uuid) -> journal::Operation {
+    fn journal_operation(root: &std::path::Path, writer: Uuid) -> journal::Operation {
         let (operation, active) = journal::begin_active_with(
             root,
             Uuid::new_v4(),
@@ -261,7 +261,7 @@ mod tests {
 
     fn recorded_journal() -> (tempfile::TempDir, journal::Operation) {
         let root = tempfile::tempdir().unwrap();
-        let operation = operation(root.path(), Uuid::new_v4());
+        let operation = journal_operation(root.path(), Uuid::new_v4());
         let requested = vec![change("refs/heads/main", '0', 'a'), change("refs/heads/other", '0', 'b')];
         // Non-atomic push: `other` fails, so the successful subset is `main`.
         journal::record_ref_transaction_intent(&operation, &requested).unwrap();
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn rejects_missing_request_receipt_or_committed_hook() {
         let root = tempfile::tempdir().unwrap();
-        let operation = operation(root.path(), Uuid::new_v4());
+        let operation = journal_operation(root.path(), Uuid::new_v4());
         // Receipt and committed event without the pre-receive request.
         journal::record_ref_transaction_receipt(&operation, &[change("refs/heads/main", '0', 'a')]).unwrap();
         grant(&operation);
@@ -336,7 +336,7 @@ mod tests {
         assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_none());
 
         let root = tempfile::tempdir().unwrap();
-        let operation = operation(root.path(), Uuid::new_v4());
+        let operation = journal_operation(root.path(), Uuid::new_v4());
         // Request only: Git was admitted but never acknowledged a ref.
         journal::record_ref_transaction_intent(&operation, &[change("refs/heads/main", '0', 'a')]).unwrap();
         grant(&operation);
@@ -344,7 +344,7 @@ mod tests {
         assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_none());
 
         let root = tempfile::tempdir().unwrap();
-        let operation = operation(root.path(), Uuid::new_v4());
+        let operation = journal_operation(root.path(), Uuid::new_v4());
         let requested = [change("refs/heads/main", '0', 'a')];
         journal::record_ref_transaction_intent(&operation, &requested).unwrap();
         // A bare receipt file with no committed reference-transaction event.
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn rejects_receipt_outside_request_or_committed_set() {
         let root = tempfile::tempdir().unwrap();
-        let operation = operation(root.path(), Uuid::new_v4());
+        let operation = journal_operation(root.path(), Uuid::new_v4());
         let requested = [change("refs/heads/main", '0', 'a'), change("refs/heads/other", '0', 'b')];
         journal::record_ref_transaction_intent(&operation, &requested).unwrap();
         // Receipt claims a ref that was never requested, even though the
