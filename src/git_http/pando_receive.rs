@@ -65,7 +65,7 @@ pub(super) async fn execute(
         }
         return receive_response(status, content_type, reply);
     };
-    match Box::pin(publish::publish(
+    match Box::pin(publish::publish_typed(
         &state, &repo, &actor, tenant_id, &snapshot, &prepared, &requested, &ref_guard, deadline,
     ))
     .await

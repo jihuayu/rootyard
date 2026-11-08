@@ -121,6 +121,28 @@ pub async fn publish(
     requested: &[RefChange],
     guard: &PublicationGuard,
     deadline: Instant,
+) -> Result<i64, Error> {
+    publish_typed(state, repo, actor, tenant_id, snapshot, prepared, requested, guard, deadline)
+        .await
+        .map_err(|error| match error {
+            PublishError::RefRejected(rejection) => Error(StatusCode::CONFLICT, rejection.reason),
+            PublishError::Failed(error) => error,
+        })
+}
+
+/// Same publication as [`publish`], but preserves the typed pre-commit CAS
+/// refusal for the in-crate Git gateway. The proof must never be served as a
+/// receive-pack report by a caller that cannot prove its pre-commit nature.
+pub(crate) async fn publish_typed(
+    state: &Arc<AppState>,
+    repo: &Repository,
+    actor: &Identity,
+    tenant_id: Uuid,
+    snapshot: &Snapshot,
+    prepared: &PreparedPush,
+    requested: &[RefChange],
+    guard: &PublicationGuard,
+    deadline: Instant,
 ) -> Result<i64, PublishError> {
     if repo.storage_backend != "pando"
         || snapshot.storage_generation != repo.storage_generation
