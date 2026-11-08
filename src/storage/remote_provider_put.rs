@@ -66,7 +66,7 @@ impl LegacyS3Store {
             match tokio::time::timeout_at(tokio_deadline(deadline), observe(RemoteOp::Put, guard.writer().write(chunk)))
                 .await
             {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => guard.note_written(read),
                 Ok(Err(failure)) => {
                     let mapped = BlobError::Remote(failure.into_error());
                     guard.abort_now().await;
@@ -87,7 +87,7 @@ impl LegacyS3Store {
                 BlobError::DigestMismatch { expected: expected_sha256.to_owned(), actual }
             });
         }
-        match guard.close(tokio_deadline(deadline)).await {
+        match guard.close(tokio_deadline(deadline), UPLOAD_CHUNK as u64).await {
             Ok(()) => {}
             Err(BlobError::AlreadyExists) => {
                 // Conditional PUT conflicts can arrive only at multipart

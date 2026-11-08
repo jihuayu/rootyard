@@ -74,10 +74,24 @@ impl RemoteSdkKind {
 enum RemoteFailure {
     /// A response the SDK classified as a failed HTTP status.
     Http(u16),
+    /// A failed HTTP response plus the bounded classification derived by the
+    /// upstream S3 parser. No provider body, resource path or URL survives.
+    HttpTyped {
+        status: u16,
+        kind: RemoteSdkKind,
+        temporary: bool,
+    },
     /// An opaque transport/SDK error source. It is retained so the complete
     /// OpenDAL error chain survives, but it is never formatted into a message
-    /// or a log event.
+    /// or a log event. Legacy `remote_objects` callers keep this variant.
     Transport(Box<dyn std::error::Error + Send + Sync>),
+    /// A finite, source-free transport classification. It retains only the
+    /// bounded SDK kind and temporary flag: no URL, provider body or nested
+    /// error object is stored, so `source()` stays empty.
+    TransportTyped {
+        kind: RemoteSdkKind,
+        temporary: bool,
+    },
     Timeout,
     /// No numeric status was observed for this failure; only the bounded SDK
     /// family is known. It is never rendered as a pseudo HTTP code.
@@ -96,8 +110,18 @@ impl RemoteStoreError {
         Self { op, failure: RemoteFailure::Http(status) }
     }
 
+    pub(crate) fn http_typed(op: RemoteOp, status: u16, kind: RemoteSdkKind, temporary: bool) -> Self {
+        Self { op, failure: RemoteFailure::HttpTyped { status, kind, temporary } }
+    }
+
     pub(crate) fn transport(op: RemoteOp, error: Box<dyn std::error::Error + Send + Sync>) -> Self {
         Self { op, failure: RemoteFailure::Transport(error) }
+    }
+
+    /// Source-free transport classification for SDK failures that may carry a
+    /// private provider URL. Only finite values survive.
+    pub(crate) fn transport_typed(op: RemoteOp, kind: RemoteSdkKind, temporary: bool) -> Self {
+        Self { op, failure: RemoteFailure::TransportTyped { kind, temporary } }
     }
 
     pub(crate) fn timeout(op: RemoteOp) -> Self {
@@ -115,7 +139,7 @@ impl RemoteStoreError {
     /// Safe numeric HTTP status, if the failure was a completed response.
     pub(crate) fn http_status(&self) -> Option<u16> {
         match &self.failure {
-            RemoteFailure::Http(status) => Some(*status),
+            RemoteFailure::Http(status) | RemoteFailure::HttpTyped { status, .. } => Some(*status),
             _ => None,
         }
     }
@@ -128,9 +152,23 @@ impl std::fmt::Display for RemoteStoreError {
             RemoteFailure::Http(status) => {
                 write!(formatter, "remote object store {} failed with status {status}", self.op.as_str())
             }
+            RemoteFailure::HttpTyped { status, kind, temporary } => write!(
+                formatter,
+                "remote object store {} failed with status {status} provider kind {} {}",
+                self.op.as_str(),
+                kind.as_str(),
+                if *temporary { "temporary" } else { "permanent" }
+            ),
             RemoteFailure::Transport(_) => {
                 write!(formatter, "remote object store {} transport failed", self.op.as_str())
             }
+            RemoteFailure::TransportTyped { kind, temporary } => write!(
+                formatter,
+                "remote object store {} transport failed provider kind {} {}",
+                self.op.as_str(),
+                kind.as_str(),
+                if *temporary { "temporary" } else { "permanent" }
+            ),
             RemoteFailure::Timeout => write!(formatter, "remote object store {} timed out", self.op.as_str()),
             RemoteFailure::Sdk(kind) => write!(
                 formatter,
@@ -153,6 +191,7 @@ impl std::error::Error for RemoteStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.failure {
             RemoteFailure::Transport(error) => Some(error.as_ref()),
+            // Typed transport causes are finite values, not nested errors.
             _ => None,
         }
     }

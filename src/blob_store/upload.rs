@@ -28,30 +28,49 @@ pub(crate) struct UploadGuard {
     abort_timeout: Duration,
     /// `None` for the legacy adapter, which is not part of the process budget.
     lease: Option<UploadLease>,
+    /// Bytes accepted by the SDK writer so far. OpenDAL performs a single
+    /// `PutObject` when all bytes fit in one configured chunk; otherwise it
+    /// completes a multipart upload. This lets a fallback close failure keep
+    /// the real request stage without inventing one.
+    written: u64,
 }
 
 impl UploadGuard {
     /// Legacy constructor: unchanged behaviour, no process-wide slot.
     pub(crate) fn new(writer: Writer, abort_timeout: Duration) -> Self {
-        Self { writer: Some(writer), abort_timeout, lease: None }
+        Self { writer: Some(writer), abort_timeout, lease: None, written: 0 }
     }
 
     /// New BlobStore constructor: the upload slot is owned until close/abort is
     /// finished and dropped with the guard.
     pub(crate) fn new_with_lease(writer: Writer, abort_timeout: Duration, lease: UploadLease) -> Self {
-        Self { writer: Some(writer), abort_timeout, lease: Some(lease) }
+        Self { writer: Some(writer), abort_timeout, lease: Some(lease), written: 0 }
     }
 
     pub(crate) fn writer(&mut self) -> &mut Writer {
         self.writer.as_mut().expect("upload guard exposes its writer until it is closed")
     }
 
+    /// Record one successfully written chunk. Only a byte count is kept; no
+    /// payload or key is retained.
+    pub(crate) fn note_written(&mut self, bytes: usize) {
+        self.written = self.written.saturating_add(bytes as u64);
+    }
+
+    /// The close request stage implied by the writer's configured chunk size:
+    /// OpenDAL writes once (PutObject) when everything fits in one chunk, and
+    /// otherwise completes a multipart upload.
+    fn close_op(&self, chunk_bytes: u64) -> RemoteOp {
+        if self.written <= chunk_bytes { RemoteOp::Put } else { RemoteOp::MultipartComplete }
+    }
+
     /// Close and disarm on success. Any close error or timeout attempts abort.
-    pub(crate) async fn close(&mut self, deadline: Instant) -> Result<(), BlobError> {
+    pub(crate) async fn close(&mut self, deadline: Instant, chunk_bytes: u64) -> Result<(), BlobError> {
+        let op = self.close_op(chunk_bytes);
         let Some(writer) = self.writer.as_mut() else {
             return Err(BlobError::Provider("upload writer was already closed".into()));
         };
-        match timeout_at(deadline, observe(RemoteOp::Put, writer.close())).await {
+        match timeout_at(deadline, observe(op, writer.close())).await {
             Ok(Ok(_metadata)) => {
                 self.writer.take();
                 Ok(())

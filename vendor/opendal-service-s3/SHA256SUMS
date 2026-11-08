@@ -1,0 +1,24 @@
+# SHA-256 manifest for the vendored opendal-service-s3 0.57.0 tree.
+# crates.io package checksum (the .crate archive):
+313d46c9f5ae70bca26b7c3e3fbb9b639292625f28af73aa016f47e788af9deb  opendal-service-s3-0.57.0.crate
+# Files below are after the one-function local shim and provenance additions.
+afbf9d0f3560b0fd7795e81c42a0a79ee6b6fc67e064f77826aee642cad28d91  ./.cargo-ok
+d7c959580ee4807b6013e6a55f32522e921064209de9ce29e080ef9ad31b6f92  ./.cargo_vcs_info.json
+cbe17a2cc36d94b13c9284896fc102ddd3169a17469fcfd92421d9122bc4525c  ./Cargo.lock
+19a7fe6b322f661aeee5a9f3214e9405c95e70c2e23d1a5f2c70aefa552c1913  ./Cargo.toml
+538e417d2eec2a1e8a01bdc3775d1af38a3cff2217ca205543190863d77c0cbe  ./Cargo.toml.orig
+c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4  ./LICENSE
+e852f32f647898fcd6fd8bf77c2ba75036465cebdb3bb315992e3e843cf3fea9  ./NOTICE
+1568dc4dc3dbc42452549cdf5d369600e01c16a2de3c89994b3e0ce1b7fbfd7e  ./README.vendor.md
+e6bd332c9def1f3d73356d677fb361f3a47f4b5c1287bb5ec2efa7b35bddb19f  ./src/backend.rs
+5f55cce0cdff1a07652100edbb842bcb8d67271191b0099d49559fda5461bb04  ./src/compatible_services.md
+1c459348a53aa59a7fa8aa9ed136b71e288e2566afcd267b5726c253de7b1cc9  ./src/config.rs
+ba82d290a3a587f84174f0ed7fe8140af7a23b52a45e8c0d774e9563422c0b82  ./src/copier.rs
+3dd019a79626419f34b7f3290cd288dff53c2d5dcac8e174aad9f7bdb2471fbb  ./src/core.rs
+2f4f1aaeb026b5f3e706025003a60f1b01abae1354b91cc318f0d094c01508a0  ./src/deleter.rs
+4a611e65024a89207b64ad2b172fe2eaeef6d9e6e8fb436e861c05dcfacf91c2  ./src/docs.md
+2d583fbe9bd0d0881d59fe2bd450776641abee65b6558b183436e23ec44679ec  ./src/error.rs
+6aafa3197bb8547f911d8fca9425daf7c7451a10d2d676219fd87ea5b9fef9ac  ./src/lib.rs
+79f4a6a2b3d171c9f3f2ae82e0f429559928d7d42310e452878b07c61b07a156  ./src/lister.rs
+fb7928c50954c0cf07054d2f5889908aaafbcc87cc41c997795ef3048ddb0617  ./src/mod.rs
+8ee36f5461e659ee35029a07bfdd82098abccfedc22c575fa4985f1f9b7c2b07  ./src/writer.rs

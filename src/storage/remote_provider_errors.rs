@@ -1,20 +1,23 @@
 //! Typed privacy bridge between the OpenDAL adapter and the ref-store
 //! `RemoteStoreError` diagnostics surface.
 //!
-//! OpenDAL 0.57 does not expose a numeric response status through its public
-//! error API. Parsing `Display`/`Debug` text or inventing a code from an
-//! `ErrorKind` is therefore forbidden here.
+//! OpenDAL 0.57 exposes only an `ErrorKind` through its public error API. It
+//! does not expose the numeric HTTP status. Parsing `Display`/`Debug` text or
+//! inventing a status from an `ErrorKind` is therefore forbidden here.
 //!
-//! Instead the SDK's own [`HttpFetch`] client is wrapped at the exact request
+//! The SDK's own [`HttpFetch`] client is wrapped at the exact request
 //! boundary. Signing, TLS, connection pooling, redirects, retries, multipart
-//! and response parsing remain inside the SDK. For every observed non-2xx
-//! response the wrapper returns an `opendal::Error` whose private source is a
-//! [`HttpFailure`] carrying only the numeric status and one finite [`RemoteOp`]
-//! derived from the request method and fixed query keys. Successful responses
-//! pass through untouched, so an HTTP 200 carrying an embedded provider error
-//! is still parsed by the SDK and reported with no HTTP status.
+//! and successful-response parsing remain inside the SDK. For every observed
+//! non-2xx response the wrapper reads the error body with a strict 64 KiB
+//! bound, feeds that body to the pinned upstream S3 parser
+//! (`opendal_service_s3::parse_error_response`) so provider codes retain their
+//! real semantics, then discards the provider message/context and returns an
+//! `opendal::Error` whose private source is a [`HttpFailure`] carrying only the
+//! numeric status, the finite [`RemoteOp`] and the bounded SDK classification.
 //!
-//! Attribution is therefore per request: a retry that ends in a transport
+//! Successful responses pass through untouched, so an HTTP 200 carrying an
+//! embedded provider error is still parsed by the SDK and reported with no
+//! HTTP status. Attribution is per request: a retry that ends in a transport
 //! failure, or a later 200 decode failure, can never report status from an
 //! earlier 503. Concurrent multipart requests each carry their own marker.
 //! No URL, path, query value, header, credential or body is stored, logged or
@@ -29,9 +32,11 @@ use std::future::{Future, IntoFuture};
 // and `axum` re-exports the same `http` 1.x crate that `opendal-core` uses, so
 // these are the exact request/response types of the `HttpFetch` trait.
 use axum::http::{Method, Request, Response, Uri};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use opendal::raw::oio::Read as _;
 use opendal::raw::{HttpBody, HttpClient, HttpFetch};
 use opendal::{Buffer, ErrorKind, Result as SdkResult};
+use opendal_service_s3::parse_error_response;
 
 use crate::blob_store::BlobError;
 
@@ -40,15 +45,21 @@ use super::remote_errors::{RemoteOp, RemoteSdkKind, RemoteStoreError};
 /// Bounded source-chain walk. OpenDAL nests at most an SDK error plus one
 /// transport/body error; a finite limit also stops a hostile cyclic chain.
 const MAX_CAUSE_DEPTH: usize = 8;
+/// Strict ceiling for an error-response body. Only a failed response is read
+/// here, and never beyond this many bytes.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const HTTP_FAILURE_MESSAGE: &str = "remote object store request failed";
 const TRANSPORT_FAILURE_MESSAGE: &str = "remote object store transport failed";
 
 /// Private marker attached to the exact failing HTTP response. It holds only
-/// a numeric status and a finite operation label.
+/// finite values: a numeric status, an operation label and the bounded SDK
+/// classification derived by the upstream parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HttpFailure {
     status: u16,
     op: RemoteOp,
+    kind: RemoteSdkKind,
+    temporary: bool,
 }
 
 impl fmt::Display for HttpFailure {
@@ -60,10 +71,21 @@ impl fmt::Display for HttpFailure {
 
 impl StdError for HttpFailure {}
 
-/// Private marker for a request that produced no HTTP response at all. The
-/// original SDK error is retained as an opaque source so the provider error
-/// chain survives; `Display`/`Debug` never format it.
-struct NetworkFailure(Box<dyn StdError + Send + Sync>);
+/// Finite transport classification for a request that produced no HTTP
+/// response at all. It deliberately stores no SDK error: OpenDAL's public API
+/// does not let us extract an owned URL-free underlying cause, and its error
+/// text/context may contain the request URL. Keeping only the kind and
+/// temporary flag is the strongest privacy-preserving contract possible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TransportCause {
+    kind: RemoteSdkKind,
+    temporary: bool,
+}
+
+struct NetworkFailure {
+    op: RemoteOp,
+    cause: TransportCause,
+}
 
 impl fmt::Display for NetworkFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -79,14 +101,15 @@ impl fmt::Debug for NetworkFailure {
 
 impl StdError for NetworkFailure {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        Some(self.0.as_ref())
+        // No original SDK error and no URL-bearing provider context is kept.
+        None
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cause {
-    Http { status: u16, op: RemoteOp },
-    Transport,
+    Http { status: u16, op: RemoteOp, kind: RemoteSdkKind, temporary: bool },
+    Transport { op: RemoteOp, cause: TransportCause },
 }
 
 /// Walk the bounded source chain for private markers only.
@@ -95,48 +118,62 @@ fn exact_cause(error: &(dyn StdError + 'static)) -> Option<Cause> {
     for _ in 0..MAX_CAUSE_DEPTH {
         let source = next?;
         if let Some(http) = source.downcast_ref::<HttpFailure>() {
-            return Some(Cause::Http { status: http.status, op: http.op });
+            return Some(Cause::Http { status: http.status, op: http.op, kind: http.kind, temporary: http.temporary });
         }
-        if source.downcast_ref::<NetworkFailure>().is_some() {
-            return Some(Cause::Transport);
+        if let Some(network) = source.downcast_ref::<NetworkFailure>() {
+            return Some(Cause::Transport { op: network.op, cause: network.cause });
         }
         next = source.source();
     }
     None
 }
 
-/// Map an observed HTTP status to the SDK's bounded control-flow kind. This
-/// preserves the same `NotFound`/precondition classifications the S3 service
-/// would derive, without parsing a provider body or retaining its text.
-fn http_kind(status: u16) -> (ErrorKind, bool) {
-    match status {
-        403 => (ErrorKind::PermissionDenied, false),
-        404 => (ErrorKind::NotFound, false),
-        304 | 412 => (ErrorKind::ConditionNotMatch, false),
-        // Conditional create conflict: keep the SDK's retryable conflict
-        // classification so the caller's idempotent-verify path still runs.
-        409 => (ErrorKind::ConditionNotMatch, true),
-        499 => (ErrorKind::Unexpected, true),
-        500 | 502 | 503 | 504 => (ErrorKind::Unexpected, true),
-        429 => (ErrorKind::RateLimited, true),
-        _ => (ErrorKind::Unexpected, false),
-    }
-}
+/// Keep the upstream parser's kind and retry flags, but replace its provider
+/// message/context with fixed text and an exact request marker. The parsed
+/// error is dropped immediately, so no XML body, resource path or URL survives.
+fn parsed_http_failure(parsed: opendal::Error, status: u16, op: RemoteOp) -> opendal::Error {
+    let kind = parsed.kind();
+    let temporary = parsed.is_temporary();
+    let persistent = parsed.is_persistent();
+    let sdk_kind = sdk_kind(kind);
+    drop(parsed);
 
-fn http_failure(status: u16, op: RemoteOp) -> opendal::Error {
-    let (kind, temporary) = http_kind(status);
-    let mut error = opendal::Error::new(kind, HTTP_FAILURE_MESSAGE).set_source(HttpFailure { status, op });
+    let mut error = opendal::Error::new(kind, HTTP_FAILURE_MESSAGE).set_source(HttpFailure {
+        status,
+        op,
+        kind: sdk_kind,
+        temporary,
+    });
     if temporary {
         error = error.set_temporary();
+    } else if persistent {
+        error = error.set_persistent();
     }
     error
 }
 
-fn network_failure(error: opendal::Error) -> opendal::Error {
+/// Bounded fallback when the error body could not be read or exceeded the
+/// 64 KiB ceiling. No body bytes are retained and no S3 code is guessed: only
+/// the observed status and a bounded `Other` classification survive.
+fn unparsed_http_failure(status: u16, op: RemoteOp) -> opendal::Error {
+    opendal::Error::new(ErrorKind::Unexpected, HTTP_FAILURE_MESSAGE).set_source(HttpFailure {
+        status,
+        op,
+        kind: RemoteSdkKind::Other,
+        temporary: false,
+    })
+}
+
+/// Convert one SDK transport failure into a finite marker. The original error
+/// may carry a URL-bearing context, so it is dropped rather than retained.
+fn network_failure(error: opendal::Error, op: RemoteOp) -> opendal::Error {
     let kind = error.kind();
     let temporary = error.is_temporary();
     let persistent = error.is_persistent();
-    let mut wrapped = opendal::Error::new(kind, TRANSPORT_FAILURE_MESSAGE).set_source(NetworkFailure(Box::new(error)));
+    let cause = TransportCause { kind: sdk_kind(kind), temporary };
+    drop(error);
+
+    let mut wrapped = opendal::Error::new(kind, TRANSPORT_FAILURE_MESSAGE).set_source(NetworkFailure { op, cause });
     if temporary {
         wrapped = wrapped.set_temporary();
     } else if persistent {
@@ -145,10 +182,22 @@ fn network_failure(error: opendal::Error) -> opendal::Error {
     wrapped
 }
 
-/// True for an SDK-level body/transport failure that did not pass through our
-/// request marker (for example the response body fails after a 200 head).
-fn is_sdk_transport(error: &opendal::Error) -> bool {
-    error.kind() == ErrorKind::Unexpected && error.source().is_some()
+/// Read at most [`MAX_ERROR_BODY_BYTES`] from an error response. The SDK's
+/// `HttpBody` stream is polled directly; `to_buffer` (which is unbounded and
+/// would retain an arbitrary provider body) is never used.
+async fn collect_error_body(mut body: HttpBody) -> Option<Buffer> {
+    let mut collected = BytesMut::with_capacity(4 * 1024);
+    loop {
+        let chunk = body.read().await.ok()?;
+        if chunk.is_empty() {
+            break;
+        }
+        if collected.len().checked_add(chunk.len())? > MAX_ERROR_BODY_BYTES {
+            return None;
+        }
+        collected.extend_from_slice(&chunk.to_bytes());
+    }
+    Some(Buffer::from(collected.freeze()))
 }
 
 fn query_has_key(uri: &Uri, key: &str) -> bool {
@@ -188,7 +237,7 @@ fn request_stage(method: &Method, uri: &Uri) -> RemoteOp {
 }
 
 /// Exact-request HTTP wrapper: successful responses pass through, every
-/// observed non-2xx response becomes an SDK error with a private marker.
+/// observed non-2xx response is classified by the upstream S3 parser.
 struct StatusAttributingFetch {
     inner: HttpClient,
 }
@@ -198,12 +247,21 @@ impl HttpFetch for StatusAttributingFetch {
         let op = request_stage(request.method(), request.uri());
         let response = match self.inner.fetch(request).await {
             Ok(response) => response,
-            Err(error) => return Err(network_failure(error)),
+            Err(error) => return Err(network_failure(error, op)),
         };
         if response.status().is_success() {
             return Ok(response);
         }
-        Err(http_failure(response.status().as_u16(), op))
+
+        let status = response.status().as_u16();
+        let (parts, body) = response.into_parts();
+        match collect_error_body(body).await {
+            Some(buffer) => {
+                let parsed = parse_error_response(Response::from_parts(parts, buffer));
+                Err(parsed_http_failure(parsed, status, op))
+            }
+            None => Err(unparsed_http_failure(status, op)),
+        }
     }
 }
 
@@ -225,14 +283,13 @@ impl RemoteFailure {
     fn classify(error: opendal::Error, fallback_op: RemoteOp) -> Self {
         let kind = error.kind();
         let cause = exact_cause(&error);
-        let sdk_transport = cause.is_none() && is_sdk_transport(&error);
         let error = match cause {
-            // Exact status and request stage of the response that failed.
-            Some(Cause::Http { status, op }) => RemoteStoreError::http(op, status),
-            Some(Cause::Transport) => RemoteStoreError::transport(fallback_op, Box::new(error)),
-            // A body/transport failure after a successful head response: no
-            // HTTP status may be attributed to it.
-            None if sdk_transport => RemoteStoreError::transport(fallback_op, Box::new(error)),
+            // Exact status, request stage and upstream S3 classification of
+            // the response that failed.
+            Some(Cause::Http { status, op, kind, temporary }) => {
+                RemoteStoreError::http_typed(op, status, kind, temporary)
+            }
+            Some(Cause::Transport { op, cause }) => RemoteStoreError::transport_typed(op, cause.kind, cause.temporary),
             // The SDK dropped its source or parsed an embedded 200 error:
             // retain only the bounded kind, never an invented status.
             None => RemoteStoreError::sdk(fallback_op, sdk_kind(kind)),
@@ -267,8 +324,8 @@ where
 
 /// One body-stream poll. A lazy reader issues its GET while being polled, so
 /// an initial non-2xx response keeps its exact HTTP marker. A body that fails
-/// after a successful 200 instead carries a transport/stream error with no
-/// HTTP status; an earlier status is never reused.
+/// after a successful 200 instead carries a finite transport/stream error with
+/// no HTTP status; an earlier status is never reused.
 pub(crate) async fn observe_body_poll<S>(op: RemoteOp, poll: S) -> Result<Option<Bytes>, BlobError>
 where
     S: Future<Output = Result<Option<Bytes>, std::io::Error>>,
@@ -282,9 +339,10 @@ where
 
 fn classify_io_error(op: RemoteOp, error: std::io::Error) -> RemoteStoreError {
     match exact_cause(&error) {
-        Some(Cause::Http { status, op }) => RemoteStoreError::http(op, status),
-        Some(Cause::Transport) => RemoteStoreError::transport(op, Box::new(error)),
-        None if error.source().is_some() => RemoteStoreError::transport(op, Box::new(error)),
+        Some(Cause::Http { status, op, kind, temporary }) => RemoteStoreError::http_typed(op, status, kind, temporary),
+        Some(Cause::Transport { op, cause }) => RemoteStoreError::transport_typed(op, cause.kind, cause.temporary),
+        // Body I/O without one of our markers: keep only the bounded Stream
+        // family. No opaque source that might contain a provider URL survives.
         None => RemoteStoreError::sdk(op, RemoteSdkKind::Stream),
     }
 }
@@ -335,45 +393,113 @@ mod tests {
         RemoteFailure::classify(error, RemoteOp::Put).into_error()
     }
 
-    #[test]
-    fn exact_failed_response_keeps_status_and_request_stage() {
-        let part = classify(http_failure(503, RemoteOp::MultipartPart));
-        assert_eq!(part.http_status(), Some(503));
-        assert_eq!(part.op(), RemoteOp::MultipartPart);
+    fn classify_failure(error: opendal::Error) -> RemoteFailure {
+        RemoteFailure::classify(error, RemoteOp::Put)
+    }
 
-        let complete = classify(http_failure(412, RemoteOp::MultipartComplete));
-        assert_eq!(complete.http_status(), Some(412));
-        assert_eq!(complete.op(), RemoteOp::MultipartComplete);
+    fn upstream_parse(status: u16, body: &str) -> opendal::Error {
+        let mut response = Response::new(Buffer::from(body.as_bytes().to_vec()));
+        *response.status_mut() = axum::http::StatusCode::from_u16(status).expect("test status");
+        parsed_http_failure(parse_error_response(response), status, RemoteOp::Get)
     }
 
     #[test]
-    fn observed_status_preserves_control_flow_and_temporary_flags() {
-        assert_eq!(http_failure(404, RemoteOp::Get).kind(), ErrorKind::NotFound);
+    fn no_such_bucket_404_is_config_invalid() {
+        let failure = classify_failure(upstream_parse(
+            404,
+            r#"<Error><Code>NoSuchBucket</Code><Message>no such bucket</Message><Resource>/private/bucket</Resource><RequestId>x</RequestId></Error>"#,
+        ));
+        assert_eq!(failure.kind, ErrorKind::ConfigInvalid);
+        assert!(!failure.is_not_found());
+        let error = failure.into_error();
+        assert_eq!(error.http_status(), Some(404));
+        assert_eq!(error.op(), RemoteOp::Get);
+    }
 
-        let precondition = http_failure(412, RemoteOp::MultipartComplete);
-        assert_eq!(precondition.kind(), ErrorKind::ConditionNotMatch);
-        assert!(!precondition.is_temporary());
+    #[test]
+    fn request_timeout_400_stays_retryable() {
+        let failure = classify_failure(upstream_parse(
+            400,
+            r#"<Error><Code>RequestTimeout</Code><Message>request timed out</Message></Error>"#,
+        ));
+        assert_eq!(failure.kind, ErrorKind::Unexpected);
+        assert!(!failure.is_conflict());
+        let error = failure.into_error();
+        assert_eq!(error.http_status(), Some(400));
+    }
 
-        let conflict = http_failure(409, RemoteOp::MultipartComplete);
-        assert_eq!(conflict.kind(), ErrorKind::ConditionNotMatch);
-        assert!(conflict.is_temporary());
+    #[test]
+    fn operation_aborted_409_is_unexpected_not_conditional() {
+        let failure = classify_failure(upstream_parse(
+            409,
+            r#"<Error><Code>OperationAborted</Code><Message>conflicting operation</Message></Error>"#,
+        ));
+        assert_eq!(failure.kind, ErrorKind::Unexpected);
+        assert!(!failure.is_conflict());
+        let error = failure.into_error();
+        assert_eq!(error.http_status(), Some(409));
+    }
 
-        let unavailable = http_failure(503, RemoteOp::MultipartPart);
-        assert_eq!(unavailable.kind(), ErrorKind::Unexpected);
-        assert!(unavailable.is_temporary());
+    #[test]
+    fn normal_412_remains_permanent_condition_not_match() {
+        let failure = classify_failure(upstream_parse(
+            412,
+            r#"<Error><Code>PreconditionFailed</Code><Message>precondition failed</Message></Error>"#,
+        ));
+        assert_eq!(failure.kind, ErrorKind::ConditionNotMatch);
+        assert!(failure.is_conflict());
+        let error = failure.into_error();
+        assert_eq!(error.http_status(), Some(412));
+    }
 
-        let limited = http_failure(429, RemoteOp::Get);
-        assert_eq!(limited.kind(), ErrorKind::RateLimited);
-        assert!(limited.is_temporary());
+    #[test]
+    fn exact_failed_response_keeps_status_and_request_stage() {
+        let part = classify(upstream_parse(503, "<Error><Code>InternalError</Code></Error>"));
+        assert_eq!(part.http_status(), Some(503));
+        assert_eq!(part.op(), RemoteOp::Get);
+    }
+
+    #[test]
+    fn oversized_error_body_is_bounded_and_never_parsed() {
+        let body = "x".repeat(MAX_ERROR_BODY_BYTES + 1);
+        let error = unparsed_http_failure(503, RemoteOp::MultipartComplete);
+        let failure = classify_failure(error);
+        assert_eq!(failure.kind, ErrorKind::Unexpected);
+        let typed = failure.into_error();
+        assert_eq!(typed.http_status(), Some(503));
+        assert_eq!(typed.op(), RemoteOp::MultipartComplete);
+        assert!(!typed.to_string().contains(&body));
+    }
+
+    #[test]
+    fn transport_marker_is_finite_and_carries_the_exact_request_stage() {
+        let error = network_failure(
+            opendal::Error::new(ErrorKind::Unexpected, "connection reset at https://example.invalid/private")
+                .with_context("url", "https://user:secret@example.invalid/private/object?token=secret"),
+            RemoteOp::MultipartPart,
+        );
+        let failure = classify_failure(error);
+        assert_eq!(failure.kind, ErrorKind::Unexpected);
+        let typed = failure.into_error();
+        assert_eq!(typed.http_status(), None);
+        assert_eq!(typed.op(), RemoteOp::MultipartPart);
+        let display = typed.to_string();
+        let debug = format!("{typed:?}");
+        assert!(display.contains("transport failed"));
+        for rendered in [display, debug] {
+            assert!(!rendered.contains("://"));
+            assert!(!rendered.contains("secret"));
+            assert!(!rendered.contains("/private"));
+            assert!(!rendered.contains("token"));
+        }
     }
 
     #[test]
     fn a_prior_503_is_not_reused_for_a_later_transport_failure() {
-        let stale = classify(http_failure(503, RemoteOp::Get));
+        let stale = classify(upstream_parse(503, "<Error><Code>InternalError</Code></Error>"));
         assert_eq!(stale.http_status(), Some(503));
 
-        let transport = opendal::Error::new(ErrorKind::Unexpected, "request failed")
-            .set_source(NetworkFailure(Box::new(opendal::Error::new(ErrorKind::Unexpected, "connection reset"))));
+        let transport = network_failure(opendal::Error::new(ErrorKind::Unexpected, "connection reset"), RemoteOp::Put);
         let later = classify(transport);
         assert_eq!(later.http_status(), None);
         assert_eq!(later.op(), RemoteOp::Put);
@@ -382,7 +508,7 @@ mod tests {
 
     #[test]
     fn a_prior_503_is_not_reused_for_a_200_embedded_provider_error() {
-        let stale = classify(http_failure(503, RemoteOp::Get));
+        let stale = classify(upstream_parse(503, "<Error><Code>InternalError</Code></Error>"));
         assert_eq!(stale.http_status(), Some(503));
 
         // The SDK parsed an error document carried by HTTP 200: no source and
@@ -394,30 +520,33 @@ mod tests {
 
     #[test]
     fn concurrent_requests_keep_their_own_status_and_stage() {
-        // Deliberately classify in reverse completion order: each marker is
-        // bound to its own request, so no operation-global state can leak.
-        let complete = classify(http_failure(429, RemoteOp::MultipartComplete));
-        let part = classify(http_failure(403, RemoteOp::MultipartPart));
-        assert_eq!((complete.http_status(), complete.op()), (Some(429), RemoteOp::MultipartComplete));
-        assert_eq!((part.http_status(), part.op()), (Some(403), RemoteOp::MultipartPart));
+        let complete = classify(upstream_parse(429, "<Error><Code>SlowDown</Code></Error>"));
+        let part = classify(upstream_parse(403, "<Error><Code>AccessDenied</Code></Error>"));
+        assert_eq!((complete.http_status(), complete.op()), (Some(429), RemoteOp::Get));
+        assert_eq!((part.http_status(), part.op()), (Some(403), RemoteOp::Get));
     }
 
     #[test]
     fn initial_body_get_failure_keeps_the_exact_http_tag() {
-        let error = std::io::Error::new(std::io::ErrorKind::Interrupted, http_failure(503, RemoteOp::Get));
+        let error = std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            upstream_parse(503, "<Error><Code>InternalError</Code></Error>"),
+        );
         let typed = classify_io_error(RemoteOp::Get, error);
         assert_eq!(typed.http_status(), Some(503));
         assert_eq!(typed.op(), RemoteOp::Get);
     }
 
     #[test]
-    fn mid_body_failure_after_200_has_no_http_status() {
+    fn mid_body_failure_after_200_has_no_http_status_and_no_unsafe_source() {
         let inner = opendal::Error::new(ErrorKind::Unexpected, "read body")
-            .set_source(std::io::Error::other("connection reset"));
+            .set_source(std::io::Error::other("connection reset at https://example.invalid/private"));
         let error = std::io::Error::new(std::io::ErrorKind::Interrupted, inner);
         let typed = classify_io_error(RemoteOp::Get, error);
         assert_eq!(typed.http_status(), None);
-        assert!(typed.to_string().contains("transport failed"));
+        assert!(typed.to_string().contains("provider kind stream"));
+        assert!(!typed.to_string().contains("://"));
+        assert!(!format!("{typed:?}").contains("://"));
     }
 
     #[test]

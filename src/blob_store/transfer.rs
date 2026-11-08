@@ -208,7 +208,7 @@ impl BlobStore {
             }
             let chunk = bytes::Bytes::copy_from_slice(&buffer[..read]);
             match tokio::time::timeout_at(tokio_deadline(deadline), guard.writer().write(chunk)).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => guard.note_written(read),
                 Ok(Err(error)) => {
                     let mapped = map_provider_error(error);
                     guard.abort_now().await;
@@ -233,7 +233,7 @@ impl BlobStore {
                 BlobError::DigestMismatch { expected: locator.sha256().to_owned(), actual: actual_sha256 }
             });
         }
-        guard.close(tokio_deadline(deadline)).await?;
+        guard.close(tokio_deadline(deadline), super::opendal::UPLOAD_CHUNK_BYTES as u64).await?;
         if Instant::now() >= deadline {
             // Close may have committed the object, but a late caller never gets
             // a receipt. The upload slot is released as the guard drops.
