@@ -50,6 +50,11 @@ class Harness:
         self.env.update(DATABASE_URL=self.db, ROOTYARD_DATA_DIR=str(self.root / "data"),
                         GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
                         GIT_CONFIG_GLOBAL=os.devnull, LC_ALL="C")
+        # Production admission is deliberately conservative. Functional suites
+        # perform many loopback sign-ins from one peer; widen only this
+        # disposable process budget. tests/auth_admission.py overrides it with a
+        # small threshold to exercise the production rejection path.
+        self.env["ROOTYARD_AUTH_ADMISSION_ATTEMPTS_PER_SOURCE"] = "1000"
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             self.port = s.getsockname()[1]

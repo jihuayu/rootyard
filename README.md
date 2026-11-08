@@ -104,6 +104,11 @@ The repository is the security boundary. A reader may obtain historical or unrea
 | `ROOTYARD_GIT_TIMEOUT_SECONDS` | `120` | Git request deadline |
 | `ROOTYARD_GIT_MEMORY_BYTES` | `1073741824` | Per-child address-space resource limit |
 | `ROOTYARD_MAX_REPO_BYTES` | `1073741824` | Repository size admission threshold |
+| `ROOTYARD_AUTH_ADMISSION_MAX_INFLIGHT` | `4` | Concurrent login/token-exchange/identity-lookup admissions per process; must stay below the database pool |
+| `ROOTYARD_AUTH_ADMISSION_ATTEMPTS_PER_SOURCE` | `10` | Login/identity attempts per real peer address in a fixed window |
+| `ROOTYARD_AUTH_ADMISSION_SOURCE_WINDOW_SECONDS` | `60` | Fixed per-source admission window |
+| `ROOTYARD_AUTH_ADMISSION_MAX_SOURCES` | `4096` | Maximum bounded in-memory admission source entries |
+| `ROOTYARD_AUTH_ADMISSION_SOURCE_TTL_SECONDS` | `300` | Idle admission source entry TTL; at least the window |
 | `ROOTYARD_PG_CA_PEM` | unset | CA bundle used with `sslmode=require` for certificate/hostname verification |
 | `ROOTYARD_PG_CLIENT_CERT_PEM` / `ROOTYARD_PG_CLIENT_KEY_PEM` | unset | Optional PostgreSQL client certificate and key for mutual TLS |
 
