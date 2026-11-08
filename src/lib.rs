@@ -20,6 +20,7 @@ pub mod git_http;
 pub mod journal;
 pub mod kafka_wake;
 pub mod pando_gateway;
+pub mod ref_store;
 #[rustfmt::skip]
 pub mod lfs;
 pub mod maintenance;

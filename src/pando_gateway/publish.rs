@@ -8,6 +8,7 @@ use crate::{
     db::{Identity, Repository},
     events::{self, OperationRecord, RefEventInput},
     journal::RefChange,
+    ref_store::{IssuerLane, OperationIdentity, OperationState, PgRefStore, RefStoreError, RequestDigest, TerminalOutcome, TerminalResult},
     storage::ref_publication::PublicationGuard,
 };
 use axum::http::StatusCode;
@@ -18,6 +19,46 @@ use uuid::Uuid;
 const MAX_PACKS: usize = 256;
 fn conflict() -> Error {
     Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs")
+}
+
+fn push_digest(
+    repo: &Repository,
+    tenant_id: Uuid,
+    snapshot: &Snapshot,
+    prepared: &PreparedPush,
+    actor: &Identity,
+) -> RequestDigest {
+    let mut fields: Vec<Vec<u8>> = vec![
+        repo.id.as_bytes().to_vec(),
+        tenant_id.as_bytes().to_vec(),
+        repo.storage_generation.to_be_bytes().to_vec(),
+        repo.object_format.as_bytes().to_vec(),
+        snapshot.ref_generation.to_be_bytes().to_vec(),
+        actor.id.as_bytes().to_vec(),
+    ];
+    if let Some(pack) = &prepared.pack {
+        fields.push(b"pack".to_vec());
+        fields.push(pack.id.as_bytes().to_vec());
+    }
+    for change in &prepared.changes {
+        fields.push(change.ref_name.as_bytes().to_vec());
+        fields.push(change.old_oid.as_bytes().to_vec());
+        fields.push(change.new_oid.as_bytes().to_vec());
+    }
+    let fields: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+    RequestDigest::of("pando-pg-ref-cas-v1", &fields)
+}
+
+fn ref_store_error(error: RefStoreError) -> Error {
+    if matches!(&error, RefStoreError::Timeout) {
+        Error::timeout()
+    } else if matches!(&error, RefStoreError::Cancelled { .. } | RefStoreError::UnknownOperation { .. }) {
+        conflict()
+    } else if error.is_conflict() {
+        conflict()
+    } else {
+        Error::internal(error)
+    }
 }
 
 fn deletes_head(head_ref: &str, changes: &[RefChange]) -> bool {
@@ -118,6 +159,20 @@ pub async fn publish(
     let mut pack_ids: Vec<Uuid> = current.get("pack_ids");
     let next_ref = ref_generation.checked_add(1).ok_or_else(conflict)?;
     let next_operation = operation_sequence.checked_add(1).ok_or_else(conflict)?;
+    // The server preallocates a stable identity before any ref mutation and
+    // persists its pending/terminal rows in this same PG transaction. Existing
+    // callers do not yet carry an operation id across retries, so this is NOT
+    // client-request idempotency: a retried client push is a new operation.
+    let operation_id = Uuid::new_v4();
+    let identity = OperationIdentity::new(
+        repo.id,
+        actor.id,
+        IssuerLane::new("pando-publish").map_err(Error::internal)?,
+        next_operation,
+        operation_id,
+        push_digest(repo, tenant_id, snapshot, prepared, actor),
+    )
+    .map_err(Error::internal)?;
     for change in &prepared.changes {
         let old = tx
             .query_opt(
@@ -195,6 +250,11 @@ pub async fn publish(
             .await
             .map_err(Error::internal)?;
     }
+    let ref_store = PgRefStore;
+    let begun = ref_store.begin(&tx, &identity, deadline).await.map_err(ref_store_error)?;
+    if begun.record.state() != OperationState::Pending {
+        return Err(conflict());
+    }
     for change in &prepared.changes {
         if change.new_oid.bytes().all(|byte| byte == b'0') {
             tx.execute("DELETE FROM pando_refs WHERE repository_id=$1 AND ref_name=$2", &[&repo.id, &change.ref_name])
@@ -219,7 +279,7 @@ pub async fn publish(
     .await
     .map_err(Error::internal)?;
     let record = OperationRecord {
-        id: Uuid::new_v4(),
+        id: operation_id,
         repository_id: repo.id,
         actor_id: actor.id,
         token_id: actor.token_id,
@@ -246,6 +306,18 @@ pub async fn publish(
         })
         .collect();
     events::publish_in_tx(&tx, &record, &events).await.map_err(Error::internal)?;
+    let terminal = TerminalResult::json(serde_json::json!({
+        "state": "committed",
+        "ref_generation": next_ref,
+        "operation_sequence": next_operation,
+        "pack_id": prepared.pack.as_ref().map(|pack| pack.id),
+        "change_count": prepared.changes.len(),
+    }))
+    .map_err(Error::internal)?;
+    ref_store
+        .record_terminal(&tx, &identity, TerminalOutcome::Committed, &terminal, deadline)
+        .await
+        .map_err(ref_store_error)?;
     window.ensure_active()?;
     auth::finish_tx(tx, actor, true).await?;
     state.dispatch.committed();
