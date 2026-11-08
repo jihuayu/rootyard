@@ -145,6 +145,8 @@ jobs:
         run: python3 tests/backup_ci_pins.py --binary target/debug/rootyard --report test-results/backup-ci-pins.json
       - name: Exercise durable push recovery
         run: python3 tests/reliability.py --binary target/debug/rootyard --report test-results/reliability.json
+      - name: Recover native Git receipts after token revocation
+        run: python3 tests/recorded_recovery.py --binary target/debug/rootyard --report test-results/recorded-recovery.json
       - name: Exercise offline backup and fresh database restore
         run: python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json
       - name: Exercise restored schema-003 recovery protections
@@ -185,6 +187,7 @@ jobs:
         run: python3 tests/git_views.py --binary target/debug/rootyard-view-lab --report test-results/git-views.json
       - name: Exercise Pando object store delta resolution, graph traversal, and differential export
         run: |
+          test "$(id -u)" -ne 0
           python3 tests/pando_lab.py --binary target/debug/rootyard-pando-lab
           mkdir -p test-results
           latest_pando=$(ls -td /tmp/rootyard-pando-lab-* 2>/dev/null | head -1 || true)

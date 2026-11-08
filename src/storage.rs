@@ -20,6 +20,7 @@ pub mod admission;
 pub mod encrypted_objects;
 pub mod no_grant_proof;
 pub mod read_leases;
+pub mod recorded_receipt_proof;
 pub mod ref_admission;
 pub mod ref_publication;
 mod remote_errors;

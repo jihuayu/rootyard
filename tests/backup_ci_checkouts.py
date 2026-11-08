@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Schema008 grant/tombstone backup and real format4/schema007 compatibility.
+"""Current-format grant/tombstone backup and real format4/schema007 compatibility.
 
 Only disposable synthetic PostgreSQL. --legacy-binary must be a trusted local
 schema007/format4 executable; it creates a real old archive without rewriting
@@ -20,6 +20,7 @@ from backup_ci_pins import BackupCiPinsHarness
 from ci_job_checkouts import JobCheckoutHarness
 from schema_baseline import (
     CATALOG_JSON_PATH,
+    CURRENT_BACKUP_FORMAT,
     RESTORED_CATALOG_JSON_PATH,
     SCHEMA_VERSIONS,
     SCHEMA_VERSION_CSV,
@@ -66,7 +67,7 @@ class CheckoutBackupHarness(BackupCiPinsHarness):
         self.backup_command()
         self.cli('backup-verify', str(self.backup))
         manifest = json.loads((self.backup / 'manifest.json').read_text())
-        assert manifest['format'] == 7 and manifest['schema_versions'] == SCHEMA_VERSIONS
+        assert manifest['format'] == CURRENT_BACKUP_FORMAT and manifest['schema_versions'] == SCHEMA_VERSIONS
         assert self.raw.encode() not in (self.backup / 'metadata.dump').read_bytes()
         legacy_env = self.env.copy()
         legacy_env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target))
@@ -104,7 +105,7 @@ class CheckoutBackupHarness(BackupCiPinsHarness):
         assert status == 401 and b'PACK' not in body
         self.stop_mirror()
         self.stop()
-        return dict(format7_current_schema=True, immutable_grants=True, permanent_tombstones=True,
+        return dict(current_format=CURRENT_BACKUP_FORMAT, immutable_grants=True, permanent_tombstones=True,
                     backup_then_cancel_then_restore_revokes_grant=True, raw_credential_not_persisted=True, live_old_bearer_denied_discovery_and_rpc=True,
                     ordinary_owner_restored_target_access=True, genuine_native_pin_and_issuance=True)
 
@@ -133,7 +134,7 @@ def legacy_restore(args):
         hybrid = h.root / 'hybrid-archive'
         shutil.copytree(h.backup, hybrid, symlinks=True)
         changed = copy.deepcopy(manifest)
-        changed['format'] = 7
+        changed['format'] = CURRENT_BACKUP_FORMAT
         changed['lfs_objects'] = []
         changed['schema_versions'] = SCHEMA_VERSIONS
         changed['binary_sha256'] = hashlib.sha256(Path(args.binary).read_bytes()).hexdigest()
@@ -172,7 +173,7 @@ def main():
     h = CheckoutBackupHarness(args)
     success = False
     try:
-        h.case('format7_checkout_authority_restore', h.grants)
+        h.case('current_checkout_authority_restore', h.grants)
         h.case('format4_real_legacy_restore_then_upgrade', lambda: legacy_restore(args))
         success = True
     except Exception as error:

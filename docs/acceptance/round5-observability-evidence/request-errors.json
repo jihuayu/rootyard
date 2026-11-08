@@ -1,0 +1,74 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "harness_setup_api_roundtrip",
+      "status": "passed",
+      "detail": "ok"
+    },
+    {
+      "name": "owned_sqlstate_23503_trigger_installed",
+      "status": "passed",
+      "detail": "sqlstate=23503"
+    },
+    {
+      "name": "fk_fault_http_503_generic_no_store_server_uuid",
+      "status": "passed",
+      "detail": "ok"
+    },
+    {
+      "name": "json_error_event_correlated",
+      "status": "passed",
+      "detail": "kind=database,sqlstate=23503,route=/api/repos"
+    },
+    {
+      "name": "log_privacy_no_secret_or_raw_request_content",
+      "status": "passed",
+      "detail": "checked fixed categories only"
+    },
+    {
+      "name": "database_statement_timeout_57014_http_503_generic_no_store",
+      "status": "passed",
+      "detail": "elapsed=5.02s,sqlstate=57014"
+    },
+    {
+      "name": "database_timeout_event_correlated",
+      "status": "passed",
+      "detail": "kind=database,sqlstate=57014,route=/api/repos"
+    },
+    {
+      "name": "database_timeout_log_privacy",
+      "status": "passed",
+      "detail": "checked fixed categories only"
+    },
+    {
+      "name": "owned_trigger_function_removed_before_good_request",
+      "status": "passed",
+      "detail": "ok"
+    },
+    {
+      "name": "valid_request_after_cleanup_201",
+      "status": "passed",
+      "detail": "ok"
+    },
+    {
+      "name": "authenticated_read_401_own_uuid",
+      "status": "passed",
+      "detail": "ok"
+    }
+  ],
+  "binary_sha256": "9faf71fd95691a358157be0442e2efc47b595a67d0aa3aa9d0404d5266c51a96",
+  "compiled_receipt": {
+    "path": "/workspace/scratch/round5-implementation/observability135-v1/rootyard.build.json",
+    "sha256": "9e5cbfbae2120466d13af7a62dbe62812591c38b5ed50489b2f58bc3cb1bb9e8"
+  },
+  "harness_git_head": "b7af6df71a1bfea67cca6b238126acbf326c668a",
+  "harness_e2e_sha256": "aa424e6a322675e304413e886691b52de18c72ce434376aa8049bbdf881ee454",
+  "head_label": "harness_git_head is repository HEAD at harness time, not independent build provenance",
+  "limitations": [
+    "One owned synthetic SQLSTATE 23503 trigger and one owned pg_sleep(6) trigger cancelled by statement_timeout=5000; not a forged application principal or a real user data fault.",
+    "The remote-outage typed event is covered separately by tests/lfs_hydration_concurrency.py against owned Garage; this script does not certify it.",
+    "Worker backlog, capture freshness and remote repair metrics are verified separately; this script covers request errors.",
+    "Acceptance is limited to the cases executed by this invocation and the attested executable named by its binary hash and compiled receipt."
+  ]
+}

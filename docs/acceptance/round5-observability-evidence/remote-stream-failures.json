@@ -1,0 +1,265 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "concurrent_cold_hydration",
+      "status": "passed",
+      "seconds": 13.9834,
+      "detail": {
+        "s3_backend": {
+          "host": "127.0.0.1",
+          "port": 55480,
+          "kind": "garage"
+        },
+        "oid": "8f5cf4506e665dee86206208cc569440bdc4dbea8561883d4cb43fcee3b1676d",
+        "size": 8388608,
+        "cold_start_local_missing": true,
+        "successful_singleflight": {
+          "backend_gets": 1,
+          "backend_heads": 1,
+          "follower_joined_before_release": true,
+          "both_client_bodies_overlapped": true
+        },
+        "failed_flight": {
+          "waiters_failed_explicitly": 2,
+          "retry_backend_gets": 1,
+          "responses_with_server_request_id": 2
+        },
+        "remote_failure_observability": {
+          "correlated_events": 2,
+          "kind": "remote_store",
+          "remote_op": "get",
+          "remote_status": 502,
+          "secret_or_header_text_absent": true
+        },
+        "truncated_body_flight": {
+          "waiters_failed_explicitly": 2,
+          "backend_gets_for_shared_flight": 1,
+          "retry_backend_gets": 1,
+          "partial_final_published": false,
+          "staging_leftovers": 0
+        },
+        "truncated_body_observability": {
+          "correlated_events": 2,
+          "kind": "remote_store",
+          "remote_op": "get",
+          "remote_status_present": false,
+          "raw_url_or_token_absent": true
+        },
+        "cancellation": {
+          "partial_final_never_published": true,
+          "detached_hydration_completed_valid_bytes": true,
+          "staging_leftovers": 0,
+          "fresh_flight_after_completion": true
+        },
+        "proxy_events": [
+          {
+            "kind": "pass_through",
+            "monotonic": 30821.356166,
+            "method": "HEAD",
+            "status": 404,
+            "bytes": 0
+          },
+          {
+            "kind": "pass_through",
+            "monotonic": 30821.544722,
+            "method": "PUT",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "pass_through",
+            "monotonic": 30821.549043,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "pass_through",
+            "monotonic": 30821.734878,
+            "method": "GET",
+            "status": 200,
+            "bytes": 8388608
+          },
+          {
+            "kind": "target_head_received",
+            "monotonic": 30821.948954
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30821.9517,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "target_get_received",
+            "monotonic": 30821.954049,
+            "local_final_exists": false
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30824.145799,
+            "method": "GET",
+            "status": 200,
+            "bytes": 8388608
+          },
+          {
+            "kind": "target_head_received",
+            "monotonic": 30825.003466
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30825.007817,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "target_get_received",
+            "monotonic": 30825.010855,
+            "local_final_exists": false
+          },
+          {
+            "kind": "target_get_failed",
+            "monotonic": 30827.011658
+          },
+          {
+            "kind": "target_get_received",
+            "monotonic": 30827.114548,
+            "local_final_exists": false
+          },
+          {
+            "kind": "target_get_failed",
+            "monotonic": 30827.114556
+          },
+          {
+            "kind": "target_get_received",
+            "monotonic": 30827.317003,
+            "local_final_exists": false
+          },
+          {
+            "kind": "target_get_failed",
+            "monotonic": 30827.317011
+          },
+          {
+            "kind": "target_head_received",
+            "monotonic": 30827.330723
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30827.333726,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "target_get_received",
+            "monotonic": 30827.338082,
+            "local_final_exists": false
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30827.518205,
+            "method": "GET",
+            "status": 200,
+            "bytes": 8388608
+          },
+          {
+            "kind": "target_head_received",
+            "monotonic": 30828.260051
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30828.263265,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "target_get_received",
+            "monotonic": 30828.265594,
+            "local_final_exists": false
+          },
+          {
+            "kind": "target_get_truncated",
+            "monotonic": 30830.361195,
+            "status": 200,
+            "declared": 8388608,
+            "forwarded": 32768
+          },
+          {
+            "kind": "target_head_received",
+            "monotonic": 30830.382945
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30830.389231,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "target_get_received",
+            "monotonic": 30830.393695,
+            "local_final_exists": false
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30830.589827,
+            "method": "GET",
+            "status": 200,
+            "bytes": 8388608
+          },
+          {
+            "kind": "target_head_received",
+            "monotonic": 30831.268426
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30831.271156,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "target_get_received",
+            "monotonic": 30831.274215,
+            "local_final_exists": false
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30831.656454,
+            "method": "GET",
+            "status": 200,
+            "bytes": 8388608
+          },
+          {
+            "kind": "target_head_received",
+            "monotonic": 30832.402031
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30832.405174,
+            "method": "HEAD",
+            "status": 200,
+            "bytes": 0
+          },
+          {
+            "kind": "target_get_received",
+            "monotonic": 30832.408449,
+            "local_final_exists": false
+          },
+          {
+            "kind": "target_response",
+            "monotonic": 30832.595938,
+            "method": "GET",
+            "status": 200,
+            "bytes": 8388608
+          }
+        ]
+      }
+    }
+  ],
+  "binary_sha256": "9faf71fd95691a358157be0442e2efc47b595a67d0aa3aa9d0404d5266c51a96"
+}
