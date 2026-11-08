@@ -15,6 +15,8 @@ pub mod metadata;
 pub mod pg;
 pub(crate) mod tx;
 
+pub use core::artifact_hold;
+
 pub use contract::{
     BeginReceipt, CancelReceipt, Capabilities, CommitReceipt, IssuerLane, OperationIdentity, OperationLookup,
     OperationRecord, OperationState, RefStoreError, RequestDigest, SequenceReservation, TerminalOutcome,

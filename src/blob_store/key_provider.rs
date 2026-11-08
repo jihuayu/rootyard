@@ -113,9 +113,7 @@ impl KeyId {
     pub fn parse(value: &str) -> Result<Self, KeyProviderError> {
         let valid = value.len() <= 64
             && value.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+            && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
         if !valid {
             return Err(KeyProviderError::InvalidKeyId);
         }
@@ -412,20 +410,12 @@ pub trait KeyProvider: fmt::Debug + Send + Sync {
         data_key: &[u8; DATA_KEY_BYTES],
         context: &WrapContext,
     ) -> Result<WrappedKey, KeyProviderError>;
-    fn unwrap_data_key(
-        &self,
-        wrapped: &WrappedKey,
-        context: &WrapContext,
-    ) -> Result<DataKey, KeyProviderError>;
+    fn unwrap_data_key(&self, wrapped: &WrappedKey, context: &WrapContext) -> Result<DataKey, KeyProviderError>;
     fn capabilities(&self) -> KeyProviderCapabilities;
 
     /// Default rewrap keeps the DEK byte-for-byte and only mints new wrapped
     /// metadata under the provider's current key.
-    fn rewrap_data_key(
-        &self,
-        wrapped: &WrappedKey,
-        context: &WrapContext,
-    ) -> Result<WrappedKey, KeyProviderError> {
+    fn rewrap_data_key(&self, wrapped: &WrappedKey, context: &WrapContext) -> Result<WrappedKey, KeyProviderError> {
         let data_key = self.unwrap_data_key(wrapped, context)?;
         self.wrap_data_key(data_key.expose_secret(), context)
     }
@@ -499,11 +489,7 @@ impl KeyProvider for LocalFileKeyProvider {
         self.wrap_with(&self.current, data_key, context)
     }
 
-    fn unwrap_data_key(
-        &self,
-        wrapped: &WrappedKey,
-        context: &WrapContext,
-    ) -> Result<DataKey, KeyProviderError> {
+    fn unwrap_data_key(&self, wrapped: &WrappedKey, context: &WrapContext) -> Result<DataKey, KeyProviderError> {
         wrapped.validate()?;
         // Select exactly the recorded id; never try other retained keys.
         let kek = self.key(wrapped.key_id())?;
@@ -567,8 +553,8 @@ struct KeyRingEntryWire {
 }
 
 fn parse_manifest(bytes: &[u8]) -> Result<KeyRing, KeyProviderError> {
-    let wire: KeyRingWire = serde_json::from_slice(bytes)
-        .map_err(|_| KeyProviderError::KeyRing("manifest is not valid JSON"))?;
+    let wire: KeyRingWire =
+        serde_json::from_slice(bytes).map_err(|_| KeyProviderError::KeyRing("manifest is not valid JSON"))?;
     if wire.schema != KEYRING_SCHEMA {
         return Err(KeyProviderError::KeyRing("unsupported manifest schema"));
     }
@@ -594,9 +580,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<KeyRing, KeyProviderError> {
 
 fn open_keyring_dir(directory: &Path) -> Result<File, KeyProviderError> {
     let clean = directory.is_absolute()
-        && directory
-            .components()
-            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)));
+        && directory.components().all(|component| matches!(component, Component::RootDir | Component::Normal(_)));
     if !clean {
         return Err(KeyProviderError::KeyRing("keyring directory must be a clean absolute path"));
     }
@@ -649,12 +633,7 @@ fn read_manifest(directory: &File) -> Result<KeyRing, KeyProviderError> {
 }
 
 fn read_key_file(file: File) -> Result<Zeroizing<[u8; DATA_KEY_BYTES]>, KeyProviderError> {
-    let bytes = read_regular(
-        file,
-        DATA_KEY_BYTES as u64,
-        Some(DATA_KEY_BYTES as u64),
-        KeyProviderError::KeyFile,
-    )?;
+    let bytes = read_regular(file, DATA_KEY_BYTES as u64, Some(DATA_KEY_BYTES as u64), KeyProviderError::KeyFile)?;
     let mut key = Zeroizing::new([0u8; DATA_KEY_BYTES]);
     key[..].copy_from_slice(&bytes);
     Ok(key)
@@ -687,10 +666,7 @@ fn read_regular(
         return Err(reject("size is not the required fixed length"));
     }
     let mut bytes = Zeroizing::new(Vec::new());
-    (&file)
-        .take(max.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| reject("bounded read failed"))?;
+    (&file).take(max.saturating_add(1)).read_to_end(&mut bytes).map_err(|_| reject("bounded read failed"))?;
     if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > max {
         return Err(reject("size changed during the bounded read"));
     }
@@ -721,11 +697,7 @@ fn seal(
     let cipher = cipher(kek)?;
     let mut in_out = Zeroizing::new(*data_key);
     let tag = cipher
-        .seal_in_place_separate_tag(
-            Nonce::assume_unique_for_key(*nonce),
-            Aad::from(aad),
-            &mut in_out[..],
-        )
+        .seal_in_place_separate_tag(Nonce::assume_unique_for_key(*nonce), Aad::from(aad), &mut in_out[..])
         .map_err(|_| KeyProviderError::AuthenticationFailed)?;
     let mut wrapped = [0u8; WRAPPED_DEK_BYTES];
     wrapped[..DATA_KEY_BYTES].copy_from_slice(&in_out[..]);
@@ -742,11 +714,7 @@ fn open(
     let cipher = cipher(kek)?;
     let mut in_out = Zeroizing::new(*wrapped);
     let plaintext = cipher
-        .open_in_place(
-            Nonce::assume_unique_for_key(*nonce),
-            Aad::from(aad),
-            &mut in_out[..],
-        )
+        .open_in_place(Nonce::assume_unique_for_key(*nonce), Aad::from(aad), &mut in_out[..])
         .map_err(|_| KeyProviderError::AuthenticationFailed)?;
     if plaintext.len() != DATA_KEY_BYTES {
         return Err(KeyProviderError::AuthenticationFailed);

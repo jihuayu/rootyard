@@ -19,6 +19,23 @@
 //! close/abort finished and before the post-close read-back, which needs a
 //! reader slot instead. Read-back verification holds one reader slot for the
 //! whole streamed download.
+//!
+//! This module is also the sealed boundary for both capabilities. The raw
+//! single-object write (`BlobStore::put_file`) is `pub(super)`: only the
+//! `blob_store` subtree can reach it and the production caller is the protected
+//! uploader (`blob_store::protected`) after it consumed an opaque grant. No
+//! feature-gated raw-write hook exists, so `pando-lab` builds expose exactly the
+//! same protected-only path. A receipt can be minted only by the bounded
+//! verifier below: `BlobReceipt::new` lives in the private `receipt` module and
+//! is `pub(super)` to this module, while the type itself is re-exported
+//! read-only.
+//!
+//! A consumed intent carries the physical [`super::BlobBackendIdentity`] of the
+//! store that minted it. `put_file` compares it with this store's immutable
+//! identity and returns [`BlobError::ForeignBackend`] before opening the source
+//! or touching the provider, so a grant acquired for one backend can never
+//! publish into another. The read-back receipt records the identity of the
+//! store that actually verified the bytes.
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -31,8 +48,12 @@ use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
 use tokio::{fs::File, io::AsyncReadExt};
 
+mod receipt;
+
+pub use receipt::BlobReceipt;
+
 use super::{
-    BlobError, BlobLocator, BlobReceipt, UploadIntent,
+    BlobError, BlobLocator, UploadIntent,
     budget::UploadLease,
     opendal::{BlobStore, DOWNLOAD_CHUNK_BYTES, DOWNLOAD_CONCURRENCY, map_provider_error},
     upload::UploadGuard,
@@ -117,14 +138,29 @@ impl BlobStore {
     /// and a caller cannot replay a stored locator. The caller must already know
     /// the SHA-256 and length; a mismatch aborts the provider write and yields
     /// no receipt.
-    pub async fn put_file(
+    ///
+    /// Sealed raw write: `pub(super)` keeps this reachable only inside the
+    /// `blob_store` subtree. It proves the bytes, not the authorization: the
+    /// production caller is the protected uploader after an opaque grant is
+    /// consumed, and no service route may call it directly.
+    ///
+    /// The protected uploader (`blob_store::protected`) is the only production
+    /// caller. Before any source or provider IO the intent's privately bound
+    /// backend identity is checked against this store: a foreign intent is
+    /// refused with [`BlobError::ForeignBackend`] and nothing is opened.
+    pub(super) async fn put_file(
         &self,
         intent: UploadIntent,
         source: &Path,
         deadline: Instant,
     ) -> Result<BlobReceipt, BlobError> {
-        // Moving the private field is allowed only inside blob_store descendants.
-        let UploadIntent { locator } = intent;
+        // Moving the private fields is allowed only inside blob_store descendants.
+        let UploadIntent { locator, backend_identity } = intent;
+        // Physical binding first: a foreign intent must not even open the local
+        // source, let alone acquire a slot or touch the provider.
+        if backend_identity.as_hex() != self.backend_identity().as_hex() {
+            return Err(BlobError::ForeignBackend);
+        }
         self.validate_locator(&locator)?;
         // Queueing is cancellable and completes before an owned task is spawned.
         let lease = self.resources().acquire_upload(deadline).await?;
@@ -325,6 +361,6 @@ impl BlobStore {
         if actual_sha256 != expected_sha256 {
             return Err(BlobError::DigestMismatch { expected: expected_sha256.to_owned(), actual: actual_sha256 });
         }
-        Ok(BlobReceipt::new(locator.clone(), self.provider(), actual_sha256, seen))
+        Ok(BlobReceipt::new(locator.clone(), self.provider(), self.backend_identity().clone(), actual_sha256, seen))
     }
 }

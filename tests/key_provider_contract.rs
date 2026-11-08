@@ -63,10 +63,8 @@ fn dir_path(dir: &TempDir) -> PathBuf {
 }
 
 fn write_keyring(dir: &Path, entries: &[(&str, &[u8])], current: &str) {
-    let keys: Vec<Value> = entries
-        .iter()
-        .map(|(id, bytes)| json!({ "key_id": id, "sha256": hex_digest(bytes) }))
-        .collect();
+    let keys: Vec<Value> =
+        entries.iter().map(|(id, bytes)| json!({ "key_id": id, "sha256": hex_digest(bytes) })).collect();
     let manifest = json!({ "schema": 1, "current": current, "keys": keys });
     write_private(&dir.join("keyring.json"), &serde_json::to_vec(&manifest).unwrap());
     for (id, bytes) in entries {
@@ -199,10 +197,7 @@ fn tampered_ciphertext_nonce_aad_and_version_fail_closed() {
     );
 
     let other_context = context("workspace", 0xcd);
-    assert_eq!(
-        provider.unwrap_data_key(&wrapped, &other_context).unwrap_err(),
-        KeyProviderError::ContextMismatch
-    );
+    assert_eq!(provider.unwrap_data_key(&wrapped, &other_context).unwrap_err(), KeyProviderError::ContextMismatch);
 }
 
 #[test]
@@ -233,10 +228,7 @@ fn wrapped_metadata_validation_rejects_bad_lengths_ids_and_oversize() {
 
     let mut value = original.clone();
     value["key_id"] = json!("../escape");
-    assert!(matches!(
-        WrappedKey::from_json(&serde_json::to_vec(&value).unwrap()),
-        Err(KeyProviderError::InvalidKeyId)
-    ));
+    assert!(matches!(WrappedKey::from_json(&serde_json::to_vec(&value).unwrap()), Err(KeyProviderError::InvalidKeyId)));
 
     let mut oversized = serde_json::to_vec(&original).unwrap();
     oversized.resize(1025, b' ');
@@ -399,10 +391,7 @@ fn rejects_malformed_key_files_modes_symlinks_and_fifos() {
 
 #[test]
 fn rejects_unsafe_keyring_directory_and_manifest_shapes() {
-    assert!(matches!(
-        LocalFileKeyProvider::load(Path::new("relative-keyring")),
-        Err(KeyProviderError::KeyRing(_))
-    ));
+    assert!(matches!(LocalFileKeyProvider::load(Path::new("relative-keyring")), Err(KeyProviderError::KeyRing(_))));
 
     let fixture = KeyRingFixture::new(&[(ID_V1, &key(0x71))], ID_V1);
     set_mode(&fixture.path(), 0o750);

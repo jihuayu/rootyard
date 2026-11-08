@@ -24,6 +24,7 @@
 //! machine and receipt codec), `snapshot_sql`/`snapshot_usage` (SQL-only
 //! helpers) and `snapshot_pg`/`pin_pg` (owned short transactions over migration
 //! 140).
+pub mod artifact_hold;
 pub mod command;
 pub mod contract;
 pub mod pg;

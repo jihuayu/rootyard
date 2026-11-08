@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Current-format backup roundtrip of **populated** schema140 RefStore metadata.
 
+The archive is current format17/schema141.  The six schema140 tables remain the
+only new rows this A2 fixture populates; it makes no claim about the schema141
+global artifact-hold ledger and is not a hold-row or Blob-byte backup drill.
+
 This is the acceptance drill for #107-A2.  It subclasses the inherited
 ``tests/backup_refstore_core139.py`` harness, so its seven cases are exactly the
 seven real backup cases (synthetic source, offline barrier/snapshot, corrupt
@@ -62,7 +66,7 @@ import sys
 import uuid
 
 from backup_refstore_core139 import BackupRefStoreCore139Harness, uuid_literal
-from schema_baseline import CURRENT_BACKUP_FORMAT
+from schema_baseline import CURRENT_BACKUP_FORMAT, SCHEMA_VERSIONS
 
 #: The six tables migration 140 adds.  Every one of them must be non-empty.
 NEW_TABLES = (
@@ -465,13 +469,12 @@ class BackupRefStoreSnapshot140Harness(BackupRefStoreCore139Harness):
     def lock_and_snapshot(self):
         result = super().lock_and_snapshot()
         manifest = json.loads((self.backup / "manifest.json").read_text())
-        assert manifest["format"] == CURRENT_BACKUP_FORMAT == 16, (
-            "the drill did not produce the current format 16 archive")
-        assert 138 in manifest["schema_versions"]
-        assert 139 in manifest["schema_versions"]
-        assert 140 in manifest["schema_versions"], "the archive does not record schema 140"
+        assert manifest["format"] == CURRENT_BACKUP_FORMAT, (
+            "the drill did not produce the current-format archive")
+        assert manifest["schema_versions"] == SCHEMA_VERSIONS, (
+            "the archive does not record exactly the current migration set")
         result.update({"backup_format": manifest["format"],
-                       "archive_contains_schema_versions": [138, 139, 140]})
+                       "archive_contains_schema_versions": SCHEMA_VERSIONS[-4:]})
         return result
 
     # ------------------------------------------------------------- restore 140
@@ -495,7 +498,8 @@ class BackupRefStoreSnapshot140Harness(BackupRefStoreCore139Harness):
         assert restored_gate["revision"] == self.snapshot_marker["scope"]["gate_revision"]
         assert restored_gate["history_incarnation"] == self.snapshot_marker["scope"]["history_incarnation"]
         assert self.core_rows() == self.source_core_rows, "restored migration-139 rows differ"
-        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version IN (138,139,140)") == "3"
+        assert self.sql("SELECT max(version) FROM schema_migrations") == str(SCHEMA_VERSIONS[-1])
+        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version BETWEEN 138 AND 141") == "4"
         restored_repo = self.core_repository_row()
         assert restored_repo == self.source_core_repo
         assert restored_repo["state"] == "provisioning"
@@ -638,6 +642,7 @@ def main():
                 "The migration-140 snapshot, ref, pin, receipt and usage rows are produced by the real typed PgRefStoreCore adapter and replayed through the public typed requests.",
                 "A metadata pin is not protective of Git objects: pack membership stays 'unavailable', there is no physical GC or serving claim, and the drill repository is never served.",
                 "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise.",
+                "This A2 fixture does not populate or assert the schema141 global artifact-hold ledger; hold-row roundtrip and Blob byte-closure qualification remain separate.",
                 "Only three pin lifecycles (active renewed, exactly released, database-clock expired) are covered here; concurrency, quotas and ABA races are covered by the Rust suites.",
             ],
         )

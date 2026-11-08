@@ -1,19 +1,19 @@
 //! Provider contract tests for the standalone OpenDAL Blob profile.
 //!
-//! Provider-dependent tests run **only** when `ROOTYARD_BLOB_SERVICE` and the
-//! rest of the `ROOTYARD_BLOB_*` profile are configured against a real service.
-//! Without it they print `SKIPPED` and make no provider assertion: an absent
-//! provider is never reported as a qualified provider. Purely local assertions
-//! (strict profile parsing, locator/layout invariants) always run.
+//! These cases live inside the `blob_store` subtree (`#[cfg(test)]`) so they can
+//! call the sealed raw writer directly. There is no feature-gated public
+//! raw-write hook: every feature combination, including `pando-lab`, exposes only
+//! the protected uploader, and production builds contain no raw-write entry
+//! point outside this subtree.
+//!
+//! Provider-dependent tests are explicitly `#[ignore = "requires real
+//! ROOTYARD_BLOB_* provider"]` and are mandatory-configured when invoked with
+//! `--ignored`: a missing profile panics that case instead of being reported as
+//! skipped or passed. Purely local assertions (strict profile parsing,
+//! locator/layout invariants, backend-identity binding and foreign-intent
+//! refusal) run as normal unit tests over the `cfg(test)` memory operator.
+
 use futures_util::FutureExt;
-use rootyard::{
-    blob_store::{
-        BlobDeletePolicy, BlobError, BlobLocator, BlobProvider,
-        config::BlobProfile,
-        opendal::{BlobStore, MAX_RANGE_BYTES},
-    },
-    storage::remote_objects::ObjectKey,
-};
 use sha2::{Digest, Sha256};
 use std::panic::AssertUnwindSafe;
 use std::{
@@ -23,6 +23,15 @@ use std::{
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+
+use super::{
+    BlobBackendIdentity, BlobDeletePolicy, BlobError, BlobLocator, BlobProvider,
+    budget::{LEASE_UNIT_BYTES, ResourceLimits},
+    config::BlobProfile,
+    opendal::{BlobStore, MAX_RANGE_BYTES},
+    test_support,
+};
+use crate::storage::remote_objects::ObjectKey;
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(180)
@@ -40,6 +49,10 @@ fn sha256_file(path: &Path) -> String {
         hash.update(&buffer[..read]);
     }
     hex::encode(hash.finalize())
+}
+
+fn private_limits() -> ResourceLimits {
+    ResourceLimits::new(1, 1, 4 * LEASE_UNIT_BYTES).expect("private test limits")
 }
 
 #[test]
@@ -80,9 +93,69 @@ fn locator_binds_tenant_authority_generation_attempt_and_keeps_legacy_paths() {
     assert_eq!(scoped.path(), format!("tenants/{tenant}/authorities/{authority}/g7/pando-pack/{digest}"));
 }
 
+#[test]
+fn backend_identity_is_deterministic_canonical_hex() {
+    let limits = private_limits();
+    let profile = BlobProfile::memory_profile(limits);
+    let first = BlobBackendIdentity::from_profile(&profile);
+    let second = BlobBackendIdentity::from_profile(&profile);
+    assert_eq!(first, second, "the same actual profile mapping must yield one identity");
+    assert_eq!(first.as_hex().len(), 64);
+    assert!(
+        first.as_hex().bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "identity hex must be lowercase sha256"
+    );
+    let cloned = first.clone();
+    assert_eq!(cloned.as_hex(), first.as_hex(), "cloning identity data must preserve its hex");
+
+    // A cfg(test) memory operator is not an S3 realm: its identity is its own
+    // fresh realm, never the synthetic profile's mapping.
+    let (memory, _) = test_support::store(limits);
+    assert_ne!(memory.backend_identity(), &first);
+    assert_ne!(memory.backend_identity().as_hex(), first.as_hex());
+}
+
 #[tokio::test]
-#[ignore = "requires a disposable real ROOTYARD_BLOB_* provider and owned-key fault injection"]
+async fn receipt_and_intent_bind_the_actual_store_identity() {
+    let limits = private_limits();
+    let (blob, _) = test_support::store(limits);
+    let bytes = b"backend identity binding";
+    let dir = tempfile::tempdir().unwrap();
+    let source = test_support::write_source(dir.path(), bytes);
+    let intent = test_support::upload(&blob, "identity", bytes);
+    let locator = intent.locator().clone();
+
+    assert_eq!(intent.backend_identity(), blob.backend_identity());
+    let receipt = blob.put_file(intent, &source, deadline()).await.expect("publish");
+    assert!(receipt.matches(&locator), "metadata equality still works for compatibility");
+    assert_eq!(receipt.backend_identity(), blob.backend_identity());
+    assert_eq!(receipt.provider(), blob.provider());
+}
+
+#[tokio::test]
+async fn foreign_backend_intent_is_rejected_before_source_io() {
+    let limits = private_limits();
+    let (mint_store, _) = test_support::store(limits);
+    let (other_store, _) = test_support::store(limits);
+    assert_ne!(mint_store.backend_identity(), other_store.backend_identity());
+
+    let bytes = b"foreign backend";
+    let intent = test_support::upload(&mint_store, "foreign", bytes);
+    let locator = intent.locator().clone();
+    assert_eq!(intent.backend_identity(), mint_store.backend_identity());
+
+    // The source does not exist: reaching a source-open error instead of
+    // ForeignBackend would prove the check ran too late.
+    let missing = std::path::Path::new("/nonexistent/rootyard-foreign-source");
+    assert!(matches!(other_store.put_file(intent, missing, deadline()).await, Err(BlobError::ForeignBackend)));
+    assert_eq!(other_store.head(&locator, deadline()).await.unwrap(), None);
+}
+
+#[tokio::test]
+#[ignore = "requires real ROOTYARD_BLOB_* provider"]
 async fn real_provider_publish_verify_range_delete_contract() {
+    // `--ignored` is mandatory-configured: a missing profile panics here and is
+    // never reported as skipped or passed.
     let profile = BlobProfile::from_env().expect("real provider configuration is required");
     let store = BlobStore::open(profile.clone()).expect("configured real provider must pass startup capability gate");
     let raw = fixture_operator(&profile);
@@ -99,7 +172,8 @@ async fn real_provider_publish_verify_range_delete_contract() {
     let tenant = Uuid::new_v4();
     let authority = Uuid::new_v4();
 
-    // Fresh one-use intents: the attempt id is minted inside the byte layer.
+    // Fresh one-use intents: the attempt id is minted inside the byte layer, and
+    // each intent is privately bound to this store's physical backend.
     let first_intent =
         store.new_upload(tenant, authority, 1, "contract", &digest, size).expect("first intent must be minted");
     // A read-only locator may be cloned from stored metadata before the write
@@ -110,11 +184,14 @@ async fn real_provider_publish_verify_range_delete_contract() {
     let second = second_intent.locator().clone();
     assert_ne!(first.attempt_id(), second.attempt_id());
     assert_ne!(first.path(), second.path(), "fresh intents must never share an attempt path");
+    assert_eq!(first_intent.backend_identity(), store.backend_identity());
+    assert_eq!(second_intent.backend_identity(), store.backend_identity());
 
     let mut owned_keys = vec![first.path(), second.path()];
     let outcome = AssertUnwindSafe(async {
         let receipt = store.put_file(first_intent, &source, deadline()).await.expect("first attempt publish");
         assert!(receipt.matches(&first));
+        assert_eq!(receipt.backend_identity(), store.backend_identity());
         assert_eq!(receipt.verified_sha256(), digest);
         assert_eq!(receipt.verified_length(), size);
 
@@ -125,6 +202,7 @@ async fn real_provider_publish_verify_range_delete_contract() {
             .await
             .expect("cross-client receipt re-verification");
         assert!(reverified.matches(&first));
+        assert_eq!(reverified.backend_identity(), independent.backend_identity());
 
         // Publishing the same bytes under a fresh intent allocates a distinct
         // address; the old single-locator retry API no longer exists.
@@ -219,7 +297,7 @@ async fn real_provider_publish_verify_range_delete_contract() {
 }
 
 fn fixture_operator(profile: &BlobProfile) -> opendal::Operator {
-    use rootyard::blob_store::config::BlobCredentials;
+    use super::config::BlobCredentials;
     let result = match profile.credentials() {
         BlobCredentials::S3 { access_key_id, secret_access_key, session_token } => {
             let mut builder = opendal::services::S3::default()

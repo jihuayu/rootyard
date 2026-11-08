@@ -18,7 +18,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::{
-    BlobError, BlobLocator, BlobProvider, UploadIntent,
+    BlobBackendIdentity, BlobError, BlobLocator, BlobProvider, UploadIntent,
     budget::{self, ResourceContext},
     config::{BlobCredentials, BlobProfile},
 };
@@ -60,6 +60,10 @@ pub struct BlobStore {
     capabilities: BlobCapabilities,
     /// The one process-wide upload/reader/staging budget this store charges.
     resources: Arc<ResourceContext>,
+    /// Immutable physical identity of the profile whose operator was opened.
+    /// Cloned into every intent and receipt minted by this store; it is derived
+    /// from the actual store mapping, never from a caller's logical scope.
+    backend_identity: BlobBackendIdentity,
 }
 
 impl BlobStore {
@@ -96,7 +100,10 @@ impl BlobStore {
                 profile.provider().as_str()
             )));
         }
-        Ok(Self { profile, operator, capabilities, resources })
+        // Derived from the profile whose operator was actually built above, so
+        // the identity describes the store this handle will really talk to.
+        let backend_identity = BlobBackendIdentity::from_profile(&profile);
+        Ok(Self { profile, operator, capabilities, resources, backend_identity })
     }
 
     /// Build a store over the in-process `memory` service for IO lifecycle unit
@@ -116,7 +123,10 @@ impl BlobStore {
             conditional_create: capability.write_with_if_not_exists,
         };
         assert!(capabilities.stat && capabilities.read && capabilities.write);
-        Self { profile, operator, capabilities, resources }
+        // A memory operator is not an S3/Azure realm. Give it its own fresh
+        // realm identity instead of pretending the synthetic profile's mapping.
+        let backend_identity = BlobBackendIdentity::memory_test_realm();
+        Self { profile, operator, capabilities, resources, backend_identity }
     }
 
     pub fn resources(&self) -> &Arc<ResourceContext> {
@@ -127,7 +137,7 @@ impl BlobStore {
         self.capabilities
     }
 
-    pub fn profile(&self) -> &BlobProfile {
+    pub(super) fn profile(&self) -> &BlobProfile {
         &self.profile
     }
 
@@ -135,11 +145,21 @@ impl BlobStore {
         self.profile.provider()
     }
 
-    pub(crate) fn operator(&self) -> &Operator {
+    /// Immutable physical backend identity of this opened store. Read-only
+    /// data: it is not a write capability and cannot be built from stored hex.
+    pub fn backend_identity(&self) -> &BlobBackendIdentity {
+        &self.backend_identity
+    }
+
+    /// Raw operator access is sealed to the `blob_store` subtree. This is the
+    /// only place a provider handle exists; no sibling subtree or service path
+    /// can name it.
+    pub(super) fn operator(&self) -> &Operator {
         &self.operator
     }
 
-    pub(crate) fn object_path(&self, locator: &BlobLocator) -> String {
+    /// Provider object path is sealed for the same reason as `operator`.
+    pub(super) fn object_path(&self, locator: &BlobLocator) -> String {
         self.profile.object_path(locator)
     }
 
@@ -158,7 +178,9 @@ impl BlobStore {
     ) -> Result<UploadIntent, BlobError> {
         let locator = BlobLocator::new(tenant_id, authority_id, generation, Uuid::new_v4(), namespace, sha256, length)?;
         self.validate_locator(&locator)?;
-        Ok(UploadIntent::new(locator))
+        // The caller supplies the logical authority scope only; the physical
+        // backend is always this opened store's own identity.
+        Ok(UploadIntent::new(locator, self.backend_identity.clone()))
     }
 
     /// Reject a locator whose digest/length pair exceeds the configured ceiling
@@ -206,44 +228,63 @@ fn build_operator(profile: &BlobProfile) -> Result<Operator, BlobError> {
 }
 
 fn s3_operator(profile: &BlobProfile) -> Result<Operator, BlobError> {
-    let BlobCredentials::S3 { access_key_id, secret_access_key, session_token } = profile.credentials() else {
-        return Err(BlobError::Config("credential kind does not match the s3 provider".into()));
-    };
-    // Setters consume the builder in 0.57, so chain/reassign explicitly.
-    let mut builder = S3::default()
-        .bucket(profile.bucket())
-        .root(profile.root())
-        .disable_config_load()
-        .disable_ec2_metadata()
-        .access_key_id(access_key_id)
-        .secret_access_key(secret_access_key);
-    if let Some(region) = profile.region() {
-        builder = builder.region(region);
+    // A cfg-aware `match`, not `let ... else`: with `blob-azblob` off this enum
+    // has exactly one variant, so an irrefutable `let` would make the `else`
+    // clause unreachable (clippy `irrefutable_let_patterns`). Gating the
+    // rejection arm on the feature keeps Azure-only credential mismatch refusal
+    // when Azure is compiled in and keeps the match exhaustive in both feature
+    // matrices, with no lint suppression.
+    match profile.credentials() {
+        BlobCredentials::S3 { access_key_id, secret_access_key, session_token } => {
+            // Setters consume the builder in 0.57, so chain/reassign explicitly.
+            let mut builder = S3::default()
+                .bucket(profile.bucket())
+                .root(profile.root())
+                .disable_config_load()
+                .disable_ec2_metadata()
+                .access_key_id(access_key_id)
+                .secret_access_key(secret_access_key);
+            if let Some(region) = profile.region() {
+                builder = builder.region(region);
+            }
+            if let Some(endpoint) = profile.endpoint() {
+                builder = builder.endpoint(endpoint.as_str());
+            }
+            if let Some(token) = session_token.as_deref() {
+                builder = builder.session_token(token);
+            }
+            let builder = Operator::new(builder).map_err(map_provider_error)?;
+            Ok(finish_operator!(builder, profile))
+        }
+        #[cfg(feature = "blob-azblob")]
+        BlobCredentials::Azblob { .. } => {
+            Err(BlobError::Config("credential kind does not match the s3 provider".into()))
+        }
     }
-    if let Some(endpoint) = profile.endpoint() {
-        builder = builder.endpoint(endpoint.as_str());
-    }
-    if let Some(token) = session_token.as_deref() {
-        builder = builder.session_token(token);
-    }
-    let builder = Operator::new(builder).map_err(map_provider_error)?;
-    Ok(finish_operator!(builder, profile))
 }
 
 #[cfg(feature = "blob-azblob")]
 fn azblob_operator(profile: &BlobProfile) -> Result<Operator, BlobError> {
-    let BlobCredentials::Azblob { account_name, account_key } = profile.credentials() else {
-        return Err(BlobError::Config("credential kind does not match the azblob provider".into()));
-    };
-    let endpoint = profile.endpoint().ok_or_else(|| BlobError::Config("azblob needs an explicit endpoint".into()))?;
-    let builder = Azblob::default()
-        .container(profile.bucket())
-        .root(profile.root())
-        .account_name(account_name)
-        .account_key(account_key)
-        .endpoint(endpoint.as_str());
-    let builder = Operator::new(builder).map_err(map_provider_error)?;
-    Ok(finish_operator!(builder, profile))
+    // Same cfg-aware shape as `s3_operator`: both variants exist here because
+    // this function is only compiled with `blob-azblob`, so the S3 arm is the
+    // reachable credential-kind rejection instead of an unreachable `else`.
+    match profile.credentials() {
+        BlobCredentials::Azblob { account_name, account_key } => {
+            let endpoint =
+                profile.endpoint().ok_or_else(|| BlobError::Config("azblob needs an explicit endpoint".into()))?;
+            let builder = Azblob::default()
+                .container(profile.bucket())
+                .root(profile.root())
+                .account_name(account_name)
+                .account_key(account_key)
+                .endpoint(endpoint.as_str());
+            let builder = Operator::new(builder).map_err(map_provider_error)?;
+            Ok(finish_operator!(builder, profile))
+        }
+        BlobCredentials::S3 { .. } => {
+            Err(BlobError::Config("credential kind does not match the azblob provider".into()))
+        }
+    }
 }
 
 /// Classify provider failures by stable kind only. The full OpenDAL error

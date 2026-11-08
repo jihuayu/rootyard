@@ -86,10 +86,13 @@ jobs:
         run: cargo test --locked --features pando-lab --test outbox --test resolution_fences -- --ignored
       - name: Verify PostgreSQL RefStore registry and metadata-core contracts
         timeout-minutes: 5
-        run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core --test ref_store_core_snapshot -- --ignored --test-threads=1
+        run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core --test ref_store_core_snapshot --test ref_store_artifact_holds -- --ignored --test-threads=1
       - name: Build selected source-bound populated snapshot fixture integration test
         timeout-minutes: 10
         run: python3 scripts/build_native_test.py --test ref_store_snapshot_backup_fixture --features pando-lab --output test-results/refstore-snapshot-fixture
+      - name: Build selected source-bound populated artifact-hold fixture integration test
+        timeout-minutes: 10
+        run: python3 scripts/build_native_test.py --test ref_store_holds_backup_fixture --features pando-lab --output test-results/refstore-holds-fixture
       - run: python3 scripts/build_native.py --features pando-lab --bins
       - run: cargo build --locked --bin rootyard-view-lab
       - name: Verify design documentation integrity
@@ -157,12 +160,15 @@ jobs:
         run: python3 tests/recorded_recovery.py --binary target/debug/rootyard --report test-results/recorded-recovery.json
       - name: Exercise offline backup and fresh database restore
         run: python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json
-      - name: Restore populated PostgreSQL RefStore core metadata from a format16 backup
+      - name: Restore populated PostgreSQL RefStore core metadata from the current format17 backup
         timeout-minutes: 5
         run: python3 tests/backup_refstore_core139.py --binary target/debug/rootyard --report test-results/backup-refstore-core.json
-      - name: Restore populated PostgreSQL RefStore snapshot metadata from a format16 backup
+      - name: Restore populated PostgreSQL RefStore snapshot metadata from the current format17 backup
         timeout-minutes: 5
         run: python3 tests/backup_refstore_snapshot140.py --binary target/debug/rootyard --snapshot-fixture-binary test-results/refstore-snapshot-fixture --report test-results/backup-refstore-snapshot.json
+      - name: Restore populated permanent artifact-hold metadata from the current format17 backup
+        timeout-minutes: 5
+        run: python3 tests/backup_refstore_holds141.py --binary target/debug/rootyard --holds-fixture-binary test-results/refstore-holds-fixture --report test-results/backup-refstore-holds.json
       - name: Exercise restored schema-003 recovery protections
         run: python3 tests/backup_recovery.py --binary target/debug/rootyard --report test-results/backup-recovery.json
       - name: Exercise independent workers after fresh restore

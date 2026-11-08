@@ -20,21 +20,65 @@
 //! This file intentionally contains no destructive-GC or hold-ledger logic:
 //! remote deletion for the new profile stays disabled until the persistent
 //! hold/root protocols (#113/#114) are reviewed and enabled explicitly.
+//!
+//! The write boundary is deliberately narrow. The raw single-object publish
+//! (`opendal::BlobStore::put_file`) is `pub(super)`: only this `blob_store`
+//! subtree can reach it, and its production caller is the protected uploader
+//! (`blob_store::protected`), which may publish only after it consumed an opaque
+//! grant. There is no feature-gated raw-write hook: every feature combination,
+//! including `pando-lab`, exposes only the protected path. Producer, runtime and
+//! service routes must never call the raw writer directly.
+//!
+//! Every upload intent is bound at mint time to the immutable
+//! [`BlobBackendIdentity`] of the store that created it, and the sealed writer
+//! refuses a foreign intent before any source or provider IO. The identity is a
+//! non-secret digest of the actually opened profile (provider, endpoint,
+//! bucket, root, region and stable account identity) and never of the caller's
+//! logical authority scope, so a grant for one physical backend cannot publish
+//! into another.
+//!
+//! Receipts are minted in the private `transfer::receipt` module. The public
+//! [`BlobReceipt`] surface is read-only (getters, `clone`, metadata `matches`)
+//! and the constructor is `pub(super)` to `transfer`, so another `blob_store`
+//! child, adapter or service handler cannot forge acknowledgement of
+//! provider-held bytes.
+//!
+//! Claimed state: the default production profile still writes through the
+//! legacy `RemoteObjectStore` path; the standalone v1 profile has no serving
+//! route, no remote delete ([`BlobDeletePolicy::Disabled`] is the only policy),
+//! no persistent hold ledger and no storage-membership model. Nothing here
+//! enables deletion or claims a production serving path.
 
+mod backend_identity;
 pub mod budget;
 pub mod config;
 pub mod key_provider;
 pub mod opendal;
+pub mod protected;
 pub mod readback;
 pub mod transfer;
 pub mod upload;
+
+/// Deterministic, non-secret physical backend identity of an opened store.
+/// Read-only data: the only constructors are private to the `blob_store`
+/// subtree (profile-derived for real stores, a fresh realm for `cfg(test)`
+/// memory operators), so stored hex can be compared but never turned back into
+/// a proof or an upload capability.
+pub use backend_identity::BlobBackendIdentity;
+/// Read-only verified receipt. It is defined in the private `transfer::receipt`
+/// module, so the only constructor stays reachable from the transfer verifier
+/// alone; the public surface here is the read-only type, its getters, `clone`,
+/// metadata-only [`BlobReceipt::matches`] and `backend_identity`.
+pub use transfer::BlobReceipt;
 
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
-mod test_support;
+mod provider_contract_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::fmt;
 
@@ -215,10 +259,11 @@ impl fmt::Debug for BlobLocator {
 /// must verify that existing object or mint a completely new attempt rather
 /// than recovering a write capability after a restart.
 ///
-/// [`opendal::BlobStore::put_file`] consumes the intent by value. A
-/// retry after an unknown outcome must verify the old read-only locator (no
-/// overwrite) or mint a fresh intent/path. A process crash may leave an orphan
-/// object, but its address can never be reused for a later publication.
+/// The sealed raw writer (`BlobStore::put_file`, reachable only inside the
+/// `blob_store` subtree) consumes the intent by value. A retry after an unknown
+/// outcome must verify the old read-only locator (no overwrite) or mint a fresh
+/// intent/path. A process crash may leave an orphan object, but its address can
+/// never be reused for a later publication.
 ///
 /// ```compile_fail
 /// fn clone_cap(x: rootyard::blob_store::UploadIntent) -> rootyard::blob_store::UploadIntent {
@@ -233,6 +278,9 @@ impl fmt::Debug for BlobLocator {
 /// ```
 pub struct UploadIntent {
     locator: BlobLocator,
+    /// Physical backend of the store that minted this intent. Cloned from the
+    /// store's immutable identity, never supplied or influenced by a caller.
+    backend_identity: BlobBackendIdentity,
 }
 
 impl UploadIntent {
@@ -243,78 +291,26 @@ impl UploadIntent {
         &self.locator
     }
 
+    /// Read-only borrow of the physical backend this write capability is bound
+    /// to. The hold ledger persists the hex form; a stored hex string is a
+    /// claim, not a proof, and cannot be turned back into an intent.
+    pub fn backend_identity(&self) -> &BlobBackendIdentity {
+        &self.backend_identity
+    }
+
     /// Module-private mint point; `BlobStore::new_upload` is the only caller.
-    fn new(locator: BlobLocator) -> Self {
-        Self { locator }
+    /// It clones the store's own immutable identity, so a caller cannot choose
+    /// the backend a grant will target.
+    fn new(locator: BlobLocator, backend_identity: BlobBackendIdentity) -> Self {
+        Self { locator, backend_identity }
     }
 }
 
 impl fmt::Debug for UploadIntent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UploadIntent").field("locator", &self.locator).finish()
-    }
-}
-
-/// Durable acknowledgement of provider-held bytes. It is issued only after a
-/// fresh provider read-back (not a `stat`, not an ETag, not the local file)
-/// reproduced `sha256` and `length` exactly.
-#[derive(Clone, PartialEq, Eq)]
-pub struct BlobReceipt {
-    schema: u32,
-    locator: BlobLocator,
-    provider: BlobProvider,
-    verified_sha256: String,
-    verified_length: u64,
-}
-
-impl BlobReceipt {
-    /// Only the blob_store driver can mint a receipt, and only after a provider
-    /// read-back. There is no `Deserialize`/public constructor, so an untrusted
-    /// receipt cannot be forged into verification.
-    pub(crate) fn new(
-        locator: BlobLocator,
-        provider: BlobProvider,
-        verified_sha256: String,
-        verified_length: u64,
-    ) -> Self {
-        Self { schema: BLOB_LOCATOR_SCHEMA, locator, provider, verified_sha256, verified_length }
-    }
-
-    pub fn schema(&self) -> u32 {
-        self.schema
-    }
-    pub fn locator(&self) -> &BlobLocator {
-        &self.locator
-    }
-    pub fn provider(&self) -> BlobProvider {
-        self.provider
-    }
-    pub fn verified_sha256(&self) -> &str {
-        &self.verified_sha256
-    }
-    pub fn verified_length(&self) -> u64 {
-        self.verified_length
-    }
-
-    /// Metadata equality only. A receipt reloaded from an untrusted store must
-    /// still pass [`BlobStore::verify_receipt`] against the provider before it
-    /// is treated as proof of content.
-    pub fn matches(&self, locator: &BlobLocator) -> bool {
-        self.schema == BLOB_LOCATOR_SCHEMA
-            && &self.locator == locator
-            && self.verified_sha256 == locator.sha256
-            && self.verified_length == locator.length
-    }
-}
-
-impl fmt::Debug for BlobReceipt {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BlobReceipt")
-            .field("schema", &self.schema)
+        f.debug_struct("UploadIntent")
             .field("locator", &self.locator)
-            .field("provider", &self.provider)
-            .field("verified_sha256", &"<redacted>")
-            .field("verified_length", &self.verified_length)
+            .field("backend_identity", &self.backend_identity)
             .finish()
     }
 }
@@ -354,6 +350,12 @@ pub enum BlobError {
     /// silently would give two operators different beliefs about one budget.
     CapacityConflict,
     DeleteDisabled,
+    /// A sealed raw write received an intent minted by a different physical
+    /// backend (provider, endpoint, bucket/container, root, region or stable
+    /// account identity). Nothing is opened, read or written: the refusal
+    /// happens before any local source or provider IO. The variant carries no
+    /// descriptor, credential or identity hash.
+    ForeignBackend,
     Provider(String),
     /// Typed legacy remote-store failure. The legacy OpenDAL adapter must not
     /// flatten a provider failure into `Provider` text: worker diagnostics
@@ -388,6 +390,7 @@ impl fmt::Display for BlobError {
                 write!(f, "blob resource limits conflict with the initialized process-wide context")
             }
             Self::DeleteDisabled => write!(f, "blob deletion is disabled for this profile"),
+            Self::ForeignBackend => write!(f, "blob upload intent belongs to a different physical backend"),
             Self::Provider(m) => write!(f, "blob provider error: {m}"),
             // `RemoteStoreError` has its own fixed, privacy-safe template.
             Self::Remote(remote) => write!(f, "{remote}"),

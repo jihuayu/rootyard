@@ -9,6 +9,7 @@
 use std::{fmt, time::Duration};
 
 use reqwest::Url;
+use sha2::{Digest, Sha256};
 
 use super::{
     BlobDeletePolicy, BlobError, BlobProvider, MAX_NAMESPACE_BYTES, MAX_OBJECT_BYTES,
@@ -47,6 +48,19 @@ pub enum BlobCredentials {
 }
 
 impl BlobCredentials {
+    /// Stable, non-secret account identity used as backend-identity hash input.
+    /// S3 contributes a domain-separated SHA-256 of the access key id (never the
+    /// secret or session token); Azure contributes its public account name.
+    pub(super) fn account_identity(&self) -> String {
+        match self {
+            Self::S3 { access_key_id, .. } => {
+                format!("s3-access-key-id-sha256:{}", hex::encode(Sha256::digest(access_key_id.as_bytes())))
+            }
+            #[cfg(feature = "blob-azblob")]
+            Self::Azblob { account_name, .. } => format!("azblob-account-name:{account_name}"),
+        }
+    }
+
     fn describe(&self) -> &'static str {
         match self {
             Self::S3 { .. } => "s3 static credentials",
@@ -236,7 +250,7 @@ impl BlobProfile {
     pub fn root(&self) -> &str {
         &self.root
     }
-    pub fn credentials(&self) -> &BlobCredentials {
+    pub(super) fn credentials(&self) -> &BlobCredentials {
         &self.credentials
     }
     pub fn object_timeout(&self) -> Duration {
@@ -299,8 +313,9 @@ impl BlobProfile {
     }
 
     /// Relative object path. `ROOTYARD_BLOB_ROOT` is applied exactly once by
-    /// the operator builder root, never duplicated here.
-    pub(crate) fn object_path(&self, locator: &super::BlobLocator) -> String {
+    /// the operator builder root, never duplicated here. Sealed to the
+    /// `blob_store` subtree with the raw operator.
+    pub(super) fn object_path(&self, locator: &super::BlobLocator) -> String {
         locator.path()
     }
 }
