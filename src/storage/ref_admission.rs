@@ -233,21 +233,53 @@ pub async fn fence_epoch(
 }
 
 /// Settlement inside the exact transaction that publishes `git_operations` and
-/// outbox events. It re-verifies the route epoch, the token/role authority and
-/// the ADMITTED state before allowing any row to become visible.
+/// outbox events. It re-verifies the repository generation/state, the route
+/// epoch/fence, the database actor/token identity and the ADMITTED state before
+/// allowing any row to become visible.
+///
+/// Two journal capabilities may skip only the *current* token/RBAC recheck:
+/// `NoGrantAbort` for a provably ref-free interrupted push and
+/// `RecordedReceiptProof` for a transaction native Git already committed. Both
+/// are re-bound here to the database admission identity; normal new writes and
+/// any missing or mismatched proof still verify current authority.
+#[allow(clippy::too_many_arguments)]
 pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
     tx: &C,
     repository_id: Uuid,
+    storage_generation: i64,
     admission: &crate::events::AdmissionRecord,
     actor_id: Uuid,
     token_id: Uuid,
     outcome: &str,
+    changes: &[crate::events::RefEventInput],
     no_grant: Option<&crate::storage::no_grant_proof::NoGrantAbort>,
+    recorded: Option<&crate::storage::recorded_receipt_proof::RecordedReceiptProof>,
 ) -> anyhow::Result<()> {
+    // Same-transaction repository row: the current generation must still be
+    // the operation's generation. A journal capability may project past facts
+    // while the repository carries only the temporary unknown-push flag; every
+    // other state or operator recovery reason still rejects settlement.
+    let repo = tx
+        .query_opt(
+            "SELECT storage_generation,state,COALESCE(recovery_reason,'') FROM repositories WHERE id=$1 FOR SHARE",
+            &[&repository_id],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repository is missing during ref settlement"))?;
+    if repo.get::<_, i64>(0) != storage_generation {
+        anyhow::bail!("repository generation changed during ref settlement");
+    }
+    let repo_state: String = repo.get(1);
+    let recovery_reason: String = repo.get(2);
+    let proof_present = no_grant.is_some() || recorded.is_some();
+    if repo_state != "ready"
+        && !(proof_present && repo_state == "recovering" && recovery_reason == "push_outcome_unknown")
+    {
+        anyhow::bail!("repository state does not allow ref settlement");
+    }
     let row = tx
         .query_opt(
-            "SELECT state,shard_epoch FROM git_ref_admissions \
-             WHERE writer_id=$1 AND repository_id=$2 FOR UPDATE",
+            "SELECT state,shard_epoch,actor_id,token_id,ref_names FROM git_ref_admissions WHERE writer_id=$1 AND repository_id=$2 FOR UPDATE",
             &[&admission.writer_id, &repository_id],
         )
         .await?
@@ -272,10 +304,17 @@ pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
     if admitted_epoch != admission.shard_epoch {
         anyhow::bail!("ref admission epoch differs from its journal");
     }
+    // The database row, never the caller's proof or journal, owns actor/token
+    // identity. A proof minted for another principal cannot settle here.
+    let database_actor: Uuid = row.get(2);
+    let database_token: Uuid = row.get(3);
+    let database_refs: Vec<String> = row.get(4);
+    if database_actor != actor_id || database_token != token_id {
+        anyhow::bail!("ref admission actor/token identity changed");
+    }
     if let Some(route) = tx
         .query_opt(
-            "SELECT route_epoch,primary_node_id,draining,read_only_degraded,fenced_epoch \
-             FROM repository_shard_routes WHERE repository_id=$1 FOR SHARE",
+            "SELECT route_epoch,primary_node_id,draining,read_only_degraded,fenced_epoch FROM repository_shard_routes WHERE repository_id=$1 FOR SHARE",
             &[&repository_id],
         )
         .await?
@@ -299,9 +338,39 @@ pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
     // receipt or request ever existed means the child could not have changed a
     // ref, so the authority recheck is skipped for that exact identity-matched
     // proof and only for `no_ref_changes`; route/epoch/fence checks still apply.
+    // No request exists in that case, so no ref names are invented here.
     let proven_ref_free = outcome == "no_ref_changes"
         && no_grant.is_some_and(|proof| proof.matches_admission(repository_id, admission, actor_id, token_id));
-    if !proven_ref_free {
+    // A real receipt plus matching request and committed reference events may
+    // skip only the current token/RBAC/`ready` recheck: the transaction being
+    // projected already committed before the crash and this path never grants
+    // a new ref. The proof must cover exactly the admitted ref-name set, the
+    // database principal and the complete event payload.
+    let proven_recorded = match recorded {
+        Some(proof) => {
+            if outcome != "recorded" {
+                anyhow::bail!("recorded receipt proof differs from settlement outcome");
+            }
+            if changes.is_empty() {
+                anyhow::bail!("recorded receipt proof has no committed changes");
+            }
+            if !proof.matches_admission(
+                repository_id,
+                storage_generation,
+                admission,
+                actor_id,
+                token_id,
+                database_actor,
+                database_token,
+                &database_refs,
+            ) {
+                anyhow::bail!("recorded receipt proof differs from its admission");
+            }
+            true
+        }
+        None => false,
+    };
+    if !proven_ref_free && !proven_recorded {
         auth::verify_repo_write_access(
             tx,
             actor_id,
