@@ -89,16 +89,17 @@ impl OriginGuard {
         }
     }
 
-    /// Run at most `origin_permits` origin loads concurrently. Queue wait plus
-    /// origin work share one absolute deadline (`origin_wait + origin_deadline`).
-    /// A queue timeout is `Busy`; an exhausted work deadline is `Deadline`.
+    /// Run at most `origin_permits` origin loads concurrently. Permit acquisition
+    /// is capped by `origin_wait`; after acquisition the origin body gets its own
+    /// absolute `origin_deadline`. A queue timeout is `Busy`; an exhausted work
+    /// deadline is `Deadline`.
     pub async fn call<T, E, F, Fut>(&self, call: F) -> Result<T, OriginError<E>>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        let deadline = Instant::now().checked_add(self.wait.saturating_add(self.deadline)).unwrap_or_else(Instant::now);
-        let queue_wait = deadline.saturating_duration_since(Instant::now());
+        let queue_deadline = Instant::now().checked_add(self.wait).unwrap_or_else(Instant::now);
+        let queue_wait = queue_deadline.saturating_duration_since(Instant::now());
         if queue_wait.is_zero() {
             return Err(OriginError::Busy);
         }
@@ -111,7 +112,8 @@ impl OriginGuard {
             drop(permit);
             return Err(OriginError::CircuitOpen);
         }
-        let work = deadline.saturating_duration_since(Instant::now());
+        let work_deadline = Instant::now().checked_add(self.deadline).unwrap_or_else(Instant::now);
+        let work = work_deadline.saturating_duration_since(Instant::now());
         if work.is_zero() {
             drop(permit);
             return Err(OriginError::Deadline);
@@ -247,7 +249,7 @@ impl fmt::Debug for SingleFlight {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::AtomicBool};
     use tokio::sync::{Notify, oneshot};
 
     fn limits() -> CacheLimits {
@@ -263,7 +265,9 @@ mod tests {
 
     #[tokio::test]
     async fn origin_permits_bound_concurrency_without_spawning() {
-        let guard = Arc::new(OriginGuard::new(limits()).unwrap());
+        let limits = limits();
+        let queue_budget = limits.origin_wait;
+        let guard = Arc::new(OriginGuard::new(limits).unwrap());
         let started = Arc::new(Notify::new());
         let (release, wait) = oneshot::channel();
         let first = tokio::spawn({
@@ -280,8 +284,25 @@ mod tests {
             }
         });
         started.notified().await;
-        let second = guard.call(|| async { Ok::<_, ()>(2) }).await;
+        let body_polled = Arc::new(AtomicBool::new(false));
+        let queued_at = Instant::now();
+        let second = guard
+            .call({
+                let body_polled = body_polled.clone();
+                move || {
+                    body_polled.store(true, Ordering::SeqCst);
+                    async { Ok::<_, ()>(2) }
+                }
+            })
+            .await;
+        let waited = queued_at.elapsed();
         assert_eq!(second, Err(OriginError::Busy));
+        assert!(!body_polled.load(Ordering::SeqCst), "origin body ran after queue deadline");
+        assert!(
+            waited >= queue_budget.saturating_sub(Duration::from_millis(5)),
+            "queue Busy returned before its budget: {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(2), "queue wait exceeded its bound: {waited:?}");
         release.send(()).unwrap();
         assert_eq!(first.await.unwrap(), Ok(1));
     }

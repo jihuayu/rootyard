@@ -129,7 +129,7 @@ impl RedisCacheLimits {
 
 /// Proof obtained from a dedicated Redis server before caching is enabled.
 /// Stored policy is one of the fixed eviction names, safe to print.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RedisServerContract {
     pub maxmemory_bytes: u64,
     pub maxmemory_policy: &'static str,
@@ -149,6 +149,21 @@ fn eviction_policy(raw: &str) -> Result<&'static str> {
         "noeviction" => bail!("Redis cache instance must not use noeviction"),
         _ => bail!("unsupported Redis maxmemory-policy for a cache instance"),
     }
+}
+
+/// Decode a bounded cache read. A TTL expiry, FLUSH, replacement or corrupt value
+/// between STRLEN and GETRANGE is a miss, never an error or authority signal.
+fn decode_bounded(key: &CacheKey, raw: &[u8], declared_length: u64) -> Option<CacheValue> {
+    if raw.len() as u64 != declared_length {
+        return None;
+    }
+    CacheValue::decode(key, raw).ok()
+}
+
+/// Check the cheap encoded-length bound before allocating the encoded value.
+fn encode_bounded(value: &CacheValue, max_value_bytes: usize) -> Result<Vec<u8>> {
+    ensure!(value.encoded_len() <= max_value_bytes, "cache value exceeds max_value_bytes");
+    Ok(value.encode())
 }
 
 /// Bounded Redis cache. A connection manager maintains one multiplexed
@@ -218,34 +233,50 @@ impl RedisCache {
         Ok(manager.clone())
     }
 
+    async fn inspect_server_contract(&self, connection: &mut ConnectionManager) -> Result<RedisServerContract> {
+        let maxmemory: Vec<String> = ::redis::cmd("CONFIG")
+            .arg("GET")
+            .arg("maxmemory")
+            .query_async(&mut *connection)
+            .await
+            .map_err(|_| anyhow::anyhow!("Redis cache maxmemory inspection failed"))?;
+        ensure!(maxmemory.len() == 2, "invalid Redis maxmemory response");
+        let maxmemory_bytes: u64 =
+            maxmemory[1].parse().map_err(|_| anyhow::anyhow!("invalid Redis maxmemory value"))?;
+        ensure!(maxmemory_bytes > 0, "Redis cache instance must set a finite maxmemory");
+        ensure!(
+            maxmemory_bytes >= self.limits.max_value_bytes as u64,
+            "Redis maxmemory is smaller than max_value_bytes"
+        );
+        let policy: Vec<String> = ::redis::cmd("CONFIG")
+            .arg("GET")
+            .arg("maxmemory-policy")
+            .query_async(&mut *connection)
+            .await
+            .map_err(|_| anyhow::anyhow!("Redis cache eviction inspection failed"))?;
+        ensure!(policy.len() == 2, "invalid Redis maxmemory-policy response");
+        Ok(RedisServerContract { maxmemory_bytes, maxmemory_policy: eviction_policy(&policy[1])? })
+    }
+
     async fn read_server_contract(&self) -> Result<RedisServerContract> {
         self.bounded(|| async {
             let _permit = self.inflight.acquire().await.map_err(|_| anyhow::anyhow!("Redis cache unavailable"))?;
             let mut connection = self.connection().await?;
-            let maxmemory: Vec<String> = ::redis::cmd("CONFIG")
-                .arg("GET")
-                .arg("maxmemory")
-                .query_async(&mut connection)
-                .await
-                .map_err(|_| anyhow::anyhow!("Redis cache maxmemory inspection failed"))?;
-            ensure!(maxmemory.len() == 2, "invalid Redis maxmemory response");
-            let maxmemory_bytes: u64 =
-                maxmemory[1].parse().map_err(|_| anyhow::anyhow!("invalid Redis maxmemory value"))?;
-            ensure!(maxmemory_bytes > 0, "Redis cache instance must set a finite maxmemory");
-            ensure!(
-                maxmemory_bytes >= self.limits.max_value_bytes as u64,
-                "Redis maxmemory is smaller than max_value_bytes"
-            );
-            let policy: Vec<String> = ::redis::cmd("CONFIG")
-                .arg("GET")
-                .arg("maxmemory-policy")
-                .query_async(&mut connection)
-                .await
-                .map_err(|_| anyhow::anyhow!("Redis cache eviction inspection failed"))?;
-            ensure!(policy.len() == 2, "invalid Redis maxmemory-policy response");
-            Ok(RedisServerContract { maxmemory_bytes, maxmemory_policy: eviction_policy(&policy[1])? })
+            self.inspect_server_contract(&mut connection).await
         })
         .await
+    }
+
+    /// Re-check the cached proof before cache mutations. A changed maxmemory or
+    /// eviction policy fails closed until an explicit reconnect revalidates it.
+    async fn verify_contract_before_mutation(&self, connection: &mut ConnectionManager) -> Result<()> {
+        let expected = self.contract()?;
+        let observed = self.inspect_server_contract(connection).await?;
+        ensure!(
+            observed == expected,
+            "Redis cache server resource contract changed; reconnect required"
+        );
+        Ok(())
     }
 
     fn contract(&self) -> Result<RedisServerContract> {
@@ -278,8 +309,7 @@ impl RedisCache {
                 .query_async(&mut connection)
                 .await
                 .map_err(|_| anyhow::anyhow!("Redis cache request failed"))?;
-            ensure!(raw.len() as u64 == length, "Redis cache value changed during bounded read");
-            CacheValue::decode(key, &raw).map(Some)
+            Ok(decode_bounded(key, &raw, length))
         })
         .await
     }
@@ -291,13 +321,13 @@ impl RedisCache {
             "cache value does not match key kind/version"
         );
         let ttl = self.limits.effective_ttl(ttl)?;
-        let encoded = value.encode();
-        ensure!(encoded.len() <= self.limits.max_value_bytes, "cache value exceeds max_value_bytes");
+        let encoded = encode_bounded(&value, self.limits.max_value_bytes)?;
         let milliseconds = ttl.as_millis().max(1);
         ensure!(milliseconds <= u64::MAX as u128, "cache ttl too large");
         self.bounded(|| async {
             let _permit = self.inflight.acquire().await.map_err(|_| anyhow::anyhow!("Redis cache unavailable"))?;
             let mut connection = self.connection().await?;
+            self.verify_contract_before_mutation(&mut connection).await?;
             ::redis::cmd("SET")
                 .arg(key.as_str())
                 .arg(encoded)
@@ -316,6 +346,7 @@ impl RedisCache {
         self.bounded(|| async {
             let _permit = self.inflight.acquire().await.map_err(|_| anyhow::anyhow!("Redis cache unavailable"))?;
             let mut connection = self.connection().await?;
+            self.verify_contract_before_mutation(&mut connection).await?;
             ::redis::cmd("DEL")
                 .arg(key.as_str())
                 .query_async::<i64>(&mut connection)
@@ -555,6 +586,22 @@ mod tests {
         let text = format!("{wake:?}");
         assert!(!text.contains("private-password"));
         assert!(!text.contains("user"));
+    }
+
+    #[test]
+    fn bounded_read_mismatch_is_a_miss_and_oversize_is_rejected_before_encode() {
+        let key = key(CacheKind::TreeListing, 5, "bounded-unit");
+        let value = CacheValue::new(CacheKind::TreeListing, 5, b"ok".to_vec());
+        let encoded = value.encode();
+        assert_eq!(decode_bounded(&key, &encoded, encoded.len() as u64), Some(value));
+        assert_eq!(decode_bounded(&key, &encoded[..encoded.len() - 1], encoded.len() as u64), None);
+        let mut corrupt = encoded.clone();
+        corrupt[0] = b'X';
+        assert_eq!(decode_bounded(&key, &corrupt, encoded.len() as u64), None);
+        assert_eq!(decode_bounded(&key, &encoded, encoded.len() as u64 + 1), None);
+
+        let oversized = CacheValue::new(CacheKind::TreeListing, 5, vec![0; 1024]);
+        assert!(encode_bounded(&oversized, 64).is_err());
     }
 
     #[tokio::test]

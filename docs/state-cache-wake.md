@@ -78,11 +78,12 @@ connection-manager connection with built-in reconnect, an in-flight semaphore,
 and one absolute deadline covering permit wait, first connection-manager
 initialization and every command. Reads issue `STRLEN` first and only a capped
 `GETRANGE` (at most `max_value_bytes`) when it fits, so an oversized value is
-never fully fetched. Writes reject oversized values before sending.
+never fully fetched. Writes reject oversized values before encoding/allocation.
 
 No code path spawns an unbounded task or retries in a tight loop. Origin fallback
-uses a semaphore, an absolute queue+work deadline and a consecutive-failure
-circuit breaker; overloaded, timed-out or open-breaker callers receive
+uses a semaphore, a bounded queue wait, a separate absolute origin-work
+deadline and a consecutive-failure circuit breaker; overloaded, timed-out or
+open-breaker callers receive
 `Busy`/`Deadline`/`CircuitOpen` and must degrade explicitly. Dropping a timed-out
 future is cooperative cancellation, not a guarantee that an underlying network
 operation was stopped. Warmup singleflight has a bounded key map; a leader RAII
@@ -97,7 +98,7 @@ remains non-authoritative and final publish must use PG/RefStore CAS.
 ```toml
 state-redis = ["dep:redis"]
 redis = { version = "=0.32.7", optional = true, default-features = false,
-          features = ["tokio-comp", "connection-manager", "tls-rustls", "acl"] }
+          features = ["tokio-rustls-comp", "connection-manager", "acl"] }
 ```
 
 The pin is exact and must be validated by the build owner when regenerating
@@ -127,9 +128,14 @@ silently passed to Redis: `RedisCacheLimits` deliberately omits them.
 whose `CONFIG GET maxmemory` is finite and at least `max_value_bytes`, and whose
 `maxmemory-policy` is an `allkeys-*` or `volatile-*` eviction policy
 (`noeviction` is rejected). Missing CONFIG permission, an unparseable response,
-zero maxmemory or an unsupported policy fails startup closed. This proves
-server-side evictability, not a per-key aggregate logical count or a hard quota.
-Do not share the instance with non-evictable or authoritative data.
+zero maxmemory or an unsupported policy fails startup closed. The contract is
+cached after connect and revalidated (inside the same whole-operation deadline)
+before every cache mutation (`SET`/`DEL`); if maxmemory or policy changes, the
+mutation fails closed until an explicit reconnect revalidates it. Reads do not
+revalidate on every call. This proves server-side evictability, not a per-key
+aggregate logical count, a process-level hard quota, or a guarantee that the
+operator will not change configuration between checks. Do not share the instance
+with non-evictable or authoritative data.
 
 The cache adapter is intentionally not wired into every read path yet. Consumers
 must opt in and retain their PG/RefStore authority checks; this document does not
@@ -169,10 +175,13 @@ never execute an effect.
 
 Unit tests cover key versioning/typed values, redacted `Debug`, Memory
 entry/byte/TTL bounds, bounded metadata under thousands of replacements/deletes
-and expiry, origin semaphore/absolute-deadline/breaker bounds, singleflight
-coalescing, explicit leader abort with follower wake and generation-safe cleanup,
-URL/TLS policy, channel bounds and eviction-policy allowlist. Real-Redis contract
-tests are `#[ignore]`d and require a dedicated server with maxmemory + eviction
+and expiry, origin semaphore queue-budget/body-not-polled plus absolute-work-
+deadline/breaker bounds, singleflight coalescing, explicit leader abort with
+follower wake and generation-safe cleanup, URL/TLS policy, channel bounds and
+eviction-policy allowlist. Redis unit tests cover bounded-read length/corruption
+as a miss, cheap pre-encode oversize rejection, whole-deadline permit wait and
+refusal to operate without a validated server contract. Real-Redis contract tests
+are `#[ignore]`d and require a dedicated server with maxmemory + eviction
 configured and CONFIG permission:
 
 ```sh

@@ -7,10 +7,11 @@
 //! PostgreSQL/RefStore state. Redis is independently enableable and does not
 //! require Raft.
 //!
-//! Default deployments are standalone Memory with local `Notify` wake hints.
-//! Redis is compiled only with the optional `state-redis` feature and uses the
-//! mature `redis` async client; this module contains no hand-written RESP,
-//! TCP or TLS implementation.
+//! This module provides the available boundary; the serving process does not
+//! construct cache consumers yet. Dispatch continues to use local `Notify` and
+//! an optional mature RedisWake. Redis cache/wake compilation is gated by the
+//! optional `state-redis` feature and uses the mature `redis` async client;
+//! this module contains no hand-written RESP, TCP or TLS implementation.
 use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{fmt, future::Future, pin::Pin, time::Duration};
