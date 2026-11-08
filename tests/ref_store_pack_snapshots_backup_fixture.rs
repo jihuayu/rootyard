@@ -910,6 +910,13 @@ async fn seed(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()> {
         old_page.complete() && old_page.packs() == rootyard::ref_store::core::PackMembershipDescriptor::unavailable(),
         "the pre-activation A2 page is not a complete metadata-only page"
     );
+    ensure!(
+        old_receipt.ref_count() == 0 && old_page.ref_count() == 0 && old_page.refs().is_empty(),
+        "the pre-activation A2 snapshot captured refs receipt={} page={} rows={} (expected none before the A4 commit)",
+        old_receipt.ref_count(),
+        old_page.ref_count(),
+        old_page.refs().len()
+    );
 
     // (2) Real typed A4 verified commit (A4a pipeline).
     let git = GitRepo::new(fixture.git.clone(), format).await?;
@@ -1255,8 +1262,8 @@ async fn seed(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()> {
     let a2 = a2_usage(pool, repository).await?;
     let row_counts = snapshot_counts(pool, repository).await?;
     ensure!(
-        row_counts == (5, 5, 5, 7, 4),
-        "A2/A5 row cardinalities differ from the drill shape (one old A2 receipt plus six A5 receipts)"
+        row_counts == (5, 4, 5, 7, 4),
+        "A2/A5 row cardinalities differ from the drill shape (one old A2 receipt, four A5 ref captures plus six A5 receipts): actual {row_counts:?}"
     );
 
     // Exact charge accounting from TYPED receipt bytes + the implementation's

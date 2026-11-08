@@ -93,7 +93,7 @@ SNAPSHOT_COUNTS = {
 }
 A2_COUNTS = {
     "ref_store_core_snapshots": 5,
-    "ref_store_core_snapshot_refs": 5,
+    "ref_store_core_snapshot_refs": 4,
     "ref_store_core_pins": 5,
     "ref_store_core_receipts": 7,
     "ref_store_core_repo_usage": 1,
