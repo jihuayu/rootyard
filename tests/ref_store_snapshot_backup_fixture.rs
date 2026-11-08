@@ -238,7 +238,7 @@ async fn renew(pool: &Pool, request: &RenewMetadataPinRequest) -> Result<Metadat
     PgRefStoreCore.renew_metadata_pin(&mut client, request, deadline()).await
 }
 
-async fn release(pool: &Pool, request: &ReleaseMetadataPinRequest) -> Result<MetadataPinOutcome, RefStoreError> {
+async fn release_pin(pool: &Pool, request: &ReleaseMetadataPinRequest) -> Result<MetadataPinOutcome, RefStoreError> {
     let mut client = pool.get().await.map_err(|error| RefStoreError::Database(error.to_string()))?;
     PgRefStoreCore.release_metadata_pin(&mut client, request, deadline()).await
 }
@@ -442,7 +442,7 @@ async fn release_exactly(pool: &Pool, scope: &MetadataSnapshotScope, lifecycle: 
         1,
         PinReleaseReason::ClientDone,
     )?;
-    let outcome = release(pool, &request).await.context("release_metadata_pin")?;
+    let outcome = release_pin(pool, &request).await.context("release_metadata_pin")?;
     if outcome.replayed {
         bail!("a fresh release request id must not replay");
     }
@@ -655,7 +655,7 @@ async fn replay_lifecycle(
             int_field(release, "expected_generation")?,
             PinReleaseReason::parse(&text_field(release, "reason")?)?,
         )?;
-        let replayed = release(pool, &request).await.context("exact release replay")?;
+        let replayed = release_pin(pool, &request).await.context("exact release replay")?;
         if !replayed.replayed {
             bail!("an exact release replay did not report a replay for pin {pin_id}");
         }
