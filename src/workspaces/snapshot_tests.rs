@@ -70,10 +70,14 @@ impl Workspace {
     }
 }
 
+/// Deterministic fixture bytes. The explicit mode keeps entry modes (and thus
+/// fingerprints) stable on hosts whose umask is 077 instead of 022; production
+/// still hashes whatever mode the workspace actually has.
 fn write(root: &Path, name: &str, bytes: &[u8]) {
     let path = root.join(name);
     fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-    fs::write(path, bytes).expect("write");
+    fs::write(&path, bytes).expect("write");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("mode");
 }
 
 fn entry(relative: &str, kind: &str, mode: u32, bytes: &[u8]) -> core::Entry {
@@ -196,6 +200,22 @@ fn upper_type_changes_hide_the_replaced_lower_subtree() {
     assert!(entries.contains_key("file_x/inner"));
     assert!(!entries.contains_key("link_z"), "an upper directory hides a lower symlink");
     assert!(entries.contains_key("link_z/inner"));
+}
+
+#[test]
+fn empty_upper_directory_hides_a_lower_file_and_symlink() {
+    let workspace = Workspace::new();
+    let lower = workspace.lower();
+    write(&lower, "file_target", b"x");
+    symlink("file_target", lower.join("link_target")).expect("symlink");
+    let upper = workspace.upper();
+    fs::create_dir_all(upper.join("file_target")).expect("upper dir");
+    fs::create_dir_all(upper.join("link_target")).expect("upper dir");
+
+    let entries = merged(&workspace.raw());
+    assert!(!entries.contains_key("file_target"), "an empty upper directory hides a lower file");
+    assert!(!entries.contains_key("link_target"), "an empty upper directory hides a lower symlink");
+    assert!(entries.is_empty(), "an empty upper directory contributes no entries of its own");
 }
 
 #[test]
