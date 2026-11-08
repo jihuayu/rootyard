@@ -220,9 +220,9 @@ jobs:
         env:
           ROOTYARD_TEST_EVIDENCE_DIR: ${{ github.workspace }}/test-results/evidence
         run: python3 tests/web_sessions.py --binary target/debug/rootyard --report test-results/web-sessions.json
-      - name: Exercise multi-node repository sharding, epoch write fencing, and automated failover
+      - name: Exercise sharded control-plane placement, lease/epoch fencing, and explicit refusal of unmeasured failover, rebalance and DR
         run: python3 tests/sharding.py --binary target/debug/rootyard --report test-results/sharding.json
-      - name: Exercise multi-node 1/2/4-node concurrency and P95/P99 sharding benchmark suite
+      - name: Exercise labelled simulation-only 1/2/4-node sharding benchmark metadata receipts
         run: python3 tests/benchmark_tiers.py --binary target/debug/rootyard --report test-results/benchmark-tiers.json
       - name: Exercise explicitly labeled 4-tier reference models
         run: ROOTYARD_E2E_REQUIRE_M5=1 ROOTYARD_E2E_REQUIRE_P2=1 ROOTYARD_E2E_REQUIRE_P3=1 python3 tests/e2e_tiers.py --reference-only --tier all --report test-results/reference-tiers.json

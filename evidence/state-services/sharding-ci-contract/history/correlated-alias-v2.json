@@ -1,0 +1,122 @@
+{
+  "passed": false,
+  "returncode": 1,
+  "seconds": 4.722,
+  "command": [
+    "python3",
+    "/workspace/scratch/state-shared-contract-gates/tests/sharding.py",
+    "--binary",
+    "/workspace/scratch/state-pg139-app-v1/rootyard",
+    "--report",
+    "/workspace/scratch/state-sharding134-native-v2/native.json"
+  ],
+  "before": {
+    "compiled_inputs": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "app": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+    "compiled_checkout": "52bfa6a87fff79ee613ddfeb20145473d9c51bdc",
+    "harness_checkout": "aabd86d25a81772b27ac117060967f3aa3cca1d0",
+    "harness_files": {
+      "tests/sharding.py": "050838e394d1602a107e679050463be2fe010202b40f5ee985af72dca1e27cb1",
+      "tests/pulls.py": "488ee7aec6f61c9ffa05a879661230f9322ec871b8996458060e85197e0f973d",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "2854e34acd30ef7e7945c1ba9015b6d7422823fe424f85043670c866832458f9"
+    },
+    "driver": "bff6f4f4fab7c47f0f8fd966e358344c7df9d2ad4bb38e3b7e2a4ee59ca8066d"
+  },
+  "after": {
+    "compiled_inputs": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "app": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+    "compiled_checkout": "52bfa6a87fff79ee613ddfeb20145473d9c51bdc",
+    "harness_checkout": "aabd86d25a81772b27ac117060967f3aa3cca1d0",
+    "harness_files": {
+      "tests/sharding.py": "050838e394d1602a107e679050463be2fe010202b40f5ee985af72dca1e27cb1",
+      "tests/pulls.py": "488ee7aec6f61c9ffa05a879661230f9322ec871b8996458060e85197e0f973d",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "2854e34acd30ef7e7945c1ba9015b6d7422823fe424f85043670c866832458f9"
+    },
+    "driver": "bff6f4f4fab7c47f0f8fd966e358344c7df9d2ad4bb38e3b7e2a4ee59ca8066d"
+  },
+  "identities_unchanged": true,
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2",
+    "source_inputs_sha256": "7964693e5544f18ba53826f1ac89c18228cea5d7669166ee2b3d40e4ccce80a9",
+    "workspace_commit": "0bb2b6c8c6587d6f3a88100d309bb98126d833f1",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-pg-core#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-pg-core#rootyard@0.1.0"
+      }
+    ]
+  },
+  "native": {
+    "passed": false,
+    "mode": "live_metadata_drill",
+    "scope": "sharded control-plane placement, lease/epoch fencing and explicit refusal of unsupported failover, simulated DR and unmeasured rebalance",
+    "production_validation": false,
+    "multi_node_ha_validation": false,
+    "data_plane_success_claimed": false,
+    "benchmark_receipts": "simulation_only",
+    "reference_only": false,
+    "data_plane_validation": "run cluster_workload_native.py and cluster_migration_native.py",
+    "cases": [
+      {
+        "name": "setup",
+        "status": "passed",
+        "seconds": 4.1293,
+        "detail": null
+      },
+      {
+        "name": "migration",
+        "status": "passed",
+        "seconds": 0.026,
+        "detail": null
+      },
+      {
+        "name": "virtual_bucket_placement_and_occupied_route_refusal",
+        "status": "failed",
+        "seconds": 0.0467,
+        "error": "invalid literal for int() with base 10: ''",
+        "traceback": "Traceback (most recent call last):\n  File \"/workspace/scratch/state-shared-contract-gates/tests/pulls.py\", line 68, in case\n    detail = fn()\n             ^^^^\n  File \"/workspace/scratch/state-shared-contract-gates/tests/sharding.py\", line 2782, in virtual_bucket_placement_and_occupied_route_refusal\n    unused = int(\n             ^^^^\nValueError: invalid literal for int() with base 10: ''\n"
+      }
+    ],
+    "binary_sha256": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2"
+  },
+  "limits": [
+    "Actual HTTP/PostgreSQL control-plane guard test only; application contains additional unserved metadata-core code beyond the harness checkout.",
+    "No multi-node transfer, failover, HA, physical fencing or production benchmark success claimed."
+  ]
+}
