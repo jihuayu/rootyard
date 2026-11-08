@@ -495,10 +495,7 @@ mod tests {
         let with_pack = plan(vec![pack()]).unwrap();
         assert_ne!(first.parent_digest(), with_pack.parent_digest());
         assert_eq!(with_pack.identity().digest(), with_pack.parent_digest());
-        assert!(
-            first.identity().digest() != first.parent_digest()
-                || first.parent_digest() == with_pack.identity().digest()
-        );
+        assert_eq!(first.identity().digest(), first.parent_digest());
     }
 
     #[test]
