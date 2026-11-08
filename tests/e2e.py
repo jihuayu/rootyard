@@ -186,6 +186,41 @@ class Harness:
         assert status in (code if isinstance(code, tuple) else (code,)), f"{path}: expected {code}, got {status}: {body[:300]!r}"
         return body
 
+    def create_repository(self, payload, token=None):
+        """Create a real repository and wait for the API's ready view.
+
+        202 is an accepted pending provisioning request, never a ready fixture.
+        """
+        status, body, _ = self.http("/api/repos", token=token, method="POST", body=payload)
+        assert status in (201, 202), f"POST /api/repos: expected 201/202, got {status}: {body[:300]!r}"
+        created = json.loads(body)
+        identity = {}
+        for field in ("id", "owner", "name"):
+            value = created.get(field)
+            assert isinstance(value, str) and value, f"POST /api/repos: missing stable {field}: {created!r}"
+            identity[field] = value
+        path = "/api/repos/" + urllib.parse.quote(identity["owner"], safe="") + "/" + urllib.parse.quote(identity["name"], safe="")
+        deadline = time.monotonic() + 20
+        attempts = 0
+        last = {"status": status, "state": created.get("state"), **identity}
+        while True:
+            attempts += 1
+            code, raw, _ = self.http(path, token=token)
+            if code != 200:
+                raise AssertionError(self.redact(f"GET {path}: repository unavailable while provisioning; status={code} {last!r}"))
+            current = json.loads(raw)
+            observed = {field: current.get(field) for field in identity}
+            if observed != identity:
+                raise AssertionError(self.redact(f"GET {path}: repository identity changed; expected {identity!r}, got {observed!r}"))
+            last = {"status": code, "state": current.get("state"), **identity}
+            if current.get("state") == "ready":
+                return current
+            if current.get("state") != "provisioning":
+                raise AssertionError(self.redact(f"GET {path}: unexpected terminal repository state; {last!r}"))
+            if time.monotonic() >= deadline:
+                raise AssertionError(self.redact(f"POST /api/repos: {identity!r} not ready after {attempts} poll(s) in 20s; last={last!r}"))
+            time.sleep(.1)
+
     def setup(self):
         self.sql('CREATE SCHEMA "' + self.schema + '"', isolated=False)
         self.schema_created = True
@@ -215,7 +250,7 @@ class Harness:
         self.expect("/api/repos", 401)
         self.expect("/api/repos", 401, token={"token": "invalid"})
         self.expect("/api/repos", 403, method="POST", token=self.reader, body={"name": "forbidden"})
-        repo = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice, body={"name": "demo"}))
+        repo = self.create_repository({"name": "demo"}, token=self.alice)
         self.repo = repo
         assert repo["state"] == "ready"
         assert repo["clone_path"] == "/git/alice/demo.git"
@@ -320,7 +355,7 @@ class Harness:
         # remove pack transfer as a confounder and exercise receive-pack's ref lock.
         # An ambiguous rejected RPC can intentionally block its repository in
         # phase two. Isolate the race so later independent scenarios remain valid.
-        race_repo = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice, body={"name": "cas-race"}))
+        race_repo = self.create_repository({"name": "cas-race"}, token=self.alice)
         race_remote = self.base + race_repo["clone_path"]
         self.git("push", race_remote, self.first + ":refs/heads/race", self.second + ":refs/heads/main", cwd=self.work, token=self.alice)
         barrier = threading.Barrier(2)
@@ -363,8 +398,7 @@ class Harness:
         self.git("fsck", "--full", cwd=self.root / "after-crash")
 
     def provisioning_recovery(self):
-        existing = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice,
-                                          body={"name": "recover-existing"}))
+        existing = self.create_repository({"name": "recover-existing"}, token=self.alice)
         self.stop(hard=True)
         owner = str(uuid.UUID(self.alice["user_id"]))
         pending = [(str(uuid.uuid4()), "recover-missing"), (str(uuid.uuid4()), "recover-staging")]

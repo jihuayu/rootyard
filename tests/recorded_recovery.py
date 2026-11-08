@@ -57,8 +57,7 @@ class RecordedRecoveryHarness(ReliabilityHarness):
         return {"fixture_repo": self.repo["id"], "second_oid": self.second}
 
     def recorded_settlement_with_revoked_token(self):
-        repo = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice,
-                                      body={"name": "recorded-recovery"}))
+        repo = self.create_repository({"name": "recorded-recovery"}, token=self.alice)
         # A dedicated token is revoked after the push, exactly like an operator
         # or expiry revoking a PAT between native publication and restart.
         push_token = self.account("create-token", "alice")

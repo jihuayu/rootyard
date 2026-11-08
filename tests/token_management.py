@@ -166,8 +166,8 @@ def main():
     exit_code = 1
     try:
         h.setup()
-        json.loads(h.expect("/api/repos", 201, method="POST", token=h.alice, body={"name": "demo"}))
-        json.loads(h.expect("/api/repos", 201, method="POST", token=h.bob, body={"name": "other"}))
+        h.create_repository({"name": "demo"}, token=h.alice)
+        h.create_repository({"name": "other"}, token=h.bob)
         demo = repo_id(h, "alice", "demo")
         other = repo_id(h, "bob", "other")
 
