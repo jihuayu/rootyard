@@ -1,0 +1,28 @@
+
+running 9 tests
+test debug_and_serialization_redact_all_key_material ... ok
+test length_delimited_aad_prevents_adjacent_field_collisions ... FAILED
+test rejects_unsafe_keyring_directory_and_manifest_shapes ... ok
+test rejects_malformed_key_files_modes_symlinks_and_fifos ... ok
+test roundtrip_uses_current_key_and_fresh_nonces ... ok
+test rotation_keeps_old_reads_rewraps_to_current_and_preserves_the_dek ... ok
+test tampered_ciphertext_nonce_aad_and_version_fail_closed ... ok
+test wrapped_metadata_validation_rejects_bad_lengths_ids_and_oversize ... ok
+test wrong_key_and_missing_key_file_fail_closed_without_generation ... ok
+
+failures:
+
+---- length_delimited_aad_prevents_adjacent_field_collisions stdout ----
+
+thread 'length_delimited_aad_prevents_adjacent_field_collisions' (479765) panicked at tests/key_provider_contract.rs:313:5:
+assertion `left == right` failed: the fixture must collide without field lengths
+  left: [118, 49, 120, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+ right: [118, 49, 120, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    length_delimited_aad_prevents_adjacent_field_collisions
+
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

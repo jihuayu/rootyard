@@ -1,0 +1,16 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "stock_lfs_second_node_recovery",
+      "status": "passed",
+      "seconds": 8.0091,
+      "detail": {
+        "bytes": 1048576,
+        "recovered_after_source_volume_loss": true,
+        "remote_only_pointer_push": true
+      }
+    }
+  ],
+  "binary_sha256": "5b1bca4e0b20cce7970c65147e7ab875f6007d89a6c1c32e3370b351cf3d9a1f"
+}

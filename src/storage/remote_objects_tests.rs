@@ -20,11 +20,22 @@ fn timeout_and_transport_never_expose_a_status_or_url() {
     assert!(!format!("{timeout:?}").contains("://"));
     let client = Client::new();
     let transport = client.request(Method::GET, "http://[").build().unwrap_err();
-    let error = RemoteStoreError::transport(RemoteOp::Head, transport);
+    let error = RemoteStoreError::transport(RemoteOp::Head, Box::new(transport));
     assert_eq!(error.http_status(), None);
     assert_eq!(error.op().as_str(), "head");
     assert!(!error.to_string().contains("://"));
     assert!(std::error::Error::source(&error).is_some());
+}
+
+#[test]
+fn generic_boxed_transport_source_survives_without_a_reqwest_type() {
+    let error = RemoteStoreError::transport(RemoteOp::Put, Box::new(std::io::Error::other("opaque transport failure")));
+    assert_eq!(error.http_status(), None);
+    assert_eq!(error.op(), RemoteOp::Put);
+    assert!(std::error::Error::source(&error).is_some());
+    let rendered = format!("{error} {error:?}");
+    assert!(rendered.contains("transport failed"));
+    assert!(!rendered.contains("opaque transport failure"));
 }
 
 #[tokio::test]

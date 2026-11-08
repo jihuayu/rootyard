@@ -1,0 +1,47 @@
+{
+  "kind": "rust-integration-test",
+  "relocated_artifact": true,
+  "original_artifact_sha256": "123de79ea662947a1855665e5a28d60bf0a987db36a1ad2781410c92af31f819",
+  "workspace_commit": "d02a24e0f7c1fa47e27d4429802560840627caf7",
+  "source_inputs_sha256": "ecc7399d5e1b4d027e97745fa94c591f433e50a78b3c43d7504e48f98ef7cfe7",
+  "binary_sha256": "123de79ea662947a1855665e5a28d60bf0a987db36a1ad2781410c92af31f819",
+  "integration_test_source_sha256": "3934bdc91fc7ce319450bb578eb2bf34c494f0249d74eb9095ce86d458f59521",
+  "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+  "command": [
+    "cargo",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "--config",
+    "profile.test.package.rootyard.debug=0",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "--config",
+    "profile.test.package.rootyard.strip=\"debuginfo\"",
+    "rustc",
+    "--locked",
+    "--profile",
+    "test",
+    "--test",
+    "key_provider_contract",
+    "--features",
+    "blob-azblob",
+    "--message-format=json-render-diagnostics"
+  ],
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "package_rebuilt": true,
+  "fresh_false_artifacts": [
+    {
+      "target": "key_provider_contract",
+      "kind": "test",
+      "fresh": false,
+      "profile": {
+        "opt_level": "0",
+        "debuginfo": 0,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "test": true
+      },
+      "executable": "/workspace/rootyard/target/debug/deps/key_provider_contract-ea6df5be106ed565"
+    }
+  ]
+}

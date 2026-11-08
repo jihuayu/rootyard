@@ -1,9 +1,11 @@
+#![recursion_limit = "256"]
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 #[rustfmt::skip]
 pub mod auth;
 pub mod backup;
+pub mod blob_store;
 #[rustfmt::skip]
 pub mod browse;
 #[rustfmt::skip]
