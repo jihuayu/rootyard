@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 pub mod admission;
 pub mod encrypted_objects;
+pub mod no_grant_proof;
 pub mod read_leases;
 pub mod ref_admission;
 pub mod ref_publication;

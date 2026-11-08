@@ -322,18 +322,36 @@ def wait_owner_lock_wait(h, blocker_pid, timeout=20):
 
 
 def wait_owner_backend_gone(h, owner_pid, timeout=30):
-    """While the revoker still holds the row, the blocked owner must disappear."""
+    """While the revoker still holds the row, the owner must leave its work.
+
+    The owner runs on a pooled connection, so a finished request returns the
+    backend to the pool as ``idle`` instead of closing it; requiring
+    ``pid NOT IN pg_stat_activity`` would wait forever. Terminal evidence is:
+    the owner backend is absent, or it holds no transaction (``xact_start IS
+    NULL``), and no backend anywhere still waits on the late-authorisation
+    query shape (the known blocker is gone).
+    """
     owner_pid = int(owner_pid)
     until = time.monotonic() + timeout
     last = None
     while time.monotonic() < until:
-        live = int(h.sql("SELECT count(*) FROM pg_stat_activity WHERE pid = " + str(owner_pid)))
+        row = h.sql("SELECT concat_ws('|', coalesce(state, ''), (xact_start IS NOT NULL)::text, "
+                    "coalesce(wait_event_type, '')) FROM pg_stat_activity WHERE pid = "
+                    + str(owner_pid))
         blocked = int(h.sql("SELECT count(*) FROM pg_stat_activity WHERE " + OWNER_WAIT_PREDICATE))
-        last = {"owner_pid": owner_pid, "live": live, "blocked_owners": blocked}
-        if live == 0 and blocked == 0:
+        if row:
+            fields = (row.split("|") + ["", "", ""])[:3]
+            present, in_transaction, wait_type = True, fields[1] == "true", fields[2]
+        else:
+            present, in_transaction, wait_type = False, False, ""
+        last = {"owner_pid": owner_pid, "backend_present": present,
+                "in_transaction": in_transaction, "wait_event_type": wait_type,
+                "blocked_owners": blocked}
+        if blocked == 0 and not in_transaction and wait_type != "Lock":
             return last
         time.sleep(0.02)
-    raise AssertionError("owner backend did not disappear while the revoker still held the token row: " + repr(last))
+    raise AssertionError("owner backend kept a token-row wait/transaction while the revoker held the row: "
+                         + repr(last))
 
 
 def probe_row_available(h, token_id):
@@ -349,7 +367,21 @@ def probe_row_available(h, token_id):
         probe.close()
 
 
+def as_do_statement(statement):
+    """A plpgsql block cannot return a query result.
+
+    ``SELECT ... FOR UPDATE`` must become ``PERFORM ... FOR UPDATE`` inside the
+    DO wrapper; otherwise the block raises 42601 for an unhandled ``SELECT``
+    before the lock wait is ever attempted and the probe proves nothing.
+    """
+    stripped = statement.strip()
+    if stripped[:6].upper() == "SELECT":
+        return "PERFORM" + stripped[6:]
+    return stripped
+
+
 def expect_sqlstate(h, session, statement, expected="55P03", lock_timeout="100ms"):
+    statement = as_do_statement(statement)
     session.send("SET lock_timeout = '" + lock_timeout + "'")
     session.send("CREATE TEMP TABLE IF NOT EXISTS fence_outcome(k text)")
     session.send("TRUNCATE fence_outcome")
@@ -363,6 +395,7 @@ def expect_sqlstate(h, session, statement, expected="55P03", lock_timeout="100ms
 
 def wait_sqlstate(h, session, statement, expected="RAN", timeout=20, lock_timeout="100ms"):
     """Bounded retries until the statement has the expected SQLSTATE."""
+    statement = as_do_statement(statement)
     until = time.monotonic() + timeout
     outcomes = []
     while time.monotonic() < until:
@@ -523,6 +556,25 @@ def run_case(h, name, fn):
     return h.results[-1]
 
 
+def diagnostics_evidence(h, repository_id, key):
+    """Read one boolean evidence field of the newest recorded operation."""
+    return h.sql("SELECT coalesce(evidence->>'" + key + "', '') FROM git_operations WHERE repository_id="
+                 + quote(repository_id) + " AND outcome='recorded' ORDER BY settled_at DESC NULLS LAST LIMIT 1")
+
+
+def publication_diagnostics(h, repository_id):
+    """Row/state diagnostics only: never token ids, digests, DSNs or paths."""
+    return {
+        "operations": h.sql("SELECT coalesce(string_agg(outcome || ':' || n::text, ',' ORDER BY outcome), '') "
+                            "FROM (SELECT outcome, count(*) AS n FROM git_operations WHERE repository_id="
+                            + quote(repository_id) + " GROUP BY outcome) rows"),
+        "admissions": h.sql("SELECT coalesce(string_agg(state || ':' || n::text, ',' ORDER BY state), '') "
+                            "FROM (SELECT state, count(*) AS n FROM git_ref_admissions WHERE repository_id="
+                            + quote(repository_id) + " GROUP BY state) rows"),
+        "outbox": h.sql("SELECT count(*) FROM outbox_events WHERE repository_id=" + quote(repository_id)),
+    }
+
+
 def assert_no_new_publication(h, repository_id, before, repo, ref, label):
     after = counts(h, repository_id)
     assert after["operations"] == before["operations"], (label, after, before)
@@ -560,11 +612,18 @@ def case_revoker_first(h, work):
         assert_no_new_publication(h, repository_id, before, repo, "refs/heads/fence-a",
                                   "revoked push published")
         assert not (set(markers(h)) - set(before_markers)), "an ACK marker survived the refused push"
-        # A different valid token must still be able to publish the same ref.
+        # A different valid token must publish the same ref. This is a hard
+        # single-shot assertion: a stranded admission/journal would answer 503
+        # (or leave the ref unpublished) and must fail the case immediately.
         valid = h.account("create-token", "alice")
-        push_with_retry(h, remote(h, repo), "refs/heads/fence-a", valid, work)
-        assert ref_oid(h, repo, "refs/heads/fence-a") is not None
+        published = h.git("push", remote(h, repo), "HEAD:refs/heads/fence-a", cwd=work,
+                          token=valid, check=False)
+        if published.returncode != 0 or ref_oid(h, repo, "refs/heads/fence-a") is None:
+            raise AssertionError("valid token push after the refused revocation failed: "
+                                 + h.redact(published.stderr.decode(errors="replace")[-500:])
+                                 + " diagnostics=" + repr(publication_diagnostics(h, repository_id)))
         assert counts(h, repository_id)["outbox"] == before["outbox"] + 1
+        assert not (set(markers(h)) - set(before_markers)), "valid push left no ACK marker"
         return ("owner FOR SHARE wait blocked by revoker backend %d (owner %d); revocation refused the push; "
                 "valid token published" % (revoker.pid, wait["owner_pid"]))
     finally:
@@ -624,6 +683,9 @@ def case_lock_outlives_cas(h, work, native):
         assert code == 0, "push failed after the CAS barrier was released: " + err
         assert ref_oid(h, repo, "refs/heads/fence-b") is not None, "push succeeded without a ref"
         assert counts(h, repository_id)["outbox"] == before["outbox"] + 1
+        assert counts(h, repository_id)["operations"] == before["operations"] + 1
+        assert diagnostics_evidence(h, repository_id, "ungranted_without_hooks") not in (None, "true"), \
+            "a granted native CAS was settled as an ungranted no-ref-change abort"
         # Settlement released the lock, so the same writes now succeed.
         settled = wait_sqlstate(h, probe, "SELECT 1 FROM tokens WHERE id = "
                                 + quote(scoped["token_id"]) + " FOR UPDATE")
@@ -680,8 +742,8 @@ def case_cancel_releases(h, work):
         fresh = h.account("create-token", "alice")
         push_with_retry(h, remote(h, repo), "refs/heads/fence-c", fresh, work)
         assert ref_oid(h, repo, "refs/heads/fence-c") is not None
-        return ("owner backend %d gone while the revoker held the row (%r); independent session %d acquired "
-                "the token row FOR UPDATE NOWAIT; fresh push published"
+        return ("owner backend %d left its transaction while the revoker held the row (%r); independent "
+                "session %d acquired the token row FOR UPDATE NOWAIT; fresh push published"
                 % (wait["owner_pid"], gone, available["pid"]))
     finally:
         if worker is not None:

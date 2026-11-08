@@ -242,6 +242,7 @@ pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
     actor_id: Uuid,
     token_id: Uuid,
     outcome: &str,
+    no_grant: Option<&crate::storage::no_grant_proof::NoGrantAbort>,
 ) -> anyhow::Result<()> {
     let row = tx
         .query_opt(
@@ -293,16 +294,25 @@ pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
             anyhow::bail!("ref admission writer is not the current repository primary");
         }
     }
-    auth::verify_repo_write_access(
-        tx,
-        actor_id,
-        token_id,
-        repository_id,
-        false,
-        crate::token_scopes::RepoAction::ContentsWrite,
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!(error.1))?;
+    // A revocation that races a provably ref-free push must not strand the
+    // admission. Journal-derived proof that no grant marker, hook event,
+    // receipt or request ever existed means the child could not have changed a
+    // ref, so the authority recheck is skipped for that exact identity-matched
+    // proof and only for `no_ref_changes`; route/epoch/fence checks still apply.
+    let proven_ref_free = outcome == "no_ref_changes"
+        && no_grant.is_some_and(|proof| proof.matches_admission(repository_id, admission, actor_id, token_id));
+    if !proven_ref_free {
+        auth::verify_repo_write_access(
+            tx,
+            actor_id,
+            token_id,
+            repository_id,
+            false,
+            crate::token_scopes::RepoAction::ContentsWrite,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.1))?;
+    }
     let terminal = match outcome {
         "no_ref_changes" => State::Aborted,
         _ => State::Committed,
