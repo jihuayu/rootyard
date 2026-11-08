@@ -104,13 +104,13 @@ async fn namespace_page(
                 .filter(|r| r.name.starts_with(namespace) && prefix.is_none_or(|p| r.name.starts_with(p)))
                 .collect();
             if records > limit && items.len() <= limit {
-                return scan_namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await;
+                return scan_namespace_page(state, repo_id, namespace, marker, prefix, limit).await;
             }
             Ok(items)
         }
         GitOutcome::CommandFailed { exit: Some(129) } => {
             report_seek_fallback();
-            scan_namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await
+            scan_namespace_page(state, repo_id, namespace, marker, prefix, limit).await
         }
         GitOutcome::CommandFailed { exit } => {
             report_step_failure(GitStep::RefsPage, exit);
@@ -145,14 +145,18 @@ fn selects_part_of_namespace(prefix: Option<&str>) -> bool {
 /// from the namespace start to that range and never the rest of the namespace.
 /// Memory is `limit + 1` refs plus one line, the child is killed and reaped on
 /// early stop, and records (1M), bytes (64 MiB), record size and time are hard
-/// bounded. The Git argv carries only the compiled namespace pattern, never the
-/// caller's prefix, so a prefix that contains glob bytes stays a literal byte
-/// filter and can never become a Git pattern.
+/// bounded. The Git argv carries only `--sort`, `--format` and the compiled
+/// namespace pattern: never the caller's prefix, so a prefix that contains glob
+/// bytes stays a literal byte filter and can never become a Git pattern. It also
+/// carries no `--exclude`: the compiled pattern selects one public namespace and
+/// `parse_for_each_ref_output` drops every ref outside it, reserved CI refs and
+/// private proposal refs, so an exclusion option would be redundant here (the
+/// modern seek path still uses one). Only `--start-after` is a capability the
+/// seek path must fall back from on Git 2.43; `--exclude` is supported there too.
 async fn scan_namespace_page(
     state: &AppState,
     repo_id: Uuid,
     namespace: &str,
-    excluded: &str,
     marker: &str,
     prefix: Option<&str>,
     limit: usize,
@@ -161,12 +165,14 @@ async fn scan_namespace_page(
     // which is exactly the namespace-wide request.
     let prefix = prefix.unwrap_or("");
     let pattern = namespace.trim_end_matches('/');
+    // Minimal portable argv: the compiled namespace pattern selects one public
+    // namespace, and `parse_for_each_ref_output` drops reserved CI refs, private
+    // proposal refs and any other non-public name, so no `--exclude` is needed
+    // on this path (Git does support it; the seek path above still passes one).
     let args = [
         "for-each-ref",
         "--sort=refname",
         "--format=%(refname)%00%(objectname)%00%(*objectname)",
-        excluded,
-        "--exclude=refs/rootyard-ci/*",
         pattern,
     ];
     let mut cmd = git_cmd(state, repo_id)?;
@@ -229,7 +235,7 @@ pub(crate) async fn page_refs(
         }
         let marker = after.filter(|cursor| cursor.starts_with(namespace)).unwrap_or(namespace);
         items.extend(if selective {
-            scan_namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await?
+            scan_namespace_page(state, repo_id, namespace, marker, prefix, limit).await?
         } else {
             namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await?
         });

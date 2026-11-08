@@ -135,9 +135,14 @@ def selects_part_of_namespace(prefix):
 
 
 def scan_page(repo, namespace, marker, limit, prefix=None):
-    """Mirror of the bounded streaming scan in `scan_namespace_page`."""
+    """Mirror of the bounded streaming scan in `scan_namespace_page`.
+
+    The production scan argv carries no `--exclude`: the compiled namespace
+    pattern selects one public namespace and the parser drops reserved and
+    private refs, so the scan stays minimal (the seek path keeps its excludes).
+    """
     argv = [GIT, "--git-dir", str(repo), "for-each-ref", "--sort=refname", FORMAT,
-            excluded_for(namespace), "--exclude=refs/rootyard-ci/*", namespace.rstrip("/")]
+            namespace.rstrip("/")]
     proc = subprocess.Popen(argv, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     names, read, consumed = [], 0, 0
     try:
@@ -324,7 +329,7 @@ class GitReadStepsSourceTest(unittest.TestCase):
         route = self.read[self.read.index("pub(crate) async fn page_refs("):]
         route = route[:route.index("\n}\n")]
         self.assertIn("items.extend(if selective {", route)
-        self.assertIn("scan_namespace_page(state, repo_id, namespace, excluded, marker, prefix, limit).await?", route)
+        self.assertIn("scan_namespace_page(state, repo_id, namespace, marker, prefix, limit).await?", route)
         # The literal filter runs inside the sink, before a ref is counted.
         scan = self.read[self.read.index("async fn scan_namespace_page("):]
         scan = scan[:scan.index("\n}\n")]
@@ -357,6 +362,29 @@ class GitReadStepsSourceTest(unittest.TestCase):
         self.assertIn("GitStep::RefsPage.label()", fallback)
         for forbidden in ("args", "stderr", "stdout", "marker"):
             self.assertNotIn(forbidden, fallback)
+
+    def test_bounded_scan_argv_needs_no_exclude_and_seek_keeps_its_own(self):
+        """The scan argv is option-free; the modern seek path is retained."""
+        scan = self.read[self.read.index("async fn scan_namespace_page("):]
+        scan = scan[:scan.index("\n}\n")]
+        argv = scan[scan.index("let args = ["):scan.index("];", scan.index("let args = ["))]
+        self.assertNotIn("--exclude", argv)
+        self.assertNotIn("excluded", argv)
+        self.assertIn("pattern", argv)
+        # Redundant, not unsupported: the compiled namespace pattern and the
+        # parser already drop outside, reserved CI and private proposal refs.
+        self.assertIn("crate::ci_pins::reserved(name)", self.read)
+        self.assertIn("models::valid_public_ref(name)", self.read)
+        seek = self.read[self.read.index("async fn namespace_page("):]
+        seek = seek[:seek.index("\n}\n")]
+        seek_argv = seek[seek.index("let args = ["):seek.index("];", seek.index("let args = ["))]
+        self.assertIn('"--exclude=refs/rootyard-ci/*"', seek_argv)
+        self.assertIn("excluded", seek_argv)
+        # The corrected facts: --exclude is supported on Git 2.43; only
+        # --start-after is the usage-gated capability.
+        self.assertNotIn("2.43 does not implement", self.read)
+        self.assertNotIn("2.43's `for-each-ref` does not", self.read)
+        self.assertIn("`--exclude` is supported there too", self.read)
 
     def test_bounded_scan_reuses_process_helpers(self):
         scan = self.read[self.read.index("async fn scan_namespace_page("):]
@@ -494,6 +522,12 @@ class RealGitFixtureTest(unittest.TestCase):
         self.assertEqual(page["items"][:1], ["refs/tags/perf-00011-" + LONG])
         self.assertLess(page["refs_read"], 64, "bounded scan drained the whole namespace")
         self.assertLess(page["bytes_read"], 64 * 1024)
+
+    def test_bounded_scan_without_exclude_keeps_outside_refs_out(self):
+        repo, third = self.fixture()
+        git("--git-dir", str(repo), "update-ref", "refs/rootyard-ci/job-1/checkout", third)
+        page = scan_page(repo, "refs/heads/", "refs/heads/", 50)
+        self.assertEqual(page["items"], ["refs/heads/feature", "refs/heads/main"])
 
     def test_first_public_namespace_page_is_ordered(self):
         repo, _ = self.fixture()

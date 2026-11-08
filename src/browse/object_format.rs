@@ -67,19 +67,29 @@ pub fn detect_git_dir_object_format(repo_path: &StdPath) -> Option<ObjectFormat>
     None
 }
 
+/// Parse `rev-parse --show-object-format`; a successful probe always prints one
+/// supported format, so anything else is a broken read, never a SHA-1 guess.
+fn parse_object_format_probe(raw: &[u8]) -> Result<ObjectFormat, Error> {
+    ObjectFormat::from_str_name(&String::from_utf8_lossy(raw))
+        .ok_or_else(|| Error::internal(crate::git_http::GitCommandFailed { exit: None }))
+}
+
 pub async fn detect_repo_object_format(state: &AppState, repo_id: Uuid) -> Result<ObjectFormat, Error> {
     let repo_path = state.storage.verify_path(repo_id).map_err(Error::internal)?;
     if let Some(fmt) = detect_git_dir_object_format(&repo_path) { return Ok(fmt); }
-    if let Ok(out) = git_read::run_git(
+    // The explicit receipt/config read above is the fast path; otherwise the
+    // probe is authoritative, because the project-minimum Git 2.43 implements
+    // `--show-object-format`. A failed or unparseable probe is a broken read:
+    // internal, never a SHA-1 guess on a damaged SHA-256 repository.
+    let out = git_read::run_git(
         state,
         repo_id,
         git_read::GitStep::ObjectFormat,
         &["rev-parse", "--show-object-format"],
         64,
     )
-    .await
-        && let Some(fmt) = ObjectFormat::from_str_name(&String::from_utf8_lossy(&out)) { return Ok(fmt); }
-    Ok(ObjectFormat::Sha1)
+    .await?;
+    parse_object_format_probe(&out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,5 +456,16 @@ mod tests {
             updates: vec![RefUpdateInput { ref_name: "refs/heads/main".to_owned(), old_oid: Some(sha1), new_oid: Some(sha256) }],
         };
         assert!(mixed.normalize().is_err());
+    }
+
+    #[test]
+    fn object_format_probe_never_falls_back_to_sha1() {
+        assert_eq!(parse_object_format_probe(b"sha1\n").ok(), Some(ObjectFormat::Sha1));
+        assert_eq!(parse_object_format_probe(b"sha256\n").ok(), Some(ObjectFormat::Sha256));
+        for damaged in [b"".as_slice(), b"sha512\n".as_slice(), b"\xff".as_slice()] {
+            let err = parse_object_format_probe(damaged).expect_err("damaged probe output");
+            assert!(err.0.is_server_error(), "damaged probe must be internal, got {}", err.0);
+            assert_ne!(err.0, StatusCode::NOT_FOUND, "a broken probe is never a SHA-1 guess");
+        }
     }
 }

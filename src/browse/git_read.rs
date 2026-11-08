@@ -335,6 +335,18 @@ pub(crate) async fn read_tree(
     Ok(TreeResponse { oid: root_oid, tree_oid, path: rel_path.to_owned(), items, next_after })
 }
 
+/// Parse the decimal byte count printed by `cat-file -s`.
+///
+/// The blob's existence and type are proved before this read, so output that is
+/// not a plain decimal size is a broken native read: an internal failure with a
+/// fixed message, never a 404.
+pub(crate) fn parse_blob_size(raw: &[u8]) -> Result<u64, Error> {
+    String::from_utf8_lossy(raw).trim().parse::<u64>().map_err(|_| {
+        report_step_failure(GitStep::BlobSize, None);
+        Error::internal(crate::git_http::GitCommandFailed { exit: None })
+    })
+}
+
 pub(crate) async fn read_blob(
     state: &AppState,
     repo_id: Uuid,
@@ -367,7 +379,7 @@ pub(crate) async fn read_blob(
         return Err(Error::not_found());
     }
     let size_out = run_git(state, repo_id, GitStep::BlobSize, &["cat-file", "-s", &blob_oid], 64).await?;
-    let size: u64 = String::from_utf8_lossy(&size_out).trim().parse().map_err(|_| Error::not_found())?;
+    let size = parse_blob_size(&size_out)?;
     if size as usize > MAX_BROWSE_BLOB_BYTES {
         return Err(Error(StatusCode::PAYLOAD_TOO_LARGE, "blob exceeds browse size limit"));
     }
@@ -383,6 +395,17 @@ pub(crate) async fn read_blob(
     let content = (!is_binary).then(|| std::str::from_utf8(&bytes).ok().map(str::to_owned)).flatten();
     let content_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(BlobResponse { oid: blob_oid, size, is_binary, content, content_base64 })
+}
+
+/// Classify a failed `merge-base` call.
+///
+/// `git merge-base` answers "no common ancestor" with its precise quiet exit 1,
+/// which the merge-base step maps to 404; only that verdict becomes `None`.
+/// Every other failure - a timeout, a damaged object database, a usage error, a
+/// signal, a spawn failure - is a broken read and propagates unchanged instead
+/// of being reported as an absent merge base.
+fn merge_base_from_failure(err: Error) -> Result<Option<String>, Error> {
+    if err.0 == StatusCode::NOT_FOUND { Ok(None) } else { Err(err) }
 }
 
 pub(crate) async fn compare_commits(
@@ -407,10 +430,15 @@ pub(crate) async fn compare_commits(
     {
         Ok(out) => {
             let s = String::from_utf8_lossy(&out).trim().to_owned();
-            models::valid_non_zero_oid(&s).then_some(s)
+            if !models::valid_non_zero_oid(&s) {
+                // A successful merge-base prints the common commit; anything
+                // else is a broken native read, never "no common ancestor".
+                report_step_failure(GitStep::MergeBase, None);
+                return Err(Error::internal(crate::git_http::GitCommandFailed { exit: None }));
+            }
+            Some(s)
         }
-        Err(err) if err.0 == StatusCode::GATEWAY_TIMEOUT => return Err(err),
-        Err(_) => None,
+        Err(err) => merge_base_from_failure(err)?,
     };
     let fast_forward = merge_base_oid.as_deref() == Some(base_oid.as_str());
     let sym_range = format!("{base_oid}...{head_oid}");
@@ -460,4 +488,39 @@ pub(crate) async fn compare_commits(
         commits,
         diff: String::from_utf8_lossy(&diff_out).into_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The service's internal failure class (503) with its fixed message; the
+    /// point is that a broken read is never the 404 "not found".
+    fn assert_internal(err: &Error) {
+        assert!(err.0.is_server_error(), "broken read must be internal, got {}", err.0);
+        assert_ne!(err.0, StatusCode::NOT_FOUND, "corruption is never an absent object");
+        assert_eq!(err.1, "service temporarily unavailable", "fixed, secret-free message");
+    }
+
+    #[test]
+    fn blob_size_parse_is_internal_after_the_existence_probe() {
+        assert_eq!(parse_blob_size(b"12\n").ok(), Some(12));
+        assert_eq!(parse_blob_size(b" 0\n").ok(), Some(0));
+        for damaged in [b"".as_slice(), b"not-a-number\n".as_slice(), b"-1\n".as_slice(), b"1 2\n".as_slice()] {
+            assert_internal(&parse_blob_size(damaged).expect_err("damaged blob size"));
+        }
+    }
+
+    #[test]
+    fn only_a_genuine_no_merge_base_verdict_is_none() {
+        let none = merge_base_from_failure(Error::not_found()).expect("a real absence is not an error");
+        assert!(none.is_none());
+        for broken in [Error::timeout(), Error::internal("damaged read")] {
+            let status = merge_base_from_failure(broken).expect_err("must propagate").0;
+            assert!(
+                status.is_server_error() || status == StatusCode::GATEWAY_TIMEOUT,
+                "broken merge-base must stay a server failure, got {status}"
+            );
+        }
+    }
 }
