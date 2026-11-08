@@ -1,12 +1,13 @@
 //! A non-forgeable witness that one native publication never touched a ref.
 //!
 //! Reconciliation may only mint this after deriving `no_ref_changes` from the
-//! operation's own finished journal: the managed reference-transaction hook
-//! cannot perform its native CAS without a parent publication grant, so an
-//! absent grant marker plus empty events/receipt/request proves the child was
-//! stopped before any ref update. HTTP bodies, request JSON and database rows
-//! can never construct this value, and settlement still re-checks the writer,
-//! repository, actor, token, generation and shard epoch it is bound to.
+//! operation's own finished and quiescent journal: the managed
+//! reference-transaction hook cannot perform its native CAS without a parent
+//! publication grant, so an absent grant marker plus empty events/receipt/
+//! request proves the child was stopped before any ref update. HTTP bodies,
+//! request JSON and database rows can never construct this value, and
+//! settlement still re-checks the writer, repository, actor, token, generation
+//! and shard epoch it is bound to.
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug)]
@@ -23,9 +24,14 @@ impl NoGrantAbort {
     /// Re-derives every condition from the on-disk journal of `operation`.
     /// `outcome` must be the exact terminal outcome reconciliation computed for
     /// that same journal; anything else (recorded/unknown, another generation,
-    /// a live or interrupted journal, any hook evidence or a grant marker)
+    /// a live or unfinished journal, any hook evidence or a grant marker)
     /// yields no proof, so settlement keeps verifying authority.
-    pub fn from_journal(operation: &crate::journal::Operation, outcome: &str) -> Option<Self> {
+    ///
+    /// The liveness lock is checked here, not by the caller: a journal whose
+    /// active guard is still held may acquire admission and run the native hook
+    /// after any caller-side observation, so `finished` metadata alone is not
+    /// quiescence.
+    pub(crate) fn from_journal(operation: &crate::journal::Operation, outcome: &str) -> Option<Self> {
         if outcome != "no_ref_changes"
             || !operation.requires_parent_publication
             || operation.id.is_nil()
@@ -35,6 +41,9 @@ impl NoGrantAbort {
             || operation.storage_generation <= 0
             || operation.shard_epoch <= 0
         {
+            return None;
+        }
+        if crate::journal::ActiveGuard::operation_is_live(operation).ok()? {
             return None;
         }
         if !crate::journal::is_finished(operation).ok()? {
@@ -98,11 +107,14 @@ impl NoGrantAbort {
 #[cfg(test)]
 mod tests {
     use super::NoGrantAbort;
+    use crate::events::{AdmissionRecord, OperationRecord};
+    use crate::journal::{self, ActiveGuard, Operation, RefChange};
     use uuid::Uuid;
 
-    fn finished_journal() -> (tempfile::TempDir, crate::journal::Operation) {
+    /// Real persisted journal metadata from the production constructor.
+    fn live_journal() -> (tempfile::TempDir, Operation, ActiveGuard) {
         let root = tempfile::tempdir().unwrap();
-        let (operation, active) = crate::journal::begin_active_with(
+        let (operation, active) = journal::begin_active_with(
             root.path(),
             Uuid::new_v4(),
             Uuid::new_v4(),
@@ -113,20 +125,94 @@ mod tests {
             7,
         )
         .unwrap();
+        (root, operation, active)
+    }
+
+    fn finished_journal() -> (tempfile::TempDir, Operation) {
+        let (root, operation, active) = live_journal();
         drop(active);
-        crate::journal::finish(&operation).unwrap();
+        journal::finish(&operation).unwrap();
         (root, operation)
     }
 
+    fn change() -> RefChange {
+        RefChange { old_oid: "0".repeat(40), new_oid: "a".repeat(40), ref_name: "refs/heads/main".into() }
+    }
+
+    fn record(operation: &Operation) -> OperationRecord {
+        OperationRecord {
+            id: operation.id,
+            repository_id: operation.repository_id,
+            actor_id: operation.actor_id,
+            token_id: operation.token_id,
+            service_principal_id: None,
+            actor_name: operation.actor_name.clone(),
+            sequence: operation.sequence,
+            storage_generation: operation.storage_generation,
+            outcome: "no_ref_changes".into(),
+            evidence: serde_json::json!({"version":1,"ungranted_without_hooks":true}),
+            admission: Some(AdmissionRecord {
+                writer_id: operation.id,
+                shard_epoch: operation.shard_epoch,
+            }),
+        }
+    }
+
     #[test]
-    fn proof_needs_finished_ungranted_no_ref_change_journal() {
+    fn live_operation_never_mints_a_proof() {
+        let (_root, operation, active) = live_journal();
+        // Terminal metadata written by another path must not outrun the child.
+        journal::finish(&operation).unwrap();
+        assert!(ActiveGuard::operation_is_live(&operation).unwrap(), "guard must hold the liveness lock");
+        assert!(
+            NoGrantAbort::from_journal(&operation, "no_ref_changes").is_none(),
+            "a live operation could still acquire admission and run the hook"
+        );
+        drop(active);
+        assert!(
+            NoGrantAbort::from_journal(&operation, "no_ref_changes").is_some(),
+            "quiescent finished journal must mint the proof"
+        );
+    }
+
+    #[test]
+    fn unfinished_journal_is_not_a_proof() {
+        let (_root, operation, active) = live_journal();
+        drop(active);
+        assert!(NoGrantAbort::from_journal(&operation, "no_ref_changes").is_none());
+        journal::finish(&operation).unwrap();
+        assert!(NoGrantAbort::from_journal(&operation, "no_ref_changes").is_some());
+    }
+
+    #[test]
+    fn only_a_clean_finished_journal_is_a_proof() {
         let (_root, operation) = finished_journal();
-        // A different terminal outcome never mints a proof, even with a clean journal.
         assert!(NoGrantAbort::from_journal(&operation, "recorded").is_none());
         assert!(NoGrantAbort::from_journal(&operation, "unknown").is_none());
         let proof = NoGrantAbort::from_journal(&operation, "no_ref_changes").expect("clean journal proof");
         assert_eq!(proof.operation_id(), operation.id);
-        // Any real grant marker means the hook could have run: no proof.
+
+        // A whole-push admission request proves validation only; native CAS can
+        // still follow it, so it removes the proof.
+        let request = operation.path.join("pre-receive.json");
+        std::fs::write(&request, serde_json::to_vec(&vec![change()]).unwrap()).unwrap();
+        assert!(NoGrantAbort::from_journal(&operation, "no_ref_changes").is_none());
+        std::fs::remove_file(&request).unwrap();
+
+        // A post-receive receipt is direct evidence that refs changed.
+        let receipt = operation.path.join("post-receive.json");
+        std::fs::write(&receipt, serde_json::to_vec(&vec![change()]).unwrap()).unwrap();
+        assert!(NoGrantAbort::from_journal(&operation, "no_ref_changes").is_none());
+        std::fs::remove_file(&receipt).unwrap();
+
+        // Unreadable or invalid hook evidence is never treated as absence.
+        std::fs::write(operation.path.join("00000000000000000001.event.json"), b"not an event").unwrap();
+        assert!(NoGrantAbort::from_journal(&operation, "no_ref_changes").is_none());
+    }
+
+    #[test]
+    fn a_real_grant_marker_is_never_a_proof() {
+        let (_root, operation) = finished_journal();
         let marker = operation.path.join("publication.grant");
         std::fs::write(&marker, b"granted").unwrap();
         assert!(NoGrantAbort::from_journal(&operation, "no_ref_changes").is_none());
@@ -136,12 +222,33 @@ mod tests {
     }
 
     #[test]
-    fn proof_requires_parent_publication_and_a_non_live_journal() {
-        let (_root, mut operation) = finished_journal();
-        operation.requires_parent_publication = false;
-        assert!(NoGrantAbort::from_journal(&operation, "no_ref_changes").is_none());
-        operation.requires_parent_publication = true;
-        operation.shard_epoch = 0;
-        assert!(NoGrantAbort::from_journal(&operation, "no_ref_changes").is_none());
+    fn proof_matches_exactly_one_operation_record() {
+        let (_root, operation) = finished_journal();
+        let proof = NoGrantAbort::from_journal(&operation, "no_ref_changes").expect("clean journal proof");
+        let good = record(&operation);
+        assert!(proof.matches_operation(&good), "the derived record must bind to its proof");
+
+        let differ = |mutate: &dyn Fn(&mut OperationRecord)| {
+            let mut altered = good.clone();
+            mutate(&mut altered);
+            assert!(!proof.matches_operation(&altered));
+        };
+        differ(&|r| r.id = Uuid::new_v4());
+        differ(&|r| r.repository_id = Uuid::new_v4());
+        differ(&|r| r.actor_id = Uuid::new_v4());
+        differ(&|r| r.token_id = Uuid::new_v4());
+        differ(&|r| r.storage_generation += 1);
+        differ(&|r| r.sequence += 1);
+        differ(&|r| r.admission.as_mut().unwrap().shard_epoch += 1);
+        differ(&|r| r.admission.as_mut().unwrap().writer_id = Uuid::new_v4());
+        differ(&|r| r.admission = None);
+
+        let admission = good.admission.as_ref().unwrap();
+        assert!(proof.matches_admission(good.repository_id, admission, good.actor_id, good.token_id));
+        assert!(!proof.matches_admission(Uuid::new_v4(), admission, good.actor_id, good.token_id));
+        assert!(!proof.matches_admission(good.repository_id, admission, Uuid::new_v4(), good.token_id));
+        assert!(!proof.matches_admission(good.repository_id, admission, good.actor_id, Uuid::new_v4()));
+        let other_epoch = AdmissionRecord { writer_id: admission.writer_id, shard_epoch: admission.shard_epoch + 1 };
+        assert!(!proof.matches_admission(good.repository_id, &other_epoch, good.actor_id, good.token_id));
     }
 }
