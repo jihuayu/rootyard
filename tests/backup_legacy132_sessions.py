@@ -7,13 +7,16 @@ repository authority.  The legacy binary writes an offline archive.  The
 candidate must reject that archive unless its explicit legacy schema opt-in is
 given, restore into a brand-new database/data directory under one newly minted
 Pando authority, apply the reviewed current migrations, and serve stock Git
-fetch/clone for both repositories.  The shared contract is reused by the
-format10/schema134 entry point, which upgrades to the current schema135 target.
+fetch/clone for both repositories.  Every frozen predecessor source contract
+here keeps its own format/schema verification and then upgrades to the same
+current reviewed target: format15/schema139.
 
-``backup_legacy133_identity.py`` reuses this harness with the format9/schema133
-contract and ``backup_legacy134_metrics_index.py`` with format10/schema134; all
-assert the same Pando/session/Git boundaries after the reviewed later-migration
-upgrade to schema135.
+``backup_legacy133_identity.py`` through ``backup_legacy138_core.py`` reuse this
+harness with the format9/schema133 through format14/schema138 contracts and
+assert the same Pando/session/Git boundaries plus the current target catalog.
+A genuine format14/schema138 archive carries no RefStore core rows, so the
+schema139 core tables are verified to exist, be correctly constrained and stay
+empty; this harness never claims a core-row roundtrip.
 
 Only random task-owned databases and temporary storage are used.  Secrets, DSNs,
 raw HTTP logs and Garage/Vault credentials are never printed; recorded failures
@@ -61,6 +64,13 @@ SCHEMA136_INDEXES = TARGET_INDEXES + (
     "token_repository_scopes_repository_idx",
     "token_namespace_scopes_organization_idx",
 )
+# schema139 adds the minimal RefStore core: one initialized gate per repository,
+# the current ref CAS rows it owns and immutable terminal/event receipts.
+SCHEMA139_INDEXES = SCHEMA136_INDEXES + ("ref_store_core_refs_prefix",)
+SCHEMA139_CORE_TABLES = ("ref_store_core_gates", "ref_store_core_refs",
+                         "ref_store_core_events")
+SCHEMA139_CORE_TRIGGER = "ref_store_core_event_immutable"
+SCHEMA139_CORE_TRIGGER_FUNCTION = "rootyard_ref_store_core_event_immutable"
 
 SCHEMA134_FOREIGN_KEYS = (
     "pando_manifest_artifacts_manifest_identity_fkey",
@@ -79,34 +89,56 @@ class ArchiveContract:
     schema: int
     flag: str
     source_label: str
-    target_schema: int = 138
-    indexes: tuple = SCHEMA136_INDEXES
+    target_schema: int = 139
+    indexes: tuple = SCHEMA139_INDEXES
     foreign_keys: tuple = SCHEMA134_FOREIGN_KEYS
     unique_constraints: tuple = SCHEMA134_UNIQUE
     removed_foreign_key: str = SCHEMA134_REMOVED_FOREIGN_KEY
 
 
 LEGACY132 = ArchiveContract(format=8, schema=132, flag="--allow-legacy-schema132",
-                            source_label="schema132", target_schema=138,
-                            indexes=SCHEMA136_INDEXES)
+                            source_label="schema132", target_schema=139,
+                            indexes=SCHEMA139_INDEXES)
 LEGACY133 = ArchiveContract(format=9, schema=133, flag="--allow-legacy-schema133",
-                            source_label="schema133", target_schema=138,
-                            indexes=SCHEMA136_INDEXES)
-# Format10/schema134 is the immediately previous frozen contract.  Its archive
-# upgrades through the same reviewed path to the current schema137 target.
+                            source_label="schema133", target_schema=139,
+                            indexes=SCHEMA139_INDEXES)
+# Format10/schema134 is an older frozen contract.  Its archive upgrades through
+# the same reviewed path to the current schema139 target.
 LEGACY134 = replace(LEGACY132, format=10, schema=134,
                     flag="--allow-legacy-schema134", source_label="schema134")
 # Format11/schema135 carries the frozen schema135 catalog and no schema136
-# tables; it upgrades through migrations 136 and 137.
+# tables; it upgrades through migrations 136 through 139.
 LEGACY135 = replace(LEGACY134, format=11, schema=135,
                     flag="--allow-legacy-schema135", source_label="schema135")
-# Format12/schema136 is the immediate predecessor of the current format13
-# contract; it upgrades through migration 137 (terminal-admission projection).
+# Format12/schema136 upgrades through the terminal-admission projection (137),
+# the operation registry (138) and the minimal RefStore core (139).
 LEGACY136 = replace(LEGACY135, format=12, schema=136,
                     flag="--allow-legacy-schema136", source_label="schema136")
-# Genuine predecessor format13 archive; current migration138 adds durable operation identity.
+# Genuine predecessor format13 archive; migrations 138 and 139 add durable
+# operation identity and then the minimal RefStore core.
 LEGACY137 = replace(LEGACY136, format=13, schema=137,
                     flag="--allow-legacy-schema137", source_label="schema137")
+# Genuine format14/schema138 archive: the immediate predecessor of the current
+# format15/schema139 contract.  Its archive may carry the schema138 operation
+# registry but never the schema139 core rows, so every restored target is
+# checked for the schema139 core schema.
+LEGACY138 = replace(LEGACY137, format=14, schema=138,
+                    flag="--allow-legacy-schema138", source_label="schema138")
+
+# Every legacy opt-in this shared harness knows about, oldest first.  The
+# adjacent entry is used for the mixed-flag and mismatched-opt-in rejections.
+LEGACY_FLAGS = (
+    "--allow-legacy-schema132", "--allow-legacy-schema133",
+    "--allow-legacy-schema134", "--allow-legacy-schema135",
+    "--allow-legacy-schema136", "--allow-legacy-schema137",
+    "--allow-legacy-schema138",
+)
+
+
+def neighbour_legacy_flag(flag):
+    index = LEGACY_FLAGS.index(flag)
+    return (LEGACY_FLAGS[index + 1]
+            if index + 1 < len(LEGACY_FLAGS) else LEGACY_FLAGS[index - 1])
 
 
 class LegacyArchiveHarness(BackupHarness):
@@ -336,8 +368,12 @@ class LegacyArchiveHarness(BackupHarness):
             env=self.env, check=False)
         assert no_archive_flags.returncode != 0
         assert b"usage:" in no_archive_flags.stderr, no_archive_flags.stderr[-400:]
-        other = ("--allow-legacy-schema132"
-                 if self.contract.schema != 132 else "--allow-legacy-schema133")
+        other = neighbour_legacy_flag(self.contract.flag)
+        # The candidate's own usage line must document this contract's opt-in
+        # (and its adjacent one), so the drill cannot pass against a binary that
+        # silently lacks the flag.
+        assert self.contract.flag.encode() in missing.stderr, missing.stderr[-1200:]
+        assert other.encode() in missing.stderr, missing.stderr[-1200:]
         mixed = self.run(
             [self.candidate_binary, "restore", str(self.legacy_backup),
              "--isolated", "--trust-backup", self.contract.flag, other],
@@ -346,7 +382,9 @@ class LegacyArchiveHarness(BackupHarness):
         assert b"usage:" in mixed.stderr, mixed.stderr[-400:]
         assert not self.reject_data.exists()
         return dict(missing_arguments_usage=True, missing_flags_usage=True,
-                    mixed_legacy_flags_usage=True)
+                    mixed_legacy_flags_usage=True,
+                    documented_opt_in=self.contract.flag,
+                    documented_neighbour_opt_in=other)
 
     def candidate_rejects_without_opt_in(self):
         self.use_candidate(self.reject_db, self.reject_data)
@@ -355,8 +393,7 @@ class LegacyArchiveHarness(BackupHarness):
             [self.candidate_binary, "restore", str(self.legacy_backup),
              "--isolated", "--trust-backup"], env=self.env, check=False)
         assert result.returncode != 0
-        wrong = ("--allow-legacy-schema132"
-                 if self.contract.schema != 132 else "--allow-legacy-schema133")
+        wrong = neighbour_legacy_flag(self.contract.flag)
         mismatched = self.run(
             [self.candidate_binary, "restore", str(self.legacy_backup),
              "--isolated", "--trust-backup", wrong], env=self.env, check=False)
@@ -376,6 +413,66 @@ class LegacyArchiveHarness(BackupHarness):
                     mismatched_legacy_opt_in_rejected=True,
                     target_data_published=False, target_database_empty=True)
 
+    def assert_core_schema(self):
+        """The migrated target must carry the complete schema139 core schema.
+
+        A genuine format14/schema138 source has no RefStore core rows (and older
+        sources have no core tables at all), so migration139 must create the
+        gates/refs/events tables, the current-ref CAS key, the operation FK and
+        the immutable-event trigger while leaving every core table empty.
+        """
+        tables = self.query(
+            self.restore_db,
+            "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables "
+            "WHERE schemaname='public' AND tablename IN ('" +
+            "','".join(SCHEMA139_CORE_TABLES) + "')")
+        assert tables == ",".join(sorted(SCHEMA139_CORE_TABLES)), tables
+        refs_key = self.query(
+            self.restore_db,
+            "SELECT string_agg(a.attname, ',' ORDER BY a.attnum) FROM pg_constraint k "
+            "JOIN pg_class c ON c.oid=k.conrelid "
+            "JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum = ANY(k.conkey) "
+            "WHERE n.nspname='public' AND c.relname='ref_store_core_refs' "
+            "AND k.contype='p' AND k.convalidated")
+        assert refs_key == "repository_id,ref_name", refs_key
+        event_fk = self.query(
+            self.restore_db,
+            "SELECT count(*) FROM pg_constraint k "
+            "JOIN pg_class c ON c.oid=k.conrelid "
+            "JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE n.nspname='public' AND c.relname='ref_store_core_events' "
+            "AND k.contype='f' AND k.convalidated "
+            "AND k.confrelid = 'ref_store_operations'::regclass")
+        assert event_fk == "1", event_fk
+        triggers = self.query(
+            self.restore_db,
+            "SELECT string_agg(t.tgname || ':' || c.relname || ':' || "
+            "t.tgtype::text || ':' || CASE WHEN (t.tgtype & 2) <> 0 THEN 'before' "
+            "WHEN (t.tgtype & 64) <> 0 THEN 'instead' ELSE 'after' END || ':' || "
+            "p.proname, ',' ORDER BY t.tgname) FROM pg_trigger t "
+            "JOIN pg_class c ON c.oid=t.tgrelid "
+            "JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "JOIN pg_proc p ON p.oid=t.tgfoid WHERE n.nspname='public' "
+            "AND NOT t.tgisinternal AND c.relname IN ('" +
+            "','".join(SCHEMA139_CORE_TABLES) + "')")
+        expected_trigger = (SCHEMA139_CORE_TRIGGER +
+                            ":ref_store_core_events:19:before:" +
+                            SCHEMA139_CORE_TRIGGER_FUNCTION)
+        assert triggers == expected_trigger, triggers
+        rows = self.query(
+            self.restore_db,
+            "SELECT (SELECT count(*) FROM ref_store_core_gates)::text || '/' || "
+            "(SELECT count(*) FROM ref_store_core_refs)::text || '/' || "
+            "(SELECT count(*) FROM ref_store_core_events)::text")
+        assert rows == "0/0/0", rows
+        return dict(schema139_core_tables=len(SCHEMA139_CORE_TABLES),
+                    schema139_core_refs_key=refs_key,
+                    schema139_core_event_operation_fkey=True,
+                    schema139_core_event_immutable_trigger=True,
+                    schema139_core_rows=rows,
+                    genuine_schema138_source_had_core_rows=False)
+
     def candidate_restores_and_rotates_authority(self):
         self.use_candidate(self.restore_db, self.restore_data)
         self.args.binary = self.candidate_binary
@@ -391,6 +488,9 @@ class LegacyArchiveHarness(BackupHarness):
                 "SELECT count(*) FROM pg_tables WHERE schemaname='public' "
                 "AND tablename IN ('ref_store_operations','ref_store_cancellations','ref_store_issuer_lanes')")
             assert registry_tables == "3", registry_tables
+        core = {}
+        if self.contract.target_schema >= 139:
+            core = self.assert_core_schema()
         names = self.query(
             self.restore_db,
             "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes "
@@ -482,10 +582,12 @@ class LegacyArchiveHarness(BackupHarness):
             "SELECT count(*) FROM tokens WHERE kind='browser' AND revoked")
         assert revoked_sessions == "1", revoked_sessions
         assert revoked_browser == "1", revoked_browser
-        return dict(schema_version=int(last), indexes=len(self.contract.indexes),
+        return dict(**core, schema_version=int(last),
+                    indexes=len(self.contract.indexes),
                     schema134_identity_constraints=True,
                     schema135_metrics_index=True,
                     schema136_token_scope_schema=True,
+                    schema138_operation_registry=True,
                     legacy_tokens_default_unrestricted=True,
                     target_authority_id=authority,
                     target_authority_differs_from_source=True,
@@ -650,6 +752,10 @@ def run_main(contract=None, argv=None):
                 "Loopback functional drill; no production RPO/RTO or power-loss claim.",
                 "The legacy archive is produced by the trusted format" + str(contract.format) + " binary and is never edited.",
                 "source_head values are repository heads, not binary build provenance.",
+                "Genuine format" + str(contract.format) + "/schema" +
+                str(contract.schema) + " sources carry no ref-store core rows; the "
+                "migrated schema139 core tables are verified present, constrained "
+                "and empty, not round-tripped.",
             ])
         if args.keep:
             report["retained_directory"] = str(harness.root)
