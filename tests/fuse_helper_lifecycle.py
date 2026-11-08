@@ -273,7 +273,10 @@ def case_workspace_epoch(suite: Suite) -> dict:
         suite.expect_error(wrong_freeze, helper, errno.ESTALE)
         wrong_finish = helper.freeze_finish(a, 999, 8001, True)[0]
         suite.expect_error(wrong_finish, helper, errno.ESTALE)
-        wrong_handoff = helper.handoff(a, 9)
+        # A trusted parent may explicitly authorize a newer epoch. A stale
+        # epoch after that handoff must be rejected.
+        suite.expect_ok(helper.handoff(a, 2), helper)
+        wrong_handoff = helper.handoff(a, 1)
         suite.expect_error(wrong_handoff, helper, errno.ESTALE)
         return {"mount_without_workspace": "EINVAL", "envelope_mismatch": "EINVAL",
                 "mount_epoch_zero": "EINVAL", "wrong_epoch_freeze": "ESTALE",
@@ -335,7 +338,10 @@ def _park(helper: support.HelperProcess, workspace: str, epoch: int, op_id: int,
     if not reply.ok:
         writer.finish(2.0)
         raise AssertionError(f"freeze_begin failed: {reply.code} {reply.message}")
-    before = writer.quiesce(0.45)
+    before = writer.quiesce(0.15)
+    time.sleep(0.30)
+    if helper.state_phase(workspace, epoch) != "frozen":
+        raise AssertionError("gate did not remain frozen while the write was parked")
     if not writer.is_alive():
         raise AssertionError(f"writer was not parked by freeze: error={writer.error}")
     if writer.bytes != before:
