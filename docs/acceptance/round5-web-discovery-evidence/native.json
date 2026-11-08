@@ -1,0 +1,149 @@
+{
+  "backend": "native",
+  "binary": "/workspace/scratch/round5-implementation/web-repository136-v1/rootyard",
+  "binary_sha256": "9e9578fe121caa7d016eecb242412facea04ac7409e74faa5c346a94ba4af570",
+  "source_head": "889393a0082ce9ef9723833b8515b9d57984163c",
+  "source_digest": "9f33758696c25d0e5d73caffe0e98ea6e6b98edde1bd7d62dd4d63f5d3534829",
+  "build": {
+    "attested": true,
+    "version": 1,
+    "binary_sha256": "9e9578fe121caa7d016eecb242412facea04ac7409e74faa5c346a94ba4af570",
+    "source_inputs_sha256": "9f33758696c25d0e5d73caffe0e98ea6e6b98edde1bd7d62dd4d63f5d3534829",
+    "workspace_commit": "e011b2d5b5e84d7ddaeedb2df06f4de48067efbd",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/round5-implementation/web-repository-pagination#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/round5-implementation/web-repository-pagination#rootyard@0.1.0"
+      }
+    ]
+  },
+  "passed": true,
+  "cases": [
+    {
+      "name": "fixture",
+      "status": "passed",
+      "seconds": 2.6868,
+      "detail": {
+        "bulk_rows": 105,
+        "api_created": 1,
+        "visible": 106
+      }
+    },
+    {
+      "name": "two_page_traversal",
+      "status": "passed",
+      "seconds": 0.0429,
+      "detail": {
+        "first_page": 100,
+        "second_page": 6,
+        "unique": 106,
+        "next_relative": true
+      }
+    },
+    {
+      "name": "cursor_contract",
+      "status": "passed",
+      "seconds": 0.1282,
+      "detail": {
+        "malformed_rejected": 11,
+        "unknown_query_rejected": 3,
+        "valid_cursor_resumes": true
+      }
+    },
+    {
+      "name": "actor_binding",
+      "status": "passed",
+      "seconds": 0.232,
+      "detail": {
+        "bob_sees": [
+          [
+            "alice",
+            "demo"
+          ]
+        ],
+        "alice_cursor_on_bob": 400,
+        "bob_repo_read": 200
+      }
+    },
+    {
+      "name": "current_membership",
+      "status": "passed",
+      "seconds": 0.196,
+      "detail": {
+        "before": 200,
+        "after_revoke": 404,
+        "listing_invisible": true
+      }
+    },
+    {
+      "name": "read_only",
+      "status": "passed",
+      "seconds": 0.047,
+      "detail": {
+        "browser_rows": 106,
+        "bearer_rows": 106,
+        "bearer_status": 200
+      }
+    },
+    {
+      "name": "restricted_token",
+      "status": "passed",
+      "seconds": 0.2045,
+      "detail": {
+        "granted_rows": [
+          [
+            "alice",
+            "demo"
+          ]
+        ],
+        "empty_web": 200,
+        "empty_api": 200,
+        "restricted_login": 403
+      }
+    },
+    {
+      "name": "anonymous_contract",
+      "status": "passed",
+      "seconds": 0.0057,
+      "detail": {
+        "plain": 401,
+        "navigate": 303,
+        "login_page": 200
+      }
+    }
+  ],
+  "limitations": [
+    "One loopback process and one disposable PostgreSQL schema; this is not a scalability benchmark.",
+    "The 105-row fixture is an explicit operator bulk seed; those rows intentionally have no Git repository on disk.",
+    "The cursor is a bounded scope-bound position, not a snapshot or signed capability.",
+    "Restricted tokens are seeded through SQL because no public restricted-PAT issuer is released.",
+    "No Cargo build, native acceptance harness or root fixture was run by this test."
+  ]
+}
