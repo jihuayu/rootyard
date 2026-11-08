@@ -1,0 +1,13 @@
+{
+  "job_id": 128817386055,
+  "run_id": 42508876472,
+  "failed_step": "Build deployable image with embedded schema contracts",
+  "error": "patch location /build/vendor/opendal-service-s3 does not contain packages matching opendal-service-s3",
+  "cause": "Docker build stage copied Cargo.toml/lock and src/migrations/schema but omitted vendor.",
+  "fix": "COPY vendor ./vendor",
+  "dockerfile_sha256": "5b3044957360202dbdb2154fa240b80adf9f62ec0414665b51937d3d50f19f19",
+  "compiled_rust_inputs_unchanged": true,
+  "source_inputs_sha256": "cafca60c5f0043cf018655256f6be30ccc6f10c2021b945cd7c135104cad7e2e",
+  "local_validation": "Real cargo metadata --locked --offline --filter-platform x86_64-unknown-linux-gnu over copied Docker build-stage files resolves the actual local S3 patch.",
+  "remote_container_rebuild_pending": true
+}

@@ -86,3 +86,14 @@ Implementation was primarily real DeepSeek subagents; Luna Max reviewed the
 production boundaries, adversarial tests and backup fixtures. Root integrated,
 built and ran native qualification. Full remote CI is pending; the parent retains
 the separately tracked #95 FUSE-service failure. Old FUSE artifacts were untouched.
+
+## Container build input follow-up
+
+The first remote container job (128817386055) failed before compilation because
+the Dockerfile omitted `vendor/opendal-service-s3`, required by Cargo's local
+patch. `COPY vendor ./vendor` supplies the reviewed source in the build stage.
+Actual offline Cargo resolution over the copied Linux build inputs now resolves
+the vendored crate; this is not a full local image-build pass. The first metadata
+probe selected all platforms and wanted an uncached WASM dependency; the Linux
+filter matches this image target and succeeds. The remote image rebuild remains
+pending. Dockerfile/evidence changes do not alter any qualified Rust inputs.

@@ -1,0 +1,13 @@
+{
+  "passed": true,
+  "method": "actual offline Cargo dependency resolution over copied Docker build-stage sources",
+  "filter_platform": "x86_64-unknown-linux-gnu",
+  "patched_crate": "opendal-service-s3",
+  "version": "0.57.0",
+  "manifest_under_copied_vendor": true,
+  "lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+  "seconds": 0.244,
+  "limits": [
+    "Not a complete local release image build; remote container job must compile and validate the image."
+  ]
+}

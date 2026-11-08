@@ -1,5 +1,5 @@
 {
-  "README.md": "3aaca12a2e99e4220ad5b9476f4d2025230818ed8fc08490639da730ed3fb3c0",
+  "README.md": "89241b83f2e336b76a8c4e20fb9658b2b67a4028160ba5c7441ccd4fd2dd0c3d",
   "app.build.json": "c8ed1287507e79870dc20f42e6594961cc012db39839902bf2236eec76815968",
   "backup17-native.json": "973199b80b8d0b98c12a1789c5a5eace76902c3cea349fef8ea95f317b54c1b0",
   "backup17.json": "6a78ca640d05b8cae939d3d4b110d48b9406711ad1061ed9c0485faec9fd23d7",
@@ -7,8 +7,11 @@
   "checks.json": "69c1fa44c31bb0766a2060bacff5b1d393582e579c766e44bf3afcec7bd5ec69",
   "clippy-azure-feature.log": "8ace7c788d1ee354c82b132a4b65ec693a0f1f7c45ffcd09100ceb6e59d82d19",
   "clippy.log": "9fdebd527ad1c21020571346347e7e486ebf1344e11d22be750039a5909b62c6",
+  "docker-input-fix.json": "63f4403278e65645bdb1d9278ecce62398fdbc13eb4ed5a210030c962df7464a",
+  "docker-source-resolution.json": "c0b6519ac4b8d5747022ddc310ea61c05cdd25daba15623308f71311e5651f45",
   "fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "helper.build.json": "80e936023141f74988226980cae710038cde16af2759e25884d6abbf8051a85b",
+  "history/docker-metadata-all-platforms-v1.log": "a7d480c353b047e01be30fe6f52dadc2e651b043976a4157b1cccb2f5a5c4c01",
   "history/pg-diagnostic-v1.json": "600e17a4cc1bfddb0d62a711ef4ab6f81717d4a8781ab976b79b9c59cc207799",
   "history/pg-diagnostic-v1.log": "559751c9a6260c2c7054bfa9a49556a247847a723f3f9cef90a5e4acd3900116",
   "history/pg-v2.build.json": "03afbdbf8f7c1fd8ae43f57175ee1358a4ef0d30bc4ce4f626cbe6df5fe9bd25",
