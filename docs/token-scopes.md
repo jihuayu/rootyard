@@ -1,4 +1,4 @@
-# Personal access token scopes (schema 136)
+# Personal access token scopes (schema 137, backup format 13)
 
 > **Status:** the authorisation helpers, the discovery predicates, the common
 > repository/namespace action enforcement and the browser-login rejection are
@@ -8,14 +8,20 @@
 > Restricted parent tokens are refused browser login, so this path cannot widen
 > their scope. Restricted browser-child inheritance remains unsupported.
 > The existing CLI still issues legacy unrestricted API tokens.
+> Schema 137 changes no token shape: it only narrows the historical Git
+> admission bypass in the membership trigger, and it has no new native evidence
+> of its own.
 
 
 ## Integration provenance
 
 The module comes from `codex/round5-pat-scopes` (`dd1228f`, cumulative diff
 `6abfddf..dd1228f`) applied *selectively* on top of the current main line
-(schema 135 / backup format 11 at integration time; this branch now carries the
-schema136 / format12 contract):
+(schema 135 / backup format 11 at integration time). That integration produced
+the historic **schema136 / format12 foundation**; the branch now carries
+**schema 137 / backup format 13**, whose only change is migration
+`137_historical_admission_projection.sql` replacing the `git_operations` branch
+of `enforce_repository_actor_membership`:
 
 * Taken: `src/token_scopes.rs` (split below), `migrations/136_token_scopes.sql`,
   the explicit `RepoAction`/`NamespaceAction` call-site changes, the
@@ -32,7 +38,7 @@ schema136 / format12 contract):
 
 ## Data model
 
-Migration `136_token_scopes.sql` adds to `tokens`:
+Migration `136_token_scopes.sql` (the format12 foundation) adds to `tokens`:
 
 * `is_restricted BOOLEAN NOT NULL DEFAULT false` — tokens that predate the
   migration keep their historical account-wide `read_only` semantics.
@@ -149,17 +155,32 @@ suite. CI and operator/trusted-check authority remain independent.
   `38ad0ba7c445db156514a5650c408b59ac8feaabec33001167b7980e1d38334e`
   from source `6a72c41` passed twelve scope HTTP cases and actual-binary schema136
   checks. These results predate management/CAS and do not validate those additions.
+* The schema137 membership-trigger tightening has no native or HTTP evidence
+  yet: no build, catalog generation or PostgreSQL acceptance run was performed
+  for it on this branch.
 
 ## Contract status
 
-`schema/136_catalog.sql` (the frozen 135 catalog projection query copied
-unchanged) and the three `schema/136_*_catalog.json` fixtures were generated
+The historic **schema136 / format12 foundation** owns the frozen contract
+artefacts: `schema/136_catalog.sql` (the frozen 135 catalog projection query
+copied unchanged) and the three `schema/136_*_catalog.json` fixtures, generated
 from real PostgreSQL 17 databases with the reviewed SQL migration path
-(`tests/schema_contract.py --sql-migrate --write`). The backup code now uses
-format 12 / schema 136, keeps format 11 frozen at schema 135, and accepts a
-genuine format11/schema135 archive only with
-`--allow-legacy-schema135`, upgrading it through migration 136 in the same
-restore session. The old format 4-10 contracts and their opt-ins are unchanged.
+(`tests/schema_contract.py --sql-migrate --write`). They describe schema 136 and
+stay as they are; they are not evidence about schema 137.
+
+The branch now carries **schema 137 / backup format 13**. Migration 137 changes
+no table shape — it only replaces a trigger function — so the schema137 catalog
+projection and fixtures must still be regenerated from real PostgreSQL 17
+databases by the coordinator after this SQL edit. Until that generation lands,
+no schema137 contract exists and nothing here claims one; equally, no new native
+build or acceptance pass is claimed for this change.
+
+The backup code uses format 13 / schema 137, keeps format 12 frozen at schema
+136 and format 11 frozen at schema 135, and accepts a genuine format12/schema136
+archive only with `--allow-legacy-schema136` (format11/schema135 only with
+`--allow-legacy-schema135`), upgrading it through the current migrations in the
+same restore session. The old format 4-10 contracts and their opt-ins are
+unchanged.
 
 That foundation executable also passed seven genuine format11/schema135 archive
 cases using previous executable SHA256

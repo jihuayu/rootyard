@@ -1,5 +1,10 @@
 -- Schema 137: narrow historical projection for terminal Git admissions.
 --
+-- Migration 136 (the schema136 / backup format12 foundation) introduced scoped
+-- personal access tokens; this migration changes no table shape at all. It only
+-- replaces the membership guard so that one historic, already-committed case
+-- stops being refused after the fact.
+--
 -- Native Git may have committed a real receive-pack transaction before SQL
 -- membership changed. Rust settlement moves the admitted writer to COMMITTED
 -- (or ABORTED for a ref-free push) in the *same* transaction that inserts the
@@ -14,8 +19,35 @@
 --     same repository, actor and token;
 --   * COMMITTED allows only unknown/recorded, ABORTED only unknown/
 --     no_ref_changes;
---   * UPDATE must keep the immutable operation identity, generation, sequence
---     and actor name, and may not change a terminal outcome.
+--   * INSERT must either create a brand-new row at the current repository
+--     generation or replay a row whose identity already matches exactly;
+--   * UPDATE must keep the immutable operation identity, generation, sequence,
+--     actor name and created_at, and may not change a terminal outcome.
+--
+-- UPDATE boundary (the part this migration tightens). A row whose stored
+-- outcome is already terminal is a *receipt*: a withdrawn actor may still
+-- replay it, but only byte-for-byte. So for OLD.outcome <> 'unknown' the new
+-- row must keep the same evidence and the same settled_at, and created_at is
+-- immutable for every exempted UPDATE. Only OLD.outcome = 'unknown' may be
+-- settled for the first time, which legitimately supplies the final evidence
+-- and the first settled_at.
+--
+-- Where the receipt proof actually lives: in Rust, not in this ledger.
+-- src/events.rs replays through INSERT ... ON CONFLICT (id) DO NOTHING and then
+-- re-reads the row FOR UPDATE, rejecting any mismatch in repository, actor,
+-- token, service principal, actor name, sequence or storage generation, any
+-- terminal-outcome change and any difference in the stored evidence before it
+-- runs UPDATE git_operations SET outcome=$2,evidence=$3,
+-- settled_at=CASE WHEN $2='unknown' THEN NULL ELSE COALESCE(settled_at,
+-- clock_timestamp()) END. Because an already-terminal row has a non-null
+-- settled_at, an exact replay stores its old value unchanged, which is exactly
+-- why this trigger can require NEW.settled_at = OLD.settled_at. The trigger is
+-- therefore only the conservative envelope: it cannot prove a receipt by
+-- itself and is not meant to. A caller that can write this table without going
+-- through the settlement transaction cannot mint a receipt, because it cannot
+-- obtain a matching terminal outcome *and* matching evidence *and* matching
+-- settled_at for a withdrawn actor unless that row already exists.
+--
 -- A new ADMITTED write has no terminal row and still requires current
 -- membership. A terminal row for a different operation, actor, token or
 -- generation cannot authorize anything.
@@ -88,7 +120,11 @@ BEGIN
           AND OLD.actor_name=NEW.actor_name
           AND OLD.sequence=NEW.sequence
           AND OLD.storage_generation=NEW.storage_generation
-          AND (OLD.outcome='unknown' OR OLD.outcome=NEW.outcome)
+          AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at
+          AND (OLD.outcome='unknown'
+            OR (OLD.outcome=NEW.outcome
+                AND NEW.evidence IS NOT DISTINCT FROM OLD.evidence
+                AND NEW.settled_at IS NOT DISTINCT FROM OLD.settled_at))
           AND EXISTS (
             SELECT 1 FROM git_ref_admissions a
             WHERE a.writer_id=NEW.id AND a.repository_id=NEW.repository_id

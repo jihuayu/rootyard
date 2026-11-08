@@ -79,7 +79,7 @@ class ArchiveContract:
     schema: int
     flag: str
     source_label: str
-    target_schema: int = 136
+    target_schema: int = 137
     indexes: tuple = SCHEMA136_INDEXES
     foreign_keys: tuple = SCHEMA134_FOREIGN_KEYS
     unique_constraints: tuple = SCHEMA134_UNIQUE
@@ -87,19 +87,23 @@ class ArchiveContract:
 
 
 LEGACY132 = ArchiveContract(format=8, schema=132, flag="--allow-legacy-schema132",
-                            source_label="schema132", target_schema=136,
+                            source_label="schema132", target_schema=137,
                             indexes=SCHEMA136_INDEXES)
 LEGACY133 = ArchiveContract(format=9, schema=133, flag="--allow-legacy-schema133",
-                            source_label="schema133", target_schema=136,
+                            source_label="schema133", target_schema=137,
                             indexes=SCHEMA136_INDEXES)
 # Format10/schema134 is the immediately previous frozen contract.  Its archive
-# upgrades through the same reviewed path to the current schema136 target.
+# upgrades through the same reviewed path to the current schema137 target.
 LEGACY134 = replace(LEGACY132, format=10, schema=134,
                     flag="--allow-legacy-schema134", source_label="schema134")
-# Format11/schema135 is the immediate predecessor of the current format12
-# contract. It carries the frozen schema135 catalog and no schema136 tables.
+# Format11/schema135 carries the frozen schema135 catalog and no schema136
+# tables; it upgrades through migrations 136 and 137.
 LEGACY135 = replace(LEGACY134, format=11, schema=135,
                     flag="--allow-legacy-schema135", source_label="schema135")
+# Format12/schema136 is the immediate predecessor of the current format13
+# contract; it upgrades through migration 137 (terminal-admission projection).
+LEGACY136 = replace(LEGACY135, format=12, schema=136,
+                    flag="--allow-legacy-schema136", source_label="schema136")
 
 
 class LegacyArchiveHarness(BackupHarness):

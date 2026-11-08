@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Genuine format11/schema135 archive upgraded to the schema136 target.
+"""Genuine format11/schema135 archive upgraded to the schema137 target.
 
 Light entry point over the shared ``backup_legacy132_sessions`` harness. The
 trusted ``observability135-v2`` binary writes an unmodified format11/schema135
