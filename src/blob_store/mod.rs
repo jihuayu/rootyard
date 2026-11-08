@@ -318,7 +318,6 @@ impl fmt::Debug for BlobReceipt {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
 pub enum BlobError {
     Config(String),
     /// `fs`/`memory` and unknown services never qualify for production.

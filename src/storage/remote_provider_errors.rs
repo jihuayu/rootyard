@@ -28,7 +28,7 @@
 //! poll, because a lazily constructed reader issues its first HTTP request only
 //! when the stream is first polled.
 
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::sync::{Arc, Mutex};
 
 // `http` is not a direct dependency of this crate (the root owns `Cargo.toml`)
@@ -36,7 +36,8 @@ use std::sync::{Arc, Mutex};
 // these are the exact request/response types of the `HttpFetch` trait.
 use axum::http::{Request, Response};
 use bytes::Bytes;
-use opendal::raw::{Buffer, HttpBody, HttpClient, HttpFetch};
+use opendal::Buffer;
+use opendal::raw::{HttpBody, HttpClient, HttpFetch};
 use opendal::{ErrorKind, Result as SdkResult};
 
 use crate::blob_store::BlobError;
@@ -157,10 +158,10 @@ impl RemoteFailure {
 /// pass through unchanged; a provider failure becomes a typed [`RemoteFailure`].
 pub(crate) async fn observe<T, F>(op: RemoteOp, future: F) -> Result<T, RemoteFailure>
 where
-    F: Future<Output = SdkResult<T>>,
+    F: IntoFuture<Output = SdkResult<T>>,
 {
     let traffic = Arc::new(ObservedTraffic::default());
-    let result = OBSERVED_TRAFFIC.scope(traffic.clone(), future).await;
+    let result = OBSERVED_TRAFFIC.scope(traffic.clone(), future.into_future()).await;
     result.map_err(|error| RemoteFailure::classify(error, op, traffic.snapshot()))
 }
 
@@ -171,11 +172,11 @@ where
 /// is classified as the bounded `Stream` family with `http_status() == None`.
 pub(crate) async fn observe_body_poll<S>(op: RemoteOp, poll: S) -> Result<Option<Bytes>, BlobError>
 where
-    S: Future<Output = Result<Option<Buffer>, std::io::Error>>,
+    S: Future<Output = Result<Option<Bytes>, std::io::Error>>,
 {
     let traffic = Arc::new(ObservedTraffic::default());
     match OBSERVED_TRAFFIC.scope(traffic.clone(), poll).await {
-        Ok(Some(chunk)) => Ok(Some(Bytes::from(chunk.to_vec()))),
+        Ok(Some(chunk)) => Ok(Some(chunk)),
         Ok(None) => Ok(None),
         Err(_error) => {
             let observed = traffic.snapshot();

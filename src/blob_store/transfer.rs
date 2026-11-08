@@ -21,12 +21,11 @@
 //! whole streamed download.
 
 #[cfg(test)]
+use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::Arc;
-use std::{
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-    time::Instant,
-};
+
+use std::{os::unix::fs::OpenOptionsExt, path::Path, time::Instant};
 
 use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
