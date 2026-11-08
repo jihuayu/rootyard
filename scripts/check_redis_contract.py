@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Optional source-bound real-Redis contract gate for the state-redis feature.
 
-The runner owns one disposable Docker Redis fixture (official redis:7.2.6
+The runner owns one disposable Docker Redis fixture (official redis:7.2.6-alpine
 image), builds the library test binary from the current sources, runs the six
 ignored real-Redis cases over plaintext loopback and verified private-CA TLS,
 then proves an untrusted CA fails and the owned CA restores trust. It never
@@ -32,7 +32,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 import build_native  # noqa: E402
 
-REDIS_IMAGE = "redis:7.2.6"
+REDIS_IMAGE = "redis:7.2.6-alpine"
 REDIS_VERSION = "7.2.6"
 REDIS_VERSION_MARKER = "v=7.2.6"
 MAXMEMORY_BYTES = 33554432
@@ -395,7 +395,7 @@ class OwnedRedisFixture:
                 self.image_digest = digest.strip()
                 break
         if not self.image_digest:
-            raise RunnerError("official redis:7.2.6 image has no redis repo digest")
+            raise RunnerError("official redis:7.2.6-alpine image has no redis repo digest")
 
     def _mount(self, source: Path, target: str) -> str:
         return f"type=bind,source={source},target={target},readonly"

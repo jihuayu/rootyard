@@ -16,7 +16,7 @@ flow and never uses an inherited Redis endpoint.
 - A finite `32 MiB` `allkeys-lru` cache with persistence disabled.
 - An ephemeral CA and a server certificate with `IP:127.0.0.1` SAN. OpenSSL
   output is discarded so private key material is never printed.
-- One official `redis:7.2.6` container, labelled with this process's nonce,
+- One official `redis:7.2.6-alpine` container, labelled with this process's nonce,
   directory, uid and name, running as the current uid:gid. Only the config and
   TLS files are mounted, read-only. The container binds `0.0.0.0` **inside** the
   container; Docker publishes only ephemeral `127.0.0.1` ports for 6379 and
@@ -60,7 +60,7 @@ are redacted before writing.
 `.github/workflows/redis-contract.yml` is a separate job with checkout, the
 pinned Rust toolchain, native prerequisites used by the existing CI
 (OpenSSL/FUSE/pkg-config/CMake/Clang), Rust caching, an explicit
-`docker pull redis:7.2.6`, runner unit tests without Docker, all-target Clippy
+`docker pull redis:7.2.6-alpine`, runner unit tests without Docker, all-target Clippy
 with `state-redis` and denied warnings, the owned fixture gate, and an
 always-uploaded report. The existing `.github/workflows/ci.yml` verify flow is
 not changed.
@@ -68,7 +68,7 @@ not changed.
 Local invocation (requires Docker, OpenSSL, Cargo and the official image):
 
 ```sh
-docker pull redis:7.2.6
+docker pull redis:7.2.6-alpine
 python3 scripts/check_redis_contract.py \
   --report test-results/state-redis/contract.json \
   --log-dir test-results/state-redis/logs
