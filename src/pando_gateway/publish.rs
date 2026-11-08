@@ -23,8 +23,43 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 const MAX_PACKS: usize = 256;
-fn conflict() -> Error {
-    Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs")
+/// A refusal proven before the publication transaction committed: every listed
+/// ref still has its pre-push authoritative value and no ref, operation, event
+/// or outbox row from this request is visible. Only this typed proof may be
+/// translated into a Git receive-pack `ng`; an ambiguous commit, an authority
+/// failure or an internal error must keep its distinct HTTP error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RefRejection {
+    pub refs: Vec<String>,
+    pub reason: &'static str,
+}
+
+/// Reason reported to a stock client that lost a same-ref race. It must stay
+/// protocol-safe: no NUL, newline or control byte.
+pub(crate) const REF_CHANGED: &str = "ref changed; retry from current refs";
+
+impl RefRejection {
+    fn cas(requested: &[RefChange]) -> Self {
+        Self { refs: requested.iter().map(|change| change.ref_name.clone()).collect(), reason: REF_CHANGED }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum PublishError {
+    /// Exact advertised-old ref CAS refusal. Returned before `finish_tx`, so the
+    /// transaction is dropped and no part of the push commits.
+    RefRejected(RefRejection),
+    Failed(Error),
+}
+
+impl From<Error> for PublishError {
+    fn from(error: Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+fn conflict() -> PublishError {
+    PublishError::Failed(Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs"))
 }
 
 fn push_digest(
@@ -84,7 +119,7 @@ pub async fn publish(
     requested: &[RefChange],
     guard: &PublicationGuard,
     deadline: Instant,
-) -> Result<i64, Error> {
+) -> Result<i64, PublishError> {
     if repo.storage_backend != "pando"
         || snapshot.storage_generation != repo.storage_generation
         || guard.repository_id() != repo.id
@@ -160,7 +195,7 @@ pub async fn publish(
         return Err(conflict());
     }
     if deletes_head(&head_ref, &prepared.changes) {
-        return Err(Error(StatusCode::CONFLICT, "cannot delete the advertised HEAD ref; retarget HEAD first"));
+        return Err(Error(StatusCode::CONFLICT, "cannot delete the advertised HEAD ref; retarget HEAD first").into());
     }
     let mut pack_ids: Vec<Uuid> = current.get("pack_ids");
     let next_ref = ref_generation.checked_add(1).ok_or_else(conflict)?;
@@ -190,12 +225,15 @@ pub async fn publish(
         let zero = "0".repeat(change.old_oid.len());
         let actual = old.as_ref().map(|row| row.get::<_, String>(0)).unwrap_or(zero);
         if actual != change.old_oid {
-            return Err(conflict());
+            // The exact advertised old OID is gone. Nothing in this transaction
+            // has been committed yet, so the caller may report a negotiated
+            // `ng` for every requested ref instead of an HTTP 409.
+            return Err(PublishError::RefRejected(RefRejection::cas(requested)));
         }
     }
     let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
     if timeout.is_zero() {
-        return Err(Error::timeout());
+        return Err(Error::timeout().into());
     }
     guard
         .guard(Box::pin(policy::validate(
@@ -329,7 +367,7 @@ pub async fn publish(
     // This absolute check prevents a late token scan/commit after the caller's
     // publication deadline. A lost reply after PG commit remains unknown.
     if Instant::now() >= deadline {
-        return Err(Error::timeout());
+        return Err(Error::timeout().into());
     }
     auth::finish_tx(tx, actor, true).await?;
     state.dispatch.committed();
@@ -343,6 +381,17 @@ mod tests {
 
     fn change(name: &str, oid: char) -> RefChange {
         RefChange { old_oid: "a".repeat(40), new_oid: oid.to_string().repeat(40), ref_name: name.into() }
+    }
+
+    #[test]
+    fn only_an_explicit_ref_rejection_is_typed_known() {
+        let failed: PublishError = Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs").into();
+        assert!(matches!(failed, PublishError::Failed(_)));
+        let rejection = RefRejection::cas(&[change("refs/heads/main", 'b')]);
+        assert_eq!(rejection.refs, ["refs/heads/main"]);
+        assert_eq!(rejection.reason, REF_CHANGED);
+        let typed = PublishError::RefRejected(rejection);
+        assert!(matches!(typed, PublishError::RefRejected(proof) if proof.reason == REF_CHANGED));
     }
 
     #[test]

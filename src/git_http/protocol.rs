@@ -5,6 +5,19 @@ pub(super) struct ReceiveCommands {
     pub bytes: Vec<u8>,
     pub refs: Vec<String>,
     pub changes: Vec<journal::RefChange>,
+    pub capabilities: ReceiveCapabilities,
+}
+
+/// Capabilities the client requested on its first receive command. A report
+/// format the client did not negotiate is never invented: without any
+/// report-status a refusal must stay an HTTP error rather than become an
+/// unparseable success or a status line the client will not read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ReceiveCapabilities {
+    pub report_status: bool,
+    pub report_status_v2: bool,
+    pub sideband_64k: bool,
+    pub atomic: bool,
 }
 
 /// Read only the bounded command pkt-lines, before Git sees the pack. The
@@ -20,6 +33,7 @@ pub(super) async fn receive_commands(
     let mut bytes = Vec::new();
     let mut refs = Vec::new();
     let mut changes = Vec::new();
+    let mut capabilities = ReceiveCapabilities::default();
     loop {
         if bytes.len() + 4 > 128 * 1024 {
             return Err(Error::bad_request());
@@ -41,7 +55,8 @@ pub(super) async fn receive_commands(
         bytes.resize(start + length - 4, 0);
         reader.read_exact(&mut bytes[start..]).await.map_err(Error::internal)?;
         let packet = &bytes[start..];
-        let command = packet.split(|b| *b == 0).next().ok_or_else(Error::bad_request)?;
+        let separator = packet.iter().position(|byte| *byte == 0);
+        let command = separator.map_or(packet, |index| &packet[..index]);
         let command = command.strip_suffix(b"\n").unwrap_or(command);
         let command = std::str::from_utf8(command).map_err(|_| Error::bad_request())?;
         // Shallow lines precede commands, but never confer a publication key.
@@ -62,6 +77,23 @@ pub(super) async fn receive_commands(
         {
             return Err(Error::bad_request());
         }
+        if refs.is_empty()
+            && let Some(separator) = separator
+        {
+            // Capabilities travel only on the first command packet, after the
+            // NUL separator. Unknown and valued tokens are deliberately ignored.
+            let list = &packet[separator + 1..];
+            let list = list.strip_suffix(b"\n").unwrap_or(list);
+            for token in list.split(|byte| *byte == b' ') {
+                match token {
+                    b"report-status" => capabilities.report_status = true,
+                    b"report-status-v2" => capabilities.report_status_v2 = true,
+                    b"side-band-64k" => capabilities.sideband_64k = true,
+                    b"atomic" => capabilities.atomic = true,
+                    _ => {}
+                }
+            }
+        }
         refs.push(name.to_string());
         changes.push(journal::RefChange {
             ref_name: name.to_string(),
@@ -69,7 +101,70 @@ pub(super) async fn receive_commands(
             new_oid: new.to_ascii_lowercase(),
         });
     }
-    Ok(ReceiveCommands { bytes, refs, changes })
+    Ok(ReceiveCommands { bytes, refs, changes, capabilities })
+}
+
+fn push_pktline(out: &mut Vec<u8>, payload: &[u8]) -> Result<(), Error> {
+    let length = payload.len() + 4;
+    if length > 65520 {
+        return Err(Error::internal("receive-pack pkt-line exceeds protocol bound"));
+    }
+    out.extend_from_slice(format!("{length:04x}").as_bytes());
+    out.extend_from_slice(payload);
+    Ok(())
+}
+
+/// The exact pkt-line report a receive-pack server sends when every requested
+/// ref was refused before commit: `unpack ok`, one `ng` per ref, then a flush.
+/// report-status-v2 uses these same ref status lines (its `option` lines are
+/// optional). With `side-band-64k` the inner report travels on band 1 exactly
+/// as native receive-pack sends it. Without a negotiated report-status this
+/// returns the unchanged refusal instead of fabricating protocol output.
+pub(super) fn rejected_refs_report(
+    capabilities: &ReceiveCapabilities,
+    refs: &[String],
+    reason: &str,
+) -> Result<Vec<u8>, Error> {
+    if refs.is_empty()
+        || reason.is_empty()
+        || reason.bytes().any(|byte| byte < 32 || byte == 127)
+        || refs.iter().any(|name| !name.starts_with("refs/") || name.bytes().any(|byte| byte <= 32 || byte == 127))
+    {
+        return Err(Error::internal("invalid receive-pack rejection"));
+    }
+    if !(capabilities.report_status || capabilities.report_status_v2) {
+        return Err(Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs"));
+    }
+    let mut inner = Vec::new();
+    push_pktline(&mut inner, b"unpack ok\n")?;
+    for name in refs {
+        push_pktline(&mut inner, format!("ng {name} {reason}\n").as_bytes())?;
+    }
+    inner.extend_from_slice(b"0000");
+    if !capabilities.sideband_64k {
+        return Ok(inner);
+    }
+    let mut outer = Vec::new();
+    for chunk in inner.chunks(65515) {
+        let mut payload = Vec::with_capacity(chunk.len() + 1);
+        payload.push(1);
+        payload.extend_from_slice(chunk);
+        push_pktline(&mut outer, &payload)?;
+    }
+    // Native receive-pack terminates its sideband report with an outer flush.
+    outer.extend_from_slice(b"0000");
+    Ok(outer)
+}
+
+/// True only when native receive-pack itself reported `ng` for every requested
+/// ref. Callers invoke this after proving the disposable snapshot changed no
+/// ref, so a pass-through report cannot be an acknowledgement of a commit.
+pub(super) fn reports_rejection(report: &[u8], refs: &[String]) -> bool {
+    !refs.is_empty()
+        && refs.iter().all(|name| {
+            let needle = format!("ng {name} ");
+            report.windows(needle.len()).any(|window| window == needle.as_bytes())
+        })
 }
 
 #[cfg(test)]
@@ -104,6 +199,29 @@ mod receive_tests {
         assert!(receive_commands(&mut duplicate.as_slice(), 40).await.is_err());
         let mut wrong_format = source.as_slice();
         assert!(receive_commands(&mut wrong_format, 64).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn capabilities_parse_only_from_the_first_command_packet() {
+        let oid = "1".repeat(40);
+        let zero = "0".repeat(40);
+        let first = format!(
+            "{zero} {oid} refs/heads/a\0 report-status-v2 side-band-64k quiet atomic ofs-delta agent=git/2.52.0\n"
+        );
+        let second = format!("{zero} {oid} refs/heads/b\n");
+        let mut source = packet(first.as_bytes());
+        source.extend(packet(second.as_bytes()));
+        source.extend(b"0000");
+        let parsed = receive_commands(&mut source.as_slice(), 40).await.unwrap();
+        assert_eq!(
+            parsed.capabilities,
+            ReceiveCapabilities { report_status: false, report_status_v2: true, sideband_64k: true, atomic: true }
+        );
+        assert_eq!(parsed.refs, ["refs/heads/a", "refs/heads/b"]);
+        let mut bare = packet(second.as_bytes());
+        bare.extend(b"0000");
+        let parsed = receive_commands(&mut bare.as_slice(), 40).await.unwrap();
+        assert_eq!(parsed.capabilities, ReceiveCapabilities::default());
     }
 }
 
@@ -260,6 +378,94 @@ mod tests {
         assert!(job_response_prefix(&mut &packet[..], 8).await.is_err());
         assert!(job_response_prefix(&mut &packet[..], 3).await.is_err());
     }
+
+    fn pkt(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = format!("{:04x}", payload.len() + 4).into_bytes();
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn pkt_payloads(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut payloads = Vec::new();
+        let mut rest = bytes;
+        loop {
+            assert!(rest.len() >= 4, "truncated pkt-line header");
+            let length = usize::from_str_radix(std::str::from_utf8(&rest[..4]).unwrap(), 16).unwrap();
+            rest = &rest[4..];
+            if length == 0 {
+                break;
+            }
+            assert!(length >= 4 && length - 4 <= rest.len(), "invalid pkt-line length");
+            payloads.push(rest[..length - 4].to_vec());
+            rest = &rest[length - 4..];
+        }
+        assert!(rest.is_empty(), "trailing bytes after flush");
+        payloads
+    }
+
+    fn lines(payloads: &[Vec<u8>]) -> Vec<String> {
+        payloads.iter().map(|payload| String::from_utf8(payload.clone()).unwrap()).collect()
+    }
+
+    #[test]
+    fn rejection_report_is_plain_without_sideband_and_never_acknowledges() {
+        let refs = vec!["refs/heads/main".to_owned()];
+        let capabilities = ReceiveCapabilities { report_status: true, ..ReceiveCapabilities::default() };
+        let reply = rejected_refs_report(&capabilities, &refs, "ref changed; retry from current refs").unwrap();
+        let lines = lines(&pkt_payloads(&reply));
+        assert_eq!(lines[0], "unpack ok\n");
+        assert_eq!(lines[1], "ng refs/heads/main ref changed; retry from current refs\n");
+        assert_eq!(lines.iter().filter(|line| line.starts_with("ng ")).count(), 1);
+        assert!(!lines.iter().any(|line| line.starts_with("ok ")));
+    }
+
+    #[test]
+    fn rejection_report_uses_band_one_only_when_sideband_is_negotiated() {
+        let refs = vec!["refs/heads/a".to_owned(), "refs/heads/b".to_owned()];
+        let capabilities =
+            ReceiveCapabilities { report_status: false, report_status_v2: true, sideband_64k: true, atomic: true };
+        let reply = rejected_refs_report(&capabilities, &refs, "ref changed; retry from current refs").unwrap();
+        let outer = pkt_payloads(&reply);
+        assert!(outer.iter().all(|payload| payload.first() == Some(&1)));
+        let inner: Vec<u8> = outer.iter().flat_map(|payload| payload[1..].to_vec()).collect();
+        let lines = lines(&pkt_payloads(&inner));
+        assert_eq!(lines[0], "unpack ok\n");
+        assert_eq!(lines.iter().filter(|line| line.starts_with("ng ")).count(), 2);
+        assert!(!lines.iter().any(|line| line.starts_with("ok ")));
+    }
+
+    #[test]
+    fn rejection_report_requires_a_negotiated_status_format() {
+        let refs = vec!["refs/heads/main".to_owned()];
+        let error = rejected_refs_report(&ReceiveCapabilities::default(), &refs, "ref changed").unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(rejected_refs_report(&ReceiveCapabilities::default(), &[], "ref changed").is_err());
+        assert!(rejected_refs_report(&ReceiveCapabilities::default(), &refs, "bad\nreason").is_err());
+        assert!(rejected_refs_report(&ReceiveCapabilities::default(), &refs, "new\0line").is_err());
+    }
+
+    #[test]
+    fn native_refusal_detection_requires_every_requested_ref() {
+        let refs = vec!["refs/heads/a".to_owned(), "refs/heads/b".to_owned()];
+        let mut refused = pkt(b"unpack ok\n");
+        refused.extend(pkt(b"ng refs/heads/a stale info\n"));
+        refused.extend(pkt(b"ng refs/heads/b stale info\n"));
+        refused.extend_from_slice(b"0000");
+        assert!(reports_rejection(&refused, &refs));
+        let mut partial = pkt(b"unpack ok\n");
+        partial.extend(pkt(b"ng refs/heads/a stale info\n"));
+        partial.extend(pkt(b"ok refs/heads/b\n"));
+        partial.extend_from_slice(b"0000");
+        assert!(!reports_rejection(&partial, &refs));
+        assert!(!reports_rejection(&pkt(b"unpack ok\n"), &refs));
+        assert!(!reports_rejection(&refused, &[]));
+        let mut payload = vec![1u8];
+        payload.extend_from_slice(&refused);
+        let mut banded = pkt(&payload);
+        banded.extend_from_slice(b"0000");
+        assert!(reports_rejection(&banded, &refs));
+    }
+
     #[test]
     fn rejects_unsafe_routes() {
         for path in [
