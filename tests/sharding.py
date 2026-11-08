@@ -2642,7 +2642,25 @@ class ShardingReferenceRunner:
 
 
 class ShardingHarness(PullsHarness):
-    """Live PostgreSQL + Rootyard HTTP server E2E harness for Track 4 (F39 & F40)."""
+    """Live PostgreSQL + Rootyard HTTP guard harness for the sharded control plane.
+
+    Every case below runs against the shipped Rust handlers and asserts the
+    contract they actually implement: metadata-only virtual bucket placement,
+    server-clock node leases, route epoch/fencing-token version fences, and the
+    supported read-only degradation/recovery drill. Operations the service
+    deliberately refuses (caller-supplied replica watermarks, automatic
+    takeover without a verified target and physical source fencing, simulated
+    DR, rebalance without a measured transfer) are proved refused with the
+    handler's exact 409 and fixed reason, and are never counted as data-plane
+    success.
+
+    The two other Track 4 references stay separately labelled:
+    ``ShardingReferenceEngine``/``ShardingReferenceRunner`` are the explicitly
+    simulated ``--reference-only`` model, and the real transfer/failover data
+    plane is owned by ``cluster_workload_native.py`` and
+    ``cluster_migration_native.py``. Shard node endpoints created here are
+    metadata fixtures: no case claims a byte was served from them.
+    """
 
     def ensure_migration_060(self) -> None:
         if self.sql("SELECT to_regclass('shard_nodes') IS NOT NULL") != "t":
@@ -2665,117 +2683,311 @@ class ShardingHarness(PullsHarness):
         self.bucketspath = "/api/shards/buckets"
         self.rebalancepath = "/api/shards/rebalance"
         self.routepath = "/api/repos/alice/forge/shard-route"
+        self.resolvepath = self.routepath + "/resolve"
         self.fencepath = "/api/repos/alice/forge/shard-fence"
         self.failoverpath = "/api/repos/alice/forge/shard-failover"
         self.degradepath = "/api/repos/alice/forge/shard-degrade"
+        self.migratepath = "/api/repos/alice/forge/shard-migrate"
         self.drdrillpath = "/api/repos/alice/forge/shard-dr-drill"
         self.clusterbenchpath = "/api/shards/benchmark"
         self.repobenchpath = "/api/repos/alice/forge/shard-benchmark"
+        self.repodir = (
+            Path(self.env["ROOTYARD_DATA_DIR"]) / "repos" / (self.repo["id"] + ".git")
+        )
         self.outsider = self.issue_token("outsider", create_user=True)
         # Cluster authority is a per-token database grant (migration 080), never
-        # implied by repository ownership. The dedicated operator token is used
-        # only for cluster-global control-plane calls so that the ordinary
-        # personal token keeps proving it cannot administer infrastructure.
+        # implied by repository ownership. This dedicated operator token is the
+        # only one used for cluster-global controls, so the ordinary personal
+        # token and the repository-admin-only token keep proving they cannot
+        # administer infrastructure.
         self.operator = self.issue_token("shard-operator", create_user=True)
+        self.grant_operator(self.operator, "native-sharding")
+        # Repo-scoped operator-only controls need the *same* principal that holds
+        # the repository role, so a second alice token is granted explicitly and
+        # the original alice token is left ungranted on purpose.
+        self.alice_operator = self.issue_token("alice")
+        self.grant_operator(self.alice_operator, "native-sharding-repo-admin")
+        # A genuinely repository-admin-only token: restricted scopes carrying one
+        # explicit grant. It is not a cluster operator and it cannot even read
+        # the route, because repo_read was not granted.
+        self.repo_admin = self.issue_token("alice")
+        self.sql(
+            "UPDATE tokens SET is_restricted = true WHERE id = '"
+            + self.repo_admin["token_id"]
+            + "'"
+        )
+        self.sql(
+            "INSERT INTO token_repository_scopes (token_id, repository_id, action) VALUES ('"
+            + self.repo_admin["token_id"]
+            + "', '"
+            + self.repo["id"]
+            + "', 'repo_admin')"
+        )
+        # PullsHarness.setup() pushed real refs through the native Git ingress,
+        # which is also what provisioned the repository shard route.
+        assert len(self.refs_on_volume()) >= 1
+
+    def grant_operator(self, token: dict, granted_by: str) -> None:
         self.sql(
             "INSERT INTO cluster_operator_tokens(token_id, granted_by) VALUES ('"
-            + self.operator["token_id"]
-            + "', 'native-sharding')"
+            + token["token_id"]
+            + "', '"
+            + granted_by
+            + "')"
         )
+
+    def route_state(self) -> dict:
+        return self.document(self.routepath)
+
+    def refs_on_volume(self) -> list:
+        """Refs read from the repository volume, not through the ingress."""
+        out = self.run(
+            [
+                "git",
+                "--git-dir",
+                str(self.repodir),
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+            ]
+        )
+        return out.stdout.decode().splitlines()
+
+    def refusal(self, path, code, reason, token=None, method="GET", json_body=None):
+        """Assert one exact status and the handler's fixed reason."""
+        body = self.document(
+            path, code=code, token=token, method=method, json_body=json_body
+        )
+        assert body.get("error") == reason, (path, body)
+        return body
 
     def migration(self) -> None:
         assert self.sql("SELECT to_regclass('shard_nodes') IS NOT NULL") == "t"
         assert self.sql("SELECT to_regclass('repository_shard_routes') IS NOT NULL") == "t"
 
-    def virtual_bucket_routing_and_explicit_overrides(self) -> None:
-        # An ordinary personal token cannot administer cluster infrastructure.
-        self.document(
-            self.nodespath,
-            code=403,
-            method="POST",
-            json_body={"node_id": "shard-node-a", "endpoint": "http://shard-a:8080", "role": "primary", "status": "healthy", "lease_ttl_seconds": 120},
-        )
+    def virtual_bucket_placement_and_occupied_route_refusal(self) -> None:
         for payload in (
             {"node_id": "shard-node-a", "endpoint": "http://shard-a:8080", "role": "primary", "status": "healthy", "lease_ttl_seconds": 120},
-            {"node_id": "shard-node-b", "endpoint": "http://shard-b:8080", "role": "replica", "status": "healthy"},
-            {"node_id": "shard-node-c", "endpoint": "http://shard-c:8080", "role": "replica", "status": "healthy"},
+            {"node_id": "shard-node-b", "endpoint": "http://shard-b:8080", "role": "replica", "status": "healthy", "lease_ttl_seconds": 120},
+            {"node_id": "shard-node-c", "endpoint": "http://shard-c:8080", "role": "replica", "status": "healthy", "lease_ttl_seconds": 120},
         ):
-            self.document(self.nodespath, code=201, token=self.operator, method="POST", json_body=payload)
-        # Placement is published before the repository route exists so the
-        # bucket can adopt it; a route row created first would make this an
-        # explicit-override conflict instead of a placement decision.
-        bucket_id = deterministic_bucket_id(self.repo["id"])
-        self.document(
+            created = self.document(
+                self.nodespath, code=201, token=self.operator, method="POST", json_body=payload
+            )
+            assert created["node_id"] == payload["node_id"]
+        route_before = self.route_state()
+        refs_before = self.refs_on_volume()
+        # Placement is only accepted on a bucket that no repository route maps
+        # to. Ask SQL for such a bucket instead of assuming the test repository
+        # bucket is free: native Git traffic already created that route.
+        unused = int(
+            self.sql(
+                "SELECT bucket_id FROM generate_series(0, 1023) AS bucket_id "
+                "WHERE NOT EXISTS (SELECT 1 FROM repository_shard_routes route "
+                "WHERE route.bucket_id = bucket_id) ORDER BY bucket_id LIMIT 1"
+            )
+        )
+        assert unused != route_before["bucket_id"]
+        mapped = (
+            self.sql(
+                "SELECT COUNT(*) FROM shard_virtual_buckets WHERE bucket_id = "
+                + str(unused)
+            )
+            == "1"
+        )
+        placed = self.document(
             self.bucketspath,
-            code=201,
+            code=200 if mapped else 201,
             token=self.operator,
             method="POST",
             json_body={
-                "bucket_id": bucket_id,
+                "bucket_id": unused,
                 "primary_node_id": "shard-node-a",
                 "read_replica_nodes": ["shard-node-b", "shard-node-c"],
             },
         )
-        route = self.document(self.routepath, code=200)
-        assert route["bucket_id"] == bucket_id
-        assert route["primary_node_id"] == "shard-node-a"
-        assert route["read_replica_nodes"] == ["shard-node-b", "shard-node-c"]
-        assert route["explicit_override"] is False
+        assert placed["bucket_id"] == unused
+        assert placed["primary_node_id"] == "shard-node-a"
+        assert placed["read_replica_nodes"] == ["shard-node-b", "shard-node-c"]
+        # An unused bucket owns no repository route, so re-placing it is a
+        # metadata edit, not a data move.
+        replaced = self.document(
+            self.bucketspath,
+            code=200,
+            token=self.operator,
+            method="POST",
+            json_body={
+                "bucket_id": unused,
+                "primary_node_id": "shard-node-b",
+                "read_replica_nodes": ["shard-node-c"],
+            },
+        )
+        assert replaced["primary_node_id"] == "shard-node-b"
+        assert replaced["route_epoch"] == placed["route_epoch"] + 1
+        buckets_before = self.document(self.bucketspath + "?limit=1024")
+        # Moving the occupied bucket, the occupied repository route, or the
+        # repository itself must be refused and must leave route rows, bucket
+        # rows and refs untouched. No fake migration is recorded anywhere.
+        occupied = route_before["bucket_id"]
+        self.refusal(
+            self.bucketspath,
+            409,
+            "bucket placement has repositories; use verified repository migration",
+            token=self.operator,
+            method="POST",
+            json_body={
+                "bucket_id": occupied,
+                "primary_node_id": "shard-node-c",
+                "read_replica_nodes": ["shard-node-b"],
+            },
+        )
+        placement = {"primary_node_id": "shard-node-c", "read_replica_nodes": ["shard-node-b"]}
+        self.refusal(
+            self.routepath, 403, "cluster operator capability required", method="PUT", json_body=placement
+        )
+        self.refusal(
+            self.routepath,
+            409,
+            "placement changes require verified data migration",
+            token=self.alice_operator,
+            method="PUT",
+            json_body=placement,
+        )
+        self.refusal(
+            self.migratepath,
+            409,
+            "migration must run on source storage node",
+            token=self.alice_operator,
+            method="POST",
+            json_body={"target_node_id": "shard-node-c"},
+        )
+        assert self.route_state() == route_before
+        assert self.document(self.bucketspath + "?limit=1024") == buckets_before
+        assert self.refs_on_volume() == refs_before
 
     def primary_node_lease_renewal_and_expiry_fencing(self) -> None:
-        # Node lease renewal is infrastructure authority, not repository RBAC.
-        self.document(
-            f"{self.nodespath}/shard-node-a/lease",
-            code=403,
-            method="POST",
-            json_body={"lease_ttl_seconds": 60, "expected_lease_epoch": 1, "now_unix": 1_700_000_000},
-        )
+        route = self.route_state()
+        primary = route["primary_node_id"]
+        leasepath = self.nodespath + "/" + primary + "/lease"
+        # Lease renewal is infrastructure authority, not repository RBAC.
+        for token, reason in (
+            (self.alice, "cluster operator capability required"),
+            (self.repo_admin, "cluster operator capability required"),
+            (self.outsider, "cluster operator capability required"),
+            (self.reader, "write permission required"),
+        ):
+            self.refusal(
+                leasepath,
+                403,
+                reason,
+                token=token,
+                method="POST",
+                json_body={"lease_ttl_seconds": 60, "expected_lease_epoch": 1},
+            )
+        current = self.document(self.nodespath + "/" + primary)
         renewed = self.document(
-            f"{self.nodespath}/shard-node-a/lease",
+            leasepath,
             code=200,
             token=self.operator,
             method="POST",
-            json_body={"lease_ttl_seconds": 60, "expected_lease_epoch": 1, "now_unix": 1_700_000_000},
+            json_body={"lease_ttl_seconds": 60, "expected_lease_epoch": current["lease_epoch"]},
         )
-        assert renewed["lease_epoch"] == 2
-        self.document(
-            f"{self.routepath}/resolve?op=write&now_unix=1700000090",
-            code=409,
+        assert renewed["lease_epoch"] == current["lease_epoch"] + 1
+        # Expiry comes from the server clock plus the TTL; no caller wall clock.
+        assert abs(renewed["lease_expires_unix"] - (int(time.time()) + 60)) <= 120
+        # A stale lease epoch stays fenced and cannot advance the node.
+        self.refusal(
+            leasepath,
+            409,
+            "stale or mismatched node lease_epoch",
+            token=self.operator,
+            method="POST",
+            json_body={"lease_ttl_seconds": 60, "expected_lease_epoch": renewed["lease_epoch"] - 1},
         )
-        self.document(
-            f"{self.nodespath}/shard-node-a/lease",
+        held = self.document(self.nodespath + "/" + primary)
+        assert held["lease_epoch"] == renewed["lease_epoch"]
+        write = self.document(self.resolvepath + "?op=write", code=200)
+        assert write["target_node_id"] == primary and write["target_role"] == "primary"
+        # Stated fixture: expiry is forced in SQL because the contract expires
+        # leases on the server clock. There is no caller-supplied wall clock
+        # that can be presented as a successful write.
+        self.sql(
+            "UPDATE shard_nodes SET lease_expires_unix = 1 WHERE node_id = '"
+            + primary
+            + "'"
+        )
+        self.refusal(
+            self.resolvepath + "?op=write",
+            409,
+            "primary shard node unavailable, fenced, lease-expired, or degraded for writes",
+        )
+        self.refusal(
+            self.resolvepath + "?op=read",
+            409,
+            "no watermark-qualified replica or readable primary available",
+        )
+        revived = self.document(
+            leasepath,
             code=200,
             token=self.operator,
             method="POST",
-            json_body={"lease_ttl_seconds": 300, "expected_lease_epoch": 2, "now_unix": 1_700_000_090},
+            json_body={"lease_ttl_seconds": 300, "expected_lease_epoch": renewed["lease_epoch"]},
         )
+        assert revived["lease_expires_unix"] > int(time.time())
+        write = self.document(self.resolvepath + "?op=write", code=200)
+        assert write["target_node_id"] == primary
 
-    def dual_layer_epoch_and_generation_write_barriers(self) -> None:
+    def epoch_generation_write_barrier_fence_and_unfence(self) -> None:
+        route = self.route_state()
+        refs_before = self.refs_on_volume()
         fenced = self.document(
             self.fencepath,
             code=200,
             method="POST",
-            json_body={"action": "fence", "fenced_epoch": 2, "storage_generation": 1, "now_unix": 1_700_000_100},
+            json_body={
+                "action": "fence",
+                "fenced_epoch": route["route_epoch"],
+                "reason": "control-plane fence guard",
+            },
         )
         assert fenced["write_admitted"] is False
-        self.document(
+        assert fenced["fenced_epoch"] == route["route_epoch"]
+        self.refusal(
             self.fencepath,
-            code=409,
+            409,
+            "repository or primary shard node route_epoch is fenced",
             method="POST",
-            json_body={"action": "verify", "now_unix": 1_700_000_105},
+            json_body={"action": "verify"},
+        )
+        self.refusal(
+            self.resolvepath + "?op=write",
+            409,
+            "primary shard node unavailable, fenced, lease-expired, or degraded for writes",
+        )
+        self.refusal(
+            self.fencepath,
+            409,
+            "fenced_epoch cannot move backward",
+            method="POST",
+            json_body={"action": "fence", "fenced_epoch": max(0, fenced["fenced_epoch"] - 1)},
         )
         unfenced = self.document(
-            self.fencepath,
-            code=200,
-            method="POST",
-            json_body={"action": "unfence", "storage_generation": 1, "now_unix": 1_700_000_110},
+            self.fencepath, code=200, method="POST", json_body={"action": "unfence"}
         )
         assert unfenced["write_admitted"] is True
+        assert unfenced["fenced_epoch"] < unfenced["route_epoch"]
+        write = self.document(self.resolvepath + "?op=write", code=200)
+        assert write["target_node_id"] == unfenced["primary_node_id"]
+        assert self.refs_on_volume() == refs_before
 
-    def read_write_watermark_routing_and_replica_fallback(self) -> None:
-        self.document(
+    def caller_watermark_refusal_and_read_path_fallback(self) -> None:
+        route = self.route_state()
+        refs_before = self.refs_on_volume()
+        # Caller-supplied replica watermarks are refused: only a measured
+        # replication path may publish one.
+        self.refusal(
             self.routepath,
-            code=200,
+            409,
+            "replica watermarks require measured data replication",
             method="PUT",
             json_body={
                 "replica_watermarks": {
@@ -2786,42 +2998,81 @@ class ShardingHarness(PullsHarness):
                 "required_op_sequence": 10,
             },
         )
-        res = self.document(f"{self.routepath}/resolve?op=read&now_unix=1700000120", code=200)
-        assert res["target_node_id"] == "shard-node-c" and res["target_role"] == "replica"
+        assert self.route_state() == route
+        # With no verified watermark the only honest read target is the primary.
+        read = self.document(self.resolvepath + "?op=read", code=200)
+        assert read["target_node_id"] == route["primary_node_id"]
+        assert read["target_role"] == "primary"
+        assert read["fallback_to_primary"] is True and read["read_only_degraded"] is False
+        self.refusal(
+            self.resolvepath + "?op=read&client_route_epoch=" + str(route["route_epoch"] + 5),
+            409,
+            "stale or mismatched client route_epoch",
+        )
+        assert self.refs_on_volume() == refs_before
 
-    def automated_four_stage_failover_state_machine(self) -> None:
+    def automatic_failover_explicitly_refused(self) -> None:
+        route = self.route_state()
+        failovers_before = self.document(self.failoverpath)
+        refs_before = self.refs_on_volume()
+        payload = {"new_primary_node_id": "shard-node-b", "reason": "unverified takeover"}
+        self.refusal(
+            self.failoverpath,
+            403,
+            "cluster operator capability required",
+            method="POST",
+            json_body=payload,
+        )
+        # Even with repository admin and the operator grant the takeover is
+        # refused: it needs a verified target and a physically fenced source.
+        self.refusal(
+            self.failoverpath,
+            409,
+            "automatic takeover requires verified target data and physical source fencing",
+            token=self.alice_operator,
+            method="POST",
+            json_body=payload,
+        )
+        assert self.route_state() == route
+        assert self.document(self.failoverpath) == failovers_before
+        assert self.refs_on_volume() == refs_before
+
+    def read_only_degradation_and_recovery(self) -> None:
+        route = self.route_state()
+        # Recovery is gated on a live primary lease, so renew on the server clock.
         self.document(
-            self.failoverpath,
-            code=409,
-            method="POST",
-            json_body={"new_primary_node_id": "shard-node-b", "reason": "lagging"},
-        )
-        op = self.document(
-            self.failoverpath,
+            self.nodespath + "/" + route["primary_node_id"] + "/lease",
             code=200,
+            token=self.operator,
             method="POST",
-            json_body={"new_primary_node_id": "shard-node-c", "reason": "promote c", "now_unix": 1_700_000_150},
+            json_body={"lease_ttl_seconds": 300},
         )
-        assert op["state"] == "promoted" and op["new_primary_node_id"] == "shard-node-c"
-
-    def read_only_degradation_drill_and_recovery(self) -> None:
-        deg = self.document(
+        degraded = self.document(
             self.degradepath,
             code=200,
             method="POST",
-            json_body={"mode": "degrade", "reason": "drill", "now_unix": 1_700_000_160},
+            json_body={"mode": "degrade", "reason": "read-only drill"},
         )
-        assert deg["read_only_degraded"] is True
-        self.document(f"{self.routepath}/resolve?op=write&now_unix=1700000165", code=409)
-        rec = self.document(
-            self.degradepath,
-            code=200,
-            method="POST",
-            json_body={"mode": "recover", "now_unix": 1_700_000_170},
+        assert degraded["read_only_degraded"] is True and degraded["write_admitted"] is False
+        assert degraded["degraded_reason"] == "read-only drill"
+        self.refusal(
+            self.resolvepath + "?op=write",
+            409,
+            "primary shard node unavailable, fenced, lease-expired, or degraded for writes",
         )
-        assert rec["read_only_degraded"] is False and rec["write_admitted"] is True
+        recovered = self.document(
+            self.degradepath, code=200, method="POST", json_body={"mode": "recover"}
+        )
+        assert recovered["read_only_degraded"] is False
+        assert recovered["write_admitted"] is True and recovered["degraded_reason"] == ""
+        write = self.document(self.resolvepath + "?op=write", code=200)
+        assert write["target_node_id"] == route["primary_node_id"]
+        self.refusal(
+            self.degradepath, 400, "invalid request", method="POST", json_body={"mode": "takeover"}
+        )
 
-    def online_bucket_and_repo_rebalance(self) -> None:
+    def rebalance_dry_run_plan_and_measured_transfer_refusal(self) -> None:
+        route = self.route_state()
         self.document(
             self.nodespath,
             code=201,
@@ -2833,137 +3084,203 @@ class ShardingHarness(PullsHarness):
                 "role": "primary",
                 "status": "healthy",
                 "lease_ttl_seconds": 300,
-                "now_unix": 1_700_000_180,
             },
         )
-        route = self.document(self.routepath, code=200)
-        self.document(
-            self.bucketspath,
-            code=200,
-            token=self.operator,
-            method="POST",
-            json_body={"bucket_id": route["bucket_id"], "primary_node_id": "shard-node-c", "read_replica_nodes": ["shard-node-b"]},
+        refs_before = self.refs_on_volume()
+        plan = {
+            "bucket_id": route["bucket_id"],
+            "source_node_id": route["primary_node_id"],
+            "target_node_id": "shard-node-d",
+            "repository_id": route["repository_id"],
+            "reason": "plan only",
+        }
+        planned = self.document(
+            self.rebalancepath, code=200, method="POST", json_body={**plan, "dry_run": True}
         )
-        reb = self.document(
+        # The dry-run reports a plan, never a completed transfer.
+        assert planned["dry_run"] is True and planned["state"] == "dry_run"
+        assert planned["phases"] == REBALANCE_PHASES
+        assert self.route_state() == route
+        assert self.refs_on_volume() == refs_before
+        self.refusal(
             self.rebalancepath,
-            code=200,
-            token=self.operator,
+            403,
+            "cluster operator capability required",
             method="POST",
-            json_body={
-                "bucket_id": route["bucket_id"],
-                "source_node_id": "shard-node-c",
-                "target_node_id": "shard-node-d",
-                "repository_id": route["repository_id"],
-                "reason": "hotspot rebalance",
-                "now_unix": 1_700_000_190,
-            },
+            json_body={**plan, "dry_run": False},
         )
-        assert reb["phases"] == ["drain", "sync", "fence", "cutover"]
+        self.refusal(
+            self.rebalancepath,
+            409,
+            "rebalance requires measured repository transfer; use shard-migrate",
+            token=self.alice_operator,
+            method="POST",
+            json_body={**plan, "dry_run": False},
+        )
+        assert self.route_state() == route
+        assert self.refs_on_volume() == refs_before
 
-    def rpo_rto_disaster_recovery_drill(self) -> None:
-        self.document(
+    def simulated_dr_drill_explicitly_refused(self) -> None:
+        route = self.route_state()
+        drills_before = self.document(self.drdrillpath)
+        payload = {
+            "primary_node_id": route["primary_node_id"],
+            "standby_node_id": "shard-node-b",
+            "target_rpo_secs": 5,
+            "target_rto_ms": 200,
+            "simulated_lag_secs": 1,
+            "simulated_takeover_ms": 50,
+            "verify_rollback": True,
+        }
+        self.refusal(
             self.drdrillpath,
-            code=409,
+            403,
+            "cluster operator capability required",
             method="POST",
-            json_body={
-                "primary_node_id": "shard-node-d",
-                "standby_node_id": "shard-node-b",
-                "target_rpo_secs": 5,
-                "target_rto_ms": 200,
-                "simulated_lag_secs": 15,
-                "simulated_takeover_ms": 100,
-            },
+            json_body=payload,
         )
-        ok_drill = self.document(
+        self.refusal(
             self.drdrillpath,
-            code=200,
+            409,
+            "simulated DR inputs cannot promote storage; use native cluster recovery workload",
+            token=self.alice_operator,
             method="POST",
-            json_body={
-                "primary_node_id": "shard-node-d",
-                "standby_node_id": "shard-node-b",
-                "target_rpo_secs": 5,
-                "target_rto_ms": 200,
-                "simulated_lag_secs": 1,
-                "simulated_takeover_ms": 50,
-                "verify_rollback": True,
-            },
+            json_body=payload,
         )
-        assert ok_drill["rpo_met"] is True and ok_drill["rto_met"] is True
+        assert self.route_state() == route
+        assert self.document(self.drdrillpath) == drills_before
 
-    def multi_node_benchmark_and_pinned_root_reachability(self) -> None:
-        c_bench = self.document(
+    def benchmark_simulation_receipt_honesty(self) -> None:
+        receipt = self.document(
             self.clusterbenchpath,
             code=200,
             token=self.operator,
             method="POST",
             json_body={"node_counts": [1, 2, 4], "concurrency": 8, "operations_per_tier": 24},
         )
-        assert c_bench["pinned_roots_verified"] is True
-        assert [t["node_count"] for t in c_bench["node_tiers"]] == [1, 2, 4]
-        r_bench = self.document(
+        # A 200 here is a labelled simulation receipt, not measured reachability.
+        assert receipt["status"] == "simulation_only"
+        assert receipt["pinned_roots_verified"] is False and receipt["failover_verified"] is False
+        assert [tier["node_count"] for tier in receipt["node_tiers"]] == [1, 2, 4]
+        assert receipt["markdown_report"].startswith("# Simulation only")
+        repo_receipt = self.document(
             self.repobenchpath,
             code=200,
             method="POST",
-            json_body={"node_counts": [1, 2, 4], "concurrency": 8, "operations_per_tier": 24},
+            json_body={"node_counts": [1, 2], "concurrency": 8, "operations_per_tier": 24},
         )
-        assert r_bench["pinned_roots_verified"] is True
-        self.document(
+        assert repo_receipt["status"] == "simulation_only"
+        assert repo_receipt["pinned_roots_verified"] is False
+        assert str(uuid.UUID(repo_receipt["repository_id"])) == str(uuid.UUID(self.repo["id"]))
+        self.refusal(
             self.repobenchpath,
-            code=409,
+            409,
+            "pinned root reachability check failed",
             method="POST",
             json_body={"simulate_missing_pinned_objects": 1},
         )
+        self.refusal(
+            self.clusterbenchpath,
+            403,
+            "cluster operator capability required",
+            method="POST",
+            json_body={"node_counts": [1, 2, 4]},
+        )
+        self.refusal(
+            self.clusterbenchpath,
+            400,
+            "invalid request",
+            token=self.operator,
+            method="POST",
+            json_body={"node_counts": [3]},
+        )
 
     def access_and_boundaries(self) -> None:
-        self.document(self.routepath, code=404, token=self.outsider)
-        # Operator capability does not grant repository authority: the granted
-        # operator token is not a collaborator on this repository.
-        self.document(self.routepath, code=404, token=self.operator)
-        # Ordinary and unrelated tokens stay unable to mutate cluster
-        # infrastructure even with an otherwise valid payload.
-        for token in (self.alice, self.outsider):
-            self.document(
+        route = self.route_state()
+        self.refusal(self.routepath, 404, "not found", token=self.outsider)
+        # Operator capability does not grant repository authority.
+        self.refusal(self.routepath, 404, "not found", token=self.operator)
+        # The restricted token really is admin-only: its single grant does not
+        # include repo_read.
+        self.refusal(
+            self.routepath, 403, "token scope does not permit this action", token=self.repo_admin
+        )
+        # A read-only token may read route metadata but never mutate it.
+        assert self.document(self.routepath, token=self.reader) == route
+        node_payload = {
+            "node_id": "shard-node-denied",
+            "endpoint": "http://shard-denied:8080",
+            "role": "replica",
+            "status": "healthy",
+        }
+        for token in (self.alice, self.repo_admin, self.outsider):
+            self.refusal(
                 self.nodespath,
-                code=403,
-                method="POST",
+                403,
+                "cluster operator capability required",
                 token=token,
-                json_body={
-                    "node_id": "shard-node-denied",
-                    "endpoint": "http://shard-denied:8080",
-                    "role": "replica",
-                    "status": "healthy",
-                },
+                method="POST",
+                json_body=node_payload,
             )
-        self.document(
-            self.bucketspath,
-            code=403,
+        self.refusal(
+            self.nodespath,
+            403,
+            "write permission required",
+            token=self.reader,
             method="POST",
-            json_body={"bucket_id": 0, "primary_node_id": "shard-node-a"},
+            json_body=node_payload,
         )
-        self.document(
+        self.document(self.nodespath, code=200, token=self.reader)
+        bucket_payload = {"bucket_id": route["bucket_id"], "primary_node_id": "shard-node-a"}
+        self.refusal(
             self.bucketspath,
-            code=400,
+            403,
+            "cluster operator capability required",
             method="POST",
-            json_body={"bucket_id": 1024, "primary_node_id": "shard-node-c"},
+            json_body=bucket_payload,
         )
+        self.refusal(
+            self.bucketspath,
+            403,
+            "write permission required",
+            token=self.reader,
+            method="POST",
+            json_body=bucket_payload,
+        )
+        self.refusal(
+            self.bucketspath,
+            400,
+            "invalid request",
+            token=self.operator,
+            method="POST",
+            json_body={"bucket_id": 1024, "primary_node_id": "shard-node-a"},
+        )
+        self.refusal(
+            self.bucketspath,
+            404,
+            "not found",
+            token=self.operator,
+            method="POST",
+            json_body={"bucket_id": 7, "primary_node_id": "shard-node-missing"},
+        )
+        assert self.route_state() == route
 
     def run_all(self) -> None:
         for name in (
             "setup",
             "migration",
-            "virtual_bucket_routing_and_explicit_overrides",
+            "virtual_bucket_placement_and_occupied_route_refusal",
             "primary_node_lease_renewal_and_expiry_fencing",
-            "dual_layer_epoch_and_generation_write_barriers",
-            "read_write_watermark_routing_and_replica_fallback",
-            "automated_four_stage_failover_state_machine",
-            "read_only_degradation_drill_and_recovery",
-            "online_bucket_and_repo_rebalance",
-            "rpo_rto_disaster_recovery_drill",
-            "multi_node_benchmark_and_pinned_root_reachability",
+            "epoch_generation_write_barrier_fence_and_unfence",
+            "caller_watermark_refusal_and_read_path_fallback",
+            "automatic_failover_explicitly_refused",
+            "read_only_degradation_and_recovery",
+            "rebalance_dry_run_plan_and_measured_transfer_refusal",
+            "simulated_dr_drill_explicitly_refused",
+            "benchmark_simulation_receipt_honesty",
             "access_and_boundaries",
         ):
             self.case(name, getattr(self, name))
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -3013,7 +3330,11 @@ def main() -> int:
         report = {
             "passed": success,
             "mode": mode,
+            "scope": "sharded control-plane placement, lease/epoch fencing and explicit refusal of unsupported failover, simulated DR and unmeasured rebalance",
             "production_validation": False,
+            "multi_node_ha_validation": False,
+            "data_plane_success_claimed": False,
+            "benchmark_receipts": "simulation_only",
             "reference_only": args.reference_only,
             "data_plane_validation": "run cluster_workload_native.py and cluster_migration_native.py",
             "cases": runner.results,
