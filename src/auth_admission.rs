@@ -339,11 +339,7 @@ impl AuthAdmission {
         self.try_admit_at(source, Instant::now())
     }
 
-    pub(crate) fn try_admit_at(
-        &self,
-        source: IpAddr,
-        now: Instant,
-    ) -> Result<AdmissionPermit, AdmissionRejection> {
+    pub(crate) fn try_admit_at(&self, source: IpAddr, now: Instant) -> Result<AdmissionPermit, AdmissionRejection> {
         if !self.consume_source(source, now) {
             self.rejected_rate.fetch_add(1, Ordering::Relaxed);
             return Err(AdmissionRejection::Overloaded);
@@ -365,10 +361,7 @@ impl AuthAdmission {
     /// Admit an attempt that requires a transport peer. Used by the explicit
     /// auth lookup route: missing `ConnectInfo` is refused instead of silently
     /// trusting a caller-supplied header or invented identity.
-    pub(crate) fn try_admit_required(
-        &self,
-        source: Option<IpAddr>,
-    ) -> Result<AdmissionPermit, AdmissionRejection> {
+    pub(crate) fn try_admit_required(&self, source: Option<IpAddr>) -> Result<AdmissionPermit, AdmissionRejection> {
         let Some(source) = source else {
             self.rejected_missing_peer.fetch_add(1, Ordering::Relaxed);
             return Err(AdmissionRejection::MissingPeer);
@@ -655,11 +648,7 @@ mod tests {
     #[tokio::test]
     async fn login_route_requires_a_transport_peer() {
         let admission = AuthAdmission::new(config(4, 10, 16));
-        let login = Request::builder()
-            .method(Method::POST)
-            .uri("/web/login")
-            .body(Body::empty())
-            .unwrap();
+        let login = Request::builder().method(Method::POST).uri("/web/login").body(Body::empty()).unwrap();
         assert!(is_login_attempt(&login));
         // No ConnectInfo: the login gate fails closed instead of admitting.
         let Err(rejection) = admit_login_attempt(&admission, &login) else {
@@ -679,17 +668,9 @@ mod tests {
             .unwrap();
         assert!(admit_login_attempt(&admission, &login_with_peer).is_ok());
         // Other routes and methods do not enter the login gate.
-        let whoami = Request::builder()
-            .method(Method::GET)
-            .uri("/api/auth/whoami")
-            .body(Body::empty())
-            .unwrap();
+        let whoami = Request::builder().method(Method::GET).uri("/api/auth/whoami").body(Body::empty()).unwrap();
         assert!(!is_login_attempt(&whoami));
-        let other_post = Request::builder()
-            .method(Method::POST)
-            .uri("/api/repos")
-            .body(Body::empty())
-            .unwrap();
+        let other_post = Request::builder().method(Method::POST).uri("/api/repos").body(Body::empty()).unwrap();
         assert!(!is_login_attempt(&other_post));
     }
 
