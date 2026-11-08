@@ -1825,24 +1825,38 @@ async fn direct_sql_scope_fks_and_delete_guards_are_durable() -> Result<()> {
         let created = create(&pool, &request).await?.receipt;
         let client = pool.get().await?;
 
-        // A pin cannot bind a snapshot/tenant scope that does not exist: the
-        // backend's full-scope foreign key answers SQLSTATE 23503.
-        let wrong_tenant = Uuid::new_v4();
+        // Clone the header only inside this failing statement so the probe has
+        // no existing pin and cannot stop at the one-pin-per-snapshot UNIQUE.
+        // The repository and tenant are valid; only the owner disagrees with
+        // the immutable header, exercising the full-scope snapshot FK itself.
+        // The failing statement also rolls back its temporary header.
+        let wrong_owner = Uuid::new_v4();
         let error = client
             .execute(
-                "INSERT INTO ref_store_core_pins(
+                "WITH probe AS (
+                     INSERT INTO ref_store_core_snapshots(
+                         snapshot_id,repository_id,tenant_id,owner_id,purpose,object_format,
+                         history_incarnation,authority_epoch,group_epoch,gate_revision,gate_digest,
+                         head_ref,head_oid,ref_count,refs_digest,logical_bytes)
+                     SELECT $4,repository_id,tenant_id,owner_id,purpose,object_format,
+                         history_incarnation,authority_epoch,group_epoch,gate_revision,gate_digest,
+                         head_ref,head_oid,ref_count,refs_digest,logical_bytes
+                     FROM ref_store_core_snapshots WHERE snapshot_id=$8
+                     RETURNING snapshot_id
+                 ) INSERT INTO ref_store_core_pins(
                      pin_id,repository_id,tenant_id,snapshot_id,owner_id,purpose,create_request_id,
                      create_digest,generation,state,expires_at)
-                 VALUES($1,$2,$3,$4,$5,'verification',$6,$7,1,'active',
-                        clock_timestamp()+interval '60 seconds')",
+                 SELECT $1,$2,$3,probe.snapshot_id,$5,'verification',$6,$7,1,'active',
+                        clock_timestamp()+interval '60 seconds' FROM probe",
                 &[
                     &Uuid::new_v4(),
                     &repo,
-                    &wrong_tenant,
-                    &created.snapshot_id(),
                     &tenant,
                     &Uuid::new_v4(),
+                    &wrong_owner,
+                    &Uuid::new_v4(),
                     &"a".repeat(64),
+                    &created.snapshot_id(),
                 ],
             )
             .await
