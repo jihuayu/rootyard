@@ -451,7 +451,7 @@ fn watchdog(state: Arc<State>) {
 }
 
 /// Pure deadline predicate so the watchdog decision is unit-testable.
-fn any_pending_expired<I: Iterator<Item = Instant>>(deadlines: I, now: Instant) -> bool {
+fn any_pending_expired<I: Iterator<Item = Instant>>(mut deadlines: I, now: Instant) -> bool {
     deadlines.any(|deadline| deadline <= now)
 }
 
