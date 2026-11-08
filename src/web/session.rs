@@ -8,11 +8,12 @@
 use crate::{AppState, Error, auth, db, web::templates::html_response};
 use axum::{
     extract::{Form, Query, State},
-    http::{HeaderMap, Method, Request, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
 };
 use base64::Engine;
+use deadpool_postgres::Pool;
 use rand::RngCore;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -33,6 +34,30 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 pub fn session_token(headers: &HeaderMap) -> Option<String> {
     cookie(headers, "rootyard_session")
         .filter(|s| s.len() == 68 && s.starts_with(SESSION_PREFIX) && s[4..].bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Normalise browser cookies into the `Authorization` header understood by
+/// [`auth::authenticate`].
+///
+/// The browser credential is only the HttpOnly session cookie minted by
+/// `/web/login`. Long-lived API tokens must not be replayed as raw web
+/// cookies or headers; API clients can still use Authorization directly.
+pub fn normalize_web_headers(headers: &HeaderMap) -> HeaderMap {
+    if headers.contains_key(header::AUTHORIZATION) {
+        return headers.clone();
+    }
+    let mut out = headers.clone();
+    if let Some(tok) = session_token(headers)
+        && let Ok(hv) = HeaderValue::from_str(&format!("Bearer {tok}"))
+    {
+        out.insert(header::AUTHORIZATION, hv);
+    }
+    out
+}
+
+/// Authenticate a browser request (session cookie) or an API request header.
+pub async fn authenticate_web(pool: &Pool, headers: &HeaderMap) -> Result<db::Identity, Error> {
+    auth::authenticate(pool, &normalize_web_headers(headers)).await
 }
 
 fn session_parent(secret: &str) -> Option<Uuid> {
@@ -581,7 +606,7 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 }
 
 pub async fn discover(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, Error> {
-    let actor = super::handlers::authenticate_web(&state.pool, &headers).await?;
+    let actor = authenticate_web(&state.pool, &headers).await?;
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
     auth::verify_token(&tx, &actor, false).await?;
