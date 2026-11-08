@@ -1,0 +1,80 @@
+{
+  "passed": true,
+  "case_count": 11,
+  "cases_run": 11,
+  "cases_passed": 11,
+  "cases_failed": 0,
+  "cases": [
+    {
+      "name": "setup_repos",
+      "status": "passed",
+      "seconds": 5.6157,
+      "detail": null
+    },
+    {
+      "name": "refs_and_pagination",
+      "status": "passed",
+      "seconds": 1.5887,
+      "detail": null
+    },
+    {
+      "name": "commits_and_pagination",
+      "status": "passed",
+      "seconds": 1.2624,
+      "detail": null
+    },
+    {
+      "name": "tree_and_blob",
+      "status": "passed",
+      "seconds": 3.6382,
+      "detail": null
+    },
+    {
+      "name": "compare_revisions",
+      "status": "passed",
+      "seconds": 1.5495,
+      "detail": null
+    },
+    {
+      "name": "ref_transactions_atomic_cas",
+      "status": "passed",
+      "seconds": 2.3324,
+      "detail": null
+    },
+    {
+      "name": "idempotency_and_concurrency",
+      "status": "passed",
+      "seconds": 2.7454,
+      "detail": null
+    },
+    {
+      "name": "access_and_fences",
+      "status": "passed",
+      "seconds": 2.2958,
+      "detail": null
+    },
+    {
+      "name": "object_format_and_negotiation",
+      "status": "passed",
+      "seconds": 2.1123,
+      "detail": null
+    },
+    {
+      "name": "bounded_ref_and_commit_pages",
+      "status": "passed",
+      "seconds": 3.7445,
+      "detail": null
+    },
+    {
+      "name": "protected_writes_and_ref_ack_failure",
+      "status": "passed",
+      "seconds": 4.096,
+      "detail": null
+    }
+  ],
+  "binary_sha256": "9f861ff7b098836fc9b80bba945545c4e9b2fb1e78fe5136c76c316a91fda8db",
+  "limitations": [
+    "Browse blob endpoint enforces a 4 MiB maximum object size cap.",
+    "Ref transactions support up to 128 atomic ref updates per request."
+  ]
+}

@@ -26,13 +26,29 @@ ordinary Git workload evidence, not synchronized old-OID CAS or rejection-atomic
 qualification. The loser of competing Git pushes may receive HTTP409 rather than
 a Git report-status rejection (tracked separately in #126).
 
-All accepted application reports bind to binary SHA-256
-a060369d0c55ddf543d25f9bcda0cb9a0bde8e9bbca35339a4b06d063b8a434d.
-The app used for backup/publication was built at3998fe5; the final f1d7919 build
-changed only the regression test and produced the identical app digest. Its full
-source/build receipt is included. Root-package debug symbols were explicitly
-disabled; these loopback tests do not establish power-loss, HA or production
-latency/RPO/RTO guarantees.
+The original reports (`native-publication.json`, `backup-format14.json`,
+`legacy137-restore.json` and `application.build.json`) remain historical evidence
+for binary `a060369d0c55ddf543d25f9bcda0cb9a0bde8e9bbca35339a4b06d063b8a434d`
+from3998fe5/f1d7919. They are not re-labelled as current-head qualification.
+
+The fresh application receipt `current-app.build.json` binds clean194caff
+(the shared-contract/backup-test fixes included) and binary
+`9f861ff7b098836fc9b80bba945545c4e9b2fb1e78fe5136c76c316a91fda8db`.
+Its `current-app-publication.json` passed41 cases with18 committed,0 pending,
+18 terminal rows; `current-backup-format14.json` passed all7 backup/restore cases.
+`current-pg-operations-core.json` records7 realPG cases on the unchanged registry
+core at9e8c450, with its separate source-bound test receipt; it is not a194caff
+rebuild of that test. The genuine legacy137 restore report is historical above.
+
+`current-browse.json` passed all11 native Browse cases against the new application
+using the shared harness at a261c99. That Python-only fix uses an explicit manual
+recovery reason for the synthetic fence: the real reconciler legitimately clears
+`push_outcome_unknown` without unresolved operations. The prior fixture raced
+that reconciler and failed with a200 instead of409. The11 original HTTP/security
+assertions remain; another remote first-read404 has not been reproduced locally.
+
+Root-package debug symbols were explicitly disabled. These loopback tests do not
+establish power-loss, HA or production latency/RPO/RTO guarantees.
 
 Earlier failures were retained locally, and an explicit ENOSPC backup failure is
 included. A minimal restore subsequently passed; full backup and genuine legacy
