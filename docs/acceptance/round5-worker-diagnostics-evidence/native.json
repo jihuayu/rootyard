@@ -52,18 +52,18 @@
       "detail": "ok"
     }
   ],
-  "binary_sha256": "6795ee27961ce0f0cf510578fb542daefe209de3e313aa967a872a3a7fbb5252",
+  "binary_sha256": "4eacc3aae0344a9d724b68d17a806dde9508be31fd627b354ea71464a624d5ea",
   "compiled_receipt": {
-    "path": "/workspace/scratch/round5-implementation/worker-diagnostics135-v2/rootyard.build.json",
-    "sha256": "c223a4a15e66c6731b84a1e312bf9bf49679b809f608e10c270c1eb570d6bd68",
+    "path": "/workspace/scratch/round5-implementation/worker-diagnostics135-v3/rootyard.build.json",
+    "sha256": "670422854af17b5e18cc3289da4d232e746ed7e5d134ef872aa57426b9fa2f0b",
     "attested": true
   },
   "build": {
     "attested": true,
     "version": 1,
-    "binary_sha256": "6795ee27961ce0f0cf510578fb542daefe209de3e313aa967a872a3a7fbb5252",
-    "source_inputs_sha256": "32a8f18b4a4192bfa7d6bc2677d9ed680309e921fafd6da2d04a6e65c56e04d7",
-    "workspace_commit": "ee80cd16db6806e9648db0843bc1b98e65491745",
+    "binary_sha256": "4eacc3aae0344a9d724b68d17a806dde9508be31fd627b354ea71464a624d5ea",
+    "source_inputs_sha256": "6092a7f156e8bdb72fedd088ce499cd32c1cedd18b1a8ff04ed466d72deaa7e1",
+    "workspace_commit": "2a6dbaf7e58c32a7faf5c801f520c42f58c3b86c",
     "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
     "command": [
       "cargo",
@@ -99,10 +99,10 @@
     ]
   },
   "build_attested": true,
-  "source_inputs_sha256": "32a8f18b4a4192bfa7d6bc2677d9ed680309e921fafd6da2d04a6e65c56e04d7",
-  "receipt_source_inputs_sha256": "32a8f18b4a4192bfa7d6bc2677d9ed680309e921fafd6da2d04a6e65c56e04d7",
+  "source_inputs_sha256": "6092a7f156e8bdb72fedd088ce499cd32c1cedd18b1a8ff04ed466d72deaa7e1",
+  "receipt_source_inputs_sha256": "6092a7f156e8bdb72fedd088ce499cd32c1cedd18b1a8ff04ed466d72deaa7e1",
   "source_attested": true,
-  "harness_git_head": "ee80cd16db6806e9648db0843bc1b98e65491745",
+  "harness_git_head": "2a6dbaf7e58c32a7faf5c801f520c42f58c3b86c",
   "harness_git_head_role": "auxiliary repository HEAD at harness time; never binary or source provenance",
   "harness_e2e_sha256": "aa424e6a322675e304413e886691b52de18c72ce434376aa8049bbdf881ee454",
   "head_label": "harness_git_head is repository HEAD at harness time, not independent build provenance",
