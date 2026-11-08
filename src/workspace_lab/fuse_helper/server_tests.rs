@@ -37,7 +37,7 @@ fn operation_tombstones_are_bounded() {
     assert_eq!(lock(&state.freeze_tombstones).len(), TOMBSTONES);
     assert_eq!(lock(&state.mount_tombstones).len(), TOMBSTONES);
     // The oldest entry was evicted, the newest is still known.
-    assert!(ops::take_freeze_tombstone(&state, 0));
+    assert!(!ops::take_freeze_tombstone(&state, 0));
     assert!(ops::take_freeze_tombstone(&state, TOMBSTONES as u64 + 7));
     assert!(!ops::take_freeze_tombstone(&state, TOMBSTONES as u64 + 7), "a tombstone is one-shot");
 }
