@@ -6,12 +6,14 @@ schema007/format4 executable; it creates a real old archive without rewriting
 its manifest or bypassing the actual restored-catalog check.
 """
 import argparse
+import base64
 import copy
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -29,6 +31,10 @@ from schema_baseline import (
 )
 
 
+class BackupCaseFailure(Exception):
+    """A failure already formatted and redacted by the harness that owns the case."""
+
+
 class CheckoutBackupHarness(BackupCiPinsHarness):
     rpc = JobCheckoutHarness.rpc
 
@@ -38,33 +44,57 @@ class CheckoutBackupHarness(BackupCiPinsHarness):
         self.env['ROOTYARD_CI_MIRROR_AUDIENCE'] = self.audience
         self.mirror_env['ROOTYARD_CI_MIRROR_AUDIENCE'] = self.audience
         self.step_name = 'startup'
-        # Diagnostics only: the basename of the last native/psql/git process and
-        # its captured stderr. Never store argv (Git argv can carry credentials).
+        # Diagnostics only: the last process's program label, outcome and
+        # captured stderr. Never argv, str(exception) or cmd: Git argv and
+        # TimeoutExpired/CalledProcessError strings can carry Basic credentials.
         self.last_process = None
 
     def mark(self, name):
         """Name the phase being exercised so a later bare assertion is locatable."""
         self.step_name = name
 
+    def register_token(self, username, token):
+        """Register raw and Git Basic forms so diagnostics stay secret-free."""
+        self.secrets.extend([token, base64.b64encode((username + ':' + token).encode()).decode()])
+
     def run(self, argv, **kwargs):
         try:
             process = super().run(argv, **kwargs)
         except Exception as error:
-            self.last_process = dict(program=Path(str(argv[0])).name, returncode=None,
-                                     stderr=str(error)[-4000:])
+            self._record_process_failure(argv, error)
             raise
         self.last_process = dict(program=Path(str(argv[0])).name, returncode=process.returncode,
-                                 stderr=process.stderr.decode(errors='replace')[-4000:])
+                                 error_type=None, stderr=process.stderr.decode(errors='replace')[-4000:])
         return process
 
+    def _record_process_failure(self, argv, error):
+        stderr = getattr(error, 'stderr', None)
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors='replace')
+        self.last_process = dict(program=Path(str(argv[0])).name, returncode=None,
+                                 error_type=type(error).__name__, stderr=(stderr or '')[-4000:])
+
+    @staticmethod
+    def _safe_error_text(error):
+        """Describe an exception without ever rendering argv/cmd.
+
+        TimeoutExpired and CalledProcessError carry the full command line in
+        their string form; Git's extraHeader argument is a Basic credential.
+        """
+        if isinstance(error, subprocess.TimeoutExpired):
+            return f'TimeoutExpired: command exceeded {error.timeout}s'
+        if isinstance(error, subprocess.CalledProcessError):
+            return f'CalledProcessError: command exited {error.returncode}'
+        return str(error).strip()
+
     def failure_detail(self, error):
-        """Redacted failure report: assertion message, step, exact source line, native stderr.
+        """Redacted failure report: message, step, exact source line, native stderr.
 
         Tracebacks are formatted without local variables so credentials held in
         fixture locals cannot leak into CI logs; the result still passes through
         Harness.redact for tokens and database URLs.
         """
-        message = str(error).strip() or f'{type(error).__name__} raised without a message (bare assert?)'
+        message = self._safe_error_text(error) or f'{type(error).__name__} raised without a message (bare assert?)'
         frames = traceback.extract_tb(error.__traceback__)
         lines = [f'{type(error).__name__}: {message}', f'step: {self.step_name}']
         for frame in frames[-4:]:
@@ -74,9 +104,12 @@ class CheckoutBackupHarness(BackupCiPinsHarness):
             except ValueError:
                 shown = str(source)
             lines.append(f'at {shown}:{frame.lineno} in {frame.name}: {(frame.line or "<unavailable>").strip()}')
-        if self.last_process:
-            lines.append('last process: {program} exit={returncode} stderr={stderr!r}'.format(
-                **self.last_process))
+        process = self.last_process
+        if process:
+            outcome = (f"exit={process['returncode']}" if process.get('returncode') is not None
+                       else f"error={process.get('error_type')}")
+            lines.append('last process: {program} {outcome} stderr={stderr!r}'.format(
+                program=process.get('program'), outcome=outcome, stderr=process.get('stderr')))
         log = self.root / 'server.log'
         if log.exists():
             lines.append('server.log tail: ' + log.read_text(errors='replace')[-4000:])
@@ -94,7 +127,7 @@ class CheckoutBackupHarness(BackupCiPinsHarness):
         issued = json.loads(self.expect('/api/repos/alice/demo/ci-checkouts', (200, 201),
                                         token=self.alice, method='POST', body=request))
         self.plan, self.raw = issued['plan'], issued['token']
-        self.secrets.append(self.raw)
+        self.register_token('alice', self.raw)
         self.job_token = dict(username='alice', token=self.raw)
         self.start_mirror()
         self.sync()
@@ -183,7 +216,8 @@ def legacy_restore(args):
     old_args = copy.copy(args)
     old_args.binary = str(Path(args.legacy_binary).resolve())
     h = CheckoutBackupHarness(old_args)
-    try:
+
+    def run_case():
         h.mark('legacy_schema007_source_archive')
         h.setup()
         h.backup_command()
@@ -249,8 +283,27 @@ def legacy_restore(args):
         return dict(real_historical_binary_archive=True, genuine_archive_manifest_unchanged=True,
                     explicit_legacy_opt_in_required=True, schema007_verified_before_upgrade=True,
                     current_schema_upgrade_empty_authority=True, mismatched_dump_rejected_guard_retained=True)
-    finally:
+
+    detail = cleanup_detail = None
+    outcome = None
+    try:
+        outcome = run_case()
+    except BackupCaseFailure:
+        raise
+    except Exception as error:
+        # This case owns its own harness: format and redact with it before its
+        # fixture directories (and server.log) are removed.
+        detail = h.failure_detail(error)
+    try:
         h.cleanup()
+    except Exception as error:
+        cleanup_detail = 'legacy case cleanup failed: ' + h.redact(error)
+    if detail is not None:
+        # A cleanup failure is appended, never substituted for the real failure.
+        raise BackupCaseFailure(detail if cleanup_detail is None else detail + '\n' + cleanup_detail) from None
+    if cleanup_detail is not None:
+        raise BackupCaseFailure(cleanup_detail)
+    return outcome
 
 
 def main():
@@ -265,19 +318,36 @@ def main():
         parser.error('dedicated synthetic ROOTYARD_TEST_DATABASE_URL required')
     h = CheckoutBackupHarness(args)
     success = False
-    failure = None
+    failure = cleanup_failure = None
     try:
         h.case('current_checkout_authority_restore', h.grants)
         h.case('format4_real_legacy_restore_then_upgrade', lambda: legacy_restore(args))
         success = True
+    except BackupCaseFailure as error:
+        # Already redacted against the harness that owned the case; the outer
+        # harness's step/last-process state belongs to a different case.
+        failure = str(error)
+        if h.results and h.results[-1].get('status') == 'failed':
+            h.results[-1]['error'] = failure
     except Exception as error:
         failure = h.failure_detail(error)
-        print(failure, file=sys.stderr)
         if h.results and h.results[-1].get('status') == 'failed':
             h.results[-1]['error'] = failure
             h.results[-1]['step'] = h.step_name
     finally:
-        h.cleanup()
+        try:
+            h.cleanup()
+        except Exception as error:
+            # Cleanup is recorded independently: it must neither mask the real
+            # failure nor suppress the JSON report below.
+            cleanup_failure = h.redact(error)
+            success = False
+    if cleanup_failure is not None:
+        h.results.append(dict(name='cleanup', status='failed', error='cleanup failed: ' + cleanup_failure))
+        if failure is None:
+            failure = 'cleanup failed: ' + cleanup_failure
+    if failure is not None:
+        print(failure, file=sys.stderr)
     report = dict(passed=success, cases=h.results,
                   binary_sha256=hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
                   legacy_binary_sha256=hashlib.sha256(Path(args.legacy_binary).read_bytes()).hexdigest(),
