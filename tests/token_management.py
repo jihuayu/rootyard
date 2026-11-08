@@ -349,7 +349,7 @@ def main():
             h.secrets.append(rotated["secret"])
             h.expect("/api/repos", 401, token={"username": "alice", "token": created["secret"]})
             h.sessions_page = h.expect("/web/settings/sessions", 200, extra_headers={"Cookie": cookie})
-            assert "Browser sessions" in h.sessions_page
+            assert b"Browser sessions" in h.sessions_page
             return "cookie+CSRF create/rotate 200; missing CSRF/cross-origin/Basic 403; secret once"
 
         def case_api_authorization_only():
