@@ -348,8 +348,7 @@ mod tests {
         let requested = [change("refs/heads/main", '0', 'a')];
         journal::record_ref_transaction_intent(&operation, &requested).unwrap();
         // A bare receipt file with no committed reference-transaction event.
-        std::fs::write(operation.path.join("post-receive.json"), serde_json::to_vec(&requested).unwrap())
-            .unwrap();
+        std::fs::write(operation.path.join("post-receive.json"), serde_json::to_vec(&requested).unwrap()).unwrap();
         grant(&operation);
         journal::finish(&operation).unwrap();
         assert!(RecordedReceiptProof::from_journal(&operation, "recorded", 1).is_none());
@@ -544,8 +543,13 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        let actor =
-            crate::db::Identity { id: actor_id, token_id, username: "alice".into(), read_only: false, token_digest: digest };
+        let actor = crate::db::Identity {
+            id: actor_id,
+            token_id,
+            username: "alice".into(),
+            read_only: false,
+            token_digest: digest,
+        };
         let repo = Uuid::new_v4();
         pool.get()
             .await
@@ -615,11 +619,8 @@ mod tests {
         )
         .unwrap();
         drop(active);
-        let requested = vec![journal::RefChange {
-            ref_name: name.into(),
-            old_oid: "0".repeat(40),
-            new_oid: "a".repeat(40),
-        }];
+        let requested =
+            vec![journal::RefChange { ref_name: name.into(), old_oid: "0".repeat(40), new_oid: "a".repeat(40) }];
         journal::record_ref_transaction_intent(&operation, &requested).unwrap();
         journal::record_ref_transaction_receipt(&operation, &requested).unwrap();
         grant(&operation);
@@ -647,13 +648,19 @@ mod tests {
         pool.get()
             .await
             .unwrap()
-            .execute("UPDATE repositories SET state='recovering',recovery_reason='push_outcome_unknown' WHERE id=$1", &[&repo])
+            .execute(
+                "UPDATE repositories SET state='recovering',recovery_reason='push_outcome_unknown' WHERE id=$1",
+                &[&repo],
+            )
             .await
             .unwrap();
-        pool.get().await.unwrap().execute("UPDATE tokens SET revoked=true WHERE id=$1", &[&actor.token_id]).await.unwrap();
-        events::publish_with_recorded_receipt(&pool, &record(&operation, "recorded"), &changes, &proof)
+        pool.get()
+            .await
+            .unwrap()
+            .execute("UPDATE tokens SET revoked=true WHERE id=$1", &[&actor.token_id])
             .await
             .unwrap();
+        events::publish_with_recorded_receipt(&pool, &record(&operation, "recorded"), &changes, &proof).await.unwrap();
         let state: String = pool
             .get()
             .await
@@ -663,7 +670,8 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(state, "COMMITTED");
-        let outbox: i64 = pool.get().await.unwrap().query_one("SELECT COUNT(*) FROM outbox_events", &[]).await.unwrap().get(0);
+        let outbox: i64 =
+            pool.get().await.unwrap().query_one("SELECT COUNT(*) FROM outbox_events", &[]).await.unwrap().get(0);
         assert_eq!(outbox, 1);
     }
 
@@ -680,11 +688,16 @@ mod tests {
         pool.get()
             .await
             .unwrap()
-            .execute("UPDATE repositories SET state='recovering',recovery_reason='journal_invalid' WHERE id=$1", &[&repo])
+            .execute(
+                "UPDATE repositories SET state='recovering',recovery_reason='journal_invalid' WHERE id=$1",
+                &[&repo],
+            )
             .await
             .unwrap();
         assert!(
-            events::publish_with_recorded_receipt(&pool, &record(&operation, "recorded"), &changes, &proof).await.is_err()
+            events::publish_with_recorded_receipt(&pool, &record(&operation, "recorded"), &changes, &proof)
+                .await
+                .is_err()
         );
         let state: String = pool
             .get()
@@ -710,26 +723,39 @@ mod tests {
         pool.get()
             .await
             .unwrap()
-            .execute("UPDATE repositories SET state='recovering',recovery_reason='push_outcome_unknown' WHERE id=$1", &[&repo])
+            .execute(
+                "UPDATE repositories SET state='recovering',recovery_reason='push_outcome_unknown' WHERE id=$1",
+                &[&repo],
+            )
             .await
             .unwrap();
         pool.get()
             .await
             .unwrap()
-            .execute("UPDATE git_ref_admissions SET ref_names=ARRAY['refs/heads/other'] WHERE writer_id=$1", &[&admission.writer_id])
+            .execute(
+                "UPDATE git_ref_admissions SET ref_names=ARRAY['refs/heads/other'] WHERE writer_id=$1",
+                &[&admission.writer_id],
+            )
             .await
             .unwrap();
         assert!(
-            events::publish_with_recorded_receipt(&pool, &record(&operation, "recorded"), &changes, &proof).await.is_err()
+            events::publish_with_recorded_receipt(&pool, &record(&operation, "recorded"), &changes, &proof)
+                .await
+                .is_err()
         );
         pool.get()
             .await
             .unwrap()
-            .execute("UPDATE git_ref_admissions SET ref_names=$2,shard_epoch=8 WHERE writer_id=$1", &[&admission.writer_id, &refs])
+            .execute(
+                "UPDATE git_ref_admissions SET ref_names=$2,shard_epoch=8 WHERE writer_id=$1",
+                &[&admission.writer_id, &refs],
+            )
             .await
             .unwrap();
         assert!(
-            events::publish_with_recorded_receipt(&pool, &record(&operation, "recorded"), &changes, &proof).await.is_err()
+            events::publish_with_recorded_receipt(&pool, &record(&operation, "recorded"), &changes, &proof)
+                .await
+                .is_err()
         );
     }
 

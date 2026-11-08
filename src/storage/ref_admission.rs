@@ -271,24 +271,12 @@ async fn ensure_terminal_replay<C: tokio_postgres::GenericClient + Sync>(
         .await?;
     let stored = rows
         .iter()
-        .map(|row| {
-            (
-                row.get::<_, i64>(0),
-                row.get::<_, String>(1),
-                row.get::<_, String>(2),
-                row.get::<_, String>(3),
-            )
-        })
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, String>(3)))
         .collect::<HashSet<_>>();
     let replayed = changes
         .iter()
         .map(|change| {
-            (
-                change.transaction_sequence,
-                change.ref_name.clone(),
-                change.old_oid.clone(),
-                change.new_oid.clone(),
-            )
+            (change.transaction_sequence, change.ref_name.clone(), change.old_oid.clone(), change.new_oid.clone())
         })
         .collect::<HashSet<_>>();
     if stored.len() != rows.len() || replayed.len() != changes.len() || stored != replayed {
@@ -881,7 +869,12 @@ mod tests {
             .get(0);
         assert_eq!(state, "COMMITTED");
         // Legitimate historical replay must not depend on current auth or route.
-        pool.get().await.unwrap().execute("UPDATE tokens SET revoked=true WHERE id=$1", &[&actor.token_id]).await.unwrap();
+        pool.get()
+            .await
+            .unwrap()
+            .execute("UPDATE tokens SET revoked=true WHERE id=$1", &[&actor.token_id])
+            .await
+            .unwrap();
         pool.get()
             .await
             .unwrap()
@@ -975,7 +968,12 @@ mod tests {
             .get(0);
         assert_eq!(state, "ABORTED");
         // Terminal ABORTED replay also survives current auth and route changes.
-        pool.get().await.unwrap().execute("UPDATE tokens SET revoked=true WHERE id=$1", &[&actor.token_id]).await.unwrap();
+        pool.get()
+            .await
+            .unwrap()
+            .execute("UPDATE tokens SET revoked=true WHERE id=$1", &[&actor.token_id])
+            .await
+            .unwrap();
         pool.get()
             .await
             .unwrap()

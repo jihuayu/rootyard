@@ -2,12 +2,12 @@
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-/// New archives use format 12 / schema 136. Formats 4-11 stay frozen so older
+/// New archives use format 13 / schema 137. Formats 4-12 stay frozen so older
 /// archives remain verifiable and restorable through their explicit legacy
 /// upgrade paths (schema007, schema130, schema131, schema132, schema133,
-/// schema134 and schema135). Format12 consumes exactly the migration set
-/// embedded in this executable.
-pub(super) const FORMAT: u32 = 12;
+/// schema134, schema135 and schema136). Format13 consumes exactly the migration
+/// set embedded in this executable.
+pub(super) const FORMAT: u32 = 13;
 
 pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
     let raw = match format {
@@ -56,6 +56,11 @@ pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
             include_str!("../../schema/136_restored_catalog.json"),
             include_str!("../../schema/136_upgraded_catalog.json"),
         ],
+        13 => [
+            include_str!("../../schema/137_catalog.json"),
+            include_str!("../../schema/137_restored_catalog.json"),
+            include_str!("../../schema/137_upgraded_catalog.json"),
+        ],
         _ => bail!("unsupported backup format"),
     };
     Ok([serde_json::from_str(raw[0])?, serde_json::from_str(raw[1])?, serde_json::from_str(raw[2])?])
@@ -71,7 +76,8 @@ pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
         9 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 133).collect()),
         10 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 134).collect()),
         11 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 135).collect()),
-        12 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
+        12 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 136).collect()),
+        13 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
         _ => bail!("unsupported backup format"),
     }
 }
