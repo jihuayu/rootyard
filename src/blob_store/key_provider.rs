@@ -10,7 +10,7 @@
 //! # Keyring and key identity
 //!
 //! [`LocalFileKeyProvider::load`] is an explicit configuration-time operation.
-//! It takes an absolute keyring directory that must be owned by the effective
+//! It takes a clean absolute keyring directory that must be owned by the effective
 //! uid with mode exactly `0700`. The directory holds:
 //!
 //! * `keyring.json` (regular file, owner euid, mode `0600`, at most 16 KiB) with
@@ -34,14 +34,16 @@
 //!
 //! # Honest path policy
 //!
-//! The keyring directory's final component is opened with `O_NOFOLLOW` and the
-//! absolute-path requirement avoids a racy relative lookup. Intermediate path
+//! The keyring directory path must be a clean absolute path (no `.`/`..`
+//! components), and its final component is opened with `O_NOFOLLOW`; this avoids
+//! a racy relative lookup. Intermediate path
 //! components are resolved by the kernel and are **not** re-walked or
 //! independently pinned; the configured path must therefore live on an
 //! operator-controlled filesystem that other users cannot rename or replace.
 //! Entries inside a mode-`0700` directory are opened with `openat` on the pinned
 //! descriptor, which prevents key-file path TOCTOU. A same-uid attacker is out of
-//! scope: it can read the process/keyring anyway.
+//! scope: it can read the process/keyring anyway. Permission bits are checked,
+//! not POSIX ACLs, immutable mounts, fs-verity or similar.
 //!
 //! # Backup and rotation boundary
 //!
@@ -72,18 +74,17 @@ use std::{
         fd::{AsRawFd, FromRawFd},
         unix::fs::{MetadataExt, OpenOptionsExt},
     },
-    path::Path,
+    path::{Component, Path},
 };
 
 use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
-    constant_time,
     rand::{SecureRandom, SystemRandom},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// Version of the wrapped-key metadata and AAD transcript.
 pub const WRAP_FORMAT_VERSION: u32 = 1;
@@ -254,7 +255,7 @@ impl WrapContext {
     }
 
     pub fn aad_digest(&self, key_id: &KeyId) -> [u8; AAD_DIGEST_BYTES] {
-        Sha256::digest(self.aad(key_id)).into()
+        sha256_array(&self.aad(key_id))
     }
 }
 
@@ -449,8 +450,9 @@ impl LocalFileKeyProvider {
             let name = format!("{}.key", entry.key_id);
             let file = open_dir_entry(&directory, &name, KeyProviderError::KeyFile)?;
             let key = read_key_file(file)?;
-            let actual = Sha256::digest(&key[..]);
-            if constant_time::verify_slices_are_equal(&actual, &entry.fingerprint).is_err() {
+            let actual = sha256_array(&key[..]);
+            // Both values are public fingerprints, not secret key bytes.
+            if actual != entry.fingerprint {
                 return Err(KeyProviderError::KeyIdentityMismatch(entry.key_id.clone()));
             }
             keys.insert(entry.key_id.clone(), key);
@@ -478,7 +480,7 @@ impl LocalFileKeyProvider {
             key_id: key_id.clone(),
             nonce,
             wrapped_dek,
-            aad_digest: Sha256::digest(&aad).into(),
+            aad_digest: sha256_array(&aad),
         })
     }
 }
@@ -506,8 +508,10 @@ impl KeyProvider for LocalFileKeyProvider {
         // Select exactly the recorded id; never try other retained keys.
         let kek = self.key(wrapped.key_id())?;
         let aad = context.aad(wrapped.key_id());
-        let expected = Sha256::digest(&aad);
-        if constant_time::verify_slices_are_equal(&expected, &wrapped.aad_digest).is_err() {
+        let expected = sha256_array(&aad);
+        // The digest and all AAD inputs are public metadata; the AEAD tag still
+        // authenticates them with the secret key.
+        if expected != wrapped.aad_digest {
             return Err(KeyProviderError::ContextMismatch);
         }
         let data_key = open(kek, &wrapped.nonce, &aad, &wrapped.wrapped_dek)?;
@@ -589,8 +593,12 @@ fn parse_manifest(bytes: &[u8]) -> Result<KeyRing, KeyProviderError> {
 }
 
 fn open_keyring_dir(directory: &Path) -> Result<File, KeyProviderError> {
-    if !directory.is_absolute() {
-        return Err(KeyProviderError::KeyRing("keyring directory must be an absolute path"));
+    let clean = directory.is_absolute()
+        && directory
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)));
+    if !clean {
+        return Err(KeyProviderError::KeyRing("keyring directory must be a clean absolute path"));
     }
     let file = OpenOptions::new()
         .read(true)
@@ -647,7 +655,7 @@ fn read_key_file(file: File) -> Result<Zeroizing<[u8; DATA_KEY_BYTES]>, KeyProvi
         KeyProviderError::KeyFile,
     )?;
     let mut key = Zeroizing::new([0u8; DATA_KEY_BYTES]);
-    key.copy_from_slice(&bytes);
+    key[..].copy_from_slice(&bytes);
     Ok(key)
 }
 
@@ -688,6 +696,13 @@ fn read_regular(
         return Err(reject("size is not the required fixed length"));
     }
     Ok(bytes)
+}
+
+fn sha256_array(bytes: &[u8]) -> [u8; AAD_DIGEST_BYTES] {
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; AAD_DIGEST_BYTES];
+    out.copy_from_slice(&digest);
+    out
 }
 
 fn cipher(kek: &[u8; DATA_KEY_BYTES]) -> Result<LessSafeKey, KeyProviderError> {
