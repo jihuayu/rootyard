@@ -1,0 +1,41 @@
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "fresh_migration_accounts",
+      "status": "passed",
+      "seconds": 2.2934,
+      "detail": null
+    },
+    {
+      "name": "repository_api_and_real_pushes",
+      "status": "passed",
+      "seconds": 0.1517,
+      "detail": null
+    },
+    {
+      "name": "real_alice_history_fixture",
+      "status": "passed",
+      "seconds": 1.7451,
+      "detail": null
+    },
+    {
+      "name": "collaborator_terminal_receipt_survives_withdrawal",
+      "status": "failed",
+      "seconds": 4.8597,
+      "error": "SQL unexpectedly succeeded: UPDATE git_operations SET evidence='{}'::jsonb WHERE id='d186b46d-00f6-4d3c-ace4-0868c29cfe77'"
+    }
+  ],
+  "limitations": [
+    "This harness kills the service process; it does not emulate kernel or power loss.",
+    "The SQL fault is an injected BEFORE trigger on git_operations, not a disk failure.",
+    "The retained journal is the real native post-receive evidence; no synthetic push claim is used.",
+    "No external consumer exactly-once delivery is claimed."
+  ],
+  "runtime": {
+    "git_client": "git version 2.52.0",
+    "git_server": "git version 2.52.0",
+    "binary_sha256": "46af460d135986414decdc5935d6009135ff2526dbc0a2211a9d26c2aa48a4c4",
+    "native_executed_by_implementer": false
+  }
+}

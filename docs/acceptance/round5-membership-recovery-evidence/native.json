@@ -1,0 +1,97 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "fresh_migration_accounts",
+      "status": "passed",
+      "seconds": 2.2752,
+      "detail": null
+    },
+    {
+      "name": "repository_api_and_real_pushes",
+      "status": "passed",
+      "seconds": 0.2238,
+      "detail": null
+    },
+    {
+      "name": "real_alice_history_fixture",
+      "status": "passed",
+      "seconds": 2.2435,
+      "detail": null
+    },
+    {
+      "name": "collaborator_terminal_receipt_survives_withdrawal",
+      "status": "passed",
+      "seconds": 5.9017,
+      "detail": {
+        "metadata": {
+          "id": "1e797701-5694-4537-adc8-d18bad432bc8",
+          "repository_id": "b8e9b44a-7908-4bbc-94c8-01d847831817",
+          "actor_id": "9372dad3-9019-4fa7-b999-70890ff425c3",
+          "actor_name": "bob",
+          "token_id": "699fabc9-1755-4958-9d15-438ada17af7f",
+          "sequence": 3,
+          "storage_generation": 1,
+          "requires_parent_publication": true,
+          "shard_epoch": 1
+        },
+        "receipt_digest": "4986acd0ba7dcb074653ac0d6c137b1b28fdcbe0ba69aaf3521fe960c5a96dff",
+        "journal_evidence_digest": "b3fec9bd531477e4894022dec7f808157043e4d0b697660de96a372b262b11fc",
+        "operation_outcome": "recorded",
+        "admission_state": "COMMITTED",
+        "repository_ready": true,
+        "access_restored": false,
+        "new_push_denied": true,
+        "exact_terminal_replay": true,
+        "replay_copy_is_actual_journal": true,
+        "removal": "api_collaborator_delete",
+        "generic_forge_denied": true,
+        "non_admitted_new_git_denied": true,
+        "foreign_actor_ledger_denied": true,
+        "nonterminal_ledger_denied": true,
+        "fenced_ledger_denied": true,
+        "terminal_identity_generation_sequence_name_binding": true
+      }
+    },
+    {
+      "name": "organization_member_terminal_receipt_survives_withdrawal",
+      "status": "passed",
+      "seconds": 3.6371,
+      "detail": {
+        "metadata": {
+          "id": "afbf7ddb-4dbe-41b0-bfa6-97a2e9eec472",
+          "repository_id": "29936797-aff0-4309-8dbe-9a89041bb47a",
+          "actor_id": "9372dad3-9019-4fa7-b999-70890ff425c3",
+          "actor_name": "bob",
+          "token_id": "699fabc9-1755-4958-9d15-438ada17af7f",
+          "sequence": 1,
+          "storage_generation": 1,
+          "requires_parent_publication": true,
+          "shard_epoch": 1
+        },
+        "receipt_digest": "0f59ab2608ebdee3860def38ebc25cbbbb456449c31215030dbb856d6df75e15",
+        "journal_evidence_digest": "eb8c08a74f1fdc93b9a95e57275717753a26b2426ed540fd35c88dcfae86efff",
+        "operation_outcome": "recorded",
+        "admission_state": "COMMITTED",
+        "repository_ready": true,
+        "access_restored": false,
+        "new_push_denied": true,
+        "exact_terminal_replay": false,
+        "replay_copy_is_actual_journal": true,
+        "removal": "api_organization_member_delete"
+      }
+    }
+  ],
+  "limitations": [
+    "This harness kills the service process; it does not emulate kernel or power loss.",
+    "The SQL fault is an injected BEFORE trigger on git_operations, not a disk failure.",
+    "The retained journal is the real native post-receive evidence; no synthetic push claim is used.",
+    "No external consumer exactly-once delivery is claimed."
+  ],
+  "runtime": {
+    "git_client": "git version 2.52.0",
+    "git_server": "git version 2.52.0",
+    "binary_sha256": "4990a6db38201773b67276a1dd6c04eba2611cd3ba7ba330a64bd08520d6e52a",
+    "native_executed_by_implementer": false
+  }
+}
