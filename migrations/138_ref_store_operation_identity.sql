@@ -13,7 +13,7 @@ CREATE TABLE ref_store_issuer_lanes (
     repository_id UUID NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
     issuer_id UUID NOT NULL,
     lane TEXT NOT NULL CHECK (
-        octet_length(lane) BETWEEN 1 AND 64
+        octet_length(lane) >= 1 AND octet_length(lane) <= 64
         AND lane !~ '[^A-Za-z0-9._:-]'
     ),
     last_reserved_sequence BIGINT NOT NULL DEFAULT 0 CHECK (last_reserved_sequence >= 0),
