@@ -45,6 +45,11 @@
 //! * `consume` (private) — pure row/body verification helpers;
 //! * `pg` — the owned short-transaction acquire/consume adapter;
 //! * `query` — receipt-only unknown-COMMIT resolution (no grant, no IO).
+//! * `registration_ledger` — read-only, fully cross-validated in-transaction
+//!   view of one finished acquire+consume batch for A4 registration. It is
+//!   re-exported core-scoped only, opens no transaction, takes no lock, does no
+//!   IO and mints no grant/token; A4 still checks current pending parent,
+//!   cancellation and gate separately.
 pub mod contract;
 pub mod receipt;
 pub mod request;
@@ -53,6 +58,7 @@ mod consume;
 mod pg;
 mod query;
 mod quota;
+mod registration_ledger;
 mod sql;
 mod sql_rows;
 
@@ -71,3 +77,8 @@ pub use request::AcquireArtifactHoldsRequest;
 /// nameable crate-wide, but nothing outside `pg::capability` can construct a
 /// [`ConsumedArtifacts`] token in the first place.
 pub(crate) use pg::ConsumedUpload;
+
+/// Core-scoped re-export of the read-only A4 registration ledger view. It is
+/// deliberately not `pub`: only `crate::ref_store::core` (A4 registration) may
+/// read immutable receipts this way, and the value is metadata, not authority.
+pub(in crate::ref_store::core) use registration_ledger::{RegistrationLedger, read_registration_ledger};

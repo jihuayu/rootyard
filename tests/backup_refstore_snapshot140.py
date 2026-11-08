@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Current-format backup roundtrip of **populated** schema140 RefStore metadata.
 
-The archive is current format17/schema141.  The six schema140 tables remain the
+The archive is current format18/schema142.  The six schema140 tables remain the
 only new rows this A2 fixture populates; it makes no claim about the schema141
-global artifact-hold ledger and is not a hold-row or Blob-byte backup drill.
+global artifact-hold ledger or the schema142 pack-registration/membership
+ledger and is not a hold-row, pack-row or Blob-byte backup drill.  The dynamic
+dump is still inspected for every A4 pack table derived from the generated
+142-vs-141 catalogs, and those tables must restore empty with the gate at the
+default ``metadata_only`` mode.
 
 This is the acceptance drill for #107-A2.  It subclasses the inherited
 ``tests/backup_refstore_core139.py`` harness, so its seven cases are exactly the
@@ -85,6 +89,28 @@ HELPER_TEST = "snapshot_backup_metadata_fixture"
 HELPER_TARGET = "ref_store_snapshot_backup_fixture"
 ROOT = Path(__file__).resolve().parents[1]
 HELPER_SOURCE = ROOT / "tests" / "ref_store_snapshot_backup_fixture.rs"
+
+
+def catalog_tables(version):
+    """Regular public tables in one generated catalog, never a guessed list."""
+    path = ROOT / "schema" / (f"{version:03d}_catalog.json")
+    try:
+        catalog = json.loads(path.read_text())
+    except OSError as error:
+        raise AssertionError(
+            "catalog " + str(path) + " is unavailable; the root runner must "
+            "generate it from settled PostgreSQL: " + str(error))
+    tables = catalog.get("tables")
+    assert isinstance(tables, list), str(path) + " has no tables list"
+    return {entry["name"] for entry in tables if entry.get("kind") == "r"}
+
+
+def schema142_pack_tables():
+    """The exact current-vs-141 catalog delta; no fabricated names."""
+    tables = catalog_tables(142) - catalog_tables(141)
+    assert tables, ("the 142 catalog adds no pack table; root must regenerate "
+                    "it from settled PostgreSQL")
+    return sorted(tables)
 
 
 def sha256_file(path):
@@ -473,8 +499,23 @@ class BackupRefStoreSnapshot140Harness(BackupRefStoreCore139Harness):
             "the drill did not produce the current-format archive")
         assert manifest["schema_versions"] == SCHEMA_VERSIONS, (
             "the archive does not record exactly the current migration set")
+        listing = self.run(["pg_restore", "--list", str(self.backup / "metadata.dump")]).stdout.decode()
+        pack_tables = schema142_pack_tables()
+        for table in pack_tables:
+            assert ("TABLE DATA public " + table in listing) or (
+                'TABLE DATA public "' + table + '"' in listing), (
+                "parent snapshot dump silently excluded schema142 table " + table)
+            assert self.sql(
+                'SELECT count(*) FROM public."' + table + '"') == "0", (
+                    "A2 fixture fabricated a schema142 pack row in " + table)
+        assert self.sql(
+            "SELECT string_agg(DISTINCT pack_mode, ',' ORDER BY pack_mode) "
+            "FROM ref_store_core_gates") == "metadata_only"
         result.update({"backup_format": manifest["format"],
-                       "archive_contains_schema_versions": SCHEMA_VERSIONS[-4:]})
+                       "schema142_pack_ledger_tables": pack_tables,
+                       "schema142_pack_tables_empty_and_not_fabricated": True,
+                       "gate_pack_mode_default_metadata_only": True,
+                       "archive_contains_schema_versions": SCHEMA_VERSIONS[-5:]})
         return result
 
     # ------------------------------------------------------------- restore 140
@@ -499,7 +540,12 @@ class BackupRefStoreSnapshot140Harness(BackupRefStoreCore139Harness):
         assert restored_gate["history_incarnation"] == self.snapshot_marker["scope"]["history_incarnation"]
         assert self.core_rows() == self.source_core_rows, "restored migration-139 rows differ"
         assert self.sql("SELECT max(version) FROM schema_migrations") == str(SCHEMA_VERSIONS[-1])
-        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version BETWEEN 138 AND 141") == "4"
+        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version BETWEEN 138 AND 142") == "5"
+        for table in schema142_pack_tables():
+            assert self.sql(
+                'SELECT count(*) FROM public."' + table + '"') == "0", (
+                    "restore fabricated a schema142 pack row in " + table)
+        assert restored_gate["pack_mode"] == "metadata_only", restored_gate
         restored_repo = self.core_repository_row()
         assert restored_repo == self.source_core_repo
         assert restored_repo["state"] == "provisioning"
@@ -587,6 +633,9 @@ class BackupRefStoreSnapshot140Harness(BackupRefStoreCore139Harness):
             "triggers_enabled_not_disabled_by_the_drill": True,
             "snapshot_pins_are_not_physical_git_object_protection": True,
             "core_repository_stays_provisioning_gitfs_unserved": True,
+            "schema142_pack_ledger_tables_empty_after_current_restore": True,
+            "schema142_gate_pack_mode_metadata_only": True,
+            "schema142_pack_registration_fabricated": False,
         })
         return result
 

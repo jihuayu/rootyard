@@ -9,18 +9,20 @@ given, restore into a brand-new database/data directory under one newly minted
 Pando authority, apply the reviewed current migrations, and serve stock Git
 fetch/clone for both repositories.  Every frozen predecessor source contract
 here keeps its own format/schema verification and then upgrades to the same
-current reviewed target: format17/schema141.
+current reviewed target: format18/schema142.
 
-``backup_legacy133_identity.py`` through ``backup_legacy140_holds.py`` reuse this
-harness with the format9/schema133 through format16/schema140 contracts and
+``backup_legacy133_identity.py`` through ``backup_legacy141_packs.py`` reuse this
+harness with the format9/schema133 through format17/schema141 contracts and
 assert the same Pando/session/Git boundaries, the frozen source contract and the
-reviewed current migration target.  A genuine format8 through format16 archive
+reviewed current migration target.  A genuine format8 through format17 archive
 carries no RefStore core rows for this fixture, so the schema139 core tables are
 verified to exist, be correctly constrained and stay empty; this harness never
 claims a core-row roundtrip and does not assert the schema140 snapshot tables
-that migration 140 introduces.  It also verifies that the new schema141 global
+that migration 140 introduces.  It also verifies that the schema141 global
 artifact-hold tables exist and stay empty except for an exact fixed global shard
-seed if the settled migration SQL inserts one; no hold row is fabricated.
+seed if the settled migration SQL inserts one, and that the schema142 pack
+registration/membership/history/usage tables exist and stay empty; no hold or
+pack row is fabricated.
 
 Only random task-owned databases and temporary storage are used.  Secrets, DSNs,
 raw HTTP logs and Garage/Vault credentials are never printed; recorded failures
@@ -95,8 +97,8 @@ class ArchiveContract:
     schema: int
     flag: str
     source_label: str
-    target_schema: int = 141
-    target_format: int = 17
+    target_schema: int = 142
+    target_format: int = 18
     indexes: tuple = SCHEMA139_INDEXES
     foreign_keys: tuple = SCHEMA134_FOREIGN_KEYS
     unique_constraints: tuple = SCHEMA134_UNIQUE
@@ -104,13 +106,13 @@ class ArchiveContract:
 
 
 LEGACY132 = ArchiveContract(format=8, schema=132, flag="--allow-legacy-schema132",
-                            source_label="schema132", target_schema=141,
+                            source_label="schema132", target_schema=142,
                             indexes=SCHEMA139_INDEXES)
 LEGACY133 = ArchiveContract(format=9, schema=133, flag="--allow-legacy-schema133",
-                            source_label="schema133", target_schema=141,
+                            source_label="schema133", target_schema=142,
                             indexes=SCHEMA139_INDEXES)
 # Format10/schema134 is an older frozen contract.  Its archive upgrades through
-# the same reviewed path to the current schema141/format17 target.
+# the same reviewed path to the current schema142/format18 target.
 LEGACY134 = replace(LEGACY132, format=10, schema=134,
                     flag="--allow-legacy-schema134", source_label="schema134")
 # Format11/schema135 carries the frozen schema135 catalog and no schema136
@@ -134,7 +136,7 @@ LEGACY138 = replace(LEGACY137, format=14, schema=138,
 # Genuine format15/schema139 archive: the immediate predecessor of the frozen
 # format16/schema140 contract.  It is produced by a trusted schema139 binary and
 # is verified against its frozen schema139 catalogs before the reviewed
-# migrations to schema141; earlier core rows stay empty on this fixture and no
+# migrations to schema142; earlier core rows stay empty on this fixture and no
 # schema140 snapshot-table assertion is made here.
 LEGACY139 = replace(LEGACY138, format=15, schema=139,
                     flag="--allow-legacy-schema139", source_label="schema139")
@@ -145,6 +147,14 @@ LEGACY139 = replace(LEGACY138, format=15, schema=139,
 # current catalog instead of being populated by a fake fixture.
 LEGACY140 = replace(LEGACY139, format=16, schema=140,
                     flag="--allow-legacy-schema140", source_label="schema140")
+# Genuine format17/schema141 archive: the immediate predecessor of this
+# format18/schema142 target.  Root supplies the real retained old producer and
+# archive (the native raw producer binary is retained outside this worktree);
+# this harness never manufactures, edits or relabels one.  The source has no
+# schema142 pack ledger rows, so the migrated tables are inspected empty against
+# the current catalog instead of being populated by a fake fixture.
+LEGACY141 = replace(LEGACY140, format=17, schema=141,
+                    flag="--allow-legacy-schema141", source_label="schema141")
 
 # Every legacy opt-in this shared harness knows about, oldest first.  The
 # adjacent entry is used for the mixed-flag and mismatched-opt-in rejections.
@@ -153,7 +163,7 @@ LEGACY_FLAGS = (
     "--allow-legacy-schema134", "--allow-legacy-schema135",
     "--allow-legacy-schema136", "--allow-legacy-schema137",
     "--allow-legacy-schema138", "--allow-legacy-schema139",
-    "--allow-legacy-schema140",
+    "--allow-legacy-schema140", "--allow-legacy-schema141",
 )
 
 
@@ -177,22 +187,33 @@ def catalog_tables(version):
     return {entry["name"] for entry in tables if entry.get("kind") == "r"}
 
 
-def schema141_seed_counts():
-    """Exact fixed row counts the settled migration141 SQL itself seeds."""
-    path = ROOT / "migrations" / "141_ref_store_artifact_holds.sql"
+def migration_seed_counts(version):
+    """Exact fixed row counts one settled migration SQL file itself seeds."""
+    matches = sorted((ROOT / "migrations").glob(f"{version:03d}_*.sql"))
+    if len(matches) != 1:
+        raise AssertionError(
+            "expected exactly one settled migration" + str(version) +
+            " SQL file, found " + repr([str(path) for path in matches]))
+    path = matches[0]
     try:
         sql = path.read_text()
     except OSError as error:
-        raise AssertionError("settled migration141 SQL is unavailable: " + str(error))
+        raise AssertionError("settled migration" + str(version) +
+                             " SQL is unavailable: " + str(error))
     pattern = re.compile(
         r"INSERT\s+INTO\s+([a-z_][a-z0-9_]*)\s*\([^;]*?\)\s*SELECT\s+"
         r"generate_series\(\s*(\d+)\s*,\s*(\d+)\s*\)", re.I | re.S)
     seeds = {}
     for table, first, last in pattern.findall(sql):
         first, last = int(first), int(last)
-        assert last >= first, "migration141 seed range is descending for " + table
+        assert last >= first, ("migration" + str(version) +
+                               " seed range is descending for " + table)
         seeds[table] = seeds.get(table, 0) + (last - first + 1)
     return seeds
+
+
+def schema141_seed_counts():
+    return migration_seed_counts(141)
 
 
 class LegacyArchiveHarness(BackupHarness):
@@ -540,7 +561,9 @@ class LegacyArchiveHarness(BackupHarness):
         hold, request or consumption row and invents no quota value.
         """
         assert self.contract.target_schema >= 141, self.contract.target_schema
-        current = catalog_tables(self.contract.target_schema)
+        # The schema141 hold ledger is exactly the 141-vs-140 catalog delta,
+        # independent of whatever newer schema the current target carries.
+        current = catalog_tables(141)
         prior = catalog_tables(140)
         new_tables = current - prior
         assert new_tables, ("the current catalog adds no schema141 table; root "
@@ -587,6 +610,78 @@ class LegacyArchiveHarness(BackupHarness):
             schema141_new_tables_empty_except_migration_seed=True,
             schema141_hold_rows_fabricated=False)
 
+    def assert_pack_ledger_schema(self):
+        """Verify the schema142 pack ledger without fabricating a pack row.
+
+        A genuine format8 through format17 source carries no A4 pack
+        registration, artifact, membership, history or usage row.  The table
+        names come from the generated 142-vs-141 catalog difference, never a
+        guessed list.  Any row count is taken from a fixed seed in the settled
+        migration142 SQL itself; normally there is none, so every pack table
+        must be empty.  The schema141 shard seed and counters must be unchanged.
+        """
+        assert self.contract.target_schema >= 142, self.contract.target_schema
+        new_tables = catalog_tables(142) - catalog_tables(141)
+        assert new_tables, ("the current catalog adds no schema142 table; root "
+                            "must regenerate it from settled PostgreSQL")
+        for name in new_tables:
+            assert re.fullmatch(r"[a-z_][a-z0-9_]*", name), name
+        categories = {
+            "registration": sorted(n for n in new_tables
+                                   if "publication" in n or "artifact" in n),
+            "membership": sorted(n for n in new_tables if "membership" in n),
+            "history": sorted(n for n in new_tables if "history" in n),
+            "usage": sorted(n for n in new_tables if "usage" in n),
+        }
+        for category, names in categories.items():
+            assert names, (category, new_tables)
+        present = self.query(
+            self.restore_db,
+            "SELECT COALESCE(string_agg(tablename, ',' ORDER BY tablename), '')"
+            " FROM pg_tables WHERE schemaname='public' AND tablename IN ('" +
+            "','".join(sorted(new_tables)) + "')")
+        assert set(filter(None, present.split(","))) == new_tables, present
+        seeds = migration_seed_counts(142)
+        assert set(seeds) <= new_tables, (seeds, new_tables)
+        counts = {
+            name: int(self.query(
+                self.restore_db,
+                'SELECT count(*) FROM public."' + name + '"'))
+            for name in sorted(new_tables)
+        }
+        expected = {name: seeds.get(name, 0) for name in new_tables}
+        assert counts == expected, (counts, expected)
+        assert all(value == 0 for value in counts.values()), counts
+        pack_mode = self.query(
+            self.restore_db,
+            "SELECT string_agg(column_name || ':' || data_type || ':' || "
+            "is_nullable || ':' || coalesce(column_default,''), ',' ORDER BY "
+            "column_name) FROM information_schema.columns WHERE "
+            "table_schema='public' AND table_name='ref_store_core_gates' "
+            "AND column_name='pack_mode'")
+        assert pack_mode == "pack_mode:text:NO:'metadata_only'::text", pack_mode
+        gate_modes = self.query(
+            self.restore_db,
+            "SELECT string_agg(DISTINCT pack_mode, ',' ORDER BY pack_mode) "
+            "FROM ref_store_core_gates")
+        assert gate_modes == "metadata_only", gate_modes
+        shards = self.query(
+            self.restore_db,
+            "SELECT count(*) FROM artifact_hold_shards WHERE shard_id BETWEEN "
+            "0 AND 63 AND hold_count=0 AND declared_bytes=0 AND "
+            "logical_bytes=0 AND receipt_count=0")
+        assert shards == "64", shards
+        return dict(
+            schema142_new_tables=sorted(new_tables),
+            schema142_registration_tables=categories["registration"],
+            schema142_membership_tables=categories["membership"],
+            schema142_history_tables=categories["history"],
+            schema142_usage_tables=categories["usage"],
+            schema142_new_tables_empty_except_migration_seed=not seeds,
+            schema142_gate_pack_mode_default="metadata_only",
+            schema142_active_pack_membership_fabricated=False,
+            schema141_shard_seed_unchanged=True)
+
     def candidate_restores_and_rotates_authority(self):
         self.use_candidate(self.restore_db, self.restore_data)
         self.args.binary = self.candidate_binary
@@ -608,6 +703,9 @@ class LegacyArchiveHarness(BackupHarness):
         holds = {}
         if self.contract.target_schema >= 141:
             holds = self.assert_holds_schema()
+        packs = {}
+        if self.contract.target_schema >= 142:
+            packs = self.assert_pack_ledger_schema()
         names = self.query(
             self.restore_db,
             "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes "
@@ -699,7 +797,7 @@ class LegacyArchiveHarness(BackupHarness):
             "SELECT count(*) FROM tokens WHERE kind='browser' AND revoked")
         assert revoked_sessions == "1", revoked_sessions
         assert revoked_browser == "1", revoked_browser
-        return dict(**core, **holds, schema_version=int(last),
+        return dict(**core, **holds, **packs, schema_version=int(last),
                     target_format=self.contract.target_format,
                     indexes=len(self.contract.indexes),
                     schema134_identity_constraints=True,
@@ -883,9 +981,14 @@ def run_main(contract=None, argv=None):
                 "current-vs-140 catalogs and are verified present with only the "
                 "exact fixed rows seeded by the settled migration141 SQL; this "
                 "fixture inserts no hold, request or consumption row.",
+                "The schema142 pack-registration/membership/history/usage "
+                "tables are derived from the generated 142-vs-141 catalogs and "
+                "must stay empty on a genuine pre-142 source; this fixture "
+                "inserts no pack row and claims no pack-verified gate.",
                 "A format16 drill requires root to supply the genuine retained "
-                "old schema140 producer and its archive; this harness never "
-                "fabricates or relabels one.",
+                "old schema140 producer and its archive; a format17 drill "
+                "requires the genuine retained schema141 producer; this "
+                "harness never fabricates or relabels one.",
             ])
         if args.keep:
             report["retained_directory"] = str(harness.root)

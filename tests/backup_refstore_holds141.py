@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Current-format17/schema141 backup roundtrip of populated artifact holds.
+"""Current-format18/schema142 backup roundtrip of populated artifact holds.
 
 This is the #107/#105 A3 drill. It subclasses the inherited
 ``tests/backup_refstore_core139.py`` seven-case harness, so the seven real
@@ -7,7 +7,7 @@ offline backup cases (synthetic source, barrier/snapshot, corrupt inputs,
 barrier failure, interrupted restore, post-backup write exclusion and a fresh
 authenticated restore/clone/fsck) are mandatory with zero skips.
 
-The six migration-141 tables are populated by the real typed
+The schema141 artifact-hold tables remain populated by the real typed
 ``PgArtifactHoldStore`` in ``tests/ref_store_holds_backup_fixture.rs``:
 one acquired batch is consumed (durable receipts), and a second acquired batch
 is deliberately dropped without consuming its grant. Replaying that second
@@ -22,7 +22,13 @@ IO, raw upload or read-back is attempted; restored Blob bytes are not qualified
 and no physical backup/protection closure is claimed. The dump is inspected to
 show the dynamic schema-141 tables are present; the restored rows are compared
 globally and exactly, including all 64 fixed shard rows and monotone quota
-counters. No DSN/token is written to the public report.
+counters. The current archive is format18/schema142, so the drill also derives
+the six new schema142 pack-ledger tables from the generated 142-vs-141
+catalogs, proves the dynamic dump carries no silent table exclusion, and
+requires those tables to stay empty with the gate at the default
+``metadata_only`` mode: this A3 fixture fabricates no pack registration,
+membership or pack-verified transition and copies no Blob pack bytes. No
+DSN/token is written to the public report.
 """
 import argparse
 import hashlib
@@ -50,6 +56,28 @@ HELPER_TEST = "artifact_hold_backup_metadata_fixture"
 HELPER_TARGET = "ref_store_holds_backup_fixture"
 ROOT = Path(__file__).resolve().parents[1]
 HELPER_SOURCE = ROOT / "tests" / "ref_store_holds_backup_fixture.rs"
+
+
+def catalog_tables(version):
+    """Regular public tables in one generated catalog, never a guessed list."""
+    path = ROOT / "schema" / (f"{version:03d}_catalog.json")
+    try:
+        catalog = json.loads(path.read_text())
+    except OSError as error:
+        raise AssertionError(
+            "catalog " + str(path) + " is unavailable; the root runner must "
+            "generate it from settled PostgreSQL: " + str(error))
+    tables = catalog.get("tables")
+    assert isinstance(tables, list), str(path) + " has no tables list"
+    return {entry["name"] for entry in tables if entry.get("kind") == "r"}
+
+
+def schema142_pack_tables():
+    """The exact current-vs-141 catalog delta; no fabricated names."""
+    tables = catalog_tables(142) - catalog_tables(141)
+    assert tables, ("the 142 catalog adds no pack table; root must regenerate "
+                    "it from settled PostgreSQL")
+    return sorted(tables)
 
 
 def sha256_file(path):
@@ -436,8 +464,24 @@ class BackupRefStoreHolds141Harness(BackupRefStoreCore139Harness):
             assert ("TABLE DATA public " + table in listing) or (
                 'TABLE DATA public "' + table + '"' in listing), (
                 "parent snapshot dump does not contain migration-141 table " + table)
+        pack_tables = schema142_pack_tables()
+        for table in pack_tables:
+            assert ("TABLE DATA public " + table in listing) or (
+                'TABLE DATA public "' + table + '"' in listing), (
+                "parent snapshot dump silently excluded schema142 table " + table)
+            assert self.sql(
+                'SELECT count(*) FROM public."' + table + '"') == "0", (
+                    "A3 fixture fabricated a schema142 pack row in " + table)
+        gate_modes = self.sql(
+            "SELECT string_agg(DISTINCT pack_mode, ',' ORDER BY pack_mode) "
+            "FROM ref_store_core_gates")
+        assert gate_modes == "metadata_only", gate_modes
         result.update({"backup_format": manifest["format"],
-                       "schema141_is_current": SCHEMA_VERSIONS[-1] == 141,
+                       "schema141_retained_in_current_schema": SCHEMA_VERSIONS[-1] >= 141,
+                       "schema142_is_current": SCHEMA_VERSIONS[-1] == 142,
+                       "schema142_pack_ledger_tables": pack_tables,
+                       "schema142_pack_tables_empty_and_not_fabricated": True,
+                       "gate_pack_mode_default_metadata_only": True,
                        "parent_snapshot_inspected_dynamic_schema141_tables": list(NEW_TABLES)})
         return result
 
@@ -457,8 +501,17 @@ class BackupRefStoreHolds141Harness(BackupRefStoreCore139Harness):
         gate = self.core_gate_row()
         assert gate["revision"] == 2 == self.holds_marker["scope"]["gate_revision"]
         assert gate["history_incarnation"] == self.holds_marker["scope"]["history_incarnation"]
+        pack_tables = schema142_pack_tables()
+        for table in pack_tables:
+            assert self.sql(
+                'SELECT count(*) FROM public."' + table + '"') == "0", (
+                    "restore fabricated a schema142 pack row in " + table)
+        assert gate["pack_mode"] == "metadata_only", gate
         assert self.sql("SELECT max(version) FROM schema_migrations") == str(SCHEMA_VERSIONS[-1])
-        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version BETWEEN 138 AND 141") == "4"
+        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version BETWEEN 138 AND 142") == "5"
+        assert self.sql("SELECT count(*) FROM pg_trigger WHERE tgname LIKE "
+                        "'ref_store_core_pack_%' AND tgenabled <> 'O'") == "0", (
+                            "a migration-142 guard was disabled")
         before_replay = self.new_rows()
         verify = self.run_holds_fixture("verify", db=self.db)
         self.assert_binary_binding("verify")
@@ -526,6 +579,9 @@ class BackupRefStoreHolds141Harness(BackupRefStoreCore139Harness):
             "all_six_schema141_tables_restored_exactly": True,
             "hold_requests_holds_receipts_usage_nonempty_after_restore": True,
             "all_64_shard_rows_and_monotone_quota_counters_restored": True,
+            "schema142_pack_ledger_tables_empty_after_current_restore": True,
+            "schema142_gate_pack_mode_metadata_only": True,
+            "schema142_pack_registration_fabricated": False,
             "typed_replay_verify_helper_ran": True,
             "exact_replay_returned_old_acks_and_receipts_without_writes": True,
             "dropped_grant_replay_cannot_remint": True,

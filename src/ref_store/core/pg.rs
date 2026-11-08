@@ -409,6 +409,20 @@ impl PgRefStoreCore {
             .await;
         }
 
+        // A4a persistent fence: once one verified pack commit has activated this
+        // gate, every fresh metadata-only A1 write is refused while immutable
+        // terminal replay above stays available. The gate row is already locked.
+        let pack_mode: String = tx
+            .query_one("SELECT pack_mode FROM ref_store_core_gates WHERE repository_id=$1", &[&request.repository_id()])
+            .await
+            .map_err(pg::db_error)?
+            .get(0);
+        if pack_mode != "metadata_only" {
+            return Err(RefStoreError::Unsupported(
+                "gate is pack_verified; fresh metadata-only ref commits are refused",
+            ));
+        }
+
         let existing = lock_relevant_refs(tx, request.repository_id(), lookup_names(request, gate.head_ref())).await?;
         if let Err((code, name, expected, actual)) = check_cas(request, &existing) {
             return reject(tx, request, Some(&gate), code, Some(name), expected, actual, deadline).await;

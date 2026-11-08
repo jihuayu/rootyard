@@ -27,6 +27,8 @@
 pub mod artifact_hold;
 pub mod command;
 pub mod contract;
+/// A4a durable pack registration + verified commit foundation (unserved).
+pub mod pack_commit;
 pub mod pg;
 pub mod sql;
 pub mod terminal;
