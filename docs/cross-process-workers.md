@@ -104,7 +104,7 @@ cause unnecessary scans, not delivery correctness.
 
 Building with `--features state-redis` selects a mature redis-rs adapter instead
 and supports `ROOTYARD_REDIS_URL=rediss://...` with ACL credentials, TLS
-verification, connection-manager reconnect, command deadlines and sanitized
+verification, owned connections with bounded publication concurrency, command deadlines and sanitized
 errors/Debug. Plaintext `redis://` remains loopback-only and there is no
 redirect/TLS-downgrade fallback. Redis is still only an advisory wake transport;
 PG scanning is mandatory in both modes. See the [bounded cache/wake contract](state-cache-wake.md).

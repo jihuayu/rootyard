@@ -65,9 +65,9 @@ impl ReplyBlackhole {
                                 if n == 0 {
                                     return Ok::<(), std::io::Error>(());
                                 }
+                                server_write.write_all(&bytes[..n]).await?;
                                 reads.fetch_add(1, Ordering::SeqCst);
                                 read_event.notify_one();
-                                server_write.write_all(&bytes[..n]).await?;
                             }
                         };
                         let download = async {

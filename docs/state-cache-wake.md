@@ -73,10 +73,11 @@ durable PG/Ref-CAS reservation.
 
 Memory uses a short in-process lock, entry/byte budgets and bounded insertion
 order metadata. Replacing, deleting or expiring an entry removes its order
-record, so metadata cannot grow past the entry cap. Redis uses one multiplexed
-connection-manager connection with built-in reconnect, an in-flight semaphore,
-and one absolute deadline covering permit wait, first connection-manager
-initialization and every command. Reads issue `STRLEN` first and only a capped
+record, so metadata cannot grow past the entry cap. Redis uses an exclusive,
+bounded idle pool of canonical multiplexed connections, an in-flight semaphore,
+and one absolute deadline covering permit wait, connection checkout/creation
+and every command. Failed or abandoned connections are discarded; subsequent
+operations create replacements through the SDK. Reads issue `STRLEN` first and only a capped
 `GETRANGE` (at most `max_value_bytes`) when it fits, so an oversized value is
 never fully fetched. Writes reject oversized values before encoding/allocation.
 
@@ -185,19 +186,29 @@ are `#[ignore]`d and require a dedicated server with maxmemory + eviction
 configured and CONFIG permission:
 
 ```sh
-ROOTYARD_TEST_REDIS_URL='rediss://user:secret@dedicated-cache:6380/0' \
-  cargo test --features state-redis cache_wake::redis -- --ignored
+ROOTYARD_TEST_REDIS_DESTRUCTIVE=owned-fixture \
+ROOTYARD_TEST_REDIS_URL='rediss://user:secret@127.0.0.1:6380/0' \
+SSL_CERT_FILE=/path/to/owned-fixture-ca.pem \
+  cargo test --locked --features state-redis cache_wake::redis -- --ignored --test-threads=1
 ```
 
 Missing `ROOTYARD_TEST_REDIS_URL` panics the explicitly selected contract test;
 it is never reported as a successful real-Redis run. Do not point this at a
 shared or production cache.
 
-Remaining unverified gaps: the exact redis-rs pin/lock and feature compilation
-were not run by the implementer; no real Redis/TLS/ACL service was available;
-HA/Sentinel/Cluster, PG failover, production performance and complete cache
-consumer wiring (#110) are out of scope for this increment. The Redis contract
-does not make Redis a hard quota or authority.
+Root validation includes source-bound real Redis7.4.2 tests on a disposable
+loopback instance:21 unit cases, six real cases over plaintext and again over
+verified private-CA TLS, rejection with an untrusted CA and success after
+restoring trust. Cases cover bounded reads, FLUSHALL, ACL rejection, unsafe
+policy rejection/restoration, advisory wake and real driver teardown after
+blackholed replies/caller abort. The selected report records exact source,
+executable, fixture version and case counts in
+`evidence/state-services/cache-wake/redis-contract.json`.
+
+HA/Sentinel/Cluster, PG failover, production performance, least-privilege
+production ACLs and complete serving-cache consumer wiring (#110) remain
+unverified. This increment does not complete #111 or make Redis a hard quota or
+authority. The default build still needs no Redis.
 
 The full ignored real-Redis suite includes destructive FLUSHALL and CONFIG SET
 checks. Run it only against a disposable, task-owned instance and explicitly set
@@ -205,7 +216,7 @@ checks. Run it only against a disposable, task-owned instance and explicitly set
 `ROOTYARD_TEST_REDIS_URL`. This flag is an operator attestation, not automatic
 proof of ownership. The cancellation test also requires an IPv4 loopback
 endpoint; its byte-forwarding proxy changes only the port and uses the SDK for
-all Redis/TLS handling. A TLS fixture certificate must cover127.0.0.1.
+all Redis/TLS handling. A TLS fixture certificate must cover 127.0.0.1.
 
 Redis cache connections are now exclusively checked out from a bounded idle
 pool. Only fully completed successful operations recycle their connection.
