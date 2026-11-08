@@ -73,6 +73,7 @@ impl RemoteSdkKind {
 
 enum RemoteFailure {
     /// A response the SDK classified as a failed HTTP status.
+    #[cfg(test)]
     Http(u16),
     /// A failed HTTP response plus the bounded classification derived by the
     /// upstream S3 parser. No provider body, resource path or URL survives.
@@ -84,6 +85,7 @@ enum RemoteFailure {
     /// An opaque transport/SDK error source. It is retained so the complete
     /// OpenDAL error chain survives, but it is never formatted into a message
     /// or a log event. Legacy `remote_objects` callers keep this variant.
+    #[cfg(test)]
     Transport(Box<dyn std::error::Error + Send + Sync>),
     /// A finite, source-free transport classification. It retains only the
     /// bounded SDK kind and temporary flag: no URL, provider body or nested
@@ -106,6 +108,7 @@ pub struct RemoteStoreError {
 }
 
 impl RemoteStoreError {
+    #[cfg(test)]
     pub(crate) fn http(op: RemoteOp, status: u16) -> Self {
         Self { op, failure: RemoteFailure::Http(status) }
     }
@@ -114,6 +117,7 @@ impl RemoteStoreError {
         Self { op, failure: RemoteFailure::HttpTyped { status, kind, temporary } }
     }
 
+    #[cfg(test)]
     pub(crate) fn transport(op: RemoteOp, error: Box<dyn std::error::Error + Send + Sync>) -> Self {
         Self { op, failure: RemoteFailure::Transport(error) }
     }
@@ -139,7 +143,9 @@ impl RemoteStoreError {
     /// Safe numeric HTTP status, if the failure was a completed response.
     pub(crate) fn http_status(&self) -> Option<u16> {
         match &self.failure {
-            RemoteFailure::Http(status) | RemoteFailure::HttpTyped { status, .. } => Some(*status),
+            #[cfg(test)]
+            RemoteFailure::Http(status) => Some(*status),
+            RemoteFailure::HttpTyped { status, .. } => Some(*status),
             _ => None,
         }
     }
@@ -149,6 +155,7 @@ impl std::fmt::Display for RemoteStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Fixed safe text only: op is a bounded enum and http_status a u16.
         match &self.failure {
+            #[cfg(test)]
             RemoteFailure::Http(status) => {
                 write!(formatter, "remote object store {} failed with status {status}", self.op.as_str())
             }
@@ -159,6 +166,7 @@ impl std::fmt::Display for RemoteStoreError {
                 kind.as_str(),
                 if *temporary { "temporary" } else { "permanent" }
             ),
+            #[cfg(test)]
             RemoteFailure::Transport(_) => {
                 write!(formatter, "remote object store {} transport failed", self.op.as_str())
             }
@@ -190,6 +198,7 @@ impl std::fmt::Debug for RemoteStoreError {
 impl std::error::Error for RemoteStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.failure {
+            #[cfg(test)]
             RemoteFailure::Transport(error) => Some(error.as_ref()),
             // Typed transport causes are finite values, not nested errors.
             _ => None,

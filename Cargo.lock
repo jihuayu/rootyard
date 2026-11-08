@@ -1481,8 +1481,6 @@ dependencies = [
 [[package]]
 name = "opendal-service-s3"
 version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "313d46c9f5ae70bca26b7c3e3fbb9b639292625f28af73aa016f47e788af9deb"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2170,6 +2168,7 @@ dependencies = [
  "hmac 0.12.1",
  "libc",
  "opendal",
+ "opendal-service-s3",
  "rand 0.9.5",
  "rdkafka",
  "reqwest 0.12.28",
