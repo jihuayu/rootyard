@@ -1,0 +1,122 @@
+{
+  "status": "passed",
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "09916cb69762d808ec1f7aa21c47fe7ce206ba5f1f6e83080a54fff3de326968",
+    "source_inputs_sha256": "4cec138446e26aebd54eee651f63cba2016055119c099c637a73109483c267e0",
+    "workspace_commit": "1c2b4e1890cc4a6deb0c2dd6d2f6c09038b5c0f4",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-shared-contract-gates#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-shared-contract-gates#rootyard@0.1.0"
+      }
+    ]
+  },
+  "runner_sha256": "530f5dae30ca8b7205e0e4613f02bf02fa006ee7013d6e874a0c7ab17758d27e",
+  "qualification_driver_sha256": "648491b8a1153bf448f2650ec95fcf40b3338049a2a5079e63cbb7a0ccd544d3",
+  "cases_expected": [
+    "setup_repos",
+    "refs_and_pagination",
+    "commits_and_pagination",
+    "tree_and_blob",
+    "compare_revisions",
+    "ref_transactions_atomic_cas",
+    "idempotency_and_concurrency",
+    "access_and_fences",
+    "object_format_and_negotiation",
+    "bounded_ref_and_commit_pages",
+    "selective_ref_prefix",
+    "protected_writes_and_ref_ack_failure"
+  ],
+  "variants": [
+    {
+      "label": "git243",
+      "git_version": "git version 2.43.0",
+      "command": [
+        "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+        "/workspace/scratch/state-shared-contract-gates/tests/browse.py",
+        "--binary",
+        "/workspace/scratch/state-browse130-app-v3/rootyard",
+        "--report",
+        "/workspace/scratch/state-browse130-git243-native-v1.json"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "report": "/workspace/scratch/state-browse130-git243-native-v1.json",
+      "log": "/workspace/scratch/state-browse130-git243-native-v1.log"
+    },
+    {
+      "label": "git247",
+      "git_version": "git version 2.47.3",
+      "command": [
+        "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+        "/workspace/scratch/state-shared-contract-gates/tests/browse.py",
+        "--binary",
+        "/workspace/scratch/state-browse130-app-v3/rootyard",
+        "--report",
+        "/workspace/scratch/state-browse130-git247-native-v1.json"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "report": "/workspace/scratch/state-browse130-git247-native-v1.json",
+      "log": "/workspace/scratch/state-browse130-git247-native-v1.log"
+    },
+    {
+      "label": "git252",
+      "git_version": "git version 2.52.0",
+      "command": [
+        "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/bin/python3",
+        "/workspace/scratch/state-shared-contract-gates/tests/browse.py",
+        "--binary",
+        "/workspace/scratch/state-browse130-app-v3/rootyard",
+        "--report",
+        "/workspace/scratch/state-browse130-git252-native-v1.json"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "report": "/workspace/scratch/state-browse130-git252-native-v1.json",
+      "log": "/workspace/scratch/state-browse130-git252-native-v1.log"
+    }
+  ],
+  "limits": [
+    "One physical host and loopback PostgreSQL; no throughput/HA qualification.",
+    "Configured native Git is selected per variant; counting and ref-ack fault wrappers delegate to that same selected executable.",
+    "Git2.43 is an isolated upstream server-only NO_CURL build; its source/binary receipt is retained. Git2.47 exercises the same unsupported-start-after fallback; clients use stock Git2.52."
+  ],
+  "source_matches_after": true,
+  "runner_matches_after": true,
+  "binary_matches_after": true
+}
