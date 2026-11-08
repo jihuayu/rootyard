@@ -317,7 +317,7 @@ mod tests {
             ..limits()
         })
         .unwrap();
-        let result = guard.call(|| std::future::pending::<Result<(), ()>>()).await;
+        let result = guard.call(std::future::pending::<Result<(), ()>>).await;
         assert_eq!(result, Err(OriginError::Deadline));
         assert_eq!(guard.call(|| async { Ok::<_, ()>(4) }).await, Ok(4));
     }

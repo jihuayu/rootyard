@@ -95,10 +95,10 @@ impl MemoryCache {
             let Some((sequence, candidate)) = inner.order.pop_first() else {
                 break;
             };
-            if inner.entries.get(&candidate).is_some_and(|entry| entry.sequence == sequence) {
-                if let Some(removed) = inner.entries.remove(&candidate) {
-                    inner.bytes = inner.bytes.saturating_sub(removed.size);
-                }
+            if inner.entries.get(&candidate).is_some_and(|entry| entry.sequence == sequence)
+                && let Some(removed) = inner.entries.remove(&candidate)
+            {
+                inner.bytes = inner.bytes.saturating_sub(removed.size);
             }
         }
         inner.sequence = inner.sequence.wrapping_add(1);
