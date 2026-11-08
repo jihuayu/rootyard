@@ -26,6 +26,16 @@ credentials. No keys, tokens, passwords or private wrapper paths are included.
 | `native-publication-runner.py` | Exact runner used for the Pando report (`runner_sha256` in the report matches this file) | Static harness code only; no credentials. |
 | `state-blob-legacy-publication-v8.json` | **Historical failure, retained unchanged** | Source `3257358` / binary `9f0e1d46...`; first 6 setup cases passed, then the first Pando push failed after the server process disappeared (client saw connection refused). The server-side cause was diagnosed as a Tokio stack overflow in the deeply nested OpenDAL layer stack; `719c7cc` type-erases the layers (`operator.finish()` before applying custom layers) and bounds the async stack. The same workload was re-qualified successfully at b8 above. This file is a counterexample, not a b8 result. |
 
+The v8 failing test's server log (618 bytes, full-file SHA-256
+`717fd31f15fae0cff4c3543383e413c7b218a6d82b8843da667d40d19eeddfc9`) contains
+the confirming stack-overflow lines, quoted exactly and nothing else from that
+log:
+
+```
+thread 'tokio-rt-worker' (456315) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+```
+
 ## Hash and command table (from the receipts)
 
 | Artifact | Binary SHA-256 | Inputs |
@@ -82,8 +92,11 @@ each decompressed stream matched the corresponding `binary_sha256` above.
    `python3 native-publication-runner.py --binary <path>/rootyard
    --source-root <checkout> --report <out>.json`. The runner requires
    `rootyard.build.json` beside the binary and refuses hash/source mismatch.
-6. `cargo test --lib` and `cargo clippy --all-targets --features blob-azblob`
-   reproduce the library, stack and lint gates.
+6. `cargo test --lib` reproduces the 283-test library suite (8 explicitly
+   ignored) but does **not** run `tests/legacy_s3_stack.rs`, which is a separate
+   integration-test target: run `cargo test --test legacy_s3_stack` for the
+   two-MiB-stack gate. Run
+   `cargo clippy --all-targets --features blob-azblob` for the lint gate.
 
 All test data is synthetic: random tenants/digests, fixture-only buckets and
 generated 64 KiB block payloads. No production content is used.
@@ -94,8 +107,10 @@ Azure is a compile-only optional feature; the real runtime case is S3 only.
 Provider `write_with_if_not_exists` was observed to return success for a
 duplicate multipart completion, so native conditional create is **unqualified**
 and is not the uniqueness mechanism: opaque one-use `UploadIntent`s are.
-New-profile deletion is always disabled (`DeleteDisabled`), and
-`ROOTYARD_BLOB_DELETE` is rejected. This evidence does **not** qualify all
+New-profile deletion is always disabled. `ROOTYARD_BLOB_DELETE=disabled` (or
+unset/empty) is the only accepted value; `ROOTYARD_BLOB_DELETE=exact-locator`
+is rejected, as is any other value, because no persistent hold/root retirement
+protocol exists yet. This evidence does **not** qualify all
 content classes, standalone deployment, HA, physical durability, a KeyProvider,
 or GC/hold protocols. Production still uses the legacy Vault-backed profile;
 the new serving profile remains disabled. #109, #110 and #112-#123 remain open.
