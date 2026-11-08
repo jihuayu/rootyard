@@ -18,13 +18,27 @@
 use super::super::contract::{MetadataMutationAction, MetadataPinPurpose, RefStoreError};
 use super::super::pg;
 use super::contract::CoreGate;
+use super::pack_commit::PackMode;
 use super::pin::{PinIdentity, PinRow, PinState, SnapshotHeader};
 use super::snapshot_contract::{MAX_SNAPSHOT_REFS, MetadataSnapshotScope};
 use super::snapshot_receipt::MetadataReceipt;
 use super::snapshot_request::PinReleaseReason;
 use super::types::{GitObjectFormat, RefName};
+use tokio::time::Instant;
 use tokio_postgres::{Row, Transaction};
 use uuid::Uuid;
+
+/// Force durable commit in the one owned write transaction: hosted policy may set
+/// `synchronous_commit=off`, and only an explicitly durable `COMMIT` may be
+/// acknowledged. Called by write paths only, and bounded by the caller's absolute
+/// deadline like every other SQL stage after `BEGIN`.
+pub(super) async fn durable_write(tx: &Transaction<'_>, deadline: Instant) -> Result<(), RefStoreError> {
+    pg::before_deadline(deadline, async {
+        tx.execute("SET LOCAL synchronous_commit = 'on'", &[]).await.map_err(pg::db_error)
+    })
+    .await?;
+    Ok(())
+}
 
 /// First lock of every metadata mutation: one advisory key derived from the
 /// request id. It serializes concurrent attempts of the *same* request so the
@@ -159,6 +173,19 @@ pub(super) async fn lock_scope(
     Ok(gate)
 }
 
+/// The pack mode of the already gate-locked row: `lock_scope` holds it `FOR
+/// UPDATE`/`FOR SHARE`, so this read adds no lock. A2 fresh writes require
+/// `metadata_only`; A5 fresh capture and reads require `pack_verified`.
+pub(super) async fn gate_pack_mode(tx: &Transaction<'_>, repository_id: Uuid) -> Result<PackMode, RefStoreError> {
+    let row = tx
+        .query_opt("SELECT pack_mode FROM ref_store_core_gates WHERE repository_id=$1", &[&repository_id])
+        .await
+        .map_err(pg::db_error)?
+        .ok_or(RefStoreError::Unsupported("repository has no initialized core gate"))?;
+    let mode: String = row.get(0);
+    PackMode::parse(&mode)
+}
+
 /// Read the current refs of the gate-locked repository. The caller holds the
 /// gate `FOR UPDATE`, so `CommitRefs` cannot interleave and refs/HEAD/version
 /// are one revision.
@@ -206,6 +233,15 @@ pub(super) struct SnapshotInsert<'a> {
     pub ref_count: i64,
     pub refs_digest: &'a str,
     pub logical_bytes: i64,
+    /// `Some` only for an A5 pack-aware snapshot; `None` is the exact A2 shape.
+    pub pack: Option<PackHeaderInsert<'a>>,
+}
+
+/// Additive pack columns of one snapshot header row.
+pub(super) struct PackHeaderInsert<'a> {
+    pub pack_count: i64,
+    pub membership_digest: &'a str,
+    pub snapshot_digest: &'a str,
 }
 
 /// The stored `ref_count` column is `INTEGER` (`int4`) in migration 140 while
@@ -224,12 +260,24 @@ fn ref_count_param(ref_count: i64) -> Result<i32, RefStoreError> {
 pub(super) async fn insert_snapshot(tx: &Transaction<'_>, insert: &SnapshotInsert<'_>) -> Result<(), RefStoreError> {
     let scope = insert.scope;
     let ref_count = ref_count_param(insert.ref_count)?;
+    let (pack_mode, pack_state, pack_count, membership_digest, snapshot_digest) = match &insert.pack {
+        None => ("metadata_only", "unavailable", 0i32, None, None),
+        Some(pack) => (
+            "pack_verified",
+            "complete",
+            i32::try_from(pack.pack_count)
+                .map_err(|_| RefStoreError::Database("pack snapshot pack_count does not fit INTEGER".into()))?,
+            Some(pack.membership_digest),
+            Some(pack.snapshot_digest),
+        ),
+    };
     tx.execute(
         "INSERT INTO ref_store_core_snapshots(
              snapshot_id,repository_id,tenant_id,owner_id,purpose,object_format,history_incarnation,
              authority_epoch,group_epoch,gate_revision,gate_digest,head_ref,head_oid,ref_count,
-             refs_digest,logical_bytes)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+             refs_digest,logical_bytes,pack_membership_state,pack_mode,pack_count,membership_digest,
+             snapshot_digest)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)",
         &[
             &insert.snapshot_id,
             &scope.repository_id(),
@@ -247,6 +295,11 @@ pub(super) async fn insert_snapshot(tx: &Transaction<'_>, insert: &SnapshotInser
             &ref_count,
             &insert.refs_digest,
             &insert.logical_bytes,
+            &pack_state,
+            &pack_mode,
+            &pack_count,
+            &membership_digest,
+            &snapshot_digest,
         ],
     )
     .await
@@ -281,7 +334,8 @@ pub(super) async fn snapshot_header(
         .query_opt(
             "SELECT snapshot_id,repository_id,tenant_id,owner_id,purpose,object_format,
                     history_incarnation,authority_epoch,group_epoch,gate_revision,gate_digest,
-                    head_ref,head_oid,ref_count,refs_digest,logical_bytes
+                    head_ref,head_oid,ref_count,refs_digest,logical_bytes,pack_membership_state,
+                    pack_mode,pack_count,membership_digest,snapshot_digest
              FROM ref_store_core_snapshots WHERE snapshot_id=$1 AND repository_id=$2",
             &[&snapshot_id, &repository_id],
         )
@@ -291,6 +345,13 @@ pub(super) async fn snapshot_header(
     let purpose: String = row.get(4);
     let object_format: String = row.get(5);
     let head_ref: String = row.get(11);
+    let pack_mode = PackMode::parse(&row.get::<_, String>(17))?;
+    let expected_state = if pack_mode == PackMode::PackVerified { "complete" } else { "unavailable" };
+    if row.get::<_, String>(16) != expected_state {
+        return Err(RefStoreError::Database(
+            "stored snapshot pack_membership_state disagrees with its pack_mode".into(),
+        ));
+    }
     Ok(Some(SnapshotHeader {
         snapshot_id: row.get(0),
         repository_id: row.get(1),
@@ -311,6 +372,10 @@ pub(super) async fn snapshot_header(
         ref_count: i64::from(row.get::<_, i32>(13)),
         refs_digest: row.get(14),
         logical_bytes: row.get(15),
+        pack_mode,
+        pack_count: i64::from(row.get::<_, i32>(18)),
+        membership_digest: row.get(19),
+        snapshot_digest: row.get(20),
     }))
 }
 

@@ -73,20 +73,16 @@ fn map_usage_error(error: tokio_postgres::Error) -> RefStoreError {
 /// Lock (or create) the retained tenant usage row and then the repository usage
 /// row, and return both counters. This is the quota prefix of the fixed lock
 /// order: it is always taken before the repository/gate rows and never after.
-pub(super) async fn lock_usage(
-    tx: &Transaction<'_>,
-    tenant_id: Uuid,
-    repository_id: Uuid,
-) -> Result<(UsageCounts, UsageCounts), RefStoreError> {
+/// Lock (or create) and read the retained *tenant* usage row.
+///
+/// Split out from the repository row so a caller that also owns a permanent
+/// pack-snapshot counter row can follow one global order: every tenant-scope
+/// row first, then every repository-scope row. The pair helper below keeps the
+/// A2-only call sites unchanged.
+pub(super) async fn lock_tenant_usage(tx: &Transaction<'_>, tenant_id: Uuid) -> Result<UsageCounts, RefStoreError> {
     tx.execute(
         "INSERT INTO ref_store_core_tenant_usage(tenant_id) VALUES($1) ON CONFLICT(tenant_id) DO NOTHING",
         &[&tenant_id],
-    )
-    .await
-    .map_err(map_usage_error)?;
-    tx.execute(
-        "INSERT INTO ref_store_core_repo_usage(repository_id,tenant_id) VALUES($2,$1) ON CONFLICT(repository_id) DO NOTHING",
-        &[&tenant_id, &repository_id],
     )
     .await
     .map_err(map_usage_error)?;
@@ -98,6 +94,22 @@ pub(super) async fn lock_usage(
         )
         .await
         .map_err(pg::db_error)?;
+    Ok(usage_from_row(&tenant))
+}
+
+/// Lock (or create) and read the retained *repository* usage row. It is always
+/// taken after the tenant-scope row(s) of the same transaction.
+pub(super) async fn lock_repository_usage(
+    tx: &Transaction<'_>,
+    tenant_id: Uuid,
+    repository_id: Uuid,
+) -> Result<UsageCounts, RefStoreError> {
+    tx.execute(
+        "INSERT INTO ref_store_core_repo_usage(repository_id,tenant_id) VALUES($2,$1) ON CONFLICT(repository_id) DO NOTHING",
+        &[&tenant_id, &repository_id],
+    )
+    .await
+    .map_err(map_usage_error)?;
     let repository = tx
         .query_one(
             "SELECT snapshot_count,snapshot_ref_count,logical_bytes,receipt_count
@@ -106,7 +118,19 @@ pub(super) async fn lock_usage(
         )
         .await
         .map_err(pg::db_error)?;
-    Ok((usage_from_row(&tenant), usage_from_row(&repository)))
+    Ok(usage_from_row(&repository))
+}
+
+/// Lock the tenant row and then the repository row and return both counters.
+/// Used by the A2-only paths that hold no permanent pack-snapshot counter.
+pub(super) async fn lock_usage(
+    tx: &Transaction<'_>,
+    tenant_id: Uuid,
+    repository_id: Uuid,
+) -> Result<(UsageCounts, UsageCounts), RefStoreError> {
+    let tenant = lock_tenant_usage(tx, tenant_id).await?;
+    let repository = lock_repository_usage(tx, tenant_id, repository_id).await?;
+    Ok((tenant, repository))
 }
 
 /// Retained admission check against locked counters. Backpressure is explicit;

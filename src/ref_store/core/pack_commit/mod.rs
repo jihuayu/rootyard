@@ -59,4 +59,5 @@ pub use receipt::{
     PackCommitReceipt, PackCommitTerminal, PackRegistrationAck, PackRegistrationReceipt, PackTerminalRegistration,
     ensure_pack_terminal_budget,
 };
+pub use registration::{StoredRegistrationView, read_membership_set, read_pack_bindings, read_registered_pack};
 pub use request::{PAIR_SLOTS, PackPendingToken, PackRegistrationRequest, PairArtifact};

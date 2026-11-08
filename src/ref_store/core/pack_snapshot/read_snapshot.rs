@@ -1,0 +1,212 @@
+//! The sealed A5a read result: one complete, immutable, registered-membership
+//! snapshot value.
+//!
+//! [`PackReadSnapshot`] has private fields, no public constructor, no
+//! `Serialize`/`Deserialize` and no unchecked factory, so it can only be built by
+//! the PostgreSQL adapter after it re-derived every digest from the stored rows
+//! and proved the live pin generation/lease under the gate lock.
+//!
+//! What it does claim: the complete captured ref set, HEAD, the exact gate
+//! revision/digest/mode and every registered pack membership (full locator,
+//! provider, backend identity, verified sha256/length and artifact-set digest)
+//! captured atomically under that one gate lock.
+//!
+//! What it does **not** claim: current Blob bytes, native Git object closure,
+//! any serving cutover or write authority. `complete_git_read_snapshot()` stays
+//! `false` until A5b performs the verified byte/native read outside every PG
+//! lease.
+use super::super::pack_commit::{CapturedRef, RegisteredPack};
+use super::super::snapshot_contract::{MAX_SNAPSHOT_PACKS, MAX_SNAPSHOT_REFS, MetadataSnapshotScope};
+use super::contract::{PACK_MODE_VERIFIED, READ_RESULT_DIGEST_DOMAIN};
+use crate::ref_store::contract::{RefStoreError, RequestDigest};
+use std::collections::BTreeSet;
+use std::time::SystemTime;
+use uuid::Uuid;
+
+/// Every field needed to build one sealed read result. The adapter fills it from
+/// locked/re-derived rows only.
+pub(super) struct ReadSnapshotParts {
+    pub snapshot_id: Uuid,
+    pub pin_id: Uuid,
+    pub pin_generation: i64,
+    pub scope: MetadataSnapshotScope,
+    pub gate_revision: i64,
+    pub gate_digest: String,
+    pub head_ref: String,
+    pub head_oid: Option<String>,
+    pub refs: Vec<CapturedRef>,
+    pub packs: Vec<RegisteredPack>,
+    pub membership_digest: String,
+    pub snapshot_digest: String,
+    pub logical_bytes: i64,
+    pub expires_at_unix_micros: i64,
+}
+
+/// One complete registered-membership snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackReadSnapshot {
+    snapshot_id: Uuid,
+    pin_id: Uuid,
+    pin_generation: i64,
+    scope: MetadataSnapshotScope,
+    gate_revision: i64,
+    gate_digest: String,
+    head_ref: String,
+    head_oid: Option<String>,
+    refs: Vec<CapturedRef>,
+    packs: Vec<RegisteredPack>,
+    membership_digest: String,
+    snapshot_digest: String,
+    read_digest: RequestDigest,
+    logical_bytes: i64,
+    expires_at_unix_micros: i64,
+}
+
+impl PackReadSnapshot {
+    pub(super) fn new(parts: ReadSnapshotParts) -> Result<Self, RefStoreError> {
+        if parts.snapshot_id.is_nil() || parts.pin_id.is_nil() || parts.pin_generation <= 0 {
+            return Err(RefStoreError::Database("pack read snapshot identity is invalid".into()));
+        }
+        if parts.refs.len() > MAX_SNAPSHOT_REFS {
+            return Err(RefStoreError::MetadataSnapshotTooLarge {
+                ref_count: parts.refs.len(),
+                max_refs: MAX_SNAPSHOT_REFS,
+            });
+        }
+        if parts.packs.is_empty() || parts.packs.len() > MAX_SNAPSHOT_PACKS {
+            return Err(RefStoreError::MetadataSnapshotTooLarge {
+                ref_count: parts.packs.len(),
+                max_refs: MAX_SNAPSHOT_PACKS,
+            });
+        }
+        let mut refs = parts.refs;
+        refs.sort();
+        let mut names = BTreeSet::new();
+        if !refs.iter().all(|reference| names.insert(reference.name().to_owned())) {
+            return Err(RefStoreError::Database("pack read snapshot contains a duplicate ref name".into()));
+        }
+        let mut packs = parts.packs;
+        packs.sort_by_key(RegisteredPack::pack_id);
+        let mut pack_ids = BTreeSet::new();
+        if !packs.iter().all(|pack| pack_ids.insert(pack.pack_id())) {
+            return Err(RefStoreError::Database("pack read snapshot contains a duplicate pack id".into()));
+        }
+        let read_digest = RequestDigest::of(
+            READ_RESULT_DIGEST_DOMAIN,
+            &[
+                parts.snapshot_id.as_bytes(),
+                parts.pin_id.as_bytes(),
+                &parts.pin_generation.to_be_bytes(),
+                &parts.gate_revision.to_be_bytes(),
+                parts.gate_digest.as_bytes(),
+                PACK_MODE_VERIFIED.as_bytes(),
+                parts.snapshot_digest.as_bytes(),
+                parts.membership_digest.as_bytes(),
+            ],
+        );
+        Ok(Self {
+            snapshot_id: parts.snapshot_id,
+            pin_id: parts.pin_id,
+            pin_generation: parts.pin_generation,
+            scope: parts.scope,
+            gate_revision: parts.gate_revision,
+            gate_digest: parts.gate_digest,
+            head_ref: parts.head_ref,
+            head_oid: parts.head_oid,
+            refs,
+            packs,
+            membership_digest: parts.membership_digest,
+            snapshot_digest: parts.snapshot_digest,
+            read_digest,
+            logical_bytes: parts.logical_bytes,
+            expires_at_unix_micros: parts.expires_at_unix_micros,
+        })
+    }
+
+    pub fn snapshot_id(&self) -> Uuid {
+        self.snapshot_id
+    }
+    pub fn pin_id(&self) -> Uuid {
+        self.pin_id
+    }
+    pub fn pin_generation(&self) -> i64 {
+        self.pin_generation
+    }
+    pub fn scope(&self) -> &MetadataSnapshotScope {
+        &self.scope
+    }
+    pub fn repository_id(&self) -> Uuid {
+        self.scope.repository_id()
+    }
+    pub fn tenant_id(&self) -> Uuid {
+        self.scope.tenant_id()
+    }
+    pub fn owner_id(&self) -> Uuid {
+        self.scope.owner_id()
+    }
+    pub fn gate_revision(&self) -> i64 {
+        self.gate_revision
+    }
+    pub fn gate_digest_hex(&self) -> &str {
+        &self.gate_digest
+    }
+    pub fn pack_mode(&self) -> &'static str {
+        PACK_MODE_VERIFIED
+    }
+    pub fn head_ref(&self) -> &str {
+        &self.head_ref
+    }
+    pub fn head_oid_hex(&self) -> Option<&str> {
+        self.head_oid.as_deref()
+    }
+    /// The complete captured ref set, sorted by name, unique, `<= 4096` rows.
+    pub fn refs(&self) -> &[CapturedRef] {
+        &self.refs
+    }
+    pub fn ref_count(&self) -> i64 {
+        i64::try_from(self.refs.len()).unwrap_or(i64::MAX)
+    }
+    /// The complete registered pack set, sorted by pack id, unique, `1..=16`.
+    pub fn packs(&self) -> &[RegisteredPack] {
+        &self.packs
+    }
+    pub fn pack_count(&self) -> i64 {
+        i64::try_from(self.packs.len()).unwrap_or(i64::MAX)
+    }
+    pub fn membership_digest_hex(&self) -> &str {
+        &self.membership_digest
+    }
+    /// The capture-time canonical digest stored on the immutable header.
+    pub fn snapshot_digest_hex(&self) -> &str {
+        &self.snapshot_digest
+    }
+    /// The per-read canonical digest: the stored capture digest plus the exact
+    /// pin id/generation this value was read under.
+    pub fn read_digest_hex(&self) -> String {
+        self.read_digest.as_hex()
+    }
+    pub fn logical_bytes(&self) -> i64 {
+        self.logical_bytes
+    }
+    pub fn expires_at_unix_micros(&self) -> i64 {
+        self.expires_at_unix_micros
+    }
+    pub fn expires_at(&self) -> Result<SystemTime, RefStoreError> {
+        super::super::snapshot_contract::expires_at_from_micros(self.expires_at_unix_micros)
+    }
+
+    /// A5a is a durable metadata foundation: registered membership only.
+    pub const fn complete_registered_pack_membership(&self) -> bool {
+        true
+    }
+
+    /// Never `true` in A5a. A5b must verify current Blob bytes and native Git
+    /// closure before any value may claim a complete Git read snapshot.
+    pub const fn complete_git_read_snapshot(&self) -> bool {
+        false
+    }
+
+    pub const fn packs_complete(&self) -> bool {
+        true
+    }
+}

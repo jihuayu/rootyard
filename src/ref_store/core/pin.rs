@@ -14,7 +14,8 @@
 //!   * Expiry denies new pages and renewals only. It never deletes, refunds or
 //!     revives anything, and an exact release is still allowed.
 use super::super::contract::{MetadataMutationAction, MetadataPinPurpose, RefStoreError};
-use super::snapshot_contract::{MAX_RECEIPT_BODY_BYTES, MetadataSnapshotScope};
+use super::pack_commit::PackMode;
+use super::snapshot_contract::{MAX_RECEIPT_BODY_BYTES, MAX_SNAPSHOT_PACKS, MetadataSnapshotScope};
 use super::snapshot_receipt::{MetadataPinReceipt, MetadataReceipt, MetadataSnapshotReceipt};
 use super::snapshot_request::PinReleaseReason;
 use super::types::GitObjectFormat;
@@ -61,9 +62,66 @@ pub(super) struct SnapshotHeader {
     pub ref_count: i64,
     pub refs_digest: String,
     pub logical_bytes: i64,
+    /// A5 additive pack membership summary. A metadata-only header always has
+    /// `PackMode::MetadataOnly`, zero packs and no digests (the migration-143
+    /// table check enforces the same shape); a pack-aware header always has
+    /// `PackVerified`, 1..=16 packs and both 64-hex digests.
+    pub pack_mode: PackMode,
+    pub pack_count: i64,
+    pub membership_digest: Option<String>,
+    pub snapshot_digest: Option<String>,
 }
 
 impl SnapshotHeader {
+    pub(super) fn is_pack_verified(&self) -> bool {
+        self.pack_mode == PackMode::PackVerified
+    }
+
+    /// The trusted *historical* scope of this stored snapshot. A pack snapshot
+    /// is read under the stored epochs/format/history/owner, never under a
+    /// fresh caller-supplied realm; the current gate is then compared with it
+    /// by `snapshot_sql::lock_scope(require_unserved = true)`.
+    pub(super) fn stored_scope(&self) -> Result<MetadataSnapshotScope, RefStoreError> {
+        MetadataSnapshotScope::new(
+            self.repository_id,
+            self.tenant_id,
+            self.owner_id,
+            self.purpose,
+            self.object_format,
+            self.history_incarnation,
+            self.authority_epoch,
+            self.group_epoch,
+        )
+    }
+
+    /// A pack read handle names only repository/tenant; the header supplies the
+    /// historical owner/purpose/format/history/epochs. A foreign repository or
+    /// tenant can therefore never be answered with this header.
+    pub(super) fn ensure_read_identity(&self, repository_id: Uuid, tenant_id: Uuid) -> Result<(), RefStoreError> {
+        if self.repository_id != repository_id || self.tenant_id != tenant_id {
+            return Err(RefStoreError::MetadataScopeMismatch("snapshot repository/tenant"));
+        }
+        Ok(())
+    }
+
+    /// Require a complete pack-aware header. A metadata-only header is a typed
+    /// refusal: it has no registered membership to return, and an empty pack set
+    /// would be a false claim.
+    pub(super) fn ensure_pack_verified(&self) -> Result<(), RefStoreError> {
+        if !self.is_pack_verified() {
+            return Err(RefStoreError::Unsupported("metadata-only snapshot has no registered pack membership to read"));
+        }
+        if self.pack_count < 1 || self.pack_count > MAX_SNAPSHOT_PACKS as i64 {
+            return Err(RefStoreError::Database("stored pack snapshot pack_count is outside 1..=16".into()));
+        }
+        if self.membership_digest.is_none() || self.snapshot_digest.is_none() {
+            return Err(RefStoreError::Database(
+                "stored pack snapshot header is missing its membership/snapshot digest".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// A stored snapshot row must match the full requested scope. A later refs
     /// revision is fine (rows are immutable); a different
     /// tenant/owner/purpose/format/history/authority/group is not.
@@ -339,6 +397,29 @@ pub(super) fn ensure_receipt_snapshot(receipt: &MetadataReceipt, header: &Snapsh
     {
         return Err(RefStoreError::MetadataScopeMismatch("stored receipt snapshot summary"));
     }
+    // A5: the additive pack summary must match the stored header exactly. A
+    // metadata-only header accepts only an old body (all four fields absent); a
+    // pack-aware header requires all four to be present and equal, so a body can
+    // neither manufacture pack membership nor strip it.
+    if let MetadataReceipt::Snapshot(snapshot) = receipt {
+        let pack_matches = match header.pack_mode {
+            PackMode::MetadataOnly => {
+                snapshot.pack_mode().is_none()
+                    && snapshot.pack_count().is_none()
+                    && snapshot.membership_digest_hex().is_none()
+                    && snapshot.snapshot_digest_hex().is_none()
+            }
+            PackMode::PackVerified => {
+                snapshot.pack_mode() == Some(super::snapshot_receipt::PACK_MODE_VERIFIED)
+                    && snapshot.pack_count() == Some(header.pack_count)
+                    && snapshot.membership_digest_hex() == header.membership_digest.as_deref()
+                    && snapshot.snapshot_digest_hex() == header.snapshot_digest.as_deref()
+            }
+        };
+        if !pack_matches {
+            return Err(RefStoreError::MetadataScopeMismatch("stored receipt pack membership"));
+        }
+    }
     Ok(())
 }
 
@@ -430,6 +511,7 @@ mod tests {
             refs_digest: "b".repeat(64),
             logical_bytes: 1,
             expires_at_unix_micros: 1,
+            pack: None,
         });
         let body = encode_receipt(&MetadataReceipt::Snapshot(snapshot)).unwrap();
         assert!(matches!(decode_receipt(MetadataMutationAction::Create, &body).unwrap(), MetadataReceipt::Snapshot(_)));

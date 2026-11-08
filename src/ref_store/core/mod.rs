@@ -29,6 +29,8 @@ pub mod command;
 pub mod contract;
 /// A4a durable pack registration + verified commit foundation (unserved).
 pub mod pack_commit;
+/// A5a complete registered-pack-membership snapshot + durable pin (unserved).
+pub mod pack_snapshot;
 pub mod pg;
 pub mod sql;
 pub mod terminal;
@@ -46,12 +48,16 @@ pub mod snapshot_receipt;
 
 pub use command::CommitRefsRequest;
 pub use contract::{CommitMode, CoreGate, CoreGateInit, CoreGateVersion, VersionCheck};
+pub use pack_snapshot::{
+    CreatePackSnapshotRequest, PackPinReceipt, PackReadSnapshot, PackSnapshotExpectation, PackSnapshotLookup,
+    PackSnapshotOutcome, PackSnapshotReceipt, PackSnapshotReceiptQuery, PackSnapshotRef, PgPackSnapshot,
+};
 pub use pg::PgRefStoreCore;
 pub use snapshot_contract::{
-    MAX_PIN_LEASE_SECONDS, MAX_RECEIPT_BODY_BYTES, MAX_SNAPSHOT_LOGICAL_BYTES, MAX_SNAPSHOT_PAGE, MAX_SNAPSHOT_REFS,
-    MetadataSnapshotCursor, MetadataSnapshotScope, PackMembershipDescriptor, REPO_MAX_LOGICAL_BYTES, REPO_MAX_RECEIPTS,
-    REPO_MAX_SNAPSHOT_REFS, REPO_MAX_SNAPSHOTS, RefPrefix, TENANT_MAX_LOGICAL_BYTES, TENANT_MAX_RECEIPTS,
-    TENANT_MAX_SNAPSHOT_REFS, TENANT_MAX_SNAPSHOTS,
+    MAX_PIN_LEASE_SECONDS, MAX_RECEIPT_BODY_BYTES, MAX_SNAPSHOT_LOGICAL_BYTES, MAX_SNAPSHOT_PACKS, MAX_SNAPSHOT_PAGE,
+    MAX_SNAPSHOT_REFS, MetadataSnapshotCursor, MetadataSnapshotScope, PackMembershipDescriptor, REPO_MAX_LOGICAL_BYTES,
+    REPO_MAX_RECEIPTS, REPO_MAX_SNAPSHOT_REFS, REPO_MAX_SNAPSHOTS, RefPrefix, TENANT_MAX_LOGICAL_BYTES,
+    TENANT_MAX_RECEIPTS, TENANT_MAX_SNAPSHOT_REFS, TENANT_MAX_SNAPSHOTS,
 };
 pub use snapshot_receipt::{
     CreateMetadataSnapshotOutcome, MetadataPinOutcome, MetadataPinReceipt, MetadataReceipt, MetadataReceiptLookup,

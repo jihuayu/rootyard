@@ -111,6 +111,19 @@ pub struct MetadataSnapshotReceipt {
     refs_digest: String,
     logical_bytes: i64,
     expires_at_unix_micros: i64,
+    /// A5 additive pack membership summary. All four are `None` for a
+    /// metadata-only (A2) snapshot, are skipped in the canonical JSON when
+    /// `None`, and decode as `None` for an old A2 body, so an old receipt stays
+    /// byte-identical and replay-exact. A pack snapshot sets all four together
+    /// and they must equal the stored header exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack_count: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    membership_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_digest: Option<String>,
 }
 
 /// Construction fields for a creation receipt (locked gate/ref rows -> typed
@@ -129,6 +142,16 @@ pub(super) struct SnapshotReceiptParts {
     pub refs_digest: String,
     pub logical_bytes: i64,
     pub expires_at_unix_micros: i64,
+    /// `Some` only for an A5 pack-aware snapshot (always `pack_verified`).
+    pub pack: Option<PackReceiptFields>,
+}
+
+/// The additive pack fields of a pack-aware creation receipt. Every value is
+/// copied from the immutable snapshot header it was captured with.
+pub(super) struct PackReceiptFields {
+    pub pack_count: i64,
+    pub membership_digest: String,
+    pub snapshot_digest: String,
 }
 
 impl MetadataSnapshotReceipt {
@@ -154,6 +177,10 @@ impl MetadataSnapshotReceipt {
             refs_digest: parts.refs_digest,
             logical_bytes: parts.logical_bytes,
             expires_at_unix_micros: parts.expires_at_unix_micros,
+            pack_mode: parts.pack.as_ref().map(|_| PACK_MODE_VERIFIED.to_owned()),
+            pack_count: parts.pack.as_ref().map(|pack| i32::try_from(pack.pack_count).unwrap_or(i32::MAX)),
+            membership_digest: parts.pack.as_ref().map(|pack| pack.membership_digest.clone()),
+            snapshot_digest: parts.pack.as_ref().map(|pack| pack.snapshot_digest.clone()),
         }
     }
 
@@ -226,7 +253,23 @@ impl MetadataSnapshotReceipt {
     pub fn complete_git_read_snapshot(&self) -> bool {
         false
     }
+    /// Stored pack mode exactly as captured: `None` for a metadata-only row.
+    pub fn pack_mode(&self) -> Option<&str> {
+        self.pack_mode.as_deref()
+    }
+    pub fn pack_count(&self) -> Option<i64> {
+        self.pack_count.map(i64::from)
+    }
+    pub fn membership_digest_hex(&self) -> Option<&str> {
+        self.membership_digest.as_deref()
+    }
+    pub fn snapshot_digest_hex(&self) -> Option<&str> {
+        self.snapshot_digest.as_deref()
+    }
 }
+
+/// The only pack mode a pack-aware snapshot receipt may carry.
+pub(super) const PACK_MODE_VERIFIED: &str = "pack_verified";
 
 /// Immutable renew/release receipt from the shared mutation ledger.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -494,6 +537,7 @@ mod tests {
             refs_digest: "c".repeat(64),
             logical_bytes: 512,
             expires_at_unix_micros: 1_700_000_000_000_000,
+            pack: None,
         });
         let body = serde_json::to_string(&receipt).unwrap();
         assert_eq!(serde_json::from_str::<MetadataSnapshotReceipt>(&body).unwrap(), receipt);

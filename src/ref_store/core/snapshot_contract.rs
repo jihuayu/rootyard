@@ -16,6 +16,9 @@ use uuid::Uuid;
 
 /// Hard maximum refs copied into one immutable snapshot.
 pub const MAX_SNAPSHOT_REFS: usize = 4096;
+/// Hard maximum registered pack memberships bound into one snapshot (A5).
+pub const MAX_SNAPSHOT_PACKS: usize = 16;
+
 /// Hard maximum page size; a page always fetches `limit + 1` rows.
 pub const MAX_SNAPSHOT_PAGE: u32 = 256;
 /// Hard maximum lease a caller may request (one hour).

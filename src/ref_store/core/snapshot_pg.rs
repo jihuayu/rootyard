@@ -23,6 +23,8 @@
 use super::super::contract::{MetadataMutationAction, RefStoreError, RequestDigest};
 use super::super::pg;
 use super::super::tx::{begin_bounded, commit_bounded};
+use super::pack_commit::PackMode;
+use super::pack_snapshot;
 use super::pg::PgRefStoreCore;
 use super::pin;
 use super::snapshot_contract::{
@@ -64,7 +66,7 @@ pub(super) fn metadata_commit_result(
 /// deliberately never compared with the current refs revision, pin generation
 /// or expiry: a legitimate renewal/release advances the pin, and an old receipt
 /// must remain the exact old receipt.
-async fn validate_stored_receipt(
+pub(super) async fn validate_stored_receipt(
     tx: &Transaction<'_>,
     stored: &snapshot_sql::StoredReceipt,
     scope: &MetadataSnapshotScope,
@@ -129,6 +131,7 @@ impl PgRefStoreCore {
     ) -> Result<CreateMetadataSnapshotOutcome, RefStoreError> {
         request.validate()?;
         let tx = begin_bounded(client, deadline).await?;
+        snapshot_sql::durable_write(&tx, deadline).await?;
         let result = self.create_snapshot_in_tx(&tx, request, deadline).await;
         match result {
             Ok(outcome) => {
@@ -174,12 +177,57 @@ impl PgRefStoreCore {
                 .ok_or_else(|| RefStoreError::Database("create request id resolved to a non-create receipt".into()))?;
             return Ok(CreateMetadataSnapshotOutcome { replayed: true, receipt: receipt.clone() });
         }
+        // A5 reservation: a request id that already names a permanent pack
+        // operation is resolved from the retained ledger. Exact historical data
+        // replays with no new live lease and no write; any other scope/action/
+        // digest is a typed conflict before any quota or admission work.
+        let request_digest = request.digest().as_hex();
+        if let Some(reservation) = pack_snapshot::sql::reserved_history(
+            tx,
+            &pack_snapshot::sql::ReservationLookup {
+                request_id: request.request_id(),
+                scope,
+                kind: pack_snapshot::sql::HISTORY_CREATED,
+                snapshot_id: Some(request.snapshot_id()),
+                pin_id: request.pin_id(),
+                request_digest: &request_digest,
+            },
+        )
+        .await?
+        {
+            let receipt = reservation
+                .receipt
+                .as_snapshot()
+                .ok_or_else(|| RefStoreError::Database("reserved create request id is not a create receipt".into()))?
+                .clone();
+            return Ok(CreateMetadataSnapshotOutcome { replayed: true, receipt });
+        }
+        // (1b) Retained A5 create identity: a snapshot id or pin id that already
+        // owns a permanent pack `created` row is never reusable by a fresh
+        // metadata-only create under another request id, even after the A2 rows
+        // were cascaded away with a deleted repository. Historical A2-only ids
+        // stay an unprotected frozen namespace: only A5 created rows are checked,
+        // so no permanence is newly claimed for them.
+        if pack_snapshot::sql::retained_create_identity(tx, request.snapshot_id(), request.pin_id()).await?.is_some() {
+            return Err(RefStoreError::IdentityConflict);
+        }
         let (tenant_usage, repository_usage) =
             snapshot_usage::lock_usage(tx, scope.tenant_id(), scope.repository_id()).await?;
 
         // Gate `FOR UPDATE` serializes capture with `CommitRefs`, so refs, HEAD
         // and the gate revision/digest are one revision.
         let gate = snapshot_sql::lock_scope(tx, scope, true, true).await?;
+        // Persistent mode fence. An exact historical receipt already replayed
+        // above, so an old A2 create receipt still replays as itself; but a
+        // *fresh* metadata-only snapshot must never acknowledge a pack_verified
+        // gate, because it would publish a refs/HEAD page whose pack membership is
+        // `unavailable` for a repository whose object bytes are pack-verified.
+        // This is a typed refusal with zero writes and zero charges.
+        if snapshot_sql::gate_pack_mode(tx, scope.repository_id()).await? != PackMode::MetadataOnly {
+            return Err(RefStoreError::Unsupported(
+                "fresh metadata-only snapshot create is refused on a pack_verified gate; use the pack snapshot API",
+            ));
+        }
         if gate.digest() != request.expected_gate_digest() {
             return Err(RefStoreError::MetadataGateVersionMismatch);
         }
@@ -209,6 +257,7 @@ impl PgRefStoreCore {
             ref_count: refs.len() as i64,
             refs_digest: &refs_digest_hex,
             logical_bytes: snapshot_bytes,
+            pack: None,
         };
         snapshot_sql::insert_snapshot(tx, &insert).await?;
         snapshot_sql::insert_snapshot_refs(tx, request.snapshot_id(), &refs).await?;
@@ -237,6 +286,9 @@ impl PgRefStoreCore {
             refs_digest: refs_digest_hex,
             logical_bytes: snapshot_bytes,
             expires_at_unix_micros,
+            // A2 fresh writes are metadata-only: no pack row, no pack fields in
+            // the canonical body (an old body stays byte-identical).
+            pack: None,
         }));
         let body = pin::encode_receipt(&receipt)?;
         snapshot_sql::insert_receipt(

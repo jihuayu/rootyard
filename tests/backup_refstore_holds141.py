@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Current-format18/schema142 backup roundtrip of populated artifact holds.
+"""Current-format19/schema143 backup roundtrip of populated artifact holds.
 
 This is the #107/#105 A3 drill. It subclasses the inherited
 ``tests/backup_refstore_core139.py`` seven-case harness, so the seven real
@@ -22,12 +22,14 @@ IO, raw upload or read-back is attempted; restored Blob bytes are not qualified
 and no physical backup/protection closure is claimed. The dump is inspected to
 show the dynamic schema-141 tables are present; the restored rows are compared
 globally and exactly, including all 64 fixed shard rows and monotone quota
-counters. The current archive is format18/schema142, so the drill also derives
+counters. The current archive is format19/schema143, so the drill also derives
 the six new schema142 pack-ledger tables from the generated 142-vs-141
 catalogs, proves the dynamic dump carries no silent table exclusion, and
 requires those tables to stay empty with the gate at the default
-``metadata_only`` mode: this A3 fixture fabricates no pack registration,
-membership or pack-verified transition and copies no Blob pack bytes. No
+``metadata_only`` mode.  The four schema143 A5 pack-snapshot tables derived from
+the generated 143-vs-142 catalogs must also restore empty, every old A2 snapshot
+must keep the default metadata-only shape, and no pack pin or history row is
+fabricated.  This A3 fixture copies no Blob pack bytes. No
 DSN/token is written to the public report.
 """
 import argparse
@@ -39,7 +41,7 @@ import sys
 import uuid
 
 from backup_refstore_core139 import BackupRefStoreCore139Harness, uuid_literal
-from schema_baseline import CURRENT_BACKUP_FORMAT, SCHEMA_VERSIONS
+from schema_baseline import A5_PACK_SNAPSHOT_TABLES, CURRENT_BACKUP_FORMAT, SCHEMA_VERSIONS
 
 NEW_TABLES = (
     "artifact_hold_requests",
@@ -472,13 +474,21 @@ class BackupRefStoreHolds141Harness(BackupRefStoreCore139Harness):
             assert self.sql(
                 'SELECT count(*) FROM public."' + table + '"') == "0", (
                     "A3 fixture fabricated a schema142 pack row in " + table)
+        for table in A5_PACK_SNAPSHOT_TABLES:
+            assert ("TABLE DATA public " + table in listing) or (
+                'TABLE DATA public "' + table + '"' in listing), (
+                "parent snapshot dump silently excluded schema143 table " + table)
+            assert self.sql(
+                'SELECT count(*) FROM public."' + table + '"') == "0", (
+                    "A3 fixture fabricated an A5 snapshot-pack row in " + table)
         gate_modes = self.sql(
             "SELECT string_agg(DISTINCT pack_mode, ',' ORDER BY pack_mode) "
             "FROM ref_store_core_gates")
         assert gate_modes == "metadata_only", gate_modes
         result.update({"backup_format": manifest["format"],
                        "schema141_retained_in_current_schema": SCHEMA_VERSIONS[-1] >= 141,
-                       "schema142_is_current": SCHEMA_VERSIONS[-1] == 142,
+                       "schema142_is_current_base": SCHEMA_VERSIONS[-1] >= 142,
+                       "schema143_pack_snapshot_tables": list(A5_PACK_SNAPSHOT_TABLES),
                        "schema142_pack_ledger_tables": pack_tables,
                        "schema142_pack_tables_empty_and_not_fabricated": True,
                        "gate_pack_mode_default_metadata_only": True,
@@ -508,7 +518,18 @@ class BackupRefStoreHolds141Harness(BackupRefStoreCore139Harness):
                     "restore fabricated a schema142 pack row in " + table)
         assert gate["pack_mode"] == "metadata_only", gate
         assert self.sql("SELECT max(version) FROM schema_migrations") == str(SCHEMA_VERSIONS[-1])
-        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version BETWEEN 138 AND 142") == "5"
+        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version BETWEEN 138 AND " +
+                        str(SCHEMA_VERSIONS[-1])) == str(
+                            len([v for v in SCHEMA_VERSIONS if v >= 138]))
+        for table in A5_PACK_SNAPSHOT_TABLES:
+            assert self.sql(
+                'SELECT count(*) FROM public."' + table + '"') == "0", (
+                    "restore fabricated an A5 snapshot-pack row in " + table)
+        assert self.sql(
+            "SELECT count(*) FROM ref_store_core_snapshots WHERE "
+            "pack_mode<>'metadata_only' OR pack_count<>0 OR "
+            "membership_digest IS NOT NULL OR snapshot_digest IS NOT NULL OR "
+            "pack_membership_state<>'unavailable'") == "0"
         assert self.sql("SELECT count(*) FROM pg_trigger WHERE tgname LIKE "
                         "'ref_store_core_pack_%' AND tgenabled <> 'O'") == "0", (
                             "a migration-142 guard was disabled")

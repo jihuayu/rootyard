@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Current-format18/schema142 backup roundtrip of a populated A4a pack ledger.
+"""Current-format19/schema143 backup roundtrip of a populated A4a pack ledger.
 
 This is the #107 A4a drill. It subclasses the inherited
 ``tests/backup_refstore_core139.py`` seven-case harness, so the seven real
@@ -28,7 +28,12 @@ charges no quota and needs no source-only tempfiles; the external S3 originals
 are re-read and hashed. This drill compares every schema142 table plus the
 complete old migration-141 hold ledger and the pack repository's 139 rows
 globally and scoped, checks actual dump table inclusion and requires the
-``pack_verified`` gate to be retained.
+``pack_verified`` gate to be retained.  The older A4 fixture keeps its six
+schema142 tables nonempty across migration143; the four new schema143 A5
+snapshot-pack binding/history/permanent-usage tables are derived from the
+generated 143-vs-142 catalogs and must stay empty, with every old A2 snapshot
+defaulted to metadata-only/unavailable.  No pack snapshot, pin or history row is
+fabricated and no complete Git-read snapshot is claimed.
 
 No Blob byte backup is claimed: the S3 originals are external, unchanged and
 never deleted. No DSN/token/credential is written to the report.
@@ -50,7 +55,7 @@ from backup_refstore_holds141 import (
     schema142_pack_tables,
     sha256_file,
 )
-from schema_baseline import CURRENT_BACKUP_FORMAT, SCHEMA_VERSIONS
+from schema_baseline import A5_PACK_SNAPSHOT_TABLES, CURRENT_BACKUP_FORMAT, SCHEMA_VERSIONS
 
 MARKER = "ROOTYARD-REF-STORE-PACKS-FIXTURE-METADATA"
 FIXTURE_KIND = "rootyard/ref-store-core-packs-backup-fixture"
@@ -564,9 +569,16 @@ class BackupRefStorePacks142Harness(BackupRefStoreCore139Harness):
         result = super().lock_and_snapshot()
         manifest = json.loads((self.backup / "manifest.json").read_text())
         assert manifest["format"] == CURRENT_BACKUP_FORMAT, "drill did not produce the current backup format"
-        assert CURRENT_BACKUP_FORMAT == 18, "the current backup format is not the expected 18"
         assert manifest["schema_versions"] == SCHEMA_VERSIONS, "the archive schema versions differ"
-        assert SCHEMA_VERSIONS[-1] == 142, "the current schema is not 142"
+        assert SCHEMA_VERSIONS[-1] >= 142, "the current schema predates the A4 pack ledger"
+        for table in A5_PACK_SNAPSHOT_TABLES:
+            assert self.sql('SELECT count(*) FROM public."' + table + '"') == "0", (
+                "the A4 fixture fabricated an A5 snapshot-pack row in " + table)
+        assert self.sql(
+            "SELECT count(*) FROM ref_store_core_snapshots WHERE "
+            "pack_mode<>'metadata_only' OR pack_count<>0 OR "
+            "membership_digest IS NOT NULL OR snapshot_digest IS NOT NULL OR "
+            "pack_membership_state<>'unavailable'") == "0"
         assert "metadata.dump" in manifest["files"], "the parent snapshot has no metadata dump"
         listing = self.run(["pg_restore", "--list", str(self.backup / "metadata.dump")]).stdout.decode()
         for table in self.pack_tables() + list(HOLD_TABLES):
@@ -582,7 +594,8 @@ class BackupRefStorePacks142Harness(BackupRefStoreCore139Harness):
         assert self.sql("SELECT count(*) FROM ref_store_core_gates WHERE pack_mode='pack_verified'") == "1", (
             "the snapshot does not carry exactly one activated pack gate")
         result.update({"backup_format": manifest["format"],
-                       "schema142_is_current": SCHEMA_VERSIONS[-1] == 142,
+                       "schema142_is_current_base": SCHEMA_VERSIONS[-1] >= 142,
+                       "schema143_pack_snapshot_tables": list(A5_PACK_SNAPSHOT_TABLES),
                        "schema142_pack_ledger_tables": self.pack_tables(),
                        "schema142_pack_ledger_nonempty": True,
                        "schema141_hold_ledger_complete": {table: len(rows) for table, rows in self.source_hold_rows.items()},
@@ -611,8 +624,13 @@ class BackupRefStorePacks142Harness(BackupRefStoreCore139Harness):
         gate = self.pack_gate_row()
         assert gate["pack_mode"] == "pack_verified", "the restored gate lost pack_verified mode"
         assert gate["revision"] == marker["gate"]["committed"]["revision"] == 2
-        assert self.sql("SELECT max(version) FROM schema_migrations") == "142"
-        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version BETWEEN 138 AND 142") == "5"
+        assert self.sql("SELECT max(version) FROM schema_migrations") == str(SCHEMA_VERSIONS[-1])
+        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version BETWEEN 138 AND " +
+                        str(SCHEMA_VERSIONS[-1])) == str(
+                            len([v for v in SCHEMA_VERSIONS if v >= 138]))
+        for table in A5_PACK_SNAPSHOT_TABLES:
+            assert self.sql('SELECT count(*) FROM public."' + table + '"') == "0", (
+                "restore fabricated an A5 snapshot-pack row in " + table)
         triggers = int(self.sql("SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'ref_store_core_pack%'"))
         assert triggers >= 14, "the migration-142 ledger/fence guards are missing"
         assert self.sql("SELECT count(*) FROM pg_trigger WHERE tgname='ref_store_core_gate_pack_mode_fence'") == "1", (

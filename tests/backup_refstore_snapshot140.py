@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Current-format backup roundtrip of **populated** schema140 RefStore metadata.
 
-The archive is current format18/schema142.  The six schema140 tables remain the
+The archive is current format19/schema143.  The six schema140 tables remain the
 only new rows this A2 fixture populates; it makes no claim about the schema141
 global artifact-hold ledger or the schema142 pack-registration/membership
 ledger and is not a hold-row, pack-row or Blob-byte backup drill.  The dynamic
 dump is still inspected for every A4 pack table derived from the generated
-142-vs-141 catalogs, and those tables must restore empty with the gate at the
-default ``metadata_only`` mode.
+142-vs-141 catalogs and for the A5 pack-snapshot tables derived from the
+generated 143-vs-142 catalogs; both sets must restore empty, the old snapshots
+keep the default ``metadata_only``/``unavailable`` shape, and the gate stays at
+the default ``metadata_only`` mode.
 
 This is the acceptance drill for #107-A2.  It subclasses the inherited
 ``tests/backup_refstore_core139.py`` harness, so its seven cases are exactly the
@@ -70,7 +72,7 @@ import sys
 import uuid
 
 from backup_refstore_core139 import BackupRefStoreCore139Harness, uuid_literal
-from schema_baseline import CURRENT_BACKUP_FORMAT, SCHEMA_VERSIONS
+from schema_baseline import A5_PACK_SNAPSHOT_TABLES, CURRENT_BACKUP_FORMAT, SCHEMA_VERSIONS
 
 #: The six tables migration 140 adds.  Every one of them must be non-empty.
 NEW_TABLES = (
@@ -511,11 +513,24 @@ class BackupRefStoreSnapshot140Harness(BackupRefStoreCore139Harness):
         assert self.sql(
             "SELECT string_agg(DISTINCT pack_mode, ',' ORDER BY pack_mode) "
             "FROM ref_store_core_gates") == "metadata_only"
+        for table in A5_PACK_SNAPSHOT_TABLES:
+            assert ("TABLE DATA public " + table in listing) or (
+                'TABLE DATA public "' + table + '"' in listing), (
+                "parent snapshot dump silently excluded schema143 table " + table)
+            assert self.sql(
+                'SELECT count(*) FROM public."' + table + '"') == "0", (
+                    "A2 fixture fabricated an A5 snapshot-pack row in " + table)
+        assert self.sql(
+            "SELECT count(*) FROM ref_store_core_snapshots WHERE "
+            "pack_mode<>'metadata_only' OR pack_count<>0 OR "
+            "membership_digest IS NOT NULL OR snapshot_digest IS NOT NULL OR "
+            "pack_membership_state<>'unavailable'") == "0"
         result.update({"backup_format": manifest["format"],
+                       "schema143_pack_snapshot_tables": list(A5_PACK_SNAPSHOT_TABLES),
                        "schema142_pack_ledger_tables": pack_tables,
                        "schema142_pack_tables_empty_and_not_fabricated": True,
                        "gate_pack_mode_default_metadata_only": True,
-                       "archive_contains_schema_versions": SCHEMA_VERSIONS[-5:]})
+                       "archive_contains_schema_versions": SCHEMA_VERSIONS[-6:]})
         return result
 
     # ------------------------------------------------------------- restore 140
@@ -540,11 +555,18 @@ class BackupRefStoreSnapshot140Harness(BackupRefStoreCore139Harness):
         assert restored_gate["history_incarnation"] == self.snapshot_marker["scope"]["history_incarnation"]
         assert self.core_rows() == self.source_core_rows, "restored migration-139 rows differ"
         assert self.sql("SELECT max(version) FROM schema_migrations") == str(SCHEMA_VERSIONS[-1])
-        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version BETWEEN 138 AND 142") == "5"
-        for table in schema142_pack_tables():
+        assert self.sql("SELECT count(*) FROM schema_migrations WHERE version BETWEEN 138 AND " +
+                        str(SCHEMA_VERSIONS[-1])) == str(
+                            len([v for v in SCHEMA_VERSIONS if v >= 138]))
+        for table in schema142_pack_tables() + list(A5_PACK_SNAPSHOT_TABLES):
             assert self.sql(
                 'SELECT count(*) FROM public."' + table + '"') == "0", (
-                    "restore fabricated a schema142 pack row in " + table)
+                    "restore fabricated a pack/snapshot row in " + table)
+        assert self.sql(
+            "SELECT count(*) FROM ref_store_core_snapshots WHERE "
+            "pack_mode<>'metadata_only' OR pack_count<>0 OR "
+            "membership_digest IS NOT NULL OR snapshot_digest IS NOT NULL OR "
+            "pack_membership_state<>'unavailable'") == "0"
         assert restored_gate["pack_mode"] == "metadata_only", restored_gate
         restored_repo = self.core_repository_row()
         assert restored_repo == self.source_core_repo

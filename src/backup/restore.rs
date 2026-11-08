@@ -19,7 +19,7 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
     ensure!(expected.len() == 64 && hash(&source.join("manifest.json"))? == expected, "incomplete or damaged manifest");
     let manifest: Manifest = serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
     ensure!(
-        matches!(manifest.format, 4..=18)
+        matches!(manifest.format, 4..=19)
             && manifest.schema_versions == schema_versions(manifest.format)?
             && manifest.schema_contract_sha256 == schema_contract_digest(manifest.format)?,
         "unsupported backup format"
@@ -100,6 +100,7 @@ pub async fn restore(
     allow_legacy_schema139: bool,
     allow_legacy_schema140: bool,
     allow_legacy_schema141: bool,
+    allow_legacy_schema142: bool,
 ) -> Result<()> {
     let started = Instant::now();
     let source = absolute(source, true)?;
@@ -120,6 +121,7 @@ pub async fn restore(
             + u8::from(allow_legacy_schema139)
             + u8::from(allow_legacy_schema140)
             + u8::from(allow_legacy_schema141)
+            + u8::from(allow_legacy_schema142)
             <= 1,
         "choose one explicit legacy schema upgrade"
     );
@@ -136,6 +138,7 @@ pub async fn restore(
     ensure!(!allow_legacy_schema139 || manifest.format == 15, "legacy opt-in requires format15/schema139");
     ensure!(!allow_legacy_schema140 || manifest.format == 16, "legacy opt-in requires format16/schema140");
     ensure!(!allow_legacy_schema141 || manifest.format == 17, "legacy opt-in requires format17/schema141");
+    ensure!(!allow_legacy_schema142 || manifest.format == 18, "legacy opt-in requires format18/schema142");
     ensure!(
         (allow_legacy_schema007 && manifest.format == 4)
             || (allow_legacy_schema130 && manifest.format == 6)
@@ -150,6 +153,7 @@ pub async fn restore(
             || (allow_legacy_schema139 && manifest.format == 15)
             || (allow_legacy_schema140 && manifest.format == 16)
             || (allow_legacy_schema141 && manifest.format == 17)
+            || (allow_legacy_schema142 && manifest.format == 18)
             || manifest.binary_sha256 == hash(&std::env::current_exe()?)?,
         "restore requires the exact backup binary; upgrade separately"
     );
@@ -175,6 +179,19 @@ pub async fn restore(
                 && manifest.schema_versions == schema_versions(17)?
                 && manifest.schema_contract_sha256 == schema_contract_digest(17)?,
             "legacy opt-in requires the exact format17/schema141 catalog"
+        );
+    }
+    // The schema142 opt-in may only ever consume a genuine frozen format18
+    // archive produced by the retained A4 producer. Re-check the complete
+    // source contract here, before migration 143 can add the A5 pack-snapshot
+    // binding/history/permanent-usage ledger. A relabelled or mixed archive is
+    // refused by verify() and by this exact frozen-catalog comparison.
+    if allow_legacy_schema142 {
+        ensure!(
+            manifest.format == 18
+                && manifest.schema_versions == schema_versions(18)?
+                && manifest.schema_contract_sha256 == schema_contract_digest(18)?,
+            "legacy opt-in requires the exact format18/schema142 catalog"
         );
     }
     let mut client = pg(config).await?;
@@ -228,7 +245,7 @@ pub async fn restore(
     // The catalog projection ends with SET search_path=pg_catalog. Restore the
     // target's public application schema before applying the reviewed upgrade.
     client.batch_execute("SET search_path=public").await?;
-    // Formats 6 through 17 are frozen at schema 130 through 141. Preserve them
+    // Formats 6 through 18 are frozen at schema 130 through 142. Preserve them
     // for old archives and apply the reviewed Rust migration path only after the
     // exact frozen catalog and version list have been verified from the restored
     // dump. Those formats always need their explicit legacy opt-in, so no
@@ -236,9 +253,10 @@ pub async fn restore(
     // migrations (including schema135 metrics index, schema136 token scopes and the
     // schema137 terminal-admission projection guard, the schema138 RefStore
     // operation registry, the schema139 RefStore core, the schema140 metadata
-    // snapshot/pin contract, the schema141 global artifact-hold ledger and the
-    // schema142 durable pack-registration/membership foundation).
-    if matches!(manifest.format, 6..=17) {
+    // snapshot/pin contract, the schema141 global artifact-hold ledger, the
+    // schema142 durable pack-registration/membership foundation and the
+    // schema143 added pack-snapshot binding/history/permanent-usage ledger).
+    if matches!(manifest.format, 6..=18) {
         let mut upgraded = client;
         crate::db::migrate_client(&mut upgraded).await?;
         ensure!(

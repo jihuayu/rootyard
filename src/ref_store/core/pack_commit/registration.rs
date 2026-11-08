@@ -6,6 +6,7 @@
 //! `LedgerIntegrity`/`RegistrationConflict` refusal and **never** "found".
 //! Nothing here grants authority, opens a nested transaction or performs IO.
 use super::artifact::RegisteredPack;
+use super::context::PackMembershipEntry;
 use super::contract::{MAX_ACTIVE_MEMBERSHIPS, PackArtifactRole};
 use super::error::{PackCommitError, PackCommitRejectCode, PackCommitRejection};
 use super::plan::PackCommitScope;
@@ -343,6 +344,163 @@ pub(super) async fn old_memberships(
                 Some(joined_revision),
             )
             .map_err(|_| integrity("old membership registered pack is inconsistent"))?,
+        );
+    }
+    Ok(packs)
+}
+
+/// Read-only export of one fully validated stored registration for a historical
+/// (already durable) consumer. Data only: it is not a receipt, a grant, an
+/// upload intent, a `BlobReceipt` or a proof, and it carries no live authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredRegistrationView {
+    /// Full registered pack: pack id, registration id, exact artifact-set digest
+    /// and both complete read-only artifact identities.
+    pub pack: RegisteredPack,
+    /// Gate revision the publication was captured at. An active membership of
+    /// this registration can only have joined at exactly `+1`.
+    pub publication_gate_revision: i64,
+    /// Gate digest captured by the same verified commit.
+    pub publication_gate_digest: String,
+}
+
+/// Read one durable registration through the same full validation as every
+/// other A4 path (`by_registration_id`: outer row, ACK body, both artifact rows,
+/// A3 acquire batch and both A3 consume receipts). A missing row is `None`; a
+/// partial/rewritten/A3-inconsistent row is `LedgerIntegrity`, never `Found`.
+///
+/// This is the *only* registration reader a historical consumer should call: it
+/// adds no second SQL projection of the publication/artifact/ledger rows.
+pub async fn read_registered_pack(
+    tx: &Transaction<'_>,
+    scope: &PackCommitScope,
+    registration_id: Uuid,
+    pack_id: Uuid,
+    deadline: Instant,
+) -> Result<Option<StoredRegistrationView>, PackCommitError> {
+    crate::ref_store::pg::bound(tx, deadline).await?;
+    let Some(stored) = by_registration_id(tx, scope, registration_id, deadline).await? else { return Ok(None) };
+    if stored.pack.pack_id() != pack_id {
+        return Err(conflict("stored registration belongs to another pack id"));
+    }
+    Ok(Some(StoredRegistrationView {
+        pack: stored.pack,
+        publication_gate_revision: stored.ack.gate_revision,
+        publication_gate_digest: stored.ack.gate_digest.clone(),
+    }))
+}
+
+/// The complete current active membership set of one gate-locked repository,
+/// read through [`old_memberships`] (full publication/ACK/artifact/A3-ledger
+/// validation, stored publisher owner, `joined_revision` rules).
+///
+/// Read-only: no lock is taken here beyond what the caller already holds, no
+/// grant/consume/proof is minted and nothing is written. A consumer that holds
+/// the gate `FOR UPDATE` gets exactly the membership of that one revision.
+pub async fn read_membership_set(
+    tx: &Transaction<'_>,
+    gate: &CoreGate,
+    deadline: Instant,
+) -> Result<Vec<RegisteredPack>, PackCommitError> {
+    old_memberships(tx, gate, deadline).await
+}
+
+/// The immutable publication realm (stored publisher owner) of one durable
+/// registration. A single bounded read of one immutable column, used only to
+/// reconstruct the historical scope that [`by_registration_id`] then validates
+/// in full: a wrong/foreign owner can therefore only produce a typed conflict,
+/// never a `Found` registration.
+async fn publication_owner(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    registration_id: Uuid,
+    pack_id: Uuid,
+) -> Result<Option<Uuid>, PackCommitError> {
+    let row = tx
+        .query_opt(
+            "SELECT owner_id FROM ref_store_core_pack_publications
+             WHERE repository_id=$1 AND registration_id=$2 AND pack_id=$3",
+            &[&repository_id, &registration_id, &pack_id],
+        )
+        .await
+        .map_err(pg::db_error)?;
+    Ok(row.map(|row| row.get(0)))
+}
+
+/// Read the exact registered packs that were bound into a retained snapshot.
+///
+/// `entries` are the stored bindings `(pack id, registration id, artifact-set
+/// digest, joined revision)`; each one is re-read through the full A4 reader
+/// under the *stored publication owner* plus the snapshot's stored
+/// repository/tenant/format/history/epochs, exactly like [`old_memberships`].
+/// No `owner == tenant` or `old publisher == new producer` rule exists: a
+/// snapshot producer may legitimately include packs registered by another
+/// internal publisher identity.
+///
+/// Refused as `LedgerIntegrity`/`RegistrationConflict`: a missing registration,
+/// a pack id or artifact-set digest that differs from the durable rows, a
+/// `joined_revision` that is not `publication.gate_revision + 1`, or a
+/// `joined_revision` after the captured snapshot revision. The caller gets data
+/// only, never a proof or a Git-read attestation.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_pack_bindings(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    tenant_id: Uuid,
+    object_format: GitObjectFormat,
+    history_incarnation: Uuid,
+    authority_epoch: i64,
+    group_epoch: i64,
+    captured_gate_revision: i64,
+    entries: &[PackMembershipEntry],
+    deadline: Instant,
+) -> Result<Vec<RegisteredPack>, PackCommitError> {
+    crate::ref_store::pg::bound(tx, deadline).await?;
+    if entries.is_empty() || entries.len() as i64 > MAX_ACTIVE_MEMBERSHIPS {
+        return Err(integrity("snapshot pack binding set is not 1..=16 packs"));
+    }
+    let mut packs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(stored_owner) = publication_owner(tx, repository_id, entry.registration_id(), entry.pack_id()).await?
+        else {
+            return Err(integrity("snapshot binding has no durable publication"));
+        };
+        if stored_owner.is_nil() {
+            return Err(integrity("snapshot binding publication owner is nil"));
+        }
+        let historical_scope = PackCommitScope::new(
+            repository_id,
+            tenant_id,
+            stored_owner,
+            object_format,
+            history_incarnation,
+            authority_epoch,
+            group_epoch,
+        )
+        .map_err(|_| integrity("snapshot binding historical scope is invalid"))?;
+        let Some(stored) =
+            read_registered_pack(tx, &historical_scope, entry.registration_id(), entry.pack_id(), deadline).await?
+        else {
+            return Err(integrity("snapshot binding has no durable registration"));
+        };
+        if stored.pack.artifact_set_digest() != entry.artifact_set_digest() {
+            return Err(integrity("snapshot binding artifact set differs from its registration"));
+        }
+        if entry.joined_revision() != stored.publication_gate_revision.saturating_add(1) {
+            return Err(integrity("snapshot binding joined revision is not publication.gate_revision + 1"));
+        }
+        if entry.joined_revision() <= 0 || entry.joined_revision() > captured_gate_revision {
+            return Err(integrity("snapshot binding joined after the captured snapshot revision"));
+        }
+        packs.push(
+            RegisteredPack::new(
+                entry.pack_id(),
+                entry.registration_id(),
+                stored.pack.artifact_set_digest(),
+                stored.pack.artifacts().to_vec(),
+                Some(entry.joined_revision()),
+            )
+            .map_err(|_| integrity("snapshot binding registered pack is inconsistent"))?,
         );
     }
     Ok(packs)
