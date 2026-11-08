@@ -411,7 +411,6 @@ mod tests {
     #[test]
     fn head_resolution_rejects_ambiguous_deletion_and_missing_retarget() {
         let name = |value: &str| RefName::new(value).unwrap();
-        let target = |byte| RefTarget::Oid(oid(GitObjectFormat::Sha1, byte));
         let mut existing = BTreeMap::new();
         existing.insert("refs/heads/main".into(), oid(GitObjectFormat::Sha1, 1).as_hex());
         existing.insert("refs/heads/next".into(), oid(GitObjectFormat::Sha1, 2).as_hex());

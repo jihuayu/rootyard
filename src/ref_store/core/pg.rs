@@ -27,14 +27,14 @@
 //! updates `repositories`, `pando_repository_states` or `pando_refs` and is not
 //! a serving cutover.
 use super::super::contract::{
-    CancelReceipt, Capabilities, OperationIdentity, OperationLookup, OperationState, PgRefStore, RefStoreError,
-    TerminalOutcome,
+    CancelReceipt, Capabilities, OperationIdentity, OperationLookup, OperationState, RefStoreError, TerminalOutcome,
 };
-use super::super::pg;
-use super::contract::{CommitRefsRequest, CoreGate, CoreGateInit, CoreGateVersion, VersionCheck};
+use super::super::pg::{self, PgRefStore};
+use super::command::CommitRefsRequest;
+use super::contract::{CoreGate, CoreGateInit, CoreGateVersion, VersionCheck};
 use super::sql::{
-    check_cas, check_existing_prefixes, gate_row, insert_event, lock_relevant_refs, lookup_names, reject,
-    replay_terminal,
+    check_cas, check_existing_prefixes, gate_from_row, gate_row, insert_event, lock_relevant_refs, lookup_names,
+    reject, replay_terminal,
 };
 use super::terminal::{CommitRefsReceipt, CommitRejectCode, CommitTerminal, RefCommitResult};
 use super::types::{GitObjectFormat, GitOid, RefTarget, resolve_head};

@@ -4,11 +4,10 @@
 //! `super::pg` starts. They contain no commit/rollback logic of their own and
 //! never open a connection, so the transaction ownership and rollback policy
 //! live in exactly one place.
-use super::super::contract::{
-    BeginReceipt, OperationState, PgRefStore, RefStoreError, TerminalOutcome, TerminalResult,
-};
-use super::super::pg;
-use super::contract::{CommitRefsRequest, CoreGate};
+use super::super::contract::{BeginReceipt, OperationState, RefStoreError, TerminalOutcome, TerminalResult};
+use super::super::pg::{self, PgRefStore};
+use super::command::CommitRefsRequest;
+use super::contract::CoreGate;
 use super::terminal::{CommitRefsReceipt, CommitRejectCode, CommitRejection, CommitTerminal, RefCommitResult};
 use super::types::{GitObjectFormat, HeadUpdate, RefName, RefPrecondition};
 use std::collections::BTreeMap;
