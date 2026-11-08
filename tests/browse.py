@@ -7,6 +7,8 @@ from contextlib import contextmanager
 import hashlib
 import json
 import os
+import shlex
+import shutil
 from pathlib import Path
 import sys
 import uuid
@@ -42,6 +44,7 @@ class BrowseHarness(Harness):
     def __init__(self, args):
         super().__init__(args)
         self.actor_labels = {}
+        self.native_git = os.environ.get("ROOTYARD_GIT") or shutil.which("git") or "git"
 
     def account(self, *args):
         account = super().account(*args)
@@ -351,7 +354,7 @@ class BrowseHarness(Harness):
         self.git("push", "origin", "HEAD:refs/heads/batch-page", cwd=self.work, token=self.alice)
         count_path = self.root / "cat-file-count"
         wrapper = self.root / "git-count-wrapper"
-        wrapper.write_text("#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ]; then echo x >> '" + str(count_path) + "'; fi\ndone\nexec /usr/bin/git \"$@\"\n")
+        wrapper.write_text("#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ]; then echo x >> '" + str(count_path) + "'; fi\ndone\nexec " + shlex.quote(self.native_git) + " \"$@\"\n")
         wrapper.chmod(0o700)
         self.stop()
         self.env["ROOTYARD_GIT"] = str(wrapper)
@@ -469,7 +472,7 @@ class BrowseHarness(Harness):
         wrapper = self.root / "git-fault-wrapper"
         wrapper.write_text("#!/bin/sh\nupdate=0\nfor a in \"$@\"; do [ \"$a\" = update-ref ] && update=1; done\n"
                            + "if [ \"$update\" = 1 ] && [ -f '" + str(before_marker) + "' ]; then exit 42; fi\n"
-                           + "/usr/bin/git \"$@\"\nrc=$?\n"
+                           + shlex.quote(self.native_git) + " \"$@\"\nrc=$?\n"
                            + "if [ \"$update\" = 1 ] && [ \"$rc\" = 0 ] && [ -f '" + str(after_marker) + "' ]; then exit 42; fi\n"
                            + "exit \"$rc\"\n")
         wrapper.chmod(0o700)
