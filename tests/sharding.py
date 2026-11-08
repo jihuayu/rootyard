@@ -2672,48 +2672,68 @@ class ShardingHarness(PullsHarness):
         self.clusterbenchpath = "/api/shards/benchmark"
         self.repobenchpath = "/api/repos/alice/forge/shard-benchmark"
         self.outsider = self.issue_token("outsider", create_user=True)
+        # Cluster authority is a per-token database grant (migration 080), never
+        # implied by repository ownership. The dedicated operator token is used
+        # only for cluster-global control-plane calls so that the ordinary
+        # personal token keeps proving it cannot administer infrastructure.
+        self.operator = self.issue_token("shard-operator", create_user=True)
+        self.sql(
+            "INSERT INTO cluster_operator_tokens(token_id, granted_by) VALUES ('"
+            + self.operator["token_id"]
+            + "', 'native-sharding')"
+        )
 
     def migration(self) -> None:
         assert self.sql("SELECT to_regclass('shard_nodes') IS NOT NULL") == "t"
         assert self.sql("SELECT to_regclass('repository_shard_routes') IS NOT NULL") == "t"
 
     def virtual_bucket_routing_and_explicit_overrides(self) -> None:
+        # An ordinary personal token cannot administer cluster infrastructure.
         self.document(
             self.nodespath,
-            code=201,
+            code=403,
             method="POST",
             json_body={"node_id": "shard-node-a", "endpoint": "http://shard-a:8080", "role": "primary", "status": "healthy", "lease_ttl_seconds": 120},
         )
-        self.document(
-            self.nodespath,
-            code=201,
-            method="POST",
-            json_body={"node_id": "shard-node-b", "endpoint": "http://shard-b:8080", "role": "replica", "status": "healthy"},
-        )
-        self.document(
-            self.nodespath,
-            code=201,
-            method="POST",
-            json_body={"node_id": "shard-node-c", "endpoint": "http://shard-c:8080", "role": "replica", "status": "healthy"},
-        )
-        route = self.document(self.routepath, code=200)
+        for payload in (
+            {"node_id": "shard-node-a", "endpoint": "http://shard-a:8080", "role": "primary", "status": "healthy", "lease_ttl_seconds": 120},
+            {"node_id": "shard-node-b", "endpoint": "http://shard-b:8080", "role": "replica", "status": "healthy"},
+            {"node_id": "shard-node-c", "endpoint": "http://shard-c:8080", "role": "replica", "status": "healthy"},
+        ):
+            self.document(self.nodespath, code=201, token=self.operator, method="POST", json_body=payload)
+        # Placement is published before the repository route exists so the
+        # bucket can adopt it; a route row created first would make this an
+        # explicit-override conflict instead of a placement decision.
+        bucket_id = deterministic_bucket_id(self.repo["id"])
         self.document(
             self.bucketspath,
             code=201,
+            token=self.operator,
             method="POST",
             json_body={
-                "bucket_id": route["bucket_id"],
+                "bucket_id": bucket_id,
                 "primary_node_id": "shard-node-a",
                 "read_replica_nodes": ["shard-node-b", "shard-node-c"],
             },
         )
-        updated = self.document(self.routepath, code=200)
-        assert updated["primary_node_id"] == "shard-node-a"
+        route = self.document(self.routepath, code=200)
+        assert route["bucket_id"] == bucket_id
+        assert route["primary_node_id"] == "shard-node-a"
+        assert route["read_replica_nodes"] == ["shard-node-b", "shard-node-c"]
+        assert route["explicit_override"] is False
 
     def primary_node_lease_renewal_and_expiry_fencing(self) -> None:
+        # Node lease renewal is infrastructure authority, not repository RBAC.
+        self.document(
+            f"{self.nodespath}/shard-node-a/lease",
+            code=403,
+            method="POST",
+            json_body={"lease_ttl_seconds": 60, "expected_lease_epoch": 1, "now_unix": 1_700_000_000},
+        )
         renewed = self.document(
             f"{self.nodespath}/shard-node-a/lease",
             code=200,
+            token=self.operator,
             method="POST",
             json_body={"lease_ttl_seconds": 60, "expected_lease_epoch": 1, "now_unix": 1_700_000_000},
         )
@@ -2725,6 +2745,7 @@ class ShardingHarness(PullsHarness):
         self.document(
             f"{self.nodespath}/shard-node-a/lease",
             code=200,
+            token=self.operator,
             method="POST",
             json_body={"lease_ttl_seconds": 300, "expected_lease_epoch": 2, "now_unix": 1_700_000_090},
         )
@@ -2804,6 +2825,7 @@ class ShardingHarness(PullsHarness):
         self.document(
             self.nodespath,
             code=201,
+            token=self.operator,
             method="POST",
             json_body={
                 "node_id": "shard-node-d",
@@ -2818,12 +2840,14 @@ class ShardingHarness(PullsHarness):
         self.document(
             self.bucketspath,
             code=200,
+            token=self.operator,
             method="POST",
             json_body={"bucket_id": route["bucket_id"], "primary_node_id": "shard-node-c", "read_replica_nodes": ["shard-node-b"]},
         )
         reb = self.document(
             self.rebalancepath,
             code=200,
+            token=self.operator,
             method="POST",
             json_body={
                 "bucket_id": route["bucket_id"],
@@ -2870,6 +2894,7 @@ class ShardingHarness(PullsHarness):
         c_bench = self.document(
             self.clusterbenchpath,
             code=200,
+            token=self.operator,
             method="POST",
             json_body={"node_counts": [1, 2, 4], "concurrency": 8, "operations_per_tier": 24},
         )
@@ -2891,6 +2916,30 @@ class ShardingHarness(PullsHarness):
 
     def access_and_boundaries(self) -> None:
         self.document(self.routepath, code=404, token=self.outsider)
+        # Operator capability does not grant repository authority: the granted
+        # operator token is not a collaborator on this repository.
+        self.document(self.routepath, code=404, token=self.operator)
+        # Ordinary and unrelated tokens stay unable to mutate cluster
+        # infrastructure even with an otherwise valid payload.
+        for token in (self.alice, self.outsider):
+            self.document(
+                self.nodespath,
+                code=403,
+                method="POST",
+                token=token,
+                json_body={
+                    "node_id": "shard-node-denied",
+                    "endpoint": "http://shard-denied:8080",
+                    "role": "replica",
+                    "status": "healthy",
+                },
+            )
+        self.document(
+            self.bucketspath,
+            code=403,
+            method="POST",
+            json_body={"bucket_id": 0, "primary_node_id": "shard-node-a"},
+        )
         self.document(
             self.bucketspath,
             code=400,
