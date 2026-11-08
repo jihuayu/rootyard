@@ -1860,9 +1860,31 @@ async fn permanent_ledger_survives_delete_and_cross_ledger_request_reuse_is_refu
     .await;
     db.finish(outcome).await
 }
+/// Bounded refusal diagnostics: actual SQLSTATE, the database message and the exact refused statement.
+/// Output is clipped and a client-side failure never echoes a connection URL (it may embed
+/// credentials), so a wrong guard expectation is debuggable without leaking the test profile.
+fn bounded_refusal(statement: &str, error: &tokio_postgres::Error) -> String {
+    fn clip(text: &str, limit: usize) -> String {
+        let flat: String = text.chars().map(|character| if character.is_control() { ' ' } else { character }).collect();
+        match flat.char_indices().nth(limit) {
+            Some((index, _)) => format!("{}...", &flat[..index]),
+            None => flat,
+        }
+    }
+    let code = error.code().map(|code| code.code()).unwrap_or("<no-sqlstate>");
+    let message = error
+        .as_db_error()
+        .map(|db| match db.detail() {
+            Some(detail) => format!("{} (detail: {detail})", db.message()),
+            None => db.message().to_owned(),
+        })
+        .unwrap_or_else(|| "no database error body (client-side failure)".to_owned());
+    format!("actual SQLSTATE {code}; db message `{}`; statement `{}`", clip(&message, 240), clip(statement, 160))
+}
 async fn expect_client_sqlstate(client: &tokio_postgres::Client, statement: &str, expected: &str) -> Result<()> {
     let error = client.batch_execute(statement).await.expect_err("statement must be refused");
-    ensure!(error.code().map(|code| code.code()) == Some(expected), "unexpected SQLSTATE: {error}");
+    let actual = error.code().map(|code| code.code());
+    ensure!(actual == Some(expected), "expected SQLSTATE {expected} but saw {}", bounded_refusal(statement, &error));
     Ok(())
 }
 #[tokio::test]
@@ -1892,7 +1914,55 @@ async fn header_check_constraints_and_permanent_bounds_refuse_without_partial_ch
         expect_client_sqlstate(&client, &format!("UPDATE ref_store_core_pack_snapshot_repo_usage SET snapshot_ref_count=16385 WHERE repository_id='{repo}'"), "23514").await?;
         expect_client_sqlstate(&client, &format!("UPDATE ref_store_core_pack_snapshot_repo_usage SET binding_count=1025 WHERE repository_id='{repo}'"), "23514").await?;
         expect_client_sqlstate(&client, &format!("UPDATE ref_store_core_pack_snapshot_repo_usage SET snapshot_count=snapshot_count-1 WHERE repository_id='{repo}'"), "P0001").await?;
-        expect_client_sqlstate(&client, &format!("DELETE FROM ref_store_core_pack_memberships WHERE repository_id='{repo}'"), "23503").await?;
+        // Migration 142's row-level BEFORE DELETE immutability trigger raises P0001 before the
+        // migration-143 A5 FK RESTRICT could ever raise 23503, so the observed runtime guard
+        // SQLSTATE is P0001. The RESTRICT binding itself is asserted structurally below.
+        expect_client_sqlstate(
+            &client,
+            &format!("DELETE FROM ref_store_core_pack_memberships WHERE repository_id='{repo}'"),
+            "P0001",
+        )
+        .await?;
+        let binding_fk = client
+            .query(
+                "SELECT c.convalidated, c.confdeltype::text,
+                        (SELECT coalesce(string_agg(a.attname::text, ',' ORDER BY a.attname), '')
+                           FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                           JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum),
+                        (SELECT coalesce(string_agg(a.attname::text, ',' ORDER BY a.attname), '')
+                           FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+                           JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum),
+                        (SELECT coalesce(bool_and(ca.attname = fa.attname), false)
+                           FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                           JOIN pg_attribute ca ON ca.attrelid = c.conrelid AND ca.attnum = k.attnum
+                           JOIN unnest(c.confkey) WITH ORDINALITY AS r(attnum, ord) ON r.ord = k.ord
+                           JOIN pg_attribute fa ON fa.attrelid = c.confrelid AND fa.attnum = r.attnum),
+                        pg_get_constraintdef(c.oid)
+                   FROM pg_constraint c
+                  WHERE c.contype = 'f'
+                    AND c.conrelid = 'ref_store_core_snapshot_packs'::regclass
+                    AND c.confrelid = 'ref_store_core_pack_memberships'::regclass",
+                &[],
+            )
+            .await?;
+        ensure!(binding_fk.len() == 1, "expected exactly one A5 binding -> membership FK, saw {}", binding_fk.len());
+        let validated: bool = binding_fk[0].get(0);
+        let delete_action: String = binding_fk[0].get(1);
+        let binding_columns: String = binding_fk[0].get(2);
+        let membership_columns: String = binding_fk[0].get(3);
+        let same_names: bool = binding_fk[0].get(4);
+        let definition: String = binding_fk[0].get(5);
+        let exact_columns = "artifact_set_digest,pack_id,registration_id,repository_id";
+        ensure!(validated, "A5 binding -> membership FK is not validated: {definition}");
+        ensure!(
+            delete_action == "r",
+            "A5 binding -> membership FK delete action is {delete_action}, not RESTRICT: {definition}"
+        );
+        ensure!(same_names, "A5 binding -> membership FK pairs differently named columns: {definition}");
+        ensure!(
+            binding_columns == exact_columns && membership_columns == exact_columns,
+            "A5 binding -> membership FK columns are {binding_columns} -> {membership_columns}, expected {exact_columns}: {definition}"
+        );
         let usage_before = pack_usage(&db.pool, repo).await?;
         let counts_before = snapshot_counts(&db.pool, repo).await?;
         let stale = CreatePackSnapshotRequest::new(scope, Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), 300,
