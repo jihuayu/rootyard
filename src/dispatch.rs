@@ -1,12 +1,15 @@
 //! Advisory wake transports. Only PostgreSQL owns delivery state and effects.
 use anyhow::{Context, Result, bail, ensure};
 use deadpool_postgres::Pool;
-use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+#[cfg(not(feature = "state-redis"))]
+use std::net::SocketAddr;
+#[cfg(not(feature = "state-redis"))]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
-    sync::Notify,
 };
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -58,14 +61,21 @@ impl Settings {
         );
         ensure!(consumers.len() == 1 || consumers[0] != consumers[1], "duplicate worker consumer");
         let transport: Option<Arc<dyn WakeTransport>> = match std::env::var("ROOTYARD_WAKE_TRANSPORT").as_deref() {
-            Err(_) | Ok("poll") => None,
+            Err(_) | Ok("poll") | Ok("memory") => None,
             Ok("redis") => {
-                let address = std::env::var("ROOTYARD_REDIS_ADDRESS")
-                    .context("ROOTYARD_REDIS_ADDRESS is required")?
-                    .parse()
-                    .context("Redis address must be a loopback socket address")?;
-                let channel = std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
-                Some(Arc::new(RedisWake::new(address, channel)?))
+                #[cfg(feature = "state-redis")]
+                {
+                    Some(Arc::new(crate::cache_wake::RedisWake::from_env()?))
+                }
+                #[cfg(not(feature = "state-redis"))]
+                {
+                    let address: std::net::SocketAddr = std::env::var("ROOTYARD_REDIS_ADDRESS")
+                        .context("ROOTYARD_REDIS_ADDRESS is required")?
+                        .parse()
+                        .context("Redis address must be a loopback socket address")?;
+                    let channel = std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
+                    Some(Arc::new(RedisWake::new(address, channel)?))
+                }
             }
             Ok("kafka") => Some(Arc::new(crate::kafka_wake::KafkaWake::new(
                 std::env::var("ROOTYARD_KAFKA_BOOTSTRAP_SERVERS")
@@ -73,7 +83,7 @@ impl Settings {
                 std::env::var("ROOTYARD_KAFKA_TOPIC").context("ROOTYARD_KAFKA_TOPIC is required")?,
                 std::env::var("ROOTYARD_KAFKA_GROUP").context("ROOTYARD_KAFKA_GROUP is required")?,
             )?)),
-            _ => bail!("wake transport must be poll, redis or kafka"),
+            _ => bail!("wake transport must be poll, memory, redis or kafka"),
         };
         Ok(Self {
             poll: Duration::from_millis(number("ROOTYARD_WORKER_POLL_MS", 5000, 50, 60_000)?),
@@ -177,12 +187,14 @@ pub async fn publisher(transport: Option<Arc<dyn WakeTransport>>, signal: Arc<No
     }
 }
 
+#[cfg(not(feature = "state-redis"))]
 /// Plain RESP2 over loopback only. Use a local authenticated TLS tunnel/proxy
 /// for a remote Redis deployment. No URL credentials or event data are accepted.
 pub struct RedisWake {
     address: SocketAddr,
     channel: String,
 }
+#[cfg(not(feature = "state-redis"))]
 impl RedisWake {
     pub fn new(address: SocketAddr, channel: String) -> Result<Self> {
         ensure!(
@@ -249,6 +261,7 @@ impl RedisWake {
         }
     }
 }
+#[cfg(not(feature = "state-redis"))]
 impl WakeTransport for RedisWake {
     fn publish(&self) -> Task<'_, Result<()>> {
         Box::pin(async move {
@@ -267,6 +280,7 @@ impl WakeTransport for RedisWake {
         Box::pin(self.listen(signal, stop))
     }
 }
+#[cfg(not(feature = "state-redis"))]
 fn encode(parts: &[&[u8]]) -> Vec<u8> {
     let mut output = format!("*{}\r\n", parts.len()).into_bytes();
     for part in parts {
@@ -276,12 +290,14 @@ fn encode(parts: &[&[u8]]) -> Vec<u8> {
     }
     output
 }
+#[cfg(not(feature = "state-redis"))]
 #[derive(Debug, PartialEq, Eq)]
 enum Frame {
     Bulk(Vec<u8>),
     Integer(i64),
     Array(Vec<Frame>),
 }
+#[cfg(not(feature = "state-redis"))]
 async fn line<R: tokio::io::AsyncBufRead + Unpin>(stream: &mut R, budget: &mut usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     loop {
@@ -296,6 +312,7 @@ async fn line<R: tokio::io::AsyncBufRead + Unpin>(stream: &mut R, budget: &mut u
         }
     }
 }
+#[cfg(not(feature = "state-redis"))]
 fn frame<'a, R: tokio::io::AsyncBufRead + Unpin + Send>(
     stream: &'a mut R,
     budget: &'a mut usize,
@@ -331,6 +348,7 @@ fn frame<'a, R: tokio::io::AsyncBufRead + Unpin + Send>(
         }
     })
 }
+#[cfg(not(feature = "state-redis"))]
 async fn read_frame<R: tokio::io::AsyncBufRead + Unpin + Send>(stream: &mut R) -> Result<Frame> {
     frame(stream, &mut 1024, 0).await
 }
@@ -338,6 +356,7 @@ async fn read_frame<R: tokio::io::AsyncBufRead + Unpin + Send>(stream: &mut R) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "state-redis"))]
     #[test]
     fn endpoint_and_channel_bounds() {
         assert!(RedisWake::new("0.0.0.0:6379".parse().unwrap(), "valid".into()).is_err());
@@ -346,6 +365,7 @@ mod tests {
         }
         assert!(RedisWake::new("[::1]:6379".parse().unwrap(), "rootyard:test_1-v1".into()).is_ok());
     }
+    #[cfg(not(feature = "state-redis"))]
     #[tokio::test]
     async fn bounded_resp() {
         let mut good = &b"*3\r\n$7\r\nmessage\r\n$1\r\nx\r\n$2\r\nv1\r\n"[..];

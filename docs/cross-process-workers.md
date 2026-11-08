@@ -58,8 +58,9 @@ downgraded.
 | `ROOTYARD_WORKER_POLL_MS` | `5000` | 50–60000; periodic idle rescan interval |
 | `ROOTYARD_WORKER_BATCH` | `64` | 1–1000 claims per consumer per scan |
 | `ROOTYARD_WORKER_LEASE_SECONDS` | `60` | 1–3600; short leases may expire during work and cause retries |
-| `ROOTYARD_WAKE_TRANSPORT` | `poll` | `poll`, `redis` or `kafka`; other values fail startup |
-| `ROOTYARD_REDIS_ADDRESS` | none | Required for Redis, numeric loopback socket address with nonzero port |
+| `ROOTYARD_WAKE_TRANSPORT` | `poll` | `poll`, `memory`, `redis` or `kafka`; other values fail startup |
+| `ROOTYARD_REDIS_URL` | none | Optional feature `state-redis`: `rediss://` remote with ACL in URL, or loopback `redis://` |
+| `ROOTYARD_REDIS_ADDRESS` | none | Legacy loopback address when `state-redis` is off, or compatibility fallback when on |
 | `ROOTYARD_WAKE_CHANNEL` | `rootyard:outbox:v1` | 1–128 ASCII alphanumeric, colon, underscore or hyphen |
 
 Example role split (set the database URL using your normal secret mechanism):
@@ -94,13 +95,19 @@ aggregate frame bytes (1024), line bytes (256), bulk bytes (256), array members
 (3), and nesting before allocation. Invalid frames disconnect; they never execute
 an effect. Errors log fixed descriptions, not Redis payloads or credentials.
 
-Only plaintext loopback connections are supported. For a remote Redis server,
-provide an already configured local authenticated TLS proxy/tunnel; Rootyard does
-not create credentials, configure that proxy, or support Redis AUTH, TLS, Sentinel,
-Cluster discovery, or arbitrary remote addresses here. Keep the local port
-private. Use distinct non-sensitive channel names for separate installations:
-Redis database numbers do not isolate Pub/Sub channels. A wrong/shared channel
-can change wake latency or cause unnecessary scans, not delivery correctness.
+The default build preserves the legacy plaintext loopback adapter: for a remote
+Redis server without the optional feature, provide an already configured local
+authenticated TLS proxy/tunnel. Keep that local port private. Use distinct
+non-sensitive channel names for separate installations: Redis database numbers do
+not isolate Pub/Sub channels. A wrong/shared channel can change wake latency or
+cause unnecessary scans, not delivery correctness.
+
+Building with `--features state-redis` selects a mature redis-rs adapter instead
+and supports `ROOTYARD_REDIS_URL=rediss://...` with ACL credentials, TLS
+verification, connection-manager reconnect, command deadlines and sanitized
+errors/Debug. Plaintext `redis://` remains loopback-only and there is no
+redirect/TLS-downgrade fallback. Redis is still only an advisory wake transport;
+PG scanning is mandatory in both modes. See the [bounded cache/wake contract](state-cache-wake.md).
 
 Redis Pub/Sub is at-most-once and drops messages while subscribers disconnect.
 That behavior is intentional for hints; PG polling is mandatory, including when

@@ -24,6 +24,7 @@
 - [显式事故恢复](manual-recovery.md)
 - [指标](metrics.md)
 - [跨进程 worker](cross-process-workers.md)
+- [有界 advisory state cache/wake（#111 增量）](state-cache-wake.md)
 - [Kafka 唤醒适配器](kafka-wakes.md)
 - [私有 owner Issue API](forge-issues.md)
 - [Pull Request、Review、Check Run、分支保护与原子 Merge](../src/pulls.rs)
