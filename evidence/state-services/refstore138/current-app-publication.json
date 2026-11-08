@@ -1,0 +1,390 @@
+{
+  "version": 1,
+  "status": "passed",
+  "profile": "legacy-pando-s3-vault",
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "9f861ff7b098836fc9b80bba945545c4e9b2fb1e78fe5136c76c316a91fda8db",
+    "source_inputs_sha256": "cda300af50f7b566ba6a33014f4bd36fa79d1861b0dcea50e8bd5680a681642e",
+    "workspace_commit": "194caff8781bc19d964adf21957cf22068545919",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-refstore#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-refstore#rootyard@0.1.0"
+      }
+    ]
+  },
+  "binary_bytes": 163809224,
+  "runner_sha256": "3272ab6ed466b5fb862c222600fffb43e70382d2aadc3b5f2f3100899d574ea5",
+  "cases": [
+    {
+      "name": "schema_accounts_server_ready",
+      "seconds": 1.1329366599966306,
+      "status": "passed"
+    },
+    {
+      "name": "gitfs_seed_push_0",
+      "seconds": 0.3890876869991189,
+      "status": "passed"
+    },
+    {
+      "name": "gitfs_seed_push_1",
+      "seconds": 0.38294614299957175,
+      "status": "passed"
+    },
+    {
+      "name": "offline_pando_cutover_state-baseline-0",
+      "seconds": 1.290162879988202,
+      "status": "passed"
+    },
+    {
+      "name": "offline_pando_cutover_state-baseline-1",
+      "seconds": 1.3278028259956045,
+      "status": "passed"
+    },
+    {
+      "name": "pando_server_ready",
+      "seconds": 0.5936322519992245,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_0_0",
+      "seconds": 2.364667362009641,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_0_1",
+      "seconds": 2.2964329889946384,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_0_2",
+      "seconds": 2.23827737600368,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_1_0",
+      "seconds": 2.116743127000518,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_1_1",
+      "seconds": 2.3353661580040352,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_1_2",
+      "seconds": 2.3046093029988697,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_0_ref_3",
+      "seconds": 2.7817352739948547,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_0_ref_1",
+      "seconds": 2.859448739007348,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_0_ref_2",
+      "seconds": 2.9379611879994627,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_0_ref_0",
+      "seconds": 3.1368462450045627,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_1_ref_1",
+      "seconds": 2.9651848420035094,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_1_ref_0",
+      "seconds": 3.0969945450051455,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_1_ref_2",
+      "seconds": 3.062691918996279,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_1_ref_3",
+      "seconds": 3.1054529459943296,
+      "status": "passed"
+    },
+    {
+      "name": "pando_cross_repo_new_pack_1",
+      "seconds": 3.8844067530008033,
+      "status": "passed"
+    },
+    {
+      "name": "pando_cross_repo_new_pack_0",
+      "seconds": 3.8897507090005092,
+      "status": "passed"
+    },
+    {
+      "name": "pando_same_ref_contender_1",
+      "seconds": 3.812705543998163,
+      "status": "passed"
+    },
+    {
+      "name": "pando_same_ref_contender_0",
+      "seconds": 5.033908608005731,
+      "status": "passed"
+    },
+    {
+      "name": "pando_atomic_two_refs",
+      "seconds": 2.6571797039941885,
+      "status": "passed"
+    },
+    {
+      "name": "pando_cold_clone_0",
+      "seconds": 5.001820166988182,
+      "status": "passed"
+    },
+    {
+      "name": "pando_warm_clone_0",
+      "seconds": 3.445181622999371,
+      "status": "passed"
+    },
+    {
+      "name": "pando_cold_clone_1",
+      "seconds": 4.342312132997904,
+      "status": "passed"
+    },
+    {
+      "name": "pando_warm_clone_1",
+      "seconds": 2.916048098995816,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_0",
+      "seconds": 0.01235052700212691,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_1",
+      "seconds": 0.011495066995848902,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_2",
+      "seconds": 0.013199754990637302,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_3",
+      "seconds": 0.007231063995277509,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_4",
+      "seconds": 0.01163145799364429,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_5",
+      "seconds": 0.005995188010274433,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_6",
+      "seconds": 0.005838857003254816,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_7",
+      "seconds": 0.006797259993618354,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_8",
+      "seconds": 0.005594021000433713,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_9",
+      "seconds": 0.005952414998319,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_10",
+      "seconds": 0.008487295999657363,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_11",
+      "seconds": 0.00575834400660824,
+      "status": "passed"
+    }
+  ],
+  "harness_sha256": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+  "cargo_lock_sha256": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "memory_total": "18440100 kB",
+    "scope": "host-visible resources; not a reserved hardware allocation"
+  },
+  "provider_versions": {
+    "garage": null,
+    "vault": null,
+    "reason": "service executable inspection unavailable to test uid"
+  },
+  "limits": [
+    "One physical host, loopback PostgreSQL/Garage/Vault; no throughput or HA qualification.",
+    "Small fixed workload; no production latency objective inferred.",
+    "PG sampling every 250ms can miss short waits; observed peak is a lower bound.",
+    "Git materialization, internal lock wait, and Blob costs are not separately instrumented."
+  ],
+  "unmeasured": {
+    "git_materialization_ms": null,
+    "blob_io_bytes": null,
+    "exact_lock_wait_ms": null,
+    "artifact_authority_contention_ms": null,
+    "native_git_cpu_seconds": null,
+    "peak_temp_disk_bytes": null
+  },
+  "idle_after_setup": {
+    "VmHWM": 31988,
+    "VmRSS": 31988,
+    "Threads": 5,
+    "units": {
+      "VmRSS": "KiB",
+      "VmHWM": "KiB",
+      "Threads": "count"
+    }
+  },
+  "pg_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "git_version": "git version 2.52.0",
+  "idle_pando": {
+    "VmHWM": 31876,
+    "VmRSS": 31876,
+    "Threads": 5,
+    "units": {
+      "VmRSS": "KiB",
+      "VmHWM": "KiB",
+      "Threads": "count"
+    }
+  },
+  "same_ref_result": {
+    "contenders": 2,
+    "accepted": 1,
+    "rejected": 1,
+    "winner_read_back": true,
+    "mode": "ordinary competing Git pushes; advertised old OIDs are not synchronized"
+  },
+  "final_resources": {
+    "VmHWM": 41516,
+    "VmRSS": 41516,
+    "Threads": 7,
+    "units": {
+      "VmRSS": "KiB",
+      "VmHWM": "KiB",
+      "Threads": "count"
+    }
+  },
+  "latency_ms": {
+    "serial_push": {
+      "n": 6,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 2296.4329889946384,
+      "p95": 2364.667362009641,
+      "p99": 2364.667362009641
+    },
+    "different_ref": {
+      "n": 8,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 2965.1848420035094,
+      "p95": 3136.8462450045627,
+      "p99": 3136.8462450045627
+    },
+    "cross_repo_new_pack": {
+      "n": 2,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 3884.4067530008033,
+      "p95": 3889.7507090005092,
+      "p99": 3889.7507090005092
+    },
+    "same_ref": {
+      "n": 2,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 3812.705543998163,
+      "p95": 5033.908608005731,
+      "p99": 5033.908608005731
+    },
+    "cold_clone": {
+      "n": 2,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 4342.312132997904,
+      "p95": 5001.820166988182,
+      "p99": 5001.820166988182
+    },
+    "warm_clone": {
+      "n": 2,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 2916.048098995816,
+      "p95": 3445.181622999371,
+      "p99": 3445.181622999371
+    },
+    "api_list": {
+      "n": 12,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 6.797259993618354,
+      "p95": 13.199754990637302,
+      "p99": 13.199754990637302
+    }
+  },
+  "operation_registry_audit": {
+    "total": 18,
+    "committed": 18,
+    "pending": 0,
+    "terminal": 18,
+    "scope": "Successful ordinary Pando Git publication registered durable terminal rows; no client retry-idempotency or distributed RefStore claim"
+  },
+  "pg_samples": {
+    "count": 199,
+    "peak_connections": 15,
+    "peak_lock_waiters": 0,
+    "peak_active": 2,
+    "errors": []
+  },
+  "fixture_root": "/tmp/rootyard-e2e-147t_gmf",
+  "binary_still_matches": true,
+  "source_still_matches": true
+}
