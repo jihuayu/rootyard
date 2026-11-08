@@ -9,14 +9,16 @@ given, restore into a brand-new database/data directory under one newly minted
 Pando authority, apply the reviewed current migrations, and serve stock Git
 fetch/clone for both repositories.  Every frozen predecessor source contract
 here keeps its own format/schema verification and then upgrades to the same
-current reviewed target: format15/schema139.
+current reviewed target: format16/schema140.
 
-``backup_legacy133_identity.py`` through ``backup_legacy138_core.py`` reuse this
-harness with the format9/schema133 through format14/schema138 contracts and
-assert the same Pando/session/Git boundaries plus the current target catalog.
-A genuine format14/schema138 archive carries no RefStore core rows, so the
-schema139 core tables are verified to exist, be correctly constrained and stay
-empty; this harness never claims a core-row roundtrip.
+``backup_legacy133_identity.py`` through ``backup_legacy139_snapshots.py``
+reuse this harness with the format9/schema133 through format15/schema139
+contracts and assert the same Pando/session/Git boundaries, the frozen source
+contract and the reviewed current migration target.  A genuine format8 through
+format15 archive carries no RefStore core rows, so the schema139 core tables are
+verified to exist, be correctly constrained and stay empty; this harness never
+claims a core-row roundtrip and deliberately does not assert the schema140
+snapshot tables that migration 140 introduces.
 
 Only random task-owned databases and temporary storage are used.  Secrets, DSNs,
 raw HTTP logs and Garage/Vault credentials are never printed; recorded failures
@@ -89,7 +91,7 @@ class ArchiveContract:
     schema: int
     flag: str
     source_label: str
-    target_schema: int = 139
+    target_schema: int = 140
     indexes: tuple = SCHEMA139_INDEXES
     foreign_keys: tuple = SCHEMA134_FOREIGN_KEYS
     unique_constraints: tuple = SCHEMA134_UNIQUE
@@ -97,13 +99,13 @@ class ArchiveContract:
 
 
 LEGACY132 = ArchiveContract(format=8, schema=132, flag="--allow-legacy-schema132",
-                            source_label="schema132", target_schema=139,
+                            source_label="schema132", target_schema=140,
                             indexes=SCHEMA139_INDEXES)
 LEGACY133 = ArchiveContract(format=9, schema=133, flag="--allow-legacy-schema133",
-                            source_label="schema133", target_schema=139,
+                            source_label="schema133", target_schema=140,
                             indexes=SCHEMA139_INDEXES)
 # Format10/schema134 is an older frozen contract.  Its archive upgrades through
-# the same reviewed path to the current schema139 target.
+# the same reviewed path to the current schema140 target.
 LEGACY134 = replace(LEGACY132, format=10, schema=134,
                     flag="--allow-legacy-schema134", source_label="schema134")
 # Format11/schema135 carries the frozen schema135 catalog and no schema136
@@ -118,12 +120,19 @@ LEGACY136 = replace(LEGACY135, format=12, schema=136,
 # operation identity and then the minimal RefStore core.
 LEGACY137 = replace(LEGACY136, format=13, schema=137,
                     flag="--allow-legacy-schema137", source_label="schema137")
-# Genuine format14/schema138 archive: the immediate predecessor of the current
+# Genuine format14/schema138 archive: the immediate predecessor of the frozen
 # format15/schema139 contract.  Its archive may carry the schema138 operation
 # registry but never the schema139 core rows, so every restored target is
 # checked for the schema139 core schema.
 LEGACY138 = replace(LEGACY137, format=14, schema=138,
                     flag="--allow-legacy-schema138", source_label="schema138")
+# Genuine format15/schema139 archive: the immediate predecessor of the current
+# format16/schema140 contract.  It is produced by a trusted schema139 binary and
+# is verified against its frozen schema139 catalogs before the reviewed
+# migration to schema140; earlier core rows stay empty on this fixture and no
+# schema140 snapshot-table assertion is made here.
+LEGACY139 = replace(LEGACY138, format=15, schema=139,
+                    flag="--allow-legacy-schema139", source_label="schema139")
 
 # Every legacy opt-in this shared harness knows about, oldest first.  The
 # adjacent entry is used for the mixed-flag and mismatched-opt-in rejections.
@@ -131,7 +140,7 @@ LEGACY_FLAGS = (
     "--allow-legacy-schema132", "--allow-legacy-schema133",
     "--allow-legacy-schema134", "--allow-legacy-schema135",
     "--allow-legacy-schema136", "--allow-legacy-schema137",
-    "--allow-legacy-schema138",
+    "--allow-legacy-schema138", "--allow-legacy-schema139",
 )
 
 
@@ -416,10 +425,13 @@ class LegacyArchiveHarness(BackupHarness):
     def assert_core_schema(self):
         """The migrated target must carry the complete schema139 core schema.
 
-        A genuine format14/schema138 source has no RefStore core rows (and older
-        sources have no core tables at all), so migration139 must create the
-        gates/refs/events tables, the current-ref CAS key, the operation FK and
-        the immutable-event trigger while leaving every core table empty.
+        Every genuine format8 through format15 source has no RefStore core rows
+        (and older sources have no core tables at all), so migration139 must
+        create the gates/refs/events tables, the current-ref CAS key, the
+        operation FK and the immutable-event trigger while leaving every core
+        table empty.  This fixture does not assert the schema140 snapshot
+        tables added by migration 140; a populated current-schema backrestore
+        qualification is separate.
         """
         tables = self.query(
             self.restore_db,
@@ -756,6 +768,9 @@ def run_main(contract=None, argv=None):
                 str(contract.schema) + " sources carry no ref-store core rows; the "
                 "migrated schema139 core tables are verified present, constrained "
                 "and empty, not round-tripped.",
+                "No schema140 snapshot/pin table or row assertion is made; that "
+                "populated current-format qualification follows the primary "
+                "migration-140 SQL.",
             ])
         if args.keep:
             report["retained_directory"] = str(harness.root)

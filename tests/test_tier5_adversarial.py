@@ -477,6 +477,8 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             "pando_pack_manifests",
             "pando_repository_states",
             "ref_store_core_gates",
+            "ref_store_core_pins",
+            "ref_store_core_snapshots",
             "repository_audit_log",
             "repository_collaborators",
             "repository_shard_routes",

@@ -354,6 +354,22 @@ pub struct Capabilities {
     /// caller may run legacy and core writes for one repository at once.
     pub serving_cutover: bool,
     pub dual_write_with_legacy: bool,
+    /// Metadata-only snapshot capture: immutable refs/HEAD rows plus the exact
+    /// gate revision/digest they were read with, in one short transaction.
+    /// This is not a Git ReadSnapshot and says nothing about pack/object
+    /// completeness.
+    pub metadata_snapshot_capture: bool,
+    /// Bounded, snapshot-scoped keyset pagination over immutable metadata rows.
+    pub metadata_snapshot_pagination: bool,
+    /// Durable metadata pin lifecycle (create/renew/release) with repaired
+    /// commit-unknown resolution. Existing `durable_snapshot_pin` stays false
+    /// because a metadata pin is not protective of Git objects.
+    pub metadata_pin_lease: bool,
+    /// Retained repo/tenant admission usage for snapshots, refs, logical
+    /// metadata bytes and successful mutation receipts.
+    pub metadata_quota_admission: bool,
+    /// False until a real pack manifest/receipt contract exists (#108/#109).
+    pub pack_membership_snapshot: bool,
 }
 
 impl Capabilities {
@@ -381,6 +397,11 @@ impl Capabilities {
             core_commit_events: false,
             serving_cutover: false,
             dual_write_with_legacy: false,
+            metadata_snapshot_capture: false,
+            metadata_snapshot_pagination: false,
+            metadata_pin_lease: false,
+            metadata_quota_admission: false,
+            pack_membership_snapshot: false,
         }
     }
 
@@ -412,6 +433,11 @@ impl Capabilities {
             core_commit_events: true,
             serving_cutover: false,
             dual_write_with_legacy: false,
+            metadata_snapshot_capture: true,
+            metadata_snapshot_pagination: true,
+            metadata_pin_lease: true,
+            metadata_quota_admission: true,
+            pack_membership_snapshot: false,
         }
     }
 }
@@ -460,6 +486,8 @@ impl SequenceReservation {
     }
 }
 
+pub use super::metadata::{MetadataMutationAction, MetadataPinPurpose, MetadataQuotaResource, MetadataQuotaScope};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RefStoreError {
     InvalidIdentity(String),
@@ -501,6 +529,58 @@ pub enum RefStoreError {
         repository_id: Uuid,
         operation_id: Option<Uuid>,
     },
+    /// A metadata snapshot/pin `COMMIT` was issued but no acknowledgement was
+    /// observed. The transaction may still commit, so this is neither an abort
+    /// nor a rejection: resolve it with the same `request_id` through the
+    /// metadata receipt ledger. The action and both stable ids are carried so a
+    /// caller cannot mislabel create as renew/release (or the reverse).
+    MetadataCommitUnknown {
+        repository_id: Uuid,
+        request_id: Uuid,
+        pin_id: Uuid,
+        action: MetadataMutationAction,
+    },
+    MetadataSnapshotNotFound {
+        snapshot_id: Uuid,
+    },
+    MetadataPinNotFound {
+        pin_id: Uuid,
+    },
+    /// A released pin is terminal; the same id can never be re-activated.
+    MetadataPinReleased {
+        pin_id: Uuid,
+        generation: i64,
+    },
+    /// The lease elapsed. Expiry stops new pages/renewals but never deletes the
+    /// pin, refunds usage or prevents an exact release.
+    MetadataPinExpired {
+        pin_id: Uuid,
+        generation: i64,
+    },
+    MetadataPinGenerationMismatch {
+        pin_id: Uuid,
+        expected: i64,
+        actual: i64,
+    },
+    MetadataSnapshotTooLarge {
+        ref_count: usize,
+        max_refs: usize,
+    },
+    /// A stored snapshot/pin row does not match the requested
+    /// repository/tenant/owner/purpose/format/history/authority/group scope.
+    MetadataScopeMismatch(&'static str),
+    /// A private typed cursor was presented with a different scope, snapshot,
+    /// pin, pin generation or prefix than the page it was issued for.
+    MetadataCursorScopeMismatch,
+    /// Explicit admission backpressure: retained metadata is at its repo or
+    /// tenant bound. Old identities are never discarded to make room.
+    MetadataQuotaExceeded {
+        scope: MetadataQuotaScope,
+        resource: MetadataQuotaResource,
+    },
+    /// The caller's expected gate proof is stale: refs/HEAD may have moved. The
+    /// snapshot was not captured.
+    MetadataGateVersionMismatch,
     Database(String),
 }
 
@@ -513,6 +593,7 @@ impl RefStoreError {
                 | Self::CancellationConflict
                 | Self::TerminalImmutable
                 | Self::GateConflict
+                | Self::MetadataGateVersionMismatch
         )
     }
 }
@@ -546,6 +627,43 @@ impl fmt::Display for RefStoreError {
                     "ref-store bootstrap COMMIT outcome for repository {repository_id} is unknown; the gate may still exist, so resolve it with an idempotent check_version"
                 ),
             },
+            Self::MetadataCommitUnknown { repository_id, request_id, pin_id, action } => write!(
+                formatter,
+                "ref-store metadata {} COMMIT outcome for repository {repository_id} request {request_id} pin {pin_id} is unknown; the commit may still land, so query that same request id instead of assuming an abort",
+                action.as_str()
+            ),
+            Self::MetadataSnapshotNotFound { snapshot_id } => {
+                write!(formatter, "metadata snapshot {snapshot_id} not found in scope")
+            }
+            Self::MetadataPinNotFound { pin_id } => write!(formatter, "metadata pin {pin_id} not found in scope"),
+            Self::MetadataPinReleased { pin_id, generation } => {
+                write!(formatter, "metadata pin {pin_id} is released at generation {generation}")
+            }
+            Self::MetadataPinExpired { pin_id, generation } => write!(
+                formatter,
+                "metadata pin {pin_id} generation {generation} lease expired; only an exact explicit release is allowed"
+            ),
+            Self::MetadataPinGenerationMismatch { pin_id, expected, actual } => {
+                write!(formatter, "metadata pin {pin_id} generation mismatch: expected {expected}, stored {actual}")
+            }
+            Self::MetadataSnapshotTooLarge { ref_count, max_refs } => {
+                write!(formatter, "metadata snapshot has {ref_count} refs, above the bounded maximum {max_refs}")
+            }
+            Self::MetadataScopeMismatch(field) => {
+                write!(formatter, "metadata snapshot scope mismatch on {field}")
+            }
+            Self::MetadataCursorScopeMismatch => {
+                formatter.write_str("metadata snapshot cursor does not belong to this scope/snapshot/pin/prefix")
+            }
+            Self::MetadataQuotaExceeded { scope, resource } => write!(
+                formatter,
+                "metadata admission backpressure: retained {} {} quota is exhausted; old identities are kept",
+                scope.as_str(),
+                resource.as_str()
+            ),
+            Self::MetadataGateVersionMismatch => {
+                formatter.write_str("metadata snapshot gate version moved before capture; re-read the gate version")
+            }
             Self::Database(message) => write!(formatter, "ref-store database error: {message}"),
         }
     }

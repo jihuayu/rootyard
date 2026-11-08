@@ -19,7 +19,7 @@ LATEST_PREFIX = f"{LATEST_VERSION:03d}"
 
 # Single explicit source for the current archive format. Tests must not infer
 # the expected format from the manifest produced by the implementation under test.
-CURRENT_BACKUP_FORMAT = 15
+CURRENT_BACKUP_FORMAT = 16
 
 CATALOG_SQL_PATH = SCHEMA_DIR / f"{LATEST_PREFIX}_catalog.sql"
 CATALOG_JSON_PATH = SCHEMA_DIR / f"{LATEST_PREFIX}_catalog.json"

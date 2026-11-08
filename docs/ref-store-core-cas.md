@@ -247,3 +247,87 @@ selected without `ROOTYARD_TEST_DATABASE_URL`. It covers:
   same operation id after removing the owned trigger commits or replays
   exactly once, never as a false abort;
 - unknown gates.
+
+## A2: bounded metadata snapshot + durable metadata pin
+
+A2 adds an internal, **metadata-only** snapshot/pin increment on top of the A1
+unserved core gate. It is not a Git `ReadSnapshot`: refs/HEAD rows are copied
+with the exact gate revision/digest they were read with, pack membership is
+typed `Unavailable`, and a metadata pin is not protective of Git objects. No
+HTTP route, serving cutover, Blob receipt, artifact hold, logical root, GC
+consumer, `git fsck` or physical protection is added, and the existing long PG
+read leases remain the only Git-object read protection.
+
+Capabilities (`Capabilities::pg_core_increment()`): `metadata_snapshot_capture`,
+`metadata_snapshot_pagination`, `metadata_pin_lease` and
+`metadata_quota_admission` are true. `atomic_read_snapshot`,
+`durable_snapshot_pin`, `gc_observes_pins`, `logical_roots`, `artifact_holds`,
+`pack_membership_snapshot`, `serving_cutover` and `client_idempotent_publish`
+stay false.
+
+APIs (`PgRefStoreCore`, migration `140_ref_store_core_snapshots.sql`):
+
+- `create_metadata_snapshot(CreateMetadataSnapshotRequest) -> MetadataSnapshotReceipt`
+  — caller fixes request/pin/snapshot ids, lease and the expected gate digest
+  before the call. One short owned transaction locks the advisory request key,
+  the tenant usage row, the repository usage row, the repository row
+  `FOR SHARE`, the gate `FOR UPDATE` (the same lock `CommitRefs` takes), then
+  inserts the immutable header, the immutable ref rows, the durable pin and the
+  creation receipt. There is no list-then-pin sequence.
+- `read_metadata_snapshot_page(ReadMetadataSnapshotPageRequest) -> MetadataSnapshotPage`
+  — bounded (`limit` 1..=256, `limit + 1` fetched) byte-ordered keyset page over
+  immutable rows with an optional literal bounded prefix. It rechecks the
+  current A1 unserved predicate (provisioning/gitfs/stable, no Pando authority,
+  no legacy ref projection, tenant/format), the stored snapshot scope, and the
+  live pin generation, holding repository/gate and pin `FOR SHARE`.
+- `renew_metadata_pin(RenewMetadataPinRequest) -> MetadataPinReceipt` — same
+  unserved predicate and generation CAS; advances the generation by exactly one
+  and re-bases `expires_at` on `clock_timestamp()`.
+- `release_metadata_pin(ReleaseMetadataPinRequest) -> MetadataPinReceipt` —
+  explicit terminal release at the expected generation; allowed after expiry or
+  a repository transition, never on a newer generation and never on another pin.
+- `metadata_receipt(scope, request_id) -> MetadataReceiptLookup` — scoped
+  receipt/pin-status lookup for an unknown COMMIT. A missing id is `Unknown`,
+  never a success or abort guess; there is no unrestricted get-by-UUID path.
+
+Lifecycle and replay: one globally unique request-id ledger (bounded body
+≤4096 bytes, fixed action/purpose/reason enums) records `create`/`renew`/
+`release`. An identical request id + canonical digest (which covers the action
+and every semantic field) replays the original immutable receipt and ids only —
+never a page, never a revived lease, never an extended expiry. A different
+digest, or the same id in another repository, is a conflict. `COMMIT` errors
+after the reply was sent are typed `MetadataCommitUnknown` with the stable
+request/pin/action identity; the same request id resolves them. Released pins
+are terminal and pin ids are not reused; `expires_at` only denies new pages and
+renewals, and never deletes or refunds anything.
+
+Retained admission bounds (logical, at repository **and** tenant scope, over all
+history including expired/released rows): per repository 64 snapshots / 16384
+snapshot-ref rows / 16 MiB logical metadata / 2048 successful receipts; per
+tenant 256 / 65536 / 64 MiB / 8192. Snapshot capture itself is bounded to 4096
+refs and 8 MiB logical bytes. Receipts are at most 4096 bytes. Counters live in
+`ref_store_core_repo_usage` / `ref_store_core_tenant_usage`, are charged in the
+creating transaction and are never refunded by release or expiry: hitting a
+bound is explicit `MetadataQuotaExceeded` backpressure, not eviction. These are
+admission bounds, not physical SQL page, WAL, disk or RSS quotas.
+
+Schema: `ref_store_core_snapshots`, `ref_store_core_snapshot_refs`,
+`ref_store_core_pins`, `ref_store_core_receipts`, `ref_store_core_repo_usage`,
+`ref_store_core_tenant_usage`, with update-immutability triggers on snapshots,
+snapshot refs and receipts, and a pin guard trigger (identity columns immutable,
+generation advances by at most one, released is terminal, no lease change
+without a generation advance). Snapshot headers keep
+`pack_membership_state = 'unavailable'`; there is no pack/receipt FK. Lock order
+for new mutations is documentation-of-record in `core/snapshot_pg.rs`:
+request advisory key → tenant usage → repository usage → repository → gate →
+snapshot/pin → receipt; A1 `CommitRefs` keeps operation → lane → repository →
+gate and no path takes quota after the gate.
+
+Known limitations (not claims): no Git object closure, pack membership, Blob
+receipt FK, artifact hold, GC observation/roots, serving cutover or archival
+protocol. All retained budgets stay full forever until such a reviewed protocol
+exists. The real-PG suite `tests/ref_store_core_snapshot.rs` is ignored and
+requires `ROOTYARD_TEST_DATABASE_URL`; it proves metadata rows, generation CAS,
+replay, rollback, quota races and fences only. Migration 140 registration,
+schema catalogs and backup/restore qualification for the new tables are owned by
+the separate backup/registration change and the root runner.

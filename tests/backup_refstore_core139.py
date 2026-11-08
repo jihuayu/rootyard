@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Format15/schema139 backup roundtrip with populated RefStore core metadata.
+"""Current-format backup roundtrip of populated schema139 RefStore core metadata.
 
 This is a native, offline ``rootyard backup --offline`` drill on disposable
 PostgreSQL databases and volume directories.  It reuses the shared
@@ -10,6 +10,12 @@ clone/fsck) and adds one task-owned repository that is deliberately unserved:
 ``transition_state='stable'``, no Pando state row, no legacy ref projection and
 no bare Git directory.  Its next provisioning retry is far in the future so a
 service restart during the drill cannot provision or serve it.
+
+The current archive format asserted here comes from
+``tests/schema_baseline.CURRENT_BACKUP_FORMAT``; the populated fixture still
+covers only the tables introduced by migration 139 and proves their row
+equality and immutability.  It does not claim that the schema140
+snapshot/pin tables are nonempty.
 
 The rows in ``ref_store_issuer_lanes``, ``ref_store_operations``,
 ``ref_store_cancellations`` and the migration-139 gate/ref/event tables are
@@ -32,6 +38,7 @@ import urllib.parse
 import uuid
 
 from backup import BackupHarness
+from schema_baseline import CURRENT_BACKUP_FORMAT
 
 
 CORE_TABLES = (
@@ -244,7 +251,8 @@ class BackupRefStoreCore139Harness(BackupHarness):
     def lock_and_snapshot(self):
         result = super().lock_and_snapshot()
         manifest = json.loads((self.backup / "manifest.json").read_text())
-        assert manifest["format"] == 15, "drill did not produce a format15 archive"
+        assert manifest["format"] == CURRENT_BACKUP_FORMAT, (
+            "drill did not produce the current backup format")
         assert 138 in manifest["schema_versions"] and 139 in manifest["schema_versions"]
         result.update({"backup_format": manifest["format"],
                        "archive_contains_schema_versions": [138, 139]})
