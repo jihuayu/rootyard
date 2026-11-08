@@ -609,7 +609,8 @@ fn open_keyring_dir(directory: &Path) -> Result<File, KeyProviderError> {
     if !metadata.is_dir() {
         return Err(KeyProviderError::KeyRing("keyring path is not a directory"));
     }
-    if metadata.uid() != libc::geteuid() {
+    // SAFETY: geteuid takes no pointers and only reads this process's uid.
+    if metadata.uid() != unsafe { libc::geteuid() } {
         return Err(KeyProviderError::KeyRing("keyring directory owner is not the effective uid"));
     }
     if metadata.mode() & 0o777 != 0o700 {
@@ -672,7 +673,8 @@ fn read_regular(
     if !metadata.is_file() {
         return Err(reject("not a regular file"));
     }
-    if metadata.uid() != libc::geteuid() {
+    // SAFETY: geteuid takes no pointers and only reads this process's uid.
+    if metadata.uid() != unsafe { libc::geteuid() } {
         return Err(reject("owner is not the effective uid"));
     }
     if metadata.mode() & 0o777 != 0o600 {
