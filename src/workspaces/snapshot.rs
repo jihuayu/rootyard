@@ -452,10 +452,7 @@ fn whiteouts(upper: &Path) -> Result<Vec<PathBuf>, Error> {
     }
     let raw = core::read_regular(&path, core::MAX_MANIFEST).map_err(Error::internal)?;
     let names: Vec<String> = serde_json::from_slice(&raw).map_err(Error::internal)?;
-    names
-        .into_iter()
-        .map(|name| core::relative_path(name.as_bytes()).map_err(Error::internal))
-        .collect()
+    names.into_iter().map(|name| core::relative_path(name.as_bytes()).map_err(Error::internal)).collect()
 }
 
 /// Internal whiteout bookkeeping never becomes part of a snapshot, at any depth.

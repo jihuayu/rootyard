@@ -26,8 +26,7 @@ impl Workspace {
     fn new() -> Self {
         let root = tempfile::tempdir().expect("temp dir");
         let id = Uuid::new_v4();
-        fs::create_dir_all(root.path().join("workspace-service/workspaces").join(id.to_string()))
-            .expect("lower root");
+        fs::create_dir_all(root.path().join("workspace-service/workspaces").join(id.to_string())).expect("lower root");
         Self { root, id }
     }
 
@@ -430,23 +429,13 @@ fn hydrated_copies_verify_length_digest_and_mode() {
 
     // A digest mismatch is refused instead of publishing different bytes.
     let corrupt = file("bad.bin", 0o644, b"other bytes");
-    let error = snapshot::copy_hydrated(
-        &dest,
-        Path::new("bad.bin"),
-        &corrupt,
-        File::open(&source).expect("open"),
-        &mut 0,
-    );
+    let error =
+        snapshot::copy_hydrated(&dest, Path::new("bad.bin"), &corrupt, File::open(&source).expect("open"), &mut 0);
     assert!(error.is_err());
     // The length promise is enforced before the digest is trusted.
     let truncated = file("short.bin", 0o644, b"remote bytes!");
-    let error = snapshot::copy_hydrated(
-        &dest,
-        Path::new("short.bin"),
-        &truncated,
-        File::open(&source).expect("open"),
-        &mut 0,
-    );
+    let error =
+        snapshot::copy_hydrated(&dest, Path::new("short.bin"), &truncated, File::open(&source).expect("open"), &mut 0);
     assert!(error.is_err());
     let oversized = file("huge.bin", 0o644, b"x");
     let mut total = core::MAX_BYTES;
