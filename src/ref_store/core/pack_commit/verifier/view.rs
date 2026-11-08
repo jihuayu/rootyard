@@ -12,9 +12,10 @@
 //! 2. `git index-pack --stdin` lets Git compute the canonical `pack-<hash>` name
 //!    and content-validate the pack (zlib, deltas, per-object hashes); the pack
 //!    directory must then hold exactly the expected canonical pairs;
-//! 3. the exact resulting refs are written with `update-ref --stdin` and HEAD with
-//!    `symbolic-ref`, so Git itself rejects invalid names, dangling names and
-//!    directory/file conflicts;
+//! 3. the exact resulting refs are written as one sorted, validated `packed-refs`
+//!    file with `create_new`/`0600` in the owned `0700` workspace, and HEAD with
+//!    `symbolic-ref`; no user-controlled loose-ref directory tree is created, so
+//!    a legal deep ref name cannot amplify into nested directories (issue139);
 //! 4. `for-each-ref` must reproduce the context's ref map exactly; the branch
 //!    targets must be commit objects (one bounded `cat-file --batch-check`);
 //! 5. `git fsck --connectivity-only --no-dangling` must report no problem, which
@@ -31,6 +32,8 @@ use crate::ref_store::core::pack_commit::contract::VERIFIER_PIPE_BYTES;
 use crate::ref_store::core::pack_commit::error::PackCommitError;
 use crate::ref_store::core::types::{GitObjectFormat, RefName};
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -171,7 +174,7 @@ impl NativeView {
 
     /// Write the exact resulting refs and HEAD, then re-read and attest them.
     pub(super) async fn attest(&self, checked: &Checked<'_>, deadline: Instant) -> Result<(), PackCommitError> {
-        self.write_refs(&checked.resulting, deadline).await?;
+        self.write_refs(&checked.resulting)?;
         self.runner
             .run(
                 "symbolic-ref",
@@ -203,32 +206,43 @@ impl NativeView {
         self.check_head(&checked.head, checked.head_oid.as_deref(), deadline).await
     }
 
-    async fn write_refs(&self, refs: &RefMap, deadline: Instant) -> Result<(), PackCommitError> {
-        let mut input = String::with_capacity(refs.len() * 96);
-        for (name, oid) in refs {
-            input.push_str("update ");
-            input.push_str(name);
-            input.push(' ');
-            input.push_str(oid);
-            input.push('\n');
-        }
-        if input.len() > VERIFIER_PIPE_BYTES {
-            return Err(refuse("resulting ref batch exceeds the verifier stdin bound"));
-        }
-        if input.is_empty() {
+    /// Write the exact resulting refs as one sorted, validated `packed-refs` file.
+    ///
+    /// The file is created with `create_new` and mode `0600` inside the owned
+    /// 0700 workspace. It never creates a loose-ref directory tree, so legal deep
+    /// ref names cannot amplify into an attacker-shaped directory hierarchy.
+    /// HEAD is not a packed ref: it is written separately as a symbolic ref by
+    /// the caller. The created inode and a read-back must match exactly before
+    /// native Git is allowed to read it.
+    fn write_refs(&self, refs: &RefMap) -> Result<(), PackCommitError> {
+        if refs.is_empty() {
             return Ok(());
         }
-        self.runner
-            .run(
-                "update-ref",
-                &["update-ref", "--stdin", "--no-deref"],
-                Some(&self.git_dir),
-                None,
-                Stdin::Bytes(input.as_bytes()),
-                deadline,
-                &self.lease,
-            )
-            .await?;
+        let contents = refs::packed_refs_file(refs, self.format)?;
+        let path = self.git_dir.join("packed-refs");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(refuse("native Git view already holds a packed-refs file"));
+            }
+            Err(_) => return Err(refuse("native Git view packed-refs file cannot be created")),
+        };
+        let metadata = file.metadata().map_err(|_| refuse("native Git view packed-refs file cannot be inspected"))?;
+        inspect_packed_refs(&metadata)?;
+        file.write_all(&contents).map_err(|_| refuse("native Git view packed-refs file cannot be written"))?;
+        file.sync_all().map_err(|_| refuse("native Git view packed-refs file cannot be flushed"))?;
+        drop(file);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|_| refuse("native Git view packed-refs file cannot be inspected"))?;
+        inspect_packed_refs(&metadata)?;
+        let observed =
+            std::fs::read(&path).map_err(|_| refuse("native Git view packed-refs file cannot be read back"))?;
+        if observed != contents {
+            return Err(refuse("native Git view packed-refs read-back differs from the exact ref set"));
+        }
         Ok(())
     }
 
@@ -350,6 +364,63 @@ impl NativeView {
     }
 }
 
+/// The packed-refs inode must be exactly the private regular file this view
+/// created: no symlink, no foreign owner, no extra hard link and no group/other
+/// permission.
+fn inspect_packed_refs(metadata: &std::fs::Metadata) -> Result<(), PackCommitError> {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(refuse("native Git view packed-refs is not a regular file"));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err(refuse("native Git view packed-refs is not mode 0600"));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(refuse("native Git view packed-refs is owned by another user"));
+    }
+    if metadata.nlink() != 1 {
+        return Err(refuse("native Git view packed-refs is not singly linked"));
+    }
+    Ok(())
+}
+
 fn is_lower_hex(value: &str, length: usize) -> bool {
     value.len() == length && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    /// The packed-refs file is an owned 0600 regular file created with
+    /// `create_new`; no loose `refs/` tree is created and a second write refuses.
+    #[test]
+    fn packed_refs_are_private_created_new_and_create_no_loose_tree() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.try_acquire_owned().expect("slot");
+        let lease = VerificationLease::new(permit).expect("lease");
+        let view =
+            NativeView::create(Path::new("/nonexistent/git"), Arc::clone(&lease), GitObjectFormat::Sha1).expect("view");
+        std::fs::DirBuilder::new().mode(0o700).create(&view.git_dir).expect("git dir");
+        let mut refs = RefMap::new();
+        refs.insert("refs/heads/topic".into(), "a".repeat(40));
+        refs.insert("refs/tags/v1".into(), "b".repeat(40));
+        view.write_refs(&refs).expect("packed refs");
+        let path = view.git_dir.join("packed-refs");
+        let metadata = std::fs::symlink_metadata(&path).expect("metadata");
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            refs::packed_refs_file(&refs, GitObjectFormat::Sha1).expect("expected")
+        );
+        assert!(!view.git_dir.join("refs").exists(), "no loose refs tree is created");
+        assert!(view.write_refs(&refs).is_err(), "packed-refs is create_new");
+        assert!(view.write_refs(&RefMap::new()).is_ok(), "empty refs write nothing");
+    }
 }
