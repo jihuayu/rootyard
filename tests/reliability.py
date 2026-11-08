@@ -385,9 +385,9 @@ class ReliabilityHarness(Harness):
     def oversized_batch(self):
         repo = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice,
                                     body={"name": "oversized-batch"}))
-        count = 4097
+        count = 129
         refs = ["refs/heads/batch-bound/branch-" + str(i).zfill(4) for i in range(count)]
-        # One controlled HTTP request carries all 4097 command pkt-lines. This
+        # One controlled HTTP request exceeds the parser's 128-command bound.
         # does not rely on a smart Git client choosing not to split the batch.
         body = b"".join(self._receive_packet(self.second, ref) for ref in refs) + b"0000"
         detail = self._assert_http_preflight_rejected(repo, body)
@@ -490,7 +490,8 @@ class ReliabilityHarness(Harness):
             (hooks / "pre-receive").unlink()
             before_ops, before_events = self.operations(), self.events()
             self.expect(self.repo["clone_path"] + "/git-receive-pack", 503,
-                        token=self.alice, basic=True, method="POST", body=b"0000",
+                        token=self.alice, basic=True, method="POST",
+                        body=self._receive_packet(self.second, "refs/heads/runner-missing-hook-http") + b"0000",
                         content_type="application/x-git-receive-pack-request")
             denied = self.push("HEAD:runner-missing-hook", check=False)
             assert denied.returncode != 0
