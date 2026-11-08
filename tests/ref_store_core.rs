@@ -14,7 +14,10 @@ use rootyard::ref_store::{
     OperationState, PgRefStoreCore, RefName, RefPrecondition, RefStoreError, RefTarget, RefUpdate, TerminalKind,
     VersionCheck,
 };
+use std::future::{Future, poll_fn};
+use std::task::Poll;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -1272,6 +1275,278 @@ async fn check_version_is_unknown_before_initialization() -> Result<()> {
     })
     .await
     .context("unknown gate test panicked")?;
+    teardown(&admin, &schema).await?;
+    outcome?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn queued_begin_deadline_leaves_no_open_transaction_or_partial_gate() -> Result<()> {
+    let (admin, pool, schema, tenant, repo) = setup().await?;
+    let outcome = tokio::spawn(async move {
+        let format = GitObjectFormat::Sha1;
+        let history = Uuid::new_v4();
+
+        // Fixture-owned barrier: this connection holds an advisory lock while
+        // the victim connection has already sent a statement that waits for it.
+        let key = i64::from_be_bytes(Uuid::new_v4().into_bytes()[..8].try_into().expect("eight bytes"));
+        let mut blocker = pool.get().await?;
+        let blocker_tx = blocker.transaction().await?;
+        blocker_tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&key]).await?;
+
+        let mut victim = pool.get().await?;
+        let backend_pid: i32 = victim.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+        let blocking_sql = format!("SELECT pg_advisory_xact_lock({key})");
+        let mut blocked_statement = Box::pin(victim.batch_execute(&blocking_sql));
+        // Poll exactly once so the statement is on the wire, then drop the
+        // future to release the Rust borrow. It keeps blocking on the server.
+        poll_fn(|context| {
+            let _ = blocked_statement.as_mut().poll(context);
+            Poll::Ready(())
+        })
+        .await;
+        drop(blocked_statement);
+
+        let observer = pool.get().await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let blocked: bool = observer
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM pg_locks
+                         WHERE pid=$1 AND locktype='advisory' AND NOT granted)",
+                        &[&backend_pid],
+                    )
+                    .await?
+                    .get(0);
+                if blocked {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("victim statement never blocked on the advisory barrier")??;
+
+        // The core BEGIN is queued behind the blocked statement, so it cannot
+        // execute before the barrier release. The absolute deadline fires while
+        // BEGIN is still pending on this connection.
+        let started = Instant::now();
+        let error = PgRefStoreCore
+            .initialize(
+                &mut victim,
+                &gate(repo, tenant, format, history, "refs/heads/main"),
+                Instant::now() + Duration::from_millis(300),
+            )
+            .await
+            .expect_err("queued core BEGIN must hit its absolute deadline");
+        assert!(matches!(error, RefStoreError::Timeout), "unexpected queued BEGIN error: {error}");
+        assert!(started.elapsed() < Duration::from_secs(5), "queued BEGIN deadline returned too late");
+
+        // Release the server-side barrier. The SDK rollback guard queued
+        // ROLLBACK behind BEGIN; ordering the next query after them proves the
+        // backend returns to idle instead of staying in a transaction.
+        blocker_tx.rollback().await?;
+        drop(blocker);
+        tokio::time::timeout(Duration::from_secs(10), victim.batch_execute("SELECT 1"))
+            .await
+            .context("queued BEGIN/ROLLBACK did not settle after barrier release")??;
+        let state: Option<String> = observer
+            .query_opt("SELECT state FROM pg_stat_activity WHERE pid=$1", &[&backend_pid])
+            .await?
+            .map(|row| row.get(0));
+        assert_eq!(
+            state.as_deref(),
+            Some("idle"),
+            "SDK rollback guard must leave the backend out of a transaction"
+        );
+        assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_gates WHERE repository_id=$1", repo).await?, 0);
+        assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_refs WHERE repository_id=$1", repo).await?, 0);
+        assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1", repo).await?, 0);
+        assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_operations WHERE repository_id=$1", repo).await?, 0);
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("queued BEGIN deadline test panicked")?;
+    teardown(&admin, &schema).await?;
+    outcome?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires ROOTYARD_TEST_DATABASE_URL"]
+async fn commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once() -> Result<()> {
+    let (admin, pool, schema, tenant, repo) = setup().await?;
+    let outcome = tokio::spawn(async move {
+        let format = GitObjectFormat::Sha1;
+        let history = Uuid::new_v4();
+        initialize(&pool, &gate(repo, tenant, format, history, "refs/heads/main")).await?;
+
+        let operation = Uuid::new_v4();
+        let attempt = request(
+            repo,
+            tenant,
+            tenant,
+            1,
+            operation,
+            format,
+            history,
+            1,
+            HeadUpdate::Keep,
+            vec![update("refs/heads/main", None, Some(oid(format, 1)))],
+        );
+
+        // Fixture-owned barrier. The core event insert is valid, but a deferred
+        // constraint trigger makes COMMIT wait for an advisory lock held by
+        // another fixture connection. Only this fixture owns the function,
+        // trigger and lock key.
+        let key = i64::from_be_bytes(Uuid::new_v4().into_bytes()[..8].try_into().expect("eight bytes"));
+        let mut blocker = pool.get().await?;
+        let blocker_tx = blocker.transaction().await?;
+        blocker_tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&key]).await?;
+        pool.get()
+            .await?
+            .batch_execute(&format!(
+                "CREATE FUNCTION core_commit_gate() RETURNS trigger LANGUAGE plpgsql AS $$
+                   BEGIN PERFORM pg_advisory_xact_lock({key}); RETURN NEW; END $$;
+                 CREATE CONSTRAINT TRIGGER core_commit_gate AFTER INSERT ON ref_store_core_events
+                   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+                   EXECUTE FUNCTION core_commit_gate();"
+            ))
+            .await?;
+
+        let mut commit_client = pool.get().await?;
+        let commit_pid: i32 = commit_client.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+        let expected = attempt.clone();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (returned_tx, returned_rx) = oneshot::channel::<()>();
+        let commit_task = tokio::spawn(async move {
+            let result = PgRefStoreCore
+                .commit_refs(&mut commit_client, &expected, Instant::now() + Duration::from_millis(2000))
+                .await;
+            // Signal the client-side deadline outcome without letting the
+            // server COMMIT finish yet; only the barrier release may do that.
+            let _ = returned_tx.send(());
+            let _ = release_rx.await;
+            // Settle the connection after the already-issued COMMIT finishes;
+            // the SELECT is queued behind it on the same connection.
+            let settled = commit_client.batch_execute("SELECT 1").await;
+            (result, commit_client, settled)
+        });
+
+        let observer = pool.get().await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let activity = observer
+                    .query_opt("SELECT state,query FROM pg_stat_activity WHERE pid=$1", &[&commit_pid])
+                    .await?;
+                let waiting: bool = observer
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM pg_locks
+                         WHERE pid=$1 AND locktype='advisory' AND NOT granted)",
+                        &[&commit_pid],
+                    )
+                    .await?
+                    .get(0);
+                if let Some(row) = activity {
+                    let state: Option<String> = row.get(0);
+                    let query: Option<String> = row.get(1);
+                    if state.as_deref() == Some("active") && query.as_deref() == Some("COMMIT") && waiting {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                }
+                assert!(!commit_task.is_finished(), "commit escaped the deferred trigger barrier");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("COMMIT never reached the deferred advisory barrier")??;
+        drop(observer);
+
+        // Observe (not sleep) that the commit future returned at its absolute
+        // deadline while COMMIT is still blocked, then let the server finish.
+        // The only legitimate report is an unknown outcome, never an abort.
+        tokio::time::timeout(Duration::from_secs(10), returned_rx)
+            .await
+            .context("commit future never returned at its deadline")??;
+        blocker_tx.rollback().await?;
+        drop(blocker);
+        let _ = release_tx.send(());
+        let (result, commit_client, settled) = tokio::time::timeout(Duration::from_secs(10), commit_task)
+            .await
+            .context("commit task did not settle after barrier release")??;
+        settled.context("settled query after COMMIT failed")?;
+        drop(commit_client);
+        match result {
+            Err(RefStoreError::CommitUnknown { repository_id, operation_id }) => {
+                assert_eq!(repository_id, repo);
+                assert_eq!(operation_id, Some(operation));
+            }
+            other => panic!("COMMIT at its deadline must be typed Unknown, not a claimed abort: {other:?}"),
+        }
+
+        // Remove the owned trigger before retrying, and make sure the first
+        // transaction is settled so the trigger DDL cannot wait behind it.
+        pool.get()
+            .await?
+            .batch_execute(
+                "DROP TRIGGER core_commit_gate ON ref_store_core_events;
+                 DROP FUNCTION core_commit_gate();",
+            )
+            .await?;
+
+        let lookup = {
+            let mut client = pool.get().await?;
+            PgRefStoreCore.query_operation(&mut client, repo, operation, deadline()).await?
+        };
+        let landed = match lookup {
+            OperationLookup::Known(record) => {
+                assert_eq!(record.state(), OperationState::Committed, "the registry may only be Committed or Unknown");
+                let terminal = record.terminal_result().expect("committed terminal result").value();
+                assert_eq!(terminal["kind"], "committed");
+                assert_eq!(terminal["repository_id"], repo.to_string());
+                assert_eq!(terminal["revision"], 2);
+                assert_eq!(terminal["head_ref"], "refs/heads/main");
+                assert_eq!(terminal["refs"][0]["outcome"], "applied");
+                assert_eq!(terminal["refs"][0]["name"], "refs/heads/main");
+                assert_eq!(terminal["refs"][0]["new_oid"], oid(format, 1).as_hex());
+                true
+            }
+            OperationLookup::Unknown => false,
+        };
+        let refs = count(&pool, "SELECT count(*) FROM ref_store_core_refs WHERE repository_id=$1", repo).await?;
+        let events = count(&pool, "SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1", repo).await?;
+        let operations = count(&pool, "SELECT count(*) FROM ref_store_operations WHERE repository_id=$1", repo).await?;
+        if landed {
+            assert_eq!((refs, events, operations), (1, 1, 1), "landed COMMIT must have its exact ref, event and terminal");
+        } else {
+            // A server-side statement_timeout may legitimately have aborted the
+            // COMMIT while the client already stopped waiting. Never force it
+            // to look committed; the same identity must still resolve exactly.
+            assert_eq!((refs, events, operations), (0, 0, 0), "aborted COMMIT must leave no ref, event or terminal");
+        }
+
+        // Retry the SAME operation identity after removing the fixture trigger.
+        // It either replays the landed terminal or commits exactly once after a
+        // server-side abort; it is never reported as a false abort.
+        let retried = commit(&pool, &attempt).await?;
+        assert!(retried.is_committed(), "same-identity retry must commit or replay, not reject");
+        assert_eq!(retried.terminal.revision, 2);
+        assert_eq!(retried.terminal.head_ref.as_deref(), Some("refs/heads/main"));
+        if landed {
+            assert!(retried.replayed, "an already-landed commit must replay its terminal");
+        }
+        assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_refs WHERE repository_id=$1", repo).await?, 1);
+        assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1", repo).await?, 1);
+        assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_operations WHERE repository_id=$1", repo).await?, 1);
+        assert!(matches!(
+            check_version(&pool, repo, tenant, None).await?,
+            VersionCheck::Changed(version) if version.revision() == 2
+        ));
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("COMMIT deadline test panicked")?;
     teardown(&admin, &schema).await?;
     outcome?;
     Ok(())
