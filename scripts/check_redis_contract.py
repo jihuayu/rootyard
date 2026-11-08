@@ -51,7 +51,12 @@ CONTAINER_PORT = 6379
 TLS_CONTAINER_PORT = 6380
 CLEAN_COMMAND = ["cargo", "clean", "--package", "rootyard"]
 BUILD_COMMAND = [
-    "cargo", "test", "--locked", "--lib", "--features", "state-redis",
+    "cargo",
+    "--config", "profile.dev.package.rootyard.debug=0",
+    "--config", "profile.test.package.rootyard.debug=0",
+    "--config", 'profile.dev.package.rootyard.strip="debuginfo"',
+    "--config", 'profile.test.package.rootyard.strip="debuginfo"',
+    "test", "--locked", "--lib", "--features", "state-redis",
     "--no-run", "--message-format=json-render-diagnostics",
 ]
 SENSITIVE_ENV = (
@@ -346,6 +351,7 @@ class OwnedRedisFixture:
         self.nonce = secrets.token_hex(16)
         self.secret = secrets.token_hex(32)
         self.cid: str | None = None
+        self.create_attempted = False
         self.name = f"rootyard-owned-redis-{self.nonce[:12]}"
         self.plain_port: int | None = None
         self.tls_port: int | None = None
@@ -395,6 +401,7 @@ class OwnedRedisFixture:
         return f"type=bind,source={source},target={target},readonly"
 
     def _create_container(self) -> str:
+        self.create_attempted = True
         uid, gid = os.getuid(), os.getgid()
         arguments = [
             "create", "--name", self.name,
@@ -494,13 +501,45 @@ class OwnedRedisFixture:
             raise RunnerError(
                 f"owned Redis {'TLS' if tls else 'plaintext'} probe returned no RESP reply")
 
+    def _labels(self, cid: str) -> dict[str, str]:
+        labels = {}
+        for label in ("kind", "nonce", "directory", "uid", "name"):
+            inspected = self._raw_docker(
+                "inspect", "--type", "container", "--format",
+                f'{{{{index .Config.Labels "rootyard.fixture.{label}"}}}}',
+                cid, timeout=30)
+            labels[label] = inspected.stdout.strip() if inspected.returncode == 0 else ""
+        return labels
+
+    def _owned(self, actual: str, labels: dict[str, str]) -> bool:
+        return (
+            re.fullmatch(r"[0-9a-f]{64}", actual) is not None
+            and (self.cid is None or actual == self.cid)
+            and labels["kind"] == "owned-redis"
+            and labels["nonce"] == self.nonce
+            and labels["directory"] == str(self.directory)
+            and labels["uid"] == str(os.getuid())
+            and labels["name"] == self.name
+        )
+
+    def _remove(self, actual: str, labels: dict[str, str], errors: list[str]) -> bool:
+        if not self._owned(actual, labels):
+            errors.append("owned Redis container could not be proven by id/labels; keeping fixture")
+            return False
+        result = self._raw_docker("rm", "-f", "--", actual, timeout=60)
+        if result.returncode != 0:
+            errors.append("docker could not remove the owned Redis container; keeping fixture")
+            return False
+        self.cid = None
+        return True
+
     def stop(self) -> list[str]:
-        """Remove only this process's created container id, even after failure."""
+        """Remove only this run's container, even after an ambiguous create result."""
         errors: list[str] = []
         removed = False
         absent = False
-        if self.cid:
-            try:
+        try:
+            if self.cid:
                 result = self._raw_docker(
                     "inspect", "--type", "container", "--format", "{{.Id}}", self.cid, timeout=30)
                 if result.returncode != 0:
@@ -510,38 +549,32 @@ class OwnedRedisFixture:
                         errors.append("owned Redis container could not be inspected for cleanup")
                 else:
                     actual = result.stdout.strip()
-                    labels = {}
-                    for label in ("kind", "nonce", "directory", "uid", "name"):
-                        inspected = self._raw_docker(
-                            "inspect", "--type", "container", "--format",
-                            f'{{{{index .Config.Labels "rootyard.fixture.{label}"}}}}',
-                            self.cid, timeout=30)
-                        labels[label] = inspected.stdout.strip() if inspected.returncode == 0 else ""
-                    owned = (
-                        actual == self.cid
-                        and labels["kind"] == "owned-redis"
-                        and labels["nonce"] == self.nonce
-                        and labels["directory"] == str(self.directory)
-                        and labels["uid"] == str(os.getuid())
-                        and labels["name"] == self.name
-                    )
-                    if not owned:
-                        errors.append("owned Redis container labels did not match; refusing removal")
+                    removed = self._remove(actual, self._labels(self.cid), errors)
+            elif self.create_attempted:
+                # docker create may have created the daemon object before a CLI
+                # timeout or invalid stdout prevented recording its id. Resolve
+                # only this run's random name, then prove the full id and every
+                # ownership label before removing it.
+                result = self._raw_docker(
+                    "inspect", "--type", "container", "--format", "{{.Id}}", self.name, timeout=30)
+                if result.returncode != 0:
+                    if "no such container" in result.stderr.lower():
+                        absent = True
                     else:
-                        removed_result = self._raw_docker("rm", "-f", "--", self.cid, timeout=60)
-                        if removed_result.returncode != 0:
-                            errors.append("docker could not remove the owned Redis container")
-                        else:
-                            removed = True
-                            self.cid = None
-            except RunnerError as error:
-                errors.append(f"owned Redis cleanup failed: {redact(error)}")
+                        errors.append("owned Redis create result is ambiguous; keeping fixture")
+                else:
+                    actual = result.stdout.strip()
+                    removed = self._remove(actual, self._labels(actual), errors)
+        except RunnerError as error:
+            errors.append(f"owned Redis cleanup unresolved: {redact(error)}")
         if not self.cid or removed or absent:
-            if self.directory.exists():
-                shutil.rmtree(self.directory, ignore_errors=True)
-            if self.directory.exists():
-                errors.append("private fixture directory could not be removed")
+            if not errors:
+                if self.directory.exists():
+                    shutil.rmtree(self.directory, ignore_errors=True)
+                if self.directory.exists():
+                    errors.append("private fixture directory could not be removed")
         return errors
+
 def build_libtest() -> dict:
     """Build one fresh source-bound rootyard lib test executable via Cargo JSON."""
     source_before = build_native.source_digest()

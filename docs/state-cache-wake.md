@@ -227,3 +227,12 @@ behind a bounded permit. Physical teardown still requires runtime scheduling;
 there is no claim to synchronously cancel kernel I/O. The stall regression
 keeps the cache alive, blackholes real server replies and checks TCP closure
 after repeated deadlines and an explicit caller abort, followed by recovery.
+
+## Optional CI real-Redis gate
+
+`scripts/check_redis_contract.py` owns a disposable Docker `redis:7.2.6`
+fixture and runs the source-bound six-case plaintext, TLS, untrusted-CA and
+restored-trust contract. The separate `.github/workflows/redis-contract.yml`
+job wraps it with all-target `state-redis` Clippy and report upload. Remote CI
+execution is pending in this worktree; no remote PASSED result is claimed.
+See [owned real-Redis contract gate](redis-contract-gate.md).

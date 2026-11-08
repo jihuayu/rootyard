@@ -150,6 +150,8 @@ class BuildReceiptTest(unittest.TestCase):
         self.assertEqual("before", receipt["source_inputs_sha256"])
         self.assertEqual(str(self.executable.resolve()), receipt["executable"])
         self.assertEqual(gate.BUILD_COMMAND, receipt["command"])
+        self.assertIn("profile.test.package.rootyard.debug=0", receipt["command"])
+        self.assertIn('profile.dev.package.rootyard.strip="debuginfo"', receipt["command"])
 
     def test_stale_source_or_fresh_artifact_is_rejected(self):
         with self.assertRaisesRegex(gate.RunnerError, "source inputs changed"):
@@ -208,6 +210,30 @@ class CleanupOwnershipTest(unittest.TestCase):
     def test_label_mismatch_refuses_removal_and_keeps_fixture(self):
         self.fixture.cid = self.cid
         self.fixture.nonce = "x" * 32
+        errors = self.fixture.stop()
+        self.assertTrue(errors)
+        self.assertEqual([], self.rm_calls)
+        self.assertTrue(self.fixture.directory.exists())
+
+    def test_timeout_after_daemon_create_resolves_exact_name_and_removes(self):
+        self.fixture.create_attempted = True
+        self.assertEqual([], self.fixture.stop())
+        self.assertEqual([["docker", "rm", "-f", "--", self.cid]], self.rm_calls)
+        self.assertFalse(self.fixture.directory.exists())
+
+    def test_invalid_cid_output_uses_the_same_name_resolution_path(self):
+        self.fixture.docker_runner = lambda *_args, **_kwargs: "not-a-full-cid"
+        with self.assertRaisesRegex(gate.RunnerError, "full container id"):
+            self.fixture._create_container()
+        self.assertIsNone(self.fixture.cid)
+        self.assertTrue(self.fixture.create_attempted)
+        self.assertEqual([], self.fixture.stop())
+        self.assertEqual([["docker", "rm", "-f", "--", self.cid]], self.rm_calls)
+
+    def test_ambiguous_name_lookup_keeps_fixture_and_reports_unresolved(self):
+        self.fixture.create_attempted = True
+        self.fixture.command_runner = lambda command, **kwargs: completed(
+            returncode=1, stderr="Cannot connect to the Docker daemon\n")
         errors = self.fixture.stop()
         self.assertTrue(errors)
         self.assertEqual([], self.rm_calls)
