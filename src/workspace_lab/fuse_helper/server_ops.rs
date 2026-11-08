@@ -10,7 +10,13 @@ use super::{
     FreezeOp, MOUNT_QUEUE_CAPACITY, Mounted, PendingMount, State, gate_for, lock, reply, reply_errno, reply_error,
 };
 use crate::workspace_lab::fuse_helper::{validate_root, workspace_paths};
-use crate::workspace_lab::fuse_mount::{FreezeDecision, LazySource, MutationGate, Overlay, spawn as spawn_mount};
+// The independent helper owns its mounts: `spawn_helper` is the only path that
+// adds `MountOption::AutoUnmount`, so killing this process (or losing it to a
+// parent death) makes the owned mountpoints disappear without any umount from
+// the API parent, which never holds the FUSE descriptor.
+use crate::workspace_lab::fuse_mount::{
+    FreezeDecision, LazySource, MutationGate, Overlay, spawn_helper as spawn_mount,
+};
 use crate::workspaces::lazy::Reader;
 use std::{
     fs, io,

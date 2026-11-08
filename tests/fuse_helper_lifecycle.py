@@ -43,7 +43,7 @@ REQUIRED_CASES = [
     "mount_cancel_and_retry",
     "normal_shutdown_exit_zero_and_mounts_gone",
     "heartbeat_eof_watchdog_fences_and_exits",
-    "child_sigkill_mounts_unconfirmable_and_queued_writes_fail",
+    "child_sigkill_auto_unmount_and_queued_writes_fail",
     "independent_parent_sigkill_orphans_helper",
 ]
 
@@ -155,6 +155,53 @@ class Suite:
         rows = support.owned_mounts(root)
         self.require(not rows, f"{label}: owned mountpoints still mounted after helper death: "
                                f"{[r['mountpoint'] for r in rows]}")
+
+    def expect_owned_ids_gone(self, fixture: support.WorkFixture, ids: list[str], label: str,
+                              timeout: float = 10.0) -> list[str]:
+        """Require the exact owned mount IDs captured before an owner death to be gone.
+
+        This is the qualified AutoUnmount contract, asserted BEFORE any normal
+        owned cleanup backstop runs: the dying helper closes its last FUSE
+        descriptor and the fusermount3 monitor socket, so fusermount3 unmounts
+        exactly its own mounts without an explicit umount from this harness or
+        from the API parent. The backstop must never mask a violation here.
+        """
+        def mounted() -> list[str]:
+            rows = {row["mountpoint"] for row in support.owned_mounts(fixture.root)}
+            return [mountpoint for mountpoint in ids if mountpoint in rows]
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not mounted():
+                return []
+            time.sleep(0.05)
+        remaining = mounted()
+        self.require(not remaining,
+                     f"{label}: owned mount IDs still mounted {timeout}s after owner death: {remaining}")
+        return []
+
+    def expect_fresh_mount(self, fixture: support.WorkFixture, workspace: str, label: str) -> dict:
+        """Mount the same workspace UUID path with a fresh helper afterwards.
+
+        Proves the killed owner's mount identity really disappeared rather than
+        being stacked, hidden or merely reported clean: the path must be
+        mountable and readable/writable again by a new owner.
+        """
+        helper = self.spawn(label)
+        try:
+            self.expect_ok(helper.hello(), helper)
+            reply = helper.mount(fixture.root, workspace, 1)
+            self.expect_ok(reply, helper, "mounted", workspace=workspace, epoch=1)
+            mountpoint = fixture.mounts[workspace]
+            written = write_read(mountpoint / "fresh-mount.txt", b"fresh mount after auto-unmount\n")
+            self.require((mountpoint / "fresh-mount.txt").exists(),
+                         f"{label}: fresh same-UUID path mount is not usable")
+            self.require(any(row["mountpoint"] == str(mountpoint) for row in support.owned_mounts(fixture.root)),
+                         f"{label}: fresh same-UUID mount {mountpoint} missing from mountinfo")
+            return {"workspace": workspace, "mountpoint": str(mountpoint),
+                    "write_read": written.decode()}
+        finally:
+            self.release(helper, fixture, f"{label}-release")
 
     def _cleanup_error(self, step: str, error: BaseException, evidence: dict) -> None:
         row = {"step": step, "error": support.redact(f"{type(error).__name__}: {error}")}
@@ -790,11 +837,23 @@ def case_heartbeat_eof(suite: Suite) -> dict:
 
 
 def case_child_sigkill(suite: Suite) -> dict:
+    """SIGKILLed helper: AutoUnmount removes its exact mounts, writer fails.
+
+    The asserted contract is the helper's ownership boundary on a qualified
+    environment (private mount namespace, namespace root, fusermount3): the
+    exact mount IDs captured before the kill must disappear in bounded time
+    after the helper exit and queued-writer termination, BEFORE the normal
+    owned cleanup backstop. A fresh helper must then be able to mount the same
+    workspace UUID path. API-parent SIGKILL semantics are NOT covered here.
+    """
     helper = suite.spawn("sigkill")
     fixture = suite.fixture()
     try:
         suite.expect_ok(helper.hello(), helper)
         a, b = mount_pair(suite, helper, fixture)
+        owned_ids = sorted(row["mountpoint"] for row in support.owned_mounts(fixture.root))
+        suite.require(owned_ids == sorted([str(fixture.mounts[a]), str(fixture.mounts[b])]),
+                      f"owned mount IDs before kill {owned_ids} do not match the requested mounts")
         writer, parked = _park(suite, helper, a, 1, 9501, fixture.mounts[a], "a-kill.bin")
         try:
             helper.signal(signal.SIGKILL)
@@ -812,16 +871,21 @@ def case_child_sigkill(suite: Suite) -> dict:
                 except OSError as error:
                     suite.require(error.errno in (errno.EIO, errno.ENOTCONN, errno.ENOENT),
                                   f"post-SIGKILL write errno {error.errno} on {ws}")
-            # SIGKILL does not request an unmount; a disconnected owned mount
-            # may remain.  Do not assume automatic cleanup: record it and let
-            # the owning release perform a normal non-lazy unmount afterwards.
-            still_owned = [row["mountpoint"] for row in support.owned_mounts(fixture.root)]
+            suite.require(writer.finished.is_set(), "queued writer did not terminate before the mount check")
+            # AutoUnmount contract: the kernel closed the helper's last FUSE
+            # descriptor and fusermount3 saw its monitor socket close, so it
+            # unmounted exactly the captured mount IDs. Required BEFORE the
+            # normal owned cleanup backstop so the backstop cannot mask it.
+            gone = suite.expect_owned_ids_gone(fixture, owned_ids, "child-sigkill")
+            remount = suite.expect_fresh_mount(fixture, a, "sigkill-remount")
             dead_a = suite.expect_dead_control(helper, a, "sigkill-a")
             dead_b = suite.expect_dead_control(helper, b, "sigkill-b")
             return {"exit": code, "queue_errno": writer.error.errno, "parked_bytes": parked,
                     "post_kill_write": "error", "control_a": dead_a, "control_b": dead_b,
-                    "owned_mounts_before_cleanup": still_owned,
-                    "explicit_cleanup": "owned normal non-lazy umount in release"}
+                    "mount_ids_before_kill": owned_ids, "mount_ids_after_kill": gone,
+                    "auto_unmount": "owned mount IDs gone before the cleanup backstop",
+                    "fresh_same_uuid_mount": remount,
+                    "explicit_cleanup": "normal non-lazy umount remains the release backstop only"}
         finally:
             writer.request_stop()
     finally:
@@ -893,16 +957,30 @@ def case_parent_sigkill(suite: Suite) -> dict:
         suite.require(info.get("lower_read") == "lower-a\n"
                       and info.get("probe_read") == "stub alive\n",
                       "stub did not prove real mount read/write before readiness")
+        owned_ids = [mountpoint for mountpoint in info.get("owned_mounts", [])
+                     if mountpoint == str(fixture.mounts[a])]
+        suite.require(owned_ids == [str(fixture.mounts[a])],
+                      f"parent stub did not capture its exact owned mount ID: {info.get('owned_mounts')}")
         os.kill(stub_pid, signal.SIGKILL)
         os.waitpid(stub_pid, 0)
         stub_pid = 0
         helper_pid = int(info["helper_pid"])
         exited = support.wait_pid_gone(helper_pid, support.EXIT_DEADLINE)
         suite.require(exited, f"orphaned helper pid {helper_pid} stayed alive after parent SIGKILL")
+        # Same AutoUnmount contract as the direct child SIGKILL: the orphaned
+        # helper's death must remove exactly its captured mount ID in bounded
+        # time, before this case's normal owned cleanup backstop runs.
+        gone = suite.expect_owned_ids_gone(fixture, owned_ids, "parent-sigkill")
+        remount = suite.expect_fresh_mount(fixture, a, "parent-sigkill-remount")
         return {"parent_stub": "SIGKILL", "helper_pid": helper_pid,
                 "orphan_exited": exited, "hello_mount_asserted": True,
                 "real_mount_read_write": True,
+                "mount_ids_before_kill": owned_ids, "mount_ids_after_kill": gone,
+                "auto_unmount": "orphaned helper's owned mount ID gone before the cleanup backstop",
+                "fresh_same_uuid_mount": remount,
                 "api_harness_case": "not_executed",
+                "api_client_sigkill": "not claimed: this is an external RPC parent stub, "
+                                      "not the production API client",
                 "coverage": "external RPC parent stub (not production API client)"}
     finally:
         if stub_pid:
@@ -1002,6 +1080,19 @@ def main() -> int:
         "in the harness; no lazy unmount or global FUSE abort is used.",
         "Every FUSE mount lives under the owned temporary root in a private mount namespace; no host "
         "mount is touched, no LSM policy is changed and no other mount is accessed.",
+        "The SIGKILL cases assert the qualified AutoUnmount contract: the exact owned mount IDs "
+        "captured before the kill must disappear in bounded time after the owner is confirmed dead "
+        "and the queued writer has terminated, BEFORE the normal owned cleanup backstop, and a fresh "
+        "helper must then mount and use the same workspace UUID path again. This is the fuse-helper "
+        "deployment contract on a qualified host; it is NOT an assumption that any killed FUSE "
+        "mount disappears, and the backstop is never used as evidence for it.",
+        "Qualification is host policy, not harness capability: AutoUnmount needs fusermount3 and a "
+        "caller allowed to use auto_unmount/allow_other, so the supported shape is a private user "
+        "and mount namespace entered as namespace root (unshare -Urm). This harness targets that "
+        "namespace-root shape; native qualification of a conventional non-root host is pending and "
+        "may need user_allow_other in the host fuse.conf. Nothing here edits a global fuse.conf or "
+        "an LSM policy, the session ACL stays owner-only (no explicit AllowOther/AllowRoot), and no "
+        "unsupported rootless guarantee is implied.",
         "Compilation and native execution are owned by the root workflow; this harness only executes "
         "an already built --binary and never runs Cargo.",
     ]

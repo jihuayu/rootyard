@@ -333,24 +333,72 @@ impl Overlay {
     }
 }
 
+/// Mount options shared by every mount.
+///
+/// `AutoUnmount` is added only for the independent helper. The in-process
+/// service mount and the lab mount keep the historical option list so an
+/// existing deployment is not switched onto the fusermount3 path by accident.
+fn mount_options(auto_unmount: bool) -> Vec<MountOption> {
+    let mut options = vec![MountOption::FSName("rootyard-vfs".into()), MountOption::DefaultPermissions];
+    if auto_unmount {
+        options.push(MountOption::AutoUnmount);
+    }
+    options
+}
+
+fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> io::Result<MountHandle> {
+    let fs = MountFs::new(overlay)?;
+    let dispatcher = fs.dispatcher().clone();
+    let session = fuser::spawn_mount2(fs, mountpoint, &mount_options(auto_unmount))?;
+    Ok(MountHandle { _session: session, dispatcher })
+}
+
 /// Spawn the bounded per-mount dispatcher and mount `overlay` in the background.
 ///
 /// Every mount owns its own queue and actor, so a slow read on one mount cannot
 /// stall another mount. Queue limits are shared per helper and per process.
+///
+/// This is the legacy option list (no `AutoUnmount`): used by the in-process
+/// service mount, whose unmount is driven by the owning API process.
 pub fn spawn(overlay: Overlay, mountpoint: &Path) -> io::Result<MountHandle> {
-    let fs = MountFs::new(overlay)?;
-    let dispatcher = fs.dispatcher().clone();
-    let session = fuser::spawn_mount2(
-        fs,
-        mountpoint,
-        &[MountOption::FSName("rootyard-vfs".into()), MountOption::DefaultPermissions],
-    )?;
-    Ok(MountHandle { _session: session, dispatcher })
+    spawn_with(overlay, mountpoint, false)
+}
+
+/// Spawn a mount owned by one independent FUSE helper process with
+/// [`MountOption::AutoUnmount`].
+///
+/// The helper is the only owner of its `/dev/fuse` descriptors: the API parent
+/// never receives them and nothing outside the helper unmounts on its behalf.
+/// `AutoUnmount` therefore makes the helper's death the ownership boundary.
+/// `fuser` takes the pure-Rust `fusermount3` path, keeps the fusermount monitor
+/// socket inside its `Mount`, and passes `auto_unmount` to `fusermount3`. When
+/// the helper is SIGKILLed the kernel closes its last FUSE fd and that socket
+/// together, so `fusermount3` unmounts exactly the mount it created at that
+/// path; no explicit `umount` from the harness or the API is involved.
+///
+/// Owner ACL is deliberately unchanged: `AutoUnmount` is the only option added
+/// here. `fuser` injects `allow_other` on the *fusermount command line* when it
+/// is needed for `auto_unmount`, but it derives `SessionACL` from the original
+/// option list, so the session stays `SessionACL::Owner`. Do not add
+/// `AllowOther`/`AllowRoot` here: that would widen the session ACL, and
+/// `DefaultPermissions` keeps the kernel/userspace permission checks in place.
+///
+/// Qualification is the deployment's job, not this function's: the helper needs
+/// a host policy where `fusermount3` exists and the caller may use
+/// `auto_unmount`/`allow_other`. Where the host is conventionally non-root the
+/// supported shape is a private user/mount namespace entered as namespace root
+/// (`unshare -Urm`), which the lifecycle harness and CI already use; a
+/// conventional non-root host without that wrapper may need `user_allow_other`
+/// in the host `fuse.conf` and is *not* qualified by this change. This service
+/// never edits a global `fuse.conf` or any LSM policy, and makes no implicit
+/// rootless guarantee.
+pub fn spawn_helper(overlay: Overlay, mountpoint: &Path) -> io::Result<MountHandle> {
+    spawn_with(overlay, mountpoint, true)
 }
 
 pub fn mount(lower: PathBuf, upper: PathBuf, mountpoint: PathBuf) -> io::Result<()> {
     let fs = MountFs::new(Overlay::new(lower, upper)?)?;
-    fuser::mount2(fs, mountpoint, &[MountOption::FSName("rootyard-vfs".into()), MountOption::DefaultPermissions])
+    fuser::mount2(fs, mountpoint, &mount_options(false))
 }
 
 #[cfg(test)]
@@ -407,5 +455,23 @@ mod tests {
             release_tx.send(()).unwrap();
         });
         drop(gate.mutation().expect("thaw admits mutations"));
+    }
+
+    #[test]
+    fn helper_mount_options_add_auto_unmount_without_widening_the_owner_acl() {
+        let legacy = mount_options(false);
+        assert!(!legacy.contains(&MountOption::AutoUnmount), "the legacy mount keeps its option list");
+        let helper = mount_options(true);
+        assert!(helper.contains(&MountOption::AutoUnmount), "AutoUnmount is helper-only");
+        assert!(helper.contains(&MountOption::DefaultPermissions), "permission checks stay enabled");
+        // fuser derives SessionACL from the options it is given, so adding an
+        // Allow* option here would widen the session ACL; AutoUnmount alone
+        // keeps SessionACL::Owner while fusermount still gets its implicit
+        // allow_other for auto_unmount.
+        assert!(!helper.contains(&MountOption::AllowOther), "AllowOther must not be added explicitly");
+        assert!(!helper.contains(&MountOption::AllowRoot), "AllowRoot must not be added explicitly");
+        let stripped: Vec<MountOption> =
+            helper.iter().filter(|option| **option != MountOption::AutoUnmount).cloned().collect();
+        assert_eq!(stripped, legacy, "the helper adds exactly one option");
     }
 }
