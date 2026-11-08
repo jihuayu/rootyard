@@ -11,3 +11,5 @@ The scan bounds Rust records/bytes/record size and time, counts matching public 
 This is one-host regression evidence, not latency/throughput/HA/power-loss qualification. Old Git and selective-prefix scans can still cost a linear scan up to the cursor/range, within configured limits. Earlier dual-version passes and failed stream-fixture/source-assertion attempts remain in the local immutable task archives; only the exact reports here qualify the final change.
 
 Reproduce using a built artifact plus dedicated `ROOTYARD_TEST_DATABASE_URL`: set `ROOTYARD_GIT` to each selected Git and run `python3 tests/browse.py --binary BINARY --report REPORT`. The toolchain/build flags and artifact receipts are included. Remote CI still needs to complete on the pushed stack.
+
+The subsequent CI formatting repair changes import order and expression layout in Git process helpers only. These receipts preserve their exact pre-format input hashes; current-head verification is tracked by remote CI.
