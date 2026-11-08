@@ -90,6 +90,8 @@ def ids(page):
 
 
 def assert_safe_metadata(raw, secret):
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
     lowered = raw.lower()
     assert secret not in raw, "list/read response leaked the plaintext secret"
     for forbidden in ('"digest"', '"secret"', '"csrf', '"session'):
@@ -307,7 +309,7 @@ def main():
             cookie = cookie_header(cookies)
             csrf = cookies["rootyard_csrf"]
             page_raw = h.expect("/web/settings/tokens", 200, extra_headers={"Cookie": cookie})
-            assert "Personal access tokens" in page_raw, page_raw[:300]
+            assert b"Personal access tokens" in page_raw, page_raw[:300]
             h.expect("/web/settings/tokens", 403, method="POST", body=body("ui-csrf-missing"),
                      extra_headers={"Cookie": cookie, "Origin": h.base})
             h.expect("/web/settings/tokens", 403, method="POST", body=body("ui-cross-origin"),
@@ -322,7 +324,7 @@ def main():
             h.secrets.append(created["secret"])
             assert header(headers, "Cache-Control") == "no-store", headers
             assert header(headers, "X-Content-Type-Options") == "nosniff", headers
-            assert created["secret"] not in h.expect("/web/settings/tokens", 200,
+            assert created["secret"].encode() not in h.expect("/web/settings/tokens", 200,
                                                      extra_headers={"Cookie": cookie})
             # Basic is ambient browser authority: a cross-site form post with a
             # Basic credential is rejected, and the target token stays live.
@@ -347,7 +349,7 @@ def main():
             h.secrets.append(rotated["secret"])
             h.expect("/api/repos", 401, token={"username": "alice", "token": created["secret"]})
             h.sessions_page = h.expect("/web/settings/sessions", 200, extra_headers={"Cookie": cookie})
-            assert "Browser sessions" in h.sessions_page
+            assert b"Browser sessions" in h.sessions_page
             return "cookie+CSRF create/rotate 200; missing CSRF/cross-origin/Basic 403; secret once"
 
         def case_api_authorization_only():

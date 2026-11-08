@@ -82,9 +82,10 @@ async fn member_organizations(state: &AppState, actor: &Identity) -> Result<Vec<
     let client = state.pool.get().await.map_err(Error::internal)?;
     let rows = client
         .query(
-            "SELECT o.id, o.slug FROM organizations o \
+            "SELECT o.id, ns.slug FROM organizations o \
+               JOIN namespaces ns ON ns.organization_id = o.id AND ns.kind = 'organization' \
                JOIN organization_memberships m ON m.organization_id = o.id \
-              WHERE m.user_id = $1 ORDER BY o.slug LIMIT 101",
+              WHERE m.user_id = $1 ORDER BY ns.slug LIMIT 101",
             &[&actor.id],
         )
         .await

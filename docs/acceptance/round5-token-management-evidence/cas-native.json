@@ -1,0 +1,58 @@
+{
+  "suite": "pat_git_publication_fence",
+  "executed_native": true,
+  "native_barrier": {
+    "wrapper_pids": [
+      325376
+    ],
+    "token_row_share_holders": [
+      325114
+    ],
+    "ref_absent": true,
+    "grant_observed": true,
+    "blocked_sqlstates": {
+      "read_only": "55P03",
+      "grant_writer": "55P03"
+    }
+  },
+  "ok": true,
+  "coverage_complete": false,
+  "untested_scope": [
+    "Restricted token issuance is still SQL-seeded; the public issuer/API/UI is a separate branch and is not claimed released.",
+    "Exact browser-child inheritance for a restricted parent remains unimplemented and is not covered here.",
+    "The token grant list/read API is not exercised; grants are seeded by SQL inside the isolated schema."
+  ],
+  "cases": [
+    {
+      "name": "cas.revoker_first_denied_then_valid_push",
+      "status": "passed",
+      "seconds": 2.7732,
+      "detail": "owner FOR SHARE wait blocked by revoker backend 325150 (owner 325012); revocation refused the push; valid token published"
+    },
+    {
+      "name": "cas.owner_token_lock_outlives_native_cas",
+      "status": "passed",
+      "seconds": 1.9102,
+      "detail": "native child entered the prepared barrier (wrapper pid [325376], token row share holders [325114]); token FOR SHARE blocked read_only flip (55P03) and grant writer (55P03) before CAS; settlement released both (['RAN'])"
+    },
+    {
+      "name": "cas.cancel_during_authorization_releases",
+      "status": "passed",
+      "seconds": 5.6731,
+      "detail": "owner backend 325012 left its transaction while the revoker held the row ({'owner_pid': 325012, 'backend_present': True, 'in_transaction': False, 'wait_event_type': 'Client', 'blocked_owners': 0}); independent session 325900 acquired the token row FOR UPDATE NOWAIT; fresh push published"
+    }
+  ],
+  "notes": [
+    "Every case drives one real `git push` over Git HTTP against the real binary; no helper transaction substitutes for native CAS.",
+    "Case A uses the documented repository publication advisory key so the revoker owns the token row before the owner's late authorisation; the resulting wait is read from pg_stat_activity and its blockers from pg_blocking_pids (the statement carries $1, never the raw token).",
+    "Case B holds the push in the pre-receive/parent wait, then installs a test-owned synthetic fixture for the installed reference-transaction hook: for $1=prepared only it touches `entered` and waits (bounded) for `release`, then execs a copied genuine hook with the same argv/stdin/environment. It asserts SQLSTATE 55P03 for the read_only flip and the grant-writer FOR UPDATE step while the owner still holds the row FOR SHARE, then restores the hook and releases the barrier.",
+    "Case C kills the HTTP client while the owner waits; the owner backend must vanish from pg_stat_activity while the revoker still holds the token row, and an independent session proves the row is lockable with a real SELECT ... FOR UPDATE NOWAIT.",
+    "Refusal evidence counts every git_operations row for the repository (outcome has no 'committed' value), plus outbox events, committed admissions and the published ref.",
+    "Restricted authority is seeded by SQL because no public issuer exists."
+  ],
+  "limitations": [
+    "Loopback single-node timings are not a scalability benchmark.",
+    "The Case B barrier is a temporary test-owned fixture over the installed hook entry; .runner and all production files are unmodified and the original symlink is restored before the barrier is released.",
+    "Not executed by the authoring worker (no cargo build, no native run there)."
+  ]
+}
