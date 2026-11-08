@@ -51,9 +51,8 @@ pub(crate) async fn run_once(
                 observability::observe_internal(&error);
                 let accepted = jobs::finish(&state.pool, &job, json!({}), Some(&error.to_string()), policy)
                     .await
-                    .map_err(|finish_error| {
-                        observability::observe_internal(&finish_error);
-                        finish_error
+                    .inspect_err(|finish_error| {
+                        observability::observe_internal(finish_error);
                     })?;
                 let status = if !accepted {
                     "superseded"
