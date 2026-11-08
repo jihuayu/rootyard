@@ -1,0 +1,7 @@
+{
+  "kind": "Root static cross-check of Luna/DeepSeek proposal",
+  "rejected_proposal": "Add binding overhead again to per-create fixed charge",
+  "reason": "PgPackSnapshot::create sets logical_bytes=snapshot_bytes+binding_logical_bytes. Typed PackSnapshotReceipt.logical_bytes already includes it; adding again double-counts.",
+  "observed_native_confirmation": "Actual backup helper passed exact permanent-byte equality before failing the following missing cancellation-table field check in backup19-v2.",
+  "kept_behavior": "Original formula retained and documented; failed proposal diff preserved outside public worktree."
+}

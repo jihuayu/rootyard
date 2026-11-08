@@ -1,0 +1,79 @@
+{
+  "passed": false,
+  "returncode": 101,
+  "seconds": 28.304,
+  "summary": "test result: FAILED. 9 passed; 1 failed; 0 ignored;",
+  "command": [
+    "/workspace/scratch/state-pack143-provider-build-v1/ref_store_pack_snapshots",
+    "--ignored",
+    "--test-threads=1"
+  ],
+  "before": {
+    "source": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "test": "48f48672cdfd2b3a625258c8131e3c2571076a90ffe2597632fe4778837ab2e5",
+    "binary": "b689fa2ba4e3e2c01bce8d3e23d3eda82893bc4ffc58fafb3b6f7fb6b6b8bd8b",
+    "head": "5a675f7c3791a534fc4a54b12611b824c5df6793",
+    "clean": true
+  },
+  "after": {
+    "source": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "test": "48f48672cdfd2b3a625258c8131e3c2571076a90ffe2597632fe4778837ab2e5",
+    "binary": "b689fa2ba4e3e2c01bce8d3e23d3eda82893bc4ffc58fafb3b6f7fb6b6b8bd8b",
+    "head": "5a675f7c3791a534fc4a54b12611b824c5df6793",
+    "clean": true
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "3be9df22c3541f55a34f18b1f70960b78597efda7dddaf970ecb8e7b8e59b328",
+  "build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "b689fa2ba4e3e2c01bce8d3e23d3eda82893bc4ffc58fafb3b6f7fb6b6b8bd8b",
+    "workspace_commit": "5a675f7c3791a534fc4a54b12611b824c5df6793",
+    "fresh": false,
+    "source_inputs_sha256": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "binary_sha256": "b689fa2ba4e3e2c01bce8d3e23d3eda82893bc4ffc58fafb3b6f7fb6b6b8bd8b",
+    "integration_test_source_sha256": "48f48672cdfd2b3a625258c8131e3c2571076a90ffe2597632fe4778837ab2e5",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_pack_snapshots",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_pack_snapshots",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_pack_snapshots-caa9bf159720127b"
+      }
+    ]
+  },
+  "limits": [
+    "Loopback PG17, Garage S3, actual native Git; A5a registered-membership metadata/pins only; no materialized Git ReadSnapshot, serving, restart, HA, encryption, GC, roots or physical Blob backup qualification."
+  ],
+  "qualification_kind": "clean-candidate"
+}

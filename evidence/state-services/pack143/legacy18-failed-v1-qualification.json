@@ -1,0 +1,227 @@
+{
+  "passed": false,
+  "kind": "legacy18",
+  "returncode": 1,
+  "command": [
+    "python3",
+    "/workspace/scratch/state-services-pack-snapshot/tests/backup_legacy142_pack_snapshots.py",
+    "--binary",
+    "/workspace/scratch/state-pack143-app-v1/rootyard",
+    "--report",
+    "/workspace/scratch/state-pack143-legacy18-restore-v1/native.json",
+    "--legacy-binary",
+    "/workspace/scratch/state-pack142-app-v1/rootyard",
+    "--legacy-fixture-binary",
+    "/workspace/scratch/state-pack142-backup-helper-build-v2/ref_store_packs_backup_fixture",
+    "--legacy-fixture-receipt",
+    "/workspace/scratch/state-pack142-backup-helper-build-v2/ref_store_packs_backup_fixture.build.json"
+  ],
+  "seconds": 41.869,
+  "before": {
+    "source": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "binary": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "head": "e1d6c57bac8ac243b8b94927d6e765ab3db0a2d5",
+    "harness": {
+      "tests/backup_legacy142_pack_snapshots.py": "bee542dcaabb360dd5c8be101a66f7dee5e8867b4d35bcbbcc901d59c3672b8c",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "a61c4c63993365602741335f7173cda663a2eed2d54e7e46145f83167aa16661",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
+      "tests/backup_refstore_pack_snapshots143.py": "6cb1d5c63f3d543da64b377985ef392b1f604324d55f40c865f9187a91228a28",
+      "tests/backup_legacy132_sessions.py": "ed2e1f40f79d39133d11875a65c04a659aa7fb7ad28408c72c84cc51d16ba383"
+    },
+    "legacy_binary": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "legacy_fixture_binary": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+    "legacy_fixture_receipt": "212b9b4fe71eba7f4c283db90c6926aefdcd29735d50ad6536c89053ca719beb"
+  },
+  "after": {
+    "source": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "binary": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "head": "e1d6c57bac8ac243b8b94927d6e765ab3db0a2d5",
+    "harness": {
+      "tests/backup_legacy142_pack_snapshots.py": "bee542dcaabb360dd5c8be101a66f7dee5e8867b4d35bcbbcc901d59c3672b8c",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "a61c4c63993365602741335f7173cda663a2eed2d54e7e46145f83167aa16661",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
+      "tests/backup_refstore_pack_snapshots143.py": "6cb1d5c63f3d543da64b377985ef392b1f604324d55f40c865f9187a91228a28",
+      "tests/backup_legacy132_sessions.py": "ed2e1f40f79d39133d11875a65c04a659aa7fb7ad28408c72c84cc51d16ba383"
+    },
+    "legacy_binary": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "legacy_fixture_binary": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+    "legacy_fixture_receipt": "212b9b4fe71eba7f4c283db90c6926aefdcd29735d50ad6536c89053ca719beb"
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "8842c251b3d1f04f581288d14142fd1fe0b1d250a6e7c643f5a3481b95c8bdb0",
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "source_inputs_sha256": "83d6e4d428f102bccf9e841196705ca8e3ba8fa3fb6166985e7ed1631582db80",
+    "workspace_commit": "e1d6c57bac8ac243b8b94927d6e765ab3db0a2d5",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-pack-snapshot#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-pack-snapshot#rootyard@0.1.0"
+      }
+    ]
+  },
+  "helper_build_receipt": null,
+  "native": {
+    "passed": false,
+    "cases": [
+      {
+        "name": "create_real_schema142_pando_source",
+        "status": "passed",
+        "seconds": 6.001,
+        "detail": {
+          "source_heads": {
+            "alpha": "977f47a3033023ed5d19608b6bbf2f42d5963267",
+            "beta": "ea838c308447b9523e47bef3b5929dc459c260e5"
+          },
+          "source_refs": {
+            "alpha": {
+              "refs/heads/main": "977f47a3033023ed5d19608b6bbf2f42d5963267"
+            },
+            "beta": {
+              "refs/heads/main": "ea838c308447b9523e47bef3b5929dc459c260e5"
+            }
+          },
+          "source_authority_id": "a0db5604-da40-4180-9553-85565c750543",
+          "source_remote_paths_count": 8,
+          "source_remote_paths_sha256": "366decd10ac38954f33b882f321c9f459b1475c46dad3522dad25a49fa44aee7",
+          "cutovers": {
+            "alpha": {
+              "refs": 1,
+              "packs": 1,
+              "objects_verified": 3
+            },
+            "beta": {
+              "refs": 1,
+              "packs": 1,
+              "objects_verified": 3
+            }
+          },
+          "web_session_created": true,
+          "browser_token_created": true
+        }
+      },
+      {
+        "name": "legacy_binary_writes_format18_schema142_archive",
+        "status": "passed",
+        "seconds": 18.9627,
+        "detail": {
+          "format": 18,
+          "schema_last": 142,
+          "schema_contains_next": false,
+          "legacy_a4_fixture_seeded": true,
+          "legacy_a4_fixture_gate_pack_verified": "pack_verified",
+          "schema143_absent_from_old_archive": true,
+          "old_helper_verify_mode_run_against_143": false,
+          "repository_count": 3,
+          "legacy_binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+          "backup_verified": true
+        }
+      },
+      {
+        "name": "candidate_cli_usage_and_mixed_legacy_flags",
+        "status": "passed",
+        "seconds": 0.0328,
+        "detail": {
+          "missing_arguments_usage": true,
+          "missing_flags_usage": true,
+          "mixed_legacy_flags_usage": true,
+          "documented_opt_in": "--allow-legacy-schema142",
+          "documented_neighbour_opt_in": "--allow-legacy-schema141"
+        }
+      },
+      {
+        "name": "candidate_rejects_without_schema142_opt_in",
+        "status": "passed",
+        "seconds": 7.8052,
+        "detail": {
+          "explicit_schema_opt_in_required": true,
+          "mismatched_legacy_opt_in_rejected": true,
+          "target_data_published": false,
+          "target_database_empty": true
+        }
+      },
+      {
+        "name": "candidate_restores_schema143_one_new_authority",
+        "status": "failed",
+        "seconds": 7.7863,
+        "error": "the retained schema139 core rows were not restored exactly"
+      }
+    ],
+    "reviewed_target_schema": 143,
+    "reviewed_target_format": 19,
+    "binary_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+    "legacy_binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "legacy_pack_fixture_helper": {
+      "binary": "/workspace/scratch/state-pack142-backup-helper-build-v2/ref_store_packs_backup_fixture",
+      "binary_sha256": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+      "build_receipt": "/workspace/scratch/state-pack142-backup-helper-build-v2/ref_store_packs_backup_fixture.build.json",
+      "build_receipt_sha256": "212b9b4fe71eba7f4c283db90c6926aefdcd29735d50ad6536c89053ca719beb",
+      "kind": "rust-integration-test",
+      "fresh": false,
+      "retained_binding_stages": [
+        "seed"
+      ],
+      "integration_test_source_sha256": "b451f874975d94183643d6d000aa57a88409568c34bac852e5a2b540b1ae445f",
+      "integration_test_source_matches_source_file": true,
+      "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+      "source_inputs_match_old_producer_receipt_prefix": true,
+      "verify_mode_run_against_schema143": false,
+      "helper_binary_sha256_after_run": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+      "binaries_unchanged_after_run": true
+    },
+    "harness_git_head": "e1d6c57bac8ac243b8b94927d6e765ab3db0a2d5",
+    "limitations": [
+      "Loopback functional drill; no production RPO/RTO or power-loss claim.",
+      "The legacy archive is produced by the trusted format18 binary and is never edited.",
+      "source_head values are repository heads, not binary build provenance.",
+      "A source older than a ledger schema gains that ledger empty (except an exact settled-migration seed); a genuine source that already carries schema139/140/141/142 rows has the exact rows preserved across migration143, never fabricated.",
+      "A genuine pre-schema140 source gains an empty migration-140 snapshot/pin schema; a genuine source that carries it has its exact rows preserved and every old snapshot left metadata-only.",
+      "The schema141 ledger tables are derived from the generated 140-vs-139 catalogs; a source older than schema141 must leave them at the exact settled seed, while a genuine format16/17/18 source's rows are compared exactly. This fixture inserts no hold, request or consumption row.",
+      "The schema142 pack-registration/membership/history/usage tables are derived from the generated 142-vs-141 catalogs and must stay empty on a genuine pre-142 source, while a genuine format18 A4 source's rows and gate mode are preserved exactly. This fixture inserts no pack row and claims no pack-verified gate.",
+      "The schema143 pack-snapshot binding/history/permanent-usage tables are derived from the generated 143-vs-142 catalogs and must stay empty; no A5 pack snapshot, pin or history row is fabricated and no complete Git-read snapshot is claimed.",
+      "The format18/schema142 drill seeds its genuine A4 S3/native-Git pack/A3 ledger with the retained old A4 helper (seed mode only) before the old archive is written; that helper's verify mode is never run against the schema143 target.",
+      "A format16 drill requires root to supply the genuine retained old schema140 producer and its archive; format17/18 drills require the genuine retained schema141/schema142 producers (the format18 producer is the retained A4 app); this harness never fabricates or relabels one."
+    ]
+  },
+  "limits": [
+    "Loopback PostgreSQL/Garage/nativeGit metadata backup only; external original Blob bytes are not archived.",
+    "A5a complete registered-membership metadata/pins; no materialized Git ReadSnapshot or serving qualification.",
+    "Genuine format18 uses retained schema142 producer and old typed A4 helper seed-only, never seeds against143."
+  ]
+}

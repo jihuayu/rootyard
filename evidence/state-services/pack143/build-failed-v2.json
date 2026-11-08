@@ -1,0 +1,11 @@
+{
+  "status": "failed",
+  "candidate": "05c5dba",
+  "target": "ref_store_pack_snapshots",
+  "compiler_errors": [
+    "E0428 duplicate bounded_refusal definition",
+    "E0061 new diagnostic collided with existing one-argument refusal classifier"
+  ],
+  "retention": "Summary transcribed from actual compiler stdout; no raw compiler log file produced by failed selected-test builder.",
+  "resolution": "Renamed new SQL diagnostic function sql_refusal_diagnostic; fresh v3 build and ten real cases passed at928d8a0."
+}

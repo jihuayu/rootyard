@@ -1,0 +1,288 @@
+create_real_schema142_pando_source: passed
+legacy_binary_writes_format18_schema142_archive: passed
+candidate_cli_usage_and_mixed_legacy_flags: passed
+candidate_rejects_without_schema142_opt_in: passed
+candidate_restores_schema143_one_new_authority: passed
+restored_service_git_and_session_boundaries: passed
+source_authority_and_remote_objects_remain_available: passed
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "create_real_schema142_pando_source",
+      "status": "passed",
+      "seconds": 5.1603,
+      "detail": {
+        "source_heads": {
+          "alpha": "53534b4151b02ec5a4a866997a366d66d89a4518",
+          "beta": "3c8cfe31c1af0cc6b245c666ef9f6de4ed35c30b"
+        },
+        "source_refs": {
+          "alpha": {
+            "refs/heads/main": "53534b4151b02ec5a4a866997a366d66d89a4518"
+          },
+          "beta": {
+            "refs/heads/main": "3c8cfe31c1af0cc6b245c666ef9f6de4ed35c30b"
+          }
+        },
+        "source_authority_id": "70285384-9796-4b4c-9830-95e9d5b65fc2",
+        "source_remote_paths_count": 8,
+        "source_remote_paths_sha256": "d8db88e162de81f351298e482ef8cf0001ddc16654e4eed6cc6bf62df036ba38",
+        "cutovers": {
+          "alpha": {
+            "refs": 1,
+            "packs": 1,
+            "objects_verified": 3
+          },
+          "beta": {
+            "refs": 1,
+            "packs": 1,
+            "objects_verified": 3
+          }
+        },
+        "web_session_created": true,
+        "browser_token_created": true
+      }
+    },
+    {
+      "name": "legacy_binary_writes_format18_schema142_archive",
+      "status": "passed",
+      "seconds": 14.917,
+      "detail": {
+        "format": 18,
+        "schema_last": 142,
+        "schema_contains_next": false,
+        "legacy_a4_fixture_seeded": true,
+        "legacy_a4_fixture_gate_pack_verified": "pack_verified",
+        "schema143_absent_from_old_archive": true,
+        "old_helper_verify_mode_run_against_143": false,
+        "repository_count": 3,
+        "legacy_binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+        "backup_verified": true
+      }
+    },
+    {
+      "name": "candidate_cli_usage_and_mixed_legacy_flags",
+      "status": "passed",
+      "seconds": 0.0296,
+      "detail": {
+        "missing_arguments_usage": true,
+        "missing_flags_usage": true,
+        "mixed_legacy_flags_usage": true,
+        "documented_opt_in": "--allow-legacy-schema142",
+        "documented_neighbour_opt_in": "--allow-legacy-schema141"
+      }
+    },
+    {
+      "name": "candidate_rejects_without_schema142_opt_in",
+      "status": "passed",
+      "seconds": 8.5406,
+      "detail": {
+        "explicit_schema_opt_in_required": true,
+        "mismatched_legacy_opt_in_rejected": true,
+        "target_data_published": false,
+        "target_database_empty": true
+      }
+    },
+    {
+      "name": "candidate_restores_schema143_one_new_authority",
+      "status": "passed",
+      "seconds": 9.2727,
+      "detail": {
+        "schema139_core_tables": 3,
+        "schema139_core_refs_key": "repository_id,ref_name",
+        "schema139_core_event_operation_fkey": true,
+        "schema139_core_event_immutable_trigger": true,
+        "schema142_core_gate_pack_mode_fence": true,
+        "schema142_core_gate_pack_mode_fence_enabled": true,
+        "schema139_core_rows": "1/1/1",
+        "preserved_genuine_source_core_rows": true,
+        "schema141_new_tables": [
+          "artifact_hold_consume_receipts",
+          "artifact_hold_repo_usage",
+          "artifact_hold_requests",
+          "artifact_hold_shards",
+          "artifact_hold_tenant_usage",
+          "artifact_holds"
+        ],
+        "schema141_hold_request_tables": [
+          "artifact_hold_requests"
+        ],
+        "schema141_hold_tables": [
+          "artifact_holds"
+        ],
+        "schema141_consumption_tables": [
+          "artifact_hold_consume_receipts"
+        ],
+        "schema141_seeded_rows": {
+          "artifact_hold_shards": 64
+        },
+        "schema141_new_tables_empty_except_migration_seed": false,
+        "schema141_hold_rows_preserved_from_genuine_source": true,
+        "schema141_hold_rows_fabricated": false,
+        "schema142_new_tables": [
+          "ref_store_core_pack_artifacts",
+          "ref_store_core_pack_history",
+          "ref_store_core_pack_memberships",
+          "ref_store_core_pack_publications",
+          "ref_store_core_pack_repo_usage",
+          "ref_store_core_pack_tenant_usage"
+        ],
+        "schema142_registration_tables": [
+          "ref_store_core_pack_artifacts",
+          "ref_store_core_pack_publications"
+        ],
+        "schema142_membership_tables": [
+          "ref_store_core_pack_memberships"
+        ],
+        "schema142_history_tables": [
+          "ref_store_core_pack_history"
+        ],
+        "schema142_usage_tables": [
+          "ref_store_core_pack_repo_usage",
+          "ref_store_core_pack_tenant_usage"
+        ],
+        "schema142_new_tables_empty_except_migration_seed": false,
+        "schema142_pack_rows_preserved_from_genuine_source": true,
+        "schema142_gate_pack_mode": "pack_verified",
+        "schema142_active_pack_membership_fabricated": false,
+        "schema141_shard_seed_unchanged": false,
+        "schema143_pack_snapshot_tables": [
+          "ref_store_core_pack_snapshot_history",
+          "ref_store_core_pack_snapshot_repo_usage",
+          "ref_store_core_pack_snapshot_tenant_usage",
+          "ref_store_core_snapshot_packs"
+        ],
+        "schema143_binding_tables": [
+          "ref_store_core_snapshot_packs"
+        ],
+        "schema143_history_tables": [
+          "ref_store_core_pack_snapshot_history"
+        ],
+        "schema143_usage_tables": [
+          "ref_store_core_pack_snapshot_repo_usage",
+          "ref_store_core_pack_snapshot_tenant_usage"
+        ],
+        "schema143_new_tables_empty_except_migration_seed": true,
+        "schema143_old_snapshot_rows_metadata_only": true,
+        "schema143_old_snapshot_rows_preserved_from_genuine_source": true,
+        "schema143_pack_pin_or_history_fabricated": false,
+        "complete_git_read_snapshot_claimed": false,
+        "legacy_a4_pack_ledger_nonempty": {
+          "ref_store_core_pack_artifacts": 2,
+          "ref_store_core_pack_history": 2,
+          "ref_store_core_pack_memberships": 1,
+          "ref_store_core_pack_publications": 1,
+          "ref_store_core_pack_repo_usage": 1,
+          "ref_store_core_pack_tenant_usage": 1
+        },
+        "legacy_a3_hold_ledger_nonempty": {
+          "artifact_hold_consume_receipts": 2,
+          "artifact_hold_repo_usage": 1,
+          "artifact_hold_requests": 1,
+          "artifact_hold_shards": 64,
+          "artifact_hold_tenant_usage": 1,
+          "artifact_holds": 2
+        },
+        "legacy_core_rows_nonempty": {
+          "ref_store_cancellations": 0,
+          "ref_store_core_events": 1,
+          "ref_store_core_gates": 1,
+          "ref_store_core_refs": 1,
+          "ref_store_issuer_lanes": 1,
+          "ref_store_operations": 1
+        },
+        "legacy_a4_pack_ledger_restored_exactly": true,
+        "legacy_a3_hold_ledger_restored_exactly": true,
+        "legacy_core_rows_restored_exactly": true,
+        "legacy_a4_gate_pack_verified_retained": true,
+        "legacy_a4_ack_body_matches_typed_registration": true,
+        "legacy_format18_archive_has_no_schema143_rows": true,
+        "legacy_a5_pack_snapshot_fabricated": false,
+        "legacy_old_helper_verify_mode_run_against_143": false,
+        "legacy_old_helper_seed_only": true,
+        "schema_version": 143,
+        "target_format": 19,
+        "indexes": 10,
+        "schema134_identity_constraints": true,
+        "schema135_metrics_index": true,
+        "schema136_token_scope_schema": true,
+        "schema138_operation_registry": true,
+        "legacy_tokens_default_unrestricted": true,
+        "target_authority_id": "e6556e3e-accd-47a4-a8c5-910be849601c",
+        "target_authority_differs_from_source": true,
+        "target_manifest_artifacts": 8,
+        "target_authority_singleton_unique": true,
+        "target_remote_paths_count": 8,
+        "source_and_target_remote_paths_disjoint": true,
+        "browser_session_revoked": true,
+        "browser_token_revoked": true
+      }
+    },
+    {
+      "name": "restored_service_git_and_session_boundaries",
+      "status": "passed",
+      "seconds": 3.5323,
+      "detail": {
+        "api_token_readable": true,
+        "old_browser_cookie_rejected": true,
+        "old_browser_bearer_rejected": true,
+        "git_clones": 2,
+        "clone_heads_exact": true,
+        "clone_contents_exact": true,
+        "fsck_clean": true,
+        "first_repo_refetch_after_second_ok": true,
+        "sole_target_authority_unchanged": true
+      }
+    },
+    {
+      "name": "source_authority_and_remote_objects_remain_available",
+      "status": "passed",
+      "seconds": 2.9255,
+      "detail": {
+        "source_authority_unchanged": true,
+        "source_remote_paths_unchanged": true,
+        "source_remote_paths_count": 8,
+        "source_remote_paths_sha256": "d8db88e162de81f351298e482ef8cf0001ddc16654e4eed6cc6bf62df036ba38",
+        "source_clone_heads_exact": true,
+        "source_clone_contents_exact": true,
+        "source_git_fsck_clean": true
+      }
+    }
+  ],
+  "reviewed_target_schema": 143,
+  "reviewed_target_format": 19,
+  "binary_sha256": "c61d3f9a5617fe03d17afd4a5277912c6e6948414c06e5d6e3a5460b4508d96b",
+  "legacy_binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+  "legacy_pack_fixture_helper": {
+    "binary": "/workspace/scratch/state-pack142-backup-helper-build-v2/ref_store_packs_backup_fixture",
+    "binary_sha256": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+    "build_receipt": "/workspace/scratch/state-pack142-backup-helper-build-v2/ref_store_packs_backup_fixture.build.json",
+    "build_receipt_sha256": "212b9b4fe71eba7f4c283db90c6926aefdcd29735d50ad6536c89053ca719beb",
+    "kind": "rust-integration-test",
+    "fresh": false,
+    "retained_binding_stages": [
+      "seed"
+    ],
+    "integration_test_source_sha256": "b451f874975d94183643d6d000aa57a88409568c34bac852e5a2b540b1ae445f",
+    "integration_test_source_matches_source_file": true,
+    "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "source_inputs_match_old_producer_receipt_prefix": true,
+    "verify_mode_run_against_schema143": false,
+    "helper_binary_sha256_after_run": "79a1f599ed92697b4627c8d5dbdc8645ce1da147cb064431abfd1405567738ef",
+    "binaries_unchanged_after_run": true
+  },
+  "harness_git_head": "6ca9e7538c1c52c20ff41199e4d6b2c563b2ee44",
+  "limitations": [
+    "Loopback functional drill; no production RPO/RTO or power-loss claim.",
+    "The legacy archive is produced by the trusted format18 binary and is never edited.",
+    "source_head values are repository heads, not binary build provenance.",
+    "A source older than a ledger schema gains that ledger empty (except an exact settled-migration seed); a genuine source that already carries schema139/140/141/142 rows has the exact rows preserved across migration143, never fabricated.",
+    "A genuine pre-schema140 source gains an empty migration-140 snapshot/pin schema; a genuine source that carries it has its exact rows preserved and every old snapshot left metadata-only.",
+    "The schema141 ledger tables are derived from the generated 140-vs-139 catalogs; a source older than schema141 must leave them at the exact settled seed, while a genuine format16/17/18 source's rows are compared exactly. This fixture inserts no hold, request or consumption row.",
+    "The schema142 pack-registration/membership/history/usage tables are derived from the generated 142-vs-141 catalogs and must stay empty on a genuine pre-142 source, while a genuine format18 A4 source's rows and gate mode are preserved exactly. This fixture inserts no pack row and claims no pack-verified gate.",
+    "The schema143 pack-snapshot binding/history/permanent-usage tables are derived from the generated 143-vs-142 catalogs and must stay empty; no A5 pack snapshot, pin or history row is fabricated and no complete Git-read snapshot is claimed.",
+    "The format18/schema142 drill seeds its genuine A4 S3/native-Git pack/A3 ledger with the retained old A4 helper (seed mode only) before the old archive is written; that helper's verify mode is never run against the schema143 target.",
+    "A format16 drill requires root to supply the genuine retained old schema140 producer and its archive; format17/18 drills require the genuine retained schema141/schema142 producers (the format18 producer is the retained A4 app); this harness never fabricates or relabels one."
+  ]
+}

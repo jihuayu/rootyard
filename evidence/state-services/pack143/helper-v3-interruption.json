@@ -1,0 +1,5 @@
+{
+  "status": "interrupted-unqualified",
+  "candidate": "8b73fa6",
+  "notes": "Execution session disappeared before a receipt; cargo and rustc were zombies, no fresh binary/build receipt existed. No PASS claimed. Rebuilt through retained background builder v4 with full stdout and process-result.json, returncode0."
+}
