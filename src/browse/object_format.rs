@@ -71,7 +71,7 @@ pub fn detect_git_dir_object_format(repo_path: &StdPath) -> Option<ObjectFormat>
 /// supported format, so anything else is a broken read, never a SHA-1 guess.
 fn parse_object_format_probe(raw: &[u8]) -> Result<ObjectFormat, Error> {
     ObjectFormat::from_str_name(&String::from_utf8_lossy(raw))
-        .ok_or_else(|| Error::internal(crate::git_http::GitCommandFailed { exit: None }))
+        .ok_or_else(|| git_read::invalid_output(git_read::GitStep::ObjectFormat))
 }
 
 pub async fn detect_repo_object_format(state: &AppState, repo_id: Uuid) -> Result<ObjectFormat, Error> {

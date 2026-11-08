@@ -22,8 +22,7 @@ mod commit_decode;
 mod command;
 mod paging;
 
-use command::report_step_failure;
-pub(crate) use command::{GitStep, git_cmd, run_git};
+pub(crate) use command::{GitStep, git_cmd, invalid_output, run_git};
 use commit_decode::parse_batch_commits;
 pub use commit_decode::parse_commit_raw;
 pub(crate) use paging::page_refs;
@@ -58,15 +57,13 @@ pub(crate) async fn object_type(state: &AppState, repo_id: Uuid, spec: &str) -> 
     if !models::valid_non_zero_oid(&resolved) {
         // A verified name always prints the object id it resolved to. Anything
         // else is a broken native read, not an absent object.
-        report_step_failure(GitStep::ObjectType, None);
-        return Err(Error::internal(crate::git_http::GitCommandFailed { exit: None }));
+        return Err(command::invalid_output(GitStep::RevParse));
     }
     match run_git(state, repo_id, GitStep::ObjectType, &["cat-file", "-t", &resolved], 64).await {
         Ok(out) => {
             let kind = String::from_utf8_lossy(&out).trim().to_owned();
             if kind.is_empty() {
-                report_step_failure(GitStep::ObjectType, None);
-                return Err(Error::internal(crate::git_http::GitCommandFailed { exit: None }));
+                return Err(command::invalid_output(GitStep::ObjectType));
             }
             Ok(Some(kind))
         }
@@ -341,10 +338,8 @@ pub(crate) async fn read_tree(
 /// not a plain decimal size is a broken native read: an internal failure with a
 /// fixed message, never a 404.
 pub(crate) fn parse_blob_size(raw: &[u8]) -> Result<u64, Error> {
-    String::from_utf8_lossy(raw).trim().parse::<u64>().map_err(|_| {
-        report_step_failure(GitStep::BlobSize, None);
-        Error::internal(crate::git_http::GitCommandFailed { exit: None })
-    })
+    String::from_utf8_lossy(raw).trim().parse::<u64>()
+        .map_err(|_| command::invalid_output(GitStep::BlobSize))
 }
 
 pub(crate) async fn read_blob(
@@ -433,8 +428,7 @@ pub(crate) async fn compare_commits(
             if !models::valid_non_zero_oid(&s) {
                 // A successful merge-base prints the common commit; anything
                 // else is a broken native read, never "no common ancestor".
-                report_step_failure(GitStep::MergeBase, None);
-                return Err(Error::internal(crate::git_http::GitCommandFailed { exit: None }));
+                return Err(command::invalid_output(GitStep::MergeBase));
             }
             Some(s)
         }

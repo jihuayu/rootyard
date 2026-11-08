@@ -3,7 +3,7 @@ use crate::{
     browse::models::{self, CommitSummary},
 };
 
-use super::command::{GitStep, report_step_failure};
+use super::command::{GitStep, invalid_output};
 
 /// A required object read that the verified object could not satisfy.
 ///
@@ -14,8 +14,7 @@ use super::command::{GitStep, report_step_failure};
 /// diagnostic carries only the compiled step label, never Git text or
 /// repository content.
 fn corrupt_object(step: GitStep) -> Error {
-    report_step_failure(step, None);
-    Error::internal(crate::git_http::GitCommandFailed { exit: None })
+    invalid_output(step)
 }
 
 fn parse_signature(sig: &str) -> (String, String, i64) {

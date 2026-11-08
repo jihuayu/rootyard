@@ -137,20 +137,27 @@ pub(in crate::browse::git_read) fn report_seek_fallback() {
 
 /// Emit one bounded, secret-free record for a failed required native read step.
 pub(in crate::browse::git_read) fn report_step_failure(step: GitStep, exit: Option<i32>) {
+    let code = exit.map_or_else(|| "signal".to_owned(), |code| code.to_string());
+    report_read_failure(step, step.failure_class(exit), &code);
+}
+
+/// Malformed output is a decode failure, not a child signal or an exit verdict.
+pub(crate) fn invalid_output(step: GitStep) -> Error {
+    report_read_failure(step, "decode", "unavailable");
+    Error::internal("invalid native Git output")
+}
+
+fn report_read_failure(step: GitStep, class: &'static str, code: &str) {
     // A broken storage volume must not be able to flood stderr per request.
     const BUDGET: u32 = 64;
     static REPORTED: AtomicU32 = AtomicU32::new(0);
     if REPORTED.fetch_add(1, Ordering::Relaxed) >= BUDGET {
         return;
     }
-    let code = match exit {
-        Some(code) => code.to_string(),
-        None => "signal".to_owned(),
-    };
     eprintln!(
         "rootyard: browse git read step={} class={} exit={}",
         step.label(),
-        step.failure_class(exit),
+        class,
         code
     );
 }

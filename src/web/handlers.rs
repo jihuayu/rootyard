@@ -116,7 +116,7 @@ pub(crate) async fn read_web_blob_preview(state: &AppState, repo_id: Uuid, oid_o
         return Err(Error::not_found());
     }
     let size_out = git_read::run_git(state, repo_id, git_read::GitStep::BlobSize, &["cat-file", "-s", &blob_oid], 64).await?;
-    let total_size: u64 = String::from_utf8_lossy(&size_out).trim().parse().map_err(|_| Error::not_found())?;
+    let total_size = git_read::parse_blob_size(&size_out)?;
 
     let mut cmd = git_read::git_cmd(state, repo_id)?;
     cmd.args(["cat-file", "blob", &blob_oid])
