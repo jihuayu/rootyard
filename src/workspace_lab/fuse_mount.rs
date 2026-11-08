@@ -373,7 +373,7 @@ fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> io::Re
     let fs = MountFs::new(overlay)?;
     let dispatcher = fs.dispatcher().clone();
     let session = fuser::spawn_mount2(fs, mountpoint, &mount_options(auto_unmount))?;
-    Ok(MountHandle { _session: session, dispatcher })
+    Ok(MountHandle { session, dispatcher })
 }
 
 /// Spawn the bounded per-mount dispatcher and mount `overlay` in the background.
