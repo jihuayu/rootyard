@@ -413,9 +413,34 @@ fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> io::Re
     // Capture the kernel mount identity before anyone else can observe the
     // mount point. An unverifiable mount is not published: a later path-based
     // unmount could otherwise hit a different mount stacked at the same path.
-    let Some(mount_id) = mount_id_at_path(&mountpoint)? else {
-        drop(session);
-        return Err(io::Error::other("owned FUSE mount is missing from /proc/self/mountinfo"));
+    let mount_id = match mount_id_at_path(&mountpoint) {
+        Ok(Some(mount_id)) => mount_id,
+        Ok(None) => {
+            // The helper mount already succeeded, so dropping the background
+            // session would leave an untracked FUSE thread and a mount nobody
+            // can prove ownership of. `AutoUnmount` removes the mount when the
+            // last helper descriptor dies, so exit immediately and lock-free:
+            // no IO, no unmount guess, no destructor that joins the session.
+            if auto_unmount {
+                // SAFETY: `_exit` is async-signal-safe and does not touch
+                // Rust state or any lock; process death closes the owned FUSE
+                // descriptor and lets `AutoUnmount` clean the mountpoint.
+                unsafe { libc::_exit(1) }
+            }
+            drop(session);
+            return Err(io::Error::other("owned FUSE mount is missing from /proc/self/mountinfo"));
+        }
+        Err(error) => {
+            // Same fail-closed rule when the mount table cannot be read at
+            // all. The legacy (non-`AutoUnmount`) caller keeps its previous
+            // error propagation because it has no helper death cleanup.
+            if auto_unmount {
+                // SAFETY: as above; this path must not run any Rust teardown.
+                unsafe { libc::_exit(1) }
+            }
+            drop(session);
+            return Err(error);
+        }
     };
     Ok(MountHandle { session, dispatcher, mountpoint, mount_id })
 }

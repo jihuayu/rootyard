@@ -69,7 +69,16 @@ pub(super) fn register_pending(
     deadline: Instant,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), (i32, String)> {
+    if state.in_shutdown() {
+        return Err((libc::ESHUTDOWN, "helper is shutting down; no new mount may be admitted".into()));
+    }
     let mut pending = lock(&state.pending);
+    // Linearize admission with `begin_shutdown`: a registration that raced the
+    // flag is either visible as pending (and the shutdown barrier waits for
+    // it) or is rejected here once the flag is visible under this lock.
+    if state.in_shutdown() {
+        return Err((libc::ESHUTDOWN, "helper is shutting down; no new mount may be admitted".into()));
+    }
     if let Some(entry) = pending.get(&workspace) {
         if entry.cancelled.load(Ordering::Acquire) || Instant::now() >= entry.deadline {
             return Err((libc::ETIMEDOUT, "the previous operation on this workspace timed out".into()));
@@ -83,11 +92,23 @@ pub(super) fn register_pending(
     Ok(())
 }
 
-fn remove_pending(state: &State, workspace: Uuid, request: u64) {
-    let mut pending = lock(&state.pending);
+/// Remove only the entry this exact request token owns. A foreign reservation,
+/// a pending build or another unmount is never released by a late owner.
+fn take_owned_pending(
+    pending: &mut std::collections::HashMap<Uuid, PendingMount>,
+    workspace: Uuid,
+    request: u64,
+) -> bool {
     if pending.get(&workspace).map(|entry| entry.request) == Some(request) {
         pending.remove(&workspace);
+        true
+    } else {
+        false
     }
+}
+
+fn remove_pending(state: &State, workspace: Uuid, request: u64) {
+    take_owned_pending(&mut lock(&state.pending), workspace, request);
 }
 
 pub(super) fn mount(
@@ -106,6 +127,11 @@ pub(super) fn mount(
     }
     if db_epoch <= 0 {
         return reply_error(state, request, workspace, libc::EINVAL, "mount requires a lease epoch");
+    }
+    if state.in_shutdown() {
+        // A queued mount job can start on another pool worker after shutdown
+        // began. It must not build, publish or enter the pending barrier.
+        return reply_error(state, request, workspace, libc::ESHUTDOWN, "helper is shutting down");
     }
     // Idempotent retry: a mount whose reply was lost may already be published
     // at exactly this epoch and root. Ownership transfer is linearized with
@@ -133,6 +159,9 @@ pub(super) fn mount(
             publish(state, request, workspace, body.workspace, handle, gate, reader, root)
         }
         Err((code, message)) => {
+            // `build` dropped every owned resource (gate, reader, overlay and
+            // any partially created session) before returning, so the pending
+            // entry can be released without leaving an untracked mount.
             remove_pending(state, body.workspace, request);
             reply_error(state, request, workspace, code, message);
         }
@@ -269,6 +298,22 @@ fn build(
     Ok((handle, gate, reader, root))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PublishOwner {
+    Own,
+    Foreign,
+    Missing,
+}
+
+/// Pure ownership verdict for the publish checkpoint.
+pub(super) fn publish_owner(pending_request: Option<u64>, request: u64) -> PublishOwner {
+    match pending_request {
+        Some(token) if token == request => PublishOwner::Own,
+        Some(_) => PublishOwner::Foreign,
+        None => PublishOwner::Missing,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn publish(
     state: &Arc<State>,
@@ -280,33 +325,37 @@ fn publish(
     reader: Option<Arc<Reader>>,
     root: PathBuf,
 ) {
-    // Publish and the cancel path share the pending lock: a cancel either
-    // marks the pending entry first (and this publish refuses) or finds the
-    // published mount afterwards (and tears it down). No window publishes a
-    // mount the parent already gave up on.
+    // Publish, cancel, unmount and admission share pending -> mounts lock
+    // order. A cancel either marks this entry first (and publish refuses) or
+    // finds the published mount afterwards and inserts a teardown
+    // reservation. No window publishes a mount the parent already gave up on.
     let mut pending = lock(&state.pending);
+    let owner = publish_owner(pending.get(&ws).map(|entry| entry.request), request);
     let Some(entry) = pending.get(&ws) else {
-        drop(pending);
-        // The pending entry is gone (cancel or retry took it): join this owned
-        // session before replying so the refused mount cannot outlive the reply.
-        handle.shutdown_and_join();
-        return reply_error(state, request, workspace, libc::ESTALE, "mount was cancelled before it was published");
+        // A reservation proven ours is the only permission to own this path.
+        // Joining an untracked mount would let a remount race this teardown, so
+        // fail closed instead (the installed exit path is lock-free and makes
+        // process death release the owned descriptor via `AutoUnmount`).
+        super::failstop(state, "publish lost its pending reservation", 1);
     };
-    let cancelled = entry.cancelled.load(Ordering::Acquire);
+    if owner != PublishOwner::Own {
+        super::failstop(state, "publish found a pending reservation owned by another request", 1);
+    }
+    // The shutdown flag is part of cancellation: no new mount may be published
+    // once the graceful barrier began, even if nobody sent AbortMount.
+    let cancelled = state.in_shutdown() || entry.cancelled.load(Ordering::Acquire);
     let expired = Instant::now() >= entry.deadline;
-    let owned = entry.request == request;
-    if !owned || cancelled || expired {
-        pending.remove(&ws);
+    if cancelled || expired {
+        // Keep OUR entry through the owned teardown: it keeps the path reserved
+        // (every remount sees EBUSY) until the handle is fully gone.
         drop(pending);
-        // Consuming teardown: the denied mount must be fully unmounted before
-        // this reply claims it was never published.
         handle.shutdown_and_join();
+        // Remove compare-ownership: never release another request's entry.
+        remove_pending(state, ws, request);
         let (code, message) = if cancelled {
             (libc::ECANCELED, "mount was cancelled before it was published")
-        } else if expired {
-            (libc::ETIMEDOUT, "mount deadline expired before it was published")
         } else {
-            (libc::ESTALE, "mount was superseded before it was published")
+            (libc::ETIMEDOUT, "mount deadline expired before it was published")
         };
         return reply_error(state, request, workspace, code, message);
     }
@@ -315,14 +364,15 @@ fn publish(
         let mut mounts = lock(&state.mounts);
         if mounts.contains_key(&ws) {
             drop(mounts);
-            pending.remove(&ws);
             drop(pending);
+            // Keep the reservation until this owned session is fully torn down.
             handle.shutdown_and_join();
+            remove_pending(state, ws, request);
             return reply_error(state, request, workspace, libc::EEXIST, "workspace is already mounted");
         }
         mounts.insert(ws, Mounted { handle, gate, reader, root, request });
     }
-    pending.remove(&ws);
+    take_owned_pending(&mut pending, ws, request);
     drop(pending);
     reply(
         state,
@@ -368,6 +418,27 @@ pub(super) fn cancel_mount(state: &Arc<State>, workspace: Option<Uuid>, mount_re
     if let Some(gate) = pending_gate {
         gate.fence();
     }
+    if removed.is_some() {
+        // The published owner is gone from `mounts`; reserve the path for its
+        // exact request token BEFORE unlocking, so no new mount (and no second
+        // unmount) can be admitted while the cancelled session is joined.
+        match pending.get(&ws) {
+            Some(entry) if entry.request != mount_request => {
+                super::failstop(state, "cancel found a foreign pending reservation for a published mount", 1)
+            }
+            _ => {
+                pending.insert(
+                    ws,
+                    PendingMount {
+                        request: mount_request,
+                        deadline: Instant::now() + crate::workspace_lab::fuse_helper::protocol::MOUNT_OP_DEADLINE,
+                        cancelled: Arc::new(AtomicBool::new(true)),
+                        gate: None,
+                    },
+                );
+            }
+        }
+    }
     drop(mounts);
     drop(pending);
     removed
@@ -377,44 +448,36 @@ pub(super) fn abort_mount_reply(state: &Arc<State>, request: u64, workspace: Opt
     if let Some(mount) = removed {
         // Cancellation is only acknowledged once the owned session teardown
         // completed; a detached session could otherwise outlive the reply.
+        let owner = mount.request;
         mount.handle.shutdown_and_join();
+        if let Some(ws) = workspace {
+            // Release exactly the teardown reservation this cancel installed.
+            // A second abort of the same mount request found no handle here
+            // and must not release the first cancel's reservation.
+            remove_pending(state, ws, owner);
+        }
     }
     reply(state, request, workspace, 0, Body::Ok(OkReply { op_id: None }));
 }
 
-/// Request id that reserves a workspace while its owner unmounts and joins the
-/// session. Parent-issued request ids are handed out far below the maximum and
-/// no cancel can name this value.
-const UNMOUNT_RESERVATION: u64 = u64::MAX;
-
-/// Take the published mount and reserve the workspace for the whole teardown.
-///
-/// The reservation replaces a half-built pending entry, exactly like the plain
-/// removal it supersedes: a build that has not published yet fails its
-/// `pending` ownership check and tears its own handle down instead of
-/// republishing onto the mountpoint this unmount is about to release. The
-/// reservation is bounded by the same mount deadline as any other pending
-/// operation, so a lost owner still times out instead of blocking forever.
-fn reserve_unmount(state: &State, ws: Uuid) -> Option<Mounted> {
-    {
-        let mut pending = lock(&state.pending);
-        pending.insert(
-            ws,
-            PendingMount {
-                request: UNMOUNT_RESERVATION,
-                deadline: Instant::now() + crate::workspace_lab::fuse_helper::protocol::MOUNT_OP_DEADLINE,
-                cancelled: Arc::new(AtomicBool::new(false)),
-                gate: None,
-            },
-        );
-    }
-    lock(&state.mounts).remove(&ws)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnmountAdmission {
+    Reserve,
+    Busy,
+    Missing,
 }
 
-fn release_unmount(state: &State, ws: Uuid) {
-    let mut pending = lock(&state.pending);
-    if pending.get(&ws).map(|entry| entry.request) == Some(UNMOUNT_RESERVATION) {
-        pending.remove(&ws);
+/// Pure admission policy for unmount. ANY pending entry already owns the
+/// workspace: a pending build is never replaced, a teardown/abort reservation
+/// is never overwritten, and a second unmount is EBUSY rather than releasing
+/// the first owner's reservation.
+pub(super) fn unmount_admission(pending: bool, mounted: bool) -> UnmountAdmission {
+    if pending {
+        UnmountAdmission::Busy
+    } else if mounted {
+        UnmountAdmission::Reserve
+    } else {
+        UnmountAdmission::Missing
     }
 }
 
@@ -422,25 +485,47 @@ pub(super) fn unmount(state: &Arc<State>, request: u64, workspace: Option<Uuid>)
     let Some(ws) = workspace else {
         return reply_error(state, request, None, libc::EINVAL, "unmount requires a workspace id");
     };
-    // Keep the workspace reserved for the whole unmount+join: a concurrent
-    // mount must see the pending reservation (EBUSY) instead of rebuilding on a
-    // mountpoint that this owner is still unmounting.
-    let removed = reserve_unmount(state, ws);
-    match removed {
-        Some(mount) => {
-            // Join the owned session before acknowledging: an unmounted reply
-            // must not race a still-detached teardown of this mount.
-            mount.handle.shutdown_and_join();
-            // Release only after unmount+join completed, so the reservation
-            // covers the whole teardown and no remount can race it.
-            release_unmount(state, ws);
-            reply(state, request, workspace, 0, Body::Unmounted);
+    let mut pending = lock(&state.pending);
+    let mut mounts = lock(&state.mounts);
+    match unmount_admission(pending.contains_key(&ws), mounts.contains_key(&ws)) {
+        UnmountAdmission::Busy => {
+            drop(mounts);
+            drop(pending);
+            return reply_error(state, request, workspace, libc::EBUSY, "another mount or unmount owns this workspace");
         }
-        None => {
-            release_unmount(state, ws);
-            reply_error(state, request, workspace, libc::ENOENT, "workspace is not mounted")
+        UnmountAdmission::Missing => {
+            drop(mounts);
+            drop(pending);
+            return reply_error(state, request, workspace, libc::ENOENT, "workspace is not mounted");
         }
+        UnmountAdmission::Reserve => {}
     }
+    let Some(mount) = mounts.remove(&ws) else {
+        drop(mounts);
+        drop(pending);
+        return reply_error(state, request, workspace, libc::ENOENT, "workspace is not mounted");
+    };
+    // Bind the reservation to THIS unmount's unique incoming request id under
+    // the same pending -> mounts locks that removed the mount. There is no
+    // shared sentinel, so a late release can only ever remove its own entry.
+    pending.insert(
+        ws,
+        PendingMount {
+            request,
+            deadline: Instant::now() + crate::workspace_lab::fuse_helper::protocol::MOUNT_OP_DEADLINE,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            gate: None,
+        },
+    );
+    drop(mounts);
+    drop(pending);
+    // Join the owned session before acknowledging: an unmounted reply must not
+    // race a still-detached teardown, and the reservation covers the entire
+    // teardown so no remount can race it.
+    mount.handle.shutdown_and_join();
+    // Compare-ownership release: only the exact request above may remove it.
+    remove_pending(state, ws, request);
+    reply(state, request, workspace, 0, Body::Unmounted);
 }
 
 pub(super) fn freeze_begin(state: &Arc<State>, request: u64, workspace: Option<Uuid>, db_epoch: i64, op_id: u64) {
@@ -689,6 +774,43 @@ mod tests {
             libc::ETIMEDOUT,
             "a worker that starts after the admission budget must not run"
         );
+    }
+
+    #[test]
+    fn duplicate_unmount_and_pending_build_are_busy() {
+        assert_eq!(unmount_admission(false, true), UnmountAdmission::Reserve);
+        assert_eq!(unmount_admission(true, true), UnmountAdmission::Busy);
+        assert_eq!(
+            unmount_admission(true, false),
+            UnmountAdmission::Busy,
+            "a pending build owns the path; unmount must not replace it"
+        );
+        assert_eq!(unmount_admission(false, false), UnmountAdmission::Missing);
+    }
+
+    #[test]
+    fn foreign_publish_owner_is_never_released() {
+        assert_eq!(publish_owner(Some(11), 11), PublishOwner::Own);
+        assert_eq!(publish_owner(Some(11), 12), PublishOwner::Foreign);
+        assert_eq!(publish_owner(None, 12), PublishOwner::Missing);
+        let mut pending = std::collections::HashMap::new();
+        pending.insert(
+            Uuid::nil(),
+            PendingMount {
+                request: 11,
+                deadline: Instant::now() + Duration::from_secs(5),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                gate: None,
+            },
+        );
+        assert!(!take_owned_pending(&mut pending, Uuid::nil(), 12));
+        assert_eq!(
+            pending.get(&Uuid::nil()).map(|entry| entry.request),
+            Some(11),
+            "a foreign request must not release the owner's entry"
+        );
+        assert!(take_owned_pending(&mut pending, Uuid::nil(), 11));
+        assert!(pending.is_empty());
     }
 
     #[test]

@@ -225,9 +225,16 @@ impl State {
     ///
     /// Each owned mount uses the consuming `shutdown_and_join`, so this returns
     /// only after every session teardown completed. `teardown` then exits 0: a
-    /// graceful exit never claims success while an owned unmount is still in
-    /// flight, and a stuck join is caught by the independent shutdown-deadline
-    /// failstop instead of being masked.
+    /// graceful exit never claims success while an owned unmount, build or
+    /// denied publish is still in flight.
+    ///
+    /// The pending map is deliberately NOT cleared here: every pending owner
+    /// (build, explicit unmount, abort teardown, denied publish) keeps its own
+    /// entry until it joined every resource and then removes it by exact
+    /// request token. The bounded sleep below is a completion barrier for those
+    /// in-flight builders, which could otherwise finish `spawn` after shutdown
+    /// and need denied-publish cleanup. The independent shutdown-deadline
+    /// watchdog bounds this wait, and no lock is held while sleeping.
     fn unmount_all(&self) {
         {
             let pending = lock(&self.pending);
@@ -241,6 +248,12 @@ impl State {
         };
         for mount in mounts {
             mount.handle.shutdown_and_join();
+        }
+        // A registration that raced `begin_shutdown` is visible here; one that
+        // races after the flag is rejected under the pending lock. Either way
+        // this barrier cannot exit while an owned pending teardown is running.
+        while !lock(&self.pending).is_empty() {
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -404,10 +417,14 @@ fn watchdog(state: Arc<State>) {
         let now = state.now_ms();
         if let Some(deadline) = state.shutdown_deadline() {
             if now >= deadline {
-                // Graceful teardown may join a session, so only this
-                // independent, lock-free watchdog can bound it.
+                // Graceful teardown may join a session or wait for an in-flight
+                // pending build, so only this independent, lock-free watchdog
+                // can bound that barrier.
                 failstop(&state, "graceful shutdown exceeded its watchdog deadline", 1);
             }
+            // During shutdown the atomic deadline above is the single bound;
+            // per-pending deadlines must not fire against the barrier's own
+            // retained entries.
             continue;
         }
         if state.heartbeat_age() > HEARTBEAT_DEADLINE {
@@ -415,15 +432,43 @@ fn watchdog(state: Arc<State>) {
             // socket open, so EOF alone is not a liveness signal.
             failstop(&state, "heartbeat deadline missed", 1);
         }
-        if enforce_freeze_deadlines(&state) {
+        // Both inspections are non-blocking and share the stuck-lock budget:
+        // a pending entry whose deadline expired means a normal unmount,
+        // cancel or denied publish is stuck in an unbounded join while still
+        // holding its reservation. Fail-stop lock-free; `_exit` does not need
+        // the pending or mount mutex.
+        let freezes_inspected = enforce_freeze_deadlines(&state);
+        let pending_inspected = enforce_pending_deadlines(&state);
+        if freezes_inspected && pending_inspected {
             stuck_ticks = 0;
         } else {
             stuck_ticks = stuck_ticks.saturating_add(1);
             if stuck_ticks >= WATCHDOG_STUCK_TICKS {
-                failstop(&state, "watchdog could not inspect frozen operations", 1);
+                failstop(&state, "watchdog could not inspect frozen or pending operations", 1);
             }
         }
     }
+}
+
+/// Pure deadline predicate so the watchdog decision is unit-testable.
+fn any_pending_expired<I: Iterator<Item = Instant>>(deadlines: I, now: Instant) -> bool {
+    deadlines.any(|deadline| deadline <= now)
+}
+
+/// Snapshot the pending deadlines without blocking. Any expired reservation is
+/// unrecoverable: its owner is still holding the workspace while an unmount,
+/// cancel or denied-publish join has not returned, so the process fail-stops
+/// instead of letting a later mount race an unbounded teardown.
+fn enforce_pending_deadlines(state: &State) -> bool {
+    let now = Instant::now();
+    let expired = {
+        let Some(pending) = try_lock(&state.pending) else { return false };
+        any_pending_expired(pending.values().map(|entry| entry.deadline), now)
+    };
+    if expired {
+        failstop(state, "pending workspace reservation exceeded its deadline", 1);
+    }
+    true
 }
 
 /// Snapshot the expired freeze operations without ever holding a lock across a

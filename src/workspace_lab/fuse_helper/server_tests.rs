@@ -213,3 +213,50 @@ fn pending_mount_gate_is_fenced_without_being_published() {
     assert!(ops::checkpoint(&AtomicBool::new(true), Instant::now() + Duration::from_secs(1)).is_err());
     assert!(ops::checkpoint(&AtomicBool::new(false), Instant::now()).is_err());
 }
+
+#[test]
+fn pending_deadline_inspection_detects_an_expired_reservation() {
+    let now = Instant::now();
+    assert!(!any_pending_expired(std::iter::empty(), now));
+    assert!(!any_pending_expired([now + Duration::from_secs(1), now + Duration::from_secs(30)].into_iter(), now));
+    assert!(
+        any_pending_expired([now + Duration::from_secs(1), now].into_iter(), now),
+        "any expired pending entry must trip the watchdog fail-stop"
+    );
+}
+
+#[test]
+fn graceful_barrier_waits_for_owned_pending_cleanup() {
+    let state = test_state();
+    let workspace = Uuid::nil();
+    lock(&state.pending).insert(
+        workspace,
+        PendingMount {
+            request: 5,
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            gate: None,
+        },
+    );
+    let cleaner = state.clone();
+    let cleanup = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(40));
+        let mut pending = lock(&cleaner.pending);
+        // The barrier must have marked cancellation but must not have removed
+        // the entry on the owner's behalf.
+        let cancelled = pending.get(&workspace).map(|entry| entry.cancelled.load(Ordering::Acquire));
+        // Compare-owner cleanup, exactly like a finished build/cancel.
+        if pending.get(&workspace).map(|entry| entry.request) == Some(5) {
+            pending.remove(&workspace);
+        }
+        cancelled
+    });
+    let started = Instant::now();
+    state.unmount_all();
+    assert!(
+        started.elapsed() >= Duration::from_millis(20),
+        "the barrier must wait for the in-flight pending owner instead of clearing it"
+    );
+    assert_eq!(cleanup.join().unwrap(), Some(true), "the barrier cancels the pending owner");
+    assert!(lock(&state.pending).is_empty(), "the owner removed only its own entry");
+}
