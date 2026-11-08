@@ -53,6 +53,20 @@ drops the transaction. Pando also checks the absolute deadline before final
 `auth::finish_tx`. A connection drop after PG commit remains an unknown outcome
 and is not converted into an invented rollback.
 
+The isolated metadata core uses the shared helpers in `src/ref_store/tx.rs` for
+its owned short transactions. `begin_bounded` relies on the pinned
+`tokio-postgres` `RollbackIfNotDone` guard (the SDK queues `ROLLBACK` if the
+`BEGIN` builder future is cancelled), so a timed-out `BEGIN` never leaks an open
+server transaction. `commit_bounded` checks the absolute deadline before
+issuing `COMMIT`; an already-expired deadline rolls back and returns `Timeout`
+without sending `COMMIT`. Once `COMMIT` has been issued, a timeout or error
+reply is `RefStoreError::CommitUnknown { repository_id, operation_id }`
+(`None` for bootstrap), never a claimed abort or rejection, because the commit
+may still land. Callers resolve it by querying/retrying the same identity;
+initialize resolves an unknown bootstrap commit through its idempotent gate and
+`check_version`. Rollback cleanup can finish after the deadline and is not
+claimed as a hard physical return bound.
+
 `migrations/138_ref_store_operation_identity.sql` adds lane heads, operations
 and cancellations. Database triggers reject identity changes and any rewrite of
 a terminal result, so the guarantee does not depend only on adapter code. The

@@ -21,13 +21,38 @@ query_operation(client, ...)  read-only registry lookup
 cancel(client, ...)           migration-138 cancellation tombstone
 ```
 
-A returned receipt means the transaction `COMMIT` succeeded. Every `Err` —
-validation, deadline expiry, authority fence or a database error at any point —
-rolls the owned transaction back before returning, so a public mutation cannot
-leave refs, a gate revision, a pending operation, a terminal or an event
-committable after a Rust error. A failed commit reply is reported as an error
-(unknown outcome); it is never reported as a false abort. Callers do not own a
+A returned receipt means the transaction `COMMIT` was acknowledged. Every `Err`
+returned before `COMMIT` is issued — validation, an expired absolute deadline,
+the authority fence or a database error — rolls the owned transaction back, so
+a public mutation cannot leave refs, a gate revision, a pending operation, a
+terminal or an event committable after such an error. Callers do not own a
 transaction and are never asked to repair a partially written one.
+
+`BEGIN` and `COMMIT` use the shared helpers in `src/ref_store/tx.rs`:
+
+- `begin_bounded` wraps the `tokio-postgres` `Client::transaction()` future in
+  `timeout_at(deadline, ...)`. In the pinned SDK (0.7.18,
+  `src/transaction_builder.rs`) the `BEGIN` message is sent synchronously and a
+  `RollbackIfNotDone` guard queues `ROLLBACK` if the builder future is dropped
+  before the `Transaction` is created. A queued or cancelled `BEGIN` therefore
+  cannot leak an open server transaction; this slice relies on that SDK
+  guarantee instead of writing `BEGIN`/`ROLLBACK` protocol itself.
+- `commit_bounded` checks the absolute deadline before issuing `COMMIT`. If it
+  has already expired, it rolls back and returns `Timeout` without sending
+  `COMMIT`. Once `COMMIT` is sent, only an acknowledged success is a success.
+  A client-side timeout or an error reply returns typed
+  `RefStoreError::CommitUnknown { repository_id, operation_id }` (bootstrap uses
+  `operation_id: None`) because the commit may still land or the reply may be
+  lost. `CommitUnknown` is not a conflict or a rejection, and it is never
+  collapsed into `Timeout`/abort. Callers query the same operation identity
+  (`query_operation`) or, for bootstrap, resolve the gate idempotently via
+  `check_version`.
+
+Rollback cleanup may itself finish after the absolute deadline; this slice does
+not claim a hard physical return bound for cleanup. The important guarantees
+are that a deadline-expired pre-commit path sends no `COMMIT`, that only an
+acknowledged `COMMIT` returns a receipt, and that a possibly-landed `COMMIT` is
+reported as unknown rather than aborted.
 
 ## Terminal budget
 
@@ -120,9 +145,11 @@ migration-138 registry (including cancel-before-register tombstones).
   written together with its event in the same transaction that then commits.
   They do not change refs or the gate revision. Callers MUST inspect
   `receipt.is_committed()`.
-- Infrastructure/deadline errors return `Err` after the owned transaction was
-  rolled back. A lost commit reply therefore leaves the outcome unknown, not
-  false-aborted.
+- Errors detected before `COMMIT` is issued return `Err` after the owned
+  transaction was rolled back. A deadline that expires before `COMMIT` is sent
+  is `Timeout` and sends no `COMMIT`; a timeout or error after `COMMIT` was
+  issued is `CommitUnknown` and may still commit. It is never reported as an
+  abort or domain rejection; the caller queries/retries the same identity.
 - Same operation id and same canonical digest replays the exact stored
   `TerminalResult`. Same id with a different digest is `DigestConflict`.
 - A durable `Pending` record that this transaction did not create returns
@@ -206,4 +233,17 @@ selected without `ROOTYARD_TEST_DATABASE_URL`. It covers:
   initialization rejecting new mutations while exact terminal replay and lookup
   remain stable, and mutations resuming after the repository is explicitly
   unserved again;
+- a queued `BEGIN`: a prior polled-then-dropped blocking statement on the same
+  connection holds the server busy behind an advisory lock; core `BEGIN` is
+  queued, its absolute deadline returns `Timeout`, and after the barrier is
+  released the SDK rollback guard leaves that backend `idle` (not idle in
+  transaction) with no gate/ref/operation/event write;
+- a `COMMIT` deadline: a fixture-owned `DEFERRABLE INITIALLY DEFERRED`
+  constraint trigger on core events waits on an advisory lock held by another
+  connection, proven through `pg_locks`/`pg_stat_activity`; `commit_refs`
+  returns `CommitUnknown` at the deadline. After release, the server either
+  committed (in which case the exact terminal/ref/event is consistent) or its
+  own statement timeout aborted it (unknown with no refs/events). Retrying the
+  same operation id after removing the owned trigger commits or replays
+  exactly once, never as a false abort;
 - unknown gates.

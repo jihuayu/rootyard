@@ -491,6 +491,16 @@ pub enum RefStoreError {
     TerminalImmutable,
     Unsupported(&'static str),
     Timeout,
+    /// `COMMIT` was issued but no successful acknowledgement was observed
+    /// before the absolute deadline (or the reply was an error). The server
+    /// transaction may still commit, so this is not an abort, a conflict or a
+    /// domain rejection. Callers must query the durable identity and retry the
+    /// same identity. `operation_id` is `None` for bootstrap, where the
+    /// idempotent gate/revision check is the resolution path.
+    CommitUnknown {
+        repository_id: Uuid,
+        operation_id: Option<Uuid>,
+    },
     Database(String),
 }
 
@@ -526,6 +536,16 @@ impl fmt::Display for RefStoreError {
             Self::TerminalImmutable => formatter.write_str("terminal operation result is immutable"),
             Self::Unsupported(capability) => write!(formatter, "ref-store capability is unsupported: {capability}"),
             Self::Timeout => formatter.write_str("ref-store transaction deadline expired"),
+            Self::CommitUnknown { repository_id, operation_id } => match operation_id {
+                Some(operation_id) => write!(
+                    formatter,
+                    "ref-store COMMIT outcome for repository {repository_id} operation {operation_id} is unknown; the commit may still land, so query that same operation instead of assuming an abort"
+                ),
+                None => write!(
+                    formatter,
+                    "ref-store bootstrap COMMIT outcome for repository {repository_id} is unknown; the gate may still exist, so resolve it with an idempotent check_version"
+                ),
+            },
             Self::Database(message) => write!(formatter, "ref-store database error: {message}"),
         }
     }
@@ -663,5 +683,23 @@ mod tests {
         assert!(!capabilities.automatic_dedup_trimming);
         assert!(!capabilities.serving_cutover);
         assert!(!capabilities.dual_write_with_legacy);
+    }
+
+    #[test]
+    fn commit_unknown_is_typed_and_never_a_conflict_or_abort() {
+        let repository_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let error = RefStoreError::CommitUnknown { repository_id, operation_id: Some(operation_id) };
+        assert!(!error.is_conflict());
+        let text = error.to_string();
+        assert!(text.contains("unknown"), "{text}");
+        assert!(text.contains(&repository_id.to_string()), "{text}");
+        assert!(text.contains(&operation_id.to_string()), "{text}");
+        let bootstrap = RefStoreError::CommitUnknown { repository_id, operation_id: None };
+        assert!(!bootstrap.is_conflict());
+        assert!(bootstrap.to_string().contains("bootstrap"), "{bootstrap}");
+        let timeout = RefStoreError::Timeout;
+        assert!(!timeout.is_conflict());
+        assert!(!timeout.to_string().contains("unknown"), "{timeout}");
     }
 }

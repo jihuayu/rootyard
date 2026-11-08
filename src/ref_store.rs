@@ -8,6 +8,7 @@
 pub mod contract;
 pub mod core;
 pub mod pg;
+pub(crate) mod tx;
 
 pub use contract::{
     BeginReceipt, CancelReceipt, Capabilities, CommitReceipt, IssuerLane, OperationIdentity, OperationLookup,

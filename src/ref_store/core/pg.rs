@@ -3,12 +3,17 @@
 //! Every public method opens and owns one short transaction from a caller
 //! `&mut tokio_postgres::Client`:
 //!
-//! - a returned receipt means `COMMIT` succeeded;
-//! - every `Err` (validation, deadline, authority fence or database) rolls the
-//!   transaction back before returning, so a Rust error can never leave
-//!   refs/revision/pending/terminal/event writes committable by the caller;
-//! - a lost commit reply is reported as an error (unknown outcome), never as a
-//!   false abort.
+//! - a returned receipt means `COMMIT` was acknowledged;
+//! - every `Err` before `COMMIT` is issued (validation, deadline, authority
+//!   fence or database) rolls the transaction back before returning, so such a
+//!   Rust error cannot leave refs/revision/pending/terminal/event writes
+//!   committable by the caller;
+//! - a `BEGIN` past the absolute deadline is cancelled through the pinned SDK,
+//!   whose rollback guard queues `ROLLBACK` on the borrowed connection;
+//! - once `COMMIT` is issued, a deadline timeout or an error reply is reported
+//!   as `CommitUnknown`, never as a false abort or a successful receipt. The
+//!   commit may still land, so callers query the same operation identity.
+//!   Only an acknowledged `COMMIT` returns `Ok`.
 //!
 //! No method performs Git/pack/blob/network IO or holds a long-lived request
 //! connection. Lock order is fixed:
@@ -30,6 +35,7 @@ use super::super::contract::{
     CancelReceipt, Capabilities, OperationIdentity, OperationLookup, OperationState, RefStoreError, TerminalOutcome,
 };
 use super::super::pg::{self, PgRefStore};
+use super::super::tx::{begin_bounded, commit_bounded};
 use super::command::CommitRefsRequest;
 use super::contract::{CoreGate, CoreGateInit, CoreGateVersion, VersionCheck};
 use super::sql::{
@@ -57,20 +63,22 @@ impl PgRefStoreCore {
     /// `storage_backend='gitfs'`, `transition_state='stable'`, no
     /// `pando_repository_states` row, no legacy `repository_ref_projection`
     /// rows, the same tenant and the same object format. It never changes
-    /// serving authority. On `Err` the owned transaction is rolled back.
+    /// serving authority. Errors before `COMMIT` roll the owned transaction
+    /// back; a `COMMIT` timeout or error reply is `CommitUnknown`, whose
+    /// resolution is an idempotent retry/`check_version` for this repository.
     pub async fn initialize(
         &self,
         client: &mut Client,
         init: &CoreGateInit,
         deadline: Instant,
     ) -> Result<CoreGate, RefStoreError> {
-        let tx = client.transaction().await.map_err(pg::db_error)?;
+        let tx = begin_bounded(client, deadline).await?;
         let result = self.initialize_in_tx(&tx, init, deadline).await;
         match result {
-            Ok(gate) => match tx.commit().await {
-                Ok(()) => Ok(gate),
-                Err(error) => Err(pg::db_error(error)),
-            },
+            Ok(gate) => {
+                commit_bounded(tx, deadline, init.repository_id(), None).await?;
+                Ok(gate)
+            }
             Err(error) => {
                 let _ = tx.rollback().await;
                 Err(error)
@@ -193,7 +201,7 @@ impl PgRefStoreCore {
         known: Option<&CoreGateVersion>,
         deadline: Instant,
     ) -> Result<VersionCheck, RefStoreError> {
-        let tx = client.transaction().await.map_err(pg::db_error)?;
+        let tx = begin_bounded(client, deadline).await?;
         let result = self.check_version_in_tx(&tx, repository_id, tenant_id, known, deadline).await;
         let _ = tx.rollback().await;
         result
@@ -249,9 +257,12 @@ impl PgRefStoreCore {
     /// returned as `Ok(receipt)` only after that terminal+event pair commits;
     /// callers MUST inspect [`CommitRefsReceipt::is_committed`].
     ///
-    /// Infrastructure/deadline errors return `Err` after the owned transaction
-    /// was rolled back. A failed `COMMIT` reply is an unknown outcome and is
-    /// never reported as an abort.
+    /// Infrastructure/deadline errors before `COMMIT` return `Err` after the
+    /// owned transaction was rolled back. An expired deadline is checked
+    /// before `COMMIT` is issued, so that case never sends `COMMIT`. Once
+    /// `COMMIT` is issued, only an acknowledged success returns the receipt;
+    /// a timeout or error reply returns `CommitUnknown`, never a claimed abort.
+    /// Callers resolve it with `query_operation` for this exact operation id.
     pub async fn commit_refs(
         &self,
         client: &mut Client,
@@ -259,13 +270,14 @@ impl PgRefStoreCore {
         deadline: Instant,
     ) -> Result<CommitRefsReceipt, RefStoreError> {
         request.validate()?;
-        let tx = client.transaction().await.map_err(pg::db_error)?;
+        let tx = begin_bounded(client, deadline).await?;
         let result = self.commit_refs_in_tx(&tx, request, deadline).await;
         match result {
-            Ok(receipt) => match tx.commit().await {
-                Ok(()) => Ok(receipt),
-                Err(error) => Err(pg::db_error(error)),
-            },
+            Ok(receipt) => {
+                commit_bounded(tx, deadline, request.repository_id(), Some(request.identity().operation_id()))
+                    .await?;
+                Ok(receipt)
+            }
             Err(error) => {
                 let _ = tx.rollback().await;
                 Err(error)
@@ -493,7 +505,7 @@ impl PgRefStoreCore {
         operation_id: Uuid,
         deadline: Instant,
     ) -> Result<OperationLookup, RefStoreError> {
-        let tx = client.transaction().await.map_err(pg::db_error)?;
+        let tx = begin_bounded(client, deadline).await?;
         let result = PgRefStore.get(&tx, repository_id, operation_id, deadline).await;
         let _ = tx.rollback().await;
         result
@@ -509,13 +521,13 @@ impl PgRefStoreCore {
         identity: &OperationIdentity,
         deadline: Instant,
     ) -> Result<CancelReceipt, RefStoreError> {
-        let tx = client.transaction().await.map_err(pg::db_error)?;
+        let tx = begin_bounded(client, deadline).await?;
         let result = PgRefStore.cancel(&tx, identity, deadline).await;
         match result {
-            Ok(receipt) => match tx.commit().await {
-                Ok(()) => Ok(receipt),
-                Err(error) => Err(pg::db_error(error)),
-            },
+            Ok(receipt) => {
+                commit_bounded(tx, deadline, identity.repository_id(), Some(identity.operation_id())).await?;
+                Ok(receipt)
+            }
             Err(error) => {
                 let _ = tx.rollback().await;
                 Err(error)
