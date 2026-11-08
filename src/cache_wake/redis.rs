@@ -27,18 +27,38 @@ type ConnectionManager = ::redis::aio::ConnectionManager;
 /// `redis://` is accepted only for an explicitly loopback authority.
 fn validate_redis_url(raw: &str) -> Result<()> {
     ensure!(!raw.is_empty() && raw.len() <= 1024, "invalid Redis URL");
-    if let Some(rest) = raw.strip_prefix("rediss://") {
+    // redis-rs treats a URL fragment named `insecure` as permission to disable
+    // certificate and hostname verification. This adapter has no unsafe TLS
+    // mode, so reject every fragment before the client can interpret it.
+    ensure!(!raw.contains('#'), "Redis URL fragments, including #insecure, are not allowed");
+    let rest = if let Some(rest) = raw.strip_prefix("rediss://") {
         ensure!(!authority_host(rest).is_empty(), "Redis TLS URL requires a host");
-        return Ok(());
-    }
-    if let Some(rest) = raw.strip_prefix("redis://") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("redis://") {
         ensure!(
             matches!(authority_host(rest), "127.0.0.1" | "::1" | "localhost"),
             "plaintext redis:// is only allowed for a loopback endpoint; use rediss:// for remote Redis"
         );
-        return Ok(());
+        rest
+    } else {
+        bail!("Redis URL must use rediss:// (or redis:// only for loopback)")
+    };
+    // The pinned redis-rs TCP parser recognizes only `protocol` in a query.
+    // Reject every other parameter, including names other clients use to
+    // disable TLS verification, instead of accepting and silently ignoring
+    // them. Normal rediss:// certificate and hostname verification remains
+    // delegated to redis-rs/rustls; this module contains no TLS code.
+    if let Some((_, query)) = rest.split_once('?') {
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            ensure!(name == "protocol", "unsupported Redis URL query parameter");
+            ensure!(
+                matches!(value, "2" | "3" | "resp2" | "resp3"),
+                "unsupported Redis protocol query value"
+            );
+        }
     }
-    bail!("Redis URL must use rediss:// (or redis:// only for loopback)")
+    Ok(())
 }
 
 /// Host extraction is used only for the plaintext-loopback policy check. Full
@@ -523,6 +543,7 @@ impl fmt::Debug for RedisWake {
 mod tests {
     use super::*;
     use crate::cache_wake::{AdvisoryCache, CacheKeyParts, CacheKind};
+    use std::time::Instant;
     use uuid::Uuid;
 
     fn live_url() -> String {
@@ -530,6 +551,97 @@ mod tests {
         // reported as successful real-Redis coverage.
         std::env::var("ROOTYARD_TEST_REDIS_URL")
             .expect("ROOTYARD_TEST_REDIS_URL is required for real Redis contract tests")
+    }
+
+    fn owned_destructive_fixture() {
+        // Destructive commands are allowed only when the operator explicitly
+        // attests that this URL names a disposable, test-owned server.
+        let guard = std::env::var("ROOTYARD_TEST_REDIS_DESTRUCTIVE")
+            .expect("ROOTYARD_TEST_REDIS_DESTRUCTIVE=owned-fixture is required before a destructive Redis command");
+        assert_eq!(
+            guard, "owned-fixture",
+            "destructive Redis tests require ROOTYARD_TEST_REDIS_DESTRUCTIVE=owned-fixture"
+        );
+    }
+
+    fn live_redis_serial() -> &'static tokio::sync::Mutex<()> {
+        static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    async fn raw_connection(url: &str) -> ConnectionManager {
+        ::redis::Client::open(url)
+            .expect("dedicated real Redis URL must parse")
+            .get_connection_manager()
+            .await
+            .expect("dedicated real Redis connection failed")
+    }
+
+    async fn current_maxmemory_policy(url: &str) -> String {
+        let mut connection = raw_connection(url).await;
+        let response: Vec<String> = ::redis::cmd("CONFIG")
+            .arg("GET")
+            .arg("maxmemory-policy")
+            .query_async(&mut connection)
+            .await
+            .expect("dedicated real Redis must permit CONFIG GET maxmemory-policy");
+        assert_eq!(response.len(), 2, "invalid CONFIG GET maxmemory-policy response");
+        response[1].clone()
+    }
+
+    async fn set_maxmemory_policy(url: &str, policy: &str) -> Result<()> {
+        let mut connection = ::redis::Client::open(url)
+            .map_err(|_| anyhow::anyhow!("test Redis URL failed to parse"))?
+            .get_connection_manager()
+            .await
+            .map_err(|_| anyhow::anyhow!("test Redis connection unavailable"))?;
+        ::redis::cmd("CONFIG")
+            .arg("SET")
+            .arg("maxmemory-policy")
+            .arg(policy)
+            .query_async::<()>(&mut connection)
+            .await
+            .map_err(|_| anyhow::anyhow!("test Redis CONFIG SET maxmemory-policy failed"))?;
+        Ok(())
+    }
+
+    struct PolicyRestore {
+        url: String,
+        policy: String,
+        restored: bool,
+    }
+
+    impl PolicyRestore {
+        fn new(url: String, policy: String) -> Self {
+            Self { url, policy, restored: false }
+        }
+
+        async fn restore(&mut self) -> Result<()> {
+            set_maxmemory_policy(&self.url, &self.policy).await?;
+            self.restored = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for PolicyRestore {
+        fn drop(&mut self) {
+            if self.restored {
+                return;
+            }
+            let url = self.url.clone();
+            let policy = self.policy.clone();
+            // Best-effort RAII fallback for panic/cancellation paths. A small
+            // standalone runtime keeps this independent of the test runtime.
+            let _ = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                    return;
+                };
+                let _ = runtime.block_on(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), set_maxmemory_policy(&url, &policy)).await;
+                });
+            })
+            .join();
+        }
     }
 
     fn test_key(kind: CacheKind, version: u64, discriminator: &str) -> CacheKey {
@@ -561,6 +673,48 @@ mod tests {
         assert!(!format!("{error}").contains("redis.internal"));
         let error = RedisCache::new("rediss://user:private-password@", RedisCacheLimits::default()).unwrap_err();
         assert!(!format!("{error}").contains("private-password"));
+    }
+
+    #[test]
+    fn redis_url_rejects_tls_weakening_and_accepts_supported_sdk_syntax() {
+        for accepted in [
+            "redis://127.0.0.1:6379",
+            "redis://[::1]:6379",
+            "redis://localhost:6379/0",
+            "redis://user:password@localhost:6379/0",
+            "redis://:password@localhost:6379/0?protocol=resp3",
+            "rediss://cache.internal:6379",
+            "rediss://user:secret@cache.internal:6380/0",
+            "rediss://user:secret@cache.internal:6380/0?protocol=resp2",
+            "rediss://cache.internal:6379/?protocol=3",
+        ] {
+            assert!(validate_redis_url(accepted).is_ok(), "supported Redis URL rejected: {accepted}");
+        }
+        for rejected in [
+            "rediss://cache.internal:6379/#insecure",
+            "rediss://cache.internal:6379/0#insecure",
+            "rediss://cache.internal:6379#insecure",
+            "rediss://cache.internal:6379/#INSECURE",
+            "rediss://cache.internal:6379?tls_verify=false",
+            "rediss://cache.internal:6379?ssl_cert_reqs=none",
+            "rediss://cache.internal:6379?insecure=true",
+            "rediss://cache.internal:6379?danger_accept_invalid_certs=true",
+            "rediss://cache.internal:6379?danger_accept_invalid_hostnames=true",
+            "rediss://cache.internal:6379?verify=false",
+            "rediss://cache.internal:6379/0?protocol=resp3&tls_verify=false",
+            "rediss://cache.internal:6379/0?protocol=resp4",
+            "redis://127.0.0.1:6379/#insecure",
+        ] {
+            assert!(validate_redis_url(rejected).is_err(), "TLS-weakening Redis URL accepted: {rejected}");
+        }
+        let error = RedisCache::new(
+            "rediss://user:private-password@cache.internal:6379/#insecure",
+            RedisCacheLimits::default(),
+        )
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(!text.contains("private-password"));
+        assert!(!text.contains("cache.internal"));
     }
 
     #[test]
@@ -628,8 +782,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_loopback_port_outage_is_bounded_without_process_signals() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("loopback bind failed");
+        let address = listener.local_addr().expect("loopback address unavailable");
+        drop(listener);
+        let url = format!("redis://{address}");
+        let limits =
+            RedisCacheLimits { request_timeout: Duration::from_millis(250), ..RedisCacheLimits::default() };
+        let started = Instant::now();
+        assert!(RedisCache::connect(&url, limits).await.is_err(), "closed loopback port must fail cache connect");
+        assert!(started.elapsed() <= Duration::from_secs(3), "closed-port cache connect was not bounded");
+        let wake = RedisWake::from_url(&url, "rootyard:test:closed-port".into()).expect("loopback URL is valid");
+        let started = Instant::now();
+        assert!(wake.publish().await.is_err(), "closed loopback port publish must fail as an advisory hint");
+        assert!(started.elapsed() <= Duration::from_secs(3), "closed-port wake publish was not bounded");
+    }
+
+    #[tokio::test]
     #[ignore = "requires a dedicated real Redis via ROOTYARD_TEST_REDIS_URL"]
     async fn real_redis_cache_contract_round_trip_and_bounded_read() {
+        let _serial = live_redis_serial().lock().await;
         let url = live_url();
         let limits = RedisCacheLimits { request_timeout: Duration::from_secs(2), ..RedisCacheLimits::default() };
         let cache = RedisCache::connect(&url, limits).await.unwrap();
@@ -659,6 +831,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a dedicated real Redis via ROOTYARD_TEST_REDIS_URL"]
     async fn real_redis_wake_publishes_only_a_hint() {
+        let _serial = live_redis_serial().lock().await;
         let url = live_url();
         let channel = format!("rootyard:test:_{}", Uuid::new_v4().simple());
         let wake = Arc::new(RedisWake::from_url(&url, channel).unwrap());
@@ -683,5 +856,99 @@ mod tests {
             .await
             .expect("Redis wake subscriber did not cancel")
             .expect("Redis wake subscriber panicked");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated real Redis via ROOTYARD_TEST_REDIS_URL"]
+    async fn real_redis_flushall_is_authoritative_cache_miss() {
+        let _serial = live_redis_serial().lock().await;
+        let url = live_url();
+        let limits = RedisCacheLimits { request_timeout: Duration::from_secs(2), ..RedisCacheLimits::default() };
+        let cache = RedisCache::connect(&url, limits).await.expect("dedicated real Redis contract must validate");
+        let key = test_key(CacheKind::TreeListing, 5, "flushall");
+        let value = CacheValue::new(CacheKind::TreeListing, 5, b"before-flushall".to_vec());
+        cache.put(&key, value.clone(), Some(Duration::from_secs(30))).await.unwrap();
+        assert_eq!(cache.get(&key).await.unwrap(), Some(value));
+        let mut raw = raw_connection(&url).await;
+        owned_destructive_fixture();
+        ::redis::cmd("FLUSHALL")
+            .query_async::<()>(&mut raw)
+            .await
+            .expect("dedicated owned real Redis must permit FLUSHALL");
+        assert_eq!(cache.get(&key).await.unwrap(), None, "FLUSHALL must surface as a miss, not stale cache data");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated real Redis via ROOTYARD_TEST_REDIS_URL"]
+    async fn real_redis_bad_acl_credentials_are_rejected_bounded_and_redacted() {
+        let _serial = live_redis_serial().lock().await;
+        let url = live_url();
+        const BAD_USER: &str = "rootyard-invalid-acl-user";
+        const BAD_PASSWORD: &str = "rootyard-invalid-acl-secret";
+        let mut parsed =
+            ::redis::parse_redis_url(&url).expect("ROOTYARD_TEST_REDIS_URL must be a redis:// or rediss:// URL");
+        parsed.set_username(BAD_USER).expect("test URL username can be replaced");
+        parsed.set_password(Some(BAD_PASSWORD)).expect("test URL password can be replaced");
+        let bad_url = parsed.to_string();
+        let limits = RedisCacheLimits { request_timeout: Duration::from_millis(500), ..RedisCacheLimits::default() };
+        let cache = RedisCache::new(&bad_url, limits).expect("bad-credential URL is syntactically valid");
+        let cache_debug = format!("{cache:?}");
+        assert!(!cache_debug.contains(BAD_USER));
+        assert!(!cache_debug.contains(BAD_PASSWORD));
+        let started = Instant::now();
+        let error = RedisCache::connect(&bad_url, limits)
+            .await
+            .expect_err("wrong ACL credentials must reject cache connect");
+        assert!(started.elapsed() <= Duration::from_secs(3), "wrong ACL rejection was not bounded");
+        let display = format!("{error}");
+        let debug = format!("{error:?}");
+        let chain = format!("{error:#}");
+        for text in [&display, &debug, &chain] {
+            assert!(!text.contains(BAD_USER), "error leaked ACL username: {text}");
+            assert!(!text.contains(BAD_PASSWORD), "error leaked ACL password: {text}");
+            assert!(
+                !text.contains("redis://") && !text.contains("rediss://"),
+                "error leaked the Redis URL: {text}"
+            );
+        }
+        let wake = RedisWake::from_url(&bad_url, "rootyard:test:bad-acl".into()).expect("bad-credential URL is valid");
+        let wake_debug = format!("{wake:?}");
+        assert!(!wake_debug.contains(BAD_USER));
+        assert!(!wake_debug.contains(BAD_PASSWORD));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a dedicated real Redis via ROOTYARD_TEST_REDIS_URL"]
+    async fn real_redis_noeviction_policy_fails_connect_closed_and_restores() {
+        let _serial = live_redis_serial().lock().await;
+        let url = live_url();
+        let limits = RedisCacheLimits { request_timeout: Duration::from_secs(2), ..RedisCacheLimits::default() };
+        let original = current_maxmemory_policy(&url).await;
+        assert!(
+            eviction_policy(&original).is_ok(),
+            "dedicated fixture must start with an accepted eviction policy"
+        );
+        let mut restore = PolicyRestore::new(url.clone(), original.clone());
+        owned_destructive_fixture();
+        set_maxmemory_policy(&url, "noeviction")
+            .await
+            .expect("dedicated owned real Redis must permit CONFIG SET maxmemory-policy");
+        let result = RedisCache::connect(&url, limits).await;
+        let error = match &result {
+            Ok(_) => None,
+            Err(error) => Some(format!("{error:#}")),
+        };
+        restore.restore().await.expect("RAII maxmemory-policy restore failed");
+        assert!(result.is_err(), "noeviction must fail cache connect closed");
+        assert!(
+            error.as_deref().is_some_and(|text| text.contains("noeviction")),
+            "unexpected noeviction connect error: {error:?}"
+        );
+        assert_eq!(
+            current_maxmemory_policy(&url).await,
+            original,
+            "original maxmemory-policy was not restored"
+        );
+        RedisCache::connect(&url, limits).await.expect("cache must reconnect after policy restore");
     }
 }
