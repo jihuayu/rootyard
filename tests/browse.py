@@ -3,6 +3,7 @@
 import argparse
 import base64
 import concurrent.futures
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -15,18 +16,220 @@ from e2e import Harness  # noqa: E402
 
 ZERO_OID = "0" * 40
 
+# The reconciler only auto-clears its own durable push ambiguity marker.  A
+# manual fence must use an unrelated reason so a concurrent worker cannot turn
+# the expected 409 into a 200 and hide the read/transaction gate.
+MANUAL_RECOVERY_REASON = "manual_test_browse_recovery_fence"
+
+CASE_NAMES = (
+    "setup_repos",
+    "refs_and_pagination",
+    "commits_and_pagination",
+    "tree_and_blob",
+    "compare_revisions",
+    "ref_transactions_atomic_cas",
+    "idempotency_and_concurrency",
+    "access_and_fences",
+    "object_format_and_negotiation",
+    "bounded_ref_and_commit_pages",
+    "protected_writes_and_ref_ack_failure",
+)
+
 
 class BrowseHarness(Harness):
-    def document(self, path, code=200, token=None, **kwargs):
-        status, body, headers = self.http(path, token=token or self.alice, **kwargs)
-        norm_headers = {k.lower(): v for k, v in headers.items()}
-        if isinstance(code, tuple):
-            assert status in code, f"{path}: expected {code}, got {status}: {body[:300]!r}"
+    def __init__(self, args):
+        super().__init__(args)
+        self.actor_labels = {}
+
+    def account(self, *args):
+        account = super().account(*args)
+        self.register_token(account)
+        if account.get("token_id"):
+            if args and args[0] == "create-user":
+                self.actor_labels[account["token_id"]] = (
+                    "owner" if args[1] == "alice" else "non-member"
+                )
+            elif "--read-only" in args:
+                self.actor_labels[account["token_id"]] = "read-only"
+            else:
+                self.actor_labels[account["token_id"]] = "token"
+        return account
+
+    def register_token(self, account):
+        """Keep raw and Git Basic credential forms out of every diagnostic."""
+        token = account.get("token")
+        if not isinstance(token, str) or not token:
+            return
+        forms = [token]
+        username = account.get("username")
+        if isinstance(username, str) and username:
+            forms.append(base64.b64encode((username + ":" + token).encode()).decode())
+        for form in forms:
+            if form not in self.secrets:
+                self.secrets.append(form)
+
+    def actor_label(self, token):
+        """Return a stable role label, never a token id or credential."""
+        if not token:
+            return "anonymous"
+        label = self.actor_labels.get(token.get("token_id"))
+        if label:
+            return label
+        if token.get("read_only"):
+            return "read-only"
+        return "unknown"
+
+    @staticmethod
+    def _sql_literal(value):
+        return str(value).replace("'", "''")
+
+    def repository_diagnostics(self):
+        """Current schema and repository row facts for an unexpected response."""
+        repo = getattr(self, "repo", {}) or {}
+        repo_id = repo.get("id") if isinstance(repo, dict) else None
+        details = {
+            "schema": getattr(self, "schema", "unknown"),
+            "repository_id": repo_id or "unknown",
+            "role_effective_identity": "unavailable",
+            "row_effective_identity": "unavailable",
+            "current_state": "unavailable",
+            "recovery_reason": None,
+        }
+        if not repo_id:
+            return details
+        query = (
+            "SELECT json_build_object("
+            "'schema',current_schema(),"
+            "'repository_id',r.id::text,"
+            "'owner_id',r.owner_id::text,"
+            "'owner',ns.slug,"
+            "'name',r.name,"
+            "'state',r.state,"
+            "'recovery_reason',r.recovery_reason,"
+            "'storage_generation',r.storage_generation,"
+            "'storage_backend',r.storage_backend,"
+            "'row_effective_identity',json_build_object("
+            "'id',r.id::text,'owner_id',r.owner_id::text,"
+            "'owner',ns.slug,'name',r.name)) "
+            "FROM repositories r LEFT JOIN namespaces ns ON ns.id=r.owner_id "
+            "WHERE r.id='" + self._sql_literal(repo_id) + "'"
+        )
+        try:
+            raw = self.sql(query)
+            if not raw:
+                details["current_state"] = "missing"
+                details["row_effective_identity"] = "missing"
+                return details
+            row = json.loads(raw)
+        except Exception as error:  # noqa: BLE001 - diagnostic collection must not mask
+            details["current_state"] = "query_failed"
+            details["row_effective_identity"] = "query_failed"
+            details["diagnostic_error"] = type(error).__name__
+            return details
+        details.update({
+            "schema": row.get("schema") or details["schema"],
+            "repository_id": row.get("repository_id") or details["repository_id"],
+            "current_state": row.get("state") or "unknown",
+            "recovery_reason": row.get("recovery_reason"),
+            "storage_generation": row.get("storage_generation"),
+            "storage_backend": row.get("storage_backend"),
+            "row_effective_identity": row.get("row_effective_identity"),
+        })
+        return details
+
+    def _server_log_tail(self, limit=4000):
+        log = self.root / "server.log"
+        try:
+            return log.read_text(errors="replace")[-limit:]
+        except FileNotFoundError:
+            return ""
+        except Exception as error:  # noqa: BLE001 - type only, never str(error)
+            return "unavailable:" + type(error).__name__
+
+    def http_failure_detail(
+        self, path, expected, status, body, headers, token, note=None, error_type=None
+    ):
+        """Redacted facts for an unexpected HTTP result; never renders argv or creds."""
+        if isinstance(body, bytes):
+            body_text = body.decode(errors="replace")
+        elif body is None:
+            body_text = ""
         else:
-            assert status == code, f"{path}: expected {code}, got {status}: {body[:300]!r}"
-        assert norm_headers.get("cache-control") == "no-store", norm_headers
-        assert "application/json" in norm_headers.get("content-type", ""), norm_headers
-        return json.loads(body)
+            body_text = str(body)
+        details = {
+            "request_path": path,
+            "actor": self.actor_label(token),
+            "expected_status": expected,
+            "observed_status": status,
+            "response_content_type": headers.get("content-type")
+            or headers.get("Content-Type"),
+            "response_body": body_text[:1000],
+            "server_log_tail": self._server_log_tail(),
+        }
+        details.update(self.repository_diagnostics())
+        if note:
+            details["note"] = note
+        if error_type:
+            details["http_error"] = error_type
+        summary = f"{path}: expected {expected}, got {status}"
+        if body_text:
+            summary += f": {body_text[:300]!r}"
+        return self.redact(summary + "\n" + json.dumps(details, sort_keys=True))
+
+    def document(self, path, code=200, token=None, **kwargs):
+        actor = token or self.alice
+        try:
+            status, body, headers = self.http(path, token=actor, **kwargs)
+        except Exception as error:  # noqa: BLE001 - retain type only, not str(error)
+            raise AssertionError(
+                self.http_failure_detail(
+                    path, code, "exception", b"", {}, actor,
+                    error_type=type(error).__name__,
+                )
+            ) from None
+        norm_headers = {k.lower(): v for k, v in headers.items()}
+        expected = code if isinstance(code, tuple) else (code,)
+        if status not in expected:
+            raise AssertionError(
+                self.http_failure_detail(path, code, status, body, headers, actor)
+            )
+        notes = []
+        if norm_headers.get("cache-control") != "no-store":
+            notes.append(f"cache-control={norm_headers.get('cache-control')!r}")
+        if "application/json" not in norm_headers.get("content-type", ""):
+            notes.append(f"content-type={norm_headers.get('content-type')!r}")
+        if notes:
+            raise AssertionError(
+                self.http_failure_detail(
+                    path, code, status, body, headers, actor, note="; ".join(notes)
+                )
+            )
+        try:
+            return json.loads(body)
+        except Exception as error:  # noqa: BLE001 - retain type only
+            raise AssertionError(
+                self.http_failure_detail(
+                    path, code, status, body, headers, actor,
+                    note="invalid JSON response: " + type(error).__name__,
+                )
+            ) from None
+
+    @contextmanager
+    def recovery_fence(self):
+        """Set an operator/manual fence and always restore the ready row."""
+        repo_id = self._sql_literal(self.repo["id"])
+        self.sql(
+            "UPDATE repositories SET state='recovering', recovery_reason='"
+            + MANUAL_RECOVERY_REASON
+            + "' WHERE id='" + repo_id + "'"
+        )
+        try:
+            yield
+        finally:
+            self.sql(
+                "UPDATE repositories SET state='ready', recovery_reason=NULL WHERE id='"
+                + repo_id + "'"
+            )
 
     def repo_api(self, suffix="", repo="demo", owner="alice"):
         return f"/api/repos/{owner}/{repo}{suffix}"
@@ -632,18 +835,13 @@ class BrowseHarness(Harness):
             body=tx_body,
         )
 
-        # Repository recovering fence
-        self.sql(
-            f"UPDATE repositories SET state='recovering', recovery_reason='push_outcome_unknown' WHERE id='{self.repo['id']}'"
-        )
-        try:
+        # Repository recovering fence.  Use a manual reason, never the
+        # reconciler-owned push ambiguity marker, because a concurrent worker
+        # would legitimately auto-heal that marker and return 200 here.
+        with self.recovery_fence():
             for path in read_paths:
                 self.document(path, 409)
             self.document(self.repo_api("/ref-transactions"), 409, method="POST", body=tx_body)
-        finally:
-            self.sql(
-                f"UPDATE repositories SET state='ready', recovery_reason=NULL WHERE id='{self.repo['id']}'"
-            )
 
     def object_format_and_negotiation(self):
         status_doc = self.document(self.repo_api("/object-format"), token=self.reader)
@@ -730,20 +928,16 @@ def main():
     harness = BrowseHarness(args)
     success = False
     try:
-        for name in (
-            "setup_repos",
-            "refs_and_pagination",
-            "commits_and_pagination",
-            "tree_and_blob",
-            "compare_revisions",
-            "ref_transactions_atomic_cas",
-            "idempotency_and_concurrency",
-            "access_and_fences",
-            "object_format_and_negotiation",
-            "bounded_ref_and_commit_pages",
-            "protected_writes_and_ref_ack_failure",
-        ):
+        for name in CASE_NAMES:
             harness.case(name, getattr(harness, name))
+        executed = [item["name"] for item in harness.results]
+        if executed != list(CASE_NAMES):
+            raise AssertionError(
+                "native case inventory mismatch: expected "
+                + repr(list(CASE_NAMES))
+                + ", executed "
+                + repr(executed)
+            )
         success = True
     except Exception as error:
         print(harness.redact(error), file=sys.stderr)
@@ -763,6 +957,10 @@ def main():
         )
         report = dict(
             passed=success,
+            case_count=len(CASE_NAMES),
+            cases_run=len(harness.results),
+            cases_passed=sum(1 for item in harness.results if item["status"] == "passed"),
+            cases_failed=sum(1 for item in harness.results if item["status"] == "failed"),
             cases=harness.results,
             binary_sha256=binary_sha,
             limitations=[
