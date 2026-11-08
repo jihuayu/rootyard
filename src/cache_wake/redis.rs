@@ -2,7 +2,8 @@
 //!
 //! This module is compiled only with `--features state-redis`. It contains no
 //! RESP parser, raw TCP client or TLS implementation. A standalone default
-//! build uses only `MemoryCache` and local `Notify` hints.
+//! build exposes the Memory boundary and uses local `Notify` hints. Serving
+//! cache consumers are not wired by this increment.
 //!
 //! `CacheLimits::max_entries`/`max_bytes` are Memory limits. Redis uses an
 //! explicit, separate startup contract: a dedicated instance must set a finite
