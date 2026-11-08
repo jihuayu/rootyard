@@ -159,16 +159,16 @@ fn query_has_key(uri: &Uri, key: &str) -> bool {
 /// of fixed multipart query keys. Query values, paths and headers are never
 /// read or retained.
 fn request_stage(method: &Method, uri: &Uri) -> RemoteOp {
-    if method == &Method::GET {
+    if method == Method::GET {
         return RemoteOp::Get;
     }
-    if method == &Method::HEAD {
+    if method == Method::HEAD {
         return RemoteOp::Head;
     }
-    if method == &Method::DELETE {
+    if method == Method::DELETE {
         return if query_has_key(uri, "uploadId") { RemoteOp::MultipartAbort } else { RemoteOp::Delete };
     }
-    if method == &Method::POST {
+    if method == Method::POST {
         if query_has_key(uri, "uploads") {
             return RemoteOp::MultipartInitiate;
         }
@@ -177,7 +177,7 @@ fn request_stage(method: &Method, uri: &Uri) -> RemoteOp {
         }
         return RemoteOp::Put;
     }
-    if method == &Method::PUT {
+    if method == Method::PUT {
         return if query_has_key(uri, "uploadId") && query_has_key(uri, "partNumber") {
             RemoteOp::MultipartPart
         } else {

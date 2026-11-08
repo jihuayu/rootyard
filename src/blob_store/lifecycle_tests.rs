@@ -184,7 +184,7 @@ async fn outer_timeout_detaches_readback_and_keeps_lease_until_inner_drains() {
     let download = tokio::spawn(async move {
         blob.get_to_file(&object, &destination, Instant::now() + Duration::from_millis(150)).await
     });
-    tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+    let _ = tokio::time::timeout(Duration::from_secs(1), entered.acquire())
         .await
         .expect("inner task must reach the gate")
         .expect("gate open");
@@ -220,7 +220,7 @@ async fn outer_timeout_detaches_upload_and_keeps_slot_until_abort_finishes() {
     let (entered, release) = transfer::install_upload_read_stall(source.clone());
     let upload =
         tokio::spawn(async move { blob.put_file(intent, &source, Instant::now() + Duration::from_millis(150)).await });
-    tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+    let _ = tokio::time::timeout(Duration::from_secs(1), entered.acquire())
         .await
         .expect("owned upload must reach the local read gate")
         .expect("gate open");
