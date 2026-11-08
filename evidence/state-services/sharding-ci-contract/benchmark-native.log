@@ -1,0 +1,263 @@
+setup: passed
+tier_1_2_4_multi_node_concurrency_benchmark: passed
+pinned_root_reachability_under_gc_eviction_and_failover: passed
+cluster_and_repo_benchmark_endpoints_and_reports: passed
+benchmark_access_and_validation_boundaries: passed
+{
+  "passed": true,
+  "mode": "live_metadata_drill",
+  "production_validation": false,
+  "multi_node_ha_validation": false,
+  "data_plane_success_claimed": false,
+  "benchmark_receipts": "simulation_only",
+  "reference_only": false,
+  "data_plane_validation": "run cluster_workload_native.py and cluster_migration_native.py",
+  "node_counts": [
+    1,
+    2,
+    4
+  ],
+  "concurrency": 8,
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "seconds": 3.8803,
+      "detail": null
+    },
+    {
+      "name": "tier_1_2_4_multi_node_concurrency_benchmark",
+      "status": "passed",
+      "seconds": 0.0128,
+      "detail": null
+    },
+    {
+      "name": "pinned_root_reachability_under_gc_eviction_and_failover",
+      "status": "passed",
+      "seconds": 0.0206,
+      "detail": null
+    },
+    {
+      "name": "cluster_and_repo_benchmark_endpoints_and_reports",
+      "status": "passed",
+      "seconds": 0.0151,
+      "detail": null
+    },
+    {
+      "name": "benchmark_access_and_validation_boundaries",
+      "status": "passed",
+      "seconds": 0.0176,
+      "detail": null
+    }
+  ],
+  "benchmark_receipt": {
+    "benchmark_id": "be70507b-5ee7-44d0-a0cb-14daeb1eb247",
+    "repository_id": "59a0ead1-318c-48e8-ad22-550721e3e998",
+    "status": "simulation_only",
+    "node_tiers": [
+      {
+        "node_count": 1,
+        "virtual_buckets_assigned": 1024,
+        "concurrency": 8,
+        "total_operations": 24,
+        "elapsed_ms": 1,
+        "throughput_ops_per_sec": 24000.0,
+        "throughput_bytes_per_sec": 141136000.0,
+        "scaling_efficiency_vs_1node": 1.0,
+        "overall_latency": {
+          "count": 24,
+          "min_us": 9,
+          "p50_us": 18,
+          "p95_us": 25,
+          "p99_us": 48,
+          "max_us": 48,
+          "mean_us": 18
+        },
+        "push_latency": {
+          "count": 6,
+          "min_us": 23,
+          "p50_us": 28,
+          "p95_us": 33,
+          "p99_us": 33,
+          "max_us": 33,
+          "mean_us": 27
+        },
+        "fetch_latency": {
+          "count": 12,
+          "min_us": 12,
+          "p50_us": 20,
+          "p95_us": 51,
+          "p99_us": 51,
+          "max_us": 51,
+          "mean_us": 22
+        },
+        "gc_latency": {
+          "count": 6,
+          "min_us": 25,
+          "p50_us": 32,
+          "p95_us": 35,
+          "p99_us": 35,
+          "max_us": 35,
+          "mean_us": 31
+        },
+        "failover_latency_us": 25,
+        "cache_hit_ratio": 0.6666666666666666,
+        "resources": {
+          "cpu_user_ms": 630,
+          "cpu_sys_ms": 310,
+          "rss_bytes": 38510592,
+          "peak_rss_bytes": 418263040,
+          "temp_disk_bytes": 2945,
+          "io_read_bytes": 2945,
+          "io_write_bytes": 90238976,
+          "db_wait_ms": 0
+        },
+        "pinned_root_check": {
+          "pinned_refs_checked": 2,
+          "active_snapshots_checked": 8,
+          "reachable_objects_verified": 32,
+          "missing_objects": 0,
+          "all_reachable": true,
+          "split_brain_writes_rejected": 1
+        }
+      },
+      {
+        "node_count": 2,
+        "virtual_buckets_assigned": 1024,
+        "concurrency": 8,
+        "total_operations": 24,
+        "elapsed_ms": 1,
+        "throughput_ops_per_sec": 32400.000000000004,
+        "throughput_bytes_per_sec": 145008000.0,
+        "scaling_efficiency_vs_1node": 0.675,
+        "overall_latency": {
+          "count": 24,
+          "min_us": 8,
+          "p50_us": 16,
+          "p95_us": 25,
+          "p99_us": 88,
+          "max_us": 88,
+          "mean_us": 19
+        },
+        "push_latency": {
+          "count": 6,
+          "min_us": 23,
+          "p50_us": 24,
+          "p95_us": 33,
+          "p99_us": 33,
+          "max_us": 33,
+          "mean_us": 27
+        },
+        "fetch_latency": {
+          "count": 12,
+          "min_us": 11,
+          "p50_us": 18,
+          "p95_us": 27,
+          "p99_us": 27,
+          "max_us": 27,
+          "mean_us": 18
+        },
+        "gc_latency": {
+          "count": 6,
+          "min_us": 23,
+          "p50_us": 29,
+          "p95_us": 103,
+          "p99_us": 103,
+          "max_us": 103,
+          "mean_us": 41
+        },
+        "failover_latency_us": 25,
+        "cache_hit_ratio": 0.6666666666666666,
+        "resources": {
+          "cpu_user_ms": 630,
+          "cpu_sys_ms": 310,
+          "rss_bytes": 38514688,
+          "peak_rss_bytes": 418263040,
+          "temp_disk_bytes": 2945,
+          "io_read_bytes": 2945,
+          "io_write_bytes": 90238976,
+          "db_wait_ms": 0
+        },
+        "pinned_root_check": {
+          "pinned_refs_checked": 2,
+          "active_snapshots_checked": 8,
+          "reachable_objects_verified": 32,
+          "missing_objects": 0,
+          "all_reachable": true,
+          "split_brain_writes_rejected": 2
+        }
+      },
+      {
+        "node_count": 4,
+        "virtual_buckets_assigned": 1024,
+        "concurrency": 8,
+        "total_operations": 24,
+        "elapsed_ms": 1,
+        "throughput_ops_per_sec": 49199.99999999999,
+        "throughput_bytes_per_sec": 148608000.0,
+        "scaling_efficiency_vs_1node": 0.5125,
+        "overall_latency": {
+          "count": 24,
+          "min_us": 7,
+          "p50_us": 16,
+          "p95_us": 63,
+          "p99_us": 66,
+          "max_us": 66,
+          "mean_us": 20
+        },
+        "push_latency": {
+          "count": 6,
+          "min_us": 23,
+          "p50_us": 24,
+          "p95_us": 74,
+          "p99_us": 74,
+          "max_us": 74,
+          "mean_us": 40
+        },
+        "fetch_latency": {
+          "count": 12,
+          "min_us": 10,
+          "p50_us": 18,
+          "p95_us": 27,
+          "p99_us": 27,
+          "max_us": 27,
+          "mean_us": 18
+        },
+        "gc_latency": {
+          "count": 6,
+          "min_us": 26,
+          "p50_us": 31,
+          "p95_us": 39,
+          "p99_us": 39,
+          "max_us": 39,
+          "mean_us": 32
+        },
+        "failover_latency_us": 25,
+        "cache_hit_ratio": 0.6666666666666666,
+        "resources": {
+          "cpu_user_ms": 630,
+          "cpu_sys_ms": 310,
+          "rss_bytes": 38514688,
+          "peak_rss_bytes": 418263040,
+          "temp_disk_bytes": 2945,
+          "io_read_bytes": 2945,
+          "io_write_bytes": 90238976,
+          "db_wait_ms": 0
+        },
+        "pinned_root_check": {
+          "pinned_refs_checked": 2,
+          "active_snapshots_checked": 8,
+          "reachable_objects_verified": 32,
+          "missing_objects": 0,
+          "all_reachable": true,
+          "split_brain_writes_rejected": 4
+        }
+      }
+    ],
+    "pinned_roots_verified": false,
+    "failover_verified": false,
+    "markdown_report": "# Simulation only \u2014 not measured Git or cluster readiness\n\n# Rootyard Multi-Node Sharding Benchmark Report\n\n| Node Tier | Virtual Buckets | Concurrency | Ops/sec | P50 (us) | P95 (us) | P99 (us) | RSS (bytes) | DB Wait (ms) | Pinned Roots Verified |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n| 1-node | 1024 | 8 | 24000.00 | 18 | 25 | 48 | 38510592 | 0 | true |\n| 2-node | 1024 | 8 | 32400.00 | 16 | 25 | 88 | 38514688 | 0 | true |\n| 4-node | 1024 | 8 | 49200.00 | 16 | 63 | 66 | 38514688 | 0 | true |\n\n- **Pinned Roots Verified**: `false`\n",
+    "updated_unix": 1794145813
+  },
+  "binary_sha256": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2"
+}
