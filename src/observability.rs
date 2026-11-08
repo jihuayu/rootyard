@@ -479,7 +479,8 @@ mod tests {
     fn reqwest_transport_chain_stays_remote_and_never_formats_display() {
         let client = reqwest::Client::new();
         let transport = client.request(reqwest::Method::GET, "http://[").build().unwrap_err();
-        let chained = anyhow::Error::new(RemoteStoreError::transport(RemoteOp::Head, transport)).context(SENTINEL);
+        let chained =
+            anyhow::Error::new(RemoteStoreError::transport(RemoteOp::Head, Box::new(transport))).context(SENTINEL);
         let text = event_json(&chained as &dyn Any);
         assert!(!text.contains("SECRET"));
         assert!(!text.contains("http://"));

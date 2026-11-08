@@ -107,10 +107,10 @@ impl fmt::Debug for BlobProfile {
 impl BlobProfile {
     /// Production entry point. Any absent or unsafe setting is a hard error.
     pub fn from_env() -> Result<Self, BlobError> {
-        if let Some(driver) = env_optional("ROOTYARD_BLOB_DRIVER")? {
-            if driver != "opendal" {
-                return Err(BlobError::UnsupportedService(format!("driver `{driver}`")));
-            }
+        if let Some(driver) = env_optional("ROOTYARD_BLOB_DRIVER")?
+            && driver != "opendal"
+        {
+            return Err(BlobError::UnsupportedService(format!("driver `{driver}`")));
         }
         let provider = BlobProvider::parse(&env_required("ROOTYARD_BLOB_SERVICE")?)?;
         let bucket = env_required(if provider == BlobProvider::S3 {

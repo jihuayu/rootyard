@@ -18,7 +18,7 @@ use reqwest::Url;
 use crate::blob_store::{BlobError, MAX_OBJECT_BYTES, opendal::map_provider_error, upload::UploadGuard};
 
 use super::remote_errors::RemoteOp;
-use super::remote_provider_errors::{deadline_error, observe, observing_http_client};
+use super::remote_provider_errors::{classifying_http_client, deadline_error, observe};
 
 pub(crate) const READ_CHUNK: usize = 64 * 1024;
 /// S3 multipart requires >=5 MiB parts; 8 MiB keeps every part compliant.
@@ -63,9 +63,10 @@ impl LegacyS3Store {
         }
         let operator = Operator::new(builder)
             .map_err(map_provider_error)?
-            // Passive status observer: signing, TLS, retries and multipart stay
-            // in the SDK; only the numeric response status is recorded.
-            .layer(HttpClientLayer::new(observing_http_client().map_err(map_provider_error)?))
+            // Exact-response classifier: signing, TLS, retries and multipart
+            // stay in the SDK; each non-2xx response gets its own private
+            // status/request-stage marker.
+            .layer(HttpClientLayer::new(classifying_http_client().map_err(map_provider_error)?))
             .layer(TimeoutLayer::new().with_timeout(OBJECT_TIMEOUT).with_io_timeout(IO_TIMEOUT))
             .layer(ConcurrentLimitLayer::new(CONCURRENCY))
             .layer(RetryLayer::new().with_max_times(RETRY_MAX_TIMES))

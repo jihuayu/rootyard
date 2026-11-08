@@ -32,7 +32,9 @@ use futures_util::StreamExt;
 #[cfg(test)]
 use reqwest::{Client, Method};
 #[cfg(test)]
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use tokio::time::Instant;
 
 use crate::storage::remote_provider::LegacyS3Store;
 
@@ -54,7 +56,7 @@ where
 {
     match tokio::time::timeout_at(deadline, stream.next()).await {
         Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
-        Ok(Some(Err(error))) => Err(RemoteStoreError::transport(op, error).into()),
+        Ok(Some(Err(error))) => Err(RemoteStoreError::transport(op, Box::new(error)).into()),
         Ok(None) => Ok(None),
         Err(_) => Err(RemoteStoreError::timeout(op).into()),
     }
@@ -69,7 +71,7 @@ where
 async fn remote_text(response: reqwest::Response, op: RemoteOp, deadline: Instant) -> Result<String> {
     match tokio::time::timeout_at(deadline, response.text()).await {
         Ok(Ok(text)) => Ok(text),
-        Ok(Err(error)) => Err(RemoteStoreError::transport(op, error).into()),
+        Ok(Err(error)) => Err(RemoteStoreError::transport(op, Box::new(error)).into()),
         Err(_) => Err(RemoteStoreError::timeout(op).into()),
     }
 }
