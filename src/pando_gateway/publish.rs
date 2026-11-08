@@ -108,6 +108,21 @@ fn deletes_head(head_ref: &str, changes: &[RefChange]) -> bool {
     changes.iter().any(|change| change.ref_name == head_ref && change.new_oid.bytes().all(|byte| byte == b'0'))
 }
 
+/// Classify an observed advertised-old mismatch. Only an absolute deadline that
+/// has not passed and a publication guard that is still live (ref locks,
+/// maintenance lease and admission) prove the refusal happened before any
+/// commit; a concurrent timeout or lease failure during the `FOR UPDATE` queries
+/// wins and stays a generic [`PublishError::Failed`], never a typed `ng`.
+fn classify_ref_mismatch(deadline: Instant, liveness: Result<(), Error>, requested: &[RefChange]) -> PublishError {
+    if Instant::now() >= deadline {
+        Error::timeout().into()
+    } else if let Err(error) = liveness {
+        error.into()
+    } else {
+        PublishError::RefRejected(RefRejection::cas(requested))
+    }
+}
+
 /// Caller has completed native receive-pack in a disposable Snapshot and
 /// staged any new closure. It must retain the exact-ref guard, but release the
 /// local snapshot read lock before this method enters the publication window.
@@ -202,6 +217,13 @@ pub(crate) async fn publish_typed(
         )
         .await
         .map_err(Error::internal)?;
+    // The row lock may have waited until the absolute deadline passed, or have
+    // outlived the ref guard. Neither is a proven advertised-old refusal, so
+    // validate both before any later branch could classify one.
+    if Instant::now() >= deadline {
+        return Err(Error::timeout().into());
+    }
+    guard.ensure_active()?;
     if current.get::<_, i64>("storage_generation") != repo.storage_generation
         || current.get::<_, i64>("pando_generation") != repo.storage_generation
         || current.get::<_, &str>("storage_backend") != "pando"
@@ -251,8 +273,9 @@ pub(crate) async fn publish_typed(
         if actual != change.old_oid {
             // The exact advertised old OID is gone. Nothing in this transaction
             // has been committed yet, so the caller may report a negotiated
-            // `ng` for every requested ref instead of an HTTP 409.
-            return Err(PublishError::RefRejected(RefRejection::cas(requested)));
+            // `ng` for every requested ref instead of an HTTP 409 -- but only
+            // while this request still owns a live deadline and guard.
+            return Err(classify_ref_mismatch(deadline, guard.ensure_active(), requested));
         }
     }
     let timeout = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(120));
@@ -416,6 +439,25 @@ mod tests {
         assert_eq!(rejection.reason, REF_CHANGED);
         let typed = PublishError::RefRejected(rejection);
         assert!(matches!(typed, PublishError::RefRejected(proof) if proof.reason == REF_CHANGED));
+    }
+
+    #[test]
+    fn concurrent_timeout_or_lost_lease_keeps_the_error_generic() {
+        let requested = [change("refs/heads/main", 'b')];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Only a live admission can turn the mismatch into typed proof.
+        let live = classify_ref_mismatch(deadline, Ok(()), &requested);
+        assert!(matches!(live, PublishError::RefRejected(proof) if proof.refs == ["refs/heads/main"]));
+        // An expired deadline is a timeout, never a negotiated `ng`.
+        let expired = classify_ref_mismatch(Instant::now(), Ok(()), &requested);
+        assert!(matches!(expired, PublishError::Failed(error) if error.0 == StatusCode::GATEWAY_TIMEOUT));
+        // A guard/lease lost during the `FOR UPDATE` wait stays generic too.
+        let lost = classify_ref_mismatch(
+            deadline,
+            Err(Error(StatusCode::SERVICE_UNAVAILABLE, "ref publication guard unavailable")),
+            &requested,
+        );
+        assert!(matches!(lost, PublishError::Failed(error) if error.0 == StatusCode::SERVICE_UNAVAILABLE));
     }
 
     #[test]

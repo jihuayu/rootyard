@@ -60,7 +60,7 @@ pub(super) async fn execute(
         // is the authoritative pre-commit answer: pass it through instead of
         // turning a Git `ng` into an opaque HTTP 409. Otherwise nothing was
         // accepted and the unchanged HTTP refusal remains.
-        if !protocol::reports_rejection(&reply, &refs) {
+        if !protocol::reports_rejection(&reply, &refs, &capabilities) {
             return Err(Error(StatusCode::CONFLICT, "Pando receive did not change refs"));
         }
         return receive_response(status, content_type, reply);

@@ -156,15 +156,141 @@ pub(super) fn rejected_refs_report(
     Ok(outer)
 }
 
+/// Largest status report worth parsing. A native report costs a few short
+/// lines, so this only bounds hostile buffered native output.
+const MAX_STATUS_REPORT: usize = 1024 * 1024;
+/// Protocol maximum for one pkt-line, header included.
+const MAX_PKT_LINE: usize = 65_520;
+
+/// Split one pkt-line stream into its payloads. The stream must be well-formed
+/// pkt-lines terminated by exactly one flush packet with nothing after it;
+/// truncation, a `0001`/`0002` special packet, a non-hex header, an oversized
+/// packet, a missing flush or trailing bytes are all malformed.
+fn pkt_line_payloads(stream: &[u8], max_packets: usize) -> Option<Vec<&[u8]>> {
+    if stream.len() > MAX_STATUS_REPORT {
+        return None;
+    }
+    let mut payloads = Vec::new();
+    let mut rest = stream;
+    loop {
+        if rest.len() < 4 {
+            return None;
+        }
+        let header = std::str::from_utf8(&rest[..4]).ok()?;
+        if !header.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let length = usize::from_str_radix(header, 16).ok()?;
+        rest = &rest[4..];
+        if length == 0 {
+            // A single terminating flush must end the stream exactly.
+            return rest.is_empty().then_some(payloads);
+        }
+        if !(4..=MAX_PKT_LINE).contains(&length) || length - 4 > rest.len() || payloads.len() >= max_packets {
+            return None;
+        }
+        payloads.push(&rest[..length - 4]);
+        rest = &rest[length - 4..];
+    }
+}
+
 /// True only when native receive-pack itself reported `ng` for every requested
-/// ref. Callers invoke this after proving the disposable snapshot changed no
-/// ref, so a pass-through report cannot be an acknowledgement of a commit.
-pub(super) fn reports_rejection(report: &[u8], refs: &[String]) -> bool {
-    !refs.is_empty()
-        && refs.iter().all(|name| {
-            let needle = format!("ng {name} ");
-            report.windows(needle.len()).any(|window| window == needle.as_bytes())
-        })
+/// ref, in the exact status format the client negotiated. Callers invoke this
+/// after proving the disposable snapshot changed no ref, so a pass-through
+/// report cannot be an acknowledgement of a commit.
+///
+/// The buffered reply is parsed as bounded real pkt-lines instead of searched
+/// for the text `ng <ref>`: progress text, an `ng` embedded in another ref's
+/// reason, a duplicated or unknown ref, an `ok` line, a truncated or
+/// trailing-byte stream, a sideband error band and any malformed encoding are
+/// all "not a proven rejection" and can never become an HTTP 200.
+pub(super) fn reports_rejection(report: &[u8], refs: &[String], capabilities: &ReceiveCapabilities) -> bool {
+    // Without a negotiated report format native receive-pack sends no status at
+    // all, so nothing could prove a per-ref refusal.
+    if refs.is_empty()
+        || !(capabilities.report_status || capabilities.report_status_v2)
+        || report.len() > MAX_STATUS_REPORT
+    {
+        return false;
+    }
+    let max_packets = refs.len().saturating_mul(4).saturating_add(16);
+    let inner = if capabilities.sideband_64k {
+        // Only a negotiated side-band-64k demultiplexes the reply. Band 1 carries
+        // the status bytes; band 2 is progress and can never establish an `ng`;
+        // band 3 (fatal error), an empty packet, an unknown band or malformed
+        // framing ends the proof.
+        let Some(outer) = pkt_line_payloads(report, max_packets) else {
+            return false;
+        };
+        let mut inner = Vec::new();
+        for payload in outer {
+            let Some((band, body)) = payload.split_first() else {
+                return false;
+            };
+            match *band {
+                1 => {
+                    if inner.len() + body.len() > MAX_STATUS_REPORT {
+                        return false;
+                    }
+                    inner.extend_from_slice(body);
+                }
+                2 => {}
+                _ => return false,
+            }
+        }
+        inner
+    } else {
+        report.to_vec()
+    };
+    let Some(packets) = pkt_line_payloads(&inner, max_packets) else {
+        return false;
+    };
+    let mut statuses = packets.into_iter();
+    // The unpack status is mandatory and must be `ok`: an unpack failure is a
+    // transport-level error, never a proven per-ref refusal.
+    let unpack = statuses.next().unwrap_or_default();
+    if unpack.strip_suffix(b"\n").unwrap_or(unpack) != b"unpack ok" {
+        return false;
+    }
+    let mut rejected: Vec<&str> = Vec::new();
+    let mut previous_was_status = false;
+    for payload in statuses {
+        if payload.contains(&0u8) {
+            return false;
+        }
+        let line = payload.strip_suffix(b"\n").unwrap_or(payload);
+        let mut fields = line.splitn(2, |byte| *byte == b' ');
+        let kind = fields.next().unwrap_or_default();
+        let rest = fields.next().unwrap_or_default();
+        if kind == b"ok" {
+            // A native acknowledgement is never a refusal.
+            return false;
+        } else if kind == b"ng" {
+            let mut fields = rest.splitn(2, |byte| *byte == b' ');
+            let name = fields.next().unwrap_or_default();
+            let reason = fields.next().unwrap_or_default();
+            let Ok(name) = std::str::from_utf8(name) else {
+                return false;
+            };
+            if name.is_empty()
+                || reason.is_empty()
+                || !refs.iter().any(|requested| requested == name)
+                || rejected.contains(&name)
+            {
+                return false;
+            }
+            rejected.push(name);
+            previous_was_status = true;
+        } else if kind != b"option" || !capabilities.report_status_v2 || !previous_was_status {
+            // report-status-v2 `option` lines are advisory metadata for the
+            // preceding ref status: they can never establish a rejection and are
+            // only legal in the v2 format, after a status line. Everything else
+            // is malformed.
+            return false;
+        }
+    }
+    // Exactly one `ng` per requested ref, with no duplicate or unknown names.
+    rejected.len() == refs.len()
 }
 
 #[cfg(test)]
@@ -444,26 +570,177 @@ mod tests {
         assert!(rejected_refs_report(&ReceiveCapabilities::default(), &refs, "new\0line").is_err());
     }
 
+    fn status_caps(report_status: bool, report_status_v2: bool, sideband_64k: bool) -> ReceiveCapabilities {
+        ReceiveCapabilities { report_status, report_status_v2, sideband_64k, atomic: false }
+    }
+
+    fn report(lines: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for line in lines {
+            bytes.extend(pkt(line));
+        }
+        bytes.extend_from_slice(b"0000");
+        bytes
+    }
+
     #[test]
-    fn native_refusal_detection_requires_every_requested_ref() {
+    fn native_refusal_detection_requires_exact_pkt_lines() {
+        let v1 = status_caps(true, false, false);
         let refs = vec!["refs/heads/a".to_owned(), "refs/heads/b".to_owned()];
-        let mut refused = pkt(b"unpack ok\n");
-        refused.extend(pkt(b"ng refs/heads/a stale info\n"));
-        refused.extend(pkt(b"ng refs/heads/b stale info\n"));
-        refused.extend_from_slice(b"0000");
-        assert!(reports_rejection(&refused, &refs));
-        let mut partial = pkt(b"unpack ok\n");
-        partial.extend(pkt(b"ng refs/heads/a stale info\n"));
-        partial.extend(pkt(b"ok refs/heads/b\n"));
-        partial.extend_from_slice(b"0000");
-        assert!(!reports_rejection(&partial, &refs));
-        assert!(!reports_rejection(&pkt(b"unpack ok\n"), &refs));
-        assert!(!reports_rejection(&refused, &[]));
-        let mut payload = vec![1u8];
-        payload.extend_from_slice(&refused);
-        let mut banded = pkt(&payload);
-        banded.extend_from_slice(b"0000");
-        assert!(reports_rejection(&banded, &refs));
+        let refused = report(&[b"unpack ok\n", b"ng refs/heads/a stale info\n", b"ng refs/heads/b stale info\n"]);
+        assert!(reports_rejection(&refused, &refs, &v1));
+        // Every rejection needs the negotiated report format.
+        assert!(!reports_rejection(&refused, &refs, &ReceiveCapabilities::default()));
+        assert!(!reports_rejection(&refused, &[], &v1));
+        // One `ok` line means the native result was a partial success.
+        let mixed = report(&[b"unpack ok\n", b"ng refs/heads/a stale info\n", b"ok refs/heads/b\n"]);
+        assert!(!reports_rejection(&mixed, &refs, &v1));
+        // Duplicates do not stand in for the missing ref.
+        let duplicated = report(&[b"unpack ok\n", b"ng refs/heads/a x\n", b"ng refs/heads/a y\n"]);
+        assert!(!reports_rejection(&duplicated, &refs, &v1));
+        let repeated = report(&[
+            b"unpack ok\n",
+            b"ng refs/heads/a x\n",
+            b"ng refs/heads/a x\n",
+            b"ng refs/heads/b y\n",
+        ]);
+        assert!(!reports_rejection(&repeated, &refs, &v1));
+        // An unknown ref is never substituted for a requested one.
+        let extra = report(&[b"unpack ok\n", b"ng refs/heads/a x\n", b"ng refs/heads/b y\n", b"ng refs/heads/c z\n"]);
+        assert!(!reports_rejection(&extra, &refs, &v1));
+        // A missing or failed unpack status is not a per-ref refusal.
+        assert!(!reports_rejection(&report(&[b"ng refs/heads/a x\n", b"ng refs/heads/b y\n"]), &refs, &v1));
+        let unpack_failed = report(&[b"unpack eof before pack\n", b"ng refs/heads/a x\n", b"ng refs/heads/b y\n"]);
+        assert!(!reports_rejection(&unpack_failed, &refs, &v1));
+        // An empty ng reason is malformed.
+        let no_reason = report(&[b"unpack ok\n", b"ng refs/heads/a \n", b"ng refs/heads/b y\n"]);
+        assert!(!reports_rejection(&no_reason, &refs, &v1));
+        // The stream must be complete: no flush, or bytes after the flush.
+        let mut unterminated = pkt(b"unpack ok\n");
+        unterminated.extend(pkt(b"ng refs/heads/a x\n"));
+        unterminated.extend(pkt(b"ng refs/heads/b y\n"));
+        assert!(!reports_rejection(&unterminated, &refs, &v1));
+        let mut trailing = refused.clone();
+        trailing.extend_from_slice(b"PACK");
+        assert!(!reports_rejection(&trailing, &refs, &v1));
+        let mut second_flush = refused.clone();
+        second_flush.extend_from_slice(b"0000");
+        assert!(!reports_rejection(&second_flush, &refs, &v1));
+        // A truncated final packet is malformed, never a silent flush.
+        assert!(!reports_rejection(&refused[..refused.len() - 1], &refs, &v1));
+        assert!(!reports_rejection(b"0000", &refs, &v1));
+        // Special packets, a bad header and an oversized length are rejected.
+        let mut delimiter = pkt(b"unpack ok\n");
+        delimiter.extend_from_slice(b"0001");
+        delimiter.extend(pkt(b"ng refs/heads/a x\n"));
+        delimiter.extend(pkt(b"ng refs/heads/b y\n"));
+        delimiter.extend_from_slice(b"0000");
+        assert!(!reports_rejection(&delimiter, &refs, &v1));
+        let mut bad_hex = b"zzzzunpack ok\n".to_vec();
+        bad_hex.extend(pkt(b"ng refs/heads/a x\n"));
+        bad_hex.extend(pkt(b"ng refs/heads/b y\n"));
+        bad_hex.extend_from_slice(b"0000");
+        assert!(!reports_rejection(&bad_hex, &refs, &v1));
+        let mut oversized = b"ffffunpack ok\n".to_vec();
+        oversized.extend(pkt(b"ng refs/heads/a x\n"));
+        oversized.extend_from_slice(b"0000");
+        assert!(!reports_rejection(&oversized, &refs, &v1));
+    }
+
+    #[test]
+    fn embedded_ng_text_and_progress_never_prove_a_rejection() {
+        let v1 = status_caps(true, false, false);
+        let refs = vec!["refs/heads/a".to_owned(), "refs/heads/b".to_owned()];
+        // `refs/heads/a` appears only inside refs/heads/b's error message.
+        let embedded = report(&[b"unpack ok\n", b"ng refs/heads/b see ng refs/heads/a stale\n"]);
+        assert!(!reports_rejection(&embedded, &refs, &v1));
+        // ... and here only inside band 2 progress, which is not status bytes.
+        let banded = report(&[
+            b"\x01unpack ok\n",
+            b"\x02ng refs/heads/a stale ng refs/heads/b stale\n",
+            b"\x01ng refs/heads/b stale\n",
+        ]);
+        assert!(!reports_rejection(&banded, &refs, &status_caps(true, false, true)));
+        // Raw progress text is not a status line either.
+        let raw_progress = report(&[b"unpack ok\n", b"remote: ng refs/heads/a nope\n"]);
+        assert!(!reports_rejection(&raw_progress, &refs, &v1));
+    }
+
+    #[test]
+    fn sideband_needs_negotiation_and_band_one_status_bytes() {
+        let banded = status_caps(true, false, true);
+        let plain = status_caps(true, false, false);
+        let refs = vec!["refs/heads/a".to_owned(), "refs/heads/b".to_owned()];
+        let refused = report(&[b"\x01unpack ok\n", b"\x01ng refs/heads/a stale\n", b"\x01ng refs/heads/b stale\n"]);
+        assert!(reports_rejection(&refused, &refs, &banded));
+        // Sideband framing is required once negotiated, and never invented.
+        let plain_report = report(&[b"unpack ok\n", b"ng refs/heads/a x\n", b"ng refs/heads/b y\n"]);
+        assert!(!reports_rejection(&plain_report, &refs, &banded));
+        assert!(!reports_rejection(&refused, &refs, &plain));
+        // Band 2 progress is ignored but cannot break a valid band-1 report.
+        let with_progress = report(&[
+            b"\x02Resolving deltas\n",
+            b"\x01unpack ok\n",
+            b"\x01ng refs/heads/a stale\n",
+            b"\x02ng refs/heads/b stale\n",
+            b"\x01ng refs/heads/b stale\n",
+        ]);
+        assert!(reports_rejection(&with_progress, &refs, &banded));
+        // Band 1 payloads may split any inner pkt-line.
+        let split = report(&[b"\x01unpack", b"\x01 ok\n\x01ng refs/heads/a stale\n", b"\x01ng refs/heads/b stale\n"]);
+        assert!(reports_rejection(&split, &refs, &banded));
+        // Band 3, an empty band payload or an unknown band is fatal, not approval.
+        for fatal in [b"\x03fatal: something\n".as_slice(), b"".as_slice(), b"\x04weird\n".as_slice()] {
+            let mut lines: Vec<&[u8]> =
+                vec![b"\x01unpack ok\n", b"\x01ng refs/heads/a stale\n", b"\x01ng refs/heads/b stale\n"];
+            lines.push(fatal);
+            assert!(!reports_rejection(&report(&lines), &refs, &banded));
+        }
+        // Malformed outer framing is not a proof either.
+        let mut truncated = refused.clone();
+        truncated.truncate(truncated.len() - 2);
+        assert!(!reports_rejection(&truncated, &refs, &banded));
+        let mut trailing = refused.clone();
+        trailing.extend_from_slice(b"0000");
+        assert!(!reports_rejection(&trailing, &refs, &banded));
+    }
+
+    #[test]
+    fn report_status_v2_option_lines_are_advisory_only() {
+        let v2 = status_caps(false, true, false);
+        let v1 = status_caps(true, false, false);
+        let refs = vec!["refs/heads/a".to_owned()];
+        let with_options = report(&[
+            b"unpack ok\n",
+            b"ng refs/heads/a stale\n",
+            b"option old-oid 1111111111111111111111111111111111111111\n",
+            b"option new-oid 2222222222222222222222222222222222222222\n",
+        ]);
+        assert!(reports_rejection(&with_options, &refs, &v2));
+        // `option` lines are not legal in report-status v1 ...
+        assert!(!reports_rejection(&with_options, &refs, &v1));
+        // ... nor before any ref status, even in v2.
+        let leading_option = report(&[b"unpack ok\n", b"option old-oid 1111\n", b"ng refs/heads/a stale\n"]);
+        assert!(!reports_rejection(&leading_option, &refs, &v2));
+        // A v2 report still may not acknowledge a ref.
+        assert!(!reports_rejection(&report(&[b"unpack ok\n", b"ok refs/heads/a\n"]), &refs, &v2));
+        // v1 and v2 share the plain framing for status lines.
+        assert!(reports_rejection(&report(&[b"unpack ok\n", b"ng refs/heads/a stale\n"]), &refs, &v1));
+    }
+
+    #[test]
+    fn generated_rejection_reports_round_trip_through_the_parser() {
+        let refs = vec!["refs/heads/a".to_owned(), "refs/heads/b".to_owned()];
+        for capabilities in [
+            status_caps(true, false, false),
+            status_caps(false, true, false),
+            status_caps(true, false, true),
+            status_caps(false, true, true),
+        ] {
+            let reply = rejected_refs_report(&capabilities, &refs, "ref changed; retry from current refs").unwrap();
+            assert!(reports_rejection(&reply, &refs, &capabilities));
+            assert!(!reports_rejection(&reply, &refs[..1], &capabilities));
+        }
     }
 
     #[test]
