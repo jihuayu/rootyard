@@ -7,7 +7,7 @@
 use super::super::contract::{OperationIdentity, RefStoreError, RequestDigest};
 use super::contract::CommitMode;
 use super::terminal::ensure_terminal_budget;
-use super::types::{GitObjectFormat, GitOid, HeadUpdate, MAX_REFS_PER_COMMIT, RefName, RefUpdate, batch_prefix_conflict};
+use super::types::{GitObjectFormat, GitOid, HeadUpdate, MAX_REFS_PER_COMMIT, RefUpdate, batch_prefix_conflict};
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
@@ -69,25 +69,25 @@ impl CommitRefsRequest {
                     update.name()
                 )));
             }
-            if let Some(oid) = update.precondition().oid() {
-                if oid.format() != object_format {
-                    return Err(RefStoreError::InvalidIdentity(
-                        "old object id does not match the gate object format".into(),
-                    ));
-                }
+            if let Some(oid) = update.precondition().oid()
+                && oid.format() != object_format
+            {
+                return Err(RefStoreError::InvalidIdentity(
+                    "old object id does not match the gate object format".into(),
+                ));
             }
-            if let Some(oid) = update.target().oid() {
-                if oid.format() != object_format {
-                    return Err(RefStoreError::InvalidIdentity(
-                        "new object id does not match the gate object format".into(),
-                    ));
-                }
+            if let Some(oid) = update.target().oid()
+                && oid.format() != object_format
+            {
+                return Err(RefStoreError::InvalidIdentity(
+                    "new object id does not match the gate object format".into(),
+                ));
             }
         }
-        if let HeadUpdate::Retarget(target) = &head {
-            if !target.is_branch() {
-                return Err(RefStoreError::InvalidIdentity("HEAD must name a refs/heads/ branch".into()));
-            }
+        if let HeadUpdate::Retarget(target) = &head
+            && !target.is_branch()
+        {
+            return Err(RefStoreError::InvalidIdentity("HEAD must name a refs/heads/ branch".into()));
         }
         let identity = OperationIdentity::new(
             repository_id,
@@ -241,8 +241,8 @@ fn commit_digest(
 
 #[cfg(test)]
 mod tests {
-    use super::super::contract::IssuerLane;
-    use super::super::types::{RefPrecondition, RefTarget};
+    use crate::ref_store::IssuerLane;
+    use super::super::types::{RefName, RefPrecondition, RefTarget};
     use super::*;
 
     fn format() -> GitObjectFormat {
