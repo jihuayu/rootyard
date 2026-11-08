@@ -41,6 +41,7 @@ NOTES = [
     "Basic Authorization on a web mutation is ambient browser authority and is rejected with 403 regardless of Origin; Bearer remains an explicit non-ambient API credential.",
     "Rotation re-validates every copied grant. Any failure (lost role, non-ready repository, database error) aborts before a new row or revocation, so it cannot silently drop a scope.",
     "The Git CAS parent-token lock and restricted browser-child inheritance are tracked on a separate branch; this suite does not exercise or claim them.",
+    "Self revocation is real owner intent, not a bypass: begin re-verifies the acting row under the per-user advisory lock, the acting token is re-proved after every target-row lock wait and immediately before the revocation statement, and only a transaction that revoked the acting row itself may commit without the final re-check. Cross-user/non-self targets and restricted/read-only issuers keep the full check.",
 ]
 
 
@@ -391,6 +392,68 @@ def main():
             assert any(item["id"] == data["id"] for item in after["items"]), "aborted rotation revoked the old token"
             return "non-ready rotate 409; old token active and scopes untouched; no new row"
 
+        def case_self_rotate_own_cli_token():
+            # A dedicated unrestricted CLI credential, so no fixture actor's
+            # token is rotated by this case.
+            account = h.account("create-user", "selfrotate")
+            token = {"username": account["username"], "token": account["token"]}
+            h.expect("/api/tokens", 200, token=token)
+            status, raw, headers = h.http(f"/api/tokens/{account['token_id']}/rotate",
+                                          method="POST", token=token, body={})
+            assert status == 200, f"self rotation expected 200, got {status}: {raw[:300]!r}"
+            rotated = json.loads(raw)
+            h.secrets.append(rotated["secret"])
+            assert rotated["id"] != account["token_id"], "self rotation reused the token id"
+            assert rotated["secret"] != account["token"], "self rotation replayed the old secret"
+            assert rotated["is_restricted"] is False, rotated
+            assert header(headers, "Cache-Control") == "no-store", headers
+            # The credential that performed the rotation is gone ...
+            h.expect("/api/tokens", 401, token=token)
+            # ... and the replacement it received works with the same scopes.
+            fresh = {"username": account["username"], "token": rotated["secret"]}
+            page, listing = token_list(h, fresh)
+            assert rotated["id"] in ids(page), "replacement token missing from its own list"
+            assert_safe_metadata(listing, rotated["secret"])
+            return "dedicated CLI token rotates itself 200; old secret 401; new secret works"
+
+        def case_self_revoke_own_cli_token():
+            account = h.account("create-user", "selfrevoke")
+            token = {"username": account["username"], "token": account["token"]}
+            h.expect("/api/tokens", 200, token=token)
+            h.expect(f"/api/tokens/{account['token_id']}", 204, method="DELETE", token=token)
+            # The committed self-revocation is observable: this token is dead for
+            # reads, further mutations and rotation.
+            h.expect("/api/tokens", 401, token=token)
+            h.expect(f"/api/tokens/{account['token_id']}", 401, method="DELETE", token=token)
+            h.expect(f"/api/tokens/{account['token_id']}/rotate", 401, method="POST", token=token, body={})
+            return "dedicated CLI token revokes itself 204; revoked credential 401 everywhere"
+
+        def case_self_revoke_current_browser_session():
+            before = {item["token_id"] for item in
+                      json.loads(h.expect("/api/sessions", 200, token=h.alice))["items"]}
+            cookies = login_browser(h, "alice", h.alice["token"])
+            after = [item["token_id"] for item in
+                     json.loads(h.expect("/api/sessions", 200, token=h.alice))["items"]]
+            created = [token_id for token_id in after if token_id not in before]
+            assert len(created) == 1, f"login did not create exactly one session: {created}"
+            current = created[0]
+            cookie = cookie_header(cookies)
+            csrf = cookies["rootyard_csrf"]
+            h.expect("/web/settings/tokens", 200, extra_headers={"Cookie": cookie})
+            status, raw, _ = h.http(f"/web/settings/sessions/{current}/revoke", method="POST",
+                                    body={}, extra_headers={"Cookie": cookie, "Origin": h.base,
+                                                            "X-CSRF-Token": csrf})
+            assert status == 200, f"self session revoke expected 200, got {status}: {raw[:300]!r}"
+            assert json.loads(raw) == {"revoked": True}, raw[:300]
+            # The acting browser child is dead immediately ...
+            h.expect("/web/settings/tokens", 401, extra_headers={"Cookie": cookie})
+            remaining = [item["token_id"] for item in
+                         json.loads(h.expect("/api/sessions", 200, token=h.alice))["items"]]
+            assert current not in remaining, "self-revoked session still listed"
+            # ... while its unrestricted parent API token is untouched.
+            h.expect("/api/tokens", 200, token=h.alice)
+            return "cookie+CSRF revokes the current session 200; cookie 401; parent API token still valid"
+
         for name, fn in (
             ("tokens.create_once_digest_only", case_create_once_digest_only),
             ("tokens.owner_cross_user_404", case_owner_404),
@@ -404,6 +467,9 @@ def main():
             ("api.authorization_only", case_api_authorization_only),
             ("tokens.keyset_actor_cursor", case_keyset_and_actor_cursor),
             ("tokens.nonready_rotation_aborts", case_nonready_rotation_aborts),
+            ("tokens.self_rotate_own_cli_token", case_self_rotate_own_cli_token),
+            ("tokens.self_revoke_own_cli_token", case_self_revoke_own_cli_token),
+            ("sessions.self_revoke_current_browser", case_self_revoke_current_browser_session),
         ):
             run_case(h, name, fn)
         exit_code = 0 if all(case["status"] == "passed" for case in h.results) else 1
@@ -435,6 +501,7 @@ def main():
                 "Expiry is exercised by moving one token's expires_at with SQL (existing Harness bootstrap channel), not by waiting 30 days.",
                 "The non-ready repository case flips repositories.state with SQL and restores it; role and scope data are never SQL-seeded.",
                 "Chromium-level rendering is exercised by tests/browser_ui.py; this suite drives the same cookie/Origin/CSRF middleware over HTTP.",
+                "The self-rotation/self-revocation cases use dedicated CLI-created users and tokens so no fixture actor is retired; the acting credential is intentionally dead afterwards, which is why they never reuse h.alice/h.bob.",
                 "The implementation worker did not build or run this native suite; the coordinator must run it with --binary/--report before any pass claim.",
             ],
             release_blocker="Private branch: Git CAS parent-token locking is owned by a parallel branch; restricted token issuance is not released or deployed from here.",
