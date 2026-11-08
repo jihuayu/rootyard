@@ -13,10 +13,13 @@ use opendal::services::Azblob;
 use opendal::services::S3;
 use opendal::{ErrorKind, Operator};
 
+use std::sync::Arc;
+
 use uuid::Uuid;
 
 use super::{
     BlobError, BlobLocator, BlobProvider, UploadIntent,
+    budget::{self, ResourceContext},
     config::{BlobCredentials, BlobProfile},
 };
 
@@ -26,6 +29,10 @@ pub const MAX_RANGE_BYTES: u64 = 1024 * 1024;
 pub(crate) const UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 /// Download/hash window so read-back memory is bounded regardless of object size.
 pub(crate) const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
+/// One in-flight SDK read window per verified reader. The number of concurrent
+/// verified downloads is bounded by the process-wide reader budget instead, so a
+/// reader never multiplies its own staging/queue pressure behind our back.
+pub(crate) const DOWNLOAD_CONCURRENCY: usize = 1;
 
 /// Capability declaration reported by the provider. stat/read/write are a
 /// startup gate, not proof of behaviour: every publish additionally performs a
@@ -46,16 +53,33 @@ pub struct BlobCapabilities {
     pub conditional_create: bool,
 }
 
+#[derive(Clone)]
 pub struct BlobStore {
     profile: BlobProfile,
     operator: Operator,
     capabilities: BlobCapabilities,
+    /// The one process-wide upload/reader/staging budget this store charges.
+    resources: Arc<ResourceContext>,
 }
 
 impl BlobStore {
     /// Build the driver. Missing/unsupported configuration or a provider that
     /// cannot stat/read/write is rejected here, before any startup ACK.
+    ///
+    /// This registers (or joins) the single process-wide resource context. A
+    /// second profile with different capacities is rejected with
+    /// [`BlobError::CapacityConflict`] rather than silently reusing the first.
     pub fn open(profile: BlobProfile) -> Result<Self, BlobError> {
+        let resources = budget::process_resources(profile.resource_limits())?;
+        Self::open_with_resources(profile, resources)
+    }
+
+    /// Build the driver against an explicit context. Used by tests with private
+    /// budgets and by [`BlobStore::open`] with the process-wide one.
+    pub(crate) fn open_with_resources(
+        profile: BlobProfile,
+        resources: Arc<ResourceContext>,
+    ) -> Result<Self, BlobError> {
         ensure_crypto_provider();
         let operator = build_operator(&profile)?;
         let capability = operator.info().full_capability();
@@ -72,7 +96,31 @@ impl BlobStore {
                 profile.provider().as_str()
             )));
         }
-        Ok(Self { profile, operator, capabilities })
+        Ok(Self { profile, operator, capabilities, resources })
+    }
+
+    /// Build a store over the in-process `memory` service for IO lifecycle unit
+    /// tests only. Production start-up never takes this path: the strict profile
+    /// rejects `memory` by name and this function is compiled under `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) fn open_memory(profile: BlobProfile, resources: Arc<ResourceContext>) -> Self {
+        let operator = Operator::new(opendal::services::Memory::default().root("/"))
+            .expect("in-memory test operator")
+            .finish();
+        let capability = operator.info().full_capability();
+        let capabilities = BlobCapabilities {
+            stat: capability.stat,
+            read: capability.read,
+            write: capability.write,
+            delete: capability.delete,
+            conditional_create: capability.write_with_if_not_exists,
+        };
+        assert!(capabilities.stat && capabilities.read && capabilities.write);
+        Self { profile, operator, capabilities, resources }
+    }
+
+    pub fn resources(&self) -> &Arc<ResourceContext> {
+        &self.resources
     }
 
     pub fn capabilities(&self) -> BlobCapabilities {

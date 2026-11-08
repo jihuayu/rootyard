@@ -10,7 +10,13 @@ use std::{fmt, time::Duration};
 
 use reqwest::Url;
 
-use super::{BlobDeletePolicy, BlobError, BlobProvider, MAX_NAMESPACE_BYTES, MAX_OBJECT_BYTES};
+use super::{
+    BlobDeletePolicy, BlobError, BlobProvider, MAX_NAMESPACE_BYTES, MAX_OBJECT_BYTES,
+    budget::{
+        DEFAULT_ACTIVE_READERS, DEFAULT_ACTIVE_UPLOADS, DEFAULT_STAGING_BYTES, LEASE_UNIT_BYTES, MAX_ACTIVE_SLOTS,
+        MAX_STAGING_BYTES, ResourceLimits,
+    },
+};
 
 pub const DEFAULT_OBJECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(60);
@@ -72,6 +78,8 @@ pub struct BlobProfile {
     range_full_get_max_bytes: u64,
     abort_timeout: Duration,
     delete_policy: BlobDeletePolicy,
+    /// Shared upload/reader/staging capacities for the whole process.
+    resources: ResourceLimits,
 }
 
 impl fmt::Debug for BlobProfile {
@@ -87,7 +95,9 @@ impl fmt::Debug for BlobProfile {
             .field("io_timeout", &self.io_timeout)
             .field("concurrency", &self.concurrency)
             .field("retry_max_times", &self.retry_max_times)
+            .field("max_object_bytes", &self.max_object_bytes)
             .field("range_full_get_max_bytes", &self.range_full_get_max_bytes)
+            .field("resources", &self.resources)
             .field("abort_timeout", &self.abort_timeout)
             .field("delete_policy", &self.delete_policy)
             .finish()
@@ -153,12 +163,44 @@ impl BlobProfile {
                 ));
             }
         };
+        let resources = ResourceLimits::new(
+            bounded_usize("ROOTYARD_BLOB_ACTIVE_UPLOADS", DEFAULT_ACTIVE_UPLOADS, 1, MAX_ACTIVE_SLOTS)?,
+            bounded_usize("ROOTYARD_BLOB_ACTIVE_READERS", DEFAULT_ACTIVE_READERS, 1, MAX_ACTIVE_SLOTS)?,
+            bounded_u64(
+                "ROOTYARD_BLOB_STAGING_BYTES",
+                DEFAULT_STAGING_BYTES,
+                LEASE_UNIT_BYTES,
+                MAX_STAGING_BYTES,
+            )?,
+        )?;
+        // The default object ceiling follows the staging budget: this contract
+        // only acknowledges objects it can also fetch back for verification.
         let max_object_bytes = match env_optional("ROOTYARD_BLOB_MAX_OBJECT_BYTES")? {
             Some(raw) => raw.parse::<u64>().map_err(|_| BlobError::Config("invalid blob object ceiling".into()))?,
-            None => MAX_OBJECT_BYTES,
+            None => resources.staging_bytes().min(MAX_OBJECT_BYTES),
         };
         if max_object_bytes == 0 || max_object_bytes > MAX_OBJECT_BYTES {
             return Err(BlobError::Config("blob object ceiling is out of range".into()));
+        }
+        if max_object_bytes > resources.staging_bytes() {
+            return Err(BlobError::Config(
+                "blob object ceiling exceeds the staging budget and no alternative full-read API exists to verify it \
+                 (raise ROOTYARD_BLOB_STAGING_BYTES up to 16 GiB or lower ROOTYARD_BLOB_MAX_OBJECT_BYTES)"
+                    .into(),
+            ));
+        }
+        // A small staging budget lowers the *default* range ceiling too; only an
+        // explicit ceiling above the budget is a configuration error.
+        let range_full_get_max_bytes = bounded_u64(
+            "ROOTYARD_BLOB_RANGE_FULL_GET_MAX_BYTES",
+            DEFAULT_RANGE_FULL_GET_MAX_BYTES.min(resources.staging_bytes()),
+            1024 * 1024,
+            MAX_RANGE_FULL_GET_MAX_BYTES,
+        )?;
+        if range_full_get_max_bytes > resources.staging_bytes() {
+            return Err(BlobError::Config(
+                "blob range full-get ceiling exceeds the staging budget; such a range could never be staged".into(),
+            ));
         }
         Ok(Self {
             provider,
@@ -176,15 +218,11 @@ impl BlobProfile {
                 0,
                 MAX_RETRY_TIMES,
             )?,
-            range_full_get_max_bytes: bounded_u64(
-                "ROOTYARD_BLOB_RANGE_FULL_GET_MAX_BYTES",
-                DEFAULT_RANGE_FULL_GET_MAX_BYTES,
-                1024 * 1024,
-                MAX_RANGE_FULL_GET_MAX_BYTES,
-            )?,
+            range_full_get_max_bytes,
             abort_timeout: duration_ms("ROOTYARD_BLOB_ABORT_TIMEOUT_MS", DEFAULT_ABORT_TIMEOUT)?,
             max_object_bytes,
             delete_policy: BlobDeletePolicy::parse(&env_optional("ROOTYARD_BLOB_DELETE")?.unwrap_or_default())?,
+            resources,
         })
     }
 
@@ -229,6 +267,40 @@ impl BlobProfile {
     }
     pub fn delete_policy(&self) -> BlobDeletePolicy {
         self.delete_policy
+    }
+    /// Process-wide upload/reader/staging capacities requested by this profile.
+    /// `BlobStore::open` registers them once per process and rejects conflicts.
+    pub fn resource_limits(&self) -> ResourceLimits {
+        self.resources
+    }
+
+    /// Test-only profile for the in-process `memory` backend. It carries no real
+    /// credentials and never reaches the production builder (see
+    /// `BlobStore::open_memory`), so lifecycle unit tests need neither env vars
+    /// nor a provider.
+    #[cfg(test)]
+    pub(crate) fn memory_profile(resources: ResourceLimits) -> Self {
+        Self {
+            provider: BlobProvider::S3,
+            bucket: "blob-test-bucket".into(),
+            region: Some("us-east-1".into()),
+            endpoint: Url::parse("https://127.0.0.1:9").ok(),
+            root: String::new(),
+            credentials: BlobCredentials::S3 {
+                access_key_id: "test-access-key".into(),
+                secret_access_key: "test-secret-key".into(),
+                session_token: None,
+            },
+            object_timeout: DEFAULT_OBJECT_TIMEOUT,
+            io_timeout: DEFAULT_IO_TIMEOUT,
+            concurrency: 2,
+            retry_max_times: 0,
+            max_object_bytes: resources.staging_bytes().min(MAX_OBJECT_BYTES),
+            range_full_get_max_bytes: resources.staging_bytes().min(DEFAULT_RANGE_FULL_GET_MAX_BYTES),
+            abort_timeout: Duration::from_millis(100),
+            delete_policy: BlobDeletePolicy::Disabled,
+            resources,
+        }
     }
 
     /// Relative object path. `ROOTYARD_BLOB_ROOT` is applied exactly once by

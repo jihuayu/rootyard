@@ -21,11 +21,19 @@
 //! remote deletion for the new profile stays disabled until the persistent
 //! hold/root protocols (#113/#114) are reviewed and enabled explicitly.
 
+pub mod budget;
 pub mod config;
 pub mod opendal;
 pub mod readback;
 pub mod transfer;
 pub mod upload;
+
+#[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
+mod test_support;
 
 use std::fmt;
 
@@ -336,6 +344,15 @@ pub enum BlobError {
         limit: u64,
     },
     DeadlineExceeded,
+    /// A staging lease larger than the whole process staging budget can never be
+    /// granted; this is refused before any queue wait instead of hanging.
+    StagingBudgetExceeded {
+        requested: u64,
+        limit: u64,
+    },
+    /// A second profile asked for different process-wide limits. First-wins
+    /// silently would give two operators different beliefs about one budget.
+    CapacityConflict,
     DeleteDisabled,
     Provider(String),
 }
@@ -358,6 +375,13 @@ impl fmt::Display for BlobError {
                 write!(f, "verified range read needs a full {length}-byte download, above ceiling {limit}")
             }
             Self::DeadlineExceeded => write!(f, "blob operation deadline exceeded"),
+            Self::StagingBudgetExceeded { requested, limit } => write!(
+                f,
+                "blob staging lease of {requested} bytes exceeds the process staging budget {limit}"
+            ),
+            Self::CapacityConflict => {
+                write!(f, "blob resource limits conflict with the initialized process-wide context")
+            }
             Self::DeleteDisabled => write!(f, "blob deletion is disabled for this profile"),
             Self::Provider(m) => write!(f, "blob provider error: {m}"),
         }

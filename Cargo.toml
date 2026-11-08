@@ -62,6 +62,11 @@ zeroize = "1.9"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: the in-process `memory` service backs IO lifecycle unit tests
+# (`cfg(test)` constructors only). Production keeps the strict remote profile and
+# never compiles or accepts `memory`; features are additive, no extra crate is
+# pulled in and the lockfile is unchanged.
+opendal = { version = "=0.57.0", default-features = false, features = ["services-memory"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

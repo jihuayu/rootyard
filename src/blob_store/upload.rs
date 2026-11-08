@@ -7,22 +7,36 @@
 //! Tokio handle; it never blocks the runtime and never spawns unbounded tasks.
 //! Abort after a process kill is not guaranteed, so orphan bytes may remain and
 //! no receipt is ever issued for an unknown completion.
+//!
+//! New-profile uploads carry an optional [`UploadLease`]. The process-wide
+//! upload slot stays owned by the guard until the writer is really gone: a
+//! cancelled operation hands both the writer and the lease to the bounded abort
+//! task, so a background abort never presents itself as released capacity.
 
 use std::time::Duration;
 
 use opendal::Writer;
 use tokio::time::{Instant, timeout, timeout_at};
 
-use super::{BlobError, opendal::map_provider_error};
+use super::{BlobError, budget::UploadLease, opendal::map_provider_error};
 
 pub(crate) struct UploadGuard {
     writer: Option<Writer>,
     abort_timeout: Duration,
+    /// `None` for the legacy adapter, which is not part of the process budget.
+    lease: Option<UploadLease>,
 }
 
 impl UploadGuard {
+    /// Legacy constructor: unchanged behaviour, no process-wide slot.
     pub(crate) fn new(writer: Writer, abort_timeout: Duration) -> Self {
-        Self { writer: Some(writer), abort_timeout }
+        Self { writer: Some(writer), abort_timeout, lease: None }
+    }
+
+    /// New BlobStore constructor: the upload slot is owned until close/abort is
+    /// finished and dropped with the guard.
+    pub(crate) fn new_with_lease(writer: Writer, abort_timeout: Duration, lease: UploadLease) -> Self {
+        Self { writer: Some(writer), abort_timeout, lease: Some(lease) }
     }
 
     pub(crate) fn writer(&mut self) -> &mut Writer {
@@ -49,8 +63,9 @@ impl UploadGuard {
                 Err(map_provider_error(error))
             }
             Err(_) => {
+                let lease = self.lease.take();
                 if let Some(writer) = self.writer.take() {
-                    schedule_abort(writer, self.abort_timeout);
+                    schedule_abort(writer, self.abort_timeout, lease);
                 }
                 Err(BlobError::DeadlineExceeded)
             }
@@ -63,28 +78,35 @@ impl UploadGuard {
             let _ = timeout(self.abort_timeout, writer.abort()).await;
         }
         self.writer.take();
+        self.lease = None;
     }
 
-    /// Successful close already completed; drop must not abort.
+    /// Successful close already completed; drop must not abort and hands the
+    /// upload slot back to the process.
     pub(crate) fn disarm(mut self) {
         self.writer = None;
+        self.lease = None;
     }
 }
 
 impl Drop for UploadGuard {
     fn drop(&mut self) {
         if let Some(writer) = self.writer.take() {
-            schedule_abort(writer, self.abort_timeout);
+            let lease = self.lease.take();
+            schedule_abort(writer, self.abort_timeout, lease);
         }
     }
 }
 
 /// Best-effort, bounded abort on cancellation. No-op outside a Tokio runtime.
-fn schedule_abort(mut writer: Writer, budget: Duration) {
+/// The upload slot (`lease`) is dropped only after the abort future finished, so
+/// a still-owned writer is never counted as free capacity.
+fn schedule_abort(mut writer: Writer, budget: Duration, lease: Option<UploadLease>) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
     handle.spawn(async move {
         let _ = timeout(budget, writer.abort()).await;
+        drop(lease);
     });
 }
