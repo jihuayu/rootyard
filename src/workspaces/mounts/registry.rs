@@ -107,16 +107,15 @@ impl<C, I> Registry<C, I> {
         self.entries.insert(id, MountEntry::InProcess(entry));
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.entries.clear();
-    }
-
     /// Check the workspace and reserve it in one critical section.
     ///
     /// Exactly one caller can receive `Reserved` for a workspace while no
     /// confirmed/in-process mount exists. Losers see `Pending` and must not
     /// send a mount RPC or cancel anything on the shared workspace.
-    pub(crate) fn admit(shared: &Arc<Mutex<Self>>, id: Uuid, client: C, helper_generation: u64) -> Admission<C, I> {
+    pub(crate) fn admit(shared: &Arc<Mutex<Self>>, id: Uuid, client: C, helper_generation: u64) -> Admission<C, I>
+    where
+        C: Clone,
+    {
         let mut registry = lock(shared);
         match registry.entries.get(&id) {
             Some(MountEntry::InProcess(_)) => Admission::InProcess,
