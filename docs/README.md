@@ -16,6 +16,7 @@
 
 - [运行与部署](operations.md)
 - [HA 参考配置与物理 HA 未闭项（#26/#43/#44）](operations-HA.md)
+- [OpenDAL Blob 层：配置、回执、删除策略与未实现边界](opendal-blob.md)
 - [开发与测试、MSRV 1.88 与 fmt/Clippy 门禁工具链](development.md)
 - [仓库列表严格键集分页 API](repository-pagination.md)
 - [并行开发与模块边界](parallel-development.md)

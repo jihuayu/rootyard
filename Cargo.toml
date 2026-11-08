@@ -13,6 +13,9 @@ rust-version = "1.88"
 
 [features]
 pando-lab = []
+# Optional Azure Blob provider for the standalone OpenDAL Blob profile.
+# S3 is always compiled; no fs/memory service is enabled for this profile.
+blob-azblob = ["opendal/services-azblob"]
 
 [[bin]]
 name = "rootyard-pando-lab"
@@ -34,6 +37,10 @@ deadpool-postgres = "0.14"
 fs2 = "0.4"
 fuser = { version = "0.16", default-features = false, features = ["abi-7-31"] }
 futures-util = "0.3"
+# Apache OpenDAL owns provider signing, TLS, multipart/abort, retry, timeout and
+# concurrency layers. Pinned exactly; default features stay off so no fs/memory
+# or tracing/metrics stack is pulled into the minimal profile.
+opendal = { version = "=0.57.0", default-features = false, features = ["services-s3", "rustls", "layers-concurrent-limit", "layers-retry", "layers-timeout"] }
 hex = "0.4"
 hmac = "0.12"
 libc = "0.2"

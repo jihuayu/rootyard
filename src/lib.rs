@@ -4,6 +4,7 @@
 #[rustfmt::skip]
 pub mod auth;
 pub mod backup;
+pub mod blob_store;
 #[rustfmt::skip]
 pub mod browse;
 #[rustfmt::skip]
