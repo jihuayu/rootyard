@@ -79,7 +79,9 @@ class RecordedRecoveryHarness(ReliabilityHarness):
             receipt = json.loads((path / "post-receive.json").read_text())
             assert (path / "finished").exists()
             assert [(item["ref_name"], item["new_oid"]) for item in receipt] == [(expected_ref, self.second)]
-            assert self.ref(expected_ref) == self.second
+            bare = self.root / "data" / "repos" / (repo["id"] + ".git")
+            observed = self.git("--git-dir=" + str(bare), "rev-parse", "--verify", expected_ref)
+            assert observed.stdout.decode().strip() == self.second
             self.stop(hard=True)
         finally:
             self.stop(hard=True)
