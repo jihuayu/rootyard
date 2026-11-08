@@ -585,11 +585,24 @@ impl HelperClient {
     }
 
     pub fn unmount(&self, workspace: Uuid) -> Result<(), HelperError> {
-        let reply = self.call(Some(workspace), 0, Body::Unmount, MOUNT_DEADLINE)?;
-        match reply {
-            Body::Unmounted => Ok(()),
-            other => Err(HelperError::protocol(format!("unexpected unmount reply `{}`", other.op()))),
+        let failed = match self.call(Some(workspace), 0, Body::Unmount, MOUNT_DEADLINE) {
+            Ok(Body::Unmounted) => return Ok(()),
+            Ok(other) => HelperError::protocol(format!("unexpected unmount reply `{}`", other.op())),
+            Err(error) => error,
+        };
+        // A timed-out (or malformed) unmount reply is not proof the child
+        // stopped working: the teardown may still be running, or the mount may
+        // still be owned, and the API must not keep claiming a healthy helper
+        // after a blocked cleanup. Fail-close the generation exactly like a
+        // mount timeout; the dedicated reaper kills and reaps that child, and
+        // the next mount builds a fresh generation instead of reusing it.
+        if matches!(failed.code, libc::ETIMEDOUT | libc::EPROTO) {
+            self.inner.fail_generation(
+                failed.code,
+                format!("unmount did not produce a trustworthy reply; fail-stopping generation: {}", failed.message),
+            );
         }
+        Err(failed)
     }
 
     /// Ask the child to fence, unmount and exit, then reap it within `grace`.

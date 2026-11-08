@@ -222,6 +222,12 @@ impl State {
 
     /// Fence first (via the caller), then cancel pending work and unmount one
     /// mount at a time so a slow session join cannot hold the mount registry.
+    ///
+    /// Each owned mount uses the consuming `shutdown_and_join`, so this returns
+    /// only after every session teardown completed. `teardown` then exits 0: a
+    /// graceful exit never claims success while an owned unmount is still in
+    /// flight, and a stuck join is caught by the independent shutdown-deadline
+    /// failstop instead of being masked.
     fn unmount_all(&self) {
         {
             let pending = lock(&self.pending);
@@ -234,8 +240,7 @@ impl State {
             mounts.drain().map(|(_, mount)| mount).collect()
         };
         for mount in mounts {
-            mount.handle.shutdown();
-            drop(mount.handle);
+            mount.handle.shutdown_and_join();
         }
     }
 

@@ -74,7 +74,7 @@ pub use self::fuse_dispatch::QueueUsage as DispatchQueueUsage;
 /// Live kernel mount. Dropping the session unmounts and drops the shim, which
 /// stops the actor and drains every queued reply.
 pub struct MountHandle {
-    _session: fuser::BackgroundSession,
+    session: fuser::BackgroundSession,
     dispatcher: Arc<fuse_dispatch::Dispatcher>,
 }
 
@@ -87,8 +87,31 @@ impl MountHandle {
     /// still sitting in a queue slot fails with `EIO`; an operation already
     /// admitted to the gate may still finish. Reads executing in the global
     /// read pool re-check the shutdown flag after I/O and reply `EIO`.
+    ///
+    /// This is the non-consuming half: it neither unmounts nor waits for the
+    /// kernel session thread. Callers that own the handle and are about to
+    /// exit (the helper teardown, unmount, cancel and publish-failure paths)
+    /// must use [`MountHandle::shutdown_and_join`] instead.
     pub fn shutdown(&self) {
         self.dispatcher.shutdown();
+    }
+
+    /// Consuming teardown with a completion barrier.
+    ///
+    /// Stops the dispatcher, then consumes the `fuser::BackgroundSession` and
+    /// calls its public `join()`: `join` drops the mount (requesting the
+    /// unmount and, for `AutoUnmount`, closing the fusermount monitor socket)
+    /// and blocks until the kernel session thread has actually ended. That is
+    /// the difference from `shutdown()` + drop, where the background session
+    /// detaches its join handle and a process exiting right afterwards can
+    /// terminate before the unmount completed and leave an owned mount behind.
+    ///
+    /// Returns only after every owned session teardown has completed, so an
+    /// owner may exit successfully after this call. A session thread that
+    /// panicked propagates here (fail closed) instead of being ignored.
+    pub fn shutdown_and_join(self) {
+        self.dispatcher.shutdown();
+        self.session.join();
     }
 }
 
@@ -473,5 +496,21 @@ mod tests {
         let stripped: Vec<MountOption> =
             helper.iter().filter(|option| **option != MountOption::AutoUnmount).cloned().collect();
         assert_eq!(stripped, legacy, "the helper adds exactly one option");
+    }
+
+    #[test]
+    fn mount_handle_offers_a_consuming_joined_teardown_and_a_borrowable_stop() {
+        // Compile-time contract only (no mount is created here): the owned
+        // helper teardown consumes the handle and returns after the session
+        // join, while the legacy non-consuming stop stays callable through a
+        // shared borrow for existing callers.
+        fn owning(handle: MountHandle) {
+            handle.shutdown_and_join();
+        }
+        fn borrowed(handle: &MountHandle) {
+            handle.shutdown();
+        }
+        let _: fn(MountHandle) = owning;
+        let _: fn(&MountHandle) = borrowed;
     }
 }

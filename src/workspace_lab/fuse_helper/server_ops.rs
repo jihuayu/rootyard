@@ -287,8 +287,9 @@ fn publish(
     let mut pending = lock(&state.pending);
     let Some(entry) = pending.get(&ws) else {
         drop(pending);
-        handle.shutdown();
-        drop(handle);
+        // The pending entry is gone (cancel or retry took it): join this owned
+        // session before replying so the refused mount cannot outlive the reply.
+        handle.shutdown_and_join();
         return reply_error(state, request, workspace, libc::ESTALE, "mount was cancelled before it was published");
     };
     let cancelled = entry.cancelled.load(Ordering::Acquire);
@@ -297,8 +298,9 @@ fn publish(
     if !owned || cancelled || expired {
         pending.remove(&ws);
         drop(pending);
-        handle.shutdown();
-        drop(handle);
+        // Consuming teardown: the denied mount must be fully unmounted before
+        // this reply claims it was never published.
+        handle.shutdown_and_join();
         let (code, message) = if cancelled {
             (libc::ECANCELED, "mount was cancelled before it was published")
         } else if expired {
@@ -315,8 +317,7 @@ fn publish(
             drop(mounts);
             pending.remove(&ws);
             drop(pending);
-            handle.shutdown();
-            drop(handle);
+            handle.shutdown_and_join();
             return reply_error(state, request, workspace, libc::EEXIST, "workspace is already mounted");
         }
         mounts.insert(ws, Mounted { handle, gate, reader, root, request });
@@ -374,8 +375,9 @@ pub(super) fn cancel_mount(state: &Arc<State>, workspace: Option<Uuid>, mount_re
 
 pub(super) fn abort_mount_reply(state: &Arc<State>, request: u64, workspace: Option<Uuid>, removed: Option<Mounted>) {
     if let Some(mount) = removed {
-        mount.handle.shutdown();
-        drop(mount.handle);
+        // Cancellation is only acknowledged once the owned session teardown
+        // completed; a detached session could otherwise outlive the reply.
+        mount.handle.shutdown_and_join();
     }
     reply(state, request, workspace, 0, Body::Ok(OkReply { op_id: None }));
 }
@@ -390,8 +392,9 @@ pub(super) fn unmount(state: &Arc<State>, request: u64, workspace: Option<Uuid>)
     let removed = lock(&state.mounts).remove(&ws);
     match removed {
         Some(mount) => {
-            mount.handle.shutdown();
-            drop(mount);
+            // Join the owned session before acknowledging: an unmounted reply
+            // must not race a still-detached teardown of this mount.
+            mount.handle.shutdown_and_join();
             reply(state, request, workspace, 0, Body::Unmounted);
         }
         None => reply_error(state, request, workspace, libc::ENOENT, "workspace is not mounted"),
