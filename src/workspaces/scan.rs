@@ -26,6 +26,7 @@ const TIMEOUT_ENV: &str = "ROOTYARD_WORKSPACE_SCAN_TIMEOUT_MS";
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+#[derive(Debug)]
 pub(super) enum ScanFailure {
     /// Every worker already owns a running scan (or its queue is full).
     Busy,
@@ -236,19 +237,18 @@ mod tests {
         let (caller, on_thread) = worker::run(&context, worker::Phase::Reconcile, async {
             let caller = worker::blocking_scope().expect("caller has a worker scope");
             let on_thread = frozen(Uuid::new_v4(), Duration::from_secs(5), || {
-                (worker::current(), std::thread::current().name().map(str::to_owned), Ok(()))
+                Ok((worker::current(), std::thread::current().name().map(str::to_owned)))
             })
             .await;
             (caller, on_thread)
         })
         .await;
-        let (observed, name, outcome) = on_thread.expect("scan completed");
+        let (observed, name) = on_thread.expect("scan completed");
         let observed = observed.expect("scan thread lost its worker scope");
         assert_eq!(observed.worker, worker::WorkerKind::WorkspaceCapture);
         assert_eq!(observed.phase, worker::Phase::Reconcile);
         assert_eq!(observed.operation_id, caller.operation_id);
         assert!(name.is_some_and(|name| name.starts_with("rootyard-workspace-scan-")), "not a pool thread");
-        assert!(outcome.is_ok());
         // A caller without an explicit worker scope never invents one.
         let detached = frozen(Uuid::new_v4(), Duration::from_secs(5), || Ok(worker::current())).await;
         assert!(detached.expect("scan completed").is_none(), "detached scan gained an operation scope");

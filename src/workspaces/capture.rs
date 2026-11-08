@@ -367,7 +367,9 @@ mod tests {
             }
         })
         .await;
-        let error = outcome.expect_err("scan failure is returned to the caller");
+        let scan::ScanFailure::Failed(error) = outcome.expect_err("scan failure is returned to the caller") else {
+            panic!("expected the filesystem failure from the scan worker");
+        };
         assert_eq!(error.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         let (scope, event, thread) =
             observed.lock().expect("observation slot").clone().expect("scan thread recorded no observation");
