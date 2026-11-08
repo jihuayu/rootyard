@@ -83,7 +83,7 @@ async fn verified_download_queue_deadline_grants_no_lease_or_destination() {
     ));
     assert!(!destination.exists(), "a timed-out download must not create the destination");
     // The caller's lease is still charged: a failed operation invents no capacity.
-    assert_eq!(resources.available_readers(), 1);
+    assert_eq!(resources.available_readers(), 0);
     assert_eq!(resources.available_staging_bytes(), 0);
 
     drop(held);
