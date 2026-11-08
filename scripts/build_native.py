@@ -110,7 +110,11 @@ def run_build(args, popen=None):
         # Clear only the rootyard package; dependency artifacts stay shared.
         clean_command = ['cargo', 'clean', '--package', DEFAULT_BIN]
         subprocess.run(clean_command, cwd=ROOT, check=True)
-        command = ['cargo', 'build', '--locked']
+        command = ['cargo']
+        package_debug = getattr(args, 'package_debug', None)
+        if type(package_debug) is int and package_debug in (0, 1, 2):
+            command += ['--config', f'profile.dev.package.rootyard.debug={package_debug}']
+        command += ['build', '--locked']
         command += ['--bins'] if args.bins else ['--bin', DEFAULT_BIN]
         if args.features:
             command += ['--features', args.features]
@@ -164,6 +168,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='Build a native binary and record its source binding.')
     parser.add_argument('--features')
     parser.add_argument('--bins', action='store_true')
+    parser.add_argument('--package-debug', type=int, choices=(0, 1, 2),
+                        help='Record an explicit debug-symbol setting for the root package only')
     args = parser.parse_args(argv)
     try:
         report = run_build(args)
