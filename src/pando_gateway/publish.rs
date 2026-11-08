@@ -58,9 +58,9 @@ fn push_digest(
 fn ref_store_error(error: RefStoreError) -> Error {
     if matches!(&error, RefStoreError::Timeout) {
         Error::timeout()
-    } else if matches!(&error, RefStoreError::Cancelled { .. } | RefStoreError::UnknownOperation { .. }) {
-        conflict()
-    } else if error.is_conflict() {
+    } else if matches!(&error, RefStoreError::Cancelled { .. } | RefStoreError::UnknownOperation { .. })
+        || error.is_conflict()
+    {
         conflict()
     } else {
         Error::internal(error)
