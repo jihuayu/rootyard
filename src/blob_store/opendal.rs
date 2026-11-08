@@ -178,11 +178,18 @@ impl BlobStore {
 /// The `OperatorBuilder` type is intentionally not named here.
 macro_rules! finish_operator {
     ($builder:expr, $profile:expr) => {
+        // Finish the statically composed builder first, then layer through
+        // `Operator::layer`, which re-erases the accessor after every layer.
+        // Layers kept on `OperatorBuilder` nest each monomorphized future
+        // inside the next, and a 2 MiB Tokio worker overflowed its stack while
+        // polling that layout during publication. Layer order, retries,
+        // deadlines, concurrency and capabilities are unchanged; only the
+        // composition boundary becomes dynamic.
         $builder
+            .finish()
             .layer(TimeoutLayer::new().with_timeout($profile.object_timeout()).with_io_timeout($profile.io_timeout()))
             .layer(ConcurrentLimitLayer::new($profile.concurrency()))
             .layer(RetryLayer::new().with_max_times($profile.retry_max_times()))
-            .finish()
     };
 }
 

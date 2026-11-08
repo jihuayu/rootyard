@@ -61,16 +61,24 @@ impl LegacyS3Store {
         if let Some(token) = session_token.as_deref() {
             builder = builder.session_token(token);
         }
+        // `OperatorBuilder::layer` composes statically, so every layer's
+        // monomorphized future nests inside the next. On a 2 MiB Tokio worker
+        // the legacy Pando push overflowed the thread stack polling that
+        // layout. Finish first, then apply each layer through
+        // `Operator::layer`, which re-erases the accessor behind dynamic
+        // dispatch after every layer. Layer order and every
+        // retry/deadline/concurrency capability stay exactly as before; only
+        // the composition boundary changes.
         let operator = Operator::new(builder)
             .map_err(map_provider_error)?
+            .finish()
             // Exact-response classifier: signing, TLS, retries and multipart
             // stay in the SDK; each non-2xx response gets its own private
             // status/request-stage marker.
             .layer(HttpClientLayer::new(classifying_http_client().map_err(map_provider_error)?))
             .layer(TimeoutLayer::new().with_timeout(OBJECT_TIMEOUT).with_io_timeout(IO_TIMEOUT))
             .layer(ConcurrentLimitLayer::new(CONCURRENCY))
-            .layer(RetryLayer::new().with_max_times(RETRY_MAX_TIMES))
-            .finish();
+            .layer(RetryLayer::new().with_max_times(RETRY_MAX_TIMES));
         let capability = operator.info().full_capability();
         if !(capability.stat && capability.read && capability.write && capability.delete) {
             return Err(BlobError::Config(
