@@ -45,7 +45,7 @@ impl BlobStore {
         let path = self.object_path(locator);
         let writer =
             self.operator().writer_with(&path).chunk(super::opendal::UPLOAD_CHUNK_BYTES).concurrent(UPLOAD_CONCURRENCY);
-        let writer = if self.capabilities().conditional_create { writer.if_none_match("*") } else { writer };
+        let writer = if self.capabilities().conditional_create { writer.if_not_exists(true) } else { writer };
         let writer = match tokio::time::timeout_at(tokio_deadline(deadline), async { writer.await }).await {
             Ok(Ok(writer)) => writer,
             Ok(Err(error)) => return Err(map_provider_error(error)),

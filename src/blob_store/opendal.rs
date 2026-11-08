@@ -55,7 +55,7 @@ impl BlobStore {
             read: capability.read,
             write: capability.write,
             delete: capability.delete,
-            conditional_create: capability.write_with_if_none_match,
+            conditional_create: capability.write_with_if_not_exists,
         };
         if !(capabilities.stat && capabilities.read && capabilities.write) {
             return Err(BlobError::Config(format!(

@@ -70,7 +70,7 @@ impl LegacyS3Store {
                 "legacy object store provider lacks stat/read/write/delete capability".into(),
             ));
         }
-        if !capability.write_with_if_none_match {
+        if !capability.write_with_if_not_exists {
             return Err(BlobError::Config(
                 "legacy object store provider lacks conditional create (if-none-match)".into(),
             ));

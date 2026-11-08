@@ -23,7 +23,7 @@ impl LegacyS3Store {
     ) -> Result<(), BlobError> {
         Self::verify_ceiling(expected_size)?;
         let writer =
-            self.operator().writer_with(path).chunk(UPLOAD_CHUNK).concurrent(UPLOAD_CONCURRENCY).if_none_match("*");
+            self.operator().writer_with(path).chunk(UPLOAD_CHUNK).concurrent(UPLOAD_CONCURRENCY).if_not_exists(true);
         let writer = match tokio::time::timeout_at(tokio_deadline(deadline), async { writer.await }).await {
             Ok(Ok(writer)) => writer,
             Ok(Err(error)) if matches!(error.kind(), ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch) => {
