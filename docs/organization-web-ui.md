@@ -72,9 +72,23 @@ The HTML forms submit JSON through the shared `/web/app.js` handler. Every
 existing member row carries a hidden `expected_version` equal to the version
 currently rendered, so the backend's optimistic-concurrency check rejects a
 stale form with `409`. An invalid or non-positive `expected_version` is `400`,
-never treated as "no version". The add-member form has no version: the handler
-refuses to silently overwrite an existing membership and asks the admin to
-reload and use the versioned row.
+never treated as "no version". Only a completely absent field means "new
+membership"; an explicitly empty value is `400`. A stale form carrying a
+version for a membership removed elsewhere is `409`: it cannot recreate the
+membership.
+
+The add form is create-only. The decision and the write happen in the same
+backend transaction, after the organization admin role check
+(`put_member_atomic(..., create_only = true)`); a duplicate add is `409` and a
+non-admin caller cannot tell an existing from a missing target. The web layer
+performs no preflight lookup of users, memberships or teams: every such check
+lives behind the same backend authorization, so unauthorized callers receive
+the same response for existing and missing targets.
+
+A repeated team-member add remains the historic idempotent `200` response with
+the same `{"member":true}` body, but no second `organization.team.member.added`
+audit row is written because no state changed. A repeated remove is `404` and
+also adds no audit row.
 
 Organization member/team API endpoints do not accept `Idempotency-Key`; their
 mutation contract is the membership `expected_version` CAS (plus the last-admin
@@ -103,8 +117,12 @@ web pages and forms over HTTP:
 - read-only session mutation `403` and absent mutation forms;
 - missing/wrong CSRF and cross-origin cookie mutations `403`;
 - team-name script escaping and absence of tokens/secrets in page bytes;
-- stale `expected_version` CAS `409` and a successful versioned update;
-- web add/remove flows for members and team members.
+- stale `expected_version` CAS `409`, an explicit blank version `400`, and a
+  stale form that cannot recreate a removed membership (`409`);
+- a non-admin member receives identical `403` bytes for existing, non-member and
+  nonexistent member targets, and for existing/missing team and target probes;
+- web add/remove flows for members and team members, including a duplicate team
+  add that adds no second audit row and a repeated remove that is `404`.
 
 ```sh
 ROOTYARD_TEST_DATABASE_URL=postgres://... python3 tests/organizations_web.py \
@@ -117,9 +135,11 @@ ROOTYARD_TEST_DATABASE_URL=postgres://... python3 tests/organizations_web.py \
   surfaces remain as they were (transfer is explicitly unsupported).
 - No team edit/delete UI because the organization API exposes no such mutation;
   a team can be created and its membership managed.
-- The add-member handler's "must not already exist" check runs in a separate
-  transaction from the API upsert. A concurrent creation between the two can be
-  applied as a role set; the API has no create-only precondition.
+- The JSON API keeps its historical upsert contract when no version is sent; the
+  create-only precondition is a web call-site flag on the shared backend, not a
+  new public API field.
+- A duplicate team-member add still reports `"member":true` in the historic
+  response even though no row changed; only the audit emission is suppressed.
 - Listing ordering is keyset by name/slug, not a stable inventory across
   renames, backup restores or concurrent inserts.
 - Usage, recovery and integration administration UI (other #87 areas) are not

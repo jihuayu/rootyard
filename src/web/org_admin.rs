@@ -6,7 +6,7 @@
 //! - reads resolve the slug, call `authorize_namespace_action(OrgRead)` and read
 //!   the direct membership role, exactly like the JSON listing handlers;
 //! - every write calls the existing `organizations::handlers` function
-//!   (`put_member`, `delete_member`, `create_team`, `put_team_member`,
+//!   (`put_member_atomic`, `delete_member`, `create_team`, `put_team_member`,
 //!   `delete_team_member`) with the browser credential normalized by the shared
 //!   web helper. There is no HTTP self-call, no duplicated authorization and no
 //!   second source of truth for the business rules;

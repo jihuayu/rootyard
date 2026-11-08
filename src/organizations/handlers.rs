@@ -224,6 +224,23 @@ pub async fn put_member(
     headers: HeaderMap,
     Json(input): Json<MembershipInput>,
 ) -> Res {
+    put_member_atomic(state, slug, username, headers, input, false).await
+}
+
+/// Shared member upsert used by the JSON API and the `/web/organizations` add
+/// form. `create_only` is evaluated inside the same authorized,
+/// organization-locked transaction as the write, *after* the organization
+/// admin role check. A non-admin caller therefore cannot distinguish an
+/// existing from a missing membership, and a stale form cannot recreate a
+/// removed membership.
+pub(crate) async fn put_member_atomic(
+    state: Arc<AppState>,
+    slug: String,
+    username: String,
+    headers: HeaderMap,
+    input: MembershipInput,
+    create_only: bool,
+) -> Res {
     let actor = auth::authenticate(&state.pool, &headers).await?;
     if !db::valid_name(&username) || input.expected_version.is_some_and(|v| v <= 0) {
         return Err(Error::bad_request());
@@ -247,6 +264,12 @@ pub async fn put_member(
         .await
         .map_err(Error::internal)?;
     let (code, version) = if let Some(row) = existing {
+        if create_only {
+            // The web add form is create-only. Refusing here, after the admin
+            // and lock checks, keeps an unauthorized caller from learning
+            // whether the membership exists.
+            return Err(Error(StatusCode::CONFLICT, "membership already exists"));
+        }
         let version: i64 = row.get(0);
         if input.expected_version.is_some_and(|v| v != version) {
             return Err(Error(StatusCode::CONFLICT, "membership version conflict"));
@@ -359,6 +382,18 @@ async fn change_team_member(
         .map_err(Error::internal)?
         .ok_or_else(Error::not_found)?
         .get(0);
+    // The composite team/membership foreign key would otherwise surface a
+    // non-member as an internal error. Check the precondition here, after the
+    // admin and team checks, so an unauthorized caller still learns nothing.
+    if add {
+        tx.query_opt(
+            "SELECT 1 FROM organization_memberships WHERE organization_id=$1 AND user_id=$2",
+            &[&org, &user],
+        )
+        .await
+        .map_err(Error::internal)?
+        .ok_or_else(|| Error(StatusCode::CONFLICT, "user is not an organization member"))?;
+    }
     let changed = if add {
         tx.execute("INSERT INTO organization_team_members(team_id,organization_id,user_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", &[&team,&org,&user]).await.map_err(Error::internal)?
     } else {
@@ -369,15 +404,19 @@ async fn change_team_member(
     if !add && changed == 0 {
         return Err(Error::not_found());
     }
-    audit(
-        &tx,
-        org,
-        actor.id,
-        if add { "organization.team.member.added" } else { "organization.team.member.removed" },
-        &username,
-        sjson!({"team":team_slug}),
-    )
-    .await?;
+    // A repeated add is an idempotent NO-OP: keep the historic 200 response
+    // but do not append a second audit event for a state that did not change.
+    if changed != 0 {
+        audit(
+            &tx,
+            org,
+            actor.id,
+            if add { "organization.team.member.added" } else { "organization.team.member.removed" },
+            &username,
+            sjson!({"team":team_slug}),
+        )
+        .await?;
+    }
     auth::finish_tx(tx, &actor, true).await?;
     Ok(json(StatusCode::OK, sjson!({"team":team_slug,"username":username,"member":add})))
 }

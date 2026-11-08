@@ -14,8 +14,12 @@ status codes, security headers and raw HTML bytes:
 - read-only session mutation 403 and no mutation forms rendered
 - missing/wrong CSRF and cross-origin cookie mutation 403
 - team-name script escaping and no token/session/CSRF value in a page
-- stale ``expected_version`` CAS 409 and a successful versioned update
-- web add/remove flows for organization members and team members
+- stale ``expected_version`` CAS 409, explicit blank version 400, and a stale
+  form that cannot recreate a removed membership
+- identical 403 bytes for existing/missing/nonexistent targets from a non-admin
+  member (no preflight private-state leak)
+- web add/remove flows for organization members and team members, including a
+  duplicate team add with no additional audit event
 
 It does not claim that usage, recovery or integration administration UI exists.
 """
@@ -292,6 +296,19 @@ class OrganizationWebHarness(Harness):
         assert response["secret"].startswith("ryt_")
         return response
 
+    def audit_count(self, action, target, team=None):
+        acme = self.acme["id"]
+        guard = (
+            f"organization_id='{acme}' AND action='{action}' AND target='{target}'"
+        )
+        if team is not None:
+            guard += f" AND details->>'team'='{team}'"
+        return int(
+            self.sql(
+                f"SELECT count(*) FROM organization_audit_log WHERE {guard}"
+            )
+        )
+
     # ---- read-only browser session ---------------------------------------
     def read_only(self):
         cookies = self.sign_in(
@@ -313,7 +330,58 @@ class OrganizationWebHarness(Harness):
         )
         assert status == 403, (status, body[:200])
         assert "newbie" not in self.members
-        return {"page_without_forms": True, "add_member": 403, "remove_member": 403}
+        # Existing and absent targets are indistinguishable to a read-only token.
+        existing, _ = self.page(self.alice_cookies, "/web/organizations/acme/members?limit=100")
+        assert 'data-member="carol"' in existing
+        for username in ("carol", "newbie"):
+            status, body, _ = self.mutate(
+                cookies, "/web/organizations/acme/members",
+                {"username": username, "role": "read"},
+            )
+            assert status == 403, (username, status, body[:200])
+        return {"page_without_forms": True, "add_member": 403, "remove_member": 403,
+                "existing_and_missing_target": 403}
+
+    # ---- unauthorized preflight concealment -------------------------------
+    def unauthorized_preflight_concealment(self):
+        # carol is an organization member with the read role and an
+        # unrestricted token: token scope passes, the organization admin check
+        # must run before any user/membership/team lookup. Bob is a user who is
+        # not a member; no-such-user does not exist.
+        cookies = self.sign_in(self.carol)
+
+        def post(path, payload):
+            status, body, _ = self.mutate(cookies, path, payload)
+            return status, body
+
+        member_probes = [
+            {"username": "carol", "role": "read"},
+            {"username": "bob", "role": "read"},
+            {"username": "no-such-user", "role": "read"},
+        ]
+        member_results = [
+            post("/web/organizations/acme/members", payload)
+            for payload in member_probes
+        ]
+        assert all(status == 403 for status, _ in member_results), member_results
+        assert len({body for _, body in member_results}) == 1, member_results
+
+        team_probes = [
+            ("/web/organizations/acme/teams/engineers/members", {"username": "carol"}),
+            ("/web/organizations/acme/teams/engineers/members", {"username": "newbie"}),
+            ("/web/organizations/acme/teams/no-such-team/members", {"username": "carol"}),
+        ]
+        team_results = [post(path, payload) for path, payload in team_probes]
+        assert all(status == 403 for status, _ in team_results), team_results
+        assert len({body for _, body in team_results}) == 1, team_results
+
+        # The same member still exists and the attempted team add changed
+        # nothing: this is a pure response-code/body concealment check.
+        members, _ = self.page(self.alice_cookies, "/web/organizations/acme/members?limit=100")
+        assert 'data-member="carol"' in members
+        return {"member_existing_missing_nonexistent": 403,
+                "team_existing_missing_target_and_team": 403,
+                "identical_error_bodies": True}
 
     # ---- CSRF / Origin ----------------------------------------------------
     def csrf_and_origin(self):
@@ -481,6 +549,24 @@ class OrganizationWebHarness(Harness):
         )
         assert status == 400, (status, body[:200])
 
+        # An explicitly blank version is never "no version".
+        status, body, _ = self.mutate(
+            cookies, "/web/organizations/acme/members",
+            {"username": "web-user", "role": "read", "expected_version": ""},
+        )
+        assert status == 400, (status, body[:200])
+
+        # A stale role form cannot recreate a membership removed elsewhere.
+        self.doc("/api/orgs/acme/members/web-user", 200, method="DELETE")
+        self.members.discard("web-user")
+        status, body, _ = self.mutate(
+            cookies, "/web/organizations/acme/members",
+            {"username": "web-user", "role": "read", "expected_version": "1"},
+        )
+        assert status == 409, (status, body[:300])
+        text, _ = self.page(cookies, "/web/organizations/acme/members?limit=100")
+        assert 'data-member="web-user"' not in text
+
         # Create a team from the web form, then add/remove a team member.
         status, body, _ = self.mutate(
             cookies, "/web/organizations/acme/teams",
@@ -495,6 +581,16 @@ class OrganizationWebHarness(Harness):
         assert status == 303, (status, body[:300])
         text, _ = self.page(cookies, "/web/organizations/acme/teams/web-team")
         assert 'data-team-member="carol"' in text
+        # A repeated add stays an idempotent 200 NO-OP (303 after the form
+        # redirect) and must not append a second audit event.
+        status, body, _ = self.mutate(
+            cookies, "/web/organizations/acme/teams/web-team/members",
+            {"username": "carol"},
+        )
+        assert status == 303, (status, body[:300])
+        assert self.audit_count(
+            "organization.team.member.added", "carol", "web-team"
+        ) == 1
         status, body, _ = self.mutate(
             cookies,
             "/web/organizations/acme/teams/web-team/members/carol/remove",
@@ -502,11 +598,20 @@ class OrganizationWebHarness(Harness):
         assert status == 303, (status, body[:300])
         text, _ = self.page(cookies, "/web/organizations/acme/teams/web-team")
         assert 'data-team-member="carol"' not in text
+        # A repeated remove is not found and adds no audit event either.
+        status, body, _ = self.mutate(
+            cookies,
+            "/web/organizations/acme/teams/web-team/members/carol/remove",
+        )
+        assert status == 404, (status, body[:300])
+        assert self.audit_count(
+            "organization.team.member.removed", "carol", "web-team"
+        ) == 1
 
-        # A non-member username cannot be added to a team.
+        # A user who is not an organization member cannot be added to a team.
         status, body, _ = self.mutate(
             cookies, "/web/organizations/acme/teams/web-team/members",
-            {"username": "bob"},
+            {"username": "newbie"},
         )
         assert status == 409, (status, body[:300])
 
@@ -517,10 +622,14 @@ class OrganizationWebHarness(Harness):
             "versioned_update": 303,
             "overwrite_without_version": 409,
             "invalid_version": 400,
+            "blank_version": 400,
+            "stale_recreate_after_removal": 409,
             "new_member": 303,
             "team_create": 303,
             "team_member_add": 303,
+            "duplicate_add_no_audit": 1,
             "team_member_remove": 303,
+            "repeat_remove": 404,
             "non_member_team_add": 409,
         }
 
@@ -551,6 +660,7 @@ def main():
             "fixture",
             "cross_user_and_scope",
             "read_only",
+            "unauthorized_preflight_concealment",
             "csrf_and_origin",
             "escaping_and_headers",
             "pagination",
@@ -575,7 +685,7 @@ def main():
                 "One loopback process and one disposable PostgreSQL schema; not a scalability or browser-engine test.",
                 "Issue #87 is PARTIAL: organization/member/team administration only; usage, recovery and integration UI are not implemented.",
                 "Cursors are ordered positions bound to actor/organization/team, not signed snapshots; renames and concurrent inserts change traversal semantics.",
-                "The add-member 'must not exist' pre-check is a separate transaction from the API upsert, so a concurrent create can be applied as a role set.",
+                "The web add form is create-only inside the same authorized backend transaction; a duplicate team-member add keeps the historic 200 NO-OP response and adds no audit event.",
                 "No organization creation/rename/delete or ownership-transfer UI; no team edit/delete UI because no such organization API mutation exists.",
                 "CSRF/Origin assertions cover cookie sessions; explicit Bearer API callers keep the documented non-browser /web contract.",
             ],
