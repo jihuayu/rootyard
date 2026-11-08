@@ -47,6 +47,7 @@ impl BlobStore {
     /// Build the driver. Missing/unsupported configuration or a provider that
     /// cannot stat/read/write is rejected here, before any startup ACK.
     pub fn open(profile: BlobProfile) -> Result<Self, BlobError> {
+        ensure_crypto_provider();
         let operator = build_operator(&profile)?;
         let capability = operator.info().full_capability();
         let capabilities = BlobCapabilities {
@@ -176,6 +177,15 @@ pub(crate) fn map_provider_error(error: opendal::Error) -> BlobError {
         ErrorKind::NotFound => BlobError::NotFound,
         ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch => BlobError::AlreadyExists,
         other => BlobError::Provider(format!("provider error kind {other}")),
+    }
+}
+
+pub(crate) fn ensure_crypto_provider() {
+    // Reqwest 0.13's no-provider feature requires explicit installation, even
+    // when Ring is the only compiled implementation. Respect an application's
+    // existing choice; concurrent first-time installs are harmless.
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
     }
 }
 

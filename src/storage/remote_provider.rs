@@ -46,6 +46,7 @@ impl LegacyS3Store {
         secret_access_key: String,
         session_token: Option<String>,
     ) -> Result<Self, BlobError> {
+        crate::blob_store::opendal::ensure_crypto_provider();
         let mut builder = S3::default()
             .bucket(bucket)
             .region(region)

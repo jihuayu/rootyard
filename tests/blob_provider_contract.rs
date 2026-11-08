@@ -84,8 +84,8 @@ fn locator_binds_tenant_authority_generation_attempt_and_keeps_legacy_paths() {
 #[ignore = "requires a disposable real ROOTYARD_BLOB_* provider and owned-key fault injection"]
 async fn real_provider_publish_verify_range_delete_contract() {
     let profile = BlobProfile::from_env().expect("real provider configuration is required");
-    let raw = fixture_operator(&profile);
     let store = BlobStore::open(profile.clone()).expect("configured real provider must pass startup capability gate");
+    let raw = fixture_operator(&profile);
     let independent = BlobStore::open(profile).expect("independent client must pass the capability gate");
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
