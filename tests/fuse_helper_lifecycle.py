@@ -60,6 +60,7 @@ class Suite:
         self.writers: list[support.ParkedWriter] = []
         self.fixtures: list[support.WorkFixture] = []
         self.cleanup_errors: list[dict] = []
+        self.uncertain_owner_roots: set[Path] = set()
         self.notes: list[str] = []
         self.entry_ns = support.ns_inode("mnt")
         self.caller_ns = int(os.environ.get("ROOTYARD_FUSE_HELPER_CALLER_NS", "0") or 0)
@@ -209,6 +210,8 @@ class Suite:
                 owner_dead = owner_dead or support.process_state(helper_pid) in (None, "Z")
         evidence["owner_confirmed_dead"] = owner_dead
         if not owner_dead:
+            if fixture is not None:
+                self.uncertain_owner_roots.add(fixture.root)
             self._cleanup_error("owner-dead", support.HarnessError(
                 "helper FD owner not confirmed dead; refusing writer join and mount cleanup"), evidence)
             evidence["cleanup_skipped"] = "owner-not-confirmed-dead"
@@ -344,6 +347,10 @@ class Suite:
             evidence["cleanup_skipped"] = "owner-or-writer-not-confirmed"
         else:
             for fixture in self.fixtures:
+                if fixture.root in self.uncertain_owner_roots:
+                    record(f"fixture-retained:{fixture.root}", support.HarnessError(
+                        "external helper owner was not confirmed dead; refusing final mount cleanup"))
+                    continue
                 try:
                     evidence["umount_backstop"].extend(support.umount_owned(fixture.root))
                     remaining = [row["mountpoint"] for row in support.owned_mounts(fixture.root)]
