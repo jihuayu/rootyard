@@ -1,0 +1,120 @@
+{
+  "suite": "token_management",
+  "executed_native": true,
+  "ok": true,
+  "coverage_complete": false,
+  "untested_scope": [
+    "Git CAS parent-token lock across publication: separate branch, not claimed here.",
+    "Restricted browser-child inheritance for a restricted parent: unimplemented, so only parent login rejection and unrestricted sessions are covered.",
+    "The 128-grant ceiling is unit-tested; this suite does not build 129 real grants across multiple repositories.",
+    "Long-running concurrency/deadlock probes are not a scalability benchmark on this single loopback process."
+  ],
+  "cases": [
+    {
+      "name": "tokens.create_once_digest_only",
+      "status": "passed",
+      "seconds": 0.0642,
+      "detail": "create 201 once; digest-only; list/read carry no secret/digest"
+    },
+    {
+      "name": "tokens.owner_cross_user_404",
+      "status": "passed",
+      "seconds": 0.022,
+      "detail": "cross-user get/patch/delete/rotate 404; list isolated"
+    },
+    {
+      "name": "tokens.restricted_readonly_issuer_403",
+      "status": "passed",
+      "seconds": 0.0208,
+      "detail": "restricted issuer 403; read-only issuer write 403, read 200"
+    },
+    {
+      "name": "tokens.scope_patch_subset_cas",
+      "status": "passed",
+      "seconds": 0.0516,
+      "detail": "patch subset 200/version bump; widening 403; stale CAS 409; empty deny-all"
+    },
+    {
+      "name": "tokens.rotation_once_then_409",
+      "status": "passed",
+      "seconds": 0.0447,
+      "detail": "rotation 200 once; old 401; new exact scopes; repeat 409"
+    },
+    {
+      "name": "tokens.revoke_idempotent",
+      "status": "passed",
+      "seconds": 0.0298,
+      "detail": "revoke 204, use 401, repeated revoke 204, delisted"
+    },
+    {
+      "name": "tokens.expiry_bounds",
+      "status": "passed",
+      "seconds": 0.0381,
+      "detail": "days 0/366 rejected 400; expired token 401"
+    },
+    {
+      "name": "sessions.own_only_revoke",
+      "status": "passed",
+      "seconds": 0.0475,
+      "detail": "own sessions listed/revoked 204; other user 404; revoked cookie 401"
+    },
+    {
+      "name": "web.cookie_csrf_basic",
+      "status": "passed",
+      "seconds": 0.0701,
+      "detail": "cookie+CSRF create/rotate 200; missing CSRF/cross-origin/Basic 403; secret once"
+    },
+    {
+      "name": "api.authorization_only",
+      "status": "passed",
+      "seconds": 0.0042,
+      "detail": "API accepts Authorization only; cookie/marker cannot authenticate"
+    },
+    {
+      "name": "tokens.keyset_actor_cursor",
+      "status": "passed",
+      "seconds": 0.045,
+      "detail": "limit 0/101 400; keyset pages disjoint; foreign/invalid cursor 400"
+    },
+    {
+      "name": "tokens.nonready_rotation_aborts",
+      "status": "passed",
+      "seconds": 0.0582,
+      "detail": "non-ready rotate 409; old token active and scopes untouched; no new row"
+    },
+    {
+      "name": "tokens.self_rotate_own_cli_token",
+      "status": "passed",
+      "seconds": 0.0658,
+      "detail": "dedicated CLI token rotates itself 200; old secret 401; new secret works"
+    },
+    {
+      "name": "tokens.self_revoke_own_cli_token",
+      "status": "passed",
+      "seconds": 0.0674,
+      "detail": "dedicated CLI token revokes itself 204; revoked credential 401 everywhere"
+    },
+    {
+      "name": "sessions.self_revoke_current_browser",
+      "status": "passed",
+      "seconds": 0.0506,
+      "detail": "cookie+CSRF revokes the current session 200; cookie 401; parent API token still valid"
+    }
+  ],
+  "notes": [
+    "Every managed token is issued by POST /api/tokens (real service); only repository ids, digest verification, expiry time travel and the repository provisioning-state fixture use SQL.",
+    "The browser cases use the real /web/login form and the real cookie/Origin/CSRF middleware. Login is issued with http.client so both Set-Cookie headers (session + CSRF) are observable; all other requests use the shared Harness HTTP path.",
+    "Basic Authorization on a web mutation is ambient browser authority and is rejected with 403 regardless of Origin; Bearer remains an explicit non-ambient API credential.",
+    "Rotation re-validates every copied grant. Any failure (lost role, non-ready repository, database error) aborts before a new row or revocation, so it cannot silently drop a scope.",
+    "The Git CAS parent-token lock and restricted browser-child inheritance are tracked on a separate branch; this suite does not exercise or claim them.",
+    "Self revocation is real owner intent, not a bypass: begin re-verifies the acting row under the per-user advisory lock, the acting token is re-proved after every target-row lock wait and immediately before the revocation statement, and only a transaction that revoked the acting row itself may commit without the final re-check. Cross-user/non-self targets and restricted/read-only issuers keep the full check."
+  ],
+  "limitations": [
+    "Expiry is exercised by moving one token's expires_at with SQL (existing Harness bootstrap channel), not by waiting 30 days.",
+    "The non-ready repository case flips repositories.state with SQL and restores it; role and scope data are never SQL-seeded.",
+    "Chromium-level rendering is exercised by tests/browser_ui.py; this suite drives the same cookie/Origin/CSRF middleware over HTTP.",
+    "The self-rotation/self-revocation cases use dedicated CLI-created users and tokens so no fixture actor is retired; the acting credential is intentionally dead afterwards, which is why they never reuse h.alice/h.bob.",
+    "The implementation worker did not build or run this native suite; the coordinator must run it with --binary/--report before any pass claim."
+  ],
+  "release_blocker": "Private branch: Git CAS parent-token locking is owned by a parallel branch; restricted token issuance is not released or deployed from here."
+}

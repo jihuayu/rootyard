@@ -46,3 +46,26 @@ and authenticated clone/fsck after fresh restore.
 Receipts are in `round5-membership-recovery-evidence/`. These are functional
 loopback tests, not power-loss or production RPO/RTO qualification. No issue is
 closed and no release or deployment is claimed by this record.
+
+## Parent integration qualification
+
+The later parent merge `9e2bccf` adds detail pagination and remote-object unit
+test extraction, so it changes the overall compiled-input digest. Its fresh
+binary SHA-256 is
+`b9446ed9f2de4ec4a99fef6ba1676048b6f4d592bb3c25d8b91cb25280767e1d`,
+with compiled-input SHA-256
+`a4b83299839799fcbbdc03fdc950f4a339020c4af3a5d3ff204d5edcd2852236`.
+All-target Clippy, 248 Rust tests, four explicit PostgreSQL receipt-proof tests
+and five admission tests passed. The same binary passed five membership
+recovery stages, eight detail-pagination cases, fifteen Token-management cases
+and three revoked-token receipt stages.
+
+The native fixture now explicitly accepts asynchronous repository creation and
+polls the real API until the same repository is ready; generic status checks
+and negative authorization assertions remain strict. Early combined runs
+encountered prolonged provisioning while the local workspace disk was at 99%;
+after compressing older task-owned binaries, the two affected suites passed.
+The Token and revoked-token reruns were serialized. These are functional
+results, not a concurrency-throughput claim. The fixture-only commit `4a55a54`
+does not change the compiled inputs. The earlier genuine legacy archive and
+full-backup receipts remain tied to their explicitly named source candidate.

@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (/workspace/rootyard/target/debug/deps/rootyard-c512e8eeea7428b7)
+
+running 5 tests
+test storage::ref_admission::tests::fenced_epoch_prevents_outbox_settlement ... ok
+test storage::ref_admission::tests::aborted_no_ref_changes_replays_only_its_own_operation ... ok
+test storage::ref_admission::tests::operation_cannot_borrow_another_admission_writer ... ok
+test storage::ref_admission::tests::admitted_writer_settles_once_and_replays_idempotently ... ok
+test storage::ref_admission::tests::revoked_token_cannot_settle_admitted_refs ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 251 filtered out; finished in 1.87s
+
