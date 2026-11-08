@@ -1,0 +1,21 @@
+[
+  {
+    "name": "start_after",
+    "exit_code": 129
+  },
+  {
+    "name": "exclude",
+    "exit_code": 0
+  },
+  {
+    "name": "namespace_scan",
+    "exit_code": 0
+  },
+  {
+    "name": "populated_exclude_tag_a",
+    "exit_code": 0,
+    "result": [
+      "refs/tags/b"
+    ]
+  }
+]

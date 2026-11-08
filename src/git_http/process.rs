@@ -207,6 +207,177 @@ impl Drop for Process {
     }
 }
 
+/// Fixed, secret-free description of a failed read-only Git invocation.
+///
+/// Only the process exit code leaves the child. Command-line arguments, stdout
+/// and stderr stay inside the process group, so a credential, an object id or
+/// repository content can never reach an HTTP body, a log record or a test
+/// artifact through this type.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GitCommandFailed {
+    pub(crate) exit: Option<i32>,
+}
+
+impl std::fmt::Display for GitCommandFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.exit {
+            Some(code) => write!(formatter, "read-only Git command failed (exit {code})"),
+            None => formatter.write_str("read-only Git command failed (signal)"),
+        }
+    }
+}
+
+impl std::error::Error for GitCommandFailed {}
+
+/// Hard bounds for one streamed native read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StreamLimits {
+    /// Maximum number of records handed to the sink.
+    pub(crate) max_records: usize,
+    /// Maximum number of stdout bytes consumed from one child.
+    pub(crate) max_bytes: usize,
+    /// Maximum size of a single record line.
+    pub(crate) max_record_bytes: usize,
+}
+
+/// Read chunk size for one streamed native read.
+///
+/// Deliberately independent of the per-record cap: a record is rejected the
+/// moment it crosses `max_record_bytes`, so an unterminated record can never
+/// make the reader hold more than one chunk beyond the per-record limit.
+const STREAM_CHUNK_BYTES: usize = 4 * 1024;
+
+/// Stream one Git command's stdout records through `sink`.
+///
+/// The sink receives one newline-delimited line at a time and returns `false`
+/// when it has everything it needs; the child process group is then killed and
+/// reaped before this function returns, so no producer is left writing into a
+/// closed pipe. Records, total bytes and record size are bounded *while*
+/// reading, and the read, the leader's exit and the process-group quiescence
+/// all share one deadline: a child that closes stdout and then hangs cannot
+/// park the caller past the timeout. On expiry the existing cancellation path
+/// ([`Process::stop`]) signals the group and keeps the unreaped leader as the
+/// PGID reservation until every member is dead. Only the exit code of a failed
+/// child is reported; stdout, stderr and argv never leave the process group.
+pub(crate) async fn stream_git_lines<F>(
+    mut command: tokio::process::Command,
+    limits: StreamLimits,
+    timeout: std::time::Duration,
+    mut sink: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&[u8]) -> bool,
+{
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    let pid = child.id().ok_or_else(|| io::Error::other("missing Git PID"))? as i32;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let drain = tokio::spawn(async move {
+        let mut bytes = [0u8; 4096];
+        while matches!(stderr.read(&mut bytes).await,Ok(n) if n>0) {}
+    });
+    let mut process = Process { child, input: None, stderr: drain, pid };
+    let outcome = tokio::time::timeout(timeout, async {
+        let mut reader = stdout.take(limits.max_bytes as u64 + 1);
+        let mut chunk = [0u8; STREAM_CHUNK_BYTES];
+        let mut line = Vec::new();
+        let mut consumed = 0usize;
+        let mut records = 0usize;
+        let mut satisfied = false;
+        loop {
+            let read = reader.read(&mut chunk[..]).await?;
+            if read == 0 {
+                break;
+            }
+            consumed = consumed.saturating_add(read);
+            if consumed > limits.max_bytes {
+                return Err(anyhow::anyhow!("maintenance output exceeds limit"));
+            }
+            let mut start = 0usize;
+            while start < read {
+                let available = &chunk[start..read];
+                let newline = available.iter().position(|byte| *byte == b'\n');
+                let take = newline.map_or(available.len(), |index| index + 1);
+                // Bound the record before it grows: checking only after an
+                // unbounded `read_until` would allocate the whole stream limit
+                // first and would never return for an unterminated record.
+                if line.len().saturating_add(take) > limits.max_record_bytes {
+                    return Err(anyhow::anyhow!("maintenance output exceeds limit"));
+                }
+                line.extend_from_slice(&available[..take]);
+                start += take;
+                if newline.is_some() {
+                    records = records.saturating_add(1);
+                    if records > limits.max_records {
+                        return Err(anyhow::anyhow!("maintenance output exceeds limit"));
+                    }
+                    let keep = sink(&line);
+                    line.clear();
+                    if !keep {
+                        satisfied = true;
+                        break;
+                    }
+                }
+            }
+            if satisfied {
+                break;
+            }
+        }
+        // A trailing record without a newline still reaches the sink.
+        if !satisfied && !line.is_empty() {
+            records = records.saturating_add(1);
+            if records > limits.max_records {
+                return Err(anyhow::anyhow!("maintenance output exceeds limit"));
+            }
+            satisfied = !sink(&line);
+        }
+        // Close our read end before the leader is reaped: a satisfied producer
+        // gets EPIPE instead of blocking on a pipe nobody reads.
+        drop(reader);
+        if satisfied {
+            unsafe {
+                libc::kill(-process.pid, libc::SIGKILL);
+            }
+        }
+        // The leader's exit and the process-group quiescence belong to the same
+        // logical timeout as the read: a child that closes stdout but keeps
+        // running must be cancelled below, never waited on forever.
+        let status = process.finish().await?;
+        // An early stop is an intentional termination: the sink already had what
+        // it needed, so the group was killed on purpose and its exit status says
+        // nothing about the read. Only a drained stream must prove that the
+        // leader itself succeeded, so a failing native read still reports its
+        // exit code instead of looking like a satisfied page.
+        if !satisfied && !status.success() {
+            return Err(anyhow::Error::new(GitCommandFailed { exit: status.code() }));
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        // Every other outcome still needs the cancellation path. `stop` is a
+        // no-op once `finish` reaped the leader, so a late failure is safe.
+        Ok(Err(error)) => {
+            process.stop().await;
+            Err(error)
+        }
+        Err(_) => {
+            process.stop().await;
+            Err(anyhow::anyhow!("maintenance Git command timed out"))
+        }
+    }
+}
+
 /// Bounded read-only maintenance command using the same process-group cleanup.
 pub(crate) async fn collect_git_output(
     command: tokio::process::Command,
@@ -244,12 +415,15 @@ pub(crate) async fn collect_git_output_input(
     let result = tokio::time::timeout(timeout, async {
         (&mut stdout).take(limit as u64 + 1).read_to_end(&mut output).await?;
         if output.len() > limit {
-            return Err(io::Error::other("maintenance output exceeds limit"));
+            return Err(anyhow::Error::new(io::Error::other("maintenance output exceeds limit")));
         }
-        if !process.finish().await?.success() {
-            return Err(io::Error::other("read-only Git command failed"));
+        let status = process.finish().await?;
+        if !status.success() {
+            // Keep the historical "Git command failed" wording (existing
+            // callers classify on it) and add only the exit code.
+            return Err(anyhow::Error::new(GitCommandFailed { exit: status.code() }));
         }
-        Ok::<(), io::Error>(())
+        Ok::<(), anyhow::Error>(())
     })
     .await;
     process.stop().await;
@@ -350,5 +524,112 @@ mod process_tests {
         drop(process);
         assert_not_running(descendant).await;
         assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists());
+    }
+    /// The per-record cap is enforced while reading: an unterminated record must
+    /// end the read, not buffer the whole stream limit and then block until the
+    /// deadline.
+    #[tokio::test]
+    async fn unterminated_record_is_rejected_while_reading() {
+        // 4 MiB of a single record with no newline is far below the 64 MiB total
+        // cap, and the writer then sleeps, so no EOF can end `read_until`-style
+        // accumulation. Only a cap applied in-read can answer here.
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "head -c 4194304 /dev/zero | tr '\\0' x; exec sleep 300"]);
+        let limits = StreamLimits { max_records: 1024, max_bytes: 64 * 1024 * 1024, max_record_bytes: 64 * 1024 };
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            stream_git_lines(command, limits, std::time::Duration::from_secs(30), |_| true),
+        )
+        .await
+        .expect("the record cap must end the read before the stream deadline");
+        let error = result.expect_err("an unterminated 4 MiB record must be rejected");
+        assert!(error.to_string().contains("exceeds limit"), "unexpected error: {error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the per-record cap was applied only after buffering the stream limit"
+        );
+    }
+    /// The record cap counts the delimiter, exactly like the released limit.
+    #[tokio::test]
+    async fn record_cap_counts_the_trailing_newline() {
+        let limits = StreamLimits { max_records: 8, max_bytes: 64, max_record_bytes: 8 };
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printf 'abcdefg\\n'"]);
+        let mut seen = Vec::new();
+        stream_git_lines(command, limits, std::time::Duration::from_secs(10), |line| {
+            seen.extend_from_slice(line);
+            true
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen, b"abcdefg\n".to_vec());
+
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printf 'abcdefgh\\n'"]);
+        let error = stream_git_lines(command, limits, std::time::Duration::from_secs(10), |_| true)
+            .await
+            .expect_err("one byte over the cap must be rejected");
+        assert!(error.to_string().contains("exceeds limit"), "unexpected error: {error}");
+    }
+    /// A child that closes stdout and then hangs must still be stopped at the
+    /// logical deadline: EOF on stdout is not proof that the leader exited.
+    #[tokio::test]
+    async fn child_that_closes_stdout_and_hangs_is_stopped_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("hang.pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; printf 'a\\n'; exec 1>&-; sleep 300", "hang"])
+            .arg(&pid_file);
+        let limits = StreamLimits { max_records: 16, max_bytes: 1024 * 1024, max_record_bytes: 4096 };
+        let mut lines = 0usize;
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stream_git_lines(command, limits, std::time::Duration::from_millis(500), |_| {
+                lines += 1;
+                true
+            }),
+        )
+        .await
+        .expect("EOF on stdout must not leave the leader running past the deadline");
+        let error = result.expect_err("a hung leader must not be reported as a finished read");
+        assert!(error.to_string().contains("timed out"), "unexpected error: {error}");
+        assert_eq!(lines, 1, "the complete line before EOF must still reach the sink");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "the deadline was not enforced");
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        assert_not_running(pid).await;
+    }
+    /// A sink that already has what it needs ends the read successfully: the
+    /// group is killed on purpose, so the producer's signal status is not a
+    /// failed Git command.
+    #[tokio::test]
+    async fn satisfied_sink_returns_success_and_leaves_no_live_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("producer.pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; printf 'a\\nb\\nc\\n'; exec sleep 300", "producer"])
+            .arg(&pid_file);
+        let limits = StreamLimits { max_records: 16, max_bytes: 1024 * 1024, max_record_bytes: 4096 };
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let started = Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stream_git_lines(command, limits, std::time::Duration::from_secs(10), |line| {
+                seen.push(line.to_vec());
+                seen.len() < 2
+            }),
+        )
+        .await
+        .expect("a satisfied sink must stop the producer, not wait for it")
+        .expect("an intentional early stop is a success, not a failed Git command");
+        assert_eq!(seen.len(), 2, "the sink must stop the stream after its second record");
+        assert_eq!(seen[0].as_slice(), &b"a\n"[..]);
+        assert_eq!(seen[1].as_slice(), &b"b\n"[..]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "the producer was not stopped early");
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        assert_not_running(pid).await;
     }
 }

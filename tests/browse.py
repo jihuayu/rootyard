@@ -7,9 +7,12 @@ from contextlib import contextmanager
 import hashlib
 import json
 import os
+import shlex
+import shutil
 from pathlib import Path
 import sys
 import uuid
+import urllib.parse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from e2e import Harness  # noqa: E402
@@ -32,6 +35,7 @@ CASE_NAMES = (
     "access_and_fences",
     "object_format_and_negotiation",
     "bounded_ref_and_commit_pages",
+    "selective_ref_prefix",
     "protected_writes_and_ref_ack_failure",
 )
 
@@ -40,6 +44,7 @@ class BrowseHarness(Harness):
     def __init__(self, args):
         super().__init__(args)
         self.actor_labels = {}
+        self.native_git = os.environ.get("ROOTYARD_GIT") or shutil.which("git") or "git"
 
     def account(self, *args):
         account = super().account(*args)
@@ -349,7 +354,7 @@ class BrowseHarness(Harness):
         self.git("push", "origin", "HEAD:refs/heads/batch-page", cwd=self.work, token=self.alice)
         count_path = self.root / "cat-file-count"
         wrapper = self.root / "git-count-wrapper"
-        wrapper.write_text("#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ]; then echo x >> '" + str(count_path) + "'; fi\ndone\nexec /usr/bin/git \"$@\"\n")
+        wrapper.write_text("#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = cat-file ]; then echo x >> '" + str(count_path) + "'; fi\ndone\nexec " + shlex.quote(self.native_git) + " \"$@\"\n")
         wrapper.chmod(0o700)
         self.stop()
         self.env["ROOTYARD_GIT"] = str(wrapper)
@@ -361,6 +366,85 @@ class BrowseHarness(Harness):
             after = len(count_path.read_text().splitlines())
             assert after - before == 2, (size, after - before)
         packed.write_text("# pack-refs with: peeled fully-peeled sorted\n" + "\n".join(existing) + "\n")
+
+    def selective_ref_prefix(self):
+        # A literal prefix narrower than a whole namespace must count the page
+        # after the filter.  a1/a2 sort in front of the only z-matches, so
+        # asking Git for the first page of heads and filtering that page
+        # afterwards would have answered an empty page for refs/heads/z.
+        def refs(prefix, limit=20, after=None):
+            query = "limit=" + str(limit) + "&prefix=" + urllib.parse.quote(prefix, safe="")
+            if after is not None:
+                query += "&after=" + urllib.parse.quote(after, safe="")
+            page = self.document(self.repo_api("/refs?" + query))
+            return [item["name"] for item in page["items"]], page["next_after"]
+
+        def walk(limit=1):
+            collected, cursor = [], None
+            while len(collected) <= 4096:
+                query = "/refs?limit=" + str(limit)
+                if cursor is not None:
+                    query += "&after=" + urllib.parse.quote(cursor, safe="")
+                page = self.document(self.repo_api(query))
+                collected.extend(item["name"] for item in page["items"])
+                cursor = page["next_after"]
+                if cursor is None:
+                    return collected, None
+            return collected, cursor
+
+        def write(ref_name, old_oid, new_oid):
+            self.document(self.repo_api("/ref-transactions"), 200, method="POST", body={
+                "updates": [{"ref_name": ref_name, "old_oid": old_oid, "new_oid": new_oid}]})
+
+        def local(*args):
+            return self.git("--git-dir=" + str(self.bare), *args)
+
+        created = ("refs/heads/a1", "refs/heads/a2", "refs/heads/z1", "refs/heads/z2")
+        # Refs Git returns but Browse must never show: reserve-managed proposal
+        # refs inside the public heads namespace, plus a valid Git name past the
+        # 1024-byte public limit.  They sort between a1 and z1, so a page that
+        # counts raw Git records instead of public refs is truncated here.
+        hidden = ("refs/heads/rootyard-proposals/one", "refs/heads/rootyard-proposals/two",
+                  "refs/heads/long/" + "/".join(["x" * 200] * 6))
+        try:
+            for name in created:
+                write(name, ZERO_OID, self.third)
+            for name in hidden:
+                local("update-ref", name, self.third)
+            # A limit-1 walk of the namespace-wide listing must deliver every
+            # public ref exactly once and hide the non-public ones.
+            expected = sorted(
+                name for name in local("for-each-ref", "--format=%(refname)").stdout.decode().splitlines()
+                if name.startswith(("refs/heads/", "refs/tags/"))
+                and len(name) <= 1024
+                and not name.startswith(("refs/heads/rootyard-proposals/", "refs/rootyard-ci/")))
+            collected, cursor = walk()
+            assert cursor is None, collected
+            assert collected == expected, (collected, expected)
+            assert len(set(collected)) == len(collected), collected
+            assert not [name for name in collected if name in hidden], collected
+            names, cursor = refs("refs/heads/z", limit=1)
+            assert names == ["refs/heads/z1"], names
+            assert cursor == "refs/heads/z1", cursor
+            # The cursor page continues inside the same literal prefix.
+            names, cursor = refs("refs/heads/z", limit=1, after=cursor)
+            assert names == ["refs/heads/z2"], names
+            assert cursor is None, cursor
+            # The full exact ref name is still a one-item page.
+            assert refs("refs/heads/z2")[0] == ["refs/heads/z2"]
+            # A narrow tag prefix keeps the existing tag and nothing else.
+            assert refs("refs/tags/v1")[0] == ["refs/tags/v1.0"]
+            assert refs("refs/heads/zzz")[0] == []
+            # `*` is a literal byte here, never a Git pattern: as a pattern it
+            # would match every branch, as a literal it matches none.
+            assert refs("refs/heads/*")[0] == []
+        finally:
+            for name in hidden:
+                local("update-ref", "-d", name)
+            for name in created:
+                write(name, self.third, ZERO_OID)
+        # The fixture is back to the refs the other cases assert.
+        assert refs("refs/heads/z")[0] == [] and refs("refs/heads/a")[0] == []
 
     def protected_writes_and_ref_ack_failure(self):
         self.git("push", "origin", self.third + ":refs/heads/release", cwd=self.work, token=self.alice)
@@ -388,7 +472,7 @@ class BrowseHarness(Harness):
         wrapper = self.root / "git-fault-wrapper"
         wrapper.write_text("#!/bin/sh\nupdate=0\nfor a in \"$@\"; do [ \"$a\" = update-ref ] && update=1; done\n"
                            + "if [ \"$update\" = 1 ] && [ -f '" + str(before_marker) + "' ]; then exit 42; fi\n"
-                           + "/usr/bin/git \"$@\"\nrc=$?\n"
+                           + shlex.quote(self.native_git) + " \"$@\"\nrc=$?\n"
                            + "if [ \"$update\" = 1 ] && [ \"$rc\" = 0 ] && [ -f '" + str(after_marker) + "' ]; then exit 42; fi\n"
                            + "exit \"$rc\"\n")
         wrapper.chmod(0o700)
