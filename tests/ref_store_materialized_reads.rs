@@ -1503,22 +1503,33 @@ async fn two_idle_views_do_not_starve_a4_and_drop_reclaims_the_budget() -> Resul
                 && a4.new_packs.len() == 1,
             "a real A4 verified commit did not complete beside two retained views"
         );
-        // The separate materialized-view budget is exactly two.
+        // A third view must wait at admission, not time out in T1 or start a
+        // native child and merely time out later. This trusted wrapper would
+        // leave a marker if admission incorrectly allowed its first Git call.
+        let third_gate = GitGate::new(&git)?;
+        let blocked_materializer = third_gate.materializer(&store)?;
+        let _third_release = GateRelease(&third_gate);
+        let admission_started = StdInstant::now();
         let third = materialize(
-            &materializer,
+            &blocked_materializer,
             &db.pool,
             v.repo,
             v.tenant,
             first_snapshot,
             first_pin,
             1,
-            TokioInstant::now() + Duration::from_millis(500),
+            TokioInstant::now() + Duration::from_millis(1500),
         )
         .await;
         ensure!(
-            matches!(third, Err(RefStoreError::Timeout) | Err(RefStoreError::Unsupported(_))),
-            "a third live view was admitted beyond the process-wide view budget"
+            matches!(third, Err(RefStoreError::Unsupported("native materialized read verification is unavailable"))),
+            "the third view did not reach bounded native-view admission"
         );
+        ensure!(
+            admission_started.elapsed() >= Duration::from_secs(1),
+            "view admission failed before waiting on its budget"
+        );
+        ensure!(!third_gate.ready_marker().exists(), "a third view started a native child beyond the view budget");
         // Dropping one view reclaims its workspace and budget slot.
         drop(first);
         let third =
