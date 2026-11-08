@@ -1,0 +1,202 @@
+{
+  "passed": true,
+  "kind": "core139",
+  "returncode": 0,
+  "command": [
+    "python3",
+    "/workspace/scratch/trace-state142-backup.py",
+    "/workspace/scratch/state-services-pack-commit/tests/backup_refstore_core139.py",
+    "--binary",
+    "/workspace/scratch/state-pack142-app-v1/rootyard",
+    "--report",
+    "/workspace/scratch/state-pack142-core139-backup-regression-v1/native.json"
+  ],
+  "seconds": 115.29,
+  "before": {
+    "source": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "binary": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "head": "492fc929d017e968b5a9fdbafacc9316c117de91",
+    "harness": {
+      "tests/backup_refstore_core139.py": "8749fcc6530d6d8b7fd72c8b19fab71efb266b608f88ab3bab040192b4b4bfcf",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "887cfaf14554329a0334aea87b1e4ccf183d22deac642bd2a80aa492a40d2efc",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376"
+    },
+    "diagnostic_launcher": "35d8fb4fdb820d0ee6b76542eb4684d836664c21c3ec1ffb4232352bf2d906d6"
+  },
+  "after": {
+    "source": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "binary": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "head": "492fc929d017e968b5a9fdbafacc9316c117de91",
+    "harness": {
+      "tests/backup_refstore_core139.py": "8749fcc6530d6d8b7fd72c8b19fab71efb266b608f88ab3bab040192b4b4bfcf",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "887cfaf14554329a0334aea87b1e4ccf183d22deac642bd2a80aa492a40d2efc",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376"
+    },
+    "diagnostic_launcher": "35d8fb4fdb820d0ee6b76542eb4684d836664c21c3ec1ffb4232352bf2d906d6"
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "affd9304822c930a5ef6399138cc0dffe3e144096b6b013869729eff1e8bf11c",
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "workspace_commit": "32e87d1421dad2e339a0bce9fbec317188aa3160",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-pack-commit#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-pack-commit#rootyard@0.1.0"
+      }
+    ]
+  },
+  "helper_build_receipt": null,
+  "native": {
+    "passed": true,
+    "cases": [
+      {
+        "name": "synthetic_source_with_populated_refstore_core",
+        "status": "passed",
+        "seconds": 3.2996,
+        "detail": {
+          "fresh_databases": 2,
+          "live_server_backup_rejected": true,
+          "unknown_and_unfinished_journal": true,
+          "direct_sql_core_fixture_repository": "bd4f4191-fc0d-41a3-94dc-0212aa5669a2",
+          "core_fixture_is_adapter_or_protocol_acknowledgement": false,
+          "populated_fixture_rows_by_table": {
+            "ref_store_issuer_lanes": 1,
+            "ref_store_operations": 2,
+            "ref_store_cancellations": 1,
+            "ref_store_core_gates": 1,
+            "ref_store_core_refs": 1,
+            "ref_store_core_events": 1
+          }
+        }
+      },
+      {
+        "name": "offline_barriers_and_snapshot",
+        "status": "passed",
+        "seconds": 14.024,
+        "detail": {
+          "snapshot_includes_commit_after_barrier_wait": true,
+          "inherited_volume_lock_rejected": true,
+          "backup_seconds": 11.284076448,
+          "backup_format": 18,
+          "archive_contains_schema_versions": [
+            138,
+            139
+          ]
+        }
+      },
+      {
+        "name": "unsafe_or_corrupt_inputs",
+        "status": "passed",
+        "seconds": 62.2414,
+        "detail": {
+          "corrupt_missing_extra_traversal_symlink_rejected_before_sql": true,
+          "existing_targets_and_overlap_refused": true,
+          "external_object_dependencies_refused": true
+        }
+      },
+      {
+        "name": "backup_barrier_failures",
+        "status": "passed",
+        "seconds": 11.1972,
+        "detail": {
+          "exporter_connection_loss_no_publication": true,
+          "queued_ddl_bounded_safe_failure": true
+        }
+      },
+      {
+        "name": "interrupted_restore_guard",
+        "status": "passed",
+        "seconds": 10.1351,
+        "detail": {
+          "killed_parent_while_native_pg_restore_blocked": true,
+          "no_orphan_import_or_partial_sql": true,
+          "persistent_guard_blocks_startup": true,
+          "restore_guard_preflight_seconds": 5.615,
+          "native_pg_restore_blocked_seconds": 3.432
+        }
+      },
+      {
+        "name": "post_backup_write_not_in_snapshot",
+        "status": "passed",
+        "seconds": 1.0874,
+        "detail": {
+          "post_backup_acknowledged_commit": true,
+          "seconds_after_backup_boundary": 98.884
+        }
+      },
+      {
+        "name": "new_environment_restore_core_rows_clone_fsck",
+        "status": "passed",
+        "seconds": 11.1284,
+        "detail": {
+          "fresh_database_and_directory": true,
+          "separate_pg_server": false,
+          "standard_authenticated_clone_fsck_refs_content": true,
+          "revoked_and_read_only_auth_preserved": true,
+          "unknown_stays_blocked": true,
+          "restore_seconds": 9.455261013,
+          "backup_boundary_commits_missing": 0,
+          "post_backup_acknowledged_commits_not_recovered": 1,
+          "observed_backup_age_at_last_ack_seconds": 98.884,
+          "production_rpo_rto_guarantee": false,
+          "populated_core_rows_restored_exactly": true,
+          "gates_refs_events_operations_cancellations_issuer_lanes_nonempty": true,
+          "terminal_event_cancellation_updates_refused_without_row_changes": true,
+          "core_repository_stays_provisioning_gitfs_unserved": true,
+          "core_fixture_direct_sql_not_adapter_acknowledgement": true
+        }
+      }
+    ],
+    "binary": "/workspace/scratch/state-pack142-app-v1/rootyard",
+    "binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "limitations": [
+      "RefStore core rows are direct SQL metadata fixtures, not adapter/protocol ACK evidence; Rust ref_store_* tests own that proof.",
+      "The unserved provisioning repository is never served or cut over; its core gate/ref rows are not native Git ref authority.",
+      "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise.",
+      "One committed operation/event and one cancelled tombstone/terminal are populated; batches, rejections and concurrency are covered by Rust tests."
+    ]
+  },
+  "limits": [
+    "Migration139 core refs/HEAD/parent operation are explicit SQL metadata fixtures, not a Git commit ACK.",
+    "New142 pack registry remains empty; this is a seven-case regression of the inherited metadata-only backup harness.",
+    "Same source-bound schema142 app; no serving/Blob byte backup/HA qualification."
+  ]
+}

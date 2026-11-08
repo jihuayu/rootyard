@@ -15039,7 +15039,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
             for line in ci_text.splitlines()
         ]
         self.assertIn(
-            ["python3", "scripts/build_native.py", "--features", "pando-lab", "--bins"],
+            ["python3", "scripts/build_native.py", "--features", "pando-lab", "--bins", "--strip-debuginfo"],
             live_commands,
         )
 

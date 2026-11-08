@@ -7,6 +7,13 @@ streams Cargo JSON, checks Fresh=false proof, hashes the artifact and installs
 the receipt atomically. Any raw cargo invocation that targets the same directory
 must take the same lock or be serialized externally: otherwise it can overwrite
 the artifact after this transaction releases the lock.
+
+``--strip-debuginfo`` is optional, off by default and mirrors
+``scripts/build_native_test.py``: it injects only
+``profile.dev.package.rootyard.strip="debuginfo"`` as an explicit ``--config``
+argument of the executed cargo command, so the recorded receipt ``command`` is
+exactly the profile that was built. It never sets RUSTFLAGS and never touches
+dependency or workspace-wide profiles.
 """
 import argparse
 import contextlib
@@ -114,6 +121,10 @@ def run_build(args, popen=None):
         command += ['--bins'] if args.bins else ['--bin', DEFAULT_BIN]
         if args.features:
             command += ['--features', args.features]
+        # Optional debuginfo stripping for this package only; the flag is part of
+        # the recorded command so the receipt cannot describe a different profile.
+        if getattr(args, 'strip_debuginfo', False):
+            command += ['--config', 'profile.dev.package.rootyard.strip="debuginfo"']
         command += ['--message-format=json-render-diagnostics']
         events = []
         process = popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=None,
@@ -164,6 +175,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='Build a native binary and record its source binding.')
     parser.add_argument('--features')
     parser.add_argument('--bins', action='store_true')
+    parser.add_argument('--strip-debuginfo', action='store_true',
+                        help='strip rootyard dev debug information')
     args = parser.parse_args(argv)
     try:
         report = run_build(args)
