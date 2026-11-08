@@ -1884,7 +1884,11 @@ fn sql_refusal_diagnostic(statement: &str, error: &tokio_postgres::Error) -> Str
 async fn expect_client_sqlstate(client: &tokio_postgres::Client, statement: &str, expected: &str) -> Result<()> {
     let error = client.batch_execute(statement).await.expect_err("statement must be refused");
     let actual = error.code().map(|code| code.code());
-    ensure!(actual == Some(expected), "expected SQLSTATE {expected} but saw {}", sql_refusal_diagnostic(statement, &error));
+    ensure!(
+        actual == Some(expected),
+        "expected SQLSTATE {expected} but saw {}",
+        sql_refusal_diagnostic(statement, &error)
+    );
     Ok(())
 }
 #[tokio::test]
