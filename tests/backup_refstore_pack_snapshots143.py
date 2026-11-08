@@ -446,6 +446,7 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
             assert row["logical_bytes"] == entry["receipt"]["logical_bytes"] > 0
         old_row = snapshots_by_id[old["snapshot_id"]]
         assert old_row["pack_mode"] == "metadata_only" and old_row["pack_count"] == 0
+        assert old_row["ref_count"] == 0, "the old snapshot predates the first ref publication"
         assert old_row["pack_membership_state"] == "unavailable"
         assert old_row["membership_digest"] is None and old_row["snapshot_digest"] is None
         assert old_row["gate_revision"] == 1 and old_row["owner_id"] == scope["tenant_id"]
@@ -558,7 +559,7 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
         assert a2_usage is not None
         assert [a2_usage[name] for name in
                 ("snapshot_count", "snapshot_ref_count", "logical_bytes", "receipt_count")] == marker["a2_usage"]
-        assert a2_usage["snapshot_count"] == 5 and a2_usage["snapshot_ref_count"] == 5
+        assert a2_usage["snapshot_count"] == 5 and a2_usage["snapshot_ref_count"] == 4
         assert a2_usage["receipt_count"] == 7 and a2_usage["logical_bytes"] > 0
 
         gate = core_rows["ref_store_core_gates"][0]
