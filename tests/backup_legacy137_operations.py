@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restore a genuine schema137/format13 archive into schema138/format14.
+"""Restore a genuine schema137/format13 archive into schema139/format15.
 
 The shared harness requires the unmodified predecessor binary to create the
 archive, rejects absent or mismatched legacy opt-ins, and checks restored Git,

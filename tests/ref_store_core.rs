@@ -422,7 +422,7 @@ async fn cancel_before_register_prevents_ref_changes() -> Result<()> {
         assert!(matches!(error, RefStoreError::Cancelled { .. }), "unexpected {error}");
         assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_refs WHERE repository_id=$1", repo).await?, 0);
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM ref_store_core_cancellations WHERE repository_id=$1", repo).await?,
+            count(&pool, "SELECT count(*) FROM ref_store_cancellations WHERE repository_id=$1", repo).await?,
             1
         );
         assert!(matches!(
@@ -697,7 +697,15 @@ async fn atomic_rejection_writes_no_partial_refs_and_epochs_history_tenant_prefi
         );
         assert!(matches!(commit(&pool, &batch_prefix).await, Err(RefStoreError::InvalidIdentity(_))));
         assert_eq!(operation_state(&pool, repo, batch_operation).await?, None);
-        assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1", repo).await?, 2);
+        // The seed commit and both durable rejections (the old-OID atomic
+        // batch and the current-row prefix conflict) each record exactly one
+        // immutable event; the within-batch prefix conflict is rejected
+        // before the registry, so it has neither an event nor a row.
+        assert_eq!(
+            count(&pool, "SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1", repo).await?,
+            3,
+            "seed commit, old-OID rejection and prefix rejection each have one event"
+        );
 
         // Epoch/history/tenant/revision mismatches are durable rejections and
         // never mutate refs.
