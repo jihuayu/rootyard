@@ -1,18 +1,13 @@
 //! Service-owned FUSE sessions for ordinary workspace filesystem access.
 //!
-//! Two backends share this registry:
+//! The experimental `fuse-helper` backend talks to an independent helper child
+//! over [`crate::workspace_lab::fuse_helper`]. The API registry stores clients;
+//! gates, FUSE sessions, overlays and lazy readers live in the child. Native
+//! lifecycle acceptance remains pending.
 //!
-//! * `ROOTYARD_WORKSPACE_MOUNT_MODE=fuse-helper` (production, issue #91 phase 3)
-//!     - the API process talks to an independent helper child over the protocol
-//!     in [`crate::workspace_lab::fuse_helper`]. The registry only stores the
-//!     helper client registration per workspace: no `BackgroundSession`, no
-//!     `Overlay`, no `Reader` lives in the API process. The gate, the dispatcher
-//!     and the lazily hydrated reader all live in the child.
-//! * `ROOTYARD_WORKSPACE_MOUNT_MODE=fuse` - the older same-process prototype.
-//!     It keeps a `fuser::BackgroundSession` in the API process, so an operator
-//!     `SIGKILL` can still leave a blocked session owning the FUSE descriptor. It
-//!     is retained for the existing in-process native tests and is *not* the
-//!     phase-3 delivery; only `fuse-helper` closes that lifecycle.
+//! The legacy `fuse` backend owns sessions in the API process. Its full live
+//! sandbox/capture workload still reproduces blocked kernel I/O (issue #95).
+//! Queue-level tests alone do not establish service or crash correctness.
 //!
 //! Parent-side authorization and lease handling stay here: `ensure` is called
 //! after the lease transaction committed a new `lease_epoch`, `prepare` ran with
