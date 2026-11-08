@@ -286,11 +286,21 @@ class WebListingHarness(Harness):
 
     def read_only(self):
         reader = self.sign_in(token=self.reader["token"], username="alice")
-        rows, _, body = self.page(reader)
-        assert len(rows) == 106 and b"alice/demo" in body, len(rows)
+        rows, next_page, _ = self.page(reader)
+        assert len(rows) == 100 and next_page is not None
+        tail, done, _ = self.page(reader, next_page)
+        rows += tail
+        assert done is None and len(rows) == len(set(rows)) == 106 and ("alice", "demo") in rows
         status, bearer_body, _ = self.get("/web/repos", bearer=self.reader["token"])
-        assert status == 200 and b"alice/demo" in bearer_body
-        return {"browser_rows": len(rows), "bearer_status": status}
+        assert status == 200 and len(self.links(bearer_body)) == 100
+        bearer_rows = self.links(bearer_body)
+        next_page = self.next_href(bearer_body)
+        assert next_page is not None
+        status, bearer_tail, _ = self.get("/web/repos" + next_page, bearer=self.reader["token"])
+        assert status == 200 and self.next_href(bearer_tail) is None
+        bearer_rows += self.links(bearer_tail)
+        assert len(bearer_rows) == len(set(bearer_rows)) == 106 and set(bearer_rows) == set(rows)
+        return {"browser_rows": len(rows), "bearer_rows": len(bearer_rows), "bearer_status": status}
 
     def restricted_token(self):
         scoped = self.account("create-token", "alice")
