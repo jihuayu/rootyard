@@ -324,6 +324,10 @@ fn lazy_fingerprint_matches_the_former_merge() {
     let lower = workspace.lower();
     write(&lower, "data.bin", &[0_u8; 12]);
     workspace.write_manifest(&[file("data.bin", 0o644, b"remote-bytes"), link("link", "data.bin")]);
+    assert!(snapshot::fingerprint(&workspace.mount()).is_err(), "a manifest cannot replace a missing symlink");
+    // Lazy preparation materializes symlink targets locally; only regular
+    // worktree contents remain sparse until hydration.
+    symlink("data.bin", lower.join("link")).expect("materialized lazy symlink");
     let upper = workspace.upper();
     write(&upper, "extra.txt", b"extra");
     let mut expected = BTreeMap::new();
