@@ -317,7 +317,8 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
 
     def snapshot_rows(self, db=None, scoped=True):
         return {table: self._json_rows(
-            table, self._scoped_where(table, "tenant", self.snapshot_scope) if scoped else None, db=db)
+            table, self._scoped_where(table, "tenant" if table.endswith("_tenant_usage") else "repo",
+                                      self.snapshot_scope) if scoped else None, db=db)
             for table in self.snapshot_tables()}
 
     def a2_rows(self, db=None, scoped=True):
@@ -330,7 +331,8 @@ class BackupRefStorePackSnapshots143Harness(BackupRefStoreCore139Harness):
 
     def pack_rows(self, db=None, scoped=True):
         return {table: self._json_rows(
-            table, self._scoped_where(table, "tenant", self.snapshot_scope) if scoped else None, db=db)
+            table, self._scoped_where(table, "tenant" if table.endswith("_tenant_usage") else "repo",
+                                      self.snapshot_scope) if scoped else None, db=db)
             for table in self.pack_tables()}
 
     def hold_rows(self, db=None, scoped=True):
