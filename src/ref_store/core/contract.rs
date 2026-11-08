@@ -282,9 +282,7 @@ mod tests {
     #[test]
     fn gate_requires_non_nil_identity_and_positive_epochs() {
         let head = RefName::new("refs/heads/main").unwrap();
-        assert!(
-            CoreGateInit::new(Uuid::nil(), Uuid::new_v4(), format(), Uuid::new_v4(), 1, 1, head.clone()).is_err()
-        );
+        assert!(CoreGateInit::new(Uuid::nil(), Uuid::new_v4(), format(), Uuid::new_v4(), 1, 1, head.clone()).is_err());
         assert!(
             CoreGateInit::new(Uuid::new_v4(), Uuid::new_v4(), format(), Uuid::new_v4(), 0, 1, head.clone()).is_err()
         );

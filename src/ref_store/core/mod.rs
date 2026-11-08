@@ -22,7 +22,9 @@ pub mod types;
 pub use command::CommitRefsRequest;
 pub use contract::{CommitMode, CoreGate, CoreGateInit, CoreGateVersion, VersionCheck};
 pub use pg::PgRefStoreCore;
-pub use terminal::{CommitRefsReceipt, CommitRejectCode, CommitRejection, CommitTerminal, RefCommitResult, TerminalKind};
+pub use terminal::{
+    CommitRefsReceipt, CommitRejectCode, CommitRejection, CommitTerminal, RefCommitResult, TerminalKind,
+};
 pub use types::{
     GitObjectFormat, GitOid, HeadUpdate, MAX_REFS_PER_COMMIT, RefName, RefPrecondition, RefTarget, RefUpdate,
 };

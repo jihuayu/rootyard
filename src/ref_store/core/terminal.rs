@@ -102,12 +102,7 @@ pub struct CommitTerminal {
 }
 
 impl CommitTerminal {
-    pub(crate) fn committed(
-        repository_id: Uuid,
-        revision: i64,
-        head_ref: String,
-        refs: Vec<RefCommitResult>,
-    ) -> Self {
+    pub(crate) fn committed(repository_id: Uuid, revision: i64, head_ref: String, refs: Vec<RefCommitResult>) -> Self {
         Self { kind: TerminalKind::Committed, repository_id, revision, head_ref: Some(head_ref), refs, rejection: None }
     }
 

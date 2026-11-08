@@ -237,11 +237,7 @@ impl PgRefStoreCore {
             return Err(RefStoreError::RepositoryNotFound);
         }
         let version = gate.version();
-        if known == Some(&version) {
-            Ok(VersionCheck::Unchanged(version))
-        } else {
-            Ok(VersionCheck::Changed(version))
-        }
+        if known == Some(&version) { Ok(VersionCheck::Unchanged(version)) } else { Ok(VersionCheck::Changed(version)) }
     }
 
     /// Exact old/new CAS in one owned short transaction.
@@ -274,8 +270,7 @@ impl PgRefStoreCore {
         let result = self.commit_refs_in_tx(&tx, request, deadline).await;
         match result {
             Ok(receipt) => {
-                commit_bounded(tx, deadline, request.repository_id(), Some(request.identity().operation_id()))
-                    .await?;
+                commit_bounded(tx, deadline, request.repository_id(), Some(request.identity().operation_id())).await?;
                 Ok(receipt)
             }
             Err(error) => {
@@ -414,8 +409,7 @@ impl PgRefStoreCore {
             .await;
         }
 
-        let existing =
-            lock_relevant_refs(tx, request.repository_id(), lookup_names(request, gate.head_ref())).await?;
+        let existing = lock_relevant_refs(tx, request.repository_id(), lookup_names(request, gate.head_ref())).await?;
         if let Err((code, name, expected, actual)) = check_cas(request, &existing) {
             return reject(tx, request, Some(&gate), code, Some(name), expected, actual, deadline).await;
         }

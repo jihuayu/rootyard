@@ -62,10 +62,7 @@ impl GitOid {
         if value.len() != format.oid_hex_len()
             || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            return Err(RefStoreError::InvalidIdentity(format!(
-                "object id must be lowercase {} hex",
-                format.as_str()
-            )));
+            return Err(RefStoreError::InvalidIdentity(format!("object id must be lowercase {} hex", format.as_str())));
         }
         let bytes = hex::decode(value).map_err(|_| RefStoreError::InvalidIdentity("invalid object id hex".into()))?;
         if bytes.iter().all(|byte| *byte == 0) {
@@ -178,9 +175,9 @@ fn valid_ref_name(value: &str) -> bool {
     if value.bytes().any(|byte| matches!(byte, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\' | 0x7f)) {
         return false;
     }
-    value.split('/').all(|component| {
-        !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
-    })
+    value
+        .split('/')
+        .all(|component| !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock"))
 }
 
 /// Strict ancestor relationship used for `foo` vs `foo/bar` conflicts.
@@ -315,9 +312,7 @@ pub(crate) fn resolve_head(
     };
     match head {
         HeadUpdate::Keep => {
-            if refs
-                .iter()
-                .any(|update| update.name().as_str() == current_head && update.target() == &RefTarget::Delete)
+            if refs.iter().any(|update| update.name().as_str() == current_head && update.target() == &RefTarget::Delete)
             {
                 return Err((CommitRejectCode::HeadDeletedWithoutRetarget, Some(current_head.to_owned())));
             }
@@ -351,10 +346,7 @@ mod tests {
         assert!(GitOid::parse(GitObjectFormat::Sha256, &"a".repeat(40)).is_err());
         assert!(GitOid::parse(GitObjectFormat::Sha1, &"A".repeat(40)).is_err());
         assert!(GitOid::parse(GitObjectFormat::Sha1, &"0".repeat(40)).is_err());
-        assert_eq!(
-            GitOid::target_value(GitObjectFormat::Sha1, &"0".repeat(40)).unwrap(),
-            RefTarget::Delete
-        );
+        assert_eq!(GitOid::target_value(GitObjectFormat::Sha1, &"0".repeat(40)).unwrap(), RefTarget::Delete);
         assert_eq!(
             GitOid::precondition_value(GitObjectFormat::Sha256, &"0".repeat(64)).unwrap(),
             RefPrecondition::Absent
@@ -399,10 +391,7 @@ mod tests {
             RefUpdate::new(name("refs/heads/topic"), RefPrecondition::Absent, target(1)),
             RefUpdate::new(name("refs/heads/topic/sub"), RefPrecondition::Absent, target(2)),
         ];
-        assert_eq!(
-            batch_prefix_conflict(&batch),
-            Some(("refs/heads/topic".into(), "refs/heads/topic/sub".into()))
-        );
+        assert_eq!(batch_prefix_conflict(&batch), Some(("refs/heads/topic".into(), "refs/heads/topic/sub".into())));
         assert!(is_strict_prefix("refs/heads/a", "refs/heads/a/b"));
         assert!(!is_strict_prefix("refs/heads/a", "refs/heads/ab"));
         assert!(!is_strict_prefix("refs/heads/a/b", "refs/heads/a"));
@@ -425,22 +414,12 @@ mod tests {
             Err((super::super::terminal::CommitRejectCode::HeadDeletedWithoutRetarget, Some("refs/heads/main".into())))
         );
         assert_eq!(
-            resolve_head(
-                "refs/heads/main",
-                &existing,
-                &delete_main,
-                &HeadUpdate::Retarget(name("refs/heads/next"))
-            )
-            .unwrap(),
+            resolve_head("refs/heads/main", &existing, &delete_main, &HeadUpdate::Retarget(name("refs/heads/next")))
+                .unwrap(),
             "refs/heads/next"
         );
         assert_eq!(
-            resolve_head(
-                "refs/heads/main",
-                &existing,
-                &delete_main,
-                &HeadUpdate::Retarget(name("refs/heads/unborn"))
-            ),
+            resolve_head("refs/heads/main", &existing, &delete_main, &HeadUpdate::Retarget(name("refs/heads/unborn"))),
             Err((super::super::terminal::CommitRejectCode::HeadTargetMissing, Some("refs/heads/unborn".into())))
         );
         let delete_next = vec![RefUpdate::new(
@@ -449,12 +428,7 @@ mod tests {
             RefTarget::Delete,
         )];
         assert_eq!(
-            resolve_head(
-                "refs/heads/main",
-                &existing,
-                &delete_next,
-                &HeadUpdate::Retarget(name("refs/heads/next"))
-            ),
+            resolve_head("refs/heads/main", &existing, &delete_next, &HeadUpdate::Retarget(name("refs/heads/next"))),
             Err((super::super::terminal::CommitRejectCode::HeadTargetMissing, Some("refs/heads/next".into())))
         );
     }

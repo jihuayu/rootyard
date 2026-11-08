@@ -47,10 +47,7 @@ use uuid::Uuid;
 /// `BEGIN`; the SDK rollback guard then queues `ROLLBACK`, so the connection
 /// returns to `idle` once the queued statement is processed. Any other error
 /// is a connection/database error before a usable `Transaction` existed.
-pub(crate) async fn begin_bounded(
-    client: &mut Client,
-    deadline: Instant,
-) -> Result<Transaction<'_>, RefStoreError> {
+pub(crate) async fn begin_bounded(client: &mut Client, deadline: Instant) -> Result<Transaction<'_>, RefStoreError> {
     match timeout_at(deadline, client.transaction()).await {
         Ok(Ok(tx)) => Ok(tx),
         Ok(Err(error)) => Err(db_error(error)),

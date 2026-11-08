@@ -25,12 +25,12 @@ pub(super) fn replay_terminal(begun: BeginReceipt) -> Result<CommitRefsReceipt, 
             let terminal = CommitTerminal::from_terminal_result(stored)?;
             Ok(CommitRefsReceipt { replayed: true, record: begun.record, terminal })
         }
-        OperationState::Cancelled => Err(RefStoreError::Cancelled {
-            operation_id: begun.record.identity().operation_id(),
-        }),
-        OperationState::Pending => Err(RefStoreError::OperationPending {
-            operation_id: begun.record.identity().operation_id(),
-        }),
+        OperationState::Cancelled => {
+            Err(RefStoreError::Cancelled { operation_id: begun.record.identity().operation_id() })
+        }
+        OperationState::Pending => {
+            Err(RefStoreError::OperationPending { operation_id: begun.record.identity().operation_id() })
+        }
     }
 }
 

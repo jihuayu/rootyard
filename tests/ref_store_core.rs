@@ -99,9 +99,7 @@ async fn setup() -> Result<(Pool, Pool, String, Uuid, Uuid)> {
     let schema = format!("ref_store_core_test_{}", Uuid::new_v4().simple());
     admin.get().await?.batch_execute(&format!("CREATE SCHEMA {schema}")).await?;
     let mut config: tokio_postgres::Config = url.parse()?;
-    config.options(format!(
-        "-c search_path={schema} -c timezone=UTC -c statement_timeout=15000 -c lock_timeout=10000"
-    ));
+    config.options(format!("-c search_path={schema} -c timezone=UTC -c statement_timeout=15000 -c lock_timeout=10000"));
     let pool = Pool::builder(Manager::new(config, tokio_postgres::NoTls))
         .runtime(deadpool_postgres::Runtime::Tokio1)
         .max_size(12)
@@ -187,9 +185,7 @@ async fn seed_legacy_projection(pool: &Pool, tenant: Uuid, repo: Uuid) -> Result
     let client = pool.get().await?;
     let token = Uuid::new_v4();
     let digest = vec![0u8; 32];
-    client
-        .execute("INSERT INTO tokens(id,user_id,digest) VALUES($1,$2,$3)", &[&token, &tenant, &digest])
-        .await?;
+    client.execute("INSERT INTO tokens(id,user_id,digest) VALUES($1,$2,$3)", &[&token, &tenant, &digest]).await?;
     let operation = Uuid::new_v4();
     client
         .execute(
@@ -356,10 +352,7 @@ async fn commit_replays_exact_terminal_and_digest_conflicts_do_not_mutate() -> R
             other => panic!("unexpected version after commit: {other:?}"),
         };
         assert_eq!(gate_version.revision(), 2);
-        assert!(matches!(
-            check_version(&pool, repo, tenant, Some(&gate_version)).await?,
-            VersionCheck::Unchanged(_)
-        ));
+        assert!(matches!(check_version(&pool, repo, tenant, Some(&gate_version)).await?, VersionCheck::Unchanged(_)));
 
         // Same identity and digest: exact saved terminal, no second mutation.
         let replay = commit(&pool, &first).await?;
@@ -531,12 +524,10 @@ async fn two_connections_same_old_oid_have_one_committer_and_one_terminal_reject
         blocker_tx.rollback().await?;
         drop(blocker);
 
-        let left_result = tokio::time::timeout(Duration::from_secs(10), left_task)
-            .await
-            .context("left commit deadlocked")??;
-        let right_result = tokio::time::timeout(Duration::from_secs(10), right_task)
-            .await
-            .context("right commit deadlocked")??;
+        let left_result =
+            tokio::time::timeout(Duration::from_secs(10), left_task).await.context("left commit deadlocked")??;
+        let right_result =
+            tokio::time::timeout(Duration::from_secs(10), right_task).await.context("right commit deadlocked")??;
         let receipts = [left_result, right_result];
         let committed = receipts.iter().filter(|receipt| receipt.is_committed()).count();
         let rejected = receipts.iter().filter(|receipt| !receipt.is_committed()).count();
@@ -551,11 +542,13 @@ async fn two_connections_same_old_oid_have_one_committer_and_one_terminal_reject
                     Some(CommitRejectCode::RevisionMismatch)
                 );
                 assert_eq!(receipt.terminal.kind, TerminalKind::Rejected);
-                assert!(receipt
-                    .terminal
-                    .refs
-                    .iter()
-                    .all(|result| matches!(result, rootyard::ref_store::RefCommitResult::NotApplied { .. })));
+                assert!(
+                    receipt
+                        .terminal
+                        .refs
+                        .iter()
+                        .all(|result| matches!(result, rootyard::ref_store::RefCommitResult::NotApplied { .. }))
+                );
             }
         }
         assert!(matches!(
@@ -1024,9 +1017,7 @@ async fn core_error_rolls_back_partial_writes_and_a_client_commit_cannot_publish
         failing_client.batch_execute("COMMIT").await?;
 
         client
-            .batch_execute(
-                "DROP TRIGGER core_event_boom ON ref_store_core_events; DROP FUNCTION core_event_boom();",
-            )
+            .batch_execute("DROP TRIGGER core_event_boom ON ref_store_core_events; DROP FUNCTION core_event_boom();")
             .await?;
 
         assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_refs WHERE repository_id=$1", repo).await?, 0);
@@ -1075,9 +1066,7 @@ async fn oversized_aggregate_terminal_is_rejected_before_any_write() -> Result<(
         let history = Uuid::new_v4();
         initialize(&pool, &gate(repo, tenant, format, history, "refs/heads/main")).await?;
 
-        let long_name = |index: usize| {
-            format!("refs/heads/{index:03}{}", "a".repeat(1024 - "refs/heads/".len() - 3))
-        };
+        let long_name = |index: usize| format!("refs/heads/{index:03}{}", "a".repeat(1024 - "refs/heads/".len() - 3));
         let oversized_operation = Uuid::new_v4();
         let oversized = request(
             repo,
@@ -1355,11 +1344,7 @@ async fn queued_begin_deadline_leaves_no_open_transaction_or_partial_gate() -> R
             .query_opt("SELECT state FROM pg_stat_activity WHERE pid=$1", &[&backend_pid])
             .await?
             .map(|row| row.get(0));
-        assert_eq!(
-            state.as_deref(),
-            Some("idle"),
-            "SDK rollback guard must leave the backend out of a transaction"
-        );
+        assert_eq!(state.as_deref(), Some("idle"), "SDK rollback guard must leave the backend out of a transaction");
         assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_gates WHERE repository_id=$1", repo).await?, 0);
         assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_refs WHERE repository_id=$1", repo).await?, 0);
         assert_eq!(count(&pool, "SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1", repo).await?, 0);
@@ -1437,9 +1422,8 @@ async fn commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once() -
         let observer = pool.get().await?;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let activity = observer
-                    .query_opt("SELECT state,query FROM pg_stat_activity WHERE pid=$1", &[&commit_pid])
-                    .await?;
+                let activity =
+                    observer.query_opt("SELECT state,query FROM pg_stat_activity WHERE pid=$1", &[&commit_pid]).await?;
                 let waiting: bool = observer
                     .query_one(
                         "SELECT EXISTS(SELECT 1 FROM pg_locks
@@ -1518,7 +1502,11 @@ async fn commit_deadline_is_unknown_then_same_identity_retry_is_exactly_once() -
         let events = count(&pool, "SELECT count(*) FROM ref_store_core_events WHERE repository_id=$1", repo).await?;
         let operations = count(&pool, "SELECT count(*) FROM ref_store_operations WHERE repository_id=$1", repo).await?;
         if landed {
-            assert_eq!((refs, events, operations), (1, 1, 1), "landed COMMIT must have its exact ref, event and terminal");
+            assert_eq!(
+                (refs, events, operations),
+                (1, 1, 1),
+                "landed COMMIT must have its exact ref, event and terminal"
+            );
         } else {
             // A server-side statement_timeout may legitimately have aborted the
             // COMMIT while the client already stopped waiting. Never force it

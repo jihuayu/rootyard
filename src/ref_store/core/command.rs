@@ -64,10 +64,7 @@ impl CommitRefsRequest {
         let mut names = BTreeSet::new();
         for update in &refs {
             if !names.insert(update.name().as_str()) {
-                return Err(RefStoreError::InvalidIdentity(format!(
-                    "duplicate ref {} in one commit",
-                    update.name()
-                )));
+                return Err(RefStoreError::InvalidIdentity(format!("duplicate ref {} in one commit", update.name())));
             }
             if let Some(oid) = update.precondition().oid()
                 && oid.format() != object_format
@@ -109,14 +106,8 @@ impl CommitRefsRequest {
             mode,
             &refs,
         );
-        let identity = OperationIdentity::new(
-            repository_id,
-            issuer_id,
-            identity.lane().clone(),
-            sequence,
-            operation_id,
-            digest,
-        )?;
+        let identity =
+            OperationIdentity::new(repository_id, issuer_id, identity.lane().clone(), sequence, operation_id, digest)?;
         Ok(Self {
             identity,
             tenant_id,
@@ -241,9 +232,9 @@ fn commit_digest(
 
 #[cfg(test)]
 mod tests {
-    use crate::ref_store::IssuerLane;
     use super::super::types::{RefName, RefPrecondition, RefTarget};
     use super::*;
+    use crate::ref_store::IssuerLane;
 
     fn format() -> GitObjectFormat {
         GitObjectFormat::Sha1
@@ -455,9 +446,7 @@ mod tests {
     #[test]
     fn commit_validation_carries_the_terminal_budget() {
         let base = request();
-        let long = |index: usize| {
-            format!("refs/heads/{index:03}{}", "a".repeat(1024 - "refs/heads/".len() - 3))
-        };
+        let long = |index: usize| format!("refs/heads/{index:03}{}", "a".repeat(1024 - "refs/heads/".len() - 3));
         let oversized = CommitRefsRequest::new(
             base.repository_id(),
             base.tenant_id(),

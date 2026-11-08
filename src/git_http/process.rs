@@ -579,9 +579,7 @@ mod process_tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("hang.pid");
         let mut command = tokio::process::Command::new("/bin/sh");
-        command
-            .args(["-c", "echo $$ > \"$1\"; printf 'a\\n'; exec 1>&-; sleep 300", "hang"])
-            .arg(&pid_file);
+        command.args(["-c", "echo $$ > \"$1\"; printf 'a\\n'; exec 1>&-; sleep 300", "hang"]).arg(&pid_file);
         let limits = StreamLimits { max_records: 16, max_bytes: 1024 * 1024, max_record_bytes: 4096 };
         let mut lines = 0usize;
         let started = Instant::now();
@@ -609,9 +607,7 @@ mod process_tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("producer.pid");
         let mut command = tokio::process::Command::new("/bin/sh");
-        command
-            .args(["-c", "echo $$ > \"$1\"; printf 'a\\nb\\nc\\n'; exec sleep 300", "producer"])
-            .arg(&pid_file);
+        command.args(["-c", "echo $$ > \"$1\"; printf 'a\\nb\\nc\\n'; exec sleep 300", "producer"]).arg(&pid_file);
         let limits = StreamLimits { max_records: 16, max_bytes: 1024 * 1024, max_record_bytes: 4096 };
         let mut seen: Vec<Vec<u8>> = Vec::new();
         let started = Instant::now();
