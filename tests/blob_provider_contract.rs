@@ -107,7 +107,8 @@ async fn real_provider_publish_verify_range_delete_contract() {
         assert!(receipt.matches(&first));
         assert_eq!(receipt.verified_sha256(), digest);
         assert_eq!(receipt.verified_length(), size);
-        assert!(matches!(store.put_file(&first, &source, deadline()).await, Err(BlobError::AlreadyExists)));
+        let repeated = store.put_file(&first, &source, deadline()).await;
+        assert!(matches!(repeated, Err(BlobError::AlreadyExists)), "duplicate immutable locator result: {repeated:?}");
         independent.verify(&first, deadline()).await.expect("duplicate write must leave the first bytes intact");
         store.put_file(&second, &source, deadline()).await.expect("second attempt publish same bytes");
 
