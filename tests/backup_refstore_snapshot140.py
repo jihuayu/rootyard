@@ -245,7 +245,7 @@ class BackupRefStoreSnapshot140Harness(BackupRefStoreCore139Harness):
         assert mode in ("seed", "verify")
         process = self.run(
             [str(self.snapshot_fixture_binary), "--ignored", "--exact", HELPER_TEST,
-             "--nocapture", "--test-threads=1"],
+             "--format=terse", "--nocapture", "--test-threads=1"],
             env=self.fixture_env(mode, db or self.db))
         stdout = process.stdout.decode()
         summaries = [line for line in stdout.splitlines() if line.startswith("test result:")]
