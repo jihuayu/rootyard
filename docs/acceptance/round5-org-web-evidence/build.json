@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "binary_sha256": "03b4e6809051b7df872cb6c2ab8288fd29eb7e0086772cb5b038b5d26ba11421",
+  "source_inputs_sha256": "5d25e2144fbeecbbe8079259dae2891fa174069325e2c8f8b5809e2a3abb9c66",
+  "workspace_commit": "3ddd2095bf18429daa98a6ed997a03ff7750ce9f",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--bin",
+    "rootyard",
+    "--message-format=json-render-diagnostics"
+  ],
+  "package_rebuilt": true,
+  "clean_command": [
+    "cargo",
+    "clean",
+    "--package",
+    "rootyard"
+  ],
+  "target_dir": "/workspace/rootyard/target",
+  "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+  "fresh_false_artifacts": [
+    {
+      "target": "rootyard",
+      "kind": "lib",
+      "fresh": false,
+      "package_id": "path+file:///workspace/scratch/round5-implementation/web-org-admin#rootyard@0.1.0"
+    },
+    {
+      "target": "rootyard",
+      "kind": "bin",
+      "fresh": false,
+      "executable": "/workspace/rootyard/target/debug/rootyard",
+      "package_id": "path+file:///workspace/scratch/round5-implementation/web-org-admin#rootyard@0.1.0"
+    }
+  ]
+}

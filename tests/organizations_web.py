@@ -76,7 +76,8 @@ class OrganizationWebHarness(Harness):
 
     @staticmethod
     def lower(headers):
-        return {key.lower(): value for key, value in headers}
+        entries = headers.items() if hasattr(headers, "items") else headers
+        return {key.lower(): value for key, value in entries}
 
     def doc(self, path, code=200, token=None, method="GET", body=None):
         status, raw, headers = self.http(

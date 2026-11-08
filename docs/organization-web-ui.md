@@ -72,8 +72,8 @@ The HTML forms submit JSON through the shared `/web/app.js` handler. Every
 existing member row carries a hidden `expected_version` equal to the version
 currently rendered, so the backend's optimistic-concurrency check rejects a
 stale form with `409`. An invalid or non-positive `expected_version` is `400`,
-never treated as "no version". Only a completely absent field means "new
-membership"; an explicitly empty value is `400`. A stale form carrying a
+never treated as "no version". An absent field or JSON `null` means "new
+membership"; an explicitly empty string is `400`. A stale form carrying a
 version for a membership removed elsewhere is `409`: it cannot recreate the
 membership.
 
@@ -144,3 +144,14 @@ ROOTYARD_TEST_DATABASE_URL=postgres://... python3 tests/organizations_web.py \
   renames, backup restores or concurrent inserts.
 - Usage, recovery and integration administration UI (other #87 areas) are not
   implemented.
+
+## Native acceptance
+
+The candidate at `3ddd209` passed all-target Clippy and eight native HTTP cases
+against an isolated PostgreSQL schema, using binary SHA-256
+`03b4e6809051b7df872cb6c2ab8288fd29eb7e0086772cb5b038b5d26ba11421`.
+The harness header adapter was corrected to accept both mapping and pair-list
+headers before this run. Luna Max reviewed the authorization and CAS corrections
+and found no P1/P2 issues. The receipts in
+`docs/acceptance/round5-org-web-evidence/` bind this pre-integration candidate;
+a later parent merge is not a claim of another native run.
