@@ -170,10 +170,7 @@ mod tests {
             storage_generation: operation.storage_generation,
             outcome: "no_ref_changes".into(),
             evidence: serde_json::json!({"version":1,"ungranted_without_hooks":true}),
-            admission: Some(AdmissionRecord {
-                writer_id: operation.id,
-                shard_epoch: operation.shard_epoch,
-            }),
+            admission: Some(AdmissionRecord { writer_id: operation.id, shard_epoch: operation.shard_epoch }),
         }
     }
 
