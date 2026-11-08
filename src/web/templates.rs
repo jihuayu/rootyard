@@ -55,6 +55,33 @@ pub fn render_page_shell(header: &RepoHeaderCtx, view_name: &str, page_title: &s
     )
 }
 
+/// Append a next-page navigation link to an already-rendered detail page.
+///
+/// The link is a relative query-only reference (`?cursor=...`), so the browser
+/// resolves it against the current owner/repo/parent path and re-authorizes on
+/// the next request. Only an opaque cursor is exposed; no ordering column,
+/// SQL fragment or page offset leaks into the markup.
+pub fn attach_next_page_nav(html: String, next_cursor: Option<&str>, label: &str) -> String {
+    let Some(cursor) = next_cursor else {
+        return html;
+    };
+    let href = escape_html(&format!("?cursor={cursor}"));
+    let label = escape_html(label);
+    let nav = format!(
+        r#"<nav class="detail-pagination" data-page-next="true"><a rel="next" href="{href}">{label}</a></nav>"#
+    );
+    match html.rfind("</body>") {
+        Some(idx) => {
+            let mut out = String::with_capacity(html.len() + nav.len());
+            out.push_str(&html[..idx]);
+            out.push_str(&nav);
+            out.push_str(&html[idx..]);
+            out
+        }
+        None => html + &nav,
+    }
+}
+
 pub fn render_repo_overview(data: &OverviewViewData) -> String {
     let head_target = escape_html(data.head.target.as_deref().unwrap_or("HEAD"));
     let head_oid = escape_html(data.head.oid.as_deref().unwrap_or("unborn"));

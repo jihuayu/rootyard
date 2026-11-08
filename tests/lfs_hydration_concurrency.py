@@ -212,7 +212,7 @@ class S3ControlProxy:
                 declared = int(value)
         if truncate:
             partial = payload[:TRUNCATED_BODY_BYTES]
-            self.note("target_get_truncated", declared=declared, forwarded=len(partial))
+            self.note("target_get_truncated", status=status, declared=declared, forwarded=len(partial))
             self.relay_truncated(handler, method, status, response_headers, partial, declared)
             return
         self.relay(handler, method, status, response_headers, payload, declared)
@@ -549,10 +549,14 @@ class HydrationHarness(LfsHarness):
         assert not proxy.errors, proxy.errors
         assert proxy.snapshot() == (heads_before + 1, gets_before + 1), (
             "a body-boundary failure must not restart the S3 request", proxy.snapshot())
+        stimuli = [event for event in proxy.events if event.get("kind") == "target_get_truncated"]
+        assert len(stimuli) == 1, stimuli
+        assert (stimuli[0]["status"], stimuli[0]["declared"], stimuli[0]["forwarded"]) == (
+            200, size, TRUNCATED_BODY_BYTES), stimuli[0]
         truncated_ids = []
         for name, (status, headers, body) in results.items():
-            assert status in (500, 503), (name, status)
-            assert len(body) < size, (name, "truncated flight streamed a full body")
+            assert status == 503, (name, status)
+            assert json.loads(body) == {"error": "service temporarily unavailable"}, (name, body)
             request_id = headers.get("x-request-id")
             assert request_id, (name, "failed response lost the server X-Request-ID")
             try:

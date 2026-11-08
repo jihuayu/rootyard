@@ -6,8 +6,7 @@ CARGO_TARGET_DIR while it digests sources, clears only the rootyard package,
 streams Cargo JSON, checks Fresh=false proof, hashes the artifact and installs
 the receipt atomically. Any raw cargo invocation that targets the same directory
 must take the same lock or be serialized externally: otherwise it can overwrite
-the artifact after this transaction releases the lock. The former wrapper used
-subprocess.run(command, cwd=ROOT, check=True); it could not prove a rebuild.
+the artifact after this transaction releases the lock.
 """
 import argparse
 import contextlib
