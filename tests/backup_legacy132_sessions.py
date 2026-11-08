@@ -79,7 +79,7 @@ class ArchiveContract:
     schema: int
     flag: str
     source_label: str
-    target_schema: int = 137
+    target_schema: int = 138
     indexes: tuple = SCHEMA136_INDEXES
     foreign_keys: tuple = SCHEMA134_FOREIGN_KEYS
     unique_constraints: tuple = SCHEMA134_UNIQUE
@@ -87,10 +87,10 @@ class ArchiveContract:
 
 
 LEGACY132 = ArchiveContract(format=8, schema=132, flag="--allow-legacy-schema132",
-                            source_label="schema132", target_schema=137,
+                            source_label="schema132", target_schema=138,
                             indexes=SCHEMA136_INDEXES)
 LEGACY133 = ArchiveContract(format=9, schema=133, flag="--allow-legacy-schema133",
-                            source_label="schema133", target_schema=137,
+                            source_label="schema133", target_schema=138,
                             indexes=SCHEMA136_INDEXES)
 # Format10/schema134 is the immediately previous frozen contract.  Its archive
 # upgrades through the same reviewed path to the current schema137 target.
@@ -104,6 +104,9 @@ LEGACY135 = replace(LEGACY134, format=11, schema=135,
 # contract; it upgrades through migration 137 (terminal-admission projection).
 LEGACY136 = replace(LEGACY135, format=12, schema=136,
                     flag="--allow-legacy-schema136", source_label="schema136")
+# Genuine predecessor format13 archive; current migration138 adds durable operation identity.
+LEGACY137 = replace(LEGACY136, format=13, schema=137,
+                    flag="--allow-legacy-schema137", source_label="schema137")
 
 
 class LegacyArchiveHarness(BackupHarness):
@@ -382,6 +385,12 @@ class LegacyArchiveHarness(BackupHarness):
         last = self.query(
             self.restore_db, "SELECT max(version) FROM schema_migrations")
         assert last == str(self.contract.target_schema), last
+        if self.contract.target_schema >= 138:
+            registry_tables = self.query(
+                self.restore_db,
+                "SELECT count(*) FROM pg_tables WHERE schemaname='public' "
+                "AND tablename IN ('ref_store_operations','ref_store_cancellations','ref_store_issuer_lanes')")
+            assert registry_tables == "3", registry_tables
         names = self.query(
             self.restore_db,
             "SELECT string_agg(indexname, ',' ORDER BY indexname) FROM pg_indexes "
