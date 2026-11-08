@@ -559,7 +559,8 @@ async fn reservation_begin_and_cancel_share_operation_lock_without_deadlock() ->
             let store = PgRefStore;
             let mut client = cancel_pool.get().await?;
             let tx = client.transaction().await?;
-            cancel_started_tx.send(()).map_err(|_| anyhow!("cancel start receiver dropped"))?;
+            let backend_pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+            cancel_started_tx.send(backend_pid).map_err(|_| anyhow!("cancel start receiver dropped"))?;
             let outcome = match store.cancel(&tx, &cancel_identity, deadline()).await {
                 Ok(_) => {
                     tx.commit().await?;
@@ -572,9 +573,20 @@ async fn reservation_begin_and_cancel_share_operation_lock_without_deadlock() ->
             };
             Ok::<Option<RefStoreError>, anyhow::Error>(outcome)
         });
-        cancel_started_rx.await?;
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(!cancel_task.is_finished(), "cancel bypassed the reservation's operation lock");
+        let cancel_pid = cancel_started_rx.await?;
+        let observer = pool.get().await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = observer.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted)",
+                    &[&cancel_pid],
+                ).await?.get(0);
+                if waiting { break Ok::<(), anyhow::Error>(()); }
+                assert!(!cancel_task.is_finished(), "cancel finished before reaching the advisory-lock barrier");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.context("cancel never reached the advisory-lock barrier")??;
+        drop(observer);
 
         // The owner can still enter begin while the cancel waits. Without the
         // pre-reservation operation lock this would invert into a lane/operation
