@@ -333,3 +333,13 @@ class HttpConflictClassificationTest(unittest.TestCase):
         for text in (b"RPC failed; HTTP 500 curl 22", b"RPC failed; HTTP 403 curl 22", b"connection refused"):
             with self.assertRaises(AssertionError):
                 baseline.same_ref_failure_kind(types.SimpleNamespace(returncode=1, stderr=text))
+
+class MixedConflictFailureTest(unittest.TestCase):
+    def test_explicit_fault_is_not_hidden_by_409_marker(self):
+        for fault in (b"authentication failed", b"connection refused", b"RPC failed; HTTP 500 curl 22"):
+            with self.assertRaises(AssertionError):
+                baseline.same_ref_failure_kind(types.SimpleNamespace(returncode=1,
+                    stderr=b"RPC failed; HTTP 409 curl 22\n" + fault))
+    def test_partial_capture_remains_a_reportable_failure(self):
+        summary = baseline.phase_metrics_accounting([{"name": "late", "phase_metrics": {"status": "partial"}}])
+        self.assertEqual(summary["unexpected"], ["late"])

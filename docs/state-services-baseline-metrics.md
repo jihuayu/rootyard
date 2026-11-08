@@ -215,18 +215,20 @@ bind, no scrape and no extra report keys. With it:
   **invalid for individual or batch aggregation** and remain historical raw data
   only; the report carries this in `interpretation.historical_v1` and the root's
   v2 run supersedes them.
-* the non-winning same-ref contender is accepted as a rejection only when its
-  stderr shows a Git ref rejection (`[remote rejected]`, `[rejected]`,
-  non-fast-forward, failed to update ref, stale info) and shows no auth or
-  transport fault; otherwise the run fails. This is ordinary competing pushes,
-  not an explicit-old-OID CAS assertion.
+* the non-winning same-ref contender is classified as either a concrete Git
+  ref rejection reason or an observed HTTP409 response. Only the former counts
+  as `git_ref_rejected`; HTTP409 counts separately as `http_conflicts`, with
+  `git_ref_rejected=0`. Explicit auth, transport and server faults fail capture,
+  including mixed diagnostics containing a 409 marker. HTTP409 is not proof of
+  a particular application cause or synchronized old-OID CAS. Protocol handling
+  is tracked in #126.
 * the exporter is opened through a handler that **refuses redirects**: a 302/301
   raises instead of following a `Location` that could point outside loopback, so
   the private-origin claim holds even for a misbehaving listener.
 * every scanned case carries a fixed `phase_metrics.status`, summarised in
   `phase_metrics.accounting`. `captured`, `not_applicable` (setup and process
   start lifecycle) and `offline` are anticipated; `service_stopped`,
-  `process_restarted`, `unavailable` and `feature_disabled` are listed as
+  `process_restarted`, `unavailable`, `feature_disabled` and `partial` are listed as
   `unexpected` and force the run status to `failed`, so a lost sample can never
   look like a clean pass. A case that loses process continuity also marks the
   capture `partial` and stops further scraping.

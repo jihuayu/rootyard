@@ -269,8 +269,8 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
 
 
 PHASE_CASE_STATUSES = ('captured', 'not_applicable', 'offline', 'service_stopped',
-                       'process_restarted', 'unavailable', 'feature_disabled')
-UNEXPECTED_CASE_STATUSES = ('service_stopped', 'process_restarted', 'unavailable', 'feature_disabled')
+                       'process_restarted', 'unavailable', 'feature_disabled', 'partial')
+UNEXPECTED_CASE_STATUSES = ('service_stopped', 'process_restarted', 'unavailable', 'feature_disabled', 'partial')
 
 
 def phase_metrics_accounting(cases):
@@ -289,15 +289,21 @@ def phase_metrics_accounting(cases):
     return {'cases': len(cases), 'by_status': counts, 'unexpected': unexpected}
 
 
-def same_ref_rejection_diagnostic(result):
-    """Prove the non-winning contender was rejected as a Git ref update, not by a transport fault."""
+def _same_ref_stderr(result):
     if result.returncode == 0:
         raise AssertionError('the non-winning contender unexpectedly exited zero')
     text = (result.stderr or b'').decode('utf-8', 'replace').lower()
     for forbidden in ('authentication failed', 'could not read username', 'unable to access',
-                      'connection refused', 'connection timed out', 'proxy', 'ssl'):
+                      'connection refused', 'connection timed out', 'proxy', 'ssl',
+                      'http 401', 'http 403', 'http 500', 'http 502', 'http 503'):
         if forbidden in text:
             raise AssertionError('non-winning contender failed for a non-ref reason: ' + forbidden)
+    return text
+
+
+def same_ref_rejection_diagnostic(result):
+    """Prove the non-winning contender was rejected as a Git ref update, not by a transport fault."""
+    text = _same_ref_stderr(result)
     for expected in ('failed to update ref', 'fetch first',
                      'non-fast-forward', 'cannot lock ref', 'stale info'):
         if expected in text:
@@ -308,10 +314,10 @@ def same_ref_failure_kind(result):
     """Keep an observed HTTP conflict distinct from a Git ref rejection."""
     if result.returncode == 0:
         raise AssertionError('expected a non-winning contender')
-    text = (result.stderr or b'').decode('utf-8', 'replace')
+    text = _same_ref_stderr(result)
     # A 409 is an observed application conflict, not a proven old-OID CAS or
     # a protocol-level Git rejection. Every other generic failure still fails.
-    if re.search(r"RPC failed; HTTP 409 curl 22\b", text):
+    if re.search(r"rpc failed; http 409 curl 22\b", text):
         return 'observed_http_conflict'
     same_ref_rejection_diagnostic(result)
     return 'git_ref_rejection'
@@ -650,7 +656,7 @@ def main():
             'loser_kind': loser_kind,
             'loser_rejection_is_git_ref_rejection': loser_kind == 'git_ref_rejection',
             'mode': 'ordinary competing Git pushes; advertised old OIDs are not synchronized; the loser is '
-                    'classified separately as a Git ref rejection or observed HTTP409 application conflict. '
+                    'classified separately as a Git ref rejection or observed HTTP409 response. '
                     'HTTP409 is not a Git ref rejection or an explicit-old-OID CAS proof'}
         measure('pando_atomic_two_refs', lambda: h.git('push', '--atomic', remote,
                 'HEAD:refs/heads/atomic-a', 'HEAD:refs/heads/atomic-b', cwd=work, token=h.alice))
