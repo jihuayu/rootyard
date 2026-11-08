@@ -2,11 +2,11 @@
 //! Run with `ROOTYARD_TEST_DATABASE_URL=... cargo test --test ref_store_operations -- --ignored`.
 use anyhow::{Context, Result, anyhow};
 use deadpool_postgres::{Manager, Pool};
+use rootyard::db;
 use rootyard::ref_store::{
     IssuerLane, OperationIdentity, OperationLookup, OperationState, PgRefStore, RefStoreError, RequestDigest,
     TerminalOutcome, TerminalResult,
 };
-use rootyard::db;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -44,9 +44,7 @@ async fn setup(url: &str) -> Result<(Pool, Pool, String, Uuid, Uuid)> {
     let schema = format!("ref_store_test_{}", Uuid::new_v4().simple());
     admin.get().await?.batch_execute(&format!("CREATE SCHEMA {schema}")).await?;
     let mut config: tokio_postgres::Config = url.parse()?;
-    config.options(format!(
-        "-c search_path={schema} -c timezone=UTC -c statement_timeout=15000 -c lock_timeout=10000"
-    ));
+    config.options(format!("-c search_path={schema} -c timezone=UTC -c statement_timeout=15000 -c lock_timeout=10000"));
     let pool = Pool::builder(Manager::new(config, tokio_postgres::NoTls))
         .runtime(deadpool_postgres::Runtime::Tokio1)
         .max_size(8)
@@ -86,7 +84,8 @@ async fn same_digest_replays_and_different_digest_conflicts() -> Result<()> {
         tx.commit().await?;
 
         let tx = client.transaction().await?;
-        let committed = store.record_terminal(&tx, &original, TerminalOutcome::Committed, &result(1), deadline()).await?;
+        let committed =
+            store.record_terminal(&tx, &original, TerminalOutcome::Committed, &result(1), deadline()).await?;
         assert!(!committed.replayed);
         tx.commit().await?;
 
@@ -273,10 +272,7 @@ async fn reserved_sequences_are_transactional_and_monotonic() -> Result<()> {
         // Rollback does not consume the sequence.
         let operation = Uuid::new_v4();
         let tx = client.transaction().await?;
-        assert_eq!(
-            store.reserve_sequence(&tx, repo, actor, operation, &lane, deadline()).await?.sequence(),
-            1
-        );
+        assert_eq!(store.reserve_sequence(&tx, repo, actor, operation, &lane, deadline()).await?.sequence(), 1);
         tx.rollback().await?;
 
         let tx = client.transaction().await?;
@@ -288,10 +284,7 @@ async fn reserved_sequences_are_transactional_and_monotonic() -> Result<()> {
         tx.commit().await?;
 
         let tx = client.transaction().await?;
-        assert_eq!(
-            store.reserve_sequence(&tx, repo, actor, Uuid::new_v4(), &lane, deadline()).await?.sequence(),
-            2
-        );
+        assert_eq!(store.reserve_sequence(&tx, repo, actor, Uuid::new_v4(), &lane, deadline()).await?.sequence(), 2);
         tx.rollback().await?;
         Ok::<(), anyhow::Error>(())
     })
@@ -526,107 +519,112 @@ async fn registry_methods_observe_absolute_deadline_while_lock_blocked() -> Resu
 async fn reservation_begin_and_cancel_share_operation_lock_without_deadlock() -> Result<()> {
     let url = std::env::var("ROOTYARD_TEST_DATABASE_URL")?;
     let (admin, pool, schema, actor, repo) = setup(&url).await?;
-    let result = tokio::spawn(async move {
-        let operation = Uuid::new_v4();
-        let lane = IssuerLane::new("reservation-race").unwrap();
-        let digest = RequestDigest::from_bytes([31; 32]);
+    let result =
+        tokio::spawn(async move {
+            let operation = Uuid::new_v4();
+            let lane = IssuerLane::new("reservation-race").unwrap();
+            let digest = RequestDigest::from_bytes([31; 32]);
 
-        let (reserved_tx, reserved_rx) = oneshot::channel();
-        let (proceed_tx, proceed_rx) = oneshot::channel();
-        let (begun_tx, begun_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        let owner_pool = pool.clone();
-        let owner = tokio::spawn(async move {
-            let store = PgRefStore;
-            let mut client = owner_pool.get().await?;
-            let tx = client.transaction().await?;
-            let reservation = store.reserve_sequence(&tx, repo, actor, operation, &lane, deadline()).await?;
-            let identity = reservation.identity(digest)?;
-            reserved_tx.send(()).map_err(|_| anyhow!("reserved receiver dropped"))?;
-            proceed_rx.await?;
-            store.begin(&tx, &identity, deadline()).await?;
-            begun_tx.send(()).map_err(|_| anyhow!("begun receiver dropped"))?;
-            release_rx.await?;
-            tx.commit().await?;
-            Ok::<(), anyhow::Error>(())
-        });
-        reserved_rx.await?;
+            let (reserved_tx, reserved_rx) = oneshot::channel();
+            let (proceed_tx, proceed_rx) = oneshot::channel();
+            let (begun_tx, begun_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            let owner_pool = pool.clone();
+            let owner = tokio::spawn(async move {
+                let store = PgRefStore;
+                let mut client = owner_pool.get().await?;
+                let tx = client.transaction().await?;
+                let reservation = store.reserve_sequence(&tx, repo, actor, operation, &lane, deadline()).await?;
+                let identity = reservation.identity(digest)?;
+                reserved_tx.send(()).map_err(|_| anyhow!("reserved receiver dropped"))?;
+                proceed_rx.await?;
+                store.begin(&tx, &identity, deadline()).await?;
+                begun_tx.send(()).map_err(|_| anyhow!("begun receiver dropped"))?;
+                release_rx.await?;
+                tx.commit().await?;
+                Ok::<(), anyhow::Error>(())
+            });
+            reserved_rx.await?;
 
-        let (cancel_started_tx, cancel_started_rx) = oneshot::channel();
-        let cancel_pool = pool.clone();
-        let cancel_identity = identity_with_lane(repo, actor, "reservation-race", 1, operation, 31);
-        let cancel_task = tokio::spawn(async move {
-            let store = PgRefStore;
-            let mut client = cancel_pool.get().await?;
-            let tx = client.transaction().await?;
-            let backend_pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
-            cancel_started_tx.send(backend_pid).map_err(|_| anyhow!("cancel start receiver dropped"))?;
-            let outcome = match store.cancel(&tx, &cancel_identity, deadline()).await {
-                Ok(_) => {
-                    tx.commit().await?;
-                    None
-                }
-                Err(error) => {
-                    tx.rollback().await?;
-                    Some(error)
-                }
-            };
-            Ok::<Option<RefStoreError>, anyhow::Error>(outcome)
-        });
-        let cancel_pid = cancel_started_rx.await?;
-        let observer = pool.get().await?;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let waiting: bool = observer.query_one(
+            let (cancel_started_tx, cancel_started_rx) = oneshot::channel();
+            let cancel_pool = pool.clone();
+            let cancel_identity = identity_with_lane(repo, actor, "reservation-race", 1, operation, 31);
+            let cancel_task = tokio::spawn(async move {
+                let store = PgRefStore;
+                let mut client = cancel_pool.get().await?;
+                let tx = client.transaction().await?;
+                let backend_pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+                cancel_started_tx.send(backend_pid).map_err(|_| anyhow!("cancel start receiver dropped"))?;
+                let outcome = match store.cancel(&tx, &cancel_identity, deadline()).await {
+                    Ok(_) => {
+                        tx.commit().await?;
+                        None
+                    }
+                    Err(error) => {
+                        tx.rollback().await?;
+                        Some(error)
+                    }
+                };
+                Ok::<Option<RefStoreError>, anyhow::Error>(outcome)
+            });
+            let cancel_pid = cancel_started_rx.await?;
+            let observer = pool.get().await?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let waiting: bool = observer.query_one(
                     "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted)",
                     &[&cancel_pid],
                 ).await?.get(0);
-                if waiting { break Ok::<(), anyhow::Error>(()); }
-                assert!(!cancel_task.is_finished(), "cancel finished before reaching the advisory-lock barrier");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }).await.context("cancel never reached the advisory-lock barrier")??;
-        drop(observer);
-
-        // The owner can still enter begin while the cancel waits. Without the
-        // pre-reservation operation lock this would invert into a lane/operation
-        // deadlock. A database deadlock error fails this test below.
-        proceed_tx.send(()).map_err(|_| anyhow!("proceed receiver dropped"))?;
-        tokio::time::timeout(Duration::from_secs(5), begun_rx)
+                    if waiting {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    assert!(!cancel_task.is_finished(), "cancel finished before reaching the advisory-lock barrier");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
             .await
-            .expect("begin deadlocked against reservation/cancel")?;
-        release_tx.send(()).map_err(|_| anyhow!("release receiver dropped"))?;
-        owner.await??;
+            .context("cancel never reached the advisory-lock barrier")??;
+            drop(observer);
 
-        let cancel_outcome = tokio::time::timeout(Duration::from_secs(5), cancel_task)
-            .await
-            .expect("cancel deadlocked after owner commit")??;
-        assert!(cancel_outcome.is_none(), "unexpected serialized cancel error: {cancel_outcome:?}");
+            // The owner can still enter begin while the cancel waits. Without the
+            // pre-reservation operation lock this would invert into a lane/operation
+            // deadlock. A database deadlock error fails this test below.
+            proceed_tx.send(()).map_err(|_| anyhow!("proceed receiver dropped"))?;
+            tokio::time::timeout(Duration::from_secs(5), begun_rx)
+                .await
+                .expect("begin deadlocked against reservation/cancel")?;
+            release_tx.send(()).map_err(|_| anyhow!("release receiver dropped"))?;
+            owner.await??;
 
-        let mut client = pool.get().await?;
-        let tx = client.transaction().await?;
-        let row = tx
-            .query_one(
-                "SELECT issuer_id,lane,state FROM ref_store_operations WHERE repository_id=$1 AND operation_id=$2",
-                &[&repo, &operation],
-            )
-            .await?;
-        assert_eq!(row.get::<_, Uuid>(0), actor);
-        assert_eq!(row.get::<_, String>(1), "reservation-race");
-        assert_eq!(row.get::<_, String>(2), "cancelled");
-        let tombstones: i64 = tx
-            .query_one(
-                "SELECT count(*) FROM ref_store_cancellations WHERE repository_id=$1 AND operation_id=$2",
-                &[&repo, &operation],
-            )
-            .await?
-            .get(0);
-        assert_eq!(tombstones, 1);
-        tx.rollback().await?;
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("reservation/begin/cancel race test panicked");
+            let cancel_outcome = tokio::time::timeout(Duration::from_secs(5), cancel_task)
+                .await
+                .expect("cancel deadlocked after owner commit")??;
+            assert!(cancel_outcome.is_none(), "unexpected serialized cancel error: {cancel_outcome:?}");
+
+            let mut client = pool.get().await?;
+            let tx = client.transaction().await?;
+            let row = tx
+                .query_one(
+                    "SELECT issuer_id,lane,state FROM ref_store_operations WHERE repository_id=$1 AND operation_id=$2",
+                    &[&repo, &operation],
+                )
+                .await?;
+            assert_eq!(row.get::<_, Uuid>(0), actor);
+            assert_eq!(row.get::<_, String>(1), "reservation-race");
+            assert_eq!(row.get::<_, String>(2), "cancelled");
+            let tombstones: i64 = tx
+                .query_one(
+                    "SELECT count(*) FROM ref_store_cancellations WHERE repository_id=$1 AND operation_id=$2",
+                    &[&repo, &operation],
+                )
+                .await?
+                .get(0);
+            assert_eq!(tombstones, 1);
+            tx.rollback().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("reservation/begin/cancel race test panicked");
     teardown(&admin, &schema).await?;
     result??;
     Ok(())

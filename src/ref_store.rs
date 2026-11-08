@@ -10,6 +10,7 @@ pub mod pg;
 
 pub use contract::{
     BeginReceipt, CancelReceipt, Capabilities, CommitReceipt, IssuerLane, OperationIdentity, OperationLookup,
-    OperationRecord, OperationState, RefStoreError, RequestDigest, SequenceReservation, TerminalOutcome, TerminalResult,
+    OperationRecord, OperationState, RefStoreError, RequestDigest, SequenceReservation, TerminalOutcome,
+    TerminalResult,
 };
 pub use pg::PgRefStore;
