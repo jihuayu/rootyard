@@ -1,0 +1,185 @@
+{
+  "version": 1,
+  "issue": "126",
+  "supporting": [
+    "prioritized105"
+  ],
+  "profile": "legacy-pando-ref-status-native",
+  "status": "failed",
+  "started_at": "2026-11-08T10:44:51.514777+00:00",
+  "runner_path": "/workspace/scratch/state-pando-ref-status-native.py",
+  "runner_sha256_before": "b2377ff63c636db602a893bc88920ad8d467329c8848a7d768a817709fce27bd",
+  "binary_path": "/workspace/scratch/state-pando-ref-status-app-v1/rootyard",
+  "source_root": "/workspace/scratch/state-pando-ref-status",
+  "case_inventory": [
+    "legacy_pando_setup",
+    "same_old_oid_two_stock_clients_one_winner",
+    "loser_negotiated_sideband_ng_reason",
+    "atomic_multiref_rejection_no_ref_changed",
+    "auth_failure_distinct_from_refusal",
+    "post_commit_response_lost_unknown_transport",
+    "source_binary_runner_stable"
+  ],
+  "cases": [
+    {
+      "name": "legacy_pando_setup",
+      "status": "passed",
+      "detail": {
+        "repository_id": "1c28fc05-34a6-4081-912d-cb0dfef0b337",
+        "clone_path": "/git/alice/retstatus-cas.git",
+        "seed_oid": "308106a073f59a770c9c14631f77800d8b88980f",
+        "contender_oids": [
+          "f5a995bb7b04f5518b41995abcfc64874e5520f9",
+          "db77eec0427bd5c15acaece7a953dc325434561b"
+        ],
+        "mode": "GitFS seed, offline Pando cutover, stock Git clones"
+      },
+      "seconds": 8.3036
+    },
+    {
+      "name": "same_old_oid_two_stock_clients_one_winner",
+      "status": "failed",
+      "error": "client A basis is not the current advertised old OID",
+      "seconds": 1.0574
+    },
+    {
+      "name": "loser_negotiated_sideband_ng_reason",
+      "status": "failed",
+      "error": "blocked: synchronized race capture is unavailable: client A basis is not the current advertised old OID",
+      "seconds": 0.0001
+    },
+    {
+      "name": "atomic_multiref_rejection_no_ref_changed",
+      "status": "failed",
+      "error": "atomic push produced no receive POST; connection, auth or transport failure is not acceptance",
+      "seconds": 4.4181
+    },
+    {
+      "name": "auth_failure_distinct_from_refusal",
+      "status": "passed",
+      "detail": {
+        "http_statuses": [
+          401,
+          403
+        ],
+        "unauthenticated_returncode": 128,
+        "read_only_returncode": 128,
+        "posts": 0,
+        "ng_seen": false,
+        "refs_unchanged": true,
+        "classification": "authentication_or_authorization_failure_before_receive",
+        "not_a_ref_refusal": true
+      },
+      "seconds": 3.9036
+    },
+    {
+      "name": "post_commit_response_lost_unknown_transport",
+      "status": "failed",
+      "error": "response-drop receive POST count; observed 0",
+      "seconds": 3.2791
+    },
+    {
+      "name": "source_binary_runner_stable",
+      "status": "passed",
+      "detail": {
+        "binary_sha256_before_and_after": "7d1cea075bf3f36c5079120ab6d0a7b5c9deca589fa0d754a6b7b5ab69c8b5bb",
+        "source_inputs_sha256_before_and_after": "7d109c35cc0b7990e4cb9becf5321ac2a8fe567c85cc06d63ba6eb272e1355a7",
+        "runner_sha256_before_and_after": "b2377ff63c636db602a893bc88920ad8d467329c8848a7d768a817709fce27bd",
+        "build_receipt_bound": true
+      },
+      "seconds": 0.1389
+    }
+  ],
+  "environment": {
+    "ROOTYARD_TEST_DATABASE_URL_present": true,
+    "ROOTYARD_OBJECT_STORE_ENDPOINT_present": true,
+    "credentials_or_headers_recorded": false,
+    "note": "Only presence booleans are recorded; values, argv and HTTP header values are never written."
+  },
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "memory_total": "18440100 kB",
+    "scope": "host-visible resources; not a reserved allocation"
+  },
+  "provider_versions": {
+    "garage": null,
+    "vault": null,
+    "reason": "service executables are not inspected by this harness"
+  },
+  "limits": [
+    "One physical host and loopback services; no HA, durability, power-loss or throughput qualification.",
+    "The two stock clients are synchronized only at authenticated advertisement GETs; server CAS ordering after the barrier is not forced.",
+    "The response-drop case is an owned proxy closing after the complete upstream response; it is not a general network partition.",
+    "Full client operation query/retry idempotency (#112/#117) is not exercised; no issue126-complete claim follows from this report.",
+    "No FUSE, mount, kernel control or old FUSE directory is used or traversed."
+  ],
+  "unmeasured": {
+    "server_cas_order": null,
+    "network_partition": null,
+    "client_retry_idempotency": null,
+    "throughput": null
+  },
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "7d1cea075bf3f36c5079120ab6d0a7b5c9deca589fa0d754a6b7b5ab69c8b5bb",
+    "source_inputs_sha256": "7d109c35cc0b7990e4cb9becf5321ac2a8fe567c85cc06d63ba6eb272e1355a7",
+    "workspace_commit": "fc8fe80d286a500ba4ba6fece6dcd984eb541e03",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-pando-ref-status#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-pando-ref-status#rootyard@0.1.0"
+      }
+    ]
+  },
+  "receipt_path": "/workspace/scratch/state-pando-ref-status-app-v1/rootyard.build.json",
+  "binary_bytes": 87413176,
+  "binary_sha256_before": "7d1cea075bf3f36c5079120ab6d0a7b5c9deca589fa0d754a6b7b5ab69c8b5bb",
+  "source_inputs_sha256_before": "7d109c35cc0b7990e4cb9becf5321ac2a8fe567c85cc06d63ba6eb272e1355a7",
+  "cargo_lock_sha256": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+  "git_client_version": "git version 2.52.0",
+  "finished_at": "2026-11-08T10:45:12.910548+00:00",
+  "seconds": 21.3958,
+  "runner_sha256_after": "b2377ff63c636db602a893bc88920ad8d467329c8848a7d768a817709fce27bd",
+  "binary_sha256_after": "7d1cea075bf3f36c5079120ab6d0a7b5c9deca589fa0d754a6b7b5ab69c8b5bb",
+  "source_inputs_sha256_after": "7d109c35cc0b7990e4cb9becf5321ac2a8fe567c85cc06d63ba6eb272e1355a7",
+  "binary_still_matches": true,
+  "source_still_matches": true,
+  "runner_still_matches": true,
+  "fixture_root": "/tmp/rootyard-e2e-ylc5gw01",
+  "fixture_retained": false
+}
