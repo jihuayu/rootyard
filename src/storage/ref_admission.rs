@@ -570,10 +570,14 @@ pub async fn rollback_fenced(state: &AppState, operation: &journal::Operation) -
 
 async fn rollback_refs(state: &AppState, repository_id: Uuid, changes: &[journal::RefChange]) -> anyhow::Result<()> {
     for change in changes {
+        // A missing ref must read as "absent", not as a failed observation:
+        // `show-ref --verify` reports absence as the generic fatal 128, while
+        // the quiet `rev-parse --verify` probe answers exactly 1 for it.
         let observed = match crate::browse::git_read::run_git(
             state,
             repository_id,
-            &["show-ref", "--verify", "--hash", &change.ref_name],
+            crate::browse::git_read::GitStep::RefVerify,
+            &["rev-parse", "--verify", "--quiet", &change.ref_name],
             128,
         )
         .await
