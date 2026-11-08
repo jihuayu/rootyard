@@ -266,17 +266,9 @@ pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("repository is missing during ref settlement"))?;
-    if repo.get::<_, i64>(0) != storage_generation {
-        anyhow::bail!("repository generation changed during ref settlement");
-    }
     let repo_state: String = repo.get(1);
     let recovery_reason: String = repo.get(2);
     let proof_present = no_grant.is_some() || recorded.is_some();
-    if repo_state != "ready"
-        && !(proof_present && repo_state == "recovering" && recovery_reason == "push_outcome_unknown")
-    {
-        anyhow::bail!("repository state does not allow ref settlement");
-    }
     let row = tx
         .query_opt(
             "SELECT state,shard_epoch,actor_id,token_id,ref_names FROM git_ref_admissions WHERE writer_id=$1 AND repository_id=$2 FOR UPDATE",
@@ -299,6 +291,17 @@ pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
     }
     if state == State::FencedAborted {
         anyhow::bail!("ref admission is fenced");
+    }
+    // Only an ADMITTED settlement has to project into the current repository
+    // generation/state; a terminal replay below is already durable and only
+    // repeats identical rows.
+    if repo.get::<_, i64>(0) != storage_generation {
+        anyhow::bail!("repository generation changed during ref settlement");
+    }
+    if repo_state != "ready"
+        && !(proof_present && repo_state == "recovering" && recovery_reason == "push_outcome_unknown")
+    {
+        anyhow::bail!("repository state does not allow ref settlement");
     }
     let admitted_epoch: i64 = row.get(1);
     if admitted_epoch != admission.shard_epoch {
