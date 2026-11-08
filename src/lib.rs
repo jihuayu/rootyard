@@ -4,6 +4,7 @@
 #[rustfmt::skip]
 pub mod auth;
 pub mod backup;
+pub mod baseline_metrics;
 #[rustfmt::skip]
 pub mod browse;
 #[rustfmt::skip]

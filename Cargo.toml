@@ -13,6 +13,9 @@ rust-version = "1.88"
 
 [features]
 pando-lab = []
+# Opt-in, default-OFF phase instrumentation for #106 baseline evidence. Adds no
+# dependencies; a default build compiles no recording code.
+state-baseline-metrics = []
 
 [[bin]]
 name = "rootyard-pando-lab"

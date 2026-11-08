@@ -353,6 +353,9 @@ fn render(
         );
         metrics_workers::render(&mut output, workers);
     }
+    // Opt-in (#106) phase observations, fixed series only. A default build
+    // compiles this to nothing, so the exposition above is unchanged.
+    crate::baseline_metrics::render(&mut output);
     output
 }
 
@@ -421,6 +424,10 @@ mod tests {
             let (name, value) = line.split_once(' ').unwrap();
             assert!(name.starts_with("rootyard_"));
             assert!(value.parse::<f64>().unwrap().is_finite());
+            // Opt-in baseline series have their own fixed-label test.
+            if name.starts_with("rootyard_baseline_") {
+                continue;
+            }
             if let Some((_, label)) = name.split_once('{') {
                 let mut allowed: Vec<String> = [
                     "outcome=\"success\"}",
@@ -451,7 +458,12 @@ mod tests {
                 assert!(allowed.iter().any(|entry| entry.as_str() == label), "unexpected label {label}");
             }
         }
-        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), 91);
+        let mut baseline = String::new();
+        crate::baseline_metrics::render(&mut baseline);
+        assert_eq!(
+            text.lines().filter(|l| !l.starts_with('#')).count(),
+            91 + baseline.lines().filter(|l| !l.starts_with('#')).count()
+        );
     }
 
     #[test]

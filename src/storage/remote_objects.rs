@@ -1,6 +1,7 @@
 //! Streaming, content-addressed object storage shared by pack, LFS and workspace publishers.
 //! Keys are tenant-scoped and immutable; callers publish their database manifests only
 //! after `put_file` and a verifying read complete.
+use crate::baseline_metrics::{Outcome, Phase, Timer};
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
@@ -205,14 +206,25 @@ impl RemoteObjectStore {
     ) -> Result<StoredObject> {
         let actual = hash_file(source, deadline).await?;
         ensure!(actual.size == expected_size && actual.sha256 == key.sha256, "object source digest or size mismatch");
-        match self {
-            Self::Local(root) => local_put(root, key, source, deadline).await?,
-            Self::S3(s3) => s3.put(key, source, expected_size, deadline).await?,
+        // Bytes are this process's source stream length, counted only after the
+        // upload reports success. Client-internal retries are unknown here.
+        let upload = Timer::start(Phase::RemotePut);
+        let uploaded = match self {
+            Self::Local(root) => local_put(root, key, source, deadline).await,
+            Self::S3(s3) => s3.put(key, source, expected_size, deadline).await,
+        };
+        match uploaded {
+            Ok(()) => upload.finish_with_bytes(Outcome::Ok, expected_size),
+            Err(error) => {
+                upload.finish(Outcome::Error);
+                return Err(error);
+            }
         }
         let head = self.head(key, deadline).await?.context("uploaded object is missing")?;
         ensure!(head.size == expected_size, "uploaded object is truncated");
         let verification = std::env::temp_dir().join(format!("rootyard-verify-{}", Uuid::new_v4()));
-        let verified = self.get_to_file(key, &verification, expected_size, deadline).await;
+        let verified =
+            self.fetch_to_file(Phase::RemoteVerifiedReadback, key, &verification, expected_size, deadline).await;
         let _ = fs::remove_file(&verification).await;
         verified?;
         Ok(actual)
@@ -242,10 +254,25 @@ impl RemoteObjectStore {
         expected_size: u64,
         deadline: Instant,
     ) -> Result<()> {
+        self.fetch_to_file(Phase::RemoteGet, key, destination, expected_size, deadline).await
+    }
+
+    /// Shared download path. The caller picks the fixed phase, so a plain GET and
+    /// a post-upload verification read are never conflated and never both counted
+    /// for one transfer.
+    async fn fetch_to_file(
+        &self,
+        phase: Phase,
+        key: &ObjectKey,
+        destination: &Path,
+        expected_size: u64,
+        deadline: Instant,
+    ) -> Result<()> {
         let parent = destination.parent().context("object destination parent missing")?;
         fs::create_dir_all(parent).await?;
         let temp = parent.join(format!(".rootyard-object-{}", Uuid::new_v4()));
         let _temp_guard = TempObject { path: temp.clone() };
+        let transfer = Timer::start(phase);
         let result = async {
             let mut out = fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
             let mut hash = Sha256::new();
@@ -286,13 +313,17 @@ impl RemoteObjectStore {
             out.sync_all().await?;
             fs::rename(&temp, destination).await?;
             File::open(parent).await?.sync_all().await?;
-            Ok::<(), anyhow::Error>(())
+            Ok::<u64, anyhow::Error>(size)
         }
         .await;
+        match &result {
+            Ok(bytes) => transfer.finish_with_bytes(Outcome::Ok, *bytes),
+            Err(_) => transfer.finish(Outcome::Error),
+        }
         if result.is_err() {
             let _ = fs::remove_file(&temp).await;
         }
-        result
+        result.map(|_| ())
     }
 
     pub async fn get_range(&self, key: &ObjectKey, start: u64, len: u64, deadline: Instant) -> Result<Vec<u8>> {

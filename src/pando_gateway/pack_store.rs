@@ -2,6 +2,7 @@
 //! the PostgreSQL manifest is the sole authority for a ready pack set.
 use super::retention::{self, Slot};
 use crate::{
+    baseline_metrics::{Phase, timed_result},
     git_http,
     storage::{
         encrypted_objects::{self, Envelope, VaultTransit},
@@ -265,7 +266,7 @@ impl PackStore {
         };
         for _ in 0..3 {
             let (cipher_slot, pack_envelope_slot, index_cipher_slot, index_envelope_slot) = {
-                let mut client = pool.get().await?;
+                let mut client = timed_result(Phase::PoolCheckout, pool.get()).await?;
                 let tx = client.transaction().await?;
                 let (cipher, envelope) = retention::reserve_pair(
                     &*tx,
@@ -293,7 +294,7 @@ impl PackStore {
                 .await?;
             Box::pin(self.upload_slot(&index_envelope_slot, &index_envelope, index_receipt.envelope_bytes, deadline))
                 .await?;
-            let mut client = pool.get().await?;
+            let mut client = timed_result(Phase::PoolCheckout, pool.get()).await?;
             let tx = client.transaction().await?;
             let authority = retention::authority(&*tx).await?;
             let active = retention::activate(
@@ -393,7 +394,7 @@ impl PackStore {
     }
 
     async fn load_manifest(&self, pool: &Pool, repository_id: Uuid, pack_id: Uuid) -> Result<PackManifest> {
-        let client = pool.get().await?;
+        let client = timed_result(Phase::PoolCheckout, pool.get()).await?;
         let row = client
             .query_one(
                 "SELECT tenant_id,storage_generation,object_format,manifest             FROM pando_pack_manifests WHERE repository_id=$1 AND id=$2",
@@ -522,7 +523,7 @@ impl PackStore {
     ) -> Result<PackManifest> {
         let manifest = self.load_manifest(pool, repository_id, pack_id).await?;
         let (pack_cipher, pack_envelope, index_cipher, index_envelope) = {
-            let client = pool.get().await?;
+            let client = timed_result(Phase::PoolCheckout, pool.get()).await?;
             let pack_cipher = retention::resolve_artifact(
                 &**client,
                 manifest.tenant_id,
