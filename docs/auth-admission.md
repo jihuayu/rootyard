@@ -80,8 +80,8 @@ status/body, so an unauthenticated caller cannot distinguish them.
   hot source is `O(log n)` and never accumulates stale positions. Expired
   entries are removed lazily with a fixed budget of at most 64 removals per
   admission check, and at the bound the least-recently-seen entry is evicted in
-  `O(log n)`. No admission check scans the whole table, so per-request work does
-  not grow with `max_sources`.
+  `O(log n)`. No admission check scans the whole table; each check performs at
+  most 64 expiry removals and one capacity eviction.
 - **No secret/identity telemetry:** rejections carry fixed generic text. Counters
   are aggregate process counters with no labels and are not exported with peer,
   username or credential dimensions.
