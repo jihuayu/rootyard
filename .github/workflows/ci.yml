@@ -84,6 +84,9 @@ jobs:
       - run: cargo test --locked --all-targets --features pando-lab
       - name: Verify durable PostgreSQL workers
         run: cargo test --locked --features pando-lab --test outbox --test resolution_fences -- --ignored
+      - name: Verify PostgreSQL RefStore registry and metadata-core contracts
+        timeout-minutes: 5
+        run: cargo test --locked --features pando-lab --test ref_store_operations --test ref_store_core -- --ignored --test-threads=1
       - run: python3 scripts/build_native.py --features pando-lab --bins
       - run: cargo build --locked --bin rootyard-view-lab
       - name: Verify design documentation integrity
@@ -151,6 +154,9 @@ jobs:
         run: python3 tests/recorded_recovery.py --binary target/debug/rootyard --report test-results/recorded-recovery.json
       - name: Exercise offline backup and fresh database restore
         run: python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json
+      - name: Restore populated PostgreSQL RefStore metadata from backup15
+        timeout-minutes: 5
+        run: python3 tests/backup_refstore_core139.py --binary target/debug/rootyard --report test-results/backup-refstore-core.json
       - name: Exercise restored schema-003 recovery protections
         run: python3 tests/backup_recovery.py --binary target/debug/rootyard --report test-results/backup-recovery.json
       - name: Exercise independent workers after fresh restore
