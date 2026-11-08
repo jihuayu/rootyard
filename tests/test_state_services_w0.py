@@ -53,6 +53,9 @@ class StateServicesDocumentsTest(unittest.TestCase):
                 with self.subTest(profile=document["profile"], wal=invalid):
                     candidate = dict(document, metadata_wal_store=invalid)
                     self.assertTrue(checks.validate_schema(candidate, schema, schema))
+            omitted = dict(document)
+            omitted.pop('metadata_wal_store', None)
+            self.assertTrue(checks.validate_schema(omitted, schema, schema))
 
     def test_table_inventory_rejects_mentions_without_ddl(self):
         self.assertFalse(checks.declares_table('-- CREATE TABLE ghost(id int);', 'ghost'))

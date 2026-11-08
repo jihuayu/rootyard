@@ -46,8 +46,8 @@ python3 scripts/state_services_baseline.py \
 
 ## 明确未完成（#106 保持 OPEN）
 
-- 已记录可重跑原生 legacy Pando v4 基线；它不代表新后端、精确 CAS 竞态、多故障域或完整 #106 验收。
-- v1 因错误 PG selector 被拒绝；v4 使用 API 自有 socket 的 client port 匹配 PG 连接，并替代 v2/v3 草稿测量。零采样锁等待不能证明无争用。
+- 已记录可重跑原生 legacy Pando v5 基线；它不代表新后端、精确 CAS 竞态、多故障域或完整 #106 验收。
+- v1 因错误 PG selector 被拒绝；v5 使用 API 自有 socket 的 client port 匹配 PG 连接，并替代 v2/v3 草稿测量。零采样锁等待不能证明无争用。
 - 全阶段 waits、Blob bytes、真实多主机/多故障域和完整 producer coverage 仍为 null/unmeasured。
 - 设计中的 Scope CLOSING/CancelDecision、RefStore、BlobStore/OpenDAL、W1–W9 均未实现。
 - 现有生产路径继续是 **legacy** GitFS/PG 或已存在的 Pando remote+Vault 路径；不得把两者标成 target/new deployment。

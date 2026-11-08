@@ -12,7 +12,8 @@
     "content_store",
     "database_url_env",
     "data_dir",
-    "limits"
+    "limits",
+    "metadata_wal_store"
   ],
   "properties": {
     "schema": {

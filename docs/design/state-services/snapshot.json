@@ -44,9 +44,10 @@
     "tests": "tests/test_state_services_w0.py",
     "baseline_evidence": "evidence/state-services/w0-local-git-smoke.json",
     "native_baseline_runner": "scripts/state_services_native_baseline.py",
-    "native_baseline_report": "evidence/state-services/w0-native-legacy-pando-v4.json",
+    "native_baseline_report": "evidence/state-services/w0-native-legacy-pando-v5.json",
     "native_build_helper": "scripts/build_native.py",
-    "native_build_tests": "tests/test_native_build_receipt.py"
+    "native_build_tests": "tests/test_native_build_receipt.py",
+    "native_baseline_input_tests": "tests/test_state_services_native_baseline.py"
   },
   "truth_boundary": {
     "code_changed_by_w0": false,

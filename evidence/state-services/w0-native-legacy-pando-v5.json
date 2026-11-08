@@ -1,0 +1,381 @@
+{
+  "version": 1,
+  "status": "passed",
+  "profile": "legacy-pando-s3-vault",
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "f39838f139e27d6f00a55a88c7ef98974c993f2da3139e0eb3b4e04b05ff8e0b",
+    "source_inputs_sha256": "6225c08c28ace0bc45c4e6810e0e8642ee4215a9cb0bc930b87d5fa3eab7fb10",
+    "workspace_commit": "d689bf8062a73cfadbc0a72abf3f1546d992e09c",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/round5-implementation/baseline-source#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/round5-implementation/baseline-source#rootyard@0.1.0"
+      }
+    ]
+  },
+  "binary_bytes": 279117272,
+  "runner_sha256": "8a36ccc9e8db2ac7a79425ee4af8a0c979d80992d44bb1bf93c82042650bed01",
+  "cases": [
+    {
+      "name": "schema_accounts_server_ready",
+      "seconds": 2.2398219009992317,
+      "status": "passed"
+    },
+    {
+      "name": "gitfs_seed_push_0",
+      "seconds": 0.4108710610016715,
+      "status": "passed"
+    },
+    {
+      "name": "gitfs_seed_push_1",
+      "seconds": 0.3438127409972367,
+      "status": "passed"
+    },
+    {
+      "name": "offline_pando_cutover_state-baseline-0",
+      "seconds": 1.0604244300047867,
+      "status": "passed"
+    },
+    {
+      "name": "offline_pando_cutover_state-baseline-1",
+      "seconds": 1.0823983059963211,
+      "status": "passed"
+    },
+    {
+      "name": "pando_server_ready",
+      "seconds": 1.4968824290044722,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_0_0",
+      "seconds": 1.8640733549982542,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_0_1",
+      "seconds": 1.940632858000754,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_0_2",
+      "seconds": 1.9154684280001675,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_1_0",
+      "seconds": 1.857329883001512,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_1_1",
+      "seconds": 1.8443240269989474,
+      "status": "passed"
+    },
+    {
+      "name": "pando_serial_push_1_2",
+      "seconds": 2.0078472130044247,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_0_ref_3",
+      "seconds": 2.050807526000426,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_0_ref_1",
+      "seconds": 2.281592314997397,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_0_ref_0",
+      "seconds": 2.3823434980004095,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_0_ref_2",
+      "seconds": 2.4651544770022156,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_1_ref_2",
+      "seconds": 1.6936989480018383,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_1_ref_0",
+      "seconds": 2.0735482199961552,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_1_ref_3",
+      "seconds": 1.8141240529948846,
+      "status": "passed"
+    },
+    {
+      "name": "pando_parallel_repo_1_ref_1",
+      "seconds": 2.0953094610013068,
+      "status": "passed"
+    },
+    {
+      "name": "pando_cross_repo_new_pack_0",
+      "seconds": 2.7238267670036294,
+      "status": "passed"
+    },
+    {
+      "name": "pando_cross_repo_new_pack_1",
+      "seconds": 2.766144560999237,
+      "status": "passed"
+    },
+    {
+      "name": "pando_same_ref_contender_1",
+      "seconds": 2.6992686000012327,
+      "status": "passed"
+    },
+    {
+      "name": "pando_same_ref_contender_0",
+      "seconds": 3.7297311829970567,
+      "status": "passed"
+    },
+    {
+      "name": "pando_atomic_two_refs",
+      "seconds": 1.8717451929987874,
+      "status": "passed"
+    },
+    {
+      "name": "pando_cold_clone_0",
+      "seconds": 3.6992551400035154,
+      "status": "passed"
+    },
+    {
+      "name": "pando_warm_clone_0",
+      "seconds": 2.9114438540054834,
+      "status": "passed"
+    },
+    {
+      "name": "pando_cold_clone_1",
+      "seconds": 3.0555368140048813,
+      "status": "passed"
+    },
+    {
+      "name": "pando_warm_clone_1",
+      "seconds": 2.0437059870018857,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_0",
+      "seconds": 0.005749174000811763,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_1",
+      "seconds": 0.0044369709939928725,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_2",
+      "seconds": 0.004108815002837218,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_3",
+      "seconds": 0.0030435789958573878,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_4",
+      "seconds": 0.00341798500448931,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_5",
+      "seconds": 0.002790872000332456,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_6",
+      "seconds": 0.0029905200062785298,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_7",
+      "seconds": 0.0033490819987491705,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_8",
+      "seconds": 0.0030096350019448437,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_9",
+      "seconds": 0.0029422309962683357,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_10",
+      "seconds": 0.003074572996411007,
+      "status": "passed"
+    },
+    {
+      "name": "api_repo_list_11",
+      "seconds": 0.003003985999384895,
+      "status": "passed"
+    }
+  ],
+  "harness_sha256": "c5a2964e687b4c10b77f548defd0f25407e42c0a57a64ffaddc7bb7b2a128dbc",
+  "cargo_lock_sha256": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+  "hardware": {
+    "kernel": "6.18.57",
+    "machine": "x86_64",
+    "logical_cpus": 5,
+    "memory_total": "18440100 kB",
+    "scope": "host-visible resources; not a reserved hardware allocation"
+  },
+  "provider_versions": {
+    "garage": null,
+    "vault": null,
+    "reason": "service executable inspection unavailable to test uid"
+  },
+  "limits": [
+    "One physical host, loopback PostgreSQL/Garage/Vault; no throughput or HA qualification.",
+    "Small fixed workload; no production latency objective inferred.",
+    "PG sampling every 250ms can miss short waits; observed peak is a lower bound.",
+    "Git materialization, internal lock wait, and Blob costs are not separately instrumented."
+  ],
+  "unmeasured": {
+    "git_materialization_ms": null,
+    "blob_io_bytes": null,
+    "exact_lock_wait_ms": null,
+    "artifact_authority_contention_ms": null,
+    "native_git_cpu_seconds": null,
+    "peak_temp_disk_bytes": null
+  },
+  "idle_after_setup": {
+    "VmHWM": 31260,
+    "VmRSS": 31260,
+    "Threads": 5,
+    "units": {
+      "VmRSS": "KiB",
+      "VmHWM": "KiB",
+      "Threads": "count"
+    }
+  },
+  "pg_version": "17.11 (Debian 17.11-0+deb13u1)",
+  "git_version": "git version 2.52.0",
+  "idle_pando": {
+    "VmHWM": 31808,
+    "VmRSS": 31808,
+    "Threads": 5,
+    "units": {
+      "VmRSS": "KiB",
+      "VmHWM": "KiB",
+      "Threads": "count"
+    }
+  },
+  "same_ref_result": {
+    "contenders": 2,
+    "accepted": 1,
+    "rejected": 1,
+    "winner_read_back": true,
+    "mode": "ordinary competing Git pushes; advertised old OIDs are not synchronized"
+  },
+  "final_resources": {
+    "VmHWM": 40856,
+    "VmRSS": 40856,
+    "Threads": 8,
+    "units": {
+      "VmRSS": "KiB",
+      "VmHWM": "KiB",
+      "Threads": "count"
+    }
+  },
+  "latency_ms": {
+    "serial_push": {
+      "n": 6,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 1864.0733549982542,
+      "p95": 2007.8472130044247,
+      "p99": 2007.8472130044247
+    },
+    "different_ref": {
+      "n": 8,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 2073.5482199961552,
+      "p95": 2465.1544770022156,
+      "p99": 2465.1544770022156
+    },
+    "cross_repo_new_pack": {
+      "n": 2,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 2723.8267670036294,
+      "p95": 2766.144560999237,
+      "p99": 2766.144560999237
+    },
+    "same_ref": {
+      "n": 2,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 2699.2686000012327,
+      "p95": 3729.7311829970567,
+      "p99": 3729.7311829970567
+    },
+    "cold_clone": {
+      "n": 2,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 3055.5368140048813,
+      "p95": 3699.2551400035154,
+      "p99": 3699.2551400035154
+    },
+    "warm_clone": {
+      "n": 2,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 2043.7059870018857,
+      "p95": 2911.4438540054834,
+      "p99": 2911.4438540054834
+    },
+    "api_list": {
+      "n": 12,
+      "method": "nearest rank; small-sample descriptive only",
+      "p50": 3.043578995857388,
+      "p95": 5.749174000811763,
+      "p99": 5.749174000811763
+    }
+  },
+  "pg_samples": {
+    "count": 160,
+    "peak_connections": 15,
+    "peak_lock_waiters": 0,
+    "peak_active": 2,
+    "errors": []
+  },
+  "fixture_root": "/tmp/rootyard-e2e-ekyizatp",
+  "binary_still_matches": true,
+  "source_still_matches": true
+}

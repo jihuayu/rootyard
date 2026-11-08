@@ -13,6 +13,7 @@ import statistics
 import sys
 import threading
 import time
+import uuid
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 if not __debug__:
@@ -21,6 +22,34 @@ if not __debug__:
 HARNESS_ROOT = Path(os.environ.get('ROOTYARD_BASELINE_HARNESS_ROOT', Path(__file__).resolve().parents[1])).resolve()
 sys.path.insert(0, str(HARNESS_ROOT / 'tests'))
 from e2e import Harness
+
+def validate_repository(repo, name, expected_id=None):
+    value = repo.get('id')
+    try:
+        identity = uuid.UUID(value) if isinstance(value, str) else None
+    except ValueError:
+        identity = None
+    if identity is None or identity.int == 0 or str(identity) != value:
+        raise ValueError('repository response must contain a canonical non-nil UUID')
+    if expected_id is not None and value != expected_id:
+        raise ValueError('repository identity changed during provisioning')
+    # Names and owner here are the fixed, harness-created fixture identities.
+    if repo.get('name') != name or repo.get('clone_path') != '/git/alice/' + name + '.git':
+        raise ValueError('repository response has an unexpected name or clone path')
+    return value
+
+def owned_cache_path(fixture_root, repository_id):
+    identity = uuid.UUID(repository_id)
+    if str(identity) != repository_id or identity.int == 0:
+        raise ValueError('cache path requires a canonical repository UUID')
+    owned = fixture_root.resolve()
+    parent = owned / 'data' / 'pando-cache'
+    cache = parent / repository_id
+    if not parent.resolve().is_relative_to(owned) or cache.is_symlink() or cache.resolve().parent != parent.resolve():
+        raise ValueError('disposable cache escapes its owned fixture directory')
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise RuntimeError('cache cleanup requires descriptor-safe rmtree')
+    return cache
 
 def digest(path):
     h = hashlib.sha256()
@@ -135,12 +164,14 @@ def main():
             code, body, _ = h.http('/api/repos', token=h.alice, method='POST', body={'name': name})
             assert code in (201, 202), code
             repo = json.loads(body)
+            expected_id = validate_repository(repo, name)
             end = time.monotonic() + 30
             while repo['state'] != 'ready' and time.monotonic() < end:
                 time.sleep(.1)
                 code, body, _ = h.http('/api/repos/alice/' + name, token=h.alice)
                 assert code == 200
                 repo = json.loads(body)
+                validate_repository(repo, name, expected_id)
             assert repo['state'] == 'ready'
             work = h.root / ('work-' + str(idx))
             h.git('init', '--initial-branch=main', str(work))
@@ -203,7 +234,7 @@ def main():
         h.stop()
         # Only the two exact, owned, documented disposable cache directories.
         for repo, _, _ in repos:
-            cache = h.root / 'data' / 'pando-cache' / repo['id']
+            cache = owned_cache_path(h.root, repo['id'])
             if cache.exists():
                 shutil.rmtree(cache)
         h.start()
