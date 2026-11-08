@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import signal
 import subprocess
@@ -19,6 +20,39 @@ import time
 import urllib.parse
 import uuid
 from e2e import Harness
+
+# Bounded observation budgets for the interrupted-restore proof. The restore CLI
+# re-verifies the whole source closure and the exact running binary BEFORE it
+# writes the crash guard, so "guard exists" is a setup deadline, never the
+# safety proof. The killed-parent proof below still requires a real pg_restore
+# backend parked on the fixture-owned pg_class lock.
+RESTORE_PREFLIGHT_SECONDS = 90.0
+RESTORE_GUARD_POLL_SECONDS = 0.01
+RESTORE_BARRIER_POLL_SECONDS = 0.02
+RESTORE_LOCK_SECONDS = 15.0
+RESTORE_BARRIER_SECONDS = 30.0
+RESTORE_ORPHAN_SECONDS = 10.0
+RESTORE_EXIT_SECONDS = 5.0
+LOG_TAIL_BYTES = 4096
+
+
+def bounded_line(stream, deadline, label, on_wait=None):
+    """Read one short status line without an unbounded ``readline()``."""
+    buffer = b""
+    while b"\n" not in buffer:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(label + " reported no status line within its bounded deadline")
+        if on_wait is not None:
+            on_wait()
+        ready, _, _ = select.select([stream.fileno()], [], [], min(remaining, 0.2))
+        if not ready:
+            continue
+        chunk = os.read(stream.fileno(), LOG_TAIL_BYTES)
+        if not chunk:
+            raise AssertionError(label + " closed its status pipe before reporting readiness")
+        buffer += chunk
+    return buffer.split(b"\n", 1)[0].strip()
 
 
 class BackupHarness(Harness):
@@ -225,43 +259,97 @@ class BackupHarness(Harness):
             for proc in (writer,ddl,backup):
                 if proc and proc.poll() is None:proc.kill();proc.wait()
 
+    def log_tail(self, path, limit=LOG_TAIL_BYTES):
+        """Bounded, redacted tail of a fixture-owned log file. Never the environment."""
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - limit))
+                data = handle.read(limit)
+        except OSError as error:
+            return "<" + type(error).__name__ + ">"
+        return self.redact(data.decode("utf-8", "replace")).strip() or "<empty>"
+
+    def restore_activity(self, database):
+        """Bounded observation of fixture-owned backends; no DSN, argv or environment."""
+        try:
+            activity = self.query(
+                database,
+                "SELECT coalesce(string_agg(application_name||'|'||state||'|'||coalesce(wait_event_type,'-'),' ' "
+                "ORDER BY application_name),'-') FROM pg_stat_activity "
+                "WHERE datname=current_database() AND pid<>pg_backend_pid()")
+        except Exception as error:
+            return "<" + type(error).__name__ + ">"
+        return activity or "-"
+
+    def restore_state(self, restore, guard, target, database, started, logs):
+        staging = sorted(path.name for path in target.parent.glob(".rootyard-restore-*.partial"))
+        return ("elapsed=%.3fs exit=%r guard=%s target=%s staging=%s activity=%s stderr=%r stdout=%r" % (
+            time.monotonic() - started, restore.poll(), guard.exists(), target.exists(), staging,
+            self.restore_activity(database), self.log_tail(logs[1]), self.log_tail(logs[0])))
+
     def interrupted_restore(self):
         database = self.new_database(self.restore_admin)
         target = self.root / "interrupted-target"
         guard = target.parent / ("." + target.name + ".rootyard-restoring")
         env = self.env.copy();env.update(DATABASE_URL=database,ROOTYARD_DATA_DIR=str(target))
-        restore = subprocess.Popen([self.args.binary,"restore",str(self.backup),"--isolated","--trust-backup"],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        logs = (self.root / "interrupted-restore.stdout.log", self.root / "interrupted-restore.stderr.log")
+        # Owned restore output goes to files, never to undrained pipes: no output
+        # volume can stall the child before the guard, and a failure keeps a
+        # bounded, redacted tail inside the fixture directory for diagnosis.
+        with logs[0].open("wb") as stdout_file, logs[1].open("wb") as stderr_file:
+            restore = subprocess.Popen([self.args.binary,"restore",str(self.backup),"--isolated","--trust-backup"],
+                                       env=env,stdin=subprocess.DEVNULL,stdout=stdout_file,stderr=stderr_file)
+        started = time.monotonic()
         blocker = None
         try:
-            deadline=time.monotonic()+20
+            # Setup deadline, not the proof: the guard is written only after the
+            # CLI re-verifies the source closure and the exact running binary.
+            # Liveness is asserted on every poll, so an early exit is reported
+            # with its redacted log tail instead of an empty timeout error.
+            deadline = started + RESTORE_PREFLIGHT_SECONDS
             while not guard.exists():
-                assert restore.poll() is None, "Restore exited before guard"
-                assert time.monotonic()<deadline
-                time.sleep(.01)
+                assert restore.poll() is None, "Restore exited before publishing the crash guard: " + self.restore_state(restore,guard,target,database,started,logs)
+                assert time.monotonic() < deadline, ("Restore preflight (%s) did not publish the crash guard within %.0fs: " % (self.args.binary, RESTORE_PREFLIGHT_SECONDS)) + self.restore_state(restore,guard,target,database,started,logs)
+                time.sleep(RESTORE_GUARD_POLL_SECONDS)
+            preflight = time.monotonic() - started
             parts=urllib.parse.urlsplit(database);pg_env=env.copy()
-            pg_env.update(PGHOST=parts.hostname,PGPORT=str(parts.port),PGDATABASE=parts.path.lstrip("/"),PGUSER=parts.username,PGPASSWORD=parts.password or "")
+            pg_env.update(PGHOST=parts.hostname,PGPORT=str(parts.port),PGDATABASE=parts.path.lstrip("/"),PGUSER=parts.username,PGPASSWORD=parts.password or "",PGAPPNAME="backup-restore-blocker")
             blocker=subprocess.Popen(["psql","-X","-qAt","-v","ON_ERROR_STOP=1"],env=pg_env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             blocker.stdin.write(b"BEGIN; LOCK TABLE pg_catalog.pg_class IN SHARE MODE;\n\\echo LOCKED\n");blocker.stdin.flush()
-            assert blocker.stdout.readline().strip()==b"LOCKED"
-            deadline=time.monotonic()+30
+            def blocker_alive():
+                assert blocker.poll() is None, "pg_class SHARE blocker exited before reporting readiness"
+            assert bounded_line(blocker.stdout, time.monotonic() + RESTORE_LOCK_SECONDS, "pg_class SHARE blocker", blocker_alive) == b"LOCKED", "pg_class SHARE blocker did not report LOCKED"
+            barrier_start = time.monotonic()
+            deadline=barrier_start+RESTORE_BARRIER_SECONDS
             while True:
                 count=self.query(database,"SELECT count(*) FROM pg_stat_activity WHERE application_name='pg_restore' AND wait_event_type='Lock'")
                 if int(count):break
-                assert restore.poll() is None, "Restore did not reach blocked native pg_restore"
-                assert time.monotonic()<deadline
-                time.sleep(.02)
-            os.kill(restore.pid,signal.SIGKILL);restore.wait(timeout=5)
-            deadline=time.monotonic()+10
+                assert restore.poll() is None, "Restore did not reach blocked native pg_restore: " + self.restore_state(restore,guard,target,database,started,logs)
+                assert time.monotonic()<deadline, ("Native pg_restore did not park on the fixture-owned pg_class lock within %.0fs: " % RESTORE_BARRIER_SECONDS) + self.restore_state(restore,guard,target,database,started,logs)
+                time.sleep(RESTORE_BARRIER_POLL_SECONDS)
+            barrier = time.monotonic() - barrier_start
+            os.kill(restore.pid,signal.SIGKILL)
+            try:
+                restore.wait(timeout=RESTORE_EXIT_SECONDS)
+            except subprocess.TimeoutExpired as error:
+                raise AssertionError(("Killed restore parent did not exit within %.0fs: " % RESTORE_EXIT_SECONDS) + self.restore_state(restore,guard,target,database,started,logs)) from error
+            deadline=time.monotonic()+RESTORE_ORPHAN_SECONDS
             while int(self.query(database,"SELECT count(*) FROM pg_stat_activity WHERE application_name='pg_restore'")):
-                assert time.monotonic()<deadline,"Orphan pg_restore backend survived parent death"
+                assert time.monotonic()<deadline, "Orphan pg_restore backend survived parent death: " + self.restore_state(restore,guard,target,database,started,logs)
                 time.sleep(.05)
-            blocker.stdin.write(b"ROLLBACK;\n\\q\n");blocker.stdin.flush();assert blocker.wait(timeout=5)==0
+            blocker.stdin.write(b"ROLLBACK;\n\\q\n");blocker.stdin.flush()
+            try:
+                assert blocker.wait(timeout=RESTORE_EXIT_SECONDS)==0, "pg_class SHARE blocker did not exit cleanly after ROLLBACK"
+            except subprocess.TimeoutExpired as error:
+                raise AssertionError("pg_class SHARE blocker did not exit within %.0fs after ROLLBACK" % RESTORE_EXIT_SECONDS) from error
             assert self.query(database,"SELECT count(*) FROM pg_tables WHERE schemaname='public'")=="0"
             assert guard.exists() and not target.exists()
             failed=self.run([self.args.binary,"serve"],env=env,check=False)
-            assert failed.returncode!=0 and b"incomplete restore guard" in failed.stderr
+            assert failed.returncode!=0 and b"incomplete restore guard" in failed.stderr, "serve did not refuse the persisted restore guard: " + self.redact(failed.stderr.decode(errors="replace")[-LOG_TAIL_BYTES:])
             assert not target.exists()
-            return {"killed_parent_while_native_pg_restore_blocked":True,"no_orphan_import_or_partial_sql":True,"persistent_guard_blocks_startup":True}
+            return {"killed_parent_while_native_pg_restore_blocked":True,"no_orphan_import_or_partial_sql":True,"persistent_guard_blocks_startup":True,
+                    "restore_guard_preflight_seconds":round(preflight,3),"native_pg_restore_blocked_seconds":round(barrier,3)}
         finally:
             for proc in (restore,blocker):
                 if proc and proc.poll() is None:proc.kill();proc.wait()

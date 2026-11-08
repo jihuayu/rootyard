@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "framing_extraction_body_unchanged": true,
+  "old_source_sha256": "2a25d2925867a43e2e1d88fab6764f2ad74df5f953d26d788caf37cd877731d9",
+  "new_framing_sha256": "3201536f595b255d66257551357e5fdbd4f8be74c34563e3d840301da7909020",
+  "reference_tests": {
+    "backend": "reference_model",
+    "production_acceptance": false,
+    "tier": "all",
+    "feature": null,
+    "total": 591,
+    "passed": 591,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0,
+    "success": true
+  }
+}
