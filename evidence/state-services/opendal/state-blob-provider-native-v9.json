@@ -1,0 +1,79 @@
+{
+  "status": "passed",
+  "provider": "real S3-compatible loopback task fixture",
+  "qualification_scope": "one physical host; Azure not runtime-qualified; no hold/GC or production durability qualification",
+  "seconds": 54.45411103699007,
+  "returncode": 0,
+  "build_receipt": {
+    "kind": "test",
+    "workspace_commit": "b8e6fc67337acb4c0109ea082ae99bafb488d746",
+    "source_inputs_sha256": "7d8fda90ba516390ff4a612b707fee9c3540fba26d9b8f8505d83448ff4833cb",
+    "binary_sha256": "936236eb013f55dfe683a0863a4d2a6cb5bef936d4c2b627d5dc7f4022829f6d",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "test",
+      "--locked",
+      "--lib",
+      "--test",
+      "legacy_s3_stack",
+      "--test",
+      "remote_objects",
+      "--test",
+      "blob_provider_contract",
+      "--features",
+      "blob-azblob",
+      "--no-run",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "relocated_artifact": true,
+    "original_artifact_sha256": "936236eb013f55dfe683a0863a4d2a6cb5bef936d4c2b627d5dc7f4022829f6d",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": false
+        }
+      },
+      {
+        "target": "blob_provider_contract",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/blob_provider_contract-af316458f4185ad0"
+      }
+    ],
+    "test_source_sha256": "7897c8293a6588d14b959db8461cb355db63280addc6bb886e265a6c57ea136b"
+  },
+  "command": [
+    "/workspace/scratch/state-blob-qualified-v9/blob_provider_contract",
+    "--ignored",
+    "--exact",
+    "real_provider_publish_verify_range_delete_contract",
+    "--nocapture"
+  ],
+  "log_sha256": "616a92d8ba3500d7704ba4f0e7b457f7b0dc2e4ced4aa01d4f28fd8561e8c5df",
+  "binary_still_matches": true
+}

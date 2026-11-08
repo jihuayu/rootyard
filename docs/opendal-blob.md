@@ -1,10 +1,16 @@
 # OpenDAL Blob layer: #105 / #108
 
 Status: the new unique-attempt S3 component passed its source-bound21MiB
-provider contract at clean `eaab8cd`, including independent read-back/range
-verification, corruption rejection and disabled deletion. Optional Azure is
-compile-only. This does not complete #108 or qualify all-content Blob storage,
-standalone deployment, conditional creation, HA or physical durability.
+provider contract at b8e6fc6 (it first passed at `eaab8cd`), including
+independent read-back/range verification, corruption rejection and disabled
+deletion. The legacy content-addressed paths were separately qualified at the
+same commit: 283 library tests (8 explicitly ignored), the two-MiB-stack
+regression, a two-process S3 publish/recover cycle, 41 native Pando cases with
+18/18 committed and zero pending operation rows, and a stock Git LFS
+remote-only push with replacement-volume recovery. Optional Azure is
+compile-only. This still does not complete #108 or qualify all-content Blob
+storage, standalone deployment, conditional creation, HA or physical
+durability.
 
 The custom S3 signer, XML multipart implementation and HTTP retry code are replaced by Apache OpenDAL 0.57.0. Minimal features select S3, Tokio execution, bounded concurrency/retry/timeout layers and `reqwest-rustls-no-provider-tls`; the application already supplies Rustls Ring. `blob-azblob` adds Azure. The project target is Rust 1.88, matching the pending security integration; OpenDAL 0.57 itself declares Rust 1.85. Cargo.lock is regenerated and reviewed, not left implicit.
 
@@ -58,7 +64,7 @@ Normal `cargo test --test blob_provider_contract` runs local invariants and expl
 
 Local lifecycle unit tests (`cargo test --lib blob_store`) use a private per-test `memory`-backed store and a private `ResourceContext`, so they never mutate process environment for each other. Deterministic stalled-readback and stalled-upload-read gates prove that an outer timeout detaches the owned task without releasing its reader/staging or upload capacity until the inner local operation and bounded abort drain. They cover weighted staging that never overcommits, oversize refusal before waiting, queue-deadline expiry with no receipt and accounting released where possible, upload-slot release before read-back with a single slot, a cancelled writer retaining then returning its slot, shared process limits with conflict rejection, bounded limits, and symlink/FIFO source refusal. A deadline does not promise side-effect freedom: an outstanding Tokio FS write, fsync or rename may complete late and leave a destination or orphan staging file. They are not provider qualification.
 
-The real case covers multipart publication through owned one-use intents, distinct attempt paths for identical bytes, independent-client read-back, verified download/range, a short read-only locator against an existing key, refusal of wrong source length and wrong expected digest with no ACK, fixture truncation and same-length corruption, global digest validation for a range outside the corrupt byte, product deletion refusal and late old-attempt deletion isolation. The two `compile_fail` examples on `UploadIntent` prove that cloning the write capability and forging one from a locator do not compile. Cleanup runs on caught assertion failure and targets only exact owned paths. These cases do not establish the cross-store hold/GC protocol, exhaustive cancellation/retry behavior, a different provider's contract or physical durability/HA.
+The real case covers multipart publication through owned one-use intents, distinct attempt paths for identical bytes, independent-client read-back, verified download/range, a short read-only locator against an existing key, refusal of wrong source length and wrong expected digest with no ACK, fixture truncation and same-length corruption, global digest validation for a range outside the corrupt byte, product deletion refusal and late old-attempt deletion isolation. The two `compile_fail` examples on `UploadIntent` prove that cloning the write capability and forging one from a locator do not compile. Cleanup runs on caught assertion failure and targets only exact owned paths. These cases do not establish the cross-store hold/GC protocol, exhaustive cancellation/retry behavior, a different provider's contract or physical durability/HA. The full source-bound reports are in `evidence/state-services/opendal/`.
 
 Follow-ups: #109 connects content ACKs and KeyProvider; #113/#114 own persistent retention; #120 owns Blob backup/restore. All-content Blob publication, removal of local authority, standalone defaults, real Azure service qualification and destructive GC remain unqualified.
 
@@ -86,15 +92,30 @@ opaque SDK source that can retain private URLs. Unknown decode/stream failures
 have no invented HTTP status. Deadline exhaustion retains typed timeout(op).
 
 283 Rust library tests passed (eight service-dependent tests explicitly ignored),
-and all-target Clippy passed with S3/Azure enabled. The provider executable from
-eaab8cd passed the one explicitly selected realS3 contract, with zero ignored
-cases; its receipt includes source/test/lock hashes and actual build flags.
-The observed multipart conditional-create weakness remains recorded above;
-fresh opaque upload intents, rather than a conditional-write claim, supply the
-new address-uniqueness contract.
+and the operator's all-target Clippy run (v10 log) ended `Finished` with no
+diagnostics. The provider executable
+from b8e6fc6 passed the one explicitly selected realS3 contract, with zero
+ignored cases; its receipt includes source/test/lock hashes and actual build
+flags. Two `UploadIntent` compile-fail doc-tests also passed. The observed
+multipart conditional-create weakness remains recorded above; fresh opaque
+upload intents, rather than a conditional-write claim, supply the new
+address-uniqueness contract.
 
-Legacy real-service application/fault qualification is tracked separately;
-helper/SDK-parser unit tests do not establish an actual429/503/disconnect
-fault-injection or production guarantee. Existing encrypted Pando still requires
-Vault. Serving-mode switch, KeyProvider replacement, durable roots/holds and GC
-remain #109/#110/#112-#123 work.
+The legacy real-service paths were also exercised at b8e6fc6: 41 native Pando
+cases passed with 18 committed, zero pending and 18 terminal operation rows; the
+legacy S3 adapter published and then recovered a 20MiB+4-byte object in two
+separate processes; stock Git LFS pushed a remote-only pointer and recovered
+after replacement-volume loss. These ran against loopback PostgreSQL, Garage and
+Vault on one physical host. They are ordinary-workload and recovery evidence,
+not synchronized old-OID CAS, fault-injection for actual429/503/disconnect
+responses, two-host HA or physical-durability qualification. The v8 attempt at
+source `3257358` failed on the first Pando push after the server process
+exited; that failure is retained as a counterexample and is attributed to the
+pre-`719c7cc` async layer stack, which the type-erasure fix and the two-MiB-stack
+regression now bound.
+
+Existing encrypted Pando still requires Vault and the production legacy profile
+remains the active one; the new serving profile stays disabled. Serving-mode
+switch, KeyProvider replacement, durable roots/holds and GC remain
+#109/#110/#112-#123 work. Azure stays compile-only and conditional create is
+unqualified.

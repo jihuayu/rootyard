@@ -1,0 +1,13 @@
+# SHA-256 of the exact operator-held gzip archives in
+# /workspace/scratch/state-blob-qualified-v9. The archives are not committed
+# (about 56 MiB of binaries); these hashes are recorded so a holder of the
+# archives can prove they are the ones used for the build receipts.
+#
+# The gzip files are archives of the relocated binaries. At evidence time each
+# archive was decompressed and the decompressed stream matched the
+# binary_sha256 in the corresponding *.build.json receipt exactly.
+8cc5aa9d3292030f6088a6ac55a393f568638c7f30b0dc53d534a43f7694d7cf  blob_provider_contract.gz
+bce36e59d3939ca9759c8b5886faa1656e47e6cc713e1f2601cbc15b621261d6  legacy_s3_stack.gz
+87dc56b4f44fdd5d8c81ddcc741f0aa7d3d3393253bac45ccc140c70d3ca8b3e  remote_objects.gz
+df04a50fa1863dc7f6bfdc848ff8f9e655006045b5c442facfe5090bd81a9422  rootyard-lib-contract.gz
+b0a2aefda21881589584e98c9900fb1efb24bf6e0d53dd0b94057550754bb99a  rootyard.gz
