@@ -20,16 +20,19 @@ use std::{
     io,
     os::{
         fd::OwnedFd,
-        unix::{net::UnixStream, process::CommandExt},
+        unix::{
+            net::{Shutdown, UnixStream},
+            process::CommandExt,
+        },
     },
     path::Path,
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, RecvTimeoutError},
+        mpsc::{self, RecvTimeoutError, TrySendError},
     },
-    thread::{self, JoinHandle},
+    thread,
     time::{Duration, Instant},
 };
 use uuid::Uuid;
@@ -37,6 +40,11 @@ use uuid::Uuid;
 /// Bound on queued cancel frames. One worker sends them, so a caller that
 /// abandons a begin/mount can never spawn an unbounded number of threads.
 const ABORT_QUEUE: usize = 64;
+/// Bounded grace for the dedicated reaper to observe SIGKILL and hold its
+/// child lock; no caller waits on this path.
+const CHILD_REAP_GRACE: Duration = Duration::from_secs(2);
+/// How often the reaper checks the dead flag without relying on the channel.
+const REAPER_TICK: Duration = Duration::from_millis(50);
 
 /// Failure while talking to the helper. The code is an errno value when one is
 /// meaningful, so callers can distinguish `EBUSY`/`ESTALE`/timeouts.
@@ -61,6 +69,10 @@ impl HelperError {
 
     pub fn is_disconnected(&self) -> bool {
         self.code == libc::ECONNRESET
+    }
+
+    pub fn is_protocol(&self) -> bool {
+        self.code == libc::EPROTO
     }
 }
 
@@ -87,17 +99,26 @@ enum AbortJob {
     Mount { workspace: Uuid, request: u64 },
 }
 
+enum ReapRequest {
+    GenerationDead,
+}
+
 struct Inner {
     generation: u64,
     control: Mutex<UnixStream>,
     heartbeat: Mutex<UnixStream>,
+    /// Extra clones used to wake a blocked reader/writer with `shutdown(2)`
+    /// during fail-closed generation death, without taking those mutexes.
+    control_shutdown: UnixStream,
+    heartbeat_shutdown: UnixStream,
     pending: Mutex<HashMap<u64, PendingReply>>,
     aborts: mpsc::SyncSender<AbortJob>,
+    reaper: mpsc::SyncSender<ReapRequest>,
     next_request: AtomicU64,
     dead: AtomicBool,
     stop: AtomicBool,
+    death: Mutex<Option<HelperError>>,
     child: Mutex<Option<Child>>,
-    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -106,14 +127,35 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Inner {
     fn mark_dead(&self) {
-        self.dead.store(true, Ordering::Release);
+        self.fail_generation(libc::ECONNRESET, "workspace FUSE helper is not available");
+    }
+
+    /// Fail-close the whole helper generation. This never joins a reader or
+    /// waits for the child: it records the first reason, fails every waiter,
+    /// stops the heartbeat, wakes blocked socket I/O, and asks the one
+    /// dedicated reaper thread to kill and reap the child.
+    fn fail_generation(&self, code: i32, message: impl Into<String>) {
+        let reason = HelperError::new(code, message);
+        if !self.dead.swap(true, Ordering::AcqRel) {
+            *lock(&self.death) = Some(reason.clone());
+        }
+        self.stop.store(true, Ordering::Release);
+        // `shutdown` on either duplicate wakes every blocked read/write on the
+        // shared socket, including the control reader that must drop its Arc.
+        let _ = self.control_shutdown.shutdown(Shutdown::Both);
+        let _ = self.heartbeat_shutdown.shutdown(Shutdown::Both);
         let orphaned: Vec<PendingReply> = {
             let mut pending = lock(&self.pending);
             pending.drain().map(|(_, pending)| pending).collect()
         };
         for pending in orphaned {
-            let _ = pending.sender.send(Err(HelperError::disconnected()));
+            let _ = pending.sender.send(Err(reason.clone()));
         }
+        let _ = self.reaper.try_send(ReapRequest::GenerationDead);
+    }
+
+    fn failure(&self) -> HelperError {
+        lock(&self.death).clone().unwrap_or_else(HelperError::disconnected)
     }
 
     fn deliver(&self, frame: Frame) {
@@ -139,14 +181,32 @@ impl Inner {
                 Err(error) => Err(HelperError::protocol(error.to_string())),
             }
         };
+        let protocol_failure =
+            result.as_ref().err().filter(|error| error.is_protocol()).map(|error| error.message.clone());
         let _ = expected.sender.send(result);
+        if let Some(message) = protocol_failure {
+            // One malformed/mismatched reply means the generation can no
+            // longer be trusted for any healthy operation.
+            self.fail_generation(libc::EPROTO, message);
+        }
     }
 
     fn queue_abort(&self, job: AbortJob) {
-        // Non-blocking by design: the child-side operation deadline covers a
-        // full queue, and a dead helper has nothing left to cancel. This is
-        // what keeps a dropped freeze token from spawning one thread per call.
-        let _ = self.aborts.try_send(job);
+        // A cancellation may not be silently dropped: if the bounded worker
+        // cannot take it, the only fail-closed outcome is to stop the whole
+        // generation. This call itself never blocks; the dedicated reaper owns
+        // the kill/reap.
+        match self.aborts.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => self.fail_generation(
+                libc::EIO,
+                "workspace FUSE helper cancellation queue is full; fail-stopping generation",
+            ),
+            Err(TrySendError::Disconnected(_)) => self.fail_generation(
+                libc::ECONNRESET,
+                "workspace FUSE helper cancellation worker is gone; fail-stopping generation",
+            ),
+        }
     }
 
     fn next_request(&self) -> u64 {
@@ -165,7 +225,7 @@ impl Inner {
         deadline: Duration,
     ) -> (u64, Result<Body, HelperError>) {
         if self.dead.load(Ordering::Acquire) {
-            return (0, Err(HelperError::disconnected()));
+            return (0, Err(self.failure()));
         }
         let request_id = self.next_request();
         let (sender, receiver) = mpsc::channel();
@@ -195,11 +255,8 @@ impl Inner {
         };
         if let Err(error) = written {
             lock(&self.pending).remove(&request_id);
-            self.mark_dead();
-            return (
-                request_id,
-                Err(HelperError::new(libc::ECONNRESET, format!("helper control write failed: {error}"))),
-            );
+            self.fail_generation(libc::ECONNRESET, format!("helper control write failed: {error}"));
+            return (request_id, Err(self.failure()));
         }
         match receiver.recv_timeout(deadline) {
             Ok(result) => (request_id, result),
@@ -207,7 +264,7 @@ impl Inner {
                 lock(&self.pending).remove(&request_id);
                 (request_id, Err(HelperError::new(libc::ETIMEDOUT, "workspace FUSE helper request deadline expired")))
             }
-            Err(RecvTimeoutError::Disconnected) => (request_id, Err(HelperError::disconnected())),
+            Err(RecvTimeoutError::Disconnected) => (request_id, Err(self.failure())),
         }
     }
 
@@ -238,11 +295,9 @@ impl Inner {
                 }
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
                 Ok(None) => {
-                    let mut child = lock(&self.child);
-                    if let Some(child) = child.as_mut() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
+                    // Bounded SIGKILL reap. The reaper owns the same helper and
+                    // no caller waits for an unkillable child indefinitely.
+                    self.kill_and_reap_bounded(CHILD_REAP_GRACE);
                     return Err(HelperError::new(
                         libc::ETIMEDOUT,
                         "workspace FUSE helper did not exit within the shutdown grace",
@@ -253,26 +308,45 @@ impl Inner {
         }
     }
 
-    fn join_threads(&self) {
-        let threads: Vec<JoinHandle<()>> = std::mem::take(&mut *lock(&self.threads));
-        for handle in threads {
-            let _ = handle.join();
+    /// Take the child only after a bounded `try_lock`, SIGKILL it and poll
+    /// `try_wait` for a bounded window. Never use a blocking `wait()` here.
+    fn kill_and_reap_bounded(&self, grace: Duration) {
+        let lock_deadline = Instant::now() + grace;
+        let child = loop {
+            match self.child.try_lock() {
+                Ok(mut child) => break child.take(),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner().take(),
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < lock_deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => return,
+            }
+        };
+        let Some(mut child) = child else { return };
+        let _ = child.kill();
+        let reap_deadline = Instant::now() + grace;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < reap_deadline => thread::sleep(Duration::from_millis(10)),
+                // Dropping `Child` after SIGKILL never blocks waiting.
+                _ => return,
+            }
         }
     }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        // No other thread can own this `Arc` here, so locks are uncontended.
+        // Stop and reap without joining: a thread handle cycle or blocked
+        // reader must never keep the generation alive.
         self.stop.store(true, Ordering::Release);
-        if let Some(mut child) = self.child.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
-            // The child watchdog also fences and exits on its own when the
-            // heartbeat stops; killing here only avoids a stray process while
-            // the parent is being torn down by tests or a panic.
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.mark_dead();
-        self.join_threads();
+        self.dead.store(true, Ordering::AcqRel);
+        let _ = self.control_shutdown.shutdown(Shutdown::Both);
+        let _ = self.heartbeat_shutdown.shutdown(Shutdown::Both);
+        let _ = self.reaper.try_send(ReapRequest::GenerationDead);
+        self.kill_and_reap_bounded(Duration::from_secs(1));
     }
 }
 
@@ -334,37 +408,44 @@ impl HelperClient {
 
         let reader_stream = control.try_clone()?;
         let heartbeat_stream = parent_heartbeat;
+        let control_shutdown = control.try_clone()?;
+        let heartbeat_shutdown = heartbeat_stream.try_clone()?;
         let (aborts, abort_jobs) = mpsc::sync_channel(ABORT_QUEUE);
+        let (reaper, reap_jobs) = mpsc::sync_channel(1);
         let inner = Arc::new(Inner {
             generation,
             control: Mutex::new(control),
             heartbeat: Mutex::new(heartbeat_stream),
+            control_shutdown,
+            heartbeat_shutdown,
             pending: Mutex::new(HashMap::new()),
             aborts,
+            reaper,
             next_request: AtomicU64::new(1),
             dead: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            death: Mutex::new(None),
             child: Mutex::new(Some(child)),
-            threads: Mutex::new(Vec::new()),
         });
 
         let reader_inner = inner.clone();
-        let reader = thread::Builder::new()
+        thread::Builder::new()
             .name("fuse-helper-control-reader".into())
             .spawn(move || control_reader(reader_inner, reader_stream))?;
         let heartbeat_inner = inner.clone();
-        let heartbeat = thread::Builder::new()
+        thread::Builder::new()
             .name("fuse-helper-heartbeat".into())
             .spawn(move || heartbeat_writer(heartbeat_inner))?;
         let abort_inner = inner.clone();
-        let aborts = thread::Builder::new()
+        thread::Builder::new()
             .name("fuse-helper-freeze-abort".into())
             .spawn(move || abort_worker(abort_inner, abort_jobs))?;
-        let mut threads = lock(&inner.threads);
-        threads.push(reader);
-        threads.push(heartbeat);
-        threads.push(aborts);
-        drop(threads);
+        // Exactly one dedicated reaper; its handle is detached so `Inner`
+        // never owns a join handle whose closure owns another `Inner` Arc.
+        let reap_inner = inner.clone();
+        thread::Builder::new()
+            .name("fuse-helper-reaper".into())
+            .spawn(move || reaper(reap_inner, reap_jobs))?;
         Ok(Self { inner })
     }
 
@@ -483,7 +564,6 @@ impl HelperClient {
         match self.inner.wait_exit(grace) {
             Ok(()) => {
                 self.inner.mark_dead();
-                self.inner.join_threads();
                 match request {
                     Ok(Body::ShuttingDown) | Err(HelperError { code: libc::ECONNRESET, .. }) => Ok(()),
                     Ok(other) => Err(HelperError::protocol(format!("unexpected shutdown reply `{}`", other.op()))),
@@ -491,8 +571,7 @@ impl HelperClient {
                 }
             }
             Err(error) => {
-                self.inner.mark_dead();
-                self.inner.join_threads();
+                self.inner.fail_generation(error.code, error.message.clone());
                 Err(error)
             }
         }
@@ -510,10 +589,11 @@ fn control_reader(inner: Arc<Inner>, mut stream: UnixStream) {
     loop {
         match read_frame(&mut stream) {
             Ok(frame) => inner.deliver(frame),
-            Err(_) => {
+            Err(error) => {
                 // EOF or a protocol error: the child is gone. Every pending
-                // request fails closed and `alive()` turns false.
-                inner.mark_dead();
+                // request fails closed, the heartbeat stops and the reaper
+                // kills/reaps the child; this reader never joins itself.
+                inner.fail_generation(libc::ECONNRESET, format!("workspace FUSE helper control channel closed: {error}"));
                 return;
             }
         }
@@ -536,7 +616,10 @@ fn heartbeat_writer(inner: Arc<Inner>) {
             write_frame(&mut *heartbeat, &frame)
         };
         if written.is_err() {
-            inner.mark_dead();
+            if inner.stop.load(Ordering::Acquire) {
+                return;
+            }
+            inner.fail_generation(libc::ECONNRESET, "workspace FUSE helper heartbeat write failed");
             return;
         }
         thread::sleep(HEARTBEAT_INTERVAL);
@@ -557,6 +640,9 @@ fn abort_worker(inner: Arc<Inner>, jobs: mpsc::Receiver<AbortJob>) {
             }
             Err(RecvTimeoutError::Disconnected) => return,
         };
+        if inner.stop.load(Ordering::Acquire) || inner.dead.load(Ordering::Acquire) {
+            return;
+        }
         let (workspace, epoch, body) = match job {
             AbortJob::Freeze { workspace, epoch, op_id } => {
                 (workspace, epoch, Body::AbortFreeze(AbortFreeze { op_id }))
@@ -565,6 +651,29 @@ fn abort_worker(inner: Arc<Inner>, jobs: mpsc::Receiver<AbortJob>) {
         };
         let _ = inner.call(Some(workspace), epoch, body, ABORT_DEADLINE);
     }
+}
+
+/// One dedicated, detached worker: it never joins, never accepts new threads,
+/// and kills/reaps exactly the one child after generation death. It also polls
+/// the dead flag, so a full signal channel cannot lose the kill request.
+fn reaper(inner: Arc<Inner>, jobs: mpsc::Receiver<ReapRequest>) {
+    loop {
+        match jobs.recv_timeout(REAPER_TICK) {
+            Ok(ReapRequest::GenerationDead) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                if inner.dead.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if inner.dead.load(Ordering::Acquire) {
+                    break;
+                }
+                return;
+            }
+        }
+    }
+    inner.kill_and_reap_bounded(CHILD_REAP_GRACE);
 }
 
 /// One freeze attempt whose operation id exists before the begin frame.

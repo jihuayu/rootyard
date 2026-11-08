@@ -28,22 +28,32 @@ fn teardown_policy_can_only_fence() {
 }
 
 #[test]
-fn operation_tombstones_are_bounded() {
+fn retired_floor_survives_more_than_64_cancellations_and_refuses_an_old_retry() {
     let state = test_state();
-    for op_id in 0..(TOMBSTONES as u64 + 8) {
-        ops::push_freeze_tombstone(&state, op_id);
-        ops::push_mount_tombstone(&state, Uuid::nil(), op_id);
+    let workspace = Uuid::nil();
+    for id in 1..=96 {
+        ops::push_freeze_tombstone(&state, id);
+        ops::push_mount_tombstone(&state, workspace, id);
     }
-    assert_eq!(lock(&state.freeze_tombstones).len(), TOMBSTONES);
-    assert_eq!(lock(&state.mount_tombstones).len(), TOMBSTONES);
-    // The oldest entry was evicted, the newest is still known.
-    assert!(!ops::take_freeze_tombstone(&state, 0));
-    assert!(ops::take_freeze_tombstone(&state, TOMBSTONES as u64 + 7));
-    assert!(!ops::take_freeze_tombstone(&state, TOMBSTONES as u64 + 7), "a tombstone is one-shot");
+    assert!(ops::freeze_is_retired(&state, 1), "the oldest cancellation is never evicted");
+    assert!(ops::mount_is_retired(&state, 1), "an old mount id is never revived");
+    assert!(!ops::mount_is_retired(&state, 97), "a genuinely newer id is not retired");
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let refused = ops::register_pending(
+        &state,
+        workspace,
+        1,
+        Instant::now() + Duration::from_secs(1),
+        cancel,
+    )
+    .unwrap_err();
+    assert_eq!(refused.0, libc::ECANCELED, "a late old request must not be admitted");
+    assert!(lock(&state.pending).is_empty());
 }
 
 #[test]
-fn cancelled_admission_is_refused_after_the_tombstone() {
+fn cancelled_admission_is_refused_after_the_retired_floor() {
     let state = test_state();
     let workspace = Uuid::nil();
     assert!(ops::cancel_mount(&state, Some(workspace), 7).is_none());
@@ -52,6 +62,28 @@ fn cancelled_admission_is_refused_after_the_tombstone() {
         ops::register_pending(&state, workspace, 7, Instant::now() + Duration::from_secs(1), cancel).unwrap_err();
     assert_eq!(refused.0, libc::ECANCELED, "an abort between check and insert must win");
     assert!(lock(&state.pending).is_empty());
+}
+
+#[test]
+fn cancelled_or_expired_existing_mount_cannot_be_reused() {
+    let same = ops::ExistingMount::Same { epoch: 5 };
+    assert!(matches!(
+        ops::reuse_verdict(true, false, false, same),
+        Some(Err((libc::ECANCELED, _)))
+    ));
+    assert!(matches!(
+        ops::reuse_verdict(false, true, false, same),
+        Some(Err((libc::ETIMEDOUT, _)))
+    ));
+    assert!(matches!(
+        ops::reuse_verdict(false, false, true, same),
+        Some(Err((libc::EBUSY, _)))
+    ));
+    assert!(matches!(ops::reuse_verdict(false, false, false, same), Some(Ok(5))));
+    assert!(matches!(
+        ops::reuse_verdict(false, false, false, ops::ExistingMount::Fenced),
+        Some(Err((libc::EROFS, _)))
+    ));
 }
 
 #[test]
@@ -88,7 +120,6 @@ fn freeze_release_records_the_finishing_request_and_epoch() {
             begin_request: 2,
             deadline,
             failstop_at: deadline + FREEZE_JOIN_GRACE,
-            expired: AtomicBool::new(false),
             decision,
             done: done.clone(),
             released: AtomicBool::new(false),
@@ -99,6 +130,61 @@ fn freeze_release_records_the_finishing_request_and_epoch() {
     assert!(waiter.recv().unwrap(), "the accepted decision is delivered");
     ops::freeze_release(&state, 78, Some(workspace), 1, 5, 5, false);
     assert_eq!(*lock(&done), Some(77), "a duplicate finish cannot replace the owner");
+}
+
+#[test]
+fn freeze_release_never_blocks_on_a_full_decision_slot() {
+    let state = test_state();
+    let workspace = Uuid::nil();
+    let (decision, waiter) = mpsc::sync_channel::<bool>(1);
+    let done = Arc::new(Mutex::new(None));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let filler = decision.clone();
+    lock(&state.freezes).insert(
+        1,
+        FreezeOp {
+            workspace,
+            epoch: 5,
+            begin_request: 2,
+            deadline,
+            failstop_at: deadline + FREEZE_JOIN_GRACE,
+            decision,
+            done: done.clone(),
+            released: AtomicBool::new(false),
+        },
+    );
+    // Simulate the parent's timed-out abort occupying the single slot while
+    // the freeze thread is still stuck inside a gate drain. This is a channel
+    // regression only; it does not reproduce a blocked FUSE actor.
+    filler.send(true).unwrap();
+    ops::freeze_release(&state, 77, Some(workspace), 1, 5, 5, true);
+    assert_eq!(*lock(&done), None, "a full slot must not be claimed as a successful finish");
+    assert!(waiter.try_recv().is_ok());
+}
+
+#[test]
+fn watchdog_expiry_does_not_block_on_a_full_decision_slot() {
+    let state = test_state();
+    let workspace = Uuid::nil();
+    let (decision, _waiter) = mpsc::sync_channel::<bool>(1);
+    let done = Arc::new(Mutex::new(None));
+    let deadline = Instant::now() - Duration::from_secs(1);
+    let filler = decision.clone();
+    lock(&state.freezes).insert(
+        1,
+        FreezeOp {
+            workspace,
+            epoch: 5,
+            begin_request: 2,
+            deadline,
+            failstop_at: Instant::now() + Duration::from_secs(30),
+            decision,
+            done,
+            released: AtomicBool::new(false),
+        },
+    );
+    filler.send(true).unwrap();
+    assert!(enforce_freeze_deadlines(&state), "the watchdog snapshot must not block");
 }
 
 #[test]
@@ -116,7 +202,6 @@ fn freeze_release_rejects_a_foreign_frame_epoch() {
             begin_request: 2,
             deadline,
             failstop_at: deadline + FREEZE_JOIN_GRACE,
-            expired: AtomicBool::new(false),
             decision,
             done: done.clone(),
             released: AtomicBool::new(false),

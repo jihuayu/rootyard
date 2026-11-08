@@ -7,8 +7,7 @@
 //! park a gate or a per-workspace slot forever.
 use super::super::protocol::{Body, FREEZE_OP_DEADLINE, MountRequest, MountedReply, OkReply, PrewarmReply};
 use super::{
-    FreezeOp, MOUNT_QUEUE_CAPACITY, Mounted, PendingMount, State, TOMBSTONES, gate_for, lock, reply, reply_errno,
-    reply_error,
+    FreezeOp, MOUNT_QUEUE_CAPACITY, Mounted, PendingMount, State, gate_for, lock, reply, reply_errno, reply_error,
 };
 use crate::workspace_lab::fuse_helper::{validate_root, workspace_paths};
 use crate::workspace_lab::fuse_mount::{FreezeDecision, LazySource, MutationGate, Overlay, spawn as spawn_mount};
@@ -39,41 +38,19 @@ pub(super) fn checkpoint(cancel: &AtomicBool, deadline: Instant) -> Result<(), (
 }
 
 pub(super) fn push_freeze_tombstone(state: &State, op_id: u64) {
-    let mut tombstones = lock(&state.freeze_tombstones);
-    if tombstones.len() >= TOMBSTONES {
-        tombstones.pop_front();
-    }
-    tombstones.push_back(op_id);
+    state.freeze_tombstones.retire(op_id);
 }
 
-pub(super) fn take_freeze_tombstone(state: &State, op_id: u64) -> bool {
-    let mut tombstones = lock(&state.freeze_tombstones);
-    match tombstones.iter().position(|candidate| *candidate == op_id) {
-        Some(index) => {
-            tombstones.remove(index);
-            true
-        }
-        None => false,
-    }
+pub(super) fn freeze_is_retired(state: &State, op_id: u64) -> bool {
+    state.freeze_tombstones.is_retired(op_id)
 }
 
-pub(super) fn push_mount_tombstone(state: &State, workspace: Uuid, request: u64) {
-    let mut tombstones = lock(&state.mount_tombstones);
-    if tombstones.len() >= TOMBSTONES {
-        tombstones.pop_front();
-    }
-    tombstones.push_back((workspace, request));
+pub(super) fn push_mount_tombstone(state: &State, _workspace: Uuid, request: u64) {
+    state.mount_tombstones.retire(request);
 }
 
-fn take_mount_tombstone(state: &State, workspace: Uuid, request: u64) -> bool {
-    let mut tombstones = lock(&state.mount_tombstones);
-    match tombstones.iter().position(|candidate| *candidate == (workspace, request)) {
-        Some(index) => {
-            tombstones.remove(index);
-            true
-        }
-        None => false,
-    }
+pub(super) fn mount_is_retired(state: &State, request: u64) -> bool {
+    state.mount_tombstones.is_retired(request)
 }
 
 /// Linearize admission with `cancel_mount`: the tombstone check, the busy
@@ -93,7 +70,7 @@ pub(super) fn register_pending(
         }
         return Err((libc::EBUSY, "another mount or unmount owns this workspace".into()));
     }
-    if take_mount_tombstone(state, workspace, request) {
+    if mount_is_retired(state, request) {
         return Err((libc::ECANCELED, "mount was cancelled before it was admitted".into()));
     }
     pending.insert(workspace, PendingMount { request, deadline, cancelled: cancel, gate: None });
@@ -125,18 +102,11 @@ pub(super) fn mount(
         return reply_error(state, request, workspace, libc::EINVAL, "mount requires a lease epoch");
     }
     // Idempotent retry: a mount whose reply was lost may already be published
-    // at exactly this epoch and root. Reuse it instead of failing with EEXIST
-    // forever; anything else must be reconciled explicitly.
-    let existing = lock(&state.mounts).get(&body.workspace).map(|mount| (mount.gate.epoch(), mount.root.clone()));
-    if let Some((epoch, root)) = existing {
-        let same_root = root == Path::new(&body.root)
-            || validate_root(&body.root).map(|candidate| candidate == root).unwrap_or(false);
-        if same_root && epoch == db_epoch {
-            // The retry now owns the registration: a delayed cancel for the
-            // previous frame must not remove the mount this retry just reused.
-            if let Some(mount) = lock(&state.mounts).get_mut(&body.workspace) {
-                mount.request = request;
-            }
+    // at exactly this epoch and root. Ownership transfer is linearized with
+    // `cancel_mount` under the shared pending -> mounts lock order, and an
+    // expired or retired retry can never take over the existing mount.
+    match reuse_existing(state, request, body.workspace, &body, db_epoch, deadline) {
+        Some(Ok(epoch)) => {
             return reply(
                 state,
                 request,
@@ -145,13 +115,8 @@ pub(super) fn mount(
                 Body::Mounted(MountedReply { epoch, queue_capacity: MOUNT_QUEUE_CAPACITY }),
             );
         }
-        return reply_error(
-            state,
-            request,
-            workspace,
-            libc::EEXIST,
-            "workspace is already mounted at another epoch or root; reconcile the lease first",
-        );
+        Some(Err((code, message))) => return reply_error(state, request, workspace, code, message),
+        None => {}
     }
     let cancel = Arc::new(AtomicBool::new(false));
     if let Err((code, message)) = register_pending(state, body.workspace, request, deadline, cancel.clone()) {
@@ -166,6 +131,92 @@ pub(super) fn mount(
             reply_error(state, request, workspace, code, message);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExistingMount {
+    Missing,
+    Same { epoch: i64 },
+    Conflict,
+    Fenced,
+}
+
+/// Pure fast-path verdict used under pending -> mounts before ownership moves.
+/// Cancellation and expiry are checked before a same-root/epoch reuse, so a
+/// cancelled retry can never take over an existing healthy mount.
+pub(super) fn reuse_verdict(
+    cancelled: bool,
+    expired: bool,
+    pending: bool,
+    existing: ExistingMount,
+) -> Option<Result<i64, (i32, String)>> {
+    if expired {
+        return Some(Err((libc::ETIMEDOUT, "mount deadline expired before it could reuse an existing mount".into())));
+    }
+    if cancelled {
+        return Some(Err((libc::ECANCELED, "mount was cancelled before it could reuse an existing mount".into())));
+    }
+    if pending {
+        return Some(Err((libc::EBUSY, "another mount or unmount owns this workspace".into())));
+    }
+    match existing {
+        ExistingMount::Missing => None,
+        ExistingMount::Same { epoch } => Some(Ok(epoch)),
+        ExistingMount::Conflict => Some(Err((
+            libc::EEXIST,
+            "workspace is already mounted at another epoch or root; reconcile the lease first".into(),
+        ))),
+        ExistingMount::Fenced => {
+            Some(Err((libc::EROFS, "existing mount is fenced; reconcile the lease first".into())))
+        }
+    }
+}
+
+/// Reuse one already-published mount for an idempotent retry.
+///
+/// `None` means there is no existing mount and normal admission should run.
+/// `Some` is a final reply decision. The full check and ownership transfer run
+/// under the same `pending` then `mounts` order used by `cancel_mount`,
+/// `register_pending` and `publish`, so a cancelled retry either sees the
+/// cancellation first or is removed by the cancel immediately afterwards.
+fn reuse_existing(
+    state: &State,
+    request: u64,
+    ws: Uuid,
+    body: &MountRequest,
+    db_epoch: i64,
+    deadline: Instant,
+) -> Option<Result<i64, (i32, String)>> {
+    let requested_root = Path::new(&body.root).to_path_buf();
+    let canonical_root = validate_root(&body.root).ok();
+    let pending = lock(&state.pending);
+    let mut mounts = lock(&state.mounts);
+    let existing = match mounts.get(&ws) {
+        None => ExistingMount::Missing,
+        Some(mount) => {
+            let same_root = mount.root == requested_root
+                || canonical_root.as_ref().is_some_and(|candidate| candidate == &mount.root);
+            if !same_root || mount.gate.epoch() != db_epoch {
+                ExistingMount::Conflict
+            } else if mount.gate.is_fenced() {
+                ExistingMount::Fenced
+            } else {
+                ExistingMount::Same { epoch: mount.gate.epoch() }
+            }
+        }
+    };
+    let verdict = reuse_verdict(
+        mount_is_retired(state, request),
+        Instant::now() >= deadline,
+        pending.contains_key(&ws),
+        existing,
+    );
+    if matches!(&verdict, Some(Ok(_))) {
+        if let Some(mount) = mounts.get_mut(&ws) {
+            mount.request = request;
+        }
+    }
+    verdict
 }
 
 type Built = (crate::workspace_lab::fuse_mount::MountHandle, Arc<MutationGate>, Option<Arc<Reader>>, PathBuf);
@@ -279,36 +330,42 @@ fn publish(
 
 /// Cancel one admitted mount and remove a mount that was published after the
 /// reply was lost. Returns the published mount so a worker can join it.
+///
+/// The retired floor, the pending cancellation and the published ownership
+/// check share pending -> mounts lock order with `reuse_existing`. A cancel
+/// therefore either wins before an idempotent retry or removes the mount that
+/// retry just took over; it can never leave a cancelled request as owner.
 pub(super) fn cancel_mount(state: &Arc<State>, workspace: Option<Uuid>, mount_request: u64) -> Option<Mounted> {
-    let ws = workspace?;
-    // Registration and this cancel share the `pending` guard: either the
-    // pending entry exists here, or it can no longer be admitted. The tombstone
-    // is stored under the same guard so a mount that has not reached
-    // `register_pending` yet is refused when it does.
-    let pending_gate = {
-        let mut pending = lock(&state.pending);
-        push_mount_tombstone(state, ws, mount_request);
-        match pending.get_mut(&ws) {
-            Some(entry) if entry.request == mount_request => {
-                entry.cancelled.store(true, Ordering::Release);
-                entry.gate.clone()
-            }
-            _ => None,
-        }
+    let Some(ws) = workspace else {
+        state.mount_tombstones.retire(mount_request);
+        return None;
     };
-    // Fence synchronously, before the slow session join is queued: a cancelling
-    // mount must stop admitting mutations even while its handle still exists.
-    if let Some(gate) = pending_gate {
-        gate.fence();
-    }
+    let mut pending = lock(&state.pending);
+    push_mount_tombstone(state, ws, mount_request);
+    let pending_gate = match pending.get_mut(&ws) {
+        Some(entry) if entry.request == mount_request => {
+            entry.cancelled.store(true, Ordering::Release);
+            entry.gate.clone()
+        }
+        _ => None,
+    };
     let mut mounts = lock(&state.mounts);
-    match mounts.get(&ws) {
+    let removed = match mounts.get(&ws) {
         Some(mount) if mount.request == mount_request => {
             mount.gate.fence();
             mounts.remove(&ws)
         }
         _ => None,
+    };
+    // Fence synchronously while the ownership decision is still linearized:
+    // a cancelling mount must stop admitting mutations even before the slow
+    // session join is handed to a worker.
+    if let Some(gate) = pending_gate {
+        gate.fence();
     }
+    drop(mounts);
+    drop(pending);
+    removed
 }
 
 pub(super) fn abort_mount_reply(state: &Arc<State>, request: u64, workspace: Option<Uuid>, removed: Option<Mounted>) {
@@ -356,7 +413,7 @@ pub(super) fn freeze_begin(state: &Arc<State>, request: u64, workspace: Option<U
             return reply_error(state, request, workspace, libc::EEXIST, "freeze operation id reused");
         }
     }
-    if take_freeze_tombstone(state, op_id) {
+    if freeze_is_retired(state, op_id) {
         return reply_error(state, request, workspace, libc::ESTALE, "freeze operation was already cancelled");
     }
     let (decision, waiter) = mpsc::sync_channel::<bool>(1);
@@ -370,7 +427,6 @@ pub(super) fn freeze_begin(state: &Arc<State>, request: u64, workspace: Option<U
             begin_request: request,
             deadline,
             failstop_at: deadline + super::FREEZE_JOIN_GRACE,
-            expired: AtomicBool::new(false),
             decision,
             done: done.clone(),
             released: AtomicBool::new(false),
@@ -452,26 +508,31 @@ pub(super) fn freeze_release(
     epoch: i64,
     thaw: bool,
 ) {
-    let (claimed, exists) = {
+    let (claimed, exists, decision, done_slot) = {
         let freezes = lock(&state.freezes);
         match freezes.get(&op_id) {
             Some(op) if workspace == Some(op.workspace) && frame_epoch == op.epoch => {
                 if epoch >= 0 && epoch != op.epoch {
-                    (Err((libc::ESTALE, "freeze epoch does not match the operation")), true)
+                    (Err((libc::ESTALE, "freeze epoch does not match the operation")), true, None, None)
                 } else if op.released.swap(true, Ordering::AcqRel) {
-                    (Err((libc::ESTALE, "freeze operation was already released")), true)
+                    (Err((libc::ESTALE, "freeze operation was already released")), true, None, None)
                 } else {
                     let mut done = lock(&op.done);
                     if done.is_some() {
-                        (Err((libc::ESTALE, "freeze operation already has a finishing request")), true)
+                        (Err((libc::ESTALE, "freeze operation already has a finishing request")), true, None, None)
                     } else {
                         *done = Some(request);
-                        (Ok(op.workspace), true)
+                        (
+                            Ok(op.workspace),
+                            true,
+                            Some(op.decision.clone()),
+                            Some(op.done.clone()),
+                        )
                     }
                 }
             }
-            Some(_) => (Err((libc::ESTALE, "freeze frame does not match the operation context")), true),
-            None => (Err((libc::ESTALE, "freeze operation is not pending")), false),
+            Some(_) => (Err((libc::ESTALE, "freeze frame does not match the operation context")), true, None, None),
+            None => (Err((libc::ESTALE, "freeze operation is not pending")), false, None, None),
         }
     };
     let op_workspace = match claimed {
@@ -489,22 +550,17 @@ pub(super) fn freeze_release(
     if epoch < 0
         && let Some(gate) = gate_for(state, op_workspace)
     {
+        // Synchronous fence BEFORE the non-blocking decision signal, so even a
+        // thaw already occupying the one-slot channel cannot revive the gate.
         gate.fence();
     }
-    let sent = {
-        let freezes = lock(&state.freezes);
-        freezes.get(&op_id).map(|op| op.decision.send(thaw).is_ok()).unwrap_or(false)
-    };
+    // The freezes lock is released. Never block the control reader or watchdog
+    // on a full decision slot: a full slot already holds a decision and the
+    // gate is fenced, while a disconnected receiver means the thread is gone.
+    let sent = decision.is_some_and(|sender| sender.try_send(thaw).is_ok());
     if !sent {
-        // The decision could not be delivered (the thread is gone or the
-        // watchdog already queued a fence). Drop our acknowledgement claim so
-        // no stale `finished` reply can claim the decision was applied.
-        let mut done = {
-            let freezes = lock(&state.freezes);
-            freezes.get(&op_id).map(|op| op.done.clone())
-        };
-        if let Some(slot) = done.as_mut() {
-            let mut slot = lock(&**slot);
+        if let Some(slot) = done_slot {
+            let mut slot = lock(&*slot);
             if *slot == Some(request) {
                 *slot = None;
             }

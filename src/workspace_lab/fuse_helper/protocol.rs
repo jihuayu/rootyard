@@ -44,9 +44,12 @@ pub const PREWARM_DEADLINE: Duration = Duration::from_secs(60);
 /// Deadline for the out-of-band cancel frame. A cancel that cannot be sent in
 /// this window is covered by the child-side operation deadline instead.
 pub const ABORT_DEADLINE: Duration = Duration::from_secs(2);
-/// Child-side mount deadline: the parent gives up first, and a mount that
-/// outlives this window must not be published as writable.
-pub const MOUNT_OP_DEADLINE: Duration = Duration::from_secs(20);
+/// Child-side, queue-inclusive mount deadline. It is strictly below the
+/// parent's own mount deadline with margin: a mount that outlives this window
+/// is replied as failed and can never publish as healthy. A lost reply is still
+/// covered by the parent's `AbortMount`; a cancellation that cannot be queued
+/// fail-stops the parent generation instead of trusting a best-effort abort.
+pub const MOUNT_OP_DEADLINE: Duration = Duration::from_secs(10);
 /// Child-side freeze deadline: a freeze whose caller vanished (or whose begin
 /// reply was lost) fences itself instead of holding the gate forever.
 pub const FREEZE_OP_DEADLINE: Duration = Duration::from_secs(35);
@@ -419,7 +422,10 @@ mod tests {
         // caller's own operation window.
         assert_eq!(MAX_INFLIGHT, 64);
         assert!(REQUEST_DEADLINE <= Duration::from_secs(30));
-        assert!(MOUNT_DEADLINE < MOUNT_OP_DEADLINE);
+        assert!(
+            MOUNT_OP_DEADLINE + Duration::from_secs(2) <= MOUNT_DEADLINE,
+            "the child-side mount deadline must leave the parent margin to cancel a lost reply"
+        );
         assert!(FREEZE_DEADLINE < FREEZE_OP_DEADLINE);
         assert!(HEARTBEAT_INTERVAL * 6 <= HEARTBEAT_DEADLINE);
     }

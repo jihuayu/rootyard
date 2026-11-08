@@ -38,7 +38,7 @@ use super::protocol::{
 use crate::workspace_lab::fuse_mount::{MountHandle, MutationGate};
 use crate::workspaces::lazy::Reader;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     io,
     os::fd::{FromRawFd, OwnedFd},
     os::unix::net::UnixStream,
@@ -55,6 +55,8 @@ use uuid::Uuid;
 
 #[path = "server_ops.rs"]
 mod ops;
+#[path = "retired.rs"]
+mod retired;
 
 /// Per-mount operation queue, mirrored from `fuse_dispatch` for diagnostics.
 pub(super) const MOUNT_QUEUE_CAPACITY: u32 = 128;
@@ -75,12 +77,23 @@ const PREWARM_QUEUE: usize = 8;
 /// bounded queues are full the helper fail-stops instead of spawning threads.
 const CLEANUP_WORKERS: usize = 1;
 const CLEANUP_QUEUE: usize = 8;
-/// Bounded memory of cancelled operation ids, so a cancel that races ahead of
-/// its begin/mount frame cannot be forgotten and a late frame cannot revive it.
-pub(super) const TOMBSTONES: usize = 64;
+/// A graceful shutdown may attempt owned teardown, but an independent watchdog
+/// fail-stops the process if that teardown cannot finish in this window.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// If the watchdog cannot inspect frozen-operation state for this many ticks,
+/// a stuck mutex is itself a fail-stop condition.
+const WATCHDOG_STUCK_TICKS: u32 = 20;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn try_lock<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 /// One blocking job. `Box<dyn FnOnce>` keeps the pools type-agnostic.
@@ -115,7 +128,6 @@ pub(super) struct FreezeOp {
     pub begin_request: u64,
     pub deadline: Instant,
     pub failstop_at: Instant,
-    pub expired: AtomicBool,
     pub decision: SyncSender<bool>,
     /// Request id that receives the `finished` reply once the gate is free.
     pub done: Arc<Mutex<Option<u64>>>,
@@ -125,13 +137,17 @@ pub(super) struct FreezeOp {
 pub(super) struct State {
     pub generation: AtomicU64,
     pub hello: AtomicBool,
-    pub last_heartbeat: Mutex<Instant>,
+    pub started: Instant,
+    pub last_heartbeat_ms: AtomicU64,
+    /// Zero means no graceful shutdown is in progress; otherwise this is the
+    /// absolute fail-stop deadline in milliseconds since `started`.
+    pub shutdown_deadline_ms: AtomicU64,
     pub control: Mutex<UnixStream>,
     pub mounts: Mutex<HashMap<Uuid, Mounted>>,
     pub pending: Mutex<HashMap<Uuid, PendingMount>>,
-    pub mount_tombstones: Mutex<VecDeque<(Uuid, u64)>>,
+    pub mount_tombstones: retired::RetiredIds,
     pub freezes: Mutex<HashMap<u64, FreezeOp>>,
-    pub freeze_tombstones: Mutex<VecDeque<u64>>,
+    pub freeze_tombstones: retired::RetiredIds,
     pub ops: SyncSender<Job>,
     pub prewarm: SyncSender<Job>,
     pub cleanup: SyncSender<Job>,
@@ -142,17 +158,45 @@ impl State {
         Self {
             generation: AtomicU64::new(0),
             hello: AtomicBool::new(false),
-            last_heartbeat: Mutex::new(Instant::now()),
+            started: Instant::now(),
+            last_heartbeat_ms: AtomicU64::new(0),
+            shutdown_deadline_ms: AtomicU64::new(0),
             control: Mutex::new(control),
             mounts: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
-            mount_tombstones: Mutex::new(VecDeque::new()),
+            mount_tombstones: retired::RetiredIds::new(),
             freezes: Mutex::new(HashMap::new()),
-            freeze_tombstones: Mutex::new(VecDeque::new()),
+            freeze_tombstones: retired::RetiredIds::new(),
             ops,
             prewarm,
             cleanup,
         }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    fn touch_heartbeat(&self) {
+        self.last_heartbeat_ms.store(self.now_ms(), Ordering::Release);
+    }
+
+    fn heartbeat_age(&self) -> Duration {
+        Duration::from_millis(self.now_ms().saturating_sub(self.last_heartbeat_ms.load(Ordering::Acquire)))
+    }
+
+    fn begin_shutdown(&self) {
+        let grace = SHUTDOWN_GRACE.as_millis().min(u64::MAX as u128) as u64;
+        self.shutdown_deadline_ms.store(self.now_ms().saturating_add(grace).max(1), Ordering::Release);
+    }
+
+    fn shutdown_deadline(&self) -> Option<u64> {
+        let deadline = self.shutdown_deadline_ms.load(Ordering::Acquire);
+        (deadline != 0).then_some(deadline)
+    }
+
+    fn in_shutdown(&self) -> bool {
+        self.shutdown_deadline().is_some()
     }
 
     /// Fence every published mount and every gate that is still being built.
@@ -280,8 +324,8 @@ pub fn run() -> io::Result<()> {
         Ok(Ok(LoopOutcome::Shutdown)) => loop {
             thread::park_timeout(Duration::from_secs(1));
         },
-        Ok(Err(_)) => teardown(&state, "control loop failed", 1),
-        Err(_) => teardown(&state, "control loop panicked", 1),
+        Ok(Err(_)) => failstop(&state, "control loop failed", 1),
+        Err(_) => failstop(&state, "control loop panicked", 1),
     }
 }
 
@@ -348,97 +392,98 @@ fn stream_from_fd(fd: i32) -> io::Result<UnixStream> {
 }
 
 fn watchdog(state: Arc<State>) {
+    let mut stuck_ticks = 0u32;
     loop {
         thread::sleep(WATCHDOG_TICK);
-        let elapsed = lock(&state.last_heartbeat).elapsed();
-        if elapsed > HEARTBEAT_DEADLINE {
+        let now = state.now_ms();
+        if let Some(deadline) = state.shutdown_deadline() {
+            if now >= deadline {
+                // Graceful teardown may join a session, so only this
+                // independent, lock-free watchdog can bound it.
+                failstop(&state, "graceful shutdown exceeded its watchdog deadline", 1);
+            }
+            continue;
+        }
+        if state.heartbeat_age() > HEARTBEAT_DEADLINE {
             // The parent may be SIGKILLed while another thread still holds the
             // socket open, so EOF alone is not a liveness signal.
-            teardown(&state, "heartbeat deadline missed", 1);
+            failstop(&state, "heartbeat deadline missed", 1);
         }
-        enforce_freeze_deadlines(&state);
+        if enforce_freeze_deadlines(&state) {
+            stuck_ticks = 0;
+        } else {
+            stuck_ticks = stuck_ticks.saturating_add(1);
+            if stuck_ticks >= WATCHDOG_STUCK_TICKS {
+                failstop(&state, "watchdog could not inspect frozen operations", 1);
+            }
+        }
     }
 }
 
-/// A freeze can block inside `begin_freeze` while an admitted mutation never
-/// drains; the waiter deadline alone would never fire there. The watchdog does
-/// it independently: fence the gate, cancel the begin and release the decision
-/// as a fence. If the thread still cannot leave the drain, exit the helper.
-fn enforce_freeze_deadlines(state: &State) {
+/// Snapshot the expired freeze operations without ever holding a lock across a
+/// blocking channel send or a control write. Returns false when a mutex could
+/// not be inspected, so the watchdog can still reach its own fail-stop bound.
+fn enforce_freeze_deadlines(state: &State) -> bool {
     let now = Instant::now();
-    let expired: Vec<(u64, Uuid, i64, u64, Instant)> = {
-        let freezes = lock(&state.freezes);
-        freezes
-            .iter()
-            .filter(|(_, op)| op.deadline <= now)
-            .map(|(op_id, op)| (*op_id, op.workspace, op.epoch, op.begin_request, op.failstop_at))
-            .collect()
-    };
-    for (op_id, workspace, _epoch, begin_request, failstop_at) in expired {
-        // Fence once per operation. A thaw already buffered in the decision
-        // channel cannot revive a fenced gate, so reply with a timeout instead
-        // of ever reporting a drained gate.
-        let first = {
-            let freezes = lock(&state.freezes);
-            match freezes.get(&op_id) {
-                Some(op) => {
-                    if op.expired.swap(true, Ordering::AcqRel) {
-                        false
-                    } else {
-                        // Release the decision as a fence when the drain is
-                        // still stuck; a thaw already buffered stays harmless
-                        // because the gate is fenced below.
-                        let _ = op.decision.send(false);
-                        true
-                    }
-                }
-                None => continue,
-            }
-        };
-        if first {
-            if let Some(gate) = gate_for(state, workspace) {
-                gate.fence();
-            }
-            reply_error(
-                state,
-                begin_request,
-                Some(workspace),
-                libc::ETIMEDOUT,
-                "freeze drain deadline expired; the epoch stays fenced",
-            );
+    let mut expired = Vec::new();
+    {
+        let Some(freezes) = try_lock(&state.freezes) else { return false };
+        for op in freezes.values().filter(|op| op.deadline <= now) {
+            let Some(mounts) = try_lock(&state.mounts) else { return false };
+            let gate = mounts.get(&op.workspace).map(|mount| mount.gate.clone());
+            drop(mounts);
+            expired.push((op.decision.clone(), gate, op.failstop_at));
         }
+    }
+    for (decision, gate, failstop_at) in expired {
+        // Fence synchronously BEFORE releasing the waiter. A thaw already
+        // queued in the one-slot channel can then never revive the gate.
+        if let Some(gate) = gate {
+            gate.fence();
+        }
+        // Non-blocking: a full slot already carries a decision, and a
+        // disconnected receiver means the freeze thread is gone. Repeating
+        // this every tick is harmless and keeps the watchdog lock-bounded.
+        let _ = decision.try_send(false);
         if now >= failstop_at {
             // The drain still did not release: bounded fail-stop, never a
             // healthy reply and never an unbounded wait for the IO.
             failstop(state, "freeze drain could not be released within its deadline", 1);
         }
     }
+    true
 }
 
-fn failstop(state: &State, reason: &str, code: i32) -> ! {
-    // Do not join FUSE sessions here: the point of this path is that an
-    // admitted IO may never return. Fencing and process exit are the bounded
-    // termination; the kernel aborts the mount when the descriptors close.
-    eprintln!("rootyard: workspace FUSE helper {reason}; fencing before fail-stop");
-    state.fence_all();
-    state.release_freezes();
-    std::process::exit(code)
+fn failstop(_state: &State, reason: &str, code: i32) -> ! {
+    // This is the final bounded path. Do not join FUSE sessions and do not
+    // take state, mount or gate mutexes: an admitted IO may never return and a
+    // poisoned/stuck mutex must not prevent process death. `_exit` closes the
+    // descriptors, which fails pending FUSE I/O. It does NOT perform an owned
+    // unmount: a SIGKILLed helper can leave a disconnected kernel mount that
+    // still needs identity-checked cleanup before a replacement is trusted.
+    eprintln!("rootyard: workspace FUSE helper fail-stop: {reason}");
+    // SAFETY: `_exit` is async-signal-safe and never touches Rust state.
+    unsafe { libc::_exit(code) }
 }
 
 fn heartbeat_reader(state: Arc<State>, mut stream: UnixStream) {
     loop {
         let frame = match read_frame(&mut stream) {
             Ok(frame) => frame,
-            Err(_) => teardown(&state, "heartbeat socket closed", 1),
+            Err(_) if state.in_shutdown() => return,
+            Err(_) => failstop(&state, "heartbeat socket closed", 1),
         };
         if !matches!(frame.body(), Ok(Body::Heartbeat(Heartbeat { .. }))) {
-            teardown(&state, "unexpected heartbeat frame", 1);
+            if state.in_shutdown() {
+                return;
+            }
+            failstop(&state, "unexpected heartbeat frame", 1);
         }
         let generation = state.generation.load(Ordering::Acquire);
         if state.hello.load(Ordering::Acquire) && frame.generation != generation {
-            teardown(&state, "heartbeat generation mismatch", 1);
+            failstop(&state, "heartbeat generation mismatch", 1);
         }
-        *lock(&state.last_heartbeat) = Instant::now();
+        state.touch_heartbeat();
     }
 }
 
@@ -468,7 +513,7 @@ fn control_loop(state: Arc<State>, mut stream: UnixStream) -> io::Result<LoopOut
                     }
                     state.generation.store(frame.generation, Ordering::Release);
                     state.hello.store(true, Ordering::Release);
-                    *lock(&state.last_heartbeat) = Instant::now();
+                    state.touch_heartbeat();
                     reply(&state, frame.request_id, None, 0, Body::Ok(OkReply { op_id: None }));
                 }
                 _ => {
@@ -507,9 +552,7 @@ fn dispatch(
     // is part of the caller's budget, not free time for the worker.
     let admitted = Instant::now();
     match body {
-        Body::Heartbeat(_) => {
-            *lock(&state.last_heartbeat) = Instant::now();
-        }
+        Body::Heartbeat(_) => state.touch_heartbeat(),
         Body::Mount(request_body) => {
             let job_state = state.clone();
             let deadline = admitted + MOUNT_OP_DEADLINE;
@@ -590,6 +633,9 @@ fn dispatch(
             }
         }
         Body::Shutdown => {
+            // From here the heartbeat writer stops, so the watchdog switches
+            // from the heartbeat deadline to this independent teardown bound.
+            state.begin_shutdown();
             reply(state, request, None, 0, Body::ShuttingDown);
             let job_state = state.clone();
             let job: Job = Box::new(move || teardown(&job_state, "explicit shutdown", 0));
