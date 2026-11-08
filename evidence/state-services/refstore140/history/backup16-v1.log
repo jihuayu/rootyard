@@ -1,0 +1,44 @@
+name 'uuid_literal' is not defined
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "synthetic_source_with_seeded_refstore_core",
+      "status": "failed",
+      "seconds": 3.001,
+      "error": "name 'uuid_literal' is not defined"
+    }
+  ],
+  "binary": "/workspace/scratch/state-pg140-app-v1/rootyard",
+  "binary_sha256": "c11acf141750ab40e87ddbe65aa8c8cdecc5d8c069332450905dbc058bb5ad76",
+  "backup_format": 16,
+  "snapshot_fixture_helper": {
+    "binary": "/workspace/scratch/state-pg140-backup-helper-v1/ref_store_snapshot_backup_fixture",
+    "binary_sha256": "4b6bf9d9b49596a2ded50d6447a49d084f639744a8887f0e29a6d0ebaac37e86",
+    "build_receipt": "/workspace/scratch/state-pg140-backup-helper-v1/ref_store_snapshot_backup_fixture.build.json",
+    "build_receipt_sha256": "3bea192a5b5f157a460ad5f6121054004069824e0ed22e572930c8c56ee35667",
+    "build_kind": "rust-integration-test",
+    "package_rebuilt": true,
+    "fresh": false,
+    "fresh_false_artifact": {
+      "target": "ref_store_snapshot_backup_fixture",
+      "kind": "test",
+      "fresh": false
+    },
+    "test_profile": true,
+    "integration_test_source_sha256": "e1405400dbde0df42a931bb4012428ea6ee62f172d3bdc4c2f9a2de65f435f53",
+    "integration_test_source_matches_source_file": true,
+    "source_inputs_sha256": "e7d68a840b82d600f1b9fc294944c46cb3c97b70df57a52b8bfa36d89b6b069e",
+    "candidate_application_receipt": "/workspace/scratch/state-pg140-app-v1/rootyard.build.json",
+    "candidate_application_sha256": "c11acf141750ab40e87ddbe65aa8c8cdecc5d8c069332450905dbc058bb5ad76",
+    "candidate_application_package_rebuilt": true,
+    "source_inputs_match_candidate_application": true
+  },
+  "limitations": [
+    "The migration-139 gate/refs/lane/operation rows are still a direct SQL metadata fixture; they are not an adapter or Git ACK.",
+    "The migration-140 snapshot, ref, pin, receipt and usage rows are produced by the real typed PgRefStoreCore adapter and replayed through the public typed requests.",
+    "A metadata pin is not protective of Git objects: pack membership stays 'unavailable', there is no physical GC or serving claim, and the drill repository is never served.",
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise.",
+    "Only three pin lifecycles (active renewed, exactly released, database-clock expired) are covered here; concurrency, quotas and ABA races are covered by the Rust suites."
+  ]
+}

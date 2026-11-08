@@ -1,0 +1,148 @@
+{
+  "passed": true,
+  "elapsed_seconds": 27.16,
+  "command": [
+    "/workspace/scratch/state-pg140-snapshot-test-v4/ref_store_core_snapshot",
+    "--ignored",
+    "--test-threads=1"
+  ],
+  "returncode": 0,
+  "summary": "test result: ok. 17 passed; 0 failed; 0 ignored;",
+  "cases": [
+    {
+      "name": "capture_serializes_with_commit_refs_and_commits_one_revision",
+      "passed": true
+    },
+    {
+      "name": "corrupt_ledger_bodies_and_direct_pin_rewrites_are_typed_denials",
+      "passed": true
+    },
+    {
+      "name": "direct_sql_scope_fks_and_delete_guards_are_durable",
+      "passed": true
+    },
+    {
+      "name": "exact_create_replay_returns_old_receipt_and_never_double_charges",
+      "passed": true
+    },
+    {
+      "name": "expired_and_released_replays_never_extend_or_revive",
+      "passed": true
+    },
+    {
+      "name": "expired_pin_denies_pages_and_renew_but_release_is_exact",
+      "passed": true
+    },
+    {
+      "name": "failure_after_inserts_rolls_back_every_metadata_row",
+      "passed": true
+    },
+    {
+      "name": "non_ascii_refs_page_with_literal_prefix_and_cursor",
+      "passed": true
+    },
+    {
+      "name": "oversize_capture_is_typed_and_writes_no_metadata_or_quota",
+      "passed": true
+    },
+    {
+      "name": "renew_after_live_check_observes_expiry_without_charge",
+      "passed": true
+    },
+    {
+      "name": "renew_release_generation_aba_and_exact_replay",
+      "passed": true
+    },
+    {
+      "name": "retained_quota_is_exact_without_refund_and_racing_creates",
+      "passed": true
+    },
+    {
+      "name": "scope_and_cursor_fences",
+      "passed": true
+    },
+    {
+      "name": "stale_gate_is_rejected_and_pages_stay_immutable_while_refs_change",
+      "passed": true
+    },
+    {
+      "name": "transition_blocks_pages_and_renew_but_allows_exact_release",
+      "passed": true
+    },
+    {
+      "name": "unknown_commit_resolves_by_same_request_id",
+      "passed": true
+    },
+    {
+      "name": "unknown_lookups_and_metadata_capabilities",
+      "passed": true
+    }
+  ],
+  "source_binary_test_head_unchanged": true,
+  "before": {
+    "source": "4ec07e2404cff55bae787752ee8c9fe72336360599c812059d67b04148577746",
+    "binary": "ed68d95b64b42634d07e3248999719cd42943b55e56adfd91f2c16e2b6fcbdab",
+    "test": "2c670cecd7884529c3597e9b04b3b4cf4f8329416ca41c3a6b843e6fd51dd516",
+    "head": "839baaa87962c0147f6165a01918c41547b7a13f"
+  },
+  "after": {
+    "source": "4ec07e2404cff55bae787752ee8c9fe72336360599c812059d67b04148577746",
+    "binary": "ed68d95b64b42634d07e3248999719cd42943b55e56adfd91f2c16e2b6fcbdab",
+    "test": "2c670cecd7884529c3597e9b04b3b4cf4f8329416ca41c3a6b843e6fd51dd516",
+    "head": "839baaa87962c0147f6165a01918c41547b7a13f"
+  },
+  "build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "ed68d95b64b42634d07e3248999719cd42943b55e56adfd91f2c16e2b6fcbdab",
+    "workspace_commit": "839baaa87962c0147f6165a01918c41547b7a13f",
+    "fresh": false,
+    "source_inputs_sha256": "4ec07e2404cff55bae787752ee8c9fe72336360599c812059d67b04148577746",
+    "binary_sha256": "ed68d95b64b42634d07e3248999719cd42943b55e56adfd91f2c16e2b6fcbdab",
+    "integration_test_source_sha256": "2c670cecd7884529c3597e9b04b3b4cf4f8329416ca41c3a6b843e6fd51dd516",
+    "cargo_lock_sha256": "1d463290291864226a654eb509bb81e095dd4c1e1a109254b670fbd0c4342034",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_core_snapshot",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_core_snapshot",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_core_snapshot-cd59c96f1a5d649a"
+      }
+    ]
+  },
+  "compiled_commit": "839baaa87962c0147f6165a01918c41547b7a13f",
+  "tested_checkout_commit": "839baaa87962c0147f6165a01918c41547b7a13f",
+  "compiled_inputs_and_integration_test_match_receipt": true,
+  "limits": [
+    "Real PostgreSQL on one loopback host; metadata pins only; no serving/cutover, pack membership, physical roots/holds, multi-host or power-loss qualification."
+  ]
+}

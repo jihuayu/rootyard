@@ -1,0 +1,135 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-pg-snapshot)
+error: cannot find macro `json` in this scope
+    --> tests/ref_store_core_snapshot.rs:1960:34
+     |
+1960 |             body["request_id"] = json!(request_id);
+     |                                  ^^^^
+
+error: cannot find macro `json` in this scope
+    --> tests/ref_store_core_snapshot.rs:1952:31
+     |
+1952 |             ("logical_bytes", json!(stored["logical_bytes"].as_i64().expect("stored logical bytes") + 1)),
+     |                               ^^^^
+
+error: cannot find macro `json` in this scope
+    --> tests/ref_store_core_snapshot.rs:1951:29
+     |
+1951 |             ("refs_digest", json!("d".repeat(64))),
+     |                             ^^^^
+
+error: cannot find macro `json` in this scope
+    --> tests/ref_store_core_snapshot.rs:1950:27
+     |
+1950 |             ("ref_count", json!(stored["ref_count"].as_i64().expect("stored ref count") + 1)),
+     |                           ^^^^
+
+error: cannot find macro `json` in this scope
+    --> tests/ref_store_core_snapshot.rs:1949:29
+     |
+1949 |             ("gate_digest", json!("c".repeat(64))),
+     |                             ^^^^
+
+error: cannot find macro `json` in this scope
+    --> tests/ref_store_core_snapshot.rs:1948:31
+     |
+1948 |             ("gate_revision", json!(stored["gate_revision"].as_i64().expect("stored gate revision") + 1)),
+     |                               ^^^^
+
+error: cannot find macro `json` in this scope
+    --> tests/ref_store_core_snapshot.rs:1947:26
+     |
+1947 |             ("head_oid", json!("0".repeat(40))),
+     |                          ^^^^
+
+error: cannot find macro `json` in this scope
+    --> tests/ref_store_core_snapshot.rs:1946:26
+     |
+1946 |             ("head_ref", json!("refs/heads/corrupt")),
+     |                          ^^^^
+
+error[E0609]: no field `replayed` on type `Result<CreateMetadataSnapshotOutcome, RefStoreError>`
+   --> tests/ref_store_core_snapshot.rs:555:26
+    |
+555 |         assert!(!created.replayed);
+    |                          ^^^^^^^^ unknown field
+    |
+    = note: the full name for the type has been written to '/workspace/rootyard/target/debug/deps/ref_store_core_snapshot-a7f533fd9a73437d.long-type-18168599644678046362.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+help: one of the expressions' fields has a field of the same name
+    |
+555 |         assert!(!created.unwrap().replayed);
+    |                          +++++++++
+
+error[E0609]: no field `receipt` on type `Result<CreateMetadataSnapshotOutcome, RefStoreError>`
+   --> tests/ref_store_core_snapshot.rs:556:28
+    |
+556 |         assert_eq!(created.receipt.gate_revision(), before.revision());
+    |                            ^^^^^^^ unknown field
+    |
+    = note: the full name for the type has been written to '/workspace/rootyard/target/debug/deps/ref_store_core_snapshot-a7f533fd9a73437d.long-type-18168599644678046362.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+help: one of the expressions' fields has a field of the same name
+    |
+556 |         assert_eq!(created.unwrap().receipt.gate_revision(), before.revision());
+    |                            +++++++++
+
+error[E0609]: no field `receipt` on type `Result<CreateMetadataSnapshotOutcome, RefStoreError>`
+   --> tests/ref_store_core_snapshot.rs:557:28
+    |
+557 |         assert_eq!(created.receipt.ref_count(), 3);
+    |                            ^^^^^^^ unknown field
+    |
+    = note: the full name for the type has been written to '/workspace/rootyard/target/debug/deps/ref_store_core_snapshot-a7f533fd9a73437d.long-type-18168599644678046362.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+help: one of the expressions' fields has a field of the same name
+    |
+557 |         assert_eq!(created.unwrap().receipt.ref_count(), 3);
+    |                            +++++++++
+
+error[E0609]: no field `receipt` on type `Result<CreateMetadataSnapshotOutcome, RefStoreError>`
+   --> tests/ref_store_core_snapshot.rs:558:28
+    |
+558 |         assert_eq!(created.receipt.head_ref(), "refs/heads/main");
+    |                            ^^^^^^^ unknown field
+    |
+    = note: the full name for the type has been written to '/workspace/rootyard/target/debug/deps/ref_store_core_snapshot-a7f533fd9a73437d.long-type-18168599644678046362.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+help: one of the expressions' fields has a field of the same name
+    |
+558 |         assert_eq!(created.unwrap().receipt.head_ref(), "refs/heads/main");
+    |                            +++++++++
+
+error[E0609]: no field `receipt` on type `Result<CreateMetadataSnapshotOutcome, RefStoreError>`
+   --> tests/ref_store_core_snapshot.rs:559:28
+    |
+559 |         assert_eq!(created.receipt.head_oid_hex(), Some(oid(1).as_hex().as_str()));
+    |                            ^^^^^^^ unknown field
+    |
+    = note: the full name for the type has been written to '/workspace/rootyard/target/debug/deps/ref_store_core_snapshot-a7f533fd9a73437d.long-type-18168599644678046362.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+help: one of the expressions' fields has a field of the same name
+    |
+559 |         assert_eq!(created.unwrap().receipt.head_oid_hex(), Some(oid(1).as_hex().as_str()));
+    |                            +++++++++
+
+error[E0599]: no method named `is_committed` found for enum `std::result::Result<T, E>` in the current scope
+   --> tests/ref_store_core_snapshot.rs:564:27
+    |
+564 |         assert!(committed.is_committed());
+    |                           ^^^^^^^^^^^^ method not found in `Result<CommitRefsReceipt, RefStoreError>`
+    |
+note: the method `is_committed` exists on the type `rootyard::ref_store::CommitRefsReceipt`
+   --> src/ref_store/core/terminal.rs:207:5
+    |
+207 |     pub fn is_committed(&self) -> bool {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: the full name for the type has been written to '/workspace/rootyard/target/debug/deps/ref_store_core_snapshot-a7f533fd9a73437d.long-type-11097917036985861173.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+help: consider using `Result::expect` to unwrap the `rootyard::ref_store::CommitRefsReceipt` value, panicking if the value is a `Result::Err`
+    |
+564 |         assert!(committed.expect("REASON").is_committed());
+    |                          +++++++++++++++++
+
+Some errors have detailed explanations: E0599, E0609.
+For more information about an error, try `rustc --explain E0599`.
+error: could not compile `rootyard` (test "ref_store_core_snapshot") due to 14 previous errors
