@@ -71,14 +71,22 @@ pub async fn create(
     let dest = service::checkpoint_repo(&state, cp);
     // Check the native index and worktree around the immutable copy. A changed
     // source is rejected; external editors are not fenced by this DB lock.
+    //
+    // Everything inside the freeze reads service-owned raw layers only — the
+    // lower tree, the upper tree, the lazy manifest and verified lazy-cache
+    // bytes. Reading the FUSE mount here would queue behind the inode lock of a
+    // parked write and deadlock the freezer (the process then parks in `D`).
     let (before, before_index, captured, after, after_index) = super::mounts::with_frozen(id, || {
-        let before = super::capture::fingerprint(&source)?;
-        let before_index = fs::read(source.join(".git/index")).unwrap_or_default();
-        copy_snapshot(&source, &dest)?;
-        let captured = super::capture::fingerprint(&dest)?;
-        let after = super::capture::fingerprint(&source)?;
-        let after_index = fs::read(source.join(".git/index")).unwrap_or_default();
-        Ok((before, before_index, captured, after, after_index))
+        let before_raw = super::snapshot::Raw::load(&source)?
+            .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
+        let before_index = before_raw.raw_file(FsPath::new(".git/index"))?;
+        super::snapshot::copy(&state, &before_raw, &dest)?;
+        let captured = super::snapshot::fingerprint(&dest)?;
+        let after_raw = super::snapshot::Raw::load(&source)?
+            .ok_or_else(|| Error::internal("workspace raw snapshot unavailable"))?;
+        let after = after_raw.digest().to_owned();
+        let after_index = after_raw.raw_file(FsPath::new(".git/index"))?;
+        Ok((before_raw.digest().to_owned(), before_index, captured, after, after_index))
     })?;
     if before != after || before != captured || before_index != after_index {
         let _ = fs::remove_dir_all(&dest);
