@@ -74,13 +74,23 @@ class WebTrack1ContractTest(unittest.TestCase):
         web_rs = ROOT / "src/web.rs"
         web_src = web_rs.read_text(encoding="utf-8")
         regs = t5._extract_route_registrations(web_rs)
-        self.assertEqual(len(regs), 42, f"Expected 19 repository pairs and 4 session routes, got {len(regs)}")
+        self.assertEqual(
+            len(regs), 48,
+            f"Expected 19 repository pairs and 10 web/session/token routes, got {len(regs)}",
+        )
         session_routes = {path: set(methods) for path, methods in regs if not path.startswith(("/web/repos/", "/ui/repos/"))}
         self.assertEqual(session_routes, {
             "/web/login": {"GET", "POST"},
             "/web/app.js": {"GET"},
             "/web/logout": {"POST"},
             "/web/repos": {"GET"},
+            # PAT token/session management UI added after the first 42 routes.
+            "/web/settings/tokens": {"GET", "POST"},
+            "/web/settings/tokens/{id}/rotate": {"POST"},
+            "/web/settings/tokens/{id}/revoke": {"POST"},
+            "/web/settings/tokens/{id}/scope": {"POST"},
+            "/web/settings/sessions": {"GET"},
+            "/web/settings/sessions/{id}/revoke": {"POST"},
         })
         repository_pairs = []
         for prefix in ("/web", "/ui"):
@@ -189,6 +199,21 @@ class WebTrack1ContractTest(unittest.TestCase):
             '"no-store"',
         ):
             self.assertIn(tok, templates_src, f"Missing {tok} in src/web/templates.rs")
+
+        session_src = (ROOT / "src/web/session.rs").read_text(encoding="utf-8")
+        # Cookie/header normalisation and browser authentication live in the
+        # session domain; handlers must keep the compatibility re-export for
+        # every caller that imports them from `web::handlers`.
+        self.assertIn(
+            "pub fn normalize_web_headers(headers: &HeaderMap) -> HeaderMap",
+            session_src,
+        )
+        self.assertIn("pub async fn authenticate_web(", session_src)
+        self.assertIn("auth::authenticate(pool, &normalize_web_headers(headers))", session_src)
+        self.assertIn(
+            "pub use super::session::{authenticate_web, normalize_web_headers};",
+            handlers_src,
+        )
 
         for h_tok in (
             "auth::authenticate",

@@ -135,7 +135,18 @@ class PullsTrack1ContractTest(unittest.TestCase):
             ("merge.rs", merge_src),
         ):
             self.assertIn("auth::authenticate", src, f"{name} must authenticate via auth::authenticate")
-            self.assertIn("authorize(", src, f"{name} must authorize via auth::authorize_repo")
+            # Repository authorization is typed: the removed untyped
+            # `auth::authorize_repo` wrapper must not come back, and every call
+            # site must name the explicit PAT action it is performing.
+            self.assertNotIn("auth::authorize_repo(", src, f"{name} must not use the removed untyped auth::authorize_repo")
+            self.assertIn(
+                "auth::authorize_repo_with_role(", src,
+                f"{name} must authorize via the typed auth::authorize_repo_with_role",
+            )
+            self.assertIn(
+                "crate::token_scopes::RepoAction::", src,
+                f"{name} must pass an explicit crate::token_scopes::RepoAction",
+            )
             self.assertIn("finish(", src, f"{name} must commit via auth::finish_tx")
 
         for required_merge_token in (
