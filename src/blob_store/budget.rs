@@ -131,7 +131,7 @@ impl ResourceContext {
             Some(take(&self.staging_units, units, deadline).await?)
         };
         Ok(ReadLease {
-            reader: Some(ReaderLease { permit: Some(reader), _private: () }),
+            reader: ReaderLease { permit: Some(reader), _private: () },
             staging: StagingLease { permit: staging, bytes: staging_bytes },
         })
     }
