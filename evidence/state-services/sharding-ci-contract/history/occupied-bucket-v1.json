@@ -1,0 +1,29 @@
+{
+  "passed": false,
+  "mode": "live_metadata_drill",
+  "production_validation": false,
+  "reference_only": false,
+  "data_plane_validation": "run cluster_workload_native.py and cluster_migration_native.py",
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "seconds": 4.1971,
+      "detail": null
+    },
+    {
+      "name": "migration",
+      "status": "passed",
+      "seconds": 0.0163,
+      "detail": null
+    },
+    {
+      "name": "virtual_bucket_routing_and_explicit_overrides",
+      "status": "failed",
+      "seconds": 0.0327,
+      "error": "/api/shards/buckets: expected 201, got 409: b'{\"error\":\"bucket placement has repositories; use verified repository migration\"}'",
+      "traceback": "Traceback (most recent call last):\n  File \"/workspace/scratch/state-shared-contract-gates/tests/pulls.py\", line 68, in case\n    detail = fn()\n             ^^^^\n  File \"/workspace/scratch/state-shared-contract-gates/tests/sharding.py\", line 2708, in virtual_bucket_routing_and_explicit_overrides\n    self.document(\n  File \"/workspace/scratch/state-shared-contract-gates/tests/pulls.py\", line 117, in document\n    assert status in expected, f\"{path}: expected {code}, got {status}: {body[:200]!r}\"\n           ^^^^^^^^^^^^^^^^^^\nAssertionError: /api/shards/buckets: expected 201, got 409: b'{\"error\":\"bucket placement has repositories; use verified repository migration\"}'\n"
+    }
+  ],
+  "binary_sha256": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2"
+}

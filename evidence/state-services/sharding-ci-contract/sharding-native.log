@@ -1,0 +1,98 @@
+setup: passed
+migration: passed
+virtual_bucket_placement_and_occupied_route_refusal: passed
+primary_node_lease_renewal_and_expiry_fencing: passed
+epoch_generation_write_barrier_fence_and_unfence: passed
+caller_watermark_refusal_and_read_path_fallback: passed
+automatic_failover_explicitly_refused: passed
+read_only_degradation_and_recovery: passed
+rebalance_dry_run_plan_and_measured_transfer_refusal: passed
+simulated_dr_drill_explicitly_refused: passed
+benchmark_simulation_receipt_honesty: passed
+access_and_boundaries: passed
+{
+  "passed": true,
+  "mode": "live_metadata_drill",
+  "scope": "sharded control-plane placement, lease/epoch fencing and explicit refusal of unsupported failover, simulated DR and unmeasured rebalance",
+  "production_validation": false,
+  "multi_node_ha_validation": false,
+  "data_plane_success_claimed": false,
+  "benchmark_receipts": "simulation_only",
+  "reference_only": false,
+  "data_plane_validation": "run cluster_workload_native.py and cluster_migration_native.py",
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "seconds": 4.4719,
+      "detail": null
+    },
+    {
+      "name": "migration",
+      "status": "passed",
+      "seconds": 0.0158,
+      "detail": null
+    },
+    {
+      "name": "virtual_bucket_placement_and_occupied_route_refusal",
+      "status": "passed",
+      "seconds": 0.1283,
+      "detail": null
+    },
+    {
+      "name": "primary_node_lease_renewal_and_expiry_fencing",
+      "status": "passed",
+      "seconds": 0.1033,
+      "detail": null
+    },
+    {
+      "name": "epoch_generation_write_barrier_fence_and_unfence",
+      "status": "passed",
+      "seconds": 0.0819,
+      "detail": null
+    },
+    {
+      "name": "caller_watermark_refusal_and_read_path_fallback",
+      "status": "passed",
+      "seconds": 0.0396,
+      "detail": null
+    },
+    {
+      "name": "automatic_failover_explicitly_refused",
+      "status": "passed",
+      "seconds": 0.0486,
+      "detail": null
+    },
+    {
+      "name": "read_only_degradation_and_recovery",
+      "status": "passed",
+      "seconds": 0.0761,
+      "detail": null
+    },
+    {
+      "name": "rebalance_dry_run_plan_and_measured_transfer_refusal",
+      "status": "passed",
+      "seconds": 0.0575,
+      "detail": null
+    },
+    {
+      "name": "simulated_dr_drill_explicitly_refused",
+      "status": "passed",
+      "seconds": 0.0437,
+      "detail": null
+    },
+    {
+      "name": "benchmark_simulation_receipt_honesty",
+      "status": "passed",
+      "seconds": 0.0365,
+      "detail": null
+    },
+    {
+      "name": "access_and_boundaries",
+      "status": "passed",
+      "seconds": 0.0801,
+      "detail": null
+    }
+  ],
+  "binary_sha256": "d19daacca4629e60d1109ccb36bcc883c792155b91367d71715e23be98b7fbe2"
+}
