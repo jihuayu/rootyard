@@ -61,7 +61,7 @@ from pathlib import Path
 import sys
 import uuid
 
-from backup_refstore_core139 import BackupRefStoreCore139Harness
+from backup_refstore_core139 import BackupRefStoreCore139Harness, uuid_literal
 from schema_baseline import CURRENT_BACKUP_FORMAT
 
 #: The six tables migration 140 adds.  Every one of them must be non-empty.
