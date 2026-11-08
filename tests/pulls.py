@@ -18,6 +18,34 @@ from schema_baseline import SCHEMA_VERSION_CSV, SCHEMA_VERSIONS  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# `forge_check_runs` contract fields returned by the checks API (`CHECK_FIELDS`
+# in `src/pulls/models.rs`). Rows this harness writes must not move at all.
+CHECK_ROW_FIELDS = (
+    "repository_id",
+    "commit_oid",
+    "context",
+    "attempt",
+    "sequence",
+    "status",
+    "conclusion",
+    "output",
+    "created_at",
+    "updated_at",
+)
+# Only the always-on pull synchronizer writes `ci/default`
+# (`src/webhooks/delivery.rs`); `ci/test` and `ci/lint` are harness-written here.
+AUTOMATIC_CHECK_CONTEXT = "ci/default"
+MANUAL_CHECK_CONTEXTS = frozenset({"ci/lint", "ci/test"})
+AUTOMATIC_CHECK_OUTPUT = "queued by pull request synchronization"
+AUTOMATIC_CONFIG_SHA256 = hashlib.sha256(
+    b"rootyard-ci-config-v1\0ci/default"
+).hexdigest()
+CHECK_STATUSES = frozenset({"queued", "in_progress", "completed"})
+CHECK_CONCLUSIONS = frozenset(
+    {"success", "failure", "neutral", "cancelled", "timed_out", "skipped"}
+)
+CHECK_DIAGNOSTIC_LIMIT = 8
+
 
 def migration_009_path() -> Path:
     promoted = ROOT / "migrations/009_forge_pulls.sql"
@@ -116,6 +144,301 @@ class PullsHarness(ForgeHarness):
                 assert item["conclusion"] is None, item
                 assert item["output"] == "queued by pull request synchronization", item
         return contexts
+
+    def split_check_rows(self, document: dict) -> tuple:
+        """Partition one `/checks` payload into manual and automatic rows.
+
+        Returns `(manual, automatic)`: `manual` maps context to the full API row
+        for the contexts this harness writes itself, and `automatic` is the
+        scheduler-owned `ci/default` row or `None`. Duplicate or unknown
+        contexts fail, and every item must be accounted for exactly once, so a
+        restart comparison cannot silently drop a row.
+        """
+        manual, automatic = {}, None
+        for item in document["items"]:
+            context = item["context"]
+            if context == AUTOMATIC_CHECK_CONTEXT:
+                assert automatic is None, self.redact(item)
+                automatic = item
+                continue
+            assert context in MANUAL_CHECK_CONTEXTS, self.redact(item)
+            assert context not in manual, self.redact(item)
+            manual[context] = item
+        assert len(document["items"]) == len(manual) + (automatic is not None), (
+            self.redact(document["items"])
+        )
+        return manual, automatic
+
+    def check_row_diff(self, manual_before: dict, manual_after: dict) -> str:
+        """Render a bounded, redacted per-field diff of two check-row maps."""
+        lines = []
+        for context in sorted(set(manual_before) | set(manual_after)):
+            left, right = manual_before.get(context), manual_after.get(context)
+            if left == right:
+                continue
+            if left is None or right is None:
+                label = "added" if left is None else "removed"
+                lines.append(f"{context}: {label} {right or left}")
+                continue
+            for field in CHECK_ROW_FIELDS:
+                if left.get(field) != right.get(field):
+                    lines.append(
+                        f"{context}.{field}: {left.get(field)!r} -> {right.get(field)!r}"
+                    )
+        if not lines:
+            lines.append("no field differences")
+        return self.redact(
+            "check rows changed across restart (bounded to "
+            f"{CHECK_DIAGNOSTIC_LIMIT} entries): " + "; ".join(
+                lines[:CHECK_DIAGNOSTIC_LIMIT]
+            )
+        )
+
+    def automatic_check_binding(self, repository_id: str, head_oid: str) -> dict:
+        """Read durable scheduler records for one commit's `ci/default` row.
+
+        `src/webhooks/delivery.rs` queues the placeholder together with a
+        `ci_runs` job and a `ci_pull_sync_progress` marker for one
+        `(pull, version, head, base, storage_generation)`, so a job joined to a
+        completed marker for that same tuple is durable evidence that the
+        automatic synchronizer orchestrated this commit and context. It is
+        supporting evidence, not an authenticity proof: matching recorded rows
+        cannot by themselves exclude another writer. The marker is a GC root
+        (`src/storage_lifecycle/retention.rs`), so no pruning is expected; a
+        future retention policy that pruned it would leave only the `ci_runs`
+        rows, which still bind commit, context and job identity.
+        """
+        digest_filter = (
+            f"count(*) FILTER (WHERE r.config_sha256 = '{AUTOMATIC_CONFIG_SHA256}')"
+        )
+        rows = self.sql(
+            "SELECT count(*)::text || ':' || "
+            + digest_filter
+            + "::text || ':' || count(DISTINCT r.job_id)::text || ':' || "
+            + "count(*) FILTER (WHERE c.ci_run_id = r.id)::text || ':' || "
+            + "count(DISTINCT c.ci_run_id)::text "
+            + "FROM ci_runs r JOIN ci_pull_sync_progress s "
+            + "ON s.repository_id = r.repository_id AND s.pull_number = r.pull_number "
+            + "AND s.pull_version = r.pull_version AND s.head_oid = r.head_oid "
+            + "AND s.base_oid = r.base_oid "
+            + "AND s.storage_generation = r.storage_generation "
+            + "JOIN forge_check_runs c ON c.repository_id = r.repository_id "
+            + "AND c.commit_oid = r.head_oid AND c.context = r.context "
+            + f"WHERE r.repository_id='{repository_id}' "
+            + f"AND r.context='{AUTOMATIC_CHECK_CONTEXT}' AND r.head_oid='{head_oid}' "
+            + f"AND c.commit_oid='{head_oid}' "
+            + f"AND c.context='{AUTOMATIC_CHECK_CONTEXT}'"
+        ).split(":")
+        return dict(
+            synced_jobs=int(rows[0]),
+            matching_config=int(rows[1]),
+            jobs=int(rows[2]),
+            direct_links=int(rows[3]),
+            linked_ids=int(rows[4]),
+        )
+
+    def assert_automatic_check_row(
+        self, row: dict, repository_id: str, head_oid: str
+    ) -> None:
+        """Validate one scheduler-owned `ci/default` row against outer identity.
+
+        Identity is taken from the enclosing document and its manual rows, never
+        from this row's own fields, so a row bound to another repository, commit
+        or context fails even when it first appears only after the restart. The
+        finite status/conclusion vocabulary and positive `(attempt, sequence)`
+        counters hold for every attempt; the exact initial placeholder form is
+        required only for the `(1, 1) queued` row `delivery.rs` inserts.
+        """
+        diff = self.redact(row)
+        assert row["context"] == AUTOMATIC_CHECK_CONTEXT, diff
+        assert row["repository_id"] == repository_id, diff
+        assert row["commit_oid"] == head_oid, diff
+        assert row["status"] in CHECK_STATUSES, diff
+        assert isinstance(row["attempt"], int) and row["attempt"] >= 1, diff
+        assert isinstance(row["sequence"], int) and row["sequence"] >= 1, diff
+        assert isinstance(row["output"], str), diff
+        if row["status"] == "completed":
+            assert row["conclusion"] in CHECK_CONCLUSIONS, diff
+        else:
+            assert row["conclusion"] is None, diff
+        if (row["attempt"], row["sequence"]) == (1, 1) and row["status"] == "queued":
+            assert row["output"] == AUTOMATIC_CHECK_OUTPUT, diff
+
+    def assert_automatic_check_advance(self, before: dict, after: dict) -> None:
+        """Bound a change to the same `ci/default` row across the restart.
+
+        `upsert_callback_check_run` (`src/webhooks/signing.rs`) accepts a write
+        only when `(attempt, sequence)` moves forward, and a newer `attempt`
+        starts a fresh status lifecycle for that same row: `completed` on
+        attempt 1 may legitimately become `queued`/`in_progress` on attempt 2.
+        The API also permits another status with a later sequence in the same
+        attempt; it does not enforce a status ladder. The finite vocabulary
+        and positive counters are checked for every row by
+        `assert_automatic_check_row`. When `(attempt, sequence)` did not move the
+        row must be byte-identical (no silent rewrite).
+        """
+        diff = self.check_row_diff(
+            {AUTOMATIC_CHECK_CONTEXT: before}, {AUTOMATIC_CHECK_CONTEXT: after}
+        )
+        assert after["created_at"] == before["created_at"], diff
+        assert (after["attempt"], after["sequence"]) >= (
+            before["attempt"],
+            before["sequence"],
+        ), diff
+        if after["attempt"] == before["attempt"]:
+            assert after["sequence"] >= before["sequence"], diff
+        else:
+            assert after["attempt"] > before["attempt"], diff
+        if (after["attempt"], after["sequence"]) == (
+            before["attempt"],
+            before["sequence"],
+        ):
+            assert after == before, diff
+
+    def assert_checks_survive_restart(self, before: dict, after: dict) -> tuple:
+        """Assert the pull checklist survives a hard restart with its contract.
+
+        Every `ci/test`/`ci/lint` row this harness wrote must be byte-identical,
+        including `created_at`/`updated_at`, and must not appear or disappear.
+
+        The only tolerated change is the scheduler-owned `ci/default` row, which
+        the always-on pull synchronizer may queue for the pull's head while the
+        process is down or restarting (`ON CONFLICT DO NOTHING`, so it can also
+        arrive late for a commit other open pulls share). That allowance is
+        bounded: each present row is validated against the head/repository of
+        this document, keeps the immutable commit/context identity and positive
+        counters, stays inside the finite status/conclusion vocabulary, and is
+        backed by a durable `ci_runs` job joined to a `ci_pull_sync_progress`
+        marker for that same pull version, head, base and storage generation.
+        """
+        assert after["pull_number"] == before["pull_number"], (
+            before["pull_number"],
+            after["pull_number"],
+        )
+        assert after["head_oid"] == before["head_oid"], (
+            before["head_oid"],
+            after["head_oid"],
+        )
+        assert after["next_after"] == before["next_after"], (
+            before["next_after"],
+            after["next_after"],
+        )
+        manual_before, automatic_before = self.split_check_rows(before)
+        manual_after, automatic_after = self.split_check_rows(after)
+        diff = self.check_row_diff(manual_before, manual_after)
+        assert set(manual_after) == set(manual_before), diff
+        assert set(manual_before) == set(MANUAL_CHECK_CONTEXTS), diff
+        for context in sorted(manual_before):
+            assert manual_after[context] == manual_before[context], diff
+        repository_id = manual_before["ci/test"]["repository_id"]
+        for row in (automatic_before, automatic_after):
+            if row is not None:
+                self.assert_automatic_check_row(row, repository_id, before["head_oid"])
+        if automatic_before is not None:
+            # No write path deletes a check row, so a present automatic row may
+            # advance but must never vanish across the restart.
+            assert automatic_after is not None, self.check_row_diff(
+                {AUTOMATIC_CHECK_CONTEXT: automatic_before}, {}
+            )
+            self.assert_automatic_check_advance(automatic_before, automatic_after)
+        if automatic_before is not None or automatic_after is not None:
+            binding = self.automatic_check_binding(repository_id, before["head_oid"])
+            assert binding["synced_jobs"] >= 1, binding
+            assert binding["matching_config"] >= 1, binding
+            assert binding["jobs"] >= 1, binding
+            if binding["linked_ids"]:
+                assert binding["direct_links"] >= 1, binding
+        return manual_after, automatic_after or automatic_before
+
+    def restart_check_contract_selftest(self) -> None:
+        """Prove the restart validators reject regressions and allow a retry.
+
+        Synthetic rows only, no server or database: a legitimate retry on a
+        newer attempt or sequence must pass, while a foreign identity or a
+        rewritten row with unchanged counters must fail. This pins the two
+        restart bugs as fixed behaviour rather than
+        mirroring the implementation in the acceptance path.
+        """
+        repository_id, head = self.repo["id"], "0" * 40
+        base = {
+            "repository_id": repository_id,
+            "commit_oid": head,
+            "context": AUTOMATIC_CHECK_CONTEXT,
+            "attempt": 1,
+            "sequence": 2,
+            "status": "completed",
+            "conclusion": "success",
+            "output": "scripts passed",
+            "created_at": "2026-01-01 00:00:00+00",
+            "updated_at": "2026-01-01 00:00:01+00",
+        }
+        retry = {
+            **base,
+            "attempt": 2,
+            "sequence": 1,
+            "status": "queued",
+            "conclusion": None,
+            "output": "retry queued",
+            "updated_at": "2026-01-01 00:00:02+00",
+        }
+        self.assert_automatic_check_row(base, repository_id, head)
+        self.assert_automatic_check_row(retry, repository_id, head)
+        self.assert_automatic_check_advance(base, retry)  # newer attempt, fresh lifecycle
+        sequenced = {**base, "sequence": 3, "status": "in_progress", "conclusion": None}
+        self.assert_automatic_check_row(sequenced, repository_id, head)
+        self.assert_automatic_check_advance(base, sequenced)
+        rejected = (
+            ({**base, "repository_id": str(uuid.uuid4())}, "foreign repository"),
+            ({**base, "commit_oid": "f" * 40}, "foreign commit"),
+            ({**base, "context": "ci/other"}, "foreign context"),
+            ({**base, "conclusion": None}, "completed without conclusion"),
+            ({**base, "status": "bogus"}, "unknown status"),
+            ({**base, "attempt": 0}, "non-positive attempt"),
+            (
+                {**retry, "attempt": 1, "sequence": 1, "output": "forged queue"},
+                "non-placeholder initial queue",
+            ),
+        )
+        for row, label in rejected:
+            try:
+                self.assert_automatic_check_row(row, repository_id, head)
+            except AssertionError:
+                continue
+            raise AssertionError(
+                f"automatic check validator accepted a {label}: {self.redact(row)}"
+            )
+        # Changing status without advancing the counters is still a rewrite.
+        regressed = {**base, "status": "in_progress", "conclusion": None}
+        try:
+            self.assert_automatic_check_advance(base, regressed)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("an unsequenced status rewrite was accepted")
+        rewritten = {**base, "output": "rewritten", "updated_at": "2026-01-01 00:00:03+00"}
+        try:
+            self.assert_automatic_check_advance(base, rewritten)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("a rewritten scheduler row was accepted")
+        manual = {
+            "ci/lint": {"context": "ci/lint", "status": "completed"},
+            "ci/test": {"context": "ci/test", "status": "completed"},
+        }
+        leaked = self.check_row_diff(manual, {"ci/lint": manual["ci/lint"]})
+        assert "ci/test: removed" in leaked, leaked
+        assert "ci/other: added" in self.check_row_diff(
+            manual, {**manual, "ci/other": {"context": "ci/other"}}
+        )
+        try:
+            self.split_check_rows(
+                {"items": [base, {"context": "ci/other", "status": "completed"}]}
+            )
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("an unknown check context was accepted")
 
     def merge_version(self) -> int:
         """Fence a mutation with the version the API currently reports."""
@@ -1278,6 +1601,7 @@ class PullsHarness(ForgeHarness):
         )
 
     def restart(self):
+        self.restart_check_contract_selftest()
         pr1 = self.document(self.pr1_path)
         reviews = self.document(self.pr1_path + "/reviews")
         checks = self.document(self.pr1_path + "/checks")
@@ -1286,7 +1610,11 @@ class PullsHarness(ForgeHarness):
         self.start()
         assert self.document(self.pr1_path) == pr1
         assert self.document(self.pr1_path + "/reviews") == reviews
-        assert self.document(self.pr1_path + "/checks") == checks
+        # Manual check rows stay byte-identical; only the scheduler-owned
+        # `ci/default` row may appear or advance across the restart.
+        self.assert_checks_survive_restart(
+            checks, self.document(self.pr1_path + "/checks")
+        )
         assert self.document(self.rulespath) == rules
 
 
