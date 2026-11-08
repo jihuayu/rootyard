@@ -592,6 +592,23 @@ mod tests {
         bytes
     }
 
+    fn band(number: u8, data: &[u8]) -> Vec<u8> {
+        let mut payload = vec![number];
+        payload.extend_from_slice(data);
+        payload
+    }
+
+    /// Outer sideband framing: band payloads as outer pkt-lines, then a flush.
+    /// Band 1 data is the nested inner report, never raw status text.
+    fn outer(parts: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for part in parts {
+            bytes.extend(pkt(part));
+        }
+        bytes.extend_from_slice(b"0000");
+        bytes
+    }
+
     #[test]
     fn native_refusal_detection_requires_exact_pkt_lines() {
         let v1 = status_caps(true, false, false);
@@ -664,12 +681,11 @@ mod tests {
         let embedded = report(&[b"unpack ok\n", b"ng refs/heads/b see ng refs/heads/a stale\n"]);
         assert!(!reports_rejection(&embedded, &refs, &v1));
         // ... and here only inside band 2 progress, which is not status bytes.
-        let banded = report(&[
-            b"\x01unpack ok\n",
-            b"\x02ng refs/heads/a stale ng refs/heads/b stale\n",
-            b"\x01ng refs/heads/b stale\n",
+        let spoofed = outer(&[
+            band(1, &report(&[b"unpack ok\n", b"ng refs/heads/b stale\n"])),
+            band(2, b"ng refs/heads/a stale\n"),
         ]);
-        assert!(!reports_rejection(&banded, &refs, &status_caps(true, false, true)));
+        assert!(!reports_rejection(&spoofed, &refs, &status_caps(true, false, true)));
         // Raw progress text is not a status line either.
         let raw_progress = report(&[b"unpack ok\n", b"remote: ng refs/heads/a nope\n"]);
         assert!(!reports_rejection(&raw_progress, &refs, &v1));
@@ -680,30 +696,32 @@ mod tests {
         let banded = status_caps(true, false, true);
         let plain = status_caps(true, false, false);
         let refs = vec!["refs/heads/a".to_owned(), "refs/heads/b".to_owned()];
-        let refused = report(&[b"\x01unpack ok\n", b"\x01ng refs/heads/a stale\n", b"\x01ng refs/heads/b stale\n"]);
+        let inner = report(&[b"unpack ok\n", b"ng refs/heads/a stale\n", b"ng refs/heads/b stale\n"]);
+        let refused = outer(&[band(1, &inner)]);
         assert!(reports_rejection(&refused, &refs, &banded));
         // Sideband framing is required once negotiated, and never invented.
-        let plain_report = report(&[b"unpack ok\n", b"ng refs/heads/a x\n", b"ng refs/heads/b y\n"]);
-        assert!(!reports_rejection(&plain_report, &refs, &banded));
+        assert!(!reports_rejection(&inner, &refs, &banded));
         assert!(!reports_rejection(&refused, &refs, &plain));
+        // Raw status text in band 1 is not the nested inner report: never accepted.
+        let raw_lines = outer(&[band(1, b"unpack ok\nng refs/heads/a stale\nng refs/heads/b stale\n")]);
+        assert!(!reports_rejection(&raw_lines, &refs, &banded));
         // Band 2 progress is ignored but cannot break a valid band-1 report.
-        let with_progress = report(&[
-            b"\x02Resolving deltas\n",
-            b"\x01unpack ok\n",
-            b"\x01ng refs/heads/a stale\n",
-            b"\x02ng refs/heads/b stale\n",
-            b"\x01ng refs/heads/b stale\n",
-        ]);
+        let with_progress =
+            outer(&[band(2, b"Resolving deltas\n"), band(1, &inner), band(2, b"ng refs/heads/c stale\n")]);
         assert!(reports_rejection(&with_progress, &refs, &banded));
-        // Band 1 payloads may split any inner pkt-line.
-        let split = report(&[b"\x01unpack", b"\x01 ok\n\x01ng refs/heads/a stale\n", b"\x01ng refs/heads/b stale\n"]);
+        // ... while a band-2 spoof of a missing ng never establishes it.
+        let spoofed = outer(&[
+            band(1, &report(&[b"unpack ok\n", b"ng refs/heads/b stale\n"])),
+            band(2, b"ng refs/heads/a stale\n"),
+        ]);
+        assert!(!reports_rejection(&spoofed, &refs, &banded));
+        // Band 1 payloads may split the inner pkt-lines at any byte boundary.
+        let split = outer(&[band(1, &inner[..7]), band(1, &inner[7..30]), band(1, &inner[30..])]);
         assert!(reports_rejection(&split, &refs, &banded));
-        // Band 3, an empty band payload or an unknown band is fatal, not approval.
-        for fatal in [b"\x03fatal: something\n".as_slice(), b"".as_slice(), b"\x04weird\n".as_slice()] {
-            let mut lines: Vec<&[u8]> =
-                vec![b"\x01unpack ok\n", b"\x01ng refs/heads/a stale\n", b"\x01ng refs/heads/b stale\n"];
-            lines.push(fatal);
-            assert!(!reports_rejection(&report(&lines), &refs, &banded));
+        // Band 3, an unknown band or an empty band payload is fatal, not approval.
+        for fatal in [band(3, b"fatal: something\n"), band(4, b"weird\n"), Vec::new()] {
+            let bytes = outer(&[band(1, &inner), fatal]);
+            assert!(!reports_rejection(&bytes, &refs, &banded));
         }
         // Malformed outer framing is not a proof either.
         let mut truncated = refused.clone();
@@ -754,7 +772,7 @@ mod tests {
         ]);
         assert!(reports_rejection(&with_options, &refs, &v2));
         let banded = status_caps(true, false, true);
-        let sideband = report(&[b"\x01unpack ok\n", b"\x01ng refs/heads/a stale\n", b"\x01ng refs/heads/b stale\n"]);
+        let sideband = outer(&[band(1, &plain)]);
         assert!(reports_rejection(&sideband, &refs, &banded));
     }
 
@@ -779,6 +797,25 @@ mod tests {
         assert!(!reports_rejection(&report(&[b"unpack ok\n", b"ok refs/heads/a\n"]), &refs, &v2));
         // v1 and v2 share the plain framing for status lines.
         assert!(reports_rejection(&report(&[b"unpack ok\n", b"ng refs/heads/a stale\n"]), &refs, &v1));
+    }
+
+    #[test]
+    fn producer_sideband_report_nests_the_inner_pkt_line_stream() {
+        let refs = vec!["refs/heads/a".to_owned(), "refs/heads/b".to_owned()];
+        let reason = "ref changed; retry from current refs";
+        let plain = rejected_refs_report(&status_caps(true, false, false), &refs, reason).unwrap();
+        let banded = rejected_refs_report(&status_caps(true, false, true), &refs, reason).unwrap();
+        let mut inner = Vec::new();
+        for payload in pkt_payloads(&banded) {
+            assert_eq!(payload.first(), Some(&1));
+            inner.extend_from_slice(&payload[1..]);
+        }
+        assert_eq!(inner, plain);
+        assert!(reports_rejection(&banded, &refs, &status_caps(true, false, true)));
+        assert!(reports_rejection(&plain, &refs, &status_caps(true, false, false)));
+        // Band 1 carrying the same status text without the nesting is rejected.
+        let raw = outer(&[band(1, b"unpack ok\nng refs/heads/a stale\nng refs/heads/b stale\n")]);
+        assert!(!reports_rejection(&raw, &refs, &status_caps(true, false, true)));
     }
 
     #[test]
