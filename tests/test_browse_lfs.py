@@ -45,6 +45,8 @@ class BrowseAndLfsContractTest(unittest.TestCase):
         expected_submodules = (
             ROOT / "src/browse/models.rs",
             ROOT / "src/browse/git_read.rs",
+            ROOT / "src/browse/git_read/command.rs",
+            ROOT / "src/browse/git_read/paging.rs",
             ROOT / "src/browse/handlers.rs",
             ROOT / "src/browse/object_format.rs",
             ROOT / "src/browse/transactions.rs",
