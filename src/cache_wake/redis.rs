@@ -10,20 +10,11 @@
 //! `RedisCache::connect` fails closed when CONFIG is unavailable or the server
 //! cannot prove that bound. The Redis contract is memory eviction, not a hard
 //! quota and never an authority.
-use super::{
-    AdvisoryCache, CacheKey, CacheTask, CacheValue, WAKE_PAYLOAD, validate_wake_channel,
-};
+use super::{AdvisoryCache, CacheKey, CacheTask, CacheValue, WAKE_PAYLOAD, validate_wake_channel};
 use crate::dispatch::WakeTransport;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::StreamExt;
-use std::{
-    fmt,
-    future::Future,
-    net::SocketAddr,
-    pin::Pin,
-    sync::Arc,
-    time::Duration,
-};
+use std::{fmt, future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::{Notify, OnceCell, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -120,10 +111,7 @@ impl RedisCacheLimits {
 
     pub fn validate(&self) -> Result<()> {
         ensure!(self.max_value_bytes > 0, "Redis max_value_bytes must be positive");
-        ensure!(
-            self.max_value_bytes <= i64::MAX as usize,
-            "Redis max_value_bytes exceeds GETRANGE bounds"
-        );
+        ensure!(self.max_value_bytes <= i64::MAX as usize, "Redis max_value_bytes exceeds GETRANGE bounds");
         ensure!(!self.default_ttl.is_zero(), "Redis default_ttl must be positive");
         ensure!(self.default_ttl <= self.max_ttl, "Redis default_ttl exceeds max_ttl");
         ensure!(!self.request_timeout.is_zero(), "Redis request_timeout must be positive");
@@ -255,10 +243,7 @@ impl RedisCache {
                 .await
                 .map_err(|_| anyhow::anyhow!("Redis cache eviction inspection failed"))?;
             ensure!(policy.len() == 2, "invalid Redis maxmemory-policy response");
-            Ok(RedisServerContract {
-                maxmemory_bytes,
-                maxmemory_policy: eviction_policy(&policy[1])?,
-            })
+            Ok(RedisServerContract { maxmemory_bytes, maxmemory_policy: eviction_policy(&policy[1])? })
         })
         .await
     }
@@ -293,10 +278,7 @@ impl RedisCache {
                 .query_async(&mut connection)
                 .await
                 .map_err(|_| anyhow::anyhow!("Redis cache request failed"))?;
-            ensure!(
-                raw.len() as u64 == length,
-                "Redis cache value changed during bounded read"
-            );
+            ensure!(raw.len() as u64 == length, "Redis cache value changed during bounded read");
             CacheValue::decode(key, &raw).map(Some)
         })
         .await
@@ -393,9 +375,8 @@ impl RedisWake {
             Err(_) => {
                 let address = std::env::var("ROOTYARD_REDIS_ADDRESS")
                     .context("ROOTYARD_REDIS_URL or ROOTYARD_REDIS_ADDRESS is required for Redis wake")?;
-                let address: SocketAddr = address
-                    .parse()
-                    .context("ROOTYARD_REDIS_ADDRESS must be a loopback socket address")?;
+                let address: SocketAddr =
+                    address.parse().context("ROOTYARD_REDIS_ADDRESS must be a loopback socket address")?;
                 ensure!(
                     address.ip().is_loopback() && address.port() != 0,
                     "ROOTYARD_REDIS_ADDRESS must be a nonzero loopback address"
@@ -447,10 +428,7 @@ impl RedisWake {
                     .get_async_pubsub()
                     .await
                     .map_err(|_| anyhow::anyhow!("Redis wake subscription unavailable"))?;
-                pubsub
-                    .subscribe(&self.channel)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Redis wake subscribe failed"))?;
+                pubsub.subscribe(&self.channel).await.map_err(|_| anyhow::anyhow!("Redis wake subscribe failed"))?;
                 Ok::<_, anyhow::Error>(pubsub)
             };
             let connected = tokio::select! {biased;
@@ -515,7 +493,7 @@ impl fmt::Debug for RedisWake {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache_wake::{AdvisoryCache, CacheKind, CacheKeyParts};
+    use crate::cache_wake::{AdvisoryCache, CacheKeyParts, CacheKind};
     use uuid::Uuid;
 
     fn live_url() -> String {
@@ -566,19 +544,14 @@ mod tests {
 
     #[test]
     fn debug_never_prints_redis_credentials() {
-        let cache = RedisCache::new(
-            "rediss://user:private-password@cache.internal:6379",
-            RedisCacheLimits::default(),
-        )
-        .unwrap();
+        let cache =
+            RedisCache::new("rediss://user:private-password@cache.internal:6379", RedisCacheLimits::default()).unwrap();
         let text = format!("{cache:?}");
         assert!(!text.contains("private-password"));
         assert!(!text.contains("user"));
-        let wake = RedisWake::from_url(
-            "rediss://user:private-password@cache.internal:6379",
-            "rootyard:outbox:v1".into(),
-        )
-        .unwrap();
+        let wake =
+            RedisWake::from_url("rediss://user:private-password@cache.internal:6379", "rootyard:outbox:v1".into())
+                .unwrap();
         let text = format!("{wake:?}");
         assert!(!text.contains("private-password"));
         assert!(!text.contains("user"));
@@ -627,11 +600,7 @@ mod tests {
         // Plant an oversized raw value outside the cache boundary. STRLEN must
         // reject it before GETRANGE can fetch the full body.
         let oversized_key = key(CacheKind::TreeListing, 5, "oversized-raw");
-        let mut raw = ::redis::Client::open(url.as_str())
-            .unwrap()
-            .get_connection_manager()
-            .await
-            .unwrap();
+        let mut raw = ::redis::Client::open(url.as_str()).unwrap().get_connection_manager().await.unwrap();
         ::redis::cmd("SET")
             .arg(oversized_key.as_str())
             .arg(vec![0u8; limits.max_value_bytes + 1])
@@ -639,11 +608,7 @@ mod tests {
             .await
             .unwrap();
         assert!(cache.get(&oversized_key).await.is_err());
-        ::redis::cmd("DEL")
-            .arg(oversized_key.as_str())
-            .query_async::<i64>(&mut raw)
-            .await
-            .unwrap();
+        ::redis::cmd("DEL").arg(oversized_key.as_str()).query_async::<i64>(&mut raw).await.unwrap();
     }
 
     #[tokio::test]

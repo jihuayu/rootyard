@@ -97,9 +97,7 @@ impl OriginGuard {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
-        let deadline = Instant::now()
-            .checked_add(self.wait.saturating_add(self.deadline))
-            .unwrap_or_else(Instant::now);
+        let deadline = Instant::now().checked_add(self.wait.saturating_add(self.deadline)).unwrap_or_else(Instant::now);
         let queue_wait = deadline.saturating_duration_since(Instant::now());
         if queue_wait.is_zero() {
             return Err(OriginError::Busy);
@@ -196,12 +194,7 @@ impl SingleFlight {
     pub fn new(max_keys: usize, wait: Duration) -> Result<Self> {
         ensure!(max_keys > 0, "singleflight max_keys must be positive");
         ensure!(!wait.is_zero(), "singleflight wait must be positive");
-        Ok(Self {
-            inflight: Mutex::new(HashMap::new()),
-            max_keys,
-            wait,
-            next_generation: AtomicU64::new(1),
-        })
+        Ok(Self { inflight: Mutex::new(HashMap::new()), max_keys, wait, next_generation: AtomicU64::new(1) })
     }
 
     pub async fn run<T, F, Fut>(&self, key: String, compute: F) -> Result<WarmupOutcome<T>>
@@ -384,8 +377,7 @@ mod tests {
             .unwrap();
         assert_eq!(follower_result, WarmupOutcome::Waited);
 
-        let recovered =
-            flight.run("cancel:key".into(), || async { Ok::<_, anyhow::Error>(7) }).await.unwrap();
+        let recovered = flight.run("cancel:key".into(), || async { Ok::<_, anyhow::Error>(7) }).await.unwrap();
         assert_eq!(recovered, WarmupOutcome::Computed(7));
         assert_eq!(flight.tracked_keys(), 0);
     }

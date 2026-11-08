@@ -38,8 +38,7 @@ pub const WAKE_PAYLOAD: &[u8] = b"v1";
 /// names, never secrets and never tenant-private data.
 pub fn validate_wake_channel(channel: &str) -> Result<()> {
     ensure!(
-        (1..=128).contains(&channel.len())
-            && channel.bytes().all(|c| c.is_ascii_alphanumeric() || b":_-".contains(&c)),
+        (1..=128).contains(&channel.len()) && channel.bytes().all(|c| c.is_ascii_alphanumeric() || b":_-".contains(&c)),
         "invalid wake channel"
     );
     Ok(())
@@ -338,28 +337,13 @@ impl CacheLimits {
             )? as usize,
             default_ttl: Duration::from_secs(number("ROOTYARD_CACHE_TTL_SECONDS", 60, 1, 3600)?),
             max_ttl: Duration::from_secs(number("ROOTYARD_CACHE_MAX_TTL_SECONDS", 3600, 1, 86_400)?),
-            request_timeout: Duration::from_millis(number(
-                "ROOTYARD_CACHE_REQUEST_TIMEOUT_MS",
-                1000,
-                10,
-                30_000,
-            )?),
+            request_timeout: Duration::from_millis(number("ROOTYARD_CACHE_REQUEST_TIMEOUT_MS", 1000, 10, 30_000)?),
             max_inflight: number("ROOTYARD_CACHE_MAX_INFLIGHT", 32, 1, 1024)? as usize,
             origin_permits: number("ROOTYARD_CACHE_ORIGIN_PERMITS", 8, 1, 1024)? as usize,
             origin_wait: Duration::from_millis(number("ROOTYARD_CACHE_ORIGIN_WAIT_MS", 250, 1, 30_000)?),
-            origin_deadline: Duration::from_millis(number(
-                "ROOTYARD_CACHE_ORIGIN_DEADLINE_MS",
-                15_000,
-                10,
-                300_000,
-            )?),
+            origin_deadline: Duration::from_millis(number("ROOTYARD_CACHE_ORIGIN_DEADLINE_MS", 15_000, 10, 300_000)?),
             breaker_failures: number("ROOTYARD_CACHE_BREAKER_FAILURES", 5, 1, 1000)? as u32,
-            breaker_cooldown: Duration::from_millis(number(
-                "ROOTYARD_CACHE_BREAKER_COOLDOWN_MS",
-                5000,
-                10,
-                300_000,
-            )?),
+            breaker_cooldown: Duration::from_millis(number("ROOTYARD_CACHE_BREAKER_COOLDOWN_MS", 5000, 10, 300_000)?),
         };
         limits.validate()?;
         Ok(limits)
@@ -435,17 +419,19 @@ mod tests {
         assert!(!text.contains("Bearer"));
         assert_eq!(value.kind(), CacheKind::TreeListing);
         assert_eq!(value.version(), 7);
-        assert!(CacheKey::new(CacheKeyParts {
-            environment: "Standalone",
-            schema: 1,
-            history_incarnation: Uuid::nil(),
-            tenant: Uuid::nil(),
-            repo: Uuid::nil(),
-            kind: CacheKind::TreeListing,
-            version: 1,
-            discriminator: "",
-        })
-        .is_err());
+        assert!(
+            CacheKey::new(CacheKeyParts {
+                environment: "Standalone",
+                schema: 1,
+                history_incarnation: Uuid::nil(),
+                tenant: Uuid::nil(),
+                repo: Uuid::nil(),
+                kind: CacheKind::TreeListing,
+                version: 1,
+                discriminator: "",
+            })
+            .is_err()
+        );
     }
 
     #[test]

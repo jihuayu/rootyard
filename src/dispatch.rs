@@ -1,15 +1,15 @@
 //! Advisory wake transports. Only PostgreSQL owns delivery state and effects.
 use anyhow::{Context, Result, bail, ensure};
 use deadpool_postgres::Pool;
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 #[cfg(not(feature = "state-redis"))]
 use std::net::SocketAddr;
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use tokio::sync::Notify;
 #[cfg(not(feature = "state-redis"))]
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -73,7 +73,8 @@ impl Settings {
                         .context("ROOTYARD_REDIS_ADDRESS is required")?
                         .parse()
                         .context("Redis address must be a loopback socket address")?;
-                    let channel = std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
+                    let channel =
+                        std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
                     Some(Arc::new(RedisWake::new(address, channel)?))
                 }
             }

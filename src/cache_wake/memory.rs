@@ -138,7 +138,7 @@ impl AdvisoryCache for MemoryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cache_wake::CacheKind, cache_wake::CacheKeyParts};
+    use crate::{cache_wake::CacheKeyParts, cache_wake::CacheKind};
     use uuid::Uuid;
 
     fn key(kind: CacheKind, version: u64, name: &str) -> CacheKey {
@@ -181,13 +181,8 @@ mod tests {
 
     #[tokio::test]
     async fn entry_and_byte_budgets_are_enforced() {
-        let cache = MemoryCache::new(CacheLimits {
-            max_entries: 2,
-            max_bytes: 512,
-            max_value_bytes: 128,
-            ..limits()
-        })
-        .unwrap();
+        let cache =
+            MemoryCache::new(CacheLimits { max_entries: 2, max_bytes: 512, max_value_bytes: 128, ..limits() }).unwrap();
         let first = key(CacheKind::IssueView, 1, "first");
         let second = key(CacheKind::IssueView, 1, "second");
         let third = key(CacheKind::IssueView, 1, "third");
@@ -218,10 +213,7 @@ mod tests {
         })
         .unwrap();
         let key = key(CacheKind::QueryNegative, 1, "query");
-        cache
-            .put(&key, CacheValue::new(CacheKind::QueryNegative, 1, b"negative".to_vec()), None)
-            .await
-            .unwrap();
+        cache.put(&key, CacheValue::new(CacheKind::QueryNegative, 1, b"negative".to_vec()), None).await.unwrap();
         assert!(cache.get(&key).await.unwrap().is_some());
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert!(cache.get(&key).await.unwrap().is_none());
