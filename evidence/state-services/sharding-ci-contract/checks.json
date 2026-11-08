@@ -1,0 +1,22 @@
+{
+  "sharding_native_cases": 12,
+  "benchmark_native_cases": 5,
+  "source_units": {
+    "run": 286,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 6
+  },
+  "review": "Luna Max found no P1/P2 after explicit operator/scoped-negative/refusal/receipt corrections; TTL P2 was tightened to5s for60/300s and rerun.",
+  "remote_prior_failure": {
+    "run": 42479393344,
+    "job": 128727805279,
+    "step": 60,
+    "path": "/api/shards/nodes",
+    "expected": 201,
+    "actual": 403,
+    "reason": "cluster operator capability required"
+  },
+  "scope": "Control-plane HTTP/PostgreSQL guards and honest simulation-only receipt metadata. No data-plane, production HA or throughput qualification.",
+  "remaining": "Full remoteCI pending; issue134 staysopen untilmerged+accepted permaintainer."
+}
