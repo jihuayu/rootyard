@@ -6,6 +6,7 @@
 pub mod handlers;
 pub mod models;
 pub mod native_reads;
+pub mod repository_listing;
 pub mod sanitize;
 pub mod session;
 pub mod session_gc;
@@ -24,7 +25,7 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/web/login", get(session::login_page).post(session::login))
         .route("/web/app.js", get(session::app_js))
         .route("/web/logout", post(session::logout))
-        .route("/web/repos", get(session::discover))
+        .route("/web/repos", get(repository_listing::discover))
         .route("/web/repos/{owner}/{name}", get(handlers::repo_overview))
         .route("/web/repos/{owner}/{name}/tree", get(handlers::tree_view))
         .route("/web/repos/{owner}/{name}/tree/{oid}", get(handlers::tree_by_oid_view))
