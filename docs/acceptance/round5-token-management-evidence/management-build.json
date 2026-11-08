@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "binary_sha256": "aadde45b61644a2d5869daa2da93bdafffab72f33da7d98bee6469c9921f0391",
-  "source_inputs_sha256": "daaa3fa07779145eac0fa1522986d3a36258cedb71506d04e6d661e5ece83995",
-  "workspace_commit": "728d9484fea5e4a77180c7a16da52e9fd0d77163",
+  "binary_sha256": "c4d0ef514e45682b6bc554cc137630b720ea3bb39d12499458dbd15169f42d7d",
+  "source_inputs_sha256": "9e41d518c13a1a340821d6c3a86a46243b20ee0497c7afd00399ca0e8517b758",
+  "workspace_commit": "a6e4200f188a53730120b3db81454e7855bfad78",
   "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
   "command": [
     "cargo",
