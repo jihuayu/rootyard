@@ -1,0 +1,115 @@
+create_real_schema141_pando_source: passed
+legacy_binary_writes_format17_schema141_archive: passed
+candidate_cli_usage_and_mixed_legacy_flags: passed
+candidate_rejects_without_schema141_opt_in: passed
+Traceback (most recent call last):
+  File "/workspace/scratch/trace-state142-backup.py", line 9, in traced
+    try:return fn()
+               ^^^^
+  File "/workspace/scratch/state-services-pack-commit/tests/backup_legacy132_sessions.py", line 728, in candidate_restores_and_rotates_authority
+    packs = self.assert_pack_ledger_schema()
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/scratch/state-services-pack-commit/tests/backup_legacy132_sessions.py", line 687, in assert_pack_ledger_schema
+    assert gate_modes == "metadata_only", gate_modes
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "create_real_schema141_pando_source",
+      "status": "passed",
+      "seconds": 4.1206,
+      "detail": {
+        "source_heads": {
+          "alpha": "2f3bfc4ac658fc9f160d187628f666c51627380f",
+          "beta": "dc0ea98cd1e47c26731751c10dea8efdf190246e"
+        },
+        "source_refs": {
+          "alpha": {
+            "refs/heads/main": "2f3bfc4ac658fc9f160d187628f666c51627380f"
+          },
+          "beta": {
+            "refs/heads/main": "dc0ea98cd1e47c26731751c10dea8efdf190246e"
+          }
+        },
+        "source_authority_id": "0a45fb65-88b5-454e-8b48-89ea0504d48e",
+        "source_remote_paths_count": 8,
+        "source_remote_paths_sha256": "7303844e8c4a632552a76d2b3c9df0f24edc3da06de9caf85e800cfa45590778",
+        "cutovers": {
+          "alpha": {
+            "refs": 1,
+            "packs": 1,
+            "objects_verified": 3
+          },
+          "beta": {
+            "refs": 1,
+            "packs": 1,
+            "objects_verified": 3
+          }
+        },
+        "web_session_created": true,
+        "browser_token_created": true
+      }
+    },
+    {
+      "name": "legacy_binary_writes_format17_schema141_archive",
+      "status": "passed",
+      "seconds": 14.2621,
+      "detail": {
+        "format": 17,
+        "schema_last": 141,
+        "schema_contains_next": false,
+        "repository_count": 2,
+        "legacy_binary_sha256": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+        "backup_verified": true
+      }
+    },
+    {
+      "name": "candidate_cli_usage_and_mixed_legacy_flags",
+      "status": "passed",
+      "seconds": 0.0252,
+      "detail": {
+        "missing_arguments_usage": true,
+        "missing_flags_usage": true,
+        "mixed_legacy_flags_usage": true,
+        "documented_opt_in": "--allow-legacy-schema141",
+        "documented_neighbour_opt_in": "--allow-legacy-schema140"
+      }
+    },
+    {
+      "name": "candidate_rejects_without_schema141_opt_in",
+      "status": "passed",
+      "seconds": 7.7017,
+      "detail": {
+        "explicit_schema_opt_in_required": true,
+        "mismatched_legacy_opt_in_rejected": true,
+        "target_data_published": false,
+        "target_database_empty": true
+      }
+    },
+    {
+      "name": "candidate_restores_schema142_one_new_authority",
+      "status": "failed",
+      "seconds": 6.7829,
+      "error": ""
+    }
+  ],
+  "reviewed_target_schema": 142,
+  "reviewed_target_format": 18,
+  "binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+  "legacy_binary_sha256": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668",
+  "harness_git_head": "2fdc74fe1f92c8f7653aef24c8370bf1d805f3f0",
+  "limitations": [
+    "Loopback functional drill; no production RPO/RTO or power-loss claim.",
+    "The legacy archive is produced by the trusted format17 binary and is never edited.",
+    "source_head values are repository heads, not binary build provenance.",
+    "Genuine format17/schema141 sources carry no ref-store core rows; the migrated schema139 core tables are verified present, constrained and empty, not round-tripped.",
+    "No schema140 snapshot/pin table or row assertion is made; that populated current-format qualification follows the primary migration-140 SQL.",
+    "The schema141 ledger tables are derived from the generated current-vs-140 catalogs and are verified present with only the exact fixed rows seeded by the settled migration141 SQL; this fixture inserts no hold, request or consumption row.",
+    "The schema142 pack-registration/membership/history/usage tables are derived from the generated 142-vs-141 catalogs and must stay empty on a genuine pre-142 source; this fixture inserts no pack row and claims no pack-verified gate.",
+    "A format16 drill requires root to supply the genuine retained old schema140 producer and its archive; a format17 drill requires the genuine retained schema141 producer; this harness never fabricates or relabels one."
+  ]
+}

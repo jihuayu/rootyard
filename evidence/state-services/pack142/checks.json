@@ -1,0 +1,27 @@
+{
+  "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+  "code_candidate": "32e87d1421dad2e339a0bce9fbec317188aa3160",
+  "followup_harness_head": "71410c9a633190789b9b2933276301f297380d88",
+  "schema": 142,
+  "format": 18,
+  "native_packs": "8 passed, zero ignored, 12.135s",
+  "library": "374 passed, nine ignored, 14.615s",
+  "backup18": "seven cases passed, 116.070s",
+  "genuine17": "seven cases passed, 43.750s",
+  "binary_schema": "111 tables,36 functions,84 triggers; all upgrade/search-path/roundtrip checks passed",
+  "azure": "compile-only; real provider qualification is S3",
+  "development": "Primary implementation: real DeepSeek auto/deepseek-v4.1-flash; Luna Max source review; Root integration/native execution",
+  "retained_producers": {
+    "schema142_format18_app_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "schema141_format17_app_sha256": "c3003c7cfbd96702eb4b53efed491ed4d86a35066c73d9ed53d05429ee065668"
+  },
+  "limits": [
+    "Unserved A4a foundation; full pack-aware materialized ReadSnapshot/pin, roots/decisions/subsets, GC, encryption and serving remain follow-ups.",
+    "Metadata archives do not include external S3 pack/index bytes; restore verifies original external objects remain readable.",
+    "Single loopback PG17/Garage fixture; no restart/HA/powerloss/production RPO/RTO promise.",
+    "Native cancellation cleanup ownership was source-reviewed and covered by library lease tests; no claim of an unkillable-kernel-process or response-packet-loss drill.",
+    "Nine ignored library cases listed separately; native/service/kernel suites excluded from source-unit run, with six existing source-unit skips.",
+    "Source-bound native/library results retain original commit IDs; later changes corrected backup fixture markers/guard assertions only, with identical production source digest.",
+    "Full remote CI remains separate; draft PR138 is not merged and issues105/107 remain open."
+  ]
+}

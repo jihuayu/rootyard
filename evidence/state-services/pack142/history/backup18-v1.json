@@ -1,0 +1,196 @@
+{
+  "passed": false,
+  "kind": "backup18",
+  "returncode": 1,
+  "command": [
+    "python3",
+    "/workspace/scratch/state-services-pack-commit/tests/backup_refstore_packs142.py",
+    "--binary",
+    "/workspace/scratch/state-pack142-app-v1/rootyard",
+    "--report",
+    "/workspace/scratch/state-pack142-populated-backup18-v1/native.json",
+    "--pack-fixture-binary",
+    "/workspace/scratch/state-pack142-backup-helper-build-v1/ref_store_packs_backup_fixture"
+  ],
+  "seconds": 7.333,
+  "before": {
+    "source": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "binary": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "head": "32e87d1421dad2e339a0bce9fbec317188aa3160",
+    "harness": {
+      "tests/backup_refstore_packs142.py": "2ebd5759901bdfbd5c1e7ff52694b39e51caf7aaf0cb1350fd056506dfb567f2",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "887cfaf14554329a0334aea87b1e4ccf183d22deac642bd2a80aa492a40d2efc",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
+      "tests/backup_refstore_core139.py": "8749fcc6530d6d8b7fd72c8b19fab71efb266b608f88ab3bab040192b4b4bfcf",
+      "tests/ref_store_packs_backup_fixture.rs": "7a4536a81ee3d5fc8afc847c4f024e06b0979618225f6efcc1bd9bd1890aefc0"
+    },
+    "fixture_binary": "ea62155cfac8168831a8ca3c0ad9bb3b1f4bb03b4b0e46102b6d02b23938b6db"
+  },
+  "after": {
+    "source": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "binary": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "head": "32e87d1421dad2e339a0bce9fbec317188aa3160",
+    "harness": {
+      "tests/backup_refstore_packs142.py": "2ebd5759901bdfbd5c1e7ff52694b39e51caf7aaf0cb1350fd056506dfb567f2",
+      "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+      "tests/schema_baseline.py": "887cfaf14554329a0334aea87b1e4ccf183d22deac642bd2a80aa492a40d2efc",
+      "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
+      "tests/backup_refstore_core139.py": "8749fcc6530d6d8b7fd72c8b19fab71efb266b608f88ab3bab040192b4b4bfcf",
+      "tests/ref_store_packs_backup_fixture.rs": "7a4536a81ee3d5fc8afc847c4f024e06b0979618225f6efcc1bd9bd1890aefc0"
+    },
+    "fixture_binary": "ea62155cfac8168831a8ca3c0ad9bb3b1f4bb03b4b0e46102b6d02b23938b6db"
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "107ac382697789a604691e13f020150122f38eb46b81c937462c76711ca5055b",
+  "build_receipt": {
+    "version": 1,
+    "binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "workspace_commit": "32e87d1421dad2e339a0bce9fbec317188aa3160",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "build",
+      "--locked",
+      "--bin",
+      "rootyard",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "clean_command": [
+      "cargo",
+      "clean",
+      "--package",
+      "rootyard"
+    ],
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false,
+        "package_id": "path+file:///workspace/scratch/state-services-pack-commit#rootyard@0.1.0"
+      },
+      {
+        "target": "rootyard",
+        "kind": "bin",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/rootyard",
+        "package_id": "path+file:///workspace/scratch/state-services-pack-commit#rootyard@0.1.0"
+      }
+    ]
+  },
+  "helper_build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "ea62155cfac8168831a8ca3c0ad9bb3b1f4bb03b4b0e46102b6d02b23938b6db",
+    "workspace_commit": "32e87d1421dad2e339a0bce9fbec317188aa3160",
+    "fresh": false,
+    "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "binary_sha256": "ea62155cfac8168831a8ca3c0ad9bb3b1f4bb03b4b0e46102b6d02b23938b6db",
+    "integration_test_source_sha256": "7a4536a81ee3d5fc8afc847c4f024e06b0979618225f6efcc1bd9bd1890aefc0",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_packs_backup_fixture",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_packs_backup_fixture",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_packs_backup_fixture-4e92ee35cb1342ad"
+      }
+    ]
+  },
+  "native": {
+    "passed": false,
+    "cases": [
+      {
+        "name": "synthetic_source_with_typed_native_pack_commit",
+        "status": "failed",
+        "seconds": 6.3012,
+        "error": ""
+      }
+    ],
+    "skips": 0,
+    "binary": "/workspace/scratch/state-pack142-app-v1/rootyard",
+    "binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "backup_format": 18,
+    "schema_version": 142,
+    "pack_fixture_helper": {
+      "binary": "/workspace/scratch/state-pack142-backup-helper-build-v1/ref_store_packs_backup_fixture",
+      "binary_sha256": "ea62155cfac8168831a8ca3c0ad9bb3b1f4bb03b4b0e46102b6d02b23938b6db",
+      "build_receipt": "/workspace/scratch/state-pack142-backup-helper-build-v1/ref_store_packs_backup_fixture.build.json",
+      "build_receipt_sha256": "9b9f3f404910fdbb3ae5840e90e0207e3ebd66e97568e234c4ba61c053041378",
+      "build_kind": "rust-integration-test",
+      "package_rebuilt": true,
+      "fresh": false,
+      "fresh_false_artifact": {
+        "target": "ref_store_packs_backup_fixture",
+        "kind": "test",
+        "fresh": false
+      },
+      "test_profile": true,
+      "integration_test_source_sha256": "7a4536a81ee3d5fc8afc847c4f024e06b0979618225f6efcc1bd9bd1890aefc0",
+      "integration_test_source_matches_source_file": true,
+      "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+      "candidate_application_receipt": "/workspace/scratch/state-pack142-app-v1/rootyard.build.json",
+      "candidate_application_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+      "candidate_application_package_rebuilt": true,
+      "source_inputs_match_candidate_application": true,
+      "retained_binding_stages": [
+        "seed"
+      ],
+      "helper_binary_sha256_after_run": "ea62155cfac8168831a8ca3c0ad9bb3b1f4bb03b4b0e46102b6d02b23938b6db",
+      "candidate_application_sha256_after_run": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+      "binaries_unchanged_after_run": true
+    },
+    "limitations": [
+      "The typed pack ledger is seeded by the real A3/A4 pipeline and native PackVerifier; no SQL ACK, proof or registration is fabricated.",
+      "The inherited migration-139 metadata gate/ref fixture is plain SQL and is never used for the native proof; the drill uses its own typed gate.",
+      "The random pack repository stays provisioning/gitfs/unserved for the whole drill.",
+      "Blob byte backup is not claimed: the S3 originals are external, re-read read-only and never deleted; only PostgreSQL metadata is restored.",
+      "The read-only restored replay mints no proof, grant or authority and charges no quota.",
+      "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise."
+    ]
+  },
+  "limits": [
+    "One loopback PostgreSQL/Garage fixture; no HA/powerloss/production RPO/RTO/serving/GC qualification.",
+    "Current18 pack ledger seeded by real protectedS3/nativeGit/typed verified commit; external original Blob bytes remain outside the metadata archive.",
+    "Genuine17 is produced by retained schema141 app C300; upgraded142 pack tables must be empty, no fabricated registration."
+  ]
+}

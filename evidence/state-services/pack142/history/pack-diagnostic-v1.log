@@ -1,0 +1,47 @@
+
+running 8 tests
+test blocked_gate_capture_fails_on_bounded_deadline_and_client_recovers ... ok
+test caller_session_off_still_records_durable_on_and_never_leaks_setlocal ... FAILED
+test mismatched_idx_and_missing_closure_object_are_denied_without_writes ... FAILED
+test registration_and_cancel_serialize_on_the_138_prefix ... FAILED
+test sha1_native_pack_registers_publishes_commits_and_replays_terminal ... FAILED
+test sha256_native_pack_registers_publishes_and_commits ... FAILED
+test truncated_pack_header_and_wrong_object_format_are_denied ... ok
+test usage_counter_ddl_is_denied_and_historic_ack_query_needs_the_trusted_scope ... FAILED
+
+failures:
+
+---- caller_session_off_still_records_durable_on_and_never_leaks_setlocal stdout ----
+Error: pack closure proof unavailable: native Git view holds a non-canonical pack name
+
+---- mismatched_idx_and_missing_closure_object_are_denied_without_writes stdout ----
+rootyard: pack verify step=verify-pack class=refused
+Error: ref store: operation identity fields conflict with a durable record
+
+---- registration_and_cancel_serialize_on_the_138_prefix stdout ----
+Error: db error
+
+Caused by:
+    ERROR: operator does not exist: bigint | oid
+    HINT: No operator matches the given name and argument types. You might need to add explicit type casts.
+
+---- sha1_native_pack_registers_publishes_commits_and_replays_terminal stdout ----
+Error: pack closure proof unavailable: native Git view holds a non-canonical pack name
+
+---- sha256_native_pack_registers_publishes_and_commits stdout ----
+Error: pack closure proof unavailable: native Git view holds a non-canonical pack name
+
+---- usage_counter_ddl_is_denied_and_historic_ack_query_needs_the_trusted_scope stdout ----
+Error: pack closure proof unavailable: native Git view holds a non-canonical pack name
+
+
+failures:
+    caller_session_off_still_records_durable_on_and_never_leaks_setlocal
+    mismatched_idx_and_missing_closure_object_are_denied_without_writes
+    registration_and_cancel_serialize_on_the_138_prefix
+    sha1_native_pack_registers_publishes_commits_and_replays_terminal
+    sha256_native_pack_registers_publishes_and_commits
+    usage_counter_ddl_is_denied_and_historic_ack_query_needs_the_trusted_scope
+
+test result: FAILED. 2 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.39s
+

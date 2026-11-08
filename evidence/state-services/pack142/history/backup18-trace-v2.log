@@ -1,0 +1,64 @@
+Traceback (most recent call last):
+  File "/workspace/scratch/trace-state142-backup.py", line 9, in traced
+    try:return fn()
+               ^^^^
+  File "/workspace/scratch/state-services-pack-commit/tests/backup_refstore_packs142.py", line 514, in seed_core_fixture
+    self.assert_pack_ledger_populated(marker, self.source_pack_rows, self.source_hold_rows,
+  File "/workspace/scratch/state-services-pack-commit/tests/backup_refstore_packs142.py", line 469, in assert_pack_ledger_populated
+    assert operation["request_digest"] == plan["operation"]["operation_digest"]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "synthetic_source_with_typed_native_pack_commit",
+      "status": "failed",
+      "seconds": 4.6803,
+      "error": ""
+    }
+  ],
+  "skips": 0,
+  "binary": "/workspace/scratch/state-pack142-app-v1/rootyard",
+  "binary_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+  "backup_format": 18,
+  "schema_version": 142,
+  "pack_fixture_helper": {
+    "binary": "/workspace/scratch/state-pack142-backup-helper-build-v1/ref_store_packs_backup_fixture",
+    "binary_sha256": "ea62155cfac8168831a8ca3c0ad9bb3b1f4bb03b4b0e46102b6d02b23938b6db",
+    "build_receipt": "/workspace/scratch/state-pack142-backup-helper-build-v1/ref_store_packs_backup_fixture.build.json",
+    "build_receipt_sha256": "9b9f3f404910fdbb3ae5840e90e0207e3ebd66e97568e234c4ba61c053041378",
+    "build_kind": "rust-integration-test",
+    "package_rebuilt": true,
+    "fresh": false,
+    "fresh_false_artifact": {
+      "target": "ref_store_packs_backup_fixture",
+      "kind": "test",
+      "fresh": false
+    },
+    "test_profile": true,
+    "integration_test_source_sha256": "7a4536a81ee3d5fc8afc847c4f024e06b0979618225f6efcc1bd9bd1890aefc0",
+    "integration_test_source_matches_source_file": true,
+    "source_inputs_sha256": "46ffb5e6ebb0c0659ef17e598163fa2c0da3c50c48cf4353ca6eabd29c88bfe1",
+    "candidate_application_receipt": "/workspace/scratch/state-pack142-app-v1/rootyard.build.json",
+    "candidate_application_sha256": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "candidate_application_package_rebuilt": true,
+    "source_inputs_match_candidate_application": true,
+    "retained_binding_stages": [
+      "seed"
+    ],
+    "helper_binary_sha256_after_run": "ea62155cfac8168831a8ca3c0ad9bb3b1f4bb03b4b0e46102b6d02b23938b6db",
+    "candidate_application_sha256_after_run": "0be216508eec5348294bd6d1f2c28feb8513112fba6b407a52fdb4c9a2b329d1",
+    "binaries_unchanged_after_run": true
+  },
+  "limitations": [
+    "The typed pack ledger is seeded by the real A3/A4 pipeline and native PackVerifier; no SQL ACK, proof or registration is fabricated.",
+    "The inherited migration-139 metadata gate/ref fixture is plain SQL and is never used for the native proof; the drill uses its own typed gate.",
+    "The random pack repository stays provisioning/gitfs/unserved for the whole drill.",
+    "Blob byte backup is not claimed: the S3 originals are external, re-read read-only and never deleted; only PostgreSQL metadata is restored.",
+    "The read-only restored replay mints no proof, grant or authority and charges no quota.",
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise."
+  ]
+}
