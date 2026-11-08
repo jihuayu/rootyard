@@ -203,6 +203,33 @@ bind, no scrape and no extra report keys. With it:
   because each scrape itself takes one pooled PostgreSQL connection and runs one
   SQL snapshot statement outside the instrumented spans, plus `phase_limits`
   and the per-process start/stop/final observation markers.
+* **concurrent cases are bracketed once per batch.** Each `ThreadPoolExecutor`
+  group (different-ref, cross-repo new pack, competing same-ref) is one
+  `measure("…batch", run_all_futures)` case, so a batch produces exactly one
+  before/after scrape pair. Workers never call `measure` or scrape. Per-push
+  worker wall times are reported under `concurrent_wall_times` and are **not**
+  phase attributed: the phase deltas belong to the whole batch and must never be
+  divided, summed or compared per push.
+* historical v1 reports that recorded one `measure()` per concurrent push have
+  overlapping process-global counter deltas. Their per-case phase values are
+  **invalid for individual or batch aggregation** and remain historical raw data
+  only; the report carries this in `interpretation.historical_v1` and the root's
+  v2 run supersedes them.
+* the non-winning same-ref contender is accepted as a rejection only when its
+  stderr shows a Git ref rejection (`[remote rejected]`, `[rejected]`,
+  non-fast-forward, failed to update ref, stale info) and shows no auth or
+  transport fault; otherwise the run fails. This is ordinary competing pushes,
+  not an explicit-old-OID CAS assertion.
+* the exporter is opened through a handler that **refuses redirects**: a 302/301
+  raises instead of following a `Location` that could point outside loopback, so
+  the private-origin claim holds even for a misbehaving listener.
+* every scanned case carries a fixed `phase_metrics.status`, summarised in
+  `phase_metrics.accounting`. `captured`, `not_applicable` (setup and process
+  start lifecycle) and `offline` are anticipated; `service_stopped`,
+  `process_restarted`, `unavailable` and `feature_disabled` are listed as
+  `unexpected` and force the run status to `failed`, so a lost sample can never
+  look like a clean pass. A case that loses process continuity also marks the
+  capture `partial` and stops further scraping.
 
 Report interpretation stays as above: `state_row`/`authority_lock` are client
 round trips rather than exact SQL lock wait (still unmeasured), phase spans nest
@@ -210,8 +237,10 @@ and must never be summed, and bytes are logical payload of successful S3-backed
 transfers only. `python3 -m unittest tests.test_state_services_native_baseline`
 checks the parser and delta logic (valid cumulative input, unexpected labels and
 series, non-finite/negative/fractional counters, inconsistent histograms,
-restart vs regression, and that skipped or unavailable cases never scrape)
-without running any native workload.
+restart vs regression, skipped/unavailable cases never scraping, the
+one-bracket-per-batch structure, the status accounting, the same-ref rejection
+diagnostic and the redirect refusal without external contact) without running
+any native workload.
 
 ## Status
 

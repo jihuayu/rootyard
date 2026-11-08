@@ -260,6 +260,50 @@ def process_identity(pid):
     return {'pid': pid, 'starttime': int(fields[19])}
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """The exporter is a fixed loopback origin: a redirect is a failure, never a hop."""
+
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        raise ValueError('metrics endpoint must not redirect (status ' + str(code) + ')')
+
+
+PHASE_CASE_STATUSES = ('captured', 'not_applicable', 'offline', 'service_stopped',
+                       'process_restarted', 'unavailable', 'feature_disabled')
+UNEXPECTED_CASE_STATUSES = ('service_stopped', 'process_restarted', 'unavailable', 'feature_disabled')
+
+
+def phase_metrics_accounting(cases):
+    """Group per-case phase-metrics statuses so a run cannot silently lose a case."""
+    counts, unexpected = {}, []
+    for case in cases:
+        entry = case.get('phase_metrics')
+        if entry is None:
+            raise ValueError('case ' + str(case.get('name')) + ' has no phase metrics accounting')
+        status = entry.get('status')
+        if status not in PHASE_CASE_STATUSES:
+            raise ValueError('unexpected phase metrics status: ' + str(status))
+        counts[status] = counts.get(status, 0) + 1
+        if status in UNEXPECTED_CASE_STATUSES:
+            unexpected.append(case.get('name'))
+    return {'cases': len(cases), 'by_status': counts, 'unexpected': unexpected}
+
+
+def same_ref_rejection_diagnostic(result):
+    """Prove the non-winning contender was rejected as a Git ref update, not by a transport fault."""
+    if result.returncode == 0:
+        raise AssertionError('the non-winning contender unexpectedly exited zero')
+    text = (result.stderr or b'').decode('utf-8', 'replace').lower()
+    for forbidden in ('authentication failed', 'could not read username', 'unable to access',
+                      'connection refused', 'connection timed out', 'proxy', 'ssl'):
+        if forbidden in text:
+            raise AssertionError('non-winning contender failed for a non-ref reason: ' + forbidden)
+    for expected in ('[remote rejected]', '[rejected]', 'failed to update ref',
+                     'non-fast-forward', 'cannot lock ref', 'stale info'):
+        if expected in text:
+            return expected
+    raise AssertionError('non-winning contender reports no Git ref rejection')
+
+
 class PhaseMetricsCapture:
     """Opt-in before/after scrape of the private loopback exporter, per process."""
 
@@ -278,7 +322,7 @@ class PhaseMetricsCapture:
             return None
         begin = time.monotonic()
         identity = process_identity(pid)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirect())
         with opener.open(self.url, timeout=self.timeout) as response:
             if response.status != 200:
                 raise ValueError('metrics endpoint returned status ' + str(response.status))
@@ -297,6 +341,12 @@ class PhaseMetricsCapture:
                            'the binary was built without the state-baseline-metrics feature')
             return None
         return {'identity': identity, 'sample': sample}
+
+    def fail(self, reason):
+        """Mark the capture unusable for the rest of the run; the report status fails."""
+        if self.status == 'ready':
+            self.status = 'partial'
+        self.reason = reason
 
     def _failed(self, error):
         self.status = 'unavailable'
@@ -342,6 +392,7 @@ class PhaseMetricsCapture:
         try:
             delta = sample_delta(marker['sample'], after)
         except MetricsRestart as error:
+            self.fail('phase metrics lost process continuity during a case: ' + str(error))
             return {'status': 'process_restarted', 'reason': str(error)}
         return {'status': 'captured', 'identity': after['identity'], 'phases': delta,
                 'note': 'phase spans nest and are not additive; the scrape adds one pooled SQL '
@@ -396,6 +447,20 @@ def main():
               'unmeasured': {'git_materialization_ms': None, 'blob_io_bytes': None,
                              'exact_lock_wait_ms': None, 'artifact_authority_contention_ms': None,
                              'native_git_cpu_seconds': None, 'peak_temp_disk_bytes': None}}
+    report['concurrent_wall_times'] = {}
+    report['interpretation'] = {
+        'schema_version': 1, 'measurement_revision': 2,
+        'concurrent_measurement': 'Each concurrent batch (different-ref, cross-repo new pack, competing '
+            'same-ref) is bracketed by exactly one measure()/scrape pair. Per-push worker wall times are '
+            'reported separately and are not phase attributed, so concurrent phase deltas are never '
+            'divided, summed or compared per push.',
+        'historical_v1': 'Earlier v1 reports recorded one measure() per concurrent push. Those per-case '
+            'phase deltas overlap in the process-global counters and are INVALID for individual or batch '
+            'aggregation; they remain only as historical raw data. A v2 run replaces them.',
+        'same_ref_rejection': 'The non-winning contender is reported only with a Git ref-rejection '
+            'diagnostic (remote rejected / non-fast-forward / failed to update ref / stale info); an '
+            'authentication or transport failure fails the run and is never counted as a ref rejection. '
+            'This is ordinary competing pushes, not an explicit-old-OID CAS assertion.'}
     samples, stop = [], threading.Event()
     sampler_errors = []
     def pg_sample():
@@ -431,6 +496,7 @@ def main():
         entry = {'name': label, 'seconds': time.monotonic() - begin, 'status': 'passed'}
         if marker is not None:
             if marker.get('status') == 'sampled' and (h.proc is None or h.proc.poll() is not None):
+                capture.fail('application process ended during the sampled case ' + label)
                 entry['phase_metrics'] = {'status': 'service_stopped',
                     'reason': 'application process ended during the case; no comparable delta'}
             else:
@@ -454,7 +520,8 @@ def main():
         if capture is not None:
             capture.observe_start(h.proc.pid)
     try:
-        measure('schema_accounts_server_ready', setup_app)
+        measure('schema_accounts_server_ready', setup_app,
+                phase_skip=('not_applicable', 'setup creates the schema and starts the process'))
         report['idle_after_setup'] = resources(h.proc.pid)
         report['pg_version'] = h.sql('SHOW server_version')
         report['git_version'] = h.git('--version').stdout.decode().strip()
@@ -490,7 +557,8 @@ def main():
         for repo, work, remote in repos:
             measure('offline_pando_cutover_' + repo['name'], lambda: h.cli('pando-transition', 'cutover', '--repository', repo['id']),
                     phase_skip=('offline', 'service stopped for the offline cutover CLI; no process metrics'))
-        measure('pando_server_ready', start_app)
+        measure('pando_server_ready', start_app,
+                phase_skip=('not_applicable', 'process start lifecycle; the stop/start capture brackets it'))
         report['idle_pando'] = resources(h.proc.pid)
         for idx, (repo, work, remote) in enumerate(repos):
             for n in range(3):
@@ -498,39 +566,77 @@ def main():
                 h.git('add', '.', cwd=work)
                 h.git('commit', '-m', 'delta ' + str(n), cwd=work)
                 measure('pando_serial_push_' + str(idx) + '_' + str(n), lambda: h.git('push', remote, 'HEAD:refs/heads/main', cwd=work, token=h.alice))
+        # One bracket for the whole batch: per-operation measure() calls overlap, so their
+        # process-global counter deltas are invalid for per-push or batch aggregation.
+        parallel_wall = []
         def different_ref(item):
             idx, ref = item
             _, work, remote = repos[idx]
-            return measure('pando_parallel_repo_' + str(idx) + '_ref_' + str(ref), lambda: h.git('push', remote, 'HEAD:refs/heads/parallel-' + str(ref), cwd=work, token=h.alice))
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            list(pool.map(different_ref, [(idx, ref) for idx in range(2) for ref in range(4)]))
+            begin = time.monotonic()
+            result = h.git('push', remote, 'HEAD:refs/heads/parallel-' + str(ref), cwd=work, token=h.alice)
+            parallel_wall.append({'case': 'pando_parallel_repo_' + str(idx) + '_ref_' + str(ref),
+                                  'worker_seconds': time.monotonic() - begin})
+            return result
+        def different_ref_batch():
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                return list(pool.map(different_ref, [(idx, ref) for idx in range(2) for ref in range(4)]))
+        measure('pando_parallel_repo_batch', different_ref_batch)
+        report['concurrent_wall_times']['pando_parallel_repo_batch'] = {
+            'mode': 'per-push worker wall time; not phase attributed', 'pushes': parallel_wall}
         # Actual new packs on different repos exercise shared artifact reservation.
         for idx, (_, work, _) in enumerate(repos):
             (work / 'cross-repo.txt').write_text('cross repo pack ' + str(idx))
             h.git('add', '.', cwd=work)
             h.git('commit', '-m', 'cross repo pack', cwd=work)
+        cross_wall = []
         def cross_repo(idx):
             _, work, remote = repos[idx]
-            return measure('pando_cross_repo_new_pack_' + str(idx), lambda: h.git('push', remote, 'HEAD:refs/heads/main', cwd=work, token=h.alice))
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(cross_repo, range(2)))
+            begin = time.monotonic()
+            result = h.git('push', remote, 'HEAD:refs/heads/main', cwd=work, token=h.alice)
+            cross_wall.append({'case': 'pando_cross_repo_new_pack_' + str(idx),
+                               'worker_seconds': time.monotonic() - begin})
+            return result
+        def cross_repo_batch():
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                return list(pool.map(cross_repo, range(2)))
+        measure('pando_cross_repo_new_pack_batch', cross_repo_batch)
+        report['concurrent_wall_times']['pando_cross_repo_new_pack_batch'] = {
+            'mode': 'per-push worker wall time; not phase attributed', 'pushes': cross_wall}
         # Competing same-ref pushes: advertisements can observe different old OIDs.
         # This proves one winner, not a synchronized explicit-old-OID CAS race.
         _, work, remote = repos[0]
         old = h.git('rev-parse', 'HEAD', cwd=work).stdout.decode().strip()
         tree = h.git('rev-parse', 'HEAD^{tree}', cwd=work).stdout.decode().strip()
         contenders = [h.git('commit-tree', tree, '-p', old, '-m', 'contender ' + str(n), cwd=work).stdout.decode().strip() for n in range(2)]
+        same_ref_wall = []
         def contend(n):
-            return measure('pando_same_ref_contender_' + str(n), lambda: h.git('push', remote, contenders[n] + ':refs/heads/main', cwd=work, token=h.alice, check=False))
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            outcomes = list(pool.map(contend, range(2)))
+            begin = time.monotonic()
+            result = h.git('push', remote, contenders[n] + ':refs/heads/main', cwd=work, token=h.alice, check=False)
+            same_ref_wall.append({'case': 'pando_same_ref_contender_' + str(n),
+                                  'worker_seconds': time.monotonic() - begin,
+                                  'returncode': result.returncode})
+            return result
+        def contend_batch():
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                return list(pool.map(contend, range(2)))
+        outcomes = measure('pando_same_ref_contenders_batch', contend_batch)
+        report['concurrent_wall_times']['pando_same_ref_contenders_batch'] = {
+            'mode': 'per-push worker wall time; not phase attributed', 'pushes': same_ref_wall}
         winners = [n for n, result in enumerate(outcomes) if result.returncode == 0]
-        assert len(winners) == 1, [result.returncode for result in outcomes]
+        losers = [n for n, result in enumerate(outcomes) if result.returncode != 0]
+        assert len(winners) == 1 and len(losers) == 1, [result.returncode for result in outcomes]
+        # The loser must be a Git ref rejection, never an auth or transport failure.
+        loser_diagnostic = same_ref_rejection_diagnostic(outcomes[losers[0]])
         current = h.git('ls-remote', remote, 'refs/heads/main', token=h.alice).stdout.decode().split()[0]
         assert current == contenders[winners[0]]
         h.git('reset', '--hard', current, cwd=work)
         report['same_ref_result'] = {'contenders': 2, 'accepted': 1, 'rejected': 1, 'winner_read_back': True,
-            'mode': 'ordinary competing Git pushes; advertised old OIDs are not synchronized'}
+            'loser_returncode': outcomes[losers[0]].returncode,
+            'loser_rejection': loser_diagnostic,
+            'loser_rejection_is_git_ref_rejection': True,
+            'mode': 'ordinary competing Git pushes; advertised old OIDs are not synchronized; the loser is '
+                    'proven by a Git ref-rejection diagnostic rather than a nonzero exit code, and this is '
+                    'not an explicit-old-OID CAS claim'}
         measure('pando_atomic_two_refs', lambda: h.git('push', '--atomic', remote,
                 'HEAD:refs/heads/atomic-a', 'HEAD:refs/heads/atomic-b', cwd=work, token=h.alice))
         atomic_refs = h.git('ls-remote', remote, 'refs/heads/atomic-*', token=h.alice).stdout.decode().splitlines()
@@ -558,9 +664,16 @@ def main():
                   'cross_repo_new_pack': 'pando_cross_repo_', 'same_ref': 'pando_same_ref_',
                   'cold_clone': 'pando_cold_', 'warm_clone': 'pando_warm_', 'api_list': 'api_repo_list_'}
         report['latency_ms'] = {}
+        concurrent_groups = ('different_ref', 'cross_repo_new_pack', 'same_ref')
         for group, prefix in groups.items():
             values = sorted(item['seconds'] * 1000 for item in report['cases'] if item['name'].startswith(prefix))
-            report['latency_ms'][group] = {'n': len(values), 'method': 'nearest rank; small-sample descriptive only',
+            if not values:
+                report['latency_ms'][group] = {'n': 0, 'method': 'not measured in this run'}
+                continue
+            report['latency_ms'][group] = {'n': len(values),
+                'unit': ('batch wall time; not per push and not phase attributed' if group in concurrent_groups
+                         else 'single operation wall time'),
+                'method': 'nearest rank; small-sample descriptive only',
                 **{f'p{int(q*100)}': values[math.ceil(q*len(values))-1] for q in (.50, .95, .99)}}
         report['status'] = 'passed'
     except Exception as error:
@@ -597,6 +710,9 @@ def main():
                             'snapshot statement outside the instrumented spans, so before/after '
                             'scrapes perturb the case slightly'},
                 'phase_limits': PHASE_LIMITS, 'processes': capture.processes}
+            report['phase_metrics']['accounting'] = phase_metrics_accounting(report['cases'])
+            if report['phase_metrics']['accounting']['unexpected']:
+                report['status'] = 'failed'
             if capture.status != 'ready':
                 report['status'] = 'failed'
                 report['phase_metrics']['error'] = capture.reason

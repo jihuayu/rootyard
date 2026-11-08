@@ -1,8 +1,15 @@
+import http.server
+import inspect
+import os
+import socket
 import sys
 import tempfile
+import threading
+import types
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
@@ -183,6 +190,129 @@ class PhaseMetricsDeltaTest(unittest.TestCase):
         import socket
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(('127.0.0.1', port))
+
+
+def worker_body(source, name):
+    start = source.index('def ' + name + '(')
+    following = source.find('\n        def ', start + 1)
+    return source[start:following if following != -1 else len(source)]
+
+
+class ConcurrentBatchBracketTest(unittest.TestCase):
+    def test_concurrent_batches_are_bracketed_exactly_once(self):
+        source = inspect.getsource(baseline.main)
+        for name in ('pando_parallel_repo_batch', 'pando_cross_repo_new_pack_batch',
+                     'pando_same_ref_contenders_batch'):
+            with self.subTest(batch=name):
+                self.assertEqual(source.count("measure('" + name + "'"), 1)
+        for stale in ("measure('pando_parallel_repo_' +", "measure('pando_cross_repo_new_pack_' +",
+                      "measure('pando_same_ref_contender_' +"):
+            self.assertNotIn(stale, source, 'per-operation measure() would overlap the batch')
+        for worker in ('different_ref', 'cross_repo', 'contend'):
+            body = worker_body(source, worker)
+            self.assertNotIn('measure(', body, worker + ' must not measure inside the pool')
+            self.assertNotIn('capture.', body, worker + ' must not scrape inside the pool')
+            self.assertIn('worker_seconds', body, worker + ' reports non-phase-attributed wall time')
+        self.assertIn('same_ref_rejection_diagnostic(', source)
+
+
+class PhaseMetricsAccountingTest(unittest.TestCase):
+    def test_anticipated_and_unexpected_case_statuses_are_separated(self):
+        cases = [{'name': 'a', 'phase_metrics': {'status': 'captured'}},
+                 {'name': 'b', 'phase_metrics': {'status': 'not_applicable'}},
+                 {'name': 'c', 'phase_metrics': {'status': 'offline'}}]
+        summary = baseline.phase_metrics_accounting(cases)
+        self.assertEqual(summary, {'cases': 3, 'by_status': {
+            'captured': 1, 'not_applicable': 1, 'offline': 1}, 'unexpected': []})
+        cases += [{'name': 'd', 'phase_metrics': {'status': 'process_restarted'}},
+                  {'name': 'e', 'phase_metrics': {'status': 'service_stopped'}},
+                  {'name': 'f', 'phase_metrics': {'status': 'unavailable'}}]
+        summary = baseline.phase_metrics_accounting(cases)
+        self.assertEqual(summary['unexpected'], ['d', 'e', 'f'])
+        with self.assertRaises(ValueError):
+            baseline.phase_metrics_accounting(cases + [{'name': 'g', 'phase_metrics': {'status': 'invented'}}])
+        with self.assertRaises(ValueError):
+            baseline.phase_metrics_accounting(cases + [{'name': 'h'}])
+
+    def test_case_restart_fails_the_capture_and_stops_scraping(self):
+        capture = baseline.PhaseMetricsCapture(0)
+        sample = baseline.parse_phase_metrics(exposition())
+        marker = {'status': 'sampled', 'sample': {'identity': {'pid': 1, 'starttime': 10}, 'sample': sample}}
+        capture._scrape = lambda pid: {'identity': {'pid': 2, 'starttime': 11}, 'sample': sample}
+        outcome = capture.close_case(1, marker)
+        self.assertEqual(outcome['status'], 'process_restarted')
+        self.assertNotEqual(capture.status, 'ready')
+        self.assertIn('process continuity', capture.reason)
+        calls = []
+        capture._scrape = lambda pid: calls.append(pid)
+        self.assertEqual(capture.open_case(1)['status'], capture.status)
+        self.assertEqual(calls, [], 'a failed capture must not keep scraping')
+
+    def test_unexpected_process_end_marks_the_capture(self):
+        capture = baseline.PhaseMetricsCapture(0)
+        capture.fail('application process ended during the sampled case pando_serial_push_0_0')
+        self.assertEqual(capture.status, 'partial')
+        self.assertIn('ended during the sampled case', capture.reason)
+        self.assertEqual(capture.open_case(1), {'status': 'partial', 'reason': capture.reason})
+
+
+class SameRefRejectionTest(unittest.TestCase):
+    @staticmethod
+    def result(code, stderr):
+        return types.SimpleNamespace(returncode=code, stderr=stderr)
+
+    def test_loser_needs_a_git_ref_rejection(self):
+        self.assertEqual(baseline.same_ref_rejection_diagnostic(self.result(1, (
+            b' ! [remote rejected] main -> main (failed to update ref)\n'
+            b'error: failed to push some refs to http://127.0.0.1/git/alice/x.git\n'))),
+            '[remote rejected]')
+        self.assertEqual(baseline.same_ref_rejection_diagnostic(self.result(1, (
+            b' ! [rejected]        main -> main (non-fast-forward)\n'))), '[rejected]')
+        self.assertEqual(baseline.same_ref_rejection_diagnostic(self.result(1, (
+            b' ! [rejected]        main -> main (stale info)\n'))), '[rejected]')
+
+    def test_loser_auth_or_transport_failures_are_not_ref_rejections(self):
+        for stderr in (b'fatal: Authentication failed for http://127.0.0.1/\n',
+                       b'fatal: unable to access http://127.0.0.1/: Connection refused\n',
+                       b"fatal: could not read Username for 'http://127.0.0.1': terminal prompts disabled\n",
+                       b'fatal: something entirely unrelated\n'):
+            with self.subTest(stderr=stderr), self.assertRaises(AssertionError):
+                baseline.same_ref_rejection_diagnostic(self.result(1, stderr))
+        with self.assertRaises(AssertionError):
+            baseline.same_ref_rejection_diagnostic(self.result(0, b''))
+
+
+class MetricsRedirectTest(unittest.TestCase):
+    def test_redirect_is_refused_without_contacting_the_target(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header('Location', 'http://external.example/metrics')
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.handle_request, daemon=True).start()
+        seen = []
+        real = socket.create_connection
+
+        def stub(address, *args, **kwargs):
+            seen.append(address[0])
+            if address[0] not in ('127.0.0.1', '::1', 'localhost'):
+                raise AssertionError('external contact attempted: ' + str(address))
+            return real(address, *args, **kwargs)
+
+        try:
+            capture = baseline.PhaseMetricsCapture(server.server_port)
+            with mock.patch('socket.create_connection', stub):
+                with self.assertRaises(ValueError):
+                    capture._scrape(os.getpid())
+        finally:
+            server.server_close()
+        self.assertEqual(set(seen), {'127.0.0.1'})
+        self.assertEqual(capture.scrapes, 0, 'a refused redirect is not a sample')
 
 
 if __name__ == '__main__':
