@@ -1,5 +1,5 @@
 //! Recording implementation, compiled only with `--features state-baseline-metrics`.
-use super::{BUCKETS, BUCKET_LABELS, OUTCOMES, Outcome, Phase, WIDTH};
+use super::{BUCKET_LABELS, BUCKETS, OUTCOMES, Outcome, Phase, WIDTH};
 use std::{
     fmt::Write,
     future::Future,
@@ -13,12 +13,8 @@ use std::{
 fn add(value: &AtomicU64, amount: u64) {
     let mut current = value.load(Ordering::Relaxed);
     loop {
-        match value.compare_exchange_weak(
-            current,
-            current.saturating_add(amount),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match value.compare_exchange_weak(current, current.saturating_add(amount), Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => break,
             Err(actual) => current = actual,
         }

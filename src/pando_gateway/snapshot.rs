@@ -4,7 +4,8 @@ use super::pack_store::PackStore;
 use crate::{
     AppState, Error,
     baseline_metrics::{Phase, timed_result},
-    db::Repository, git_http,
+    db::Repository,
+    git_http,
     storage::read_leases::Lease,
 };
 use anyhow::{Result, ensure};

@@ -98,8 +98,7 @@ fn concurrent_recording_is_exact() {
         for _ in 0..8 {
             scope.spawn(|| {
                 for _ in 0..250 {
-                    Timer::start_in(&registry, Phase::NativeGitHydration)
-                        .finish_with_bytes(Outcome::Ok, 7);
+                    Timer::start_in(&registry, Phase::NativeGitHydration).finish_with_bytes(Outcome::Ok, 7);
                 }
             });
         }

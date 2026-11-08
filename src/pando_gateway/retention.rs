@@ -8,7 +8,10 @@
 //! scoped artifacts can ever become deletion candidates, and resurrection of a
 //! retired content address bumps the authority generation onto a fresh path.
 use super::pack_store::PackManifest;
-use crate::{baseline_metrics::{Phase, timed_result}, storage::remote_objects::ObjectKey};
+use crate::{
+    baseline_metrics::{Phase, timed_result},
+    storage::remote_objects::ObjectKey,
+};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use tokio_postgres::GenericClient;
@@ -77,10 +80,8 @@ async fn reserve<C: GenericClient + Sync>(
     // not a pure server-side lock wait.
     let auth = timed_result(
         Phase::AuthorityLock,
-        client.query_one(
-            "SELECT authority_id,generation FROM pando_storage_authorities WHERE singleton FOR UPDATE",
-            &[],
-        ),
+        client
+            .query_one("SELECT authority_id,generation FROM pando_storage_authorities WHERE singleton FOR UPDATE", &[]),
     )
     .await
     .context("lock Pando storage authority")?;
