@@ -1416,6 +1416,7 @@ async fn seed(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()> {
             "request_digest": old_request.digest().as_hex(),
             "snapshot_id": old_receipt.snapshot_id().to_string(),
             "pin_id": old_receipt.pin_id().to_string(),
+            "owner_id": old_scope.owner_id().to_string(),
             "pin_generation": old_receipt.pin_generation(),
             "gate_revision": old_receipt.gate_revision(),
             "gate_digest": old_receipt.gate_digest_hex(),
@@ -1680,9 +1681,40 @@ async fn verify(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()>
 
     // The genuine old A2 metadata-only snapshot is still readable and unchanged.
     let old = field(&manifest, "old_a2")?;
-    let old_page = a2_page(
+    // The A2 snapshot was captured under the repository owner (= tenant) before pack
+    // activation, while the A5 realm was captured under producer B. Rebuild the full old
+    // scope from the same captured realm/repository/tenant/format/history/authority/group/
+    // purpose with the old owner; reusing the A5 scope is the bug this asserts against.
+    let old_scope = MetadataSnapshotScope::new(
+        scope.repository_id(),
+        scope.tenant_id(),
+        uuid_field(old, "owner_id")?,
+        scope.purpose(),
+        scope.object_format(),
+        scope.history_incarnation(),
+        scope.authority_epoch(),
+        scope.group_epoch(),
+    )?;
+    ensure!(old_scope.owner_id() == tenant, "old A2 owner is not the captured tenant");
+    ensure!(old_scope.owner_id() != scope.owner_id(), "old A2 owner collides with the A5 producer B");
+    // The A5 producer scope must be refused with the typed owner mismatch: never served,
+    // and never an arbitrary error.
+    match a2_page(
         pool,
         scope,
+        uuid_field(old, "snapshot_id")?,
+        uuid_field(old, "pin_id")?,
+        int_field(old, "pin_generation")?,
+    )
+    .await
+    {
+        Err(RefStoreError::MetadataScopeMismatch("snapshot owner")) => {}
+        other => bail!("restored old A2 page under the A5 producer scope was not refused on its owner: {other:?}"),
+    }
+    // The authority check is preserved: only the correct old scope serves the page.
+    let old_page = a2_page(
+        pool,
+        old_scope,
         uuid_field(old, "snapshot_id")?,
         uuid_field(old, "pin_id")?,
         int_field(old, "pin_generation")?,
