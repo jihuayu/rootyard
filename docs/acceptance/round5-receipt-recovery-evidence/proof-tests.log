@@ -1,0 +1,20 @@
+   Compiling rootyard v0.1.0 (/workspace/scratch/round5-implementation/recorded-recovery132)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 53.60s
+     Running unittests src/lib.rs (/workspace/rootyard/target/debug/deps/rootyard-c512e8eeea7428b7)
+
+running 12 tests
+test storage::recorded_receipt_proof::tests::binds_journal_sequence_actor_name_and_human_principal ... ok
+test storage::recorded_receipt_proof::tests::binds_the_successful_non_atomic_receipt_subset ... ok
+test storage::recorded_receipt_proof::tests::grant_marker_is_required_and_read_without_symlinks ... ok
+test storage::recorded_receipt_proof::tests::live_finished_journal_never_mints_a_recorded_proof ... ok
+test storage::recorded_receipt_proof::tests::proof_cannot_be_rebound_to_another_operation_identity ... ok
+test storage::recorded_receipt_proof::tests::read_only_current_writer_still_needs_live_authority ... ok
+test storage::recorded_receipt_proof::tests::recorded_proof_rejects_admitted_ref_or_epoch_drift ... ok
+test storage::recorded_receipt_proof::tests::recorded_proof_rejects_operator_recovery_reason ... ok
+test storage::recorded_receipt_proof::tests::recorded_proof_settles_recovering_revoked_token ... ok
+test storage::recorded_receipt_proof::tests::rejects_another_outcome_or_generation ... ok
+test storage::recorded_receipt_proof::tests::rejects_missing_request_receipt_or_committed_hook ... ok
+test storage::recorded_receipt_proof::tests::rejects_receipt_outside_request_or_committed_set ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 190 filtered out; finished in 1.67s
+

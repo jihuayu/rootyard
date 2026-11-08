@@ -224,49 +224,173 @@ pub async fn fence_epoch(
     Ok(changed as usize)
 }
 
+/// A terminal admission may only replay the exact operation that originally
+/// settled it. The operation row and every outbox event are immutable once
+/// terminal, so a different operation cannot borrow a COMMITTED/ABORTED
+/// writer id and current auth/route changes cannot invalidate real history.
+#[allow(clippy::too_many_arguments)]
+async fn ensure_terminal_replay<C: tokio_postgres::GenericClient + Sync>(
+    tx: &C,
+    operation_id: Uuid,
+    repository_id: Uuid,
+    storage_generation: i64,
+    actor_id: Uuid,
+    token_id: Uuid,
+    outcome: &str,
+    changes: &[crate::events::RefEventInput],
+) -> anyhow::Result<()> {
+    let row = tx
+        .query_opt(
+            "SELECT repository_id,actor_id,token_id,storage_generation,outcome \
+             FROM git_operations WHERE id=$1 FOR UPDATE",
+            &[&operation_id],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("terminal ref admission has no original operation"))?;
+    if row.get::<_, Uuid>(0) != repository_id
+        || row.get::<_, Option<Uuid>>(1) != Some(actor_id)
+        || row.get::<_, Option<Uuid>>(2) != Some(token_id)
+        || row.get::<_, i64>(3) != storage_generation
+        || row.get::<_, String>(4) != outcome
+    {
+        anyhow::bail!("terminal operation replay identity or outcome mismatch");
+    }
+    let rows = tx
+        .query(
+            "SELECT transaction_sequence,ref_name,old_oid,new_oid FROM outbox_events WHERE operation_id=$1",
+            &[&operation_id],
+        )
+        .await?;
+    let stored = rows
+        .iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, String>(3)))
+        .collect::<HashSet<_>>();
+    let replayed = changes
+        .iter()
+        .map(|change| {
+            (change.transaction_sequence, change.ref_name.clone(), change.old_oid.clone(), change.new_oid.clone())
+        })
+        .collect::<HashSet<_>>();
+    if stored.len() != rows.len() || replayed.len() != changes.len() || stored != replayed {
+        anyhow::bail!("terminal operation replay event set differs");
+    }
+    Ok(())
+}
+
 /// Settlement inside the exact transaction that publishes `git_operations` and
-/// outbox events. It re-verifies the route epoch, the token/role authority and
-/// the ADMITTED state before allowing any row to become visible.
+/// outbox events. It re-verifies the repository generation/state, the route
+/// epoch/fence, the database actor/token identity and the ADMITTED state before
+/// allowing any row to become visible.
+///
+/// A `RecordedReceiptProof` may skip only the *current* token/RBAC recheck for a
+/// transaction native Git already committed. It is re-bound here to the
+/// database admission identity; normal new writes and any missing or mismatched
+/// proof still verify current authority.
+#[allow(clippy::too_many_arguments)]
 pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
     tx: &C,
     repository_id: Uuid,
+    storage_generation: i64,
     admission: &crate::events::AdmissionRecord,
     actor_id: Uuid,
     token_id: Uuid,
     outcome: &str,
+    changes: &[crate::events::RefEventInput],
+    recorded: Option<&crate::storage::recorded_receipt_proof::RecordedReceiptProof>,
 ) -> anyhow::Result<()> {
+    // Same-transaction repository row: the current generation must still be
+    // the operation's generation. A journal capability may project past facts
+    // while the repository carries only the temporary unknown-push flag; every
+    // other state or operator recovery reason still rejects settlement.
+    let repo = tx
+        .query_opt(
+            "SELECT storage_generation,state,COALESCE(recovery_reason,'') FROM repositories WHERE id=$1 FOR SHARE",
+            &[&repository_id],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repository is missing during ref settlement"))?;
+    let repo_state: String = repo.get(1);
+    let recovery_reason: String = repo.get(2);
+    let proof_present = recorded.is_some();
     let row = tx
         .query_opt(
-            "SELECT state,shard_epoch FROM git_ref_admissions \
-             WHERE writer_id=$1 AND repository_id=$2 FOR UPDATE",
+            "SELECT state,shard_epoch,actor_id,token_id,ref_names FROM git_ref_admissions WHERE writer_id=$1 AND repository_id=$2 FOR UPDATE",
             &[&admission.writer_id, &repository_id],
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("ref admission is missing"))?;
     let state =
         State::parse(row.get::<_, String>(0).as_str()).ok_or_else(|| anyhow::anyhow!("invalid ref admission state"))?;
+    // Immutable admission identity is checked on every path, including a
+    // terminal replay. Current authority (token/RBAC, repository ready state
+    // and the live route/fence) is checked only for a new ADMITTED settlement
+    // so a crash after commit can still replay the exact original operation.
+    let admitted_epoch: i64 = row.get(1);
+    let database_actor: Uuid = row.get(2);
+    let database_token: Uuid = row.get(3);
+    let database_refs: Vec<String> = row.get(4);
+    if admitted_epoch != admission.shard_epoch {
+        anyhow::bail!("ref admission epoch differs from its journal");
+    }
+    // The database row, never the caller's proof or journal, owns actor/token
+    // identity. A proof minted for another principal cannot settle here.
+    if database_actor != actor_id || database_token != token_id {
+        anyhow::bail!("ref admission actor/token identity changed");
+    }
+    if !changes.iter().all(|change| database_refs.iter().any(|name| name == &change.ref_name)) {
+        anyhow::bail!("ref event was not in the admitted ref-name set");
+    }
     if state == State::Committed {
         // Terminal replay after a crash between outbox commit and journal
-        // retirement. The original settlement already ran in one transaction.
+        // retirement. The original settlement already ran in one transaction;
+        // only the exact operation row and event set may be replayed.
+        ensure_terminal_replay(
+            tx,
+            admission.writer_id,
+            repository_id,
+            storage_generation,
+            actor_id,
+            token_id,
+            outcome,
+            changes,
+        )
+        .await?;
         return Ok(());
     }
     if state == State::Aborted {
-        if outcome == "no_ref_changes" {
-            return Ok(());
+        if outcome != "no_ref_changes" {
+            anyhow::bail!("ref admission was already aborted for a different outcome");
         }
-        anyhow::bail!("ref admission was already aborted for a different outcome");
+        ensure_terminal_replay(
+            tx,
+            admission.writer_id,
+            repository_id,
+            storage_generation,
+            actor_id,
+            token_id,
+            outcome,
+            changes,
+        )
+        .await?;
+        return Ok(());
     }
     if state == State::FencedAborted {
         anyhow::bail!("ref admission is fenced");
     }
-    let admitted_epoch: i64 = row.get(1);
-    if admitted_epoch != admission.shard_epoch {
-        anyhow::bail!("ref admission epoch differs from its journal");
+    // Only an ADMITTED settlement has to project into the current repository
+    // generation/state; a terminal replay above is already durable and only
+    // repeats identical rows, even after current route/auth changes.
+    if repo.get::<_, i64>(0) != storage_generation {
+        anyhow::bail!("repository generation changed during ref settlement");
+    }
+    if repo_state != "ready"
+        && !(proof_present && repo_state == "recovering" && recovery_reason == "push_outcome_unknown")
+    {
+        anyhow::bail!("repository state does not allow ref settlement");
     }
     if let Some(route) = tx
         .query_opt(
-            "SELECT route_epoch,primary_node_id,draining,read_only_degraded,fenced_epoch \
-             FROM repository_shard_routes WHERE repository_id=$1 FOR SHARE",
+            "SELECT route_epoch,primary_node_id,draining,read_only_degraded,fenced_epoch FROM repository_shard_routes WHERE repository_id=$1 FOR SHARE",
             &[&repository_id],
         )
         .await?
@@ -285,9 +409,40 @@ pub async fn settle_in_tx<C: tokio_postgres::GenericClient + Sync>(
             anyhow::bail!("ref admission writer is not the current repository primary");
         }
     }
-    auth::verify_repo_write_access(tx, actor_id, token_id, repository_id, false)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.1))?;
+    // A real receipt plus matching request and committed reference events may
+    // skip only the current token/RBAC/`ready` recheck: the transaction being
+    // projected already committed before the crash and this path never grants
+    // a new ref. The proof must cover exactly the admitted ref-name set, the
+    // database principal and the complete event payload.
+    let proven_recorded = match recorded {
+        Some(proof) => {
+            if outcome != "recorded" {
+                anyhow::bail!("recorded receipt proof differs from settlement outcome");
+            }
+            if changes.is_empty() {
+                anyhow::bail!("recorded receipt proof has no committed changes");
+            }
+            if !proof.matches_admission(
+                repository_id,
+                storage_generation,
+                admission,
+                actor_id,
+                token_id,
+                database_actor,
+                database_token,
+                &database_refs,
+            ) {
+                anyhow::bail!("recorded receipt proof differs from its admission");
+            }
+            true
+        }
+        None => false,
+    };
+    if !proven_recorded {
+        auth::verify_repo_write_access(tx, actor_id, token_id, repository_id, false)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.1))?;
+    }
     let terminal = match outcome {
         "no_ref_changes" => State::Aborted,
         _ => State::Committed,
