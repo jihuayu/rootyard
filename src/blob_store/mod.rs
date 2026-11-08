@@ -23,6 +23,7 @@
 
 pub mod budget;
 pub mod config;
+pub mod key_provider;
 pub mod opendal;
 pub mod readback;
 pub mod transfer;
