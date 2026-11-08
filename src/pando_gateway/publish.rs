@@ -96,7 +96,9 @@ fn ref_store_error(error: RefStoreError) -> Error {
     } else if matches!(&error, RefStoreError::Cancelled { .. } | RefStoreError::UnknownOperation { .. })
         || error.is_conflict()
     {
-        conflict()
+        // A generic ref-store conflict is not a proven advertised-old CAS
+        // refusal: it stays an ordinary Error and is never reported as `ng`.
+        Error(StatusCode::CONFLICT, "Pando refs changed; retry from current refs")
     } else {
         Error::internal(error)
     }
