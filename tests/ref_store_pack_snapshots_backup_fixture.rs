@@ -1296,7 +1296,7 @@ async fn seed(pool: &Pool, store: &BlobStore, fixture: &Fixture) -> Result<()> {
     ensure!(table(&core_rows, "ref_store_core_gates")?.len() == 1, "core gate row count differs");
     ensure!(table(&core_rows, "ref_store_core_refs")?.len() == 1, "core ref row count differs");
     ensure!(table(&core_rows, "ref_store_core_events")?.len() == 1, "core event row count differs");
-    ensure!(table(&core_rows, "ref_store_core_cancellations")?.is_empty(), "a cancellation tombstone was written");
+    ensure!(table(&core_rows, "ref_store_cancellations")?.is_empty(), "a cancellation tombstone was written");
     ensure!(table(&snapshot_rows, "ref_store_core_snapshot_packs")?.len() == 4, "snapshot pack bindings differ");
     ensure!(table(&snapshot_rows, "ref_store_core_pack_snapshot_history")?.len() == 6, "history rows differ");
     ensure!(table(&snapshot_rows, "ref_store_core_pack_snapshot_repo_usage")?.len() == 1, "repo usage row missing");
