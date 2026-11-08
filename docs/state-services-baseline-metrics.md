@@ -252,6 +252,14 @@ frozen budgets and full coverage of the intended phases exist. Nothing here is a
 performance claim, and the legacy
 `evidence/state-services/w0-native-legacy-pando-v5.json` baseline is unchanged.
 
+The phase-metrics evidence under `evidence/state-services/` is bound to the tree
+it was measured on (v5: source `3dd67ff7…`, binary `70f89a8…`). After stacking
+this work onto the rebased W0 security/token/membership parent (`147f76c`,
+PR102 `bcd3918`), that base is **not yet qualified**: a freshly built
+feature-enabled binary with its own receipt plus a new 32-case native run are
+required before any qualification claim, and the raw v1/v5 reports stay
+immutable historical records.
+
 ## Tests
 
 `cargo test --features state-baseline-metrics baseline_metrics::tests` uses

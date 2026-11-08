@@ -1,5 +1,14 @@
 # W0 phase measurement increment
 
+Status: **historical, pre-stack.** This measurement was produced from source
+`3dd67ff7382e…` and binary `70f89a83843d…` built from the tree that existed before
+this branch was stacked onto the rebased W0 security/token/membership parent
+(`147f76c`, PR102 `bcd3918`). It stays the accepted record for that tree and is
+**not** a qualification of the rebased stack: a freshly built feature-enabled
+binary with its own receipt plus a new 32-case native run are required (pending).
+The raw `w0-native-phase-metrics-v1.json` and `-v5.json` reports are immutable
+historical data and must not be edited.
+
 Accepted report: `w0-native-phase-metrics-v5.json`. The default-disabled
 `state-baseline-metrics` feature records twelve fixed phases through the
 existing private metrics listener. Concurrent requests are bracketed once per
