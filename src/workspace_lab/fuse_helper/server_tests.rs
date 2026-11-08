@@ -229,34 +229,42 @@ fn pending_deadline_inspection_detects_an_expired_reservation() {
 fn graceful_barrier_waits_for_owned_pending_cleanup() {
     let state = test_state();
     let workspace = Uuid::nil();
+    let cancelled = Arc::new(AtomicBool::new(false));
     lock(&state.pending).insert(
         workspace,
         PendingMount {
             request: 5,
             deadline: Instant::now() + Duration::from_secs(30),
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled: cancelled.clone(),
             gate: None,
         },
     );
-    let cleaner = state.clone();
-    let cleanup = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(40));
-        let mut pending = lock(&cleaner.pending);
-        // The barrier must have marked cancellation but must not have removed
-        // the entry on the owner's behalf.
-        let cancelled = pending.get(&workspace).map(|entry| entry.cancelled.load(Ordering::Acquire));
-        // Compare-owner cleanup, exactly like a finished build/cancel.
+    let (completed, completion) = std::sync::mpsc::channel();
+    let teardown_state = state.clone();
+    let teardown = std::thread::spawn(move || {
+        teardown_state.unmount_all();
+        let _ = completed.send(());
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !cancelled.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let cancellation_seen = cancelled.load(Ordering::Acquire);
+    let returned_before_owner_cleanup = completion.try_recv().is_ok();
+    // Always release the pending owner before asserting, including on a
+    // failure, so the test cannot leave its teardown thread parked forever.
+    {
+        let mut pending = lock(&state.pending);
         if pending.get(&workspace).map(|entry| entry.request) == Some(5) {
             pending.remove(&workspace);
         }
-        cancelled
-    });
-    let started = Instant::now();
-    state.unmount_all();
-    assert!(
-        started.elapsed() >= Duration::from_millis(20),
-        "the barrier must wait for the in-flight pending owner instead of clearing it"
-    );
-    assert_eq!(cleanup.join().unwrap(), Some(true), "the barrier cancels the pending owner");
-    assert!(lock(&state.pending).is_empty(), "the owner removed only its own entry");
+    }
+    let completed = returned_before_owner_cleanup || completion.recv_timeout(Duration::from_secs(2)).is_ok();
+    if completed {
+        teardown.join().unwrap();
+    }
+    assert!(cancellation_seen, "the barrier must cancel the pending owner");
+    assert!(!returned_before_owner_cleanup, "the barrier returned before its pending owner finished");
+    assert!(completed, "the barrier did not finish after owned cleanup");
+    assert!(lock(&state.pending).is_empty());
 }
