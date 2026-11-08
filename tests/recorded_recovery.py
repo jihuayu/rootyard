@@ -49,6 +49,13 @@ class RecordedRecoveryHarness(ReliabilityHarness):
             digest.update(event.name.encode() + b"\0" + event.read_bytes())
         return digest.hexdigest()
 
+    def native_fixture(self):
+        # Real server, clone and native pushes so the recorded case starts from
+        # an actual receipt-producing workflow rather than a synthetic ref.
+        self.api()
+        self.roundtrip()
+        return {"fixture_repo": self.repo["id"], "second_oid": self.second}
+
     def recorded_settlement_with_revoked_token(self):
         repo = json.loads(self.expect("/api/repos", 201, method="POST", token=self.alice,
                                       body={"name": "recorded-recovery"}))
@@ -72,7 +79,9 @@ class RecordedRecoveryHarness(ReliabilityHarness):
             receipt = json.loads((path / "post-receive.json").read_text())
             assert (path / "finished").exists()
             assert [(item["ref_name"], item["new_oid"]) for item in receipt] == [(expected_ref, self.second)]
-            assert self.ref(expected_ref) == self.second
+            bare = self.root / "data" / "repos" / (repo["id"] + ".git")
+            observed = self.git("--git-dir=" + str(bare), "rev-parse", "--verify", expected_ref)
+            assert observed.stdout.decode().strip() == self.second
             self.stop(hard=True)
         finally:
             self.stop(hard=True)
@@ -140,6 +149,7 @@ def main():
     success = False
     try:
         h.case("fresh_migration_accounts", h.setup)
+        h.case("native_repository_fixture", h.native_fixture)
         h.case("recorded_receipt_sets_revoked_token_operation", h.recorded_settlement_with_revoked_token)
         success = True
     except Exception as error:
