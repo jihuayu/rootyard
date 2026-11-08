@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn a_real_taken_child_is_reaping_until_its_actual_exit_is_recorded() {
         use std::process::{Child, Command};
-        use std::sync::{mpsc, Arc, Mutex};
+        use std::sync::{Arc, Mutex, mpsc};
         use std::thread;
         use std::time::Duration;
 

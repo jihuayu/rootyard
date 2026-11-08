@@ -281,11 +281,17 @@ impl Inner {
         let deadline = Instant::now() + grace;
         loop {
             // One short observation under the lock; sleep never happens here.
-            let observation = { let mut slot = lock(&self.child); slot.observe() };
+            let observation = {
+                let mut slot = lock(&self.child);
+                slot.observe()
+            };
             match observation {
                 ExitObservation::Exited(Ok(status)) if status.success => return Ok(()),
                 ExitObservation::Exited(Ok(status)) => {
-                    return Err(HelperError::new(libc::ECHILD, format!("workspace FUSE helper exited with {}", status.description)));
+                    return Err(HelperError::new(
+                        libc::ECHILD,
+                        format!("workspace FUSE helper exited with {}", status.description),
+                    ));
                 }
                 ExitObservation::Exited(Err(error)) => return Err(HelperError::new(libc::ECHILD, error)),
                 ExitObservation::Missing => {
@@ -311,7 +317,10 @@ impl Inner {
     /// real exit. A SIGKILLed process stuck in D-state is not dropped
     /// unreaped; this dedicated thread may outlive a bounded caller.
     fn reap_child_until_exit(&self) {
-        let child = { let mut slot = lock(&self.child); slot.take_for_reap() };
+        let child = {
+            let mut slot = lock(&self.child);
+            slot.take_for_reap()
+        };
         let Some(mut child) = child else { return };
         let _ = child.kill();
         loop {
@@ -333,7 +342,10 @@ impl Inner {
     /// the handle. Bounded; if the child still has not exited, forget the
     /// handle instead of dropping an unreaped `Child`.
     fn reap_for_drop(&self, grace: Duration) {
-        let child = { let mut slot = lock(&self.child); slot.take_for_reap() };
+        let child = {
+            let mut slot = lock(&self.child);
+            slot.take_for_reap()
+        };
         let Some(mut child) = child else { return };
         let _ = child.kill();
         let deadline = Instant::now() + grace;

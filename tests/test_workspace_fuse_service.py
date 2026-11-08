@@ -18,6 +18,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import tempfile
 import time
@@ -43,11 +44,11 @@ class WorkspaceFuseServiceTest(unittest.TestCase):
     backend = MOUNT_MODE
 
     def test_live_editor_capture_checkpoint_and_remount(self):
-        binary=Path("target/debug/rootyard").resolve()
+        binary=Path(os.environ.get("ROOTYARD_TEST_BINARY", "target/debug/rootyard")).resolve()
         self.assertTrue(binary.is_file())
         with tempfile.TemporaryDirectory(prefix="rootyard-userns-wrapper-") as wrapper_dir:
             wrapper=Path(wrapper_dir)/"rootyard-userns"
-            wrapper.write_text(f"#!/bin/sh\nexec unshare -Urm {binary} \"$@\"\n")
+            wrapper.write_text(f"#!/bin/sh\nexec unshare -Urm {shlex.quote(str(binary))} \"$@\"\n")
             wrapper.chmod(0o700)
             h=Harness(argparse.Namespace(binary=str(wrapper),keep=False))
             try:
