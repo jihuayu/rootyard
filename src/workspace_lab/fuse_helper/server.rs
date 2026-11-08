@@ -187,6 +187,9 @@ impl State {
     }
 
     fn begin_shutdown(&self) {
+        // Reuse, publication and new admission inspect this flag while holding
+        // pending, so none can transfer ownership after this transition.
+        let _pending = lock(&self.pending);
         let grace = SHUTDOWN_GRACE.as_millis().min(u64::MAX as u128) as u64;
         self.shutdown_deadline_ms.store(self.now_ms().saturating_add(grace).max(1), Ordering::Release);
     }

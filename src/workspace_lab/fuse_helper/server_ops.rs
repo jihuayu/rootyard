@@ -88,6 +88,12 @@ pub(super) fn register_pending(
     if mount_is_retired(state, request) {
         return Err((libc::ECANCELED, "mount was cancelled before it was admitted".into()));
     }
+    // Reuse and registration are separate checkpoints. Another request may
+    // have published between them; pending -> mounts makes this final check
+    // atomic with every publication and teardown reservation.
+    if lock(&state.mounts).contains_key(&workspace) {
+        return Err((libc::EBUSY, "workspace was mounted before admission completed".into()));
+    }
     pending.insert(workspace, PendingMount { request, deadline, cancelled: cancel, gate: None });
     Ok(())
 }
@@ -223,6 +229,9 @@ fn reuse_existing(
     let requested_root = Path::new(&body.root).to_path_buf();
     let canonical_root = validate_root(&body.root).ok();
     let pending = lock(&state.pending);
+    if state.in_shutdown() {
+        return Some(Err((libc::ESHUTDOWN, "helper is shutting down; mount reuse is unavailable".into())));
+    }
     let mut mounts = lock(&state.mounts);
     let existing = match mounts.get(&ws) {
         None => ExistingMount::Missing,
