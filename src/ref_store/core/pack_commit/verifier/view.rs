@@ -174,11 +174,24 @@ impl NativeView {
 
     /// Write the exact resulting refs and HEAD, then re-read and attest them.
     pub(super) async fn attest(&self, checked: &Checked<'_>, deadline: Instant) -> Result<(), PackCommitError> {
-        self.write_refs(&checked.resulting)?;
+        self.attest_refs(&checked.head, checked.head_oid.as_deref(), &checked.resulting, deadline).await
+    }
+
+    /// Shared refs/HEAD attestation used by the A4 proof path and the A5b
+    /// materialized-read engine. The caller supplies an already validated map
+    /// from trusted stored rows or from an independently recomputed closure.
+    pub(super) async fn attest_refs(
+        &self,
+        head: &RefName,
+        head_oid: Option<&str>,
+        refs: &RefMap,
+        deadline: Instant,
+    ) -> Result<(), PackCommitError> {
+        self.write_refs_bounded(refs, deadline).await?;
         self.runner
             .run(
                 "symbolic-ref",
-                &["symbolic-ref", "HEAD", checked.head.as_str()],
+                &["symbolic-ref", "HEAD", head.as_str()],
                 Some(&self.git_dir),
                 None,
                 Stdin::Null,
@@ -198,12 +211,12 @@ impl NativeView {
                 &self.lease,
             )
             .await?;
-        if refs::parse_ref_listing(&listing, self.format)? != checked.resulting {
-            return Err(refuse("native resulting refs are not the closure context refs"));
+        if refs::parse_ref_listing(&listing, self.format)? != *refs {
+            return Err(refuse("native resulting refs are not the verified ref set"));
         }
-        self.check_types(&checked.resulting, deadline).await?;
+        self.check_types(refs, deadline).await?;
         self.check_connectivity(deadline).await?;
-        self.check_head(&checked.head, checked.head_oid.as_deref(), deadline).await
+        self.check_head(head, head_oid, deadline).await
     }
 
     /// Write the exact resulting refs as one sorted, validated `packed-refs` file.
@@ -214,36 +227,42 @@ impl NativeView {
     /// HEAD is not a packed ref: it is written separately as a symbolic ref by
     /// the caller. The created inode and a read-back must match exactly before
     /// native Git is allowed to read it.
-    fn write_refs(&self, refs: &RefMap) -> Result<(), PackCommitError> {
+    ///
+    /// All filesystem work runs in one owned blocking task. That task moves an
+    /// `Arc<VerificationLease>`, so a stalled/full scratch filesystem cannot
+    /// release the native permit, view budget or workspace while the syscalls
+    /// may still be running. The caller's absolute deadline bounds the wait; it
+    /// never aborts or drops the owned task.
+    async fn write_refs_bounded(&self, refs: &RefMap, deadline: Instant) -> Result<(), PackCommitError> {
+        if refs.is_empty() {
+            return Ok(());
+        }
+        if deadline <= Instant::now() {
+            return Err(refuse("native Git view packed-refs has no remaining deadline"));
+        }
+        let contents = refs::packed_refs_file(refs, self.format)?;
+        let path = self.git_dir.join("packed-refs");
+        let lease = Arc::clone(&self.lease);
+        let task = tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            write_refs_file(&path, &contents)
+        });
+        // `deadline` is a `std::time::Instant`; `from_std` keeps the same
+        // absolute instant while Tokio can compare it against its own clock.
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(refuse("native Git view packed-refs task failed")),
+            Err(_) => Err(refuse("native Git view packed-refs write is retained")),
+        }
+    }
+
+    #[cfg(test)]
+    fn write_refs_sync(&self, refs: &RefMap) -> Result<(), PackCommitError> {
         if refs.is_empty() {
             return Ok(());
         }
         let contents = refs::packed_refs_file(refs, self.format)?;
-        let path = self.git_dir.join("packed-refs");
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = match options.open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(refuse("native Git view already holds a packed-refs file"));
-            }
-            Err(_) => return Err(refuse("native Git view packed-refs file cannot be created")),
-        };
-        let metadata = file.metadata().map_err(|_| refuse("native Git view packed-refs file cannot be inspected"))?;
-        inspect_packed_refs(&metadata)?;
-        file.write_all(&contents).map_err(|_| refuse("native Git view packed-refs file cannot be written"))?;
-        file.sync_all().map_err(|_| refuse("native Git view packed-refs file cannot be flushed"))?;
-        drop(file);
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|_| refuse("native Git view packed-refs file cannot be inspected"))?;
-        inspect_packed_refs(&metadata)?;
-        let observed =
-            std::fs::read(&path).map_err(|_| refuse("native Git view packed-refs file cannot be read back"))?;
-        if observed != contents {
-            return Err(refuse("native Git view packed-refs read-back differs from the exact ref set"));
-        }
-        Ok(())
+        write_refs_file(&self.git_dir.join("packed-refs"), &contents)
     }
 
     /// Branch targets must be commits; other refs may name any object Git stores.
@@ -364,6 +383,33 @@ impl NativeView {
     }
 }
 
+fn write_refs_file(path: &std::path::Path, contents: &[u8]) -> Result<(), PackCommitError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(refuse("native Git view already holds a packed-refs file"));
+        }
+        Err(_) => return Err(refuse("native Git view packed-refs file cannot be created")),
+    };
+    let metadata = file.metadata().map_err(|_| refuse("native Git view packed-refs file cannot be inspected"))?;
+    inspect_packed_refs(&metadata)?;
+    file.write_all(contents).map_err(|_| refuse("native Git view packed-refs file cannot be written"))?;
+    // The file is disposable input inside an owned private view; no fsync is
+    // needed, and avoiding it keeps this bounded filesystem section short.
+    drop(file);
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| refuse("native Git view packed-refs file cannot be inspected"))?;
+    inspect_packed_refs(&metadata)?;
+    let observed = std::fs::read(path).map_err(|_| refuse("native Git view packed-refs file cannot be read back"))?;
+    if observed != contents {
+        return Err(refuse("native Git view packed-refs read-back differs from the exact ref set"));
+    }
+    Ok(())
+}
+
 /// The packed-refs inode must be exactly the private regular file this view
 /// created: no symlink, no foreign owner, no extra hard link and no group/other
 /// permission.
@@ -407,7 +453,7 @@ mod tests {
         let mut refs = RefMap::new();
         refs.insert("refs/heads/topic".into(), "a".repeat(40));
         refs.insert("refs/tags/v1".into(), "b".repeat(40));
-        view.write_refs(&refs).expect("packed refs");
+        view.write_refs_sync(&refs).expect("packed refs");
         let path = view.git_dir.join("packed-refs");
         let metadata = std::fs::symlink_metadata(&path).expect("metadata");
         assert!(metadata.is_file());
@@ -420,7 +466,7 @@ mod tests {
             refs::packed_refs_file(&refs, GitObjectFormat::Sha1).expect("expected")
         );
         assert!(!view.git_dir.join("refs").exists(), "no loose refs tree is created");
-        assert!(view.write_refs(&refs).is_err(), "packed-refs is create_new");
-        assert!(view.write_refs(&RefMap::new()).is_ok(), "empty refs write nothing");
+        assert!(view.write_refs_sync(&refs).is_err(), "packed-refs is create_new");
+        assert!(view.write_refs_sync(&RefMap::new()).is_ok(), "empty refs write nothing");
     }
 }

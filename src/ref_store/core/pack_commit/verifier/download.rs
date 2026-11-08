@@ -1,12 +1,20 @@
 //! Verified download of the exact registered artifacts.
 //!
 //! Every byte that native Git later validates is the result of a real
-//! `BlobStore::get_to_file` GET of the *registered* locator (tenant, authority,
-//! generation, attempt, namespace, sha256, length), which itself streams the
-//! provider object into a private staging file and verifies SHA-256 and length
-//! before the atomic rename. The verifier then re-reads the local copy and
-//! independently recomputes SHA-256 and length, so the values native Git sees are
-//! the values the registration recorded and the plan planned.
+//! retained `BlobStore::get_to_file` GET of the *registered* locator (tenant,
+//! authority, generation, attempt, namespace, sha256, length), which itself
+//! streams the provider object into a private staging file and verifies SHA-256
+//! and length before the atomic rename. The verifier then re-reads the local
+//! copy and independently recomputes SHA-256 and length, so the values native Git
+//! sees are the values the registration recorded and the plan planned.
+//!
+//! The caller's owned `Arc<VerificationLease>` is threaded into the **actual**
+//! Blob transfer task and into its deferred staging unlink, so a timeout or
+//! cancellation in the materializer can never release the workspace, the view
+//! budget or the native permit while provider/local writes, the rename or the
+//! cleanup are still running. The independent SHA-256/length/header re-read also
+//! runs in one owned blocking task holding a lease clone: a timed-out join
+//! detaches it without releasing capacity until the blocking read has exited.
 //!
 //! Nothing here uses `head`/`stat`/`ETag`/`LIST` as evidence, and nothing here
 //! opens a caller-supplied path: the destination names are generated inside the
@@ -15,6 +23,7 @@
 //! Admission reads exactly the fixed 12-byte pack header (magic, version, object
 //! count) to enforce the frozen total-object bound. The verifier never parses
 //! further: native Git remains the content validator.
+use super::lease::VerificationLease;
 use super::refuse;
 use super::validate::artifact_of;
 use crate::blob_store::opendal::BlobStore;
@@ -23,8 +32,8 @@ use crate::ref_store::core::pack_commit::contract::PackArtifactRole;
 use crate::ref_store::core::pack_commit::error::PackCommitError;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::AsyncReadExt;
 
 /// Fixed native pack header size. Nothing beyond this is interpreted here.
 const PACK_HEADER_BYTES: usize = 12;
@@ -58,11 +67,17 @@ pub(super) fn check_live_backend(store: &BlobStore, packs: &[&RegisteredPack]) -
 }
 
 /// Fetch one registered pair into the owned view and independently re-verify it.
+///
+/// `lease` is the caller's owned verification lease. It travels into the actual
+/// Blob GET task (and through staging cleanup) and into the independent read-back
+/// blocking task, so no capacity is released while this pair may still be
+/// written, renamed, read or unlinked.
 pub(super) async fn fetch_pair(
     store: &BlobStore,
     pack: &RegisteredPack,
     incoming: &Path,
     index: usize,
+    lease: &Arc<VerificationLease>,
     deadline: Instant,
 ) -> Result<PairInput, PackCommitError> {
     let pack_artifact = artifact_of(pack, PackArtifactRole::Pack)?;
@@ -70,57 +85,111 @@ pub(super) async fn fetch_pair(
     let stem = format!("pair-{index:02}");
     let pack_path = incoming.join(format!("{stem}.pack"));
     let idx_path = incoming.join(format!("{stem}.idx"));
-    for (artifact, destination) in [(pack_artifact, &pack_path), (idx_artifact, &idx_path)] {
-        let locator =
-            artifact.locator().blob_locator().map_err(|_| refuse("registered locator cannot be reconstructed"))?;
-        store
-            .get_to_file(&locator, destination, deadline)
-            .await
-            .map_err(|_| refuse("verified Blob read of a registered artifact failed"))?;
-        readback(destination, artifact, deadline).await?;
-    }
-    // Admission only: the fixed pack header supplies the declared object count.
-    let objects = pack_objects(&pack_path).await?;
+
+    let pack_locator =
+        pack_artifact.locator().blob_locator().map_err(|_| refuse("registered locator cannot be reconstructed"))?;
+    store
+        .get_to_file_with_owner(&pack_locator, &pack_path, deadline, Arc::clone(lease))
+        .await
+        .map_err(|_| refuse("verified Blob read of a registered artifact failed"))?;
+    // Independent SHA-256 + length re-read of exactly the registered pack bytes,
+    // plus the fixed 12-byte admission header, in one owned blocking task.
+    let objects = readback(&pack_path, pack_artifact, true, Arc::clone(lease), deadline)
+        .await?
+        .ok_or_else(|| refuse("registered pack header was not read back"))?;
+
+    let idx_locator =
+        idx_artifact.locator().blob_locator().map_err(|_| refuse("registered locator cannot be reconstructed"))?;
+    store
+        .get_to_file_with_owner(&idx_locator, &idx_path, deadline, Arc::clone(lease))
+        .await
+        .map_err(|_| refuse("verified Blob read of a registered artifact failed"))?;
+    readback(&idx_path, idx_artifact, false, Arc::clone(lease), deadline).await?;
+
     let sha256 = pack_artifact.verified_sha256().as_str().to_owned();
     Ok(PairInput { pack: pack_path, idx: idx_path, sha256, objects })
 }
 
-/// Independent SHA-256 + length re-read of the downloaded copy.
-async fn readback(path: &Path, artifact: &RegisteredArtifact, deadline: Instant) -> Result<(), PackCommitError> {
-    let mut file =
-        tokio::fs::File::open(path).await.map_err(|_| refuse("verified artifact copy cannot be reopened"))?;
+/// Independent SHA-256 + length (and, for the pack role, fixed-header) re-read
+/// of the downloaded copy in one owned blocking task.
+///
+/// The task owns a clone of the caller's `Arc<VerificationLease>` until the
+/// closure actually returns, so a timed-out or cancelled join detaches it
+/// without releasing the workspace, the view budget or the native permit while
+/// these local reads may still run. Memory stays bounded by one
+/// [`READBACK_CHUNK`] buffer and the deadline is checked before every chunk.
+async fn readback(
+    path: &Path,
+    artifact: &RegisteredArtifact,
+    header: bool,
+    lease: Arc<VerificationLease>,
+    deadline: Instant,
+) -> Result<Option<u64>, PackCommitError> {
+    if deadline <= Instant::now() {
+        return Err(refuse("verifier deadline elapsed during artifact read-back"));
+    }
+    let path = path.to_path_buf();
+    let expected_length = artifact.verified_length();
+    let expected_sha = artifact.verified_sha256().as_str().to_owned();
+    let task = tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        readback_blocking(&path, expected_length, &expected_sha, header, deadline)
+    });
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(refuse("verified artifact read-back task failed")),
+        Err(_) => Err(refuse("verified artifact read-back is retained until it exits")),
+    }
+}
+
+/// Streaming synchronous re-read: bounded memory, one deadline check per chunk.
+/// The digest/length checks keep the exact refusal wording of the previous
+/// Tokio-FS implementation.
+fn readback_blocking(
+    path: &Path,
+    expected_length: u64,
+    expected_sha: &str,
+    header: bool,
+    deadline: Instant,
+) -> Result<Option<u64>, PackCommitError> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|_| refuse("verified artifact copy cannot be reopened"))?;
     let mut hasher = Sha256::new();
     let mut length = 0u64;
     let mut buffer = vec![0u8; READBACK_CHUNK];
+    let mut head = [0u8; PACK_HEADER_BYTES];
     loop {
         if Instant::now() >= deadline {
             return Err(refuse("verifier deadline elapsed during artifact read-back"));
         }
-        let read = file.read(&mut buffer).await.map_err(|_| refuse("verified artifact copy cannot be read back"))?;
+        let read = file.read(&mut buffer).map_err(|_| refuse("verified artifact copy cannot be read back"))?;
         if read == 0 {
             break;
         }
+        if length < PACK_HEADER_BYTES as u64 {
+            let offset = length as usize;
+            let take = read.min(PACK_HEADER_BYTES - offset);
+            head[offset..offset + take].copy_from_slice(&buffer[..take]);
+        }
         length = length.checked_add(read as u64).ok_or_else(|| refuse("artifact read-back length overflowed"))?;
-        if length > artifact.verified_length() {
+        if length > expected_length {
             return Err(refuse("artifact read-back is longer than the registered length"));
         }
         hasher.update(&buffer[..read]);
     }
-    if length != artifact.verified_length() {
+    if length != expected_length {
         return Err(refuse("artifact read-back is shorter than the registered length"));
     }
-    if hex::encode(hasher.finalize()) != artifact.verified_sha256().as_str() {
+    if hex::encode(hasher.finalize()) != expected_sha {
         return Err(refuse("artifact read-back digest is not the registered digest"));
     }
-    Ok(())
-}
-
-/// Read only the fixed pack header for admission; Git validates the content.
-async fn pack_objects(path: &Path) -> Result<u64, PackCommitError> {
-    let mut file = tokio::fs::File::open(path).await.map_err(|_| refuse("verified pack copy cannot be reopened"))?;
-    let mut header = [0u8; PACK_HEADER_BYTES];
-    file.read_exact(&mut header).await.map_err(|_| refuse("registered pack is shorter than a pack header"))?;
-    parse_pack_header(&header)
+    if !header {
+        return Ok(None);
+    }
+    if length < PACK_HEADER_BYTES as u64 {
+        return Err(refuse("registered pack is shorter than a pack header"));
+    }
+    parse_pack_header(&head).map(Some)
 }
 
 /// Fixed 12-byte admission: magic, version 2/3, declared object count.

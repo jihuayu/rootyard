@@ -16,17 +16,26 @@
 //! Kernel-blocked IO therefore stays charged to the shared read budget. Provider
 //! futures may still time out inside the task; local FS futures are never
 //! cancelled mid-operation. Rename is the commit boundary: a late rename may
-//! make a destination appear even though the caller saw a deadline error, so the
-//! caller must verify the bytes or use a fresh destination. On timeout there is
-//! no receipt. The staging file's `Drop` never blocks a Tokio thread; it defers
-//! the unlink to one bounded `spawn_blocking` task that keeps the reader slot and
-//! staging lease charged until the OS call actually returns. Runtime exit can
-//! still orphan a temp file, and these limits are not restart-durable.
+//! make a destination appear after a deadline error; the caller must verify the
+//! bytes or use a fresh destination, and a timeout yields no receipt. The staging
+//! file's `Drop` never blocks a Tokio thread: it defers the unlink to one bounded
+//! `spawn_blocking` task that keeps the reader slot and staging lease charged
+//! until the OS call returns.
+//!
+//! External ownership (the verified-read fix): [`BlobStore::get_to_file_with_owner`]
+//! attaches one opaque `Arc<T: Send + Sync>` keepalive to the **actual** owned
+//! transfer task, not to an outer waiter. It is cloned into the staging object and
+//! moved, with the `ReadLease`, into the deferred unlink task and stays owned until
+//! the OS unlink returns; a caller timeout or cancellation only detaches the
+//! owned task. If a runtime abort or panic drops it while local filesystem work
+//! may still run, its drop guard `mem::forget`s the keepalive: bounded capacity
+//! is retained until process exit. Normal success or typed-error completion only
+//! releases it after every local await returned and cleanup ownership moved. The
+//! owner stays type-erased, so this module has no caller-crate dependency.
 
-#[cfg(test)]
-use std::sync::Arc;
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
@@ -45,18 +54,69 @@ use super::{
     opendal::{BlobStore, DOWNLOAD_CHUNK_BYTES, DOWNLOAD_CONCURRENCY, MAX_RANGE_BYTES, map_provider_error},
 };
 
-/// This call's own staging file plus the verified-read lease covering it.
+/// Opaque external keepalive. Nothing in `blob_store` can interpret it; it is
+/// only ever moved and dropped.
+type Keepalive = Arc<dyn Send + Sync + 'static>;
+
+/// One deferred staging unlink plus the capacity it keeps charged.
+///
+/// The owner is deliberately type-erased. It must stay alive until the OS
+/// `unlink` has actually returned, so the blocking task takes this value by
+/// value and releases the read lease and the owner only after the call returns.
+struct StagingCleanup {
+    path: PathBuf,
+    lease: Option<ReadLease>,
+    owner: Option<Keepalive>,
+}
+
+impl StagingCleanup {
+    /// Run the unlink to completion, then release the read lease and the
+    /// external owner. Reaching the end of this function is the only way either
+    /// is released on this path.
+    fn run(mut self) {
+        #[cfg(test)]
+        stall_cleanup(&self.path);
+        let _ = std::fs::remove_file(&self.path);
+        // Only after the unlink returned do the reader slot and the caller's
+        // keepalive go back.
+        drop(self.lease.take());
+        drop(self.owner.take());
+    }
+}
+
+impl Drop for StagingCleanup {
+    fn drop(&mut self) {
+        // This runs only when the cleanup task never ran (for example a runtime
+        // abort dropped its queued closure). The unlink is unknown, so retain
+        // both the read lease and the external owner for the life of the process
+        // rather than reporting capacity that may still be in use.
+        if self.lease.is_some() {
+            std::mem::forget(self.lease.take());
+        }
+        if self.owner.is_some() {
+            std::mem::forget(self.owner.take());
+        }
+    }
+}
+
+/// This call's own staging file plus the verified-read lease covering it and an
+/// optional external keepalive.
 ///
 /// The guard is created only after `create_new` succeeded, so the path it may
 /// unlink is always one this call created.
 struct StagingObject {
     path: Option<PathBuf>,
     lease: Option<ReadLease>,
+    owner: Option<Keepalive>,
 }
 
 impl StagingObject {
     fn new(path: PathBuf, lease: ReadLease) -> Self {
-        Self { path: Some(path), lease: Some(lease) }
+        Self { path: Some(path), lease: Some(lease), owner: None }
+    }
+
+    fn with_owner(path: PathBuf, lease: ReadLease, owner: Option<Keepalive>) -> Self {
+        Self { path: Some(path), lease: Some(lease), owner }
     }
 
     fn path(&self) -> &Path {
@@ -64,30 +124,39 @@ impl StagingObject {
     }
 
     /// The temp path was renamed to its final destination: nothing to unlink and
-    /// the verified-read lease can go back to the process.
+    /// the verified-read lease and external keepalive can go back to the process.
     fn commit(mut self) {
         self.path = None;
         self.lease = None;
+        self.owner = None;
     }
 }
 
 impl Drop for StagingObject {
     fn drop(&mut self) {
         let Some(path) = self.path.take() else { return };
-        let lease = self.lease.take();
+        let cleanup = StagingCleanup { path, lease: self.lease.take(), owner: self.owner.take() };
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            // No Tokio thread to stall: unlink here, still holding `lease` until
-            // the call returns.
-            let _ = std::fs::remove_file(&path);
+            // No runtime context: this only happens while the runtime itself is
+            // being torn down, when a Tokio filesystem blocking operation may
+            // still be running. Unlink best-effort, but retain both the read
+            // lease and the caller's owner for the life of the process instead
+            // of claiming capacity against an uncertain local filesystem.
+            let mut cleanup = cleanup;
+            let _ = std::fs::remove_file(&cleanup.path);
+            if cleanup.lease.is_some() {
+                std::mem::forget(cleanup.lease.take());
+            }
+            if cleanup.owner.is_some() {
+                std::mem::forget(cleanup.owner.take());
+            }
             return;
         };
         // One pending cleanup per reader slot, so at most `active_readers` are
-        // ever in flight process-wide. The lease is dropped inside the blocking
-        // task, after the unlink returned: capacity is not reported early.
-        handle.spawn_blocking(move || {
-            let _ = std::fs::remove_file(&path);
-            drop(lease);
-        });
+        // ever in flight process-wide. The blocking task owns the lease and the
+        // external keepalive until the unlink returned; if it never runs, its
+        // `Drop` retains both fail-closed.
+        drop(handle.spawn_blocking(move || cleanup.run()));
     }
 }
 
@@ -110,7 +179,12 @@ pub(crate) struct ReadbackStall {
 }
 
 #[cfg(test)]
-static READBACK_STALL: std::sync::OnceLock<std::sync::Mutex<Option<ReadbackStall>>> = std::sync::OnceLock::new();
+static READBACK_STALLS: std::sync::OnceLock<std::sync::Mutex<Vec<ReadbackStall>>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn readback_stalls() -> &'static std::sync::Mutex<Vec<ReadbackStall>> {
+    READBACK_STALLS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
 
 #[cfg(test)]
 pub(crate) fn install_readback_stall(
@@ -119,31 +193,123 @@ pub(crate) fn install_readback_stall(
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let stall = ReadbackStall { destination, entered: Arc::clone(&entered), release: Arc::clone(&release) };
-    let slot = READBACK_STALL.get_or_init(|| std::sync::Mutex::new(None));
-    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stall);
+    readback_stalls().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(stall);
     (entered, release)
 }
 
+/// Remove only this destination's gate so parallel unit tests cannot clear each
+/// other's gates.
 #[cfg(test)]
-pub(crate) fn clear_readback_stall() {
-    if let Some(slot) = READBACK_STALL.get() {
-        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+pub(crate) fn clear_readback_stall(destination: &Path) {
+    if let Some(slot) = READBACK_STALLS.get() {
+        slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).retain(|stall| stall.destination != destination);
     }
 }
 
 #[cfg(test)]
 async fn stall_before_staging(destination: &Path) {
-    let stall = {
-        let slot = READBACK_STALL.get_or_init(|| std::sync::Mutex::new(None));
-        let guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard
-            .as_ref()
-            .filter(|stall| stall.destination == destination)
+    let gate = {
+        let slot = readback_stalls().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot.iter()
+            .find(|stall| stall.destination == destination)
             .map(|stall| (Arc::clone(&stall.entered), Arc::clone(&stall.release)))
     };
-    if let Some((entered, release)) = stall {
+    if let Some((entered, release)) = gate {
         entered.add_permits(1);
         let _ = release.acquire().await;
+    }
+}
+
+/// Test-only gate inside the deferred `spawn_blocking(remove_file)` cleanup.
+/// It proves "the transfer task returned" is not "staging cleanup finished":
+/// the external keepalive and the reader slot stay owned until this gate opens
+/// and the real unlink has returned.
+#[cfg(test)]
+pub(crate) struct CleanupStall {
+    parent: PathBuf,
+    entered: Arc<tokio::sync::Semaphore>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+static CLEANUP_STALLS: std::sync::OnceLock<std::sync::Mutex<Vec<CleanupStall>>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn cleanup_stalls() -> &'static std::sync::Mutex<Vec<CleanupStall>> {
+    CLEANUP_STALLS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Gate the deferred unlink of every staging file under `parent`. The sender is
+/// one-shot; the blocking cleanup thread waits on it before the real `unlink`.
+#[cfg(test)]
+pub(crate) fn install_cleanup_stall(parent: PathBuf) -> (Arc<tokio::sync::Semaphore>, std::sync::mpsc::SyncSender<()>) {
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    let stall = CleanupStall { parent, entered: Arc::clone(&entered), release: std::sync::Mutex::new(wait) };
+    cleanup_stalls().lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(stall);
+    (entered, release)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_cleanup_stall(parent: &Path) {
+    if let Some(slot) = CLEANUP_STALLS.get() {
+        slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).retain(|stall| stall.parent != parent);
+    }
+}
+
+#[cfg(test)]
+fn stall_cleanup(path: &Path) {
+    let gate = {
+        let mut slot = cleanup_stalls().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot.iter().position(|stall| Some(stall.parent.as_path()) == path.parent()).map(|index| slot.remove(index))
+    };
+    if let Some(stall) = gate {
+        stall.entered.add_permits(1);
+        let wait = stall.release.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = wait.recv();
+    }
+}
+
+/// Owned drop guard for the caller's opaque keepalive inside the **actual**
+/// transfer task.
+///
+/// It is settled exactly once, after the future ran to normal completion (Ok or
+/// typed error) and the staging-cleanup hand-off happened. If the owned task is
+/// dropped early — runtime abort or a panic while a local `tokio::fs` operation
+/// may still be running — the guard deliberately `mem::forget`s the keepalive:
+/// bounded capacity stays owned until process exit instead of being released
+/// against a directory that may still be used. This mirrors the fail-closed
+/// `Retained` reaper in the native verifier.
+struct TransferGuard {
+    owner: Option<Keepalive>,
+    settled: bool,
+}
+
+impl TransferGuard {
+    fn new(owner: Option<Keepalive>) -> Self {
+        Self { owner, settled: false }
+    }
+
+    fn owner_clone(&self) -> Option<Keepalive> {
+        self.owner.as_ref().map(Arc::clone)
+    }
+
+    /// Normal completion: every local await has returned and the staging object
+    /// either committed or handed its owner to the deferred cleanup task.
+    fn settle(&mut self) {
+        self.settled = true;
+        drop(self.owner.take());
+    }
+}
+
+impl Drop for TransferGuard {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Some(owner) = self.owner.take() {
+            std::mem::forget(owner);
+        }
     }
 }
 
@@ -156,6 +322,35 @@ impl BlobStore {
         destination: &Path,
         deadline: Instant,
     ) -> Result<(), BlobError> {
+        self.get_to_file_guarded(locator, destination, deadline, None).await
+    }
+
+    /// Crate-private retained variant of [`Self::get_to_file`].
+    ///
+    /// `owner` is an opaque keepalive (for example a materialized-view lease)
+    /// that is moved into the **actual** owned transfer task rather than an
+    /// outer waiter, cloned into the staging object, and released only after the
+    /// transfer and any deferred staging unlink have finished. A caller timeout
+    /// or cancellation therefore never releases the owner while local filesystem
+    /// work may still run; a runtime abort retains it fail-closed.
+    pub(crate) async fn get_to_file_with_owner<T: Send + Sync + 'static>(
+        &self,
+        locator: &BlobLocator,
+        destination: &Path,
+        deadline: Instant,
+        owner: Arc<T>,
+    ) -> Result<(), BlobError> {
+        let owner: Keepalive = owner;
+        self.get_to_file_guarded(locator, destination, deadline, Some(owner)).await
+    }
+
+    async fn get_to_file_guarded(
+        &self,
+        locator: &BlobLocator,
+        destination: &Path,
+        deadline: Instant,
+        owner: Option<Keepalive>,
+    ) -> Result<(), BlobError> {
         self.validate_locator(locator)?;
         if destination.parent().is_none() {
             return Err(BlobError::Config("blob destination parent missing".into()));
@@ -166,24 +361,43 @@ impl BlobStore {
         let locator = locator.clone();
         let destination = destination.to_path_buf();
         let handle =
-            tokio::spawn(async move { store.get_to_file_owned(&locator, &destination, lease, deadline).await });
+            tokio::spawn(async move { store.get_to_file_owned(&locator, &destination, lease, owner, deadline).await });
         match tokio::time::timeout_at(tokio_deadline(deadline), handle).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(BlobError::Provider("blob readback task failed".into())),
-            // Dropping a JoinHandle detaches; it does not abort the owned task.
+            // Dropping a JoinHandle detaches; it does not abort the owned task,
+            // so the owner keepalive stays alive inside it.
             Err(_) => Err(BlobError::DeadlineExceeded),
         }
     }
 
     /// The whole local pipeline runs in this owned task. No individual local FS
     /// future is timed out or cancelled: after a public deadline the task still
-    /// settles the current open/write/fsync/rename and keeps the read lease
-    /// charged until cleanup finishes.
+    /// settles the current open/write/fsync/rename and keeps the read lease and
+    /// the external keepalive charged until cleanup finishes.
     async fn get_to_file_owned(
         &self,
         locator: &BlobLocator,
         destination: &Path,
         lease: ReadLease,
+        owner: Option<Keepalive>,
+        deadline: Instant,
+    ) -> Result<(), BlobError> {
+        let mut guard = TransferGuard::new(owner);
+        let result = self.transfer_to_destination(locator, destination, lease, &guard, deadline).await;
+        // Reaching this point means the future polled to completion (Ok or a
+        // typed error): every local await returned and the staging object either
+        // committed or handed its keepalive to the deferred unlink task.
+        guard.settle();
+        result
+    }
+
+    async fn transfer_to_destination(
+        &self,
+        locator: &BlobLocator,
+        destination: &Path,
+        lease: ReadLease,
+        guard: &TransferGuard,
         deadline: Instant,
     ) -> Result<(), BlobError> {
         let parent = destination.parent().ok_or_else(|| BlobError::Config("blob destination parent missing".into()))?;
@@ -201,7 +415,9 @@ impl BlobStore {
             .open(&temp)
             .await
             .map_err(|_| BlobError::Provider("blob staging file creation failed".into()))?;
-        let staging = StagingObject::new(temp, lease);
+        // The staging object owns its own keepalive clone, so even if this task
+        // is aborted mid-stream the deferred unlink keeps the caller's owner.
+        let staging = StagingObject::with_owner(temp, lease, guard.owner_clone());
         self.stream_verified_to(locator, &mut output, deadline).await?;
         output.sync_all().await.map_err(|_| BlobError::Provider("blob staging fsync failed".into()))?;
         drop(output);
@@ -367,3 +583,6 @@ impl BlobStore {
         Err(BlobError::DeleteDisabled)
     }
 }
+
+#[cfg(test)]
+mod retained_tests;

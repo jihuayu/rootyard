@@ -6,7 +6,10 @@
 //! `tests/blob_provider_contract.rs`.
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -21,6 +24,16 @@ use super::{
 
 fn limits(uploads: usize, readers: usize, units: u64) -> ResourceLimits {
     ResourceLimits::new(uploads, readers, units * LEASE_UNIT_BYTES).expect("test limits")
+}
+
+/// Observable stand-in for a materialized-view lease: only its drop count
+/// matters here, so `blob_store` needs no external caller type.
+struct DropCounter(Arc<AtomicUsize>);
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[test]
@@ -181,8 +194,12 @@ async fn outer_timeout_detaches_readback_and_keeps_lease_until_inner_drains() {
 
     let destination = dir.path().join("stalled");
     let (entered, release) = readback::install_readback_stall(destination.clone());
+    let drops = Arc::new(AtomicUsize::new(0));
+    let owner = Arc::new(DropCounter(Arc::clone(&drops)));
+    let task_destination = destination.clone();
     let download = tokio::spawn(async move {
-        blob.get_to_file(&object, &destination, Instant::now() + Duration::from_millis(150)).await
+        blob.get_to_file_with_owner(&object, &task_destination, Instant::now() + Duration::from_millis(150), owner)
+            .await
     });
     let _ = tokio::time::timeout(Duration::from_secs(1), entered.acquire())
         .await
@@ -191,14 +208,16 @@ async fn outer_timeout_detaches_readback_and_keeps_lease_until_inner_drains() {
     assert!(matches!(download.await.unwrap(), Err(BlobError::DeadlineExceeded)));
 
     // The public caller is gone, but the owned task still holds the one reader
-    // slot and its staging unit while the local operation is outstanding.
+    // slot, its staging unit and the caller's keepalive while the local
+    // operation is outstanding.
     assert_eq!(resources.available_readers(), 0);
     assert_eq!(resources.available_staging_bytes(), LEASE_UNIT_BYTES);
+    assert_eq!(drops.load(Ordering::SeqCst), 0, "a timed-out outer waiter never releases the guard");
 
     release.add_permits(1);
     let mut released = false;
     for _ in 0..200 {
-        if resources.available_readers() == 1 {
+        if resources.available_readers() == 1 && drops.load(Ordering::SeqCst) == 1 {
             released = true;
             break;
         }
@@ -206,7 +225,7 @@ async fn outer_timeout_detaches_readback_and_keeps_lease_until_inner_drains() {
     }
     assert!(released, "the detached task must release the lease only after it drains");
     assert_eq!(resources.available_staging_bytes(), configured.staging_bytes());
-    readback::clear_readback_stall();
+    readback::clear_readback_stall(&destination);
 }
 
 #[tokio::test]

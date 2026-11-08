@@ -55,6 +55,7 @@ pub use pg::PgPackCommit;
 pub use plan::{ContentDigest, PackCommitExpectation, PackCommitPlan, PackCommitScope, PlannedArtifact, PlannedPack};
 pub use proof::PackClosureProof;
 pub use proof::verifier::PackVerifier;
+pub(crate) use proof::verifier::{NativeReadClosure, NativeReadEngine, NativeReadRequest};
 pub use receipt::{
     PackCommitReceipt, PackCommitTerminal, PackRegistrationAck, PackRegistrationReceipt, PackTerminalRegistration,
     ensure_pack_terminal_budget,

@@ -34,6 +34,9 @@ pub const SNAPSHOT_DIGEST_DOMAIN: &str = "core-pack-snapshot-v1";
 pub const CREATE_REQUEST_DIGEST_DOMAIN: &str = "core-pack-snapshot-create-v1";
 /// Canonical domain of the sealed read-result digest.
 pub const READ_RESULT_DIGEST_DOMAIN: &str = "core-pack-read-snapshot-v1";
+/// Canonical A5b binding of the complete materialized-read identity
+/// (scope, expiry, pin/generation, refs/HEAD, membership and full pack set).
+pub const READ_MATERIALIZATION_DIGEST_DOMAIN: &str = "core-pack-read-materialization-v1";
 
 /// Retained per-repository permanent admission bounds.
 ///

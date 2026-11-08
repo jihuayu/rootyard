@@ -1,4 +1,5 @@
-//! Native pack-closure verifier — the only mint of [`PackClosureProof`].
+//! Native pack-closure verifier — the only mint of [`PackClosureProof`], plus the
+//! shared private native engine used by A5b materialized reads.
 //!
 //! This subtree is wired as a **child** of `pack_commit::proof` (`proof.rs`
 //! declares `#[path = "verifier/mod.rs"] pub(crate) mod verifier;`), so it can
@@ -7,6 +8,10 @@
 //! and no metadata-to-proof shortcut: the only way to obtain a proof is
 //! [`PackVerifier::verify`] after a real native validation of the *actual*
 //! registered bytes.
+//!
+//! A5b reuses the same bounded download/Git/view machinery through
+//! [`NativeReadEngine`], but that engine never calls `mint::mint`, never builds a
+//! `PackCommitPlan`, and cannot produce a [`PackClosureProof`].
 //!
 //! Frozen public API:
 //!
@@ -19,23 +24,21 @@
 //! One absolute deadline (`min(caller, now + 30 s)`) covers the process-wide
 //! concurrency permit, every verified Blob read, all local IO and every native
 //! Git command. Failures are fixed `ProofUnavailable` reasons; no caller,
-//! provider or Git text is ever part of a public error, and a missing platform or
-//! Git capability is a refusal, never a degraded proof.
+//! provider or Git text is ever part of a public error.
 //!
-//! Cleanup is bounded separately from that work budget. The process-wide slot and
-//! the 0700 workspace live in one owned `lease::VerificationLease` that is
-//! shared with every child this call spawns: a child that is not confirmed reaped
-//! *and* group-quiescent keeps the lease, and therefore the slot and the files,
-//! alive. Foreground cleanup has its own bounded window; a slower or failed stop
-//! hands the child and the lease to one owned reaper task (at most one per lease,
-//! at most two leases process-wide), so retained cleanup keeps capacity reserved
-//! instead of pretending a reap.
+//! Cleanup is bounded separately from that work budget. The process-wide native
+//! slot and the 0700 workspace live in one owned `lease::VerificationLease` that
+//! is shared with every child this call spawns: a child that is not confirmed
+//! reaped *and* group-quiescent keeps the lease, and therefore the slot and the
+//! files, alive. Foreground cleanup has its own bounded window; a slower or failed
+//! stop hands the child and the lease to one owned reaper task (at most one per
+//! lease, at most two native leases process-wide), so retained cleanup keeps
+//! capacity reserved instead of pretending a reap.
 //!
 //! Flow (no PostgreSQL client, pool or lease is reachable from here):
 //!
-//! 1. [`validate`] — complete plan/context agreement, duplicate/scope identity
-//!    checks, frozen pair/byte/result-ref bounds and an independently recomputed
-//!    resulting ref map, all before any IO;
+//! 1. [`validate`] — complete plan/context agreement and frozen bounds, all
+//!    before any IO;
 //! 2. [`download`] — live backend identity/provider equality for *every*
 //!    registered artifact, then a verified `BlobStore::get_to_file` of each exact
 //!    registered locator plus an independent SHA-256/length re-read and the fixed
@@ -43,23 +46,24 @@
 //! 3. [`view`] — one owned 0700 bare repository: registered index/pack pairing,
 //!    Git-computed canonical pack names, the exact resulting refs/HEAD, branch
 //!    object types and full object connectivity;
-//! 4. [`mint`] — bind the closure context digest, parent digest, expected
-//!    revision/gate digest, resulting refs + HEAD, old membership digest and the
-//!    complete old/new pack-set digests, then require internal coherence.
+//! 4. [`mint`] — bind the closure context digest and complete closure identity.
 mod binary;
 mod download;
 mod lease;
 mod mint;
 mod process;
+mod read;
 mod refs;
 mod scratch;
 mod validate;
 mod view;
 
+pub(crate) use read::{NativeReadClosure, NativeReadEngine, NativeReadRequest};
+
 use super::super::closure::PackClosureContext;
 use super::super::contract::{
     VERIFIER_DEADLINE_SECONDS, VERIFIER_MAX_CONCURRENT, VERIFIER_MAX_OBJECTS, VERIFIER_MAX_PAIRS,
-    VERIFIER_MAX_RESULT_REFS, VERIFIER_MAX_TOTAL_BYTES,
+    VERIFIER_MAX_RESULT_REFS, VERIFIER_MAX_TOTAL_BYTES, VERIFIER_VIEW_MAX_CONCURRENT,
 };
 use super::super::error::PackCommitError;
 use super::super::plan::PackCommitPlan;
@@ -70,12 +74,22 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Process-wide verifier slot count. One `OnceLock` shared by every instance (and
-/// every verify call): a per-instance semaphore would multiply the bound.
+/// Process-wide native verification slot count. One `OnceLock` shared by every
+/// instance (and every verify call): a per-instance semaphore would multiply the
+/// bound. A4 and A5b share exactly this semaphore.
 static VERIFIER_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Process-wide materialized-view budget. Deliberately separate from native
+/// process permits: a long-lived public view keeps its workspace/budget but not
+/// a native permit.
+static VIEW_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn slots() -> &'static Arc<Semaphore> {
     VERIFIER_SLOTS.get_or_init(|| Arc::new(Semaphore::new(VERIFIER_MAX_CONCURRENT)))
+}
+
+fn view_slots() -> &'static Arc<Semaphore> {
+    VIEW_SLOTS.get_or_init(|| Arc::new(Semaphore::new(VERIFIER_VIEW_MAX_CONCURRENT)))
 }
 
 /// Fixed, caller-independent refusal reason.
@@ -131,10 +145,10 @@ impl PackVerifier {
         let checked = validate::check(plan, context)?;
         let registered = checked.old.iter().chain(checked.new.iter()).collect::<Vec<_>>();
         download::check_live_backend(&self.store, &registered)?;
-        // One owned lease binds the process-wide slot to the private workspace.
-        // It is held for the whole call and shared with every child this call
-        // spawns: capacity and files are released only after the last child is
-        // confirmed stopped (see `lease::retain_until_stopped`).
+        // One owned lease binds the process-wide native slot to the private
+        // workspace. It is held for the whole call and shared with every child
+        // this call spawns: capacity and files are released only after the last
+        // child is confirmed stopped (see `lease::retain_until_stopped`).
         let lease = lease::VerificationLease::new(acquire_slot(deadline).await?)?;
         let view = view::NativeView::create(&self.git, Arc::clone(&lease), checked.format)?;
         view.init(deadline).await?;
@@ -142,7 +156,7 @@ impl PackVerifier {
         let mut indexed = std::collections::BTreeSet::new();
         for (index, pack) in checked.old.iter().chain(checked.new.iter()).enumerate() {
             let download::PairInput { pack: pack_copy, idx, sha256, objects: declared } =
-                download::fetch_pair(&self.store, pack, view.incoming(), index, deadline).await?;
+                download::fetch_pair(&self.store, pack, view.incoming(), index, &lease, deadline).await?;
             objects = objects.checked_add(declared).ok_or_else(|| refuse("closure object count overflowed"))?;
             if objects > VERIFIER_MAX_OBJECTS {
                 return Err(refuse("closure exceeds the verifier object bound"));
@@ -174,11 +188,21 @@ fn arm(caller: Instant) -> Result<Instant, PackCommitError> {
     Ok(deadline)
 }
 
-/// Take one process-wide verifier slot, or refuse at the deadline.
+/// Take one process-wide native verifier slot, or refuse at the deadline.
 async fn acquire_slot(deadline: Instant) -> Result<OwnedSemaphorePermit, PackCommitError> {
     let semaphore = Arc::clone(slots());
     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), semaphore.acquire_owned()).await {
         Ok(Ok(permit)) => Ok(permit),
         _ => Err(refuse("no verifier concurrency slot before the deadline")),
+    }
+}
+
+/// Take one materialized-view budget slot. A5b calls this **before** native
+/// admission; the budget stays owned by the public view.
+async fn acquire_view_budget(deadline: Instant) -> Result<OwnedSemaphorePermit, PackCommitError> {
+    let semaphore = Arc::clone(view_slots());
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), semaphore.acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        _ => Err(refuse("no materialized-view budget before the deadline")),
     }
 }

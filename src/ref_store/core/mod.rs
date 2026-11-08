@@ -49,8 +49,9 @@ pub mod snapshot_receipt;
 pub use command::CommitRefsRequest;
 pub use contract::{CommitMode, CoreGate, CoreGateInit, CoreGateVersion, VersionCheck};
 pub use pack_snapshot::{
-    CreatePackSnapshotRequest, PackPinReceipt, PackReadSnapshot, PackSnapshotExpectation, PackSnapshotLookup,
-    PackSnapshotOutcome, PackSnapshotReceipt, PackSnapshotReceiptQuery, PackSnapshotRef, PgPackSnapshot,
+    CreatePackSnapshotRequest, MaterializedPackRead, PackPinReceipt, PackReadSnapshot, PackSnapshotExpectation,
+    PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceipt, PackSnapshotReceiptQuery, PackSnapshotRef,
+    PgPackSnapshot, PgPackSnapshotMaterializer,
 };
 pub use pg::PgRefStoreCore;
 pub use snapshot_contract::{

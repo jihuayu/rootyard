@@ -51,6 +51,12 @@ pub const VERIFIER_MAX_OBJECTS: u64 = 16_384;
 pub const VERIFIER_MAX_RESULT_REFS: usize = 4096;
 /// Process-wide, not per instance: two concurrent native verifiers maximum.
 pub const VERIFIER_MAX_CONCURRENT: usize = 2;
+/// Process-wide live materialized read views. Deliberately separate from native
+/// process permits so two idle long-lived views cannot starve A4 writes.
+pub const VERIFIER_VIEW_MAX_CONCURRENT: usize = 2;
+/// Conservative aggregate logical byte bound of one materialized view/scratch
+/// workspace (downloaded pack+idx copies, metadata and native index overhead).
+pub const VERIFIER_VIEW_MAX_LOGICAL_BYTES: u64 = 160 * 1024 * 1024;
 pub const VERIFIER_DEADLINE_SECONDS: u64 = 30;
 pub const VERIFIER_GIT_CPU_SECONDS: u64 = 20;
 pub const VERIFIER_GIT_ADDRESS_SPACE_BYTES: u64 = 512 * 1024 * 1024;

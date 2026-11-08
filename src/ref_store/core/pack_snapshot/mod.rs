@@ -1,3 +1,9 @@
+//! A5b adds [`PgPackSnapshotMaterializer`]: T1 sealed metadata, actual verified
+//! Blob/native Git closure outside every PostgreSQL lease, then a fresh-locked T2
+//! revalidation under one absolute effective deadline. Its
+//! [`MaterializedPackRead`] is an opaque owned local view; it grants no new
+//! serving or write authority and claims no physical Blob-byte backup.
+//!
 //! A5a: atomic, durable, complete **registered pack membership** snapshot plus a
 //! durable pin and permanent historical receipts (#107 foundation).
 //!
@@ -19,11 +25,11 @@
 //! transaction. [`PackReadSnapshot`] then re-derives every digest and returns the
 //! complete sorted ref and pack sets as one sealed value.
 //!
-//! What it does not claim: verified current Blob bytes, native Git object
-//! closure, roots/decisions/accepted subsets, serving, GC/detach, encryption or
-//! Blob-byte backup. `complete_git_read_snapshot()` is `false` everywhere here;
-//! `complete_registered_pack_membership()` is `true` only on the sealed read
-//! value, which is data carrying no write authority or capability.
+//! The A5a metadata value does not claim current Blob bytes or native Git
+//! closure: its `complete_git_read_snapshot()` remains `false`. The separate
+//! A5b materializer verifies those bytes and closure before returning a complete
+//! local view. Neither value claims roots/decisions/accepted subsets, serving,
+//! GC/detach, encryption, Blob-byte backup or write authority.
 //!
 //! A2 compatibility: the A2 header gained only defaulted pack columns, the A2
 //! receipt codec gained only `serde(default)`/`skip_serializing_if` pack fields
@@ -31,6 +37,7 @@
 //! pin mutation on a pack-aware pin is routed through this ledger/counter path,
 //! and a fresh metadata-only create is refused on a `pack_verified` gate.
 mod contract;
+mod materialize;
 mod pg;
 mod query;
 mod read_snapshot;
@@ -48,6 +55,7 @@ pub use contract::{
     TENANT_MAX_PACK_LOGICAL_BYTES, TENANT_MAX_PACK_PINS, TENANT_MAX_PACK_RECEIPTS, TENANT_MAX_PACK_REFS,
     TENANT_MAX_PACK_SNAPSHOTS, TENANT_PACK_FACTOR,
 };
+pub use materialize::{MaterializedPackRead, PgPackSnapshotMaterializer};
 pub use pg::PgPackSnapshot;
 pub use read_snapshot::PackReadSnapshot;
 pub use receipt::{PackPinReceipt, PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceipt};

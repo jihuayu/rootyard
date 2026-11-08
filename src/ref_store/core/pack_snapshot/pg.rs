@@ -390,7 +390,7 @@ impl PgPackSnapshot {
         result
     }
 
-    async fn read_checked(
+    pub(super) async fn read_checked(
         &self,
         tx: &Transaction<'_>,
         reference: &PackSnapshotRef,

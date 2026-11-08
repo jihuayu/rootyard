@@ -15,9 +15,9 @@
 //! any serving cutover or write authority. `complete_git_read_snapshot()` stays
 //! `false` until A5b performs the verified byte/native read outside every PG
 //! lease.
-use super::super::pack_commit::{CapturedRef, RegisteredPack};
+use super::super::pack_commit::{CapturedRef, RegisteredPack, refs_digest};
 use super::super::snapshot_contract::{MAX_SNAPSHOT_PACKS, MAX_SNAPSHOT_REFS, MetadataSnapshotScope};
-use super::contract::{PACK_MODE_VERIFIED, READ_RESULT_DIGEST_DOMAIN};
+use super::contract::{PACK_MODE_VERIFIED, READ_MATERIALIZATION_DIGEST_DOMAIN, READ_RESULT_DIGEST_DOMAIN};
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
 use std::collections::BTreeSet;
 use std::time::SystemTime;
@@ -185,6 +185,49 @@ impl PackReadSnapshot {
     pub fn read_digest_hex(&self) -> String {
         self.read_digest.as_hex()
     }
+    /// Complete A5b canonical binding. Unlike the narrower A5a `read_digest`
+    /// (which is kept for A5a compatibility and omits scope/expiry), this binds
+    /// the full historical scope, snapshot/pin id, generation and expiry,
+    /// snapshot digest, refs+HEAD, membership and every full pack identity
+    /// digest. T2 recomputes it and requires exact equality before a public
+    /// materialized view may exist.
+    pub(super) fn materialization_digest(&self) -> RequestDigest {
+        let mut fields: Vec<Vec<u8>> = vec![
+            self.read_digest.as_bytes().to_vec(),
+            self.scope.repository_id().as_bytes().to_vec(),
+            self.scope.tenant_id().as_bytes().to_vec(),
+            self.scope.owner_id().as_bytes().to_vec(),
+            self.scope.purpose().as_str().as_bytes().to_vec(),
+            self.scope.object_format().as_str().as_bytes().to_vec(),
+            self.scope.history_incarnation().as_bytes().to_vec(),
+            self.scope.authority_epoch().to_be_bytes().to_vec(),
+            self.scope.group_epoch().to_be_bytes().to_vec(),
+            self.snapshot_id.as_bytes().to_vec(),
+            self.pin_id.as_bytes().to_vec(),
+            self.pin_generation.to_be_bytes().to_vec(),
+            self.expires_at_unix_micros.to_be_bytes().to_vec(),
+            self.gate_revision.to_be_bytes().to_vec(),
+            self.gate_digest.as_bytes().to_vec(),
+            PACK_MODE_VERIFIED.as_bytes().to_vec(),
+            self.snapshot_digest.as_bytes().to_vec(),
+            self.membership_digest.as_bytes().to_vec(),
+            self.head_ref.as_bytes().to_vec(),
+            if self.head_oid.is_some() { b"head-oid-present".to_vec() } else { b"head-oid-absent".to_vec() },
+            self.head_oid.clone().unwrap_or_default().into_bytes(),
+            self.ref_count().to_be_bytes().to_vec(),
+            refs_digest(&self.refs).as_bytes().to_vec(),
+            self.pack_count().to_be_bytes().to_vec(),
+            self.logical_bytes.to_be_bytes().to_vec(),
+        ];
+        for pack in &self.packs {
+            fields.push(pack.pack_id().as_bytes().to_vec());
+            fields.push(pack.registration_id().as_bytes().to_vec());
+            fields.push(pack.artifact_set_digest().digest().as_bytes().to_vec());
+        }
+        let parts = fields.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        RequestDigest::of(READ_MATERIALIZATION_DIGEST_DOMAIN, &parts)
+    }
+
     pub fn logical_bytes(&self) -> i64 {
         self.logical_bytes
     }
