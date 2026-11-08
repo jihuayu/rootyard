@@ -152,16 +152,13 @@ fn parsed_http_failure(parsed: opendal::Error, status: u16, op: RemoteOp) -> ope
     error
 }
 
-/// Bounded fallback when the error body could not be read or exceeded the
-/// 64 KiB ceiling. No body bytes are retained and no S3 code is guessed: only
-/// the observed status and a bounded `Other` classification survive.
+/// An unreadable or oversized body supplies no safe provider code. Reuse the
+/// pinned parser with an empty body to preserve its status-only retry and
+/// precondition defaults, then discard its message/context as usual.
 fn unparsed_http_failure(status: u16, op: RemoteOp) -> opendal::Error {
-    opendal::Error::new(ErrorKind::Unexpected, HTTP_FAILURE_MESSAGE).set_source(HttpFailure {
-        status,
-        op,
-        kind: RemoteSdkKind::Other,
-        temporary: false,
-    })
+    let response =
+        Response::builder().status(status).body(Buffer::new()).expect("an observed response has a valid HTTP status");
+    parsed_http_failure(parse_error_response(response), status, op)
 }
 
 /// Convert one SDK transport failure into a finite marker. The original error
@@ -459,16 +456,34 @@ mod tests {
         assert_eq!(part.op(), RemoteOp::Get);
     }
 
-    #[test]
-    fn oversized_error_body_is_bounded_and_never_parsed() {
-        let body = "x".repeat(MAX_ERROR_BODY_BYTES + 1);
-        let error = unparsed_http_failure(503, RemoteOp::MultipartComplete);
-        let failure = classify_failure(error);
-        assert_eq!(failure.kind, ErrorKind::Unexpected);
-        let typed = failure.into_error();
+    #[tokio::test]
+    async fn oversized_and_unreadable_error_bodies_preserve_status_defaults() {
+        let oversized = HttpBody::new(
+            futures_util::stream::iter([
+                Ok(Buffer::from(vec![b'x'; MAX_ERROR_BODY_BYTES])),
+                Ok(Buffer::from(vec![b'y'; 1])),
+            ]),
+            None,
+        );
+        assert!(collect_error_body(oversized).await.is_none());
+        let unreadable = HttpBody::new(
+            futures_util::stream::iter([Err(opendal::Error::new(
+                ErrorKind::Unexpected,
+                "private provider body error",
+            ))]),
+            None,
+        );
+        assert!(collect_error_body(unreadable).await.is_none());
+        let retry = unparsed_http_failure(503, RemoteOp::MultipartComplete);
+        assert!(retry.is_temporary());
+        let typed = classify(retry);
         assert_eq!(typed.http_status(), Some(503));
         assert_eq!(typed.op(), RemoteOp::MultipartComplete);
-        assert!(!typed.to_string().contains(&body));
+        let conflict = classify_failure(unparsed_http_failure(412, RemoteOp::MultipartComplete));
+        assert!(conflict.is_conflict());
+        assert_eq!(conflict.into_error().http_status(), Some(412));
+        let missing = classify_failure(unparsed_http_failure(404, RemoteOp::Get));
+        assert!(missing.is_not_found());
     }
 
     #[test]

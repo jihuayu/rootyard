@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
