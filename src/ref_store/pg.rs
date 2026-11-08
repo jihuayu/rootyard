@@ -10,12 +10,23 @@ use super::contract::{
     BeginReceipt, CancelReceipt, Capabilities, CommitReceipt, IssuerLane, OperationIdentity, OperationLookup,
     OperationRecord, OperationState, RefStoreError, RequestDigest, SequenceReservation, TerminalOutcome, TerminalResult,
 };
-use std::time::Duration;
-use tokio::time::Instant;
+use std::{future::Future, time::Duration};
+use tokio::time::{Instant, timeout_at};
 use tokio_postgres::{Row, Transaction, error::SqlState};
 use uuid::Uuid;
 
 const MAX_QUERY_WINDOW: Duration = Duration::from_secs(30);
+pub const OPERATION_LOCK_DOMAIN: &str = "rootyard-ref-store-operation-v1";
+
+async fn before_deadline<T, F>(deadline: Instant, future: F) -> Result<T, RefStoreError>
+where
+    F: Future<Output = Result<T, RefStoreError>>,
+{
+    match timeout_at(deadline, future).await {
+        Ok(result) => result,
+        Err(_) => Err(RefStoreError::Timeout),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PgRefStore;
@@ -30,6 +41,17 @@ impl PgRefStore {
     /// operation id across a retry. Reservation is transactional; if the
     /// caller rolls back, the sequence is not consumed.
     pub async fn reserve_sequence(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        issuer_id: Uuid,
+        lane: &IssuerLane,
+        deadline: Instant,
+    ) -> Result<SequenceReservation, RefStoreError> {
+        before_deadline(deadline, self.reserve_sequence_inner(tx, repository_id, issuer_id, lane, deadline)).await
+    }
+
+    async fn reserve_sequence_inner(
         &self,
         tx: &Transaction<'_>,
         repository_id: Uuid,
@@ -66,7 +88,17 @@ impl PgRefStore {
         identity: &OperationIdentity,
         deadline: Instant,
     ) -> Result<BeginReceipt, RefStoreError> {
+        before_deadline(deadline, self.begin_inner(tx, identity, deadline)).await
+    }
+
+    async fn begin_inner(
+        &self,
+        tx: &Transaction<'_>,
+        identity: &OperationIdentity,
+        deadline: Instant,
+    ) -> Result<BeginReceipt, RefStoreError> {
         bound(tx, deadline).await?;
+        lock_operation_key(tx, identity.repository_id(), identity.operation_id()).await?;
         ensure_repository(tx, identity.repository_id()).await?;
         lock_lane(tx, identity).await?;
         if let Some(row) = operation_row(tx, identity.repository_id(), identity.operation_id(), true).await? {
@@ -108,7 +140,17 @@ impl PgRefStore {
         identity: &OperationIdentity,
         deadline: Instant,
     ) -> Result<CancelReceipt, RefStoreError> {
+        before_deadline(deadline, self.cancel_inner(tx, identity, deadline)).await
+    }
+
+    async fn cancel_inner(
+        &self,
+        tx: &Transaction<'_>,
+        identity: &OperationIdentity,
+        deadline: Instant,
+    ) -> Result<CancelReceipt, RefStoreError> {
         bound(tx, deadline).await?;
+        lock_operation_key(tx, identity.repository_id(), identity.operation_id()).await?;
         ensure_repository(tx, identity.repository_id()).await?;
         lock_lane(tx, identity).await?;
         let existing = match operation_row(tx, identity.repository_id(), identity.operation_id(), true).await? {
@@ -181,7 +223,19 @@ impl PgRefStore {
         result: &TerminalResult,
         deadline: Instant,
     ) -> Result<CommitReceipt, RefStoreError> {
+        before_deadline(deadline, self.record_terminal_inner(tx, identity, outcome, result, deadline)).await
+    }
+
+    async fn record_terminal_inner(
+        &self,
+        tx: &Transaction<'_>,
+        identity: &OperationIdentity,
+        outcome: TerminalOutcome,
+        result: &TerminalResult,
+        deadline: Instant,
+    ) -> Result<CommitReceipt, RefStoreError> {
         bound(tx, deadline).await?;
+        lock_operation_key(tx, identity.repository_id(), identity.operation_id()).await?;
         ensure_repository(tx, identity.repository_id()).await?;
         lock_lane(tx, identity).await?;
         let requested = outcome.state();
@@ -238,6 +292,16 @@ impl PgRefStore {
         operation_id: Uuid,
         deadline: Instant,
     ) -> Result<OperationLookup, RefStoreError> {
+        before_deadline(deadline, self.get_inner(tx, repository_id, operation_id, deadline)).await
+    }
+
+    async fn get_inner(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        operation_id: Uuid,
+        deadline: Instant,
+    ) -> Result<OperationLookup, RefStoreError> {
         if repository_id.is_nil() || operation_id.is_nil() {
             return Err(RefStoreError::InvalidIdentity("lookup ids must be non-nil".into()));
         }
@@ -248,6 +312,25 @@ impl PgRefStore {
         }
     }
 }
+/// Serialize every mutation of one repository operation UUID before any lane
+/// row is touched. Adversarial cross-lane identities therefore cannot commit a
+/// pending operation and a foreign cancellation tombstone concurrently. Hash
+/// collisions only cause extra serialization; the durable identity check after
+/// the lock still decides correctness.
+async fn lock_operation_key(
+    tx: &Transaction<'_>,
+    repository_id: Uuid,
+    operation_id: Uuid,
+) -> Result<(), RefStoreError> {
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtext($1),hashtext($2::text || '/' || $3::text))",
+        &[&OPERATION_LOCK_DOMAIN, &repository_id, &operation_id],
+    )
+    .await
+    .map_err(db_error)?;
+    Ok(())
+}
+
 async fn bound(tx: &Transaction<'_>, deadline: Instant) -> Result<(), RefStoreError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {

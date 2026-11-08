@@ -27,11 +27,26 @@ or #105 and it does not make PostgreSQL a full Ref-CAS authority.
   any different state/result is rejected.
 - `get`: repository-scoped internal lookup. Missing is `Unknown`, not aborted.
 
-The lane head row is locked before any registry read/write. This serializes
-`begin`/`cancel`/`record_terminal` for one `(repository, issuer, lane)` and makes
-cancel-before-register deterministic. All methods use the caller's absolute
-deadline plus a local `statement_timeout`/`lock_timeout`; a later query never
-gets a fresh window beyond that deadline and no method waits longer than 30s.
+Every mutation first takes a transaction advisory lock derived from the common
+repository + operation UUID, before any lane row is locked or read. It then
+locks the issuer lane and rechecks the full durable identity. This means a
+foreign issuer/lane cannot concurrently commit a pending operation and a
+cancellation tombstone for the same operation UUID; exactly one identity wins
+and different identity/digest is a conflict. Hash collisions in the advisory
+key only add serialization, not authority. One caller transaction must contain
+at most one operation mutation; a future multi-operation API must use sorted lock
+order.
+
+The lane head row then serializes `begin`/`cancel`/`record_terminal` for one
+`(repository, issuer, lane)` and makes cancel-before-register deterministic.
+Every public registry method future is also wrapped in
+`tokio::time::timeout_at` at the caller's absolute deadline, while SQL keeps a
+server `statement_timeout`/`lock_timeout` upper bound to drain cancelled queries.
+A later phase never receives a fresh 30s window beyond that deadline. Callers
+must roll back the transaction on any registry error; Pando's `?` path already
+drops the transaction. Pando also checks the absolute deadline before final
+`auth::finish_tx`. A connection drop after PG commit remains an unknown outcome
+and is not converted into an invented rollback.
 
 `migrations/138_ref_store_operation_identity.sql` adds lane heads, operations
 and cancellations. Database triggers reject identity changes and any rewrite of
@@ -54,6 +69,10 @@ generated schema files.
 The migration does not backfill old `git_operations` rows. An operation committed before
 this migration has no registry row and `get` returns `Unknown`, not committed or aborted;
 retention of pre-migration history remains the existing event/audit boundary.
+
+Backup readiness is **not** claimed here. The root owner must first generate the
+format-14 backup/catalog artifacts and run their real-PG tests; this increment
+does not edit `src/backup` or canonical schema fixtures.
 
 This change preallocates the operation UUID and digest **before ref mutation**,
 registers the pending identity before the mutation statements, and records the
@@ -109,6 +128,8 @@ runner (`ROOTYARD_TEST_DATABASE_URL`), covering:
 - pending vs terminal cancel ordering;
 - replay of committed results and rejection of terminal rewrites;
 - database triggers rejecting direct terminal/identity rewrites;
+- cross-lane begin vs foreign cancel producing exactly one identity;
+- lock-blocked begin/cancel/record_terminal/reserve_sequence returning a timely timeout;
 - transactional, monotonic sequence reservation;
 - cross-repository lookup returning `Unknown`.
 

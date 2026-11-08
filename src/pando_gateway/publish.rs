@@ -1,6 +1,9 @@
 //! Commit Pando refs, pack-set membership and event outbox in one PG CAS.
 //! Remote encrypted pack publication precedes this transaction; an orphaned
 //! ready pack is harmless, while a PG ref must never point at an absent pack.
+//! The operation-registry binding is server-preallocated before ref mutation but
+//! is not HTTP client-retry idempotency: the caller protocol does not yet carry a
+//! stable operation id across retries. A lost reply remains unknown.
 use super::{prepare::PreparedPush, snapshot::Snapshot};
 use crate::{
     AppState, Error, auth,
@@ -319,6 +322,12 @@ pub async fn publish(
         .await
         .map_err(ref_store_error)?;
     window.ensure_active()?;
+    // The registry/deadline error propagates above and drops the transaction.
+    // This absolute check prevents a late token scan/commit after the caller's
+    // publication deadline. A lost reply after PG commit remains unknown.
+    if Instant::now() >= deadline {
+        return Err(Error::timeout());
+    }
     auth::finish_tx(tx, actor, true).await?;
     state.dispatch.committed();
     window.ensure_active()?;
