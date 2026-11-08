@@ -37,12 +37,12 @@
 use crate::{
     Error, auth,
     db::{self, Identity},
-    pagination,
     token_management::{
         grants::{insert_grants, load_grants, replace_grants, validate_namespace_grant, validate_repository_grant},
         models::{self, *},
     },
 };
+use super::cursors::{decode as decode_cursor, encode as cursor};
 use axum::http::StatusCode;
 use deadpool_postgres::{Pool, Transaction};
 use rand::RngCore;
@@ -56,7 +56,7 @@ const MANAGEMENT_LOCK_SEED: i64 = 7331;
 const TOKEN_FIELDS: &str = "t.id, t.display_name, t.read_only, t.is_restricted, t.scope_version, \
      to_char(t.expires_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS expires_at, \
      to_char(t.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
-     t.created_at::text AS cursor_ts";
+     t.created_at AS cursor_ts";
 
 fn conflict(message: &'static str) -> Error {
     Error(StatusCode::CONFLICT, message)
@@ -215,22 +215,6 @@ async fn load_token_view(tx: &Transaction<'_>, token_id: Uuid) -> Result<TokenVi
     Ok(token_views(tx, &[row]).await?.pop().expect("one view"))
 }
 
-fn cursor(scope: &str, row: &Row) -> String {
-    let created: String = row.get("cursor_ts");
-    let id: Uuid = row.get("id");
-    pagination::encode(scope, &[&created, &id.to_string()])
-}
-
-fn decode_cursor(after: Option<&String>, scope: &str) -> Result<(Option<String>, Option<String>), Error> {
-    match after {
-        Some(raw) => {
-            let fields = pagination::decode(raw, scope, 2)?;
-            Ok((Some(fields[0].clone()), Some(fields[1].clone())))
-        }
-        None => Ok((None, None)),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Public service surface
 // ---------------------------------------------------------------------------
@@ -270,7 +254,11 @@ pub async fn list_tokens(pool: &Pool, actor: &Identity, after: Option<String>, l
     };
     let more = rows.len() as i64 > limit;
     let rows = &rows[..rows.len().min(limit as usize)];
-    let next_after = more.then(|| cursor(&scope, &rows[rows.len() - 1]));
+    let next_after = if more {
+        rows.last().map(|row| cursor(&scope, row)).transpose()?
+    } else {
+        None
+    };
     let items = token_views(&tx, rows).await?;
     auth::finish_tx(tx, actor, false).await?;
     Ok(TokenPage { items, next_after })
@@ -486,7 +474,7 @@ pub async fn list_sessions(
     let fields = "SELECT t.id AS id, \
                     to_char(s.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
                     to_char(s.expires_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS expires_at, \
-                    s.created_at::text AS cursor_ts \
+                    s.created_at AS cursor_ts \
                FROM web_sessions s JOIN tokens t ON t.id = s.token_id \
               WHERE t.user_id = $1 AND t.kind = 'browser' AND NOT t.revoked AND NOT s.revoked \
                 AND s.expires_at > clock_timestamp()";
@@ -508,12 +496,11 @@ pub async fn list_sessions(
     };
     let more = rows.len() as i64 > limit;
     let rows = &rows[..rows.len().min(limit as usize)];
-    let next_after = more.then(|| {
-        let row = &rows[rows.len() - 1];
-        let created: String = row.get("cursor_ts");
-        let id: Uuid = row.get("id");
-        pagination::encode(&scope, &[&created, &id.to_string()])
-    });
+    let next_after = if more {
+        rows.last().map(|row| cursor(&scope, row)).transpose()?
+    } else {
+        None
+    };
     let items = rows
         .iter()
         .map(|row| SessionView {
