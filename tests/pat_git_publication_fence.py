@@ -598,6 +598,7 @@ def assert_no_new_publication(h, repository_id, before, repo, ref, label, token_
         "WHERE o.repository_id=" + quote(repository_id) + " AND o.outcome='no_ref_changes') t"))
     assert len(closed) == 1, (label, closed)
     assert closed[0]["state"] == "ABORTED" and closed[0]["token_matches"] and closed[0]["actor_matches"] and closed[0]["expected_token"], (label, closed)
+    assert h.sql("SELECT count(*) FROM git_ref_admissions WHERE repository_id=" + quote(repository_id) + " AND state='ADMITTED'") == "0", "rejected writer left an ADMITTED row"
     assert ref_oid(h, repo, ref) is None, label + ": ref was published"
     journal = Path(h.env["ROOTYARD_DATA_DIR"]) / "journal" / repository_id
     until = time.monotonic() + 10
@@ -707,7 +708,7 @@ def case_lock_outlives_cas(h, work, native):
         assert ref_oid(h, repo, "refs/heads/fence-b") is not None, "push succeeded without a ref"
         assert counts(h, repository_id)["outbox"] == before["outbox"] + 1
         assert counts(h, repository_id)["operations"] == before["operations"] + 1
-        assert diagnostics_evidence(h, repository_id, "ungranted_without_hooks") not in (None, "true"), \
+        assert diagnostics_evidence(h, repository_id, "ungranted_without_hooks") == "false", \
             "a granted native CAS was settled as an ungranted no-ref-change abort"
         # Settlement released the lock, so the same writes now succeed.
         settled = wait_sqlstate(h, probe, "SELECT 1 FROM tokens WHERE id = "
