@@ -141,7 +141,10 @@ impl MountHandle {
     pub fn shutdown_and_join(self) {
         let Self { session, dispatcher, mountpoint, mount_id } = self;
         dispatcher.shutdown();
-        let _ = unmount_owned(&mountpoint, mount_id);
+        // A refused unmount must fail this process, never be reported as a
+        // graceful teardown: helper-only callers panic and exit non-zero, and
+        // `AutoUnmount` still closes the descriptor on unwind.
+        unmount_owned(&mountpoint, mount_id).expect("owned FUSE unmount failed");
         session.join();
     }
 }
@@ -419,11 +422,12 @@ fn spawn_with(overlay: Overlay, mountpoint: &Path, auto_unmount: bool) -> io::Re
 
 /// Normal (non-lazy) unmount of exactly the mount this handle captured.
 ///
-/// Fails closed in every other case: an unreadable mount table, a mount that is
-/// already gone and a path now owned by a newer mount are all reported instead
-/// of guessed at. `MNT_DETACH` and a `fusermount -u` fallback are deliberately
-/// not used: a lazy detach leaves the session thread parked on its descriptor,
-/// and a blind path unmount could remove a mount this handle does not own.
+/// Fails closed in every other case: an unreadable mount table and a path that
+/// now holds a different mount (or an ambiguous stack of mounts) are reported
+/// instead of guessed at; an already-unmounted path is a no-op. `MNT_DETACH`
+/// and a `fusermount -u` fallback are deliberately not used: a lazy detach
+/// leaves the session thread parked on its descriptor, and a blind path unmount
+/// could remove a mount this handle does not own.
 fn unmount_owned(mountpoint: &Path, mount_id: MountId) -> io::Result<()> {
     match mount_id_at_path(mountpoint)? {
         Some(current) if owns_current_mount(mount_id, Some(current)) => {
@@ -446,11 +450,18 @@ fn owns_current_mount(captured: MountId, current: Option<MountId>) -> bool {
 }
 
 fn mount_id_at_path(mountpoint: &Path) -> io::Result<Option<MountId>> {
-    Ok(mount_id_in(&fs::read_to_string("/proc/self/mountinfo")?, mountpoint))
+    mount_id_in(&fs::read_to_string("/proc/self/mountinfo")?, mountpoint)
 }
 
-/// Topmost (largest-ID) mount recorded at `mountpoint` in a `mountinfo` text.
-fn mount_id_in(mountinfo: &str, mountpoint: &Path) -> Option<MountId> {
+/// The single mount recorded exactly at `mountpoint` in a `mountinfo` text.
+///
+/// Kernel mount IDs are opaque and may be reused, so numeric order says nothing
+/// about which mount a path lookup sees. Two or more matching entries for the
+/// same decoded mount point are therefore reported as ambiguous
+/// (`InvalidData`) and never resolved to a "topmost" one. A private helper
+/// mountpoint plus its per-workspace reservation rules out internal stacking, so
+/// rejecting a stack is the conservative answer rather than a guess.
+fn mount_id_in(mountinfo: &str, mountpoint: &Path) -> io::Result<Option<MountId>> {
     let target = mountpoint.as_os_str().as_bytes();
     let mut found: Option<MountId> = None;
     for line in mountinfo.lines() {
@@ -464,10 +475,15 @@ fn mount_id_in(mountinfo: &str, mountpoint: &Path) -> Option<MountId> {
         if unescape_mountinfo(point).as_slice() != target {
             continue;
         }
-        // A path may carry stacked mounts; the newest (largest ID) is visible.
-        found = Some(found.map_or(id, |current| current.max(id)));
+        if found.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "multiple mounts recorded at the owned FUSE mountpoint",
+            ));
+        }
+        found = Some(id);
     }
-    found
+    Ok(found)
 }
 
 /// Undo the octal escapes mountinfo uses for spaces, tabs, newlines and
@@ -634,20 +650,35 @@ mod tests {
     }
 
     #[test]
-    fn mountinfo_identity_is_the_exact_topmost_mount_at_the_owned_path() {
+    fn mountinfo_identity_is_the_single_exact_mount_at_the_owned_path() {
         let mountinfo = "\
 36 35 0:32 / /srv/rootyard/workspaces/a/mnt rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0
 37 35 0:33 / /srv/rootyard/workspaces/a/mnt rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0
 38 35 0:34 / /srv/rootyard/workspaces/a/mnt-extra rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0
 39 35 0:35 / /srv/rootyard/workspaces/with\\040space/mnt rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0
 ";
-        // The newest mount stacked at a path is the one a path lookup sees.
-        assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a/mnt")), Some(37));
-        // A longer path that shares the prefix is a different mount.
-        assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a/mnt-extra")), Some(38));
-        assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a")), None);
+        // Stacked mounts at one path are ambiguous: never pick one, and do not
+        // assume the largest (or newest) opaque kernel ID is the visible mount.
+        let err = mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a/mnt"))
+            .expect_err("stacked mounts must not resolve to one identity");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // The same stack in the reverse ID order is just as ambiguous.
+        let reversed = "\
+37 35 0:33 / /srv/rootyard/workspaces/a/mnt rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0
+36 35 0:32 / /srv/rootyard/workspaces/a/mnt rw,relatime - fuse.rootyard-vfs rootyard-vfs rw,user_id=0
+";
+        assert_eq!(
+            mount_id_in(reversed, Path::new("/srv/rootyard/workspaces/a/mnt"))
+                .expect_err("stacked mounts are ambiguous in either ID order")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        // A single exact match is the owned identity.
+        assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a/mnt-extra")).unwrap(), Some(38));
+        // An absent path has no identity at all.
+        assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/a")).unwrap(), None);
         // mountinfo escapes whitespace octally; the comparison is on the path.
-        assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/with space/mnt")), Some(39));
+        assert_eq!(mount_id_in(mountinfo, Path::new("/srv/rootyard/workspaces/with space/mnt")).unwrap(), Some(39));
     }
 
     #[test]
