@@ -1,0 +1,58 @@
+{
+  "status": "passed",
+  "required_cases": 7,
+  "seconds": 2.7530690900021,
+  "returncode": 0,
+  "build_receipt": {
+    "source_inputs_sha256": "513e3f07eb6ad66b30ec46006654c79a6f335fda5b6b82c0d217151d6a19da98",
+    "workspace_commit": "f1d791924bcc439a23f9f9252eef1bdb2f2e8410",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "test",
+      "--locked",
+      "--test",
+      "ref_store_operations",
+      "--no-run",
+      "--message-format=json-render-diagnostics"
+    ],
+    "package_rebuilt": true,
+    "target_dir": "/workspace/rootyard/target",
+    "lock_file": "external root-only Cargo serialization",
+    "binary_sha256": "e30710014377a6cf167f0a3ee3c9e01ac242d36dd7fd84fe347b48d15c8347a7",
+    "kind": "test",
+    "fresh_false_artifacts": [
+      {
+        "target": "rootyard",
+        "kind": "lib",
+        "fresh": false
+      },
+      {
+        "target": "ref_store_operations",
+        "kind": "test",
+        "fresh": false,
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_operations-48cac8d920618479",
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        }
+      }
+    ],
+    "test_source_sha256": "daffa415855821cb1c3d39ca36d3f8d44d04b028686928805ae885323ebe6ac0"
+  },
+  "command": [
+    "/workspace/scratch/state-refstore138-v4/ref_store_operations",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=2"
+  ],
+  "log_sha256": "a17afcb65920e57fb8bcb678be2c5af21331dd6ca74ddddd278ca8378428edee",
+  "scope": "real PostgreSQL loopback; transitional operation registry, not a complete RefStore or Raft qualification"
+}
