@@ -25,11 +25,12 @@
 //! therefore releases the gate as a fence and frees the per-mount operation
 //! slot; no path relies on EOF to clean up.
 //!
-//! Failure policy: a panic, a heartbeat EOF, a missed heartbeat deadline or a
-//! lost control socket fences every gate (including gates of mounts that are
-//! still being built), drops every freeze waiter (a dropped waiter is a fence,
-//! never a thaw), unmounts every workspace and exits non-zero. An explicit
-//! `shutdown` is the only exit that reports success.
+//! Failure policy: a panic, a heartbeat EOF, a missed heartbeat deadline, a
+//! lost control socket or a stuck watchdog fail-stops with a lock-free `_exit`
+//! rather than joining a blocked actor. The kernel closes descriptors, which
+//! fails pending FUSE I/O; it does not perform an owned unmount. An explicit
+//! `shutdown` is the only exit that reports success, and its owned teardown has
+//! an independent watchdog deadline so it cannot hang forever.
 use super::protocol::{
     Body, ErrorReply, FenceIfUnchanged, Frame, FreezeBegin, FreezeFinish, HEARTBEAT_DEADLINE, Handoff, Heartbeat,
     Hello, MOUNT_OP_DEADLINE, Observe, OkReply, PREWARM_DEADLINE, PROTOCOL_VERSION, Prewarm, StateReply, read_frame,
@@ -454,15 +455,16 @@ fn enforce_freeze_deadlines(state: &State) -> bool {
     true
 }
 
-fn failstop(_state: &State, reason: &str, code: i32) -> ! {
+fn failstop(_state: &State, _reason: &str, code: i32) -> ! {
     // This is the final bounded path. Do not join FUSE sessions and do not
     // take state, mount or gate mutexes: an admitted IO may never return and a
     // poisoned/stuck mutex must not prevent process death. `_exit` closes the
     // descriptors, which fails pending FUSE I/O. It does NOT perform an owned
     // unmount: a SIGKILLed helper can leave a disconnected kernel mount that
     // still needs identity-checked cleanup before a replacement is trusted.
-    eprintln!("rootyard: workspace FUSE helper fail-stop: {reason}");
-    // SAFETY: `_exit` is async-signal-safe and never touches Rust state.
+    // Even a direct stderr write can wait on a full pipe or slow disk. The
+    // parent observes EOF and the exit status; this final path performs no IO.
+    // SAFETY: `_exit` is async-signal-safe and does not touch Rust state.
     unsafe { libc::_exit(code) }
 }
 

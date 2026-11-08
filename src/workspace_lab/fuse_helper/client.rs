@@ -24,7 +24,7 @@ use std::{
         unix::{net::UnixStream, process::CommandExt},
     },
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -35,12 +35,13 @@ use std::{
 };
 use uuid::Uuid;
 
+#[path = "client_child.rs"]
+mod child_lifecycle;
+use child_lifecycle::{ChildSlot, ExitObservation, ExitView};
+
 /// Bound on queued cancel frames. One worker sends them, so a caller that
 /// abandons a begin/mount can never spawn an unbounded number of threads.
 const ABORT_QUEUE: usize = 64;
-/// Bounded grace for the dedicated reaper to observe SIGKILL and hold its
-/// child lock; no caller waits on this path.
-const CHILD_REAP_GRACE: Duration = Duration::from_secs(2);
 /// How often the reaper checks the dead flag without relying on the channel.
 const REAPER_TICK: Duration = Duration::from_millis(50);
 
@@ -116,7 +117,7 @@ struct Inner {
     dead: AtomicBool,
     stop: AtomicBool,
     death: Mutex<Option<HelperError>>,
-    child: Mutex<Option<Child>>,
+    child: Mutex<ChildSlot>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -279,56 +280,78 @@ impl Inner {
     fn wait_exit(&self, grace: Duration) -> Result<(), HelperError> {
         let deadline = Instant::now() + grace;
         loop {
-            let status = {
-                let mut child = lock(&self.child);
-                match child.as_mut() {
-                    Some(child) => child.try_wait(),
-                    None => return Ok(()),
+            // One short observation under the lock; sleep never happens here.
+            let observation = { let mut slot = lock(&self.child); slot.observe() };
+            match observation {
+                ExitObservation::Exited(Ok(status)) if status.success => return Ok(()),
+                ExitObservation::Exited(Ok(status)) => {
+                    return Err(HelperError::new(libc::ECHILD, format!("workspace FUSE helper exited with {}", status.description)));
                 }
-            };
-            match status {
-                Ok(Some(status)) if status.success() => return Ok(()),
-                Ok(Some(status)) => {
-                    return Err(HelperError::new(libc::ECHILD, format!("workspace FUSE helper exited with {status}")));
+                ExitObservation::Exited(Err(error)) => return Err(HelperError::new(libc::ECHILD, error)),
+                ExitObservation::Missing => {
+                    return Err(HelperError::new(
+                        libc::ECHILD,
+                        "workspace FUSE helper child handle disappeared before an exit was observed",
+                    ));
                 }
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-                Ok(None) => {
-                    // Bounded SIGKILL reap. The reaper owns the same helper and
-                    // no caller waits for an unkillable child indefinitely.
-                    self.kill_and_reap_bounded(CHILD_REAP_GRACE);
+                ExitObservation::Running | ExitObservation::Reaping if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                ExitObservation::Running | ExitObservation::Reaping => {
                     return Err(HelperError::new(
                         libc::ETIMEDOUT,
                         "workspace FUSE helper did not exit within the shutdown grace",
                     ));
                 }
-                Err(error) => return Err(HelperError::new(libc::ECHILD, error.to_string())),
             }
         }
     }
 
-    /// Take the child only after a bounded `try_lock`, SIGKILL it and poll
-    /// `try_wait` for a bounded window. Never use a blocking `wait()` here.
-    fn kill_and_reap_bounded(&self, grace: Duration) {
-        let lock_deadline = Instant::now() + grace;
-        let child = loop {
-            match self.child.try_lock() {
-                Ok(mut child) => break child.take(),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner().take(),
-                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < lock_deadline => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(std::sync::TryLockError::WouldBlock) => return,
-            }
-        };
+    /// The one fixed reaper keeps polling until `Child::try_wait` reports a
+    /// real exit. A SIGKILLed process stuck in D-state is not dropped
+    /// unreaped; this dedicated thread may outlive a bounded caller.
+    fn reap_child_until_exit(&self) {
+        let child = { let mut slot = lock(&self.child); slot.take_for_reap() };
         let Some(mut child) = child else { return };
         let _ = child.kill();
-        let reap_deadline = Instant::now() + grace;
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < reap_deadline => thread::sleep(Duration::from_millis(10)),
-                // Dropping `Child` after SIGKILL never blocks waiting.
-                _ => return,
+                Ok(Some(status)) => {
+                    lock(&self.child).record_exit(Ok(ExitView::from(status)));
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
+                    lock(&self.child).record_exit(Err(error.to_string()));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Last-resort teardown when the last `Arc` is gone and no reaper can own
+    /// the handle. Bounded; if the child still has not exited, forget the
+    /// handle instead of dropping an unreaped `Child`.
+    fn reap_for_drop(&self, grace: Duration) {
+        let child = { let mut slot = lock(&self.child); slot.take_for_reap() };
+        let Some(mut child) = child else { return };
+        let _ = child.kill();
+        let deadline = Instant::now() + grace;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    lock(&self.child).record_exit(Ok(ExitView::from(status)));
+                    return;
+                }
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    std::mem::forget(child);
+                    return;
+                }
+                Err(error) => {
+                    lock(&self.child).record_exit(Err(error.to_string()));
+                    return;
+                }
             }
         }
     }
@@ -344,7 +367,7 @@ impl Drop for Inner {
         let _ = self.control_shutdown.shutdown(Shutdown::Both);
         let _ = self.heartbeat_shutdown.shutdown(Shutdown::Both);
         let _ = self.reaper.try_send(ReapRequest::GenerationDead);
-        self.kill_and_reap_bounded(Duration::from_secs(1));
+        self.reap_for_drop(Duration::from_secs(1));
     }
 }
 
@@ -423,7 +446,7 @@ impl HelperClient {
             dead: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             death: Mutex::new(None),
-            child: Mutex::new(Some(child)),
+            child: Mutex::new(ChildSlot::running(child)),
         });
 
         let reader_inner = inner.clone();
@@ -489,7 +512,16 @@ impl HelperClient {
         // malformed answer, cancel the exact mount frame so a late child-side
         // completion is torn down instead of staying writable without an owner.
         if request_id != 0 && matches!(failed.code, libc::ETIMEDOUT | libc::EPROTO) {
+            // Queue the exact-frame cancel for the normal path, then also
+            // conservatively fail-stop the generation: a bounded worker may
+            // still be behind other cancellations, and a mount that published
+            // before the child deadline could otherwise stay writable without
+            // an owner. The child is killed/reaped by the dedicated reaper.
             self.inner.queue_abort(AbortJob::Mount { workspace, request: request_id });
+            self.inner.fail_generation(
+                failed.code,
+                format!("mount did not produce a trustworthy reply; fail-stopping generation: {}", failed.message),
+            );
         }
         Err(failed)
     }
@@ -670,7 +702,7 @@ fn reap_child(inner: Arc<Inner>, jobs: mpsc::Receiver<ReapRequest>) {
             }
         }
     }
-    inner.kill_and_reap_bounded(CHILD_REAP_GRACE);
+    inner.reap_child_until_exit();
 }
 
 /// One freeze attempt whose operation id exists before the begin frame.
