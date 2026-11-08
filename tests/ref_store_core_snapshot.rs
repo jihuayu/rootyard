@@ -1908,6 +1908,10 @@ async fn direct_sql_scope_fks_and_delete_guards_are_durable() -> Result<()> {
         assert_eq!((retained.4, retained.5, retained.6, retained.7),
             (retained_before_delete.4, retained_before_delete.5, retained_before_delete.6, retained_before_delete.7),
             "repository deletion must not refund retained tenant usage");
+        // The business user fixture also creates an empty namespace with a
+        // restrictive user FK. Clear it before exercising legitimate account
+        // deletion; production account/namespace constraints stay unchanged.
+        pool.get().await?.execute("DELETE FROM namespaces WHERE user_id=$1", &[&tenant]).await?;
         pool.get().await?.execute("DELETE FROM users WHERE id=$1", &[&tenant]).await?;
         assert_eq!(usage(&pool, repo, tenant).await?, (0, 0, 0, 0, 0, 0, 0, 0), "tenant cascade left retained usage");
         let (_, stale) = create_request(scope(repo, tenant, history), version.digest(), LEASE);
