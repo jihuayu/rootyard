@@ -18,10 +18,11 @@ use crate::workspace_lab::fuse_mount::FreezeDecision;
 use std::{
     collections::HashMap,
     io,
+    net::Shutdown,
     os::{
         fd::OwnedFd,
         unix::{
-            net::{Shutdown, UnixStream},
+            net::UnixStream,
             process::CommandExt,
         },
     },
@@ -445,7 +446,7 @@ impl HelperClient {
         let reap_inner = inner.clone();
         thread::Builder::new()
             .name("fuse-helper-reaper".into())
-            .spawn(move || reaper(reap_inner, reap_jobs))?;
+            .spawn(move || reap_child(reap_inner, reap_jobs))?;
         Ok(Self { inner })
     }
 
@@ -656,7 +657,7 @@ fn abort_worker(inner: Arc<Inner>, jobs: mpsc::Receiver<AbortJob>) {
 /// One dedicated, detached worker: it never joins, never accepts new threads,
 /// and kills/reaps exactly the one child after generation death. It also polls
 /// the dead flag, so a full signal channel cannot lose the kill request.
-fn reaper(inner: Arc<Inner>, jobs: mpsc::Receiver<ReapRequest>) {
+fn reap_child(inner: Arc<Inner>, jobs: mpsc::Receiver<ReapRequest>) {
     loop {
         match jobs.recv_timeout(REAPER_TICK) {
             Ok(ReapRequest::GenerationDead) => break,
