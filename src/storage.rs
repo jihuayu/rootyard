@@ -23,11 +23,12 @@ pub mod read_leases;
 pub mod recorded_receipt_proof;
 pub mod ref_admission;
 pub mod ref_publication;
-mod remote_errors;
+pub mod remote_errors;
 pub mod remote_io;
 pub mod remote_local;
 pub mod remote_objects;
 pub mod remote_provider;
+pub(crate) mod remote_provider_errors;
 pub mod remote_provider_put;
 pub mod remote_publish;
 

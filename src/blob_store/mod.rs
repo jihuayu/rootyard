@@ -355,6 +355,12 @@ pub enum BlobError {
     CapacityConflict,
     DeleteDisabled,
     Provider(String),
+    /// Typed legacy remote-store failure. The legacy OpenDAL adapter must not
+    /// flatten a provider failure into `Provider` text: worker diagnostics
+    /// downcast to the parent `RemoteStoreError` to keep the bounded operation
+    /// label and the numeric status of the response actually observed. The
+    /// standalone Blob profile never produces this variant.
+    Remote(crate::storage::remote_errors::RemoteStoreError),
 }
 
 impl fmt::Display for BlobError {
@@ -384,6 +390,8 @@ impl fmt::Display for BlobError {
             }
             Self::DeleteDisabled => write!(f, "blob deletion is disabled for this profile"),
             Self::Provider(m) => write!(f, "blob provider error: {m}"),
+            // `RemoteStoreError` has its own fixed, privacy-safe template.
+            Self::Remote(remote) => write!(f, "{remote}"),
         }
     }
 }

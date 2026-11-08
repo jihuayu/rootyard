@@ -10,12 +10,15 @@
 use std::time::Duration;
 use tokio::time::Instant;
 
-use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
+use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer, RetryLayer, TimeoutLayer};
 use opendal::services::S3;
-use opendal::{ErrorKind, FuturesBytesStream, Operator};
+use opendal::{FuturesBytesStream, Operator};
 use reqwest::Url;
 
 use crate::blob_store::{BlobError, MAX_OBJECT_BYTES, opendal::map_provider_error, upload::UploadGuard};
+
+use super::remote_errors::RemoteOp;
+use super::remote_provider_errors::{deadline_error, observe, observing_http_client};
 
 pub(crate) const READ_CHUNK: usize = 64 * 1024;
 /// S3 multipart requires >=5 MiB parts; 8 MiB keeps every part compliant.
@@ -60,6 +63,9 @@ impl LegacyS3Store {
         }
         let operator = Operator::new(builder)
             .map_err(map_provider_error)?
+            // Passive status observer: signing, TLS, retries and multipart stay
+            // in the SDK; only the numeric response status is recorded.
+            .layer(HttpClientLayer::new(observing_http_client().map_err(map_provider_error)?))
             .layer(TimeoutLayer::new().with_timeout(OBJECT_TIMEOUT).with_io_timeout(IO_TIMEOUT))
             .layer(ConcurrentLimitLayer::new(CONCURRENCY))
             .layer(RetryLayer::new().with_max_times(RETRY_MAX_TIMES))
@@ -87,26 +93,33 @@ impl LegacyS3Store {
     }
 
     pub async fn head(&self, path: &str, deadline: Instant) -> Result<Option<u64>, BlobError> {
-        match tokio::time::timeout_at(tokio_deadline(deadline), self.operator.stat(path)).await {
+        match tokio::time::timeout_at(tokio_deadline(deadline), observe(RemoteOp::Head, self.operator.stat(path)))
+            .await
+        {
             Ok(Ok(metadata)) => Ok(Some(metadata.content_length())),
-            Ok(Err(error)) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Ok(Err(error)) => Err(map_provider_error(error)),
-            Err(_) => Err(BlobError::DeadlineExceeded),
+            Ok(Err(failure)) if failure.is_not_found() => Ok(None),
+            Ok(Err(failure)) => Err(BlobError::Remote(failure.into_error())),
+            Err(_) => Err(deadline_error(RemoteOp::Head)),
         }
     }
 
     /// Bounded byte stream over the whole object. Callers hash every chunk and
     /// enforce the expected length; `stat`/ETag are never trusted as content.
     pub async fn read_stream(&self, path: &str, deadline: Instant) -> Result<FuturesBytesStream, BlobError> {
-        let reader = match tokio::time::timeout_at(tokio_deadline(deadline), self.operator.reader(path)).await {
-            Ok(Ok(reader)) => reader,
-            Ok(Err(error)) => return Err(map_provider_error(error)),
-            Err(_) => return Err(BlobError::DeadlineExceeded),
-        };
-        match tokio::time::timeout_at(tokio_deadline(deadline), reader.into_bytes_stream(..)).await {
+        let reader =
+            match tokio::time::timeout_at(tokio_deadline(deadline), observe(RemoteOp::Get, self.operator.reader(path)))
+                .await
+            {
+                Ok(Ok(reader)) => reader,
+                Ok(Err(failure)) => return Err(BlobError::Remote(failure.into_error())),
+                Err(_) => return Err(deadline_error(RemoteOp::Get)),
+            };
+        match tokio::time::timeout_at(tokio_deadline(deadline), observe(RemoteOp::Get, reader.into_bytes_stream(..)))
+            .await
+        {
             Ok(Ok(stream)) => Ok(stream),
-            Ok(Err(error)) => Err(map_provider_error(error)),
-            Err(_) => Err(BlobError::DeadlineExceeded),
+            Ok(Err(failure)) => Err(BlobError::Remote(failure.into_error())),
+            Err(_) => Err(deadline_error(RemoteOp::Get)),
         }
     }
 
@@ -115,12 +128,15 @@ impl LegacyS3Store {
     pub async fn read_range(&self, path: &str, start: u64, len: u64, deadline: Instant) -> Result<Vec<u8>, BlobError> {
         let end = start.checked_add(len).ok_or(BlobError::LengthMismatch { expected: u64::MAX, actual: len })?;
         let buffer =
-            match tokio::time::timeout_at(tokio_deadline(deadline), self.operator.read_with(path).range(start..end))
-                .await
+            match tokio::time::timeout_at(
+                tokio_deadline(deadline),
+                observe(RemoteOp::Get, self.operator.read_with(path).range(start..end)),
+            )
+            .await
             {
                 Ok(Ok(buffer)) => buffer,
-                Ok(Err(error)) => return Err(map_provider_error(error)),
-                Err(_) => return Err(BlobError::DeadlineExceeded),
+                Ok(Err(failure)) => return Err(BlobError::Remote(failure.into_error())),
+                Err(_) => return Err(deadline_error(RemoteOp::Get)),
             };
         if buffer.len() as u64 != len {
             return Err(BlobError::LengthMismatch { expected: len, actual: buffer.len() as u64 });
@@ -130,11 +146,13 @@ impl LegacyS3Store {
 
     /// Idempotent exact-key delete. No listing, prefix or GC sweep exists here.
     pub async fn delete(&self, path: &str, deadline: Instant) -> Result<(), BlobError> {
-        match tokio::time::timeout_at(tokio_deadline(deadline), self.operator.delete(path)).await {
+        match tokio::time::timeout_at(tokio_deadline(deadline), observe(RemoteOp::Delete, self.operator.delete(path)))
+            .await
+        {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Ok(Err(error)) => Err(map_provider_error(error)),
-            Err(_) => Err(BlobError::DeadlineExceeded),
+            Ok(Err(failure)) if failure.is_not_found() => Ok(()),
+            Ok(Err(failure)) => Err(BlobError::Remote(failure.into_error())),
+            Err(_) => Err(deadline_error(RemoteOp::Delete)),
         }
     }
 

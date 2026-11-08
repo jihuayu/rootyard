@@ -57,3 +57,32 @@ Local lifecycle unit tests (`cargo test --lib blob_store`) use a private per-tes
 The real case covers multipart publication through owned one-use intents, distinct attempt paths for identical bytes, independent-client read-back, verified download/range, a short read-only locator against an existing key, refusal of wrong source length and wrong expected digest with no ACK, fixture truncation and same-length corruption, global digest validation for a range outside the corrupt byte, product deletion refusal and late old-attempt deletion isolation. The two `compile_fail` examples on `UploadIntent` prove that cloning the write capability and forging one from a locator do not compile. Cleanup runs on caught assertion failure and targets only exact owned paths. These cases do not establish the cross-store hold/GC protocol, exhaustive cancellation/retry behavior, a different provider's contract or physical durability/HA.
 
 Follow-ups: #109 connects content ACKs and KeyProvider; #113/#114 own persistent retention; #120 owns Blob backup/restore. All-content Blob publication, removal of local authority, standalone defaults, real Azure service qualification and destructive GC remain unqualified.
+
+## Legacy adapter rebase and pending qualification
+
+The OpenDAL Blob work is now stacked on the ref-store integration head
+(schema 138 / backup format 14). The rebase keeps both parents rather than
+choosing one: the ref-store typed failure surface (`storage::remote_errors` with
+`RemoteOp`, `RemoteStoreError`, the numeric status and its fixed privacy-safe
+`Display`) is preserved and re-exported from `storage::remote_objects`, while the
+legacy `RemoteObjectStore` transport is the OpenDAL adapter.
+
+The legacy adapter classifies provider failures through
+`storage::remote_provider_errors`: a passive `HttpFetch` wrapper around the
+SDK's own client records only numeric response statuses, so signing, TLS,
+retries, multipart and abort stay inside OpenDAL and no URL, header, body or
+credential is captured, formatted or logged. A failure carries the exact status
+of a `4xx`/`5xx` response observed by that operation; success statuses are never
+reported as a failure cause, two different failure statuses in one operation
+are reported as `None` instead of guessed, and an unobserved status falls back
+to a bounded provider kind (`RemoteSdkKind`). Body-stream failures carry no
+numeric status. Deadline exhaustion keeps the parent typed `timeout(op)`.
+
+Evidence status: the qualified numbers and native-fault evidence referenced
+above were collected on the pre-rebase head and are **not** valid for this
+rebuilt history. The rebased commits have not yet been compiled, run against a
+real S3 provider, or re-qualified against the legacy fault cases (429, 503,
+delayed response, truncated stream, local-I/O-only attribution). Those runs,
+plus a fresh check that numeric-status/transport/timeout classification still
+reaches worker diagnostics through the new bridge, are required before any
+qualification claim or PR is made for this head.

@@ -5,7 +5,7 @@ use reqwest::Method;
 /// discriminant and a numeric status are retained for diagnosis; URLs, object
 /// keys, query strings, headers, credentials and payloads are never captured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RemoteOp {
+pub enum RemoteOp {
     Get,
     Head,
     Put,
@@ -41,6 +41,42 @@ impl RemoteOp {
     }
 }
 
+/// Bounded provider-SDK failure labels. OpenDAL 0.57 exposes only
+/// [`opendal::ErrorKind`] publicly, so when no HTTP response was observed the
+/// kind is retained as a fixed label instead of inventing a status code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteSdkKind {
+    NotFound,
+    PermissionDenied,
+    RateLimited,
+    AlreadyExists,
+    ConditionNotMatch,
+    RangeNotSatisfied,
+    /// A provider byte-stream failure (for example a truncated body). At that
+    /// point no HTTP response exists to report a status for.
+    Stream,
+    Unsupported,
+    ConfigInvalid,
+    Other,
+}
+
+impl RemoteSdkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::PermissionDenied => "permission_denied",
+            Self::RateLimited => "rate_limited",
+            Self::AlreadyExists => "already_exists",
+            Self::ConditionNotMatch => "condition_not_match",
+            Self::RangeNotSatisfied => "range_not_satisfied",
+            Self::Stream => "stream",
+            Self::Unsupported => "unsupported",
+            Self::ConfigInvalid => "config_invalid",
+            Self::Other => "other",
+        }
+    }
+}
+
 enum RemoteFailure {
     /// A response the S3 client classified as a failed HTTP status.
     Http(u16),
@@ -49,6 +85,9 @@ enum RemoteFailure {
     /// formatted into a message or a log event.
     Transport(reqwest::Error),
     Timeout,
+    /// No numeric status was observed for this failure; only the bounded SDK
+    /// family is known. It is never rendered as a pseudo HTTP code.
+    Sdk(RemoteSdkKind),
     /// Defensive fallback for a retry loop that recorded no cause. The loop
     /// cannot normally reach this state because timeouts return immediately.
     NoRecordedCause,
@@ -56,7 +95,7 @@ enum RemoteFailure {
 
 /// Finite, privacy-safe object-store failure. `Display` is a fixed template
 /// that never formats the transport source, URL, headers, query or body.
-pub(crate) struct RemoteStoreError {
+pub struct RemoteStoreError {
     op: RemoteOp,
     failure: RemoteFailure,
 }
@@ -72,6 +111,10 @@ impl RemoteStoreError {
 
     pub(crate) fn timeout(op: RemoteOp) -> Self {
         Self { op, failure: RemoteFailure::Timeout }
+    }
+
+    pub(crate) fn sdk(op: RemoteOp, kind: RemoteSdkKind) -> Self {
+        Self { op, failure: RemoteFailure::Sdk(kind) }
     }
 
     pub(super) fn no_recorded_cause(op: RemoteOp) -> Self {
@@ -102,6 +145,12 @@ impl std::fmt::Display for RemoteStoreError {
                 write!(formatter, "remote object store {} transport failed", self.op.as_str())
             }
             RemoteFailure::Timeout => write!(formatter, "remote object store {} timed out", self.op.as_str()),
+            RemoteFailure::Sdk(kind) => write!(
+                formatter,
+                "remote object store {} failed with provider kind {}",
+                self.op.as_str(),
+                kind.as_str()
+            ),
             RemoteFailure::NoRecordedCause => {
                 write!(formatter, "remote object store {} failed without a recorded cause", self.op.as_str())
             }

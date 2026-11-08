@@ -5,12 +5,15 @@
 use tokio::time::Instant;
 
 use futures_util::TryStreamExt;
-use opendal::ErrorKind;
 use sha2::{Digest, Sha256};
 use tokio::{fs::File, io::AsyncReadExt};
 
-use crate::blob_store::{BlobError, opendal::map_provider_error};
+use crate::blob_store::BlobError;
+use crate::storage::remote_errors::RemoteOp;
 use crate::storage::remote_provider::{LegacyS3Store, READ_CHUNK, UPLOAD_CHUNK, UPLOAD_CONCURRENCY, tokio_deadline};
+use crate::storage::remote_provider_errors::{
+    deadline_error, observe, observe_body_poll,
+};
 
 impl LegacyS3Store {
     pub async fn put(
@@ -24,13 +27,15 @@ impl LegacyS3Store {
         Self::verify_ceiling(expected_size)?;
         let writer =
             self.operator().writer_with(path).chunk(UPLOAD_CHUNK).concurrent(UPLOAD_CONCURRENCY).if_not_exists(true);
-        let writer = match tokio::time::timeout_at(tokio_deadline(deadline), async { writer.await }).await {
+        let writer = match tokio::time::timeout_at(tokio_deadline(deadline), observe(RemoteOp::Put, writer)).await {
             Ok(Ok(writer)) => writer,
-            Ok(Err(error)) if matches!(error.kind(), ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch) => {
+            // Conditional-create conflict: immutable content keys stay
+            // idempotent only through an independent full verification.
+            Ok(Err(failure)) if failure.is_conflict() => {
                 return self.verify_content(path, expected_sha256, expected_size, deadline).await;
             }
-            Ok(Err(error)) => return Err(map_provider_error(error)),
-            Err(_) => return Err(BlobError::DeadlineExceeded),
+            Ok(Err(failure)) => return Err(BlobError::Remote(failure.into_error())),
+            Err(_) => return Err(deadline_error(RemoteOp::Put)),
         };
         let mut guard = self.upload_guard(writer);
         let mut file =
@@ -60,16 +65,18 @@ impl LegacyS3Store {
             }
             hasher.update(&buffer[..read]);
             let chunk = bytes::Bytes::copy_from_slice(&buffer[..read]);
-            match tokio::time::timeout_at(tokio_deadline(deadline), guard.writer().write(chunk)).await {
+            match tokio::time::timeout_at(tokio_deadline(deadline), observe(RemoteOp::Put, guard.writer().write(chunk)))
+                .await
+            {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    let mapped = map_provider_error(error);
+                Ok(Err(failure)) => {
+                    let mapped = BlobError::Remote(failure.into_error());
                     guard.abort_now().await;
                     return Err(mapped);
                 }
                 Err(_) => {
                     guard.abort_now().await;
-                    return Err(BlobError::DeadlineExceeded);
+                    return Err(deadline_error(RemoteOp::Put));
                 }
             }
         }
@@ -107,10 +114,17 @@ impl LegacyS3Store {
         let mut hasher = Sha256::new();
         let mut seen = 0u64;
         loop {
-            let next = match tokio::time::timeout_at(tokio_deadline(deadline), stream.try_next()).await {
+            // Each poll opens its own observation scope: the lazy reader issues
+            // its HTTP request while the stream is polled, not at construction.
+            let next = match tokio::time::timeout_at(
+                tokio_deadline(deadline),
+                observe_body_poll(RemoteOp::Get, stream.try_next()),
+            )
+            .await
+            {
                 Ok(Ok(chunk)) => chunk,
-                Ok(Err(error)) => return Err(crate::blob_store::opendal::map_stream_error(error)),
-                Err(_) => return Err(BlobError::DeadlineExceeded),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(deadline_error(RemoteOp::Get)),
             };
             let Some(chunk) = next else { break };
             seen = seen.saturating_add(chunk.len() as u64);

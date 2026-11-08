@@ -3,7 +3,7 @@
 //! Downloads keep the previous contract: stream into a unique staging file,
 //! hash and length-check every byte (provider-declared size or ETag is not
 //! proof), fsync, then atomically rename. Failures remove only this call's file.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
@@ -16,8 +16,10 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::storage::{
+    remote_errors::RemoteOp,
     remote_local::{TempObject, local_file, local_head, local_read_range},
     remote_objects::{ObjectKey, RemoteObjectStore, StoredObject},
+    remote_provider_errors::{deadline_error, object_error, observe_body_poll},
 };
 
 const MAX_RANGE_BYTES: u64 = 1024 * 1024;
@@ -28,7 +30,7 @@ impl RemoteObjectStore {
         let rel_path = key.path();
         let size = match self {
             Self::Local(root) => local_head(root, &rel_path).await?,
-            Self::OpenDal(store) => store.head(&rel_path, deadline).await?,
+            Self::OpenDal(store) => store.head(&rel_path, deadline).await.map_err(object_error)?,
         };
         Ok(size.map(|size| StoredObject { sha256: key.sha256.clone(), size }))
     }
@@ -53,7 +55,7 @@ impl RemoteObjectStore {
             };
             let mut remote = match self {
                 Self::Local(_) => None,
-                Self::OpenDal(store) => Some(store.read_stream(&rel_path, deadline).await?),
+                Self::OpenDal(store) => Some(store.read_stream(&rel_path, deadline).await.map_err(object_error)?),
             };
             let mut buf = [0u8; READ_CHUNK];
             let mut hash = Sha256::new();
@@ -63,10 +65,14 @@ impl RemoteObjectStore {
                     let read = tokio::time::timeout_at(deadline, file.read(&mut buf)).await??;
                     if read == 0 { None } else { Some(Bytes::copy_from_slice(&buf[..read])) }
                 } else if let Some(stream) = remote.as_mut() {
-                    match tokio::time::timeout_at(deadline, stream.try_next()).await {
+                    // Each poll opens its own observation scope: the lazy
+                    // reader issues its HTTP request while being polled.
+                    match tokio::time::timeout_at(deadline, observe_body_poll(RemoteOp::Get, stream.try_next()))
+                        .await
+                    {
                         Ok(Ok(chunk)) => chunk,
-                        Ok(Err(error)) => return Err(crate::blob_store::opendal::map_stream_error(error).into()),
-                        Err(_) => bail!("object store request timed out"),
+                        Ok(Err(error)) => return Err(object_error(error)),
+                        Err(_) => return Err(object_error(deadline_error(RemoteOp::Get))),
                     }
                 } else {
                     None
@@ -100,7 +106,7 @@ impl RemoteObjectStore {
         match self {
             Self::Local(root) => local_read_range(root, &rel_path, start, len, deadline).await,
             Self::OpenDal(store) => {
-                let bytes = store.read_range(&rel_path, start, len, deadline).await?;
+                let bytes = store.read_range(&rel_path, start, len, deadline).await.map_err(object_error)?;
                 Ok(bytes)
             }
         }

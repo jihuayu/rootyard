@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use crate::storage::remote_provider::LegacyS3Store;
 
-pub(crate) use super::remote_errors::{RemoteOp, RemoteStoreError};
+pub use super::remote_errors::{RemoteOp, RemoteSdkKind, RemoteStoreError};
 
 /// One remote body-boundary read against a `reqwest` response stream.
 ///

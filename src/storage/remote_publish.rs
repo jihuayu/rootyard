@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::storage::{
     remote_local::{hash_file, local_delete, local_put},
     remote_objects::{ObjectKey, RemoteObjectStore, StoredObject},
+    remote_provider_errors::object_error,
 };
 
 impl RemoteObjectStore {
@@ -29,7 +30,9 @@ impl RemoteObjectStore {
         let rel_path = key.path();
         match self {
             Self::Local(root) => local_put(root, &rel_path, source, deadline).await?,
-            Self::OpenDal(store) => store.put(&rel_path, source, &key.sha256, expected_size, deadline).await?,
+            Self::OpenDal(store) => {
+                store.put(&rel_path, source, &key.sha256, expected_size, deadline).await.map_err(object_error)?
+            }
         }
         let head = self.head(key, deadline).await?.context("uploaded object is missing")?;
         ensure!(head.size == expected_size, "uploaded object is truncated");
@@ -44,7 +47,7 @@ impl RemoteObjectStore {
         let rel_path = key.path();
         match self {
             Self::Local(root) => local_delete(root, &rel_path).await,
-            Self::OpenDal(store) => Ok(store.delete(&rel_path, deadline).await?),
+            Self::OpenDal(store) => Ok(store.delete(&rel_path, deadline).await.map_err(object_error)?),
         }
     }
 }

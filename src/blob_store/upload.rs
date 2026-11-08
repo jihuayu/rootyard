@@ -18,7 +18,10 @@ use std::time::Duration;
 use opendal::Writer;
 use tokio::time::{Instant, timeout, timeout_at};
 
-use super::{BlobError, budget::UploadLease, opendal::map_provider_error};
+use super::{BlobError, budget::UploadLease};
+
+use crate::storage::remote_errors::RemoteOp;
+use crate::storage::remote_provider_errors::{close_error, observe};
 
 pub(crate) struct UploadGuard {
     writer: Option<Writer>,
@@ -48,19 +51,22 @@ impl UploadGuard {
         let Some(writer) = self.writer.as_mut() else {
             return Err(BlobError::Provider("upload writer was already closed".into()));
         };
-        match timeout_at(deadline, writer.close()).await {
+        match timeout_at(deadline, observe(RemoteOp::Put, writer.close())).await {
             Ok(Ok(_metadata)) => {
                 self.writer.take();
                 Ok(())
             }
-            Ok(Err(error)) => {
+            Ok(Err(failure)) => {
                 // Keep ownership in this guard while awaiting abort: cancelling
                 // close must still let Drop schedule cleanup of the same writer.
                 if let Some(writer) = self.writer.as_mut() {
                     let _ = timeout(self.abort_timeout, writer.abort()).await;
                 }
                 self.writer.take();
-                Err(map_provider_error(error))
+                // Typed close failure: a conditional-create conflict stays
+                // `AlreadyExists`, everything else keeps the observed status or
+                // the bounded SDK family instead of a flattened string.
+                Err(close_error(failure))
             }
             Err(_) => {
                 let lease = self.lease.take();
