@@ -1,0 +1,9 @@
+{
+  "source_commit": "2c4b779497c8a93f4b1af97c0a6c056ad733c310",
+  "fmt": "passed",
+  "all_target_clippy": "passed",
+  "native_cases": 8,
+  "native_passed": true,
+  "reviewer": "gpt-6-luna, max",
+  "review": "No blocking P1/P2 in detail pagination or native harness; repository discovery is a separate remaining scope."
+}

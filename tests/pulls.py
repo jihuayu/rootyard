@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
+import traceback
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -25,6 +27,43 @@ def migration_009_path() -> Path:
 
 
 class PullsHarness(ForgeHarness):
+    def case(self, name, fn):
+        """Run one case, keeping a redacted traceback as failure evidence.
+
+        A bare ``assert x == y`` raises ``AssertionError`` with an empty message,
+        so recording only ``str(error)`` leaves a CI report that cannot name the
+        failing statement. The traceback stays fully redacted: harness secrets and
+        database URLs are substituted, and no environment is dumped.
+        """
+        started = time.monotonic()
+        try:
+            detail = fn()
+        except Exception as error:
+            self.results.append(
+                dict(
+                    name=name,
+                    status="failed",
+                    seconds=round(time.monotonic() - started, 4),
+                    error=self.redact(error),
+                    traceback=self.redact(traceback.format_exc()),
+                )
+            )
+            print(
+                f"{name}: failed\n{self.redact(traceback.format_exc())}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        self.results.append(
+            dict(
+                name=name,
+                status="passed",
+                seconds=round(time.monotonic() - started, 4),
+                detail=detail,
+            )
+        )
+        print(name + ": passed", flush=True)
+
     def issue_token(
         self, username: str, create_user: bool = False, read_only: bool = False
     ) -> dict:
@@ -51,6 +90,109 @@ class PullsHarness(ForgeHarness):
         assert norm_headers.get("cache-control") == "no-store", norm_headers
         assert "application/json" in norm_headers.get("content-type", ""), norm_headers
         return json.loads(body)
+
+    def check_contexts(self, items: list) -> list:
+        """Assert the check contexts recorded for one commit.
+
+        Always-on work legitimately queues the documented `ci/default`
+        placeholder for an open pull whose base ref has no branch rule yet, and
+        whether that row exists at this instant is a real timing race. Contexts
+        are globally sorted and unique, so the two contexts this test drives must
+        appear exactly once each, any `ci/default` row must be exactly the
+        service's queued placeholder, and every other context is a failure.
+        """
+        contexts = [item["context"] for item in items]
+        assert contexts == sorted(set(contexts)), contexts
+        assert contexts.count("ci/test") == 1, contexts
+        assert contexts.count("ci/lint") == 1, contexts
+        assert contexts in (
+            ["ci/lint", "ci/test"],
+            ["ci/default", "ci/lint", "ci/test"],
+        ), contexts
+        for item in items:
+            if item["context"] == "ci/default":
+                assert item["status"] == "queued", item
+                assert item["attempt"] == 1 and item["sequence"] == 1, item
+                assert item["conclusion"] is None, item
+                assert item["output"] == "queued by pull request synchronization", item
+        return contexts
+
+    def merge_version(self) -> int:
+        """Fence a mutation with the version the API currently reports."""
+        return self.document(self.pr1_path)["version"]
+
+    def sync_pull_head(self, pre_push: dict, head_oid: str) -> dict:
+        """Record a real Git push on PR #1, accepting whichever writer wins.
+
+        The push is the truth the service must observe; both the explicit CAS
+        PATCH and the always-on background ref synchronizer may record it. A 409
+        is accepted only for the exact version observed before the push, and only
+        after a fresh GET proves the pushed head, the unchanged base and a
+        strictly monotonic version. Any other status still fails, so this is a
+        contract check rather than a blind retry.
+        """
+        current = self.document(self.pr1_path)
+        if current["head_oid"] != head_oid:
+            status, body, headers = self.http(
+                self.pr1_path,
+                token=self.alice,
+                method="PATCH",
+                body={"expected_version": pre_push["version"], "head_oid": head_oid},
+            )
+            if status == 200:
+                norm = {k.lower(): v for k, v in headers.items()}
+                assert norm.get("cache-control") == "no-store", norm
+                assert "application/json" in norm.get("content-type", ""), norm
+                patched = json.loads(body)
+                assert patched["head_oid"] == head_oid, patched["head_oid"]
+                assert patched["base_oid"] == pre_push["base_oid"], patched["base_oid"]
+                assert patched["version"] == pre_push["version"] + 1, patched["version"]
+            else:
+                # Only losing the CAS to the background synchronizer is valid.
+                assert status == 409, (status, body[:200])
+        synced = self.document(self.pr1_path)
+        assert synced["head_oid"] == head_oid, synced["head_oid"]
+        assert synced["base_oid"] == pre_push["base_oid"], synced["base_oid"]
+        assert synced["version"] > pre_push["version"], synced["version"]
+        # Whichever writer won, the pre-push version is stale for every writer.
+        self.document(
+            self.pr1_path,
+            409,
+            method="PATCH",
+            body={"expected_version": pre_push["version"], "title": "Stale after head sync"},
+        )
+        return synced
+
+    def advance_check(self, commit_oid: str, context: str, status: str, conclusion, output) -> dict:
+        """Advance one check run from the state the service currently records.
+
+        A branch rule exists for the base ref now, so the synchronizer may already
+        have queued `(attempt 1, sequence 1)` for this context on the freshly
+        synchronized head. Ordering is server-validated on `(attempt, sequence)`,
+        so the next transition is derived from the observed row instead of a
+        hardcoded sequence that would collide with the service's placeholder.
+        """
+        path = f"/api/repos/alice/forge/commits/{commit_oid}/checks"
+        listed = self.document(path, token=self.reader)
+        existing = [item for item in listed["items"] if item["context"] == context]
+        sequence = 1 if not existing else existing[0]["sequence"] + 1
+        run = self.document(
+            path,
+            (200, 201),
+            method="POST",
+            body={
+                "context": context,
+                "status": status,
+                "conclusion": conclusion,
+                "output": output,
+                "attempt": 1,
+                "sequence": sequence,
+            },
+        )
+        assert run["context"] == context and run["status"] == status, run
+        assert run["conclusion"] == conclusion and run["attempt"] == 1, run
+        assert run["sequence"] == sequence, run
+        return run
 
     def ensure_migration_009(self):
         if self.sql("SELECT to_regclass('forge_pulls') IS NOT NULL") != "t":
@@ -531,9 +673,12 @@ class PullsHarness(ForgeHarness):
         )
 
         by_commit = self.document(commit_checks_path, token=self.reader)
-        assert [c["context"] for c in by_commit["items"]] == ["ci/lint", "ci/test"]
+        assert by_commit["commit_oid"] == self.feat1_oid, by_commit["commit_oid"]
+        self.check_contexts(by_commit["items"])
         by_pull = self.document(self.pr1_path + "/checks", token=self.reader)
-        assert [c["context"] for c in by_pull["items"]] == ["ci/lint", "ci/test"]
+        assert by_pull["pull_number"] == 1, by_pull["pull_number"]
+        assert by_pull["head_oid"] == self.feat1_oid, by_pull["head_oid"]
+        self.check_contexts(by_pull["items"])
 
     def branch_rules_and_stale_invalidation(self):
         rule = self.document(
@@ -577,6 +722,14 @@ class PullsHarness(ForgeHarness):
         listed = self.document(self.rulespath, token=self.reader)
         assert len(listed["items"]) == 1 and listed["items"][0]["version"] == 2
 
+        # The state this test observed before the push; later fenced mutations
+        # use a fresh GET instead, because the always-on synchronizer may record
+        # the push first and bump the version legitimately.
+        pre_push = self.document(self.pr1_path)
+        assert pre_push["head_oid"] == self.feat1_oid, pre_push["head_oid"]
+        assert pre_push["base_oid"] == self.base_oid, pre_push["base_oid"]
+        assert pre_push["version"] == 3, pre_push["version"]
+
         # Advance refs/heads/feature in native Git to feat2_oid.
         self.git(
             "push",
@@ -585,25 +738,24 @@ class PullsHarness(ForgeHarness):
             cwd=self.work,
             token=self.alice,
         )
-        # Merge with old expected_head_oid must fail because live ref moved to feat2_oid.
+        # Merge with the old expected_head_oid must fail because the live ref
+        # moved to feat2_oid, whether or not the pull row has caught up yet. The
+        # version is the freshly reported one, so only the head fence can 409.
         self.document(
             self.pr1_path + "/merge",
             409,
             method="POST",
             body={
-                "expected_version": 3,
+                "expected_version": self.merge_version(),
                 "expected_head_oid": self.feat1_oid,
                 "expected_base_oid": self.base_oid,
             },
         )
 
-        # Update PR #1 head_oid to feat2_oid.
-        updated_pr = self.document(
-            self.pr1_path,
-            method="PATCH",
-            body={"expected_version": 3, "head_oid": self.feat2_oid},
-        )
-        assert updated_pr["version"] == 4 and updated_pr["head_oid"] == self.feat2_oid
+        # Update PR #1 head_oid to feat2_oid; the background synchronizer may get
+        # there first, and both writers must converge on exactly this state.
+        synced = self.sync_pull_head(pre_push, self.feat2_oid)
+        assert synced["version"] == 4, synced["version"]
 
         # Merge must now fail with 409 because reviews and checks on feat1_oid do not apply to feat2_oid!
         self.document(
@@ -611,7 +763,7 @@ class PullsHarness(ForgeHarness):
             409,
             method="POST",
             body={
-                "expected_version": 4,
+                "expected_version": self.merge_version(),
                 "expected_head_oid": self.feat2_oid,
                 "expected_base_oid": self.base_oid,
             },
@@ -633,64 +785,28 @@ class PullsHarness(ForgeHarness):
             409,
             method="POST",
             body={
-                "expected_version": 4,
+                "expected_version": self.merge_version(),
                 "expected_head_oid": self.feat2_oid,
                 "expected_base_oid": self.base_oid,
             },
         )
 
         # Add passing ci/test and failing ci/lint on feat2_oid -> merge still blocked.
-        self.document(
-            self.checkspath,
-            (200, 201),
-            method="POST",
-            body={
-                "commit_oid": self.feat2_oid,
-                "context": "ci/test",
-                "status": "completed",
-                "conclusion": "success",
-                "attempt": 1,
-                "sequence": 1,
-            },
-        )
-        self.document(
-            self.checkspath,
-            (200, 201),
-            method="POST",
-            body={
-                "commit_oid": self.feat2_oid,
-                "context": "ci/lint",
-                "status": "completed",
-                "conclusion": "failure",
-                "attempt": 1,
-                "sequence": 1,
-            },
-        )
+        self.advance_check(self.feat2_oid, "ci/test", "completed", "success", "all passed")
+        self.advance_check(self.feat2_oid, "ci/lint", "completed", "failure", "1 failed")
         self.document(
             self.pr1_path + "/merge",
             409,
             method="POST",
             body={
-                "expected_version": 4,
+                "expected_version": self.merge_version(),
                 "expected_head_oid": self.feat2_oid,
                 "expected_base_oid": self.base_oid,
             },
         )
 
         # Advance ci/lint to success on feat2_oid -> all branch rules satisfied.
-        self.document(
-            self.checkspath,
-            (200, 201),
-            method="POST",
-            body={
-                "commit_oid": self.feat2_oid,
-                "context": "ci/lint",
-                "status": "completed",
-                "conclusion": "success",
-                "attempt": 1,
-                "sequence": 2,
-            },
-        )
+        self.advance_check(self.feat2_oid, "ci/lint", "completed", "success", "all passed")
 
         # Require 2 approvals; an intervening changes_requested must invalidate prior approvals on feat2_oid.
         self.document(
@@ -731,7 +847,7 @@ class PullsHarness(ForgeHarness):
             409,
             method="POST",
             body={
-                "expected_version": 4,
+                "expected_version": self.merge_version(),
                 "expected_head_oid": self.feat2_oid,
                 "expected_base_oid": self.base_oid,
             },
@@ -747,6 +863,12 @@ class PullsHarness(ForgeHarness):
                 "body": "Second approval after changes_requested",
             },
         )
+        # The next case merges with exactly this head, base and version; no
+        # background writer may have changed them while this case ran.
+        settled = self.document(self.pr1_path)
+        assert settled["head_oid"] == self.feat2_oid, settled["head_oid"]
+        assert settled["base_oid"] == self.base_oid, settled["base_oid"]
+        assert settled["version"] == 4, settled["version"]
 
     def atomic_merge_and_idempotency(self):
         merge_path = self.pr1_path + "/merge"
@@ -1202,7 +1324,12 @@ def main():
             harness.cleanup()
         except Exception as error:
             harness.results.append(
-                dict(name="cleanup", status="failed", error=harness.redact(error))
+                dict(
+                    name="cleanup",
+                    status="failed",
+                    error=harness.redact(error),
+                    traceback=harness.redact(traceback.format_exc()),
+                )
             )
             success = False
         report = dict(

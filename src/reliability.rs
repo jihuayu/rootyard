@@ -261,9 +261,23 @@ pub async fn reconcile(state: &AppState, repo: Uuid, generation: i64, startup: b
                 .requires_parent_publication
                 .then_some(events::AdmissionRecord { writer_id: operation.id, shard_epoch: operation.shard_epoch }),
         };
-        match no_grant {
-            Some(proof) => events::publish_with_no_grant(&state.pool, &record, &changes, &proof).await?,
-            None => events::publish(&state.pool, &record, &changes).await?,
+        // Only this reconciliation, and only for a journal-derived `recorded`
+        // outcome, may mint the historical settlement capability. It re-reads
+        // the same journal and must describe exactly this record and event
+        // payload; any mismatch falls back to ordinary current-authority
+        // publication, which still requires a live ready write.
+        let recorded = if outcome == "recorded" {
+            crate::storage::recorded_receipt_proof::RecordedReceiptProof::from_journal(&operation, outcome, generation)
+                .filter(|proof| proof.matches_record(&record, &changes))
+        } else {
+            None
+        };
+        match (no_grant, recorded) {
+            (Some(proof), _) => events::publish_with_no_grant(&state.pool, &record, &changes, &proof).await?,
+            (None, Some(proof)) => {
+                events::publish_with_recorded_receipt(&state.pool, &record, &changes, &proof).await?
+            }
+            (None, None) => events::publish(&state.pool, &record, &changes).await?,
         }
         // PG publication committed. Wake hints can be lost and never affect correctness.
         state.dispatch.committed();
