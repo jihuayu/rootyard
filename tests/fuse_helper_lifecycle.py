@@ -45,6 +45,7 @@ REQUIRED_CASES = [
     "heartbeat_eof_watchdog_fences_and_exits",
     "child_sigkill_auto_unmount_and_queued_writes_fail",
     "independent_parent_sigkill_orphans_helper",
+    "concurrent_same_workspace_mount_admission_single_kernel_mount",
 ]
 
 
@@ -1014,6 +1015,96 @@ def case_parent_sigkill(suite: Suite) -> dict:
                       helper_confirmed_dead=owner_dead)
 
 
+def case_concurrent_mount_admission(suite: Suite) -> dict:
+    """Burst same-workspace mounts and require exactly one kernel mount.
+
+    Regression for the pending -> mounts recheck: several valid Mount frames
+    may all observe Missing before the first publishes. They are sent without
+    waiting so the helper operation pool runs them concurrently. Only the
+    documented transient admission errors are tolerated; helper death, an
+    unexpected reply or a second kernel mount fails the case.
+    """
+    helper = suite.spawn("concurrent-admission")
+    fixture = suite.fixture()
+    try:
+        suite.expect_ok(helper.hello(), helper)
+        workspace = fixture.workspace("a")
+        mountpoint = fixture.mounts[workspace]
+        args = {"root": str(fixture.root.resolve()), "workspace": workspace,
+                "lease_until": int(time.time()) + 3600, "lazy": False}
+        burst = [helper.send("mount", args, workspace=workspace, db_epoch=1)[0]
+                 for _ in range(5)]
+        suite.require(len(set(burst)) == 5, f"mount request ids not distinct: {burst}")
+        replies: dict[int, support.Reply] = {}
+        deadline = time.monotonic() + 25.0
+        while len(replies) < len(burst):
+            remaining = deadline - time.monotonic()
+            suite.require(remaining > 0, f"timed out after {len(replies)}/{len(burst)} replies; "
+                                         f"helper exit={helper.proc.poll()} requests={burst}")
+            try:
+                frame = helper.read(max(0.1, remaining))
+            except (support.ChildExited, TimeoutError, OSError) as error:
+                code = helper.proc.poll()
+                if code is None:
+                    try:
+                        code = helper.wait_exit(2.0)
+                    except support.HarnessError:
+                        code = helper.proc.poll()
+                raise AssertionError(support.redact(
+                    f"helper died/control failed after {len(replies)}/{len(burst)} replies: "
+                    f"{type(error).__name__}: {error}; child exit={code}")) from None
+            rid = frame.get("request_id")
+            suite.require(rid in burst, f"unexpected reply request_id {rid}: {frame}")
+            suite.require(rid not in replies, f"duplicate reply for request {rid}: {frame}")
+            replies[rid] = support.Reply(frame, rid)
+        rows, mounted = [], 0
+        for rid in burst:
+            reply = replies[rid]
+            suite.expect_protocol(reply, helper)
+            if reply.op == "mounted":
+                suite.require(reply.workspace == workspace and reply.db_epoch == 1,
+                              f"mount {rid} success workspace/epoch {reply.workspace}/{reply.db_epoch}")
+                mounted += 1
+                rows.append({"request_id": rid, "op": "mounted", "epoch": reply.db_epoch})
+            else:
+                suite.require(reply.op == "error", f"mount {rid} unexpected op {reply.op}")
+                suite.require(reply.code in (errno.EBUSY, errno.EEXIST, errno.ETIMEDOUT, errno.ECANCELED),
+                              f"mount {rid} disallowed errno {reply.code}: {reply.message}")
+                rows.append({"request_id": rid, "op": "error", "errno": reply.code})
+        suite.require(mounted >= 1, f"no concurrent mount succeeded: {rows}")
+        suite.require(helper.proc.poll() is None, f"helper exited after burst: {helper.proc.poll()}")
+        phase = helper.state_phase(workspace, 1)
+        suite.require(phase == "healthy", f"phase after admission is {phase!r}")
+        owned = support.owned_mounts(fixture.root)
+        path_ids = sorted(row["mount_id"] for row in owned if row["mountpoint"] == str(mountpoint))
+        suite.require(len(path_ids) == 1, f"expected one kernel mount for {mountpoint}, got {path_ids}; "
+                                          f"owned={[(r['mountpoint'], r['mount_id']) for r in owned]}")
+        suite.require(len(owned) == 1 and owned[0]["mount_id"] == path_ids[0],
+                      f"extra owned mounts after concurrent admission: "
+                      f"{[(r['mountpoint'], r['mount_id']) for r in owned]}")
+        probe = b"concurrent admission write\n"
+        suite.require(write_read(mountpoint / "admission.txt", probe) == probe,
+                      "write/read through the admitted mount failed")
+        suite.require((mountpoint / "a.txt").read_text() == "lower-a\n",
+                      "lower file unreadable through the admitted mount")
+        unmount = helper.call("unmount", None, workspace=workspace, db_epoch=0)
+        suite.expect_ok(unmount, helper, "unmounted", workspace=workspace)
+        suite.assert_no_owned_mount(fixture.root, "concurrent-admission-unmount")
+        shutdown = helper.shutdown()
+        suite.expect_protocol(shutdown, helper, "shutting_down")
+        child_exit = helper.wait_exit(support.EXIT_DEADLINE)
+        suite.require(child_exit == 0, f"shutdown exit {child_exit}, expected 0")
+        suite.assert_no_owned_mount(fixture.root, "concurrent-admission-shutdown")
+        return {"request_ids": burst, "reply_count": len(replies), "requests": rows,
+                "mounted_replies": mounted, "kernel_mount_ids": path_ids,
+                "single_kernel_mount": True, "phase_after_admission": phase,
+                "write_read": probe.decode().strip(), "unmount": "unmounted",
+                "child_exit": child_exit,
+                "owned_mounts_after_exit": len(support.owned_mounts(fixture.root))}
+    finally:
+        suite.release(helper, fixture, "concurrent-admission")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/rootyard")
@@ -1116,6 +1207,7 @@ def main() -> int:
         (REQUIRED_CASES[10], case_heartbeat_eof),
         (REQUIRED_CASES[11], case_child_sigkill),
         (REQUIRED_CASES[12], case_parent_sigkill),
+        (REQUIRED_CASES[13], case_concurrent_mount_admission),
     ]
     blocked = None
     if pre["missing"]:
