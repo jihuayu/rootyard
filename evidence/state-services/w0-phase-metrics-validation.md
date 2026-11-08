@@ -1,18 +1,29 @@
 # W0 phase measurement increment
 
-Status: **historical, pre-stack.** This measurement was produced from source
-`3dd67ff7382e…` and binary `70f89a83843d…` built from the tree that existed before
-this branch was stacked onto the rebased W0 security/token/membership parent
-(`147f76c`, PR102 `bcd3918`). It stays the accepted record for that tree and is
-**not** a qualification of the rebased stack: a freshly built feature-enabled
-binary with its own receipt plus a new 32-case native run are required (pending).
+Status: **rebased stack requalified.** The accepted current report is
+`w0-native-phase-metrics-v6.json`, built from clean commit `0a152ec` on the
+W0/security/token/membership/shared-contract stack. Its receipt binds source
+`00d4b1d08294b2e22c2b77a8c217ec1b9a5ced67d309617f4221110327e3c846`
+and binary `79f8cf0e9d46f0077201a2760e1fb691af4367be3cb04c9083131e34e4f66607`.
+
+The current build passed all-target Clippy with `pando-lab,state-baseline-metrics`,
+ten feature unit tests, 42 state-service Python tests and twelve build-receipt
+tests. Its real PostgreSQL/Garage/Vault run passed exactly 32 cases: 26 captured,
+four anticipated lifecycle/setup cases, two offline cases, zero missing deltas.
+Source and binary hashes still matched after execution. The successful fixture
+was removed by default; no retained duplicate hook runner remained. Scrapes
+were 18.137 ms median / 44.969 ms maximum. These timings are observations on a
+shared host, not a performance improvement or production budget claim.
+
+The v5 source `3dd67ff7382e…` and binary `70f89a83843d…` predate the rebase;
+the detailed v5 measurements below remain historical observations of that tree.
 The raw `w0-native-phase-metrics-v1.json` and `-v5.json` reports are immutable
 historical data and must not be edited. The runner cleanup change (default
 removal of the owned fixture after a passed run, automatic retention after a
 failure, explicit `--keep`) applies only to future invocations and does not
 alter these reports.
 
-Accepted report: `w0-native-phase-metrics-v5.json`. The default-disabled
+Historical v5 report: `w0-native-phase-metrics-v5.json`. The default-disabled
 `state-baseline-metrics` feature records twelve fixed phases through the
 existing private metrics listener. Concurrent requests are bracketed once per
 whole batch, with individual wall times separately labelled as unattributed.
