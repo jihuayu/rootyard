@@ -1,0 +1,11 @@
+....................................................................................................s........................owned-fuse-cleanup: Refusing to open mountpoint outside the fixture-owned workspace-service/mounts UUID layout: '/tmp/rootyard-cleanup-out-mmyqo5d9/workspace-service/mounts/32a8cadc-4ec4-481a-a915-d3c13cdfc903'
+owned-fuse-cleanup: Refusing to open mountpoint outside the fixture-owned workspace-service/mounts UUID layout: '/tmp/rootyard-cleanup-out-mmyqo5d9/workspace-service/mounts/nope'
+.owned-fuse-cleanup: [Errno 20] Not a directory: 'b4c502fd-b81b-4751-b2df-95525775f0cc'
+.owned-fuse-cleanup: FD for '/tmp/rootyard-cleanup-id-3eynofxo/workspace-service/mounts/bde4c325-ff1b-4470-aeb8-9d3dcb4ac32f' has mnt_id 52, expected 53
+..owned-fuse-cleanup: [Errno 20] Not a directory: 'workspace-service'
+......................................................................................ss..................................................................sss
+----------------------------------------------------------------------
+Ran 286 tests in 24.101s
+
+OK (skipped=6)
+{"status": "passed", "run": 286, "failures": 0, "errors": 0, "skipped": 6, "exclusion_reason": "Requires dedicated native executables/services/kernel fixture; not qualified by this source/unit-only run. Full CI native suites remain required."}
