@@ -91,7 +91,7 @@ class SandboxServiceTest(unittest.TestCase):
             self.assertEqual(
                 h.sql(
                     "SELECT count(*) FROM information_schema.columns "
-                    "WHERE table_name='sandbox_jobs' AND column_name='terminal'"
+                    "WHERE table_schema=current_schema() AND table_name='sandbox_jobs' AND column_name='terminal'"
                 ),
                 "1",
             )

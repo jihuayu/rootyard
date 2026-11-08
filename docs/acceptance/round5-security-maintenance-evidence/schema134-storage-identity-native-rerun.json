@@ -1,0 +1,170 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "seconds": 1.5536,
+      "detail": null
+    },
+    {
+      "name": "schema134_contract",
+      "status": "passed",
+      "seconds": 0.0926,
+      "detail": {
+        "schema_version": 134,
+        "composite_fks": [
+          "pando_manifest_artifacts_manifest_identity_fkey",
+          "storage_maintenance_jobs_repository_owner_fkey",
+          "storage_maintenance_repo_state_repository_owner_fkey",
+          "storage_maintenance_tombstones_repository_owner_fkey"
+        ],
+        "single_column_manifest_fk_removed": true,
+        "artifact_authority_fk_retained": true,
+        "indexes": {
+          "pando_pack_manifests": [
+            "pando_pack_manifests_id_repository_tenant_key",
+            "pando_pack_manifests_pkey",
+            "pando_pack_manifests_repository_id_id_key",
+            "pando_pack_manifests_repository_idx"
+          ],
+          "pando_manifest_artifacts": [
+            "pando_manifest_artifacts_artifact",
+            "pando_manifest_artifacts_pkey",
+            "pando_manifest_artifacts_repository"
+          ],
+          "storage_maintenance_jobs": [
+            "storage_maintenance_claimable",
+            "storage_maintenance_history",
+            "storage_maintenance_jobs_pkey",
+            "storage_maintenance_one_active_kind"
+          ],
+          "storage_maintenance_repo_state": [
+            "storage_maintenance_repo_state_pkey"
+          ],
+          "storage_maintenance_tombstones": [
+            "storage_maintenance_tombstones_due",
+            "storage_maintenance_tombstones_pkey"
+          ]
+        }
+      }
+    },
+    {
+      "name": "gitfs_lifecycle_identity_pairs",
+      "status": "passed",
+      "seconds": 1.2806,
+      "detail": {
+        "owners": {
+          "a": "f7607cc3-8a88-4dd5-b652-cbbded7620e0",
+          "b": "3e67f3b2-4bdc-4da7-81a9-9be8b75fa62a"
+        },
+        "repositories": {
+          "a": "8996fb03-6a83-4472-9238-70dbc615b36a",
+          "b": "2856429d-5ffe-4837-b606-d8d51604e947"
+        },
+        "rejected": {
+          "storage_maintenance_jobs": {
+            "sqlstate": "23503",
+            "constraint": "storage_maintenance_jobs_repository_owner_fkey"
+          },
+          "storage_maintenance_repo_state": {
+            "sqlstate": "23503",
+            "constraint": "storage_maintenance_repo_state_repository_owner_fkey"
+          },
+          "storage_maintenance_tombstones": {
+            "sqlstate": "23503",
+            "constraint": "storage_maintenance_tombstones_repository_owner_fkey"
+          }
+        },
+        "legal_pairs_inserted_and_removed": true
+      }
+    },
+    {
+      "name": "pando_manifest_identity_links",
+      "status": "passed",
+      "seconds": 16.2722,
+      "detail": {
+        "owners": {
+          "a": "f7607cc3-8a88-4dd5-b652-cbbded7620e0",
+          "b": "3e67f3b2-4bdc-4da7-81a9-9be8b75fa62a"
+        },
+        "repositories": {
+          "a": "508448e9-826b-4b3f-b712-6f634a00a881",
+          "b": "6a241fc7-e80b-41c9-9839-8316e031be8f"
+        },
+        "cutovers": {
+          "508448e9-826b-4b3f-b712-6f634a00a881": {
+            "direction": "gitfs_to_pando",
+            "new_storage_backend": "pando"
+          },
+          "6a241fc7-e80b-41c9-9839-8316e031be8f": {
+            "direction": "gitfs_to_pando",
+            "new_storage_backend": "pando"
+          }
+        },
+        "published": {
+          "a": {
+            "manifest_id": "bdcd767a-8cc2-462c-9588-ff3a5fb44e4e",
+            "published_links": 8,
+            "artifact_roles": "index-cipher,index-envelope,pack-cipher,pack-envelope"
+          },
+          "b": {
+            "manifest_id": "949e7a15-221b-40eb-aab8-907cc9458c38",
+            "published_links": 8,
+            "artifact_roles": "index-cipher,index-envelope,pack-cipher,pack-envelope"
+          }
+        },
+        "rejected": {
+          "wrong_manifest_repository": {
+            "sqlstate": "23503",
+            "constraint": "pando_manifest_artifacts_manifest_identity_fkey"
+          },
+          "wrong_manifest_tenant": {
+            "sqlstate": "23503",
+            "constraint": "pando_manifest_artifacts_manifest_identity_fkey"
+          },
+          "artifact_tenant_mismatch": {
+            "sqlstate": "23503",
+            "constraint": "pando_manifest_artifacts_authority_id_tenant_id_namespace__fkey"
+          }
+        },
+        "publication_after_refusals": {
+          "a": "a7a5d7483aef5ed1776e05fe1f6a804aa4c6d499",
+          "b": "9d3aab015c37c8e32055fda2ed44441030ea05fc"
+        },
+        "synthetic_remote_metadata": false,
+        "real_artifacts_touched": false
+      }
+    }
+  ],
+  "binary_sha256": "85c66397f755768fa139cf4952fca6a21ca12747bd6d18b042f80c2a62f0eb3d",
+  "required_environment": [
+    "ROOTYARD_TEST_DATABASE_URL",
+    "ROOTYARD_OBJECT_STORE_ENDPOINT",
+    "ROOTYARD_OBJECT_STORE_BUCKET",
+    "ROOTYARD_OBJECT_STORE_REGION",
+    "ROOTYARD_OBJECT_STORE_ACCESS_KEY",
+    "ROOTYARD_OBJECT_STORE_SECRET_KEY",
+    "ROOTYARD_KMS_VAULT_URL",
+    "ROOTYARD_KMS_VAULT_TOKEN",
+    "ROOTYARD_KMS_VAULT_KEY"
+  ],
+  "not_tested": [
+    "Dirty pre-upgrade refusal on a schema133 database containing inconsistent identity pairs is proved by tests/storage_identity_upgrade.py, a separate native entry point; this script never runs a legacy binary.",
+    "Backup format/catalog gates and legacy schema133 restore are coordinator-owned follow-ups; this branch makes no backup gate claim."
+  ],
+  "reused_runtime_proofs": [
+    "tests/storage_lifecycle.py",
+    "tests/storage_lifecycle_physical.py"
+  ],
+  "limitations": [
+    "Loopback functional timings are not a scalability benchmark.",
+    "Crash tests kill the service process, not the kernel or PostgreSQL; no power-loss guarantee is inferred.",
+    "Interrupted upload uses a truncated HTTP body; exhaustive transport fault injection is not covered.",
+    "Negative link/probe rows are controlled SQL against this run's own schema; they prove the database constraints only, not that any object was uploaded.",
+    "The test environment must provide a dedicated synthetic Garage bucket. This script preserves every published remote object and never deletes a valid remote artifact; do not point it at production or shared live data.",
+    "Dirty pre-upgrade refusal (inconsistent rows on a schema133 database) is proved by tests/storage_identity_upgrade.py, not by this script.",
+    "Backup format 9 / legacy schema133 restore gates are out of scope for this script; the coordinator owns format10 and legacy133 restore support.",
+    "Runtime stale-generation, wrong-backend and not-ready fail-closed proofs are reused from tests/storage_lifecycle.py and tests/storage_lifecycle_physical.py."
+  ]
+}

@@ -37,6 +37,7 @@ def main():
         env.update(PGHOST=url.hostname, PGPORT=str(url.port or 5432),
                    PGDATABASE=url.path.lstrip('/'), PGUSER=urllib.parse.unquote(url.username),
                    PGPASSWORD=urllib.parse.unquote(url.password or ''), DATABASE_URL=db)
+        env["PGOPTIONS"] = urllib.parse.parse_qs(url.query).get("options", [""])[0]
         proc = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         if proc.returncode:
             raise RuntimeError('Synthetic schema contract command failed; private diagnostics suppressed')
@@ -51,10 +52,17 @@ def main():
 
     def migrate(db):
         if args.sql_migrate:
-            versions = run(['psql', '-X', '-qAt', '-c', "SELECT version FROM schema_migrations"], db) if run(['psql', '-X', '-qAt', '-c', "SELECT to_regclass('public.schema_migrations') IS NOT NULL"], db).strip() == 't' else ''
-            for path in sorted(Path('migrations').glob('*.sql')):
-                if str(int(path.name[:3])) not in versions.split():
-                    run(['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-f', str(path)], db)
+            initialized = run(['psql', '-X', '-qAt', '-c',
+                               "SELECT to_regclass(format('%I.schema_migrations', current_schema())) IS NOT NULL"], db).strip() == 't'
+            versions = run(['psql', '-X', '-qAt', '-c', "SELECT version FROM schema_migrations"], db) if initialized else ''
+            pending = [path for path in sorted(Path('migrations').glob('*.sql'))
+                       if str(int(path.name[:3])) not in versions.split()]
+            if pending:
+                command = ['psql', '-X', '-qAt', '--single-transaction', '-v', 'ON_ERROR_STOP=1',
+                           '-c', 'SELECT pg_advisory_xact_lock(738390103)']
+                for path in pending:
+                    command.extend(['-f', str(path)])
+                run(command, db)
         else:
             run([binary, 'migrate'], db)
 
@@ -121,7 +129,7 @@ def main():
             tenant_url = urllib.parse.urlunsplit(
                 urllib.parse.urlsplit(custom)._replace(
                     query=urllib.parse.urlencode({'options': '-csearch_path=tenant'})))
-            run([binary, 'migrate'], tenant_url)
+            migrate(tenant_url)
             tenant_versions = run(['psql', '--dbname', custom, '-X', '-qAt', '-c',
                                    "SELECT string_agg(version::text,',' ORDER BY version) FROM tenant.schema_migrations"], custom).strip()
             assert tenant_versions == ",".join(str(v) for v in sorted(SCHEMA_VERSIONS)), tenant_versions
@@ -129,7 +137,7 @@ def main():
                                 "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
                                 "WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S')"], custom).strip()
             assert public_after == public_tables, (public_tables, public_after)
-            run([binary, 'migrate'], tenant_url)
+            migrate(tenant_url)
             assert run(['psql', '--dbname', custom, '-X', '-qAt', '-c',
                         "SELECT count(*) FROM tenant.schema_migrations"], custom).strip() == str(len(SCHEMA_VERSIONS))
             assert run(['psql', '--dbname', custom, '-X', '-qAt', '-c',
@@ -159,7 +167,7 @@ def main():
                             else:
                                 print(f'DIFF in {filename} [{k}]: actual={v_list} expected={e_list}')
                 assert value == expected, 'Canonical schema fixture differs: ' + filename
-        print(json.dumps(dict(schema_version=LATEST_PREFIX, canonical=True, roundtrip=True,
+        print(json.dumps(dict(schema_version=LATEST_PREFIX, migration_mode="sql" if args.sql_migrate else "binary", canonical=True, roundtrip=True,
                               restored003_upgrade=True, restored006_upgrade=True, restored007_upgrade=True, upgraded_roundtrip=True,
                               custom_search_path_bootstrap=True, custom_migrate_idempotent=True,
                               tables=len(actual['tables']), functions=len(actual['functions']), triggers=len(actual['triggers']))))

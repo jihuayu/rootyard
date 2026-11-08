@@ -1,0 +1,46 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "invalid_optin_rejected_at_startup",
+      "status": "passed",
+      "seconds": 0.0151,
+      "detail": {
+        "invalid_value": "yes",
+        "startup_rejected": true,
+        "safe_default_not_assumed": true
+      }
+    },
+    {
+      "name": "default_retains_failed_remote_cleanup",
+      "status": "passed",
+      "seconds": 17.054,
+      "detail": {
+        "legacy_unsafe_optin": false,
+        "failed_publication_exit": 77,
+        "failed_publish_put_delta": 1,
+        "unique_orphan_digest": "7d3a914c440d2373d9b81f0f4c926218914f6dcc16962a64d9d67491c176df92",
+        "unique_orphan_only_in_failed_staging": true,
+        "unique_orphan_s3_get_sha256": "7d3a914c440d2373d9b81f0f4c926218914f6dcc16962a64d9d67491c176df92",
+        "unique_orphan_bytes_recovered": true,
+        "staging_rows_retained": 1,
+        "cleanup_pending": true,
+        "cleanup_pending_objects": 1,
+        "objects_collected": 0,
+        "s3_delete_requests_during_abandon": 0,
+        "active_checkpoint_restore_sha256": "480c2336b410f1ad5f8bf1b28944490255804b65350c527787e74ebdd511e3a4",
+        "replay_preserved_keys": true,
+        "pitr_proof": false,
+        "limitations": [
+          "Loopback, single-host PostgreSQL/Garage fixture only.",
+          "No external delete broker, epoch, or isolated PUT credentials are tested.",
+          "The full PITR delete broker is unimplemented and not exercised here.",
+          "A raw PG clone/PITR rollback against the shared bucket remains unsupported and undetected."
+        ]
+      }
+    }
+  ],
+  "binary_sha256": "9faf71fd95691a358157be0442e2efc47b595a67d0aa3aa9d0404d5266c51a96",
+  "global_legacy_optin": false,
+  "pitr_safety_claimed": false
+}

@@ -69,6 +69,72 @@ impl Drop for Staging {
     }
 }
 
+pub(crate) fn git_executable() -> OsString {
+    std::env::var_os("ROOTYARD_WORKSPACE_GIT").unwrap_or_else(|| "git".into())
+}
+
+/// Run native Git with the fixed reviewed environment: system/global config, global
+/// attributes, hooks, fsmonitor, untracked cache, optional locks and replace objects
+/// are disabled for every caller. This is the single launcher used by the read-only
+/// preflight and by store-backed operations.
+pub(crate) fn run_git(git: &OsStr, repo: &Path, args: &[&str]) -> Result<Output> {
+    let output = Command::new(git)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.excludesFile=/dev/null",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "maintenance.auto=false",
+        ])
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .context("cannot execute native Git")?;
+    Ok(output)
+}
+
+pub(crate) fn git_bytes(git: &OsStr, repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let result = run_git(git, repo, args)?;
+    ensure!(
+        result.status.success(),
+        "native Git validation failed for {} (stderr omitted)",
+        args.first().unwrap_or(&"command")
+    );
+    Ok(result.stdout)
+}
+
+pub(crate) fn git_string(git: &OsStr, repo: &Path, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8(git_bytes(git, repo, args)?)?.trim().to_owned())
+}
+
+/// Conservative attribute contract shared by the init preflight and capture: any
+/// mention of a `filter` attribute is refused instead of being interpreted, so the
+/// two call sites cannot drift apart. Filter execution, LFS and SHA-256 stay out of scope.
+pub(crate) fn ensure_no_filter_attributes(bytes: &[u8]) -> Result<()> {
+    ensure!(!bytes.windows(6).any(|x| x == b"filter"), "Git clean/smudge and LFS attributes are unsupported");
+    Ok(())
+}
+
 pub fn check_source_store_overlap(store_arg: &OsStr, source_arg: &OsStr) -> Result<()> {
     let source = fs::canonicalize(source_arg).context("source directory unavailable")?;
     let requested = Path::new(store_arg);
@@ -114,7 +180,7 @@ impl Store {
             }
             require_directory(&path)?;
         }
-        let git = std::env::var_os("ROOTYARD_WORKSPACE_GIT").unwrap_or_else(|| "git".into());
+        let git = git_executable();
         let mut store = Self { root, _lock: lock, git, git_version: String::new() };
         store.git_version = store.git_text(&store.root, &["--version"])?;
         let version = store.git_version.split_whitespace().nth(2).context("invalid Git version")?;
@@ -247,53 +313,15 @@ impl Store {
     }
 
     pub fn git_output(&self, repo: &Path, args: &[&str]) -> Result<Output> {
-        let output = Command::new(&self.git)
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("LC_ALL", "C")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_ATTR_NOSYSTEM", "1")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.untrackedCache=false",
-                "-c",
-                "core.excludesFile=/dev/null",
-                "-c",
-                "core.attributesFile=/dev/null",
-                "-c",
-                "gc.auto=0",
-                "-c",
-                "maintenance.auto=false",
-            ])
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .context("cannot execute native Git")?;
-        Ok(output)
+        run_git(&self.git, repo, args)
     }
 
     pub fn git(&self, repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
-        let result = self.git_output(repo, args)?;
-        ensure!(
-            result.status.success(),
-            "native Git validation failed for {} (stderr omitted)",
-            args.first().unwrap_or(&"command")
-        );
-        Ok(result.stdout)
+        git_bytes(&self.git, repo, args)
     }
 
     pub fn git_text(&self, repo: &Path, args: &[&str]) -> Result<String> {
-        Ok(String::from_utf8(self.git(repo, args)?)?.trim().to_owned())
+        git_string(&self.git, repo, args)
     }
 
     pub fn stage(&self) -> Result<Staging> {
@@ -365,87 +393,7 @@ impl Store {
     }
 
     pub fn validate_repo(&self, repo: &Path, base_oid: &str) -> Result<()> {
-        require_directory(repo)?;
-        require_directory(&repo.join(".git")).context("only independent native .git directories are supported")?;
-        for item in
-            ["commondir", "gitdir", "objects/info/alternates", "objects/info/http-alternates", "shallow", "info/grafts"]
-        {
-            ensure!(
-                !repo.join(".git").join(item).try_exists()?,
-                "external Git storage, shallow repositories and grafts are unsupported"
-            );
-        }
-        let git_files = walk(&repo.join(".git"))?;
-        for (path, metadata) in &git_files {
-            ensure!(!metadata.file_type().is_symlink(), "symlinks inside .git are unsupported");
-            ensure!(metadata.is_file(), "special files inside .git are unsupported");
-            ensure!(
-                !path.as_os_str().as_bytes().ends_with(b".lock"),
-                "checkpoint busy: Git lock exists; do not delete it blindly"
-            );
-            ensure!(
-                !path.starts_with("worktrees") && !path.starts_with("modules"),
-                "linked worktrees and submodules are unsupported"
-            );
-            if path.starts_with("hooks") && !path.as_os_str().as_bytes().ends_with(b".sample") {
-                bail!("custom Git hooks are unsupported");
-            }
-        }
-        // Parse local config without include expansion before other Git commands.
-        let config = self.git(repo, &["config", "--local", "--no-includes", "--null", "--list"])?;
-        for record in config.split(|b| *b == 0).filter(|x| !x.is_empty()) {
-            let split = record.iter().position(|b| *b == b'\n').context("invalid Git config")?;
-            let key = std::str::from_utf8(&record[..split])?;
-            let value = std::str::from_utf8(&record[split + 1..])?;
-            let allowed = match key {
-                "core.repositoryformatversion" => value == "0",
-                "core.filemode" | "core.logallrefupdates" => value == "true",
-                "core.bare" | "core.ignorecase" | "core.precomposeunicode" => value == "false",
-                "core.autocrlf" => ["false", "true", "input"].contains(&value),
-                "core.eol" => ["native", "lf", "crlf"].contains(&value),
-                "user.name" | "user.email" => !value.contains(['\r', '\n']),
-                _ => false,
-            };
-            ensure!(
-                allowed,
-                "unsupported local Git config key: {key}; use a trusted standalone fixture with reviewed configuration"
-            );
-        }
-        ensure!(
-            self.git_text(repo, &["rev-parse", "--show-object-format"])? == "sha1",
-            "only SHA-1 repositories are currently qualified"
-        );
-        ensure!(self.git_text(repo, &["rev-parse", "--is-bare-repository"])? == "false", "bare repository unsupported");
-        ensure!(
-            self.git_text(repo, &["cat-file", "-t", base_oid])? == "commit",
-            "base OID must identify a complete local commit"
-        );
-        ensure!(
-            self.git_text(repo, &["rev-parse", "--verify", "HEAD^{commit}"]).is_ok(),
-            "unborn HEAD unsupported by this slice"
-        );
-        let index = repo.join(".git/index");
-        if index.try_exists()? {
-            validate_index(&read_regular(&index, MAX_MANIFEST)?)?;
-        }
-        ensure!(
-            self.git(repo, &["for-each-ref", "--format=%(refname)", "refs/replace/"])?.is_empty(),
-            "replacement refs are unsupported"
-        );
-        {
-            let path = repo.join(".git/info/attributes");
-            if path.try_exists()? {
-                let bytes = read_regular(&path, MAX_MANIFEST)?;
-                ensure!(
-                    !bytes.windows(6).any(|x| x == b"filter"),
-                    "Git clean/smudge and LFS attributes are unsupported"
-                );
-            }
-        }
-        self.managed(repo)?;
-        // Check referenced objects, index entries and reflogs with Git itself.
-        self.git(repo, &["fsck", "--full", "--strict"])?;
-        Ok(())
+        validate_repo_with(Some(self), &self.git, repo, base_oid)
     }
 
     pub fn managed(&self, repo: &Path) -> Result<BTreeSet<PathBuf>> {
@@ -463,11 +411,7 @@ impl Store {
                     "managed special file cannot be checkpointed"
                 );
                 if path.file_name() == Some(OsStr::new(".gitattributes")) {
-                    let bytes = read_regular(&source.join(&path), MAX_MANIFEST)?;
-                    ensure!(
-                        !bytes.windows(6).any(|x| x == b"filter"),
-                        "Git clean/smudge and LFS attributes are unsupported"
-                    );
+                    ensure_no_filter_attributes(&read_regular(&source.join(&path), MAX_MANIFEST)?)?;
                 }
                 selected.insert(path);
             } else {
@@ -477,6 +421,113 @@ impl Store {
         copy_selected(source, destination, &selected)?;
         Ok(ignored)
     }
+}
+
+/// Read-only admission preflight for `init`.
+///
+/// It runs before `Store::open`, so a rejected source cannot create the store
+/// directory, its lock, a staging directory or a destination UUID directory. The
+/// Git checks are the very same ones `Store::validate_repo` performs (one shared
+/// implementation, no drift); only the store-bound managed-path classification is
+/// skipped because no store exists yet. The preflight adds the managed
+/// `.gitattributes` filter check and the managed symlink check that previously first
+/// ran inside `capture`, reusing the same `ensure_no_filter_attributes` contract and
+/// the same `validate_symlink` rule. The full post-open validation, capture and
+/// attribute re-check still run afterwards, because a source may change in between.
+pub fn preflight_init(source_arg: &OsStr, agent_arg: &OsStr, base_arg: &OsStr) -> Result<()> {
+    let agent_id = text_arg(agent_arg)?;
+    valid_agent(&agent_id)?;
+    let base_oid = text_arg(base_arg)?;
+    valid_oid(&base_oid)?;
+    let source = fs::canonicalize(source_arg).context("source directory unavailable")?;
+    let git = git_executable();
+    validate_repo_with(None, &git, &source, &base_oid)?;
+    super::preflight::worktree_checks(&git, &source)
+}
+
+/// Single repository validation used by both the store-backed paths and the init
+/// preflight. `store` is only needed for the managed-path classification, which
+/// requires an open store; every other check is identical for both callers.
+pub(crate) fn validate_repo_with(store: Option<&Store>, git: &OsStr, repo: &Path, base_oid: &str) -> Result<()> {
+    require_directory(repo)?;
+    require_directory(&repo.join(".git")).context("only independent native .git directories are supported")?;
+    for item in
+        ["commondir", "gitdir", "objects/info/alternates", "objects/info/http-alternates", "shallow", "info/grafts"]
+    {
+        ensure!(
+            !repo.join(".git").join(item).try_exists()?,
+            "external Git storage, shallow repositories and grafts are unsupported"
+        );
+    }
+    let git_files = walk(&repo.join(".git"))?;
+    for (path, metadata) in &git_files {
+        ensure!(!metadata.file_type().is_symlink(), "symlinks inside .git are unsupported");
+        ensure!(metadata.is_file(), "special files inside .git are unsupported");
+        ensure!(
+            !path.as_os_str().as_bytes().ends_with(b".lock"),
+            "checkpoint busy: Git lock exists; do not delete it blindly"
+        );
+        ensure!(
+            !path.starts_with("worktrees") && !path.starts_with("modules"),
+            "linked worktrees and submodules are unsupported"
+        );
+        if path.starts_with("hooks") && !path.as_os_str().as_bytes().ends_with(b".sample") {
+            bail!("custom Git hooks are unsupported");
+        }
+    }
+    // Parse local config without include expansion before other Git commands.
+    let config = git_bytes(git, repo, &["config", "--local", "--no-includes", "--null", "--list"])?;
+    for record in config.split(|b| *b == 0).filter(|x| !x.is_empty()) {
+        let split = record.iter().position(|b| *b == b'\n').context("invalid Git config")?;
+        let key = std::str::from_utf8(&record[..split])?;
+        let value = std::str::from_utf8(&record[split + 1..])?;
+        let allowed = match key {
+            "core.repositoryformatversion" => value == "0",
+            "core.filemode" | "core.logallrefupdates" => value == "true",
+            "core.bare" | "core.ignorecase" | "core.precomposeunicode" => value == "false",
+            "core.autocrlf" => ["false", "true", "input"].contains(&value),
+            "core.eol" => ["native", "lf", "crlf"].contains(&value),
+            "user.name" | "user.email" => !value.contains(['\r', '\n']),
+            _ => false,
+        };
+        ensure!(
+            allowed,
+            "unsupported local Git config key: {key}; use a trusted standalone fixture with reviewed configuration"
+        );
+    }
+    ensure!(
+        git_string(git, repo, &["rev-parse", "--show-object-format"])? == "sha1",
+        "only SHA-1 repositories are currently qualified"
+    );
+    ensure!(git_string(git, repo, &["rev-parse", "--is-bare-repository"])? == "false", "bare repository unsupported");
+    ensure!(
+        git_string(git, repo, &["cat-file", "-t", base_oid])? == "commit",
+        "base OID must identify a complete local commit"
+    );
+    ensure!(
+        git_string(git, repo, &["rev-parse", "--verify", "HEAD^{commit}"]).is_ok(),
+        "unborn HEAD unsupported by this slice"
+    );
+    let index = repo.join(".git/index");
+    if index.try_exists()? {
+        validate_index(&read_regular(&index, MAX_MANIFEST)?)?;
+    }
+    ensure!(
+        git_bytes(git, repo, &["for-each-ref", "--format=%(refname)", "refs/replace/"])?.is_empty(),
+        "replacement refs are unsupported"
+    );
+    {
+        let path = repo.join(".git/info/attributes");
+        if path.try_exists()? {
+            ensure_no_filter_attributes(&read_regular(&path, MAX_MANIFEST)?)?;
+        }
+    }
+    if let Some(store) = store {
+        store.managed(repo)?;
+    }
+    // Check referenced objects, index entries and reflogs with Git itself.
+    git_bytes(git, repo, &["fsck", "--full", "--strict"])?;
+    Ok(())
 }
 
 pub(crate) fn validate_index(bytes: &[u8]) -> Result<()> {

@@ -20,6 +20,7 @@ from ci_mirror import MirrorHarness
 from schema_baseline import (
     CATALOG_JSON_PATH,
     CATALOG_SQL_PATH,
+    CURRENT_BACKUP_FORMAT,
     RESTORED_CATALOG_JSON_PATH,
     SCHEMA_VERSIONS,
     TABLE_COUNT,
@@ -130,13 +131,13 @@ class BackupCiPinsHarness(BackupRecoveryHarness):
         self.backup_result = json.loads(self.backup_command().stdout)
         self.cli('backup-verify', str(self.backup))
         manifest = json.loads((self.backup / 'manifest.json').read_text())
-        assert manifest['format'] == 7 and manifest['schema_versions'] == SCHEMA_VERSIONS
+        assert manifest['format'] == CURRENT_BACKUP_FORMAT and manifest['schema_versions'] == SCHEMA_VERSIONS
         assert all((self.backup / 'volume' / 'ci-pins' / name).read_bytes() == data
                    for name, data in self.source_metadata.items())
         return dict(root_created_before_source_delete_and_first_mirror=True,
                     unreachable_from_ordinary_refs_survives_gc=True,
                     exact_intent_and_receipt_backed_up=True, receipt_absence_fixture=True,
-                    generic_unknown_preserved=True, full_public_tables=TABLE_COUNT, backup_format=7)
+                    generic_unknown_preserved=True, full_public_tables=TABLE_COUNT, backup_format=CURRENT_BACKUP_FORMAT)
 
     def corrupt_backups_rejected(self):
         relative = Path('volume/ci-pins') / self.repo['id'] / (self.job + '.pinned.json')

@@ -20,6 +20,7 @@
 - [仓库列表严格键集分页 API](repository-pagination.md)
 - [并行开发与模块边界](parallel-development.md)
 - [配对离线备份与恢复](backup-restore.md)
+- [Schema 134：仓库/租户复合外键与 #90 关系完整性](storage-identity-fks.md)
 - [显式事故恢复](manual-recovery.md)
 - [指标](metrics.md)
 - [跨进程 worker](cross-process-workers.md)

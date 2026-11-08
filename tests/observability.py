@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Owned PostgreSQL SQLSTATE 23503 trigger acceptance; requires ROOTYARD_TEST_DATABASE_URL."""
+"""Owned PostgreSQL fault drill: SQLSTATE 23503 and a real statement_timeout 57014.
+
+Requires ROOTYARD_TEST_DATABASE_URL. Both faults are synthetic triggers created
+only on repositories rows with a random repository name owned by this harness.
+"""
 import argparse
 import hashlib
 import json
@@ -66,7 +70,12 @@ def main():
     good_name = "fk-good-" + tag
     fn_name = "fk_fault_fn_" + tag
     trigger_name = "fk_fault_trg_" + tag
+    timeout_name = "db-timeout-" + tag
+    timeout_fn = "db_timeout_fn_" + tag
+    timeout_trigger = "db_timeout_trg_" + tag
+    timeout_query = "private-timeout-query-" + tag
     hostile = str(uuid.uuid4())
+    hostile_timeout = str(uuid.uuid4())
     hostile_read = str(uuid.uuid4())
     raw_query = "private-query-" + tag
     # Hostile value lives only in the owned trigger message. It contains a fake
@@ -92,11 +101,25 @@ def main():
             'CREATE TRIGGER "' + trigger_name + '" BEFORE INSERT ON repositories '
             "FOR EACH ROW WHEN (NEW.name = '" + repo_name + "') EXECUTE FUNCTION \"" + fn_name + '"();'
         )
+        # A separate synthetic repository name performs a real six-second sleep
+        # inside the trigger. The server pool's statement_timeout=5000 cancels
+        # the statement, so PostgreSQL itself reports 57014. This is not a
+        # forged RAISE of that SQLSTATE.
+        h.sql(
+            'CREATE FUNCTION "' + timeout_fn + '"() RETURNS trigger LANGUAGE plpgsql AS $fn$ '
+            "BEGIN PERFORM pg_sleep(6); RETURN NEW; END $fn$;"
+        )
+        h.sql(
+            'CREATE TRIGGER "' + timeout_trigger + '" BEFORE INSERT ON repositories '
+            "FOR EACH ROW WHEN (NEW.name = '" + timeout_name + "') EXECUTE FUNCTION \"" + timeout_fn + '"();'
+        )
 
     def remove():
         nonlocal trigger_installed
         if not trigger_installed:
             return
+        h.sql('DROP TRIGGER IF EXISTS "' + timeout_trigger + '" ON repositories')
+        h.sql('DROP FUNCTION IF EXISTS "' + timeout_fn + '"()')
         h.sql('DROP TRIGGER IF EXISTS "' + trigger_name + '" ON repositories')
         h.sql('DROP FUNCTION IF EXISTS "' + fn_name + '"()')
         trigger_installed = False
@@ -159,6 +182,64 @@ def main():
             dumped = json.dumps(event)
             assert sentinel not in dumped and h.alice["token"] not in dumped, "error event leaked sensitive material"
         record("log_privacy_no_secret_or_raw_request_content", "checked fixed categories only")
+        # Real database timeout: the trigger sleeps, so elapsed time proves the
+        # server-side statement_timeout cancelled an executing statement.
+        timeout_started = time.monotonic()
+        status, body, headers = h.http(
+            "/api/repos?probe=" + timeout_query, method="POST", token=h.alice,
+            body={"name": timeout_name}, extra_headers={"X-Request-ID": hostile_timeout},
+        )
+        timeout_elapsed = time.monotonic() - timeout_started
+        timeout_request_id = valid_uuid(header(headers, "x-request-id"))
+        assert status == 503, "database timeout must map to 503, got " + str(status)
+        assert timeout_elapsed >= 4.5, (
+            "database timeout returned before the pool statement_timeout could cancel the sleep: "
+            + str(round(timeout_elapsed, 2)) + "s")
+        assert timeout_elapsed < 15, "database timeout exceeded the bounded window"
+        assert timeout_request_id != hostile_timeout, "timeout response reused the client X-Request-ID"
+        assert header(headers, "cache-control") == "no-store", "timeout response must be no-store"
+        assert json.loads(body) == {"error": "service temporarily unavailable"}, (
+            "timeout body is not the fixed generic error")
+        for value in (h.alice["token"], hostile_timeout, timeout_query):
+            assert value.encode() not in body, "timeout body leaked sensitive material"
+        record("database_statement_timeout_57014_http_503_generic_no_store",
+               "elapsed=%.2fs,sqlstate=57014" % timeout_elapsed)
+        timeout_log = read_log(log_path, timeout_request_id)
+        timeout_events = []
+        for line in timeout_log.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("event") == "rootyard_error":
+                timeout_events.append(event)
+        timeout_matched = [e for e in timeout_events if e.get("request_id") == timeout_request_id]
+        assert len(timeout_matched) == 1, (
+            "expected exactly one correlated timeout event, got " + str(len(timeout_matched)))
+        timeout_event = timeout_matched[0]
+        assert timeout_event.get("scope") == "request", "timeout event scope is not request"
+        assert timeout_event.get("kind") == "database", "timeout event kind is not static database"
+        assert timeout_event.get("sqlstate") == "57014", "timeout event sqlstate is not 57014"
+        assert timeout_event.get("route") == "/api/repos", "timeout event route is not the matched path"
+        assert timeout_event.get("status") == 503, "timeout event status is not 503"
+        assert valid_uuid(timeout_event.get("event_id")) != timeout_request_id, (
+            "timeout event_id must be a distinct UUID")
+        record("database_timeout_event_correlated", "kind=database,sqlstate=57014,route=/api/repos")
+        timeout_leaks = [("client timeout request id", hostile_timeout),
+                         ("timeout raw request query", timeout_query),
+                         ("fake timeout query token", "private-timeout-query-" + tag)]
+        timeout_leaks += [("account secret", secret) for secret in h.secrets]
+        timeout_leaks += [("base database url", h.base_db), ("schema database url", h.db)]
+        for label, value in timeout_leaks:
+            assert value not in timeout_log, "application log leaked " + label
+        for event in timeout_events:
+            dumped = json.dumps(event)
+            assert sentinel not in dumped and h.alice["token"] not in dumped, (
+                "timeout error event leaked sensitive material")
+        record("database_timeout_log_privacy", "checked fixed categories only")
         remove()
         record("owned_trigger_function_removed_before_good_request")
         status, body, headers = h.http(
@@ -215,9 +296,10 @@ def main():
         "harness_e2e_sha256": hashlib.sha256(Path(e2e.__file__).read_bytes()).hexdigest(),
         "head_label": "harness_git_head is repository HEAD at harness time, not independent build provenance",
         "limitations": [
-            "One owned synthetic SQLSTATE 23503 trigger and one request; not a forged application principal.",
-            "DB timeout, remote outage and 80-request full-backlog cases remain open.",
-            "Acceptance is limited to the reported request/error cases and the attested executable; worker backlog and remote-outage qualification are separate.",
+            "One owned synthetic SQLSTATE 23503 trigger and one owned pg_sleep(6) trigger cancelled by statement_timeout=5000; not a forged application principal or a real user data fault.",
+            "The remote-outage typed event is covered separately by tests/lfs_hydration_concurrency.py against owned Garage; this script does not certify it.",
+            "Worker backlog, capture freshness and remote repair metrics are verified separately; this script covers request errors.",
+            "Acceptance is limited to the cases executed by this invocation and the attested executable named by its binary hash and compiled receipt.",
         ],
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)

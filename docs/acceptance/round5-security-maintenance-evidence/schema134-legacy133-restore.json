@@ -1,0 +1,131 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "create_real_schema133_pando_source",
+      "status": "passed",
+      "seconds": 5.1771,
+      "detail": {
+        "source_heads": {
+          "alpha": "14b430c770450e3f0f1fdcd84442396bf0f8076a",
+          "beta": "32021bb1d457f729d635249bc7eecfc05edc18b3"
+        },
+        "source_refs": {
+          "alpha": {
+            "refs/heads/main": "14b430c770450e3f0f1fdcd84442396bf0f8076a"
+          },
+          "beta": {
+            "refs/heads/main": "32021bb1d457f729d635249bc7eecfc05edc18b3"
+          }
+        },
+        "source_authority_id": "14992c4e-d96f-4907-b2ff-646da5b117cf",
+        "source_remote_paths_count": 8,
+        "source_remote_paths_sha256": "a3804d0e4b7424fd57cf3691defe30cda8e9b8daaa0b8837f22e218a0b1354e4",
+        "cutovers": {
+          "alpha": {
+            "refs": 1,
+            "packs": 1,
+            "objects_verified": 3
+          },
+          "beta": {
+            "refs": 1,
+            "packs": 1,
+            "objects_verified": 3
+          }
+        },
+        "web_session_created": true,
+        "browser_token_created": true
+      }
+    },
+    {
+      "name": "legacy_binary_writes_format9_schema133_archive",
+      "status": "passed",
+      "seconds": 37.5347,
+      "detail": {
+        "format": 9,
+        "schema_last": 133,
+        "schema_contains_next": false,
+        "repository_count": 2,
+        "legacy_binary_sha256": "35d0886f032b1f9c8b05ccfd57cb6938d8b202e15e23e354ec9e3b6ccc09d896",
+        "backup_verified": true
+      }
+    },
+    {
+      "name": "candidate_cli_usage_and_mixed_legacy_flags",
+      "status": "passed",
+      "seconds": 0.0218,
+      "detail": {
+        "missing_arguments_usage": true,
+        "missing_flags_usage": true,
+        "mixed_legacy_flags_usage": true
+      }
+    },
+    {
+      "name": "candidate_rejects_without_schema133_opt_in",
+      "status": "passed",
+      "seconds": 21.1032,
+      "detail": {
+        "explicit_schema_opt_in_required": true,
+        "mismatched_legacy_opt_in_rejected": true,
+        "target_data_published": false,
+        "target_database_empty": true
+      }
+    },
+    {
+      "name": "candidate_restores_schema134_one_new_authority",
+      "status": "passed",
+      "seconds": 16.9134,
+      "detail": {
+        "schema_version": 134,
+        "indexes": 6,
+        "schema134_identity_constraints": true,
+        "target_authority_id": "7ff3b8af-6ba3-4cbd-bb79-8370ce7ffbcb",
+        "target_authority_differs_from_source": true,
+        "target_manifest_artifacts": 8,
+        "target_authority_singleton_unique": true,
+        "target_remote_paths_count": 8,
+        "source_and_target_remote_paths_disjoint": true,
+        "browser_session_revoked": true,
+        "browser_token_revoked": true
+      }
+    },
+    {
+      "name": "restored_service_git_and_session_boundaries",
+      "status": "passed",
+      "seconds": 3.355,
+      "detail": {
+        "api_token_readable": true,
+        "old_browser_cookie_rejected": true,
+        "old_browser_bearer_rejected": true,
+        "git_clones": 2,
+        "clone_heads_exact": true,
+        "clone_contents_exact": true,
+        "fsck_clean": true,
+        "first_repo_refetch_after_second_ok": true,
+        "sole_target_authority_unchanged": true
+      }
+    },
+    {
+      "name": "source_authority_and_remote_objects_remain_available",
+      "status": "passed",
+      "seconds": 2.8941,
+      "detail": {
+        "source_authority_unchanged": true,
+        "source_remote_paths_unchanged": true,
+        "source_remote_paths_count": 8,
+        "source_remote_paths_sha256": "a3804d0e4b7424fd57cf3691defe30cda8e9b8daaa0b8837f22e218a0b1354e4",
+        "source_clone_heads_exact": true,
+        "source_clone_contents_exact": true,
+        "source_git_fsck_clean": true
+      }
+    }
+  ],
+  "binary_sha256": "85c66397f755768fa139cf4952fca6a21ca12747bd6d18b042f80c2a62f0eb3d",
+  "legacy_binary_sha256": "35d0886f032b1f9c8b05ccfd57cb6938d8b202e15e23e354ec9e3b6ccc09d896",
+  "harness_git_head": "12c0191ff22fb636c873255d7dd9ce08578797ca",
+  "limitations": [
+    "Loopback functional drill; no production RPO/RTO or power-loss claim.",
+    "The legacy archive is produced by the trusted format9 binary and is never edited.",
+    "source_head values are repository heads, not binary build provenance."
+  ]
+}

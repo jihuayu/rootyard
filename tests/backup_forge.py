@@ -17,7 +17,7 @@ import time
 
 from forge import ForgeHarness
 from restored_workers import RestoredWorkers
-from schema_baseline import EXPECTED_TABLES, SCHEMA_VERSIONS, SCHEMA_VERSION_CSV, TABLE_COUNT
+from schema_baseline import CURRENT_BACKUP_FORMAT, EXPECTED_TABLES, SCHEMA_VERSIONS, SCHEMA_VERSION_CSV, TABLE_COUNT
 
 
 FORGE_TABLES = ('forge_creation_requests', 'forge_issue_counters', 'forge_issues', 'forge_issue_comments')
@@ -170,7 +170,7 @@ class BackupForgeHarness(RestoredWorkers):
         assert self.git_authority() == self.initial_git_authority
         manifest = json.loads((self.backup / 'manifest.json').read_text())
         assert manifest['schema_versions'] == SCHEMA_VERSIONS
-        assert manifest['format'] == 7
+        assert manifest['format'] == CURRENT_BACKUP_FORMAT
         return dict(forge_tables_uncommitted_writer=True, backup_waited_on_share_barrier=True,
                     pre_boundary_commit_included=True, full_public_table_count=TABLE_COUNT,
                     issue_rows=10, comment_rows=28, issue_counter_after_commit=number + 1,
