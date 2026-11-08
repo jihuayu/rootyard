@@ -213,7 +213,7 @@ class ConcurrentBatchBracketTest(unittest.TestCase):
             self.assertNotIn('measure(', body, worker + ' must not measure inside the pool')
             self.assertNotIn('capture.', body, worker + ' must not scrape inside the pool')
             self.assertIn('worker_seconds', body, worker + ' reports non-phase-attributed wall time')
-        self.assertIn('same_ref_rejection_diagnostic(', source)
+        self.assertIn('same_ref_failure_kind(', source)
 
 
 class PhaseMetricsAccountingTest(unittest.TestCase):
@@ -323,3 +323,13 @@ class MetricsRedirectTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class HttpConflictClassificationTest(unittest.TestCase):
+    def test_http_conflict_is_not_a_git_ref_rejection(self):
+        conflict = types.SimpleNamespace(returncode=1, stderr=b"error: RPC failed; HTTP 409 curl 22 The requested URL returned error: 409\n")
+        self.assertEqual(baseline.same_ref_failure_kind(conflict), "observed_http_conflict")
+        with self.assertRaises(AssertionError):
+            baseline.same_ref_rejection_diagnostic(conflict)
+        for text in (b"RPC failed; HTTP 500 curl 22", b"RPC failed; HTTP 403 curl 22", b"connection refused"):
+            with self.assertRaises(AssertionError):
+                baseline.same_ref_failure_kind(types.SimpleNamespace(returncode=1, stderr=text))

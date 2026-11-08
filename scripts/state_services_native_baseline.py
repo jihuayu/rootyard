@@ -8,6 +8,7 @@ import platform
 import math
 from pathlib import Path
 import random
+import re
 import shutil
 import socket
 import statistics
@@ -303,6 +304,18 @@ def same_ref_rejection_diagnostic(result):
             return expected
     raise AssertionError('non-winning contender reports no Git ref rejection')
 
+def same_ref_failure_kind(result):
+    """Keep an observed HTTP conflict distinct from a Git ref rejection."""
+    if result.returncode == 0:
+        raise AssertionError('expected a non-winning contender')
+    text = (result.stderr or b'').decode('utf-8', 'replace')
+    # A 409 is an observed application conflict, not a proven old-OID CAS or
+    # a protocol-level Git rejection. Every other generic failure still fails.
+    if re.search(r"RPC failed; HTTP 409 curl 22\b", text):
+        return 'observed_http_conflict'
+    same_ref_rejection_diagnostic(result)
+    return 'git_ref_rejection'
+
 
 class PhaseMetricsCapture:
     """Opt-in before/after scrape of the private loopback exporter, per process."""
@@ -457,7 +470,7 @@ def main():
         'historical_v1': 'Earlier v1 reports recorded one measure() per concurrent push. Those per-case '
             'phase deltas overlap in the process-global counters and are INVALID for individual or batch '
             'aggregation; they remain only as historical raw data. A v2 run replaces them.',
-        'same_ref_rejection': 'The non-winning contender is reported only with a Git ref-rejection '
+        'same_ref_rejection': 'The non-winning contender is classified as an observed HTTP409 conflict or a Git ref-rejection '
             'diagnostic (remote rejected / non-fast-forward / failed to update ref / stale info); an '
             'authentication or transport failure fails the run and is never counted as a ref rejection. '
             'This is ordinary competing pushes, not an explicit-old-OID CAS assertion.'}
@@ -625,18 +638,20 @@ def main():
         winners = [n for n, result in enumerate(outcomes) if result.returncode == 0]
         losers = [n for n, result in enumerate(outcomes) if result.returncode != 0]
         assert len(winners) == 1 and len(losers) == 1, [result.returncode for result in outcomes]
-        # The loser must be a Git ref rejection, never an auth or transport failure.
-        loser_diagnostic = same_ref_rejection_diagnostic(outcomes[losers[0]])
+        # Distinguish Git ref rejection from an observed HTTP409; other faults fail.
+        report['same_ref_loser_diagnostic'] = h.redact((outcomes[losers[0]].stderr or b'').decode('utf-8', 'replace')[-4000:])
+        loser_kind = same_ref_failure_kind(outcomes[losers[0]])
         current = h.git('ls-remote', remote, 'refs/heads/main', token=h.alice).stdout.decode().split()[0]
         assert current == contenders[winners[0]]
         h.git('reset', '--hard', current, cwd=work)
-        report['same_ref_result'] = {'contenders': 2, 'accepted': 1, 'rejected': 1, 'winner_read_back': True,
+        report['same_ref_result'] = {'contenders': 2, 'accepted': 1, 'git_ref_rejected': int(loser_kind == 'git_ref_rejection'),
+            'http_conflicts': int(loser_kind == 'observed_http_conflict'), 'winner_read_back': True,
             'loser_returncode': outcomes[losers[0]].returncode,
-            'loser_rejection': loser_diagnostic,
-            'loser_rejection_is_git_ref_rejection': True,
+            'loser_kind': loser_kind,
+            'loser_rejection_is_git_ref_rejection': loser_kind == 'git_ref_rejection',
             'mode': 'ordinary competing Git pushes; advertised old OIDs are not synchronized; the loser is '
-                    'proven by a Git ref-rejection diagnostic rather than a nonzero exit code, and this is '
-                    'not an explicit-old-OID CAS claim'}
+                    'classified separately as a Git ref rejection or observed HTTP409 application conflict. '
+                    'HTTP409 is not a Git ref rejection or an explicit-old-OID CAS proof'}
         measure('pando_atomic_two_refs', lambda: h.git('push', '--atomic', remote,
                 'HEAD:refs/heads/atomic-a', 'HEAD:refs/heads/atomic-b', cwd=work, token=h.alice))
         atomic_refs = h.git('ls-remote', remote, 'refs/heads/atomic-*', token=h.alice).stdout.decode().splitlines()
