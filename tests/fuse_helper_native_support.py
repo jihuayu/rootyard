@@ -510,8 +510,9 @@ class HelperProcess:
         except RuntimeError:
             pass
         try:
-            self._log.flush()
-            self._log.close()
+            if not self._log.closed:
+                self._log.flush()
+                self._log.close()
         except OSError:
             pass
 
@@ -618,6 +619,7 @@ class WorkFixture:
     def __init__(self):
         self.root = Path(tempfile.mkdtemp(prefix="rootyard-fuse-helper-"))
         self.service = self.root / "workspace-service"
+        self.service.mkdir(mode=0o700)
         for name in ("workspaces", "uppers", "mounts"):
             (self.service / name).mkdir(mode=0o700)
         self.workspaces: dict[str, Path] = {}
