@@ -5,14 +5,15 @@
 //! as proof of content. Failed uploads attempt an explicit bounded abort and
 //! the attempt-unique path is never reused.
 //!
-//! Each public method is bounded by the caller's absolute deadline as a whole:
-//! local source open/metadata, upload-slot queueing, provider writer creation,
-//! 64 KiB source reads, writes, close and the post-close read-back all share it.
-//! The local source is opened with `O_NOFOLLOW|O_NONBLOCK` and must be a regular
-//! file, so a symlink or FIFO can never turn a publish into a hanging read. An
-//! open/read/fsync blocked inside the OS cannot be hard-cancelled by Tokio; the
-//! deadline stops waiting for it, the write is aborted with its own bounded
-//! budget and no receipt is issued.
+//! The public wait is bounded by the caller's absolute deadline, while local
+//! source open and 64 KiB reads run in an owned task. On timeout or caller drop
+//! that task is detached, never aborted: it awaits each local operation fully,
+//! checks the deadline afterwards, bounded-aborts the writer, and only then lets
+//! the upload lease drop. Provider waits keep their own deadlines. The source is
+//! opened with `O_NOFOLLOW|O_NONBLOCK` and must be a regular file, so a symlink
+//! or FIFO cannot turn a publish into a hanging read. Kernel-blocked IO cannot be
+//! hard-cancelled by Tokio, so a late close/abort can leave a committed object or
+//! orphan multipart upload; no receipt is issued for late or unknown completion.
 //!
 //! Uploads hold one process-wide upload slot; the slot is returned after
 //! close/abort finished and before the post-close read-back, which needs a
@@ -24,6 +25,8 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
+#[cfg(test)]
+use std::sync::Arc;
 
 use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
@@ -31,6 +34,7 @@ use tokio::{fs::File, io::AsyncReadExt};
 
 use super::{
     BlobError, BlobLocator, BlobReceipt, UploadIntent,
+    budget::UploadLease,
     opendal::{BlobStore, DOWNLOAD_CHUNK_BYTES, DOWNLOAD_CONCURRENCY, map_provider_error},
     upload::UploadGuard,
 };
@@ -40,6 +44,63 @@ const UPLOAD_CONCURRENCY: usize = 4;
 
 fn tokio_deadline(deadline: Instant) -> tokio::time::Instant {
     tokio::time::Instant::from_std(deadline)
+}
+
+fn check_deadline(deadline: Instant) -> Result<(), BlobError> {
+    if Instant::now() >= deadline {
+        Err(BlobError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
+}
+
+/// Test-only deterministic gate in the owned upload task just before the first
+/// local source read. It is keyed by the unique source path so parallel tests
+/// cannot interfere, and proves an outer timeout detaches the task without
+/// freeing the upload slot until the owned task aborts and settles.
+#[cfg(test)]
+pub(crate) struct UploadReadStall {
+    source: PathBuf,
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(test)]
+static UPLOAD_READ_STALL: std::sync::OnceLock<std::sync::Mutex<Option<UploadReadStall>>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_upload_read_stall(
+    source: PathBuf,
+) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let stall = UploadReadStall { source, entered: Arc::clone(&entered), release: Arc::clone(&release) };
+    let slot = UPLOAD_READ_STALL.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stall);
+    (entered, release)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_upload_read_stall() {
+    if let Some(slot) = UPLOAD_READ_STALL.get() {
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+async fn stall_before_first_read(source: &Path) {
+    let stall = {
+        let slot = UPLOAD_READ_STALL.get_or_init(|| std::sync::Mutex::new(None));
+        let guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .as_ref()
+            .filter(|stall| stall.source.as_path() == source)
+            .map(|stall| (Arc::clone(&stall.entered), Arc::clone(&stall.release)))
+    };
+    if let Some((entered, release)) = stall {
+        entered.add_permits(1);
+        let _ = release.acquire().await;
+    }
 }
 
 /// Open the publish source without following symlinks or blocking on a FIFO,
@@ -71,45 +132,49 @@ impl BlobStore {
     ) -> Result<BlobReceipt, BlobError> {
         // Moving the private field is allowed only inside blob_store descendants.
         let UploadIntent { locator } = intent;
-        let operation = self.put_file_bounded(&locator, source, deadline);
-        match tokio::time::timeout_at(tokio_deadline(deadline), operation).await {
-            Ok(result) => result,
+        self.validate_locator(&locator)?;
+        // Queueing is cancellable and completes before an owned task is spawned.
+        let lease = self.resources().acquire_upload(deadline).await?;
+        let store = self.clone();
+        let source = source.to_path_buf();
+        let handle = tokio::spawn(async move {
+            store.put_file_owned(&locator, &source, lease, deadline).await
+        });
+        match tokio::time::timeout_at(tokio_deadline(deadline), handle).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(BlobError::Provider("blob upload task failed".into())),
+            // Dropping a JoinHandle detaches; it never aborts the owned task.
             Err(_) => Err(BlobError::DeadlineExceeded),
         }
     }
 
-    async fn put_file_bounded(
+    /// The whole local upload pipeline runs in this owned task. Local open/read
+    /// are awaited fully and never timeout-cancelled; after each local call the
+    /// absolute deadline is checked and the writer is bounded-aborted before the
+    /// upload lease can drop. Provider waits keep their own deadlines.
+    async fn put_file_owned(
         &self,
         locator: &BlobLocator,
         source: &Path,
+        lease: UploadLease,
         deadline: Instant,
     ) -> Result<BlobReceipt, BlobError> {
-        self.validate_locator(locator)?;
         let expected = locator.length();
-        // Take the upload slot before opening the source: source opens are then
-        // bounded by the process-wide upload budget, never an unbounded set of
-        // detached blocking tasks. The blocking closure carries the lease back
-        // so cancellation still keeps capacity charged until open/metadata ends.
-        let upload_lease = self.resources().acquire_upload(deadline).await?;
-        let owned_source: PathBuf = source.to_path_buf();
-        let opened = tokio::time::timeout_at(
-            tokio_deadline(deadline),
-            tokio::task::spawn_blocking(move || {
-                let opened = open_regular_source(&owned_source);
-                (opened, upload_lease)
-            }),
-        )
-        .await;
-        let (opened, upload_lease) = match opened {
-            Ok(joined) => joined.map_err(|_| BlobError::Provider("local blob source open task failed".into()))?,
-            // The blocking task was detached by the timeout and still owns the
-            // lease until the syscall returns, so capacity is not reported free.
-            Err(_) => return Err(BlobError::DeadlineExceeded),
-        };
+        let owned_source = source.to_path_buf();
+        // Carry the lease through the blocking source open. A detached owner
+        // therefore cannot report the upload slot free before the syscall ends.
+        let opened = tokio::task::spawn_blocking(move || {
+            let opened = open_regular_source(&owned_source);
+            (opened, lease)
+        })
+        .await
+        .map_err(|_| BlobError::Provider("local blob source open task failed".into()))?;
+        let (opened, lease) = opened;
         let (std_file, actual_length) = opened?;
         if actual_length != expected {
             return Err(BlobError::LengthMismatch { expected, actual: actual_length });
         }
+        check_deadline(deadline)?;
         let path = self.object_path(locator);
         let writer =
             self.operator().writer_with(&path).chunk(super::opendal::UPLOAD_CHUNK_BYTES).concurrent(UPLOAD_CONCURRENCY);
@@ -120,21 +185,21 @@ impl BlobStore {
             Ok(Err(error)) => return Err(map_provider_error(error)),
             Err(_) => return Err(BlobError::DeadlineExceeded),
         };
-        let mut guard = UploadGuard::new_with_lease(writer, self.profile().abort_timeout(), upload_lease);
+        let mut guard = UploadGuard::new_with_lease(writer, self.profile().abort_timeout(), lease);
         let mut file = File::from_std(std_file);
         let mut buffer = vec![0u8; DOWNLOAD_CHUNK_BYTES];
         let mut hasher = Sha256::new();
         let mut sent = 0u64;
+        #[cfg(test)]
+        stall_before_first_read(source).await;
         loop {
-            let read = match tokio::time::timeout_at(tokio_deadline(deadline), file.read(&mut buffer)).await {
-                Ok(Ok(read)) => read,
-                Ok(Err(_)) => {
-                    guard.abort_now().await;
-                    return Err(BlobError::Provider("local blob source read failed".into()));
-                }
+            // No timeout around the local read: cancelling a Tokio FS read can
+            // leave its inner blocking read alive while capacity is freed.
+            let read = match file.read(&mut buffer).await {
+                Ok(read) => read,
                 Err(_) => {
                     guard.abort_now().await;
-                    return Err(BlobError::DeadlineExceeded);
+                    return Err(BlobError::Provider("local blob source read failed".into()));
                 }
             };
             if read == 0 {
@@ -146,6 +211,10 @@ impl BlobStore {
                 return Err(BlobError::LengthMismatch { expected, actual: sent });
             }
             hasher.update(&buffer[..read]);
+            if Instant::now() >= deadline {
+                guard.abort_now().await;
+                return Err(BlobError::DeadlineExceeded);
+            }
             let chunk = bytes::Bytes::copy_from_slice(&buffer[..read]);
             match tokio::time::timeout_at(tokio_deadline(deadline), guard.writer().write(chunk)).await {
                 Ok(Ok(())) => {}
@@ -160,6 +229,10 @@ impl BlobStore {
                 }
             }
         }
+        if Instant::now() >= deadline {
+            guard.abort_now().await;
+            return Err(BlobError::DeadlineExceeded);
+        }
         let actual_sha256 = hex::encode(hasher.finalize());
         if sent != expected || actual_sha256 != locator.sha256() {
             guard.abort_now().await;
@@ -170,9 +243,12 @@ impl BlobStore {
             });
         }
         guard.close(tokio_deadline(deadline)).await?;
-        // The raw write is closed: hand the upload slot back *before* the
-        // read-back, which needs a verified-reader slot of its own. `disarm`
-        // consumes the guard and drops the slot; Drop must not abort.
+        if Instant::now() >= deadline {
+            // Close may have committed the object, but a late caller never gets
+            // a receipt. The upload slot is released as the guard drops.
+            return Err(BlobError::DeadlineExceeded);
+        }
+        // Hand the upload slot back before read-back, which needs a reader slot.
         guard.disarm();
         self.verify(locator, deadline).await
     }

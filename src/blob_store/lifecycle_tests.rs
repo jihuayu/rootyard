@@ -15,6 +15,7 @@ use super::{
     budget::{LEASE_UNIT_BYTES, ResourceLimits, ResourceRegistry},
     readback,
     test_support::{deadline, payload, short_deadline, store, upload, write_source},
+    transfer,
     upload::UploadGuard,
 };
 
@@ -206,4 +207,40 @@ async fn outer_timeout_detaches_readback_and_keeps_lease_until_inner_drains() {
     assert!(released, "the detached task must release the lease only after it drains");
     assert_eq!(resources.available_staging_bytes(), configured.staging_bytes());
     readback::clear_readback_stall();
+}
+
+#[tokio::test]
+async fn outer_timeout_detaches_upload_and_keeps_slot_until_abort_finishes() {
+    let configured = limits(1, 1, 2);
+    let (blob, resources) = store(configured);
+    let bytes = payload(4096);
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_source(dir.path(), &bytes);
+    let intent = upload(&blob, "upload-stall", &bytes);
+    let (entered, release) = transfer::install_upload_read_stall(source.clone());
+    let upload = tokio::spawn(async move {
+        blob.put_file(intent, &source, Instant::now() + Duration::from_millis(150)).await
+    });
+    tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+        .await
+        .expect("owned upload must reach the local read gate")
+        .expect("gate open");
+    assert!(matches!(upload.await.unwrap(), Err(BlobError::DeadlineExceeded)));
+
+    // The public caller timed out, but the detached owned task still holds the
+    // one upload slot until its local read and bounded abort settle.
+    assert_eq!(resources.available_uploads(), 0);
+    release.add_permits(1);
+    let mut released = false;
+    for _ in 0..200 {
+        if resources.available_uploads() == 1 {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(released, "the detached upload must release its slot only after abort settles");
+    assert_eq!(resources.available_staging_bytes(), configured.staging_bytes());
+    assert_eq!(resources.available_readers(), 1);
+    transfer::clear_upload_read_stall();
 }
