@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import e2e_tiers  # noqa: E402
+from e2e_tiers import SchemaBoundaryIntegrationFixture  # noqa: E402
 import schema_baseline  # noqa: E402
 from workspace import WorkspaceHarness  # noqa: E402
 
@@ -246,6 +247,38 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
         self.assertEqual(param_by_prefix[("api", "repos", "{}", "{}", "teams")][0], "{team_slug}")
         self.assertEqual(param_by_prefix[("api", "repos", "{}", "{}", "teams", "{}", "members")][0], "{username}")
         self.assertEqual(param_by_prefix[("api", "repos", "{}", "{}", "permissions")][0], "{username}")
+
+    def test_route_audit_separates_services_and_rejects_same_scope_duplicates(self) -> None:
+        fixture = SchemaBoundaryIntegrationFixture
+        self.assertEqual(["legacy", "serve_blob"], fixture.audit_route_table()["scopes"])
+        with self.assertRaisesRegex(AssertionError, "router scope legacy"):
+            fixture.audit_route_table(extra_routes=[("duplicate", "/api/repos/{owner}/{name}/refs", "GET")])
+        with tempfile.TemporaryDirectory(prefix="rootyard-route-scope-") as tmp:
+            tree = Path(tmp)
+            route = '    .route("/api/repos/{owner}/{name}/refs", get(refs))\n'
+
+            def write(relative_path, count=1):
+                path = tree / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("pub fn routes() -> Router { Router::new()\n" + route * count + "}\n")
+                return path
+
+            write("src/browse.rs")
+            write("src/blob_git_gateway/mod.rs")
+            self.assertEqual(["legacy", "serve_blob"], fixture.audit_route_table(source_root=tree)["scopes"])
+            # Identical duplicate registrations within one file also collide.
+            write("src/blob_git_gateway/mod.rs", count=2)
+            with self.assertRaisesRegex(AssertionError, "router scope serve_blob"):
+                fixture.audit_route_table(source_root=tree)
+            write("src/blob_git_gateway/mod.rs")
+            duplicate = write("src/blob_git_gateway/duplicate.rs")
+            with self.assertRaisesRegex(AssertionError, "router scope serve_blob"):
+                fixture.audit_route_table(source_root=tree)
+            duplicate.unlink()
+            # An unrecognized service path is never silently exempted.
+            write("src/new_service/mod.rs")
+            with self.assertRaisesRegex(AssertionError, "router scope legacy"):
+                fixture.audit_route_table(source_root=tree)
 
     def test_no_legacy_axum_07_colon_or_star_route_syntax_and_valid_wildcard_placement(self) -> None:
         wildcard_routes: list[tuple[str, str]] = []
