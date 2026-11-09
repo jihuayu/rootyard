@@ -92,68 +92,56 @@ pub(super) fn closure_of(artifacts: &[Artifact], backend: &str, provider: &str) 
 /// ledger.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RefStoreCarry {
-    pub refs: Vec<Value>,
-    pub refs_digest: String,
-    pub head: Value,
-    pub gates: Vec<Value>,
-    pub operations: Vec<Value>,
-    pub events: Vec<Value>,
-    pub holds: Vec<Value>,
-    pub publications: Vec<Value>,
+pub(super) struct TableDigest {
+    rows: u64,
+    sha256: String,
 }
 
-fn rows(values: Vec<Value>) -> (String, Vec<Value>) {
-    let digest = hex::encode(Sha256::digest(serde_json::to_vec(&values).unwrap_or_default()));
-    (digest, values)
-}
+pub(super) type RefStoreCarry = BTreeMap<String, TableDigest>;
 
-/// Read-only capture of the durable RefStore rows of the whole snapshot.
+/// Hash rows incrementally from the same exported snapshot. PostgreSQL sorts
+/// canonical JSON using byte collation and can spill the sort to disk; Rust
+/// retains one bounded row instead of copying the operation history to RAM.
 pub(super) async fn carry(client: &(impl GenericClient + Sync)) -> Result<RefStoreCarry> {
-    let refs = client
-        .query(
-            "SELECT to_jsonb(t) FROM (SELECT repository_id,ref_name,oid FROM public.ref_store_core_refs
-                                       ORDER BY repository_id,ref_name) t",
-            &[],
-        )
-        .await?
-        .iter()
-        .map(|row| row.get(0))
-        .collect();
-    let (refs_digest, refs) = rows(refs);
-    let head = client
-        .query("SELECT jsonb_agg(to_jsonb(t) ORDER BY t.repository_id) FROM (SELECT repository_id,head_ref FROM public.ref_store_core_gates) t", &[])
-        .await?
+    use futures_util::TryStreamExt;
+    struct DigestWriter<'a>(&'a mut Sha256);
+    impl std::io::Write for DigestWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut result = BTreeMap::new();
+    for table in catalog::relations(FORMAT, true)?
         .into_iter()
-        .next()
-        .and_then(|row| row.get::<_, Option<Value>>(0))
-        .unwrap_or(Value::Null);
-    Ok(RefStoreCarry {
-        refs,
-        refs_digest,
-        head,
-        gates: table(client, "SELECT to_jsonb(t) FROM public.ref_store_core_gates t ORDER BY repository_id").await?,
-        operations: table(
-            client,
-            "SELECT to_jsonb(t) FROM public.ref_store_operations t ORDER BY repository_id,issuer_id,lane",
-        )
-        .await?,
-        events: table(
-            client,
-            "SELECT to_jsonb(t) FROM public.ref_store_core_events t ORDER BY repository_id,operation_id",
-        )
-        .await?,
-        holds: table(client, "SELECT to_jsonb(t) FROM public.artifact_holds t ORDER BY hold_id").await?,
-        publications: table(
-            client,
-            "SELECT to_jsonb(t) FROM public.ref_store_core_pack_publications t ORDER BY registration_id",
-        )
-        .await?,
-    })
-}
-
-async fn table(client: &(impl GenericClient + Sync), sql: &str) -> Result<Vec<Value>> {
-    Ok(client.query(sql, &[]).await?.iter().map(|row| row.get(0)).collect())
+        .filter(|name| name.starts_with("ref_store_") || name.starts_with("artifact_hold"))
+    {
+        let sql = format!(
+            "SELECT CASE WHEN pg_column_size(row)<=8388608 THEN row ELSE NULL END \
+             FROM (SELECT to_jsonb(t) AS row FROM public.\"{table}\" t) q \
+             ORDER BY row::text COLLATE \"C\""
+        );
+        let stream = client.query_raw(&sql, std::iter::empty::<&(dyn tokio_postgres::types::ToSql + Sync)>()).await?;
+        futures_util::pin_mut!(stream);
+        let mut digest = Sha256::new();
+        let mut rows = 0u64;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+        while let Some(row) =
+            tokio::time::timeout_at(deadline, stream.try_next()).await.context("ledger digest deadline exceeded")??
+        {
+            let value: Option<serde_json::Value> = row.get(0);
+            let value = value.context("ledger row exceeds the metadata byte ceiling")?;
+            rows += 1;
+            ensure!(rows <= MAX_ENTRIES as u64, "ledger row count exceeds its bound");
+            serde_json::to_writer(DigestWriter(&mut digest), &value)?;
+            digest.update(b"\n");
+        }
+        result.insert(table, TableDigest { rows, sha256: hex::encode(digest.finalize()) });
+    }
+    Ok(result)
 }
 
 /// Number of `pg_refstore` serving repositories in the snapshot. A non-zero
