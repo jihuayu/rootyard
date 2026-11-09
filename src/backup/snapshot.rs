@@ -137,7 +137,7 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         let artifacts = ledger::inventory(&tx, transfer.backend_identity_hex(), transfer.provider())
             .await
             .context("exact Blob closure cannot be captured from this source")?;
-        let until = Instant::now() + std::time::Duration::from_secs(3600);
+        let until = started + std::time::Duration::from_secs(3600);
         let (closure, blob_files) =
             blob_closure::export(&read, &transfer, &artifacts, &staging, until, &mutex, &tx).await?;
         for (name, entry) in blob_files {
@@ -150,7 +150,11 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     };
     // Durable RefStore rows the paired closure depends on; the restore compares
     // them with the restored database before rebuilding any byte.
-    let refstore = if format == FORMAT_PAIRED { Some(ledger::carry(&tx).await?) } else { None };
+    let refstore = if format == FORMAT_PAIRED {
+        Some(ledger::carry(&tx, tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600))).await?)
+    } else {
+        None
+    };
     let paired = blob_closure.is_some();
     let manifest = Manifest {
         format,

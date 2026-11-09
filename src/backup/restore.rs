@@ -435,7 +435,10 @@ pub async fn restore(
             "mixed legacy/Blob restore is unsupported"
         );
         ensure!(
-            Some(ledger::carry(&client).await?) == manifest.refstore,
+            Some(
+                ledger::carry(&client, tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600)))
+                    .await?
+            ) == manifest.refstore,
             "restored RefStore rows differ from the archive cut"
         );
         authority::fence(&client).await?;
@@ -446,7 +449,7 @@ pub async fn restore(
             transfer.backend_identity_hex() == closure.backend_identity && transfer.provider() == closure.provider,
             "restore target Blob backend identity differs from the archive"
         );
-        let until = Instant::now() + std::time::Duration::from_secs(3600);
+        let until = started + std::time::Duration::from_secs(3600);
         blob_closure::import(&client, &transfer, &manifest.blob_artifacts, &source, until, &mutex).await?;
     }
     ensure!(!target.exists(), "destination appeared during restore");

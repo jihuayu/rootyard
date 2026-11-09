@@ -103,7 +103,7 @@ pub(super) async fn pg(config: &Config) -> Result<Client> {
     );
     let client = crate::db::connect_config(parsed).await?;
     client
-        .batch_execute("SET application_name='rootyard-backup'; SET lock_timeout='5s'; SET statement_timeout='60s'")
+        .batch_execute("SET application_name='rootyard-backup'; SET lock_timeout='5s'; SET statement_timeout='60s'; SET timezone='UTC'; SET datestyle='ISO,YMD'; SET intervalstyle='iso_8601'; SET bytea_output='hex'; SET extra_float_digits=3")
         .await?;
     Ok(client)
 }

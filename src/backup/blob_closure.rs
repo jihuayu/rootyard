@@ -154,6 +154,9 @@ pub(super) async fn import(
     // the manifest exactly (nothing re-pointed, nothing lost).
     let after = ledger::inventory(client, &backend, &provider).await?;
     ensure!(after == artifacts, "restored Blob ledger changed during import");
-    ensure!(files.len() == rebuilt + reused, "archive member accounting mismatch");
+    ensure!(
+        files.values().filter(|entry| entry.kind == "file").count() == rebuilt + reused,
+        "archive member accounting mismatch"
+    );
     Ok(())
 }

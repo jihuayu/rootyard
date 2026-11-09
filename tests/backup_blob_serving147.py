@@ -318,7 +318,9 @@ class Drill(BlobOnlyHarness):
             # a serve-blob started now must refuse, and the backup must wait for
             # this metadata writer instead of taking a snapshot around it.
             self.wait_for_advisory_holder(self.source_db, exclusive=True)
-            assert self.serving_barrier_refused(), "serve-blob started while the offline barrier was held"
+            for mode in ("auto", "external"):
+                probe = dict(self.env, ROOTYARD_SCHEMA_MODE=mode)
+                assert self.serving_barrier_refused(probe), mode + " serve-blob started while the offline barrier was held"
             deadline = time.monotonic() + 15
             while not int(self.query(self.source_db,
                     "SELECT count(*) FROM pg_stat_activity WHERE application_name='rootyard-backup' AND wait_event_type='Lock'")):
@@ -423,7 +425,9 @@ class Drill(BlobOnlyHarness):
                 restore = subprocess.Popen([self.args.binary, "restore", str(self.backup), "--isolated", "--trust-backup"],
                                            env=env, stdout=stdout, stderr=stderr)
             self.wait_for_advisory_holder(self.target_db, exclusive=True)
-            assert self.serving_barrier_refused(env), "serve-blob started while the restore barrier was held"
+            for mode in ("auto", "external"):
+                probe = dict(env, ROOTYARD_SCHEMA_MODE=mode)
+                assert self.serving_barrier_refused(probe), mode + " serve-blob started while the restore barrier was held"
             status = restore.wait(timeout=180)
             assert status == 0, "paired restore from the archive failed (exit " + str(status) + ")"
         finally:

@@ -101,7 +101,10 @@ pub(super) type RefStoreCarry = BTreeMap<String, TableDigest>;
 /// Hash rows incrementally from the same exported snapshot. PostgreSQL sorts
 /// canonical JSON using byte collation and can spill the sort to disk; Rust
 /// retains one bounded row instead of copying the operation history to RAM.
-pub(super) async fn carry(client: &(impl GenericClient + Sync)) -> Result<RefStoreCarry> {
+pub(super) async fn carry(
+    client: &(impl GenericClient + Sync),
+    deadline: tokio::time::Instant,
+) -> Result<RefStoreCarry> {
     use futures_util::TryStreamExt;
     struct DigestWriter<'a>(&'a mut Sha256);
     impl std::io::Write for DigestWriter<'_> {
@@ -123,11 +126,15 @@ pub(super) async fn carry(client: &(impl GenericClient + Sync)) -> Result<RefSto
              FROM (SELECT to_jsonb(t) AS encoded_row FROM public.\"{table}\" t) q \
              ORDER BY encoded_row::text COLLATE \"C\""
         );
-        let stream = client.query_raw(&sql, std::iter::empty::<&(dyn tokio_postgres::types::ToSql + Sync)>()).await?;
+        let stream = tokio::time::timeout_at(
+            deadline,
+            client.query_raw(&sql, std::iter::empty::<&(dyn tokio_postgres::types::ToSql + Sync)>()),
+        )
+        .await
+        .context("ledger query deadline exceeded")??;
         futures_util::pin_mut!(stream);
         let mut digest = Sha256::new();
         let mut rows = 0u64;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
         while let Some(row) =
             tokio::time::timeout_at(deadline, stream.try_next()).await.context("ledger digest deadline exceeded")??
         {
