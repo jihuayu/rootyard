@@ -1,0 +1,20 @@
+[workspace]
+[package]
+name = "rootyard-refcas-log"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+[dependencies]
+openraft = { version = "=0.9.26", features = ["serde", "storage-v2"] }
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+fs2 = "=0.4.3"
+sha2 = "=0.10.9"
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "sync"] }
+[dev-dependencies]
+tempfile = "=3.27.0"
+[profile.dev]
+debug = 1

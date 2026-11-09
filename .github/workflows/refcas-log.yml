@@ -1,0 +1,31 @@
+name: Experimental Ref-CAS log storage
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/refcas-log.yml'
+      - 'crates/refcas-log/**'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+jobs:
+  log-storage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +1.99.1 fmt --manifest-path crates/refcas-log/Cargo.toml --all -- --check
+      - name: Check all targets
+        run: cargo +1.99.1 clippy --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets -- -D warnings
+      - name: Exercise log invariants and process crash recovery
+        run: cargo +1.99.1 test --locked --manifest-path crates/refcas-log/Cargo.toml --all-targets
