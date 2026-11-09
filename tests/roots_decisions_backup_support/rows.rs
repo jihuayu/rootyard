@@ -1,4 +1,4 @@
-//! Canonical, secret-free row-set capture for every table of the drill schema.
+//! Canonical, secret-free row-set capture of every retained RefStore ledger.
 //!
 //! The drill never writes a raw decision row into a marker, a log or a report:
 //! `ref_store_publication_decisions`/`ref_store_decision_scopes` carry the
@@ -65,13 +65,18 @@ fn digest_sql(table: &str) -> String {
 pub async fn table_digest(pool: &Pool, table: &str) -> Result<(i64, String, i64)> {
     let client = pool.get().await?;
     let row = client.query_one(&digest_sql(table), &[]).await?;
-    Ok((row.get(0), row.get(1), row.get(2)))
+    Ok((row.get(0), row.get(1), i64::from(row.get::<_, i32>(2))))
 }
 
-/// Exact digests for every table of the drill schema (no raw rows).
+/// Exact digests for all RefStore tables (no raw rows). Restore intentionally
+/// rotates unrelated cluster authority; the parent checks whole-schema
+/// non-mutation separately around read-only verification.
 pub async fn table_digests(pool: &Pool) -> Result<Value> {
     let mut map = Map::new();
     for table in table_names(pool).await? {
+        if !table.starts_with("ref_store_") {
+            continue;
+        }
         let (rows, sha256, bytes) = table_digest(pool, &table).await?;
         map.insert(table, json!({"rows": rows, "sha256": sha256, "bytes": bytes}));
     }

@@ -267,7 +267,7 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
             "the generated 144-vs-143 catalog delta is " + repr(delta))
         return tuple(delta)
 
-    def table_digests(self, db=None):
+    def table_digests(self, db=None, refstore_only=True):
         db = db or self.db
         tables = self.metadata_psql(
             "SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables "
@@ -275,7 +275,7 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
         assert tables, "the drilled database has no public tables"
         digests = {}
         for table in tables.split(","):
-            if not table:
+            if not table or (refstore_only and not table.startswith("ref_store_")):
                 continue
             row = self.metadata_psql(digest_sql(table), db=db).stdout.decode().strip()
             count, sha256, length = row.split("|")
@@ -432,6 +432,10 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
             "restored table digests differ: " + ", ".join(
                 table for table in self.backup_digests
                 if restored_before.get(table) != self.backup_digests[table]))
+        # Cluster authority deliberately rotates on restore. Compare every
+        # retained RefStore ledger exactly, then all schema tables independently
+        # around the read-only verification to detect any new mutation.
+        readonly_before = self.table_digests(self.target_db, refstore_only=False)
         verify = self.run_fixture("verify", db=self.target_db)
         self.verify_marker = verify
         self.assert_binary_binding("verify")
@@ -440,6 +444,8 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
             "the read-only restored verification mutated canonical rows, counters or timestamps: " + ", ".join(
                 table for table in restored_before
                 if restored_after.get(table) != restored_before[table]))
+        readonly_after = self.table_digests(self.target_db, refstore_only=False)
+        assert readonly_after == readonly_before, "typed verification mutated a table outside the RefStore cohort"
         for key in ("scope", "source", "gate", "roots", "materialized", "root_counts", "quota",
                     "tables", "root_family_counts", "decision_family_counts", "protocol"):
             assert verify[key] == self.marker[key], "restored typed evidence differs for " + key
@@ -452,13 +458,13 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
         repo = uuid_literal(scope["repository_id"])
         decision_id = self.marker["decisions"]["consumed_decision"]["decision_id"]
         self.reject_guard("UPDATE ref_store_publication_decisions SET state='OPEN' "
-                          "WHERE decision_id='" + decision_id + "'", "publication decision is immutable")
+                          "WHERE decision_id='" + decision_id + "'", "publication decision terminal state is immutable")
         self.reject_guard("DELETE FROM ref_store_publication_decisions "
-                          "WHERE decision_id='" + decision_id + "'", "publication decision cannot be deleted")
+                          "WHERE decision_id='" + decision_id + "'", "publication decision history is never deleted or truncated")
         self.reject_guard("UPDATE ref_store_core_root_receipts SET body='{}' "
-                          "WHERE repository_id='" + repo + "'", "retention root receipt is immutable")
+                          "WHERE repository_id='" + repo + "'", "retained roots row is immutable")
         self.reject_guard("DELETE FROM ref_store_core_root_receipts "
-                          "WHERE repository_id='" + repo + "'", "retention root receipt is immutable")
+                          "WHERE repository_id='" + repo + "'", "retained roots row is immutable")
         self.reject_guard("UPDATE ref_store_core_protocol_repos SET decision_required=FALSE "
                           "WHERE repository_id='" + repo + "'", "decision_required is a one-way fence")
         self.reject_guard("UPDATE ref_store_core_root_tenant_usage SET roots=roots-1 "
@@ -484,7 +490,8 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
         self.expect(self.unknown_repo["clone_path"] + "/info/refs?service=git-upload-pack", 503, token=self.alice)
         self.stop()
         result.update({
-            "all_schema144_and_legacy_tables_restored_exactly": True,
+            "all_refstore_schema144_and_legacy_ledgers_restored_exactly": True,
+            "all_schema_tables_unchanged_by_readonly_verification": True,
             "schema144_root_tables_restored_exactly": True,
             "schema144_decision_tables_restored_exactly": True,
             "typed_root_get_query_and_materialize_after_restore": True,
