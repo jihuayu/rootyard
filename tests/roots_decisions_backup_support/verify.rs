@@ -85,7 +85,10 @@ pub async fn verify(db: &Db, store: &BlobStore, fixture: &marker::Fixture) -> Re
         }
     }
     let decisions = marker_out.get("decisions").ok_or_else(|| anyhow!("verify marker has no decisions object"))?;
-    if decisions["consumed"] != 1u64 || decisions["cancelled"] != 1u64 || decisions["cancel_before_install"] != 1u64 {
+    if decisions["consumed"] != 1u64
+        || decisions["cancelled"] != 1u64
+        || decisions["cancel_before_install_count"] != 1u64
+    {
         return Err(anyhow!("the restored decision scenarios are not the seeded three"));
     }
     Ok(())

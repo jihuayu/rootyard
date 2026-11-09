@@ -153,7 +153,7 @@ pub async fn seed(db: &Db, store: &BlobStore, fixture: &marker::Fixture) -> Resu
             "installed": 2,
             "consumed": 1,
             "cancelled": 1,
-            "cancel_before_install": 1,
+            "cancel_before_install_count": 1,
             "pending_plan_refs": planned_refs,
             "prepared": prepared_json,
             "consumed_decision": {

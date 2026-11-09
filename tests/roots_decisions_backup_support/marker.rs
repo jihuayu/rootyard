@@ -329,11 +329,15 @@ pub async fn finish_marker(
     scenarios: &[RootScenario],
 ) -> Result<Value> {
     let gate = db::gate_version(&db.pool, repo, tenant).await?;
+    let protocol = super::decisions::read_protocol(&db.pool, repo)
+        .await?
+        .ok_or_else(|| anyhow!("fixture protocol realm missing after publication"))?;
     let mut marker = base;
     let roots_value = roots_json(&db.pool, store, &fixture.git, repo, tenant, &gate, scenarios).await?;
     let (materialized, _view) =
         materialized_json(&db.pool, store, &fixture.git, repo, tenant, &gate, scenarios[0].root_id).await?;
     let object = marker.as_object_mut().ok_or_else(|| anyhow!("marker is not an object"))?;
+    object.insert("protocol".to_owned(), protocol_json(&protocol));
     object.insert(
         "gate".to_owned(),
         json!({

@@ -364,7 +364,7 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
                 assert decision_counts[table] == expected, table + " rows differ from the drill shape"
         decisions = marker["decisions"]
         assert decisions["installed"] == 2 and decisions["consumed"] == 1
-        assert decisions["cancelled"] == 1 and decisions["cancel_before_install"] == 1
+        assert decisions["cancelled"] == 1 and decisions["cancel_before_install_count"] == 1
         rows = {row["decision_id"]: row for row in decisions["rows"]}
         consumed = rows[decisions["consumed_decision"]["decision_id"]]
         assert consumed["state"] == "CONSUMED", "the accepted-subset decision is not CONSUMED"
