@@ -151,7 +151,7 @@ class TestPhase1ImplementationStatusAndDocsSync(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, f"check_design_docs.py failed:\n{proc.stderr}")
         self.assertIn(
-            "PASS: 823 source blocks, 11 chapters, 7 synchronized diagrams",
+            f"PASS: 823 source blocks, 11 chapters, {len(list((ROOT / 'docs/design/diagrams').glob('*.mmd')))} synchronized diagrams",
             proc.stdout,
         )
         self.assertIn(expected_sha256, proc.stdout)

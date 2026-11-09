@@ -15018,7 +15018,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
             check=False,
         )
         self.assertEqual(res.returncode, 0, msg=res.stderr)
-        self.assertTrue(res.stdout.startswith("PASS: 823 source blocks, 11 chapters, 7 synchronized diagrams"))
+        self.assertTrue(res.stdout.startswith(f"PASS: 823 source blocks, 11 chapters, {len(list((ROOT / 'docs/design/diagrams').glob('*.mmd')))} synchronized diagrams"))
 
     # =========================================================================
     # Feature F20: Phase 1 Closure — CI Pipeline Wiring (5 Tests)
@@ -15131,7 +15131,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
             check=False,
         )
         self.assertEqual(res.returncode, 0, msg=res.stderr)
-        self.assertIn("PASS: 823 source blocks, 11 chapters, 7 synchronized diagrams", res.stdout)
+        self.assertIn(f"PASS: 823 source blocks, 11 chapters, {len(list((ROOT / 'docs/design/diagrams').glob('*.mmd')))} synchronized diagrams", res.stdout)
 
     # =========================================================================
     # Feature F22: Track A — Webhook Subscriptions, HMAC-SHA256 & Outbox Delivery (5 Tests)

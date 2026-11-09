@@ -1,5 +1,7 @@
 # 总体目标与技术架构
 
+> 历史来源快照：本文中的“最新/当前/优先级”仅指归档日期。现行规范见 [状态服务设计](12-state-services.md) 和 [实施计划](implementation-plan.md)，不再要求旧 GitFS 演进或旧版本升级。
+
 > 状态：目标架构与早期建议；当前权威边界以实现状态和最新路线为准。
 > [设计目录](README.md) · [实现状态](implementation-status.md) · [来源与完整归档](source-page.md)
 

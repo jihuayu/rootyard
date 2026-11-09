@@ -1,0 +1,17 @@
+flowchart TB
+  C["Git / API / Web / Agent 客户端"] --> E["应用 / 计算节点（可多个）<br/>Smart HTTP / API / 鉴权 / 发布协调"]
+  E --> PG[("业务 PostgreSQL<br/>身份 / 仓库 / 权限 / 策略（权威）<br/>决策意图 / 全局 artifact hold / 配额 / 投影 / outbox")]
+  E --> RC["Raft-backed Ref-CAS 服务<br/>每仓唯一 refs / CAS 权威<br/>refs / HEAD / membership / 终态 / 取消<br/>snapshot pin / durable root / repo retained quota"]
+  RC --> R1[("Raft 节点 A<br/>日志 / 状态机 / 快照<br/>持久设备")]
+  RC --> R2[("Raft 节点 B<br/>日志 / 状态机 / 快照<br/>持久设备")]
+  RC --> R3[("Raft 节点 C<br/>日志 / 状态机 / 快照<br/>持久设备")]
+  E --> RD[("Redis<br/>可删除 cache / wake")]
+  E --> B[("同一 Apache OpenDAL 远程 Blob<br/>pack / idx / manifest / LFS<br/>workspace / checkpoint / backup")]
+  E --> L["本地裸 Git 计算视图<br/>仅可删除物化"]
+  W["独立可选 worker<br/>PG 任务 / outbox / 扫描"] --> PG
+  W --> RD
+  W --> B
+  RC -. "durable cursor / 幂等投影" .-> PG
+  B -. "大字节不进 Raft / Redis / PG 行" .-> RC
+  F["Raft 不可用<br/>禁止 PG refs 回落"] -.-> E
+  G["PG 权限不可用<br/>禁止未授权发布"] -.-> E

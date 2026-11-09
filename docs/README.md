@@ -1,22 +1,32 @@
 # Rootyard 文档
 
-## 设计与架构
+## 当前架构与实施
+
+项目尚未发布。当前规范为 Blob-only standalone / Raft Ref-CAS distributed；旧 GitFS/Pando 运行手册是现有实现参考，不是新的默认部署承诺。
+
+- [当前架构决策](architecture.md)
+- [状态服务契约](design/12-state-services.md)
+- [剩余任务、依赖与验收](design/implementation-plan.md)
+- [新旧 issue 映射](design/issue-map.md)
+
+## 设计与历史记录
 
 - [完整设计目录](design/README.md)
 - [实现状态与计划边界](design/implementation-status.md)
 - [`6d2f0b8` 主分支验收审计](acceptance/main-6d2f0b8-audit.md)
 - [round-2 最终集成交付表（全部 native scope 已验收）](acceptance/round2-delivery.md)
 - [架构图与 Mermaid 源文件](design/architecture-diagrams.md)
-- [最新分期路线与验收闸门](design/08-roadmap.md)
+- [当前实施路线与验收闸门](design/implementation-plan.md)
 - [原始设计快照](design/source-page.md)
-- [ADR 001：当前 GitFS 权威边界](architecture.md)
+- [历史第 08 章旧路线（已被当前计划取代）](design/08-roadmap.md)
+- [当前 Blob-only / Ref-CAS 架构](architecture.md)
 - [ADR 002：操作证据与可靠事件](reliability.md)
 
 ## 运行与实现契约
 
 - [RefStore 持久根、发布决策与部分成功提交](ref-store-roots-decisions.md)
 - [运行与部署](operations.md)
-- [HA 参考配置与物理 HA 未闭项（#26/#43/#44）](operations-HA.md)
+- [历史 Patroni 单主机参考配置与验收范围](operations-HA.md)
 - [OpenDAL Blob 层：配置、回执、删除策略与未实现边界](opendal-blob.md)
 - [Local-envelope KeyProvider 组件：密钥环、AAD、轮换与未接入边界](key-provider.md)
 - [开发与测试、MSRV 1.88 与 fmt/Clippy 门禁工具链](development.md)
@@ -38,7 +48,7 @@
 - [RefStore 显式 gate、短事务 ref CAS 与终态事件增量（#107-A1，部分、未接服务）](ref-store-core-cas.md)
 - [CI source pin、只读镜像、水位 LRU 淘汰、单飞自动回源与跨集群 Runner 队列](ci-mirror.md)（含 [auto_origin.rs](../src/mirror/auto_origin.rs)）
 - [服务端 HTML Web UI、Markdown XSS 净化与大文件 UTF-8 截断预览](../src/web.rs)
-- [多节点仓库分片、一致哈希路由、Epoch 写屏障、自动故障切换、在线重平衡、RPO/RTO 灾备演练与 1/2/4 节点并发压测基准](../src/sharding.rs)（含 [rebalance.rs](../src/sharding/rebalance.rs)、[benchmark.rs](../src/sharding/benchmark.rs)、[060_sharding_fencing.sql](../src/sharding/060_sharding_fencing.sql)）
+- [历史 GitFS 分片/迁移实现与有范围限制的演练](../src/sharding.rs)（含 [rebalance.rs](../src/sharding/rebalance.rs)、[benchmark.rs](../src/sharding/benchmark.rs)、[060_sharding_fencing.sql](../src/sharding/060_sharding_fencing.sql)）
 - [Workspace 本地、增量同步、远程 CAS 恢复、多仓虚拟 Namespace、按需稀疏 VFS、可写 Namespace 跨仓回写、CoW Overlay 沙箱与断电崩溃窗口恢复实验](workspace-foundation.md)（含 [remote.rs](../src/workspace_lab/remote.rs)、[namespace.rs](../src/workspace_lab/namespace.rs)、[vfs.rs](../src/workspace_lab/vfs.rs)、[writable_view.rs](../src/workspace_lab/writable_view.rs)、[crash_recovery.rs](../src/workspace_lab/crash_recovery.rs)）
 - [Namespace、Git View 历史投影策略、签名溯源验签与跨仓 ChangeSet 实验](git-view-foundation.md)（含 [view_lab.rs](../src/view_lab.rs)、[models.rs](../src/view_lab/models.rs)、[namespace.rs](../src/view_lab/namespace.rs)、[projection.rs](../src/view_lab/projection.rs)、[changeset.rs](../src/view_lab/changeset.rs)）
 - [Pando 存储、流式 Delta、图遍历、双算子导出、在线迁移/回滚、S3 对象存储、多 Pack 合并、生命周期 KMS 加密与 SHA-1/SHA-256 双对象格式实验](../experimental/pando/README.md)（含 [migration.rs](../src/pando_lab/migration.rs)、[rollback.rs](../src/pando_lab/rollback.rs)、[object_store.rs](../src/pando_lab/object_store.rs)、[repack.rs](../src/pando_lab/repack.rs)、[lifecycle.rs](../src/pando_lab/lifecycle.rs)、[object_format.rs](../src/pando_lab/object_format.rs)）

@@ -1,0 +1,24 @@
+# Luna Max architecture review
+
+Reviewed the proposed `docs/architecture.md`, `docs/design/12-state-services.md`, and the five current Mermaid diagrams against the requested fresh-install architecture and the recorded PR142 implementation boundary. This is a read-only architecture review; I did not run tests or change runtime code.
+
+The documents now state the key boundaries consistently: the existing GitFS/Pando runtime remains the current default; PR142 provides tested but unserved library increments; the project has not been released; and the new design applies only to fresh installs. Standalone uses one application, business PostgreSQL with `PgRefStore`, in-process cache/wake and workers, and remote OpenDAL Blob. Distributed mode uses Raft Ref-CAS for repository refs, operation terminals, snapshot pins, roots, and per-repository retention state; PostgreSQL retains business authorization/decision intent, global artifact holds, quotas and projections. No PG fallback or cross-store atomicity is claimed.
+
+The protocol now closes the important authority gaps. Distributed commit and cancel outcomes are ordered in the Ref-CAS log. Revocation moves from PG `OPEN` to `CLOSING`, fans out idempotent close barriers to affected groups, uses each Ref-CAS group's persisted floor and receipts to resolve in-flight operations, and remains pending until receipts, projections and required finalizers are accounted for. RPC deadlines stay outside deterministic Raft apply. Fresh restore freezes application workers, Raft mutations and Blob deletion/maintenance, drains or closes unknown operations, binds the PG cut, Ref-CAS snapshot/index and Blob closure in one manifest, and restores under a new history incarnation with old grants fenced. These are proposed contracts, not delivered runtime behavior.
+
+Two implementation details still need explicit acceptance criteria in the task plan:
+
+- Specify how Ref-CAS authenticates a PG-issued grant and binds it to operation identity/digest, repository/group/history, base pin, accepted selection and byte proof. The design names an “authenticated grant” and a trusted installation step, but leaves the mechanism open.
+- Require the global artifact-hold bridge to wait for all affected Ref-CAS root/retirement receipts and reconciled cursors before releasing a cross-repository hold or granting physical deletion. Unknown groups, missing receipts and lagging cursors must keep bytes held.
+
+The diagrams match the text's authority split and recovery barriers. The parent reports that all five diagram sources pass Mermaid 11.12.1 parsing, including the corrected two-party notes. The referenced implementation plan and issue map were not yet present during this review, so task coverage and dependency ordering remain to be reviewed separately.
+
+## Final task-plan review (`target/task-context/final-plan.json`)
+
+The current plan accounts for all 98 source issues: 19 rewrites, 15 new tasks, 8 deliberate architecture-task deletions and all 71 remaining issues with their source open/closed state. The deletion set is limited to #20, #22, #24, #26, #43, #44, #48 and #121. The #121 entry explicitly drops legacy import, old-format upgrade and PG↔Raft authority conversion without a replacement. The #48 original body, progress and checksum are preserved in the linked retired-roadmap archive; the issue map keeps the remaining product children and closed history visible. Security/data-boundary issues including #14/#15/#77/#90/#96/#98 remain preserved.
+
+The prior four draft blockers are corrected in the current plan: #122 has complete scope and depends on all producer integrations, RETENTION_BRIDGE and REMOTE_BACKUP; #120 is explicitly PG+Blob restore and includes PR/CI producer dependencies without waiting on the remote-only #117 projector; #114 is limited to shared RefStore pin/root primitives; and #121 has no migration replacement. The dependency DAG remains acyclic and the single-node qualification path does not acquire Raft/Redis deployment prerequisites. The exact #48 history archive and issue map were inspected.
+
+The latest REMOTE_BACKUP body now closes the paired-cut ambiguity: it requires persistent per-group Ref-CAS business/management write barriers and close receipts covering pending grants/operations, drains or closes unknowns, reconciles PG decision/outbox and projector cursor to the same Raft cut, binds group/history/index and PG cut/cursor with the Blob closure in the manifest, and persists the backup closure/hold before thaw. It correctly leaves Raft consensus replication/election running and says stopping ingress alone is insufficient. This now matches the architecture's restore protocol.
+
+I found no remaining blocking coverage, dependency, or deletion-mapping gap in the reviewed draft. The design and issue map are internally reviewable for the root's planned publication step; this read-only review did not itself publish or delete issues.

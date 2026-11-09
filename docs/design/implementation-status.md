@@ -1,5 +1,29 @@
 # Rootyard 实现状态
 
+本页区分当前目标、候选代码与已验收范围。规范见 [架构](../architecture.md)、[最新实施计划](implementation-plan.md) 和 [任务映射](issue-map.md)。项目尚未发布，不安排旧版本升级或 GitFS 导入。
+
+## 当前基线与剩余工作
+
+源码检查基线：PR #142 最终提交 `49f09c233a88143ce092af556760149aa9571575`。这是尚未合并的候选栈，不把分项完成视作默认服务已替换。
+
+| 能力 | 当前状态 | 后续范围 |
+| --- | --- | --- |
+| OpenDAL Blob、KeyProvider、cache/wake | 有独立组件与限定验收 | 全内容/加密路径接入、provider 与部署边界验收 |
+| PgRefStore 操作身份、CAS、pack 发布、快照和物化 | 有未接服务的库实现 | 统一服务读写入口、正常仓库创建和权限上下文 |
+| artifact holds / durable roots | 有持久账本和真实 PG/Blob/native Git 验收 | PR/CI/Workspace/LFS producers、GC 与完整恢复闭包 |
+| PG decisions / accepted-subset | PR #142 库增量验收通过 | HTTP/业务入口、浏览器与 Merge producer、远程 Raft 决策桥 |
+| Blob-only standalone | 尚未交付为默认部署 | 一个 app + PG + Blob，在无可选服务和空计算目录下完整运行 |
+| Raft Ref-CAS distributed | 尚未交付 | 开源库选型、持久运行时、状态机、RPC、权限桥与 PG 投影 |
+| 全新环境恢复与生产资格 | 现有格式组件恢复有证据 | 新架构 PG/Raft/Blob 一致恢复、独立故障域和容量成本验收 |
+
+PR #142 的真实原生四组为 8+11+12+20=51 场景，零失败、零忽略；最终提交的主 CI、Pando lab 和 RefStore 原生工作流均通过。具体源码、二进制、失败历史和隐私扫描见 [证据](../../evidence/state-services/roots-decisions144/README.md)。这些结果不覆盖完整服务启用、真实 Raft 或物理多机 HA。
+
+## 历史实现与验收索引
+
+以下保留已发生的验收和原提交记录；其中旧“当前”指记录日期，不定义新的架构和 backlog。历史成功不因新设计而被抹除，也不作为新模式的验收结果。
+
+# 历史实现记录
+
 ## 当前：round-4 浏览器与 LFS（above 为历史快照）
 
 集成源 `4c5bcfe56516434ea5b42985e9af90a8c1efe51f`（基线 main `a91c93f`，不可变二进制 `c0049c3a…`，生产输入 `8f399a06…`/331）通过全部 11 个 native coordinator job，独立终审 `APPROVED`（0 P1）：真实 Chromium 登录/发现/Issue+PR/合并/登出并拒绝旧 cookie；可撤销浏览器会话（CSRF/Origin/过期/父令牌撤销准入检查）；真实 stock `git-lfs` + 真实 Garage，删除源 `DATA_DIR` 后由第二进程/新 `DATA_DIR` 经共享 PostgreSQL 取回精确字节；pointer 规范化覆盖官方客户端 LF/CRLF、前导 Unicode 空白/NBSP 与两个 legacy 头，12 类坏 pointer 在 4 条发布路径上共 48 组合全部在 ref 移动前拒绝，18 个官方客户端探针全部匹配；4000 个真实 staging 清理在 native 数据 `ShareLock` 释放前无法删除；离线 format-8/schema-132 恢复撤销旧浏览器会话并在无目标 endpoint 下提供 LFS 字节。生产改动 4 个文件（浏览器与 LFS），**无 DDL**，schema 仍为 132。计数不混用：145 个 Rust 单元测试与 9 份 JSON 报告中的 25 个 case。水化 `0600` 属于加固——旧 `157748a` 适配器本已原子并通过 8 MiB 并发用例，本轮**不是**截断修复；旧二进制真实失败是 CRLF pointer 绕过（保留为标注的旧证据）。单物理主机、loopback 服务与一次性 PostgreSQL/Garage/Chromium，无生产 HA、厂商、云或跨主机声明；#26/#43/#44 与 umbrella #48 保持 OPEN。证据：[round-4 验收](../acceptance/round4-browser-lfs.md)、[evidence bundle](../../evidence/round4/browser-lfs-4c5bcfe/README.md)。

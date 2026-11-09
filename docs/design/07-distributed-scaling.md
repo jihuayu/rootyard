@@ -1,5 +1,7 @@
 # 分布式与横向扩容
 
+> 历史来源快照：本文中的“最新/当前/优先级”仅指归档日期。现行规范见 [状态服务设计](12-state-services.md) 和 [实施计划](implementation-plan.md)，不再要求旧 GitFS 演进或旧版本升级。
+
 > 状态：目标设计；当前默认服务没有远程分片路由、存储接管或 HA。
 > [设计目录](README.md) · [实现状态](implementation-status.md) · [来源与完整归档](source-page.md)
 

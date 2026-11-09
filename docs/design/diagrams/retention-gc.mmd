@@ -1,0 +1,17 @@
+flowchart TB
+  B[("Blob 不可变对象<br/>pack / idx / manifest / LFS<br/>workspace / checkpoint / backup")] --> REG["pack 注册 + byte proof<br/>全局artifact hold + Blob回读核验"]
+  REG --> SNAP["pack snapshot + durable pin"]
+  SNAP --> ROOT["RefStore pin / root / live refs<br/>同权威捕获；release单向"]
+  REF["权威 refs<br/>standalone：PgRefStore<br/>distributed：Ref-CAS"] --> ROOT
+  ROOT --> E{"全部屏障满足？"}
+  GLOBAL["PG全局artifact hold / 跨仓引用 / 删除权"] --> E
+  REF --> E
+  PIN["活动 snapshot / pin / decision"] --> E
+  BK["备份保留 / 恢复点"] --> E
+  PRJ["投影 cursor 已对账"] --> E
+  E -- "否" --> KEEP["保留，不删除"]
+  E -- "是" --> PLAN["GC 计划 + 引用闭包核验<br/>计划中的消费者"]
+  PLAN -. "当前 BlobStore delete 禁用；尚无 GC 消费者" .-> DEL["物理删除（未实现）"]
+  Q["配额：只拒绝新写入，不自动裁剪"] -.-> REG
+  B -. "字节缺失或校验失败" .-> RO["仓库只读；从 Blob/备份恢复；不返回部分对象"]
+  DEL -.-> RO
