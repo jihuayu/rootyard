@@ -33,7 +33,6 @@ impl<'a> Rule<'a> {
 
 pub async fn branch_rule(pool: &Pool, tenant: Uuid, repo: Uuid, rule: Rule<'_>) -> Result<()> {
     let checks = serde_json::to_value(rule.required_checks)?;
-    let checks_text = checks.to_string();
     pool.get()
         .await?
         .execute(
@@ -46,7 +45,7 @@ pub async fn branch_rule(pool: &Pool, tenant: Uuid, repo: Uuid, rule: Rule<'_>) 
                 &repo,
                 &rule.branch_ref,
                 &rule.required_approvals,
-                &checks_text,
+                &checks,
                 &rule.prevent_deletion,
                 &rule.prevent_force_push,
                 &rule.prevent_self_approval,

@@ -148,6 +148,7 @@ pub(crate) async fn select_and_install_metadata(
     let selection_text = digests.selection_digest.as_hex();
     let policy_text = digests.policy_digest.as_hex();
     let facts_text = digests.facts_digest.as_hex();
+    let authz_text = digests.authz_digest.as_hex();
     let deps_text = digests.dependencies_digest.as_hex();
     let captured_text = digests.captured_oid_digest.as_hex();
     let mode_text = metadata_kind(request).as_str();
@@ -177,7 +178,7 @@ pub(crate) async fn select_and_install_metadata(
         &selection_text,
         &policy_text,
         &facts_text,
-        &facts_text,
+        &authz_text,
         &deps_text,
         &captured_text,
         &captured_text,

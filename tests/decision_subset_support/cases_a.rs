@@ -175,8 +175,10 @@ async fn branch_pointing_at_tree_or_blob_is_rejected_per_ref_and_valid_sibling_c
             .await?
             .ok_or_else(|| anyhow!("decision row missing"))?;
         let verdicts = facts::verdicts(&world.db.pool, decision.decision_id).await?;
-        ensure!(code(&verdicts, "refs/heads/tree-tip")? == "ref_not_writable", "tree branch type");
-        ensure!(code(&verdicts, "refs/heads/blob-tip")? == "ref_not_writable", "blob branch type");
+        let tree_code = code(&verdicts, "refs/heads/tree-tip")?;
+        ensure!(tree_code == "bad_object_type", "tree branch type expected bad_object_type, got {tree_code}");
+        let blob_code = code(&verdicts, "refs/heads/blob-tip")?;
+        ensure!(blob_code == "bad_object_type", "blob branch type expected bad_object_type, got {blob_code}");
         ensure!(accepted(&verdicts, "refs/heads/side"), "valid commit sibling missing");
         let refs = facts::refs(&world.db.pool, world.verified.repo).await?;
         ensure!(refs.get("refs/heads/side") == Some(&commit), "valid sibling not committed");

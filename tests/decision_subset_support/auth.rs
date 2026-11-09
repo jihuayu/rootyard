@@ -98,7 +98,7 @@ pub async fn expire_after_millis(pool: &Pool, token_id: Uuid, millis: i64) -> Re
         .get()
         .await?
         .execute(
-            "UPDATE tokens SET expires_at = clock_timestamp() + ($2::text || ' milliseconds')::interval
+            "UPDATE tokens SET expires_at = clock_timestamp() + ($2::bigint::text || ' milliseconds')::interval
              WHERE id=$1",
             &[&token_id, &millis],
         )

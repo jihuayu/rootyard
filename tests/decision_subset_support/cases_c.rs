@@ -1,7 +1,7 @@
 //! Decision/subset integration cases (real PG/S3/native Git).
 use super::assert as facts;
 use super::auth;
-use super::common::seeded;
+use super::common::{accepted, code, seeded};
 use super::fixture::{self};
 use super::metadata;
 use crate::retention_roots_support::db::deadline;
@@ -200,24 +200,64 @@ async fn all_rejected_prefix_and_head_dependency_refusals_leave_no_ref_revision(
         )
         .await?;
 
-        // A batch that would delete a parent and create its child is refused at
-        // plan construction: no partial clear, caller must split the operation.
+        // Atomic keeps the historical whole-batch prefix refusal and creates no
+        // pending operation. AcceptedSubset intentionally accepts the plan and
+        // applies the namespace rule in original order below.
         let operations = facts::operation_count(&world.db.pool, world.verified.repo).await?;
-        let prefix = world
-            .plan_with_head(
-                vec![
-                    fixture::update(fmt, "refs/heads/a", None, Some(&commit))?,
-                    fixture::update(fmt, "refs/heads/a/b", None, Some(&commit))?,
-                ],
-                3,
-                HeadUpdate::Keep,
-            )
-            .await;
-        ensure!(prefix.is_err(), "prefix-conflicting original plan was accepted");
+        let prefix_refs = vec![
+            fixture::update(fmt, "refs/heads/a", None, Some(&commit))?,
+            fixture::update(fmt, "refs/heads/a/b", None, Some(&commit))?,
+        ];
+        let atomic_prefix = world.plan(prefix_refs.clone(), 3, CommitMode::Atomic, HeadUpdate::Keep).await;
+        ensure!(atomic_prefix.is_err(), "Atomic plan accepted prefix-conflicting refs");
         ensure!(
             facts::operation_count(&world.db.pool, world.verified.repo).await? == operations,
-            "refused prefix plan created a pending operation"
+            "refused Atomic prefix plan created a pending operation"
         );
+
+        // Actual accepted-subset runtime: prepare/select/verify/commit the whole
+        // original-order batch, then check the per-ref namespace decision.
+        let before_prefix_memberships = facts::membership_count(&world.db.pool, world.verified.repo).await?;
+        let prefix_plan = world.plan_with_head(prefix_refs, 3, HeadUpdate::Keep).await?;
+        let prefix_identity = prefix_plan.identity().clone();
+        let prefix_receipt = world.commit_receipt(prefix_plan).await?;
+        ensure!(prefix_receipt.is_committed(), "accepted-subset prefix plan was not committed");
+        let prefix_refs_after = facts::refs(&world.db.pool, world.verified.repo).await?;
+        ensure!(
+            prefix_refs_after.get("refs/heads/a") == Some(&commit),
+            "accepted prefix parent `refs/heads/a` was not created"
+        );
+        ensure!(
+            !prefix_refs_after.contains_key("refs/heads/a/b"),
+            "prefix-conflicting child `refs/heads/a/b` was created"
+        );
+        let prefix_decision = facts::decision(&world.db.pool, world.verified.repo, prefix_identity.operation_id())
+            .await?
+            .ok_or_else(|| anyhow!("prefix decision row missing"))?;
+        ensure!(
+            prefix_decision.state == "CONSUMED" && prefix_decision.mode == "accepted_subset",
+            "prefix decision state/mode differs"
+        );
+        let prefix_verdicts = facts::verdicts(&world.db.pool, prefix_decision.decision_id).await?;
+        ensure!(accepted(&prefix_verdicts, "refs/heads/a"), "prefix parent verdict was not accept");
+        ensure!(
+            code(&prefix_verdicts, "refs/heads/a/b")? == "prefix_conflict",
+            "prefix child verdict was not prefix_conflict"
+        );
+        ensure!(
+            facts::gate_revision(&world.db.pool, world.verified.repo).await? == before_revision + 1,
+            "accepted prefix subset did not advance the gate exactly once"
+        );
+        ensure!(
+            facts::membership_count(&world.db.pool, world.verified.repo).await? == before_prefix_memberships,
+            "accepted prefix subset changed pack membership"
+        );
+
+        // The prefix commit moved refs and gate; re-baseline before the dangling
+        // HEAD retarget so any refused effect is measured from the new state.
+        world.refresh_gate().await?;
+        let before_refs = facts::refs(&world.db.pool, world.verified.repo).await?;
+        let before_revision = facts::gate_revision(&world.db.pool, world.verified.repo).await?;
 
         // HEAD retarget to a branch that is not in the final map refuses safely.
         let head_plan = world
