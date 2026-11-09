@@ -89,7 +89,7 @@ EXPECTED_ROOT_COUNTS = {
     "ref_store_core_root_oids": 2,
     "ref_store_core_root_packs": 4,
 
-    "ref_store_core_root_tombstones": 1,
+    "ref_store_core_root_tombstones": 2,
     "ref_store_core_root_receipts": 4,
     "ref_store_core_root_repo_usage": 1,
     "ref_store_core_root_tenant_usage": 1,
@@ -349,7 +349,8 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
         assert quota["repo"]["receipts"] == 4 and quota["tenant"]["receipts"] == 4
         assert quota["repo"]["pack_bindings"] == 4
         assert quota["roots_revision"] is not None
-        assert marker["root_counts"]["tombstones"] == 1
+        # Both ordinary release and release-before-register retain a tombstone.
+        assert marker["root_counts"]["tombstones"] == 2, marker["root_counts"]
         counts = marker["root_family_counts"]
         variable = ("ref_store_core_root_refs", "ref_store_core_root_oids", "ref_store_core_root_packs")
         for table, expected in EXPECTED_ROOT_COUNTS.items():
