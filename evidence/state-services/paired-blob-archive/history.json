@@ -1,0 +1,260 @@
+{
+  "binary_sha256": "bc0abc3ed0ac2c5690581480456532eca17ffbbcb5a2667d10e0a1366845c03b",
+  "blob_profile": {
+    "delete_policy": "disabled",
+    "driver": "opendal",
+    "endpoint_loopback": true,
+    "endpoint_scheme": "http",
+    "root_configured": true,
+    "service": "s3"
+  },
+  "build_receipt_sha256": "565d43a2483956407ccdfbccecced324a75e6293a5c1060985fc7083e7fab42d",
+  "case_count": 7,
+  "cases": [
+    {
+      "detail": {
+        "formats": [
+          {
+            "annotated_tag_peeled": "9ab221ce0850b605bef3dda2148a404719bee33f",
+            "format": "sha1",
+            "refs": 7
+          },
+          {
+            "annotated_tag_peeled": "8900a22c32b891b44e558f3bbd4f15f8947b67a4b685925ddb923992ee6572f5",
+            "format": "sha256",
+            "refs": 7
+          }
+        ]
+      },
+      "name": "refs_match_native_git_and_peel_annotated_tags",
+      "seconds": 17.3442,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "pages": 7,
+        "refs": [
+          "refs/heads/main",
+          "refs/heads/side",
+          "refs/tags/annotated",
+          "refs/tags/blob",
+          "refs/tags/light",
+          "refs/tags/outer",
+          "refs/tags/tree"
+        ]
+      },
+      "name": "refs_filter_cursor_and_limit_roundtrip",
+      "seconds": 6.7222,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "formats": [
+          {
+            "commits": [
+              "9c4fc69b49cea0505f5b9743dfd8ef7efd6d3b29",
+              "9ab221ce0850b605bef3dda2148a404719bee33f",
+              "0fab6469cf2890780dba6580d29ab84d6743ab03"
+            ],
+            "format": "sha1",
+            "pages": 3
+          },
+          {
+            "commits": [
+              "c226e9612d4832be90c457e5439f9dc0b871f5d337dfa826f3a3b6f4f13841ab",
+              "8900a22c32b891b44e558f3bbd4f15f8947b67a4b685925ddb923992ee6572f5",
+              "43408c739250206f07d9291fab24799f903223fd96947ae3f538556e32b43d77"
+            ],
+            "format": "sha256",
+            "pages": 3
+          }
+        ]
+      },
+      "name": "commits_match_native_rev_list_for_sha1_and_sha256",
+      "seconds": 12.7597,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "formats": [
+          {
+            "ancestor_commit": "0fab6469cf2890780dba6580d29ab84d6743ab03",
+            "commits": 4,
+            "format": "sha1",
+            "side_commit": "791dea91c96481dbadc97ff3002fa00e3f007553"
+          },
+          {
+            "ancestor_commit": "43408c739250206f07d9291fab24799f903223fd96947ae3f538556e32b43d77",
+            "commits": 4,
+            "format": "sha256",
+            "side_commit": "6e07a526ddfbf6996f48ad9abebd7bf312d7dd79695756a6263bbce06f3167ff"
+          }
+        ]
+      },
+      "name": "single_commit_detail_matches_native_git",
+      "seconds": 11.6963,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "formats": [
+          {
+            "format": "sha1",
+            "pairs": [
+              {
+                "ahead": 1,
+                "base": "e2ccc119729c8e9a1e4be66848727cf40275e42e",
+                "behind": 1,
+                "fast_forward": false,
+                "head": "21e703eafddc32197214abf46f170234c0cd9a8b",
+                "merge_base": "20458d5fb4aa1e574410cafc1dfb999c7b5cf2d9"
+              },
+              {
+                "ahead": 1,
+                "base": "21e703eafddc32197214abf46f170234c0cd9a8b",
+                "behind": 1,
+                "fast_forward": false,
+                "head": "e2ccc119729c8e9a1e4be66848727cf40275e42e",
+                "merge_base": "20458d5fb4aa1e574410cafc1dfb999c7b5cf2d9"
+              },
+              {
+                "ahead": 0,
+                "base": "e2ccc119729c8e9a1e4be66848727cf40275e42e",
+                "behind": 0,
+                "fast_forward": true,
+                "head": "e2ccc119729c8e9a1e4be66848727cf40275e42e",
+                "merge_base": "e2ccc119729c8e9a1e4be66848727cf40275e42e"
+              },
+              {
+                "ahead": 1,
+                "base": "20458d5fb4aa1e574410cafc1dfb999c7b5cf2d9",
+                "behind": 0,
+                "fast_forward": true,
+                "head": "e2ccc119729c8e9a1e4be66848727cf40275e42e",
+                "merge_base": "20458d5fb4aa1e574410cafc1dfb999c7b5cf2d9"
+              },
+              {
+                "ahead": 0,
+                "base": "e2ccc119729c8e9a1e4be66848727cf40275e42e",
+                "behind": 0,
+                "fast_forward": true,
+                "head": "e2ccc119729c8e9a1e4be66848727cf40275e42e",
+                "merge_base": "e2ccc119729c8e9a1e4be66848727cf40275e42e"
+              }
+            ]
+          },
+          {
+            "format": "sha256",
+            "pairs": [
+              {
+                "ahead": 1,
+                "base": "e981c44deb35789855f479701d533212b1566d6d9e5069d1eeae70ec446d7284",
+                "behind": 1,
+                "fast_forward": false,
+                "head": "8ca617e31adffd292bffb5bb6a364384548d23d4d6c25a1ca4e563865146de8f",
+                "merge_base": "677e30c12c5bdce0d146dc5078cf6b7633ca8b448e2a66b1a57b4b9de768c6cd"
+              },
+              {
+                "ahead": 1,
+                "base": "8ca617e31adffd292bffb5bb6a364384548d23d4d6c25a1ca4e563865146de8f",
+                "behind": 1,
+                "fast_forward": false,
+                "head": "e981c44deb35789855f479701d533212b1566d6d9e5069d1eeae70ec446d7284",
+                "merge_base": "677e30c12c5bdce0d146dc5078cf6b7633ca8b448e2a66b1a57b4b9de768c6cd"
+              },
+              {
+                "ahead": 0,
+                "base": "e981c44deb35789855f479701d533212b1566d6d9e5069d1eeae70ec446d7284",
+                "behind": 0,
+                "fast_forward": true,
+                "head": "e981c44deb35789855f479701d533212b1566d6d9e5069d1eeae70ec446d7284",
+                "merge_base": "e981c44deb35789855f479701d533212b1566d6d9e5069d1eeae70ec446d7284"
+              },
+              {
+                "ahead": 1,
+                "base": "677e30c12c5bdce0d146dc5078cf6b7633ca8b448e2a66b1a57b4b9de768c6cd",
+                "behind": 0,
+                "fast_forward": true,
+                "head": "e981c44deb35789855f479701d533212b1566d6d9e5069d1eeae70ec446d7284",
+                "merge_base": "677e30c12c5bdce0d146dc5078cf6b7633ca8b448e2a66b1a57b4b9de768c6cd"
+              },
+              {
+                "ahead": 0,
+                "base": "e981c44deb35789855f479701d533212b1566d6d9e5069d1eeae70ec446d7284",
+                "behind": 0,
+                "fast_forward": true,
+                "head": "e981c44deb35789855f479701d533212b1566d6d9e5069d1eeae70ec446d7284",
+                "merge_base": "e981c44deb35789855f479701d533212b1566d6d9e5069d1eeae70ec446d7284"
+              }
+            ]
+          }
+        ]
+      },
+      "name": "divergent_branches_compare_matches_native_git",
+      "seconds": 23.2564,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "ancestor": "20458d5fb4aa1e574410cafc1dfb999c7b5cf2d9",
+        "commits": 2,
+        "pages": 2
+      },
+      "name": "commit_listing_from_an_ancestor_paginates",
+      "seconds": 3.806,
+      "status": "passed"
+    },
+    {
+      "detail": {
+        "unauthenticated_endpoints_refused": 4
+      },
+      "name": "unauthenticated_history_reads_are_refused",
+      "seconds": 0.0044,
+      "status": "passed"
+    }
+  ],
+  "expected_cases": [
+    "refs_match_native_git_and_peel_annotated_tags",
+    "refs_filter_cursor_and_limit_roundtrip",
+    "commits_match_native_rev_list_for_sha1_and_sha256",
+    "single_commit_detail_matches_native_git",
+    "divergent_branches_compare_matches_native_git",
+    "commit_listing_from_an_ancestor_paginates",
+    "unauthenticated_history_reads_are_refused"
+  ],
+  "expected_count": 7,
+  "git_sha256": "92c38403054b6d6fef394391bd84beb54ebfaef2f096c1e93b56f5626733c649",
+  "harness_inputs_sha256": {
+    "blob_gateway_browse.py": "b441b041a3858aa08873d32c3fafc8e49d7313f96ffa85e54c76cb6a7fdc0c5e",
+    "blob_gateway_history.py": "eb16715d777a3d3f1f253d4884666f19a500716c8d84cddf056e39c0c8b710de",
+    "blob_only_service.py": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+    "e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+    "native_evidence.py": "a4cdec21201c94ce7c21ebb1852d6ec91c7f57b5a5af528af05cc3c61f1cfe2e",
+    "ops_provenance.py": "f9b3ec80d853b2cf949743be1a0cb95ae19e029e50c3a188e04ae8111a218b37",
+    "owned_fuse_cleanup.py": "1df7299f4ff20199cd338e812fd2d58af8626e024e0130249b864c7a4f0c91de"
+  },
+  "harness_sha256": "eb16715d777a3d3f1f253d4884666f19a500716c8d84cddf056e39c0c8b710de",
+  "inputs_unchanged": true,
+  "kind": "rootyard/blob-history-native-acceptance",
+  "limitations": [
+    "Loopback HTTP, one PostgreSQL server and one configured S3 provider; no HA or physical durability claim.",
+    "This verifies bounded refs/commits/compare JSON, not full legacy web/UI parity, LFS or ref transaction equivalence.",
+    "Compare is exercised on real divergent branches and ancestor -> tip; unrelated histories are not covered.",
+    "Annotated tags to commits, blobs and trees, including tag-of-tag, are checked against native ^{}.",
+    "Blob deletion stays disabled; uploaded fixture objects are not reclaimed by this harness.",
+    "Ordinary functional cases, not security or resource-exhaustion qualification."
+  ],
+  "measurement_kind": "native_execution",
+  "passed": true,
+  "qualification_kind": "clean-candidate",
+  "simulated_fields": false,
+  "skips": 0,
+  "source_head": "4c4abe182f159bad4c6647c4c79e3f721c069bc4",
+  "source_inputs_sha256": "941eccc8b92e792b723b1c65c02bcf396d12a49b64545140f72f99cf348a7053",
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)",
+    "python": "3.12.14"
+  }
+}

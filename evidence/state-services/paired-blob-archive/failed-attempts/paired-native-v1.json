@@ -1,0 +1,58 @@
+{
+  "binary_sha256": "2c4f35dd39697708655e57153d5241a3b8783f0bbfb5628fd1aa1b4368474a2e",
+  "binding_error": "case inventory mismatch: ['real_http_sha1_sha256_source_without_persistent_bare', 'offline_volume_and_postgres_snapshot_barriers']",
+  "blob_only_service_sha256": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+  "cases": [
+    {
+      "detail": {
+        "archive_volume_initialized_by_real_reconcile_cli": true,
+        "closure_artifacts": 8,
+        "formats": [
+          "sha1",
+          "sha256"
+        ],
+        "no_persistent_bare": true,
+        "owned_databases": 2,
+        "real_git_push_clone_fsck": true,
+        "shared_barrier_loss_stops_service": true
+      },
+      "name": "real_http_sha1_sha256_source_without_persistent_bare",
+      "seconds": 14.1428,
+      "status": "passed"
+    },
+    {
+      "error": "positive nonempty pg_refstore paired backup failed (exit 1)",
+      "name": "offline_volume_and_postgres_snapshot_barriers",
+      "seconds": 12.0289,
+      "status": "failed"
+    }
+  ],
+  "ci_release_gate": false,
+  "error": "positive nonempty pg_refstore paired backup failed (exit 1)",
+  "expected_cases": [
+    "real_http_sha1_sha256_source_without_persistent_bare",
+    "offline_volume_and_postgres_snapshot_barriers",
+    "incomplete_and_damaged_archives_rejected_before_sql",
+    "existing_database_and_directory_targets_refused",
+    "post_backup_acknowledged_write_excluded",
+    "fresh_database_restore_clone_refs_content_fsck",
+    "restored_exact_receive_replay_without_second_effect"
+  ],
+  "git_sha256": "92c38403054b6d6fef394391bd84beb54ebfaef2f096c1e93b56f5626733c649",
+  "harness_sha256": "5b9da15657fa75e0db2bbe86146506d941ec88d28fc6fa9676eeb93859593c96",
+  "independent_blob_closure_backup_claimed": false,
+  "kind": "rootyard/paired-blob-backup-restore-acceptance",
+  "limitations": [
+    "Restore requires the same physical Blob backend identity (provider, endpoint, bucket, root, region, account) as the archive; a different backend is refused, not remapped.",
+    "Original Blob objects are deleted only in this run-owned fixture to prove the archive closure; product GC stays disabled and is untouched.",
+    "serve-blob holds the shared lifecycle advisory lock for its whole lifetime; offline backup/restore hold the exclusive one until publication. The legacy volume flock still only covers the native GitFS path.",
+    "No interrupted restore, multi-host failure, physical power-loss, throughput, or production RPO/RTO qualification is claimed.",
+    "No legacy format/schema upgrade is exercised. The current binary must restore its own format22/schema147 archive; format21/schema147 stays readable as a metadata-only historical archive."
+  ],
+  "passed": false,
+  "qualification_kind": "clean-candidate",
+  "retained_directory": "/tmp/rootyard-e2e-xce56ldy",
+  "skips": 0,
+  "source_head": "542cab9be1426d196ef94d95d9baf768b74498c0",
+  "source_inputs_sha256": "ec5a33427d1db00b2738c08c48f87946991688580d8bcf45bd8e836a8ebc3cdd"
+}

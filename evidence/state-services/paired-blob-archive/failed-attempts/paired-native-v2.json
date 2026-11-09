@@ -1,0 +1,58 @@
+{
+  "binary_sha256": "e6491f8430403db22fb25b76b50374a164cf361fee5ce41760a60ffe883e83a6",
+  "binding_error": "case inventory mismatch: ['real_http_sha1_sha256_source_without_persistent_bare', 'offline_volume_and_postgres_snapshot_barriers']",
+  "blob_only_service_sha256": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+  "cases": [
+    {
+      "detail": {
+        "archive_volume_initialized_by_real_reconcile_cli": true,
+        "closure_artifacts": 8,
+        "formats": [
+          "sha1",
+          "sha256"
+        ],
+        "no_persistent_bare": true,
+        "owned_databases": 2,
+        "real_git_push_clone_fsck": true,
+        "shared_barrier_loss_stops_service": true
+      },
+      "name": "real_http_sha1_sha256_source_without_persistent_bare",
+      "seconds": 13.6056,
+      "status": "passed"
+    },
+    {
+      "error": "Command failed (1): Error: backup verification failed; incomplete, unsafe or mismatched files\n",
+      "name": "offline_volume_and_postgres_snapshot_barriers",
+      "seconds": 21.2135,
+      "status": "failed"
+    }
+  ],
+  "ci_release_gate": false,
+  "error": "Command failed (1): Error: backup verification failed; incomplete, unsafe or mismatched files\n",
+  "expected_cases": [
+    "real_http_sha1_sha256_source_without_persistent_bare",
+    "offline_volume_and_postgres_snapshot_barriers",
+    "incomplete_and_damaged_archives_rejected_before_sql",
+    "existing_database_and_directory_targets_refused",
+    "post_backup_acknowledged_write_excluded",
+    "fresh_database_restore_clone_refs_content_fsck",
+    "restored_exact_receive_replay_without_second_effect"
+  ],
+  "git_sha256": "92c38403054b6d6fef394391bd84beb54ebfaef2f096c1e93b56f5626733c649",
+  "harness_sha256": "5b3ac78e008fd996515d5187ca6a115b2080b477b68c6ed22f7ce91baadb5484",
+  "independent_blob_closure_backup_claimed": false,
+  "kind": "rootyard/paired-blob-backup-restore-acceptance",
+  "limitations": [
+    "Restore requires the same physical Blob backend identity (provider, endpoint, bucket, root, region, account) as the archive; a different backend is refused, not remapped.",
+    "Original Blob objects are deleted only in this run-owned fixture to prove the archive closure; product GC stays disabled and is untouched.",
+    "serve-blob holds the shared lifecycle advisory lock for its whole lifetime; offline backup/restore hold the exclusive one until publication. The legacy volume flock still only covers the native GitFS path.",
+    "No interrupted restore, multi-host failure, physical power-loss, throughput, or production RPO/RTO qualification is claimed.",
+    "No legacy format/schema upgrade is exercised. The current binary must restore its own format22/schema147 archive; format21/schema147 stays readable as a metadata-only historical archive."
+  ],
+  "passed": false,
+  "qualification_kind": "clean-candidate",
+  "retained_directory": "/tmp/rootyard-e2e-smxvd5jo",
+  "skips": 0,
+  "source_head": "baa0aa398cda5603961301248f76525741adb9e0",
+  "source_inputs_sha256": "8472ca06265838fc0daaf216584f7897cc7844366bc6f517f0dca291912b278c"
+}

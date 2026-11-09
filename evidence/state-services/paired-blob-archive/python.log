@@ -1,0 +1,24 @@
+.....................................................................................................................................owned-fuse-cleanup: Refusing to open mountpoint outside the fixture-owned workspace-service/mounts UUID layout: '/tmp/rootyard-cleanup-out-j5fis05y/workspace-service/mounts/65809882-03d5-4503-9712-69b31e5dd187'
+owned-fuse-cleanup: Refusing to open mountpoint outside the fixture-owned workspace-service/mounts UUID layout: '/tmp/rootyard-cleanup-out-j5fis05y/workspace-service/mounts/nope'
+.owned-fuse-cleanup: [Errno 20] Not a directory: 'f0ca5d1c-13de-4df0-ad91-577f7fc1faca'
+.owned-fuse-cleanup: FD for '/tmp/rootyard-cleanup-id-wmegk13y/workspace-service/mounts/64a01228-c562-495b-8cc4-df25796763bc' has mnt_id 52, expected 53
+..owned-fuse-cleanup: [Errno 20] Not a directory: 'workspace-service'
+...........................................................................................ss........................................................[main (root-commit) 47d07e8] c1
+ 2 files changed, 1502 insertions(+)
+ create mode 100644 large.txt
+ create mode 100755 script.sh
+[main 5caf9b5] c2
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+ create mode 100644 added.txt
+.PASS status_and_ignore_classification
+PASS changeset_and_atomic_apply
+PASS apply_conflict_fails_closed
+PASS sync_dirty_incremental_and_ignore_exclusion
+PASS verify_readonly_view_and_tamper_detection
+PASS writable_namespace_reverse_mapping_and_agent_leases
+PASS overlay_sandbox_and_power_loss_crash_recovery
+.............................sss.................
+----------------------------------------------------------------------
+Ran 336 tests in 132.743s
+
+OK (skipped=5)
