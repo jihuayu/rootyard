@@ -48,7 +48,10 @@ root bytes against surviving external S3 originals. Every schema table is also
 compared before/after read-only replay. Cluster authority intentionally rotates
 on restore and is not mistaken for immutable RefStore history. Real negative
 UPDATE/DELETE/quota/fence checks and a fresh authenticated clone/fsck complete
-the drill. Metadata archives do not copy external Blob bytes.
+the drill. The final review tightened exact root row/quota/released-root shape
+and Push action assertions; the complete seven cases were rerun successfully.
+CI path filters include Rust, Blob/bootstrap scripts and toolchain inputs.
+Metadata archives do not copy external Blob bytes.
 
 Failed attempts remain in this directory. The first decision run exposed an
 actual metadata INSERT bug: authz parameter25 repeated the facts digest. It was

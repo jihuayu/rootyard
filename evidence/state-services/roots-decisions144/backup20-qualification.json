@@ -9,17 +9,17 @@
     "--binary",
     "/workspace/scratch/state144-app-v2/rootyard",
     "--report",
-    "/workspace/scratch/state144-backup20-native-v6/native.json",
+    "/workspace/scratch/state144-backup20-native-v8/native.json",
     "--roots-decisions-fixture-binary",
     "/workspace/scratch/state144-backup-helper-build-v5/ref_store_roots_decisions_backup_fixture"
   ],
-  "seconds": 146.449,
+  "seconds": 151.109,
   "before": {
     "source": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
     "binary": "ec09afd7ae6ba23f4e0e0c9d98befe9e8ee11e7bf13c215e74e36f8b8ad00beb",
-    "head": "0ca638d4e4772221a686f992a46c17fcfb0bfced",
+    "head": "a1daf4f30bf51ffc8734785854cccb6c46b7f005",
     "harness": {
-      "tests/backup_refstore_roots_decisions144.py": "7da4a513aed304eac85871f09de034c6d0937d4c109b8d98218faf617cbe69d8",
+      "tests/backup_refstore_roots_decisions144.py": "58177e9af6eeaa72d4ffc6857dc2cee94e05f797fd977d2627501e601dc71f48",
       "tests/schema_baseline.py": "ee8f6b07e314105f3afd660bc0cdffc85b8f7d87f931acf71374d3348c51c729",
       "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
       "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
@@ -48,9 +48,9 @@
   "after": {
     "source": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
     "binary": "ec09afd7ae6ba23f4e0e0c9d98befe9e8ee11e7bf13c215e74e36f8b8ad00beb",
-    "head": "0ca638d4e4772221a686f992a46c17fcfb0bfced",
+    "head": "a1daf4f30bf51ffc8734785854cccb6c46b7f005",
     "harness": {
-      "tests/backup_refstore_roots_decisions144.py": "7da4a513aed304eac85871f09de034c6d0937d4c109b8d98218faf617cbe69d8",
+      "tests/backup_refstore_roots_decisions144.py": "58177e9af6eeaa72d4ffc6857dc2cee94e05f797fd977d2627501e601dc71f48",
       "tests/schema_baseline.py": "ee8f6b07e314105f3afd660bc0cdffc85b8f7d87f931acf71374d3348c51c729",
       "tests/e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
       "tests/backup.py": "2a1b99cdb8fce50790797396b44b5cba17afbb1485157a0bbdbc261e59a31376",
@@ -180,12 +180,12 @@
       {
         "name": "synthetic_source_with_typed_roots_and_decision_ledger",
         "status": "passed",
-        "seconds": 15.874,
+        "seconds": 17.1056,
         "detail": {
           "fresh_databases": 2,
           "live_server_backup_rejected": true,
           "unknown_and_unfinished_journal": true,
-          "direct_sql_core_fixture_repository": "5d0a0f01-267f-4b14-b578-9f5708b2cb44",
+          "direct_sql_core_fixture_repository": "fe1ceba9-ca09-4ea2-a683-5f4b76042797",
           "core_fixture_is_adapter_or_protocol_acknowledgement": false,
           "populated_fixture_rows_by_table": {
             "ref_store_issuer_lanes": 1,
@@ -253,11 +253,11 @@
       {
         "name": "offline_barriers_and_snapshot",
         "status": "passed",
-        "seconds": 16.3773,
+        "seconds": 17.1625,
         "detail": {
           "snapshot_includes_commit_after_barrier_wait": true,
           "inherited_volume_lock_rejected": true,
-          "backup_seconds": 12.56093798,
+          "backup_seconds": 13.266581567,
           "backup_format": 20,
           "archive_contains_schema_versions": [
             138,
@@ -311,7 +311,7 @@
       {
         "name": "unsafe_or_corrupt_inputs",
         "status": "passed",
-        "seconds": 70.5506,
+        "seconds": 73.1652,
         "detail": {
           "corrupt_missing_extra_traversal_symlink_rejected_before_sql": true,
           "existing_targets_and_overlap_refused": true,
@@ -321,7 +321,7 @@
       {
         "name": "backup_barrier_failures",
         "status": "passed",
-        "seconds": 12.5088,
+        "seconds": 11.8877,
         "detail": {
           "exporter_connection_loss_no_publication": true,
           "queued_ddl_bounded_safe_failure": true
@@ -330,31 +330,31 @@
       {
         "name": "interrupted_restore_guard",
         "status": "passed",
-        "seconds": 10.4772,
+        "seconds": 10.2583,
         "detail": {
           "killed_parent_while_native_pg_restore_blocked": true,
           "no_orphan_import_or_partial_sql": true,
           "persistent_guard_blocks_startup": true,
-          "restore_guard_preflight_seconds": 5.901,
-          "native_pg_restore_blocked_seconds": 3.429
+          "restore_guard_preflight_seconds": 6.061,
+          "native_pg_restore_blocked_seconds": 3.06
         }
       },
       {
         "name": "post_backup_write_not_in_snapshot",
         "status": "passed",
-        "seconds": 1.6028,
+        "seconds": 1.6421,
         "detail": {
           "post_backup_acknowledged_commit": true,
-          "seconds_after_backup_boundary": 111.743
+          "seconds_after_backup_boundary": 114.48
         }
       },
       {
         "name": "new_environment_restore_schema144_roots_decisions_clone_fsck",
         "status": "passed",
-        "seconds": 16.9313,
+        "seconds": 17.7543,
         "detail": {
-          "backup_id": "1687ba00-abca-47c9-bd9b-e4d02680f8a5",
-          "elapsed_seconds": 10.224169523,
+          "backup_id": "50f39b7e-2def-4be3-ae75-e876fb84e3b9",
+          "elapsed_seconds": 9.926114917,
           "restored": true,
           "started_service": false,
           "unknown_operations": 1,

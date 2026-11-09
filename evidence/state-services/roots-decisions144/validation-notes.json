@@ -28,6 +28,7 @@
     "Backup v2/v3: ordinary release also retains a tombstone; duplicate JSON cancellation count key and stale protocol marker corrected.",
     "Backup v4: exact retained-ledger hashes matched, but fixture reconstruction lost a refused registration request ID with no receipt; preserve intent metadata independently of receipts.",
     "Backup v5: restored ledgers and full-schema read-only checks passed; a negative quota mutation was correctly refused but its expected trigger-error wording was stale. Corrected the assertion, not the trigger.",
+    "Final reviewer follow-ups tighten exact root rows/released shape/Push action and broaden CI input paths; the initial added capture-revision assertion guessed all four mutations, corrected to the two registrations after reading the actual protocol. Release fences are head generations.",
     "Unfiltered Python discovery requires unrelated native executables/kernel fixtures absent from this worktree; its failures are retained. The selected source-only run explicitly excludes those modules and reports 286 tests, 6 skips."
   ],
   "boundaries": [

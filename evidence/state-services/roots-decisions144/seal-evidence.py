@@ -24,7 +24,7 @@ for target, folder in [('roots', 'state144-roots-native-v3'), ('decisions', 'sta
     copy(scratch / folder / 'native.log', target + '.log')
 
 for kind, folder in [('schema', 'state144-schema-native-v1'), ('legacy19', 'state144-legacy19-native-v1'),
-                     ('backup20', 'state144-backup20-native-v6')]:
+                     ('backup20', 'state144-backup20-native-v8')]:
     assert json.loads((scratch / folder / 'qualification.json').read_text())['passed']
     for filename in ('qualification.json', 'native.log', 'native.json'):
         if (scratch / folder / filename).is_file():
@@ -35,6 +35,9 @@ for label, folder in [('roots-first-five-of-eight', 'state144-roots-native-v1'),
                       ('decisions-first-eleven-of-twenty', 'state144-decisions-native-v1')]:
     for filename in ('qualification.json', 'native.log'):
         copy(scratch / folder / filename, label + '-' + filename)
+for filename in ('qualification.json', 'native.log', 'native.json'):
+    copy(scratch / 'state144-backup20-native-v6' / filename, 'backup20-previous-passed-v6-' + filename)
+    copy(scratch / 'state144-backup20-native-v7' / filename, 'backup20-assertion-tightening-v7-' + filename)
 for version in range(1, 6):
     for filename in ('qualification.json', 'native.log', 'native.json'):
         copy(scratch / ('state144-backup20-native-v' + str(version)) / filename,
@@ -80,6 +83,7 @@ notes = {
         'Backup v2/v3: ordinary release also retains a tombstone; duplicate JSON cancellation count key and stale protocol marker corrected.',
         'Backup v4: exact retained-ledger hashes matched, but fixture reconstruction lost a refused registration request ID with no receipt; preserve intent metadata independently of receipts.',
         'Backup v5: restored ledgers and full-schema read-only checks passed; a negative quota mutation was correctly refused but its expected trigger-error wording was stale. Corrected the assertion, not the trigger.',
+        'Final reviewer follow-ups tighten exact root rows/released shape/Push action and broaden CI input paths; the initial added capture-revision assertion guessed all four mutations, corrected to the two registrations after reading the actual protocol. Release fences are head generations.',
         'Unfiltered Python discovery requires unrelated native executables/kernel fixtures absent from this worktree; its failures are retained. The selected source-only run explicitly excludes those modules and reports 286 tests, 6 skips.',
     ],
     'boundaries': [

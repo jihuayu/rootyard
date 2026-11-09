@@ -1,0 +1,12 @@
+{
+  "reviewer": "Luna Max",
+  "kind": "source-only; no Cargo/native/service execution by reviewer",
+  "findings_closed": [
+    "Workflow filters include src/**, scripts/** and rust-toolchain.toml, including Blob/bootstrap/auth dependency changes.",
+    "Fixture consumption action must equal push; unsupported Merge cannot satisfy the assertion.",
+    "All root table counts are exact; released capture has exactly one ref/OID and two complete registered packs, with the same captured refs/head/pack identities and a distinct binding."
+  ],
+  "root_followup": "Actual native tightening first caught an incorrect added expectation of four capture revisions. The protocol increments on its two registrations; releases fence through head generations. Corrected the assertion to exact two without changing implementation. The complete seven-case backup was rerun and passed under the tightened assertions.",
+  "production_inputs_unchanged": true,
+  "final_backup": "state144-backup20-native-v8"
+}
