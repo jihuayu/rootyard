@@ -28,6 +28,8 @@ PR [#159](https://github.com/jihuayu/rootyard/pull/159) 提供显式 `serve-blob
 
 2026-11-09，本次干净候选 `f1889aa` 在同一绑定二进制上通过 HTTP/Git 11/11、Browse 7/7、严格 all-targets Clippy 和 456 项 Rust 库测试（另有 9 项显式忽略）。真实验收发现并修复了 LFS 指针扫描无法承载换行文件名的问题，特殊文件名分页夹具完整保留。完整报告、构建记录与失败历史见 [后续验收证据](../../evidence/state-services/standalone147-followup/README.md)。这些是同机功能结果，不等于默认服务、独立备份或分布式发布资格。
 
+最新干净候选 `7690758` 增加 refs、提交列表/详情和 compare JSON API：原生 Git 负责类型、标签递归剥离、提交遍历、merge-base、ahead/behind 和 diff。带注解标签可以指向 commit、blob 或 tree；历史读取支持当前 refs 可达的祖先 full OID。消息、遍历、子进程输出及 JSON 编码都有明确上限，超限拒绝。独立原生期望值下 SHA-1/SHA-256 历史 7/7、原有 HTTP 11/11、tree/blob 7/7 均零跳过通过；Rust 库测试 464 通过、9 项服务依赖测试显式忽略，最小依赖 all-targets Clippy 通过。实现与独立 review 使用官方 DeepSeek subagent，Root 整合并实测。详细源码/二进制绑定和失败历史见 [后续验收证据](../../evidence/state-services/deepseek-followup/README.md)。这仍不代表整个 #144 的 ref 事务/业务等价性或默认入口替换完成。
+
 备份仍是明确阻塞：format21/schema147 的 catalog 支持不等于非空 Blob 仓库备份。`backup::git_inventory` 仍要求 ready 仓库存在持久 bare Git，因此 `pg_refstore` 仓库的正向备份会失败；OpenDAL 内容闭包也尚未导出归档。`serve-blob` 当前不持有 legacy volume flock 或检查其 restore guard，不能套用旧服务的在线备份屏障结论。新增 `tests/backup_blob_serving147.py` 保留严格正向失败，未接入 CI；即使后续通过，它在保留原 Blob 的条件下只证明 PG 元数据恢复，独立 PG+Blob 闭包恢复仍需 #120 实现。不得伪造 bare 仓库或跳过检查来标记备份完成。
 
 LFS、PR/Merge、Workspace、CI/Namespace 的新服务接入、默认入口替换，以及 Raft 运行时、远程桥和多主机资格仍待完成。实施 issue 只有在相关实现合并并完成对应真实验收后关闭。
