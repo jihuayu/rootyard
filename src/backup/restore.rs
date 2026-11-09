@@ -44,6 +44,17 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(error.into()),
     };
+    let has_blob = match fs::symlink_metadata(source.join("blob")) {
+        Ok(meta) => {
+            ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "invalid Blob closure directory");
+            for (name, entry) in inventory(&source.join("blob"))? {
+                actual.insert(format!("blob/{name}"), entry);
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
     let dump = source.join("metadata.dump");
     let metadata = fs::symlink_metadata(&dump)?;
     ensure!(metadata.is_file() && metadata.nlink() == 1, "invalid dump file");
@@ -69,14 +80,6 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
     if has_pando {
         allowed.push("pando".into());
     }
-    let has_blob = match fs::symlink_metadata(source.join("blob")) {
-        Ok(meta) => {
-            ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "invalid Blob closure directory");
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error.into()),
-    };
     if has_blob {
         allowed.push("blob".into());
     }
@@ -113,15 +116,25 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
             }
             ensure!(manifest.refstore.is_some(), "paired archive carries no RefStore carry map");
             ensure!(
-                actual.keys().filter(|name| name.starts_with("blob/")).count() == manifest.blob_artifacts.len(),
+                actual.iter().filter(|(name, entry)| name.starts_with("blob/") && entry.kind == "file").count()
+                    == manifest.blob_artifacts.len(),
                 "Blob closure member inventory differs from its artifact locators"
             );
         }
         FORMAT => ensure!(
-            manifest.blob_closure.is_none() && manifest.blob_artifacts.is_empty() && !has_blob,
+            manifest.blob_closure.is_none()
+                && manifest.blob_artifacts.is_empty()
+                && manifest.refstore.is_none()
+                && !has_blob,
             "metadata archive must not carry Blob bytes or locators"
         ),
-        _ => {}
+        _ => ensure!(
+            manifest.blob_closure.is_none()
+                && manifest.blob_artifacts.is_empty()
+                && manifest.refstore.is_none()
+                && !has_blob,
+            "historical archive must not carry paired Blob members"
+        ),
     }
     allowed.sort();
     ensure!(names == allowed, "unexpected backup files");
