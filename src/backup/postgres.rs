@@ -157,17 +157,52 @@ pub(super) async fn schema(client: &(impl GenericClient + Sync), format: u32) ->
     Ok(versions)
 }
 pub(super) async fn repositories(client: &(impl GenericClient + Sync)) -> Result<Vec<Repository>> {
-    Ok(client.query("SELECT r.id,r.storage_generation,r.state,r.recovery_reason,r.incident_revision,(SELECT count(*) FROM public.git_operations o WHERE o.repository_id=r.id AND o.outcome='unknown') FROM public.repositories r ORDER BY r.id", &[]).await?.iter().map(|r| Repository {
-        id: r.get(0), generation: r.get(1), state: r.get(2), recovery_reason: r.get(3), incident_revision: r.get(4), unknown_operations: r.get(5), refs: None, head: None,
-    }).collect())
+    Ok(client
+        .query(
+            "SELECT r.id,r.storage_generation,r.state,r.recovery_reason,r.incident_revision,r.storage_backend,
+                    (SELECT count(*) FROM public.git_operations o WHERE o.repository_id=r.id AND o.outcome='unknown')
+                  + (SELECT count(*) FROM public.ref_store_operations o
+                      WHERE o.repository_id=r.id AND o.state NOT IN ('committed','rejected','cancelled'))
+               FROM public.repositories r ORDER BY r.id",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|r| Repository {
+            id: r.get(0),
+            generation: r.get(1),
+            state: r.get(2),
+            recovery_reason: r.get(3),
+            incident_revision: r.get(4),
+            backend: r.get(5),
+            unknown_operations: r.get(6),
+            refs: None,
+            head: None,
+        })
+        .collect())
 }
 pub(super) async fn git_inventory(config: &Config, root: &Path, repos: &mut [Repository], fsck: bool) -> Result<()> {
     for repo in repos {
         let path = root.join("repos").join(format!("{}.git", repo.id));
+        // The storage backend decides where the native authority lives: a
+        // `pg_refstore` repository is served entirely from PostgreSQL refs and
+        // OpenDAL pack bytes, so no persistent bare repository may exist (and
+        // one would be a second write authority). Any other backend is the
+        // legacy native volume and must still have its bare repository.
+        if repo.backend == "pg_refstore" {
+            ensure!(
+                fs::symlink_metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+                "pg_refstore repository must not have a persistent bare repository"
+            );
+            // PG binding and artifact checks run against the caller's exported
+            // snapshot, or after SQL import; this stage validates files only.
+            continue;
+        }
         if !path.exists() {
             ensure!(repo.state == "provisioning", "ready or recovering repository missing");
             continue;
         }
+        repo.backend = "gitfs".into();
         for name in
             ["objects/info/alternates", "objects/info/http-alternates", "shallow", "commondir", "gitdir", "worktrees"]
         {

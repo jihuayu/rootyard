@@ -19,7 +19,7 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
     ensure!(expected.len() == 64 && hash(&source.join("manifest.json"))? == expected, "incomplete or damaged manifest");
     let manifest: Manifest = serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
     ensure!(
-        matches!(manifest.format, 4..=21)
+        matches!(manifest.format, 4..=22)
             && manifest.schema_versions == schema_versions(manifest.format)?
             && manifest.schema_contract_sha256 == schema_contract_digest(manifest.format)?,
         "unsupported backup format"
@@ -68,6 +68,59 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
     let mut allowed = ["COMPLETE", "manifest.json", "metadata.dump", "volume"].map(std::ffi::OsString::from).to_vec();
     if has_pando {
         allowed.push("pando".into());
+    }
+    let has_blob = match fs::symlink_metadata(source.join("blob")) {
+        Ok(meta) => {
+            ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "invalid Blob closure directory");
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if has_blob {
+        allowed.push("blob".into());
+    }
+    // The archive version and its members must agree exactly: a paired archive
+    // carries locators, a closure summary and a blob/ tree; a format21 archive
+    // carries none of them and is never presented as an independent backup.
+    match manifest.format {
+        FORMAT_PAIRED => {
+            let closure = manifest.blob_closure.as_ref().context("paired archive carries no Blob closure")?;
+            ensure!(has_blob, "paired archive is missing its Blob byte closure");
+            ensure!(
+                closure.artifacts == manifest.blob_artifacts.len(),
+                "Blob closure count differs from its artifact locators"
+            );
+            ensure!(
+                closure.bytes == manifest.blob_artifacts.iter().map(|a| a.length).sum::<u64>(),
+                "Blob closure byte total differs from its artifact locators"
+            );
+            ensure!(
+                closure.digest
+                    == ledger::closure_of(&manifest.blob_artifacts, &closure.backend_identity, &closure.provider)
+                        .digest,
+                "Blob closure digest differs from its artifact locators"
+            );
+            for artifact in &manifest.blob_artifacts {
+                let entry =
+                    manifest.files.get(&artifact.archive_path()).context("paired archive is missing an artifact")?;
+                ensure!(
+                    entry.bytes == artifact.length && entry.sha256.as_deref() == Some(artifact.sha256.as_str()),
+                    "archived Blob member differs from its locator"
+                );
+                ensure!(!artifact.attempt_id.is_nil(), "Blob locator has no attempt id");
+            }
+            ensure!(manifest.refstore.is_some(), "paired archive carries no RefStore carry map");
+            ensure!(
+                actual.keys().filter(|name| name.starts_with("blob/")).count() == manifest.blob_artifacts.len(),
+                "Blob closure member inventory differs from its artifact locators"
+            );
+        }
+        FORMAT => ensure!(
+            manifest.blob_closure.is_none() && manifest.blob_artifacts.is_empty() && !has_blob,
+            "metadata archive must not carry Blob bytes or locators"
+        ),
+        _ => {}
     }
     allowed.sort();
     ensure!(names == allowed, "unexpected backup files");
@@ -212,7 +265,10 @@ pub async fn restore(
         );
     }
     let mut client = pg(config).await?;
-    client.query_one("SELECT pg_advisory_lock(738390103)", &[]).await?;
+    // Real lifecycle barrier shared with serve-blob, regardless of the target
+    // volume: it is held until the restored target is published.
+    let mutex = BackupMutex::acquire(&client).await?;
+    ensure_database_available(&client).await?;
     database_scope(&client, true).await?;
     let object_count: i64 = client.query_one("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'", &[]).await?.get(0);
     ensure!(object_count == 0, "restore requires a fresh empty dedicated database");
@@ -229,6 +285,7 @@ pub async fn restore(
     let guard = restore_guard_path(&target)?;
     write_private(&guard, format!("{}\n", manifest.backup_id).as_bytes())?;
     File::open(target.parent().unwrap())?.sync_all()?;
+    lifetime::restore_marker(&client, Some(manifest.backup_id)).await?;
     let staging = target.parent().unwrap().join(format!(".rootyard-restore-{}.partial", Uuid::new_v4()));
     let entries = manifest
         .files
@@ -320,7 +377,7 @@ pub async fn restore(
             .get(0);
         ensure!(!unsafe_grants, "restored checkout credentials were not invalidated");
     }
-    if manifest.format >= 6 {
+    if manifest.format >= 6 && manifest.format != FORMAT_PAIRED {
         authority::fence(&client).await?;
         // Rotate the storage authority exactly once for the whole restored
         // database before importing any repository closure. Per-repository
@@ -357,14 +414,41 @@ pub async fn restore(
             }
         }
     }
+    if manifest.format == FORMAT_PAIRED {
+        let closure = manifest.blob_closure.as_ref().context("paired archive carries no Blob closure")?;
+        ensure!(
+            manifest.repositories.iter().all(|r| r.backend == "pg_refstore"),
+            "mixed legacy/Blob restore is unsupported"
+        );
+        ensure!(
+            Some(ledger::carry(&client).await?) == manifest.refstore,
+            "restored RefStore rows differ from the archive cut"
+        );
+        authority::fence(&client).await?;
+        let profile = crate::blob_store::config::BlobProfile::from_env()?;
+        let store = crate::blob_store::opendal::BlobStore::open(profile)?;
+        let transfer = crate::blob_store::archive::ArchiveTransfer::new(store);
+        ensure!(
+            transfer.backend_identity_hex() == closure.backend_identity && transfer.provider() == closure.provider,
+            "restore target Blob backend identity differs from the archive"
+        );
+        let until = Instant::now() + std::time::Duration::from_secs(3600);
+        blob_closure::import(&client, &transfer, &manifest.blob_artifacts, &source, until, &mutex).await?;
+    }
     ensure!(!target.exists(), "destination appeared during restore");
+    // Keep the exclusive lifecycle barrier until the restored target is
+    // published, so no serving process can start inside this gap.
+    mutex.ensure_held(&client).await?;
     publish(&staging, &target)?;
     File::open(target.parent().unwrap())?.sync_all()?;
     fs::remove_file(&guard)?;
     File::open(target.parent().unwrap())?.sync_all()?;
+    lifetime::restore_marker(&client, None).await?;
+    mutex.release(&client).await?;
+    drop(client);
     println!(
         "{}",
-        serde_json::json!({"backup_id":manifest.backup_id,"restored":true,"started_service":false,"elapsed_seconds":started.elapsed().as_secs_f64(),"unknown_operations":manifest.repositories.iter().map(|r|r.unknown_operations).sum::<i64>()})
+        serde_json::json!({"backup_id":manifest.backup_id,"restored":true,"started_service":false,"blob_artifacts":manifest.blob_artifacts.len(),"elapsed_seconds":started.elapsed().as_secs_f64(),"unknown_operations":manifest.repositories.iter().map(|r|r.unknown_operations).sum::<i64>()})
     );
     Ok(())
 }

@@ -49,6 +49,7 @@
 //! no persistent hold ledger and no storage-membership model. Nothing here
 //! enables deletion or claims a production serving path.
 
+pub(crate) mod archive;
 mod backend_identity;
 pub mod budget;
 pub mod config;

@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
-"""Executable #120 gap test: current-format metadata restore of served Blob repos.
+"""Current format22/schema147 PG + Blob paired backup/restore drill.
 
-Requires an attested absolute --binary, trusted --git, a disposable PostgreSQL
-17 administrator with CREATEDB, and the strict S3 profile used by
-blob_only_service.py. Creates and drops only run-owned databases. All ready
-repositories, packs and acknowledgements come from real HTTP/stock Git traffic.
-
-This is deliberately NOT a green qualification of the present implementation:
-backup::git_inventory currently requires a persistent bare repo even for a ready
-pg_refstore repository, so the positive snapshot case must fail until production
-backup supports that backend. Do not bypass that check or fabricate a bare repo.
-
-Even after that gap is fixed, this drill retains the same external Blob originals
-and tests restored metadata against them. It does NOT back up Blob bytes or prove
-that the archive independently contains a complete Blob closure. It is not wired
-into CI and does not establish #120 completion.
+Requires an attested binary, PostgreSQL 17 with CREATEDB, the strict S3 profile,
+and boto3 (tests/requirements-blob-backup.txt). Only run-owned databases and an
+independent UUID Blob prefix are used. Ready state and ACKs come from HTTP/Git.
+The drill verifies and deletes the exact original pack/idx objects, then must
+rebuild them from the archive at unchanged locators before clone/fsck/replay.
+Product GC stays disabled. This is fresh PG/Blob functionality, not LFS,
+workspace, interrupted-restore, physical durability or HA qualification.
 """
 import argparse
 import fcntl
@@ -35,7 +28,7 @@ from blob_only_service import (
     receive_pack_request, sensitive_values, sha256_file, validate_report_cases,
     write_report,
 )
-from schema_baseline import CURRENT_BACKUP_FORMAT, CURRENT_SCHEMA_VERSION, SCHEMA_VERSIONS, catalog_tables
+from schema_baseline import CURRENT_BLOB_BACKUP_FORMAT as CURRENT_BACKUP_FORMAT, CURRENT_SCHEMA_VERSION, SCHEMA_VERSIONS, catalog_tables
 
 CASES = (
     "real_http_sha1_sha256_source_without_persistent_bare",
@@ -47,13 +40,11 @@ CASES = (
     "restored_exact_receive_replay_without_second_effect",
 )
 LIMITATIONS = [
-    "Known production gap: nonempty pg_refstore backup currently requires a missing persistent bare repository; the positive snapshot must fail.",
-    "External Blob originals remain in the same provider/root; no Blob bytes are exported or imported by this drill.",
-    "The archive is not qualified as an independent PG+Blob closure backup or as #120 completion.",
-    "The operator stops serve-blob before backup; serve-blob currently does not hold the legacy volume flock or check its restore guard.",
+    "Restore requires the same physical Blob backend identity (provider, endpoint, bucket, root, region, account) as the archive; a different backend is refused, not remapped.",
+    "Original Blob objects are deleted only in this run-owned fixture to prove the archive closure; product GC stays disabled and is untouched.",
+    "serve-blob holds the shared lifecycle advisory lock for its whole lifetime; offline backup/restore hold the exclusive one until publication. The legacy volume flock still only covers the native GitFS path.",
     "No interrupted restore, multi-host failure, physical power-loss, throughput, or production RPO/RTO qualification is claimed.",
-    "No legacy format/schema upgrade is exercised. The current binary must restore its own format21/schema147 archive.",
-    "Remote Blob deletion is disabled; objects under this run's private prefix are retained.",
+    "No legacy format/schema upgrade is exercised. The current binary must restore its own format22/schema147 archive; format21/schema147 stays readable as a metadata-only historical archive.",
 ]
 
 
@@ -71,7 +62,8 @@ class Drill(BlobOnlyHarness):
         self.source_scratch = self.scratch
         self.specs = []
         prefix = self.env.get("ROOTYARD_BLOB_ROOT", "").rstrip("/")
-        self.env["ROOTYARD_BLOB_ROOT"] = "/".join(filter(None, (prefix, "backup147-" + uuid.uuid4().hex)))
+        self.owned_blob_suffix = "backup147-" + uuid.uuid4().hex
+        self.env["ROOTYARD_BLOB_ROOT"] = "/".join(filter(None, (prefix, self.owned_blob_suffix)))
         self.secrets.extend(sensitive_values(os.environ))
         self.secrets.extend((self.restore_admin, self.env["ROOTYARD_BLOB_ROOT"]))
         for value in (self.admin, self.restore_admin):
@@ -109,7 +101,6 @@ class Drill(BlobOnlyHarness):
 
     def no_bare(self, repo, stage):
         directory = Path(self.env["ROOTYARD_DATA_DIR"]) / "repos"
-        assert not list(directory.glob("*.git")), "persistent bare exists: " + stage
         assert not directory.joinpath(repo["id"] + ".git").exists(), "persistent bare exists: " + stage
 
     def new_database(self, admin):
@@ -144,15 +135,77 @@ class Drill(BlobOnlyHarness):
             result[table] = {"count": int(count), "sha256": digest}
         return result
 
+    def artifact_rows(self, database=None):
+        """Exact original locators of the closure, from the real hold ledger."""
+        raw = self.query(database or self.source_db,
+            "SELECT encode(sha256(convert_to(coalesce(string_agg(x, E'\\n' ORDER BY x), ''), 'UTF8')), 'hex') FROM ("
+            "SELECT a.repository_id::text || ':' || a.pack_id::text || ':' || a.role || ':' || a.hold_id::text || ':' ||"
+            "h.attempt_id::text || ':' || h.storage_tenant_id::text || ':' || h.authority_id::text || ':' ||"
+            "h.authority_generation::text || ':' || h.namespace || ':' || h.sha256 || ':' || h.content_length::text AS x "
+            "FROM public.ref_store_core_pack_artifacts a JOIN public.artifact_holds h ON h.hold_id=a.hold_id "
+            "ORDER BY x) rows")
+        count = int(self.query(database or self.source_db, "SELECT count(*) FROM public.ref_store_core_pack_artifacts"))
+        assert count > 0 and len(raw) == 64
+        return {"count": count, "sha256": raw}
+
+    def s3_client(self):
+        import boto3
+        from botocore.config import Config
+        return boto3.client("s3", endpoint_url=self.env["ROOTYARD_BLOB_ENDPOINT"],
+            region_name=self.env["ROOTYARD_BLOB_REGION"],
+            aws_access_key_id=self.env["ROOTYARD_BLOB_ACCESS_KEY_ID"],
+            aws_secret_access_key=self.env["ROOTYARD_BLOB_SECRET_ACCESS_KEY"],
+            config=Config(signature_version="s3v4", connect_timeout=2, read_timeout=5,
+                          retries={"max_attempts": 1, "mode": "standard"}, s3={"addressing_style": "path"}))
+
+    def verify_original(self, client, locator):
+        import hashlib
+        key = self.env["ROOTYARD_BLOB_ROOT"].rstrip("/") + "/" + locator["key"]
+        obj = client.get_object(Bucket=self.env["ROOTYARD_BLOB_BUCKET"], Key=key)
+        assert obj["ContentLength"] == locator["length"], "original object length differs"
+        total, digest = 0, hashlib.sha256()
+        try:
+            while chunk := obj["Body"].read(65536):
+                total += len(chunk)
+                assert total <= locator["length"], "original exceeded its declared length"
+                digest.update(chunk)
+        finally:
+            obj["Body"].close()
+        assert total == locator["length"] and digest.hexdigest() == locator["sha256"], "original byte digest differs"
+        return key
+
+    def delete_originals(self, locators):
+        """Prove every exact run-owned object existed, delete it, require 404."""
+        from botocore.exceptions import ClientError
+        assert self.env["ROOTYARD_BLOB_ROOT"].endswith(self.owned_blob_suffix)
+        client, bucket = self.s3_client(), self.env["ROOTYARD_BLOB_BUCKET"]
+        keys = [self.verify_original(client, locator) for locator in locators]
+        assert keys and len(keys) == len(set(keys)), "object identity list is not unique"
+        for key in keys:
+            client.delete_object(Bucket=bucket, Key=key)
+        for key in keys:
+            try:
+                client.head_object(Bucket=bucket, Key=key)
+            except ClientError as error:
+                assert error.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404, "absence was not confirmed"
+            else:
+                raise AssertionError("original object survived deletion")
+
+    def original_locators(self, database=None):
+        raw = self.query(database or self.source_db,
+            "SELECT json_build_object('key', 'v1/tenants/' || h.storage_tenant_id::text || '/authorities/' ||"
+            " h.authority_id::text || '/g' || h.authority_generation::text || '/attempts/' || h.attempt_id::text ||"
+            " '/' || h.namespace || '/' || h.sha256, 'sha256', h.sha256, 'length', h.content_length)::text"
+            " FROM public.ref_store_core_pack_artifacts a JOIN public.artifact_holds h ON h.hold_id=a.hold_id"
+            " ORDER BY h.storage_tenant_id,h.authority_id,h.authority_generation,h.attempt_id,h.namespace,h.sha256")
+        return [json.loads(line) for line in raw.splitlines()]
+
     def synthetic_source(self):
         self.source_db = self.new_database(self.admin)
         self.target_db = self.new_database(self.restore_admin)
         self.db = self.source_db
         self.env["DATABASE_URL"] = self.db
         self.cli("migrate")
-        # This real maintenance entry initializes the archive's compatibility
-        # volume before any repository exists. No hand-made volume identity,
-        # fake bare repository, SQL ready row, proof, registration or ACK.
         self.cli("reconcile")
         assert self.source_volume.joinpath(".volume-id").is_file()
         self.alice = self.account("create-user", "alice")
@@ -192,15 +245,54 @@ class Drill(BlobOnlyHarness):
             self.no_bare(repo, "before offline backup")
             self.specs.append({"repo": repo, "remote": remote, "work": work,
                                "oid": oid, "format": fmt, "files": files, "refs": refs})
+        # Kill only the dedicated barrier session of this run-owned database.
+        killed = self.query(self.source_db,
+            "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE "
+            "datname=current_database() AND application_name='rootyard-blob-barrier') stopped")
+        assert killed == "1", "fixture did not identify one owned barrier session"
+        assert self.proc.wait(timeout=15) != 0, "service survived losing its shared barrier"
+        self.stop()
+        self.start(label="after-barrier-loss")
         self.stop()
         self.source_rows = self.ledger_digests(self.source_db)
         for table in ("ref_store_serving_repositories", "ref_store_serving_operations",
                       "ref_store_core_pack_publications", "ref_store_operations"):
             assert self.source_rows[table]["count"] >= 2, table + " was not populated by real serving"
         assert self.source_rows["ref_store_core_serving_reads"]["count"] == 0
-        return {"owned_databases": 2, "formats": ["sha1", "sha256"],
-                "real_git_push_clone_fsck": True, "no_persistent_bare": True,
-                "archive_volume_initialized_by_real_reconcile_cli": True}
+        self.closure_rows = self.artifact_rows()
+        self.originals = self.original_locators()
+        assert len(self.originals) >= 4
+        return {"owned_databases": 2, "formats": ["sha1", "sha256"], "real_git_push_clone_fsck": True,
+                "no_persistent_bare": True, "archive_volume_initialized_by_real_reconcile_cli": True,
+                "closure_artifacts": self.closure_rows["count"], "shared_barrier_loss_stops_service": True}
+
+    def wait_for_advisory_holder(self, database, exclusive, timeout=15):
+        """Wait until a real session on `database` holds the lifecycle key."""
+        mode = "ExclusiveLock" if exclusive else "ShareLock"
+        deadline = time.monotonic() + timeout
+        sql = ("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=738390103"
+               " AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND mode='" + mode + "' AND granted")
+        while int(self.query(database, sql)) == 0:
+            assert time.monotonic() < deadline, "lifecycle barrier was not taken"
+            time.sleep(0.05)
+
+    def advisory_holds(self, database):
+        return int(self.query(database,
+            "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=738390103"
+            " AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND mode='ExclusiveLock' AND granted"))
+
+    def serving_barrier_refused(self, env=None):
+        """serve-blob must refuse to start while the exclusive offline barrier is held."""
+        probe = (env or self.env).copy()
+        directory = self.root / "unrelated-probe-data"
+        directory.mkdir(exist_ok=True)
+        probe["ROOTYARD_DATA_DIR"] = str(directory)
+        try:
+            process = subprocess.run([self.args.binary, "serve-blob"], env=probe,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except subprocess.TimeoutExpired:
+            return False
+        return process.returncode != 0
 
     def snapshot(self):
         with self.source_volume.joinpath(".rootyard.lock").open("r+") as lock:
@@ -222,6 +314,11 @@ class Drill(BlobOnlyHarness):
             with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
                 backup = subprocess.Popen([self.args.binary, "backup", str(self.backup), "--offline"],
                                           env=self.env, stdout=stdout, stderr=stderr)
+            # The exclusive lifecycle lock proves the real cross-process barrier:
+            # a serve-blob started now must refuse, and the backup must wait for
+            # this metadata writer instead of taking a snapshot around it.
+            self.wait_for_advisory_holder(self.source_db, exclusive=True)
+            assert self.serving_barrier_refused(), "serve-blob started while the offline barrier was held"
             deadline = time.monotonic() + 15
             while not int(self.query(self.source_db,
                     "SELECT count(*) FROM pg_stat_activity WHERE application_name='rootyard-backup' AND wait_event_type='Lock'")):
@@ -231,43 +328,63 @@ class Drill(BlobOnlyHarness):
             writer.stdin.write(b"COMMIT;\n\\q\n")
             writer.stdin.flush()
             assert writer.wait(timeout=10) == 0
-            status = backup.wait(timeout=90)
-            assert status == 0, (
-                "positive nonempty pg_refstore backup failed (exit " + str(status) + "). "
-                "Current production git_inventory requires persistent bare storage; "
-                "this drill will not synthesize a bare repository or skip the positive restore contract.")
+            status = backup.wait(timeout=120)
+            assert status == 0, "positive nonempty pg_refstore paired backup failed (exit " + str(status) + ")"
             self.backup_result = json.loads(stdout_path.read_text())
         finally:
             for process in (writer, backup):
                 if process is not None and process.poll() is None:
                     process.kill()
                     process.wait(timeout=10)
+        assert self.advisory_holds(self.source_db) == 0, "backup did not release its exclusive barrier"
         manifest = json.loads(self.backup.joinpath("manifest.json").read_text())
-        assert manifest["format"] == CURRENT_BACKUP_FORMAT == 21
+        assert manifest["format"] == CURRENT_BACKUP_FORMAT == 22
         assert manifest["schema_versions"] == SCHEMA_VERSIONS and max(SCHEMA_VERSIONS) == 147
         assert len(manifest["repositories"]) == 2
+        assert manifest["blob_closure"]["artifacts"] == self.closure_rows["count"]
+        assert len(manifest["blob_artifacts"]) == manifest["blob_closure"]["artifacts"]
+        blob_files = [name for name in manifest["files"] if name.startswith("blob/")]
+        assert len(blob_files) == manifest["blob_closure"]["artifacts"]
+        total = sum(manifest["files"][name]["bytes"] for name in blob_files)
+        assert total == manifest["blob_closure"]["bytes"] > 0
         self.cli("backup-verify", str(self.backup))
         assert self.ledger_digests(self.source_db) == self.source_rows
         return {"format": CURRENT_BACKUP_FORMAT, "schema": CURRENT_SCHEMA_VERSION,
                 "legacy_volume_lock_refused": True, "snapshot_waited_for_metadata_commit": True,
-                "source_ledgers_unchanged": True, "blob_bytes_in_archive": False}
+                "exclusive_pg_barrier_held_during_snapshot": True, "serve_blob_refused_during_barrier": True,
+                "source_ledgers_unchanged": True, "blob_bytes_in_archive": True,
+                "closure_artifacts": manifest["blob_closure"]["artifacts"], "closure_bytes": total}
 
     def invalid_archives(self):
+        blob_member = sorted(p for p in self.backup.joinpath("blob").rglob("*") if p.is_file())[0]
         changes = (
             ("missing-complete", lambda path: path.joinpath("COMPLETE").unlink()),
             ("truncated-dump", lambda path: path.joinpath("metadata.dump").write_bytes(b"PGDMP")),
             ("changed-volume-id", lambda path: path.joinpath("volume", ".volume-id").write_text(str(uuid.uuid4()))),
+            ("changed-blob-byte", lambda path: blob_member.relative_to(self.backup) and
+                path.joinpath(blob_member.relative_to(self.backup)).write_bytes(b"tampered")),
+            ("removed-blob-member", lambda path: path.joinpath(blob_member.relative_to(self.backup)).unlink()),
+            ("false-locator", lambda path: self.forge_locator(path)),
         )
         for name, change in changes:
             damaged = self.root / name
             shutil.copytree(self.backup, damaged)
             change(damaged)
-            assert self.run([self.args.binary, "backup-verify", str(damaged)], check=False).returncode != 0
-            assert self.restore_command(source=damaged, check=False).returncode != 0
+            assert self.run([self.args.binary, "backup-verify", str(damaged)], check=False).returncode != 0, name
+            assert self.restore_command(source=damaged, check=False).returncode != 0, name
             assert not self.target.exists()
             assert self.query(self.target_db, "SELECT count(*) FROM pg_tables WHERE schemaname='public'") == "0"
             shutil.rmtree(damaged)
         return {"damaged_archives_rejected": len(changes), "target_sql_untouched": True}
+
+    def forge_locator(self, path):
+        # Replace one locator with a different (valid-looking) digest; the
+        # closure digest and member inventory must refuse it.
+        manifest = json.loads(path.joinpath("manifest.json").read_text())
+        manifest["blob_artifacts"][0]["sha256"] = "0" * 64
+        raw = json.dumps(manifest, indent=2).encode()
+        path.joinpath("manifest.json").write_bytes(raw)
+        path.joinpath("COMPLETE").write_text(sha256_file(path.joinpath("manifest.json")))
 
     def existing_targets(self):
         existing = self.root / "existing-target"
@@ -293,18 +410,47 @@ class Drill(BlobOnlyHarness):
         return {"real_post_boundary_ack": True, "post_boundary_oid": self.post_backup_oid}
 
     def restore_and_clone(self):
-        restored = json.loads(self.restore_command().stdout)
+        # Delete only this run's private Blob originals: the archive must be the
+        # sole source of every pack/idx byte from here on.
+        self.delete_originals(self.originals)
+        env = self.env.copy()
+        env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target))
+        restore = None
+        stdout_path = self.root / "restore.stdout.log"
+        stderr_path = self.root / "restore.stderr.log"
+        try:
+            with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+                restore = subprocess.Popen([self.args.binary, "restore", str(self.backup), "--isolated", "--trust-backup"],
+                                           env=env, stdout=stdout, stderr=stderr)
+            self.wait_for_advisory_holder(self.target_db, exclusive=True)
+            assert self.serving_barrier_refused(env), "serve-blob started while the restore barrier was held"
+            status = restore.wait(timeout=180)
+            assert status == 0, "paired restore from the archive failed (exit " + str(status) + ")"
+        finally:
+            if restore is not None and restore.poll() is None:
+                restore.kill()
+                restore.wait(timeout=10)
+        restored = json.loads(stdout_path.read_text())
         assert restored["restored"] is True and restored["started_service"] is False
+        assert restored["blob_artifacts"] == self.closure_rows["count"]
+        assert self.advisory_holds(self.target_db) == 0, "restore did not release its exclusive barrier"
         assert self.ledger_digests(self.target_db) == self.source_rows, "restored core/serving ledger differs from the backup cut"
+        assert self.artifact_rows(self.target_db) == self.closure_rows, "restored locators were rewritten"
+        assert self.original_locators(self.target_db) == self.originals, "restored ledger changed the original locators"
+        # Every rebuilt object must live at its exact original coordinate with
+        # exactly the archived digest and length (the locator path ends in the
+        # content digest, so the fetched bytes must hash to it).
+        client = self.s3_client()
+        for locator in self.originals:
+            self.verify_original(client, locator)
         token_id = str(uuid.UUID(self.revoked["token_id"]))
         assert self.query(self.target_db, "SELECT revoked FROM public.tokens WHERE id='" + token_id + "'") == "t"
-        # Delete only the source's disposable compute state. The source server
-        # is stopped; the restored service must materialize from retained Blob.
         shutil.rmtree(self.source_scratch)
         self.scratch = self.root / "restored-scratch"
         self.scratch.mkdir(mode=0o700)
         self.db = self.target_db
-        self.env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target), ROOTYARD_SCRATCH_DIR=str(self.scratch))
+        self.env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target),
+                        ROOTYARD_SCRATCH_DIR=str(self.scratch))
         self.start()
         for spec in self.specs:
             assert self.remote_refs(spec["remote"], self.alice) == spec["refs"]
@@ -319,7 +465,19 @@ class Drill(BlobOnlyHarness):
         return {"fresh_database": True, "formats": ["sha1", "sha256"], "exact_refs_content_fsck": True,
                 "source_scratch_deleted": True, "post_boundary_commit_excluded": True,
                 "read_only_and_revoked_token_state_preserved": True,
-                "same_external_blob_originals_retained": True, "independent_blob_closure_restore": False}
+                "same_backend_identity": True, "original_blob_objects_deleted_before_restore": True,
+                "independent_blob_closure_restore": True}
+
+    def artifact_rows_for(self, database):
+        raw = self.query(database,
+            "SELECT encode(sha256(convert_to(coalesce(string_agg(x, E'\\n' ORDER BY x), ''), 'UTF8')), 'hex') FROM ("
+            "SELECT a.repository_id::text || ':' || a.pack_id::text || ':' || a.role || ':' || a.hold_id::text || ':' ||"
+            "h.attempt_id::text || ':' || h.storage_tenant_id::text || ':' || h.authority_id::text || ':' ||"
+            "h.authority_generation::text || ':' || h.namespace || ':' || h.sha256 || ':' || h.content_length::text AS x "
+            "FROM public.ref_store_core_pack_artifacts a JOIN public.artifact_holds h ON h.hold_id=a.hold_id "
+            "ORDER BY x) rows")
+        count = int(self.query(database, "SELECT count(*) FROM public.ref_store_core_pack_artifacts"))
+        return {"count": count, "sha256": raw}
 
     def restored_replay(self):
         repo = self.specs[0]["repo"]
@@ -371,6 +529,7 @@ def main(argv=None):
         for executable in ("psql", "pg_dump", "pg_restore"):
             need(shutil.which(executable), executable + " is required")
         harness = Drill(args, profile, blob_profile)
+        blob_profile = check_blob_profile(harness.env)
         methods = (harness.synthetic_source, harness.snapshot, harness.invalid_archives, harness.existing_targets,
                    harness.write_after_backup, harness.restore_and_clone, harness.restored_replay)
         for name, method in zip(CASES, methods, strict=True):
@@ -390,7 +549,7 @@ def main(argv=None):
                 harness.results.append({"name": "cleanup", "status": "failed", "error": harness.redact(error)})
                 error_text = harness.redact(error)
                 success = False
-    report = {"kind": "rootyard/blob-serving147-backup-gap-drill", "passed": False,
+    report = {"kind": "rootyard/paired-blob-backup-restore-acceptance", "passed": False,
               "expected_cases": list(CASES), "cases": harness.results if harness else [],
               "skips": 0, "limitations": LIMITATIONS,
               "harness_sha256": script_digest, "blob_only_service_sha256": dependency_digest,
@@ -412,6 +571,7 @@ def main(argv=None):
             report["retained_directory"] = str(harness.root)
     if not success:
         report["error"] = error_text
+    report["independent_blob_closure_backup_claimed"] = bool(report["passed"])
     write_report(args.report, report)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["passed"] else 1

@@ -183,6 +183,22 @@ impl BlobStore {
         Ok(UploadIntent::new(locator, self.backend_identity.clone()))
     }
 
+    /// Sealed exact-locator intent for the offline same-coordinate restore.
+    ///
+    /// The normal [`Self::new_upload`] always mints a fresh random attempt and
+    /// remains the only producer surface. This constructor accepts an already
+    /// validated read-only [`BlobLocator`] (original tenant, authority,
+    /// generation, attempt id, namespace, digest and length) and is reachable
+    /// only from `blob_store::archive`, which requires the backup's opaque
+    /// [`crate::backup::OfflineRestorePermit`]. It grants no authority on its
+    /// own: the caller must already have held a restore permit, and the sealed
+    /// writer still enforces this store's physical backend identity before any
+    /// provider IO.
+    pub(super) fn intent_for_locator(&self, locator: BlobLocator) -> Option<UploadIntent> {
+        self.validate_locator(&locator).ok()?;
+        Some(UploadIntent::new(locator, self.backend_identity.clone()))
+    }
+
     /// Reject a locator whose digest/length pair exceeds the configured ceiling
     /// before any provider request is made.
     pub(crate) fn validate_locator(&self, locator: &BlobLocator) -> Result<(), BlobError> {

@@ -8,6 +8,11 @@ use sha2::{Digest, Sha256};
 /// generated from real PostgreSQL, never copied from a previous schema.
 pub(super) const FORMAT: u32 = 21;
 
+/// Paired PG + OpenDAL Blob closure archive (#120). The schema does not change:
+/// format tags the archive layout, not the frozen PostgreSQL catalog, so every
+/// same-schema archive maps unchanged to the same reviewed catalog/versions.
+pub(super) const FORMAT_PAIRED: u32 = 22;
+
 pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
     let raw = match format {
         4 => [
@@ -95,7 +100,7 @@ pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
             include_str!("../../schema/144_restored_catalog.json"),
             include_str!("../../schema/144_upgraded_catalog.json"),
         ],
-        21 => [
+        21 | 22 => [
             include_str!("../../schema/147_catalog.json"),
             include_str!("../../schema/147_restored_catalog.json"),
             include_str!("../../schema/147_upgraded_catalog.json"),
@@ -124,7 +129,7 @@ pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
         18 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 142).collect()),
         19 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 143).collect()),
         20 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 144).collect()),
-        21 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
+        21 | 22 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
         _ => bail!("unsupported backup format"),
     }
 }

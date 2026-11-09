@@ -70,6 +70,9 @@ pub use contract::{
     TENANT_MAX_LOGICAL_BYTES, TENANT_MAX_RECEIPTS,
 };
 pub use pg::{AcquireOutcome, ArtifactGrant, ConsumedArtifacts, PgArtifactHoldStore};
+/// Read-only typed decode of one stored consume receipt, used by the offline
+/// backup/restore ledger reader. It mints nothing and performs no IO.
+pub use receipt::ConsumeAck as ReadonlyConsumeAck;
 pub use receipt::{AcquireAck, AcquireLookup, ConsumeAck, ConsumeLookup, HoldAck, HoldArtifactIdentity};
 pub use request::AcquireArtifactHoldsRequest;
 

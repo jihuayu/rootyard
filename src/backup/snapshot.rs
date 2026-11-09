@@ -11,9 +11,13 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     let _volume = volume_lock(&root)?;
     let volume_id = volume_identity(&root)?;
     let mut client = pg(config).await?;
-    // Acquire this BEFORE beginning REPEATABLE READ: SELECT would otherwise fix
-    // the snapshot before waiting for old transactions/migrations to commit.
-    client.query_one("SELECT pg_advisory_lock(738390103)", &[]).await?;
+    ensure_database_available(&client).await?;
+    // Real lifecycle barrier shared with serve-blob: an exclusive session lock
+    // that every serving process holds shared for its whole lifetime. It is
+    // taken BEFORE the exported snapshot and held until publication finished,
+    // because SELECT would otherwise fix the snapshot before waiting for old
+    // transactions/migrations to commit.
+    let mutex = BackupMutex::acquire(&client).await?;
     let tx = client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::RepeatableRead).start().await?;
     let list = catalog::relations(FORMAT, true)?
         .iter()
@@ -22,7 +26,13 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         .join(",");
     tx.batch_execute(&format!("LOCK TABLE {list} IN SHARE MODE")).await?;
     // No snapshot-taking SELECT occurs before all DML/DDL table locks are held.
-    let versions = schema(&tx, FORMAT).await?;
+    // The archive version is selected by the actual source, never by a flag:
+    // any `pg_refstore` serving repository forces the paired Blob closure
+    // version. A Blob-served source can therefore never produce a metadata-only
+    // archive that would be mistaken for an independent byte backup.
+    let served = ledger::serving_repositories(&tx).await?;
+    let format = if served > 0 { FORMAT_PAIRED } else { FORMAT };
+    let versions = schema(&tx, format).await?;
     tx.batch_execute("SET LOCAL search_path=public").await?;
     // A durable cutover/rollback fence means the backend authority is in
     // motion. Never capture a paired backup from a repository under transition.
@@ -34,6 +44,12 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     let postgres_version: String = tx.query_one("SHOW server_version", &[]).await?.get(0);
     ensure!(postgres_version.starts_with("17."), "this format is verified only with PostgreSQL 17");
     let mut repos = repositories(&tx).await?;
+    if format == FORMAT_PAIRED {
+        ensure!(
+            repos.iter().all(|r| r.backend == "pg_refstore"),
+            "paired Blob archives currently require only pg_refstore repositories"
+        );
+    }
     let foreign_volumes: i64 = tx
         .query_one("SELECT count(*) FROM public.recovery_resolutions WHERE volume_id<>$1", &[&volume_id])
         .await?
@@ -83,7 +99,9 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         }
     }
     ensure!(inventory(&root)? == source_inventory, "volume changed during barrier");
-    // Prove the exporting session still owns its transaction before publishing.
+    // Prove the exporting session still owns its lifecycle barrier and its
+    // exported snapshot transaction before publishing.
+    mutex.ensure_held(&tx).await?;
     tx.query_one("SELECT 1", &[]).await?;
     let mut files = BTreeMap::new();
     files.insert(
@@ -102,11 +120,43 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     for (name, entry) in inventory(&pando_root)? {
         files.insert(format!("pando/{name}"), entry);
     }
+    // Exact v1 Blob closure of every `pg_refstore` repository. Bytes are the
+    // only thing that makes this an independent backup: the manifest records
+    // their checksums and the source physical backend identity.
+    let (blob_closure, blob_artifacts) = if format == FORMAT_PAIRED {
+        // Missing scope or an unsupported backend is an explicit refusal, never
+        // a silently byte-less archive.
+        let profile = crate::blob_store::config::BlobProfile::from_env()
+            .map_err(|_| anyhow::anyhow!("paired backup requires a supported OpenDAL Blob profile"))?;
+        let store = crate::blob_store::opendal::BlobStore::open(profile)
+            .map_err(|_| anyhow::anyhow!("paired backup could not open the Blob backend"))?;
+        // The export witness reads exact locators only; it is minted with the
+        // real volume/backup identities already fixed above.
+        let read = ArchiveRead::seal(volume_id, id)?;
+        let transfer = crate::blob_store::archive::ArchiveTransfer::for_export(&read, store);
+        let artifacts = ledger::inventory(&tx, transfer.backend_identity_hex(), transfer.provider())
+            .await
+            .context("exact Blob closure cannot be captured from this source")?;
+        let until = Instant::now() + std::time::Duration::from_secs(3600);
+        let (closure, blob_files) =
+            blob_closure::export(&read, &transfer, &artifacts, &staging, until, &mutex, &tx).await?;
+        for (name, entry) in blob_files {
+            ensure!(files.insert(name, entry).is_none(), "archive member path collision");
+        }
+        (Some(closure), artifacts)
+    } else {
+        ensure!(served == 0, "served pg_refstore source cannot produce a metadata archive");
+        (None, Vec::new())
+    };
+    // Durable RefStore rows the paired closure depends on; the restore compares
+    // them with the restored database before rebuilding any byte.
+    let refstore = if format == FORMAT_PAIRED { Some(ledger::carry(&tx).await?) } else { None };
+    let paired = blob_closure.is_some();
     let manifest = Manifest {
-        format: FORMAT,
+        format,
         backup_id: id,
         volume_id,
-        schema_contract_sha256: schema_contract_digest(FORMAT)?,
+        schema_contract_sha256: schema_contract_digest(format)?,
         boundary_unix_seconds: boundary,
         rootyard_version: env!("CARGO_PKG_VERSION").into(),
         binary_sha256: hash(&std::env::current_exe()?)?,
@@ -114,13 +164,21 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         pg_dump_version: String::from_utf8(checked(command("pg_dump").arg("--version")).await?)?.trim().into(),
         git_version: String::from_utf8(checked(command(&config.git).arg("--version")).await?)?.trim().into(),
         schema_versions: versions,
-        consistency: "offline-volume-flock+postgres-share-locks+exported-snapshot".into(),
+        consistency: if paired {
+            "offline-volume-flock+postgres-advisory-lock+share-locks+exported-snapshot+verified-blob-closure"
+        } else {
+            "offline-volume-flock+postgres-advisory-lock+share-locks+exported-snapshot"
+        }
+        .into(),
         journal_record_files: files
             .keys()
             .filter(|p| p.starts_with("volume/journal/") && p.ends_with("/operation.json"))
             .count(),
         repositories: repos,
         lfs_objects,
+        blob_closure,
+        blob_artifacts,
+        refstore,
         files,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -130,14 +188,15 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     tx.commit().await?;
     write_private(&staging.join("COMPLETE"), hash(&staging.join("manifest.json"))?.as_bytes())?;
     File::open(&staging)?.sync_all()?;
-    // Drop connection releases session migration lock; never modify source data.
-    drop(client);
+    // Keep the source fenced until the completed archive is durably published.
     ensure!(!destination.exists(), "destination appeared during backup");
     publish(&staging, &destination)?;
     File::open(destination.parent().unwrap())?.sync_all()?;
+    mutex.release(&client).await?;
+    drop(client);
     println!(
         "{}",
-        serde_json::json!({"backup_id":id,"complete":true,"elapsed_seconds":started.elapsed().as_secs_f64(),"boundary_unix_seconds":boundary,"unknown_operations":manifest.repositories.iter().map(|r|r.unknown_operations).sum::<i64>()})
+        serde_json::json!({"backup_id":id,"format":format,"complete":true,"elapsed_seconds":started.elapsed().as_secs_f64(),"boundary_unix_seconds":boundary,"unknown_operations":manifest.repositories.iter().map(|r|r.unknown_operations).sum::<i64>(),"blob_artifacts":manifest.blob_closure.as_ref().map_or(0,|c|c.artifacts),"blob_bytes":manifest.blob_closure.as_ref().map_or(0,|c|c.bytes)})
     );
     Ok(())
 }

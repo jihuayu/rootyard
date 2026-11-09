@@ -19,9 +19,14 @@ LATEST_PREFIX = f"{LATEST_VERSION:03d}"
 
 # Single explicit source for the current archive format. Tests must not infer
 # the expected format from the manifest produced by the implementation under test.
-# The current archive is format21/schema147. Old format20 remains frozen at
-# schema144; current fixtures are generated from actual PostgreSQL.
+# The current archive is format22/schema147: the paired PG + OpenDAL Blob
+# closure. Format21 (also schema147) remains readable as the historical
+# metadata-only archive and is never an independent byte backup. Old format20
+# remains frozen at schema144; current fixtures are generated from actual
+# PostgreSQL. The schema does not change with format22: both map to the same
+# frozen 147 catalog/version list.
 CURRENT_BACKUP_FORMAT = 21
+CURRENT_BLOB_BACKUP_FORMAT = 22
 CURRENT_SCHEMA_VERSION = 147
 assert LATEST_VERSION == CURRENT_SCHEMA_VERSION, (
     "a new migration requires an explicit current backup format/schema contract bump")
