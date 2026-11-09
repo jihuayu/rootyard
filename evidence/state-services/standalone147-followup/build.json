@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "binary_sha256": "23c2979aa492abb790ff7b6e7eb2efb8e5f1353d02498b16a6267f87029a1f9f",
+  "source_inputs_sha256": "65c9da2bb9d0234cf3b7ac8ba119886ec4ba4235fcff44bc1298d42de6266511",
+  "workspace_commit": "f1889aac45911e8a58b991c63373376f55af8939",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--no-default-features",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "--bin",
+    "rootyard",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "--message-format=json-render-diagnostics"
+  ],
+  "package_rebuilt": true,
+  "clean_command": [
+    "cargo",
+    "clean",
+    "--package",
+    "rootyard"
+  ],
+  "target_dir": "/workspace/rootyard/target",
+  "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+  "fresh_false_artifacts": [
+    {
+      "target": "rootyard",
+      "kind": "lib",
+      "fresh": false,
+      "package_id": "path+file:///workspace/rootyard#0.1.0"
+    },
+    {
+      "target": "rootyard",
+      "kind": "bin",
+      "fresh": false,
+      "executable": "/workspace/rootyard/target/debug/rootyard",
+      "package_id": "path+file:///workspace/rootyard#0.1.0"
+    }
+  ]
+}

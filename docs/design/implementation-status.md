@@ -26,6 +26,8 @@ PR [#159](https://github.com/jihuayu/rootyard/pull/159) 提供显式 `serve-blob
 
 可重跑验收入口：`tests/blob_only_service.py`（11 项）与 `tests/blob_gateway_browse.py`（7 项），均要求 `scripts/build_native.py` 生成的当前源码绑定二进制、真实 PostgreSQL、S3 和原生 Git。RefStore 原生工作流已接入这两个服务验收入口。两处 A3 gate 竞争的错误分类有单元回归；HTTP 竞争验收不保证调度恰落在这两个窗口。
 
+2026-11-09，本次干净候选 `f1889aa` 在同一绑定二进制上通过 HTTP/Git 11/11、Browse 7/7、严格 all-targets Clippy 和 456 项 Rust 库测试（另有 9 项显式忽略）。真实验收发现并修复了 LFS 指针扫描无法承载换行文件名的问题，特殊文件名分页夹具完整保留。完整报告、构建记录与失败历史见 [后续验收证据](../../evidence/state-services/standalone147-followup/README.md)。这些是同机功能结果，不等于默认服务、独立备份或分布式发布资格。
+
 备份仍是明确阻塞：format21/schema147 的 catalog 支持不等于非空 Blob 仓库备份。`backup::git_inventory` 仍要求 ready 仓库存在持久 bare Git，因此 `pg_refstore` 仓库的正向备份会失败；OpenDAL 内容闭包也尚未导出归档。`serve-blob` 当前不持有 legacy volume flock 或检查其 restore guard，不能套用旧服务的在线备份屏障结论。新增 `tests/backup_blob_serving147.py` 保留严格正向失败，未接入 CI；即使后续通过，它在保留原 Blob 的条件下只证明 PG 元数据恢复，独立 PG+Blob 闭包恢复仍需 #120 实现。不得伪造 bare 仓库或跳过检查来标记备份完成。
 
 LFS、PR/Merge、Workspace、CI/Namespace 的新服务接入、默认入口替换，以及 Raft 运行时、远程桥和多主机资格仍待完成。实施 issue 只有在相关实现合并并完成对应真实验收后关闭。

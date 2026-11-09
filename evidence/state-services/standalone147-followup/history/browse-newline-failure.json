@@ -1,0 +1,66 @@
+{
+  "binary_sha256": "9fa81542bb18e208f4dfd981d38a5399025c18214d492e65350c61d89c3e0ccd",
+  "binding_errors": [
+    "case inventory mismatch: ['sha1_tree_and_blob_match_native_git']"
+  ],
+  "blob_profile": {
+    "delete_policy": "disabled",
+    "driver": "opendal",
+    "endpoint_loopback": true,
+    "endpoint_scheme": "http",
+    "root_configured": true,
+    "service": "s3"
+  },
+  "build_receipt_sha256": "96ef8d8754faf0294f1b416645973a46d5934c249a2a1c2b81d6fd21122f3f7e",
+  "case_count": 1,
+  "cases": [
+    {
+      "error": "Command failed (1): To [REDACTED]/git/alice/browse-sha1.git\n ! [remote rejected] HEAD -> main (policy denied)\nerror: failed to push some refs to '[REDACTED]/git/alice/browse-sha1.git'\n",
+      "name": "sha1_tree_and_blob_match_native_git",
+      "seconds": 0.684,
+      "status": "failed"
+    }
+  ],
+  "expected_cases": [
+    "sha1_tree_and_blob_match_native_git",
+    "sha256_tree_and_blob_match_native_git",
+    "empty_nested_binary_and_utf8_paths_preserve_bytes",
+    "tree_pagination_and_direct_object_endpoints",
+    "annotated_tags_peel_to_the_pushed_commit",
+    "ref_advance_keeps_reachable_history_readable",
+    "restart_without_scratch_rebuilds_browse_and_clone"
+  ],
+  "expected_count": 7,
+  "git_sha256": "92c38403054b6d6fef394391bd84beb54ebfaef2f096c1e93b56f5626733c649",
+  "harness_inputs_sha256": {
+    "blob_gateway_browse.py": "b441b041a3858aa08873d32c3fafc8e49d7313f96ffa85e54c76cb6a7fdc0c5e",
+    "blob_only_service.py": "dd29e6c3f60795309eabefb775a7573152489ab056d7dee899cef518d4966bdc",
+    "e2e.py": "3cfbb377ace59ad297e7f104a35210185647c823a2d1f53b77ba2a8728f398c3",
+    "native_evidence.py": "a4cdec21201c94ce7c21ebb1852d6ec91c7f57b5a5af528af05cc3c61f1cfe2e",
+    "ops_provenance.py": "f9b3ec80d853b2cf949743be1a0cb95ae19e029e50c3a188e04ae8111a218b37",
+    "owned_fuse_cleanup.py": "1df7299f4ff20199cd338e812fd2d58af8626e024e0130249b864c7a4f0c91de"
+  },
+  "harness_sha256": "b441b041a3858aa08873d32c3fafc8e49d7313f96ffa85e54c76cb6a7fdc0c5e",
+  "inputs_unchanged": false,
+  "kind": "rootyard/blob-browse-native-acceptance",
+  "limitations": [
+    "Loopback HTTP, one PostgreSQL server and one configured S3 provider; no HA or physical durability claim.",
+    "The restart kills only the harness-owned service process group after an acknowledged push.",
+    "This verifies tree/blob JSON, not full web UI, commits/compare, LFS or ref transaction equivalence.",
+    "Blob deletion stays disabled; uploaded fixture objects are not reclaimed by this harness.",
+    "Ordinary functional/recovery cases, not security or resource-exhaustion qualification."
+  ],
+  "measurement_kind": "native_execution",
+  "passed": false,
+  "qualification_kind": "clean-candidate",
+  "simulated_fields": false,
+  "skips": 0,
+  "source_head": "9e4163bd8a3c0f3322bd145d59d4cbd29d454641",
+  "source_inputs_sha256": "149c85156d634e11e5a92226bf5a43843fcd687b1531d9060394567a056d855e",
+  "tool_versions": {
+    "git": "git version 2.52.0",
+    "openssl": "OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)",
+    "postgres_client": "psql (PostgreSQL) 17.11 (Debian 17.11-0+deb13u1)",
+    "python": "3.12.14"
+  }
+}
