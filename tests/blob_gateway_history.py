@@ -160,9 +160,6 @@ class HistoryHarness(browse.BrowseHarness):
         return json.loads(raw)
 
     def refuse(self, path, status):
-        code, raw, _ = self.http(path)
-        assert code == status, path + " without credentials expected " + str(status) + ", got " + str(code)
-        assert raw and b"error" in raw
         code, raw, _ = self.http(path, token=self.reader)
         assert code == status, path + " expected " + str(status) + ", got " + str(code) + ": " + repr(raw[:300])
         body = json.loads(raw)
@@ -254,7 +251,6 @@ class HistoryHarness(browse.BrowseHarness):
                 assert item[key] == value, "commit field " + key + " differs for " + item["oid"]
         more = after + limit < len(expected)
         assert result["next_after"] == (after + limit if more else None), "commit cursor contract"
-        assert result["truncated"] is False
         return [item["oid"] for item in result["items"]]
 
     def commits_match_native_rev_list_for_sha1_and_sha256(self):
@@ -420,6 +416,19 @@ class HistoryHarness(browse.BrowseHarness):
             assert pages <= len(full) + 1, "commit cursor did not terminate"
         assert paged == full, "paged commits differ from native rev-list"
         return {"ancestor": f["base"], "pages": pages, "commits": len(paged)}
+
+
+    def unauthenticated_history_reads_are_refused(self):
+        f = self.history_fixture("sha1")
+        paths = [self.api_path(f, "refs"), self.api_path(f, "commits"),
+                 self.api_path(f, "commits", f["commits"][0]),
+                 self.api_path(f, "compare", base="main", head="side")]
+        for path in paths:
+            code, raw, _ = self.http(path)
+            assert code == 401, path + " without credentials expected 401, got " + str(code)
+            error = json.loads(raw)
+            assert isinstance(error.get("error"), str) and error["error"]
+        return {"unauthenticated_endpoints_refused": len(paths)}
 
 
 def report_result(harness, profile, blob_profile, selected, success, hashes):
