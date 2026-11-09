@@ -7020,11 +7020,16 @@ class SchemaBoundaryIntegrationFixture:
             raise AssertionError("catalog::relations must return names in lexicographic order")
 
         # snapshot.rs: advisory lock, then the catalog relation list, then the lock.
-        adv_pos = snapshot_src.find("pg_advisory_lock(738390103)")
+        adv_pos = snapshot_src.find("BackupMutex::acquire(&client)")
+        lifetime_src = (ROOT / "src/backup/lifetime.rs").read_text(encoding="utf-8")
+        for needle in ("BARRIER_KEY: i64 = 738390103", "SELECT pg_try_advisory_lock($1)",
+                       "&BARRIER_KEY", "BackupMutex", "ensure_held"):
+            if needle not in lifetime_src:
+                raise AssertionError(f"lifetime.rs must retain the exact exclusive backup barrier ({needle})")
         rel_pos = snapshot_src.find("catalog::relations(FORMAT, true)")
         lock_pos = snapshot_src.find("LOCK TABLE {list} IN SHARE MODE")
         if adv_pos < 0:
-            raise AssertionError("snapshot.rs must take pg_advisory_lock(738390103)")
+            raise AssertionError("snapshot.rs must acquire the exclusive BackupMutex")
         if rel_pos < 0:
             raise AssertionError("snapshot.rs must build the lock list from catalog::relations(FORMAT, true)")
         if lock_pos < 0:
@@ -7036,7 +7041,7 @@ class SchemaBoundaryIntegrationFixture:
             raise AssertionError("snapshot.rs must schema-qualify and quote every locked relation")
         if '.join(",")' not in rel_segment:
             raise AssertionError("snapshot.rs must join the relation list without reordering it")
-        if "schema(&tx, FORMAT)" not in snapshot_src or "schema_contract_digest(FORMAT)" not in snapshot_src:
+        if "schema(&tx, format)" not in snapshot_src or "schema_contract_digest(format)" not in snapshot_src:
             raise AssertionError("snapshot.rs must validate and digest the same backup FORMAT")
 
         # postgres.rs proves the live catalog equals the reviewed schema.

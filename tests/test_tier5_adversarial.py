@@ -597,7 +597,7 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
         self.assertIn("names.sort();", catalog_src)
 
         snapshot_src = (ROOT / "src/backup/snapshot.rs").read_text(encoding="utf-8")
-        adv_pos = snapshot_src.find("pg_advisory_lock(738390103)")
+        adv_pos = snapshot_src.find("BackupMutex::acquire(&client)")
         rel_pos = snapshot_src.find("catalog::relations(FORMAT, true)")
         lock_pos = snapshot_src.find("LOCK TABLE {list} IN SHARE MODE")
         self.assertGreater(adv_pos, 0, "advisory lock must be taken in src/backup/snapshot.rs")
