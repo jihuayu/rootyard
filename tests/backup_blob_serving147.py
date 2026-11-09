@@ -343,7 +343,7 @@ class Drill(BlobOnlyHarness):
         assert len(manifest["repositories"]) == 2
         assert manifest["blob_closure"]["artifacts"] == self.closure_rows["count"]
         assert len(manifest["blob_artifacts"]) == manifest["blob_closure"]["artifacts"]
-        blob_files = [name for name in manifest["files"] if name.startswith("blob/")]
+        blob_files = [name for name, entry in manifest["files"].items() if name.startswith("blob/") and entry["kind"]=="file"]
         assert len(blob_files) == manifest["blob_closure"]["artifacts"]
         total = sum(manifest["files"][name]["bytes"] for name in blob_files)
         assert total == manifest["blob_closure"]["bytes"] > 0

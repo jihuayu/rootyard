@@ -102,6 +102,7 @@ pub(super) fn verify(source: &Path) -> Result<Manifest> {
                 "Blob closure digest differs from its artifact locators"
             );
             for artifact in &manifest.blob_artifacts {
+                ensure!(matches!(artifact.role.as_str(), "pack" | "idx"), "unsupported archived artifact role");
                 let entry =
                     manifest.files.get(&artifact.archive_path()).context("paired archive is missing an artifact")?;
                 ensure!(

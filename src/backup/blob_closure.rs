@@ -46,6 +46,7 @@ pub(super) async fn export(
         "Blob closure backend differs"
     );
     private_dir(&destination.join("blob"))?;
+    let mut directories = std::collections::BTreeSet::new();
     for artifact in artifacts {
         ensure!(transfer.live(deadline), "Blob export deadline reached");
         let locator = artifact.locator()?;
@@ -54,7 +55,13 @@ pub(super) async fn export(
             .await
             .context("source Blob artifact failed verified read-back")?;
         let path = destination.join(artifact.archive_path());
-        private_dir(path.parent().context("archive member parent")?)?;
+        let repository = destination.join("blob").join(artifact.repository_id.to_string());
+        let pack = repository.join(artifact.pack_id.to_string());
+        for directory in [repository, pack] {
+            if directories.insert(directory.clone()) {
+                private_dir(&directory)?;
+            }
+        }
         ensure!(
             fs::symlink_metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
             "archive member collision"
@@ -82,21 +89,21 @@ pub(super) async fn export(
 /// Exact file accounting for every archived member. The archive manifest is
 /// built from this, and restore re-derives it to prove the bytes it imports.
 fn entries(root: &Path, artifacts: &[Artifact]) -> Result<BTreeMap<String, Entry>> {
-    let mut files = BTreeMap::new();
+    let files: BTreeMap<_, _> =
+        inventory(&root.join("blob"))?.into_iter().map(|(name, entry)| (format!("blob/{name}"), entry)).collect();
+    ensure!(files.len() < MAX_ENTRIES, "archive file count exceeds bound");
+    let actual_files = files.values().filter(|entry| entry.kind == "file").count();
+    ensure!(actual_files == artifacts.len(), "archive contains extra or missing Blob files");
     for artifact in artifacts {
-        ensure!(files.len() < MAX_ENTRIES, "archive file count exceeds bound");
         let local = root.join(artifact.archive_path());
         let meta = fs::symlink_metadata(&local)?;
         ensure!(meta.is_file() && meta.nlink() == 1 && meta.len() == artifact.length, "archive Blob member differs");
-        files.insert(
-            artifact.archive_path(),
-            Entry {
-                kind: "file".into(),
-                mode: meta.mode() & 0o7777,
-                bytes: meta.len(),
-                sha256: Some(hash(&local)?),
-                target: None,
-            },
+        let entry = files.get(&artifact.archive_path()).context("missing archive Blob member")?;
+        ensure!(
+            entry.kind == "file"
+                && entry.bytes == artifact.length
+                && entry.sha256.as_deref() == Some(artifact.sha256.as_str()),
+            "archive Blob member digest differs"
         );
     }
     Ok(files)
