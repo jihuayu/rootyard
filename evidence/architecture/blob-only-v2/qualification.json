@@ -18,7 +18,8 @@
   "issue_actions": {
     "rewrite": 19,
     "create": 15,
-    "delete_planned": [
+    "preserved": 71,
+    "deleted": [
       20,
       22,
       24,
@@ -27,8 +28,9 @@
       44,
       48,
       121
-    ],
-    "preserved": 71
+    ]
   },
-  "release_policy": "No merge; completion issues only close after merged and accepted. Old architecture issues are deliberately retired, not completed."
+  "release_policy": "No merge; completion issues only close after merged and accepted. Old architecture issues are deliberately retired, not completed.",
+  "public_roadmap_archive": "https://github.com/jihuayu/rootyard/blob/5ef72e3/docs/acceptance/retired-roadmap48.md",
+  "documentation_pr": "https://github.com/jihuayu/rootyard/pull/158"
 }

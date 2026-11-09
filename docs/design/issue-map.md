@@ -8,14 +8,14 @@
 
 | 旧编号 | 处理 | 替代任务 |
 | --- | --- | --- |
-| `20` | 替代任务发布后删除 | [#108](https://github.com/jihuayu/rootyard/issues/108) |
-| `22` | 替代任务发布后删除 | [#109](https://github.com/jihuayu/rootyard/issues/109), [#110](https://github.com/jihuayu/rootyard/issues/110), [#144](https://github.com/jihuayu/rootyard/issues/144), [#148](https://github.com/jihuayu/rootyard/issues/148) |
-| `24` | 替代任务发布后删除 | [#150](https://github.com/jihuayu/rootyard/issues/150), [#143](https://github.com/jihuayu/rootyard/issues/143), [#144](https://github.com/jihuayu/rootyard/issues/144) |
-| `26` | 替代任务发布后删除 | [#115](https://github.com/jihuayu/rootyard/issues/115), [#116](https://github.com/jihuayu/rootyard/issues/116), [#152](https://github.com/jihuayu/rootyard/issues/152), [#155](https://github.com/jihuayu/rootyard/issues/155), [#157](https://github.com/jihuayu/rootyard/issues/157) |
-| `43` | 替代任务发布后删除 | [#155](https://github.com/jihuayu/rootyard/issues/155), [#157](https://github.com/jihuayu/rootyard/issues/157), [#153](https://github.com/jihuayu/rootyard/issues/153) |
-| `44` | 替代任务发布后删除 | [#157](https://github.com/jihuayu/rootyard/issues/157), [#154](https://github.com/jihuayu/rootyard/issues/154) |
-| `48` | 替代任务发布后删除 | [#105](https://github.com/jihuayu/rootyard/issues/105), [#123](https://github.com/jihuayu/rootyard/issues/123) |
-| `121` | 替代任务发布后删除 | 取消旧数据导入/迁移；没有替代迁移任务 |
+| `20` | 已删除（按新范围取消，非验收完成） | [#108](https://github.com/jihuayu/rootyard/issues/108) |
+| `22` | 已删除（按新范围取消，非验收完成） | [#109](https://github.com/jihuayu/rootyard/issues/109), [#110](https://github.com/jihuayu/rootyard/issues/110), [#144](https://github.com/jihuayu/rootyard/issues/144), [#148](https://github.com/jihuayu/rootyard/issues/148) |
+| `24` | 已删除（按新范围取消，非验收完成） | [#150](https://github.com/jihuayu/rootyard/issues/150), [#143](https://github.com/jihuayu/rootyard/issues/143), [#144](https://github.com/jihuayu/rootyard/issues/144) |
+| `26` | 已删除（按新范围取消，非验收完成） | [#115](https://github.com/jihuayu/rootyard/issues/115), [#116](https://github.com/jihuayu/rootyard/issues/116), [#152](https://github.com/jihuayu/rootyard/issues/152), [#155](https://github.com/jihuayu/rootyard/issues/155), [#157](https://github.com/jihuayu/rootyard/issues/157) |
+| `43` | 已删除（按新范围取消，非验收完成） | [#155](https://github.com/jihuayu/rootyard/issues/155), [#157](https://github.com/jihuayu/rootyard/issues/157), [#153](https://github.com/jihuayu/rootyard/issues/153) |
+| `44` | 已删除（按新范围取消，非验收完成） | [#157](https://github.com/jihuayu/rootyard/issues/157), [#154](https://github.com/jihuayu/rootyard/issues/154) |
+| `48` | 已删除（按新范围取消，非验收完成） | [#105](https://github.com/jihuayu/rootyard/issues/105), [#123](https://github.com/jihuayu/rootyard/issues/123) |
+| `121` | 已删除（按新范围取消，非验收完成） | 取消旧数据导入/迁移；没有替代迁移任务 |
 
 旧 20 的 provider 能力归 OpenDAL；旧 22 的真实网关能力归单机/Gateway，不再做 Pando 迁移；旧 24 的安全流式路由归 RPC/Gateway；旧 26/43/44 的不双写、依赖 HA、物理故障域与 RPO/RTO 归新的分布式部署/资格；旧 121 的旧库导入与双向迁移不再安排，全新 provisioning 与同格式恢复有独立任务，但不替代旧数据迁移。
 
