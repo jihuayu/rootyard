@@ -470,7 +470,7 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
                           "WHERE repository_id='" + repo + "'", "decision_required is a one-way fence")
         self.reject_guard("UPDATE ref_store_core_root_tenant_usage SET roots=roots-1 "
                           "WHERE tenant_id='" + uuid_literal(scope["tenant_id"]) + "'",
-                          "retention root usage counters are monotone")
+                          "roots quota counters are monotone")
 
         # Inherited fresh authenticated clone/fsck/auth-boundary proof.
         self.env.update(DATABASE_URL=self.target_db, ROOTYARD_DATA_DIR=str(self.target))
