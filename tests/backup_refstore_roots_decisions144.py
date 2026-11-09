@@ -355,7 +355,8 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
         assert quota["repo"]["root_oid_refs"] == quota["tenant"]["root_oid_refs"] == 4
         assert quota["repo"]["receipts"] == 4 and quota["tenant"]["receipts"] == 4
         assert quota["repo"]["pack_bindings"] == 4
-        assert quota["roots_revision"] == 4
+        # Two capture registrations; releases fence through head generations.
+        assert quota["roots_revision"] == 2, quota["roots_revision"]
         # Both ordinary release and release-before-register retain a tombstone.
         assert marker["root_counts"]["tombstones"] == 2, marker["root_counts"]
         counts = marker["root_family_counts"]
