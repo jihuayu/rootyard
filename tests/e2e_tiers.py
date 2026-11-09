@@ -6855,6 +6855,15 @@ class SchemaBoundaryIntegrationFixture:
     )
 
     @staticmethod
+    def _route_scope(relative_path: str) -> str:
+        """Keep the gateway mounted by standalone.rs separate from lib.rs."""
+        # Explicit composition rule: unknown source paths stay in the legacy
+        # scope, where collisions continue to fail the audit.
+        if relative_path.startswith("src/blob_git_gateway/") or relative_path == "src/blob_git_gateway.rs":
+            return "serve_blob"
+        return "legacy"
+
+    @staticmethod
     def is_m5_integrated() -> bool:
         return (
             (ROOT / "migrations" / "009_forge_pulls.sql").is_file()
@@ -7214,41 +7223,54 @@ class SchemaBoundaryIntegrationFixture:
         cls,
         extra_routes: Optional[list[tuple[str, str, str]]] = None,
         include_tier3_canonical: bool = False,
+        source_root: Optional[Path] = None,
     ) -> dict[str, Any]:
-        route_entries: list[tuple[str, str, str]] = []
+        # `source_root` lets a focused test audit a small fixture tree with the
+        # same parser and scope rules; its files keep repository-relative paths.
+        tree = ROOT if source_root is None else Path(source_root)
+        route_entries: list[tuple[str, str, str, str]] = []
         route_block_re = re.compile(r'\.route\(\s*"([^"]+)"\s*,([^;]+?)\)\s*(?=\.route\(|\.layer\(|\.with_state\(|;|\n\})', re.DOTALL)
         method_re = re.compile(r"\b(get|post|put|patch|delete)\s*\(")
-        for rs_file in sorted((ROOT / "src").rglob("*.rs")):
+        for rs_file in sorted((tree / "src").rglob("*.rs")):
             text = rs_file.read_text(encoding="utf-8")
+            scope = cls._route_scope(rs_file.relative_to(tree).as_posix())
             for m in route_block_re.finditer(text):
                 raw_p = m.group(1)
                 if rs_file.stem == "mirror" and not raw_p.startswith("/api/"):
                     continue
                 for mm in method_re.finditer(m.group(2)):
-                    route_entries.append((rs_file.stem, raw_p, mm.group(1).upper()))
+                    route_entries.append((rs_file.stem, raw_p, mm.group(1).upper(), scope))
 
-        present_stems = {stem for stem, _, _ in route_entries}
+        present_stems = {stem for stem, _, _, scope in route_entries if scope == "legacy"}
         for dom, path, methods_csv in cls.CANONICAL_TIER2_ROUTES:
             if dom not in present_stems:
                 for m_name in methods_csv.split(","):
-                    route_entries.append((dom, path, m_name.strip().upper()))
+                    route_entries.append((dom, path, m_name.strip().upper(), "legacy"))
 
         if include_tier3_canonical:
-            present_norm_pairs = {(re.sub(r"\{[^}]+\}", "{}", p), m) for _, p, m in route_entries}
+            present_norm_pairs = {
+                (scope, re.sub(r"\{[^}]+\}", "{}", p), m)
+                for _, p, m, scope in route_entries
+            }
             for dom, path, methods_csv in cls.CANONICAL_TIER3_ROUTES:
                 for m_name in methods_csv.split(","):
                     m_up = m_name.strip().upper()
                     norm_p = re.sub(r"\{[^}]+\}", "{}", path)
-                    if (norm_p, m_up) not in present_norm_pairs:
-                        route_entries.append((dom, path, m_up))
-                        present_norm_pairs.add((norm_p, m_up))
+                    if ("legacy", norm_p, m_up) in present_norm_pairs:
+                        continue
+                    route_entries.append((dom, path, m_up, "legacy"))
+                    present_norm_pairs.add(("legacy", norm_p, m_up))
 
         if extra_routes:
-            route_entries.extend(extra_routes)
+            # Injected routes keep their meaning: a registration in the legacy
+            # composed router, so they collide with anything on the same method
+            # and normalized path there (and never with another entrypoint).
+            route_entries.extend((src_name, path, method_name, "legacy")
+                                 for src_name, path, method_name in extra_routes)
 
-        seen_method_paths: dict[tuple[str, str], str] = {}
+        seen_method_paths: dict[tuple[str, str, str], str] = {}
         wildcards: set[tuple[str, str]] = set()
-        for src_name, raw_path, method_name in route_entries:
+        for src_name, raw_path, method_name, scope in route_entries:
             if "/:" in raw_path or "/*" in raw_path:
                 raise AssertionError(f"Legacy Axum 0.7 route syntax forbidden in {src_name}: {raw_path}")
             if "{*" in raw_path:
@@ -7260,12 +7282,20 @@ class SchemaBoundaryIntegrationFixture:
                 if len(segs) >= 5 and (segs[3] != "{owner}" or segs[4] != "{name}"):
                     raise AssertionError(f"Inconsistent repo prefix parameter names in {src_name}: {raw_path}")
             norm_path = re.sub(r"\{[^}]+\}", "{}", raw_path)
-            key = (norm_path, method_name)
-            if key in seen_method_paths and seen_method_paths[key] != f"{src_name}:{raw_path}":
-                raise AssertionError(f"Route collision on {method_name} {norm_path} between {seen_method_paths[key]} and {src_name}:{raw_path}")
+            key = (scope, norm_path, method_name)
+            if key in seen_method_paths:
+                raise AssertionError(
+                    f"Route collision on {method_name} {norm_path} between {seen_method_paths[key]} "
+                    f"and {src_name}:{raw_path} (router scope {scope})"
+                )
             seen_method_paths[key] = f"{src_name}:{raw_path}"
 
-        return {"total_routes": len(route_entries), "unique_method_paths": len(seen_method_paths), "wildcards": len(wildcards)}
+        return {
+            "total_routes": len(route_entries),
+            "unique_method_paths": len(seen_method_paths),
+            "wildcards": len(wildcards),
+            "scopes": sorted({entry[3] for entry in route_entries}),
+        }
 
     @classmethod
     def verify_tier2_staged_schemas(cls) -> dict[str, Any]:
