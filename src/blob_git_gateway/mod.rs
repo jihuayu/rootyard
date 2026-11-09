@@ -13,14 +13,15 @@
 //!   terminal).
 //!
 //! What it deliberately does not own: a permanent bare repository, a legacy
-//! data-directory authority, an LFS media service, a merge producer or a
-//! browser/tree producer. Those routes refuse explicitly (`501`) instead of
+//! data-directory authority, an LFS media service or a merge producer.
+//! Those routes refuse explicitly (`501`) instead of
 //! pretending success.
 //!
 //! Local bare Git exists only as a per-request computed view. Durable refs live
 //! in the core and durable bytes in Blob, so the RAII deletion of a compute view
 //! can never lose an already acknowledged ref or byte.
 mod api;
+mod browse;
 mod config;
 mod error;
 mod metadata;
@@ -64,7 +65,10 @@ pub fn router(state: Arc<BlobGitState>) -> Router {
         .route("/api/repos/{owner}/{name}", get(api::get_repo))
         .route("/api/repos/{owner}/{name}/operations/{operation}", get(api::get_operation))
         .route("/api/repos/{owner}/{name}/merges", post(api::unsupported_merge))
-        .route("/api/repos/{owner}/{name}/tree/{*path}", get(api::unsupported_browse))
+        .route("/api/repos/{owner}/{name}/tree", get(browse::tree))
+        .route("/api/repos/{owner}/{name}/tree/{oid}", get(browse::tree_by_oid))
+        .route("/api/repos/{owner}/{name}/blob", get(browse::blob))
+        .route("/api/repos/{owner}/{name}/blob/{oid}", get(browse::blob_by_oid))
         .route("/git/{owner}/{name}/info/refs", get(smart_http::info_refs))
         .route("/git/{owner}/{name}/git-upload-pack", post(smart_http::upload_pack))
         .route("/git/{owner}/{name}/git-receive-pack", post(receive::receive_pack))

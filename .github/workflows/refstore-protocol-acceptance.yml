@@ -13,6 +13,11 @@ on:
       - 'tests/ref_store_*.rs'
       - 'tests/retention_roots_support/**'
       - 'tests/decision_subset_support/**'
+      - 'tests/blob_only_service.py'
+      - 'tests/blob_gateway_browse.py'
+      - 'tests/e2e.py'
+      - 'tests/native_evidence.py'
+      - 'tests/ops_provenance.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
 
@@ -103,6 +108,29 @@ jobs:
               'ignored': 0, 'external_blob_backup': False, 'serving_cutover': False,
           }, indent=2) + '\n')
           PY
+      - name: Build and exercise the minimal Blob standalone service
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/build_native.py --no-default-features --package-debug 0 --strip-debuginfo \
+            > test-results/refstore/standalone-build.json
+          set -a
+          . "$RUNNER_TEMP/refstore-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="standalone-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_GIT="$(command -v git)"
+          binary="$GITHUB_WORKSPACE/target/debug/rootyard"
+          python3 tests/blob_only_service.py --binary "$binary" --git "$ROOTYARD_GIT" \
+            --report test-results/refstore/standalone-http.json
+          python3 tests/blob_gateway_browse.py --binary "$binary" --git "$ROOTYARD_GIT" \
+            --report test-results/refstore/standalone-browse.json
       - name: Stop only the job-owned Garage fixture
         if: always()
         run: |

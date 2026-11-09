@@ -453,9 +453,8 @@ async fn child_rows_are_deletable_only_through_the_header_cascade() -> Result<()
                 // the real refusal lives in the database error.
                 let message = child_guard_refusal(&error);
                 ensure!(
-                    message.as_deref() == Some(
-                        "ref-store core serving read child rows may only be deleted by their header cascade"
-                    ),
+                    message.as_deref()
+                        == Some("ref-store core serving read child rows may only be deleted by their header cascade"),
                     "unexpected refusal from {table}: {:?}",
                     message.unwrap_or_else(|| error.to_string())
                 );
@@ -644,7 +643,10 @@ async fn usage_counter_rows_decode_from_their_actual_columns() -> Result<()> {
             "the drained repository usage must keep its tenant and recount to exactly 0/0, got {repository_usage:?}"
         );
         let tenant_usage = read_tenant_usage_row(&fixture, repo.ready.tenant_id).await?;
-        ensure!(tenant_usage == Some((0, 0)), "the drained tenant usage must recount to exactly 0/0, got {tenant_usage:?}");
+        ensure!(
+            tenant_usage == Some((0, 0)),
+            "the drained tenant usage must recount to exactly 0/0, got {tenant_usage:?}"
+        );
 
         ensure!(
             read_usage_row(&fixture, repository_id).await? == (Some(repo.ready.tenant_id), (0, 0)),

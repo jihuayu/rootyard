@@ -30,13 +30,13 @@ use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 use crate::{
-    blob_store::protected::{ProtectedUploader, UploadSource},
+    blob_store::protected::{ProtectedUploadError, ProtectedUploader, UploadSource},
     db::Identity,
     ref_store::{
         GitOid, HeadUpdate, IssuerLane, OperationIdentity, PgRefStore, RefName, RefUpdate, RequestDigest,
         artifact_hold::{
-            AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldPurpose, ArtifactSpec, HoldScope,
-            PgArtifactHoldStore,
+            AcquireArtifactHoldsRequest, AcquireOutcome, ArtifactHoldError, ArtifactHoldPurpose, ArtifactSpec,
+            HoldScope, PgArtifactHoldStore,
         },
         core::{
             CommitMode,
@@ -121,14 +121,32 @@ pub(super) async fn push(
     {
         Start::Terminal(terminal) => Ok(PushOutcome::Terminal(terminal)),
         Start::Cancelled(reason) => Ok(PushOutcome::Cancelled(reason)),
-        Start::Fresh { plan, .. } => {
-            for (index, pair) in pairs.iter().enumerate() {
-                let planned =
-                    plan.packs().get(index).ok_or(GatewayError::Internal("planned pack set is incomplete"))?;
-                publish_pair(state, &plan, planned.pack_id(), pair, deadline).await?;
+        Start::Fresh { plan, _token: token } => {
+            let result = async {
+                for (index, pair) in pairs.iter().enumerate() {
+                    let planned =
+                        plan.packs().get(index).ok_or(GatewayError::Internal("planned pack set is incomplete"))?;
+                    publish_pair(state, &plan, planned.pack_id(), pair, deadline).await?;
+                }
+                decide(state, actor, (*plan).clone(), mode, deadline).await
             }
-            let terminal = decide(state, actor, *plan, mode, deadline).await?;
-            Ok(PushOutcome::Terminal(terminal))
+            .await;
+            match result {
+                Ok(terminal) => Ok(PushOutcome::Terminal(terminal)),
+                Err(error @ GatewayError::Conflict(_)) => {
+                    // Only a definite conflict is eligible. Unknown COMMIT,
+                    // timeout and provider failures keep their original outcome.
+                    match authorized(state)?
+                        .reject_superseded_serving(state.pool(), &token, &plan, actor, request_digest, deadline)
+                        .await
+                        .map_err(map_authorized)?
+                    {
+                        Some(terminal) => Ok(PushOutcome::Terminal(terminal)),
+                        None => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 }
@@ -417,7 +435,7 @@ async fn publish_pair(
                     "this operation already consumed its artifact hold; it cannot upload again",
                 ));
             }
-            Err(_) => return Err(GatewayError::Internal("artifact hold acquisition was refused")),
+            Err(error) => return Err(map_acquire(error)),
         }
         // The pooled client returns here, before any provider IO.
     };
@@ -426,11 +444,33 @@ async fn publish_pair(
     let publication = uploader
         .consume_and_upload(state.pool(), grant, &sources, to_std(deadline)?)
         .await
-        .map_err(|_| GatewayError::Internal("protected Blob upload was refused"))?;
+        .map_err(map_protected_upload)?;
     let mut client = state.pooled(deadline).await?;
     let registration = PackRegistrationRequest::new(plan, pack_id, &publication)?;
     let _ = PgPackCommit.register_publication(&mut client, registration, deadline).await?;
     Ok(())
+}
+
+/// These two A3 refusals are produced only after matching the live immutable
+/// scope and observing its gate proof move. Other scope/ledger/provider errors
+/// are not a stale-base result; unknown durability must not enter the refusal
+/// transaction. Its sealed-token check independently proves revision progress.
+fn map_acquire(error: ArtifactHoldError) -> GatewayError {
+    match error {
+        ArtifactHoldError::ScopeMismatch("expected core gate proof") => {
+            GatewayError::Conflict("repository gate changed before artifact admission")
+        }
+        _ => GatewayError::Internal("artifact hold acquisition was refused"),
+    }
+}
+
+fn map_protected_upload(error: ProtectedUploadError) -> GatewayError {
+    match error {
+        ProtectedUploadError::Consume(ArtifactHoldError::ScopeMismatch("current core gate moved before consume")) => {
+            GatewayError::Conflict("repository gate changed before artifact consumption")
+        }
+        _ => GatewayError::Internal("protected Blob upload was refused"),
+    }
 }
 
 async fn decide(
@@ -493,5 +533,50 @@ fn map_authorized(error: AuthorizedCommitError) -> GatewayError {
         AuthorizedCommitError::Ledger(_) | AuthorizedCommitError::Database(_) => {
             GatewayError::Internal("publication ledger could not be verified")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artifact_gate_refusals_only_route_same_realm_progress_to_terminalization() {
+        assert!(matches!(
+            map_acquire(ArtifactHoldError::ScopeMismatch("expected core gate proof")),
+            GatewayError::Conflict(_)
+        ));
+        assert!(matches!(
+            map_protected_upload(ProtectedUploadError::Consume(ArtifactHoldError::ScopeMismatch(
+                "current core gate moved before consume"
+            ))),
+            GatewayError::Conflict(_)
+        ));
+        for field in
+            ["gate history incarnation", "gate authority epoch", "gate object format", "parent operation identity"]
+        {
+            assert!(matches!(map_acquire(ArtifactHoldError::ScopeMismatch(field)), GatewayError::Internal(_)));
+            assert!(matches!(
+                map_protected_upload(ProtectedUploadError::Consume(ArtifactHoldError::ScopeMismatch(field))),
+                GatewayError::Internal(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn ambiguous_artifact_durability_and_provider_failure_never_route_to_terminalization() {
+        assert!(matches!(
+            map_acquire(ArtifactHoldError::AcquireUnknown { request_id: Uuid::new_v4() }),
+            GatewayError::Internal(_)
+        ));
+        assert!(matches!(
+            map_protected_upload(ProtectedUploadError::Consume(ArtifactHoldError::ConsumeUnknown {
+                consume_request_id: Uuid::new_v4(),
+                hold_ids: vec![Uuid::new_v4()]
+            })),
+            GatewayError::Internal(_)
+        ));
+        assert!(matches!(map_protected_upload(ProtectedUploadError::Checkout), GatewayError::Internal(_)));
+        assert!(matches!(map_protected_upload(ProtectedUploadError::ForeignBackend), GatewayError::Internal(_)));
     }
 }

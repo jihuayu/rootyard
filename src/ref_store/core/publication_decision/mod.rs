@@ -63,7 +63,7 @@ pub(crate) mod usage;
 pub(crate) use crate::ref_store::core::subset;
 
 pub(crate) use cancel::coordinator_cancel;
-pub(crate) use consume::authorized_final_check;
+pub(crate) use consume::{authorized_final_check, reject_superseded_push};
 pub(crate) use contract::{
     CancelOutcome, ConsumptionRecord, DecisionError, DecisionKind, PublicationAction, SelectedDecision,
 };

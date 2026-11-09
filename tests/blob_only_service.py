@@ -418,7 +418,64 @@ def concurrent_same_ref_one_winner_parseable_no_false_ok(self):
     winner_file = ("a" if winners[0] == 0 else "b") + ".txt"
     assert (clone / winner_file).read_text() == winner_file[0] + "\n"
     self.git("fsck", "--full", "--strict", cwd=clone)
-    return {"winner": winners[0], "winner_oid": winner_oid, "loser_rejected": True, "false_ok": False}
+    # The native client may refuse its stale advertisement locally. Two direct
+    # protocol requests ensure both operation identities reach receive-pack;
+    # their pack streams and commit graphs are still produced by real Git.
+    raw_ref = "refs/heads/raw-race"
+    self.git("push", "origin", base + ":" + raw_ref, cwd=work, token=self.alice)
+    bodies = []
+    for index, source in enumerate(clones):
+        pack = self.run([str(self.profile.git), "--no-pager", "pack-objects", "--stdout", "--all"],
+                        cwd=source, data=b"").stdout
+        assert pack.startswith(b"PACK"), "Git produced no race pack"
+        bodies.append(receive_pack_request(base, oids[index], raw_ref, pack))
+    raw_operations = [str(uuid.uuid4()), str(uuid.uuid4())]
+    destination = repo["clone_path"] + "/git-receive-pack"
+    raw_barrier = threading.Barrier(2)
+    def post(index, wait=False):
+        if wait:
+            raw_barrier.wait(timeout=10)
+        return self.http(destination, token=self.alice, method="POST", body=bodies[index],
+                         content_type="application/x-git-receive-pack-request",
+                         extra_headers={"X-Rootyard-Operation": raw_operations[index]})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        raw_results = list(pool.map(lambda index: post(index, True), (0, 1)))
+    first_statuses = [result[0] for result in raw_results]
+    raw_reports, durable_states = [], []
+    for index, (status, body, headers) in enumerate(raw_results):
+        operation_query = (" WHERE repository_id='" + str(uuid.UUID(repo["id"]))
+                           + "' AND operation_id='" + raw_operations[index] + "'")
+        state = self.sql("SELECT state FROM ref_store_operations" + operation_query)
+        if status == 409:
+            # A pre-admission revision race may have rolled its transaction
+            # back. A pending row behind that 409 is the regression, never a
+            # reason to retry or accept this run.
+            assert not state, "409 left a durable operation instead of a terminal: " + state
+            status, body, headers = post(index)
+            state = self.sql("SELECT state FROM ref_store_operations" + operation_query)
+        assert status == 200, "race POST status=" + str(status) + ", state=" + state
+        assert header_value(headers, "x-rootyard-operation") == raw_operations[index]
+        unpack, statuses = parse_receive_report(body)
+        assert unpack == "unpack ok", unpack
+        assert len(statuses) == 1, statuses
+        if statuses[0] == "ok " + raw_ref:
+            assert state == "committed", state
+        else:
+            assert statuses[0].startswith("ng " + raw_ref + " "), statuses
+            assert state == "rejected", state
+        durable_states.append(state)
+        raw_reports.append(body)
+    assert sorted(durable_states) == ["committed", "rejected"], durable_states
+    counts = pg_replay_counts(self, repo["id"])
+    for index in (0, 1):
+        status, body, _ = post(index)
+        assert status == 200 and body == raw_reports[index], "race terminal did not replay byte-for-byte"
+    assert pg_replay_counts(self, repo["id"]) == counts, "race replay changed the ledger"
+    raw_winner = durable_states.index("committed")
+    self.assert_ref(remote, raw_ref, oids[raw_winner])
+    return {"winner": winners[0], "winner_oid": winner_oid, "loser_rejected": True, "false_ok": False,
+            "protocol_race_statuses": first_statuses, "protocol_race_states": durable_states,
+            "protocol_terminals_replayed": True}
 def multi_ref_atomic_vs_accepted_subset_actual_git_push(self):
     repo, remote, work, base = self.seed("atomic")
     advance = self.commit_tree(work, base, "advance")

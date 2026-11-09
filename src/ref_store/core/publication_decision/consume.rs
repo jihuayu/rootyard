@@ -271,3 +271,36 @@ async fn close(
     }
     Ok(())
 }
+
+/// No-write closure after the caller, under the operation and gate locks,
+/// proved that this exact admitted plan's base revision has been superseded.
+/// There may be no decision yet (registration/prepare lost the race). Existing
+/// decision identity and native selection rows remain immutable.
+pub(crate) async fn reject_superseded_push(
+    tx: &Transaction<'_>,
+    plan: &PackCommitPlan,
+    actor: &Identity,
+) -> Result<(), DecisionError> {
+    let Some(row) =
+        sql_locks::decision_by_operation(tx, plan.repository_id(), plan.identity().operation_id(), true).await?
+    else {
+        return Ok(());
+    };
+    if row.command_digest != *plan.parent_digest()
+        || row.actor_id != actor.id
+        || row.token_id != actor.token_id
+        || row.token_digest != hex::encode(&actor.token_digest)
+        || row.base_revision != plan.expected().revision()
+        || row.base_gate_digest != *plan.expected().gate_digest()
+        || row.action != super::contract::PublicationAction::Push
+    {
+        return Err(DecisionError::Ledger("superseded decision identity differs from admitted push"));
+    }
+    match row.state {
+        DecisionState::Open => close(tx, &row, DecisionState::Rejected, DenialCode::SelectionChanged, None, None).await,
+        DecisionState::Rejected => Ok(()),
+        DecisionState::Consumed | DecisionState::Cancelled => {
+            Err(DecisionError::Ledger("superseded pending operation has a conflicting decision terminal"))
+        }
+    }
+}

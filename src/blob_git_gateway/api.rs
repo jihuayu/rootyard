@@ -356,11 +356,6 @@ pub(super) async fn unsupported_merge() -> Result<Response, GatewayError> {
     Err(GatewayError::NotImplemented("merge production is not implemented by the Blob Git gateway"))
 }
 
-/// Explicit refusal: a browser/tree producer is a later extension.
-pub(super) async fn unsupported_browse() -> Result<Response, GatewayError> {
-    Err(GatewayError::NotImplemented("browse/tree production is not implemented by the Blob Git gateway"))
-}
-
 fn strip_name(raw: &str) -> Result<&str, GatewayError> {
     let name = raw.strip_suffix(".git").unwrap_or(raw);
     if !db::valid_name(name) {

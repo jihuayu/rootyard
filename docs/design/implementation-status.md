@@ -18,6 +18,18 @@
 
 PR #142 的真实原生四组为 8+11+12+20=51 场景，零失败、零忽略；最终提交的主 CI、Pando lab 和 RefStore 原生工作流均通过。具体源码、二进制、失败历史和隐私扫描见 [证据](../../evidence/state-services/roots-decisions144/README.md)。这些结果不覆盖完整服务启用、真实 Raft 或物理多机 HA。
 
+## Blob 单机服务候选增量
+
+PR [#159](https://github.com/jihuayu/rootyard/pull/159) 提供显式 `serve-blob` 入口，基于 schema147 的正常仓库创建、PG RefStore、OpenDAL 和可丢弃 Git 计算视图运行。它尚未替换默认服务，也不代表整个 #105 路线完成。
+
+当前后续增量补充 tree/blob JSON 浏览和并发提交拒绝终态。浏览复用捕获的 RefStore 快照、Blob 物化及真实 token/session 权限；支持 SHA-1/SHA-256、带注解标签、当前 refs 可达的历史对象、分页及二进制文件。并发收尾仅在原 pending token、请求绑定与同一 realm 的持久 gate 前进得到核对后写入拒绝终态，真正结果未知的提交仍保留未知语义。
+
+可重跑验收入口：`tests/blob_only_service.py`（11 项）与 `tests/blob_gateway_browse.py`（7 项），均要求 `scripts/build_native.py` 生成的当前源码绑定二进制、真实 PostgreSQL、S3 和原生 Git。RefStore 原生工作流已接入这两个服务验收入口。两处 A3 gate 竞争的错误分类有单元回归；HTTP 竞争验收不保证调度恰落在这两个窗口。
+
+备份仍是明确阻塞：format21/schema147 的 catalog 支持不等于非空 Blob 仓库备份。`backup::git_inventory` 仍要求 ready 仓库存在持久 bare Git，因此 `pg_refstore` 仓库的正向备份会失败；OpenDAL 内容闭包也尚未导出归档。`serve-blob` 当前不持有 legacy volume flock 或检查其 restore guard，不能套用旧服务的在线备份屏障结论。新增 `tests/backup_blob_serving147.py` 保留严格正向失败，未接入 CI；即使后续通过，它在保留原 Blob 的条件下只证明 PG 元数据恢复，独立 PG+Blob 闭包恢复仍需 #120 实现。不得伪造 bare 仓库或跳过检查来标记备份完成。
+
+LFS、PR/Merge、Workspace、CI/Namespace 的新服务接入、默认入口替换，以及 Raft 运行时、远程桥和多主机资格仍待完成。实施 issue 只有在相关实现合并并完成对应真实验收后关闭。
+
 ## 历史实现与验收索引
 
 以下保留已发生的验收和原提交记录；其中旧“当前”指记录日期，不定义新的架构和 backlog。历史成功不因新设计而被抹除，也不作为新模式的验收结果。
