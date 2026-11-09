@@ -408,13 +408,13 @@ pub fn scenarios_from(marker: &Value) -> Result<Vec<RootScenario>> {
             root_id: uuid_field(entry, "root_id")?,
             operation_id: uuid_field(entry, "operation_id")?,
             prepare_request_id: uuid_field(entry, "prepare_request_id")?,
-            register_request_id: match entry.get("receipts").and_then(|r| r.get("register")) {
+            register_request_id: match entry.get("register_request_id") {
+                Some(Value::Null) | None => None,
                 Some(_) => Some(uuid_field(entry, "register_request_id")?),
-                None => None,
             },
-            release_request_id: match entry.get("receipts").and_then(|r| r.get("release")) {
+            release_request_id: match entry.get("release_request_id") {
+                Some(Value::Null) | None => None,
                 Some(_) => Some(uuid_field(entry, "release_request_id")?),
-                None => None,
             },
             release_digest: None,
             register_digest: text_field(entry, "register_digest")
