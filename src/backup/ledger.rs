@@ -11,7 +11,6 @@
 
 use super::*;
 use crate::ref_store::artifact_hold::ConsumeAck;
-use serde_json::Value;
 use tokio_postgres::GenericClient;
 
 /// Canonical sorted closure row of one repository, exactly as the restored
@@ -120,9 +119,9 @@ pub(super) async fn carry(client: &(impl GenericClient + Sync)) -> Result<RefSto
         .filter(|name| name.starts_with("ref_store_") || name.starts_with("artifact_hold"))
     {
         let sql = format!(
-            "SELECT CASE WHEN pg_column_size(row)<=8388608 THEN row ELSE NULL END \
-             FROM (SELECT to_jsonb(t) AS row FROM public.\"{table}\" t) q \
-             ORDER BY row::text COLLATE \"C\""
+            "SELECT CASE WHEN pg_column_size(encoded_row)<=8388608 THEN encoded_row ELSE NULL END \
+             FROM (SELECT to_jsonb(t) AS encoded_row FROM public.\"{table}\" t) q \
+             ORDER BY encoded_row::text COLLATE \"C\""
         );
         let stream = client.query_raw(&sql, std::iter::empty::<&(dyn tokio_postgres::types::ToSql + Sync)>()).await?;
         futures_util::pin_mut!(stream);
