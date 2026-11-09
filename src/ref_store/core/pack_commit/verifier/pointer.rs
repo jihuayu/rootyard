@@ -56,12 +56,14 @@ pub(super) async fn scan_pointers(
         input.push_str(target_hex);
         input.push(':');
         input.push_str(path);
-        input.push('\n');
+        // Git paths may contain newlines. Match the NUL framing used by the
+        // changed-path scan so one filename always remains one request.
+        input.push('\0');
     }
     let listing = view
         .step(
             "cat-file",
-            &["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+            &["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)", "-Z"],
             Stdin::Bytes(input.as_bytes()),
             deadline,
         )
@@ -157,24 +159,30 @@ pub(super) async fn scan_pointers(
 
 /// Parse one `cat-file --batch-check` listing aligned with the changed paths.
 ///
-/// `paths` lines and listing lines are one-to-one; a missing object yields
+/// NUL-delimited requests and records are one-to-one; a missing object yields
 /// `<input> missing` and is skipped. Only small `blob` candidates are returned;
 /// anything malformed refuses the whole scan (fail closed).
 fn parse_candidates(listing: &[u8], paths: &[String]) -> Option<Vec<Candidate>> {
     let text = std::str::from_utf8(listing).ok()?;
-    let lines = text.lines().collect::<Vec<_>>();
+    if paths.is_empty() {
+        return listing.is_empty().then(Vec::new);
+    }
+    let lines = text.strip_suffix('\0')?.split('\0').collect::<Vec<_>>();
     if lines.len() != paths.len() {
         return None;
     }
     let mut candidates = Vec::new();
     for (line, path_index) in lines.iter().zip(0..paths.len()) {
+        // Git echoes the complete input (including whitespace in its path)
+        // for missing objects. Its suffix, rather than whitespace splitting,
+        // identifies that outcome.
+        if line.ends_with(" missing") {
+            continue;
+        }
         let mut parts = line.split(' ');
         let (Some(object), Some(kind)) = (parts.next(), parts.next()) else {
             return None;
         };
-        if kind == "missing" {
-            continue;
-        }
         if kind != "blob" {
             continue;
         }
@@ -245,10 +253,21 @@ mod tests {
     #[test]
     fn candidate_listing_aligns_paths_and_skips_large_or_missing_blobs() {
         let paths = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let listing = format!("{} blob 3\n{} missing\n{} blob 2048\n", "a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let listing = format!("{} blob 3\0{} missing\0{} blob 2048\0", "a".repeat(40), "b".repeat(40), "c".repeat(40));
         let candidates = parse_candidates(listing.as_bytes(), &paths).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].path_index, 0);
         assert!(parse_candidates(listing.as_bytes(), &paths[..2]).is_none());
+    }
+
+    #[test]
+    fn candidate_listing_keeps_whitespace_paths_aligned() {
+        let paths = vec!["with\nnewline".to_owned(), "missing with\twhitespace".to_owned(), "last".to_owned()];
+        let oid = "a".repeat(40);
+        let listing = format!("{oid} blob 3\0{oid}:missing with\twhitespace missing\0{oid} blob 2\0");
+        let candidates = parse_candidates(listing.as_bytes(), &paths).unwrap();
+        assert_eq!(candidates.iter().map(|candidate| candidate.path_index).collect::<Vec<_>>(), vec![0, 2]);
+        assert!(parse_candidates(listing.trim_end_matches('\0').as_bytes(), &paths).is_none());
+        assert!(parse_candidates(b"", &[]).unwrap().is_empty());
     }
 }
