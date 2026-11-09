@@ -5,6 +5,7 @@ temporary workspace/target directory and fake Cargo JSON event streams, then
 prove the receipt is bound to the rebuilt artifact, invalidated on every
 failure path, and installed atomically under the target-directory flock.
 """
+import argparse
 import fcntl
 import hashlib
 import io
@@ -145,8 +146,18 @@ class BuildReceiptTest(unittest.TestCase):
         return popen
 
     @staticmethod
-    def args(features=None, bins=False):
-        return mock.Mock(features=features, bins=bins)
+    def args(features=None, bins=False, package_debug=None, no_default_features=False,
+             strip_debuginfo=False):
+        # Every attribute run_build reads is set explicitly: an auto-created
+        # Mock attribute would be stringified into the recorded cargo command
+        # and still compare equal to itself.
+        return argparse.Namespace(
+            features=features,
+            bins=bins,
+            package_debug=package_debug,
+            no_default_features=no_default_features,
+            strip_debuginfo=strip_debuginfo,
+        )
 
     def events(self, fresh=False, executable=None, kinds=('lib', 'bin')):
         executable = str(self.binary) if executable is None else executable
@@ -158,10 +169,10 @@ class BuildReceiptTest(unittest.TestCase):
                 result.append(_artifact('bin', fresh=fresh, executable=executable))
         return result
 
-    def build(self, events, **popen_kwargs):
+    def build(self, events, args=None, **popen_kwargs):
         self.popen = self.make_popen(events, **popen_kwargs)
         with mock.patch.object(build_native.subprocess, 'Popen', self.popen):
-            return build_native.run_build(self.args())
+            return build_native.run_build(self.args() if args is None else args)
 
     def assert_no_receipt(self):
         self.assertFalse(self.receipt.exists(), 'a receipt survived a failed build')
@@ -180,11 +191,12 @@ class BuildReceiptTest(unittest.TestCase):
         self.assertEqual(self.lock_violations, [])
         self.assertEqual(len(self.popen_calls), 1)
         command, kwargs = self.popen_calls[0]
-        self.assertEqual(command[:2], ['cargo', 'build'])
-        self.assertIn('--locked', command)
-        self.assertIn('--bin', command)
-        self.assertIn('rootyard', command)
-        self.assertIn('--message-format=json-render-diagnostics', command)
+        # Default profile: features, bins are explicit and the newer profile
+        # flags are absent, so the receipt command is exactly reproducible.
+        self.assertEqual(command, [
+            'cargo', 'build', '--locked', '--bin', 'rootyard',
+            '--message-format=json-render-diagnostics',
+        ])
         self.assertEqual(kwargs['cwd'], self.root)
 
         self.assertTrue(self.receipt.is_file())
@@ -207,6 +219,50 @@ class BuildReceiptTest(unittest.TestCase):
         self.assertEqual(receipt['rustc'], 'rustc 1.80.0 (fake)')
         self.assertEqual(receipt['binary_sha256'],
                          hashlib.sha256(b'native-binary').hexdigest())
+
+    def test_minimal_profile_flags_are_explicit_and_recorded_in_receipt(self):
+        args = self.args(no_default_features=True, package_debug='1')
+        report = self.build(self.events(), args=args)
+
+        command, _ = self.popen_calls[0]
+        self.assertEqual(command, [
+            'cargo', 'build', '--locked', '--no-default-features',
+            '--config', 'profile.dev.package.rootyard.debug=1',
+            '--bin', 'rootyard', '--message-format=json-render-diagnostics',
+        ])
+        self.assertEqual(report['command'], command)
+        receipt = json.loads(self.receipt.read_text())
+        self.assertEqual(receipt['command'], command)
+        self.assertEqual(receipt['binary_sha256'],
+                         hashlib.sha256(b'native-binary').hexdigest())
+
+    def test_ci_profile_bins_pando_lab_and_strip_debuginfo_are_recorded_verbatim(self):
+        args = self.args(bins=True, features='pando-lab', strip_debuginfo=True)
+        report = self.build(self.events(), args=args)
+
+        command, kwargs = self.popen_calls[0]
+        # The exact CI invocation (.github/workflows/ci.yml:
+        # `python3 scripts/build_native.py --features pando-lab --bins
+        # --strip-debuginfo`), including the quoted strip value untouched.
+        self.assertEqual(command, [
+            'cargo', 'build', '--locked', '--bins',
+            '--features', 'pando-lab',
+            '--config', 'profile.dev.package.rootyard.strip="debuginfo"',
+            '--message-format=json-render-diagnostics',
+        ])
+        self.assertEqual(kwargs['cwd'], self.root)
+        self.assertLess(command.index('--bins'), command.index('--features'))
+        self.assertEqual(report['command'], command)
+        receipt = json.loads(self.receipt.read_text())
+        self.assertEqual(receipt, report)
+        self.assertEqual(receipt['command'], command)
+        self.assertEqual(receipt['command'][receipt['command'].index('--config') + 1],
+                         'profile.dev.package.rootyard.strip="debuginfo"')
+        self.assertEqual([item['kind'] for item in receipt['fresh_false_artifacts']],
+                         ['lib', 'bin'])
+        self.assertEqual(receipt['binary_sha256'],
+                         hashlib.sha256(b'native-binary').hexdigest())
+        self.assertFalse(self.temporary.exists())
 
     def test_source_digest_is_unchanged_and_bound_to_the_receipt(self):
         before = build_native.source_digest()

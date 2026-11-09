@@ -265,7 +265,18 @@ class TestTier5RouterAndParameterNonCollision(unittest.TestCase):
                         )
                         wildcard_routes.append((rel, raw_path))
 
-        self.assertEqual(wildcard_routes, [("src/pulls.rs", "/api/repos/{owner}/{name}/branch-rules/{*branch}")])
+        # Both catch-alls are final-segment wildcards. src/pulls.rs owns the
+        # branch-rules catch-all of the PR router (branch names contain '/');
+        # src/blob_git_gateway/mod.rs is the separate Blob Git gateway ("serve-blob")
+        # router, where `any(api::unsupported_lfs)` explicitly refuses every LFS
+        # request instead of pretending to serve it.
+        self.assertEqual(
+            wildcard_routes,
+            [
+                ("src/blob_git_gateway/mod.rs", "/git/{owner}/{name}/info/lfs/{*rest}"),
+                ("src/pulls.rs", "/api/repos/{owner}/{name}/branch-rules/{*branch}"),
+            ],
+        )
 
     def test_lfs_upload_routes_disable_default_body_limit_while_api_router_caps_at_16kib(self) -> None:
         lfs_root = (ROOT / "src/lfs.rs").read_text(encoding="utf-8")
@@ -478,7 +489,9 @@ class TestTier5Schema030AndBackupCatalogAdversarial(unittest.TestCase):
             "pando_repository_states",
             "ref_store_core_gates",
             "ref_store_core_pins",
+            "ref_store_core_serving_reads",
             "ref_store_core_snapshots",
+            "ref_store_serving_repositories",
             "repository_audit_log",
             "repository_collaborators",
             "repository_shard_routes",

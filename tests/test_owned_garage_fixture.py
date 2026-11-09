@@ -11,6 +11,8 @@ Docker daemon, image pull or image cache mutation happens here.
 """
 import os
 from pathlib import Path
+import re
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -133,6 +135,28 @@ esac
 
     def docker_calls(self):
         return self.log.read_text()
+
+    def held_dead_port(self):
+        """A never-listening 127.0.0.1:0 port owned by this test, held until it ends."""
+        self.holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.holder.bind(("127.0.0.1", 0))
+        # Deliberately no listen(): a bound-but-unlistening port rejects every
+        # connection, so the S3 readiness probe cannot be satisfied by anything
+        # the test did not create (e.g. another service already on 3900).
+        self.addCleanup(self.holder.close)
+        return self.holder.getsockname()[1]
+
+    def bound_start(self, directory, *extra, env=None):
+        """Start on a port this test holds unlistening, instead of the shared default."""
+        port = self.held_dead_port()
+        return self.start(directory, 1, "--port", str(port), *extra, env=env), port
+
+    def default_probe_port(self):
+        """Port the helper probes when --port is absent: parsed from the script default."""
+        source = SCRIPT.read_text()
+        match = re.search(r'^port="?(\d+)"?$', source, re.MULTILINE)
+        self.assertIsNotNone(match, "the helper no longer declares a default port")
+        return int(match.group(1))
 
     def start(self, directory, expect, *extra, env=None):
         environment = self.env.copy()
@@ -285,8 +309,11 @@ class ColdCacheImageTest(FixtureGuardTest):
     def test_cold_cache_pulls_pinned_reference_before_first_inspect(self):
         directory = self.root / "cold"
         state = self.root / "image-state"
-        process = self.start(
-            directory, 1,
+        # No --port: the probe port is pinned to one this test holds, so a real
+        # S3 service on the helper's default port (e.g. 127.0.0.1:3900) cannot
+        # answer the probe and the expected start/cleanup failure stays exact.
+        process, _ = self.bound_start(
+            directory,
             env={
                 "STUB_IMAGE_STATE": str(state),
                 "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
@@ -312,8 +339,8 @@ class ColdCacheImageTest(FixtureGuardTest):
 
     def test_warm_cache_never_pulls(self):
         directory = self.root / "warm"
-        process = self.start(
-            directory, 1,
+        process, _ = self.bound_start(
+            directory,
             env={
                 "STUB_IMAGE_STATE": str(self.log),  # present before start
                 "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
@@ -322,6 +349,28 @@ class ColdCacheImageTest(FixtureGuardTest):
         self.assertNotIn("pull ", self.docker_calls())
         self.assertIn("create --rm", self.docker_calls())
         self.assertIn(f"rm -f -- {self.cid}", self.docker_calls())
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
+
+    def test_pinned_probe_port_is_the_one_bound_and_probed(self):
+        # Guards the isolation above: the binding and probe endpoint must follow
+        # the held port, never the helper's default, and the held socket must
+        # not be listening (SO_ACCEPTCONN == 0, so the probe can only be refused).
+        directory = self.root / "cold"
+        default = self.default_probe_port()
+        process, port = self.bound_start(
+            directory,
+            env={
+                "STUB_IMAGE_STATE": str(self.root / "image-state"),
+                "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
+            },
+        )
+        self.assertNotEqual(default, port)
+        self.assertEqual(0, self.holder.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN))
+        calls = self.docker_calls()
+        self.assertEqual([str(port)], re.findall(r"-p 127\.0\.0\.1:(\d+):3900", calls), calls)
+        self.assertEqual([], re.findall(rf"-p 127\.0\.0\.1:{default}:3900", calls), calls)
+        self.assertIn(f"rm -f -- {self.cid}", calls)
         self.assertFalse(directory.exists())
         self.assertFalse((self.root / "outside.env").exists())
 
