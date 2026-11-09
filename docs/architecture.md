@@ -4,6 +4,10 @@
 
 本文取代旧 ADR 001、历史 01—11 章及 GitFS/Patroni 拓扑作为新安装规范。历史来源和验收记录保留原范围。[实施计划](design/implementation-plan.md) 定义任务与验收，[详细协议](design/12-state-services.md) 定义边界，[架构图](design/architecture-diagrams.md) 与正文同步。
 
+## Git 传输范围
+
+对外 Git 仅提供 Smart HTTP/HTTPS。HTTPS 在入口代理终止 TLS；不实现 SSH transport、SSH daemon、SSH 登录密钥管理或 SSH clone/push 验收。内部 Raft/服务 mTLS 不属于 Git SSH。签名提交中的 SSH 签名验证与传输协议是不同功能，不因本约束误删。
+
 ## 两种目标部署
 
 | 职责 | Standalone | Distributed |

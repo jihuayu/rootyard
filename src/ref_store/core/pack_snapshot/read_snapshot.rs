@@ -57,13 +57,50 @@ pub struct PackReadSnapshot {
     packs: Vec<RegisteredPack>,
     membership_digest: String,
     snapshot_digest: String,
+    source: ReadSnapshotSourceKind,
     read_digest: RequestDigest,
     logical_bytes: i64,
     expires_at_unix_micros: i64,
 }
 
+/// Which pin family produced a [`PackReadSnapshot`].
+///
+/// The two families are deliberately disjoint: the durable A5a family
+/// (`ref_store_core_snapshots`/`ref_store_core_pins`, retained, permanent,
+/// 64 per repository) and the transient migration-146 serving read pin (bounded,
+/// deleted on release, reclaimed after expiry). The kind is bound into the A5b
+/// materialization digest, so a value from one family can never be revalidated,
+/// materialized or retained as the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadSnapshotSourceKind {
+    /// Durable, retained A5a snapshot + durable pin.
+    RetainedDurable,
+    /// Bounded transient migration-146 serving read pin.
+    ServingTransient,
+}
+
+impl ReadSnapshotSourceKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RetainedDurable => "retained_durable",
+            Self::ServingTransient => "serving_transient",
+        }
+    }
+}
+
 impl PackReadSnapshot {
+    /// The retained durable A5a constructor (unchanged semantics).
     pub(super) fn new(parts: ReadSnapshotParts) -> Result<Self, RefStoreError> {
+        Self::build(parts, ReadSnapshotSourceKind::RetainedDurable)
+    }
+
+    /// The bounded transient serving read constructor. Still private to the
+    /// pack-snapshot subtree: no adapter outside it can mint a byte proof.
+    pub(super) fn new_serving_transient(parts: ReadSnapshotParts) -> Result<Self, RefStoreError> {
+        Self::build(parts, ReadSnapshotSourceKind::ServingTransient)
+    }
+
+    fn build(parts: ReadSnapshotParts, source: ReadSnapshotSourceKind) -> Result<Self, RefStoreError> {
         if parts.snapshot_id.is_nil() || parts.pin_id.is_nil() || parts.pin_generation <= 0 {
             return Err(RefStoreError::Database("pack read snapshot identity is invalid".into()));
         }
@@ -117,10 +154,19 @@ impl PackReadSnapshot {
             packs,
             membership_digest: parts.membership_digest,
             snapshot_digest: parts.snapshot_digest,
+            source,
             read_digest,
             logical_bytes: parts.logical_bytes,
             expires_at_unix_micros: parts.expires_at_unix_micros,
         })
+    }
+
+    /// Which pin family produced this value. The retained durable path stays
+    /// [`ReadSnapshotSourceKind::RetainedDurable`]; the bounded transient serving
+    /// path is [`ReadSnapshotSourceKind::ServingTransient`] and must be
+    /// revalidated through the migration-146 pin, never the durable pin SQL.
+    pub fn source_kind(&self) -> ReadSnapshotSourceKind {
+        self.source
     }
 
     pub fn snapshot_id(&self) -> Uuid {
@@ -194,6 +240,7 @@ impl PackReadSnapshot {
     pub(in crate::ref_store::core) fn materialization_digest(&self) -> RequestDigest {
         let mut fields: Vec<Vec<u8>> = vec![
             self.read_digest.as_bytes().to_vec(),
+            self.source.as_str().as_bytes().to_vec(),
             self.scope.repository_id().as_bytes().to_vec(),
             self.scope.tenant_id().as_bytes().to_vec(),
             self.scope.owner_id().as_bytes().to_vec(),

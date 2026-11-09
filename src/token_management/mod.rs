@@ -18,6 +18,12 @@
 //! restricted browser-child inheritance are tracked on a separate branch. This
 //! module is a private implementation branch; it does not claim those pieces
 //! are released.
+//!
+//! State: the handlers depend on [`MetadataState`] (one PostgreSQL pool) only,
+//! so [`routes`] is generic over the router state. The legacy application router
+//! builds it with `Arc<AppState>`; the Blob-only gateway merges it with
+//! `Arc<BlobGitState>`. Both provide `MetadataState` through `FromRef`; no
+//! handler ever sees a legacy storage or native-Git authority.
 
 pub(crate) mod cursors;
 pub mod grants;
@@ -25,16 +31,23 @@ pub mod handlers;
 pub mod models;
 pub mod service;
 
-use crate::AppState;
+use crate::application::MetadataState;
 use axum::{
     Json, Router,
+    extract::FromRef,
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use std::sync::Arc;
 
-pub fn routes() -> Router<Arc<AppState>> {
+/// Same API paths, same token-scoped authorization: the service layer still
+/// resolves the acting user and the explicit grant set from the request's
+/// `Authorization` header. Only the extractor state type is generic.
+pub fn routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    MetadataState: FromRef<S>,
+{
     Router::new()
         .route("/api/tokens", get(handlers::list_tokens).post(handlers::create_token))
         .route(

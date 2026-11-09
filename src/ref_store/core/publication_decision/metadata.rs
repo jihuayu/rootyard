@@ -179,25 +179,26 @@ pub(super) async fn metadata_authority(
     if read_only {
         return Err(DecisionError::Denied(DenialCode::TokenReadOnly));
     }
-    let repository = tx
-        .query_opt(
-            "SELECT r.owner_id,r.state,r.storage_backend,r.transition_state,r.object_format,
-                    EXISTS(SELECT 1 FROM pando_repository_states s WHERE s.repository_id=r.id),r.storage_generation
-             FROM repositories r WHERE r.id=$1 FOR SHARE",
-            &[&repository_id],
-        )
+    // One shared strict repository predicate: the unserved gitfs fixture lane
+    // or the ready `pg_refstore` serving lane with its exact durable binding.
+    let locked = super::super::serving_scope::LockedScope::lock(tx, repository_id, false)
         .await
-        .map_err(sql_locks::sql_error)?
+        .map_err(|_| DecisionError::Unverifiable("live repository authority resolution failed"))?
         .ok_or(DecisionError::Denied(DenialCode::RepositoryNotFound))?;
-    let owner_id: Uuid = repository.get(0);
-    let state: String = repository.get(1);
-    let backend: String = repository.get(2);
-    let transition: String = repository.get(3);
-    let format: String = repository.get(4);
-    let pando: bool = repository.get(5);
-    if state != "provisioning" || backend != "gitfs" || transition != "stable" || pando {
-        return Err(DecisionError::Denied(DenialCode::RepositoryUnserved));
+    let owner_id: Uuid = locked.owner_id();
+    let lane =
+        locked.require_fresh_core_lane(owner_id).map_err(|_| DecisionError::Denied(DenialCode::RepositoryUnserved))?;
+    if lane.is_serving() {
+        // Metadata-only receipts attest no bytes. A serving ref must instead
+        // pass the pack/native proof path, even while the new repository is empty.
+        return Err(DecisionError::Denied(DenialCode::UnsupportedAction));
     }
+    let state: String = locked.state().to_owned();
+    let backend: String = locked.storage_backend().to_owned();
+    let transition: String = locked.transition_state().to_owned();
+    let format: String = locked.object_format().as_str().to_owned();
+    let pando: bool = locked.pando_authority();
+    let storage_generation: i64 = locked.storage_generation();
     let resolved = crate::members::rbac::resolve_effective_role(tx, repository_id, owner_id, actor.id)
         .await
         .map_err(|_| DecisionError::Unverifiable("live RBAC resolution failed"))?;
@@ -216,6 +217,17 @@ pub(super) async fn metadata_authority(
     .await
     .map_err(|_| DecisionError::Denied(DenialCode::ScopeDenied))?;
     let protocol = sql_locks::protocol_state(tx, repository_id).await?;
+    // The durable serving binding (pg_refstore lane) must be exactly this
+    // protocol/gate realm; the gitfs fixture lane must carry none.
+    locked
+        .require_fresh_core(&super::super::serving_scope::CoreRealm::new(
+            protocol.tenant_id,
+            locked.object_format(),
+            protocol.history_incarnation,
+            protocol.authority_epoch,
+            protocol.group_epoch,
+        ))
+        .map_err(|_| DecisionError::Denied(DenialCode::RepositoryUnserved))?;
     let grants = tx.query("SELECT action FROM token_repository_scopes WHERE token_id=$1 AND repository_id=$2 ORDER BY action LIMIT 65",
         &[&actor.token_id, &repository_id]).await.map_err(sql_locks::sql_error)?;
     if grants.len() > 64 {
@@ -239,7 +251,7 @@ pub(super) async fn metadata_authority(
         storage_backend: &backend,
         transition_state: &transition,
         pando_authority: pando,
-        storage_generation: repository.get(6),
+        storage_generation,
         actions: &[RepoAction::ContentsWrite.as_str()],
         action: "push",
     });

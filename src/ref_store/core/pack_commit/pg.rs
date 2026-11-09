@@ -121,7 +121,7 @@ impl PgPackCommit {
         })
         .await;
         match result {
-            Ok(token) => {
+            Ok((token, _created)) => {
                 commit_bounded(tx, deadline, plan.repository_id(), Some(plan.identity().operation_id()))
                     .await
                     .map_err(PackCommitError::from)?;
@@ -134,13 +134,21 @@ impl PgPackCommit {
         }
     }
 
-    async fn begin_pending_in_tx(
+    /// Exact migration-138 pending prefix on a caller-owned transaction.
+    ///
+    /// Returns the opaque token **and** whether this transaction inserted the
+    /// pending row (`BeginReceipt::created`). Callers that atomically attach
+    /// another durable row to the operation must only do so when `created` is
+    /// true; an existing pending row may never gain a new binding after the
+    /// fact.
+    pub(super) async fn begin_pending_in_tx(
         &self,
         tx: &Transaction<'_>,
         plan: &PackCommitPlan,
         deadline: Instant,
-    ) -> Result<PackPendingToken, PackCommitError> {
+    ) -> Result<(PackPendingToken, bool), PackCommitError> {
         let begun = PgRefStore.begin(tx, plan.identity(), deadline).await?;
+        let created = begun.created;
         match begun.record.state() {
             OperationState::Committed | OperationState::Rejected => {
                 return Err(reject(PackCommitRejectCode::AlreadyVerified, "operation is already terminal"));
@@ -155,17 +163,18 @@ impl PgPackCommit {
         }
         // Repository authority is re-checked after the registry prefix and
         // before any pack/ref write.
-        ensure_repository(tx, plan.repository_id(), plan.tenant_id(), false).await?;
+        ensure_repository(tx, plan, false).await?;
         let (gate, mode) = sql::gate_locked(tx, plan.repository_id())
             .await?
             .ok_or_else(|| reject(PackCommitRejectCode::GateNotFound, "core gate missing"))?;
         ensure_gate_matches(plan, &gate, mode)?;
-        PackPendingToken::established(
+        let token = PackPendingToken::established(
             plan.repository_id(),
             plan.tenant_id(),
             plan.identity().operation_id(),
             *plan.parent_digest(),
-        )
+        )?;
+        Ok((token, created))
     }
 
     /// Capture the closure context at the plan's exact expected revision with the
@@ -201,7 +210,7 @@ impl PgPackCommit {
         deadline: Instant,
     ) -> Result<PackCommitBaseline, PackCommitError> {
         crate::ref_store::pg::bound(tx, deadline).await?;
-        ensure_repository(tx, plan.repository_id(), plan.tenant_id(), true).await?;
+        ensure_repository(tx, plan, true).await?;
         let (gate, mode) = sql::gate_locked(tx, plan.repository_id())
             .await?
             .ok_or_else(|| reject(PackCommitRejectCode::GateNotFound, "core gate missing"))?;
@@ -285,26 +294,44 @@ pub(super) fn ensure_gate_matches(
     Ok(())
 }
 
-/// Repository authority recheck. `require_core` additionally requires the
-/// unchanged isolated unserved core bootstrap state for fresh writes.
+/// Repository authority recheck through the one shared strict predicate.
+///
+/// `require_core` additionally requires a fresh-write lane: the unserved
+/// `gitfs` fixture repository, or the ready `pg_refstore` serving authority
+/// whose durable binding is exactly this plan realm (owner, object format,
+/// history incarnation, authority/group epochs) and whose Blob backend is the
+/// live store. A plain ready row or a backend string is never enough.
 pub(super) async fn ensure_repository(
     tx: &Transaction<'_>,
-    repository_id: Uuid,
-    tenant_id: Uuid,
+    plan: &PackCommitPlan,
     require_core: bool,
-) -> Result<(), PackCommitError> {
-    let Some((owner, state, backend, transition, pando)) = sql::repository_authority(tx, repository_id).await? else {
-        return Err(PackCommitError::from(RefStoreError::RepositoryNotFound));
-    };
-    if owner != tenant_id {
+) -> Result<crate::ref_store::core::serving_scope::LockedScope, PackCommitError> {
+    let scope = crate::ref_store::core::serving_scope::LockedScope::lock(tx, plan.repository_id(), false)
+        .await?
+        .ok_or_else(|| PackCommitError::from(RefStoreError::RepositoryNotFound))?;
+    if scope.owner_id() != plan.tenant_id() {
         return Err(reject(PackCommitRejectCode::TenantMismatch, "repository belongs to another tenant"));
     }
-    if require_core && (state != "provisioning" || backend != "gitfs" || transition != "stable" || pando) {
-        return Err(PackCommitError::from(RefStoreError::Unsupported(
-            "repository is no longer an isolated unserved core repository",
-        )));
+    if !require_core {
+        return Ok(scope);
     }
-    Ok(())
+    let realm = crate::ref_store::core::serving_scope::CoreRealm::new(
+        plan.tenant_id(),
+        plan.object_format(),
+        plan.history_incarnation(),
+        plan.authority_epoch(),
+        plan.group_epoch(),
+    );
+    match scope.require_fresh_core(&realm) {
+        Ok(_lane) => Ok(scope),
+        Err(crate::ref_store::core::serving_scope::ScopeRefusal::Realm(
+            crate::ref_store::core::serving_scope::RealmField::ObjectFormat,
+        )) => Err(reject(PackCommitRejectCode::ObjectFormatMismatch, "repository object format differs")),
+        Err(crate::ref_store::core::serving_scope::ScopeRefusal::Realm(_)) => {
+            Err(reject(PackCommitRejectCode::HistoryIncarnationMismatch, "repository gate epochs differ"))
+        }
+        Err(refusal) => Err(PackCommitError::from(RefStoreError::Unsupported(refusal.reason()))),
+    }
 }
 
 /// Terminal replay of an already committed/rejected pack operation.

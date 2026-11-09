@@ -131,7 +131,7 @@ impl PgAuthorizedCommit {
         let stage = async {
             pg::set_ack_durability(&tx, deadline).await?;
             pg::acquire_pending_prefix(&tx, prepared.plan(), deadline).await?;
-            pg::ensure_repository(&tx, prepared.repository_id(), prepared.tenant_id(), true).await?;
+            pg::ensure_repository(&tx, prepared.plan(), true).await?;
             crate::ref_store::core::publication_decision::sql_locks::lock_source_tables(
                 &tx,
                 &crate::ref_store::core::publication_decision::contract::PublicationAction::Push,

@@ -383,6 +383,7 @@ impl PackCommitPlan {
     pub fn scope(&self) -> &PackCommitScope {
         &self.scope
     }
+
     pub fn identity(&self) -> &OperationIdentity {
         &self.identity
     }

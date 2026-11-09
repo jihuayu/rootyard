@@ -34,24 +34,6 @@ pub(super) async fn gate_locked(
     Ok(Some((gate, PackMode::parse(&mode)?)))
 }
 
-/// Same repository authority recheck the A1 path performs, under a shared row
-/// lock after the registry prefix.
-pub(super) async fn repository_authority(
-    tx: &Transaction<'_>,
-    repository_id: Uuid,
-) -> Result<Option<(Uuid, String, String, String, bool)>, RefStoreError> {
-    let row = tx
-        .query_opt(
-            "SELECT r.owner_id,r.state,r.storage_backend,r.transition_state,
-                    EXISTS(SELECT 1 FROM pando_repository_states s WHERE s.repository_id=r.id)
-             FROM repositories r WHERE r.id=$1 FOR SHARE",
-            &[&repository_id],
-        )
-        .await
-        .map_err(pg::db_error)?;
-    Ok(row.map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))))
-}
-
 /// Complete ref capture. Counts first so an overflow is a typed refusal instead
 /// of a silently truncated page.
 pub(super) async fn capture_refs(

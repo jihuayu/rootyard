@@ -40,6 +40,9 @@ mod authorized;
 pub(in crate::ref_store::core) mod facts;
 mod pg;
 mod pg_commit;
+// #144 served-path producer binding: a separate durable table, never a rewrite
+// of the core operation identity or of the A3 plan parent digest.
+mod producer;
 mod registration;
 mod sql;
 mod usage;
@@ -63,6 +66,7 @@ pub use error::{PackCommitError, PackCommitRejectCode, PackCommitRejection};
 pub(crate) use facts::{RefFacts, VerifiedPublicationFacts};
 pub use pg::PgPackCommit;
 pub use plan::{ContentDigest, PackCommitExpectation, PackCommitPlan, PackCommitScope, PlannedArtifact, PlannedPack};
+pub(crate) use producer::read_serving_operation;
 pub use proof::PackClosureProof;
 pub use proof::verifier::PackVerifier;
 pub(crate) use proof::verifier::{NativeReadClosure, NativeReadEngine, NativeReadRequest};

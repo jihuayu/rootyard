@@ -157,37 +157,38 @@ pub(super) async fn load_live_authority(
         .ok_or(DecisionError::Denied(DenialCode::TokenInvalid))?;
     let _user_id: Uuid = user_row.get(0);
 
-    // 2. Repository lifecycle. A core repository is still unserved: it must stay `provisioning`,
-    //    on the legacy `gitfs` backend, with a stable transition and no live Pando authority. The
-    //    legacy global `ready` rule is deliberately untouched.
-    let repository = tx
-        .query_opt(
-            "SELECT r.owner_id,r.state,r.storage_backend,r.transition_state,r.object_format,\
-                    r.storage_generation,\
-                    EXISTS(SELECT 1 FROM pando_repository_states s WHERE s.repository_id=r.id)
-             FROM repositories r WHERE r.id=$1 FOR SHARE",
-            &[&plan.repository_id()],
-        )
+    // 2. Repository lifecycle through the one shared strict predicate: the
+    //    unserved gitfs fixture lane or the ready `pg_refstore` serving lane
+    //    whose durable binding is exactly this plan realm. The legacy global
+    //    `ready` rule is deliberately untouched.
+    let locked = super::super::serving_scope::LockedScope::lock(tx, plan.repository_id(), false)
         .await
-        .map_err(sql_locks::sql_error)?
+        .map_err(|_| DecisionError::Unverifiable("live repository authority resolution failed"))?
         .ok_or(DecisionError::Denied(DenialCode::RepositoryNotFound))?;
-    let owner_id: Uuid = repository.get(0);
-    let repository_state: String = repository.get(1);
-    let storage_backend: String = repository.get(2);
-    let transition_state: String = repository.get(3);
-    let repository_format_text: String = repository.get(4);
-    let storage_generation: i64 = repository.get(5);
-    let pando_authority: bool = repository.get(6);
+    let owner_id: Uuid = locked.owner_id();
     if owner_id != plan.tenant_id() || owner_id != plan.owner_id() {
         return Err(DecisionError::Denied(DenialCode::TenantMismatch));
     }
-    if repository_state != "provisioning"
-        || storage_backend != "gitfs"
-        || transition_state != "stable"
-        || pando_authority
-    {
-        return Err(DecisionError::Denied(DenialCode::RepositoryUnserved));
+    let realm = super::super::serving_scope::CoreRealm::new(
+        owner_id,
+        plan.object_format(),
+        plan.history_incarnation(),
+        plan.authority_epoch(),
+        plan.group_epoch(),
+    );
+    match locked.require_fresh_core(&realm) {
+        Ok(_lane) => {}
+        Err(super::super::serving_scope::ScopeRefusal::Realm(
+            super::super::serving_scope::RealmField::ObjectFormat,
+        )) => return Err(DecisionError::Denied(DenialCode::ObjectFormatMismatch)),
+        Err(_) => return Err(DecisionError::Denied(DenialCode::RepositoryUnserved)),
     }
+    let repository_state: String = locked.state().to_owned();
+    let storage_backend: String = locked.storage_backend().to_owned();
+    let transition_state: String = locked.transition_state().to_owned();
+    let repository_format_text: String = locked.object_format().as_str().to_owned();
+    let storage_generation: i64 = locked.storage_generation();
+    let pando_authority: bool = locked.pando_authority();
     let repository_format = GitObjectFormat::parse(&repository_format_text)
         .map_err(|_| DecisionError::Ledger("repository object format is not a known format"))?;
     if repository_format != plan.object_format() {
@@ -220,6 +221,17 @@ pub(super) async fn load_live_authority(
     // 5. Core-gate protocol state (shared, Root-owned DDL) — fail closed when it is not installed.
     let protocol = sql_locks::protocol_state(tx, plan.repository_id()).await?;
     check_protocol(plan, &protocol)?;
+    // The durable serving binding (pg_refstore lane) must be exactly this
+    // protocol/gate realm; the gitfs fixture lane must carry none.
+    locked
+        .require_fresh_core(&super::super::serving_scope::CoreRealm::new(
+            protocol.tenant_id,
+            plan.object_format(),
+            protocol.history_incarnation,
+            protocol.authority_epoch,
+            protocol.group_epoch,
+        ))
+        .map_err(|_| DecisionError::Denied(DenialCode::RepositoryUnserved))?;
 
     // 6. Live policy rows.
     let policy = read_policy(tx, plan).await?;

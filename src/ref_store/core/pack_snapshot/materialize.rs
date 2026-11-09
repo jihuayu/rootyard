@@ -43,8 +43,9 @@ use super::super::pack_commit::{
 use super::super::snapshot_contract::MetadataSnapshotScope;
 use super::contract as pack_contract;
 use super::pg::PgPackSnapshot;
-use super::read_snapshot::PackReadSnapshot;
+use super::read_snapshot::{PackReadSnapshot, ReadSnapshotSourceKind};
 use super::request::PackSnapshotRef;
+use super::serving_read::{RegisteredServingRead, ServingReadCapture, revalidate_serving_capture};
 use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
 use crate::ref_store::core::snapshot_sql;
@@ -58,7 +59,7 @@ use uuid::Uuid;
 
 /// One absolute effective work deadline for the whole call, including both pool
 /// acquisitions. Never restarted between T1, native work and T2.
-fn effective_deadline(caller: Instant) -> Result<Instant, RefStoreError> {
+pub(super) fn effective_deadline(caller: Instant) -> Result<Instant, RefStoreError> {
     let ceiling = Instant::now() + std::time::Duration::from_secs(pack_commit::contract::VERIFIER_DEADLINE_SECONDS);
     let deadline = caller.min(ceiling);
     if deadline <= Instant::now() {
@@ -69,7 +70,7 @@ fn effective_deadline(caller: Instant) -> Result<Instant, RefStoreError> {
 
 /// Take one pooled client with the caller's exact effective deadline. Both T1 and
 /// T2 use this helper; no pool wait is outside the budget.
-async fn pooled_client(pool: &Pool, deadline: Instant) -> Result<deadpool_postgres::Client, RefStoreError> {
+pub(super) async fn pooled_client(pool: &Pool, deadline: Instant) -> Result<deadpool_postgres::Client, RefStoreError> {
     let pool = pool.clone();
     match timeout_at(deadline, pool.get()).await {
         Ok(Ok(client)) => Ok(client),
@@ -128,14 +129,24 @@ impl PreparedReadClosure {
 /// once; it grants no capability.
 pub struct PgPackSnapshotMaterializer {
     engine: NativeReadEngine,
+    /// Digest of the Blob backend this materializer actually opened. It is the
+    /// only value the serving-read T2 path accepts as "the live backend".
+    store_identity: crate::blob_store::BlobBackendIdentity,
 }
 
 impl PgPackSnapshotMaterializer {
     /// Build one materializer for a live Blob store and an absolute trusted Git
     /// binary. There is no ambient store and no `PATH` lookup.
     pub fn new(store: BlobStore, git_binary: PathBuf) -> Result<Self, RefStoreError> {
+        let store_identity = store.backend_identity().clone();
         let engine = NativeReadEngine::new(store, git_binary).map_err(map_native_error)?;
-        Ok(Self { engine })
+        Ok(Self { engine, store_identity })
+    }
+
+    /// Digest of the Blob backend this materializer holds open. Never a
+    /// credential and never a proof on its own.
+    pub fn backend_identity_hex(&self) -> &str {
+        self.store_identity.as_hex()
     }
 
     /// Materialize one complete Git read snapshot.
@@ -199,6 +210,136 @@ impl PgPackSnapshotMaterializer {
         // effective deadline. The opaque public value is sealed while the pin
         // lock is held and is returned only after bounded cleanup completed.
         self.revalidate(pool, reference, &prepared, native, deadline).await
+    }
+
+    /// Materialize one already-captured bounded serving read.
+    ///
+    /// `Ok(None)` means the capture was a **checked empty** repository
+    /// observation (`metadata_only` gate, no refs, no packs): there is nothing to
+    /// verify and the caller initializes an empty private Git view from that
+    /// capture. A fabricated [`PackReadSnapshot`] is never returned for it.
+    ///
+    /// Otherwise the actual shared native engine downloads every registered
+    /// pack/idx with a verified Blob GET, re-reads SHA-256/length, proves the
+    /// registered pair, writes the exact sorted `packed-refs` + HEAD and runs
+    /// `fsck` — all **outside** every PostgreSQL lease. The final (T2) recheck
+    /// then reacquires PostgreSQL under the same absolute deadline and re-proves
+    /// the migration-146 transient pin (`FOR SHARE`), the captured realm, the
+    /// live Blob backend digest, every captured ref and pack descriptor and a
+    /// fresh database-clock lease liveness. A released/expired pin, a history or
+    /// epoch move, a new authority or a foreign backend is refused before any
+    /// public value exists. A later gate *revision* in the same live history is
+    /// accepted: the captured bytes are protected by the pin.
+    ///
+    /// The caller is responsible for [`super::PgServingReads::release`] after the
+    /// returned local view has been fully built (or on any error); the pin is
+    /// held for the whole Blob/native window.
+    pub async fn materialize_serving_read(
+        &self,
+        pool: &Pool,
+        capture: &ServingReadCapture,
+        deadline: Instant,
+    ) -> Result<Option<MaterializedPackRead>, RefStoreError> {
+        if capture.is_empty() {
+            return Ok(None);
+        }
+        let deadline = effective_deadline(deadline)?;
+        let (snapshot, binding) = capture.registered_parts()?;
+        let registered = RegisteredServingRead { snapshot, binding };
+        if registered.snapshot.source_kind() != ReadSnapshotSourceKind::ServingTransient
+            || registered.snapshot.pack_mode() != pack_contract::PACK_MODE_VERIFIED
+            || !registered.snapshot.complete_registered_pack_membership()
+            || registered.snapshot.pack_count() <= 0
+        {
+            return Err(RefStoreError::Unsupported(
+                "serving read materialization requires a transient complete pack-verified capture",
+            ));
+        }
+
+        // Actual Blob + native Git closure, outside every PostgreSQL lease and
+        // bounded by the same absolute deadline as the capture and T2.
+        let binding_hex = registered.binding.as_hex();
+        let native = self
+            .engine
+            .materialize(
+                &NativeReadRequest {
+                    format: registered.snapshot.scope().object_format(),
+                    head_ref: registered.snapshot.head_ref(),
+                    head_oid: registered.snapshot.head_oid_hex(),
+                    refs: registered.snapshot.refs(),
+                    packs: registered.snapshot.packs(),
+                    read_digest: &binding_hex,
+                },
+                deadline.into_std(),
+            )
+            .await
+            .map_err(map_native_error)?;
+        if i64::try_from(native.verified_pairs()).unwrap_or(i64::MAX) != registered.snapshot.pack_count() {
+            return Err(RefStoreError::Database(
+                "native materialization did not cover every captured serving pack".into(),
+            ));
+        }
+        if native.retained_bytes(deadline.into_std()).await.map_err(map_native_error)?
+            > pack_commit::contract::VERIFIER_VIEW_MAX_LOGICAL_BYTES
+        {
+            return Err(RefStoreError::Unsupported("materialized view exceeds its workspace bound"));
+        }
+        self.revalidate_serving(pool, &registered, native, deadline).await.map(Some)
+    }
+
+    /// T2 for the transient serving read source kind.
+    ///
+    /// One fresh short transaction, one fresh database clock, the migration-146
+    /// pin row `FOR SHARE`. The opaque value is sealed inside that window and is
+    /// returned only when the bounded rollback also succeeded.
+    async fn revalidate_serving(
+        &self,
+        pool: &Pool,
+        registered: &RegisteredServingRead,
+        native: NativeReadClosure,
+        deadline: Instant,
+    ) -> Result<MaterializedPackRead, RefStoreError> {
+        let mut client = pooled_client(pool, deadline).await?;
+        let tx = begin_bounded(&mut client, deadline).await?;
+        let result = async {
+            let fresh = pg::before_deadline(
+                deadline,
+                revalidate_serving_capture(&tx, registered, self.store_identity.as_hex(), deadline),
+            )
+            .await?;
+            if fresh != registered.snapshot || fresh.materialization_digest() != registered.binding {
+                return Err(RefStoreError::MetadataScopeMismatch("serving read changed during materialization"));
+            }
+            let binding = fresh.materialization_digest();
+            if binding != registered.binding {
+                return Err(RefStoreError::MetadataScopeMismatch(
+                    "serving read binding changed during materialization",
+                ));
+            }
+            // The opaque native closure must carry exactly the digest T2 just
+            // recomputed, not merely the digest the capture computed.
+            if native.read_digest() != binding {
+                return Err(RefStoreError::MetadataScopeMismatch(
+                    "materialized native closure binding differs from the revalidated serving read",
+                ));
+            }
+            Ok(fresh)
+        }
+        .await;
+        let sealed = result.map(|fresh| {
+            let read_digest = native.read_digest_hex();
+            MaterializedPackRead { snapshot: fresh, native, read_digest }
+        });
+        let cleanup = match tokio::time::timeout_at(deadline, tx.rollback()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(RefStoreError::Database("serving read transaction cleanup failed".into())),
+            Err(_) => Err(RefStoreError::Timeout),
+        };
+        match (sealed, cleanup) {
+            (Ok(view), Ok(())) => Ok(view),
+            (Err(error), _) => Err(error),
+            (Ok(_dropped), Err(error)) => Err(error),
+        }
     }
 
     /// T2: one fresh short transaction under the retained pin `FOR SHARE`.

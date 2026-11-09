@@ -178,6 +178,9 @@ async fn execute(state: Arc<AppState>, request: Request<Body>) -> Result<Respons
         }
         (Some(identity), repo, None, None)
     };
+    if !matches!(repo.storage_backend.as_str(), "gitfs" | "pando") {
+        return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "repository backend is not served by this gateway"));
+    }
     if repo.storage_backend == "pando" && pin_oid.is_some() {
         return Err(Error(StatusCode::SERVICE_UNAVAILABLE, "Pando pinned checkout is not ready"));
     }

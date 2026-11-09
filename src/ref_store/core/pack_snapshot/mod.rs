@@ -4,6 +4,17 @@
 //! [`MaterializedPackRead`] is an opaque owned local view; it grants no new
 //! serving or write authority and claims no physical Blob-byte backup.
 //!
+//! Serving-read addition (#107/#114/#144): [`PgServingReads`] is a separate,
+//! bounded **transient** read-pin family (migration 146). One GET captures the
+//! current refs/HEAD/registered membership under the same strict `pg_refstore`
+//! serving authority and the same core gate lock, protects it for a bounded
+//! lease and deletes/reclaims the row on release/expiry. It never appends a
+//! durable snapshot, pin, receipt or history row, so the retained 64-per-
+//! repository A5a quota is unchanged. [`ServingReadCapture`] is opaque and
+//! either a checked empty-repository observation or a real [`PackReadSnapshot`]
+//! with [`ReadSnapshotSourceKind::ServingTransient`]; the materializer routes
+//! that source kind to the migration-146 T2 recheck.
+//!
 //! A5a: atomic, durable, complete **registered pack membership** snapshot plus a
 //! durable pin and permanent historical receipts (#107 foundation).
 //!
@@ -43,6 +54,9 @@ mod query;
 mod read_snapshot;
 mod receipt;
 mod request;
+mod serving_read;
+mod serving_read_request;
+mod serving_read_sql;
 pub(super) mod sql;
 pub(crate) mod usage;
 
@@ -57,6 +71,12 @@ pub use contract::{
 };
 pub use materialize::{MaterializedPackRead, PgPackSnapshotMaterializer};
 pub use pg::PgPackSnapshot;
-pub use read_snapshot::PackReadSnapshot;
+pub use read_snapshot::{PackReadSnapshot, ReadSnapshotSourceKind};
 pub use receipt::{PackPinReceipt, PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceipt};
 pub use request::{CreatePackSnapshotRequest, PackSnapshotExpectation, PackSnapshotReceiptQuery, PackSnapshotRef};
+pub use serving_read::{PgServingReads, ServingReadCapture};
+pub use serving_read_request::{
+    MAX_EXPIRED_SERVING_READ_RECLAIM, MAX_SERVING_READ_LEASE_SECONDS, MIN_SERVING_READ_LEASE_SECONDS,
+    REPO_MAX_ACTIVE_SERVING_READS, REPO_MAX_SERVING_READ_LOGICAL_BYTES, SERVING_CAPTURE_DIGEST_DOMAIN,
+    SERVING_EMPTY_CAPTURE_DIGEST_DOMAIN, TENANT_MAX_ACTIVE_SERVING_READS, TENANT_MAX_SERVING_READ_LOGICAL_BYTES,
+};

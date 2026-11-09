@@ -291,6 +291,19 @@ impl PgDecisionProtocol {
         Self
     }
 
+    /// In-transaction protocol-realm provisioning used by the atomic
+    /// `pg_refstore` bootstrap. The realm must be exactly the locked core gate
+    /// realm and the repository row must pass the shared strict predicate; no
+    /// caller boolean bypasses either check.
+    pub(crate) async fn provision_in_tx(
+        &self,
+        tx: &Transaction<'_>,
+        expectation: &RealmExpectation,
+        deadline: Instant,
+    ) -> Result<ProtocolRepoRealm, RefStoreError> {
+        pg::before_deadline(deadline, self.provision_inner(tx, expectation, false, deadline)).await
+    }
+
     /// Read-only realm lookup. `None` means the repository never entered the
     /// protocol (the legacy paths stay unchanged). No authority is implied.
     pub async fn read(
@@ -399,30 +412,27 @@ impl PgDecisionProtocol {
         // row under an external synchronous_commit=off policy.
         tx.execute("SET LOCAL synchronous_commit = 'on'", &[]).await.map_err(pg::db_error)?;
         pg::bound(tx, deadline).await?;
-        // Repository authority: unchanged isolated unserved bootstrap state. No
-        // global readiness relaxation is added here.
-        let row = tx
-            .query_opt(
-                "SELECT r.owner_id,r.state,r.storage_backend,r.transition_state,
-                        EXISTS(SELECT 1 FROM pando_repository_states s WHERE s.repository_id=r.id)
-                 FROM repositories r WHERE r.id=$1 FOR SHARE",
-                &[&expectation.repository_id()],
-            )
-            .await
-            .map_err(pg::db_error)?
+        // One shared strict predicate: the unserved gitfs fixture lane or the
+        // exact `pg_refstore` serving intent realm. No global readiness
+        // relaxation is added here.
+        let realm = super::serving_scope::CoreRealm::new(
+            expectation.tenant_id(),
+            expectation.object_format(),
+            expectation.history_incarnation(),
+            expectation.authority_epoch(),
+            expectation.group_epoch(),
+        );
+        let scope = super::serving_scope::LockedScope::lock(tx, expectation.repository_id(), false)
+            .await?
             .ok_or(RefStoreError::RepositoryNotFound)?;
-        let owner: Uuid = row.get(0);
-        let state: String = row.get(1);
-        let backend: String = row.get(2);
-        let transition: String = row.get(3);
-        let pando: bool = row.get(4);
-        if owner != expectation.tenant_id() {
-            return Err(RefStoreError::RepositoryNotFound);
-        }
-        if state != "provisioning" || backend != "gitfs" || transition != "stable" || pando {
-            return Err(RefStoreError::Unsupported(
-                "protocol provisioning requires an isolated unserved core repository (provisioning/gitfs/stable, no pando authority)",
-            ));
+        match scope.require_bootstrap(&realm) {
+            Ok(_lane) => {}
+            Err(super::serving_scope::ScopeRefusal::Tenant) => return Err(RefStoreError::RepositoryNotFound),
+            Err(_) => {
+                return Err(RefStoreError::Unsupported(
+                    "protocol provisioning requires an isolated unserved core repository or its exact pg_refstore serving intent",
+                ));
+            }
         }
         // Gate `FOR UPDATE` after the repository row: the protocol realm is a
         // copy of exactly this locked gate realm.

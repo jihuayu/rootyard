@@ -38,15 +38,28 @@ use super::super::pg::{self, PgRefStore};
 use super::super::tx::{begin_bounded, commit_bounded};
 use super::command::CommitRefsRequest;
 use super::contract::{CommitMode, CoreGate, CoreGateInit, CoreGateVersion, VersionCheck};
+use super::serving_scope::{CoreRealm, LockedScope, ScopeRefusal};
 use super::sql::{
     check_cas, check_existing_prefixes, gate_from_row, gate_row, insert_event, lock_relevant_refs, lookup_names,
     reject, replay_terminal,
 };
 use super::terminal::{CommitRefsReceipt, CommitRejectCode, CommitTerminal, RefCommitResult};
-use super::types::{GitObjectFormat, GitOid, RefTarget, resolve_head};
+use super::types::{GitOid, RefTarget, resolve_head};
 use tokio::time::Instant;
 use tokio_postgres::{Client, Transaction};
 use uuid::Uuid;
+
+/// Map the shared serving-scope refusal to this adapter's typed errors.
+fn bootstrap_refusal(refusal: ScopeRefusal) -> RefStoreError {
+    match refusal {
+        ScopeRefusal::Tenant => RefStoreError::RepositoryNotFound,
+        ScopeRefusal::Realm(_) => {
+            RefStoreError::InvalidIdentity("gate realm differs from the durable repository serving realm".into())
+        }
+        ScopeRefusal::Inconsistent(reason) => RefStoreError::Database(reason.into()),
+        other => RefStoreError::Unsupported(other.reason()),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PgRefStoreCore;
@@ -59,11 +72,11 @@ impl PgRefStoreCore {
     /// Create the explicit gate for an unserved repository in one short
     /// transaction. Idempotent only for exactly the same gate parameters.
     ///
-    /// Bootstrap requires `repositories.state='provisioning'`,
-    /// `storage_backend='gitfs'`, `transition_state='stable'`, no
-    /// `pando_repository_states` row, no legacy `repository_ref_projection`
-    /// rows, the same tenant and the same object format. It never changes
-    /// serving authority. Errors before `COMMIT` roll the owned transaction
+    /// Bootstrap goes through the one shared strict predicate: either the
+    /// unserved `provisioning`/`gitfs`/`stable` fixture repository with no
+    /// Pando authority and no legacy projection, or the durable
+    /// migration-145 `pg_refstore` serving intent whose exact realm matches
+    /// this gate request. It never changes serving authority. Errors before `COMMIT` roll the owned transaction
     /// back; a `COMMIT` timeout or error reply is `CommitUnknown`, whose
     /// resolution is an idempotent retry/`check_version` for this repository.
     pub async fn initialize(
@@ -86,7 +99,7 @@ impl PgRefStoreCore {
         }
     }
 
-    async fn initialize_in_tx(
+    pub(crate) async fn initialize_in_tx(
         &self,
         tx: &Transaction<'_>,
         init: &CoreGateInit,
@@ -102,55 +115,18 @@ impl PgRefStoreCore {
         deadline: Instant,
     ) -> Result<CoreGate, RefStoreError> {
         pg::bound(tx, deadline).await?;
-        let row = tx
-            .query_opt(
-                "SELECT r.owner_id,r.object_format,r.state,r.storage_backend,r.transition_state,
-                        EXISTS(SELECT 1 FROM pando_repository_states s WHERE s.repository_id=r.id),
-                        EXISTS(SELECT 1 FROM repository_ref_projection p WHERE p.repository_id=r.id)
-                 FROM repositories r WHERE r.id=$1 FOR UPDATE",
-                &[&init.repository_id()],
-            )
-            .await
-            .map_err(pg::db_error)?
-            .ok_or(RefStoreError::RepositoryNotFound)?;
-        let owner: Uuid = row.get(0);
-        let object_format: String = row.get(1);
-        let state: String = row.get(2);
-        let storage_backend: String = row.get(3);
-        let transition_state: String = row.get(4);
-        let pando_authority: bool = row.get(5);
-        let legacy_refs: bool = row.get(6);
-        if owner != init.tenant_id() {
-            return Err(RefStoreError::RepositoryNotFound);
-        }
-        if state != "provisioning" {
-            return Err(RefStoreError::Unsupported(
-                "core bootstrap requires an explicitly unserved provisioning repository",
-            ));
-        }
-        if transition_state != "stable" {
-            return Err(RefStoreError::Unsupported("core bootstrap requires a stable storage transition"));
-        }
-        if storage_backend != "gitfs" {
-            return Err(RefStoreError::Unsupported(
-                "repository has a non-gitfs serving backend; core initialization cannot create a second writable authority",
-            ));
-        }
-        if pando_authority {
-            return Err(RefStoreError::Unsupported(
-                "repository has a live legacy pando authority; core initialization cannot create a second writable authority",
-            ));
-        }
-        if legacy_refs {
-            return Err(RefStoreError::Unsupported(
-                "repository already has legacy refs; core bootstrap requires an empty unserved repository",
-            ));
-        }
-        if GitObjectFormat::parse(&object_format)? != init.object_format() {
-            return Err(RefStoreError::InvalidIdentity(
-                "gate object format differs from the repository object format".into(),
-            ));
-        }
+        let realm = CoreRealm::new(
+            init.tenant_id(),
+            init.object_format(),
+            init.history_incarnation(),
+            init.authority_epoch(),
+            init.group_epoch(),
+        );
+        // One shared strict predicate (repository row -> durable serving
+        // binding); no local `state`/`storage_backend` comparison remains.
+        let scope =
+            LockedScope::lock(tx, init.repository_id(), true).await?.ok_or(RefStoreError::RepositoryNotFound)?;
+        let lane = scope.require_bootstrap(&realm).map_err(bootstrap_refusal)?;
 
         let inserted = tx
             .query_opt(
@@ -172,6 +148,11 @@ impl PgRefStoreCore {
             )
             .await
             .map_err(pg::db_error)?;
+        if inserted.is_some() && lane.is_serving() && scope.binding().is_some_and(|binding| binding.ready()) {
+            return Err(RefStoreError::Database(
+                "a ready serving binding had no core gate; refusing to create a second one".into(),
+            ));
+        }
         let gate = match inserted {
             Some(row) => gate_from_row(init.repository_id(), &row)?,
             None => gate_row(tx, init.repository_id(), true)
@@ -238,6 +219,17 @@ impl PgRefStoreCore {
         }
         let version = gate.version();
         if known == Some(&version) { Ok(VersionCheck::Unchanged(version)) } else { Ok(VersionCheck::Changed(version)) }
+    }
+
+    /// Read the current core gate in a caller-owned transaction. A missing
+    /// gate is `None`; this mints no proof and changes no authority.
+    pub(crate) async fn read_gate_in_tx(
+        &self,
+        tx: &Transaction<'_>,
+        repository_id: Uuid,
+        for_update: bool,
+    ) -> Result<Option<CoreGate>, RefStoreError> {
+        gate_row(tx, repository_id, for_update).await
     }
 
     /// Exact old/new CAS in one owned short transaction.
@@ -317,33 +309,16 @@ impl PgRefStoreCore {
         }
         pg::bound(tx, deadline).await?;
 
-        // Same repository row as bootstrap, rechecked under a shared row lock
-        // after the operation/lane registry and before the core gate. A
-        // transition writer or bootstrap needs the exclusive row lock, so this
-        // check cannot race either of them; concurrent commits then serialize
-        // on the gate row below.
-        let repository = tx
-            .query_opt(
-                "SELECT r.owner_id,r.state,r.storage_backend,r.transition_state,
-                        EXISTS(SELECT 1 FROM pando_repository_states s WHERE s.repository_id=r.id)
-                 FROM repositories r WHERE r.id=$1 FOR SHARE",
-                &[&request.repository_id()],
-            )
-            .await
-            .map_err(pg::db_error)?
-            .ok_or(RefStoreError::RepositoryNotFound)?;
-        let owner: Uuid = repository.get(0);
-        if owner != request.tenant_id() {
-            return reject(tx, request, None, CommitRejectCode::TenantMismatch, None, None, None, deadline).await;
-        }
-        let state: String = repository.get(1);
-        let storage_backend: String = repository.get(2);
-        let transition_state: String = repository.get(3);
-        let pando_authority: bool = repository.get(4);
-        if state != "provisioning" || storage_backend != "gitfs" || transition_state != "stable" || pando_authority {
-            return Err(RefStoreError::Unsupported(
-                "repository is no longer an isolated unserved core repository; new core mutations are rejected",
-            ));
+        // Shared strict repository predicate: the unserved gitfs fixture lane
+        // or the ready `pg_refstore` serving lane with its exact durable
+        // binding. Never a raw `state == 'ready'` or backend-string check.
+        let scope =
+            LockedScope::lock(tx, request.repository_id(), false).await?.ok_or(RefStoreError::RepositoryNotFound)?;
+        if let Err(refusal) = scope.require_fresh_core_lane(request.tenant_id()) {
+            if refusal == ScopeRefusal::Tenant {
+                return reject(tx, request, None, CommitRejectCode::TenantMismatch, None, None, None, deadline).await;
+            }
+            return Err(bootstrap_refusal(refusal));
         }
 
         let Some(gate) = gate_row(tx, request.repository_id(), true).await? else {
@@ -357,6 +332,9 @@ impl PgRefStoreCore {
         // protocol, so enabling the fence under the same gate lock cannot
         // deadlock with this path.
         super::decision_commit::refuse_legacy_fresh_write(tx, request.repository_id()).await?;
+        // The durable serving binding (when this is the pg_refstore lane) must
+        // be exactly this locked gate realm. A gitfs lane must carry none.
+        scope.require_binding_matches_gate(&gate).map_err(bootstrap_refusal)?;
         if gate.tenant_id() != request.tenant_id() {
             return reject(tx, request, Some(&gate), CommitRejectCode::TenantMismatch, None, None, None, deadline)
                 .await;

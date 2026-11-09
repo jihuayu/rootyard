@@ -101,7 +101,7 @@ impl pg::PgPackCommit {
         // here (typed refusal, whole transaction rolled back).
         pg::acquire_pending_prefix(tx, plan, deadline).await?;
         crate::ref_store::pg::bound(tx, deadline).await?;
-        pg::ensure_repository(tx, plan.repository_id(), plan.tenant_id(), true).await?;
+        let repository_scope = pg::ensure_repository(tx, plan, true).await?;
         // Tenant -> repository quota rows are locked BEFORE the core gate.
         let locked = lock_quota(tx, plan.repository_id(), plan.tenant_id()).await?;
         // Authoritative re-check of the same bounded immutable lookup before the
@@ -122,13 +122,16 @@ impl pg::PgPackCommit {
             .await?
             .ok_or_else(|| pg::reject(PackCommitRejectCode::GateNotFound, "core gate missing"))?;
         pg::ensure_gate_matches(plan, &gate, mode)?;
-        // Irreversible decision-required fence (migration 144 protocol state),
-        // after the exact 138 operation replay and after the gate row lock but
-        // BEFORE the first pack/ref write: a fenced repository can no longer
-        // receive a fresh legacy A4 write, while an old terminal keeps
-        // replaying unchanged. Lock order 138 prefix -> repository -> quota ->
-        // gate -> protocol is shared with the decision path.
-        crate::ref_store::core::decision_commit::refuse_legacy_fresh_write(tx, plan.repository_id()).await?;
+        // Serving registration stages bytes for the authorized decision path;
+        // it publishes no refs. Preserve the historical staging fence for the
+        // separate unserved lane, and retain the legacy final-commit fence for
+        // both lanes below.
+        let lane = repository_scope.require_fresh_core_lane(plan.tenant_id()).map_err(|refusal| {
+            super::PackCommitError::from(crate::ref_store::RefStoreError::Unsupported(refusal.reason()))
+        })?;
+        if !lane.is_serving() {
+            crate::ref_store::core::decision_commit::refuse_legacy_fresh_write(tx, plan.repository_id()).await?;
+        }
         crate::ref_store::pg::bound(tx, deadline).await?;
         let pack = registered_pack(tx, plan, request, &gate).await?;
         // One stable exact ACK: the fixed point of the retained logical charge is
@@ -221,7 +224,7 @@ impl pg::PgPackCommit {
             return Err(PackCommitError::from(RefStoreError::DigestConflict));
         }
         crate::ref_store::pg::bound(tx, deadline).await?;
-        pg::ensure_repository(tx, plan.repository_id(), plan.tenant_id(), true).await?;
+        pg::ensure_repository(tx, plan, true).await?;
         // Tenant -> repository quota rows are locked before the core gate.
         let locked = lock_quota(tx, plan.repository_id(), plan.tenant_id()).await?;
         let baseline = self.recheck_baseline(tx, plan, deadline).await?;

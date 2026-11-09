@@ -24,6 +24,9 @@ async fn run() -> Result<()> {
         bail!("Rootyard phase one currently supports Linux only");
     }
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 1 && args[0] == "serve-blob" {
+        return rootyard::standalone::run_from_env().await;
+    }
     if args.first().is_some_and(|s| s == "backup-verify") && args.len() == 2 {
         return rootyard::backup::check(std::path::Path::new(&args[1]))
             .map_err(|_| anyhow::anyhow!("backup verification failed; incomplete, unsafe or mismatched files"));
@@ -353,7 +356,7 @@ async fn run() -> Result<()> {
             }
         }
         _ => bail!(
-            "usage: rootyard [serve | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130 | --allow-legacy-schema131 | --allow-legacy-schema132 | --allow-legacy-schema133 | --allow-legacy-schema134 | --allow-legacy-schema135 | --allow-legacy-schema136 | --allow-legacy-schema137 | --allow-legacy-schema138 | --allow-legacy-schema139 | --allow-legacy-schema140 | --allow-legacy-schema141 | --allow-legacy-schema142 | --allow-legacy-schema143]]"
+            "usage: rootyard [serve | serve-blob | serve-mirror | migrate | create-user NAME | create-token NAME [--read-only] | revoke-token UUID | worker | worker-once | reconcile | inspect-recovery UUID | resolve-unknown UUID --expected-generation N --fingerprint SHA256 --acknowledge-audit-gap REASON | pando-transition status|cutover|rollback --repository UUID | pando-transition recover-abandoned-draining --repository UUID --expected-transition UUID --expected-epoch N --expected-backend gitfs|pando --expected-generation N | backup PATH --offline | backup-verify PATH | restore PATH --isolated --trust-backup [--allow-legacy-schema007 | --allow-legacy-schema130 | --allow-legacy-schema131 | --allow-legacy-schema132 | --allow-legacy-schema133 | --allow-legacy-schema134 | --allow-legacy-schema135 | --allow-legacy-schema136 | --allow-legacy-schema137 | --allow-legacy-schema138 | --allow-legacy-schema139 | --allow-legacy-schema140 | --allow-legacy-schema141 | --allow-legacy-schema142 | --allow-legacy-schema143]]"
         ),
     }
     Ok(())

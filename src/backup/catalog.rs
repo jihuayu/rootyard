@@ -2,18 +2,11 @@
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-/// New archives use format 20 / schema 144. Formats 4-19 stay frozen so older
-/// archives remain verifiable and restorable through their explicit legacy
-/// upgrade paths (schema007, schema130, schema131, schema132, schema133,
-/// schema134, schema135, schema136, schema137, schema138, schema139, schema140,
-/// schema141, schema142 and schema143). Format15 is exactly schema139, format16
-/// is exactly schema140, format17 is exactly schema141, format18 is exactly
-/// schema142, format19 is exactly schema143 and format20 consumes exactly the
-/// migration set embedded in this executable (schema144). Their canonical
-/// schema/139_* through schema/144_* catalogs are generated from real
-/// PostgreSQL by the root runner; this module references those fixtures but
-/// deliberately does not fabricate a schema143 or schema144 catalog.
-pub(super) const FORMAT: u32 = 20;
+/// Current archives use format 21 / schema 147 (Blob-only serving bindings
+/// and bounded transient serving-read leases). Prior format catalogs remain
+/// frozen; format 20 is exactly schema 144. The new schema catalogs were
+/// generated from real PostgreSQL, never copied from a previous schema.
+pub(super) const FORMAT: u32 = 21;
 
 pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
     let raw = match format {
@@ -102,6 +95,11 @@ pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
             include_str!("../../schema/144_restored_catalog.json"),
             include_str!("../../schema/144_upgraded_catalog.json"),
         ],
+        21 => [
+            include_str!("../../schema/147_catalog.json"),
+            include_str!("../../schema/147_restored_catalog.json"),
+            include_str!("../../schema/147_upgraded_catalog.json"),
+        ],
         _ => bail!("unsupported backup format"),
     };
     Ok([serde_json::from_str(raw[0])?, serde_json::from_str(raw[1])?, serde_json::from_str(raw[2])?])
@@ -125,7 +123,8 @@ pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
         17 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 141).collect()),
         18 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 142).collect()),
         19 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 143).collect()),
-        20 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
+        20 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 144).collect()),
+        21 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
         _ => bail!("unsupported backup format"),
     }
 }

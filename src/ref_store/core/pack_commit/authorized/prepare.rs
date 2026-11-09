@@ -135,7 +135,7 @@ pub(super) async fn prepare_in_tx(
     }
     // Unchanged isolated unserved repository authority. No global readiness
     // relaxation is added for the authorized path.
-    pg::ensure_repository(tx, plan.repository_id(), plan.tenant_id(), true).await?;
+    pg::ensure_repository(tx, &plan, true).await?;
     // Frozen lock order: repository -> (usage) -> gate -> protocol row.
     let (gate, mode) = sql::gate_locked(tx, plan.repository_id())
         .await?

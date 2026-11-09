@@ -12,6 +12,9 @@ description = "Single-node Git hosting with PostgreSQL metadata and native Git s
 rust-version = "1.88"
 
 [features]
+default = ["kafka-wake"]
+# Transitional full profile; --no-default-features builds the Blob standalone without librdkafka.
+kafka-wake = ["dep:rdkafka"]
 pando-lab = []
 # Optional Azure Blob provider for the standalone OpenDAL Blob profile.
 # S3 is always compiled; no fs/memory service is enabled for this profile.
@@ -51,7 +54,7 @@ rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
-rdkafka = { version = "0.39", default-features = false, features = ["tokio", "ssl"] }
+rdkafka = { version = "0.39", optional = true, default-features = false, features = ["tokio", "ssl"] }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

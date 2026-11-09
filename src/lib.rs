@@ -2,6 +2,8 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod blob_git_gateway;
+pub mod standalone;
 #[rustfmt::skip]
 pub mod auth;
 pub mod backup;
@@ -20,6 +22,7 @@ pub mod events;
 pub mod forge;
 pub mod git_http;
 pub mod journal;
+#[cfg(feature = "kafka-wake")]
 pub mod kafka_wake;
 pub mod pando_gateway;
 pub mod ref_store;

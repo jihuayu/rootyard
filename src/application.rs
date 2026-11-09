@@ -23,6 +23,14 @@ pub struct AppState {
 
 #[derive(Debug)]
 pub struct Error(pub StatusCode, pub &'static str);
+impl std::fmt::Display for Error {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The vocabulary is static; no underlying provider or SQL error is retained.
+        write!(formatter, "HTTP {}: {}", self.0.as_u16(), self.1)
+    }
+}
+impl std::error::Error for Error {}
+
 impl Error {
     pub fn internal(_error: impl std::fmt::Display + std::any::Any) -> Self {
         // Only a fixed type classification, validated SQLSTATE and request
@@ -66,3 +74,6 @@ pub(crate) async fn ready(State(state): State<Arc<AppState>>) -> Result<&'static
     reliability::verify_hooks(&state).map_err(Error::internal)?;
     Ok("ready")
 }
+
+pub mod metadata;
+pub use metadata::MetadataState;

@@ -38,6 +38,18 @@ pub struct Settings {
     pub transport: Option<Arc<dyn WakeTransport>>,
 }
 impl Settings {
+    /// Minimal serving never inspects or constructs external wake transports.
+    /// Notify coalesces hints; periodic PostgreSQL scanning owns reliability.
+    pub fn standalone() -> Self {
+        Self {
+            poll: Duration::from_secs(1),
+            batch: 64,
+            lease_seconds: 60,
+            consumers: crate::events::CONSUMERS.iter().map(|name| (*name).to_owned()).collect(),
+            transport: None,
+        }
+    }
+
     pub fn from_env() -> Result<Self> {
         fn number(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
             let value = match std::env::var(name) {
@@ -67,12 +79,15 @@ impl Settings {
                 let channel = std::env::var("ROOTYARD_WAKE_CHANNEL").unwrap_or_else(|_| "rootyard:outbox:v1".into());
                 Some(Arc::new(RedisWake::new(address, channel)?))
             }
+            #[cfg(feature = "kafka-wake")]
             Ok("kafka") => Some(Arc::new(crate::kafka_wake::KafkaWake::new(
                 std::env::var("ROOTYARD_KAFKA_BOOTSTRAP_SERVERS")
                     .context("ROOTYARD_KAFKA_BOOTSTRAP_SERVERS is required")?,
                 std::env::var("ROOTYARD_KAFKA_TOPIC").context("ROOTYARD_KAFKA_TOPIC is required")?,
                 std::env::var("ROOTYARD_KAFKA_GROUP").context("ROOTYARD_KAFKA_GROUP is required")?,
             )?)),
+            #[cfg(not(feature = "kafka-wake"))]
+            Ok("kafka") => bail!("Kafka wake support was not compiled; enable kafka-wake explicitly"),
             _ => bail!("wake transport must be poll, redis or kafka"),
         };
         Ok(Self {

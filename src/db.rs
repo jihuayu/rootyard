@@ -163,12 +163,15 @@ pub const MIGRATIONS: &[(i32, &str)] = &[
     (142, include_str!("../migrations/142_ref_store_core_packs.sql")),
     (143, include_str!("../migrations/143_ref_store_core_pack_snapshots.sql")),
     (144, include_str!("../migrations/144_ref_store_core_roots_decisions.sql")),
+    (145, include_str!("../migrations/145_ref_store_serving.sql")),
+    (146, include_str!("../migrations/146_ref_store_serving_reads.sql")),
+    (147, include_str!("../migrations/147_ref_store_serving_operations.sql")),
 ];
 
 pub const SCHEMA_VERSIONS: &[i32] = &[
     1, 2, 3, 6, 7, 8, 9, 20, 30, 40, 50, 60, 70, 72, 73, 74, 75, 80, 81, 82, 83, 84, 85, 86, 90, 91, 92, 93, 94, 95,
     96, 97, 98, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 120, 121, 125, 126, 127, 128, 129, 130,
-    131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144,
+    131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147,
 ];
 
 /// Runtime roles use a read-only schema check. Migration/backup ownership is

@@ -118,6 +118,10 @@ def run_build(args, popen=None):
         clean_command = ['cargo', 'clean', '--package', DEFAULT_BIN]
         subprocess.run(clean_command, cwd=ROOT, check=True)
         command = ['cargo', 'build', '--locked']
+        if getattr(args, 'no_default_features', False):
+            command += ['--no-default-features']
+        if getattr(args, 'package_debug', None) is not None:
+            command += ['--config', 'profile.dev.package.rootyard.debug=' + args.package_debug]
         command += ['--bins'] if args.bins else ['--bin', DEFAULT_BIN]
         if args.features:
             command += ['--features', args.features]
@@ -174,6 +178,9 @@ def run_build(args, popen=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Build a native binary and record its source binding.')
     parser.add_argument('--features')
+    parser.add_argument('--package-debug', choices=('0', '1', '2'))
+    parser.add_argument('--no-default-features', action='store_true',
+                        help='build the minimal profile without optional default transports')
     parser.add_argument('--bins', action='store_true')
     parser.add_argument('--strip-debuginfo', action='store_true',
                         help='strip rootyard dev debug information')

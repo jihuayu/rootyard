@@ -91,7 +91,7 @@ async fn commit_in_tx(
     }
     // SHARE NOWAIT is taken before any authorization reads and retained through COMMIT.
     decisions::sql_locks::lock_source_tables(tx, selection.selected().action()).await.map_err(super::decision_error)?;
-    pg::ensure_repository(tx, plan.repository_id(), plan.tenant_id(), true).await?;
+    pg::ensure_repository(tx, plan, true).await?;
     decisions::sql_locks::lock_usage(tx, plan.repository_id(), plan.tenant_id())
         .await
         .map_err(super::decision_error)?;

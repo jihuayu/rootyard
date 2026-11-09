@@ -106,41 +106,32 @@ pub(super) async fn lock_scope(
     require_unserved: bool,
     gate_for_update: bool,
 ) -> Result<CoreGate, RefStoreError> {
-    let row = tx
-        .query_opt(
-            "SELECT r.owner_id,r.object_format,r.state,r.storage_backend,r.transition_state,
-                    EXISTS(SELECT 1 FROM pando_repository_states s WHERE s.repository_id=r.id),
-                    EXISTS(SELECT 1 FROM repository_ref_projection p WHERE p.repository_id=r.id)
-             FROM repositories r WHERE r.id=$1 FOR SHARE",
-            &[&scope.repository_id()],
-        )
-        .await
-        .map_err(pg::db_error)?
+    // One shared strict repository predicate (repository row -> durable
+    // serving binding), never a local `state`/`storage_backend` comparison.
+    let locked = super::serving_scope::LockedScope::lock(tx, scope.repository_id(), false)
+        .await?
         .ok_or(RefStoreError::RepositoryNotFound)?;
-    let owner: Uuid = row.get(0);
-    let object_format: String = row.get(1);
-    if owner != scope.tenant_id() {
+    if locked.owner_id() != scope.tenant_id() {
         return Err(RefStoreError::RepositoryNotFound);
     }
     if require_unserved {
-        let state: String = row.get(2);
-        let storage_backend: String = row.get(3);
-        let transition_state: String = row.get(4);
-        let pando_authority: bool = row.get(5);
-        let legacy_refs: bool = row.get(6);
-        if state != "provisioning" || storage_backend != "gitfs" || transition_state != "stable" {
-            return Err(RefStoreError::Unsupported(
-                "repository is no longer an explicitly unserved stable gitfs core repository",
-            ));
-        }
-        if pando_authority || legacy_refs {
-            return Err(RefStoreError::Unsupported(
-                "repository has a live legacy Pando authority or legacy ref projection",
-            ));
-        }
-        if GitObjectFormat::parse(&object_format)? != scope.object_format() {
-            return Err(RefStoreError::MetadataScopeMismatch("repository object format"));
-        }
+        let realm = super::serving_scope::CoreRealm::new(
+            scope.tenant_id(),
+            scope.object_format(),
+            scope.history_incarnation(),
+            scope.authority_epoch(),
+            scope.group_epoch(),
+        );
+        locked.require_fresh_core(&realm).map_err(|refusal| match refusal {
+            super::serving_scope::ScopeRefusal::Tenant => RefStoreError::RepositoryNotFound,
+            super::serving_scope::ScopeRefusal::Realm(field) => RefStoreError::MetadataScopeMismatch(match field {
+                super::serving_scope::RealmField::ObjectFormat => "repository object format",
+                super::serving_scope::RealmField::HistoryIncarnation => "repository history incarnation",
+                super::serving_scope::RealmField::AuthorityEpoch => "repository authority epoch",
+                super::serving_scope::RealmField::GroupEpoch => "repository group epoch",
+            }),
+            refusal => RefStoreError::Unsupported(refusal.reason()),
+        })?;
     }
     let query = format!(
         "SELECT tenant_id,object_format,history_incarnation,authority_epoch,group_epoch,head_ref,revision

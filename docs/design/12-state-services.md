@@ -10,6 +10,8 @@
 
 ## 1. 术语与不变量
 
+**Git 传输仅 HTTP/HTTPS**：只交付标准 Smart HTTP，入口代理终止 HTTPS；没有 SSH 服务、SSH transport、SSH 登录密钥或 SSH 兼容矩阵。原生 Git 计算视图不接受由请求指定的外部 SSH remote/命令。内部 RPC 的 mTLS 与此无关。
+
 - **repo authority**：每个仓库唯一的 refs/CAS 写权威。`pg_refstore` 或 `raft_refcas`，创建时固定，不按请求切换。
 - **authority generation**：仓库 authority 的单调代；不匹配即 fail closed。
 - **byte proof**：由实际 Blob 字节回读、SHA-256/长度、locator、native verifier 和 base snapshot 组成的发布前证明。

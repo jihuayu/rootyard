@@ -110,6 +110,8 @@ def run_build(args):
         command += ['rustc', '--locked', '--profile', 'test', '--test', args.test]
         if args.features:
             command += ['--features', args.features]
+        if getattr(args, 'no_default_features', False):
+            command += ['--no-default-features']
         command += ['--message-format=json-render-diagnostics']
         events = []
         process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=None,
@@ -174,6 +176,7 @@ def main(argv=None):
         description='Build one selected Rust integration test and record its source binding.')
     parser.add_argument('--test', required=True, help='Rust integration-test target name')
     parser.add_argument('--features')
+    parser.add_argument('--no-default-features', action='store_true')
     parser.add_argument('--package-debug', choices=('0', '1', '2'), help='rootyard dev/test debug level')
     parser.add_argument('--strip-debuginfo', action='store_true', help='strip rootyard dev/test debug information')
     parser.add_argument('--output', required=True, help='path outside CARGO_TARGET_DIR for the executable')

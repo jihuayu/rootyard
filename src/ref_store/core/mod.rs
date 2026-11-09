@@ -15,6 +15,14 @@
 //! usage. It is not a Git `ReadSnapshot`: pack membership is typed
 //! `Unavailable`, and a metadata pin is not protective of Git objects.
 //!
+//! [`serving_scope`] is the single strict repository-authority predicate shared
+//! by every fresh core mutation, read/pin, root/decision and pack-proof path. It
+//! admits exactly two lanes: the existing isolated unserved
+//! `provisioning`/`gitfs` fixture repository, and the durable migration-145
+//! `pg_refstore` serving authority (ready repository + ready serving binding
+//! whose realm equals the locked gate realm and whose Blob backend digest equals
+//! the live store). A plain ready `gitfs`/Pando repository is always refused.
+//!
 //! Layout: [`contract`] owns the gate/version proof, [`command`] the exact CAS
 //! command and its canonical digest, [`types`] the ref vocabulary,
 //! [`terminal`] the immutable terminal shapes and [`sql`]/[`pg`] the owned
@@ -44,6 +52,9 @@ pub(crate) mod publication_decision;
 /// Durable, non-expiring retention **roots** over one existing pack-verified
 /// snapshot (library only, unserved).
 pub mod retention_root;
+/// Migration-145 `pg_refstore` serving scope: the one strict, shared
+/// repository-authority predicate used by every core path.
+pub(crate) mod serving_scope;
 pub mod sql;
 /// Verified accepted-subset selection vocabulary and the private derived
 /// projection of an original whole-batch plan.
