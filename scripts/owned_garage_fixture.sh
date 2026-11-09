@@ -263,6 +263,11 @@ write_sentinel() {
 start() {
   command -v docker >/dev/null 2>&1 || fail "docker is required to run the owned Garage 2.1 fixture"
   command -v openssl >/dev/null 2>&1 || fail "openssl is required to generate the fixture secrets"
+  # Every node-id/RPC probe is bounded with timeout(1); check it up front so a
+  # missing tool fails here instead of surfacing as an unexplained node-id
+  # timeout after the owned container was created.
+  command -v timeout >/dev/null 2>&1 \
+    || fail "timeout(1) is required to bound the Garage node-id and RPC startup probes"
   [ -n "$image" ] || fail "--image is required"
   [ -n "$directory" ] || fail "--directory is required"
   [ -n "$output" ] || fail "--output-env is required"
@@ -349,16 +354,50 @@ TOML
   docker start "$container_id" >/dev/null
 
   local garage=(docker exec "$container_id" /garage -c /etc/garage.toml)
-  local node="" line deadline=$((SECONDS + 60))
+  # One absolute startup budget is shared by the node-id wait and the RPC
+  # handshake below. Every CLI call is bounded by what remains of that budget
+  # (TERM, then KILL after 5s), so a hung `garage` call can never outlive it.
+  local startup_seconds
+  startup_seconds=$(bounded_integer ROOTYARD_FIXTURE_STARTUP_TIMEOUT \
+    "${ROOTYARD_FIXTURE_STARTUP_TIMEOUT:-60}" 1 300)
+  local deadline=$((SECONDS + startup_seconds))
+  remaining() {
+    local left=$((deadline - SECONDS))
+    [ "$left" -ge 1 ] || left=1
+    printf '%s' "$left"
+  }
+  local node="" line left
   while [ "$SECONDS" -lt "$deadline" ]; do
-    line=$("${garage[@]}" node id 2>/dev/null | head -n 1 || true)
+    left=$(remaining)
+    line=$(timeout --signal=TERM --kill-after=5 "$left" "${garage[@]}" node id 2>/dev/null | head -n 1 || true)
     if [[ "$line" =~ ^([0-9a-f]{64})@[^[:space:]]+$ ]]; then
       node=${BASH_REMATCH[1]}
       break
     fi
     sleep 1
   done
-  [ -n "$node" ] || fail "Garage did not report a 64-hex node id from 'garage node id' within 60s"
+  [ -n "$node" ] \
+    || fail "Garage did not report a 64-hex node id from 'garage node id' within the ${startup_seconds}s startup budget"
+
+  # `garage node id` reads the local node identity and can succeed before the
+  # RPC listener accepts connections, so a layout mutation issued right after it
+  # races Garage startup (observed upstream: "Connection refused" at layout
+  # assign). A read-only RPC handshake must succeed first. It polls with a 1s
+  # pause between attempts; each `garage status` is bounded by the remaining
+  # absolute startup budget, and the script performs its one-shot layout
+  # mutation only after a successful handshake (never retried, since a status
+  # failure cannot prove the layout is untouched).
+  local rpc_ready=0
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    left=$(remaining)
+    if timeout --signal=TERM --kill-after=5 "$left" "${garage[@]}" status >/dev/null 2>&1; then
+      rpc_ready=1
+      break
+    fi
+    sleep 1
+  done
+  [ "$rpc_ready" = "1" ] \
+    || fail "Garage RPC did not accept a read-only 'garage status' handshake within the ${startup_seconds}s startup budget"
 
   "${garage[@]}" layout assign -z dc1 -c 1G "$node" >/dev/null
   "${garage[@]}" layout apply --version 1 >/dev/null

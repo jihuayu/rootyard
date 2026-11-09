@@ -15,6 +15,7 @@ import re
 import socket
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,7 +61,25 @@ case "$*" in
   *'create --rm'*) printf '%s\\n' "${{STUB_CONTAINER_ID:?}}" ;;
   exec*)
     case "$*" in
-      *'node id'*) printf '%s\\n' "$(printf 'b%.0s' {{1..64}})@127.0.0.1:3901" ;;
+      *'node id'*)
+        # Persistent probe count: STUB_NODE_HANG hangs one call, and the first
+        # STUB_NODE_FAILS calls fail like a node id that is not readable yet.
+        count=$(cat "${{STUB_NODE_COUNTER:?}}" 2>/dev/null || printf 0)
+        count=$((count + 1))
+        printf '%s\\n' "$count" >"${{STUB_NODE_COUNTER}}"
+        [ "$count" -gt "${{STUB_NODE_HANG_AFTER:-0}}" ] || exec sleep 600
+        [ "$count" -gt "${{STUB_NODE_FAILS:-0}}" ] || exit 1
+        printf '%s\\n' "$(printf 'b%.0s' {{1..64}})@127.0.0.1:3901" ;;
+      *' status'*)
+        # Persistent, private RPC-handshake counter: node id is always readable,
+        # but the first STUB_STATUS_FAILS read-only status calls fail the way a
+        # not-yet-ready RPC listener does.
+        count=$(cat "${{STUB_STATUS_COUNTER:?}}" 2>/dev/null || printf 0)
+        count=$((count + 1))
+        printf '%s\\n' "$count" >"${{STUB_STATUS_COUNTER}}"
+        [ "$count" -gt "${{STUB_STATUS_HANG_AFTER:-0}}" ] || exec sleep 600
+        [ "$count" -gt "${{STUB_STATUS_FAILS:-0}}" ] || {{ echo 'Error: unable to connect: Connection refused' >&2; exit 1; }}
+        printf 'Healthy: 1/1 nodes connected\n' ;;
       *'key create'*) printf 'Key ID:         %s\\nSecret key:     %s\\nCreated:        2026-11-07\\n' "${{STUB_ACCESS_KEY:-GK0123456789abcdef01234567}}" "${{STUB_SECRET_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}}" ;;
       *) exit 0 ;;
     esac ;;
@@ -80,6 +99,8 @@ esac
         self.env = os.environ.copy()
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env["PATH"]
         self.env["STUB_DOCKER_LOG"] = str(self.log)
+        self.env["STUB_STATUS_COUNTER"] = str(self.root / "status.count")
+        self.env["STUB_NODE_COUNTER"] = str(self.root / "node.count")
         self.env.pop("GITHUB_WORKSPACE", None)
         self.env.pop("RUNNER_TEMP", None)
         self.cid = "c" * 64
@@ -309,9 +330,10 @@ class ColdCacheImageTest(FixtureGuardTest):
     def test_cold_cache_pulls_pinned_reference_before_first_inspect(self):
         directory = self.root / "cold"
         state = self.root / "image-state"
-        # No --port: the probe port is pinned to one this test holds, so a real
-        # S3 service on the helper's default port (e.g. 127.0.0.1:3900) cannot
-        # answer the probe and the expected start/cleanup failure stays exact.
+        # bound_start passes --port explicitly, pinned to one this test holds:
+        # a real S3 service on the helper's default port (e.g. 127.0.0.1:3900)
+        # cannot answer the probe and the expected start/cleanup failure stays
+        # exact.
         process, _ = self.bound_start(
             directory,
             env={
@@ -349,6 +371,130 @@ class ColdCacheImageTest(FixtureGuardTest):
         self.assertNotIn("pull ", self.docker_calls())
         self.assertIn("create --rm", self.docker_calls())
         self.assertIn(f"rm -f -- {self.cid}", self.docker_calls())
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
+
+    def test_layout_mutation_waits_for_read_only_rpc_ready(self):
+        # node id is readable immediately, but the RPC handshake fails twice
+        # first: no layout mutation may be issued before a status succeeds.
+        directory = self.root / "cold"
+        process, _ = self.bound_start(
+            directory,
+            env={
+                "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "3",
+                "STUB_STATUS_FAILS": "2",
+            },
+        )
+        calls = self.docker_calls().splitlines()
+        statuses = [i for i, line in enumerate(calls) if line.endswith(" status")]
+        nodes = [i for i, line in enumerate(calls) if line.endswith(" node id")]
+        layouts = [i for i, line in enumerate(calls)
+                   if " layout assign " in line or " layout apply " in line]
+        self.assertEqual(3, len(statuses), self.docker_calls())
+        self.assertTrue(nodes and nodes[0] < statuses[0], self.docker_calls())
+        self.assertEqual(2, len(layouts), self.docker_calls())
+        self.assertLess(statuses[-1], layouts[0], self.docker_calls())
+        self.assertIn("layout assign -z dc1 -c 1G ", calls[layouts[0]])
+        self.assertIn("layout apply --version 1", calls[layouts[1]])
+        # start then proceeds past the layout to the (stubbed) S3 readiness
+        # probe, which still fails closed because no responder listens, and the
+        # owned fixture is cleaned up exactly as before.
+        self.assertEqual(1, process.returncode, process.stderr)
+        self.assertIn('S3 endpoint http://127.0.0.1:', process.stderr)
+        self.assertNotIn("read-only 'garage status' handshake", process.stderr)
+        self.assertIn(f"rm -f -- {self.cid}", self.docker_calls())
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
+        self.assertNotIn("pull ", self.docker_calls())
+
+    def test_permanently_unavailable_rpc_fails_within_bound_and_cleans_up(self):
+        # The RPC handshake never succeeds inside a short startup budget: start
+        # fails closed well under a minute, performs no layout mutation, runs no
+        # key creation, leaks nothing and reports no credential or configuration.
+        directory = self.root / "cold"
+        port = self.held_dead_port()
+        started = time.monotonic()
+        process = self.start(
+            directory, 1, "--port", str(port),
+            env={
+                "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "2",
+                "STUB_STATUS_FAILS": "1000000",
+            },
+        )
+        self.assertLess(time.monotonic() - started, 20, "the startup budget was not honoured")
+        calls = self.docker_calls()
+        self.assertNotIn(" layout assign ", calls)
+        self.assertNotIn(" layout apply ", calls)
+        self.assertNotIn("key create", calls)
+        self.assertNotIn("bucket create", calls)
+        self.assertIn("read-only 'garage status' handshake", process.stderr)
+        self.assertIn("within the 2s startup budget", process.stderr)
+        combined = process.stdout + process.stderr
+        self.assertNotIn("GK0123456789abcdef01234567", combined)
+        self.assertNotIn("ROOTYARD_", combined)
+        self.assertNotIn('"debug"', combined)
+        attempts = int((self.root / "status.count").read_text().strip())
+        self.assertGreater(attempts, 1, "the handshake was not retried within the budget")
+        self.assertIn(f"rm -f -- {self.cid}", calls)
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
+
+    def test_hung_rpc_probe_is_killed_within_the_short_budget(self):
+        # The stub docker hosts `garage status` and hangs every call. This
+        # proves the host-side stub (and the `timeout` wrapper around it) is
+        # cleaned up within the 2s absolute budget, the call sequence issues no
+        # layout/key mutation and stop runs. It does not observe whether a
+        # remote process inside a real container exits: the stuck-probe process
+        # is only signalled; removal is proven solely by the `rm -f` call.
+        directory = self.root / "cold"
+        port = self.held_dead_port()
+        started = time.monotonic()
+        process = self.start(
+            directory, 1, "--port", str(port),
+            env={
+                "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "2",
+                "STUB_STATUS_HANG_AFTER": "1000000",
+            },
+        )
+        self.assertLess(time.monotonic() - started, 20, "a hung status call was not bounded")
+        calls = self.docker_calls()
+        self.assertNotIn(" layout assign ", calls)
+        self.assertNotIn(" layout apply ", calls)
+        self.assertNotIn("key create", calls)
+        self.assertIn("read-only 'garage status' handshake", process.stderr)
+        self.assertIn("within the 2s startup budget", process.stderr)
+        self.assertEqual("", process.stdout)
+        self.assertIn(f"rm -f -- {self.cid}", calls)
+        self.assertFalse(directory.exists())
+        self.assertFalse((self.root / "outside.env").exists())
+
+    def test_hung_node_id_probe_is_killed_within_the_short_budget(self):
+        # The stub docker hosts `garage node id` and hangs its only attempt: no
+        # status call and no layout mutation are issued, the host-side stub is
+        # cleaned up, the failure names the node-id wait and stop runs. As with
+        # the hung status case, a remote (in-container) process exit is not
+        # observable here; only the `rm -f` call proves container removal.
+        directory = self.root / "cold"
+        port = self.held_dead_port()
+        started = time.monotonic()
+        process = self.start(
+            directory, 1, "--port", str(port),
+            env={
+                "ROOTYARD_FIXTURE_PROBE_TIMEOUT": "1",
+                "ROOTYARD_FIXTURE_STARTUP_TIMEOUT": "1",
+                "STUB_NODE_HANG_AFTER": "1000000",
+            },
+        )
+        self.assertLess(time.monotonic() - started, 20, "a hung node id call was not bounded")
+        calls = self.docker_calls()
+        self.assertNotIn(" status", calls)
+        self.assertNotIn(" layout assign ", calls)
+        self.assertNotIn(" layout apply ", calls)
+        self.assertIn("'garage node id' within the 1s startup budget", process.stderr)
+        self.assertIn(f"rm -f -- {self.cid}", calls)
         self.assertFalse(directory.exists())
         self.assertFalse((self.root / "outside.env").exists())
 
