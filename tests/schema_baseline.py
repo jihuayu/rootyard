@@ -19,9 +19,9 @@ LATEST_PREFIX = f"{LATEST_VERSION:03d}"
 
 # Single explicit source for the current archive format. Tests must not infer
 # the expected format from the manifest produced by the implementation under test.
-# The current archive is format22/schema147: the paired PG + OpenDAL Blob
-# closure. Format21 (also schema147) remains readable as the historical
-# metadata-only archive and is never an independent byte backup. Old format20
+# Legacy metadata archives use format21/schema147. Paired PG + OpenDAL Blob
+# closures use format22/schema147. Metadata-only format21 is never an
+# independent Blob byte backup. Old format20
 # remains frozen at schema144; current fixtures are generated from actual
 # PostgreSQL. The schema does not change with format22: both map to the same
 # frozen 147 catalog/version list.
@@ -71,3 +71,8 @@ TABLE_COUNT = len(EXPECTED_TABLES)
 # generated 143-vs-142 catalogs. A4 fixtures populate only the six migration-142
 # tables; no older fixture may fabricate an A5 snapshot-pack row.
 A5_PACK_SNAPSHOT_TABLES = schema_delta(143)
+
+
+def backup_format_arm(format):
+    """Match a complete decimal Rust pattern arm, including shared catalogs."""
+    return rf"\n\s*(?:\d+\s*\|\s*)*{format}(?:\s*\|\s*\d+)*\s*=>"

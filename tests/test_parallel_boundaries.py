@@ -53,7 +53,7 @@ class ParallelBoundariesTest(unittest.TestCase):
         self.assertEqual(
             schema_baseline.CURRENT_BACKUP_FORMAT, current,
             'tests/schema_baseline.py CURRENT_BACKUP_FORMAT must track src/backup/catalog.rs FORMAT')
-        arm = re.search(rf'\n\s*{current} => \[(.*?)\n\s*\],', catalog_rs, re.S)
+        arm = re.search(schema_baseline.backup_format_arm(current) + r' \[(.*?)\n\s*\],', catalog_rs, re.S)
         self.assertIsNotNone(arm, f'catalog arm for current format {current} missing')
         fixtures = set(re.findall(r'schema/([A-Za-z0-9_]+\.json)', arm.group(1)))
         self.assertEqual(
@@ -62,7 +62,7 @@ class ParallelBoundariesTest(unittest.TestCase):
              for name in ('catalog', 'restored_catalog', 'upgraded_catalog')},
             'current format must freeze the newest schema catalog fixtures')
         self.assertRegex(
-            catalog_rs, rf'\n\s*{current} => Ok\(crate::db::SCHEMA_VERSIONS\.to_vec\(\)\)',
+            catalog_rs, schema_baseline.backup_format_arm(current) + r' Ok\(crate::db::SCHEMA_VERSIONS\.to_vec\(\)\)',
             'current format must consume exactly the migrations embedded in this binary')
         restore_rs = (ROOT / 'src/backup/restore.rs').read_text()
         legacy_formats = {

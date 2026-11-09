@@ -6991,7 +6991,7 @@ class SchemaBoundaryIntegrationFixture:
             )
 
         # The current format must consume the newest frozen catalog triplet.
-        arm_match = re.search(rf"\b{fmt}\s*=>\s*\[(.*?)\n\s*\],", catalog_src, re.DOTALL)
+        arm_match = re.search(schema_baseline.backup_format_arm(fmt) + r"\s*\[(.*?)\n\s*\],", catalog_src, re.DOTALL)
         if arm_match is None:
             raise AssertionError(f"src/backup/catalog.rs has no catalog mapping for format {fmt}")
         includes = re.findall(r'include_str!\("([^"]+)"\)', arm_match.group(1))
@@ -7001,7 +7001,7 @@ class SchemaBoundaryIntegrationFixture:
             raise AssertionError(
                 f"backup format {fmt} must consume the latest frozen catalogs {expected_includes}, got {includes}"
             )
-        if not re.search(rf"\b{fmt}\s*=>\s*Ok\(crate::db::SCHEMA_VERSIONS\.to_vec\(\)\)", catalog_src):
+        if not re.search(schema_baseline.backup_format_arm(fmt) + r"\s*Ok\(crate::db::SCHEMA_VERSIONS\.to_vec\(\)\)", catalog_src):
             raise AssertionError(f"backup format {fmt} must accept every SCHEMA_VERSIONS migration")
 
         # catalog::relations() is the single source of the locked relation list:
