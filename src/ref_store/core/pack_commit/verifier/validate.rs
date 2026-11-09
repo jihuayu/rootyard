@@ -29,13 +29,12 @@ use crate::ref_store::core::pack_commit::contract::{
 };
 use crate::ref_store::core::pack_commit::error::PackCommitError;
 use crate::ref_store::core::pack_commit::plan::PackCommitPlan;
-use crate::ref_store::core::types::{GitObjectFormat, RefName};
+use crate::ref_store::core::types::{GitObjectFormat, RefName, RefUpdate};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 /// A validated closure ready for verified reads.
 pub(super) struct Checked<'a> {
-    pub(super) plan: &'a PackCommitPlan,
     pub(super) format: GitObjectFormat,
     pub(super) old: &'a [RegisteredPack],
     pub(super) new: &'a [RegisteredPack],
@@ -88,18 +87,42 @@ pub(super) fn check<'a>(
     if context.old_refs().len() as i64 > MAX_CAPTURE_REFS {
         return Err(refuse("captured old ref set exceeds the verifier bound"));
     }
-    let resulting = refs::resulting_refs(plan, context.old_refs())?;
+    // Atomic path: the complete plan batch. Accepted-subset path: exactly the
+    // selected accepted updates, each one an identical original plan update. A
+    // rejected ref is never part of the resulting map or of the proof.
+    let updates: &[RefUpdate] = match context.accepted() {
+        Some(accepted) => {
+            ensure_accepted_subset(plan, accepted)?;
+            accepted
+        }
+        None => plan.refs(),
+    };
+    let resulting = refs::resulting_refs_for(plan, context.old_refs(), updates)?;
     if context_map(context, plan.object_format())? != resulting {
         return Err(refuse("closure context resulting refs are not the exact planned result"));
     }
     if resulting.len() > VERIFIER_MAX_RESULT_REFS {
         return Err(refuse("closure exceeds the verifier result-ref bound"));
     }
-    let (head, head_oid) = refs::head_state(plan, context.head_ref(), &resulting)?;
+    let (head, head_oid) = refs::head_state_with(plan, updates, context.head_ref(), &resulting)?;
     if *context.resulting_head() != head {
         return Err(refuse("closure context resulting HEAD is not the exact planned HEAD"));
     }
-    Ok(Checked { plan, format: plan.object_format(), old, new, resulting, head, head_oid, pairs, bytes })
+    Ok(Checked { format: plan.object_format(), old, new, resulting, head, head_oid, pairs, bytes })
+}
+
+/// Every accepted update must be one identical original plan update, named once.
+fn ensure_accepted_subset(plan: &PackCommitPlan, accepted: &[RefUpdate]) -> Result<(), PackCommitError> {
+    let mut names = BTreeSet::new();
+    for update in accepted {
+        if !plan.refs().iter().any(|planned| planned == update) {
+            return Err(refuse("accepted subset contains an update that is not in the original plan"));
+        }
+        if !names.insert(update.name().as_str()) {
+            return Err(refuse("accepted subset repeats a ref name"));
+        }
+    }
+    Ok(())
 }
 
 /// Defensive role lookup: the verifier never trusts the artifact *order* inside a

@@ -2,17 +2,18 @@
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-/// New archives use format 19 / schema 143. Formats 4-18 stay frozen so older
+/// New archives use format 20 / schema 144. Formats 4-19 stay frozen so older
 /// archives remain verifiable and restorable through their explicit legacy
 /// upgrade paths (schema007, schema130, schema131, schema132, schema133,
 /// schema134, schema135, schema136, schema137, schema138, schema139, schema140,
-/// schema141 and schema142). Format15 is exactly schema139, format16 is exactly
-/// schema140, format17 is exactly schema141, format18 is exactly schema142 and
-/// format19 consumes exactly the migration set embedded in this executable
-/// (schema143). Their canonical schema/139_* through schema/143_* catalogs are
-/// generated from real PostgreSQL by the root runner; this module references
-/// those fixtures but deliberately does not fabricate a schema143 catalog.
-pub(super) const FORMAT: u32 = 19;
+/// schema141, schema142 and schema143). Format15 is exactly schema139, format16
+/// is exactly schema140, format17 is exactly schema141, format18 is exactly
+/// schema142, format19 is exactly schema143 and format20 consumes exactly the
+/// migration set embedded in this executable (schema144). Their canonical
+/// schema/139_* through schema/144_* catalogs are generated from real
+/// PostgreSQL by the root runner; this module references those fixtures but
+/// deliberately does not fabricate a schema143 or schema144 catalog.
+pub(super) const FORMAT: u32 = 20;
 
 pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
     let raw = match format {
@@ -96,6 +97,11 @@ pub(super) fn catalogs(format: u32) -> Result<[serde_json::Value; 3]> {
             include_str!("../../schema/143_restored_catalog.json"),
             include_str!("../../schema/143_upgraded_catalog.json"),
         ],
+        20 => [
+            include_str!("../../schema/144_catalog.json"),
+            include_str!("../../schema/144_restored_catalog.json"),
+            include_str!("../../schema/144_upgraded_catalog.json"),
+        ],
         _ => bail!("unsupported backup format"),
     };
     Ok([serde_json::from_str(raw[0])?, serde_json::from_str(raw[1])?, serde_json::from_str(raw[2])?])
@@ -118,7 +124,8 @@ pub(super) fn versions(format: u32) -> Result<Vec<i32>> {
         16 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 140).collect()),
         17 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 141).collect()),
         18 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 142).collect()),
-        19 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
+        19 => Ok(crate::db::SCHEMA_VERSIONS.iter().copied().filter(|version| *version <= 143).collect()),
+        20 => Ok(crate::db::SCHEMA_VERSIONS.to_vec()),
         _ => bail!("unsupported backup format"),
     }
 }

@@ -111,6 +111,21 @@ impl NativeView {
         Ok(())
     }
 
+    /// Run one additional fixed-argument native step against this owned view.
+    ///
+    /// The facts engine uses this only with compiled-literal args plus object ids
+    /// that the core already parsed into exact lowercase `GitOid` hex. Revisions
+    /// for ancestry checks travel on stdin, never in argv.
+    pub(super) async fn step(
+        &self,
+        step: &'static str,
+        args: &[&str],
+        stdin: Stdin<'_>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, PackCommitError> {
+        self.runner.run(step, args, Some(&self.git_dir), None, stdin, deadline, &self.lease).await
+    }
+
     /// Prove the registered index belongs to the registered pack file.
     pub(super) async fn verify_registered_pair(&self, idx: &Path, deadline: Instant) -> Result<(), PackCommitError> {
         self.runner

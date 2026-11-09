@@ -37,7 +37,7 @@ use super::super::contract::{
 use super::super::pg::{self, PgRefStore};
 use super::super::tx::{begin_bounded, commit_bounded};
 use super::command::CommitRefsRequest;
-use super::contract::{CoreGate, CoreGateInit, CoreGateVersion, VersionCheck};
+use super::contract::{CommitMode, CoreGate, CoreGateInit, CoreGateVersion, VersionCheck};
 use super::sql::{
     check_cas, check_existing_prefixes, gate_from_row, gate_row, insert_event, lock_relevant_refs, lookup_names,
     reject, replay_terminal,
@@ -259,6 +259,16 @@ impl PgRefStoreCore {
     /// `COMMIT` is issued, only an acknowledged success returns the receipt;
     /// a timeout or error reply returns `CommitUnknown`, never a claimed abort.
     /// Callers resolve it with `query_operation` for this exact operation id.
+    ///
+    /// `CommitMode::AcceptedSubset` uses the same owned transaction and the same
+    /// historical replay/fence prefix, but selects refs deterministically in the
+    /// request's original order over the actual locked old ref map
+    /// (`core::metadata_subset`): one bad CAS/prefix/HEAD ref rejects only that
+    /// ref, while an all-rejected selection persists one durable rejected
+    /// terminal with no ref/HEAD/revision change. A retarget whose final target
+    /// is absent fails the whole operation safely before any write. This is the
+    /// trusted in-process metadata scope: it grants no Git read or byte-closure
+    /// proof, and policies needing native facts are not part of it.
     pub async fn commit_refs(
         &self,
         client: &mut Client,
@@ -339,6 +349,14 @@ impl PgRefStoreCore {
         let Some(gate) = gate_row(tx, request.repository_id(), true).await? else {
             return reject(tx, request, None, CommitRejectCode::GateNotFound, None, None, None, deadline).await;
         };
+        // Irreversible decision-required fence (migration 144 protocol state).
+        // Checked AFTER the exact 138 terminal replay above and after the gate
+        // row lock, BEFORE any ref/gate-revision write: replay stays historical
+        // data while a fresh legacy metadata-only write cannot bypass the
+        // decision protocol. Lock order is 138 prefix -> repository -> gate ->
+        // protocol, so enabling the fence under the same gate lock cannot
+        // deadlock with this path.
+        super::decision_commit::refuse_legacy_fresh_write(tx, request.repository_id()).await?;
         if gate.tenant_id() != request.tenant_id() {
             return reject(tx, request, Some(&gate), CommitRejectCode::TenantMismatch, None, None, None, deadline)
                 .await;
@@ -424,6 +442,16 @@ impl PgRefStoreCore {
         }
 
         let existing = lock_relevant_refs(tx, request.repository_id(), lookup_names(request, gate.head_ref())).await?;
+        // Accepted-subset metadata-only commits are selected per ref in the
+        // caller's original order over the actual locked old ref map. The exact
+        // 138 replay, repository/gate checks, `pack_verified` fence and the
+        // irreversible `decision_required` fence above have already run; this
+        // branch keeps the trusted in-process scope (no actor, no native facts,
+        // no closure proof) and persists all per-ref verdicts in this one short
+        // transaction.
+        if request.mode() == CommitMode::AcceptedSubset {
+            return super::metadata_subset::commit_accepted_subset(tx, request, &gate, &existing, deadline).await;
+        }
         if let Err((code, name, expected, actual)) = check_cas(request, &existing) {
             return reject(tx, request, Some(&gate), code, Some(name), expected, actual, deadline).await;
         }

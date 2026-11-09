@@ -14,6 +14,7 @@
 
 ## 运行与实现契约
 
+- [RefStore 持久根、发布决策与部分成功提交](ref-store-roots-decisions.md)
 - [运行与部署](operations.md)
 - [HA 参考配置与物理 HA 未闭项（#26/#43/#44）](operations-HA.md)
 - [OpenDAL Blob 层：配置、回执、删除策略与未实现边界](opendal-blob.md)

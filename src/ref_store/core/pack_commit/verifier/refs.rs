@@ -15,7 +15,9 @@ use crate::ref_store::core::pack_commit::context::CapturedRef;
 use crate::ref_store::core::pack_commit::contract::VERIFIER_PIPE_BYTES;
 use crate::ref_store::core::pack_commit::error::PackCommitError;
 use crate::ref_store::core::pack_commit::plan::PackCommitPlan;
-use crate::ref_store::core::types::{GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget};
+use crate::ref_store::core::types::{
+    GitObjectFormat, GitOid, HeadUpdate, RefName, RefPrecondition, RefTarget, RefUpdate,
+};
 use std::collections::BTreeMap;
 
 /// One ref row of the recomputed or natively observed result.
@@ -85,8 +87,13 @@ pub(super) fn packed_refs_file(refs: &RefMap, format: GitObjectFormat) -> Result
     Ok(output)
 }
 
-/// Apply the plan's CAS batch to the captured old refs.
-pub(super) fn resulting_refs(plan: &PackCommitPlan, old: &[CapturedRef]) -> Result<RefMap, PackCommitError> {
+/// Apply exactly one update subset (the atomic batch or the accepted subset of an
+/// accepted-subset plan) to the captured old refs.
+pub(super) fn resulting_refs_for(
+    plan: &PackCommitPlan,
+    old: &[CapturedRef],
+    updates: &[RefUpdate],
+) -> Result<RefMap, PackCommitError> {
     let format = plan.object_format();
     let mut result = RefMap::new();
     for reference in old {
@@ -95,7 +102,7 @@ pub(super) fn resulting_refs(plan: &PackCommitPlan, old: &[CapturedRef]) -> Resu
             return Err(refuse("captured old ref set repeats a name"));
         }
     }
-    for update in plan.refs() {
+    for update in updates {
         let current = result.get(update.name().as_str()).cloned();
         let satisfied = match update.precondition() {
             RefPrecondition::Absent => current.is_none(),
@@ -116,16 +123,17 @@ pub(super) fn resulting_refs(plan: &PackCommitPlan, old: &[CapturedRef]) -> Resu
     Ok(result)
 }
 
-/// The exact HEAD the plan/context pair describes, plus its branch oid when the
-/// branch exists in the resulting ref set (otherwise HEAD is unborn).
-pub(super) fn head_state(
+/// HEAD state for one update subset. A selected subset must never delete the kept
+/// HEAD branch and a retarget target must already exist in the resulting map.
+pub(super) fn head_state_with(
     plan: &PackCommitPlan,
+    updates: &[RefUpdate],
     captured_head: &RefName,
     resulting: &RefMap,
 ) -> Result<(RefName, Option<String>), PackCommitError> {
     let head = match plan.head() {
         HeadUpdate::Keep => {
-            let deletes_head = plan.refs().iter().any(|update| {
+            let deletes_head = updates.iter().any(|update| {
                 update.name().as_str() == captured_head.as_str() && update.target() == &RefTarget::Delete
             });
             if deletes_head {

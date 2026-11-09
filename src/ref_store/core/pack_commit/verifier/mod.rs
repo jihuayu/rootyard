@@ -51,13 +51,18 @@ mod binary;
 mod download;
 mod lease;
 mod mint;
+mod pointer;
+mod probe;
 mod process;
+mod publication;
+mod publication_support;
 mod read;
 mod refs;
 mod scratch;
 mod validate;
 mod view;
 
+pub(crate) use publication::{PublicationFactsEngine, VerifiedPublicationFacts};
 pub(crate) use read::{NativeReadClosure, NativeReadEngine, NativeReadRequest};
 
 use super::super::closure::PackClosureContext;
@@ -69,6 +74,9 @@ use super::super::error::PackCommitError;
 use super::super::plan::PackCommitPlan;
 use super::PackClosureProof;
 use crate::blob_store::opendal::BlobStore;
+use crate::ref_store::contract::RequestDigest;
+use crate::ref_store::core::pack_commit::context::refs_digest;
+use crate::ref_store::core::types::RefUpdate;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -141,6 +149,55 @@ impl PackVerifier {
         context: &PackClosureContext,
         deadline: Instant,
     ) -> Result<PackClosureProof, PackCommitError> {
+        if context.selection_digest().is_some() {
+            return Err(refuse("atomic verification cannot use a selected closure"));
+        }
+        let (pairs, bytes) = self.execute(plan, context, deadline).await?;
+        mint::mint(plan, context, pairs, bytes)
+    }
+
+    /// Verify the FULL resulting ref map of an accepted-subset selection and mint
+    /// a proof that also binds the private selection digest.
+    ///
+    /// The original plan is the unchanged whole batch; only `selected.accepted()`
+    /// is applied to the captured old refs. Rejected refs are never in the proof,
+    /// and the proof is never re-filtered afterwards. The context must bind this
+    /// exact selection digest, accepted set and resulting-map digest, so a
+    /// selection/proof mismatch is a typed refusal and no proof exists.
+    /// Primitive selected verification used by `core::subset`'s opaque
+    /// `SelectedPackPlan` wrapper. The caller passes the bound selection digest,
+    /// accepted update set and resulting ref-map digest; this method refuses unless
+    /// the closure context binds exactly those values, verifies the FULL resulting
+    /// ref map and mints a proof that also binds the selection digest.
+    pub(crate) async fn verify_selected_parts(
+        &self,
+        plan: &PackCommitPlan,
+        context: &PackClosureContext,
+        expected_selection_digest: &RequestDigest,
+        expected_accepted: &[RefUpdate],
+        expected_resulting_refs_digest: &RequestDigest,
+        deadline: Instant,
+    ) -> Result<PackClosureProof, PackCommitError> {
+        if context.selection_digest() != Some(expected_selection_digest) {
+            return Err(refuse("closure context binds another selection digest"));
+        }
+        if context.accepted() != Some(expected_accepted) {
+            return Err(refuse("closure context binds another accepted subset"));
+        }
+        if refs_digest(context.resulting_refs()) != *expected_resulting_refs_digest {
+            return Err(refuse("closure context binds another resulting ref map"));
+        }
+        let (pairs, bytes) = self.execute(plan, context, deadline).await?;
+        mint::mint(plan, context, pairs, bytes)
+    }
+
+    /// Shared bounded native closure run used by both verification paths.
+    async fn execute(
+        &self,
+        plan: &PackCommitPlan,
+        context: &PackClosureContext,
+        deadline: Instant,
+    ) -> Result<(usize, u64), PackCommitError> {
         let deadline = arm(deadline)?;
         let checked = validate::check(plan, context)?;
         let registered = checked.old.iter().chain(checked.new.iter()).collect::<Vec<_>>();
@@ -168,7 +225,7 @@ impl PackVerifier {
         }
         view.check_pack_directory(indexed.len())?;
         view.attest(&checked, deadline).await?;
-        mint::mint(checked.plan, context, checked.pairs, checked.bytes)
+        Ok((checked.pairs, checked.bytes))
     }
 }
 

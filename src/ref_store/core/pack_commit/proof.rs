@@ -30,6 +30,7 @@ pub struct PackClosureProof {
     old_membership_digest: MembershipDigest,
     old_packs_digest: RequestDigest,
     new_packs_digest: RequestDigest,
+    selection_digest: Option<RequestDigest>,
     verified_pairs: usize,
     verified_bytes: u64,
 }
@@ -79,6 +80,12 @@ impl PackClosureProof {
         &self.new_packs_digest
     }
 
+    /// `None` for the unchanged atomic path, `Some(selection_digest)` for an
+    /// accepted-subset proof. Rejected refs are never part of this proof.
+    pub fn selection_digest(&self) -> Option<&RequestDigest> {
+        self.selection_digest.as_ref()
+    }
+
     pub fn verified_pairs(&self) -> usize {
         self.verified_pairs
     }
@@ -100,6 +107,7 @@ impl PackClosureProof {
             && self.old_membership_digest == context.old_membership_digest()
             && self.old_packs_digest == packs_digest(context.old_packs())
             && self.new_packs_digest == packs_digest(context.new_packs())
+            && self.selection_digest.as_ref() == context.selection_digest()
     }
 
     /// Internal consistency check used by the verifier after minting.

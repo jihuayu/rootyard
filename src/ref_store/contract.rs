@@ -346,8 +346,8 @@ pub struct Capabilities {
     pub core_ref_cas: bool,
     pub core_gate_epoch_checks: bool,
     pub atomic_multi_ref_commit: bool,
-    /// `accepted_subset` is a typed mode but is rejected fail-closed until it
-    /// has deterministic per-ref terminal semantics.
+    /// The metadata core persists per-ref results and applies the accepted
+    /// subset. Verified pack publication uses the separate authorized facade.
     pub accepted_subset_commit: bool,
     pub core_commit_events: bool,
     /// Initializing a gate never switches repository serving authority; no
@@ -429,7 +429,7 @@ impl Capabilities {
             core_ref_cas: true,
             core_gate_epoch_checks: true,
             atomic_multi_ref_commit: true,
-            accepted_subset_commit: false,
+            accepted_subset_commit: true,
             core_commit_events: true,
             serving_cutover: false,
             dual_write_with_legacy: false,
@@ -790,7 +790,7 @@ mod tests {
         assert!(capabilities.atomic_multi_ref_commit);
         assert!(capabilities.core_commit_events);
         assert!(capabilities.authority_epoch_checks);
-        assert!(!capabilities.accepted_subset_commit);
+        assert!(capabilities.accepted_subset_commit);
         assert!(!capabilities.atomic_read_snapshot);
         assert!(!capabilities.durable_snapshot_pin);
         assert!(!capabilities.gc_observes_pins);

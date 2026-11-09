@@ -37,6 +37,7 @@
 //! `COMMIT` was sent.
 use super::contract::RefStoreError;
 use super::pg::db_error;
+use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
 use tokio_postgres::{Client, Transaction};
 use uuid::Uuid;
@@ -74,9 +75,9 @@ pub(crate) async fn commit_bounded(
     operation_id: Option<Uuid>,
 ) -> Result<(), RefStoreError> {
     if Instant::now() >= deadline {
-        // COMMIT was never sent; rollback is safe here. The await is cleanup,
-        // not a hard return bound.
-        let _ = tx.rollback().await;
+        // COMMIT was never sent. Bound the cleanup wait separately; dropping
+        // the SDK rollback future still queues cleanup on this connection.
+        let _cleanup = timeout_at(Instant::now() + Duration::from_secs(2), tx.rollback()).await;
         return Err(RefStoreError::Timeout);
     }
     match timeout_at(deadline, tx.commit()).await {

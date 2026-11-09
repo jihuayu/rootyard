@@ -4,15 +4,14 @@
 //! semantic fields that are known up front: scope, preallocated operation and
 //! pack/registration identities, planned content digests and lengths, refs,
 //! HEAD/CAS, expected gate revision/digest/mode and the old membership digest.
-//! Fresh random server attempt paths and the actual registration artifact-set
-//! digest are deliberately excluded: they do not exist yet and adding them
-//! later would make the parent identity unknowable before acquire.
+//! Fresh attempt paths and the actual artifact-set digest are deliberately excluded.
 use super::context::{MembershipDigest, PackMembershipEntry};
 use super::contract::{
     MAX_ACTIVE_MEMBERSHIPS, MAX_BATCH_NEW_PACKS, MAX_PLAN_REFS, PackArtifactRole, PackMode, VERIFIER_MAX_TOTAL_BYTES,
     is_sha256_hex,
 };
 use super::error::PackCommitError;
+use crate::ref_store::CommitMode;
 use crate::ref_store::contract::{OperationIdentity, RequestDigest};
 use crate::ref_store::core::types::{GitObjectFormat, GitOid, HeadUpdate, RefUpdate, batch_prefix_conflict};
 use std::collections::BTreeSet;
@@ -211,6 +210,7 @@ pub struct PackCommitPlan {
     old_membership_digest: MembershipDigest,
     old_memberships: Vec<PackMembershipEntry>,
     packs: Vec<PlannedPack>,
+    commit_mode: CommitMode,
     parent_digest: RequestDigest,
 }
 
@@ -225,6 +225,51 @@ impl PackCommitPlan {
         old_membership_digest: MembershipDigest,
         old_memberships: Vec<PackMembershipEntry>,
         packs: Vec<PlannedPack>,
+    ) -> Result<Self, PackCommitError> {
+        Self::build(
+            scope,
+            identity,
+            expected,
+            head,
+            refs,
+            old_membership_digest,
+            old_memberships,
+            packs,
+            CommitMode::Atomic,
+        )
+    }
+
+    /// Same plan, explicit commit mode. `Atomic` delegates to the byte-identical
+    /// atomic domain (`.new` digest unchanged); `AcceptedSubset` uses the separate
+    /// versioned `core-pack-commit-plan-subset-v1` domain that also covers the
+    /// mode. The plan stays the ORIGINAL WHOLE BATCH: no caller can derive a
+    /// smaller plan or a different parent identity from a selection here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_mode(
+        scope: PackCommitScope,
+        identity: OperationIdentity,
+        expected: PackCommitExpectation,
+        head: HeadUpdate,
+        refs: Vec<RefUpdate>,
+        old_membership_digest: MembershipDigest,
+        old_memberships: Vec<PackMembershipEntry>,
+        packs: Vec<PlannedPack>,
+        mode: CommitMode,
+    ) -> Result<Self, PackCommitError> {
+        Self::build(scope, identity, expected, head, refs, old_membership_digest, old_memberships, packs, mode)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        scope: PackCommitScope,
+        identity: OperationIdentity,
+        expected: PackCommitExpectation,
+        head: HeadUpdate,
+        refs: Vec<RefUpdate>,
+        old_membership_digest: MembershipDigest,
+        old_memberships: Vec<PackMembershipEntry>,
+        packs: Vec<PlannedPack>,
+        commit_mode: CommitMode,
     ) -> Result<Self, PackCommitError> {
         if identity.repository_id() != scope.repository_id {
             return Err(PackCommitError::Invalid("operation identity belongs to another repository"));
@@ -264,9 +309,11 @@ impl PackCommitPlan {
                 }
             }
         }
-        if batch_prefix_conflict(&refs).is_some() {
-            // Rejection is unchanged; the previous branch had two identical
-            // literals because the fixed code detail is prefix-independent.
+        // Atomic keeps the historic whole-batch prefix refusal. AcceptedSubset
+        // defers namespace checks to the ordered selection: a non-HEAD parent
+        // delete followed by a child create may both be accepted (matching a
+        // normal stock-Git push); create-before-delete still rejects the child.
+        if commit_mode == CommitMode::Atomic && batch_prefix_conflict(&refs).is_some() {
             return Err(PackCommitError::Invalid("prefix"));
         }
         if let HeadUpdate::Retarget(target) = &head
@@ -295,7 +342,21 @@ impl PackCommitPlan {
                 actual: total_bytes as i64,
             });
         }
-        let parent_digest = parent_digest(&scope, &identity, &expected, &head, &refs, old_membership_digest, &packs);
+        let parent_digest = match commit_mode {
+            CommitMode::Atomic => {
+                parent_digest(&scope, &identity, &expected, &head, &refs, old_membership_digest, &packs)
+            }
+            CommitMode::AcceptedSubset => parent_digest_subset(
+                &scope,
+                &identity,
+                &expected,
+                &head,
+                &refs,
+                old_membership_digest,
+                &packs,
+                commit_mode,
+            ),
+        };
         let identity = OperationIdentity::new(
             identity.repository_id(),
             identity.issuer_id(),
@@ -305,7 +366,18 @@ impl PackCommitPlan {
             parent_digest,
         )
         .map_err(|_| PackCommitError::Invalid("operation identity is invalid"))?;
-        Ok(Self { scope, identity, expected, head, refs, old_membership_digest, old_memberships, packs, parent_digest })
+        Ok(Self {
+            scope,
+            identity,
+            expected,
+            head,
+            refs,
+            old_membership_digest,
+            old_memberships,
+            packs,
+            commit_mode,
+            parent_digest,
+        })
     }
 
     pub fn scope(&self) -> &PackCommitScope {
@@ -356,10 +428,8 @@ impl PackCommitPlan {
     pub fn parent_digest(&self) -> &RequestDigest {
         &self.parent_digest
     }
-
-    /// Exact plan/pack identity must match an existing durable Pending row.
-    pub fn matches_identity(&self, identity: &OperationIdentity) -> bool {
-        identity == &self.identity
+    pub fn commit_mode(&self) -> CommitMode {
+        self.commit_mode
     }
 }
 
@@ -372,6 +442,40 @@ fn parent_digest(
     membership: MembershipDigest,
     packs: &[PlannedPack],
 ) -> RequestDigest {
+    let fields = parent_fields(scope, identity, expected, head, refs, membership, packs);
+    let parts = fields.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    RequestDigest::of("core-pack-commit-plan-v1", &parts)
+}
+
+/// Versioned subset parent digest: separate domain, commit mode covered; the A3 parent stays whole-batch.
+#[allow(clippy::too_many_arguments)]
+fn parent_digest_subset(
+    scope: &PackCommitScope,
+    identity: &OperationIdentity,
+    expected: &PackCommitExpectation,
+    head: &HeadUpdate,
+    refs: &[RefUpdate],
+    membership: MembershipDigest,
+    packs: &[PlannedPack],
+    mode: CommitMode,
+) -> RequestDigest {
+    let mut fields = parent_fields(scope, identity, expected, head, refs, membership, packs);
+    fields.push(mode.as_str().as_bytes().to_vec());
+    let parts = fields.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    RequestDigest::of("core-pack-commit-plan-subset-v1", &parts)
+}
+
+/// Semantic fields known before A3, shared by both plan domains (no attempt paths or artifact-set digest).
+#[allow(clippy::too_many_arguments)]
+fn parent_fields(
+    scope: &PackCommitScope,
+    identity: &OperationIdentity,
+    expected: &PackCommitExpectation,
+    head: &HeadUpdate,
+    refs: &[RefUpdate],
+    membership: MembershipDigest,
+    packs: &[PlannedPack],
+) -> Vec<Vec<u8>> {
     let mut fields: Vec<Vec<u8>> = Vec::new();
     for bytes in [
         scope.repository_id.as_bytes().as_slice(),
@@ -417,8 +521,7 @@ fn parent_digest(
             fields.push(artifact.length.to_be_bytes().to_vec());
         }
     }
-    let parts = fields.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    RequestDigest::of("core-pack-commit-plan-v1", &parts)
+    fields
 }
 
 #[cfg(test)]

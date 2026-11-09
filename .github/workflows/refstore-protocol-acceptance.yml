@@ -1,0 +1,113 @@
+name: RefStore protocol native acceptance
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/refstore-protocol-acceptance.yml'
+      - 'src/ref_store/**'
+      - 'src/db.rs'
+      - 'src/auth.rs'
+      - 'src/token_scopes.rs'
+      - 'migrations/**'
+      - 'tests/ref_store_*.rs'
+      - 'tests/retention_roots_support/**'
+      - 'tests/decision_subset_support/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: rootyard
+          POSTGRES_DB: rootyard_protocol
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready -U rootyard -d rootyard_protocol"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      ROOTYARD_TEST_DATABASE_URL: postgresql://rootyard@127.0.0.1:55432/rootyard_protocol
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the reviewed native tool profile
+        timeout-minutes: 20
+        run: |
+          scripts/install_ci_native_tools.sh install \
+            --prefix "$RUNNER_TEMP/rootyard-ci-native" \
+            --provenance test-results/refstore/native-tools.json
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+      - name: Start the job-owned Garage S3 fixture
+        timeout-minutes: 12
+        run: |
+          scripts/owned_garage_fixture.sh start \
+            --directory "$RUNNER_TEMP/refstore-garage" \
+            --output-env "$RUNNER_TEMP/refstore-object-store.env" \
+            --bucket-prefix rootyard-protocol --region garage
+      - name: Exercise roots, decisions, accepted subset and pack-read regressions
+        timeout-minutes: 25
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          . "$RUNNER_TEMP/refstore-object-store.env"
+          set +a
+          export ROOTYARD_BLOB_DRIVER=opendal ROOTYARD_BLOB_SERVICE=s3
+          export ROOTYARD_BLOB_ENDPOINT="$ROOTYARD_OBJECT_STORE_ENDPOINT"
+          export ROOTYARD_BLOB_BUCKET="$ROOTYARD_OBJECT_STORE_BUCKET"
+          export ROOTYARD_BLOB_REGION="$ROOTYARD_OBJECT_STORE_REGION"
+          export ROOTYARD_BLOB_ACCESS_KEY_ID="$ROOTYARD_OBJECT_STORE_ACCESS_KEY"
+          export ROOTYARD_BLOB_SECRET_ACCESS_KEY="$ROOTYARD_OBJECT_STORE_SECRET_KEY"
+          export ROOTYARD_BLOB_ROOT="protocol-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          export ROOTYARD_TEST_GIT="$(command -v git)"
+          mkdir -p test-results/refstore
+          cargo test --locked --features pando-lab \
+            --test ref_store_retention_roots --test ref_store_decision_subset \
+            --test ref_store_packs --test ref_store_materialized_reads \
+            -- --ignored --test-threads=1 2>&1 | tee test-results/refstore/native.log
+          python3 - <<'PY'
+          import json, pathlib, re
+          log = pathlib.Path('test-results/refstore/native.log').read_text()
+          rows = re.findall(r'test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored;', log)
+          assert len(rows) == 4, rows
+          assert all(state == 'ok' and failed == ignored == '0' for state, _, failed, ignored in rows), rows
+          assert sorted(int(passed) for _, passed, _, _ in rows) == [8, 11, 12, 20], rows
+          pathlib.Path('test-results/refstore/native.json').write_text(json.dumps({
+              'passed': True, 'suite_counts': [int(row[1]) for row in rows],
+              'ignored': 0, 'external_blob_backup': False, 'serving_cutover': False,
+          }, indent=2) + '\n')
+          PY
+      - name: Stop only the job-owned Garage fixture
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/refstore-garage/.rootyard-owned-fixture" ]; then
+            scripts/owned_garage_fixture.sh stop --directory "$RUNNER_TEMP/refstore-garage"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: refstore-protocol-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/refstore/
+          if-no-files-found: error

@@ -6,7 +6,7 @@
 //! or a decodable HEAD can reach the operation registry or a ref row.
 use super::super::contract::{OperationIdentity, RefStoreError, RequestDigest};
 use super::contract::CommitMode;
-use super::terminal::ensure_terminal_budget;
+use super::terminal::{CommitRejectCode, ensure_subset_terminal_budget, ensure_terminal_budget};
 use super::types::{GitObjectFormat, GitOid, HeadUpdate, MAX_REFS_PER_COMMIT, RefUpdate, batch_prefix_conflict};
 use std::collections::BTreeSet;
 use uuid::Uuid;
@@ -124,20 +124,32 @@ impl CommitRefsRequest {
     }
 
     /// Construction-level checks that must fail closed before the registry is
-    /// touched. `accepted_subset` is intentionally unsupported until its
-    /// per-ref terminal semantics and tests exist; it is not downgraded. The
-    /// aggregate terminal budget of both possible outcomes is checked here, so
-    /// no oversized terminal conversion can happen after `begin` or any write.
+    /// touched. Both commit modes are accepted: the mode is bound into the
+    /// canonical digest and can never silently degrade into an atomic commit.
+    ///
+    /// - `Atomic` keeps the exact historical checks: any intrabatch prefix
+    ///   conflict refuses the whole request, and the aggregate 64 KiB budget of
+    ///   both possible outcomes is checked before `begin`/writes.
+    /// - `AcceptedSubset` keeps the batch shape checks from `new` (1..=128 unique
+    ///   names, format-exact oids) but must not reject an intrabatch
+    ///   delete-parent/create-child pair up front: deterministic original-order
+    ///   per-ref selection (`core::metadata_subset`, and the decided pack path)
+    ///   decides it, so the pre-registry 64 KiB budget covers both the
+    ///   mixed/committed and the all-rejected terminal shapes.
     pub fn validate(&self) -> Result<(), RefStoreError> {
-        if self.mode == CommitMode::AcceptedSubset {
-            return Err(RefStoreError::Unsupported("accepted_subset commit mode"));
+        match self.mode {
+            CommitMode::Atomic => {
+                if let Some((left, right)) = batch_prefix_conflict(&self.refs) {
+                    return Err(RefStoreError::InvalidIdentity(format!(
+                        "ref prefix conflict inside one commit: {left} vs {right}"
+                    )));
+                }
+                ensure_terminal_budget(self.identity.repository_id(), &self.refs)
+            }
+            CommitMode::AcceptedSubset => {
+                ensure_subset_terminal_budget(self.identity.repository_id(), &self.refs, CommitRejectCode::NoRefApplied)
+            }
         }
-        if let Some((left, right)) = batch_prefix_conflict(&self.refs) {
-            return Err(RefStoreError::InvalidIdentity(format!(
-                "ref prefix conflict inside one commit: {left} vs {right}"
-            )));
-        }
-        ensure_terminal_budget(self.identity.repository_id(), &self.refs)
     }
 
     pub fn identity(&self) -> &OperationIdentity {
@@ -396,11 +408,38 @@ mod tests {
     }
 
     #[test]
-    fn accepted_subset_fails_closed_instead_of_becoming_atomic() {
+    fn accepted_subset_passes_the_shared_checks_without_degrading_to_atomic() {
         let mut subset = request();
         subset.mode = CommitMode::AcceptedSubset;
-        assert!(matches!(subset.validate(), Err(RefStoreError::Unsupported(_))));
+        assert!(subset.validate().is_ok());
+        assert_eq!(subset.mode(), CommitMode::AcceptedSubset);
         assert_eq!(CommitMode::AcceptedSubset.as_str(), "accepted_subset");
+        // Accepted subset no longer blanket-rejects an intrabatch
+        // delete-parent/create-child pair here: deterministic original-order
+        // selection decides it per ref (`core::metadata_subset`). Atomic keeps
+        // the exact historical intrabatch prefix refusal.
+        let base = request();
+        let prefixed = |mode: CommitMode| {
+            CommitRefsRequest::new(
+                base.repository_id(),
+                base.tenant_id(),
+                base.identity().issuer_id(),
+                base.identity().lane().clone(),
+                base.identity().sequence(),
+                base.identity().operation_id(),
+                base.object_format(),
+                base.history_incarnation(),
+                base.authority_epoch(),
+                base.group_epoch(),
+                base.expected_revision(),
+                base.head().clone(),
+                mode,
+                vec![update("refs/heads/x", None, Some(1)), update("refs/heads/x/y", None, Some(2))],
+            )
+            .unwrap()
+        };
+        assert!(prefixed(CommitMode::AcceptedSubset).validate().is_ok());
+        assert!(prefixed(CommitMode::Atomic).validate().is_err());
     }
 
     #[test]

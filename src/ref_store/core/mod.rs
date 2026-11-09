@@ -25,14 +25,29 @@
 //! helpers) and `snapshot_pg`/`pin_pg` (owned short transactions over migration
 //! 140).
 pub mod artifact_hold;
+pub mod authorized_metadata;
+pub use authorized_metadata::{MetadataDecisionPreparation, PgAuthorizedMetadata, PreparedMetadataPublication};
 pub mod command;
 pub mod contract;
+/// Migration-144 per-repository protocol realm + irreversible
+/// decision-required fence (common integration state).
+pub mod decision_commit;
+mod metadata_subset;
 /// A4a durable pack registration + verified commit foundation (unserved).
 pub mod pack_commit;
 /// A5a complete registered-pack-membership snapshot + durable pin (unserved).
 pub mod pack_snapshot;
 pub mod pg;
+/// Publication decisions: live PG authorization/policy, single-use decision
+/// capabilities and the cancel-before-install tombstone (crate-private surface).
+pub(crate) mod publication_decision;
+/// Durable, non-expiring retention **roots** over one existing pack-verified
+/// snapshot (library only, unserved).
+pub mod retention_root;
 pub mod sql;
+/// Verified accepted-subset selection vocabulary and the private derived
+/// projection of an original whole-batch plan.
+pub mod subset;
 pub mod terminal;
 pub mod types;
 
@@ -48,12 +63,18 @@ pub mod snapshot_receipt;
 
 pub use command::CommitRefsRequest;
 pub use contract::{CommitMode, CoreGate, CoreGateInit, CoreGateVersion, VersionCheck};
+pub use decision_commit::{DecisionFence, PgDecisionProtocol, ProtocolRepoRealm, RealmExpectation};
 pub use pack_snapshot::{
     CreatePackSnapshotRequest, MaterializedPackRead, PackPinReceipt, PackReadSnapshot, PackSnapshotExpectation,
     PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceipt, PackSnapshotReceiptQuery, PackSnapshotRef,
     PgPackSnapshot, PgPackSnapshotMaterializer,
 };
 pub use pg::PgRefStoreCore;
+pub use retention_root::{
+    PgRetentionRoots, PrepareRootRequest, RegisterRootRequest, ReleaseRootRequest, RootCandidate, RootError,
+    RootPurpose, RootReadAuthority, RootReadRequest, RootReadView, RootReceipt, RootReceiptQuery, RootRecord, RootRef,
+    RootSelector, RootSelectorKind, RootsScope,
+};
 pub use snapshot_contract::{
     MAX_PIN_LEASE_SECONDS, MAX_RECEIPT_BODY_BYTES, MAX_SNAPSHOT_LOGICAL_BYTES, MAX_SNAPSHOT_PACKS, MAX_SNAPSHOT_PAGE,
     MAX_SNAPSHOT_REFS, MetadataSnapshotCursor, MetadataSnapshotScope, PackMembershipDescriptor, REPO_MAX_LOGICAL_BYTES,

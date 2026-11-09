@@ -56,6 +56,8 @@ pub enum PackCommitRejectCode {
     /// A stored registration row/body/hold set is partial, rewritten or
     /// internally inconsistent. Never treated as `Found`.
     LedgerIntegrity,
+    NoRefApplied,
+    DecisionRejected,
 }
 
 impl PackCommitRejectCode {
@@ -89,6 +91,8 @@ impl PackCommitRejectCode {
             "capture_overflow" => Self::CaptureOverflow,
             "already_verified" => Self::AlreadyVerified,
             "ledger_integrity" => Self::LedgerIntegrity,
+            "no_ref_applied" => Self::NoRefApplied,
+            "decision_rejected" => Self::DecisionRejected,
             _ => return Err(RefStoreError::Database("stored pack reject code is not recognized".into())),
         };
         Ok(code)
@@ -124,6 +128,8 @@ impl PackCommitRejectCode {
             Self::CaptureOverflow => "capture_overflow",
             Self::AlreadyVerified => "already_verified",
             Self::LedgerIntegrity => "ledger_integrity",
+            Self::NoRefApplied => "no_ref_applied",
+            Self::DecisionRejected => "decision_rejected",
         }
     }
 }

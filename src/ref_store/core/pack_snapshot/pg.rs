@@ -390,7 +390,7 @@ impl PgPackSnapshot {
         result
     }
 
-    pub(super) async fn read_checked(
+    pub(in crate::ref_store::core) async fn read_checked(
         &self,
         tx: &Transaction<'_>,
         reference: &PackSnapshotRef,

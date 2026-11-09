@@ -36,6 +36,7 @@ pub(super) fn mint(
         old_membership_digest: context.old_membership_digest(),
         old_packs_digest: packs_digest(context.old_packs()),
         new_packs_digest: packs_digest(context.new_packs()),
+        selection_digest: context.selection_digest().copied(),
         verified_pairs,
         verified_bytes,
     };

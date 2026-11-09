@@ -122,6 +122,13 @@ impl pg::PgPackCommit {
             .await?
             .ok_or_else(|| pg::reject(PackCommitRejectCode::GateNotFound, "core gate missing"))?;
         pg::ensure_gate_matches(plan, &gate, mode)?;
+        // Irreversible decision-required fence (migration 144 protocol state),
+        // after the exact 138 operation replay and after the gate row lock but
+        // BEFORE the first pack/ref write: a fenced repository can no longer
+        // receive a fresh legacy A4 write, while an old terminal keeps
+        // replaying unchanged. Lock order 138 prefix -> repository -> quota ->
+        // gate -> protocol is shared with the decision path.
+        crate::ref_store::core::decision_commit::refuse_legacy_fresh_write(tx, plan.repository_id()).await?;
         crate::ref_store::pg::bound(tx, deadline).await?;
         let pack = registered_pack(tx, plan, request, &gate).await?;
         // One stable exact ACK: the fixed point of the retained logical charge is
@@ -229,6 +236,13 @@ impl pg::PgPackCommit {
             .await?
             .ok_or_else(|| pg::reject(PackCommitRejectCode::GateNotFound, "core gate missing"))?;
         pg::ensure_gate_matches(plan, &gate, mode)?;
+        // Irreversible decision-required fence (migration 144 protocol state),
+        // after the exact 138 operation replay and after the gate row lock but
+        // BEFORE the first pack/ref write: a fenced repository can no longer
+        // receive a fresh legacy A4 write, while an old terminal keeps
+        // replaying unchanged. Lock order 138 prefix -> repository -> quota ->
+        // gate -> protocol is shared with the decision path.
+        crate::ref_store::core::decision_commit::refuse_legacy_fresh_write(tx, plan.repository_id()).await?;
         // Pure terminal/result: exact retained body sizes are known before the
         // first persistent ref/membership/history write.
         let prepared = prepare_commit(plan, &context, &gate)?;
@@ -237,7 +251,8 @@ impl pg::PgPackCommit {
         let quota =
             plan_quota(&locked, Charge::membership(plan.packs().len() as i64, history_body.len(), terminal_bytes)?)?;
         crate::ref_store::pg::bound(tx, deadline).await?;
-        let receipt = write_verified_commit(tx, plan, &history_body, &context, &gate, &prepared, deadline).await?;
+        let receipt =
+            write_verified_commit(tx, plan, plan.refs(), &history_body, &context, &gate, &prepared, deadline).await?;
         apply_quota(tx, &quota).await?;
         Ok(receipt)
     }
@@ -610,12 +625,12 @@ async fn write_registration(
 
 /// Pure, pre-write commit content: the exact result refs, terminal and its
 /// bounded canonical body. Nothing here touches the database.
-struct PreparedCommit {
-    new_revision: i64,
-    new_head: String,
-    terminal: PackCommitTerminal,
-    result: TerminalResult,
-    terminal_body_bytes: usize,
+pub(super) struct PreparedCommit {
+    pub(super) new_revision: i64,
+    pub(super) new_head: String,
+    pub(super) terminal: PackCommitTerminal,
+    pub(super) result: TerminalResult,
+    pub(super) terminal_body_bytes: usize,
 }
 
 fn prepare_commit(
@@ -662,9 +677,11 @@ fn prepare_commit(
     })
 }
 
-async fn write_verified_commit(
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn write_verified_commit(
     tx: &Transaction<'_>,
     plan: &PackCommitPlan,
+    updates: &[crate::ref_store::core::types::RefUpdate],
     history_body: &str,
     context: &PackClosureContext,
     gate: &crate::ref_store::core::contract::CoreGate,
@@ -673,7 +690,7 @@ async fn write_verified_commit(
 ) -> Result<PackCommitReceipt, PackCommitError> {
     let new_revision = prepared.new_revision;
     let new_head = prepared.new_head.clone();
-    for update in plan.refs() {
+    for update in updates {
         let name = update.name().as_str();
         match update.target() {
             RefTarget::Delete => {

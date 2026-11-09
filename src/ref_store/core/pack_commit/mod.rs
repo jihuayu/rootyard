@@ -34,6 +34,10 @@ pub mod proof;
 pub mod receipt;
 pub mod request;
 
+/// Decision-gated (authorized) publication pipeline: staged PostgreSQL capture
+/// and commit stages over the unchanged A4 plan/proof/terminal wire.
+mod authorized;
+pub(in crate::ref_store::core) mod facts;
 mod pg;
 mod pg_commit;
 mod registration;
@@ -41,6 +45,11 @@ mod sql;
 mod usage;
 
 pub use artifact::{ArtifactLocator, ArtifactSetDigest, RegisteredArtifact, RegisteredPack, packs_digest};
+pub use authorized::{
+    AuthorizedCancelOutcome, AuthorizedCancelReceipt, AuthorizedCommitError, AuthorizedCommitMode,
+    AuthorizedCommitReceipt, AuthorizedSelection, PgAuthorizedCommit, PrepareOutcome, PreparedPublication,
+    VerifiedAuthorizedPublication,
+};
 pub use closure::PackClosureContext;
 pub use context::{CapturedRef, MembershipDigest, PackCommitBaseline, PackMembershipEntry, refs_digest};
 pub use contract::{
@@ -51,6 +60,7 @@ pub use contract::{
     VERIFIER_MAX_RESULT_REFS, VERIFIER_MAX_TOTAL_BYTES,
 };
 pub use error::{PackCommitError, PackCommitRejectCode, PackCommitRejection};
+pub(crate) use facts::{RefFacts, VerifiedPublicationFacts};
 pub use pg::PgPackCommit;
 pub use plan::{ContentDigest, PackCommitExpectation, PackCommitPlan, PackCommitScope, PlannedArtifact, PlannedPack};
 pub use proof::PackClosureProof;

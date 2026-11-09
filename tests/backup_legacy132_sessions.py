@@ -9,7 +9,7 @@ given, restore into a brand-new database/data directory under one newly minted
 Pando authority, apply the reviewed current migrations, and serve stock Git
 fetch/clone for both repositories.  Every frozen predecessor source contract
 here keeps its own format/schema verification and then upgrades to the same
-current reviewed target: format19/schema143.
+current reviewed target: format20/schema144.
 
 ``backup_legacy133_identity.py`` through ``backup_legacy142_pack_snapshots.py`` reuse this
 harness with the format9/schema133 through format18/schema142 contracts and
@@ -109,8 +109,8 @@ class ArchiveContract:
     schema: int
     flag: str
     source_label: str
-    target_schema: int = 143
-    target_format: int = 19
+    target_schema: int = 144
+    target_format: int = 20
     indexes: tuple = SCHEMA139_INDEXES
     foreign_keys: tuple = SCHEMA134_FOREIGN_KEYS
     unique_constraints: tuple = SCHEMA134_UNIQUE
@@ -118,13 +118,13 @@ class ArchiveContract:
 
 
 LEGACY132 = ArchiveContract(format=8, schema=132, flag="--allow-legacy-schema132",
-                            source_label="schema132", target_schema=143,
+                            source_label="schema132", target_schema=144,
                             indexes=SCHEMA139_INDEXES)
 LEGACY133 = ArchiveContract(format=9, schema=133, flag="--allow-legacy-schema133",
-                            source_label="schema133", target_schema=143,
+                            source_label="schema133", target_schema=144,
                             indexes=SCHEMA139_INDEXES)
 # Format10/schema134 is an older frozen contract.  Its archive upgrades through
-# the same reviewed path to the current schema143/format19 target.
+# the same reviewed path to the current schema144/format20 target.
 LEGACY134 = replace(LEGACY132, format=10, schema=134,
                     flag="--allow-legacy-schema134", source_label="schema134")
 # Format11/schema135 carries the frozen schema135 catalog and no schema136
@@ -175,8 +175,12 @@ LEGACY141 = replace(LEGACY140, format=17, schema=141,
 # four new tables empty and leave every old A2 snapshot row at the default
 # metadata-only/unavailable shape while preserving the complete schema142
 # pack/A3 ledger rows and all schema142 columns exactly.
-LEGACY142 = replace(LEGACY141, format=18, schema=142,
-                    flag="--allow-legacy-schema142", source_label="schema142")
+LEGACY142 = replace(LEGACY141, format=18, schema=142, flag="--allow-legacy-schema142")
+# Format19/schema143 is frozen at the genuine A5a snapshot ledger.  Its entrypoint
+# (`backup_legacy143_roots_decisions.py`) seeds that ledger with the retained old
+# typed A5 helper before the old producer writes the archive, and the current
+# candidate must upgrade it to format20/schema144 and preserve every old row.
+LEGACY143 = replace(LEGACY142, format=19, schema=143, flag="--allow-legacy-schema143")
 
 # Every legacy opt-in this shared harness knows about, oldest first.  The
 # adjacent entry is used for the mixed-flag and mismatched-opt-in rejections.
@@ -186,7 +190,7 @@ LEGACY_FLAGS = (
     "--allow-legacy-schema136", "--allow-legacy-schema137",
     "--allow-legacy-schema138", "--allow-legacy-schema139",
     "--allow-legacy-schema140", "--allow-legacy-schema141",
-    "--allow-legacy-schema142",
+    "--allow-legacy-schema142", "--allow-legacy-schema143",
 )
 
 
@@ -465,6 +469,8 @@ class LegacyArchiveHarness(BackupHarness):
         if schema >= 142:
             self.source_pack_rows = self.table_rows(self.source_db,
                                                     schema_delta(142))
+        self.source_a5_rows = (self.table_rows(self.source_db, schema_delta(143))
+                              if schema >= 143 else None)
 
     # -- OPTIONAL retained schema142 A4 fixture (format18 drill only) -------------------
     LEGACY_PACK_MARKER = "ROOTYARD-REF-STORE-PACKS-FIXTURE-METADATA"
@@ -549,8 +555,11 @@ class LegacyArchiveHarness(BackupHarness):
             assert self.contract.schema < 142, (
                 "a schema142 entrypoint must supply the retained old A4 helper")
             return None
+        if self.contract.schema == 143:
+            return self.seed_legacy_a5_fixture()
         assert self.contract.schema == 142, (
-            "the retained old A4 helper is only valid for the format18/schema142 entrypoint")
+            "the retained old helper is only valid for the format18/schema142 (A4) or "
+            "format19/schema143 (A5) entrypoint")
         binding = self.validate_legacy_pack_fixture()
         assert self.query(
             self.source_db,
@@ -621,6 +630,150 @@ class LegacyArchiveHarness(BackupHarness):
                 "pack_rows": marker["counts"]["pack"],
                 "hold_rows": marker["counts"]["holds"],
                 "gate": gate}
+
+    # -- OPTIONAL retained schema143 A5 fixture (format19 drill only) --------------------
+    LEGACY_A5_MARKER = "ROOTYARD-REF-STORE-PACK-SNAPSHOTS-FIXTURE-METADATA"
+    LEGACY_A5_KIND = "rootyard/ref-store-core-pack-snapshots-backup-fixture"
+    LEGACY_A5_TEST = "ref_store_pack_snapshot_backup_metadata_fixture"
+    LEGACY_A5_TARGET = "ref_store_pack_snapshots_backup_fixture"
+    LEGACY_A5_SNAPSHOT_COUNTS = {
+        "ref_store_core_snapshot_packs": 4,
+        "ref_store_core_pack_snapshot_history": 6,
+        "ref_store_core_pack_snapshot_repo_usage": 1,
+        "ref_store_core_pack_snapshot_tenant_usage": 1,
+    }
+
+    def validate_legacy_a5_fixture(self):
+        """Bind the retained old A5 helper to its own genuine build receipt.
+
+        The receipt, not this worktree, is the provenance: the retained helper
+        was produced from the frozen schema143 source tree and is pinned by the
+        root runner (binary and receipt sha256 are recorded in qualification).
+        """
+        helper = Path(self.legacy_fixture_binary)
+        assert helper.is_file(), "retained schema143 A5 helper is missing: " + str(helper)
+        receipt_path = (Path(self.legacy_fixture_receipt) if self.legacy_fixture_receipt
+                        else Path(str(helper) + ".build.json"))
+        assert receipt_path.is_file(), (
+            "retained schema143 A5 helper receipt is missing: " + str(receipt_path))
+        receipt = json.loads(receipt_path.read_text())
+        assert isinstance(receipt, dict), "retained A5 helper receipt is not an object"
+        actual = self._file_sha256(helper)
+        recorded = (receipt.get("binary_sha256") or receipt.get("artifact_sha256") or
+                    receipt.get("sha256"))
+        assert recorded == actual, "retained A5 helper does not match its build receipt"
+        assert receipt.get("kind") == "rust-integration-test", (
+            "retained A5 helper receipt kind is " + repr(receipt.get("kind")))
+        assert receipt.get("package_rebuilt") is True, "retained A5 helper was not rebuilt"
+        entries = receipt.get("fresh_false_artifacts")
+        assert isinstance(entries, list) and len(entries) == 1, (
+            "retained A5 helper receipt must record exactly one fresh=False artifact")
+        entry = entries[0]
+        assert isinstance(entry, dict), "retained A5 helper fresh=False entry is not an object"
+        assert str(entry.get("target")) == self.LEGACY_A5_TARGET, (
+            "retained A5 helper receipt target is " + repr(entry.get("target")))
+        assert entry.get("fresh") is False and str(entry.get("kind")) == "test"
+        assert (entry.get("profile") or {}).get("test") is True
+        executable = entry.get("executable")
+        assert executable and Path(str(executable)).name.startswith(self.LEGACY_A5_TARGET)
+        assert receipt.get("relocated_artifact") is True
+        source_inputs = receipt.get("source_inputs_sha256") or receipt.get("source_inputs")
+        assert isinstance(source_inputs, str) and len(source_inputs) == 64, (
+            "retained A5 helper receipt has no source-input digest")
+        self.legacy_a5_helper = {
+            "binary": str(helper),
+            "binary_sha256": actual,
+            "build_receipt": str(receipt_path),
+            "build_receipt_sha256": self._file_sha256(receipt_path),
+            "kind": "rust-integration-test",
+            "fresh": False,
+            "source_inputs_sha256": source_inputs,
+            "integration_test_source_sha256": receipt.get("integration_test_source_sha256"),
+            "retained_binding_stages": [],
+            "seed_only_on_schema143": True,
+            "verify_mode_run_against_schema143": False,
+            "verify_mode_run_against_schema144": False,
+        }
+        return self.legacy_a5_helper
+
+    def seed_legacy_a5_fixture(self):
+        """Seed the genuine schema143 A5 ledger in the OLD database only.
+
+        The retained helper runs in ``seed`` mode against the frozen
+        format19/schema143 source before the old producer writes the archive.
+        Its ``verify`` mode is never run here (the restored schema144 target is
+        verified by the current typed helper, not by an old-schema reader).
+        """
+        binding = self.validate_legacy_a5_fixture()
+        assert self.query(
+            self.source_db, "SELECT max(version) FROM schema_migrations") == str(
+                self.contract.schema), "the source schema moved before the A5 fixture seed"
+        assert self.query(
+            self.source_db,
+            "SELECT to_regclass('public.ref_store_core_snapshot_packs') IS NOT NULL") == "t", (
+                "the genuine schema143 source has no A5 pack-snapshot tables")
+        for absent in ("ref_store_core_roots", "ref_store_publication_decisions",
+                       "ref_store_core_protocol_repos"):
+            assert self.query(
+                self.source_db,
+                "SELECT to_regclass('public." + absent + "') IS NULL") == "t", (
+                    "the frozen schema143 source already carries migration-144 table " + absent)
+        assert self.query(
+            self.source_db,
+            "SELECT count(*) FROM ref_store_core_snapshot_packs") == "0", (
+                "the frozen schema143 source already carries A5 binding rows")
+        output = self.root / "legacy-a5-fixture-manifest.json"
+        env = self.legacy_env.copy()
+        env.update(ROOTYARD_TEST_DATABASE_URL=self.source_db,
+                   ROOTYARD_PACK_SNAPSHOTS_FIXTURE_MODE="seed",
+                   ROOTYARD_PACK_SNAPSHOTS_FIXTURE_OUTPUT=str(output))
+        process = self.run(
+            [str(self.legacy_fixture_binary), "--ignored", "--exact",
+             self.LEGACY_A5_TEST, "--format=terse", "--nocapture",
+             "--test-threads=1"], env=env)
+        stdout = process.stdout.decode()
+        summaries = [line for line in stdout.splitlines()
+                     if line.startswith("test result:")]
+        assert summaries, "the retained A5 helper reported no test result at all"
+        summary = summaries[-1]
+        assert "1 passed" in summary and "0 failed" in summary and "0 ignored" in summary, summary
+        lines = [line for line in stdout.splitlines()
+                 if line.startswith(self.LEGACY_A5_MARKER + " ")]
+        assert len(lines) == 1, "the retained A5 helper must print exactly one marker line"
+        text = lines[0]
+        assert self.redact(text) == text, "the retained A5 helper marker leaked a credential or database URL"
+        marker = json.loads(text[len(self.LEGACY_A5_MARKER) + 1:])
+        assert marker["kind"] == self.LEGACY_A5_KIND
+        assert marker["mode"] == "seed"
+        assert marker["provider_io_attempted"] is True
+        assert marker["held_remote_objects_deleted"] is False
+        assert marker["restored_blob_bytes_backed_up"] is False
+        assert marker["complete_git_read_snapshot_claimed"] is False
+        assert json.loads(output.read_text()) == marker, (
+            "the private old A5 manifest differs from the public marker")
+        assert marker["counts"]["snapshot_packs"] == self.LEGACY_A5_SNAPSHOT_COUNTS, (
+            "the retained A5 helper did not seed the documented schema143 ledger")
+        for table, expected in self.LEGACY_A5_SNAPSHOT_COUNTS.items():
+            assert self.query(
+                self.source_db, 'SELECT count(*) FROM public."' + table + '"') == str(
+                    expected), table + " rows differ after the old A5 seed"
+        assert self.query(
+            self.source_db, "SELECT max(version) FROM schema_migrations") == str(
+                self.contract.schema), "the old A5 fixture moved the frozen source schema"
+        for absent in ("ref_store_core_roots", "ref_store_publication_decisions"):
+            assert self.query(
+                self.source_db,
+                "SELECT to_regclass('public." + absent + "') IS NULL") == "t", (
+                    "the old A5 fixture fabricated migration-144 table " + absent)
+        self.legacy_a5_marker = marker
+        binding["retained_binding_stages"].append("seed")
+        binding["helper_binary_sha256_after_run"] = self._file_sha256(self.legacy_fixture_binary)
+        binding["binaries_unchanged_after_run"] = (
+            binding["helper_binary_sha256_after_run"] == binding["binary_sha256"])
+        assert binding["binaries_unchanged_after_run"]
+        return {"helper": binding,
+                "snapshot_rows": marker["counts"]["snapshot_packs"],
+                "a2_rows": marker["counts"]["a2"]}
 
     def scoped_rows(self, db, tables, owners, scope):
         """Exact rows of one table family scoped to the fixture repository/tenant."""
@@ -1082,6 +1235,8 @@ class LegacyArchiveHarness(BackupHarness):
         columns) so migration143 cannot rewrite historical metadata.
         """
         assert self.contract.target_schema >= 143, self.contract.target_schema
+        if getattr(self, "source_a5_rows", None) is not None:
+            return self.assert_genuine_schema143_snapshot_ledger()
         new_tables = schema143_pack_snapshot_tables()
         for name in new_tables:
             assert re.fullmatch(r"[a-z_][a-z0-9_]*", name), name
@@ -1149,6 +1304,96 @@ class LegacyArchiveHarness(BackupHarness):
             schema143_pack_pin_or_history_fabricated=False,
             complete_git_read_snapshot_claimed=False)
 
+    def assert_genuine_schema143_snapshot_ledger(self):
+        """A genuine format19/schema143 source keeps its exact A5 rows.
+
+        Migration 144 is additive for A5: the four schema143 binding/history/
+        permanent-usage tables must be restored byte-for-byte and the old
+        metadata-only A2 snapshot rows must stay ``metadata_only``.
+        """
+        new_tables = schema143_pack_snapshot_tables()
+        present = self.query(
+            self.restore_db,
+            "SELECT COALESCE(string_agg(tablename, ',' ORDER BY tablename), '')"
+            " FROM pg_tables WHERE schemaname='public' AND tablename IN ('" +
+            "','".join(sorted(new_tables)) + "')")
+        assert set(filter(None, present.split(","))) == set(new_tables), present
+        restored = self.table_rows(self.restore_db, new_tables)
+        assert restored == self.source_a5_rows, (
+            "the upgrade rewrote the genuine schema143 A5 ledger")
+        for table in sorted(new_tables):
+            assert len(restored[table]) > 0, (
+                "the genuine schema143 ledger table " + table + " is empty after the upgrade")
+        if self.source_snapshot_rows is not None:
+            snapshots = self.table_rows(self.restore_db, schema_delta(140),
+                                        self.A5_SNAPSHOT_COLUMNS)
+            assert snapshots == self.source_snapshot_rows, (
+                "the upgrade rewrote historical schema140 snapshot rows")
+        pack_snapshot_rows = sum(len(value) for value in restored.values())
+        return dict(
+            schema143_pack_snapshot_tables=sorted(new_tables),
+            schema143_genuine_ledger_rows=pack_snapshot_rows,
+            schema143_genuine_ledger_preserved_exactly=True,
+            schema143_new_tables_empty_except_migration_seed=False,
+            schema143_pack_pin_or_history_fabricated=False,
+            complete_git_read_snapshot_claimed=False)
+
+    def assert_roots_decision_schema(self):
+        """Migration 144 adds only empty root/decision tables to a 143 source.
+
+        A genuine format19/schema143 archive carries no retention root, root
+        receipt, protocol-realm row or publication decision; the upgrade must
+        create the seventeen generated 144-vs-143 tables and leave each at its
+        exact settled-migration seed (zero for every one of them here).
+        """
+        assert self.contract.target_schema >= 144, self.contract.target_schema
+        new_tables = schema_delta(144)
+        for name in new_tables:
+            assert re.fullmatch(r"[a-z_][a-z0-9_]*", name), name
+        present = self.query(
+            self.restore_db,
+            "SELECT COALESCE(string_agg(tablename, ',' ORDER BY tablename), '')"
+            " FROM pg_tables WHERE schemaname='public' AND tablename IN ('" +
+            "','".join(sorted(new_tables)) + "')")
+        assert set(filter(None, present.split(","))) == set(new_tables), present
+        seeds = migration_seed_counts(144)
+        assert set(seeds) <= set(new_tables), (seeds, new_tables)
+        counts = {
+            name: int(self.query(self.restore_db,
+                                 'SELECT count(*) FROM public."' + name + '"'))
+            for name in sorted(new_tables)
+        }
+        expected = {name: seeds.get(name, 0) for name in sorted(new_tables)}
+        assert counts == expected, (counts, expected)
+        assert self.query(
+            self.restore_db,
+            "SELECT count(*) FROM ref_store_publication_decisions") == "0", (
+                "the schema144 upgrade fabricated a publication decision")
+        assert self.query(
+            self.restore_db,
+            "SELECT count(*) FROM ref_store_core_roots") == "0", (
+                "the schema144 upgrade fabricated a retention root")
+        assert self.query(
+            self.restore_db,
+            "SELECT count(*) FROM ref_store_core_root_receipts") == "0", (
+                "the schema144 upgrade fabricated a retention root receipt")
+        assert self.query(
+            self.restore_db,
+            "SELECT count(*) FROM ref_store_core_protocol_repos WHERE decision_required") == "0", (
+                "the schema144 upgrade enabled the irreversible decision fence")
+        roots = sorted(n for n in new_tables if "root" in n)
+        decisions = sorted(n for n in new_tables if "decision" in n)
+        protocol = sorted(n for n in new_tables if "protocol" in n)
+        assert roots and decisions and protocol, new_tables
+        return dict(
+            schema144_new_tables=sorted(new_tables),
+            schema144_root_tables=roots,
+            schema144_decision_tables=decisions,
+            schema144_protocol_tables=protocol,
+            schema144_new_tables_empty_except_migration_seed=not seeds,
+            schema144_root_or_decision_fabricated=False,
+            schema144_decision_fence_enabled=False)
+
     def candidate_restores_and_rotates_authority(self):
         self.use_candidate(self.restore_db, self.restore_data)
         self.args.binary = self.candidate_binary
@@ -1176,6 +1421,9 @@ class LegacyArchiveHarness(BackupHarness):
         a5 = {}
         if self.contract.target_schema >= 143:
             a5 = self.assert_a5_pack_snapshot_schema()
+        self.roots_decision_schema = {}
+        if self.contract.target_schema >= 144:
+            self.roots_decision_schema = self.assert_roots_decision_schema()
         legacy_fixture = {}
         if self.legacy_pack_marker is not None:
             legacy_fixture = self.assert_legacy_pack_fixture_preserved()
@@ -1498,6 +1746,8 @@ def run_main(contract=None, argv=None):
                 "(the format18 producer is the retained A4 app); this harness "
                 "never fabricates or relabels one.",
             ])
+        report["legacy_a5_fixture_helper"] = getattr(harness, "legacy_a5_helper", None)
+        report["roots_decision_schema"] = getattr(harness, "roots_decision_schema", {})
         if args.keep:
             report["retained_directory"] = str(harness.root)
         if args.report:
