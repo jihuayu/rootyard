@@ -335,6 +335,12 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
         assert active["ref_count"] == 1 and active["oid_count"] == 1
         assert active["pack_count"] == 2 and len(active["packs"]) == 2
         assert len(active["binding_digest"]) == 64 and len(active["register_digest"]) == 64
+        assert released["ref_count"] == 1 and released["oid_count"] == 1
+        assert released["pack_count"] == 2 and len(released["packs"]) == 2
+        for key in ("head_ref", "head_oid", "refs_digest", "pack_set_digest", "packs"):
+            assert released[key] == active[key], "released root lost its captured " + key
+        assert len(released["binding_digest"]) == 64 and len(released["register_digest"]) == 64
+        assert released["binding_digest"] != active["binding_digest"], "distinct roots share a binding"
         assert released["receipts"]["release"]["state"] == "released"
         assert tombstone["record"] is None, "the release-before-register tombstone gained a capture"
         assert "register" not in tombstone["receipts"], "a refused register produced a receipt"
@@ -345,19 +351,16 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
         assert materialized["readback_bytes"] == materialized["verified_bytes"]
         assert marker["source"]["source_pin_released"] is True
         quota = marker["quota"]
-        assert quota["repo"]["roots"] >= 2 and quota["tenant"]["roots"] == quota["repo"]["roots"]
+        assert quota["repo"]["roots"] == quota["tenant"]["roots"] == 3
+        assert quota["repo"]["root_oid_refs"] == quota["tenant"]["root_oid_refs"] == 4
         assert quota["repo"]["receipts"] == 4 and quota["tenant"]["receipts"] == 4
         assert quota["repo"]["pack_bindings"] == 4
-        assert quota["roots_revision"] is not None
+        assert quota["roots_revision"] == 4
         # Both ordinary release and release-before-register retain a tombstone.
         assert marker["root_counts"]["tombstones"] == 2, marker["root_counts"]
         counts = marker["root_family_counts"]
-        variable = ("ref_store_core_root_refs", "ref_store_core_root_oids", "ref_store_core_root_packs")
         for table, expected in EXPECTED_ROOT_COUNTS.items():
-            if table in variable:
-                assert counts[table] >= expected, table + " rows are below the documented drill shape"
-            else:
-                assert counts[table] == expected, table + " rows differ from the documented drill shape"
+            assert counts[table] == expected, table + " rows differ from the exact drill shape"
         decision_counts = marker["decision_family_counts"]
         for table, expected in EXPECTED_DECISION_COUNTS.items():
             if expected is not None:
@@ -368,7 +371,7 @@ class BackupRefStoreRootsDecisions144Harness(BackupRefStoreCore139Harness):
         rows = {row["decision_id"]: row for row in decisions["rows"]}
         consumed = rows[decisions["consumed_decision"]["decision_id"]]
         assert consumed["state"] == "CONSUMED", "the accepted-subset decision is not CONSUMED"
-        assert consumed["action"] in ("push", "merge"), consumed["action"]
+        assert consumed["action"] == "push", consumed["action"]
         verdicts = consumed["verdicts"]
         assert len(verdicts) == 2, "the consumed decision did not persist both per-ref verdicts"
         accepted = [v for v in verdicts if v["reject_code"] is None]

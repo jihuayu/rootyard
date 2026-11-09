@@ -5,10 +5,9 @@ on:
   pull_request:
     paths:
       - '.github/workflows/refstore-protocol-acceptance.yml'
-      - 'src/ref_store/**'
-      - 'src/db.rs'
-      - 'src/auth.rs'
-      - 'src/token_scopes.rs'
+      - 'src/**'
+      - 'scripts/**'
+      - 'rust-toolchain.toml'
       - 'migrations/**'
       - 'tests/ref_store_*.rs'
       - 'tests/retention_roots_support/**'
