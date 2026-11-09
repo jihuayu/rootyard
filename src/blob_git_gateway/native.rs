@@ -47,6 +47,8 @@ use crate::ref_store::GitObjectFormat;
 /// Hard ceiling for any stdout that is collected in memory. Streaming output is
 /// never collected; even an advertisement cannot make a `Vec` larger than this.
 const MAX_CAPTURED_STDOUT: u64 = 16 * 1024 * 1024;
+/// Hard ceiling for a trusted, caller-built stdin request list.
+const MAX_CAPTURED_STDIN: u64 = 1024 * 1024;
 /// Native stderr is drained but never stored or logged.
 const STDERR_DRAIN_LIMIT: u64 = 64 * 1024;
 /// Re-check live read authorization at most once per second during a stream.
@@ -61,6 +63,8 @@ const IO_CHUNK_BYTES: usize = 64 * 1024;
 pub(super) struct Captured {
     pub stdout: Vec<u8>,
     pub success: bool,
+    /// Native exit code (`None` when the child died from a signal).
+    pub exit_code: Option<i32>,
 }
 
 /// One owned temporary bare repository. The whole directory (repo, HOME and
@@ -180,6 +184,12 @@ impl TempGitView {
     }
 }
 
+/// Effective stdout ceiling of one request: the caller's request budget,
+/// itself never above the hard process allowance.
+fn request_stdout_limit(max_stdout: u64) -> u64 {
+    max_stdout.min(MAX_CAPTURED_STDOUT)
+}
+
 fn cleanup_bound() -> Instant {
     Instant::now() + process_guard::CLEANUP_LIMIT
 }
@@ -193,7 +203,7 @@ pub(super) async fn run_capture(
     max_stdout: u64,
     deadline: Instant,
 ) -> Result<Captured, GatewayError> {
-    let stdout_limit = max_stdout.min(MAX_CAPTURED_STDOUT);
+    let stdout_limit = request_stdout_limit(max_stdout);
     let stdin = match stdin_file {
         Some(path) => Some(
             tokio::fs::File::open(path)
@@ -260,7 +270,93 @@ pub(super) async fn run_capture(
     if stdout_over {
         return Err(GatewayError::TooLarge);
     }
-    Ok(Captured { stdout: stdout_bytes, success: status.success() })
+    Ok(Captured { stdout: stdout_bytes, success: status.success(), exit_code: status.code() })
+}
+
+/// One bounded command whose small, trusted stdin (a `cat-file --batch`
+/// request list built by the caller) is written concurrently with bounded
+/// stdout collection. Process-group cleanup, deadline and output ceilings are
+/// exactly those of [`run_capture`].
+pub(super) async fn run_capture_with_input(
+    mut command: Command,
+    stdin_bytes: Vec<u8>,
+    max_stdout: u64,
+    deadline: Instant,
+) -> Result<Captured, GatewayError> {
+    if stdin_bytes.len() as u64 > MAX_CAPTURED_STDIN {
+        return Err(GatewayError::TooLarge);
+    }
+    // `ProcessGuard::spawn` only spawns and proves group leadership; stdio is
+    // configured here exactly as by the command builders of `run_capture`.
+    // The caller owns every stdin byte, so a full stdin pipe can never block
+    // the request: the feeder writes the bounded list and closes the pipe
+    // while stdout and the drained stderr are read concurrently.
+    let stdout_limit = request_stdout_limit(max_stdout);
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut guard = ProcessGuard::spawn(command)?;
+    let Some(mut input) = guard.child.stdin.take() else {
+        let _ = guard.finish(cleanup_bound()).await;
+        return Err(GatewayError::Internal("native Git stdin is unavailable"));
+    };
+    let Some(stdout) = guard.child.stdout.take() else {
+        let _ = guard.finish(cleanup_bound()).await;
+        return Err(GatewayError::Internal("native Git stdout is unavailable"));
+    };
+    let Some(stderr) = guard.child.stderr.take() else {
+        drop(stdout);
+        let _ = guard.finish(cleanup_bound()).await;
+        return Err(GatewayError::Internal("native Git stderr is unavailable"));
+    };
+    let feeder = tokio::spawn(async move {
+        let _ = input.write_all(&stdin_bytes).await;
+        let _ = input.shutdown().await;
+    });
+    let stdout_task = tokio::spawn(read_limited(stdout, stdout_limit));
+    let stderr_task = tokio::spawn(drain_limited(stderr, STDERR_DRAIN_LIMIT));
+    let leader = guard.wait_leader(deadline).await;
+    let cleanup = cleanup_bound();
+    let finish = guard.finish(cleanup).await;
+    let stdout_result = if leader.is_ok() {
+        join_bounded(stdout_task, cleanup).await
+    } else {
+        abort_join(stdout_task).await;
+        None
+    };
+    let stderr_result = join_bounded(stderr_task, cleanup).await;
+    if leader.is_ok() {
+        let _ = join_bounded(feeder, cleanup).await;
+    } else {
+        abort_join(feeder).await;
+    }
+    leader?;
+    let status = match finish {
+        Ok(status) => status,
+        Err(_) => return Err(GatewayError::Internal("native Git process cleanup could not be completed")),
+    };
+    let (stdout_bytes, stdout_over) = match stdout_result {
+        Some(Ok(value)) => value,
+        Some(Err(_)) => return Err(GatewayError::Internal("native Git output failed")),
+        None => return Err(GatewayError::Internal("native Git output task did not finish")),
+    };
+    let _ = stderr_result;
+    if stdout_over {
+        return Err(GatewayError::TooLarge);
+    }
+    Ok(Captured { stdout: stdout_bytes, success: status.success(), exit_code: status.code() })
+}
+
+/// [`run_capture`] that additionally reports the native exit code, so a caller
+/// can distinguish Git's precise exit-class verdicts (for example
+/// `merge-base` exit 1) from every other failure. The ceiling is additionally
+/// bounded by the caller's per-request captured-output budget.
+pub(super) async fn run_capture_status(
+    command: Command,
+    stdin_file: Option<&Path>,
+    max_stdout: u64,
+    request_budget: u64,
+    deadline: Instant,
+) -> Result<Captured, GatewayError> {
+    run_capture(command, stdin_file, max_stdout.min(request_budget), deadline).await
 }
 
 /// Spool one HTTP body while decoding an optional `Content-Encoding`.

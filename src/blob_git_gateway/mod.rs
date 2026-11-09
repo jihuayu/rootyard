@@ -24,6 +24,7 @@ mod api;
 mod browse;
 mod config;
 mod error;
+mod history;
 mod metadata;
 mod native;
 mod operation;
@@ -69,6 +70,10 @@ pub fn router(state: Arc<BlobGitState>) -> Router {
         .route("/api/repos/{owner}/{name}/tree/{oid}", get(browse::tree_by_oid))
         .route("/api/repos/{owner}/{name}/blob", get(browse::blob))
         .route("/api/repos/{owner}/{name}/blob/{oid}", get(browse::blob_by_oid))
+        .route("/api/repos/{owner}/{name}/refs", get(history::refs))
+        .route("/api/repos/{owner}/{name}/commits", get(history::commits))
+        .route("/api/repos/{owner}/{name}/commits/{oid}", get(history::commit))
+        .route("/api/repos/{owner}/{name}/compare", get(history::compare))
         .route("/git/{owner}/{name}/info/refs", get(smart_http::info_refs))
         .route("/git/{owner}/{name}/git-upload-pack", post(smart_http::upload_pack))
         .route("/git/{owner}/{name}/git-receive-pack", post(receive::receive_pack))

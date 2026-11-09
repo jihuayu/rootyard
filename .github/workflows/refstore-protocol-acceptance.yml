@@ -15,6 +15,7 @@ on:
       - 'tests/decision_subset_support/**'
       - 'tests/blob_only_service.py'
       - 'tests/blob_gateway_browse.py'
+      - 'tests/blob_gateway_history.py'
       - 'tests/e2e.py'
       - 'tests/native_evidence.py'
       - 'tests/ops_provenance.py'
@@ -131,6 +132,8 @@ jobs:
             --report test-results/refstore/standalone-http.json
           python3 tests/blob_gateway_browse.py --binary "$binary" --git "$ROOTYARD_GIT" \
             --report test-results/refstore/standalone-browse.json
+          python3 tests/blob_gateway_history.py --binary "$binary" --git "$ROOTYARD_GIT" \
+            --report test-results/refstore/standalone-history.json
       - name: Stop only the job-owned Garage fixture
         if: always()
         run: |

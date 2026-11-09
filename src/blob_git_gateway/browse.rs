@@ -19,12 +19,15 @@ use super::{
     error::GatewayError,
     native,
     serving::lookup,
-    session::{authenticate, authority_error, read_authorization},
+    session::{ReadAuthorization, authenticate, authority_error, read_authorization},
     snapshot::{self, ComputedView},
     state::{BlobGitState, ByteLease},
 };
-use crate::browse::models::{
-    self, BlobByOidQuery, BlobQuery, BlobResponse, TreeByOidQuery, TreeEntry, TreeQuery, TreeResponse,
+use crate::{
+    browse::models::{
+        self, BlobByOidQuery, BlobQuery, BlobResponse, TreeByOidQuery, TreeEntry, TreeQuery, TreeResponse,
+    },
+    ref_store::GitObjectFormat,
 };
 
 const MAX_CAPTURE_BYTES: u64 = 4 * 1024 * 1024;
@@ -71,6 +74,107 @@ pub(super) async fn blob_by_oid(
     headers: HeaderMap,
 ) -> Result<Response, GatewayError> {
     read_blob(state, owner, name, BlobQuery { oid: Some(oid), path: query.path }, headers).await
+}
+
+/// One authorized, captured and materialized read view shared by every browse
+/// and history handler.
+///
+/// The pipeline is fixed and mirrored from [`read_tree`]: authenticate the
+/// current token, take the gateway slot and byte lease (released with the
+/// response body), resolve the repository through the shared serving
+/// authority, capture the RefStore ref view, build its computed view, then
+/// require the captured realm to still match. `finish` runs the second
+/// authorization revalidation right before the response is encoded.
+pub(super) struct BrowseSession {
+    pub state: Arc<BlobGitState>,
+    pub view: ComputedView,
+    pub slot: tokio::sync::OwnedSemaphorePermit,
+    pub lease: ByteLease,
+    pub deadline: tokio::time::Instant,
+    /// Captured-output ceiling for this request: the same reserved memory
+    /// budget, split so retained native output, the decoded/serialized copies
+    /// and the encoded response body all fit inside it together.
+    budget: u64,
+    authorization: ReadAuthorization,
+    /// Captured non-zero refs (`refs/*` names and stored object ids).
+    pub refs: Vec<(String, String)>,
+    pub head_ref: String,
+    pub head_oid: Option<String>,
+    pub format: GitObjectFormat,
+    pub repository_id: uuid::Uuid,
+    pub storage_generation: i64,
+}
+
+impl BrowseSession {
+    pub(super) async fn open(
+        state: Arc<BlobGitState>,
+        headers: HeaderMap,
+        owner: String,
+        name: String,
+    ) -> Result<Self, GatewayError> {
+        let actor = authenticate(&state, &headers).await?;
+        let deadline = state.deadline();
+        let slot = state.slot().await?;
+        let memory = memory_budget(&state);
+        let lease = state.reserve_bytes(memory)?;
+        let serving = lookup(state.pool(), &actor, &owner, &name, false, state.store().backend_identity(), deadline)
+            .await
+            .map_err(authority_error)?;
+        let authorization = read_authorization(state.clone(), &actor, &serving);
+        let refs = snapshot::load_ref_view(&state, &serving, deadline).await?;
+        let view = snapshot::build_view(&state, &refs, deadline).await?;
+        authorization.revalidate(deadline).await?;
+        Ok(Self {
+            refs: refs.refs.clone(),
+            head_ref: refs.head_ref.clone(),
+            head_oid: refs.head_oid.clone(),
+            format: refs.format,
+            repository_id: serving.gate.repository_id(),
+            storage_generation: serving.repository.storage_generation,
+            authorization,
+            state,
+            view,
+            slot,
+            lease,
+            deadline,
+            budget: memory / 12,
+        })
+    }
+
+    /// Per-request captured-output ceiling (never zero: the reservation above
+    /// already requires a valid `max_inflight_bytes`, and the gateway's fixed
+    /// bounds keep `memory >= 64 KiB`).
+    pub(super) fn budget(&self) -> u64 {
+        self.budget
+    }
+
+    /// Revalidate the complete read authority against the captured realm
+    /// immediately before the response is encoded.
+    pub(super) async fn finish(&self) -> Result<(), GatewayError> {
+        self.authorization.revalidate(self.deadline).await
+    }
+
+    pub(super) fn format_name(&self) -> &'static str {
+        self.format.as_str()
+    }
+}
+
+/// Quietly resolved peeled object (`rev-parse --verify --quiet <expr>`), where
+/// exit 1 is the only "no such name" verdict and every other failure is a
+/// broken native read.
+pub(super) async fn peel(session: &BrowseSession, expression: &str) -> Result<String, GatewayError> {
+    resolve(&session.state, &session.view, expression, session.deadline).await
+}
+
+/// The captured object must be a `kind` object before it is read.
+pub(super) async fn require_kind(session: &BrowseSession, oid: &str, kind: &str) -> Result<(), GatewayError> {
+    require_type(&session.state, &session.view, oid, kind, session.deadline).await
+}
+
+/// A full object id is admitted only when it belongs to the captured ref
+/// closure of the verified computed view (same rule as blob-by-oid).
+pub(super) async fn require_reachable(session: &BrowseSession, oid: &str) -> Result<(), GatewayError> {
+    reachable(&session.state, &session.view, oid, memory_budget(&session.state), session.deadline).await
 }
 
 async fn read_tree(
@@ -348,7 +452,7 @@ fn parse_tree(raw: &[u8], path: &str, after: Option<&str>, limit: usize) -> Resu
         .collect())
 }
 
-fn json_response<T: Serialize>(
+pub(super) fn json_response<T: Serialize>(
     state: &BlobGitState,
     value: &T,
     slot: tokio::sync::OwnedSemaphorePermit,
@@ -356,6 +460,15 @@ fn json_response<T: Serialize>(
 ) -> Result<Response, GatewayError> {
     let bytes = serde_json::to_vec(value)
         .map_err(|_| GatewayError::Internal("repository browse response could not be encoded"))?;
+    json_response_bytes(state, bytes, slot, lease)
+}
+
+pub(super) fn json_response_bytes(
+    state: &BlobGitState,
+    bytes: Vec<u8>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+    lease: ByteLease,
+) -> Result<Response, GatewayError> {
     if bytes.len() as u64 > state.limits().max_response_bytes {
         return Err(GatewayError::TooLarge);
     }
