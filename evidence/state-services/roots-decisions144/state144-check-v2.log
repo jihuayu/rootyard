@@ -1,0 +1,324 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+error[E0432]: unresolved import `crate::ref_store::contract::CommitMode`
+  --> src/ref_store/core/subset/projection.rs:22:34
+   |
+22 | use crate::ref_store::contract::{CommitMode, OperationIdentity, RequestDigest};
+   |                                  ^^^^^^^^^^ no `CommitMode` in `ref_store::contract`
+   |
+   = help: consider importing this enum through its public re-export instead:
+           crate::ref_store::CommitMode
+
+error[E0432]: unresolved import `crate::ref_store::contract::CommitMode`
+  --> src/ref_store/core/subset/selection.rs:20:34
+   |
+20 | use crate::ref_store::contract::{CommitMode, RequestDigest};
+   |                                  ^^^^^^^^^^ no `CommitMode` in `ref_store::contract`
+   |
+   = help: consider importing this enum through its public re-export instead:
+           crate::ref_store::CommitMode
+
+error[E0432]: unresolved import `crate::ref_store::contract::CommitMode`
+  --> src/ref_store/core/pack_commit/closure.rs:26:34
+   |
+26 | use crate::ref_store::contract::{CommitMode, RequestDigest};
+   |                                  ^^^^^^^^^^ no `CommitMode` in `ref_store::contract`
+   |
+   = help: consider importing this enum through its public re-export instead:
+           crate::ref_store::CommitMode
+
+error[E0432]: unresolved import `crate::ref_store::contract::CommitMode`
+  --> src/ref_store/core/pack_commit/plan.rs:16:34
+   |
+16 | use crate::ref_store::contract::{CommitMode, OperationIdentity, RequestDigest};
+   |                                  ^^^^^^^^^^ no `CommitMode` in `ref_store::contract`
+   |
+   = help: consider importing this enum through its public re-export instead:
+           crate::ref_store::CommitMode
+
+error[E0432]: unresolved import `crate::ref_store::contract::CommitMode`
+  --> src/ref_store/core/pack_commit/verifier/publication.rs:29:34
+   |
+29 | use crate::ref_store::contract::{CommitMode, OperationIdentity, RequestDigest};
+   |                                  ^^^^^^^^^^ no `CommitMode` in `ref_store::contract`
+   |
+   = help: consider importing this enum through its public re-export instead:
+           crate::ref_store::CommitMode
+
+error[E0603]: module `facts` is private
+  --> src/ref_store/core/subset/projection.rs:29:42
+   |
+29 | use crate::ref_store::core::pack_commit::facts::VerifiedPublicationFacts;
+   |                                          ^^^^^ private module
+   |
+note: the module `facts` is defined here
+  --> src/ref_store/core/pack_commit/mod.rs:40:1
+   |
+40 | mod facts;
+   | ^^^^^^^^^^
+help: consider importing this struct through its public re-export instead
+   |
+29 - use crate::ref_store::core::pack_commit::facts::VerifiedPublicationFacts;
+29 + use crate::ref_store::core::pack_commit::VerifiedPublicationFacts;
+   |
+
+error[E0603]: module `facts` is private
+  --> src/ref_store/core/subset/selection.rs:22:42
+   |
+22 | use crate::ref_store::core::pack_commit::facts::{RefFacts, VerifiedPublicationFacts};
+   |                                          ^^^^^ private module
+   |
+help: consider importing this struct through its public re-export instead:
+      crate::ref_store::core::pack_commit::RefFacts
+  --> src/ref_store/core/subset/selection.rs:22:50
+   |
+22 | use crate::ref_store::core::pack_commit::facts::{RefFacts, VerifiedPublicationFacts};
+   |                                                  ^^^^^^^^
+note: the module `facts` is defined here
+  --> src/ref_store/core/pack_commit/mod.rs:40:1
+   |
+40 | mod facts;
+   | ^^^^^^^^^^
+
+error[E0603]: module `facts` is private
+  --> src/ref_store/core/subset/selection.rs:22:42
+   |
+22 | use crate::ref_store::core::pack_commit::facts::{RefFacts, VerifiedPublicationFacts};
+   |                                          ^^^^^ private module
+   |
+help: consider importing this struct through its public re-export instead:
+      crate::ref_store::core::pack_commit::VerifiedPublicationFacts
+  --> src/ref_store/core/subset/selection.rs:22:60
+   |
+22 | use crate::ref_store::core::pack_commit::facts::{RefFacts, VerifiedPublicationFacts};
+   |                                                            ^^^^^^^^^^^^^^^^^^^^^^^^
+note: the module `facts` is defined here
+  --> src/ref_store/core/pack_commit/mod.rs:40:1
+   |
+40 | mod facts;
+   | ^^^^^^^^^^
+
+warning: unused import: `crate::ref_store::contract::RequestDigest`
+  --> src/ref_store/core/publication_decision/capability.rs:13:5
+   |
+13 | use crate::ref_store::contract::RequestDigest;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `GitOid` and `RefName`
+ --> src/ref_store/core/publication_decision/contract.rs:9:37
+  |
+9 | use crate::ref_store::core::types::{GitOid, RefName, RefUpdate};
+  |                                     ^^^^^^  ^^^^^^^
+
+warning: unused import: `Verdict`
+  --> src/ref_store/core/publication_decision/contract.rs:87:86
+   |
+87 | pub(crate) use super::codes::{DecisionRejectCode, DenialCode, RefVerdict, ScopeKind, Verdict};
+   |                                                                                      ^^^^^^^
+
+warning: unused import: `ObjectKind`
+ --> src/ref_store/core/publication_decision/select.rs:9:20
+  |
+9 | use super::facts::{ObjectKind, ObservedOid, PublicationFacts};
+  |                    ^^^^^^^^^^
+
+warning: unused imports: `GitOid` and `RefPrecondition`
+  --> src/ref_store/core/publication_decision/select.rs:11:22
+   |
+11 |     GitObjectFormat, GitOid, HeadUpdate, RefPrecondition, RefUpdate, batch_prefix_conflict,
+   |                      ^^^^^^              ^^^^^^^^^^^^^^^
+
+warning: unused import: `std::collections::BTreeMap`
+  --> src/ref_store/core/publication_decision/select.rs:13:5
+   |
+13 | use std::collections::BTreeMap;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `cancel`
+  --> src/ref_store/core/publication_decision/mod.rs:52:25
+   |
+52 | pub(crate) use cancel::{cancel, coordinator_cancel};
+   |                         ^^^^^^
+
+warning: unused import: `capability::DecisionCapability`
+  --> src/ref_store/core/publication_decision/mod.rs:53:16
+   |
+53 | pub(crate) use capability::DecisionCapability;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `authorized_final_check` and `reject_decision`
+  --> src/ref_store/core/publication_decision/mod.rs:54:26
+   |
+54 | pub(crate) use consume::{authorized_final_check, reject_decision};
+   |                          ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `DecisionRejectCode` and `DenialCode`
+  --> src/ref_store/core/publication_decision/mod.rs:55:24
+   |
+55 | pub(crate) use codes::{DecisionRejectCode, DenialCode};
+   |                        ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused imports: `ConsumptionRecord`, `DecisionRecord`, `DecisionState`, and `RefVerdict`
+  --> src/ref_store/core/publication_decision/mod.rs:57:20
+   |
+57 |     CancelOutcome, ConsumptionRecord, DecisionError, DecisionKind, DecisionRecord, DecisionState, RefVerdict,
+   |                    ^^^^^^^^^^^^^^^^^                               ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused imports: `ChangedPath`, `LfsPointer`, `ObjectKind`, `ObservedOid`, and `PublicationFacts`
+  --> src/ref_store/core/publication_decision/mod.rs:60:24
+   |
+60 | pub(crate) use facts::{ChangedPath, LfsPointer, ObjectKind, ObservedOid, PublicationFacts};
+   |                        ^^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+
+warning: unused imports: `cancellation`, `lookup`, and `verdicts`
+  --> src/ref_store/core/publication_decision/mod.rs:62:24
+   |
+62 | pub(crate) use query::{cancellation, lookup, verdicts};
+   |                        ^^^^^^^^^^^^  ^^^^^^  ^^^^^^^^
+
+warning: unused import: `sql_locks::decision_required`
+  --> src/ref_store/core/publication_decision/mod.rs:63:16
+   |
+63 | pub(crate) use sql_locks::decision_required;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `GitObjectKind`, `LFS_MAX_OBJECT_BYTES`, `LfsByteLocation`, `LfsByteWitness`, `LfsPointerFact`, `NoDurableLfsBytes`, `PublicationFactsEngine`, `RefFacts`, `VerifiedPackIdentity`, and `VerifiedPublicationFacts`
+  --> src/ref_store/core/pack_commit/mod.rs:63:5
+   |
+63 |     GitObjectKind, LFS_MAX_OBJECT_BYTES, LfsByteLocation, LfsByteWitness, LfsPointerFact, NoDurableLfsBytes,
+   |     ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+64 |     PublicationFactsEngine, RefFacts, VerifiedPackIdentity, VerifiedPublicationFacts,
+   |     ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::ref_store::core::types::GitObjectFormat`
+  --> src/ref_store/core/retention_root/candidate.rs:17:5
+   |
+17 | use crate::ref_store::core::types::GitObjectFormat;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: `application::Error` doesn't implement `std::fmt::Display`
+   --> src/ref_store/core/publication_decision/auth_deps.rs:200:56
+    |
+200 |         .map_err(|error| DecisionError::Database(error.to_string()))?;
+    |                                                        ^^^^^^^^^ method cannot be called on `application::Error` due to unsatisfied trait bounds
+    |
+   ::: src/application.rs:25:1
+    |
+ 25 | pub struct Error(pub StatusCode, pub &'static str);
+    | ---------------- method `to_string` not found for this struct because it doesn't satisfy `application::Error: ToString` or `application::Error: std::fmt::Display`
+    |
+    = note: the following trait bounds were not satisfied:
+            `application::Error: std::fmt::Display`
+            which is required by `application::Error: ToString`
+note: the trait `std::fmt::Display` must be implemented
+   --> /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/fmt/mod.rs:1187:0
+    = help: items from traits can only be used if the trait is implemented and in scope
+    = note: the following trait defines an item `to_string`, perhaps you need to implement it:
+            candidate #1: `ToString`
+
+error[E0599]: `application::Error` doesn't implement `std::fmt::Display`
+   --> src/ref_store/core/publication_decision/cancel.rs:189:56
+    |
+189 |         .map_err(|error| DecisionError::Database(error.to_string()))?
+    |                                                        ^^^^^^^^^ method cannot be called on `application::Error` due to unsatisfied trait bounds
+    |
+   ::: src/application.rs:25:1
+    |
+ 25 | pub struct Error(pub StatusCode, pub &'static str);
+    | ---------------- method `to_string` not found for this struct because it doesn't satisfy `application::Error: ToString` or `application::Error: std::fmt::Display`
+    |
+    = note: the following trait bounds were not satisfied:
+            `application::Error: std::fmt::Display`
+            which is required by `application::Error: ToString`
+note: the trait `std::fmt::Display` must be implemented
+   --> /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/fmt/mod.rs:1187:0
+    = help: items from traits can only be used if the trait is implemented and in scope
+    = note: the following trait defines an item `to_string`, perhaps you need to implement it:
+            candidate #1: `ToString`
+
+error[E0308]: mismatched types
+   --> src/ref_store/core/pack_commit/authorized/prepare.rs:141:29
+    |
+141 |     pg::ensure_gate_matches(plan, &gate, mode)?;
+    |     ----------------------- ^^^^ expected `&PackCommitPlan`, found `PackCommitPlan`
+    |     |
+    |     arguments to this function are incorrect
+    |
+note: function defined here
+   --> src/ref_store/core/pack_commit/pg.rs:259:15
+    |
+259 | pub(super) fn ensure_gate_matches(
+    |               ^^^^^^^^^^^^^^^^^^^
+260 |     plan: &PackCommitPlan,
+    |     ---------------------
+help: consider borrowing here
+    |
+141 |     pg::ensure_gate_matches(&plan, &gate, mode)?;
+    |                             +
+
+error[E0308]: mismatched types
+   --> src/ref_store/core/pack_commit/authorized/select.rs:115:89
+    |
+115 |         let facts = engine.facts(prepared.plan(), prepared.baseline(), new_packs, &lfs, deadline).await?;
+    |                            ----- arguments to this method are incorrect                 ^^^^^^^^ expected `std::time::Instant`, found `tokio::time::Instant`
+    |
+    = note: `tokio::time::Instant` and `std::time::Instant` have similar names, but are actually distinct types
+note: `tokio::time::Instant` is defined in crate `tokio`
+   --> /workspace/.rootyard-tools/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.54.1/src/time/instant.rs:34:1
+    |
+ 34 | pub struct Instant {
+    | ^^^^^^^^^^^^^^^^^^
+note: `std::time::Instant` is defined in crate `std`
+   --> /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/std/src/time.rs:156:0
+note: method defined here
+   --> src/ref_store/core/pack_commit/verifier/publication.rs:270:25
+    |
+270 |     pub(crate) async fn facts(
+    |                         ^^^^^
+...
+276 |         deadline: Instant,
+    |         -----------------
+help: call `Into::into` on this expression to convert `tokio::time::Instant` into `std::time::Instant`
+    |
+115 |         let facts = engine.facts(prepared.plan(), prepared.baseline(), new_packs, &lfs, deadline.into()).await?;
+    |                                                                                                 +++++++
+
+error[E0277]: the trait bound `VerifiedPublicationFacts: PublicationFacts` is not satisfied
+   --> src/ref_store/core/pack_commit/authorized/select.rs:151:69
+    |
+151 |             let selected = select_and_install(&tx, prepared.plan(), &facts, actor, kind, deadline)
+    |                                                                     ^^^^^^ unsatisfied trait bound
+    |
+help: the trait `PublicationFacts` is not implemented for `VerifiedPublicationFacts`
+   --> src/ref_store/core/pack_commit/verifier/publication.rs:50:1
+    |
+ 50 | pub(crate) struct VerifiedPublicationFacts {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: this trait has no implementations, consider adding one
+   --> src/ref_store/core/publication_decision/facts.rs:71:1
+    |
+ 71 | pub(crate) trait PublicationFacts {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: required for the cast from `&VerifiedPublicationFacts` to `&dyn PublicationFacts`
+
+error[E0277]: `BlobStore` doesn't implement `std::fmt::Debug`
+   --> src/ref_store/core/pack_commit/authorized/mod.rs:174:5
+    |
+172 | #[derive(Clone, Debug)]
+    |                 ----- in this derive macro expansion
+173 | pub struct PgAuthorizedCommit {
+174 |     pub(super) store: crate::blob_store::opendal::BlobStore,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
+    |
+help: the trait `std::fmt::Debug` is not implemented for `BlobStore`
+   --> src/blob_store/opendal.rs:57:1
+    |
+ 57 | pub struct BlobStore {
+    | ^^^^^^^^^^^^^^^^^^^^
+    = note: add `#[derive(Debug)]` to `BlobStore` or manually `impl std::fmt::Debug for BlobStore`
+
+Some errors have detailed explanations: E0277, E0308, E0432, E0599, E0603.
+For more information about an error, try `rustc --explain E0277`.
+warning: `rootyard` (lib) generated 16 warnings
+error: could not compile `rootyard` (lib) due to 14 previous errors; 16 warnings emitted

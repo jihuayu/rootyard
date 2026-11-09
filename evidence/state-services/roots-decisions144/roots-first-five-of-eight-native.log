@@ -1,0 +1,30 @@
+
+running 8 tests
+test actual_clock_pin_expiry_keeps_active_root_readable_but_refuses_delayed_register ... ok
+test durable_root_survives_source_pin_release_and_bytes_match_stock_git ... FAILED
+test exact_register_and_release_replay_is_free_and_changed_digest_conflicts ... ok
+test explicit_old_non_ref_oid_is_accepted_from_registered_pack_and_missing_oid_is_refused ... FAILED
+test independent_roots_share_packs_without_affecting_holds_and_over_quota_is_atomic ... FAILED
+test release_before_register_binds_exact_digest_and_root_id_is_never_reused ... ok
+test release_while_native_is_paused_grants_no_read_and_shared_max_pool_has_no_pg_over_native ... ok
+test whole_repository_delete_retains_root_metadata_locators_receipts_and_refuses_new_bytes ... ok
+
+failures:
+
+---- durable_root_survives_source_pin_release_and_bytes_match_stock_git stdout ----
+Error: metadata pin c99fd5e4-a9f6-45dd-aa59-7ec5d9a90e26 generation mismatch: expected 2, stored 1
+
+---- explicit_old_non_ref_oid_is_accepted_from_registered_pack_and_missing_oid_is_refused stdout ----
+Error: fixture git `update-ref` failed: fatal: not a git repository: '/tmp/.tmpjxiYnj/fixture.git'
+
+---- independent_roots_share_packs_without_affecting_holds_and_over_quota_is_atomic stdout ----
+Error: fixture git `update-ref` failed: fatal: not a git repository: '/tmp/.tmpVE6IIb/fixture.git'
+
+
+failures:
+    durable_root_survives_source_pin_release_and_bytes_match_stock_git
+    explicit_old_non_ref_oid_is_accepted_from_registered_pack_and_missing_oid_is_refused
+    independent_roots_share_packs_without_affecting_holds_and_over_quota_is_atomic
+
+test result: FAILED. 5 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.01s
+

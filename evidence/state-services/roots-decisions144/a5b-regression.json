@@ -1,0 +1,90 @@
+{
+  "passed": true,
+  "target": "ref_store_materialized_reads",
+  "expected": 12,
+  "returncode": 0,
+  "seconds": 61.661,
+  "summary": "test result: ok. 12 passed; 0 failed; 0 ignored;",
+  "command": [
+    "/workspace/scratch/state144-matrix-build-v2/ref_store_materialized_reads",
+    "--ignored",
+    "--test-threads=1"
+  ],
+  "before": {
+    "source": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "test": "f81fbc97066b5903a88b12de03a67cd3c7695f739fa88a33a32c95e9f07222f8",
+    "test_inputs": {
+      "tests/ref_store_materialized_reads.rs": "f81fbc97066b5903a88b12de03a67cd3c7695f739fa88a33a32c95e9f07222f8"
+    },
+    "binary": "19fccecf7b8a324fa5339dedcc4583c9d1065f2bbbfce4a688d9a4a10703d784",
+    "head": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25",
+    "clean": true
+  },
+  "after": {
+    "source": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "test": "f81fbc97066b5903a88b12de03a67cd3c7695f739fa88a33a32c95e9f07222f8",
+    "test_inputs": {
+      "tests/ref_store_materialized_reads.rs": "f81fbc97066b5903a88b12de03a67cd3c7695f739fa88a33a32c95e9f07222f8"
+    },
+    "binary": "19fccecf7b8a324fa5339dedcc4583c9d1065f2bbbfce4a688d9a4a10703d784",
+    "head": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25",
+    "clean": true
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "370a2900286e2526e00fe4192d97200e5d618469707a0d19bccd6e969240c0f2",
+  "build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "19fccecf7b8a324fa5339dedcc4583c9d1065f2bbbfce4a688d9a4a10703d784",
+    "workspace_commit": "84cae1e50feba336503cfae4e1a1eb4bf9a7ba25",
+    "fresh": false,
+    "source_inputs_sha256": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "binary_sha256": "19fccecf7b8a324fa5339dedcc4583c9d1065f2bbbfce4a688d9a4a10703d784",
+    "integration_test_source_sha256": "f81fbc97066b5903a88b12de03a67cd3c7695f739fa88a33a32c95e9f07222f8",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_materialized_reads",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_materialized_reads",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_materialized_reads-e4475da8c15f5108"
+      }
+    ],
+    "matrix_clean_once": true,
+    "matrix_first_rootyard_library_rebuilt": true
+  },
+  "qualification_kind": "clean-candidate",
+  "limits": [
+    "Loopback PG17 and Garage S3, native Git; no serving cutover or distributed Raft barrier.",
+    "Metadata backup does not archive original external Blob bytes."
+  ]
+}

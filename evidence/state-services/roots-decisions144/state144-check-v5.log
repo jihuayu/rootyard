@@ -1,0 +1,144 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+warning: unused imports: `BranchRuleFacts`, `CheckRunFacts`, `LfsLockFacts`, `LfsObjectFacts`, `PullApprovalFacts`, and `PullFacts`
+  --> src/ref_store/core/publication_decision/auth_deps.rs:33:23
+   |
+33 |     read_lfs_objects, BranchRuleFacts, CheckRunFacts, LfsLockFacts, LfsObjectFacts, PullApprovalFacts, PullFacts,
+   |                       ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^  ^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::ref_store::contract::RequestDigest`
+  --> src/ref_store/core/publication_decision/capability.rs:13:5
+   |
+13 | use crate::ref_store::contract::RequestDigest;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ConsumptionRecord`
+  --> src/ref_store/core/publication_decision/metadata.rs:19:5
+   |
+19 |     ConsumptionRecord, DecisionError, DecisionKind, DecisionState, DenialCode, PublicationAction,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `cancel`
+  --> src/ref_store/core/publication_decision/mod.rs:66:25
+   |
+66 | pub(crate) use cancel::{cancel, coordinator_cancel};
+   |                         ^^^^^^
+
+warning: unused import: `capability::DecisionCapability`
+  --> src/ref_store/core/publication_decision/mod.rs:67:16
+   |
+67 | pub(crate) use capability::DecisionCapability;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `reject_decision`
+  --> src/ref_store/core/publication_decision/mod.rs:68:50
+   |
+68 | pub(crate) use consume::{authorized_final_check, reject_decision};
+   |                                                  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `DecisionRecord`, `DecisionState`, `MergeBinding`, `PublicationAction`, and `RefVerdict`
+  --> src/ref_store/core/publication_decision/mod.rs:70:68
+   |
+70 |     CancelOutcome, ConsumptionRecord, DecisionError, DecisionKind, DecisionRecord, DecisionState,
+   |                                                                    ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+71 |     MergeBinding, PublicationAction, RefVerdict, SelectedDecision,
+   |     ^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused imports: `ChangedPath`, `LfsPointer`, `ObjectKind`, `ObservedOid`, and `PublicationFacts`
+  --> src/ref_store/core/publication_decision/mod.rs:73:24
+   |
+73 | pub(crate) use facts::{ChangedPath, LfsPointer, ObjectKind, ObservedOid, PublicationFacts};
+   |                        ^^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+
+warning: unused import: `select_and_install_action`
+  --> src/ref_store/core/publication_decision/mod.rs:74:46
+   |
+74 | pub(crate) use install::{select_and_install, select_and_install_action};
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `finalize_merge` and `lock_merge_target`
+  --> src/ref_store/core/publication_decision/mod.rs:75:24
+   |
+75 | pub(crate) use merge::{finalize_merge, lock_merge_target};
+   |                        ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `MetadataSelectedDecision` and `select_and_install_metadata`
+  --> src/ref_store/core/publication_decision/mod.rs:76:27
+   |
+76 | pub(crate) use metadata::{select_and_install_metadata, MetadataSelectedDecision};
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `metadata_check::authorized_metadata_final_check`
+  --> src/ref_store/core/publication_decision/mod.rs:77:16
+   |
+77 | pub(crate) use metadata_check::authorized_metadata_final_check;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `cancellation`, `lookup`, and `verdicts`
+  --> src/ref_store/core/publication_decision/mod.rs:78:24
+   |
+78 | pub(crate) use query::{cancellation, lookup, verdicts};
+   |                        ^^^^^^^^^^^^  ^^^^^^  ^^^^^^^^
+
+warning: unused imports: `decision_required`, `lock_gate_and_protocol`, `lock_source_tables`, and `lock_usage`
+  --> src/ref_store/core/publication_decision/mod.rs:79:28
+   |
+79 | pub(crate) use sql_locks::{decision_required, lock_gate_and_protocol, lock_source_tables, lock_usage};
+   |                            ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused imports: `PackMembershipEntry` and `refs_digest`
+  --> src/ref_store/core/pack_commit/verifier/publication.rs:34:5
+   |
+34 |     refs_digest, CapturedRef, MembershipDigest, PackCommitBaseline, PackMembershipEntry,
+   |     ^^^^^^^^^^^                                                     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `PackMode` and `VERIFIER_VIEW_MAX_LOGICAL_BYTES`
+  --> src/ref_store/core/pack_commit/verifier/publication.rs:37:68
+   |
+37 |     MAX_ACTIVE_MEMBERSHIPS, MAX_BATCH_NEW_PACKS, PackArtifactRole, PackMode, VERIFIER_MAX_OBJECTS,
+   |                                                                    ^^^^^^^^
+38 |     VERIFIER_MAX_PAIRS, VERIFIER_MAX_TOTAL_BYTES, VERIFIER_VIEW_MAX_LOGICAL_BYTES,
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `GitObjectKind`, `LFS_MAX_OBJECT_BYTES`, `LfsByteLocation`, `LfsByteWitness`, `LfsPointerFact`, `NoDurableLfsBytes`, `PublicationFactsEngine`, and `VerifiedPackIdentity`
+  --> src/ref_store/core/pack_commit/mod.rs:63:5
+   |
+63 |     GitObjectKind, LFS_MAX_OBJECT_BYTES, LfsByteLocation, LfsByteWitness, LfsPointerFact, NoDurableLfsBytes,
+   |     ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+64 |     PublicationFactsEngine, RefFacts, VerifiedPackIdentity, VerifiedPublicationFacts,
+   |     ^^^^^^^^^^^^^^^^^^^^^^            ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::ref_store::core::types::GitObjectFormat`
+  --> src/ref_store/core/retention_root/candidate.rs:17:5
+   |
+17 | use crate::ref_store::core::types::GitObjectFormat;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> src/ref_store/core/publication_decision/auth_deps.rs:237:9
+    |
+237 |     let mut policy = read_policy(tx, plan).await?;
+    |         ----^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error[E0716]: temporary value dropped while borrowed
+   --> src/ref_store/core/publication_decision/metadata.rs:510:24
+    |
+510 |         &decision_id, &request.repository_id(), &tenant_id, &authority.owner_id, &actor.id,
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^ creates a temporary value which is freed while still in use
+...
+516 |     ];
+    |      - temporary value is freed at the end of this statement
+...
+527 |         &params,
+    |         ------- borrow later used here
+    |
+    = note: consider using a `let` binding to create a longer lived value
+
+For more information about this error, try `rustc --explain E0716`.
+warning: `rootyard` (lib) generated 19 warnings
+error: could not compile `rootyard` (lib) due to 1 previous error; 19 warnings emitted

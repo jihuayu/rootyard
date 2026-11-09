@@ -1,0 +1,98 @@
+{
+  "passed": false,
+  "target": "ref_store_retention_roots",
+  "expected": 8,
+  "returncode": 101,
+  "seconds": 28.218,
+  "summary": "test result: FAILED. 5 passed; 3 failed; 0 ignored;",
+  "command": [
+    "/workspace/scratch/state144-roots-build-v1/ref_store_retention_roots",
+    "--ignored",
+    "--test-threads=1"
+  ],
+  "before": {
+    "source": "c3842c24b13558fcf350f8cdeb67423ce3a0ca3e5fb87098a488c489d9589c7c",
+    "test": "d2b6b3845d3c66391c6759e6eacc6a2ba706ef39cc9e9b2f6d179bbe39f9b65f",
+    "test_inputs": {
+      "tests/ref_store_retention_roots.rs": "d2b6b3845d3c66391c6759e6eacc6a2ba706ef39cc9e9b2f6d179bbe39f9b65f",
+      "tests/retention_roots_support/db.rs": "85ed5644f64d86fd469b0c20b781ec1ebe6ea63179e5457a2975226f124abe06",
+      "tests/retention_roots_support/git.rs": "7a14f72edb4752c5686ec21ff56214f331efdb520c5f70d0adf25679c6d454ff",
+      "tests/retention_roots_support/mod.rs": "51f422fb5a7bfdb2d4039e4c7b3288b9739a0539d8b68e6f512effc00636cd02",
+      "tests/retention_roots_support/pack.rs": "fe83db7b7d71c5cba065581ecb1b1dd8c17358c11c75086a29d4ad2a02a8a748",
+      "tests/retention_roots_support/roots.rs": "689bc65076d55305c3fcf97447eacec63fb8ddf4eeb4ee8a1ecbc16e2e7dda2f"
+    },
+    "binary": "3e37d05c398f4f0eb42e2f70428dc4bdf032a86d72eb7f8ee810d01770d74fb0",
+    "head": "d1bfd04c4e2348126146286c520191ca4a072a60",
+    "clean": false
+  },
+  "after": {
+    "source": "c3842c24b13558fcf350f8cdeb67423ce3a0ca3e5fb87098a488c489d9589c7c",
+    "test": "d2b6b3845d3c66391c6759e6eacc6a2ba706ef39cc9e9b2f6d179bbe39f9b65f",
+    "test_inputs": {
+      "tests/ref_store_retention_roots.rs": "d2b6b3845d3c66391c6759e6eacc6a2ba706ef39cc9e9b2f6d179bbe39f9b65f",
+      "tests/retention_roots_support/db.rs": "85ed5644f64d86fd469b0c20b781ec1ebe6ea63179e5457a2975226f124abe06",
+      "tests/retention_roots_support/git.rs": "7a14f72edb4752c5686ec21ff56214f331efdb520c5f70d0adf25679c6d454ff",
+      "tests/retention_roots_support/mod.rs": "51f422fb5a7bfdb2d4039e4c7b3288b9739a0539d8b68e6f512effc00636cd02",
+      "tests/retention_roots_support/pack.rs": "fe83db7b7d71c5cba065581ecb1b1dd8c17358c11c75086a29d4ad2a02a8a748",
+      "tests/retention_roots_support/roots.rs": "689bc65076d55305c3fcf97447eacec63fb8ddf4eeb4ee8a1ecbc16e2e7dda2f"
+    },
+    "binary": "3e37d05c398f4f0eb42e2f70428dc4bdf032a86d72eb7f8ee810d01770d74fb0",
+    "head": "d1bfd04c4e2348126146286c520191ca4a072a60",
+    "clean": false
+  },
+  "inputs_unchanged": true,
+  "runner_sha256": "370a2900286e2526e00fe4192d97200e5d618469707a0d19bccd6e969240c0f2",
+  "build_receipt": {
+    "kind": "rust-integration-test",
+    "relocated_artifact": true,
+    "original_artifact_sha256": "3e37d05c398f4f0eb42e2f70428dc4bdf032a86d72eb7f8ee810d01770d74fb0",
+    "workspace_commit": "d1bfd04c4e2348126146286c520191ca4a072a60",
+    "fresh": false,
+    "source_inputs_sha256": "c3842c24b13558fcf350f8cdeb67423ce3a0ca3e5fb87098a488c489d9589c7c",
+    "binary_sha256": "3e37d05c398f4f0eb42e2f70428dc4bdf032a86d72eb7f8ee810d01770d74fb0",
+    "integration_test_source_sha256": "d2b6b3845d3c66391c6759e6eacc6a2ba706ef39cc9e9b2f6d179bbe39f9b65f",
+    "cargo_lock_sha256": "92f76a2deabe9da8a3186aedd7607d40b1f7dfb1ff83bdaf56a1f54e5d139c48",
+    "command": [
+      "cargo",
+      "--config",
+      "profile.dev.package.rootyard.debug=0",
+      "--config",
+      "profile.test.package.rootyard.debug=0",
+      "--config",
+      "profile.dev.package.rootyard.strip=\"debuginfo\"",
+      "--config",
+      "profile.test.package.rootyard.strip=\"debuginfo\"",
+      "rustc",
+      "--locked",
+      "--profile",
+      "test",
+      "--test",
+      "ref_store_retention_roots",
+      "--features",
+      "pando-lab",
+      "--message-format=json-render-diagnostics"
+    ],
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "package_rebuilt": true,
+    "fresh_false_artifacts": [
+      {
+        "target": "ref_store_retention_roots",
+        "kind": "test",
+        "fresh": false,
+        "profile": {
+          "opt_level": "0",
+          "debuginfo": 0,
+          "debug_assertions": true,
+          "overflow_checks": true,
+          "test": true
+        },
+        "executable": "/workspace/rootyard/target/debug/deps/ref_store_retention_roots-c42e7024cc57876b"
+      }
+    ]
+  },
+  "qualification_kind": "dirty-diagnostic-only",
+  "limits": [
+    "Loopback PG17 and Garage S3, native Git; no serving cutover or distributed Raft barrier.",
+    "Metadata backup does not archive original external Blob bytes."
+  ]
+}

@@ -1,0 +1,21 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+error[E0583]: file not found for module `facts`
+  --> src/ref_store/core/publication_decision/mod.rs:51:1
+   |
+51 | pub(crate) mod facts;
+   | ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: to create the module `facts`, create file "src/ref_store/core/publication_decision/facts.rs" or "src/ref_store/core/publication_decision/facts/mod.rs"
+   = note: if there is a `mod facts` elsewhere in the crate already, import it with `use crate::...` instead
+
+error[E0583]: file not found for module `merge`
+  --> src/ref_store/core/publication_decision/mod.rs:54:1
+   |
+54 | pub(crate) mod merge;
+   | ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: to create the module `merge`, create file "src/ref_store/core/publication_decision/merge.rs" or "src/ref_store/core/publication_decision/merge/mod.rs"
+   = note: if there is a `mod merge` elsewhere in the crate already, import it with `use crate::...` instead
+
+For more information about this error, try `rustc --explain E0583`.
+error: could not compile `rootyard` (lib) due to 2 previous errors

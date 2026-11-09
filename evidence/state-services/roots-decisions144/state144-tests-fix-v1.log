@@ -1,0 +1,38 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+error[E0432]: unresolved import `super::contract`
+   --> src/ref_store/core/metadata_subset.rs:304:16
+    |
+304 |     use super::contract::CommitMode;
+    |                ^^^^^^^^ could not find `contract` in `super`
+
+warning: unused import: `self`
+  --> src/ref_store/core/publication_decision/consume.rs:17:21
+   |
+17 | use super::digest::{self, DecisionDigests};
+   |                     ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0616]: field `capability` of struct `publication_decision::metadata::MetadataSelectedDecision` is private
+  --> src/ref_store/core/publication_decision/metadata_check.rs:32:14
+   |
+32 |     selected.capability.ensure_actor(actor).map_err(DecisionError::Denied)?;
+   |              ^^^^^^^^^^ private field
+
+error[E0599]: the method `join` exists for struct `Vec<u8>`, but its trait bounds were not satisfied
+   --> src/ref_store/core/pack_commit/verifier/probe.rs:296:54
+    |
+296 |         let huge = vec![b'x'; MAX_CHANGED_PATHS + 1].join(&0u8);
+    |                                                      ^^^^ method cannot be called on `Vec<u8>` due to unsatisfied trait bounds
+    |
+    = note: the following trait bounds were not satisfied:
+            `[u8]: std::slice::Join<_>`
+
+Some errors have detailed explanations: E0432, E0599, E0616.
+For more information about an error, try `rustc --explain E0432`.
+warning: `rootyard` (lib test) generated 1 warning
+error: could not compile `rootyard` (lib test) due to 3 previous errors; 1 warning emitted
+warning: build failed, waiting for other jobs to finish...
+For more information about this error, try `rustc --explain E0616`.
+warning: `rootyard` (lib) generated 1 warning (1 duplicate)
+error: could not compile `rootyard` (lib) due to 1 previous error; 1 warning emitted

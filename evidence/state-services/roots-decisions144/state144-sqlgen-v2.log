@@ -1,0 +1,40 @@
+Failed SQL command stderr (redacted): psql:migrations/050_members_rbac.sql:11: NOTICE:  constraint "git_operations_repository_id_fkey" of relation "git_operations" does not exist, skipping
+psql:migrations/050_members_rbac.sql:127: NOTICE:  trigger "enforce_forge_issues_actor_membership" for relation "forge_issues" does not exist, skipping
+psql:migrations/050_members_rbac.sql:132: NOTICE:  trigger "enforce_forge_issue_comments_actor_membership" for relation "forge_issue_comments" does not exist, skipping
+psql:migrations/050_members_rbac.sql:137: NOTICE:  trigger "enforce_forge_pulls_actor_membership" for relation "forge_pulls" does not exist, skipping
+psql:migrations/050_members_rbac.sql:142: NOTICE:  trigger "enforce_forge_pull_reviews_actor_membership" for relation "forge_pull_reviews" does not exist, skipping
+psql:migrations/050_members_rbac.sql:147: NOTICE:  trigger "enforce_git_operations_actor_membership" for relation "git_operations" does not exist, skipping
+psql:migrations/070_repository_object_format.sql:4: NOTICE:  constraint "repositories_object_format_check" of relation "repositories" does not exist, skipping
+psql:migrations/072_forge_sha256.sql:39: NOTICE:  trigger "forge_pulls_object_format" for relation "forge_pulls" does not exist, skipping
+psql:migrations/072_forge_sha256.sql:42: NOTICE:  trigger "forge_pull_reviews_object_format" for relation "forge_pull_reviews" does not exist, skipping
+psql:migrations/072_forge_sha256.sql:45: NOTICE:  trigger "forge_check_runs_object_format" for relation "forge_check_runs" does not exist, skipping
+psql:migrations/084_transition_volume_binding.sql:3: NOTICE:  column "volume_id" of relation "shard_marker_transitions" already exists, skipping
+psql:migrations/128_pando_head_ref.sql:25: NOTICE:  constraint "pando_repository_states_head_ref_check" of relation "pando_repository_states" does not exist, skipping
+psql:migrations/130_pando_transition_fence.sql:16: NOTICE:  constraint "repositories_transition_epoch_check" of relation "repositories" does not exist, skipping
+psql:migrations/130_pando_transition_fence.sql:19: NOTICE:  constraint "repositories_transition_state_check" of relation "repositories" does not exist, skipping
+psql:migrations/130_pando_transition_fence.sql:22: NOTICE:  constraint "repositories_transition_fence_check" of relation "repositories" does not exist, skipping
+psql:migrations/131_ci_checkout_plan_shape.sql:40: NOTICE:  constraint "ci_checkout_jobs_plan_presence" of relation "ci_checkout_jobs" does not exist, skipping
+psql:migrations/144_ref_store_core_roots_decisions.sql:522: ERROR:  conflicting or redundant options
+LINE 1: ...on history is never deleted or truncated'; END $$ LANGUAGE p...
+                                                             ^
+
+Traceback (most recent call last):
+  File "/workspace/scratch/trace-state144-sqlgen.py", line 24, in <module>
+    runpy.run_path(sys.argv[1], run_name='__main__')
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/scratch/generate-state144-sql-catalogs-v2.py", line 36, in <module>
+    runpy.run_path(str(root / 'tests/schema_contract.py'), run_name='__main__')
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 180, in <module>
+    main()
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 80, in main
+    migrate(fresh)
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 65, in migrate
+    run(command, db)
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 43, in run
+    raise RuntimeError('Synthetic schema contract command failed; private diagnostics suppressed')
+RuntimeError: Synthetic schema contract command failed; private diagnostics suppressed

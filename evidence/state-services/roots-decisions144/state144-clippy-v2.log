@@ -1,0 +1,29 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+error: this creates an owned instance just for comparison
+  --> tests/roots_decisions_backup_support/verify.rs:88:33
+   |
+88 |     if decisions["consumed"] != Value::from(1u64)
+   |                                 ^^^^^^^^^^^^^^^^^ help: try: `1u64`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cmp_owned
+   = note: `-D clippy::cmp-owned` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::cmp_owned)]`
+
+error: this creates an owned instance just for comparison
+  --> tests/roots_decisions_backup_support/verify.rs:89:38
+   |
+89 |         || decisions["cancelled"] != Value::from(1u64)
+   |                                      ^^^^^^^^^^^^^^^^^ help: try: `1u64`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cmp_owned
+
+error: this creates an owned instance just for comparison
+  --> tests/roots_decisions_backup_support/verify.rs:90:50
+   |
+90 |         || decisions["cancel_before_install"] != Value::from(1u64)
+   |                                                  ^^^^^^^^^^^^^^^^^ help: try: `1u64`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#cmp_owned
+
+error: could not compile `rootyard` (test "ref_store_roots_decisions_backup_fixture") due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...

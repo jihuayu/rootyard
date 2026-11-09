@@ -1,0 +1,13 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+error: casting to the same type is unnecessary (`i64` -> `i64`)
+  --> tests/ref_store_retention_roots.rs:54:42
+   |
+54 |         ensure!(candidate.ref_count() == source.read.ref_count() as i64, "candidate omitted a captured ref");
+   |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `source.read.ref_count()`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_cast
+   = note: `-D clippy::unnecessary-cast` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::unnecessary_cast)]`
+
+error: could not compile `rootyard` (test "ref_store_retention_roots") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

@@ -1,0 +1,828 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+warning: unused imports: `PackMembershipEntry` and `refs_digest`
+  --> src/ref_store/core/pack_commit/verifier/publication.rs:36:56
+   |
+36 |     CapturedRef, MembershipDigest, PackCommitBaseline, PackMembershipEntry, refs_digest,
+   |                                                        ^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `PackMode` and `VERIFIER_VIEW_MAX_LOGICAL_BYTES`
+  --> src/ref_store/core/pack_commit/verifier/publication.rs:39:68
+   |
+39 |     MAX_ACTIVE_MEMBERSHIPS, MAX_BATCH_NEW_PACKS, PackArtifactRole, PackMode, VERIFIER_MAX_OBJECTS, VERIFIER_MAX_PAIRS,
+   |                                                                    ^^^^^^^^
+40 |     VERIFIER_MAX_TOTAL_BYTES, VERIFIER_VIEW_MAX_LOGICAL_BYTES,
+   |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `GitObjectKind`, `LFS_MAX_OBJECT_BYTES`, `LfsByteLocation`, `LfsByteWitness`, `LfsPointerFact`, `NoDurableLfsBytes`, `PublicationFactsEngine`, and `VerifiedPackIdentity`
+  --> src/ref_store/core/pack_commit/mod.rs:64:5
+   |
+64 |     GitObjectKind, LFS_MAX_OBJECT_BYTES, LfsByteLocation, LfsByteWitness, LfsPointerFact, NoDurableLfsBytes,
+   |     ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+65 |     PublicationFactsEngine, RefFacts, VerifiedPackIdentity, VerifiedPublicationFacts,
+   |     ^^^^^^^^^^^^^^^^^^^^^^            ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `BranchRuleFacts`, `CheckRunFacts`, `LfsLockFacts`, `LfsObjectFacts`, `PullApprovalFacts`, and `PullFacts`
+  --> src/ref_store/core/publication_decision/auth_deps.rs:32:5
+   |
+32 |     BranchRuleFacts, CheckRunFacts, LfsLockFacts, LfsObjectFacts, PullApprovalFacts, PullFacts, RepoPolicyFacts,
+   |     ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^  ^^^^^^^^^
+
+warning: unused import: `crate::ref_store::contract::RequestDigest`
+  --> src/ref_store/core/publication_decision/capability.rs:13:5
+   |
+13 | use crate::ref_store::contract::RequestDigest;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ConsumptionRecord`
+  --> src/ref_store/core/publication_decision/metadata.rs:19:5
+   |
+19 |     ConsumptionRecord, DecisionError, DecisionKind, DecisionState, DenialCode, MAX_DECISION_REFS,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `cancel`
+  --> src/ref_store/core/publication_decision/mod.rs:66:25
+   |
+66 | pub(crate) use cancel::{cancel, coordinator_cancel};
+   |                         ^^^^^^
+
+warning: unused import: `capability::DecisionCapability`
+  --> src/ref_store/core/publication_decision/mod.rs:67:16
+   |
+67 | pub(crate) use capability::DecisionCapability;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `reject_decision`
+  --> src/ref_store/core/publication_decision/mod.rs:68:50
+   |
+68 | pub(crate) use consume::{authorized_final_check, reject_decision};
+   |                                                  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `DecisionRecord`, `DecisionState`, `MergeBinding`, and `RefVerdict`
+  --> src/ref_store/core/publication_decision/mod.rs:70:68
+   |
+70 |     CancelOutcome, ConsumptionRecord, DecisionError, DecisionKind, DecisionRecord, DecisionState, MergeBinding,
+   |                                                                    ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^^^^^
+71 |     PublicationAction, RefVerdict, SelectedDecision,
+   |                        ^^^^^^^^^^
+
+warning: unused imports: `ChangedPath`, `LfsPointer`, `ObjectKind`, `ObservedOid`, and `PublicationFacts`
+  --> src/ref_store/core/publication_decision/mod.rs:73:24
+   |
+73 | pub(crate) use facts::{ChangedPath, LfsPointer, ObjectKind, ObservedOid, PublicationFacts};
+   |                        ^^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+
+warning: unused import: `select_and_install_action`
+  --> src/ref_store/core/publication_decision/mod.rs:74:46
+   |
+74 | pub(crate) use install::{select_and_install, select_and_install_action};
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `finalize_merge` and `lock_merge_target`
+  --> src/ref_store/core/publication_decision/mod.rs:75:24
+   |
+75 | pub(crate) use merge::{finalize_merge, lock_merge_target};
+   |                        ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `cancellation`, `lookup`, and `verdicts`
+  --> src/ref_store/core/publication_decision/mod.rs:78:24
+   |
+78 | pub(crate) use query::{cancellation, lookup, verdicts};
+   |                        ^^^^^^^^^^^^  ^^^^^^  ^^^^^^^^
+
+warning: unused imports: `decision_required` and `lock_gate_and_protocol`
+  --> src/ref_store/core/publication_decision/mod.rs:79:28
+   |
+79 | pub(crate) use sql_locks::{decision_required, lock_gate_and_protocol, lock_source_tables, lock_usage};
+   |                            ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::ref_store::core::types::GitObjectFormat`
+  --> src/ref_store/core/retention_root/candidate.rs:17:5
+   |
+17 | use crate::ref_store::core::types::GitObjectFormat;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> src/ref_store/core/publication_decision/auth_deps.rs:235:9
+    |
+235 |     let mut policy = read_policy(tx, plan).await?;
+    |         ----^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `ProtocolState` is more private than the item `lock_gate_and_protocol`
+   --> src/ref_store/core/publication_decision/sql_locks.rs:245:1
+    |
+245 | / pub(crate) async fn lock_gate_and_protocol(
+246 | |     tx: &Transaction<'_>,
+247 | |     repository_id: Uuid,
+248 | | ) -> Result<ProtocolState, DecisionError> {
+    | |_________________________________________^ function `lock_gate_and_protocol` is reachable at visibility `pub(crate)`
+    |
+note: but type `ProtocolState` is only usable at visibility `pub(in crate::ref_store::core::publication_decision)`
+   --> src/ref_store/core/publication_decision/sql_locks.rs:135:1
+    |
+135 | pub(super) struct ProtocolState {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: function `require_fence_enabled` is never used
+   --> src/ref_store/core/decision_commit.rs:286:21
+    |
+286 | pub(crate) async fn require_fence_enabled(tx: &Transaction<'_>, repository_id: Uuid) -> Result<(), RefStoreError> {
+    |                     ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `realm_digest`, `packs`, `kinds`, `ancestry`, and `view` are never read
+  --> src/ref_store/core/pack_commit/verifier/publication.rs:63:5
+   |
+59 | pub(crate) struct VerifiedPublicationFacts {
+   |                   ------------------------ fields in this struct
+...
+63 |     realm_digest: RequestDigest,
+   |     ^^^^^^^^^^^^
+...
+70 |     packs: Vec<VerifiedPackIdentity>,
+   |     ^^^^^
+71 |     refs: Vec<RefFacts>,
+72 |     kinds: BTreeMap<String, GitObjectKind>,
+   |     ^^^^^
+73 |     ancestry: BTreeMap<(String, String), bool>,
+   |     ^^^^^^^^
+74 |     view: std::sync::OnceLock<DecisionView>,
+   |     ^^^^
+
+warning: multiple methods are never used
+   --> src/ref_store/core/pack_commit/verifier/publication.rs:132:19
+    |
+ 87 | impl VerifiedPublicationFacts {
+    | ----------------------------- methods in this implementation
+...
+132 |     pub(crate) fn original_identity(&self) -> &OperationIdentity {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+136 |     pub(crate) fn original_parent_digest(&self) -> &RequestDigest {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+...
+140 |     pub(crate) fn commit_mode(&self) -> CommitMode {
+    |                   ^^^^^^^^^^^
+...
+172 |     pub(crate) fn realm_digest(&self) -> &RequestDigest {
+    |                   ^^^^^^^^^^^^
+...
+204 |     pub(crate) fn known_missing_target(&self, name: &str) -> bool {
+    |                   ^^^^^^^^^^^^^^^^^^^^
+...
+209 |     pub(crate) fn known_missing_targets(&self) -> Vec<&RefName> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+...
+213 |     pub(crate) fn refs(&self) -> &[RefFacts] {
+    |                   ^^^^
+...
+221 |     pub(crate) fn verified_packs(&self) -> &[VerifiedPackIdentity] {
+    |                   ^^^^^^^^^^^^^^
+
+warning: fields `kinds`, `ancestry`, `base`, `changed`, and `lfs` are never read
+  --> src/ref_store/core/pack_commit/verifier/publication_view.rs:24:5
+   |
+23 | pub(super) struct DecisionView {
+   |                   ------------ fields in this struct
+24 |     kinds: BTreeMap<String, ObjectKind>,
+   |     ^^^^^
+25 |     ancestry: BTreeMap<(String, String), bool>,
+   |     ^^^^^^^^
+26 |     base: BTreeMap<String, ObservedOid>,
+   |     ^^^^
+27 |     changed: BTreeMap<String, Vec<ChangedPath>>,
+   |     ^^^^^^^
+28 |     lfs: BTreeMap<String, Vec<LfsPointer>>,
+   |     ^^^
+
+warning: method `decision_view` is never used
+  --> src/ref_store/core/pack_commit/verifier/publication_view.rs:32:8
+   |
+31 | impl VerifiedPublicationFacts {
+   | ----------------------------- method in this implementation
+32 |     fn decision_view(&self) -> &DecisionView {
+   |        ^^^^^^^^^^^^^
+
+warning: function `decision_kind` is never used
+  --> src/ref_store/core/pack_commit/verifier/publication_view.rs:72:4
+   |
+72 | fn decision_kind(kind: GitObjectKind) -> ObjectKind {
+   |    ^^^^^^^^^^^^^
+
+warning: function `resulting_refs` is never used
+  --> src/ref_store/core/pack_commit/verifier/refs.rs:91:15
+   |
+91 | pub(super) fn resulting_refs(plan: &PackCommitPlan, old: &[CapturedRef]) -> Result<RefMap, PackCommitError> {
+   |               ^^^^^^^^^^^^^^
+
+warning: function `head_state` is never used
+   --> src/ref_store/core/pack_commit/verifier/refs.rs:133:15
+    |
+133 | pub(super) fn head_state(
+    |               ^^^^^^^^^^
+
+warning: field `plan` is never read
+  --> src/ref_store/core/pack_commit/verifier/validate.rs:38:16
+   |
+37 | pub(super) struct Checked<'a> {
+   |                   ------- field in this struct
+38 |     pub(super) plan: &'a PackCommitPlan,
+   |                ^^^^
+
+warning: function `original_parent` is never used
+   --> src/ref_store/core/pack_commit/authorized/mod.rs:301:15
+    |
+301 | pub(super) fn original_parent(plan: &PackCommitPlan) -> &RequestDigest {
+    |               ^^^^^^^^^^^^^^^
+
+warning: methods `path`, `size`, `durable`, and `bytes_verified` are never used
+  --> src/ref_store/core/pack_commit/facts/types.rs:59:19
+   |
+54 | impl LfsPointerFact {
+   | ------------------- methods in this implementation
+...
+59 |     pub(crate) fn path(&self) -> &str {
+   |                   ^^^^
+...
+67 |     pub(crate) fn size(&self) -> u64 {
+   |                   ^^^^
+...
+73 |     pub(crate) fn durable(&self) -> bool {
+   |                   ^^^^^^^
+...
+79 |     pub(crate) fn bytes_verified(&self) -> bool {
+   |                   ^^^^^^^^^^^^^^
+
+warning: methods `target_oid_hex`, `is_delete`, and `target_kind` are never used
+   --> src/ref_store/core/pack_commit/facts/types.rs:143:19
+    |
+100 | impl RefFacts {
+    | ------------- methods in this implementation
+...
+143 |     pub(crate) fn target_oid_hex(&self) -> Option<&str> {
+    |                   ^^^^^^^^^^^^^^
+...
+147 |     pub(crate) fn is_delete(&self) -> bool {
+    |                   ^^^^^^^^^
+...
+156 |     pub(crate) fn target_kind(&self) -> Option<GitObjectKind> {
+    |                   ^^^^^^^^^^^
+
+warning: multiple methods are never used
+   --> src/ref_store/core/pack_commit/facts/types.rs:256:19
+    |
+243 | impl VerifiedPackIdentity {
+    | ------------------------- methods in this implementation
+...
+256 |     pub(crate) fn pack_id(&self) -> Uuid {
+    |                   ^^^^^^^
+...
+260 |     pub(crate) fn registration_id(&self) -> Uuid {
+    |                   ^^^^^^^^^^^^^^^
+...
+264 |     pub(crate) fn artifact_set_digest_hex(&self) -> &str {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+...
+268 |     pub(crate) fn pack_sha256(&self) -> &str {
+    |                   ^^^^^^^^^^^
+...
+272 |     pub(crate) fn pack_length(&self) -> u64 {
+    |                   ^^^^^^^^^^^
+...
+276 |     pub(crate) fn idx_sha256(&self) -> &str {
+    |                   ^^^^^^^^^^
+...
+280 |     pub(crate) fn idx_length(&self) -> u64 {
+    |                   ^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> src/ref_store/core/pack_commit/facts/witness.rs:35:19
+   |
+32 | impl LfsByteLocation {
+   | -------------------- associated function in this implementation
+...
+35 |     pub(crate) fn new(path: PathBuf) -> Result<Self, PackCommitError> {
+   |                   ^^^
+
+warning: multiple fields are never read
+  --> src/ref_store/core/publication_decision/auth_deps.rs:43:9
+   |
+38 | pub(super) struct LiveAuthority {
+   |                   ------------- fields in this struct
+...
+43 |     pub object_format: GitObjectFormat,
+   |         ^^^^^^^^^^^^^
+44 |     pub history_incarnation: Uuid,
+   |         ^^^^^^^^^^^^^^^^^^^
+45 |     pub authority_epoch: i64,
+   |         ^^^^^^^^^^^^^^^
+46 |     pub group_epoch: i64,
+   |         ^^^^^^^^^^^
+47 |     pub base_revision: i64,
+   |         ^^^^^^^^^^^^^
+48 |     pub head_ref: String,
+   |         ^^^^^^^^
+49 |     pub decision_required: bool,
+   |         ^^^^^^^^^^^^^^^^^
+
+warning: function `cancel` is never used
+  --> src/ref_store/core/publication_decision/cancel.rs:27:21
+   |
+27 | pub(crate) async fn cancel(
+   |                     ^^^^^^
+
+warning: fields `actor_id`, `token_id`, and `created_db_millis` are never read
+  --> src/ref_store/core/publication_decision/capability.rs:24:5
+   |
+19 | pub(crate) struct DecisionCapability {
+   |                   ------------------ fields in this struct
+...
+24 |     actor_id: Uuid,
+   |     ^^^^^^^^
+25 |     token_id: Uuid,
+   |     ^^^^^^^^
+...
+32 |     created_db_millis: i64,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: multiple methods are never used
+   --> src/ref_store/core/publication_decision/capability.rs:75:19
+    |
+ 36 | impl DecisionCapability {
+    | ----------------------- methods in this implementation
+...
+ 75 |     pub(crate) fn repository_id(&self) -> Uuid {
+    |                   ^^^^^^^^^^^^^
+...
+ 78 |     pub(crate) fn tenant_id(&self) -> Uuid {
+    |                   ^^^^^^^^^
+...
+ 81 |     pub(crate) fn owner_id(&self) -> Uuid {
+    |                   ^^^^^^^^
+...
+ 84 |     pub(crate) fn actor_id(&self) -> Uuid {
+    |                   ^^^^^^^^
+...
+ 87 |     pub(crate) fn token_id(&self) -> Uuid {
+    |                   ^^^^^^^^
+...
+ 99 |     pub(crate) fn object_format(&self) -> GitObjectFormat {
+    |                   ^^^^^^^^^^^^^
+...
+102 |     pub(crate) fn base_revision(&self) -> i64 {
+    |                   ^^^^^^^^^^^^^
+...
+105 |     pub(crate) fn not_after_millis(&self) -> i64 {
+    |                   ^^^^^^^^^^^^^^^^
+...
+108 |     pub(crate) fn created_db_millis(&self) -> i64 {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+111 |     pub(super) fn digests(&self) -> &DecisionDigests {
+    |                   ^^^^^^^
+
+warning: type alias `CapabilityDigests` is never used
+   --> src/ref_store/core/publication_decision/capability.rs:160:17
+    |
+160 | pub(super) type CapabilityDigests = DecisionDigests;
+    |                 ^^^^^^^^^^^^^^^^^
+
+warning: methods `public_code` and `subset_reason` are never used
+  --> src/ref_store/core/publication_decision/codes.rs:68:25
+   |
+30 | impl DecisionRejectCode {
+   | ----------------------- methods in this implementation
+...
+68 |     pub(crate) const fn public_code(self) -> &'static str {
+   |                         ^^^^^^^^^^^
+...
+85 |     pub(crate) const fn subset_reason(self) -> &'static str {
+   |                         ^^^^^^^^^^^^^
+
+warning: variants `ModeMismatch`, `DecisionRequired`, `ConsumeConflict`, and `QuotaExceeded` are never constructed
+   --> src/ref_store/core/publication_decision/codes.rs:116:5
+    |
+ 99 | pub(crate) enum DenialCode {
+    |                 ---------- variants in this enum
+...
+116 |     ModeMismatch,
+    |     ^^^^^^^^^^^^
+117 |     ProtocolStateMissing,
+118 |     DecisionRequired,
+    |     ^^^^^^^^^^^^^^^^
+...
+129 |     ConsumeConflict,
+    |     ^^^^^^^^^^^^^^^
+130 |     ScopeClosing,
+131 |     QuotaExceeded,
+    |     ^^^^^^^^^^^^^
+    |
+    = note: `DenialCode` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: enum `Verdict` is never used
+   --> src/ref_store/core/publication_decision/codes.rs:178:17
+    |
+178 | pub(crate) enum Verdict {
+    |                 ^^^^^^^
+
+warning: struct `RefVerdict` is never constructed
+   --> src/ref_store/core/publication_decision/codes.rs:184:19
+    |
+184 | pub(crate) struct RefVerdict {
+    |                   ^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src/ref_store/core/publication_decision/codes.rs:193:19
+    |
+192 | impl RefVerdict {
+    | --------------- associated items in this implementation
+193 |     pub(crate) fn accept(update: &RefUpdate) -> Self {
+    |                   ^^^^^^
+...
+203 |     pub(crate) fn reject(
+    |                   ^^^^^^
+...
+213 |     pub(super) fn stored(
+    |                   ^^^^^^
+...
+227 |     pub(crate) fn name(&self) -> &RefName {
+    |                   ^^^^
+...
+230 |     pub(crate) fn is_accept(&self) -> bool {
+    |                   ^^^^^^^^^
+...
+233 |     pub(crate) fn code(&self) -> Option<DecisionRejectCode> {
+    |                   ^^^^
+...
+236 |     pub(crate) fn old_oid(&self) -> Option<GitOid> {
+    |                   ^^^^^^^
+...
+239 |     pub(crate) fn new_oid(&self) -> Option<GitOid> {
+    |                   ^^^^^^^
+...
+242 |     pub(crate) fn old_oid_hex(&self) -> Option<String> {
+    |                   ^^^^^^^^^^^
+...
+245 |     pub(crate) fn new_oid_hex(&self) -> Option<String> {
+    |                   ^^^^^^^^^^^
+...
+248 |     pub(crate) const fn verdict_str(&self) -> &'static str {
+    |                         ^^^^^^^^^^^
+
+warning: function `reject_decision` is never used
+   --> src/ref_store/core/publication_decision/consume.rs:196:21
+    |
+196 | pub(crate) async fn reject_decision(
+    |                     ^^^^^^^^^^^^^^^
+
+warning: function `proof_refs_digest` is never used
+   --> src/ref_store/core/publication_decision/consume.rs:294:15
+    |
+294 | pub(crate) fn proof_refs_digest(selected: &SelectedDecision) -> RequestDigest {
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_LOCK_ATTEMPTS` is never used
+  --> src/ref_store/core/publication_decision/contract.rs:34:18
+   |
+34 | pub(crate) const MAX_LOCK_ATTEMPTS: usize = 3;
+   |                  ^^^^^^^^^^^^^^^^^
+
+warning: associated functions `push` and `merge` are never used
+   --> src/ref_store/core/publication_decision/contract.rs:119:19
+    |
+118 | impl PublicationAction {
+    | ---------------------- associated functions in this implementation
+119 |     pub(crate) fn push() -> Self {
+    |                   ^^^^
+...
+123 |     pub(crate) fn merge(binding: MergeBinding) -> Self {
+    |                   ^^^^^
+
+warning: method `is_terminal` is never used
+   --> src/ref_store/core/publication_decision/contract.rs:174:25
+    |
+154 | impl DecisionState {
+    | ------------------ method in this implementation
+...
+174 |     pub(crate) const fn is_terminal(self) -> bool {
+    |                         ^^^^^^^^^^^
+
+warning: field `decision_id` is never read
+   --> src/ref_store/core/publication_decision/contract.rs:242:9
+    |
+240 |     Cancelled {
+    |     --------- field in this variant
+241 |         operation_id: Uuid,
+242 |         decision_id: Option<Uuid>,
+    |         ^^^^^^^^^^^
+    |
+    = note: `DecisionError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: methods `is_consumed`, `decision_id`, and `denial` are never used
+   --> src/ref_store/core/publication_decision/contract.rs:318:25
+    |
+317 | impl ConsumptionRecord {
+    | ---------------------- methods in this implementation
+318 |     pub(crate) const fn is_consumed(&self) -> bool {
+    |                         ^^^^^^^^^^^
+...
+321 |     pub(crate) const fn decision_id(&self) -> Uuid {
+    |                         ^^^^^^^^^^^
+...
+326 |     pub(crate) const fn denial(&self) -> Option<DenialCode> {
+    |                         ^^^^^^
+
+warning: methods `operation_id` and `is_cancelled` are never used
+   --> src/ref_store/core/publication_decision/contract.rs:344:25
+    |
+343 | impl CancelOutcome {
+    | ------------------ methods in this implementation
+344 |     pub(crate) const fn operation_id(&self) -> Uuid {
+    |                         ^^^^^^^^^^^^
+...
+352 |     pub(crate) const fn is_cancelled(&self) -> bool {
+    |                         ^^^^^^^^^^^^
+
+warning: methods `projection`, `verdict_rows`, `repository_id`, `tenant_id`, and `not_after_millis` are never used
+   --> src/ref_store/core/publication_decision/contract.rs:384:19
+    |
+371 | impl SelectedDecision {
+    | --------------------- methods in this implementation
+...
+384 |     pub(crate) fn projection(&self) -> &SelectedPackPlan {
+    |                   ^^^^^^^^^^
+...
+389 |     pub(crate) fn verdict_rows(&self) -> &[(String, String)] {
+    |                   ^^^^^^^^^^^^
+...
+409 |     pub(crate) fn repository_id(&self) -> Uuid {
+    |                   ^^^^^^^^^^^^^
+...
+412 |     pub(crate) fn tenant_id(&self) -> Uuid {
+    |                   ^^^^^^^^^
+...
+421 |     pub(crate) fn not_after_millis(&self) -> i64 {
+    |                   ^^^^^^^^^^^^^^^^
+
+warning: struct `DecisionRecord` is never constructed
+   --> src/ref_store/core/publication_decision/contract.rs:442:19
+    |
+442 | pub(crate) struct DecisionRecord {
+    |                   ^^^^^^^^^^^^^^
+
+warning: struct `CancellationRecord` is never constructed
+   --> src/ref_store/core/publication_decision/contract.rs:455:19
+    |
+455 | pub(crate) struct CancellationRecord {
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: struct `PersistedVerdict` is never constructed
+   --> src/ref_store/core/publication_decision/contract.rs:467:19
+    |
+467 | pub(crate) struct PersistedVerdict {
+    |                   ^^^^^^^^^^^^^^^^
+
+warning: associated function `from_row` is never used
+   --> src/ref_store/core/publication_decision/contract.rs:476:19
+    |
+475 | impl PersistedVerdict {
+    | --------------------- associated function in this implementation
+476 |     pub(crate) fn from_row(
+    |                   ^^^^^^^^
+
+warning: constant `DOMAIN_CAPTURED` is never used
+  --> src/ref_store/core/publication_decision/digest.rs:24:7
+   |
+24 | const DOMAIN_CAPTURED: &str = "publication-decision-captured-v1";
+   |       ^^^^^^^^^^^^^^^
+
+warning: function `captured_refs_digest` is never used
+  --> src/ref_store/core/publication_decision/digest.rs:60:15
+   |
+60 | pub(super) fn captured_refs_digest(refs: &[CapturedRef]) -> RequestDigest {
+   |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: variants `Commit`, `Tag`, `Tree`, and `Blob` are never constructed
+  --> src/ref_store/core/publication_decision/facts.rs:15:5
+   |
+14 | pub(crate) enum ObjectKind {
+   |                 ---------- variants in this enum
+15 |     Commit,
+   |     ^^^^^^
+16 |     Tag,
+   |     ^^^
+17 |     Tree,
+   |     ^^^^
+18 |     Blob,
+   |     ^^^^
+   |
+   = note: `ObjectKind` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: methods `as_str` and `may_tip_a_branch` are never used
+  --> src/ref_store/core/publication_decision/facts.rs:22:25
+   |
+21 | impl ObjectKind {
+   | --------------- methods in this implementation
+22 |     pub(crate) const fn as_str(self) -> &'static str {
+   |                         ^^^^^^
+...
+32 |     pub(crate) const fn may_tip_a_branch(self) -> bool {
+   |                         ^^^^^^^^^^^^^^^^
+
+warning: variants `Absent` and `Present` are never constructed
+  --> src/ref_store/core/publication_decision/facts.rs:40:5
+   |
+39 | pub(crate) enum ObservedOid {
+   |                 ----------- variants in this enum
+40 |     Absent,
+   |     ^^^^^^
+41 |     Present(GitOid),
+   |     ^^^^^^^
+   |
+   = note: `ObservedOid` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: method `oid` is never used
+  --> src/ref_store/core/publication_decision/facts.rs:45:19
+   |
+44 | impl ObservedOid {
+   | ---------------- method in this implementation
+45 |     pub(crate) fn oid(self) -> Option<GitOid> {
+   |                   ^^^
+
+warning: trait `PublicationFacts` is never used
+  --> src/ref_store/core/publication_decision/facts.rs:71:18
+   |
+71 | pub(crate) trait PublicationFacts {
+   |                  ^^^^^^^^^^^^^^^^
+
+warning: function `pack_error` is never used
+   --> src/ref_store/core/publication_decision/install.rs:497:15
+    |
+497 | pub(super) fn pack_error(error: PackCommitError) -> DecisionError {
+    |               ^^^^^^^^^^
+
+warning: function `binding` is never used
+  --> src/ref_store/core/publication_decision/merge.rs:22:4
+   |
+22 | fn binding<'a>(action: &'a PublicationAction) -> Result<&'a MergeBinding, DecisionError> {
+   |    ^^^^^^^
+
+warning: function `lock_merge_target` is never used
+  --> src/ref_store/core/publication_decision/merge.rs:28:21
+   |
+28 | pub(crate) async fn lock_merge_target(
+   |                     ^^^^^^^^^^^^^^^^^
+
+warning: function `finalize_merge` is never used
+  --> src/ref_store/core/publication_decision/merge.rs:60:21
+   |
+60 | pub(crate) async fn finalize_merge(
+   |                     ^^^^^^^^^^^^^^
+
+warning: methods `operation_id`, `repository_id`, and `tenant_id` are never used
+  --> src/ref_store/core/publication_decision/metadata.rs:53:19
+   |
+49 | impl MetadataSelectedDecision {
+   | ----------------------------- methods in this implementation
+...
+53 |     pub(crate) fn operation_id(&self) -> Uuid {
+   |                   ^^^^^^^^^^^^
+...
+56 |     pub(crate) fn repository_id(&self) -> Uuid {
+   |                   ^^^^^^^^^^^^^
+...
+59 |     pub(crate) fn tenant_id(&self) -> Uuid {
+   |                   ^^^^^^^^^
+
+warning: constant `DECISION_LOOKUP` is never used
+  --> src/ref_store/core/publication_decision/query.rs:17:7
+   |
+17 | const DECISION_LOOKUP: &str = "SELECT decision_id,operation_id,state,mode,selection_digest,\
+   |       ^^^^^^^^^^^^^^^
+
+warning: function `decision_record` is never used
+  --> src/ref_store/core/publication_decision/query.rs:21:4
+   |
+21 | fn decision_record(row: &tokio_postgres::Row) -> Result<DecisionRecord, DecisionError> {
+   |    ^^^^^^^^^^^^^^^
+
+warning: function `lookup` is never used
+  --> src/ref_store/core/publication_decision/query.rs:36:21
+   |
+36 | pub(crate) async fn lookup(
+   |                     ^^^^^^
+
+warning: function `lookup_in_tx` is never used
+  --> src/ref_store/core/publication_decision/query.rs:48:21
+   |
+48 | pub(super) async fn lookup_in_tx(
+   |                     ^^^^^^^^^^^^
+
+warning: function `verdicts` is never used
+  --> src/ref_store/core/publication_decision/query.rs:58:21
+   |
+58 | pub(crate) async fn verdicts(
+   |                     ^^^^^^^^
+
+warning: function `load_verdicts` is never used
+  --> src/ref_store/core/publication_decision/query.rs:70:21
+   |
+70 | pub(super) async fn load_verdicts(
+   |                     ^^^^^^^^^^^^^
+
+warning: function `parse_oid` is never used
+   --> src/ref_store/core/publication_decision/query.rs:139:4
+    |
+139 | fn parse_oid(format: GitObjectFormat, value: Option<String>) -> Result<Option<GitOid>, DecisionError> {
+    |    ^^^^^^^^^
+
+warning: function `cancellation` is never used
+   --> src/ref_store/core/publication_decision/query.rs:149:21
+    |
+149 | pub(crate) async fn cancellation(
+    |                     ^^^^^^^^^^^^
+
+warning: function `cancellation_in_tx` is never used
+   --> src/ref_store/core/publication_decision/query.rs:161:21
+    |
+161 | pub(super) async fn cancellation_in_tx(
+    |                     ^^^^^^^^^^^^^^^^^^
+
+warning: field `head` is never read
+  --> src/ref_store/core/publication_decision/select.rs:25:9
+   |
+21 | pub(super) struct SelectionInput<'a> {
+   |                   -------------- field in this struct
+...
+25 |     pub head: &'a HeadUpdate,
+   |         ^^^^
+
+warning: constant `PROTOCOL_TABLE` is never used
+  --> src/ref_store/core/publication_decision/sql_locks.rs:58:18
+   |
+58 | pub(crate) const PROTOCOL_TABLE: &str = "ref_store_core_protocol_repos";
+   |                  ^^^^^^^^^^^^^^
+
+warning: function `decision_required` is never used
+   --> src/ref_store/core/publication_decision/sql_locks.rs:205:21
+    |
+205 | pub(crate) async fn decision_required(tx: &Transaction<'_>, repository_id: Uuid) -> Result<bool, DecisionError> {
+    |                     ^^^^^^^^^^^^^^^^^
+
+warning: function `lock_gate_and_protocol` is never used
+   --> src/ref_store/core/publication_decision/sql_locks.rs:245:21
+    |
+245 | pub(crate) async fn lock_gate_and_protocol(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `object_format` and `proof_facts_digest` are never read
+   --> src/ref_store/core/publication_decision/sql_locks.rs:285:9
+    |
+275 | pub(super) struct DecisionRow {
+    |                   ----------- fields in this struct
+...
+285 |     pub object_format: String,
+    |         ^^^^^^^^^^^^^
+...
+303 |     pub proof_facts_digest: Option<RequestDigest>,
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: methods `object_format`, `head_oid`, and `uncovered_oids` are never used
+   --> src/ref_store/core/retention_root/capture.rs:118:19
+    |
+102 | impl RawCapture {
+    | --------------- methods in this implementation
+...
+118 |     pub(super) fn object_format(&self) -> GitObjectFormat {
+    |                   ^^^^^^^^^^^^^
+...
+122 |     pub(super) fn head_oid(&self) -> Option<&str> {
+    |                   ^^^^^^^^
+...
+134 |     pub(super) fn uncovered_oids(&self) -> Vec<(usize, String)> {
+    |                   ^^^^^^^^^^^^^^
+
+warning: function `read_header` is never used
+  --> src/ref_store/core/retention_root/sql_read.rs:86:21
+   |
+86 | pub(super) async fn read_header(
+   |                     ^^^^^^^^^^^
+
+warning: associated function `from_wire` is never used
+   --> src/ref_store/core/terminal.rs:219:19
+    |
+210 | impl CommitRejectCode {
+    | --------------------- associated function in this implementation
+...
+219 |     pub(crate) fn from_wire(value: &str) -> Option<Self> {
+    |                   ^^^^^^^^^
+
+warning: `rootyard` (lib) generated 84 warnings (run `cargo fix --lib -p rootyard` to apply 17 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 45.05s

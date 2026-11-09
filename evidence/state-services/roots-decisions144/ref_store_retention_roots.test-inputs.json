@@ -1,0 +1,36 @@
+{
+  "test_inputs": {
+    "tests/ref_store_retention_roots.rs": "7d917f3d9e1e997cf9d2a52fd10d25826abed6285557cbfe6b0536973bd40d62",
+    "tests/retention_roots_support/cases_extra.rs": "3aeea235b98071cbe78d778378f1c0302095c3854432cfa7ccc9f50750dfff72",
+    "tests/retention_roots_support/cases_tail.rs": "4c6c07f30d82e39760deb324fb1dea8a61d5fbd3dbe2177e85dd1469bf1675ab",
+    "tests/retention_roots_support/common.rs": "daaa493af1e6dff15f153ec4d1e99c1353693d87349b313e5d827114c5723a3c",
+    "tests/retention_roots_support/db.rs": "85ed5644f64d86fd469b0c20b781ec1ebe6ea63179e5457a2975226f124abe06",
+    "tests/retention_roots_support/git.rs": "1e9d5de62ebabda8348c5c6ef78a641d4aa47ad9bfa4079eb5f9ff1aed68df2c",
+    "tests/retention_roots_support/mod.rs": "9703d9efa566e17cec0bfe6159dc4c020e1a0063619285ead08749c704cf3066",
+    "tests/retention_roots_support/pack.rs": "01a610be32ae33b551e70cb6aecc5ff2516d2435a81d057298c21a4e04d817b7",
+    "tests/retention_roots_support/roots.rs": "689bc65076d55305c3fcf97447eacec63fb8ddf4eeb4ee8a1ecbc16e2e7dda2f"
+  },
+  "binary_sha256": "becff1a2108917f39503c504966eda71612227b8fe44f09d64e4bff7cce34d71",
+  "inputs_unchanged": true,
+  "builder_sha256": "6258fea1e831c2aa5d15e336c40df73c7c4064816c497016860c0c9da3bbad49",
+  "command": [
+    "cargo",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "--config",
+    "profile.test.package.rootyard.debug=0",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "--config",
+    "profile.test.package.rootyard.strip=\"debuginfo\"",
+    "rustc",
+    "--locked",
+    "--profile",
+    "test",
+    "--test",
+    "ref_store_retention_roots",
+    "--features",
+    "pando-lab",
+    "--message-format=json-render-diagnostics"
+  ]
+}

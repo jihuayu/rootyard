@@ -1,0 +1,17 @@
+Traceback (most recent call last):
+  File "/workspace/scratch/trace-state144-sqlgen.py", line 24, in <module>
+    runpy.run_path(sys.argv[1], run_name='__main__')
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/scratch/generate-state144-sql-catalogs-v3.py", line 36, in <module>
+    runpy.run_path(str(root / 'tests/schema_contract.py'), run_name='__main__')
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 180, in <module>
+    main()
+  File "/workspace/scratch/state-services-roots-decisions/tests/schema_contract.py", line 103, in main
+    assert catalog(upgraded6) == restored, 'Restored006 upgrade differs from full restore contract'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Restored006 upgrade differs from full restore contract

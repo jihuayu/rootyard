@@ -1,0 +1,126 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+error: expected identifier, found keyword `pub`
+   --> src/ref_store/core/publication_decision/metadata.rs:216:9
+    |
+214 |     Ok(MetadataAuthority {
+    |        ----------------- while parsing this struct
+215 |         owner_id,
+216 |         pub(super) object_format: format,
+    |         ^^^ expected identifier, found keyword
+    |
+help: escape `pub` to use it as an identifier
+    |
+216 |         r#pub(super) object_format: format,
+    |         ++
+
+error: expected identifier, found keyword `pub`
+   --> src/ref_store/core/publication_decision/metadata.rs:217:9
+    |
+214 |     Ok(MetadataAuthority {
+    |        ----------------- while parsing this struct
+...
+217 |         pub(super) tenant_id: protocol.tenant_id,
+    |         ^^^ expected identifier, found keyword
+    |
+help: escape `pub` to use it as an identifier
+    |
+217 |         r#pub(super) tenant_id: protocol.tenant_id,
+    |         ++
+
+error: expected identifier, found keyword `pub`
+   --> src/ref_store/core/publication_decision/metadata.rs:218:9
+    |
+214 |     Ok(MetadataAuthority {
+    |        ----------------- while parsing this struct
+...
+218 |         pub(super) history_incarnation: protocol.history_incarnation,
+    |         ^^^ expected identifier, found keyword
+    |
+help: escape `pub` to use it as an identifier
+    |
+218 |         r#pub(super) history_incarnation: protocol.history_incarnation,
+    |         ++
+
+error: expected identifier, found keyword `pub`
+   --> src/ref_store/core/publication_decision/metadata.rs:219:9
+    |
+214 |     Ok(MetadataAuthority {
+    |        ----------------- while parsing this struct
+...
+219 |         pub(super) authority_epoch: protocol.authority_epoch,
+    |         ^^^ expected identifier, found keyword
+    |
+help: escape `pub` to use it as an identifier
+    |
+219 |         r#pub(super) authority_epoch: protocol.authority_epoch,
+    |         ++
+
+error: expected identifier, found keyword `pub`
+   --> src/ref_store/core/publication_decision/metadata.rs:220:9
+    |
+214 |     Ok(MetadataAuthority {
+    |        ----------------- while parsing this struct
+...
+220 |         pub(super) group_epoch: protocol.group_epoch,
+    |         ^^^ expected identifier, found keyword
+    |
+help: escape `pub` to use it as an identifier
+    |
+220 |         r#pub(super) group_epoch: protocol.group_epoch,
+    |         ++
+
+error: expected identifier, found keyword `pub`
+   --> src/ref_store/core/publication_decision/metadata.rs:221:9
+    |
+214 |     Ok(MetadataAuthority {
+    |        ----------------- while parsing this struct
+...
+221 |         pub(super) head_ref: protocol.head_ref,
+    |         ^^^ expected identifier, found keyword
+    |
+help: escape `pub` to use it as an identifier
+    |
+221 |         r#pub(super) head_ref: protocol.head_ref,
+    |         ++
+
+error: expected identifier, found keyword `pub`
+   --> src/ref_store/core/publication_decision/metadata.rs:222:9
+    |
+214 |     Ok(MetadataAuthority {
+    |        ----------------- while parsing this struct
+...
+222 |         pub(super) revision: protocol.revision,
+    |         ^^^ expected identifier, found keyword
+    |
+help: escape `pub` to use it as an identifier
+    |
+222 |         r#pub(super) revision: protocol.revision,
+    |         ++
+
+error: expected identifier, found keyword `pub`
+   --> src/ref_store/core/publication_decision/metadata.rs:256:5
+    |
+256 |     pub(super) head_ref: &str,
+    |     ^^^ expected identifier, found keyword
+    |
+help: escape `pub` to use it as an identifier
+    |
+256 |     r#pub(super) head_ref: &str,
+    |     ++
+
+error: expected one of `:` or `|`, found `head_ref`
+   --> src/ref_store/core/publication_decision/metadata.rs:256:16
+    |
+256 |     pub(super) head_ref: &str,
+    |                ^^^^^^^^ expected one of `:` or `|`
+
+error: this file contains an unclosed delimiter
+   --> src/ref_store/core/pack_commit/plan.rs:598:3
+    |
+217 | impl PackCommitPlan {
+    |                     - unclosed delimiter
+...
+598 | }
+    |  ^
+
+error: could not compile `rootyard` (lib) due to 10 previous errors

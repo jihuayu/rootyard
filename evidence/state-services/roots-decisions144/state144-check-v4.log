@@ -1,0 +1,540 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+error: expected identifier, found keyword `pub`
+   --> src/ref_store/core/publication_decision/metadata.rs:256:5
+    |
+256 |     pub(super) head_ref: &str,
+    |     ^^^ expected identifier, found keyword
+    |
+help: escape `pub` to use it as an identifier
+    |
+256 |     r#pub(super) head_ref: &str,
+    |     ++
+
+error: expected one of `:` or `|`, found `head_ref`
+   --> src/ref_store/core/publication_decision/metadata.rs:256:16
+    |
+256 |     pub(super) head_ref: &str,
+    |                ^^^^^^^^ expected one of `:` or `|`
+
+error[E0432]: unresolved import `super::contract::DecisionRejectCode`
+ --> src/ref_store/core/publication_decision/query.rs:7:70
+  |
+7 |     CancellationRecord, DecisionError, DecisionKind, DecisionRecord, DecisionRejectCode, DecisionState,
+  |                                                                      ^^^^^^^^^^^^^^^^^^ no `DecisionRejectCode` in `ref_store::core::publication_decision::contract`
+  |
+  = help: consider importing this enum instead:
+          crate::ref_store::core::publication_decision::codes::DecisionRejectCode
+help: a similar name exists in the module
+  |
+7 -     CancellationRecord, DecisionError, DecisionKind, DecisionRecord, DecisionRejectCode, DecisionState,
+7 +     CancellationRecord, DecisionError, DecisionKind, DecisionRecord, DecisionRecord, DecisionState,
+  |
+
+error[E0432]: unresolved import `super::contract::DecisionRejectCode`
+  --> src/ref_store/core/publication_decision/select.rs:10:38
+   |
+10 | use super::contract::{DecisionError, DecisionRejectCode, PublicationAction, MergeBinding};
+   |                                      ^^^^^^^^^^^^^^^^^^ no `DecisionRejectCode` in `ref_store::core::publication_decision::contract`
+   |
+   = help: consider importing this enum instead:
+           crate::ref_store::core::publication_decision::codes::DecisionRejectCode
+help: a similar name exists in the module
+   |
+10 - use super::contract::{DecisionError, DecisionRejectCode, PublicationAction, MergeBinding};
+10 + use super::contract::{DecisionError, DecisionRecord, PublicationAction, MergeBinding};
+   |
+
+error[E0433]: cannot find `metadata_subset` in `super`
+   --> src/ref_store/core/pg.rs:453:27
+    |
+453 |             return super::metadata_subset::commit_accepted_subset(tx, request, &gate, &existing, deadline).await;
+    |                           ^^^^^^^^^^^^^^^ could not find `metadata_subset` in `super`
+
+error[E0425]: cannot find value `head_ref` in this scope
+   --> src/ref_store/core/publication_decision/metadata.rs:300:53
+    |
+300 |         if reason.is_none() && head_keep && name == head_ref && deleting {
+    |                                                     ^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `refs_digest` in this scope
+  --> src/ref_store/core/pack_commit/verifier/publication_support.rs:76:9
+   |
+76 |         refs_digest(old_refs).as_bytes().to_vec(),
+   |         ^^^^^^^^^^^ not found in this scope
+   |
+note: function `crate::ref_store::core::publication_decision::digest::refs_digest` exists but is inaccessible
+  --> src/ref_store/core/publication_decision/digest.rs:51:1
+   |
+51 | pub(super) fn refs_digest(refs: &[RefUpdate]) -> RequestDigest {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+help: consider importing one of these functions
+   |
+ 7 + use crate::ref_store::core::pack_commit::refs_digest;
+   |
+ 7 + use crate::ref_store::core::snapshot_contract::refs_digest;
+   |
+
+error[E0603]: enum import `DenialCode` is private
+  --> src/ref_store/core/publication_decision/auth_deps.rs:17:20
+   |
+17 |     DecisionError, DenialCode, DependencyObservation, PublicationAction, ScopeKind,
+   |                    ^^^^^^^^^^ private enum import
+   |
+note: the enum import `DenialCode` is defined here...
+  --> src/ref_store/core/publication_decision/contract.rs:13:20
+   |
+13 | use super::codes::{DenialCode, ScopeKind};
+   |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+  --> src/ref_store/core/publication_decision/codes.rs:99:1
+   |
+99 | pub(crate) enum DenialCode {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `ScopeKind` is private
+   --> src/ref_store/core/publication_decision/auth_deps.rs:17:74
+    |
+ 17 |     DecisionError, DenialCode, DependencyObservation, PublicationAction, ScopeKind,
+    |                                                                          ^^^^^^^^^ private enum import
+    |
+note: the enum import `ScopeKind` is defined here...
+   --> src/ref_store/core/publication_decision/contract.rs:13:32
+    |
+ 13 | use super::codes::{DenialCode, ScopeKind};
+    |                                ^^^^^^^^^
+note: ...and refers to the enum `ScopeKind` which is defined here
+   --> src/ref_store/core/publication_decision/codes.rs:260:1
+    |
+260 | pub(crate) enum ScopeKind {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `DenialCode` is private
+  --> src/ref_store/core/publication_decision/cancel.rs:13:50
+   |
+13 |     CancelOutcome, DecisionError, DecisionState, DenialCode, PublicationAction, MAX_CANCEL_REASON_BYTES,
+   |                                                  ^^^^^^^^^^ private enum import
+   |
+note: the enum import `DenialCode` is defined here...
+  --> src/ref_store/core/publication_decision/contract.rs:13:20
+   |
+13 | use super::codes::{DenialCode, ScopeKind};
+   |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+  --> src/ref_store/core/publication_decision/codes.rs:99:1
+   |
+99 | pub(crate) enum DenialCode {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `DenialCode` is private
+  --> src/ref_store/core/publication_decision/capability.rs:11:37
+   |
+11 | use super::contract::{DecisionKind, DenialCode, PublicationAction};
+   |                                     ^^^^^^^^^^ private enum import
+   |
+note: the enum import `DenialCode` is defined here...
+  --> src/ref_store/core/publication_decision/contract.rs:13:20
+   |
+13 | use super::codes::{DenialCode, ScopeKind};
+   |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+  --> src/ref_store/core/publication_decision/codes.rs:99:1
+   |
+99 | pub(crate) enum DenialCode {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `DenialCode` is private
+  --> src/ref_store/core/publication_decision/consume.rs:15:54
+   |
+15 |     ConsumptionRecord, DecisionError, DecisionState, DenialCode, SelectedDecision,
+   |                                                      ^^^^^^^^^^ private enum import
+   |
+note: the enum import `DenialCode` is defined here...
+  --> src/ref_store/core/publication_decision/contract.rs:13:20
+   |
+13 | use super::codes::{DenialCode, ScopeKind};
+   |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+  --> src/ref_store/core/publication_decision/codes.rs:99:1
+   |
+99 | pub(crate) enum DenialCode {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `DenialCode` is private
+  --> src/ref_store/core/publication_decision/facts_bridge.rs:9:38
+   |
+ 9 | use super::contract::{DecisionError, DenialCode, SelectedDecision};
+   |                                      ^^^^^^^^^^ private enum import
+   |
+note: the enum import `DenialCode` is defined here...
+  --> src/ref_store/core/publication_decision/contract.rs:13:20
+   |
+13 | use super::codes::{DenialCode, ScopeKind};
+   |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+  --> src/ref_store/core/publication_decision/codes.rs:99:1
+   |
+99 | pub(crate) enum DenialCode {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `DenialCode` is private
+  --> src/ref_store/core/publication_decision/install.rs:21:49
+   |
+21 |     DecisionError, DecisionKind, DecisionState, DenialCode, PublicationAction, SelectedDecision,
+   |                                                 ^^^^^^^^^^ private enum import
+   |
+note: the enum import `DenialCode` is defined here...
+  --> src/ref_store/core/publication_decision/contract.rs:13:20
+   |
+13 | use super::codes::{DenialCode, ScopeKind};
+   |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+  --> src/ref_store/core/publication_decision/codes.rs:99:1
+   |
+99 | pub(crate) enum DenialCode {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `DenialCode` is private
+  --> src/ref_store/core/publication_decision/merge.rs:15:38
+   |
+15 | use super::contract::{DecisionError, DenialCode, MergeBinding, PublicationAction};
+   |                                      ^^^^^^^^^^ private enum import
+   |
+note: the enum import `DenialCode` is defined here...
+  --> src/ref_store/core/publication_decision/contract.rs:13:20
+   |
+13 | use super::codes::{DenialCode, ScopeKind};
+   |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+  --> src/ref_store/core/publication_decision/codes.rs:99:1
+   |
+99 | pub(crate) enum DenialCode {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `DenialCode` is private
+  --> src/ref_store/core/publication_decision/metadata.rs:19:68
+   |
+19 |     ConsumptionRecord, DecisionError, DecisionKind, DecisionState, DenialCode, PublicationAction,
+   |                                                                    ^^^^^^^^^^ private enum import
+   |
+note: the enum import `DenialCode` is defined here...
+  --> src/ref_store/core/publication_decision/contract.rs:13:20
+   |
+13 | use super::codes::{DenialCode, ScopeKind};
+   |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+  --> src/ref_store/core/publication_decision/codes.rs:99:1
+   |
+99 | pub(crate) enum DenialCode {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `DenialCode` is private
+  --> src/ref_store/core/publication_decision/metadata_check.rs:6:72
+   |
+ 6 | use super::contract::{ConsumptionRecord, DecisionError, DecisionState, DenialCode};
+   |                                                                        ^^^^^^^^^^ private enum import
+   |
+note: the enum import `DenialCode` is defined here...
+  --> src/ref_store/core/publication_decision/contract.rs:13:20
+   |
+13 | use super::codes::{DenialCode, ScopeKind};
+   |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+  --> src/ref_store/core/publication_decision/codes.rs:99:1
+   |
+99 | pub(crate) enum DenialCode {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `DenialCode` is private
+  --> src/ref_store/core/publication_decision/sql_locks.rs:22:67
+   |
+22 | use super::contract::{DecisionError, DecisionKind, DecisionState, DenialCode, PublicationAction, ScopeKind};
+   |                                                                   ^^^^^^^^^^ private enum import
+   |
+note: the enum import `DenialCode` is defined here...
+  --> src/ref_store/core/publication_decision/contract.rs:13:20
+   |
+13 | use super::codes::{DenialCode, ScopeKind};
+   |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+  --> src/ref_store/core/publication_decision/codes.rs:99:1
+   |
+99 | pub(crate) enum DenialCode {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `ScopeKind` is private
+   --> src/ref_store/core/publication_decision/sql_locks.rs:22:98
+    |
+ 22 | use super::contract::{DecisionError, DecisionKind, DecisionState, DenialCode, PublicationAction, ScopeKind};
+    |                                                                                                  ^^^^^^^^^ private enum import
+    |
+note: the enum import `ScopeKind` is defined here...
+   --> src/ref_store/core/publication_decision/contract.rs:13:32
+    |
+ 13 | use super::codes::{DenialCode, ScopeKind};
+    |                                ^^^^^^^^^
+note: ...and refers to the enum `ScopeKind` which is defined here
+   --> src/ref_store/core/publication_decision/codes.rs:260:1
+    |
+260 | pub(crate) enum ScopeKind {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0603]: enum import `DenialCode` is private
+   --> src/ref_store/core/publication_decision/select.rs:248:61
+    |
+248 |         .map_err(|_| DecisionError::Denied(super::contract::DenialCode::UnsupportedAction))?;
+    |                                                             ^^^^^^^^^^ private enum import
+    |
+note: the enum import `DenialCode` is defined here...
+   --> src/ref_store/core/publication_decision/contract.rs:13:20
+    |
+ 13 | use super::codes::{DenialCode, ScopeKind};
+    |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+   --> src/ref_store/core/publication_decision/codes.rs:99:1
+    |
+ 99 | pub(crate) enum DenialCode {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: consider importing this unit variant instead
+    |
+248 -         .map_err(|_| DecisionError::Denied(super::contract::DenialCode::UnsupportedAction))?;
+248 +         .map_err(|_| DecisionError::Denied(super::codes::DenialCode::UnsupportedAction))?;
+    |
+
+error[E0603]: enum import `DenialCode` is private
+   --> src/ref_store/core/publication_decision/select.rs:250:61
+    |
+250 |         .map_err(|_| DecisionError::Denied(super::contract::DenialCode::UnsupportedAction))?;
+    |                                                             ^^^^^^^^^^ private enum import
+    |
+note: the enum import `DenialCode` is defined here...
+   --> src/ref_store/core/publication_decision/contract.rs:13:20
+    |
+ 13 | use super::codes::{DenialCode, ScopeKind};
+    |                    ^^^^^^^^^^
+note: ...and refers to the enum `DenialCode` which is defined here
+   --> src/ref_store/core/publication_decision/codes.rs:99:1
+    |
+ 99 | pub(crate) enum DenialCode {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+help: consider importing this unit variant instead
+    |
+250 -         .map_err(|_| DecisionError::Denied(super::contract::DenialCode::UnsupportedAction))?;
+250 +         .map_err(|_| DecisionError::Denied(super::codes::DenialCode::UnsupportedAction))?;
+    |
+
+warning: unused imports: `BranchRuleFacts`, `CheckRunFacts`, `LfsLockFacts`, `LfsObjectFacts`, `PullApprovalFacts`, and `PullFacts`
+  --> src/ref_store/core/publication_decision/auth_deps.rs:33:23
+   |
+33 |     read_lfs_objects, BranchRuleFacts, CheckRunFacts, LfsLockFacts, LfsObjectFacts, PullApprovalFacts, PullFacts,
+   |                       ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^  ^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::ref_store::contract::RequestDigest`
+  --> src/ref_store/core/publication_decision/capability.rs:13:5
+   |
+13 | use crate::ref_store::contract::RequestDigest;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ConsumptionRecord`
+  --> src/ref_store/core/publication_decision/metadata.rs:19:5
+   |
+19 |     ConsumptionRecord, DecisionError, DecisionKind, DecisionState, DenialCode, PublicationAction,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `cancel`
+  --> src/ref_store/core/publication_decision/mod.rs:66:25
+   |
+66 | pub(crate) use cancel::{cancel, coordinator_cancel};
+   |                         ^^^^^^
+
+warning: unused import: `capability::DecisionCapability`
+  --> src/ref_store/core/publication_decision/mod.rs:67:16
+   |
+67 | pub(crate) use capability::DecisionCapability;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `reject_decision`
+  --> src/ref_store/core/publication_decision/mod.rs:68:50
+   |
+68 | pub(crate) use consume::{authorized_final_check, reject_decision};
+   |                                                  ^^^^^^^^^^^^^^^
+
+warning: unused imports: `DecisionRecord`, `DecisionState`, `MergeBinding`, `PublicationAction`, and `RefVerdict`
+  --> src/ref_store/core/publication_decision/mod.rs:70:68
+   |
+70 |     CancelOutcome, ConsumptionRecord, DecisionError, DecisionKind, DecisionRecord, DecisionState,
+   |                                                                    ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+71 |     MergeBinding, PublicationAction, RefVerdict, SelectedDecision,
+   |     ^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused imports: `ChangedPath`, `LfsPointer`, `ObjectKind`, `ObservedOid`, and `PublicationFacts`
+  --> src/ref_store/core/publication_decision/mod.rs:73:24
+   |
+73 | pub(crate) use facts::{ChangedPath, LfsPointer, ObjectKind, ObservedOid, PublicationFacts};
+   |                        ^^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+
+warning: unused import: `select_and_install_action`
+  --> src/ref_store/core/publication_decision/mod.rs:74:46
+   |
+74 | pub(crate) use install::{select_and_install, select_and_install_action};
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `finalize_merge` and `lock_merge_target`
+  --> src/ref_store/core/publication_decision/mod.rs:75:24
+   |
+75 | pub(crate) use merge::{finalize_merge, lock_merge_target};
+   |                        ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `MetadataSelectedDecision` and `select_and_install_metadata`
+  --> src/ref_store/core/publication_decision/mod.rs:76:27
+   |
+76 | pub(crate) use metadata::{select_and_install_metadata, MetadataSelectedDecision};
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `metadata_check::authorized_metadata_final_check`
+  --> src/ref_store/core/publication_decision/mod.rs:77:16
+   |
+77 | pub(crate) use metadata_check::authorized_metadata_final_check;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `cancellation`, `lookup`, and `verdicts`
+  --> src/ref_store/core/publication_decision/mod.rs:78:24
+   |
+78 | pub(crate) use query::{cancellation, lookup, verdicts};
+   |                        ^^^^^^^^^^^^  ^^^^^^  ^^^^^^^^
+
+warning: unused imports: `decision_required`, `lock_gate_and_protocol`, `lock_source_tables`, and `lock_usage`
+  --> src/ref_store/core/publication_decision/mod.rs:79:28
+   |
+79 | pub(crate) use sql_locks::{decision_required, lock_gate_and_protocol, lock_source_tables, lock_usage};
+   |                            ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused imports: `PackMembershipEntry` and `refs_digest`
+  --> src/ref_store/core/pack_commit/verifier/publication.rs:34:5
+   |
+34 |     refs_digest, CapturedRef, MembershipDigest, PackCommitBaseline, PackMembershipEntry,
+   |     ^^^^^^^^^^^                                                     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `PackMode` and `VERIFIER_VIEW_MAX_LOGICAL_BYTES`
+  --> src/ref_store/core/pack_commit/verifier/publication.rs:37:68
+   |
+37 |     MAX_ACTIVE_MEMBERSHIPS, MAX_BATCH_NEW_PACKS, PackArtifactRole, PackMode, VERIFIER_MAX_OBJECTS,
+   |                                                                    ^^^^^^^^
+38 |     VERIFIER_MAX_PAIRS, VERIFIER_MAX_TOTAL_BYTES, VERIFIER_VIEW_MAX_LOGICAL_BYTES,
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `GitObjectKind`, `LFS_MAX_OBJECT_BYTES`, `LfsByteLocation`, `LfsByteWitness`, `LfsPointerFact`, `NoDurableLfsBytes`, `PublicationFactsEngine`, and `VerifiedPackIdentity`
+  --> src/ref_store/core/pack_commit/mod.rs:63:5
+   |
+63 |     GitObjectKind, LFS_MAX_OBJECT_BYTES, LfsByteLocation, LfsByteWitness, LfsPointerFact, NoDurableLfsBytes,
+   |     ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+64 |     PublicationFactsEngine, RefFacts, VerifiedPackIdentity, VerifiedPublicationFacts,
+   |     ^^^^^^^^^^^^^^^^^^^^^^            ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::ref_store::core::types::GitObjectFormat`
+  --> src/ref_store/core/retention_root/candidate.rs:17:5
+   |
+17 | use crate::ref_store::core::types::GitObjectFormat;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0616]: field `accepted` of struct `MetadataSelectedDecision` is private
+  --> src/ref_store/core/publication_decision/metadata_check.rs:84:17
+   |
+84 |     if selected.accepted.is_empty() {
+   |                 ^^^^^^^^ private field
+   |
+help: a method `accepted` also exists, call it with parentheses
+   |
+84 |     if selected.accepted().is_empty() {
+   |                         ++
+
+error[E0616]: field `captured` of struct `MetadataSelectedDecision` is private
+  --> src/ref_store/core/publication_decision/metadata_check.rs:88:29
+   |
+88 |     if captured != selected.captured {
+   |                             ^^^^^^^^ private field
+   |
+help: a method `captured` also exists, call it with parentheses
+   |
+88 |     if captured != selected.captured() {
+   |                                     ++
+
+error[E0616]: field `selection_digest` of struct `MetadataSelectedDecision` is private
+   --> src/ref_store/core/publication_decision/metadata_check.rs:102:26
+    |
+102 |     if fresh != selected.selection_digest || row.selection_digest != fresh {
+    |                          ^^^^^^^^^^^^^^^^ private field
+    |
+help: a method `selection_digest` also exists, call it with parentheses
+    |
+102 |     if fresh != selected.selection_digest() || row.selection_digest != fresh {
+    |                                          ++
+
+error[E0277]: the trait bound `[std::string::String]: ToSql` is not satisfied
+    --> src/ref_store/core/publication_decision/policy.rs:220:43
+     |
+ 220 |             &[&repository_id, &tenant_id, head_oids],
+     |                                           ^^^^^^^^^ the trait `ToSql` is not implemented for `[std::string::String]`
+     |
+help: the following other types implement trait `ToSql`
+    --> /workspace/.rootyard-tools/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/postgres-types-0.2.14/src/lib.rs:1001:1
+     |
+1001 | impl<T: ToSql> ToSql for &[T] {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `&[T]`
+...
+1042 | impl ToSql for &[u8] {
+     | ^^^^^^^^^^^^^^^^^^^^ `&[u8]`
+     = note: required for the cast from `&[std::string::String]` to `&dyn ToSql + std::marker::Sync`
+
+error[E0277]: the size for values of type `[std::string::String]` cannot be known at compilation time
+   --> src/ref_store/core/publication_decision/policy.rs:220:43
+    |
+220 |             &[&repository_id, &tenant_id, head_oids],
+    |                                           ^^^^^^^^^ doesn't have a size known at compile-time
+    |
+    = help: the trait `Sized` is not implemented for `[std::string::String]`
+    = note: required for the cast from `&[std::string::String]` to `&dyn ToSql + std::marker::Sync`
+help: consider borrowing the value, since `&&[std::string::String]` can be coerced into `&dyn ToSql + std::marker::Sync`
+    |
+220 |             &[&repository_id, &tenant_id, &head_oids],
+    |                                           +
+
+error[E0599]: no method named `to_bytes` found for struct `uuid::Uuid` in the current scope
+   --> src/ref_store/core/publication_decision/digest.rs:140:68
+    |
+140 |         push_field(&mut fields, check.bound_webhook_id.map(|id| id.to_bytes()).unwrap_or_default());
+    |                                                                    ^^^^^^^^
+    |
+help: there is a method `into_bytes` with a similar name
+    |
+140 |         push_field(&mut fields, check.bound_webhook_id.map(|id| id.into_bytes()).unwrap_or_default());
+    |                                                                    ++
+
+error[E0599]: no method named `to_bytes` found for struct `uuid::Uuid` in the current scope
+   --> src/ref_store/core/publication_decision/digest.rs:141:69
+    |
+141 |         push_field(&mut fields, check.issuer_webhook_id.map(|id| id.to_bytes()).unwrap_or_default());
+    |                                                                     ^^^^^^^^
+    |
+help: there is a method `into_bytes` with a similar name
+    |
+141 |         push_field(&mut fields, check.issuer_webhook_id.map(|id| id.into_bytes()).unwrap_or_default());
+    |                                                                     ++
+
+error[E0599]: no method named `matches_identity` found for reference `&PackCommitPlan` in the current scope
+   --> src/ref_store/core/pack_commit/verifier/publication.rs:244:65
+    |
+244 |         if self.parent_digest != *plan.parent_digest() || !plan.matches_identity(&self.identity) {
+    |                                                                 ^^^^^^^^^^^^^^^^
+    |
+help: there is a method `identity` with a similar name, but with different arguments
+   --> src/ref_store/core/pack_commit/plan.rs:374:5
+    |
+374 |     pub fn identity(&self) -> &OperationIdentity {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Some errors have detailed explanations: E0277, E0425, E0432, E0433, E0599, E0603, E0616.
+For more information about an error, try `rustc --explain E0277`.
+warning: `rootyard` (lib) generated 18 warnings
+error: could not compile `rootyard` (lib) due to 29 previous errors; 18 warnings emitted

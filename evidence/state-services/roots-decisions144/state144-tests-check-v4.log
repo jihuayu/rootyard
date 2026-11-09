@@ -1,0 +1,30 @@
+    Checking rootyard v0.1.0 (/workspace/scratch/state-services-roots-decisions)
+error[E0425]: cannot find function `charge_metadata_terminal` in module `decisions::usage`
+   --> src/ref_store/core/authorized_metadata.rs:157:31
+    |
+157 |             decisions::usage::charge_metadata_terminal(&tx, request.repository_id(), request.tenant_id(), body_bytes, ref_bytes)
+    |                               ^^^^^^^^^^^^^^^^^^^^^^^^ not found in `decisions::usage`
+
+warning: unused imports: `LFS_MAX_OBJECT_BYTES` and `LfsByteLocation`
+  --> src/ref_store/core/pack_commit/facts/mod.rs:19:5
+   |
+19 |     LFS_MAX_OBJECT_BYTES, LfsByteLocation, LfsByteWitness, NoDurableLfsBytes, verify_local_bytes,
+   |     ^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::ref_store::core::types::GitObjectFormat`
+  --> src/ref_store/core/retention_root/capture.rs:17:5
+   |
+17 | use crate::ref_store::core::types::GitObjectFormat;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `uuid::Uuid`
+  --> src/ref_store/core/retention_root/sql_read.rs:11:5
+   |
+11 | use uuid::Uuid;
+   |     ^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0425`.
+warning: `rootyard` (lib) generated 3 warnings
+error: could not compile `rootyard` (lib) due to 1 previous error; 3 warnings emitted

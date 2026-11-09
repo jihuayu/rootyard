@@ -1,0 +1,28 @@
+{
+  "test_inputs": {
+    "tests/ref_store_materialized_reads.rs": "f81fbc97066b5903a88b12de03a67cd3c7695f739fa88a33a32c95e9f07222f8"
+  },
+  "binary_sha256": "19fccecf7b8a324fa5339dedcc4583c9d1065f2bbbfce4a688d9a4a10703d784",
+  "inputs_unchanged": true,
+  "builder_sha256": "6258fea1e831c2aa5d15e336c40df73c7c4064816c497016860c0c9da3bbad49",
+  "command": [
+    "cargo",
+    "--config",
+    "profile.dev.package.rootyard.debug=0",
+    "--config",
+    "profile.test.package.rootyard.debug=0",
+    "--config",
+    "profile.dev.package.rootyard.strip=\"debuginfo\"",
+    "--config",
+    "profile.test.package.rootyard.strip=\"debuginfo\"",
+    "rustc",
+    "--locked",
+    "--profile",
+    "test",
+    "--test",
+    "ref_store_materialized_reads",
+    "--features",
+    "pando-lab",
+    "--message-format=json-render-diagnostics"
+  ]
+}

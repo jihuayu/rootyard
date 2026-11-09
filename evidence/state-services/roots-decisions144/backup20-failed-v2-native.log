@@ -1,0 +1,84 @@
+Traceback (most recent call last):
+  File "/workspace/scratch/trace-state142-backup.py", line 9, in traced
+    try:return fn()
+               ^^^^
+  File "/workspace/scratch/state-services-roots-decisions/tests/backup_refstore_roots_decisions144.py", line 304, in seed_core_fixture
+    self.assert_root_and_decision_scenarios(marker)
+  File "/workspace/scratch/state-services-roots-decisions/tests/backup_refstore_roots_decisions144.py", line 352, in assert_root_and_decision_scenarios
+    assert marker["root_counts"]["tombstones"] == 1
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+
+{
+  "passed": false,
+  "cases": [
+    {
+      "name": "synthetic_source_with_typed_roots_and_decision_ledger",
+      "status": "failed",
+      "seconds": 19.0363,
+      "error": ""
+    }
+  ],
+  "skips": 0,
+  "binary": "/workspace/scratch/state144-app-v2/rootyard",
+  "binary_sha256": "ec09afd7ae6ba23f4e0e0c9d98befe9e8ee11e7bf13c215e74e36f8b8ad00beb",
+  "backup_format": 20,
+  "schema_version": 144,
+  "roots_decisions_fixture_helper": {
+    "binary": "/workspace/scratch/state144-backup-helper-build-v3/ref_store_roots_decisions_backup_fixture",
+    "binary_sha256": "ca256aeef15deff399ad28c871927038785483db45c2774931c19f59901b1118",
+    "build_receipt": "/workspace/scratch/state144-backup-helper-build-v3/ref_store_roots_decisions_backup_fixture.build.json",
+    "build_receipt_sha256": "01575f683c3d14d2b474afda18d33e9b00537147db2b5e18f8ed878a06ad1446",
+    "build_kind": "rust-integration-test",
+    "package_rebuilt": true,
+    "fresh": false,
+    "fresh_false_artifact": {
+      "target": "ref_store_roots_decisions_backup_fixture",
+      "kind": "test",
+      "fresh": false
+    },
+    "test_profile": true,
+    "integration_test_source_sha256": "10f5ab2a91b22a2dbc507841ed292b6963f8ff624f30b0278919c0782a037e41",
+    "integration_test_source_matches_source_file": true,
+    "source_inputs_sha256": "753bfabe4d6c1f4ba793bad38e4997f0b610222e6bcb205de98f6e904cf00b30",
+    "candidate_application_receipt": "/workspace/scratch/state144-app-v2/rootyard.build.json",
+    "candidate_application_sha256": "ec09afd7ae6ba23f4e0e0c9d98befe9e8ee11e7bf13c215e74e36f8b8ad00beb",
+    "candidate_application_package_rebuilt": true,
+    "source_inputs_match_candidate_application": true,
+    "retained_binding_stages": [
+      "seed"
+    ],
+    "binaries_unchanged_after_run": true
+  },
+  "schema144_tables": [
+    "ref_store_core_protocol_repos",
+    "ref_store_core_root_heads",
+    "ref_store_core_root_oids",
+    "ref_store_core_root_packs",
+    "ref_store_core_root_receipts",
+    "ref_store_core_root_refs",
+    "ref_store_core_root_repo_usage",
+    "ref_store_core_root_tenant_usage",
+    "ref_store_core_root_tombstones",
+    "ref_store_core_roots",
+    "ref_store_decision_cancellations",
+    "ref_store_decision_dependencies",
+    "ref_store_decision_refs",
+    "ref_store_decision_repo_usage",
+    "ref_store_decision_scopes",
+    "ref_store_decision_tenant_usage",
+    "ref_store_publication_decisions"
+  ],
+  "limitations": [
+    "The typed A3/A4/A5, root and decision ledger is seeded by the real adapters and the real staged authorized pipeline; no SQL ACK, proof, receipt, registration or decision row is fabricated.",
+    "The inherited migration-139 metadata gate/ref fixture is plain SQL and is never used for the native proof; the drill uses its own typed gate.",
+    "The random roots repository stays provisioning/gitfs/unserved for the whole drill.",
+    "Only the AcceptedSubset decision consumes refs; the Atomic decision is cancelled before commit and the third operation is cancelled before install.",
+    "complete_git_read_snapshot() is false everywhere: this drill claims registered pack membership metadata only, never verified Blob bytes or native Git object closure.",
+    "Blob byte backup is not claimed: the S3 originals are external, re-read read-only and never deleted; only PostgreSQL metadata is restored.",
+    "The read-only restored replay mints no proof, grant or authority and charges no quota.",
+    "Decision rows are represented in the marker/report only by canonical per-table digests, counts and non-secret verdict codes; no credential or token_digest is written anywhere.",
+    "Synthetic loopback drill, no host/disk power-loss or production RPO/RTO promise."
+  ]
+}
