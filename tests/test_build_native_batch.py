@@ -13,7 +13,13 @@ temporary workspace and a fake Cargo JSON event stream, then prove:
   hold, are withdrawn on every failure path, and use the standalone field sets;
 * source changes, stale (Fresh=true) artifacts, duplicate, missing, extra or
   wrong-profile artifacts, bad selection, collisions and passthrough profile
-  environment fail closed.
+  environment fail closed;
+* the bound build inputs (every ``tests/**/*.rs`` helper, the toolchain pin, the
+  in-repo Cargo config and ``build.rs``) are frozen by path and bytes before and
+  after the build and recorded in every receipt and the manifest: an edited,
+  added or removed helper or config, a toolchain edit, a new config or an
+  untracked helper, during the build or before a later run, is refused; the
+  same inputs give the same digest.
 
 The assertions check properties of the produced receipts; they do not restate
 the implementation. The fake event stream uses the same
@@ -73,8 +79,25 @@ tempfile = "3"
 PACKAGE_ID = 'path+file:///ws#rootyard@0.1.0'
 BINS = ('rootyard', 'rootyard-vfs-mount', 'rootyard-pando-lab')
 TESTS = ('ref_store_snapshot_backup_fixture', 'ref_store_holds_backup_fixture')
+HELPER = 'tests/helper/mod.rs'
+UNTRACKED_HELPER = 'tests/helper/untracked.rs'
+CARGO_CONFIG = '.cargo/config.toml'
+# A real in-repo config the batch hashes but never interprets or executes.
+CARGO_CONFIG_TEXT = '[build]\njobs = 4\n[net]\nretry = 2\n'
 COMMON_STRIP = ['--config', 'profile.dev.package.rootyard.strip="debuginfo"',
                 '--config', 'profile.test.package.rootyard.strip="debuginfo"']
+
+
+class _LaunchSteps:
+    """One ``after`` callback per launch of a multi-run scenario."""
+
+    def __init__(self, steps):
+        self.steps, self.index = list(steps), 0
+
+    def next(self):
+        step = self.steps[self.index] if self.index < len(self.steps) else None
+        self.index += 1
+        return step, step
 
 
 class FakeProcess:
@@ -154,6 +177,13 @@ class BatchTest(unittest.TestCase):
             (self.root / 'src' / 'bin' / (name + '.rs')).write_text('fn main() {}\n')
         for name in TESTS:
             (self.root / 'tests' / (name + '.rs')).write_text('#[test]\nfn one() {}\n')
+        # A transitive helper no selected entry lists, an in-repo Cargo config
+        # and a build script: none of them is in the production source digest.
+        (self.root / 'tests' / 'helper').mkdir()
+        (self.root / HELPER).write_text('pub fn helper() {}\n')
+        (self.root / '.cargo').mkdir()
+        (self.root / CARGO_CONFIG).write_text(CARGO_CONFIG_TEXT)
+        (self.root / 'build.rs').write_text('fn main() {}\n')
         self.outdir = Path(os.path.join(self.tempdir, 'test-results'))
         self.target = Path(os.path.join(self.root, 'target')).resolve()
         self.lock_path = self.target / build_native.LOCK_NAME
@@ -168,11 +198,12 @@ class BatchTest(unittest.TestCase):
         for name in batch.PASSTHROUGH_VARIABLES:
             os.environ.pop(name, None)
         mock.patch.object(build_native, 'ROOT', self.root).start()
+        # The production digest is not stubbed (the fixture is a few files):
+        # it runs for real, so the source checks fire on their own path.
         mock.patch.object(batch, 'rustc_version', lambda: 'rustc 1.99.1 (fake)').start()
         mock.patch.object(batch, 'target_triple', lambda: 'x86_64-unknown-linux-gnu').start()
         mock.patch.object(batch, 'git_state', lambda: {'head': 'deadbeef', 'commit': 'c0ffee',
                                                        'tree': 'tree0', 'status': ''}).start()
-        mock.patch.object(batch, 'source_digest', self.digest).start()
         mock.patch.object(batch, 'run_tool', self.fake_probe).start()
         # cargo_metadata itself stays real; only the cargo process it starts is
         # replaced, by a document a real ``cargo metadata`` would print.
@@ -181,14 +212,6 @@ class BatchTest(unittest.TestCase):
         mock.patch.object(batch.subprocess, 'run', self.fake_clean).start()
 
     # -- fake build environment --------------------------------------------
-    def digest(self):
-        import hashlib
-        hasher = hashlib.sha256()
-        for path in sorted((self.root / 'src').rglob('*')):
-            if path.is_file():
-                hasher.update(path.read_bytes())
-        return hasher.hexdigest()
-
     def fake_clean(self, command, **kwargs):
         self.clean_commands.append((list(command), kwargs))
         return mock.Mock(returncode=0)
@@ -263,11 +286,27 @@ class BatchTest(unittest.TestCase):
         self.write_executables(events)
         return lambda command, **kwargs: self.launch(list(command), kwargs, events, returncode, mutate)
 
+    def fake_popen_each(self, events_for, mutate=None):
+        """A fake Cargo for several batches: executables are written per launch.
+
+        A later batch starts with an empty target/, so a stream captured once
+        before the first batch would name executables the second batch never wrote.
+        """
+        def popen(command, **kwargs):
+            events = events_for()
+            self.write_executables(events)
+            return self.launch(list(command), kwargs, events, 0, mutate)
+        return popen
+
     def launch(self, command, kwargs, events, returncode, mutate):
         self.popen_calls.append((list(command), kwargs))
         if not self.clean_commands:
             raise AssertionError('cargo build ran before the single cargo clean')
         self.assert_cargo_holds_lock()
+        if isinstance(mutate, _LaunchSteps):
+            # A sequence of launches: each entry runs when that launch's
+            # stdout is closed, so a later batch sees the previous mutation.
+            index, mutate = mutate.next()
         return FakeProcess([json.dumps(event) + '\n' for event in events], returncode=returncode,
                            after=mutate)
 
@@ -655,7 +694,10 @@ class BatchTest(unittest.TestCase):
         # change nothing this batch compiled.
         self.assert_failure(None, 'integration-test source', mutate=lambda: (
             self.root / 'tests' / (TESTS[1] + '.rs')).write_text('#[test]\nfn x() {}\n'))
-        self.assert_failure(None, 'Cargo.lock changed',
+        # Cargo.lock is part of the production digest too, so one change is
+        # caught by two independent measurements; the production one speaks
+        # first and its message names only what it measured.
+        self.assert_failure(None, 'Source inputs changed during build',
                             mutate=lambda: (self.root / 'Cargo.lock').write_text('version = 4\n'))
         calls = []
 
@@ -751,6 +793,282 @@ path = "src/bin/rootyard-view-lab.rs"
         self.assertEqual([self.popen_calls[0][0][index + 1] for index, token in
                           enumerate(self.popen_calls[0][0]) if token == '--bin'],
                          ['rootyard', 'rootyard-pando-lab', 'rootyard-vfs-mount'])
+
+    # -- bound build inputs -------------------------------------------------
+    def bound_record(self, with_blobs=False):
+        """What every receipt and the manifest carry for the bound inputs."""
+        args = self.args()
+        report = self.build(args=args)
+        receipts = [json.loads((self.target / 'debug' / (name + '.build.json')).read_text())
+                    for name in args.bin]
+        receipts += [json.loads(Path(output + '.build.json').read_text()) for output in args.output]
+        self.assertEqual(receipts[-1]['kind'], 'rust-integration-test')
+        bound, inventory = report['bound_inputs'], report['bound_input_inventory']
+        for receipt in receipts:
+            self.assertEqual(receipt['bound_inputs'], bound)
+            self.assertEqual(receipt['bound_input_inventory'], inventory)
+            self.assertEqual(receipt['batch']['bound_inputs_sha256'], bound['digest'])
+        self.assertEqual(json.loads(Path(args.manifest_out).read_text()), report)
+        if with_blobs:
+            # The raw bytes the recorded inventory was measured from.
+            return report, receipts, batch.bound_input_inventory()[1]
+        return report, receipts
+
+    def entries_of(self, report):
+        return {entry['path']: entry for entry in report['bound_input_inventory']}
+
+    def selected_entries(self):
+        return ['tests/' + name + '.rs' for name in TESTS]
+
+    def write(self, relative, text):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def assert_run_rejected(self, steps, message, args=None):
+        """Run one batch whose launch ``i`` performs ``steps[i]``; it must be refused.
+
+        The batch mutates inputs while it runs, so no receipt or manifest from
+        the previous run may survive it.
+        """
+        args = args or self.args()
+        self.seed_previous_batch(args)
+        with mock.patch.object(batch.subprocess, 'Popen',
+                               self.fake_popen(self.default_events(bins=args.bin, tests=args.test),
+                                               mutate=_LaunchSteps(steps))):
+            with self.assertRaises(batch.BuildError) as caught:
+                batch.run_batch(args)
+        self.assertIn(message, str(caught.exception))
+        self.assert_nothing_published(args)
+        return caught.exception
+
+    def next_run_rejected(self, setup, mutate, message):
+        """A passing batch (``setup()``), ``mutate`` of the worktree, then a refused second run.
+
+        The selected entries and the production digest are asserted unchanged,
+        and git (which skips untracked files) reports an empty status: only the
+        bound inventory can tell that the second run would compile something else.
+        """
+        first = setup()
+        mutate()
+        recorded = {path: entry['sha256'] for path, entry in self.entries_of(first).items()}
+        self.assertEqual(
+            {path: recorded[path] for path in self.selected_entries()},
+            {path: batch.sha256_file(self.root / path) for path in self.selected_entries()})
+        self.assertEqual(batch.source_digest(), first['source_inputs_sha256'])
+        self.assertEqual(batch.git_state()['status'], '')
+        second = self.outdir / 'second.json'
+        receipts = [self.target / 'debug' / (name + '.build.json') for name in BINS]
+        args = self.args(manifest_out=second)
+        receipts += [Path(output + '.build.json') for output in args.output]
+        with mock.patch.object(batch.subprocess, 'Popen',
+                               self.fake_popen_each(self.default_events)):
+            with self.assertRaises(batch.BuildError) as caught:
+                batch.run_batch(args)
+        self.assertIn(message, str(caught.exception))
+        leftovers = [second, *receipts, *(Path(output) for output in args.output)]
+        self.assertEqual([str(path) for path in leftovers if path.exists()], [])
+        # The manifest is not returned to a caller, so the refused run's record
+        # can only be read from the receipt the first batch published: drop it.
+        published = json.loads((self.target / 'debug' / 'rootyard.build.json').read_text())
+        self.assertEqual(published['bound_input_inventory'], first['bound_input_inventory'])
+
+    def test_bound_inputs_include_helpers_toolchain_and_config_inventory(self):
+        report, receipts = self.bound_record()
+        entries = self.entries_of(report)
+        bound = report['bound_inputs']
+        # The selected entries and the transitive helper no entry names.
+        for path in [*self.selected_entries(), 'tests/helper/mod.rs', 'rust-toolchain.toml',
+                     'build.rs', CARGO_CONFIG]:
+            self.assertEqual(entries[path]['present'], True, path)
+            self.assertEqual(entries[path]['sha256'], batch.sha256_file(self.root / path), path)
+        self.assertEqual(entries[HELPER]['role'], 'integration_test_source')
+        self.assertEqual(entries['rust-toolchain.toml']['role'], 'toolchain')
+        self.assertEqual(entries[CARGO_CONFIG]['role'], 'cargo_config')
+        self.assertEqual(entries['build.rs']['role'], 'build_script')
+        # The absent fixed candidates are inventoried too, in one sorted order.
+        paths = [entry['path'] for entry in report['bound_input_inventory']]
+        self.assertEqual(paths, sorted(paths))
+        for path in ('.cargo/config', 'rust-toolchain'):
+            self.assertEqual(entries[path], dict(entries[path], present=False, sha256=None))
+        self.assertEqual(bound['absent'], ['.cargo/config', 'rust-toolchain'])
+        self.assertEqual(bound['absent_count'], 2)
+        self.assertEqual(bound['present_count'], len(paths) - 2)
+        self.assertEqual(bound['by_role'], {'integration_test_source': len(TESTS) + 1,
+                                            'toolchain': 1, 'cargo_config': 1, 'build_script': 1})
+        expected_bytes = sum((self.root / entry['path']).stat().st_size
+                             for entry in report['bound_input_inventory'] if entry['present'])
+        self.assertEqual(bound['total_bytes'], expected_bytes)
+        self.assertEqual(len(bound['digest']), 64)
+        # The production digest keeps its meaning and its value for the existing
+        # consumers; the bound digest is a separate, complete identity.
+        self.assertEqual({receipt['source_inputs_sha256'] for receipt in receipts},
+                         {report['source_inputs_sha256']})
+        self.assertEqual({receipt['cargo_lock_sha256'] for receipt in receipts},
+                         {batch.sha256_file(self.root / 'Cargo.lock')})
+        self.assertNotEqual(bound['digest'], report['source_inputs_sha256'])
+        # Config values are never recorded, only their path and byte hash.
+        recorded = json.dumps({'manifest': report, 'receipt': receipts})
+        self.assertNotIn('jobs = 4', recorded)
+        self.assertNotIn('retry = 2', recorded)
+
+    def test_unchanged_inputs_give_the_same_digest(self):
+        first = self.build(args=self.args())
+        # A rewrite that is restored byte for byte, then a touched timestamp
+        # (mode/mtime are not identity), then a second complete batch.
+        helper = self.root / HELPER
+        helper.write_text('pub fn helper() { /* noise */ }\n')
+        helper.write_text('pub fn helper() {}\n')
+        os.utime(helper, (0, 0))
+        second = self.build(args=self.args())
+        self.assertEqual(second['bound_inputs'], first['bound_inputs'])
+        self.assertEqual(second['bound_input_inventory'], first['bound_input_inventory'])
+        self.assertEqual(second['bound_inputs']['digest'], first['bound_inputs']['digest'])
+
+    def test_helper_change_during_build_is_rejected(self):
+        self.assert_run_rejected([lambda: self.write(HELPER, 'pub fn helper() { /* changed */ }\n')],
+                                 'bound build inputs changed during build: tests/helper/mod.rs (changed)')
+
+    def test_toolchain_and_config_change_during_build_is_rejected(self):
+        pin = self.root / 'rust-toolchain.toml'
+        self.assert_run_rejected(
+            [lambda: self.write('rust-toolchain.toml', '[toolchain]\nchannel = "1.98.0"\n')],
+            'rust-toolchain.toml')
+        # restore the fixture pin for the rest of this test
+        pin.write_text('[toolchain]\nchannel = "1.99.1"\n')
+        self.assert_run_rejected([lambda: self.write(CARGO_CONFIG, CARGO_CONFIG_TEXT + '# changed\n')],
+                                 '.cargo/config.toml (changed)')
+        self.assert_run_rejected([lambda: self.write('build.rs', 'fn main() { } // changed\n')],
+                                 'build.rs (changed)')
+
+    def test_helper_added_or_removed_during_build_is_rejected(self):
+        self.assert_run_rejected(
+            [lambda: self.write(UNTRACKED_HELPER, 'pub fn untracked() {}\n')],
+            'tests/helper/untracked.rs (added)')
+        self.assert_run_rejected([lambda: (self.root / CARGO_CONFIG).unlink()],
+                                 '.cargo/config.toml (changed)')
+
+    def test_input_edited_twice_during_build_is_rejected(self):
+        # The inputs are re-read at more than one check; flipping an input
+        # between checks must not let the last read stand for the build.
+        def flip_twice():
+            self.write(HELPER, 'pub fn helper() { /* 1 */ }\n')
+            self.write(HELPER, 'pub fn helper() { /* 2 */ }\n')
+        self.assert_run_rejected([flip_twice], 'tests/helper/mod.rs (changed)')
+
+    def test_next_run_rejects_helper_changes_with_unchanged_entries(self):
+        self.next_run_rejected(lambda: self.build(args=self.args()),
+                               lambda: self.write(HELPER, 'pub fn helper() { /* changed */ }\n'),
+                               'tests/helper/mod.rs (changed)')
+
+    def test_next_run_rejects_an_added_helper_with_unchanged_entries(self):
+        self.next_run_rejected(lambda: self.build(args=self.args()),
+                               lambda: self.write(UNTRACKED_HELPER, 'pub fn untracked() {}\n'),
+                               'tests/helper/untracked.rs (added)')
+
+    def test_next_run_rejects_a_removed_helper_with_unchanged_entries(self):
+        self.next_run_rejected(lambda: self.build(args=self.args()),
+                               lambda: (self.root / HELPER).unlink(), 'tests/helper/mod.rs (removed)')
+
+    def test_next_run_rejects_a_toolchain_change_with_unchanged_entries(self):
+        # The pin itself is the input: a batch compiled under it is refused
+        # once it moves, before any rustup selection could reuse it.
+        self.next_run_rejected(
+            lambda: self.build(args=self.args()),
+            lambda: self.write('rust-toolchain.toml', '[toolchain]\nchannel = "1.98.0"\n'),
+            'rust-toolchain.toml (changed)')
+
+    def test_next_run_rejects_a_config_change_with_unchanged_entries(self):
+        self.next_run_rejected(lambda: self.build(args=self.args()),
+                               lambda: self.write(CARGO_CONFIG, '[build]\njobs = 8\n'),
+                               '.cargo/config.toml (changed)')
+
+    def test_next_run_rejects_a_removed_config_with_unchanged_entries(self):
+        self.next_run_rejected(lambda: self.build(args=self.args()),
+                               lambda: (self.root / CARGO_CONFIG).unlink(),
+                               '.cargo/config.toml (changed)')
+
+    def test_untracked_helper_is_bound_and_not_reported_by_git(self):
+        # git status (untracked files off) is blind to a new helper; the bound
+        # inventory binds it once it exists, so a later edit is still refused.
+        self.write(UNTRACKED_HELPER, 'pub fn untracked() {}\n')
+        report = self.build(args=self.args())
+        entry = self.entries_of(report)[UNTRACKED_HELPER]
+        self.assertEqual((entry['present'], entry['role']), (True, 'integration_test_source'))
+        self.assertEqual(entry['sha256'], batch.sha256_file(self.root / UNTRACKED_HELPER))
+        self.assertEqual(batch.git_state()['status'], '')
+        self.next_run_rejected(
+            lambda: report, lambda: self.write(UNTRACKED_HELPER, 'pub fn untracked() { /* edited */ }\n'),
+            'tests/helper/untracked.rs (changed)')
+
+    def test_new_cargo_config_with_unchanged_entries_is_refused(self):
+        (self.root / CARGO_CONFIG).unlink()
+        first = self.build(args=self.args())
+        self.assertIn(CARGO_CONFIG, first['bound_inputs']['absent'])
+        self.write(CARGO_CONFIG, '[build]\njobs = 2\n')
+        with mock.patch.object(batch.subprocess, 'Popen', self.fake_popen_each(self.default_events)):
+            with self.assertRaises(batch.BuildError) as caught:
+                batch.run_batch(self.args(manifest_out=self.outdir / 'after-config.json'))
+        self.assertIn('.cargo/config.toml (changed)', str(caught.exception))
+        self.assertFalse((self.outdir / 'after-config.json').exists())
+        # A config added while the build runs is an added input, never a dropped one.
+        (self.root / CARGO_CONFIG).unlink()
+        self.assert_run_rejected([lambda: self.write(CARGO_CONFIG, '[build]\njobs = 2\n')],
+                                 '.cargo/config.toml (changed)')
+        # Once present, the same source set compiles under a different bound digest.
+        report = self.build(args=self.args())
+        self.assertEqual(self.entries_of(report)[CARGO_CONFIG]['present'], True)
+        self.assertNotEqual(report['bound_inputs']['digest'], first['bound_inputs']['digest'])
+
+    def test_config_naming_an_outside_path_is_refused_not_half_recorded(self):
+        for text in ('[build]\nrustflags = ["-C", "target-cpu=native"]\n',
+                     '[target.x86_64-unknown-linux-gnu]\nlinker = "/usr/bin/ld.lld"\n',
+                     '[source.crates-io]\nreplace-with = "vendored"\n' +
+                     '[source.vendored]\ndirectory = "/outside/vendor"\n'):
+            with self.subTest(config=text):
+                self.write(CARGO_CONFIG, text)
+                self.seed_previous_batch()
+                with mock.patch.object(batch.subprocess, 'Popen', self.fake_popen_each(self.default_events)):
+                    with self.assertRaises(batch.BuildError) as caught:
+                        batch.run_batch(self.args())
+                self.assertIn('refuses rather than record a partial input set', str(caught.exception))
+                self.assert_nothing_published()
+        # Only in-repo configuration is bound: a credentials file is not an
+        # input, and no value from it is recorded.
+        self.write('.cargo/credentials.toml', 'token = "secret-token-value"\n')
+        self.write(CARGO_CONFIG, CARGO_CONFIG_TEXT)
+        report = self.build(args=self.args())
+        self.assertNotIn('.cargo/credentials.toml', self.entries_of(report))
+        self.assertNotIn('secret-token-value', json.dumps(report))
+
+    def test_bound_input_copy_cannot_omit_an_entry(self):
+        report, receipts, blobs = self.bound_record(with_blobs=True)
+        inventory = report['bound_input_inventory']
+        receipt = receipts[0]
+        # Each receipt carries the complete inventory and the manifest carries
+        # the same one, so an entry dropped from (or added to) either side is
+        # visible against the other, and the digest is recomputable from it.
+        self.assertEqual(len(receipt['bound_input_inventory']), len(inventory))
+        self.assertIn('tests/helper/mod.rs', {entry['path'] for entry in receipt['bound_input_inventory']})
+        self.assertEqual(batch.bound_inputs_digest(inventory, blobs), receipt['bound_inputs']['digest'])
+        changed = copy.deepcopy(inventory)
+        next(entry for entry in changed if entry['present'])['sha256'] = '0' * 64
+        # The digest is over the bytes, which the inventory only summarises: a
+        # record that lies about those bytes is invisible to it, so compare
+        # against edited bytes instead.
+        changed_blobs = dict(blobs, **{next(entry['path'] for entry in inventory if entry['present']):
+                                       b'edited\n'})
+        self.assertNotEqual(batch.bound_inputs_digest(changed, changed_blobs),
+                            receipt['bound_inputs']['digest'])
+        absent = [entry['path'] for entry in copy.deepcopy(inventory) if not entry['present']]
+        dropped = [entry for entry in inventory if entry['present']]
+        dropped_blobs = {path: raw for path, raw in blobs.items()
+                         if path in {entry['path'] for entry in dropped}}
+        self.assertEqual(batch.bound_inputs_digest(dropped, dropped_blobs),
+                         receipt['bound_inputs']['digest'])
+        self.assertNotEqual({entry['path'] for entry in dropped},
+                            {entry['path'] for entry in inventory})
+        self.assertTrue(absent)
 
     # -- helpers ------------------------------------------------------------
     def test_manifest_parser_reads_features_bins_optional_dependencies(self):

@@ -28,9 +28,23 @@ property of those two transactions but pays for the clean once:
   resolve to ``<canonical target>/debug/<name>``, exactly one selected test
   artifact is reported per ``--test`` with a ``test`` profile, a ``Fresh=false``
   event and an on-disk executable, exactly one successful ``build-finished``
-  event exists, and the source-input digest, ``Cargo.lock``, every selected
-  test source, HEAD and the working-tree state are identical before and after
-  the build;
+  event exists, and the source-input digest, ``Cargo.lock``, every bound input,
+  HEAD and the working-tree state are identical before and after the build;
+* the bound inputs are what an integration test or the toolchain can compile
+  or read beyond the production sources: every ``*.rs`` file under ``tests/``
+  (selected entries, transitive ``mod`` helpers and untracked new helpers
+  alike), ``rust-toolchain``/``rust-toolchain.toml``, the fixed build-affecting
+  ``.cargo/*.toml`` files and the workspace ``build.rs``. Each is recorded by
+  repository-relative path, presence and raw-byte SHA-256, every absent
+  candidate is listed too, and one ``bound_inputs_sha256`` hashes the sorted
+  inventory when it was the same before and after the build. Receipts and the
+  manifest carry that summary and the full inventory, so a missing, added or
+  edited input cannot disappear from a receipt; ``source_inputs_sha256`` keeps
+  its production meaning for the existing receipts. The batch does not parse
+  the Rust module graph: ``tests/**/*.rs`` is taken as a whole. Only in-repo
+  configuration is hashed, by raw bytes and path: its keys are inspected and no
+  value is recorded, and a config whose keys redirect inputs (flags, linker,
+  source replacement or a directory) is refused rather than half-recorded;
 * it copies test executables outside ``CARGO_TARGET_DIR`` (mode 0700) so a
   later ``cargo clean --package rootyard`` cannot delete them, and it never
   moves or rewrites a binary in ``CARGO_TARGET_DIR``;
@@ -693,14 +707,219 @@ def cargo_metadata():
     return {'target_directory': metadata.get('target_directory'), 'package_id': packages[0]['id']}
 
 
+# -- bound build inputs -------------------------------------------------------
+#: The inputs beyond the production ``source_digest()`` that a test build reads
+#: or is configured by: the whole ``tests/**/*.rs`` tree, the toolchain pins, the
+#: fixed in-repo Cargo config files and the workspace ``build.rs``. Each is
+#: bound by repository-relative path and raw bytes, listed (absent ones too) and
+#: frozen before and after the build, so no helper, config or toolchain edit can
+#: hide behind a selected entry that did not itself change.
+#: Roles of the bound inputs, in the order the summary lists them.
+BOUND_ROLES = ('integration_test_source', 'toolchain', 'cargo_config', 'build_script')
+#: Toolchain pin files; both are listed, and whichever exists is bound.
+TOOLCHAIN_PINS = ('rust-toolchain.toml', 'rust-toolchain')
+#: Build-affecting configuration Cargo reads from ``.cargo/`` without a
+#: command-line ``--config``. ``credentials.toml`` is authentication, not part of
+#: what is compiled, and other files in ``.cargo/`` are neither hashed nor refused.
+CARGO_CONFIG_FILES = ('.cargo/config.toml', '.cargo/config')
+#: Cargo config keys that change what is compiled or where inputs come from
+#: (flags, linker, source replacement, the target directory Cargo writes to),
+#: matched case-insensitively as ``<key>``, ``name.<key>`` or
+#: ``<triple>.<key>``. ``runner`` is not one: it only runs a built binary.
+PATH_KEYS = ('rustflags', 'linker', 'target-dir', 'directory', 'local-registry',
+             'registry', 'CARGO_TARGET_DIR')
+PATH_TABLES = ('build', 'target', 'source', 'env')
+TOML_KEY = re.compile(r'\s*(?:"([^"]*)"|([A-Za-z0-9_.\-]+))\s*=(.*)$')
+#: ``[target.<triple>]`` table names come from rustc's ``-vV`` output, which is
+#: JSON-encoded as a config value, so the body of a ``[target.'...'.linker]``
+#: without a separate ``[target.'...']`` segment is unambiguous only in practice;
+#: treating an unknown dotted name as a triple can therefore over- rather than
+#: under-refuse.
+def _relative(path):
+    return Path(path).relative_to(_root()).as_posix()
+
+
+def config_path_keys(raw):
+    """The keys of one Cargo config that redirect inputs (``[table]`` headers, then ``key =``)."""
+    table, keys = None, []
+    for line in raw.decode('utf-8', 'replace').splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if stripped.startswith('[') and stripped.endswith(']'):
+            table = stripped.strip('[]<').strip().strip('"')
+            continue
+        match = TOML_KEY.match(stripped)
+        if not match:
+            continue
+        key = match.group(1) if match.group(1) is not None else match.group(2).strip('"')
+        names = [key] if table is None else table.split('.') + [key]
+        candidates = {key, '.'.join(names[-2:]), '.'.join(names[-3:])}
+        table_names = names[:-1]
+        if len(table_names) >= 2 and table_names[0] in PATH_TABLES:
+            candidates.add(table_names[0] + '.' + table_names[1] + '.' + key)
+        folded = {candidate.lower() for candidate in candidates}
+        for pattern in PATH_KEYS:
+            if pattern.lower() in folded:
+                keys.append(table + '.' + key if table is not None and key != 'CARGO_TARGET_DIR'
+                            else pattern)
+                break
+    return keys
+
+
+def require_in_repository_config(name, raw):
+    """Refuse a bound config that redirects Cargo to inputs or outputs this batch cannot bind."""
+    keys = config_path_keys(raw)
+    if keys:
+        raise BuildError(name + ' sets ' + ', '.join(repr(key) for key in keys) +
+                         ', a value that redirects build inputs; this batch binds in-repository '
+                         'configuration only and refuses rather than record a partial input set')
+
+
+def bound_input_files():
+    """Every in-repository file the batch binds, sorted by path, plus the absent fixed candidates."""
+    present, absent = {}, []
+    for name in TOOLCHAIN_PINS:
+        if (_root() / name).is_file():
+            present[name] = 'toolchain'
+        else:
+            absent.append(name)
+    for name in CARGO_CONFIG_FILES:
+        if (_root() / name).is_file():
+            present[name] = 'cargo_config'
+        else:
+            absent.append(name)
+    if (_root() / 'build.rs').is_file():
+        present['build.rs'] = 'build_script'
+    else:
+        absent.append('build.rs')
+    # Every Rust file under tests/, not only the selected entries: a helper a
+    # selected entry reaches (or a new, still untracked one) is an input too.
+    # The module graph is not parsed; the whole test source tree is bound.
+    tests = _root() / 'tests'
+    if tests.is_dir():
+        for path in tests.rglob('*'):
+            if path.is_file() and path.suffix == '.rs':
+                present[_relative(path)] = 'integration_test_source'
+    return present, sorted(absent)
+
+
+def _read_bound(relative):
+    """Raw bytes of one present bound input, or None when it vanished after being listed."""
+    try:
+        return (_root() / relative).read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def bound_input_inventory():
+    """Path, role, presence and raw-byte SHA-256 of every bound input, in one canonical order.
+
+    The raw bytes are read here once: the inventory of one measurement and the
+    digest taken from it describe the same bytes, not two later reads.
+    """
+    present, absent = bound_input_files()
+    entries, blobs = [], {}
+    for relative in sorted(present):
+        raw = _read_bound(relative)
+        if raw is None:
+            absent.append(relative)
+            continue
+        if present[relative] == 'cargo_config':
+            require_in_repository_config(relative, raw)
+        blobs[relative] = raw
+        entries.append({'path': relative, 'role': present[relative], 'present': True,
+                        'sha256': hashlib.sha256(raw).hexdigest()})
+    for relative in absent:
+        entries.append({'path': relative, 'role': _fixed_role(relative), 'present': False,
+                        'sha256': None})
+    entries.sort(key=lambda entry: entry['path'])
+    return entries, blobs
+
+
+def _fixed_role(relative):
+    if relative in TOOLCHAIN_PINS:
+        return 'toolchain'
+    if relative in CARGO_CONFIG_FILES:
+        return 'cargo_config'
+    return 'build_script'
+
+
+def bound_inputs_digest(entries, blobs):
+    """One digest over the path and raw bytes of every present bound input, in the given order.
+
+    Only "present" entries are folded in, and ``blobs`` must be the bytes the
+    entries' SHA-256 values were taken from; a present entry without them is an
+    error rather than a silently dropped input. Absent candidates are listed in
+    the inventory and the summary, so adding or removing one still changes the
+    inventory; the digest is the bytes identity of what was read.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(entry['path'] for entry in entries if entry['present']):
+        raw = blobs.get(path)
+        if raw is None:
+            raise BuildError('bound input ' + path + ' is present but its bytes were not measured')
+        digest.update(bound_entry_line(path, raw))
+    return digest.hexdigest()
+
+
+def bound_entry_line(path, raw):
+    digest = hashlib.sha256()
+    digest.update(path.encode() + b'\0')
+    digest.update(hashlib.sha256(raw).digest())
+    return digest.digest()
+
+
+def bound_inputs_summary(entries, blobs):
+    present = [entry for entry in entries if entry['present']]
+    by_role = {role: sum(1 for entry in present if entry['role'] == role) for role in BOUND_ROLES}
+    return {'digest_algorithm': 'sha256(concat sha256(path\\0sha256(bytes)) over present inputs, path-sorted)',
+            'digest': bound_inputs_digest(entries, blobs),
+            'present_count': len(present), 'absent_count': len(entries) - len(present),
+            'total_bytes': sum(len(blobs[entry['path']]) for entry in present), 'by_role': by_role,
+            'absent': [entry['path'] for entry in entries if not entry['present']]}
+
+
 def source_snapshot(plan):
     """Every input whose change after the build invalidates the whole batch."""
+    bound_inputs, bound_blobs = bound_input_inventory()
+    production_inputs = source_digest()
     return {
-        'source_inputs': source_digest(),
+        'source_inputs': production_inputs,
         'cargo_lock': sha256_file(_root() / 'Cargo.lock'),
         'tests': {spec['name']: sha256_file(spec['source']) for spec in plan.tests},
+        'bound_inputs': bound_inputs,
+        # The very bytes inventoried above, not a second read: the digest and
+        # any summary derived later must be taken from these, not from disk again.
+        'bound_input_blobs': bound_blobs,
+        'bound_inputs_digest': bound_inputs_digest(bound_inputs, bound_blobs),
         'git': git_state(),
     }
+
+
+def bound_inputs_for_receipts(before, after):
+    """Re-measure the inputs at freeze time and refuse unless they are the pre-build ones.
+
+    The production digest of ``after`` was taken after the build by
+    ``require_unchanged``; the bound inputs are read from disk again here, so an
+    input changed and restored between the build and publication is still hashed
+    anew. Returns the frozen inventory the receipts and manifest record.
+    """
+    measured = after['bound_inputs']
+    old = {entry['path']: entry for entry in before['bound_inputs']}
+    new = {entry['path']: entry for entry in measured}
+    added = sorted(set(new) - set(old))
+    removed = sorted(set(old) - set(new))
+    changed = sorted(path for path in set(old) & set(new) if old[path] != new[path])
+    if added or removed or changed:
+        details = ', '.join([path + ' (added)' for path in added] +
+                            [path + ' (removed)' for path in removed] +
+                            [path + ' (changed)' for path in changed])
+        raise BuildError('bound build inputs changed during build: ' + details +
+                         '; refusing the receipt')
+    if after['bound_inputs_digest'] != before['bound_inputs_digest']:
+        raise BuildError('bound build inputs digest changed during build; refusing the receipt')
+    return measured
 
 
 def require_unchanged(before, after, metadata_before=None, metadata_after=None):
@@ -716,6 +935,20 @@ def require_unchanged(before, after, metadata_before=None, metadata_after=None):
         raise BuildError('HEAD or working-tree state changed during build; refusing the receipt')
     if metadata_after is not None and metadata_before != metadata_after:
         raise BuildError('cargo metadata (package id or target directory) changed during build')
+
+
+def bind_inputs(plan, before):
+    """Freeze the bound inputs at publish time and return the receipt fields for them.
+
+    ``after`` is measured now, after the build and before publication; it must
+    equal the pre-build inventory and digest, and the recorded summary is derived
+    from that same frozen inventory. Every receipt and the manifest record this
+    one frozen value, so neither can omit an input.
+    """
+    after = source_snapshot(plan)
+    entries = bound_inputs_for_receipts(before, after)
+    summary = bound_inputs_summary(entries, after['bound_input_blobs'])
+    return {'bound_inputs': summary, 'bound_input_inventory': entries}
 
 
 def tool_version(command):
@@ -736,7 +969,7 @@ def toolchain_record(selection):
             **selection.as_record(), 'architecture': host_architecture()}
 
 
-def binary_receipt(*, path, digests, toolchain, command, targets, lock_path, timings):
+def binary_receipt(*, path, digests, toolchain, command, targets, lock_path, timings, bound):
     """The ``build_native.py`` receipt fields, bound to this batch's single build."""
     path = Path(path)
     return {
@@ -764,12 +997,18 @@ def binary_receipt(*, path, digests, toolchain, command, targets, lock_path, tim
         'lock_file': str(lock_path),
         'fresh_false_artifacts': targets,
         'duration_seconds': timings,
+        # Additive to the standalone fields: the existing consumers of these
+        # receipts do not verify them, so they are not claimed to be verified
+        # until a consumer gate binds them.
+        'bound_inputs': bound['bound_inputs'],
+        'bound_input_inventory': bound['bound_input_inventory'],
         'batch': {'kind': KIND, 'receipt_version': RECEIPT_VERSION, 'binary': path.name,
-                  'targets': [item['target'] for item in targets]},
+                  'targets': [item['target'] for item in targets],
+                  'bound_inputs_sha256': bound['bound_inputs']['digest']},
     }
 
 
-def test_receipt(*, path, artifact, digests, toolchain, command, targets, lock_path, timings):
+def test_receipt(*, path, artifact, digests, toolchain, command, targets, lock_path, timings, bound):
     """The ``build_native_test.py`` receipt fields for one relocated test executable."""
     path = Path(path)
     return {
@@ -792,8 +1031,11 @@ def test_receipt(*, path, artifact, digests, toolchain, command, targets, lock_p
         'target_dir': str(canonical_target()),
         'lock_file': str(lock_path),
         'duration_seconds': timings,
+        'bound_inputs': bound['bound_inputs'],
+        'bound_input_inventory': bound['bound_input_inventory'],
         'batch': {'kind': KIND, 'receipt_version': RECEIPT_VERSION, 'binary': path.name,
-                  'targets': [item['target'] for item in targets] + [artifact['target']]},
+                  'targets': [item['target'] for item in targets] + [artifact['target']],
+                  'bound_inputs_sha256': bound['bound_inputs']['digest']},
     }
 
 
@@ -855,6 +1097,8 @@ def run_batch(args):
                    'working_tree': {key: before['git'][key] for key in ('tree', 'status')},
                    'test_sources': before['tests']}
         timings = {'clean_seconds': clean_seconds, 'build_seconds': build_seconds}
+        # The one frozen bound-input record of this batch, re-measured now.
+        bound = bind_inputs(plan, before)
         targets = [lib] + bins
         publisher = Publisher()
         artifacts = []
@@ -863,7 +1107,7 @@ def run_batch(args):
         for (spec, path), artifact in zip(bin_receipts, bins):
             publisher.text(path, binary_receipt(path=artifact['executable'], digests=digests,
                                                 toolchain=toolchain, command=command, targets=targets,
-                                                lock_path=lock_path, timings=timings))
+                                                lock_path=lock_path, timings=timings, bound=bound))
             stat = os.stat(artifact['executable'])
             artifacts.append({'kind': 'bin', 'target': spec['name'], 'artifact': artifact['executable'],
                               'receipt': str(path), 'fresh': False,
@@ -891,7 +1135,7 @@ def run_batch(args):
             staged = Path(artifact['output']).with_name('.' + Path(artifact['output']).name + '.batch-new')
             publisher.text(path, test_receipt(path=staged, artifact=artifact, digests=digests,
                                               toolchain=toolchain, command=command, targets=targets,
-                                              lock_path=lock_path, timings=timings))
+                                              lock_path=lock_path, timings=timings, bound=bound))
         manifest = {
             'kind': KIND,
             'manifest_version': RECEIPT_VERSION,
@@ -900,6 +1144,8 @@ def run_batch(args):
             'source_inputs_sha256': digests['source_inputs'],
             'working_tree': digests['working_tree'],
             'cargo_lock_sha256': digests['cargo_lock'],
+            'bound_inputs': bound['bound_inputs'],
+            'bound_input_inventory': bound['bound_input_inventory'],
             'toolchain': toolchain,
             'features': selection.as_record(),
             'architecture': toolchain['architecture'],
@@ -928,6 +1174,9 @@ def run_batch(args):
             if receipt['binary_sha256'] != entry['sha256']:
                 raise BuildError('staged ' + entry['target'] + ' copy does not match its receipt')
         require_unchanged(before, source_snapshot(plan))
+        if bound_inputs_for_receipts(before, source_snapshot(plan)) != \
+                bound['bound_input_inventory']:
+            raise BuildError('bound build inputs changed after their inventory was frozen')
         # The batch manifest is the last renamed payload: its presence is the
         # commit marker that every receipt of this transaction is in place.
         publisher.text(plan.manifest_out, manifest)
