@@ -71,7 +71,7 @@ impl Http {
     /// serving it on a loopback ephemeral port.
     pub async fn open(db: &Db, git: &Path, data_dir: &Path) -> Result<Self> {
         let mut database: tokio_postgres::Config = db.database_url().parse()?;
-        database.options(&format!(
+        database.options(format!(
             "-c search_path={} -c timezone=UTC -c statement_timeout=30000 -c lock_timeout=15000",
             db.schema()
         ));
