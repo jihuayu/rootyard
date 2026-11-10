@@ -58,6 +58,12 @@ def refusal_body(context, message, code, follow=""):
             + follow + f"exit {code}\n")
 
 
+def single_cause_body(context, message, code, follow=""):
+    """anyhow's standard single-cause form: the cause carries no `0:` index."""
+    return (f"printf 'Error: {quote(context)}\\nCaused by:\\n    {quote(message)}\\n' >&2\n"
+            + follow + f"exit {code}\n")
+
+
 class ProbeTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -74,22 +80,88 @@ class ProbeTest(unittest.TestCase):
         return write_executable(self.root / ("stand-in-" + str(self.counter)), body)
 
     def test_exact_refusal_per_mode_is_the_only_pass(self):
-        # Real stderr shape: an anyhow block with an indented numeric cause.
-        for mode, expected, other in (("external", EXTERNAL, AUTO), ("auto", AUTO, EXTERNAL)):
-            script = self.stand_in(
-                refusal_body(FAILURE, expected, 1, refusal_body(FAILURE, other, 1).replace("exit 1\n", ""))
-                + "echo \"secret is $ROOTYARD_BLOB_SECRET_ACCESS_KEY in $DATABASE_URL\" >&1\nexit 1\n")
-            outcome = run_probe(script, mode, root=self.owned)
-            self.assertEqual(outcome["status"], "refused", outcome)
-            self.assertEqual(outcome.get("exit"), 1, outcome)
-            self.assertTrue(outcome["reaped"])
-            # Only fixed facts are kept: no raw cause, key or DSN.
-            self.assertEqual(outcome["diagnostics"], [
-                "startup refusal context (" + FAILURE + ")", "barrier message"])
-            text = repr(outcome)
-            for leaked in SECRETS:
-                self.assertNotIn(leaked, text)
+        # Both standard anyhow shapes of the real stderr: the product wraps the
+        # barrier message in one context and anyhow prints one single cause.
+        for shape in (single_cause_body, refusal_body):
+            for mode, expected in (("external", EXTERNAL), ("auto", AUTO)):
+                script = self.stand_in(
+                    shape(FAILURE, expected, 1)
+                    + "echo \"secret is $ROOTYARD_BLOB_SECRET_ACCESS_KEY in $DATABASE_URL\" >&1\nexit 1\n")
+                outcome = run_probe(script, mode, root=self.owned)
+                name = shape.__name__ + "/" + mode
+                self.assertEqual(outcome["status"], "refused", name + ": " + probe.describe(outcome))
+                self.assertEqual(outcome.get("exit"), 1, outcome)
+                self.assertTrue(outcome["reaped"])
+                # Only fixed facts are kept: no raw cause, key or DSN.
+                self.assertEqual(outcome["diagnostics"], [
+                    "startup refusal context (" + FAILURE + ")", "barrier message"], name)
+                text = repr(outcome)
+                for leaked in SECRETS:
+                    self.assertNotIn(leaked, text)
         self.assertTrue(self.owned.is_dir())
+
+    def test_single_cause_form_needs_the_context_and_the_mode(self):
+        # The unnumbered message is only the refusal inside its own adjacent
+        # startup block and for the mode it belongs to.
+        cases = {
+            "wrong-mode-single-cause": single_cause_body(FAILURE, AUTO, 1),
+            "bare-message-without-context": f"printf '    {quote(EXTERNAL)}\\n' >&2; exit 1\n",
+            "bare-numbered-without-context": f"printf '    0: {quote(EXTERNAL)}\\n' >&2; exit 1\n",
+            "context-without-caused-by": f"printf 'Error: {quote(FAILURE)}\\n    {quote(EXTERNAL)}\\n' >&2; exit 1\n",
+            "message-separated-by-blank-line": (
+                f"printf 'Error: {quote(FAILURE)}\\nCaused by:\\n\\n    {quote(EXTERNAL)}\\n' >&2; exit 1\n"),
+            "message-before-context": (
+                f"printf '    {quote(EXTERNAL)}\\nError: {quote(FAILURE)}\\nCaused by:\\n"
+                f"    unrelated cause\\n' >&2; exit 1\n"),
+            "arbitrary-nonzero-with-single-cause": single_cause_body("invalid Blob profile", EXTERNAL, 1),
+            "single-cause-then-zero": single_cause_body(FAILURE, EXTERNAL, 0),
+        }
+        for name, body in cases.items():
+            outcome = run_probe(self.stand_in(body), "external", root=self.owned)
+            self.assertEqual(outcome["status"], "unknown", name + ": " + probe.describe(outcome))
+            self.assertTrue(outcome["reaped"])
+
+    def test_numbered_multi_cause_block_keeps_each_cause(self):
+        log = self.root / "numbered"
+        log.write_text(
+            "Error: " + FAILURE + "\n"
+            "Caused by:\n"
+            "    0: lifecycle barrier: " + EXTERNAL + "\n"
+            "    1: " + AUTO + "\n")
+        self.assertFalse(probe._exact_refusal(log, SECRETS, "external"), "two causes are not one fixed message")
+        self.assertFalse(probe._exact_refusal(log, SECRETS, "auto"))
+        self.assertEqual(probe.own_lines(log, SECRETS), [
+            "startup refusal context (" + FAILURE + ")",
+            "cause lifecycle barrier",
+            "barrier message"])
+
+    def test_numbered_causes_with_extra_arbitrary_entries_are_not_the_refusal(self):
+        for extra in ("lifecycle barrier failed at " + DSN, "invalid Blob profile"):
+            for position in ("before", "after"):
+                numbered = ([extra, EXTERNAL] if position == "before" else [EXTERNAL, extra])
+                log = self.root / ("numbered-" + position + "-" + str(len(extra)))
+                log.write_text("Error: " + FAILURE + "\nCaused by:\n"
+                               + "".join(f"    {index}: {text}\n" for index, text in enumerate(numbered)))
+                self.assertFalse(probe._exact_refusal(log, SECRETS, "external"), position)
+                self.assertIn("barrier message", probe.own_lines(log, SECRETS))
+                self.assertNotIn(extra, repr(probe.own_lines(log, SECRETS)))
+        single = self.root / "single-with-extra"
+        single.write_text("Error: " + FAILURE + "\nCaused by:\n    " + EXTERNAL + "\n    extra cause\n")
+        self.assertFalse(probe._exact_refusal(single, SECRETS, "external"), "single form has one cause")
+
+    def test_single_cause_diagnostics_stay_fixed_vocabulary(self):
+        # The real shape: context + one unnumbered cause. A barrier cause is a
+        # fixed label; any other cause keeps only its product category.
+        refused = self.root / "single-barrier"
+        refused.write_text("Error: " + FAILURE + "\nCaused by:\n    " + EXTERNAL + "\n")
+        self.assertEqual(probe.own_lines(refused, SECRETS),
+                         ["startup refusal context (" + FAILURE + ")", "barrier message"])
+        other = self.root / "single-other"
+        other.write_text("Error: " + FAILURE + "\nCaused by:\n    lifecycle barrier failed at " + DSN + "\n")
+        diagnostics = probe.own_lines(other, SECRETS)
+        self.assertEqual(diagnostics, ["startup refusal context (" + FAILURE + ")", "cause lifecycle barrier"])
+        for leaked in SECRETS:
+            self.assertNotIn(leaked, repr(diagnostics))
 
     def test_any_other_exit_is_unknown_never_a_refusal(self):
         cases = {

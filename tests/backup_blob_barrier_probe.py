@@ -9,7 +9,11 @@ it actually did; it never treats "the probe did not finish" as a pass:
 * ``refused``  - the child exited with the exact lifecycle barrier message the
   current source emits for that mode (``src/backup/lifetime.rs``): ``external``
   takes the shared serving barrier, ``auto`` takes the exclusive backup barrier
-  during migration first.
+  during migration first. The source wraps that message in one anyhow context,
+  so the accepted stderr is either anyhow's single-cause form
+  (``Caused by:`` then one unnumbered ``    message``) or its multi-cause form
+  (``    0: message``, ...), only as the causes of that startup-failure block
+  and only when they are exactly that message.
 * ``unknown``  - everything else, including a child still alive when a short
   observation window ends. Fail-closed; never called a pass.
 
@@ -51,6 +55,8 @@ _SENSITIVE = re.compile(
     r"|\b(password|passwd|secret|token)\s*[=:]\s*\S+")
 _ERROR = re.compile(r"^Error: (.*)$")
 _CAUSE = re.compile(r"^ {4}\d+: (.*)$")
+# anyhow's standard single-cause form under `Caused by:` carries no `N:` index.
+_SINGLE_CAUSE = re.compile(r"^ {4}(\S.*)$")
 _DEPENDENCY_PANIC = re.compile(r"^thread '[^']*' ?\(\d+\)? panicked at .*/(rdkafka|fuser|tokio|tokio-postgres|opendal)[^:]*/")
 _PANIC = re.compile(r"^(thread '|note: )")
 _TOML = re.compile(r'^\w+\s*=\s*"[^"]*"\s*(#.*)?$')
@@ -82,26 +88,33 @@ def own_lines(path, secrets=(), limit=16):
         lines = Path(path).read_bytes().decode("utf-8", "replace").splitlines()
     except FileNotFoundError:
         return []
-    kept, panic = [], False
+    kept, panic, causes = [], False, False  # causes: False, or "first"/"more" in a startup block
     for raw in lines:
         line = raw.rstrip()
         log = _RUST_LOG.match(line)
         if log:
             line = log.group(1)
-        if _PANIC.match(line) or _DEPENDENCY_PANIC.match(line):
-            panic = True
+        if (match := _ERROR.match(line)):
+            causes = match.group(1) == STARTUP_FAILURE
+            kept.extend(["startup refusal context (" + STARTUP_FAILURE + ")"] if causes
+                        else _facts(match.group(1), secrets))
+        elif _PANIC.match(line) or _DEPENDENCY_PANIC.match(line):
+            panic, causes = True, False
             if _DEPENDENCY_PANIC.match(line):
                 kept.append("cause dependency panic")
         elif not line.strip():
-            panic = False
+            panic = causes = False
         elif panic:
             continue
         elif _TOML.match(line):
             continue  # a profile echoed straight into the log carries its keys
-        elif match := _ERROR.match(line):
-            kept.extend(["startup refusal context (" + STARTUP_FAILURE + ")"] if match.group(1) == STARTUP_FAILURE
-                        else _facts(match.group(1), secrets))
-        elif match := _CAUSE.match(line):
+        # A cause line is kept as fixed vocabulary only inside a startup block:
+        # numbered causes for the multi-cause form, and the single-cause form's
+        # unnumbered line only directly after `Caused by:`.
+        elif line.rstrip() == "Caused by:" and causes:
+            causes = "first"
+        elif causes and (match := (_CAUSE.match(line) or (_SINGLE_CAUSE.match(line) if causes == "first" else None))):
+            causes = causes if causes == "first" else "more"
             kept.extend(["barrier message"] if match.group(1) in BARRIER_REFUSALS.values()
                         else _facts(match.group(1), secrets))
         else:
@@ -124,10 +137,35 @@ def _exact_refusal(path, secrets, mode):
     for index, line in enumerate(lines):
         if line.rstrip() != context:
             continue
-        causes = [scrub(match.group(1), secrets) for match in map(_CAUSE.match, lines[index + 1:index + 8]) if match]
-        if causes[:1] == [BARRIER_REFUSALS[mode]]:
+        # Only the adjacent `Caused by:` block counts; a message anywhere else
+        # (before the context, or past a blank line) is not this refusal. Its
+        # own causes carry exactly this mode's fixed message and nothing else:
+        # an arbitrary surrounding cause, numbered or not, fails the match.
+        causes = [scrub(group, secrets) for group in _cause_messages(lines[index + 1:index + 8])]
+        if causes and all(cause == BARRIER_REFUSALS[mode] for cause in causes):
             return True
     return False
+
+
+_MESSAGE = re.compile(r"^ {4}([^:\s].*)$")
+
+
+def _cause_messages(block):
+    """Cause messages of one anyhow block, in either standard form only.
+
+    The block is ``Caused by:`` followed by the numbered ``    N: message``
+    lines, or by exactly one unnumbered ``    message``. Anything else is not a
+    standard form and yields nothing.
+    """
+    if not block or block[0].rstrip() != "Caused by:":
+        return []
+    body = block[1:]
+    numbered = [match.group(1) for match in map(_CAUSE.match, body) if match]
+    if numbered:
+        return numbered
+    if len(body) == 1 and (match := _MESSAGE.match(body[0])):
+        return [match.group(1)]
+    return []
 
 
 def loopback_bind():
