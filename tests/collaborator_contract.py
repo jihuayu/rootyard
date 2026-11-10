@@ -202,7 +202,6 @@ class prerequisite:
             "current src/Cargo/migrations/schema/vendor inputs differ from the binary's build")
         checkout_env = dict(self.env, GIT_OPTIONAL_LOCKS="0")
         head, checkout_env, discovered_via = self.checkout_head(root, checkout_env)
-        head = head_proc.stdout.decode().strip()
         tracked = self.git("status", "--porcelain", "--untracked-files=no", cwd=root,
                            env=checkout_env).stdout
         assert not tracked.strip(), "tracked inputs are dirty: console builds embed differing debug paths"

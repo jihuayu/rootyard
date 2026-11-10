@@ -150,6 +150,41 @@ class HarnessContract(unittest.TestCase):
         self.assertEqual({method.__name__ for _, method in steps}, set(CASE_METHODS),
                          "every case method must be registered exactly once")
 
+    def test_method_locals_never_reference_undefined_names(self):
+        """Catch stale locals (like ``head_proc``) that compile but are never bound."""
+        import builtins
+        for path in HarnessModules.paths():
+            tree = ast.parse(path.read_text())
+            module_names = set()
+            for node in tree.body:
+                for item in ast.walk(node) if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)) else [node]:
+                    if isinstance(item, (ast.Import, ast.ImportFrom)):
+                        module_names |= {(alias.asname or alias.name).split(".")[0] for alias in item.names}
+                    elif isinstance(item, (ast.FunctionDef, ast.ClassDef)):
+                        module_names.add(item.name)
+                    elif isinstance(item, ast.Assign):
+                        module_names |= {target.id for target in item.targets
+                                         if isinstance(target, ast.Name)}
+            for fn in [node for node in ast.walk(tree)
+                       if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+                bound = {arg.arg for arg in fn.args.args + fn.args.kwonlyargs}
+                bound |= {node.id for node in ast.walk(fn) if isinstance(node, ast.Name)
+                          and isinstance(node.ctx, (ast.Store, ast.Del))}
+                for node in ast.walk(fn):
+                    if isinstance(node, (ast.Import, ast.ImportFrom)):
+                        bound |= {(alias.asname or alias.name).split(".")[0] for alias in node.names}
+                    elif isinstance(node, ast.ExceptHandler) and node.name:
+                        bound.add(node.name)
+                called = {id(node.func) for node in ast.walk(fn)
+                          if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+                loaded = {node.id for node in ast.walk(fn) if isinstance(node, ast.Name)
+                          and isinstance(node.ctx, ast.Load) and id(node) not in called}
+                undefined = sorted(name for name in loaded - bound - module_names
+                                   if not hasattr(builtins, name)
+                                   and not (name.startswith("__") and name.endswith("__")))
+                self.assertEqual(undefined, [],
+                                 f"{path.name}:{fn.lineno} {fn.name} references undefined names")
+
     def test_checkout_head_prefers_discovery_and_refuses_dubious_success(self):
         import subprocess
         import tempfile
