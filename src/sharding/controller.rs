@@ -190,6 +190,13 @@ async fn promote(state: &AppState, node_id: &str, candidate: &Candidate,
     local_fence::retire_volume_repository(
         &candidate.old_node, candidate.repo_id, &retired_source,
     ).map_err(|error| anyhow::anyhow!("retired source marker is not durable: {error:#}"))?;
+    faults::hit(
+        &state.storage.root,
+        "takeover-after-source-marker",
+        serde_json::json!({"repository_id": candidate.repo_id,
+                          "operation_id": candidate.operation_id,
+                          "old_node": candidate.old_node}),
+    );
     tx.execute("UPDATE shard_replication_operations SET state='completed',updated_at=clock_timestamp() WHERE id=$1 AND state='verified'",
         &[&candidate.operation_id]).await?;
     tx.execute(

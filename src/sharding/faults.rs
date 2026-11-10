@@ -31,6 +31,7 @@ const PHASES: &[&str] = &[
     "recover-before-reconcile",
     "takeover-after-source-verify",
     "takeover-before-promote",
+    "takeover-after-source-marker",
 ];
 
 fn marker_directory(root: &Path) -> Result<PathBuf, std::io::Error> {

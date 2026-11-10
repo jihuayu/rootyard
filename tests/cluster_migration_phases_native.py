@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
-"""Genuine SIGKILL/restart acceptance for the five residual migration phases.
+"""Genuine SIGKILL/restart acceptance for the six residual migration phases.
+
+The six fault boundaries covered are three migration-phase crashes
+(`copy-before-transfer`, `copy-after-transfer`, `target-delta-before-verified`)
+and three takeover-phase crashes (`takeover-after-source-verify`,
+`takeover-before-promote`, `takeover-after-source-marker`).
 
 This harness owns a disposable PostgreSQL database and its own temporary Git
 volumes. Each case drives the public migration or takeover flow, uses the
 opt-in native fault hook to SIGKILL a real Rust process at one exact durable
-boundary, inspects durable operation state, then resumes the same operation
-through the public API after restart. No SQL route/replica readiness is forged
-and hook registration alone is never treated as coverage.
+boundary, inspects durable operation state (including the still-running
+target's public shard-fence status, sampled while the target process is paused
+at the pre-commit fault boundary and before SIGKILL), then recovers. Migration
+cases retry the same operation through the public migration API after restart;
+takeover cases do not call a public resume API, but restart the target
+controller and verify its automatic retry/reconciliation promotes the node. Both
+then accept one fresh Git push through the recovered primary. No SQL
+route/replica readiness is forged and hook registration alone is never treated
+as coverage.
 """
 import argparse
 import base64
@@ -237,6 +248,49 @@ def assert_retained(h, bare, job, oid):
 def migrate_http(h, name, body):
     return h.http("/api/repos/alice/" + name + "/shard-migrate", token=h.alice,
                   method="POST", body=body)
+
+
+def wait_bounded_admission(url, h, name, deadline_seconds=20, interval=.1):
+    deadline = time.monotonic() + deadline_seconds
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            status, raw = request(url, "/api/repos/alice/" + name + "/shard-fence", h.alice)
+        except (OSError, urllib.error.URLError) as error:
+            last = {"status": "unreachable", "error": h.redact(repr(error))}
+        else:
+            if status == 200:
+                try:
+                    last = json.loads(raw)
+                except ValueError:
+                    last = {"status": status,
+                            "body": h.redact(raw[:200].decode(errors="replace"))}
+                else:
+                    # Only the real target status may end the wait; a pending
+                    # marker transition keeps write_admitted false, so it can
+                    # never be mistaken for recovery.
+                    if last.get("write_admitted") is True:
+                        return last
+            else:
+                last = {"status": status, "body": h.redact(raw[:200].decode(errors="replace"))}
+        time.sleep(interval)
+    summary = {}
+    if isinstance(last, dict):
+        if "status" not in last:
+            summary["status"] = 200
+        for key in ("status", "error", "body", "write_admitted", "primary_node_id",
+                    "route_epoch", "fenced_epoch", "storage_generation",
+                    "draining", "read_only_degraded"):
+            if key in last:
+                summary[key] = last[key]
+        marker = last.get("volume_marker")
+        if isinstance(marker, dict):
+            summary["volume_marker"] = {key: marker.get(key) for key in
+                                        ("primary_node_id", "route_epoch",
+                                         "storage_generation", "read_only_degraded")}
+    raise AssertionError("target " + name + " did not admit writes within "
+                         + str(deadline_seconds) + "s after recovery; last="
+                         + h.redact(json.dumps(summary)))
 
 
 def redacted_tails(h):
@@ -568,6 +622,21 @@ def takeover_case(args, phase):
                                           FAULT_PAUSE: "8000"})
         marker = wait_marker_alive(node1_data, phase, target, timeout=40)
         assert_marker_binding(marker, phase, h.repo["id"], op, target.pid)
+        if phase == "takeover-after-source-marker":
+            assert marker["detail"].get("old_node") == SYSTEM, \
+                ("fault marker belongs to another old node", marker["detail"])
+        # The target process is still paused inside the fault hook at the exact
+        # pre-commit takeover boundary, so only it can answer this query. The
+        # status sampled here is therefore the pre-commit boundary status. The
+        # write barrier is evaluated from durable route/generation state (it does
+        # not block on the paused hook's in-flight transaction), so it is the
+        # boundary view even if the paused thread has not fsynced its sidecar.
+        fence_status, fence_raw = request(target_url, "/api/repos/alice/demo/shard-fence", h.alice)
+        assert fence_status == 200, (fence_status, fence_raw[:300])
+        fence = json.loads(fence_raw)
+        assert fence["write_admitted"] is False, \
+            ("target admitted writes at the pre-commit boundary", fence)
+        assert fence["primary_node_id"] == SYSTEM, fence
         killed_rc = None
         target_pid = target.pid
         os.killpg(target.pid, signal.SIGKILL)
@@ -576,9 +645,16 @@ def takeover_case(args, phase):
         killed_rc = target.returncode
         tlog.close()
         blocked = (fence_dir / (SYSTEM + ".blocked")).is_file()
-        after = {"route": sql_route(h, h.repo["id"]),
+        pending_rows = int(h.sql("SELECT COUNT(*) FROM shard_marker_transitions WHERE repository_id='"
+                                 + h.repo["id"] + "' AND state='pending'"))
+        after = {"target_fence_status_at_pre_commit_boundary": {
+                     "write_admitted": fence["write_admitted"],
+                     "primary_node_id": fence["primary_node_id"],
+                     "route_epoch": fence["route_epoch"]},
+                 "route": sql_route(h, h.repo["id"]),
                  "operation_state": sql_op(h, op),
                  "promotion_rows": failover_count(h, h.repo["id"]),
+                 "pending_marker_transition_rows": pending_rows,
                  "old_process_alive": h.proc.poll() is None,
                  "blocked_marker_present": blocked,
                  "source_volume_marker_present": (h.bare / "rootyard-shard-fence.json").exists()}
@@ -587,11 +663,32 @@ def takeover_case(args, phase):
         assert after["route"]["draining"] is False, after
         assert after["operation_state"] == "verified", after
         assert after["promotion_rows"] == 0, "killed controller recorded a promotion"
-        assert after["source_volume_marker_present"] is False
-        if phase == "takeover-after-source-verify":
+        assert after["pending_marker_transition_rows"] == 0, \
+            "killed controller left a pending marker transition before commit"
+        if phase == "takeover-after-source-marker":
+            # The retired source marker was fsynced and verified inside the
+            # promotion transaction, which was then killed before commit.
+            # Read it from the durable old volume, never from process memory.
+            assert after["source_volume_marker_present"] is True, \
+                "durable source volume marker was not published before the kill"
+            retired = json.loads((h.bare / "rootyard-shard-fence.json").read_text())
+            after["source_volume_marker"] = {"primary_node_id": retired["primary_node_id"],
+                                             "route_epoch": retired["route_epoch"],
+                                             "read_only_degraded": retired["read_only_degraded"],
+                                             "fenced_node_id": retired.get("fenced_node_id")}
+            assert retired["read_only_degraded"] is True, "durable source marker is not read-only"
+            assert retired["primary_node_id"] == SYSTEM, retired
+            assert retired["route_epoch"] == route0["route_epoch"] + 1, retired
+            assert retired.get("fenced_node_id") == SYSTEM, retired
+            h.proc.wait(timeout=20)
+            assert h.proc.returncode == -signal.SIGKILL, "old source survived the physical fence"
+            assert after["blocked_marker_present"] is True, "physical fence .blocked marker missing"
+        elif phase == "takeover-after-source-verify":
+            assert after["source_volume_marker_present"] is False
             assert after["old_process_alive"] is True, "old process died before physical fence"
             assert after["blocked_marker_present"] is False
         else:
+            assert after["source_volume_marker_present"] is False
             h.proc.wait(timeout=20)
             assert h.proc.returncode == -signal.SIGKILL, "old source was not killed before promote"
             assert after["blocked_marker_present"] is True
@@ -614,6 +711,40 @@ def takeover_case(args, phase):
         assert marker_data["primary_node_id"] == SYSTEM
         assert marker_data["route_epoch"] == promoted["route_epoch"]
         assert (fence_dir / (SYSTEM + ".blocked")).is_file()
+        # The old-volume marker above is the intentionally read-only retired
+        # marker; it is not claimed to match the new target route byte for byte.
+        post = {}
+        if phase == "takeover-after-source-marker":
+            # wait_route_primary can see the committed route before the target
+            # controller finishes reconcile_pending, so wait (bounded) for the
+            # real status endpoint to admit writes before checking markers.
+            fence = wait_bounded_admission(target_url, h, "demo", deadline_seconds=20)
+            post["target_fence_status_after_recovery"] = {
+                "write_admitted": fence["write_admitted"],
+                "primary_node_id": fence["primary_node_id"],
+                "route_epoch": fence["route_epoch"]}
+            assert fence["primary_node_id"] == TARGET, fence
+            assert fence["route_epoch"] == promoted["route_epoch"], fence
+            target_gen = generation(h, h.repo["id"])
+            target_marker = json.loads((dest / "rootyard-shard-fence.json").read_text())
+            post["target_marker_matches_committed_route"] = (
+                target_marker["repository_id"] == h.repo["id"]
+                and target_marker["primary_node_id"] == TARGET
+                and target_marker["route_epoch"] == promoted["route_epoch"]
+                and target_marker["storage_generation"] == target_gen
+                and target_marker["read_only_degraded"] is False
+                and target_marker["fenced_epoch"] == promoted["fenced_epoch"])
+            assert post["target_marker_matches_committed_route"], \
+                ("target volume marker differs from committed route", target_marker, promoted)
+            post["pending_marker_transition_rows"] = int(h.sql(
+                "SELECT COUNT(*) FROM shard_marker_transitions WHERE repository_id='"
+                + h.repo["id"] + "' AND state='pending'"))
+            post["complete_marker_transition_rows"] = int(h.sql(
+                "SELECT COUNT(*) FROM shard_marker_transitions WHERE repository_id='"
+                + h.repo["id"] + "' AND state='complete'"))
+            assert post["pending_marker_transition_rows"] == 0, post
+            assert post["complete_marker_transition_rows"] == 1, \
+                ("expected one reconciled marker transition", post)
         rejected = h.run([args.binary, "serve"], check=False)
         assert rejected.returncode != 0, "old writer restarted after durable fence"
         assert (b"durable physical fence" in rejected.stderr
@@ -643,6 +774,7 @@ def takeover_case(args, phase):
                   "target_fsck": "passed",
                   "retained_ci_backup_snapshot_roots": True,
                   "old_source_volume_unchanged_after_new_push": True}
+        result.update(post)
         kill_child(target, tlog)
         target, tlog = None, None
         h.cleanup()
@@ -698,6 +830,7 @@ def main():
         migration_harness.cleanup()
         records.append(takeover_case(args, "takeover-after-source-verify"))
         records.append(takeover_case(args, "takeover-before-promote"))
+        records.append(takeover_case(args, "takeover-after-source-marker"))
         binary = Path(args.binary)
         report = {
             "kind": "native_migration_residual_phase_crash_acceptance",
@@ -711,7 +844,7 @@ def main():
             "topology": "one PostgreSQL authority and separate Rust storage processes on one Linux host",
             "port_allocation": "OS-assigned ephemeral loopback free_port; fixed HA/infra ports not used",
             "fault_hook_env_gated": True,
-            "hooks_registered": 5,
+            "hooks_registered": 6,
             "hooks_exercised": [record["phase"] for record in records],
             "phases_actual": [record["phase"] for record in records],
             "hooks_unexercised": [],
