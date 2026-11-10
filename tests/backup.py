@@ -91,15 +91,42 @@ def bounded_line(stream, deadline, label, on_wait=None):
 class BackupHarness(Harness):
     def __init__(self, args):
         super().__init__(args)
-        self.admin = self.base_db
-        self.restore_admin = os.environ.get("ROOTYARD_RESTORE_TEST_DATABASE_URL", self.admin)
+        # Before any owned database exists: a failure in the second CREATE (or
+        # later field setup) must never hide the first database from cleanup().
         self.created = []
-        self.source_db = self.new_database(self.admin)
-        self.target_db = self.new_database(self.restore_admin)
-        self.db = self.source_db
-        self.env["DATABASE_URL"] = self.db
-        self.backup = self.root / "backup"
-        self.target = self.root / "restored-data"
+        self.partial = None
+        try:
+            self.admin = self.base_db
+            self.restore_admin = os.environ.get("ROOTYARD_RESTORE_TEST_DATABASE_URL", self.admin)
+            self.source_db = self.new_database(self.admin)
+            self.target_db = self.new_database(self.restore_admin)
+            self.db = self.source_db
+            self.env["DATABASE_URL"] = self.db
+            self.backup = self.root / "backup"
+            self.target = self.root / "restored-data"
+        except BaseException as error:
+            self._discard_partial_owned()
+            raise
+
+    def _discard_partial_owned(self):
+        """Drop only databases this constructor created, then the fixture dir.
+
+        Runs once (``partial`` is set) and never raises: the original failure is
+        the one the caller must see, after its owned resources are released.
+        """
+        if self.partial is not None:
+            return
+        self.partial = True
+        for admin, name in self.created:
+            try:
+                self.query(admin, 'DROP DATABASE IF EXISTS "' + name + '" WITH (FORCE)')
+            except Exception:
+                pass
+        self.created = []
+        try:
+            shutil.rmtree(self.root)
+        except Exception:
+            pass
 
     def query(self, db, sql):
         env = self.env.copy()
@@ -109,6 +136,8 @@ class BackupHarness(Harness):
 
     def new_database(self, admin):
         name = "rootyard_backup_" + uuid.uuid4().hex
+        # Recorded only once this run's CREATE actually succeeded: no other
+        # database on the server is ever touched by cleanup.
         self.query(admin, 'CREATE DATABASE "' + name + '" TEMPLATE template0')
         self.created.append((admin, name))
         return urllib.parse.urlunsplit(urllib.parse.urlsplit(admin)._replace(path="/" + name, query=""))
