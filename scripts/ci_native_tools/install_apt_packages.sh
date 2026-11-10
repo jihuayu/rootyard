@@ -42,7 +42,7 @@ state_dir=$(resolve_absolute "$state_dir")
 work=$(resolve_absolute "$work")
 
 prepare_pgdg_repository "$work/pgdg"
-sudo apt-get update
+apt_update
 
 # Git source-build dependencies are installed here as well so the source
 # helper scripts can be run independently without assuming a previous helper.

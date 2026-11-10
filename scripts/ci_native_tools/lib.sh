@@ -69,7 +69,7 @@ EOF
   fi
   printf '%s\n' "$want" | sudo tee "$list" >/dev/null
   log "configured deb-src-only signed Ubuntu Noble source index: $list"
-  sudo apt-get update
+  apt_update
 }
 
 # Install the signed PGDG repository and key exactly as the manual
@@ -118,12 +118,33 @@ prepare_pgdg_repository() {
   fi
   printf '%s\n' "$want" | sudo tee "$list" >/dev/null
   log "configured signed PGDG repository for ${codename}"
-  sudo apt-get update
+  apt_update
+}
+
+# GitHub-hosted Ubuntu runners ship the Azure archive mirrorlist inside the
+# image's own apt configuration, and the archive is plain HTTP there. Bound
+# every acquisition instead of waiting for the runner's default timeouts:
+# Acquire::http(s)::Timeout is per stalled transfer, and the retry knobs limit
+# connection failures. These are per-invocation options (-o) only; no apt
+# configuration file on the host or in /etc is written or changed here.
+APT_NETWORK_OPTIONS=(
+  -o APT::Acquire::http::Timeout=30
+  -o APT::Acquire::https::Timeout=30
+  -o Acquire::Retries=3
+  -o Acquire::http::Pipeline-Depth=0
+)
+
+apt_run() {
+  require_command sudo
+  sudo apt-get "${APT_NETWORK_OPTIONS[@]}" "$@"
+}
+
+apt_update() {
+  apt_run update
 }
 
 apt_install() {
-  require_command sudo
-  sudo apt-get install -y --no-install-recommends "$@"
+  apt_run install -y --no-install-recommends "$@"
 }
 
 source_versions() {
@@ -148,7 +169,7 @@ fetch_source() {
   mkdir -p -- "$work"
   [ -z "$(find "$work" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
     fail "source work directory is not empty: $work"
-  (cd "$work" && apt-get source "$package=$version")
+  (cd "$work" && apt_run source "$package=$version")
 }
 
 find_source_directory() {
