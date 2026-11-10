@@ -31,7 +31,7 @@ pub fn root() -> Result<&'static str> {
 }
 
 /// The same structural rules `blob_store::config::validate_root` applies.
-fn validate<'a>(root: &'a str) -> Result<&'a str> {
+fn validate(root: &str) -> Result<&str> {
     ensure!(!root.starts_with('/'), "the Blob root must be a relative remote prefix, not a local path: {root}");
     ensure!(!root.ends_with('/') && root.len() <= 256, "the Blob root prefix is not a single relative prefix: {root}");
     for segment in root.split('/') {

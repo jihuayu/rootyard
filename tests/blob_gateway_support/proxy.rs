@@ -100,12 +100,6 @@ pub(super) fn loopback(address: SocketAddr) -> bool {
     }
 }
 
-/// A create exchange whose answer named its operation.
-#[derive(Debug, Clone)]
-pub struct CreatedOperation {
-    pub operation: uuid::Uuid,
-}
-
 /// One exchange the proxy saw (bounded metadata only).
 #[derive(Debug, Clone)]
 pub struct Record {
@@ -118,9 +112,6 @@ pub struct Record {
     /// Advertisement body after the service pkt-line prefix, for
     /// `info/refs?service=git-receive-pack` only.
     pub advertisement: Option<Vec<u8>>,
-    /// `X-Rootyard-Operation` the service answered on the create API. `None` on
-    /// every other exchange.
-    pub operation: Option<CreatedOperation>,
     pub truncated: bool,
 }
 
@@ -553,7 +544,6 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
             request_sha256: sha256(&body),
             request_bytes: body.len(),
             advertisement: None,
-            operation: None,
             truncated: false,
         };
         let receive_pack_post = is_receive_pack_post(&path, &method);
@@ -658,11 +648,6 @@ async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<()> {
                 record.truncated = traffic.truncated;
                 if target.contains("/info/refs?") && target.contains("service=git-receive-pack") {
                     record.advertisement = advertisement_body(&traffic.body);
-                }
-                if path == "/api/repos" && method == "POST" {
-                    record.operation = wire::header(&traffic.headers, "x-rootyard-operation")
-                        .and_then(|value| value.parse::<uuid::Uuid>().ok())
-                        .map(|operation| CreatedOperation { operation });
                 }
                 shared.state.lock().await.records.push(record);
                 Reply {

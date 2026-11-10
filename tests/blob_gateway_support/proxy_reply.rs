@@ -147,12 +147,9 @@ async fn forwarded_backend_challenge_reaches_the_client_unchanged() -> Result<()
     );
     let proxy = Proxy::start(backend, Limits::default()).await?;
     // This case names the operation explicitly: as a header and in the query.
-    let observed = through_proxy(
-        &proxy,
-        &format!("/git/alice/demo.git/git-receive-pack?operation={OPERATION}"),
-        Some(OPERATION),
-    )
-    .await;
+    let observed =
+        through_proxy(&proxy, &format!("/git/alice/demo.git/git-receive-pack?operation={OPERATION}"), Some(OPERATION))
+            .await;
     let records = proxy.records().await;
     let failure = proxy.failure();
     proxy.stop().await?;

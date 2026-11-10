@@ -43,7 +43,10 @@ pub(super) fn connection_closed(headers: &[(String, String)]) -> bool {
     header(headers, "connection").is_some_and(|value| value.eq_ignore_ascii_case("close"))
 }
 
-pub(super) fn parse_head(head: &[u8]) -> Result<(String, String, Vec<(String, String)>)> {
+/// One parsed request head: `(method, target, lowercase headers)`.
+pub(super) type ParsedHead = (String, String, Vec<(String, String)>);
+
+pub(super) fn parse_head(head: &[u8]) -> Result<ParsedHead> {
     let text = std::str::from_utf8(head).map_err(|_| anyhow!("proxy request head is not ASCII"))?;
     let mut lines = text.split("\r\n");
     let request = lines.next().ok_or_else(|| anyhow!("proxy request has no request line"))?;
@@ -343,14 +346,12 @@ pub(super) fn response_headers(headers: &[(String, String)]) -> Vec<(String, Str
     // Headers listed by `Connection` are themselves hop-by-hop.
     for (name, value) in headers {
         if name == "connection" {
-            hop_by_hop.extend(value.split(',').map(|token| token.trim().to_ascii_lowercase()).filter(|token| !token.is_empty()));
+            hop_by_hop.extend(
+                value.split(',').map(|token| token.trim().to_ascii_lowercase()).filter(|token| !token.is_empty()),
+            );
         }
     }
-    headers
-        .iter()
-        .filter(|(name, _)| !hop_by_hop.iter().any(|hop| hop == name))
-        .cloned()
-        .collect()
+    headers.iter().filter(|(name, _)| !hop_by_hop.iter().any(|hop| hop == name)).cloned().collect()
 }
 
 /// Write one client response: the status line, the backend end-to-end headers,
@@ -456,9 +457,8 @@ mod tests {
         let (_, status, headers) = read(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await.unwrap();
         assert_eq!(status, 404);
         assert_eq!(header(&headers, "content-length"), Some("0"));
-        let (_, status, headers) = read(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"x\"\r\n\r\n")
-            .await
-            .unwrap();
+        let (_, status, headers) =
+            read(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"x\"\r\n\r\n").await.unwrap();
         assert_eq!(status, 401);
         assert_eq!(header(&headers, "www-authenticate"), Some("Basic realm=\"x\""));
         let (_, status, headers) = read(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
@@ -485,14 +485,28 @@ mod tests {
     /// bytes on the client socket.
     async fn reply(backend: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
         let mut reader = backend;
-        let (_, status, headers) = read_backend_head(&mut reader, Instant::now() + Duration::from_secs(5)).await.unwrap();
-        let (decoded, truncated) = read_backend(&mut reader, &headers, &Bounds { max_body: 1024, max_response: 1024, idle: &Duration::from_secs(5) }).await.unwrap();
+        let (_, status, headers) =
+            read_backend_head(&mut reader, Instant::now() + Duration::from_secs(5)).await.unwrap();
+        let (decoded, truncated) = read_backend(
+            &mut reader,
+            &headers,
+            &Bounds { max_body: 1024, max_response: 1024, idle: &Duration::from_secs(5) },
+        )
+        .await
+        .unwrap();
         assert!(!truncated);
         let mut written = Vec::new();
         write_reply(&mut written, Duration::from_secs(5), status, "OK", &headers, &decoded).await.unwrap();
         let mut client = BufReader::new(written.as_slice());
-        let (_, status, reply_headers) = read_backend_head(&mut client, Instant::now() + Duration::from_secs(5)).await.unwrap();
-        let (reply_body, truncated) = read_backend(&mut client, &reply_headers, &Bounds { max_body: 1024, max_response: 1024, idle: &Duration::from_secs(5) }).await.unwrap();
+        let (_, status, reply_headers) =
+            read_backend_head(&mut client, Instant::now() + Duration::from_secs(5)).await.unwrap();
+        let (reply_body, truncated) = read_backend(
+            &mut client,
+            &reply_headers,
+            &Bounds { max_body: 1024, max_response: 1024, idle: &Duration::from_secs(5) },
+        )
+        .await
+        .unwrap();
         assert!(!truncated);
         (status, reply_headers, reply_body)
     }

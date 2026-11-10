@@ -531,11 +531,14 @@ async fn push(git: &Git, dir: &std::path::Path, pin: Option<Uuid>, args: &[&str]
     }
 }
 
+/// A parsed `report-status`: the `unpack` status and `(ref, ng reason)` per ref.
+type GitReport = (String, Vec<(String, Option<String>)>);
+
 /// The per-ref verdicts of a captured service response, parsed from its real
 /// `report-status` pkt-lines. Anything that is not `unpack <status>` or
 /// `ok|ng <ref> <reason>` followed by exactly one flush is refused, so a
 /// sideband, an HTTP body or a truncated response can never pass as a report.
-fn report_status(response: &[u8]) -> Result<(String, Vec<(String, Option<String>)>)> {
+fn report_status(response: &[u8]) -> Result<GitReport> {
     anyhow::ensure!(!response.is_empty(), "service response is empty");
     let mut position = 0usize;
     let mut unpack = None;
@@ -587,7 +590,7 @@ const GIT_REASONS: &[&str] = &[
     "internal error",
 ];
 
-fn assert_git_report(label: &str, response: &[u8]) -> Result<(String, Vec<(String, Option<String>)>)> {
+fn assert_git_report(label: &str, response: &[u8]) -> Result<GitReport> {
     let (unpack, results) = report_status(response).with_context(|| format!("{label}: not a Git report-status"))?;
     ensure!(unpack == "ok", "{label}: unpack failed: {unpack}");
     for (name, reason) in &results {
