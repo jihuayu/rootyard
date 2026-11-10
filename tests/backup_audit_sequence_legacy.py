@@ -421,6 +421,14 @@ class AuditSequenceLegacyHarness(BackupHarness):
         other = self.create_repository({"name": "ahead"}, token=self.alice)
         self.other = other
         assert other["state"] == "ready" and other["id"] != self.repo["id"], other
+        # share_base: the freshly provisioned repository's bare HEAD names an
+        # unborn main, so before any clone the real demo working repository
+        # (the one roundtrip pushed from) pushes its second commit to the new
+        # main ref with stock Git.  Both clones below then see one real base.
+        self.git("-C", str(self.work), "push", self.base + other["clone_path"],
+                 self.second + ":refs/heads/main", token=self.alice)
+        assert self.git("ls-remote", self.base + other["clone_path"], "main", token=self.alice) \
+            .stdout.decode().strip() == self.second + "\trefs/heads/main"
         # Bob's triage grant is observable through the real API before the
         # backup: a triage may file an issue and may not open a pull request.
         assert self.collaborator("bob")["role"] == "triage"
