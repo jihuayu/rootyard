@@ -2,7 +2,7 @@
   "issue": 70,
   "binary": "/run/artifacts/baseline/rootyard",
   "binary_sha256": "7bf90d617242c9a725e2b31514d86028bc62a85f3b9a1caf6e99724864d89dbe",
-  "source_head": "d00fb38a55eed632a35d45c7fd766599f0677556",
+  "source_head": "f8908ef31a995e62dafbbf89bd21f3c7abd759c9",
   "production_inputs_sha256": "34e336a0089f6c11b110a3c125764fc9d2a0c4d54b49766fe5bbda693d32fcdb",
   "baseline_receipt_workspace_commit": "2cd56993c195ecc887d5656ae88ea744f2d9e5a0",
   "script": "tests/webhook_pagination.py",
@@ -15,7 +15,7 @@
     {
       "name": "allocator_concurrency",
       "status": "passed",
-      "seconds": 0.2597,
+      "seconds": 0.2601,
       "detail": {
         "deliveries": 60,
         "page1": 50,
@@ -25,7 +25,7 @@
     {
       "name": "cursor_pagination",
       "status": "passed",
-      "seconds": 0.5045,
+      "seconds": 0.1707,
       "detail": {
         "tied_rows": 7,
         "walked_page_sizes": {
@@ -69,7 +69,7 @@
     {
       "name": "barrier_commit",
       "status": "passed",
-      "seconds": 0.0602,
+      "seconds": 0.0572,
       "detail": {
         "holder_sequence": 1,
         "waiter_sequence": 2,
@@ -79,7 +79,7 @@
     {
       "name": "barrier_rollback",
       "status": "passed",
-      "seconds": 0.0507,
+      "seconds": 0.0457,
       "detail": {
         "sequence_after_rollback": 1
       }
@@ -87,7 +87,7 @@
     {
       "name": "idempotent_duplicate",
       "status": "passed",
-      "seconds": 0.0532,
+      "seconds": 0.0576,
       "detail": {
         "next_sequence": 2
       }
@@ -95,7 +95,7 @@
     {
       "name": "delete_race",
       "status": "passed",
-      "seconds": 0.0387,
+      "seconds": 0.054,
       "detail": {
         "status": 404
       }
@@ -103,7 +103,7 @@
     {
       "name": "explain_index",
       "status": "passed",
-      "seconds": 0.0151,
+      "seconds": 0.017,
       "detail": {
         "plan_mentions": "forge_webhook_deliveries_hook_seq_idx"
       }
