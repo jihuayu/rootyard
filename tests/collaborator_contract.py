@@ -151,16 +151,38 @@ class prerequisite:
             return True
         return {"sys.platform": sys.platform, "machine": os.uname().machine}
 
-    @staticmethod
-    def worktree_git_dir(root):
-        """Git dir of ``root`` from its ``.git`` file, or None when discovery suffices."""
-        marker = Path(root) / ".git"
-        if not marker.is_file():
-            return None
-        text = marker.read_text().strip()
-        if not text.startswith("gitdir:"):
-            return None
-        return str((Path(root) / text.split(":", 1)[1].strip()).resolve())
+    def checkout_head(self, root, env):
+        """HEAD of the mounted checkout, discovered the way Git itself would.
+
+        Plain discovery honours the checkout's ``.git`` file (a run sandbox may
+        point it at a headless git dir). If that fails, the shared git dir the
+        rules mount is tried as ``GIT_DIR``. A success that Git itself marks
+        dubious (``warning:`` on stderr) is refused rather than reported as
+        this worktree's HEAD.
+        """
+        strategies = {"discovery": {}}
+        try:
+            pointer = (Path(root) / ".git").read_text().strip()
+        except OSError:
+            pointer = ""
+        if pointer.startswith("gitdir:"):
+            target = Path(pointer.split(":", 1)[1].strip())
+            common = target.parent.parent
+            if common.name == ".git":
+                strategies["shared " + str(common)] = {"GIT_DIR": str(common),
+                                                       "GIT_WORK_TREE": str(root)}
+        tried = []
+        for label, extra in strategies.items():
+            proc = self.git("rev-parse", "HEAD", cwd=root, check=False, env={**env, **extra})
+            if proc.returncode:
+                tried.append(label + ": " + proc.stderr.decode(errors="replace").strip()[-160:])
+                continue
+            assert not proc.stderr.strip(), (
+                f"{label} resolved HEAD {proc.stdout.decode().strip()} with a warning: " +
+                proc.stderr.decode(errors="replace").strip()[-300:])
+            return proc.stdout.decode().strip(), {**env, **extra}, label
+        raise AssertionError("required dependency missing: checkout HEAD unreachable (" +
+                             "; ".join(tried) + ")")
 
     def source_binding(self):
         """Bind the executed binary to the current production inputs via its build receipt."""
@@ -178,31 +200,8 @@ class prerequisite:
         current = build_native.source_digest()
         assert current == receipt["source_inputs_sha256"], (
             "current src/Cargo/migrations/schema/vendor inputs differ from the binary's build")
-        # Discover the checkout exactly as packaged CI does: ROOTYARD_GIT_DIR
-        # when this path is a linked worktree whose git dir lies outside the
-        # mounted source, else the ordinary discovery from cwd.
         checkout_env = dict(self.env, GIT_OPTIONAL_LOCKS="0")
-        git_dir = os.environ.get("ROOTYARD_GIT_DIR") or self.worktree_git_dir(root)
-        if git_dir:
-            # A worktree's git dir lives under <common>/worktrees/<name>; the
-            # mounted shared dir is <common>, which is what Git needs to read
-            # HEAD, refs and the status from this source tree.
-            common = Path(git_dir).parent.parent
-            assert common.name == ".git", f"unexpected worktree git dir {git_dir}"
-            # --git-common-dir reports the shared dir even when the worktree
-            # git dir cannot be read; a linked worktree's recorded HEAD lives
-            # in <worktree>/HEAD, so the name of the mounted directory decides.
-            shared = self.git("rev-parse", "--git-common-dir", cwd=root, check=False,
-                              env={**checkout_env, "GIT_DIR": str(common)})
-            assert shared.returncode == 0 and shared.stdout.decode().strip() == str(common), (
-                "required dependency missing: the mounted " + str(common) +
-                " is not this checkout's git dir (the worktree git dir " + git_dir + " is absent)")
-            checkout_env["GIT_DIR"] = str(common)
-        head_proc = self.git("rev-parse", "HEAD", cwd=root, check=False, env=checkout_env)
-        assert head_proc.returncode == 0, (
-            "required dependency missing: checkout Git metadata unreachable (mount the "
-            "shared .git dir or set ROOTYARD_GIT_DIR): " +
-            self.redact(head_proc.stderr.decode(errors="replace")[-300:]))
+        head, checkout_env, discovered_via = self.checkout_head(root, checkout_env)
         head = head_proc.stdout.decode().strip()
         tracked = self.git("status", "--porcelain", "--untracked-files=no", cwd=root,
                            env=checkout_env).stdout
@@ -211,7 +210,8 @@ class prerequisite:
         assert self.git("merge-base", "--is-ancestor", parent, head, cwd=root,
                         check=False, env=checkout_env).returncode == 0, (
             f"binary source commit {parent} is not an ancestor of HEAD {head}")
-        return {"source_commit": head, "binary_source_commit": parent,
+        return {"source_commit": head, "checkout_discovered_via": discovered_via,
+                "binary_source_commit": parent,
                 "binary_commit_is_ancestor": True,
                 "source_inputs_sha256": current, "binary_sha256": binary_sha,
                 "rustc": receipt.get("rustc"), "build_command": receipt.get("command"),

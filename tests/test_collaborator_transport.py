@@ -150,6 +150,32 @@ class HarnessContract(unittest.TestCase):
         self.assertEqual({method.__name__ for _, method in steps}, set(CASE_METHODS),
                          "every case method must be registered exactly once")
 
+    def test_checkout_head_prefers_discovery_and_refuses_dubious_success(self):
+        import subprocess
+        import tempfile
+        base = object.__new__(harness.CollaboratorTransportHarness)
+        base.env = {}
+        calls = []
+
+        def fake_git(*argv, cwd=None, check=True, env=None):
+            calls.append(dict(env or {}))
+            if calls[-1].get("GIT_DIR"):
+                return subprocess.CompletedProcess(argv, 0, b"b" * 40 + b"\n",
+                                                   b"warning: ignoring ref storage format\n")
+            return subprocess.CompletedProcess(argv, 0, b"a" * 40 + b"\n", b"")
+        base.git = fake_git
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / ".git").write_text("gitdir: /srv/repo/.git/worktrees/x\n")
+            head, env, via = base.checkout_head(Path(root), {})
+        self.assertEqual((head, via, env), ("a" * 40, "discovery", {}))
+        self.assertEqual(len(calls), 1)
+        base.git = lambda *argv, cwd=None, check=True, env=None: subprocess.CompletedProcess(
+            argv, 0, b"a" * 40 + b"\n", b"warning: ignoring ref storage format\n")
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / ".git").write_text("gitdir: /srv/repo/.git/worktrees/x\n")
+            with self.assertRaisesRegex(AssertionError, "with a warning"):
+                base.checkout_head(Path(root), {})
+
     def test_initialization_and_merge_contracts_are_fixed(self):
         contract = ROOT / "tests" / "collaborator_contract.py"
         lifecycle = ROOT / "tests" / "collaborator_lifecycle.py"
