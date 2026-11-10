@@ -7754,18 +7754,16 @@ class Phase1ClosureAndDocsFixture:
                 tokens = list(lexer)
             except ValueError:
                 return []
-            result: list[list[str]] = []
-            current: list[str] = []
-            for token in tokens:
-                if token and all(ch in ";&|" for ch in token):
-                    if current:
-                        result.append(current)
-                    current = []
-                else:
-                    current.append(token)
-            if current:
-                result.append(current)
-            return result
+            if current_job_name == "verify" and (
+                "eval" in tokens
+                or any(
+                    tokens[i] in {"bash", "sh"} and tokens[i + 1] == "-c"
+                    for i in range(len(tokens) - 1)
+                )
+            ):
+                # Dynamic shell evaluation cannot be audited statically.
+                tokens.append("scripts/build_native_batch.py")
+            return [tokens] if tokens else []
 
         def run_value_commands(value: str, start: int, key_indent: int) -> tuple[list[list[str]], int]:
             style = block_style(value)
@@ -7807,6 +7805,7 @@ class Phase1ClosureAndDocsFixture:
         step_indent: int | None = None
         in_root_jobs = False
         in_job = False
+        current_job_name: str | None = None
         index = 0
         while index < len(lines):
             raw = lines[index]
@@ -7819,6 +7818,7 @@ class Phase1ClosureAndDocsFixture:
                 root_key, root_value = split_key_value(stripped)
                 in_root_jobs = root_key == "jobs" and not root_value
                 in_job = False
+                current_job_name = None
                 steps_indent = None
                 step_indent = None
                 if block_style(root_value) is not None:
@@ -7836,6 +7836,7 @@ class Phase1ClosureAndDocsFixture:
             if indent == 2:
                 key, value = split_key_value(stripped)
                 in_job = is_job_key(stripped) and not value
+                current_job_name = key if in_job else None
                 steps_indent = None
                 step_indent = None
                 if not in_job:
@@ -7868,18 +7869,18 @@ class Phase1ClosureAndDocsFixture:
             if step_indent is None:
                 if stripped.startswith("-"):
                     step_indent = indent
+                else:
+                    index += 1
                     continue
-                index += 1
-                continue
             if indent < step_indent:
                 steps_indent = None
                 step_indent = None
                 continue
-            if not stripped.startswith("- "):
+            if stripped != "-" and not stripped.startswith("- "):
                 index += 1
                 continue
             item_indent = indent
-            item = stripped[2:].strip()
+            item = "" if stripped == "-" else stripped[2:].strip()
             key, value = split_key_value(item)
             if key == "run":
                 found, index = run_value_commands(value, index + 1, item_indent)
@@ -18448,7 +18449,7 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
                 self.assertIn(parent_tbl, {"users", "repositories", "forge_pulls"})
 
     # =========================================================================
-    # Feature F20: Phase 1 Closure — CI Pipeline Wiring — Boundary & Corner Cases (5 Tests)
+    # Feature F20: Phase 1 Closure — CI Pipeline Wiring — Boundary & Corner Cases (11 Tests)
     # =========================================================================
     def test_t2_f20_01_ci_validator_rejects_missing_postgresql_17_or_pg_share(self) -> None:
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -18715,6 +18716,73 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
             "          --all-bins --features pando-lib\n"
         )
         mutated = ci_text[:anchor_index] + folded_step + ci_text[anchor_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
+
+    def test_t2_f20_08_ci_validator_rejects_failure_masked_native_batch_step(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        exact_command = " ".join(
+            Phase1ClosureAndDocsFixture.ci_build_native_batch_tokens(
+                Phase1ClosureAndDocsFixture.live_ci_run_commands(ci_text)
+            )
+        )
+        step_anchor = "      - name: Build native bins and RefStore fixtures in one batch\n"
+        step_index = ci_text.index(step_anchor)
+        run_header = "        run: |\n"
+        run_index = ci_text.index(run_header, step_index)
+        next_anchor = "      - name: Verify design documentation integrity\n"
+        next_index = ci_text.index(next_anchor, run_index)
+        masked_run = run_header + f"          {exact_command} || true\n"
+        mutated = ci_text[:run_index] + masked_run + ci_text[next_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
+
+    def test_t2_f20_09_ci_validator_rejects_wrong_first_steps_item(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        verify_index = ci_text.index("  verify:\n")
+        steps_index = ci_text.index("    steps:\n", verify_index)
+        insert_index = steps_index + len("    steps:\n")
+        wrong_step = (
+            "      - name: Wrong first native batch\n"
+            "        run: python3 scripts/build_native_batch.py --all-bins --features pando-lib\n"
+        )
+        mutated = ci_text[:insert_index] + wrong_step + ci_text[insert_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
+
+    def test_t2_f20_10_ci_validator_rejects_bare_dash_first_batch_step(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        verify_index = ci_text.index("  verify:\n")
+        steps_index = ci_text.index("    steps:\n", verify_index)
+        insert_index = steps_index + len("    steps:\n")
+        wrong_step = (
+            "      -\n"
+            "        name: Wrong first native batch under bare dash\n"
+            "        run: python3 scripts/build_native_batch.py --all-bins --features pando-lib\n"
+        )
+        mutated = ci_text[:insert_index] + wrong_step + ci_text[insert_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
+
+    def test_t2_f20_11_ci_validator_rejects_dynamic_shell_batch_eval(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        anchor = "      - name: Build native bins and RefStore fixtures in one batch\n"
+        insert_index = ci_text.index(anchor)
+        dynamic_step = (
+            "      - name: Dynamic shell command in verify job\n"
+            "        env:\n"
+            "          RUN: \"python3 scripts/build_native_batch.py --all-bins --features pando-lib\"\n"
+            "        run: bash -c \"$RUN\"\n"
+        )
+        mutated = ci_text[:insert_index] + dynamic_step + ci_text[insert_index:]
 
         self.assertNotEqual(mutated, ci_text)
         with self.assertRaisesRegex(AssertionError, "build_native_batch"):
