@@ -51,15 +51,16 @@ So every PR head produced 6 runs of the same three workflows instead of 3. The P
 PR #192 pull_request runs (`42783651096`, `42786835185`, `42783650768`, `42786835555`) were
 still in progress when this change was prepared; they are left to finish and are not cancelled.
 
-## Change (checkpoint 1: `CI` trigger only)
+## Change (checkpoint 1: `ci.yml`; checkpoint 2: `pando-lab.yml`, `redis-contract.yml`)
 
-`.github/workflows/ci.yml`:
+The trigger block is now identical in `ci.yml`, `pando-lab.yml` and `redis-contract.yml`:
 
 ```yaml
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:  # pando-lab.yml, redis-contract.yml only
 ```
 
 * `pull_request` stays the single full-gate event for every PR head (the `verify` and `container`
@@ -72,19 +73,23 @@ on:
 * No `paths:` filter is added, so a required check can never be left permanently pending.
 * Tags and `workflow_dispatch` were not used by `ci.yml` at the baseline, so no meaning is lost.
 
-Explicitly deferred (checkpoints 2/3, not in this commit): the identical trigger change for
-`pando-lab.yml` and `redis-contract.yml`, which are modified by another worker in this batch and
-will be cherry-picked/integrated by Root.
-
 ## After: expected event matrix (not yet observed)
 
 | Event | Head | `CI` (`verify`, `container`) | Pando (`isolated-lab`) | Redis (`redis-contract`) |
 | --- | --- | --- | --- | --- |
-| push (open/update PR) | `codex/*`, `feat/*` | none | 1 (unchanged until checkpoint 2) | 1 (unchanged until checkpoint 2) |
+| push (open/update PR) | `codex/*`, `feat/*` | none | none | none |
 | pull_request | any PR head | 1 | 1 | 1 |
 | push | `main` merge | 1 | 1 | 1 |
-| push | tag | none (was: full CI on any tag) | 1 (until checkpoint 2) | 1 (until checkpoint 2) |
-| workflow_dispatch | any | (not offered) | (not offered) | (not offered) |
+| push | tag | none (was: full gate on any tag) | none | none |
+| workflow_dispatch | any | (not offered, as before) | 1 (new, manual specialised run) | 1 (new, manual specialised run) |
+
+Per PR head this removes 3 duplicate runs (one per workflow), from 6 to 3 in the observed
+2026-11-10 pattern. Nothing is *required less*: each PR still gets each check once, and each
+merge to `main` still gets each check once on the merged commit. `workflow_dispatch` was added
+to the two suites that had no other manual entry point (the other three workflows already had
+it); it is additive and changes no existing event's meaning. Tags previously ran the full gate;
+no tag exists in the repository and the project is unpublished, so no tag gate is lost in
+practice — if release tags are adopted, add an explicit `tags:` trigger deliberately.
 
 The reduction above is a *prediction*. No saving is claimed until Root pushes a feature branch,
 opens a PR and the actual event counts are read from `actions/runs`.

@@ -26,12 +26,11 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = ROOT / ".github" / "workflows"
 
 # workflow file -> job ids that must keep their check-run names
-STEPS_DEDUPED = ("ci.yml",)  # checkpoint 1; pando/redis move here in checkpoint 2
-PENDING_DEDUP = {
-    "pando-lab.yml": ("isolated-lab",),  # still an unfiltered push+pull_request pair
+FULL_GATE = {
+    "ci.yml": ("verify", "container"),
+    "pando-lab.yml": ("isolated-lab",),
     "redis-contract.yml": ("redis-contract",),
 }
-FULL_GATE = {"ci.yml": ("verify", "container"), **PENDING_DEDUP}
 # Path-filtered / dispatch-only suites keep their own triggers untouched.
 UNCHANGED = (
     "refstore-protocol-acceptance.yml",
@@ -100,7 +99,7 @@ def _branches(children: list[str]) -> list[str]:
 
 class TriggerDedupTest(unittest.TestCase):
     def test_deduped_workflows_use_pr_event_and_main_only_push(self) -> None:
-        for name in STEPS_DEDUPED:
+        for name in FULL_GATE:
             with self.subTest(workflow=name):
                 events = _event_keys(_on_block(WORKFLOWS / name))
                 self.assertIn("pull_request", events, f"{name}: PR gate must remain")
@@ -124,7 +123,7 @@ class TriggerDedupTest(unittest.TestCase):
     def test_required_check_run_names_are_unchanged(self) -> None:
         import yaml  # noqa: PLC0415 - optional dependency in some local envs
 
-        for name in STEPS_DEDUPED:
+        for name in FULL_GATE:
             jobs = FULL_GATE[name]
             with self.subTest(workflow=name):
                 data = yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
@@ -141,25 +140,15 @@ class TriggerDedupTest(unittest.TestCase):
                     self.assertIn(job, data["jobs"], f"{name}: check `{job}` missing")
                     # A job-level `name:` would rename the required check.
                     self.assertNotIn("name", data["jobs"][job], f"{name}:{job} was renamed")
-
-    def test_remaining_full_gate_workflows_still_offer_pr_and_main_push(self) -> None:
-        # Positive coverage for the check-run names of workflows whose trigger
-        # de-duplication is a separate checkpoint (pando-lab/redis-contract are
-        # modified by another worker in this batch). Do not drop these jobs or
-        # add path filters here even when their triggers change.
+    def test_manual_dispatch_is_available_alongside_the_pr_gate(self) -> None:
         import yaml  # noqa: PLC0415
 
-        for name, jobs in PENDING_DEDUP.items():
+        for name in ("pando-lab.yml", "redis-contract.yml"):
             with self.subTest(workflow=name):
-                data = yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
-                triggers = _triggers(data)
-                self.assertIn("pull_request", triggers, f"{name}: PR gate must remain")
-                self.assertIn("push", triggers, f"{name}: main gate must remain")
-                self.assertNotIn("paths", triggers["pull_request"], name)
-                self.assertNotIn("paths-ignore", triggers["pull_request"], name)
-                for job in jobs:
-                    self.assertIn(job, data["jobs"], f"{name}: check `{job}` missing")
-                    self.assertNotIn("name", data["jobs"][job], f"{name}:{job} was renamed")
+                triggers = _triggers(yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8")))
+                # A specialised suite can still be dispatched on a development
+                # branch without re-enabling an unfiltered push run.
+                self.assertIn("workflow_dispatch", triggers)
 
     def test_path_filtered_suites_keep_pr_paths_and_dispatch(self) -> None:
         import yaml  # noqa: PLC0415
