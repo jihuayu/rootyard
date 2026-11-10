@@ -638,11 +638,11 @@ class Client:
 
 
 async def main(argv):
-    if len(argv) != 2:
+    if len(argv) != 1:
         print(summary({}, "NO_ARGUMENTS", {}), flush=True)
         return
     try:
-        config = load_config(argv[1])
+        config = load_config(argv[0])
     except Failure as failure:
         print(summary({}, failure.reason, {}), flush=True)
         return
