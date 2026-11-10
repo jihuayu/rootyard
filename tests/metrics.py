@@ -80,7 +80,7 @@ class MetricsHarness(BrowserHarness):
         assert headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
         assert headers["cache-control"] == "no-store"
         values = dict(line.split(" ", 1) for line in text.splitlines() if not line.startswith("#"))
-        assert len(values) == 91, values
+        assert len(values) == 92, values
         for name in ("max_size", "size", "available", "busy", "waiting"):
             assert "rootyard_db_pool_" + name in values
         assert "rootyard_error_log_dropped_total" in values
@@ -90,7 +90,8 @@ class MetricsHarness(BrowserHarness):
                      "rootyard_session_gc_tokens_deleted_total", "rootyard_session_gc_failures_total",
                      "rootyard_browser_web_sessions", "rootyard_browser_tokens",
                      "rootyard_expired_browser_session_oldest_age_seconds",
-                     "rootyard_expired_browser_token_oldest_age_seconds"):
+                     "rootyard_expired_browser_token_oldest_age_seconds",
+                     "rootyard_webhook_delivery_oldest_age_seconds"):
             assert name in values, (name, sorted(values))
             assert not any(metric.startswith(name + "{") for metric in values), name
             assert float(values[name]) >= 0, (name, values)
@@ -160,6 +161,68 @@ class MetricsHarness(BrowserHarness):
                  f"VALUES ('{operation}','{ids[0]}','{resolution}','{'3'*64}')")
         assert self.verify()["rootyard_operations_unresolved"] == "0"
         assert self.sql(f"SELECT outcome FROM git_operations WHERE id='{operation}'") == "unknown"
+
+    def webhook_delivery_oldest_age(self):
+        metric = "rootyard_webhook_delivery_oldest_age_seconds"
+
+        def observe():
+            status, text, _ = self.scrape()
+            assert status == 200, status
+            samples = [line.strip() for line in text.splitlines()
+                       if line.strip() and not line.strip().startswith("#")
+                       and line.strip().split(" ", 1)[0].split("{", 1)[0] == metric]
+            assert len(samples) == 1, samples
+            name, value = samples[0].split(" ", 1)
+            assert name == metric, name
+            observed = float(value)
+            assert observed == observed and observed not in (float("inf"), float("-inf")), value
+            assert observed >= 0, observed
+            return observed
+
+        empty = self.verify()
+        assert metric in empty
+        assert empty[metric] == "0", empty[metric]
+
+        repo = self.sql("SELECT id FROM repositories WHERE name='private-ready' AND owner_id=(SELECT id FROM users WHERE username='alice')")
+        tenant = self.sql(f"SELECT owner_id FROM repositories WHERE id='{repo}'")
+        active_hook = str(uuid.uuid4())
+        inactive_hook = str(uuid.uuid4())
+        for hook, active in [(active_hook, True), (inactive_hook, False)]:
+            secret = f"metrics-{uuid.uuid4().hex}"
+            digest = hashlib.sha256(secret.encode()).hexdigest()
+            self.secrets.append(secret)
+            self.sql(f"INSERT INTO forge_webhooks (id,tenant_id,repository_id,url,secret,secret_sha256,events,ci_contexts,auto_ci_pin,active,max_attempts,timeout_ms) VALUES ('{hook}','{tenant}','{repo}','https://metrics.invalid/hook','{secret}','{digest}','[\"ping\"]'::jsonb,'[]'::jsonb,false,{'true' if active else 'false'},10,30000)")
+        cap = "(EXTRACT(EPOCH FROM clock_timestamp())::bigint + 300)"
+        claim = "(EXTRACT(EPOCH FROM clock_timestamp())::bigint + 35)"
+        rows = [(active_hook, "pending", 0, 90, "0"), (active_hook, "failed", 9, 120, cap),
+                (active_hook, "leased", 1, 180, claim), (active_hook, "delivered", 1, 172800, "0"),
+                (active_hook, "dead_letter", 3, 259200, "0"), (inactive_hook, "pending", 0, 345600, "0")]
+        for hook, state, attempts, age, next_attempt in rows:
+            body = self.sql(f"INSERT INTO forge_webhook_deliveries (id,webhook_id,tenant_id,repository_id,event_id,event_type,payload,request_headers,signature_256,state,attempts,next_attempt_unix,max_attempts,created_at,delivered_at) VALUES ('{uuid.uuid4()}','{hook}','{tenant}','{repo}','{uuid.uuid4()}','ping','{{}}'::jsonb,'{{}}'::jsonb,'sha256=' || repeat('a',64),'{state}',{attempts},{next_attempt},10,clock_timestamp()-make_interval(secs=>{age}::double precision),{'now()' if state == 'delivered' else 'NULL'}) RETURNING state")
+            lines = body.splitlines()
+            assert len(lines) == 2, body
+            assert lines[0] == state, body
+            assert lines[1] == "INSERT 0 1", body
+        counted = ["pending", "failed", "leased"]
+        excluded = ["delivered", "dead_letter", "inactive_hook_pending"]
+        counts = self.sql(f"SELECT concat_ws(',', count(*) FILTER (WHERE webhook_id='{active_hook}' AND state='pending'), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state='failed'), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state='leased'), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state='delivered'), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state='dead_letter'), count(*) FILTER (WHERE webhook_id='{inactive_hook}' AND state='pending'), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state IN ('failed','leased') AND next_attempt_unix > EXTRACT(EPOCH FROM clock_timestamp())::bigint), count(*) FILTER (WHERE webhook_id='{active_hook}' AND state IN ('pending','delivered','dead_letter') AND next_attempt_unix = 0)) FROM forge_webhook_deliveries WHERE tenant_id='{tenant}' AND repository_id='{repo}'")
+        assert counts == "1,1,1,1,1,1,2,3", counts
+
+        leased_age = observe()
+        assert 170 <= leased_age < 240, leased_age
+
+        leased = self.sql(f"UPDATE forge_webhook_deliveries SET state='dead_letter' WHERE webhook_id='{active_hook}' AND state='leased' RETURNING id")
+        assert leased
+        failed_age = observe()
+        assert 110 <= failed_age < 160, failed_age
+
+        failed = self.sql(f"UPDATE forge_webhook_deliveries SET state='dead_letter' WHERE webhook_id='{active_hook}' AND state='failed' RETURNING id")
+        assert failed
+        pending_age = observe()
+        assert 80 <= pending_age < 120, pending_age
+
+        return {"leased_age_seconds": leased_age, "failed_age_seconds": failed_age,
+                "pending_age_seconds": pending_age, "counted_states": counted, "excluded_states": excluded}
 
     def seed_browser_row(self, expires, kind="browser", revoked=False, with_session=True):
         # Only digest columns are written: no plaintext secret is invented here.
@@ -235,6 +298,7 @@ class MetricsHarness(BrowserHarness):
             assert status == 503
             assert "rootyard_postgres_up 0\n" in text
             for name in ("repositories", "operations_unresolved", "event_deliveries", "event_delivery_oldest",
+                         "webhook_delivery_oldest",
                          "provisioning", "browser_web_sessions", "browser_tokens",
                          "expired_browser_session_oldest_age", "expired_browser_token_oldest_age",
                          "workspace_capture", "workspace_lease", "storage_maintenance"):
@@ -269,6 +333,7 @@ def main():
     try:
         for name, test in [("isolated_metrics_setup", harness.setup), ("fixed_private_format", harness.verify),
                            ("authoritative_aggregates", harness.aggregates),
+                           ("webhook_delivery_oldest_age", harness.webhook_delivery_oldest_age),
                            ("browser_session_metrics", harness.browser_session_metrics),
                            ("database_failure_is_503", harness.database_failure),
                            ("non_loopback_rejected", harness.reject_non_loopback)]:
