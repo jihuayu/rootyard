@@ -66,6 +66,7 @@ REASONS = frozenset(
         "CREDENTIAL_IN_URL",
         "CREDENTIAL_IN_DOM",
         "CREDENTIAL_IN_STORAGE",
+        "STORAGE_READ_FAILED",
         "SHELL_NOT_SERVED",
         "SHELL_CSP_MISSING",
         "SHELL_SCRIPT_INVALID",
@@ -251,7 +252,14 @@ class Client:
         return [value for value in self.cookies | self.tokens if len(value) >= 8]
 
     async def no_credentials(self, page):
-        """No credential in the URL, the rendered DOM or the web storage."""
+        """No credential in the URL, the rendered DOM or the web storage.
+
+        `CREDENTIAL_IN_STORAGE` alone means a secret was actually found in the
+        serialized storage; an exception while reading or serializing
+        localStorage/sessionStorage is the distinct `STORAGE_READ_FAILED`, so a
+        failed diagnostic is never mistaken for a discovered leak. Neither
+        reason carries the exception, the stored text or a traceback.
+        """
         try:
             if any(secret in page.url for secret in self.secrets()):
                 raise Failure("CREDENTIAL_IN_URL")
@@ -262,7 +270,9 @@ class Client:
         except Failure:
             raise
         except Exception:
-            raise Failure("CREDENTIAL_IN_STORAGE") from None
+            raise Failure("STORAGE_READ_FAILED") from None
+        if not isinstance(stored, str):
+            raise Failure("STORAGE_READ_FAILED")
         if any(secret in stored for secret in self.secrets()):
             raise Failure("CREDENTIAL_IN_STORAGE")
 
