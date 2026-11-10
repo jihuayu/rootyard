@@ -479,7 +479,9 @@ pub async fn restore(
             transfer.backend_identity_hex() == closure.backend_identity && transfer.provider() == closure.provider,
             "restore target Blob backend identity differs from the archive"
         );
-        let until = started + std::time::Duration::from_secs(3600);
+        // The caller's one absolute restore deadline bounds the restored-source
+        // validation, the ledger reads and every rebuild; it is never restarted.
+        let until = tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600));
         blob_closure::import(&client, &transfer, &manifest.blob_artifacts, &source, until, &mutex).await?;
     }
     ensure!(!target.exists(), "destination appeared during restore");

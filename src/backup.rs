@@ -129,6 +129,9 @@ mod filesystem;
 #[cfg(test)]
 mod inventory_tests;
 mod ledger;
+mod ledger_canonical;
+mod ledger_sets;
+mod ledger_validation;
 mod postgres;
 mod restore;
 mod snapshot;

@@ -35,10 +35,11 @@ pub(super) async fn export(
     transfer: &ArchiveTransfer,
     artifacts: &[Artifact],
     destination: &Path,
-    deadline: Instant,
+    deadline: tokio::time::Instant,
     mutex: &BackupMutex,
     client: &(impl GenericClient + Sync),
 ) -> Result<(BlobClosure, BTreeMap<String, Entry>)> {
+    let deadline = deadline.into_std();
     let backend = transfer.backend_identity_hex().to_owned();
     let provider = transfer.provider().to_owned();
     ensure!(
@@ -122,26 +123,38 @@ pub(super) async fn import(
     transfer: &ArchiveTransfer,
     artifacts: &[Artifact],
     archive_root: &Path,
-    deadline: Instant,
+    deadline: tokio::time::Instant,
     mutex: &BackupMutex,
 ) -> Result<()> {
     let backend = transfer.backend_identity_hex().to_owned();
     let provider = transfer.provider().to_owned();
+    // The source validation and every ledger read share the caller's absolute
+    // deadline; the provider IO is bounded by the same instant.
+    let until = deadline;
     // The archive itself must carry every member before the first upload.
     let files = entries(archive_root, artifacts)?;
+    // The restored source must pass the same fail-closed validation as the
+    // source did, on the caller's connection and deadline.
+    ledger_validation::validate_source(client, until).await.context("restored artifact ledger is inconsistent")?;
     // Restored PostgreSQL must describe exactly the same closure; a difference
     // means the archive and the restored snapshot are not one paired cut.
-    let restored = ledger::inventory(client, &backend, &provider)
+    let restored = ledger::inventory(client, &backend, &provider, until)
         .await
         .context("restored Blob ledger cannot be verified before import")?;
     ensure!(restored == artifacts, "restored Blob ledger differs from the archive manifest");
     let (mut rebuilt, mut reused) = (0usize, 0usize);
     for artifact in artifacts {
-        ensure!(transfer.live(deadline), "Blob restore deadline reached");
+        ensure!(transfer.live(deadline.into_std()), "Blob restore deadline reached");
         let locator: BlobLocator = artifact.locator()?;
         let permit = OfflineRestorePermit::issue(locator.clone(), &backend)?;
         let outcome = transfer
-            .rebuild(&permit, &locator, &archive_root.join(artifact.archive_path()), &artifact.sha256, deadline)
+            .rebuild(
+                &permit,
+                &locator,
+                &archive_root.join(artifact.archive_path()),
+                &artifact.sha256,
+                deadline.into_std(),
+            )
             .await
             .context("archive Blob member could not be verified or rebuilt")?;
         match outcome {
@@ -152,8 +165,11 @@ pub(super) async fn import(
     }
     // Re-derive the ledger from the restored database and prove it still equals
     // the manifest exactly (nothing re-pointed, nothing lost).
-    let after = ledger::inventory(client, &backend, &provider).await?;
+    let after = ledger::inventory(client, &backend, &provider, until).await?;
     ensure!(after == artifacts, "restored Blob ledger changed during import");
+    // The restored database must still declare exactly the archived set: a
+    // missing retained registration is a lost protection, not a smaller archive.
+    ledger_sets::require_archive_registrations(artifacts, &after)?;
     ensure!(
         files.values().filter(|entry| entry.kind == "file").count() == rebuilt + reused,
         "archive member accounting mismatch"

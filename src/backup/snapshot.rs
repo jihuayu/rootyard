@@ -124,7 +124,16 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     // Exact v1 Blob closure of every `pg_refstore` repository. Bytes are the
     // only thing that makes this an independent backup: the manifest records
     // their checksums and the source physical backend identity.
+    // The caller's one absolute deadline bounds the source validation, the
+    // export, the inventory reads and the RefStore carry; never restarted.
+    let until = tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600));
     let (blob_closure, blob_artifacts) = if format == FORMAT_PAIRED {
+        // Fail closed before a single byte is exported: every registration a
+        // live membership, retained snapshot/root (active or released) or
+        // serving read still declares must have its exact pack/idx pair, hold
+        // binding and recomputed digest, or the archive is refused. This runs
+        // on the exported-snapshot transaction above, not on a second snapshot.
+        ledger_validation::validate_source(&tx, until).await.context("source artifact ledger cannot be archived")?;
         // Missing scope or an unsupported backend is an explicit refusal, never
         // a silently byte-less archive.
         let profile = crate::blob_store::config::BlobProfile::from_env()
@@ -135,10 +144,9 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         // real volume/backup identities already fixed above.
         let read = ArchiveRead::seal(volume_id, id)?;
         let transfer = crate::blob_store::archive::ArchiveTransfer::for_export(&read, store);
-        let artifacts = ledger::inventory(&tx, transfer.backend_identity_hex(), transfer.provider())
+        let artifacts = ledger::inventory(&tx, transfer.backend_identity_hex(), transfer.provider(), until)
             .await
             .context("exact Blob closure cannot be captured from this source")?;
-        let until = started + std::time::Duration::from_secs(3600);
         let (closure, blob_files) =
             blob_closure::export(&read, &transfer, &artifacts, &staging, until, &mutex, &tx).await?;
         for (name, entry) in blob_files {
@@ -151,11 +159,7 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
     };
     // Durable RefStore rows the paired closure depends on; the restore compares
     // them with the restored database before rebuilding any byte.
-    let refstore = if format == FORMAT_PAIRED {
-        Some(ledger::carry(&tx, tokio::time::Instant::from_std(started + std::time::Duration::from_secs(3600))).await?)
-    } else {
-        None
-    };
+    let refstore = if format == FORMAT_PAIRED { Some(ledger::carry(&tx, until).await?) } else { None };
     let paired = blob_closure.is_some();
     let manifest = Manifest {
         format,
@@ -170,7 +174,7 @@ pub async fn create(config: &Config, destination: &Path) -> Result<()> {
         git_version: String::from_utf8(checked(command(&config.git).arg("--version")).await?)?.trim().into(),
         schema_versions: versions,
         consistency: if paired {
-            "offline-volume-flock+postgres-advisory-lock+share-locks+exported-snapshot+verified-blob-closure"
+            "offline-volume-flock+postgres-advisory-lock+share-locks+exported-snapshot+verified-blob-closure+validated-source-artifact-ledger"
         } else {
             "offline-volume-flock+postgres-advisory-lock+share-locks+exported-snapshot"
         }
