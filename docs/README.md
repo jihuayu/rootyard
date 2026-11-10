@@ -14,6 +14,7 @@
 - [完整设计目录](design/README.md)
 - [实现状态与计划边界](design/implementation-status.md)
 - [`6d2f0b8` 主分支验收审计](acceptance/main-6d2f0b8-audit.md)
+- [Repository audit log cursor and restore semantics](audit-log-cursors.md)
 - [round-2 最终集成交付表（全部 native scope 已验收）](acceptance/round2-delivery.md)
 - [架构图与 Mermaid 源文件](design/architecture-diagrams.md)
 - [原始设计快照](design/source-page.md)
