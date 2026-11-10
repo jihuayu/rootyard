@@ -12,7 +12,9 @@ import ast
 from pathlib import Path
 import re
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -213,6 +215,75 @@ class SourceBindingTest(unittest.TestCase):
     def test_missing_receipt_is_a_hard_binding_failure(self):
         with self.assertRaises(source_bound_binary.SourceBindingError):
             source_bound_binary.bind(ROOT / "target" / "does-not-exist-rootyard")
+
+
+class PartialConstructionCleanupTest(unittest.TestCase):
+    """A failed construction must drop only the databases it created.
+
+    Exercises the real ``BackupHarness.__init__`` on the drill's own subclass
+    with a stubbed query layer: no PostgreSQL is touched here.
+    """
+
+    class _Args:
+        def __init__(self, root):
+            self.binary = "/nonexistent/rootyard"
+            self.keep = True
+            self.root = Path(root)
+
+    def build(self, root, databases_by_admin, failing_admin):
+        import backup
+
+        args = self._Args(root)
+        calls = []
+        harness = object.__new__(drill.AuditSequenceLegacyHarness)
+
+        def fake_init(self, _args):
+            import tempfile
+            self.args = _args
+            self.root = Path(tempfile.mkdtemp(prefix="rootyard-e2e-"))
+            self.schema = "rootyard_e2e_probe"
+            self.base_db = "postgres://admin/a"
+            self.env = {"DATABASE_URL": "unchanged", "ROOTYARD_DATA_DIR": str(self.root / "data")}
+            self.secrets, self.results, self.limits = [], [], []
+            self.proc = None
+
+        def fake_query(self, admin, sql):
+            calls.append((admin, sql))
+            if sql.startswith("CREATE"):
+                name = sql.split('"')[1]
+                if admin == failing_admin:
+                    raise AssertionError("simulated CREATE failure on the restore server")
+                databases_by_admin.setdefault(admin, set()).add(name)
+                return ""
+            for name in sql.split('"')[1:2]:
+                databases_by_admin.get(admin, set()).discard(name)
+            return ""
+
+        with mock.patch.object(backup.Harness, "__init__", fake_init), \
+                mock.patch.object(backup.BackupHarness, "query", fake_query), \
+                mock.patch.dict("os.environ", {"ROOTYARD_RESTORE_TEST_DATABASE_URL": failing_admin}):
+            try:
+                drill.AuditSequenceLegacyHarness(args)
+            except AssertionError as error:
+                self.assertIn("simulated CREATE failure", str(error))
+            else:
+                self.fail("construction must surface the second CREATE failure")
+        return harness, calls
+
+    def test_first_database_is_dropped_and_the_foreign_one_is_never_touched(self):
+        with tempfile.TemporaryDirectory() as root:
+            owned, calls = self.build(root, {"postgres://admin/a": {"other_developer_db"}},
+                                      "postgres://admin/b")
+            # The first (owned) database was created on admin/a and dropped there.
+            created = [sql for _, sql in calls if sql.startswith("CREATE")]
+            dropped = [sql for _, sql in calls if sql.startswith("DROP")]
+            self.assertEqual(len(created), 2)
+            self.assertEqual(len(dropped), 1, calls)
+            self.assertIn(created[0].split('"')[1], dropped[0])
+            self.assertTrue(all("other_developer_db" not in sql for _, sql in calls), calls)
+            # Only the restore server's CREATE failed; nothing else was dropped.
+            self.assertFalse([sql for admin, sql in calls if admin == "postgres://admin/b"
+                              and sql.startswith("DROP")])
 
 
 if __name__ == "__main__":
