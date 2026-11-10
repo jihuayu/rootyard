@@ -78,7 +78,7 @@ fn round_trip_binds_the_full_realm_at_the_served_gate_revision() {
     assert_eq!(comparison, VersionComparison::Satisfied { bound: 9 });
     let session = codec.authenticate_for_test(issued.token(), 1_010).expect("mac");
     assert_eq!(session.realm(), &live);
-    assert_eq!(session.bound(), 9);
+    assert_eq!(session.bound, 9);
 }
 
 #[test]

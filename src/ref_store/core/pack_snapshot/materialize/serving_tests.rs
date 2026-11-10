@@ -193,6 +193,18 @@ fn the_session_issuer_admits_the_sealed_a5b_binding_of_its_exact_view() {
     let sealed = serving_materialization(view, &capture).expect("seal its own capture");
     assert_eq!(sealed.proof().binding(), binding);
     assert!(sealed.admit_sealed_binding());
+    // The real production issuer — not just the helper predicate — admits the
+    // sealed value and stamps the exact proof/view gate revision (11 here).
+    let codec = crate::blob_git_gateway::repo_session::SessionTokenCodec::new(
+        [(0u8, zeroize::Zeroizing::new([9u8; 32]))],
+        0,
+        &crate::blob_store::test_support::blob_backend_identity("serving-proof-session-issuer"),
+        120,
+    )
+    .expect("fixture session codec");
+    let tokens = crate::blob_git_gateway::repo_session::SessionTokens::new(codec);
+    let issued = tokens.issue_from_materialized_read(&sealed).expect("the issuer admits the sealed A5b binding");
+    assert_eq!(issued.revision(), 11, "the issued bound is the exact proof/view gate revision");
     // The fixture distinguishes the digests: A5a is never the admitted binding,
     // and the view's native digest is A5b (the same value the proof seals).
     let a5a = probe_a5a(&snapshot);

@@ -328,18 +328,6 @@ pub(crate) struct RepoSession {
 }
 
 impl RepoSession {
-    /// Test-only: proves a parsed frame states the bound it was signed with.
-    ///
-    /// This module's `cfg(test)` build compiles as part of both the library
-    /// test binary and the binary's own unit tests; in the latter only
-    /// `compare` (which reads the field directly) and the codec are reachable,
-    /// so the accessor is dead there alone, never in production.
-    #[cfg(test)]
-    #[allow(dead_code, reason = "cfg(test)-only frame accessor for the unit tests in `repo_session::tests`")]
-    pub(crate) fn bound(&self) -> i64 {
-        self.bound
-    }
-
     /// Test-only: proves a parsed frame keeps the exact signed realm.
     #[cfg(test)]
     pub(crate) fn realm(&self) -> &SessionRealm {
@@ -480,7 +468,7 @@ pub(crate) enum SessionTokenError {
 }
 
 /// The refusal text of the scored [`VersionComparison::Behind`] answer (and of
-/// the test-only [`SessionTokenError::Behind`] mapping), naming the exact lower
+/// the test-only `SessionTokenError::Behind` mapping), naming the exact lower
 /// bound the client must keep. Kept as one constant so the message and every
 /// client-facing promise about it can be tested verbatim.
 pub(crate) const BEHIND_MESSAGE: &str = "repository session lower bound is not yet served by the authoritative store; wait for the authoritative store to reach that bound and retry against the same bound, keeping read-your-writes and monotonic reads (do not fall back to a stale, replica or cache read)";
