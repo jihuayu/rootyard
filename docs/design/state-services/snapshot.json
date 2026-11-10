@@ -1,0 +1,67 @@
+{
+  "schema": "rootyard.state-services.snapshot/v1",
+  "issue": {
+    "parent": 105,
+    "subtask": 106,
+    "work_package": "W0",
+    "title": "state services base design, producer inventory, deployment contract and bounded baseline"
+  },
+  "design_snapshot": {
+    "file": "docs/design/12-state-services.md",
+    "source_name": "state-services-design.md",
+    "source_sha256": "0187d9c00472a3b794661c450cbf6dd78440268b2ef5ce66d3ff9de54a957abf",
+    "checked_in_sha256": "0187d9c00472a3b794661c450cbf6dd78440268b2ef5ce66d3ff9de54a957abf",
+    "bytes": 80072,
+    "copied_verbatim": true,
+    "baseline_commit": "d689bf8062a73cfadbc0a72abf3f1546d992e09c",
+    "document_status": "design proposal; not implemented for production",
+    "is_part_of_archived_source_snapshot": false,
+    "historical_sources_untouched": [
+      "docs/design/source-page.md",
+      "docs/design/source-manifest.json",
+      "docs/design/01-overview.md",
+      "docs/design/02-git-storage.md",
+      "docs/design/03-workspace-vfs.md",
+      "docs/design/04-forge.md",
+      "docs/design/05-services.md",
+      "docs/design/06-message-layer.md",
+      "docs/design/07-distributed-scaling.md",
+      "docs/design/08-roadmap.md",
+      "docs/design/09-workspace-git-research.md",
+      "docs/design/10-distributed-storage-research.md",
+      "docs/design/11-ci-read-mirrors.md"
+    ],
+    "baseline_scope": "historical pre-evolution measurement/documentation point; NOT the rebased stack parent and NOT a new-backend qualification",
+    "current_stack_parent": "bcd391809c8b0d2a16409b6a28fe1147d7ed5c66",
+    "current_stack_parent_role": "security/token/membership recovery parent for this rebase; the native d689 receipt was not rerun on it"
+  },
+  "w0_artifacts": {
+    "producer_inventory": "docs/design/state-services/producers.json",
+    "deployment_contract": "docs/design/state-services/deployment-contract.json",
+    "config_schema": "docs/design/state-services/config.schema.json",
+    "budgets": "docs/design/state-services/budgets.json",
+    "dependencies": "docs/design/state-services/dependencies.json",
+    "bounded_workload": "docs/design/state-services/workloads/w0-bounded.json",
+    "validator": "scripts/check_state_services.py",
+    "baseline_runner": "scripts/state_services_baseline.py",
+    "tests": "tests/test_state_services_w0.py",
+    "baseline_evidence": "evidence/state-services/w0-local-git-smoke.json",
+    "native_baseline_runner": "scripts/state_services_native_baseline.py",
+    "native_baseline_report": "evidence/state-services/w0-native-legacy-pando-v5.json",
+    "native_build_helper": "scripts/build_native.py",
+    "native_build_tests": "tests/test_native_build_receipt.py",
+    "native_baseline_input_tests": "tests/test_state_services_native_baseline.py"
+  },
+  "truth_boundary": {
+    "service_binary_executed": true,
+    "postgres_measured": true,
+    "http_api_measured": true,
+    "opendal_blob_measured": false,
+    "raft_or_redis_measured": false,
+    "local_git_measured": true,
+    "completion_claim": "W0 tooling plus a bounded historical d689 legacy-Pando baseline. It does not qualify the rebased parent, any new backend, or #106 completion; internal phase costs, complete producer integration, Blob bytes and frozen budgets remain open.",
+    "production_code_changed_by_w0": false,
+    "service_binary_execution_baseline": "d689bf8062a73cfadbc0a72abf3f1546d992e09c historical legacy Pando run; not the rebased parent",
+    "measurement_applies_to_current_stack_parent": false
+  }
+}

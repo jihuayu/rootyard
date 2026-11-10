@@ -1,0 +1,195 @@
+{
+  "budget_evaluation": [
+    {
+      "bound": null,
+      "budget_id": "git.receive_pack.small_pack.p95",
+      "observed": null,
+      "status": "not_frozen"
+    },
+    {
+      "bound": null,
+      "budget_id": "git.update_ref.cas_conflict.p95",
+      "observed": null,
+      "status": "not_frozen"
+    },
+    {
+      "bound": null,
+      "budget_id": "git.fsck.closure.p95",
+      "observed": null,
+      "status": "not_frozen"
+    },
+    {
+      "bound": null,
+      "budget_id": "pg.round_trip.p95",
+      "observed": null,
+      "status": "not_frozen"
+    },
+    {
+      "bound": null,
+      "budget_id": "pg.advisory_lock.acquire.p95",
+      "observed": null,
+      "status": "not_frozen"
+    },
+    {
+      "bound": null,
+      "budget_id": "api.push.e2e.p95",
+      "observed": null,
+      "status": "not_frozen"
+    },
+    {
+      "bound": null,
+      "budget_id": "blob.put.p95",
+      "observed": null,
+      "status": "not_frozen"
+    },
+    {
+      "bound": null,
+      "budget_id": "blob.get.p95",
+      "observed": null,
+      "status": "not_frozen"
+    },
+    {
+      "bound": null,
+      "budget_id": "runner.child_cpu_seconds",
+      "observed": null,
+      "status": "not_frozen"
+    },
+    {
+      "bound": null,
+      "budget_id": "runner.peak_rss_bytes",
+      "observed": null,
+      "status": "not_frozen"
+    }
+  ],
+  "identity": {
+    "binary": {
+      "executed": false,
+      "path": "/workspace/scratch/state-baseline-main-v1/rootyard",
+      "provided": true,
+      "sha256": "f39838f139e27d6f00a55a88c7ef98974c993f2da3139e0eb3b4e04b05ff8e0b"
+    },
+    "runner": {
+      "git": "git version 2.52.0",
+      "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+      "python": "3.12.14",
+      "sha256": "0836dbfc07abaceb0beab1614fe1d263815dec3c17ef05459f11e0073ed50397"
+    },
+    "source": {
+      "commit": "03cb921c1707536dd641a9522a4f5d2c1236f204",
+      "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "dirty": false,
+      "status_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "tree": "c962d317a69a60ad27a0bcda25fa1a7dbdbf086c"
+    },
+    "workload": {
+      "id": "w0-bounded-v1",
+      "sha256": "fe8d6a4ab8de17298a6a728e571948a6da7b6d3a56e2d3b87c3fff950cee977a"
+    }
+  },
+  "kind": "bounded_local_git",
+  "limitations": [
+    "local /tmp Git fixture only; do not extrapolate to production",
+    "PostgreSQL/API/Blob/Raft/Redis are null or unavailable",
+    "no Rootyard binary or native service was executed",
+    "CAS latency is local git update-ref contention, not RefStore commit latency",
+    "this smoke runner does not satisfy issue #106 runtime baseline by itself"
+  ],
+  "metrics": {
+    "api.push.e2e.latency_ms": {
+      "reason": "no native HTTP service was executed in W0; API push-end-to-end is unmeasured",
+      "samples": null,
+      "status": "unavailable",
+      "value": null
+    },
+    "blob.get.latency_ms": {
+      "reason": "no OpenDAL BlobStore exists at the baseline; S3/Local adapter is not a Blob authority and no provider credentials were used",
+      "samples": null,
+      "status": "unavailable",
+      "value": null
+    },
+    "blob.put.latency_ms": {
+      "reason": "no OpenDAL BlobStore exists at the baseline; S3/Local adapter is not a Blob authority and no provider credentials were used",
+      "samples": null,
+      "status": "unavailable",
+      "value": null
+    },
+    "git.fsck.closure.duration_ms": {
+      "max": 10.249869999825023,
+      "mean": 10.071516000607517,
+      "min": 9.89316200139001,
+      "n": 2,
+      "p50": 10.071516000607517,
+      "p95": 10.232034599903272,
+      "status": "measured",
+      "value": 10.071516000607517
+    },
+    "git.receive_pack.small_pack.latency_ms": {
+      "max": 28.177211999718565,
+      "mean": 22.69856550174154,
+      "min": 21.09271399967838,
+      "n": 8,
+      "p50": 21.904421500948956,
+      "p95": 26.391629251156697,
+      "status": "measured",
+      "value": 22.69856550174154
+    },
+    "git.update_ref.cas_conflict.latency_ms": {
+      "cas_attempts": 80,
+      "cas_successes": 20,
+      "max": 8.96397999895271,
+      "mean": 4.167119774956518,
+      "min": 2.5100069979089312,
+      "n": 80,
+      "p50": 3.7013255023339298,
+      "p95": 7.2509527948568575,
+      "status": "measured",
+      "value": 4.167119774956518
+    },
+    "pg.advisory_lock.acquire_ms": {
+      "reason": "no --pg-dsn-file supplied; W0 has no permitted PostgreSQL service and does not read ambient credentials",
+      "samples": null,
+      "status": "unavailable",
+      "value": null
+    },
+    "pg.round_trip.latency_ms": {
+      "reason": "no --pg-dsn-file supplied; W0 has no permitted PostgreSQL service and does not read ambient credentials",
+      "samples": null,
+      "status": "unavailable",
+      "value": null
+    },
+    "runner.child_cpu_seconds": {
+      "max": 0.6012329999999999,
+      "mean": 0.6012329999999999,
+      "min": 0.6012329999999999,
+      "n": 1,
+      "p50": 0.6012329999999999,
+      "p95": 0.6012329999999999,
+      "status": "measured",
+      "value": 0.6012329999999999
+    },
+    "runner.peak_rss_bytes": {
+      "max": 15597568.0,
+      "mean": 15597568.0,
+      "min": 15597568.0,
+      "n": 1,
+      "p50": 15597568.0,
+      "p95": 15597568.0,
+      "status": "measured",
+      "value": 15597568.0
+    },
+    "runner.temp_bytes": {
+      "max": 123364.0,
+      "mean": 123364.0,
+      "min": 123364.0,
+      "n": 1,
+      "p50": 123364.0,
+      "p95": 123364.0,
+      "status": "measured",
+      "value": 123364.0
+    }
+  },
+  "produced_at": "2026-11-08T04:25:36Z",
+  "schema": "rootyard.state-services.baseline/v1",
+  "scope": "local ephemeral Git only; not a production, multi-host or target-architecture baseline",
+  "truncated": false
+}

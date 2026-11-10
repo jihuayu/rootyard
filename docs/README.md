@@ -16,7 +16,6 @@
 - [`6d2f0b8` 主分支验收审计](acceptance/main-6d2f0b8-audit.md)
 - [round-2 最终集成交付表（全部 native scope 已验收）](acceptance/round2-delivery.md)
 - [架构图与 Mermaid 源文件](design/architecture-diagrams.md)
-- [当前实施路线与验收闸门](design/implementation-plan.md)
 - [原始设计快照](design/source-page.md)
 - [历史第 08 章旧路线（已被当前计划取代）](design/08-roadmap.md)
 - [当前 Blob-only / Ref-CAS 架构](architecture.md)
