@@ -110,12 +110,13 @@ proves nothing about kernel or cgroup behaviour.
   environment keys but does not reject every possible secret string.
 * Suite summaries are redacted output, except the supervisor pre-spawn refusal,
   which uses a fixed summary. The self-test marks the run/report failed if a
-  known sensitive value remains in the rendered report text: it emits only
-  hashed match names and the report file then receives a fixed summary. It is
-  detection, not prevention — the full rendered report is still written to
-  stdout even when the self-test fails, so stdout is not safe to publish.
-  Raw per-suite logs (`<run-dir>/logs/<suite_id>.log`) are mode `0600` but may
-  contain secrets; keep them private.
+  known sensitive value remains in the rendered report text. It is detection,
+  not prevention: on a detected leak the runner writes and prints the same
+  minimal hashed failure payload (kind, version, run id, hashed self-test
+  matches, `gate: failed`) instead of the full report; if that file cannot be
+  written, it prints no report. Raw per-suite logs
+  (`<run-dir>/logs/<suite_id>.log`) are mode `0600` but may contain secrets;
+  keep them private.
 * The runner requires a readable Linux `/proc` and working pidfds and refuses
   to spawn anything when either is unsupported.
 * `--dry-run` validates host support and paths but starts no child and creates no
@@ -152,8 +153,10 @@ python3 scripts/run_native_acceptance.py --plan /outside/path/plan.json \
   --report /outside/path/runs/run-1/report.json --run-id run-1
 ```
 
-`--exclude SUITE` (repeatable) drops a suite after the plan has been validated;
-do not exclude a suite that a remaining suite depends on.
+`--exclude SUITE` (repeatable) drops an unreferenced suite after the original
+plan has been validated; if any included suite depends on an excluded suite, the
+runner rejects the invocation with a bounded preflight error before spawning
+suites or acquiring resource locks.
 `--verify-host` names the checkout root used to refuse in-checkout lock, run,
 log and report paths (default: the repository root).
 
