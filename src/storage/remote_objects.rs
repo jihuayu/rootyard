@@ -34,9 +34,54 @@ use reqwest::Url;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+#[cfg(test)]
+use futures_util::StreamExt;
+#[cfg(test)]
+use reqwest::{Client, Method};
+#[cfg(test)]
+use std::time::Duration;
+#[cfg(test)]
+use tokio::time::Instant;
+
 use crate::storage::remote_provider::LegacyS3Store;
 
 pub use super::remote_errors::{RemoteOp, RemoteStoreError};
+
+/// One remote body-boundary read against a `reqwest` response stream.
+///
+/// Retained from the pre-OpenDAL transport as the legacy fault-coverage
+/// oracle: it pins the equivalence the old provider guaranteed, namely that
+/// deadline exhaustion becomes `RemoteStoreError::timeout(op)` and a
+/// mid-body stream failure becomes `RemoteStoreError::transport(op, error)`
+/// with the source chain intact, while local file readers never pass
+/// through it. The live adapter reaches the provider through OpenDAL, so
+/// this helper is compiled for the regression tests only.
+#[cfg(test)]
+async fn remote_chunk<S>(stream: &mut S, op: RemoteOp, deadline: Instant) -> Result<Option<bytes::Bytes>>
+where
+    S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+{
+    match tokio::time::timeout_at(deadline, stream.next()).await {
+        Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
+        Ok(Some(Err(error))) => Err(RemoteStoreError::transport(op, Box::new(error)).into()),
+        Ok(None) => Ok(None),
+        Err(_) => Err(RemoteStoreError::timeout(op).into()),
+    }
+}
+
+/// The small control-response equivalent of [`remote_chunk`]. It is kept
+/// beside it because the legacy multipart control bodies were read under
+/// the same deadline with the same typed mapping; no production path owns a
+/// `reqwest::Response` any more, so it exists for the regression tests.
+#[cfg(test)]
+#[allow(dead_code)]
+async fn remote_text(response: reqwest::Response, op: RemoteOp, deadline: Instant) -> Result<String> {
+    match tokio::time::timeout_at(deadline, response.text()).await {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(error)) => Err(RemoteStoreError::transport(op, Box::new(error)).into()),
+        Err(_) => Err(RemoteStoreError::timeout(op).into()),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ObjectKey {
