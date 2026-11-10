@@ -41,8 +41,9 @@ require_command sudo
 state_dir=$(resolve_absolute "$state_dir")
 work=$(resolve_absolute "$work")
 
+# Installs the PGDG key and list and refreshes every index (bounded,
+# fail-closed) itself; a second full update here would repeat the same work.
 prepare_pgdg_repository "$work/pgdg"
-apt_update
 
 # Git source-build dependencies are installed here as well so the source
 # helper scripts can be run independently without assuming a previous helper.
