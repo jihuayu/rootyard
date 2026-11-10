@@ -111,11 +111,13 @@ fn historical_archives_compare_legacy_backend_from_the_database() {
     for backend in ["gitfs", "pando"] {
         let archived = repo("");
         // The comparison copy drops the backend; everything else is compared.
-        assert!(restore_metadata_repositories(&[archived.clone()], vec![repo(backend)], false).is_ok());
+        assert!(restore_metadata_repositories(std::slice::from_ref(&archived), vec![repo(backend)], false).is_ok());
         // A pg_refstore repository owns no native bare repository.
-        assert!(restore_metadata_repositories(&[archived.clone()], vec![repo("pg_refstore")], false).is_err());
-        assert!(restore_metadata_repositories(&[archived.clone()], vec![repo("")], false).is_err());
-        assert!(restore_metadata_repositories(&[archived.clone()], vec![repo("blob")], false).is_err());
+        assert!(
+            restore_metadata_repositories(std::slice::from_ref(&archived), vec![repo("pg_refstore")], false).is_err()
+        );
+        assert!(restore_metadata_repositories(std::slice::from_ref(&archived), vec![repo("")], false).is_err());
+        assert!(restore_metadata_repositories(std::slice::from_ref(&archived), vec![repo("blob")], false).is_err());
         // The backend allowance never excuses a real metadata difference.
         let mut other = repo(backend);
         other.unknown_operations = 0;

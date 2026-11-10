@@ -61,6 +61,5 @@ fn pages(prefix: &str) -> PageRouter {
         )
         .route(&page("/pulls/{number}/checks"), get(web::handlers::pull_checks_view))
         .route(&page("/pulls/{number}/merge"), post(web::handlers::merge_pull_web))
-        .route(&page("/audit"), get(web::handlers::audit_view));
-    all
+        .route(&page("/audit"), get(web::handlers::audit_view))
 }
