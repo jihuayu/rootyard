@@ -8,7 +8,10 @@ use axum::{
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use uuid::Uuid;
 
@@ -175,6 +178,7 @@ pub async fn lease(
         return Err(conflict());
     }
     let same_host = ws.host_id == state.storage.volume_id;
+    let commit_started = Arc::new(AtomicBool::new(false));
     let commit = async {
         let active: bool = tx
             .query_one(
@@ -200,12 +204,21 @@ pub async fn lease(
             .await
             .map_err(Error::internal)?
             .get(0);
+        commit_started.store(true, Ordering::Release);
         tx.commit().await.map_err(Error::internal)?;
         Ok((Workspace::from_row(&row), deadline))
     };
-    let (saved, deadline) =
-        if same_host { super::mounts::with_frozen_async(id, commit).await? } else { commit.await? };
-    super::mounts::ensure(&state, id, deadline)?;
+    // On this host the commit runs inside one freeze that fences the superseded
+    // epoch before it is released, so that epoch cannot admit writes between the
+    // commit and the authorization below. Only an error proven to precede COMMIT
+    // thaws the old epoch; success, a COMMIT transport error or cancellation
+    // leaves the gate fenced until a later committed epoch is authorized here.
+    let (saved, deadline) = if same_host {
+        super::mounts::with_frozen_async(id, commit_started.clone(), commit).await?
+    } else {
+        commit.await?
+    };
+    super::mounts::ensure(&state, id, saved.lease_epoch, deadline)?;
     Ok(Json(saved))
 }
 

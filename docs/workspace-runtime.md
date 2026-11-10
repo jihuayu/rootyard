@@ -88,6 +88,76 @@ FUSE gate on the next scan or at the previous deadline. An operation admitted
 before expiry may finish on the old host's local upper layer; the old epoch
 cannot publish a checkpoint or remote manifest after lease handoff.
 
+Workspace FUSE writes pass a process-local mutation gate with `Healthy`,
+`Frozen` and `Fenced` states. A freeze first stops new admissions and then waits
+for already admitted mutations to drain before running its closure; reads are
+not gated. Dispatch is bounded per mount: the kernel shim copies each request
+into an owned operation and a single actor per mount owns the overlay and asks
+the gate for admission exactly once. A frozen gate parks writes/creates/
+setattr/mkdir/unlink/rmdir/rename/write-open in a bounded FIFO with their
+replies held, while reads, lookup, readdir and read-only open continue. After a
+successful thaw the actor drains the FIFO in order; it notices the thaw with a
+bounded 10 ms poll and an enqueue notification, not a new kernel request. A
+fenced or lease-expired gate returns `EROFS` for parked and new mutations;
+neither path changes content. A queued mutation is stamped with the lease epoch
+seen at enqueue, and admission checks the guard's epoch against that stamp, so
+an actor poll that misses a transient fence and observes the new healthy epoch
+still rejects the old write with `EROFS`. Only a queue-limit breach returns `EAGAIN`
+(per mount 128 operations/8 MiB, all mounts 1024/32 MiB, released exactly once
+when the reply is sent). Lazy reads use the global 4-worker/256-job pool and a
+saturated pool replies `EAGAIN` instead of running inline on the actor. On
+normal shutdown the gate is fenced and the queue closed; the actor checks
+shutdown before gate phase handling and fails ready and parked replies with
+`EIO` without executing them, while an already-admitted mutation may finish. A
+lazy read already executing in the pool replays no content but checks shutdown
+after I/O and returns `EIO`; joining that in-flight read belongs to the helper
+phase. See [fuse-dispatch-phase2](fuse-dispatch-phase2.md). A fence is terminal for the current lease epoch and does not
+wait for a freeze or for an in-flight mutation. It wakes blocked waiters with
+`EROFS`, ignores the legacy deadline-only lease update, and cannot be cleared by
+that update or by reusing the old epoch. Only a strictly higher epoch restores
+writes. Both `re_authorize` and the lease handoff reject a request that arrives
+during a freeze or while a guard admitted under the old epoch is still alive;
+that rejection is `EWOULDBLOCK` and is never bypassed. The gate's RAII admission
+count is released on error and panic, and a fenced state is never thawed by a
+freeze guard being dropped.
+
+A same-host lease commit runs inside a single freeze that fences the old epoch
+before that freeze is released, and the committed epoch is authorized afterwards
+through the same fence-then-authorize handoff used by the mount `ensure` path.
+The old epoch can therefore not admit a new mutation in the window between the
+commit and the new-epoch authorization, and a handoff that is rejected leaves
+the gate `Fenced` instead of `Healthy` on the superseded epoch. The wrapper
+separates a proven pre-COMMIT rollback from an unknown outcome: an error before
+the commit flag is signalled as a known rollback and thaws the original epoch,
+while commit success, a COMMIT transport error, a panic or a cancelled caller
+(dropped future or lost release channel) leaves the gate `Fenced`. A remaining
+pre-COMMIT conflict such as an active sandbox therefore returns normally and
+keeps the same healthy epoch writable. Such a fenced mount stays read-only,
+returning `EROFS` for new mutations, until a later committed lease epoch is
+authorized by a lease acquire, checkpoint completion or startup reconcile.
+
+Lease refresh observations are epoch-ordered under the gate lock. A late epoch
+`N` response that arrives after handoff `N+1` is ignored: it neither fences the
+new epoch nor lowers its deadline. An equal observation renews only a `Healthy`
+gate and cannot clear a fence; a newer observed epoch fences the current one but
+never authorizes the observed epoch, which still requires an explicit handoff
+that passes the fence floor. A missing refresh row may be an old query snapshot,
+so it fences only if the gate's epoch and generation still match the snapshot
+taken before the query; a concurrent handoff wins over the old missing row.
+
+This gate is only a prerequisite for an independent FUSE helper. The session is
+still a `BackgroundSession` in the API process, so an operator `SIGKILL` can
+still leave a thread in `request_wait_answer` holding the same-process FUSE
+descriptor; the helper and parent-loss lifecycle remain open and have no native
+acceptance. The bounded per-mount freeze queue described above is a prototype
+inside that same process, not the helper: it has no independent child, IPC or
+heartbeat, cannot fence a second process, and keeps queued work in memory only.
+Parked freeze writes do survive a normal thaw, but an operator `SIGKILL` still
+loses them and remains unhandled. The native freeze-queue tests are `#[ignore]`d
+and executed by the coordinator; an explicit `--ignored` run without
+`ROOTYARD_FUSE_NATIVE=1` fails instead of passing. See
+[fuse-dispatch-phase2](fuse-dispatch-phase2.md).
+
 A new host can acquire an expired workspace lease only when its latest revision
 has a committed checkpoint. It verifies and materializes that checkpoint from
 the tenant-scoped remote object store before changing host ownership, then

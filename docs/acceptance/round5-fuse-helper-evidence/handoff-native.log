@@ -1,0 +1,6 @@
+test_expired_host_reattach_from_remote_checkpoint (tests.test_workspace_handoff.WorkspaceHandoffTest.test_expired_host_reattach_from_remote_checkpoint) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 6.485s
+
+OK

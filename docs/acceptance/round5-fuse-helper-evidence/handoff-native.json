@@ -1,0 +1,23 @@
+{
+  "passed": true,
+  "tests": 1,
+  "seconds": 6.485,
+  "binary_sha256": "f901cbc58e1bd6af2e1e079d8d43e6a1a349c9f433ac739503f4cfc8fdc1a23b",
+  "compiled_source_commit": "51d9a626db07e217c74ce6fe44ff1c25d9d638a8",
+  "source_inputs_sha256": "0809c16904246bc3f17621a03798de806496275a1c774b2c92b9a7898a53f88e",
+  "backend": "fuse-helper",
+  "namespace_wrapper": [
+    "unshare",
+    "-Urm"
+  ],
+  "test_inputs": {
+    "tests/test_workspace_handoff.py": "2b9542597d3715c47e3f9a31534c6e03b55071dcaaabe8868df282aa4a50d243",
+    "tests/e2e.py": "aa424e6a322675e304413e886691b52de18c72ce434376aa8049bbdf881ee454",
+    "tests/test_workspace_fuse_service.py": "d999cec94482629df23b053b2767d8dac52e4a4954c03f0b0990ab6115f26b2f"
+  },
+  "log_sha256": "0e2447de57427c633e3377cb20f3b90e04686e4b93702ad00d87f83a2e87c564",
+  "limitations": [
+    "Functional loopback qualification on private user/mount namespace root; no physical cross-host or power-loss qualification.",
+    "No production API SIGKILL/exit77 case with a deterministically parked kernel writer is claimed."
+  ]
+}

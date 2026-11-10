@@ -21,24 +21,25 @@ use crate::{
         self,
         worker::{OperationContext, Phase, WorkerKind},
     },
-    workspace_lab::core,
 };
 use futures_util::StreamExt;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const PAGE: i64 = 100;
 
+/// Fingerprint of the workspace as the overlay exposes it, built from raw
+/// service-owned layers.
+///
+/// This must not read the mount: inside a freeze a mount `stat`/`read` queues
+/// behind the kernel inode lock of a parked write, the freeze waits for this
+/// scan, the scan waits for that write and the write waits for the thaw. See
+/// [`super::snapshot`] for the raw merged inventory, upper overrides, whiteouts
+/// and the lazy manifest, and for the preserved byte format of the hash.
 pub(super) fn fingerprint(repo: &Path) -> Result<String, Error> {
-    if let Some(fingerprint) = super::lazy::fingerprint(repo)? {
-        return Ok(fingerprint);
-    }
-    let entries = core::inventory(repo).map_err(Error::internal)?;
-    let raw = serde_json::to_vec(&entries).map_err(Error::internal)?;
-    Ok(hex::encode(Sha256::digest(&raw)))
+    super::snapshot::fingerprint(repo)
 }
 
 /// A workspace with no stored baseline only records one; it never invents a
@@ -73,18 +74,18 @@ pub async fn record_current_at(tx: &deadpool_postgres::Transaction<'_>, id: Uuid
     Ok(())
 }
 
-async fn eligible_page(state: &AppState, cursor: Option<Uuid>) -> Result<Vec<(Uuid, i64)>, Error> {
+async fn eligible_page(state: &AppState, cursor: Option<Uuid>) -> Result<Vec<(Uuid, i64, i64)>, Error> {
     let client = state.pool.get().await.map_err(Error::internal)?;
     let rows = client
         .query(
-            "SELECT id,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces \
+            "SELECT id,lease_epoch,EXTRACT(EPOCH FROM lease_until)::bigint FROM workspaces \
              WHERE host_id=$1 AND state='ready' AND lease_until>clock_timestamp() \
              AND ($2::uuid IS NULL OR id>$2) ORDER BY id LIMIT $3",
             &[&state.storage.volume_id, &cursor, &PAGE],
         )
         .await
         .map_err(Error::internal)?;
-    Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+    Ok(rows.iter().map(|row| (row.get(0), row.get(1), row.get(2))).collect())
 }
 
 async fn eligible(state: &AppState, id: Uuid) -> Result<Option<(i64, i64)>, Error> {
@@ -245,8 +246,8 @@ pub async fn run(state: Arc<AppState>, stop: CancellationToken) {
             let last = rows.last().map(|row| row.0);
             let ids: Vec<Uuid> = rows
                 .into_iter()
-                .map(|(id, deadline)| {
-                    super::mounts::update_lease(id, deadline);
+                .map(|(id, epoch, deadline)| {
+                    super::mounts::update_lease(id, epoch, deadline);
                     id
                 })
                 .collect();

@@ -205,51 +205,14 @@ fn fingerprint_manifest(root: &Path, id: Uuid) -> Result<Option<LazyManifest>, E
     Ok(Some(read_manifest(&path)?))
 }
 
-/// Merge immutable baseline metadata with confined CoW entries. This avoids
-/// downloading every remote blob during the two-second capture scan.
-pub(super) fn fingerprint(path: &Path) -> Result<Option<String>, Error> {
-    let Some(id) = path.file_name().and_then(|name| name.to_str()).and_then(|name| Uuid::parse_str(name).ok()) else {
-        return Ok(None);
-    };
-    let Some(kind) = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()) else {
-        return Ok(None);
-    };
-    if kind != "mounts" && kind != "workspaces" {
-        return Ok(None);
-    }
-    let root = path.parent().and_then(Path::parent).and_then(Path::parent).ok_or_else(Error::bad_request)?;
-    let Some(manifest) = fingerprint_manifest(root, id)? else {
-        return Ok(None);
-    };
-    let upper = root.join("workspace-service/uppers").join(id.to_string());
-    let whiteout_file = upper.join(".rootyard-whiteouts.json");
-    let whiteouts: BTreeSet<PathBuf> = if whiteout_file.exists() {
-        serde_json::from_slice::<Vec<String>>(&fs::read(whiteout_file).map_err(Error::internal)?)
-            .map_err(Error::internal)?
-            .into_iter()
-            .map(PathBuf::from)
-            .collect()
-    } else {
-        BTreeSet::new()
-    };
-    let hidden = |path: &Path| whiteouts.iter().any(|w| path == w || path.starts_with(w));
-    let mut entries = BTreeMap::<PathBuf, core::Entry>::new();
-    for entry in manifest.entries {
-        let path = core::decode_path(&entry.path_base64).map_err(Error::internal)?;
-        if !hidden(&path) {
-            entries.insert(path, entry);
-        }
-    }
-    if upper.is_dir() {
-        for entry in core::inventory(&upper).map_err(Error::internal)? {
-            let rel = core::decode_path(&entry.path_base64).map_err(Error::internal)?;
-            if !rel.as_os_str().as_encoded_bytes().starts_with(b".rootyard-whiteouts.") && !hidden(&rel) {
-                entries.insert(rel, entry);
-            }
-        }
-    }
-    let raw = serde_json::to_vec(&entries.into_values().collect::<Vec<_>>()).map_err(Error::internal)?;
-    Ok(Some(hex::encode(Sha256::digest(raw))))
+/// Raw baseline metadata of a lazy workspace, revalidated by `read_manifest`.
+///
+/// Capture and checkpoint merge this manifest with the upper layer instead of
+/// walking the sparse lower tree, whose placeholder files still hash as zeroes.
+/// A fingerprint built from it stays byte-compatible with the former
+/// `lazy::fingerprint`: the same path-ordered `core::Entry` JSON list.
+pub(super) fn manifest_entries(root: &Path, id: Uuid) -> Result<Option<Vec<core::Entry>>, Error> {
+    Ok(fingerprint_manifest(root, id)?.map(|manifest| manifest.entries))
 }
 
 /// Blocking facade used by FUSE callbacks to obtain a verified local file.
@@ -259,8 +222,19 @@ pub(crate) struct Reader {
 }
 
 impl Reader {
+    /// Service facade kept for the in-process path. The independent helper uses
+    /// [`Reader::open_root`], which needs no `AppState` and no PostgreSQL.
     pub(super) fn open(state: &AppState, id: Uuid) -> Result<Option<Arc<Self>>, Error> {
-        let Some(manifest) = fingerprint_manifest(&state.storage.root, id)? else {
+        Self::open_root(&state.storage.root, id)
+    }
+
+    /// Open the lazily hydrated baseline from a storage root and a workspace id
+    /// only. The committed sidecar manifest and the forwarded object-store
+    /// environment are the complete input, so the FUSE helper child can hydrate
+    /// blob over a store it never gained by asking the control plane for a path.
+    /// `prepare` still runs in the parent and keeps its database authorization.
+    pub(crate) fn open_root(root: &Path, id: Uuid) -> Result<Option<Arc<Self>>, Error> {
+        let Some(manifest) = fingerprint_manifest(root, id)? else {
             return Ok(None);
         };
         let mut entries = BTreeMap::new();
@@ -278,8 +252,8 @@ impl Reader {
             }
             entries.insert(rel, (key, entry.size));
         }
-        let cache_root = state.storage.root.join("workspace-service/lazy-cache").join(id.to_string());
-        let fetcher = Arc::new(RemoteFetcher { store: Arc::new(remote::remote_store(state)?) });
+        let cache_root = root.join("workspace-service/lazy-cache").join(id.to_string());
+        let fetcher = Arc::new(RemoteFetcher { store: Arc::new(remote::store_at(root)?) });
         let hydrator = Hydrator::new(cache_root, fetcher, configured_timeout()).map_err(Error::internal)?;
         Ok(Some(Arc::new(Self { entries, hydrator })))
     }
@@ -291,14 +265,31 @@ impl Reader {
         self.hydrator.ensure(key, *size).map(Some)
     }
 
-    pub(super) fn prewarm(&self, paths: &[PathBuf]) -> io::Result<(usize, u64)> {
+    pub(crate) fn prewarm(&self, paths: &[PathBuf]) -> io::Result<(usize, u64)> {
+        // In-process callers keep the original per-blob budget; the helper
+        // passes an absolute admission deadline to `prewarm_until` instead.
+        let total = self.hydrator.timeout.saturating_mul(paths.len() as u32) + HYDRATION_PUBLICATION_GRACE;
+        let deadline = std::time::Instant::now()
+            .checked_add(total)
+            .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(3600));
+        self.prewarm_until(paths, deadline)
+    }
+
+    /// Prewarm inside one absolute caller deadline. Every path first checks the
+    /// remaining budget, and each single-blob hydration is bounded by the
+    /// smaller of that remaining time and the configured per-blob timeout, so
+    /// four paths cannot turn one 60s admission into 240s of work.
+    pub(crate) fn prewarm_until(&self, paths: &[PathBuf], deadline: std::time::Instant) -> io::Result<(usize, u64)> {
         let mut count = 0;
         let mut bytes = 0;
         for path in paths {
-            let Some((_, size)) = self.entries.get(path) else {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+            }
+            let Some((key, size)) = self.entries.get(path) else {
                 return Err(io::Error::from_raw_os_error(libc::ENOENT));
             };
-            self.file(path)?;
+            self.hydrator.ensure_until(key, *size, deadline)?;
             count += 1;
             bytes += size;
         }
@@ -337,30 +328,41 @@ impl Flight {
         self.done.notify_all();
     }
 
+    #[cfg(test)]
     fn wait(&self) -> io::Result<()> {
+        self.wait_until(self.deadline)
+    }
+
+    /// A follower waits for `min(caller_deadline, flight_deadline)`. Hitting
+    /// the caller budget is `ETIMEDOUT`; hitting the leader's own deadline is
+    /// the existing `EIO`. Neither case cancels the shared leader, which stays
+    /// owned by the original caller that created the flight.
+    fn wait_until(&self, caller_deadline: std::time::Instant) -> io::Result<()> {
+        let (limit, timeout_error): (std::time::Instant, fn() -> io::Error) =
+            if caller_deadline < self.deadline { (caller_deadline, etimedout) } else { (self.deadline, eio) };
         #[cfg(test)]
         self.waiters.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let result = self.wait_bounded();
+        let result = self.wait_bounded(limit, timeout_error);
         #[cfg(test)]
         self.waiters.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         result
     }
 
-    fn wait_bounded(&self) -> io::Result<()> {
+    fn wait_bounded(&self, limit: std::time::Instant, timeout_error: fn() -> io::Error) -> io::Result<()> {
         let mut outcome = lock(&self.outcome);
         loop {
             if let Some(code) = *outcome {
                 return if code == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(code)) };
             }
             let now = std::time::Instant::now();
-            if now >= self.deadline {
-                return Err(eio());
+            if now >= limit {
+                return Err(timeout_error());
             }
             let (guard, timed_out) =
-                self.done.wait_timeout(outcome, self.deadline - now).unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.done.wait_timeout(outcome, limit - now).unwrap_or_else(std::sync::PoisonError::into_inner);
             outcome = guard;
             if timed_out.timed_out() && outcome.is_none() {
-                return Err(eio());
+                return Err(timeout_error());
             }
         }
     }
@@ -445,6 +447,18 @@ impl Hydrator {
     }
 
     fn ensure(&self, key: &ObjectKey, size: u64) -> io::Result<File> {
+        let deadline = std::time::Instant::now() + self.timeout + HYDRATION_PUBLICATION_GRACE;
+        self.ensure_until(key, size, deadline)
+    }
+
+    /// One blob hydrated inside an absolute caller deadline. A follower joins
+    /// the existing single flight but bounds its own wait; it never cancels the
+    /// leader. A new leader sets the flight deadline to the smaller of the
+    /// caller budget and the configured publication window.
+    fn ensure_until(&self, key: &ObjectKey, size: u64, deadline: std::time::Instant) -> io::Result<File> {
+        if std::time::Instant::now() >= deadline {
+            return Err(etimedout());
+        }
         let digest = key.sha256.as_str();
         // Full digest validation happens once per process for this
         // service-owned cache; the fast path still re-checks the length.
@@ -467,37 +481,47 @@ impl Hydrator {
             match flights.get(digest) {
                 Some(flight) => (flight.clone(), false),
                 None => {
-                    let deadline = std::time::Instant::now() + self.timeout + HYDRATION_PUBLICATION_GRACE;
-                    let flight = Arc::new(Flight::new(deadline));
+                    let configured = std::time::Instant::now() + self.timeout + HYDRATION_PUBLICATION_GRACE;
+                    let flight = Arc::new(Flight::new(configured.min(deadline)));
                     flights.insert(digest.to_owned(), flight.clone());
                     (flight, true)
                 }
             }
         };
         if !leader {
-            flight.wait()?;
+            flight.wait_until(deadline)?;
             return self.open(digest);
         }
         let mut guard = LeaderGuard::new(self, digest.to_owned(), flight);
-        let result = self.hydrate(key, size);
+        let result = self.hydrate_until(key, size, deadline);
         guard.finish(&result);
         result?;
         self.open(digest)
     }
 
-    fn hydrate(&self, key: &ObjectKey, size: u64) -> io::Result<()> {
+    /// Hydrate one blob using the smaller of the caller's remaining budget and
+    /// the configured request timeout. A caller budget that is the binding
+    /// limit fails `ETIMEDOUT`; the configured limit keeps the existing `EIO`.
+    fn hydrate_until(&self, key: &ObjectKey, size: u64, caller_deadline: std::time::Instant) -> io::Result<()> {
         let digest = key.sha256.as_str();
         let dest = self.cache_root.join(digest);
         if verify_file(&dest, digest, size).is_ok() {
             lock(&self.verified).insert(digest.to_owned());
             return Ok(());
         }
+        let now = std::time::Instant::now();
+        if now >= caller_deadline {
+            return Err(etimedout());
+        }
+        let configured = now + self.timeout;
+        let caller_bounded = caller_deadline < configured;
+        let budget = if caller_bounded { caller_deadline - now } else { self.timeout };
+        let timeout_error: fn() -> io::Error = if caller_bounded { etimedout } else { eio };
         let mut staging = StagingFile::new(&self.cache_root, digest);
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + budget;
         let future = self.fetcher.fetch(key, staging.path().to_path_buf(), size, deadline);
         let mut handle = self.runtime.spawn(future);
-        let timeout = self.timeout;
-        let outcome = self.runtime.block_on(async { tokio::time::timeout(timeout, &mut handle).await });
+        let outcome = self.runtime.block_on(async { tokio::time::timeout(budget, &mut handle).await });
         match outcome {
             Ok(Ok(result)) => result?,
             Ok(Err(_)) => return Err(eio()),
@@ -510,7 +534,7 @@ impl Hydrator {
                     let _ = handle.await;
                     let _ = tokio::fs::remove_file(&cleanup).await;
                 });
-                return Err(eio());
+                return Err(timeout_error());
             }
         }
         if verify_file(staging.path(), digest, size).is_err() {
@@ -580,6 +604,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn eio() -> io::Error {
     io::Error::from_raw_os_error(libc::EIO)
+}
+
+fn etimedout() -> io::Error {
+    io::Error::from_raw_os_error(libc::ETIMEDOUT)
 }
 
 fn verify_file(path: &Path, digest: &str, size: u64) -> io::Result<()> {
@@ -894,6 +922,51 @@ mod tests {
             release.notify_one();
             first_thread.join().unwrap();
         });
+    }
+
+    #[test]
+    fn prewarm_until_returns_etimedout_before_starting_work() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"budgeted prewarm\n".repeat(16);
+        let key = key_for(&bytes);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = Arc::new(TestFetcher { calls: calls.clone(), behavior: Behavior::Publish(bytes.clone()) });
+        let reader = reader_for(root.path(), key, bytes.len(), fetcher, Duration::from_secs(5));
+        let expired = StdInstant::now() - StdDuration::from_millis(1);
+        let error = reader.prewarm_until(&[PathBuf::from("data.bin")], expired).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no fetch may start without budget");
+    }
+
+    #[test]
+    fn prewarm_until_uses_remaining_budget_not_the_configured_timeout() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"pending prewarm\n".repeat(16);
+        let key = key_for(&bytes);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetcher = Arc::new(TestFetcher { calls, behavior: Behavior::Pending });
+        let reader = reader_for(root.path(), key, bytes.len(), fetcher, Duration::from_secs(30));
+        let started = StdInstant::now();
+        let deadline = StdInstant::now() + StdDuration::from_millis(80);
+        let error = reader.prewarm_until(&[PathBuf::from("data.bin")], deadline).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
+        assert!(
+            started.elapsed() < StdDuration::from_secs(2),
+            "prewarm ignored the caller budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn follower_caller_deadline_does_not_cancel_the_shared_leader() {
+        let flight = Flight::new(StdInstant::now() + StdDuration::from_secs(30));
+        let started = StdInstant::now();
+        let error = flight.wait_until(StdInstant::now() + StdDuration::from_millis(40)).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ETIMEDOUT));
+        assert!(started.elapsed() < StdDuration::from_secs(1));
+        // The leader still owns the flight and can finish it later.
+        flight.finish(0);
+        assert!(flight.wait().is_ok());
     }
 
     #[test]

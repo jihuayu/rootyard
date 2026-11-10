@@ -1,0 +1,6 @@
+test_live_editor_capture_checkpoint_and_remount (tests.test_workspace_fuse_service.WorkspaceFuseServiceTest.test_live_editor_capture_checkpoint_and_remount) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 7.798s
+
+OK

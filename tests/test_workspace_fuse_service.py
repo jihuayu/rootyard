@@ -1,9 +1,24 @@
-"""Native API, bubblewrap and checkpoint integration over a real FUSE mount."""
+"""Native API, bubblewrap and checkpoint integration over a real FUSE mount.
+
+Test-only backend selector, read once at import time:
+
+* ``ROOTYARD_TEST_FUSE_BACKEND`` unset or ``fuse`` (default) runs the legacy
+  in-process service mount (``ROOTYARD_WORKSPACE_MOUNT_MODE=fuse``).  That
+  backend is NOT evidence for the independent helper or for its AutoUnmount
+  SIGKILL contract: it must never be reported as a helper-cleanup run.
+* ``ROOTYARD_TEST_FUSE_BACKEND=fuse-helper`` runs the same API scenario against
+  the independent helper (``ROOTYARD_WORKSPACE_MOUNT_MODE=fuse-helper``).  The
+  root workflow runs this selector later; it needs a qualified host (namespace
+  root, fusermount3) and is not executed by this repository's default test run.
+
+Any other value is a hard error rather than a silent fallback.
+"""
 import argparse
 import base64
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import tempfile
 import time
@@ -11,18 +26,33 @@ import unittest
 
 from tests.e2e import Harness
 
+LEGACY_BACKEND = "fuse"
+HELPER_BACKEND = "fuse-helper"
+BACKENDS = {"fuse": LEGACY_BACKEND, "fuse-helper": HELPER_BACKEND}
+SELECTED = os.environ.get("ROOTYARD_TEST_FUSE_BACKEND", "fuse").strip() or "fuse"
+if SELECTED not in BACKENDS:
+    raise SystemExit(
+        f"ROOTYARD_TEST_FUSE_BACKEND={SELECTED!r} is not a known backend; "
+        f"expected one of {sorted(BACKENDS)}")
+MOUNT_MODE = BACKENDS[SELECTED]
+
 
 class WorkspaceFuseServiceTest(unittest.TestCase):
+    # backend selects which mount implementation this API scenario proves:
+    # "fuse" is the legacy in-process mount (no AutoUnmount contract), and
+    # "fuse-helper" is the independent helper (AutoUnmount ownership boundary).
+    backend = MOUNT_MODE
+
     def test_live_editor_capture_checkpoint_and_remount(self):
-        binary=Path("target/debug/rootyard").resolve()
+        binary=Path(os.environ.get("ROOTYARD_TEST_BINARY", "target/debug/rootyard")).resolve()
         self.assertTrue(binary.is_file())
         with tempfile.TemporaryDirectory(prefix="rootyard-userns-wrapper-") as wrapper_dir:
             wrapper=Path(wrapper_dir)/"rootyard-userns"
-            wrapper.write_text(f"#!/bin/sh\nexec unshare -Urm {binary} \"$@\"\n")
+            wrapper.write_text(f"#!/bin/sh\nexec unshare -Urm {shlex.quote(str(binary))} \"$@\"\n")
             wrapper.chmod(0o700)
             h=Harness(argparse.Namespace(binary=str(wrapper),keep=False))
             try:
-                h.env["ROOTYARD_WORKSPACE_MOUNT_MODE"]="fuse"
+                h.env["ROOTYARD_WORKSPACE_MOUNT_MODE"]=MOUNT_MODE
                 h.env["ROOTYARD_SANDBOX_MODE"]="dev"
                 h.setup();h.api();h.roundtrip()
                 ws=json.loads(h.expect("/api/workspaces",201,token=h.alice,method="POST",

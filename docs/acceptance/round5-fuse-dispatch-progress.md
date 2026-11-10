@@ -1,0 +1,9 @@
+# FUSE mutation admission and bounded dispatch
+
+The in-process dispatcher now parks frozen mutations in bounded per-mount FIFO queues, stamps their admitted lease epoch, rejects stale queued work after handoff, and fences before releasing freeze waiters. Queue budgets include ready, frozen and deferred read replies. Database lease observations use the real lease epoch and reject stale observations. This changes the existing in-process mount path; an independently supervised helper is still a separate unfinished implementation.
+
+[31 library tests](round5-fuse-dispatch-evidence/library-tests.log) and [three real FUSE tests](round5-fuse-dispatch-evidence/native-tests.log) passed. The real mount cases exercise FIFO writes through two FUSE inodes sharing a private-upper host inode, independent-inode reads while frozen, another mount's progress, fenced write rejection, and a rapid handoff whose actor observes no Fenced phase but rejects the old queued epoch. The explicit ignored-test invocation sets ROOTYARD_FUSE_NATIVE=1 inside an owned user/mount namespace; default discovery does not execute these tests.
+
+The first FIFO fixture read the inode whose write was already parked. Linux serialized that read behind the unanswered write, the fixture's bounded freeze expired, and the case failed. Using an independent read-probe inode preserves the intended dispatcher guarantee; the corrected invocation passed all three cases in 0.65 seconds. Earlier resource-exhausted build attempts are not passing evidence. Clippy passed before this test-only correction. The subsequent integration of parent web changes has not yet received the final combined binary gates.
+
+This advances #91 and workspace correctness work. It does not prove API-process SIGKILL cleanup: the independent helper, heartbeat, cancellation races, child teardown and production mode integration remain pending. No issue closure is claimed.

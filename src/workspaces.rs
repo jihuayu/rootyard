@@ -23,6 +23,11 @@ mod remote_gc;
 mod scan;
 #[path = "workspaces/service.rs"]
 pub(crate) mod service;
+#[path = "workspaces/snapshot.rs"]
+pub(crate) mod snapshot;
+#[cfg(test)]
+#[path = "workspaces/snapshot_tests.rs"]
+mod snapshot_tests;
 
 use crate::AppState;
 use axum::{
