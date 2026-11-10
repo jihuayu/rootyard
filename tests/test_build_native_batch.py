@@ -539,6 +539,7 @@ class BatchTest(unittest.TestCase):
         args = self.args()
         report = self.build(args=args)
         receipt = json.loads((self.target / 'debug' / 'rootyard.build.json').read_text())
+        self.assertEqual(receipt['batch']['manifest'], str(Path(args.manifest_out).resolve()))
         # native_report_manifest.REQUIRED_RECEIPT_FIELDS
         for field in ('binary_sha256', 'source_inputs_sha256', 'workspace_commit', 'rustc', 'command'):
             self.assertTrue(receipt[field], field)
@@ -565,6 +566,7 @@ class BatchTest(unittest.TestCase):
 
         for output, name in zip(args.output, args.test):
             test = json.loads(Path(output + '.build.json').read_text())
+            self.assertEqual(test['batch']['manifest'], str(Path(args.manifest_out).resolve()))
             self.assertEqual(test['kind'], 'rust-integration-test')
             self.assertIs(test['relocated_artifact'], True)
             self.assertIs(test['package_rebuilt'], True)

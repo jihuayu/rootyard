@@ -1294,6 +1294,7 @@ def toolchain_record(selection):
 
 
 def binary_receipt(*, path, digests, toolchain, command, targets, lock_path, timings, bound,
+                   manifest_path,
                    implicit=None):
     """The ``build_native.py`` receipt fields, bound to this batch's single build.
 
@@ -1334,12 +1335,14 @@ def binary_receipt(*, path, digests, toolchain, command, targets, lock_path, tim
         'bound_input_inventory': bound['bound_input_inventory'],
         'batch': {'kind': KIND, 'receipt_version': RECEIPT_VERSION, 'binary': path.name,
                   'targets': [item['target'] for item in targets],
-                  'bound_inputs_sha256': bound['bound_inputs']['digest']},
+                  'bound_inputs_sha256': bound['bound_inputs']['digest'],
+                  'manifest': str(Path(manifest_path).resolve())},
         **({'implicit_build': implicit} if implicit is not None else {}),
     }
 
 
-def test_receipt(*, path, artifact, digests, toolchain, command, targets, lock_path, timings, bound):
+def test_receipt(*, path, artifact, digests, toolchain, command, targets, lock_path, timings, bound,
+                 manifest_path):
     """The ``build_native_test.py`` receipt fields for one relocated test executable."""
     path = Path(path)
     return {
@@ -1366,7 +1369,8 @@ def test_receipt(*, path, artifact, digests, toolchain, command, targets, lock_p
         'bound_input_inventory': bound['bound_input_inventory'],
         'batch': {'kind': KIND, 'receipt_version': RECEIPT_VERSION, 'binary': path.name,
                   'targets': [item['target'] for item in targets] + [artifact['target']],
-                  'bound_inputs_sha256': bound['bound_inputs']['digest']},
+                  'bound_inputs_sha256': bound['bound_inputs']['digest'],
+                  'manifest': str(Path(manifest_path).resolve())},
     }
 
 
@@ -1493,6 +1497,7 @@ def publish_transaction(plan, owned, lock_path, metadata_before, toolchain, comm
         publisher.text(path, binary_receipt(path=artifact['executable'], digests=digests,
                                             toolchain=toolchain, command=command, targets=targets,
                                             lock_path=lock_path, timings=timings, bound=bound,
+                                            manifest_path=plan.manifest_out,
                                             implicit=marker))
         stat = os.stat(artifact['executable'])
         artifacts.append({'kind': 'bin', 'target': spec['name'], 'artifact': artifact['executable'],
@@ -1523,7 +1528,8 @@ def publish_transaction(plan, owned, lock_path, metadata_before, toolchain, comm
         staged = Path(artifact['output']).with_name('.' + Path(artifact['output']).name + '.batch-new')
         publisher.text(path, test_receipt(path=staged, artifact=artifact, digests=digests,
                                           toolchain=toolchain, command=command, targets=targets,
-                                          lock_path=lock_path, timings=timings, bound=bound))
+                                          lock_path=lock_path, timings=timings, bound=bound,
+                                          manifest_path=plan.manifest_out))
     manifest = {
         'kind': KIND,
         'manifest_version': RECEIPT_VERSION,
