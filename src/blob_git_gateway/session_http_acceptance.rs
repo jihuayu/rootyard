@@ -44,6 +44,22 @@
 //! Every refusal body is checked against the pushed OID/ref so it discloses
 //! neither repository content nor another repository's details.
 //!
+//! Task 2 browser read integration (read-only; no browser-initiated writes):
+//!
+//! * a real `POST /web/login` API-token exchange with the exact same-origin
+//!   `Origin`; its `Set-Cookie` values are retained privately in a cookie jar;
+//! * `GET /web/blob` and the new `GET /web/blob/repos/{owner}/{name}` page load
+//!   with that cookie, and their HTML must carry no API token, cookie value or
+//!   session value;
+//! * the `/web/blob/api/...` read aliases, with only the browser cookie plus the
+//!   actual session token/revision captured from the real Git push, return the
+//!   pushed ref + OID (`/refs`), the pushed commit and `COMMIT_FILE`
+//!   (`/tree?oid=HEAD`), the pushed OID (`/commits`) and the pushed ref + OID
+//!   again (last `/refs`), each with a complete non-regressing pair that the
+//!   next read chains;
+//! * the same browser cookie sent to the unchanged ordinary `/api/.../refs`
+//!   route is still denied, so cookie authentication was not enabled globally.
+//!
 //! Messages are generic on purpose: Git URLs carry credentials, so neither a
 //! URL, Git stderr, a token, the key, the database URL nor Blob secrets are
 //! ever printed.
@@ -61,7 +77,7 @@ use axum::{
     Router,
     body::Body,
     extract::State,
-    http::{HeaderMap, Method, Request},
+    http::{HeaderMap, Method, Request, header},
     middleware::{self, Next},
     response::Response,
 };
@@ -259,8 +275,190 @@ async fn case(db: &Db) -> Result<()> {
     ensure!(!looks_like_refs(&ahead.body), "future session refusal looked like a successful refs answer");
     ensure_no_disclosure(&ahead.body, &secrets, "future session refusal")?;
 
+    // 8. Browser read integration (read-only). A real API-token exchange mints
+    // the HttpOnly browser session; its cookies stay in this jar, never printed.
+    let login = browser_login(address, &owner).await?;
+    let cookie = browser_cookie_header(&login)?;
+    let origin = format!("http://{address}");
+    for path in ["/web/blob".to_owned(), format!("/web/blob/repos/{owner_name}/{name}")] {
+        browser_page(&client, &origin, &path, &cookie, &login).await?;
+    }
+
+    // The index alias lists the authorized repository through the browser cookie
+    // (the list handler issues no session, so only its JSON is asserted).
+    let answer = browser_get(&client, &format!("{origin}/web/blob/api/repos"), &cookie, None).await?;
+    ensure!(status_succeeds(answer.status), "the Web repository list alias was refused");
+    ensure!(
+        contains(&answer.body, &name) && !looks_like_refs(&answer.body),
+        "the Web repository list did not contain the repository"
+    );
+
+    // Each detail read presents the bound of the previous answer, starting from
+    // the real push's; every answer must carry the endpoint's pushed content and
+    // a complete pair that never regresses below the presented one.
+    let mut presented = pushed_bound;
+    let mut browser_revisions = Vec::new();
+    for (path, expected) in [
+        ("refs", [Some(PUSHED_REF), Some(oid.as_str())]),
+        ("tree?oid=HEAD", [Some(&*json_string(COMMIT_FILE)), Some(oid.as_str())]),
+        ("commits", [None, Some(oid.as_str())]),
+        ("refs", [Some(PUSHED_REF), Some(oid.as_str())]),
+    ] {
+        let url = web_scope(&origin, &owner_name, &name, path);
+        let answer = browser_get(&client, &url, &cookie, Some(&presented.token)).await?;
+        ensure!(status_succeeds(answer.status), "a Web Blob read alias was refused");
+        for needle in expected.into_iter().flatten() {
+            ensure!(contains(&answer.body, needle), "a Web Blob read alias did not return its expected content");
+        }
+        if path == "tree?oid=HEAD" {
+            ensure!(
+                !contains(&answer.body, PUSHED_REF),
+                "the tree alias returned a ref name instead of the commit and file"
+            );
+        }
+        ensure_no_disclosure(&answer.body, &[cookie.as_str()], "Web Blob read alias")?;
+        let raw = RawSession { token: answer.session.token, revision: answer.session.revision };
+        presented = raw.admit_at_least(&presented)?;
+        browser_revisions.push(presented.revision);
+    }
+    ensure!(
+        browser_revisions.windows(2).all(|pair| pair[1] >= pair[0]),
+        "successive Web reads regressed their session revision"
+    );
+
+    // Outside this session, that same browser cookie on the unchanged ordinary
+    // `/api/.../refs` route is still denied: no global cookie authentication.
+    let ordinary = client.get(format!("{base}/refs")).header(header::COOKIE, cookie.clone()).send().await?;
+    let status = ordinary.status().as_u16();
+    let body = String::from_utf8_lossy(&ordinary.bytes().await?).into_owned();
+    ensure!(!status_succeeds(status), "the browser cookie authenticated the ordinary /api route");
+    ensure!(is_denial(status), "the ordinary /api route did not deny the browser cookie");
+    ensure!(!looks_like_refs(&body), "the ordinary /api denial looked like a successful refs answer");
+    ensure_no_disclosure(&body, &secrets, "ordinary /api cookie denial")?;
+
     drop(server);
     Ok(())
+}
+
+/// One browser sign-in exchange: only the two named cookies, in a private jar.
+///
+/// The values are never formatted, logged or echoed; a failed sign-in yields a
+/// generic error.
+struct BrowserLogin {
+    session: String,
+    csrf: String,
+}
+
+impl Drop for BrowserLogin {
+    fn drop(&mut self) {
+        self.session.clear();
+        self.csrf.clear();
+    }
+}
+
+/// The private `Cookie` request header value built from the jar.
+fn browser_cookie_header(login: &BrowserLogin) -> Result<String> {
+    ensure!(!login.session.is_empty() && !login.csrf.is_empty(), "browser session cookies are incomplete");
+    Ok(format!("rootyard_session={}; rootyard_csrf={}", login.session, login.csrf))
+}
+
+/// Sign in over the real `POST /web/login` with the owner's real API token and
+/// the exact same-origin `Origin`, keeping only `rootyard_session` and
+/// `rootyard_csrf` from the `303` response. Redirects are disabled so that the
+/// one exchange, its status and its `Set-Cookie` values are inspected directly.
+async fn browser_login(address: SocketAddr, owner: &Actor) -> Result<BrowserLogin> {
+    let origin = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("browser sign-in client could not be built")?;
+    let response = client
+        .post(format!("{origin}/web/login"))
+        .header(header::ORIGIN, origin.as_str())
+        // `serde_json::to_string` of strings is exactly the form-urlencoded
+        // percent encoding; the body is built without the client's `form`
+        // feature and is never printed.
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(login_form(&owner.username, &owner.token))
+        .send()
+        .await
+        .context("browser sign-in request failed")?;
+    ensure!(response.status().as_u16() == 303, "browser sign-in did not answer with 303");
+    let mut login = BrowserLogin { session: String::new(), csrf: String::new() };
+    for value in response.headers().get_all(header::SET_COOKIE) {
+        // `to_str` fails rather than echo a non-text cookie value.
+        let Ok(raw) = value.to_str() else { continue };
+        let (pair, _) = raw.split_once(';').unwrap_or((raw, ""));
+        let Some((name, value)) = pair.trim().split_once('=') else { continue };
+        match name {
+            "rootyard_session" => login.session = value.to_owned(),
+            "rootyard_csrf" => login.csrf = value.to_owned(),
+            _ => {}
+        }
+    }
+    ensure!(!login.session.is_empty(), "browser sign-in did not set the session cookie");
+    ensure!(!login.csrf.is_empty(), "browser sign-in did not set the CSRF cookie");
+    ensure!(
+        login.session != owner.token && !login.session.contains(&owner.token),
+        "browser session embedded the API token"
+    );
+    Ok(login)
+}
+
+/// The url-encoded sign-in form of one username and API token.
+fn login_form(username: &str, token: &str) -> String {
+    let field = |value: &str| serde_json::to_string(value).unwrap_or_default();
+    format!("username={}&token={}&return_to={}", field(username), field(token), field("/web/blob"))
+}
+
+/// One signed-in page load: `200`, HTML, and none of the credentials in it.
+async fn browser_page(
+    client: &reqwest::Client,
+    origin: &str,
+    path: &str,
+    cookie: &str,
+    login: &BrowserLogin,
+) -> Result<()> {
+    let response = client
+        .get(format!("{origin}{path}"))
+        .header(header::COOKIE, cookie)
+        .header(header::ACCEPT, "text/html")
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .context("browser page request failed")?;
+    ensure!(status_succeeds(response.status().as_u16()), "a signed-in browser page was not served");
+    let body = String::from_utf8_lossy(&response.bytes().await?).into_owned();
+    ensure!(body.contains("</html>"), "a signed-in browser page was not HTML");
+    for secret in [&login.session, &login.csrf] {
+        ensure!(!secret.is_empty() && !body.contains(secret), "a browser page carried a credential");
+    }
+    Ok(())
+}
+
+/// One same-origin browser read with only the cookie and an optional session
+/// header. Redirects are disabled so a refused navigation cannot hide behind a
+/// login page.
+async fn browser_get(
+    client: &reqwest::Client,
+    url: &str,
+    cookie: &str,
+    session: Option<&str>,
+) -> Result<RawAnswer> {
+    let mut request = client.get(url).header(header::COOKIE, cookie);
+    if let Some(session) = session {
+        request = request.header(SESSION_HEADER, session);
+    }
+    let response = request.send().await.context("Web Blob browser read failed")?;
+    let status = response.status().as_u16();
+    let session = RawSession::from_headers(response.headers());
+    let bytes = response.bytes().await.context("Web Blob browser read body failed")?;
+    Ok(RawAnswer { status, body: String::from_utf8_lossy(&bytes).into_owned(), session })
+}
+
+/// One read alias URL of the browser subtree for a repository.
+fn web_scope(origin: &str, owner: &str, name: &str, tail: &str) -> String {
+    format!("{origin}/web/blob/api/repos/{owner}/{name}/{tail}")
 }
 
 fn is_denial(status: u16) -> bool {

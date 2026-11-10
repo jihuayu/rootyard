@@ -248,6 +248,18 @@ fn read<const N: usize>(slice: &[u8]) -> [u8; N] {
     out
 }
 
+/// The bound named by a well-formed frame, checked structurally exactly like
+/// [`parse_body`] but without any key, MAC, realm or expiry decision.
+pub(crate) fn bound_of(token: &str) -> Option<i64> {
+    let rest = token.strip_prefix(PREFIX)?;
+    let (body, mac) = rest.split_once('.')?;
+    if mac.len() != MAC_B64_LEN || body.len() != BODY_B64_LEN {
+        return None;
+    }
+    let body = URL_SAFE_NO_PAD.decode(body).ok()?;
+    parse_body(&body).ok().map(|session| session.bound)
+}
+
 fn backend_digest(backend: &BlobBackendIdentity) -> Result<[u8; 32], GatewayError> {
     hex::decode(backend.as_hex())
         .ok()

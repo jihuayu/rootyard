@@ -151,6 +151,15 @@ pub(crate) use codec::SessionTokenCodec;
 pub(crate) use codec::presented;
 #[cfg(test)]
 pub(crate) use codec::presented as presented_for_test;
+
+/// The lower bound a presented token frame names, without authenticating it or
+/// loading any live realm. `None` means the value is not a well-formed frame;
+/// it is never a revision. Callers use it only to reject a whole-body answer
+/// that would move the browser backwards; the framework still decides admission.
+pub(crate) fn presented_bound(token: &str) -> Option<i64> {
+    codec::bound_of(token)
+}
+
 pub(crate) use codec::{MAX_LIFETIME_SECONDS, MIN_LIFETIME_SECONDS};
 
 use codec::{Presented, now_seconds};
