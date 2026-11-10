@@ -311,22 +311,32 @@ def verify_batch_receipt(receipt, receipt_file, binary):
         "batch receipt manifest artifacts must be objects",
     )
 
-    binary_resolved = Path(binary).resolve()
-    receipt_resolved = Path(receipt_file).resolve()
+    target_dir_value = receipt.get("target_dir")
+    require(
+        isinstance(target_dir_value, str)
+        and bool(target_dir_value)
+        and Path(target_dir_value).is_absolute(),
+        "receipt.target_dir must be a nonempty absolute path",
+    )
+    target_dir = Path(target_dir_value)
+    expected_binary = target_dir / "debug" / batch["binary"]
+    expected_receipt = target_dir / "debug" / f'{batch["binary"]}.build.json'
 
     def resolves_to(entry_value, expected):
         if not isinstance(entry_value, str) or not entry_value:
             return False
         try:
-            return Path(entry_value).resolve() == expected
-        except (OSError, ValueError):
+            if not Path(entry_value).is_absolute():
+                return False
+            return Path(entry_value).resolve() == expected.resolve()
+        except (OSError, ValueError, RuntimeError):
             return False
 
     matched = [
         artifact
         for artifact in artifacts
-        if resolves_to(artifact.get("artifact"), binary_resolved)
-        and resolves_to(artifact.get("receipt"), receipt_resolved)
+        if resolves_to(artifact.get("artifact"), expected_binary)
+        and resolves_to(artifact.get("receipt"), expected_receipt)
     ]
     require(
         len(matched) == 1,

@@ -220,6 +220,16 @@ class TestJobManifest(unittest.TestCase):
             },
         )
 
+    def test_accepts_batch_receipt_copied_outside_target(self):
+        self.fixture.enable_batch_receipt()
+        copied_receipt = self.fixture.root / "test-results" / "rootyard.build.json"
+        copied_receipt.parent.mkdir(parents=True, exist_ok=True)
+        copied_receipt.write_bytes(self.fixture.receipt.read_bytes())
+        self.fixture.receipt = copied_receipt
+        job = json.loads(self.fixture.job().read_text(encoding="utf-8"))
+        self.assertEqual(job["status"], "passed")
+        self.assertEqual(job["build_receipt"]["file"], str(copied_receipt))
+
     def test_rejects_missing_batch_manifest(self):
         batch_manifest = self.fixture.enable_batch_receipt()
         Path(batch_manifest).unlink()
