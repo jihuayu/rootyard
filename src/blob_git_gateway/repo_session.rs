@@ -99,16 +99,26 @@
 //!
 //! ## Issuance
 //!
-//! [`SessionTokens::issue_from_materialized_read`] takes nothing but the
-//! [`MaterializedServingRead`] the sealed serving materializer produced for the
-//! response being built, after the gateway copied and verified its packs and
-//! after the body was fully encoded and the final authorization re-read the
-//! capture's identical cluster authority incarnation (and the proof carries
-//! that same anchor). Realm, cluster incarnation and
-//! revision all come from that proof; there is no production entry point that
-//! accepts a number, a realm or an incarnation. A checked empty read has no
-//! proof, so it sends no session header and no token is minted. The low-level
-//! `i64` mint stays test-only.
+//! There are exactly two production issuers, one per direction, and both take
+//! an opaque proof rather than a number, a realm or an incarnation:
+//!
+//! * reads — [`SessionTokens::issue_from_materialized_read`] takes nothing but
+//!   the [`MaterializedServingRead`] the sealed serving materializer produced
+//!   for the response being built, after the gateway copied and verified its
+//!   packs and after the body was fully encoded and the final authorization
+//!   re-read the capture's identical cluster authority incarnation (the proof
+//!   carries that same anchor). A checked empty read has no proof, so it sends
+//!   no session header and no token is minted.
+//! * pushes — [`SessionTokens::issue_from_committed_write`] takes nothing but
+//!   the [`CommittedWriteSessionProof`] derived from a **durable committed**
+//!   `PackCommitTerminal` and two real writable serving lookups (the original,
+//!   authorization-before-body one and one taken after the complete
+//!   `report-status` body was encoded). The bound is the terminal's exact
+//!   revision, never the final live one; the proof is admitted only when both
+//!   lookups state the identical full realm (including the cluster authority
+//!   incarnation) and the final gate is at or beyond that revision.
+//!
+//! The low-level `i64` mint stays test-only.
 use std::{fmt, sync::Arc};
 
 use axum::{
@@ -120,7 +130,9 @@ use uuid::Uuid;
 use super::error::GatewayError;
 use crate::ref_store::{
     GitObjectFormat,
+    core::pack_commit::PackCommitTerminal,
     core::pack_snapshot::{MaterializedServingRead, ProvenScope},
+    serving::ServingRepository,
 };
 
 mod codec;
@@ -214,7 +226,7 @@ impl SessionRealm {
 
     /// Whether a live serving lookup still authorizes exactly this realm. The
     /// cluster incarnation is that lookup's own `NOWAIT` read, never a cache.
-    pub(super) fn matches_serving(&self, serving: &crate::ref_store::serving::ServingRepository) -> bool {
+    pub(super) fn matches_serving(&self, serving: &ServingRepository) -> bool {
         let gate = &serving.gate;
         self.tenant_id == gate.tenant_id()
             && self.repository_id == gate.repository_id()
@@ -223,6 +235,80 @@ impl SessionRealm {
             && self.authority_epoch == gate.authority_epoch()
             && self.group_epoch == gate.group_epoch()
             && self.cluster_incarnation == serving.cluster_incarnation
+    }
+
+    /// The full realm one real serving lookup states, every field re-validated
+    /// by [`Self::new`] (nil ids, a nil cluster incarnation or an epoch outside
+    /// the frame bound is [`SessionTokenError::Invalid`]).
+    fn of_serving(serving: &ServingRepository) -> Result<Self, SessionTokenError> {
+        let gate = &serving.gate;
+        Self::new(
+            gate.tenant_id(),
+            gate.repository_id(),
+            gate.object_format(),
+            gate.history_incarnation(),
+            gate.authority_epoch(),
+            gate.group_epoch(),
+            serving.cluster_incarnation,
+        )
+    }
+}
+
+/// Opaque admission ticket for a committed push: the only input
+/// [`SessionTokens::issue_from_committed_write`] accepts.
+///
+/// It is produced only by [`CommittedWriteSessionProof::new`], which validates
+/// a durable committed `PackCommitTerminal` against two real writable serving
+/// lookups. It has private fields, no public constructor, no `Clone`, no
+/// `Serialize` and no way back to a bare revision or realm, so no caller can
+/// relabel a token onto another incarnation/revision or reuse one admission.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CommittedWriteSessionProof {
+    realm: SessionRealm,
+    /// The exact durable gate revision of the committed terminal; it is the
+    /// signed lower bound and is never the final live revision.
+    revision: i64,
+}
+
+impl CommittedWriteSessionProof {
+    /// Admit one committed push terminal.
+    ///
+    /// * `terminal` must be a committed (`is_committed()`) durable terminal of
+    ///   the push being answered; its revision is the exact lower bound and
+    ///   must be positive and not ahead of the final lookup's gate.
+    /// * `authorized` is the writable lookup that authorized the request
+    ///   before the body/native/Blob stages; `final_lookup` is the fresh
+    ///   writable lookup taken after the complete response body was encoded
+    ///   and after the durable commit.
+    /// * The terminal repository must equal each lookup's repository row id
+    ///   and each lookup's gate repository id, and both lookups must state the
+    ///   identical full realm (tenant, repository, object format, history
+    ///   incarnation, authority/group epochs and cluster authority incarnation),
+    ///   so a restore between the two lookups can never relabel the terminal
+    ///   revision into a new incarnation.
+    ///
+    /// A higher final gate revision in the same realm is acceptable. The
+    /// refusal is the privacy-safe [`SessionTokenError`]; nothing divergent is
+    /// named.
+    pub(crate) fn new(
+        terminal: &PackCommitTerminal,
+        authorized: &ServingRepository,
+        final_lookup: &ServingRepository,
+    ) -> Result<Self, SessionTokenError> {
+        if !terminal.is_committed() || terminal.revision <= 0 || terminal.revision > final_lookup.gate.revision() {
+            return Err(SessionTokenError::Invalid);
+        }
+        let repository_id = terminal.repository_id;
+        for serving in [authorized, final_lookup] {
+            if repository_id != serving.repository.id || repository_id != serving.gate.repository_id() {
+                return Err(SessionTokenError::Realm);
+            }
+        }
+        let realm = SessionRealm::of_serving(final_lookup)?;
+        if realm != SessionRealm::of_serving(authorized)? {
+            return Err(SessionTokenError::Realm);
+        }
+        Ok(Self { realm, revision: terminal.revision })
     }
 }
 
@@ -435,6 +521,23 @@ impl SessionTokens {
         self.codec.issue(&realm, proof.gate_revision(), now_seconds())
     }
 
+    /// Issue the session for the response of a push whose durable terminal is
+    /// committed.
+    ///
+    /// The realm and the version bound are exactly what the opaque
+    /// [`CommittedWriteSessionProof`] admitted (a committed terminal revision
+    /// at or below the final fresh writable lookup in the same full realm), so
+    /// a caller cannot supply, raise or rebind either. The frame is signed with
+    /// the current key and the trusted wall clock by the existing codec. The
+    /// caller must already have completed the final lookup and built the proof
+    /// after encoding the whole response body; this method performs no IO.
+    pub(crate) fn issue_from_committed_write(
+        &self,
+        proof: &CommittedWriteSessionProof,
+    ) -> Result<IssuedSession, SessionTokenError> {
+        self.codec.issue(&proof.realm, proof.revision, now_seconds())
+    }
+
     /// Verify a header value against the authorized live realm and the live
     /// gate revision read in this request; `None` is the unchanged token-free
     /// path. Only callers that already parsed the header (see `presented`) use
@@ -460,8 +563,10 @@ impl SessionTokens {
     /// not a proof of what this server committed or served, so production code
     /// cannot reach it; the production path is
     /// [`Self::issue_from_materialized_read`], which takes the sealed
-    /// [`MaterializedServingRead`] of a real completed read. It never accepts a
-    /// client-supplied revision.
+    /// [`MaterializedServingRead`] of a real completed read, or
+    /// [`Self::issue_from_committed_write`], which takes the
+    /// [`CommittedWriteSessionProof`] of a durable committed push terminal. It
+    /// never accepts a client-supplied revision.
     #[cfg(test)]
     pub(crate) fn issue_for_test(
         &self,
