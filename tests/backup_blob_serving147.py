@@ -932,7 +932,12 @@ def main(argv=None):
                  "the format22 fixture source inputs differ from the executed binary")
             need(fixture_receipt.get("integration_test_source_sha256"), "the format22 fixture receipt is incomplete")
         methods = (harness.synthetic_source, harness.snapshot, harness.invalid_archives, harness.existing_targets,
-                   harness.write_after_backup, harness.restore_and_clone, harness.restored_replay)
+                   harness.write_after_backup, harness.restore_and_clone, harness.restored_replay,
+                   harness.corrupt_source_missing_pack_refused_before_publication,
+                   harness.corrupt_source_missing_idx_refused_before_publication,
+                   harness.corrupt_source_missing_all_artifacts_refused_before_publication,
+                   harness.corrupt_source_wrong_artifact_set_digest_refused_before_publication,
+                   harness.format22_active_released_roots_distinct_producer_roundtrip)
         for name, method in zip(CASES, methods, strict=True):
             harness.case(name, method)
         success = True
