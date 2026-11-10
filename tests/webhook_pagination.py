@@ -33,6 +33,10 @@ from webhooks import WebhooksHarness  # noqa: E402
 SIGNATURE = "sha256=" + ("0" * 64)
 
 
+class PagingError(AssertionError):
+    pass
+
+
 class PaginationHarness(WebhooksHarness):
     def hook(self):
         return self.document(
@@ -151,18 +155,18 @@ class PaginationHarness(WebhooksHarness):
         while True:
             query = f"limit={limit}" + (f"&cursor={cursor}" if cursor else "")
             page = self.page(hook_id, query)
-            assert 0 < len(page["items"]) <= limit
+            self.check(0 < len(page["items"]) <= limit, f"limit={limit} page size out of range")
             items.extend(page["items"])
             next_cursor = page.get("next_cursor")
             if next_cursor is not None:
-                assert next_cursor not in cursors, "cursor repeated"
                 # next_cursor is the position of the last item on this page, so
                 # its key must equal that item's (sequence, id) exactly.
                 last = page["items"][-1]
-                assert self.cursor_key(next_cursor) == (last["sequence"], uuid.UUID(last["id"])), (
-                    f"limit={limit} next_cursor {next_cursor} does not address the last item")
+                self.check(self.cursor_key(next_cursor) == (last["sequence"], uuid.UUID(last["id"])),
+                           f"limit={limit} next_cursor does not address the last item")
+                self.check(next_cursor not in cursors, "cursor repeated")
                 if cursor is not None:
-                    assert self.cursor_key(next_cursor) > self.cursor_key(cursor), "cursor did not advance"
+                    self.check(self.cursor_key(next_cursor) > self.cursor_key(cursor), "cursor did not advance")
                 cursors.append(next_cursor)
             pages.append({"limit": limit, "items": len(page["items"]),
                           "next_cursor": "present" if next_cursor else None,
@@ -171,6 +175,13 @@ class PaginationHarness(WebhooksHarness):
             if cursor is None:
                 break
         return items, pages
+
+    @staticmethod
+    def check(condition, message):
+        # Explicit raise: `python3 -O` hides bare asserts, and this suite may
+        # reject but never be silently skipped.
+        if not condition:
+            raise PagingError(message)
 
     @staticmethod
     def cursor_key(cursor):
@@ -189,12 +200,12 @@ class PaginationHarness(WebhooksHarness):
         walked = {}
         for limit in (1, 2, 50):
             seen, pages = self.walk(hook["id"], limit)
-            assert [item["id"] for item in seen] == tied, (
-                f"limit={limit} tied rows were skipped or repeated")
-            assert len({item["id"] for item in seen}) == 7
+            self.check([item["id"] for item in seen] == tied,
+                       f"limit={limit} tied rows were skipped or repeated")
+            self.check(len({item["id"] for item in seen}) == 7, f"limit={limit} wrong distinct count")
             keys = [(item["sequence"], uuid.UUID(item["id"])) for item in seen]
-            assert keys == sorted(keys)
-            assert pages[-1]["next_cursor"] is None, f"limit={limit} last page kept a cursor"
+            self.check(keys == sorted(keys), f"limit={limit} rows were not in (sequence, id) order")
+            self.check(pages[-1]["next_cursor"] is None, f"limit={limit} last page kept a cursor")
             walked[str(limit)] = {"pages": len(pages), "per_page": [p["items"] for p in pages],
                                   "exactly_once": True, "final_next_cursor": None}
 
