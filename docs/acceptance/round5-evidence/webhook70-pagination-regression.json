@@ -1,0 +1,118 @@
+{
+  "issue": 70,
+  "binary": "/run/artifacts/baseline/rootyard",
+  "binary_sha256": "7bf90d617242c9a725e2b31514d86028bc62a85f3b9a1caf6e99724864d89dbe",
+  "source_head": "f8908ef31a995e62dafbbf89bd21f3c7abd759c9",
+  "production_inputs_sha256": "34e336a0089f6c11b110a3c125764fc9d2a0c4d54b49766fe5bbda693d32fcdb",
+  "baseline_receipt_workspace_commit": "2cd56993c195ecc887d5656ae88ea744f2d9e5a0",
+  "script": "tests/webhook_pagination.py",
+  "cases": [
+    {
+      "name": "setup",
+      "status": "passed",
+      "detail": null
+    },
+    {
+      "name": "allocator_concurrency",
+      "status": "passed",
+      "seconds": 0.2601,
+      "detail": {
+        "deliveries": 60,
+        "page1": 50,
+        "page2": 10
+      }
+    },
+    {
+      "name": "cursor_pagination",
+      "status": "passed",
+      "seconds": 0.1707,
+      "detail": {
+        "tied_rows": 7,
+        "walked_page_sizes": {
+          "1": {
+            "pages": 7,
+            "per_page": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "exactly_once": true,
+            "final_next_cursor": null
+          },
+          "2": {
+            "pages": 4,
+            "per_page": [
+              2,
+              2,
+              2,
+              1
+            ],
+            "exactly_once": true,
+            "final_next_cursor": null
+          },
+          "50": {
+            "pages": 1,
+            "per_page": [
+              7
+            ],
+            "exactly_once": true,
+            "final_next_cursor": null
+          }
+        },
+        "legacy_skipped_ties": true
+      }
+    },
+    {
+      "name": "barrier_commit",
+      "status": "passed",
+      "seconds": 0.0572,
+      "detail": {
+        "holder_sequence": 1,
+        "waiter_sequence": 2,
+        "other_sequence": 1
+      }
+    },
+    {
+      "name": "barrier_rollback",
+      "status": "passed",
+      "seconds": 0.0457,
+      "detail": {
+        "sequence_after_rollback": 1
+      }
+    },
+    {
+      "name": "idempotent_duplicate",
+      "status": "passed",
+      "seconds": 0.0576,
+      "detail": {
+        "next_sequence": 2
+      }
+    },
+    {
+      "name": "delete_race",
+      "status": "passed",
+      "seconds": 0.054,
+      "detail": {
+        "status": 404
+      }
+    },
+    {
+      "name": "explain_index",
+      "status": "passed",
+      "seconds": 0.017,
+      "detail": {
+        "plan_mentions": "forge_webhook_deliveries_hook_seq_idx"
+      }
+    }
+  ],
+  "passed": true,
+  "limitations": [
+    "One host, one disposable PostgreSQL 17 and owned loopback receivers.",
+    "Sequence monotonicity covers retained per-hook history only; operator SQL prune or PITR rollback can reset cursors.",
+    "Concurrency uses bounded threads and real row locks; it is not a throughput benchmark."
+  ]
+}

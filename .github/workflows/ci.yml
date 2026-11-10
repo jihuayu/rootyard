@@ -172,6 +172,14 @@ jobs:
         run: python3 tests/recorded_recovery.py --binary target/debug/rootyard --report test-results/recorded-recovery.json
       - name: Exercise offline backup and fresh database restore
         run: python3 tests/backup.py --binary target/debug/rootyard --report test-results/backup.json
+      # Kept beside (not in place of) tests/backup.py: this drill covers the
+      # audit-ID sequence across a format21 metadata-only backup and a fresh
+      # database restore. It reuses the job's PostgreSQL 17 service URL, the
+      # source-bound binary and the job fixture env, and fails (never skips)
+      # when a dependency is missing; the report feeds the native manifest.
+      - name: Restore the audit ID sequence through an offline backup and fresh database
+        timeout-minutes: 10
+        run: python3 tests/backup_audit_sequence_legacy.py --binary target/debug/rootyard --report test-results/audit-sequence-backup.json
       - name: Restore populated PostgreSQL RefStore core metadata from the current backup format
         timeout-minutes: 10
         run: python3 tests/backup_refstore_core139.py --binary target/debug/rootyard --report test-results/backup-refstore-core.json
@@ -264,6 +272,7 @@ jobs:
             --binary target/debug/rootyard \
             --report web_sessions=test-results/web-sessions.json \
             --report webhook_worker_recovery=test-results/webhook-worker-recovery.json \
+            --report audit_sequence_backup=test-results/audit-sequence-backup.json \
             --log webhook_regressions=test-results/ci-webhook-regressions.log \
             --log-marker "webhook_regressions=201 event batches: passed" \
             --log-marker "webhook_regressions=concurrent claim fence: passed" \
@@ -272,6 +281,7 @@ jobs:
             --harness tests/web_sessions.py \
             --harness tests/webhook_worker_recovery.py \
             --harness tests/ci_webhook_regressions.py \
+            --harness tests/backup_audit_sequence_legacy.py \
             --fixture postgres=postgres:17 \
             --fixture rust="$(rustc -V)" \
             --fixture git="$(git --version)" \
