@@ -72,7 +72,7 @@
 - [PR、Review、Check Run、分支保护与配对备份测试](../tests/pulls.py)（含 [PR 备份恢复](../tests/backup_pulls.py)）
 - [外部 CI Webhook、HMAC-SHA256 投递与自动 PR CI Pin 测试](../tests/webhooks.py)（含 [test_webhooks.py](../tests/test_webhooks.py)）
 - [仓库协作者、团队 5 级 RBAC、禁止自审与审计查询测试](../tests/members.py)（含 [test_members.py](../tests/test_members.py)）
-- [直接协作者 read/write/admin 在 Git clone/fetch/push、Ref 事务与 PR 合并的授权矩阵测试](../tests/collaborator_transport.py)（含 [test_collaborator_transport.py](../tests/test_collaborator_transport.py)）
+- [直接协作者 read/write/maintain/admin 在 Git clone/fetch/push、Ref 事务、PR 合并、分支保护规则与协作成员管理的授权矩阵测试](../tests/collaborator_transport.py)（拆分自 [contract](../tests/collaborator_contract.py)、[lifecycle](../tests/collaborator_lifecycle.py)、[writes](../tests/collaborator_writes.py)，含 [test_collaborator_transport.py](../tests/test_collaborator_transport.py)）
 - [服务端 HTML Web UI、XSS 防护与浏览器工作流测试](../tests/web.py)（含 [test_web.py](../tests/test_web.py)）
 - [多节点仓库分片、Epoch 写屏障、在线重平衡、RPO/RTO 灾备演练与 1/2/4 节点并发压测基准测试](../tests/sharding.py)（含 [test_sharding.py](../tests/test_sharding.py)、[benchmark_tiers.py](../tests/benchmark_tiers.py)、[test_benchmark_tiers.py](../tests/test_benchmark_tiers.py)）
 - [仓库只读浏览、原子 Ref 事务与 SHA-1/SHA-256 双对象格式协商测试](../tests/browse.py)（含 [test_object_format.py](../tests/test_object_format.py)）
