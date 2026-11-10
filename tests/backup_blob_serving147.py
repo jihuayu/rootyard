@@ -48,7 +48,7 @@ from backup import bounded_line
 from backup_blob_barrier_probe import BARRIER_REFUSALS, describe, serving_barrier_probe
 from backup_blob_serving169_support import (
     CHANGED as CORRUPTION_CHANGED, CORRUPTION_CASES as CORRUPTION_NAMES, NativeFixtureRequest, corruption_findings,
-    corruption_plan, corruption_sql, format22_manifest_checks, format22_restore_sql, format22_serving_read_checks,
+    corruption_plan, corruption_sql, finding, format22_manifest_checks, format22_restore_sql, format22_serving_read_checks,
     native_marker_checks, validator_refusal,
 )
 
@@ -920,7 +920,7 @@ class Drill(BlobOnlyHarness):
             self.originals == self.original_locators(), name + ": the API source changed during the clone"
         assert self.ledger_digests(self.source_db) == self.source_rows, name + ": the API source ledgers changed"
         assert self.corruption_base.joinpath("COMPLETE").is_file(), name + ": the clean archive changed"
-        detail = {"case": case.name, "finding": case.finding, "statement_changed": case.targets_digest,
+        detail = {"case": case.name, "finding": finding(case), "statement_changed": case.targets_digest,
                   "breaks": list(case.broken_rows),
                   "clone_dropped": True, "failed_closed": True,
                   "validator_refusal": violation.split("|", 1)[0],
