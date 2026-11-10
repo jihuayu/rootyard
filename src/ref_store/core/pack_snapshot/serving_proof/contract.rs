@@ -79,3 +79,11 @@ impl MaterializedServingRead {
         super::VerifiedReadView::of_materialized(self.view())
     }
 }
+
+impl super::VerifiedReadView {
+    /// The cluster authority incarnation the factory read back from the view's
+    /// own T2-sealed anchor.
+    pub(crate) fn contract_cluster_incarnation(&self) -> uuid::Uuid {
+        self.cluster_incarnation
+    }
+}
