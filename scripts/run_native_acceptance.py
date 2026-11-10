@@ -52,6 +52,19 @@ supervisor exit. If that state is unknown, the keys stay locked forever and no
 final report or pass is produced. A missing readable ``/proc`` or a missing or
 unsupported pidfd interface prevents the suite from starting. The qualified
 Ubuntu host workflow is unchanged.
+
+Pre-spawn refusal: the supervisor's own preflight (pidfd, child subreaper,
+``/proc`` census, descriptor checks) runs before ``ready`` and before the suite
+CLI is forked. When it refuses, the supervisor sends exactly one
+``{"event": "refused", "reason": "preflight-failed", "leader_started": false,
+"supervisor_pid": PID}`` frame instead of the CLI being started. The runner
+accepts that frame only in ``before_ready`` from the supervisor PID it spawned,
+only with that fixed reason and ``leader_started`` false, and only once the
+status pipe has hit EOF and the supervisor has exited ``3``. Only then is the
+suite recorded as ``failed`` with ``cleanup: not-started``, ``exit_code: null``
+and a fixed refusal summary, and its own lock copies released -- no CLI ran, so
+nothing else can hold them. Any other EOF, frame, exit code or ordering stays
+fail-closed: no proof, so the locks stay held and no final report is written.
 """
 import argparse
 import concurrent.futures
@@ -97,6 +110,13 @@ SENSITIVE_ASSIGNMENT = re.compile(
     r"(?:SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|ACCESS_KEY|PRIVATE_KEY))"
     r"[A-Z0-9_]*[ \t]*[=:][ \t]*)(\"[^\"]*\"|'[^']*'|[^\s,;]*)")
 KNOWN_TOKEN = re.compile(r"\b(?:ryt|ghp|gho|glpat|xox[abp])_[A-Za-z0-9._-]{8,}")
+# The supervisor's only pre-spawn refusal code, the exact frame key set, and the
+# supervisor exit the runner requires before accepting a refusal.
+SUPERVISOR_REFUSAL_REASON = "preflight-failed"
+SUPERVISOR_REFUSAL_EXIT = 3
+SUPERVISOR_REFUSAL_KEYS = frozenset({"event", "reason", "leader_started", "supervisor_pid"})
+REFUSAL_SUMMARY = ("suite not started: the supervisor refused its pre-spawn preflight "
+                   "(reason preflight-failed) before forking the CLI; details are in the suite log")
 INTERESTING = re.compile(r"(?i)traceback|error|fail|assert|exception|panic|timed out|denied")
 
 
@@ -518,6 +538,20 @@ class Child:
     def _invalidate(self, state):
         state["phase"] = "invalid"
         state["quit_frame"] = None
+        state["refusal_frame"] = None
+
+    @staticmethod
+    def _refusal_shape(frame, supervisor_pid):
+        """The exact fixed refusal frame: exact key set, event, allowlisted reason, no CLI, our PID."""
+        return (type(frame) is dict
+                and frozenset(frame) == SUPERVISOR_REFUSAL_KEYS
+                and type(frame.get("event")) is str
+                and frame.get("event") == "refused"
+                and type(frame.get("reason")) is str
+                and frame.get("reason") == SUPERVISOR_REFUSAL_REASON
+                and frame.get("leader_started") is False
+                and Child._is_int(frame.get("supervisor_pid"))
+                and frame.get("supervisor_pid") == supervisor_pid)
 
     def _validate_frame(self, frame, state):
         if state["phase"] == "invalid":
@@ -534,6 +568,22 @@ class Child:
             self._invalidate(state)
             return
         if state["phase"] == "before_ready":
+            if event == "refused":
+                # Pre-spawn refusal: accepted only with the fixed shape, and only
+                # here (before ready/CLI). It is proof of nothing yet; _finish()
+                # also needs status EOF and the supervisor's own exit.
+                if not self._refusal_shape(frame, supervisor_pid):
+                    self._invalidate(state)
+                    return
+                state["saw_refusal"] = True
+                state["refusal_frame"] = {
+                    "event": "refused",
+                    "reason": SUPERVISOR_REFUSAL_REASON,
+                    "leader_started": False,
+                    "supervisor_pid": supervisor_pid,
+                }
+                state["phase"] = "refusal_seen"
+                return
             if event != "ready":
                 self._invalidate(state)
                 return
@@ -580,6 +630,8 @@ class Child:
                 return
             self._invalidate(state)
             return
+        # refusal_seen: the refusal was the protocol's last frame; anything after
+        # it (even ready) is ambiguous.
         self._invalidate(state)
 
     def _parse_status_data(self, data, state):
@@ -638,21 +690,45 @@ class Child:
         if self._buffer:
             self._invalidate(state)
             self._buffer.clear()
-        if state["phase"] not in ("quit_seen",):
+        # A refusal line is complete once its newline is consumed: EOF right after
+        # it is the expected end of that protocol. Anything else is invalid.
+        if state["phase"] not in ("quit_seen", "refusal_seen"):
             self._invalidate(state)
 
     def _finish(self, state):
-        if state["phase"] != "quit_seen":
-            return None
-        if not state.get("saw_quit"):
-            return None
+        """Strict proof only: the final frame, status EOF and (refusal) supervisor exit.
+
+        A validated refusal line is not proof by itself: before it is accepted the
+        supervisor must also have closed the status pipe (EOF) and exited with
+        ``SUPERVISOR_REFUSAL_EXIT``. Until both hold this returns None, which
+        keeps the caller fail-closed (no release, no final report).
+        """
         if not state.get("eof"):
             return None
         if self._buffer:
             return None
         if state["returncode"] is None:
             return None
+        if state["phase"] == "refusal_seen":
+            if not state.get("saw_refusal") or state["refusal_frame"] is None:
+                return None
+            if state["returncode"] != SUPERVISOR_REFUSAL_EXIT:
+                return None
+            return state["refusal_frame"], state["returncode"]
+        if state["phase"] != "quit_seen":
+            return None
+        if not state.get("saw_quit"):
+            return None
         return state["quit_frame"], state["returncode"]
+
+    def _fail_closed(self):
+        """Unknown state never returns: no release, no final report, no pass.
+
+        The caller's ``hold()`` then keeps this suite's locks for the life of the
+        runner process. Only a proven refusal or quit frame may end ``wait()``.
+        """
+        while True:
+            time.sleep(self._IDLE_SLEEP)
 
     def _collect_returncode(self, state):
         if state["returncode"] is not None:
@@ -676,6 +752,8 @@ class Child:
             "saw_ready": False,
             "saw_quit": False,
             "quit_frame": None,
+            "saw_refusal": False,
+            "refusal_frame": None,
             "eof": False,
             "returncode": None,
         }
@@ -685,6 +763,8 @@ class Child:
             self._invalidate(state)
         try:
             while True:
+                if state["phase"] == "invalid":
+                    return self._fail_closed()  # no proof: locks stay held
                 if not self._control_closed and self._proc is not None:
                     if (stop_event is not None and stop_event.is_set()) or self._deadline_reached(
                         suite_deadline
@@ -788,9 +868,22 @@ class Runner:
         # Child is live (or at least something may be owned): never claim
         # quiescence again unless wait() returns its validated proof.
         result["cleanup"] = "in-progress"
-        quit_frame, supervisor_returncode = child.wait(deadline, self.stop)
+        # Internal, never reported: only a validated refusal proof sets this.
+        result["_refusal_proven"] = False
+        frame, supervisor_returncode = child.wait(deadline, self.stop)
+        if frame["event"] == "refused":
+            # Proven pre-spawn refusal: the supervisor sent its one fixed frame,
+            # closed the status pipe and exited 3 before ready and before the CLI
+            # fork. No CLI (or anything it spawned) exists, so this suite's own
+            # lock copies may be released; there is no CLI exit to report.
+            # finalize() keeps this fixed summary: the diagnostic text stays in
+            # the private suite log.
+            result.update(status="failed", cleanup="not-started", exit_code=None, summary=REFUSAL_SUMMARY,
+                          _refusal_proven=True)
+            return
         # wait() only returns on strict proof: quit frame, status EOF and
         # supervisor exit. Only now may cleanup be declared quiescent.
+        quit_frame = frame
         result["cleanup"] = "quiescent"
         exit_code = quit_frame["leader_exit"]
         reason = quit_frame["reason"]
@@ -808,7 +901,11 @@ class Runner:
         result["duration_seconds"] = round(time.time() - result["started_at"], 3)
         log = Path(result["log"]) if result.get("log") else None
         text = log.read_text(errors="replace") if log and log.exists() else ""
-        if result["status"] == "passed":
+        if result.pop("_refusal_proven", False) is True:
+            # The only failed case whose summary is not raw log text: the suite
+            # never started, and its diagnostic text belongs to the private log.
+            result["summary"] = REFUSAL_SUMMARY
+        elif result["status"] == "passed":
             last = next((line for line in reversed(text.splitlines()) if line.strip()), "")
             result["summary"] = self.redactor.text(last)[:SUMMARY_LIMIT]
         else:

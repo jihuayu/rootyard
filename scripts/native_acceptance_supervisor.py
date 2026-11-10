@@ -19,6 +19,21 @@ anything is stuck, then exactly one final ``quit`` with ``cleanup``, ``reason``,
 counts.  The supervisor exits with its own status, never the CLI's, and never
 0 without a quiescent quit.
 
+Pre-spawn refusal (fail closed, a bounded answer instead of a hang): if
+``check()`` refuses anything after the arguments parse and strictly before
+``ready`` and the CLI fork, the supervisor writes exactly one refusal frame to
+the status pipe and exits ``SUPERVISOR_EXIT`` without forking or exec'ing the
+CLI::
+
+    {"event": "refused", "reason": "preflight-failed", "leader_started": false,
+     "supervisor_pid": PID}
+
+The frame is a fixed schema with an allowlisted reason code; the exception text
+goes only to stderr.  Argument errors (``parser.error``) already exit 2 before
+any frame.  A reader that vanished may also raise SIGPIPE/SIGXFSZ on the write,
+so ``main()`` keeps the default disposition of those signals: the exit status
+then proves that the frame could not be delivered.
+
 Every child (setsid leaders, double-forked orphans) is adopted by this
 subreaper and reaped by one single-threaded ``waitpid(-1, WNOHANG)`` owner.
 Quiescence is ``ECHILD`` from that ``waitpid`` plus a subsequent descendant
@@ -53,6 +68,7 @@ GRACE = float(os.environ.get("NATIVE_ACCEPTANCE_SUPERVISOR_GRACE", "2.0"))
 PROGRESS_EVERY = float(os.environ.get("NATIVE_ACCEPTANCE_SUPERVISOR_PROGRESS", "1.0"))
 PR_SET_CHILD_SUBREAPER = 36
 SUPERVISOR_EXIT = 3  # never the CLI's code, and never 0 without quiescence
+REFUSAL_REASON = "preflight-failed"  # the only refusal code; details stay on stderr
 
 
 class Ambiguous(Exception):
@@ -311,6 +327,25 @@ def check(parser, timeout, resource_fds, control, status):
         os.set_inheritable(fd, False)  # CLOEXEC: the CLI never inherits them
 
 
+def refuse(status, exc):
+    """One fixed-schema refusal frame; the exception text only ever reaches stderr.
+
+    Only the status pipe is used: nothing has been forked, and the resource fd
+    copies are closed by process exit.  A broken pipe means no reader, which is
+    not this frame's delivery, so it still exits ``SUPERVISOR_EXIT``.
+    """
+    print(f"supervisor refused: {exc}", file=sys.stderr)
+    frame = json.dumps({"event": "refused", "reason": REFUSAL_REASON,
+                        "leader_started": False, "supervisor_pid": os.getpid()},
+                       sort_keys=True).encode() + b"\n"
+    try:
+        while frame:
+            frame = frame[os.write(status, frame):]
+    except OSError:
+        pass  # no reader: the exit status, not a retry, carries the refusal
+    return SUPERVISOR_EXIT
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description="Linux child-subreaper for one CLI tree")
     parser.add_argument("--timeout", type=float, required=True)
@@ -327,8 +362,8 @@ def main(argv):
         sup = Supervisor(cli, args.timeout, args.resource_fd,
                          args.parent_control_fd, args.status_fd)
     except (OSError, Ambiguous) as exc:
-        print(f"supervisor refused: {exc}", file=sys.stderr)
-        return SUPERVISOR_EXIT
+        # Strictly before ready/fork: answer with one refusal frame, never fork.
+        return refuse(args.status_fd, exc)
     cleanup, reason = sup.main()
     sup.frame(event="quit", leader_exit=cli_code(sup.cli_status), cleanup=cleanup,
               reason=reason, signals=sup.signals, resources_closed=cleanup == "quiescent")
@@ -336,4 +371,12 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    # The refusal frame is written before any forking, and the resource copies
+    # are only closed much later; default SIGPIPE/SIGXFSZ keep a vanished reader
+    # an exit 3 (frame undelivered), never a status that could read as success.
+    for _sig in (signal.SIGPIPE, signal.SIGXFSZ):
+        try:
+            signal.signal(_sig, signal.SIG_DFL)
+        except (OSError, ValueError):
+            pass
     sys.exit(main(sys.argv[1:]))
