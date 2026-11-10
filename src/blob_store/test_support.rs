@@ -46,6 +46,12 @@ pub(crate) fn distinct_backend_identities() -> (BlobBackendIdentity, BlobBackend
     (first.backend_identity().clone(), second.backend_identity().clone())
 }
 
+/// The stable synthetic identity named `name`. Two calls with one name are
+/// equal; different names are distinct. Not a real store and not a secret.
+pub(crate) fn blob_backend_identity(name: &str) -> BlobBackendIdentity {
+    BlobBackendIdentity::named_test_identity(name)
+}
+
 pub(crate) fn payload(len: usize) -> Vec<u8> {
     (0..len).map(|index| (index % 251) as u8).collect()
 }

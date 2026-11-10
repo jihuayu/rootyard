@@ -80,10 +80,6 @@ impl BlobGitState {
         self
     }
 
-    pub(super) fn sessions(&self) -> Option<&SessionTokens> {
-        self.sessions.as_ref()
-    }
-
     pub fn pool(&self) -> &Pool {
         &self.pool
     }

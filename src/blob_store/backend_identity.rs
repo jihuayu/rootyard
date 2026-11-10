@@ -120,6 +120,19 @@ impl BlobBackendIdentity {
         Self::from_canonical(&canonical)
     }
 
+    /// One *named*, stable synthetic identity, shared by every test that uses
+    /// the same name. Unlike [`Self::memory_test_realm`] it is not randomized,
+    /// so two fixtures built in separate calls are honestly the same backend
+    /// (a MAC bound to the digest then verifies across calls).
+    #[cfg(test)]
+    pub(super) fn named_test_identity(name: &str) -> Self {
+        let mut canonical = String::new();
+        push_field(&mut canonical, "domain", MEMORY_REALM_DOMAIN);
+        push_field(&mut canonical, "provider", "test-synthetic");
+        push_field(&mut canonical, "realm", name);
+        Self::from_canonical(&canonical)
+    }
+
     fn from_canonical(canonical: &str) -> Self {
         let hex = hex::encode(Sha256::digest(canonical.as_bytes()));
         debug_assert_eq!(hex.len(), IDENTITY_HEX_LEN);
