@@ -460,7 +460,7 @@ fn require_publisher_scope(row: &tokio_postgres::Row, ack: &ConsumeAck, artifact
     ensure!(
         row.get::<_, Uuid>(30) == artifact.pack_id
             && tenant == artifact.tenant_id
-            && published(row.get(31), row.get(33), row.get(34))
+            && published(row.get(32), row.get(33), row.get(34))
             && published(artifact.repository_id, row.get(19), row.get(35))
             && published(row.get(36), row.get(37), row.get(38))
             && row.get::<_, i64>(39) == 1,

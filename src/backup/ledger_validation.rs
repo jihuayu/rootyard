@@ -92,13 +92,15 @@ pub(super) const DECLARED_SETS: &str = "WITH scoped AS (
              LEFT JOIN public.repositories r ON r.id=s.repository_id
              LEFT JOIN public.ref_store_core_gates ge ON ge.repository_id=s.repository_id)";
 
-/// The declared rows only (no artifact join), for [`super::ledger::inventory`].
-/// Every absent artifact position is typed NULL in exactly the order and types
-/// of [`ARTIFACT_COLUMNS`].
+/// The header-only declared rows (no artifact join) for
+/// [`super::ledger::inventory`]: [`DECLARED_COLUMNS`] (0..19) plus the artifact
+/// sentinel `NULL::text AS role` (20). [`decode_declared`] stops at a `role` of
+/// `None` and never reads 21.., so this deliberately is *not* a mirror of
+/// [`ARTIFACT_COLUMNS`]: only the "no artifact" sentinel is supplied.
 pub(super) fn declared_sql() -> String {
     format!(
         "{DECLARED_SETS}
-         SELECT {DECLARED_COLUMNS},{ABSENT_ARTIFACT_COLUMNS}
+         SELECT {DECLARED_COLUMNS},{ARTIFACT_SENTINEL}
            FROM published p
           ORDER BY p.repository_id,p.pack_id,p.registration_id"
     )
@@ -147,14 +149,9 @@ const ARTIFACT_COLUMNS: &str = "a.role,a.slot,a.hold_id,a.acquire_request_id,a.c
            WHERE x.consume_request_id=a.consume_request_id AND x.hold_id=a.hold_id),
         COALESCE(h.operation_id=ANY(p.issuer_operations),FALSE),h.slot";
 
-/// The absent-artifact row of [`declared_sql`]: typed NULLs in the exact order
-/// and types of [`ARTIFACT_COLUMNS`].
-const ABSENT_ARTIFACT_COLUMNS: &str =
-    "NULL::text,NULL::int,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,
-        NULL::bigint,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,
-        NULL::uuid,NULL::int,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::bigint,
-        NULL::uuid,NULL::uuid,NULL::uuid,NULL::bigint,NULL::uuid,NULL::uuid,NULL::bool,NULL::uuid,
-        NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::uuid,NULL::int";
+/// The absent-artifact sentinel of [`declared_sql`], the only extra column the
+/// header-only shape needs.
+const ARTIFACT_SENTINEL: &str = "NULL::text AS role";
 
 /// Every declared registration with its publication, artifacts, durable hold
 /// and consume receipt, optionally restricted to `ids` (a `uuid[]` parameter).
