@@ -156,8 +156,11 @@ class PaginationHarness(WebhooksHarness):
             next_cursor = page.get("next_cursor")
             if next_cursor is not None:
                 assert next_cursor not in cursors, "cursor repeated"
+                # next_cursor is the position of the last item on this page, so
+                # its key must equal that item's (sequence, id) exactly.
                 last = page["items"][-1]
-                assert (last["sequence"], uuid.UUID(last["id"])) > self.cursor_key(next_cursor)
+                assert self.cursor_key(next_cursor) == (last["sequence"], uuid.UUID(last["id"])), (
+                    f"limit={limit} next_cursor {next_cursor} does not address the last item")
                 if cursor is not None:
                     assert self.cursor_key(next_cursor) > self.cursor_key(cursor), "cursor did not advance"
                 cursors.append(next_cursor)
