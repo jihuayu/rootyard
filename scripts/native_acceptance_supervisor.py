@@ -250,8 +250,8 @@ class Supervisor:
                 kill_at = kill_at or now + GRACE
                 self.stop(ours, signal.SIGKILL if now >= kill_at else signal.SIGTERM)
                 progress = (len(ours), ambiguity, self.reason)
-                if progress != self.progress and (
-                        reported is None or now - reported >= PROGRESS_EVERY):
+                if (progress != self.progress or reported is None
+                        or now - reported >= PROGRESS_EVERY):
                     reported, self.progress = now, progress
                     self.frame(event="progress", owned=progress[0],
                                ambiguity=ambiguity, reason=self.reason)

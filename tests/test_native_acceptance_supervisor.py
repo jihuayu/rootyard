@@ -406,7 +406,7 @@ class SupervisorTest(unittest.TestCase):
                 return True
 
             self.wait_until(leader_reaped)
-            deadline = time.monotonic() + 0.1
+            deadline = time.monotonic() + 1.2
             while time.monotonic() < deadline:
                 if select.select([status_r], [], [], deadline - time.monotonic())[0]:
                     data = os.read(status_r, 65536)
@@ -416,6 +416,8 @@ class SupervisorTest(unittest.TestCase):
                     break
             self.assertNotIn("quit", {f["event"] for f in frames})
             self.assertNotIn("unknown", {f.get("result") for f in frames})
+            self.assertGreaterEqual(
+                sum(1 for f in frames if f["event"] == "progress"), 2)
             self.assertTrue(live(proxy))
             self.assertTrue(self.locked(self.ex_path))
             self.assertTrue(self.locked(self.sh_path))
