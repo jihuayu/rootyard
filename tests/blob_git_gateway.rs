@@ -78,6 +78,9 @@ async fn case(db: &Db) -> Result<()> {
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
+    // The production `blob_git_gateway::router` is mounted at its own root with
+    // no prefix proxy, so fixtures must use its unprefixed `/api/...` and
+    // `/git/{owner}/{name}/...` paths (not any gateway-prefixed routes).
     let app = router(state.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
@@ -197,7 +200,7 @@ async fn case(db: &Db) -> Result<()> {
 
 async fn create_repository(address: std::net::SocketAddr, owner: &Actor, name: &str) -> Result<serde_json::Value> {
     let response = reqwest::Client::new()
-        .post(format!("http://{address}/blob-api/repos"))
+        .post(format!("http://{address}/api/repos"))
         .bearer_auth(&owner.token)
         .json(&json!({"name": name, "object_format": "sha1"}))
         .send()
