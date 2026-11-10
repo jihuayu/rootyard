@@ -31,13 +31,26 @@ pub(super) fn reported_revision(summary: &Value, path: &[&str]) -> Result<i64> {
     node.as_i64().filter(|revision| *revision > 0).ok_or_else(|| anyhow!("the page reported no session revision"))
 }
 
+/// The page's fixed reason code, or `unknown`. Only a short code of uppercase
+/// ASCII letters and `_` (1..=40 bytes) is echoed, so neither free-form
+/// subprocess text nor a credential can reach the message.
+fn diagnostic_reason(summary: &Value) -> &str {
+    let reason = summary["reason"].as_str().unwrap_or("");
+    let safe = (1..=40).contains(&reason.len()) && reason.bytes().all(|byte| byte.is_ascii_uppercase() || byte == b'_');
+    if safe { reason } else { "unknown" }
+}
+
 /// The summary's own shape: PASS, a browser version, the fault label, the exact
 /// status of every route, and the reported chain revisions, each bounded by the
 /// live gate. The fault page's reported revisions are cross-checked against its
 /// captured refs answer in [`verify`], never against the main chain. No identity
 /// or credential is part of the summary.
 pub(super) fn summary(summary: &Value, live: i64) -> Result<Chain> {
-    ensure!(summary["result"].as_str() == Some("PASS"), "the page did not report PASS");
+    ensure!(
+        summary["result"].as_str() == Some("PASS"),
+        "the page did not report PASS: reason {}",
+        diagnostic_reason(summary)
+    );
     ensure!(summary["reason"].as_str() == Some("PASS"), "the page reported PASS with another reason");
     ensure!(!summary["browser"].as_str().unwrap_or("").is_empty(), "the page named no browser version");
     ensure!(summary["fault"]["mode"].as_str() == Some("client_fault_injection"), "the fault is not labelled");
