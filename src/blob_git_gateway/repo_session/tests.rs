@@ -536,16 +536,19 @@ mod committed_write {
     fn the_terminal_repository_must_match_both_lookups() {
         let first = serving(0, 4, 40, 20, 20);
         let terminal = committed(20, 5);
+        // Every final lookup is at or beyond the terminal revision 5, so the
+        // admission fails on repository identity, not on the revision fence.
+        let last = serving(0, 9, 40, 20, 20);
         // Terminal names another repository than either lookup.
-        assert_eq!(admit(&committed(21, 5), &first, &first).err(), Some(SessionTokenError::Realm));
+        assert_eq!(admit(&committed(21, 5), &first, &last).err(), Some(SessionTokenError::Realm));
         // A first lookup whose row names another repository.
-        assert_eq!(admit(&terminal, &serving(0, 4, 40, 20, 22), &first).err(), Some(SessionTokenError::Realm));
+        assert_eq!(admit(&terminal, &serving(0, 4, 40, 20, 22), &last).err(), Some(SessionTokenError::Realm));
         // A first lookup whose gate names another repository.
-        assert_eq!(admit(&terminal, &serving(0, 4, 40, 22, 20), &first).err(), Some(SessionTokenError::Realm));
+        assert_eq!(admit(&terminal, &serving(0, 4, 40, 22, 20), &last).err(), Some(SessionTokenError::Realm));
         // A final lookup whose row names another repository.
-        assert_eq!(admit(&terminal, &first, &serving(0, 4, 40, 20, 22)).err(), Some(SessionTokenError::Realm));
+        assert_eq!(admit(&terminal, &first, &serving(0, 9, 40, 20, 22)).err(), Some(SessionTokenError::Realm));
         // A final lookup whose gate names another repository.
-        assert_eq!(admit(&terminal, &first, &serving(0, 4, 40, 22, 20)).err(), Some(SessionTokenError::Realm));
+        assert_eq!(admit(&terminal, &first, &serving(0, 9, 40, 22, 20)).err(), Some(SessionTokenError::Realm));
     }
 
     #[test]
