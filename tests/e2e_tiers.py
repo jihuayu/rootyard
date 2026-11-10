@@ -7704,7 +7704,7 @@ class Phase1ClosureAndDocsFixture:
         """Tokenize shell commands declared under YAML run keys (inline and block scalars)."""
         commands: list[list[str]] = []
         lines = text.splitlines()
-        block_markers = ("|", "|-", "|+", ">", ">-", ">+")
+        block_header = re.compile(r"^([|>])(?:([+-])([1-9])?|([1-9])([+-])?)?(?:[ \t]+#.*)?$")
 
         def indent_of(line: str) -> int:
             return len(line) - len(line.lstrip(" "))
@@ -7712,6 +7712,10 @@ class Phase1ClosureAndDocsFixture:
         def is_skippable(line: str) -> bool:
             stripped = line.strip()
             return not stripped or stripped.startswith("#")
+
+        def block_style(value: str) -> str | None:
+            match = block_header.match(value)
+            return match.group(1) if match else None
 
         def collect_block(start: int, key_indent: int) -> tuple[list[str], int]:
             body: list[str] = []
@@ -7733,6 +7737,14 @@ class Phase1ClosureAndDocsFixture:
                 return stripped, ""
             key, value = stripped.split(":", 1)
             return key.strip(), value.strip()
+
+        def is_job_key(stripped: str) -> bool:
+            if not stripped or stripped.startswith("-"):
+                return False
+            key, value = split_key_value(stripped)
+            if not key or value:
+                return False
+            return re.fullmatch(r"[A-Za-z0-9_.\-]+", key) is not None
 
         def tokenize(script: str) -> list[list[str]]:
             try:
@@ -7756,12 +7768,13 @@ class Phase1ClosureAndDocsFixture:
             return result
 
         def run_value_commands(value: str, start: int, key_indent: int) -> tuple[list[list[str]], int]:
-            if value not in block_markers:
+            style = block_style(value)
+            if style is None:
                 if not value:
                     return [], start
                 return tokenize(value), start
             body, next_index = collect_block(start, key_indent)
-            if value.startswith(">"):
+            if style == ">":
                 paragraphs: list[list[str]] = []
                 current_paragraph: list[str] = []
                 for line in body:
@@ -7792,6 +7805,8 @@ class Phase1ClosureAndDocsFixture:
 
         steps_indent: int | None = None
         step_indent: int | None = None
+        in_root_jobs = False
+        in_job = False
         index = 0
         while index < len(lines):
             raw = lines[index]
@@ -7800,14 +7815,48 @@ class Phase1ClosureAndDocsFixture:
                 continue
             indent = indent_of(raw)
             stripped = raw.strip()
+            if indent == 0:
+                root_key, root_value = split_key_value(stripped)
+                in_root_jobs = root_key == "jobs" and not root_value
+                in_job = False
+                steps_indent = None
+                step_indent = None
+                if block_style(root_value) is not None:
+                    _, index = collect_block(index + 1, 0)
+                    in_root_jobs = False
+                    continue
+                index += 1
+                continue
+            if not in_root_jobs:
+                if block_style(split_key_value(stripped)[1]) is not None:
+                    _, index = collect_block(index + 1, indent)
+                    continue
+                index += 1
+                continue
+            if indent == 2:
+                key, value = split_key_value(stripped)
+                in_job = is_job_key(stripped) and not value
+                steps_indent = None
+                step_indent = None
+                if not in_job:
+                    if block_style(value) is not None:
+                        _, index = collect_block(index + 1, indent)
+                        continue
+                    index += 1
+                    continue
+                index += 1
+                continue
+            if not in_job:
+                index += 1
+                continue
             if steps_indent is None:
                 key, value = split_key_value(stripped)
-                if key == "steps":
+                if key == "steps" and indent == 4 and not value:
                     steps_indent = indent
                     step_indent = None
                     index += 1
                     continue
-                if value in block_markers:
+                if block_style(value) is not None:
                     _, index = collect_block(index + 1, indent)
                     continue
                 index += 1
@@ -7837,7 +7886,7 @@ class Phase1ClosureAndDocsFixture:
                 commands.extend(found)
                 continue
             property_indent = item_indent + 2
-            if value in block_markers:
+            if block_style(value) is not None:
                 _, index = collect_block(index + 1, item_indent)
                 continue
             index += 1
@@ -7857,7 +7906,7 @@ class Phase1ClosureAndDocsFixture:
                     found, index = run_value_commands(property_value, index + 1, line_indent)
                     commands.extend(found)
                     continue
-                if property_value in block_markers:
+                if block_style(property_value) is not None:
                     _, index = collect_block(index + 1, line_indent)
                 else:
                     index += 1
@@ -18624,6 +18673,52 @@ class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         with self.assertRaisesRegex(AssertionError, "non-existent Python script"):
             Phase1ClosureAndDocsFixture.validate_ci_workflow(ci_text + "\n      - run: python3 tests/nonexistent_ghost_suite.py\n")
+
+    def test_t2_f20_06_ci_validator_rejects_nested_env_steps_spoof(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        expected_tokens = Phase1ClosureAndDocsFixture.ci_build_native_batch_tokens(
+            Phase1ClosureAndDocsFixture.live_ci_run_commands(ci_text)
+        )
+        exact_command = " ".join(expected_tokens)
+
+        step_anchor = "      - name: Build native bins and RefStore fixtures in one batch\n"
+        step_index = ci_text.index(step_anchor)
+        run_header = "        run: |\n"
+        run_index = ci_text.index(run_header, step_index)
+        next_anchor = "      - name: Verify design documentation integrity\n"
+        next_index = ci_text.index(next_anchor, run_index)
+
+        mutated = (
+            ci_text[:run_index]
+            + "        run: echo no native build\n"
+            + ci_text[next_index:]
+        )
+
+        verify_index = mutated.index("  verify:\n")
+        verify_steps = "    steps:\n"
+        steps_index = mutated.index(verify_steps, verify_index)
+        spoof_env = "    env:\n      steps: |\n        - run: " + exact_command + "\n"
+        mutated = mutated[:steps_index] + spoof_env + mutated[steps_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
+
+    def test_t2_f20_07_ci_validator_rejects_folded_native_batch_step(self) -> None:
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        next_anchor = "      - name: Verify design documentation integrity\n"
+        anchor_index = ci_text.index(next_anchor)
+        folded_step = (
+            "      - name: Folded native batch with header comment\n"
+            "        run: > # folded scalar comment\n"
+            "          python3 scripts/build_native_batch.py\n"
+            "          --all-bins --features pando-lib\n"
+        )
+        mutated = ci_text[:anchor_index] + folded_step + ci_text[anchor_index:]
+
+        self.assertNotEqual(mutated, ci_text)
+        with self.assertRaisesRegex(AssertionError, "build_native_batch"):
+            Phase1ClosureAndDocsFixture.validate_ci_workflow(mutated)
 
     # =========================================================================
     # Feature F21: Phase 1 Closure — Implementation Status & Docs Sync — Boundary & Corner Cases (5 Tests)
