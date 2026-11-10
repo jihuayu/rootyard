@@ -138,6 +138,19 @@ class HarnessContract(unittest.TestCase):
                 return ast.get_source_segment(path.read_text(), node)
         raise AssertionError(f"{klass_method} not found in {path.name}")
 
+    @unittest.skip("FIXME(#4): reproduces the native defect; re-enable with its fix")
+    def test_checkout_head_never_falls_back_to_a_repository_through_cwd(self):
+        """An unavailable GIT_DIR must fail, not yield whatever repo cwd can reach."""
+        try:
+            harness.prerequisite.checkout_head(
+                object.__new__(harness.CollaboratorTransportHarness),
+                ROOT, {}, str(ROOT / "tests"), "0000000000000000000000000000000000000000")
+        except AssertionError as error:
+            self.assertTrue("name the same repository" in str(error)
+                            or "dubious checkout state" in str(error), error)
+        else:
+            self.fail("a git dir that does not describe the checkout was accepted")
+
     def test_registration_yields_name_and_callable_pairs(self):
         """main() unpacks ``for name, fn in h.execute()``; the shape must hold."""
         harness_cls = object.__new__(harness.CollaboratorTransportHarness)
