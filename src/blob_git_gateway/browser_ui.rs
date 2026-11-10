@@ -615,4 +615,24 @@ mod tests {
         assert_eq!(read.matches("adopt(").count(), 1, "the read path adopts at exactly one site");
         assert!(!script.contains("currentScript"));
     }
+
+    /// A repository read that fails after showing its refusal stops the
+    /// sequence, so no later read or the closing success status overwrites it.
+    #[test]
+    fn a_failed_repository_read_stops_the_sequence() {
+        let repository = body_of(inline::SCRIPT, "async function repository(", "async function index(", "the repository page");
+        let refs = repository.find("const refs = await read(").expect("refs are read");
+        let tree = repository.find("const tree = await read(").expect("the tree is read");
+        let commits = repository.find("const commits = await read(").expect("the commits are read");
+        let status = repository.find("show(bound ? READ : NO_SESSION, false);").expect("the success status");
+        let stop = |at: usize, value: &str| {
+            repository[at..].find(&format!("if (!{value}) return;")).map(|offset| at + offset)
+                .unwrap_or_else(|| panic!("a failed {value} read must stop the sequence"))
+        };
+        assert!(stop(refs, "refs") < tree, "a failed refs read must not start the tree read");
+        assert!(tree < stop(tree, "tree") && stop(tree, "tree") < commits, "a failed tree read must not start the commits read");
+        assert!(commits < stop(commits, "commits") && stop(commits, "commits") < status, "a failed commits read must precede the success status");
+        assert_eq!(repository.matches("show(bound ? READ : NO_SESSION, false);").count(), 1, "one closing success status");
+        assert_eq!(repository.matches("show(").count(), 1, "the page itself shows no failure status of its own");
+    }
 }

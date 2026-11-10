@@ -168,21 +168,21 @@ pub(super) const SCRIPT: &str = "'use strict';
     content.appendChild(refs.length ? table(['Name', 'Object', 'Kind'], refs.map(ref => [
       el('code', ref.name), el('code', short(ref.oid), 'oid'), el('span', ref.kind)
     ])) : el('p', 'This repository has no references yet.'));
+    // A failed read already showed its refusal; the sequence stops there so a
+    // later read cannot overwrite that status with a success.
     const tree = await read(scope, base + '/tree?oid=HEAD');
-    if (tree) {
-      content.appendChild(el('h2', 'Files at HEAD'));
-      content.appendChild(tree.length ? table(['Path', 'Kind', 'Size'], tree.map(entry => [
-        el('code', entry.path), el('span', entry.kind),
-        el('span', entry.size === null || entry.size === undefined ? '' : entry.size)
-      ])) : el('p', 'No files.'));
-    }
+    if (!tree) return;
+    content.appendChild(el('h2', 'Files at HEAD'));
+    content.appendChild(tree.length ? table(['Path', 'Kind', 'Size'], tree.map(entry => [
+      el('code', entry.path), el('span', entry.kind),
+      el('span', entry.size === null || entry.size === undefined ? '' : entry.size)
+    ])) : el('p', 'No files.'));
     const commits = await read(scope, base + '/commits');
-    if (commits) {
-      content.appendChild(el('h2', 'Commits'));
-      content.appendChild(commits.length ? table(['Commit', 'Subject', 'Author'], commits.map(commit => [
-        el('code', short(commit.oid), 'oid'), el('span', commit.subject), el('span', commit.author_name)
-      ])) : el('p', 'No commits.'));
-    }
+    if (!commits) return;
+    content.appendChild(el('h2', 'Commits'));
+    content.appendChild(commits.length ? table(['Commit', 'Subject', 'Author'], commits.map(commit => [
+      el('code', short(commit.oid), 'oid'), el('span', commit.subject), el('span', commit.author_name)
+    ])) : el('p', 'No commits.'));
     show(bound ? READ : NO_SESSION, false);
   }
 
