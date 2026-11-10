@@ -18,7 +18,7 @@ use anyhow::{Result, anyhow, ensure};
 use rootyard::ref_store::core::pack_commit::{
     PackCommitError, PackCommitPlan, PackCommitRejectCode, PackCommitScope, PackMembershipEntry, PgPackCommit,
 };
-use rootyard::ref_store::{GitObjectFormat, HeadUpdate, OperationState};
+use rootyard::ref_store::{GitObjectFormat, HeadUpdate, IssuerLane, OperationIdentity, OperationState, RequestDigest};
 use uuid::Uuid;
 
 const SHA1: GitObjectFormat = GitObjectFormat::Sha1;
@@ -106,10 +106,10 @@ async fn plan_claiming_another_tenant_is_refused_by_begin_pending() -> Result<()
             "the foreign draft token does not name its own tenant and operation"
         );
         // Same-tenant positive control: the migration-138 Pending operation that
-        // `PgPackCommit.begin_pending` created/retains for the real draft (not an
-        // A4 publication registration), produced under the second repository's
-        // tenant, is still exactly Pending and has no decision. Only the claimed
-        // tenant of the plan below differs from it.
+        // `PgPackCommit.begin_pending` created for the real draft (not an A4
+        // publication registration), produced under the second repository's
+        // tenant, is still exactly Pending and has no decision. The bad plan
+        // below is a separate operation, never an edit of this one.
         let control = facts::operation(&world.db.pool, repo, operation).await?;
         ensure!(
             control.state == OperationState::Pending.as_str() && control.terminal.is_none(),
@@ -119,6 +119,22 @@ async fn plan_claiming_another_tenant_is_refused_by_begin_pending() -> Result<()
             facts::decision(&world.db.pool, repo, operation).await?.is_none(),
             "the foreign draft registration already wrote a decision"
         );
+        // The bad plan is a fresh operation in its own lane, issued by the real
+        // foreign tenant user at a higher sequence. Its identity carries the
+        // foreign repository and the fixture's placeholder digest; the plan
+        // builder then rebinds the canonical digest over the complete plan, so
+        // the only thing wrong with it is the claimed tenant: begin_pending
+        // must reach the tenant check instead of a digest conflict.
+        let bad_lane = IssuerLane::new("pack-foreign-claim")?;
+        let bad_operation = Uuid::new_v4();
+        let foreign = OperationIdentity::new(
+            repo,
+            tenant,
+            bad_lane.clone(),
+            2,
+            bad_operation,
+            RequestDigest::from_bytes([0; 32]),
+        )?;
         let mut client = world.db.pool.get().await?;
         let baseline = PgPackCommit.capture_baseline(&mut client, repo, tenant, deadline()).await?;
         let expected = draft.plan.expected().clone();
@@ -133,7 +149,7 @@ async fn plan_claiming_another_tenant_is_refused_by_begin_pending() -> Result<()
         )?;
         let plan = PackCommitPlan::new_with_mode(
             claimed,
-            original.clone(),
+            foreign,
             expected,
             HeadUpdate::Keep,
             draft.plan.refs().to_vec(),
@@ -143,16 +159,31 @@ async fn plan_claiming_another_tenant_is_refused_by_begin_pending() -> Result<()
             baseline.mode(),
         )?;
         ensure!(
-            plan.tenant_id() == world.verified.tenant && plan.repository_id() == repo && plan.identity() == &original,
-            "the plan does not claim the world tenant on the real second repository with the draft identity"
+            plan.tenant_id() == world.verified.tenant
+                && plan.repository_id() == repo
+                && plan.identity().operation_id() == bad_operation
+                && plan.identity().lane() == &bad_lane
+                && plan.identity().sequence() == 2
+                && plan.identity().issuer_id() == tenant
+                && plan.identity().digest() != &RequestDigest::from_bytes([0; 32]),
+            "the plan does not claim the world tenant on the real second repository as a fresh foreign operation"
         );
         let refused = PgPackCommit.begin_pending(&mut client, &plan, deadline()).await;
+        drop(client);
         match refused {
             Err(PackCommitError::Rejected(rejection)) => {
                 ensure!(rejection.code == PackCommitRejectCode::TenantMismatch, "another refusal: {rejection:?}")
             }
             other => return Err(anyhow!("begin_pending refused for another reason: {other:?}")),
         }
+        ensure!(
+            facts::operation_opt(&world.db.pool, repo, bad_operation).await?.is_none(),
+            "the refused begin_pending registered the bad-tenant operation"
+        );
+        ensure!(
+            facts::decision(&world.db.pool, repo, bad_operation).await?.is_none(),
+            "the refused begin_pending wrote a decision for the bad-tenant operation"
+        );
         let after = facts::operation(&world.db.pool, repo, operation).await?;
         ensure!(after == control, "the refused begin_pending changed the original pending operation: {after:?}");
         ensure!(
