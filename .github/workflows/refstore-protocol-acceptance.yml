@@ -21,6 +21,8 @@ on:
       - 'tests/schema_baseline.py'
       - 'tests/e2e.py'
       - 'tests/native_evidence.py'
+      - 'tests/lfs.py'
+      - 'tests/lfs_remote_contract.py'
       - 'tests/ops_provenance.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -140,6 +142,112 @@ jobs:
           python3 -m pip install -r tests/requirements-blob-backup.txt
           python3 tests/backup_blob_serving147.py --binary "$binary" --git "$ROOTYARD_GIT" \
             --report test-results/refstore/standalone-paired-backup.json
+      - name: Exercise the Git LFS remote read contract against the job-owned Garage fixture
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results/refstore
+          set -a
+          . "$RUNNER_TEMP/refstore-object-store.env"
+          set +a
+          export ROOTYARD_TEST_GIT="$(command -v git)"
+          export ROOTYARD_GIT="$ROOTYARD_TEST_GIT"
+          source_commit="$(git rev-parse HEAD)"
+          test "$source_commit" = "$GITHUB_SHA"
+          database="rootyard_run_lfs_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          createdb --host 127.0.0.1 --port 55432 --username rootyard "$database"
+          export DATABASE_URL="postgresql://rootyard@127.0.0.1:55432/$database"
+          export ROOTYARD_TEST_DATABASE_URL="$DATABASE_URL"
+          binary="$GITHUB_WORKSPACE/target/debug/rootyard"
+          "$binary" migrate 2>&1 | tee test-results/refstore/lfs-migrate.log
+          mkdir -p "$RUNNER_TEMP/rootyard-lfs/schema_migrations"
+          psql --host 127.0.0.1 --port 55432 --username rootyard --dbname "$database" \
+            --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
+            --command "SELECT current_setting('server_version_num');" \
+            --command "SELECT version();" \
+            --command "SELECT version FROM schema_migrations ORDER BY version;" \
+            > "$RUNNER_TEMP/rootyard-lfs/schema_migrations/facts.raw"
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          raw = pathlib.Path(os.environ['RUNNER_TEMP'], 'rootyard-lfs', 'schema_migrations', 'facts.raw')
+          lines = [line.strip() for line in raw.read_text().splitlines() if line.strip()]
+          assert len(lines) >= 2, 'missing PostgreSQL server facts'
+          server_version, banner = lines[0], lines[1]
+          assert re.fullmatch(r'17\d{4}', server_version), 'unexpected PostgreSQL server version'
+          assert banner.startswith('PostgreSQL 17'), 'unexpected PostgreSQL server banner'
+          versions = [line for line in lines[2:] if re.fullmatch(r'\d+', line)]
+          assert versions and len(versions) == len(lines) - 2, 'unexpected schema_migrations rows'
+          numbers = sorted(int(value) for value in versions)
+          assert len(set(numbers)) == len(numbers), 'duplicate schema_migrations versions'
+          pathlib.Path('test-results/refstore/lfs-db-facts.json').write_text(json.dumps({
+              'postgres_major': 17,
+              'server_version_num': int(server_version),
+              'schema_version': numbers[-1],
+              'applied_migrations': len(numbers),
+          }, indent=2) + '\n')
+          PY
+          python3 tests/lfs.py --binary "$binary" \
+            --report test-results/refstore/lfs.json --remote-read-contract \
+            > test-results/refstore/lfs.log 2>&1
+          python3 - <<'PY'
+          import json, pathlib
+          expected = [
+              'setup_lfs',
+              'remote_read_contract',
+              'batch_upload_stream_verify_and_download',
+              'hash_and_size_mismatch_rejection',
+              'permissions_and_tenant_isolation',
+              'concurrent_upload_revocation',
+              'stalled_body_deadline',
+              'stock_lfs_locks',
+              'corrupted_on_disk_blob_fails_closed',
+              'storage_layout_for_backup',
+              'paired_backup_and_restore',
+              'garage_lfs_cleanup',
+          ]
+          report = json.loads(pathlib.Path('test-results/refstore/lfs.json').read_text())
+          assert report.get('passed') is True, 'LFS report did not pass'
+          cases = report.get('cases')
+          assert isinstance(cases, list), 'LFS report has no case list'
+          assert [case.get('name') for case in cases] == expected, [case.get('name') for case in cases]
+          assert all(case.get('status') == 'passed' for case in cases), 'LFS suite skipped or failed a case'
+          PY
+      - name: Drop only the job-owned LFS database
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          database="rootyard_run_lfs_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          dropdb --host 127.0.0.1 --port 55432 --username rootyard --if-exists "$database"
+          absent="$(psql --host 127.0.0.1 --port 55432 --username rootyard --dbname postgres \
+            --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
+            --command "SELECT count(*) FROM pg_database WHERE datname = '$database';")"
+          test "$absent" = "0"
+      - name: Record the source-bound LFS job receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/native_report_manifest.py --mode job --expect-commit "$GITHUB_SHA" \
+            --manifest-out test-results/refstore/lfs-native-job.json \
+            --build-receipt target/debug/rootyard.build.json \
+            --binary target/debug/rootyard \
+            --report lfs=test-results/refstore/lfs.json \
+            --log lfs-migrate=test-results/refstore/lfs-migrate.log \
+            --log lfs-db-facts=test-results/refstore/lfs-db-facts.json \
+            --log lfs-suite=test-results/refstore/lfs.log \
+            --log-marker lfs-suite='"passed": true' \
+            --harness workflow=.github/workflows/refstore-protocol-acceptance.yml \
+            --harness lfs=tests/lfs.py \
+            --harness lfs_remote_contract=tests/lfs_remote_contract.py \
+            --harness e2e=tests/e2e.py \
+            --harness schema_baseline=tests/schema_baseline.py \
+            --harness native_evidence=tests/native_evidence.py \
+            --harness owned_fuse_cleanup=tests/owned_fuse_cleanup.py \
+            --harness build_native=scripts/build_native.py \
+            --harness native_report_manifest=scripts/native_report_manifest.py \
+            --fixture postgres=postgres:17 \
+            --fixture garage="Garage v2.1.0 sha256:4c9b34c113e61358466e83fd6e7d66e6d18657ede14b776eb78e93ee8da7cf6a"
       - name: Stop only the job-owned Garage fixture
         if: always()
         run: |
