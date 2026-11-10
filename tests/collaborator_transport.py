@@ -80,7 +80,7 @@ class CollaboratorTransportHarness(collaborator_contract.prerequisite,
         )
         names = [name for name, _ in self.steps]
         assert len(names) == len(set(names)) == 19, names
-        return names
+        return self.steps
 
 
 def main():

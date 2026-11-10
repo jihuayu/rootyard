@@ -27,6 +27,17 @@ CASE_METHODS = (
     "withdrawal", "audit_boundary", "token_revocation",
 )
 MAX_MODULE_LINES = 700
+# Registered case name -> case method, in execution order (see execute()).
+REGISTERED_CASES = (
+    "git_matrix_version", "git_command_coverage", "source_bound_receipt", "environment",
+    "staff_owned_fixtures", "role_matrix_clone_fetch_push", "fetch_propagation",
+    "outsider_404_no_enumeration", "read_only_token_403", "non_fast_forward_rejected",
+    "ref_transactions_role_matrix", "pull_create_merge_role_matrix",
+    "branch_rule_role_matrix", "maintain_branch_rule_matrix",
+    "admin_management_not_owner_only", "pull_merge_under_collaborator_rule",
+    "withdrawal_revokes_new_requests", "git_receipts_are_not_repository_audit_log",
+    "token_revocation_401",
+)
 
 
 class HarnessModules:
@@ -118,34 +129,64 @@ class HarnessContract(unittest.TestCase):
         for _, method in registered:
             self.assertIn(method, methods, f"registered case {method} has no method")
 
+    @staticmethod
+    def method_source(path, klass_method):
+        """Exact source of one method via AST, never by slicing on text."""
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == klass_method:
+                return ast.get_source_segment(path.read_text(), node)
+        raise AssertionError(f"{klass_method} not found in {path.name}")
+
+    def test_registration_yields_name_and_callable_pairs(self):
+        """main() unpacks ``for name, fn in h.execute()``; the shape must hold."""
+        harness_cls = object.__new__(harness.CollaboratorTransportHarness)
+        steps = harness_cls.execute()
+        self.assertEqual(len(steps), 19)
+        for name, method in steps:
+            self.assertIsInstance(name, str)
+            self.assertIsInstance(method, type(self.assertEqual))
+        self.assertEqual([name for name, _ in steps], list(REGISTERED_CASES))
+        self.assertEqual({method.__name__ for _, method in steps}, set(CASE_METHODS),
+                         "every case method must be registered exactly once")
+
     def test_initialization_and_merge_contracts_are_fixed(self):
-        merge_source = (ROOT / "tests" / "collaborator_writes.py").read_text()
-        merge = merge_source[merge_source.index("    def pull_lifecycle(self):"):
-                             merge_source.index("    def rule_refusals(self):")]
+        contract = ROOT / "tests" / "collaborator_contract.py"
+        lifecycle = ROOT / "tests" / "collaborator_lifecycle.py"
+        writes = ROOT / "tests" / "collaborator_writes.py"
+        merge = self.method_source(writes, "pull_lifecycle")
         first = merge.index('status, raw, _ = self.http(merge, token=self.users[user]')
         replay = merge.index("replay = self.expect(")
         self.assertLess(first, replay)
         self.assertIn('key = {"Idempotency-Key": "merge-" + user}', merge)
         self.assertIn("extra_headers=key", merge[first:replay], "first merge must carry the key")
         self.assertIn("assert replay == raw", merge)
-        writes = (ROOT / "tests" / "collaborator_writes.py").read_text()
-        maintain = writes[writes.index("    def maintain_rule_matrix(self):"):
-                          writes.index("    def admin_management(self):")]
+        maintain = self.method_source(writes, "maintain_rule_matrix")
         self.assertNotIn("assert status == 403", maintain, "Role::Maintain may write rules")
-        admin = writes[writes.index("    def admin_management(self):"):
-                       writes.index("    def pull_merge_under_rule(self):")]
+        self.assertIn("assert status == 201", maintain)
+        admin = self.method_source(writes, "admin_management")
         self.assertNotIn("assert status == 403", admin,
                          "Role::Admin manages collaborators; only the owner row is refused")
-        self.assertIn(b"cannot modify or remove repository owner".decode(), admin)
-        managed = writes[writes.index("    def pull_merge_under_rule(self):"):
-                         writes.index("    def audit_boundary(self):")]
+        self.assertIn("cannot modify or remove repository owner", admin)
+        self.assertIn("assert status == 409", admin)
+        managed = self.method_source(writes, "pull_merge_under_rule")
         self.assertIn('("refs/heads/maint-base", True)', managed,
                       "the merge-under-rule case must use a rule an earlier case created")
-        audit = writes[writes.index("    def audit_boundary(self):"):]
-        # Demo-scoped receipts only (owner API for demo), never a schema-wide
-        # count compared with repository-scoped events.
+        audit = self.method_source(writes, "audit_boundary")
         self.assertIn('self.expect("/api/repos/alice/demo/events", 200', audit)
         self.assertNotIn("SELECT count(*) FROM outbox_events", audit)
+
+    def test_every_module_compiles_and_has_no_duplicate_statements(self):
+        """A text splice once duplicated a statement and shipped invalid Python."""
+        for path in HarnessModules.paths():
+            source = path.read_text()
+            compile(source, str(path), "exec")
+            for node in ast.walk(ast.parse(source)):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    body = [ast.dump(item) for item in node.body
+                            if not isinstance(item, ast.Expr)]
+                    self.assertEqual(len(body), len(set(body)),
+                                     f"{path.name}:{node.lineno} {node.name} repeats a statement")
 
     def test_missing_dependencies_are_argument_errors_not_skips(self):
         result = subprocess.run([sys.executable, str(Path(harness.__file__)), "--binary",
