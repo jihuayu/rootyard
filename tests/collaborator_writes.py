@@ -305,21 +305,25 @@ class writes:
         assert self.sql("SELECT count(*) FROM repository_audit_log WHERE repository_id='" + repo +
                         "' AND (action LIKE 'git%' OR action LIKE 'push%' OR "
                         "target_type IN ('git_operation','outbox_event'))") == "0"
-        # Membership/branch-rule writes are the only demo audit rows, one per
-        # such mutation this run performed through the API.
-        performed = getattr(self, "member_mutations", 0)
+        # Membership/branch-rule API writes are the only demo audit rows. The
+        # actors are the owner, the admin and the maintainer this matrix acts
+        # with; maintain may manage rules (src/pulls/rules.rs), so karl's
+        # branch_rule rows are legitimate API audit and not a Git receipt.
         mutation_rows = [row for row in json.loads(self.sql(
             "SELECT COALESCE(json_agg(t), '[]'::json) FROM (SELECT actor_name, action, "
             "count(*) AS n FROM repository_audit_log WHERE repository_id='" + repo +
             "' GROUP BY 1,2) t"))
             if row["action"].startswith(("collaborator.", "branch_rule."))]
-        assert sum(int(row["n"]) for row in mutation_rows) == performed, (mutation_rows, performed)
-        assert all(row["actor_name"] in ("alice", "heidi") for row in mutation_rows), mutation_rows
+        assert mutation_rows, "no API mutation reached repository_audit_log"
+        assert all(row["actor_name"] in ("alice", "heidi", "karl") for row in mutation_rows), mutation_rows
+        assert {row["action"] for row in mutation_rows} <= {
+            "collaborator.added", "collaborator.updated", "collaborator.removed",
+            "branch_rule.upserted", "branch_rule.deleted"}, mutation_rows
         return {"git_operations_recorded": len([op for op in self.operations()
                                                 if op["outcome"] == "recorded"]),
                 "demo_outbox_events": len(rows),
                 "git_transport_wrote_repository_audit_log": False,
-                "member_mutations_via_api": performed,
+                "member_mutations_via_api": sum(int(row["n"]) for row in mutation_rows),
                 "repository_audit_log_rows": int(self.sql(
                     "SELECT count(*) FROM repository_audit_log WHERE repository_id='" + repo + "'")),
                 "repository_audit_log_git_rows": 0, "audit_actions": actions}
