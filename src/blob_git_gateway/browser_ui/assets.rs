@@ -146,7 +146,8 @@ pub(super) const SCRIPT: &str = "'use strict';
     }
     let data;
     try { data = await response.json(); } catch (_) { data = undefined; }
-    const list = isObject(data) && Array.isArray(data.items) ? data.items : null;
+    const list = scope === 'index' && Array.isArray(data) ? data
+      : isObject(data) && Array.isArray(data.items) ? data.items : null;
     if (!list) {
       if (page === scope) show(REFUSED, true);
       return null;

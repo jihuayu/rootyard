@@ -394,9 +394,13 @@ mod tests {
         }
         assert!(inline::SCRIPT.contains("credentials: 'same-origin'"));
         assert!(inline::SCRIPT.contains("textContent"));
-        // Whole-body wire objects nest their rows under `items`; the page list
-        // handler itself issues no session, so it reads plain arrays.
-        assert!(inline::SCRIPT.contains("Array.isArray(data.items)"));
+        // Production `list_repos` returns a bare JSON array for the index,
+        // while refs/tree/commits nest rows under `items`. The client accepts
+        // a raw array only for the index scope and never infers a page.
+        assert!(inline::SCRIPT
+            .contains("scope === 'index' && Array.isArray(data) ? data"));
+        assert!(inline::SCRIPT
+            .contains("isObject(data) && Array.isArray(data.items) ? data.items"));
         assert!(!inline::SCRIPT.contains("data.page"));
         // A boundless read is still cookie-authenticated and RBAC-checked; only
         // the repository consistency bound may be missing.
