@@ -47,7 +47,7 @@ use axum::{
     Router,
     body::Body,
     extract::State,
-    http::{HeaderMap, HeaderName, Method, Request},
+    http::{HeaderMap, Method, Request},
     middleware::{self, Next},
     response::Response,
 };
@@ -241,8 +241,7 @@ struct Bound {
 }
 
 fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
-    let name = HeaderName::from_static(name);
-    headers.get(&name).map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+    headers.get(name).map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
 }
 
 fn parse_revision(value: Option<&str>) -> Result<i64> {
