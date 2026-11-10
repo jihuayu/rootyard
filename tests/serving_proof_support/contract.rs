@@ -11,8 +11,9 @@
 //! The repository, gate, actor and backend fixtures are the real ones from
 //! `tests/serving_reads_support` and `tests/serving_support` (the same modules
 //! `ref_store_serving_reads.rs` and `ref_store_serving.rs` compile), selected
-//! with `#[path]` so nothing is copied; `test_mirror` is the `rootyard` path
-//! alias those fixtures need inside the library crate. The pack is a real A4
+//! with `#[path]` so nothing is copied; inside the library's own test build the
+//! crate is available under its own name through `extern crate self as
+//! rootyard` in `src/lib.rs`. The pack is a real A4
 //! artifact hold → protected upload → registration → native verifier proof →
 //! verified commit.
 //!
@@ -30,15 +31,12 @@
 //! internal materialization proof and no gateway route consumes it.
 #![allow(clippy::too_many_arguments)]
 
-// `rootyard` first (absolute, so every `rootyard::…` path in the `#[path]`d
-// integration fixtures below resolves to this crate), then the fixtures. All
-// paths are from the repository root, the single `tests/` module path this
-// `#[path]` subtree is opened with.
-#[path = "serving_proof_support/mirror.rs"]
-mod test_mirror;
-#[path = "tests/serving_reads_support/mod.rs"]
+// Every `rootyard::…` path in the `#[path]`d integration fixtures below resolves
+// to this crate. Paths here are relative to this file
+// (`tests/serving_proof_support/`).
+#[path = "../serving_reads_support/mod.rs"]
 mod serving_reads_support;
-#[path = "tests/serving_support/mod.rs"]
+#[path = "../serving_support/mod.rs"]
 mod serving_support;
 
 use self::serving_reads_support::{
@@ -46,7 +44,6 @@ use self::serving_reads_support::{
 };
 use self::serving_support::{Fixture, actor};
 use super::PgPackSnapshotMaterializer;
-use super::contract::{contract_parts, contract_refactory};
 use crate::blob_store::config::BlobProfile;
 use crate::blob_store::opendal::BlobStore;
 use crate::blob_store::protected::{ProtectedPublication, ProtectedUploader, UploadSource};
@@ -420,7 +417,7 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
                 Err(error) => return Err(anyhow!("the production sealed builder refused a real capture: {error}")),
             };
             let view = sealed.view();
-            let (proof_revision, proven, proof_binding) = contract_parts(&sealed);
+            let (proof_revision, proven, proof_binding) = sealed.contract_parts();
             let expected_packs = protected_pack_count(&fixture, repo.ready.repository_id).await?;
             ensure!(expected_packs > 0, "the capture must register at least one pack");
             ensure!(view.pack_count() == expected_packs, "the sealed view must expose every captured pack");
@@ -445,11 +442,8 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
                 "the proof realm must be the capture realm"
             );
             ensure!(view.verified_read_scope(&binding).is_some(), "the view must prove the same A5b binding");
-            ensure!(
-                view.verified_read_scope(&a5a).is_none(),
-                "the view must never prove the narrower A5a read digest"
-            );
-            contract_refactory(&sealed)?;
+            ensure!(view.verified_read_scope(&a5a).is_none(), "the view must never prove the narrower A5a read digest");
+            sealed.contract_refactory()?;
             Ok(())
         }
         .await;

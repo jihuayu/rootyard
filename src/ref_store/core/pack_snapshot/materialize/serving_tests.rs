@@ -15,7 +15,6 @@
 //! widen it just to reach a test.
 
 use super::super::serving_proof::{VerifiedReadView, probe_a5a};
-use super::super::serving_proof::contract::{contract_parts, contract_refactory};
 use super::test_materialized_view;
 use super::*;
 use crate::ref_store::core::pack_commit::{
@@ -154,7 +153,7 @@ fn the_production_step_keeps_the_view_and_its_proof_on_the_same_a5b_binding() {
     // One value owns both halves: the verified view survives the call with the
     // proof that describes exactly it.
     assert_eq!(sealed.view().verified_pairs(), 1);
-    let (revision, scope, proof_binding) = contract_parts(&sealed);
+    let (revision, scope, proof_binding) = sealed.contract_parts();
     assert_eq!(revision, 11);
     assert_eq!(proof_binding, binding);
     assert_eq!(scope.repository_id(), Uuid::from_bytes([5; 16]));
@@ -162,7 +161,7 @@ fn the_production_step_keeps_the_view_and_its_proof_on_the_same_a5b_binding() {
     assert_eq!(scope.history_incarnation(), Uuid::from_bytes([8; 16]));
     // The seal site's own factory re-proves the sealed view on the same A5b
     // binding; A5a is never an input to it.
-    assert!(contract_refactory(&sealed).is_ok());
+    assert!(sealed.contract_refactory().is_ok());
     let view = sealed.view();
     assert!(view.verified_read_scope(&binding).is_some());
     assert!(view.verified_read_scope(&probe_a5a(view.snapshot())).is_none());
@@ -208,8 +207,7 @@ fn a_shape_with_no_registered_pack_is_never_built() {
 
 // The real-PostgreSQL contract cases must run inside this crate (the sealed
 // builder is crate-private by design), so they are `#[path]`-included here and
-// reuse the existing `tests/` fixtures rather than an integration binary.
+// reuse the existing `tests/serving_proof_support` fixtures rather than an
+// integration binary.
 #[path = "../../../../../tests/serving_proof_support/contract.rs"]
-mod contract {
-    #![path = "tests"]
-}
+mod contract;

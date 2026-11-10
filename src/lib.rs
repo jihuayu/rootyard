@@ -2,6 +2,12 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+// The `#[path]`-included real-PostgreSQL contract cases drive `tests/` fixtures
+// that name this crate as `rootyard`; in the crate's own test build that name is
+// this crate root. Test builds only: the public API is unchanged.
+#[cfg(test)]
+extern crate self as rootyard;
+
 pub mod blob_git_gateway;
 pub mod standalone;
 #[rustfmt::skip]
