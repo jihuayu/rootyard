@@ -429,6 +429,17 @@ class AuditSequenceLegacyHarness(BackupHarness):
                  self.second + ":refs/heads/main", token=self.alice)
         assert self.git("ls-remote", self.base + other["clone_path"], "main", token=self.alice) \
             .stdout.decode().strip() == self.second + "\trefs/heads/main"
+        # The demo triage-base ref is a real Git fact too: self.first already
+        # exists in this demo working repository and the server object store,
+        # so it is pushed directly with stock Git.  A Git push writes Git
+        # operations, never audit rows.
+        self.git("-C", str(self.work), "push", self.remote,
+                 self.first + ":refs/heads/triage-base", token=self.alice)
+        # ls-remote exits 0 even for an absent ref; compare full stdout.
+        assert self.git("ls-remote", self.remote, "refs/heads/triage-base", token=self.alice) \
+            .stdout.decode().strip() == self.first + "\trefs/heads/triage-base"
+        assert self.git("-C", str(self.work), "merge-base", "--is-ancestor",
+                        self.first, self.second, check=False).returncode == 0
         # Bob's triage grant is observable through the real API before the
         # backup: a triage may file an issue and may not open a pull request.
         assert self.collaborator("bob")["role"] == "triage"
