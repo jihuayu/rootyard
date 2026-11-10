@@ -54,7 +54,11 @@ _SENSITIVE = re.compile(
     r"|(?<=password=)[^\s'\"]+"
     r"|\b(password|passwd|secret|token)\s*[=:]\s*\S+")
 _ERROR = re.compile(r"^Error: (.*)$")
+# The scanner's numbered-cause form: kept text only, for fixed vocabulary.
 _CAUSE = re.compile(r"^ {4}\d+: (.*)$")
+# The strict parser's numbered-cause form: the index and the text, so the
+# indexes can be required to run sequentially from `   0:`.
+_NUMBERED_CAUSE = re.compile(r"^ {4}(\d+): (.*)$")
 # anyhow's standard single-cause form under `Caused by:` carries no `N:` index.
 _SINGLE_CAUSE = re.compile(r"^ {4}(\S.*)$")
 _DEPENDENCY_PANIC = re.compile(r"^thread '[^']*' ?\(\d+\)? panicked at .*/(rdkafka|fuser|tokio|tokio-postgres|opendal)[^:]*/")
@@ -81,44 +85,64 @@ def own_lines(path, secrets=(), limit=16):
     """Fixed-vocabulary product diagnostics from a private log the child wrote.
 
     Only the exact startup-refusal context, ``cause`` categories from ``CAUSES``
-    and the exact barrier messages (as ``barrier message``) are kept. Raw cause
-    text, panics, echoed profiles and every unrecognised line stay private.
+    and ``barrier message`` are kept. Raw cause text, panics, echoed profiles and
+    every unrecognised line stay private. ``barrier message`` is added only for
+    a complete per-mode ``_exact_refusal`` block, never from one refusal-shaped
+    line: an invalid, separated or mixed block keeps only its categories.
     """
     try:
         lines = Path(path).read_bytes().decode("utf-8", "replace").splitlines()
     except FileNotFoundError:
         return []
-    kept, panic, causes = [], False, False  # causes: False, or "first"/"more" in a startup block
+    # causes: None, "header" once `Caused by:` opens the startup block, then
+    # "first"/"more" as its cause lines are read.
+    kept, panic, causes = [], False, None
     for raw in lines:
         line = raw.rstrip()
         log = _RUST_LOG.match(line)
         if log:
             line = log.group(1)
         if (match := _ERROR.match(line)):
-            causes = match.group(1) == STARTUP_FAILURE
-            kept.extend(["startup refusal context (" + STARTUP_FAILURE + ")"] if causes
-                        else _facts(match.group(1), secrets))
+            panic, causes = False, None
+            if match.group(1) == STARTUP_FAILURE:
+                causes = "header"
+                kept.append("startup refusal context (" + STARTUP_FAILURE + ")")
+            else:
+                kept.extend(_facts(match.group(1), secrets))
         elif _PANIC.match(line) or _DEPENDENCY_PANIC.match(line):
-            panic, causes = True, False
+            panic, causes = True, None
             if _DEPENDENCY_PANIC.match(line):
                 kept.append("cause dependency panic")
         elif not line.strip():
-            panic = causes = False
-        elif panic:
+            # A blank line ends both the panic and the startup block.
+            panic, causes = False, None
+        elif causes == "header" and line == "Caused by:":
+            # The header itself is part of the standard block, not a fact; one
+            # empty separator line may follow it before the cause lines.
+            causes = "first"
+        elif causes == "first" and not line.strip():
             continue
+        elif causes in ("first", "more") and (
+                match := _CAUSE.match(line) or (_SINGLE_CAUSE.match(line) if causes == "first" else None)):
+            # Any cause line inside the block keeps only its fixed category;
+            # `barrier message` comes from the exact block alone.
+            causes = "more"
+            kept.extend(_facts(match.group(1), secrets))
         elif _TOML.match(line):
             continue  # a profile echoed straight into the log carries its keys
-        # A cause line is kept as fixed vocabulary only inside a startup block:
-        # numbered causes for the multi-cause form, and the single-cause form's
-        # unnumbered line only directly after `Caused by:`.
-        elif line.rstrip() == "Caused by:" and causes:
-            causes = "first"
-        elif causes and (match := (_CAUSE.match(line) or (_SINGLE_CAUSE.match(line) if causes == "first" else None))):
-            causes = causes if causes == "first" else "more"
-            kept.extend(["barrier message"] if match.group(1) in BARRIER_REFUSALS.values()
-                        else _facts(match.group(1), secrets))
+        elif panic:
+            causes = None
         else:
-            kept.extend(_facts(line, secrets))
+            # Any other line ends the startup block: a cause only counts when
+            # the `Caused by:` header precedes it in the same block.
+            causes = None
+            # An orphan indented line that is exactly one of the known barrier
+            # messages belongs to no established cause block, so it is
+            # suppressed rather than classified as a generic cause.
+            if line.strip() not in BARRIER_REFUSALS.values():
+                kept.extend(_facts(line, secrets))
+    if any(_exact_refusal(path, secrets, mode) for mode in BARRIER_REFUSALS):
+        kept.append("barrier message")
     kept = [line for line in kept if line]
     unique = []
     for line in kept:
@@ -137,11 +161,14 @@ def _exact_refusal(path, secrets, mode):
     for index, line in enumerate(lines):
         if line.rstrip() != context:
             continue
-        # Only the adjacent `Caused by:` block counts; a message anywhere else
-        # (before the context, or past a blank line) is not this refusal. Its
-        # own causes carry exactly this mode's fixed message and nothing else:
-        # an arbitrary surrounding cause, numbered or not, fails the match.
-        causes = [scrub(group, secrets) for group in _cause_messages(lines[index + 1:index + 8])]
+        # Only this block counts: it follows the context directly, or after one
+        # empty separator line, and starts with `Caused by:`. Its causes carry
+        # exactly this mode's fixed message and nothing else: an arbitrary
+        # surrounding cause, a mixed form or a second block fails the match.
+        block = lines[index + 1:index + 9]
+        if block and not block[0].strip():
+            block = block[1:]  # the one optional separator after the context
+        causes = [scrub(message, secrets) for message in _cause_messages(block)]
         if causes and all(cause == BARRIER_REFUSALS[mode] for cause in causes):
             return True
     return False
@@ -153,19 +180,33 @@ _MESSAGE = re.compile(r"^ {4}([^:\s].*)$")
 def _cause_messages(block):
     """Cause messages of one anyhow block, in either standard form only.
 
-    The block is ``Caused by:`` followed by the numbered ``    N: message``
-    lines, or by exactly one unnumbered ``    message``. Anything else is not a
-    standard form and yields nothing.
+    The block is ``Caused by:`` followed by exactly one unnumbered
+    ``    message``, or by the numbered ``    N: message`` lines in sequence
+    from ``   0:``. One empty separator line may sit directly after the header,
+    and trailing empty lines are dropped. Any other line (an arbitrary line, a
+    second block), a mix of both forms, or non-sequential indexes yields nothing.
     """
-    if not block or block[0].rstrip() != "Caused by:":
+    body = list(block)
+    while body and not body[-1].strip():
+        body.pop()
+    if not body or body[0] != "Caused by:":
         return []
-    body = block[1:]
-    numbered = [match.group(1) for match in map(_CAUSE.match, body) if match]
-    if numbered:
-        return numbered
-    if len(body) == 1 and (match := _MESSAGE.match(body[0])):
-        return [match.group(1)]
-    return []
+    body = body[1:]
+    if body and not body[0].strip():
+        body = body[1:]  # the optional single separator after the header
+    if not body or any(not line.strip() for line in body):
+        return []
+    # Only a numbered cause is `N: text`; an unnumbered message is any other
+    # indented text, even when its own text contains a colon.
+    numbered = [_NUMBERED_CAUSE.match(line) for line in body]
+    if all(numbered):
+        if [int(match.group(1)) for match in numbered] == list(range(len(numbered))):
+            return [match.group(2) for match in numbered]
+        return []
+    if any(numbered) or len(body) != 1:
+        return []  # a mix of both forms, or more than one unnumbered cause
+    match = _MESSAGE.match(body[0])
+    return [match.group(1)] if match else []
 
 
 def loopback_bind():

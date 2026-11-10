@@ -64,6 +64,12 @@ def single_cause_body(context, message, code, follow=""):
             + follow + f"exit {code}\n")
 
 
+def separated_body(context, message, code, follow=""):
+    """The standard layout where an empty separator line divides context and causes."""
+    return (f"printf 'Error: {quote(context)}\\n\\nCaused by:\\n    {quote(message)}\\n\\n' >&2\n"
+            + follow + f"exit {code}\n")
+
+
 class ProbeTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -94,22 +100,97 @@ class ProbeTest(unittest.TestCase):
                 self.assertTrue(outcome["reaped"])
                 # Only fixed facts are kept: no raw cause, key or DSN.
                 self.assertEqual(outcome["diagnostics"], [
-                    "startup refusal context (" + FAILURE + ")", "barrier message"], name)
+                    "startup refusal context (" + FAILURE + ")",
+                    "cause lifecycle barrier", "barrier message"], name)
                 text = repr(outcome)
                 for leaked in SECRETS:
                     self.assertNotIn(leaked, text)
         self.assertTrue(self.owned.is_dir())
+
+    def test_separated_standard_block_is_the_exact_refusal(self):
+        # An empty separator line after the context, then the standard block:
+        # either the single-cause or the numbered form, with trailing blanks.
+        for mode, expected in (("external", EXTERNAL), ("auto", AUTO)):
+            for shape in (separated_body, refusal_body):
+                body = shape(FAILURE, expected, 1) if shape is separated_body else (
+                    # Direct standard numbered block (no separator), trailing blanks.
+                    f"printf 'Error: {quote(FAILURE)}\\nCaused by:\\n    0: {quote(expected)}\\n\\n' >&2\n"
+                    "exit 1\n")
+                outcome = run_probe(self.stand_in(body), mode, root=self.owned)
+                name = shape.__name__ + "/" + mode
+                self.assertEqual(outcome["status"], "refused", name + ": " + probe.describe(outcome))
+                self.assertEqual(outcome.get("exit"), 1, outcome)
+                self.assertTrue(outcome["reaped"])
+                diagnostics = outcome["diagnostics"]
+                self.assertIn("startup refusal context (" + FAILURE + ")", diagnostics, name)
+                self.assertIn("barrier message", diagnostics, name)
+                self.assertTrue(set(diagnostics) <= {
+                    "startup refusal context (" + FAILURE + ")",
+                    "cause lifecycle barrier", "cause serving barrier",
+                    "cause dependency panic", "barrier message"}, name + ": " + repr(diagnostics))
+
+    def test_separated_blocks_that_are_not_the_exact_refusal(self):
+        cases = {
+            "mixed-single-then-numbered": "Caused by:\n    " + EXTERNAL + "\n    0: " + EXTERNAL + "\n",
+            "mixed-numbered-then-single": "Caused by:\n    0: " + EXTERNAL + "\n    " + EXTERNAL + "\n",
+            "numbered-then-bare-refusal-no-marker": "    0: " + EXTERNAL + "\n    " + EXTERNAL + "\n",
+            "non-sequential-numbered": "Caused by:\n    0: " + EXTERNAL + "\n    2: " + EXTERNAL + "\n",
+            "arbitrary-line-after-cause": "Caused by:\n    " + EXTERNAL + "\narbitrary line\n",
+            "arbitrary-line-then-caused-by": "arbitrary line\nCaused by:\n    " + EXTERNAL + "\n",
+            "two-unnumbered-causes": "Caused by:\n    " + EXTERNAL + "\n    " + EXTERNAL + "\n",
+            "blank-then-unnumbered-no-marker": "\n    " + EXTERNAL + "\n",
+            "blank-inside-numbered": "Caused by:\n    0: " + EXTERNAL + "\n\n    1: " + EXTERNAL + "\n",
+        }
+        for name, tail in cases.items():
+            log = self.root / name
+            log.write_text("Error: " + FAILURE + "\n\n" + tail)
+            for mode in ("external", "auto"):
+                self.assertFalse(probe._exact_refusal(log, SECRETS, mode), name + "/" + mode)
+            # The context is kept, but a refusal string outside a complete
+            # standard block is never reported as `barrier message`. Generic
+            # fixed cause categories are optional and not asserted exactly.
+            diagnostics = probe.own_lines(log, SECRETS)
+            self.assertIn("startup refusal context (" + FAILURE + ")", diagnostics, name)
+            self.assertNotIn("barrier message", diagnostics, name)
+            self.assertTrue(set(diagnostics) <= {
+                "startup refusal context (" + FAILURE + ")",
+                "cause lifecycle barrier", "cause serving barrier",
+                "cause dependency panic", "barrier message"}, name + ": " + repr(diagnostics))
+
+    def test_a_second_error_block_is_not_the_separated_block(self):
+        # The separated block must follow its own context; an unrelated error
+        # block in between, or the cause after another error's block, fails.
+        for name, text in {
+            "other-error-before-block": (
+                "Error: " + FAILURE + "\n\nError: invalid Blob profile\nCaused by:\n    " + EXTERNAL + "\n"),
+            "other-error-in-causes": (
+                "Error: " + FAILURE + "\n\nCaused by:\n    " + EXTERNAL + "\n\nError: invalid Blob profile\n"),
+            "other-error-separates-context": (
+                "Error: " + FAILURE + "\n\nError: other failure\nCaused by:\n    " + EXTERNAL + "\n"),
+        }.items():
+            log = self.root / name
+            log.write_text(text)
+            for mode in ("external", "auto"):
+                self.assertFalse(probe._exact_refusal(log, SECRETS, mode), name + "/" + mode)
+            self.assertIn("startup refusal context (" + FAILURE + ")", probe.own_lines(log, SECRETS))
 
     def test_single_cause_form_needs_the_context_and_the_mode(self):
         # The unnumbered message is only the refusal inside its own adjacent
         # startup block and for the mode it belongs to.
         cases = {
             "wrong-mode-single-cause": single_cause_body(FAILURE, AUTO, 1),
+            "wrong-mode-separated": separated_body(FAILURE, AUTO, 1),
             "bare-message-without-context": f"printf '    {quote(EXTERNAL)}\\n' >&2; exit 1\n",
             "bare-numbered-without-context": f"printf '    0: {quote(EXTERNAL)}\\n' >&2; exit 1\n",
             "context-without-caused-by": f"printf 'Error: {quote(FAILURE)}\\n    {quote(EXTERNAL)}\\n' >&2; exit 1\n",
-            "message-separated-by-blank-line": (
-                f"printf 'Error: {quote(FAILURE)}\\nCaused by:\\n\\n    {quote(EXTERNAL)}\\n' >&2; exit 1\n"),
+            # Two separator lines are not the one optional blank separator; each
+            # also carries a second cause, so only the blank line can differ.
+            "message-separated-by-two-blank-lines": (
+                f"printf 'Error: {quote(FAILURE)}\\nCaused by:\\n\\n    {quote(EXTERNAL)}\\n"
+                f"    1: {quote(AUTO)}\\n' >&2; exit 1\n"),
+            "context-separated-by-two-blank-lines": (
+                f"printf 'Error: {quote(FAILURE)}\\n\\n\\nCaused by:\\n    0: {quote(EXTERNAL)}\\n"
+                f"    1: {quote(AUTO)}\\n' >&2; exit 1\n"),
             "message-before-context": (
                 f"printf '    {quote(EXTERNAL)}\\nError: {quote(FAILURE)}\\nCaused by:\\n"
                 f"    unrelated cause\\n' >&2; exit 1\n"),
@@ -130,10 +211,11 @@ class ProbeTest(unittest.TestCase):
             "    1: " + AUTO + "\n")
         self.assertFalse(probe._exact_refusal(log, SECRETS, "external"), "two causes are not one fixed message")
         self.assertFalse(probe._exact_refusal(log, SECRETS, "auto"))
+        # Not the exact block, so no `barrier message`; each cause keeps only
+        # its fixed category.
         self.assertEqual(probe.own_lines(log, SECRETS), [
             "startup refusal context (" + FAILURE + ")",
-            "cause lifecycle barrier",
-            "barrier message"])
+            "cause lifecycle barrier"])
 
     def test_numbered_causes_with_extra_arbitrary_entries_are_not_the_refusal(self):
         for extra in ("lifecycle barrier failed at " + DSN, "invalid Blob profile"):
@@ -143,19 +225,32 @@ class ProbeTest(unittest.TestCase):
                 log.write_text("Error: " + FAILURE + "\nCaused by:\n"
                                + "".join(f"    {index}: {text}\n" for index, text in enumerate(numbered)))
                 self.assertFalse(probe._exact_refusal(log, SECRETS, "external"), position)
-                self.assertIn("barrier message", probe.own_lines(log, SECRETS))
+                # Not the exact block: the refusal string never becomes
+                # `barrier message` here, only its fixed category may remain.
+                self.assertNotIn("barrier message", probe.own_lines(log, SECRETS))
+                self.assertIn("startup refusal context (" + FAILURE + ")", probe.own_lines(log, SECRETS))
                 self.assertNotIn(extra, repr(probe.own_lines(log, SECRETS)))
         single = self.root / "single-with-extra"
         single.write_text("Error: " + FAILURE + "\nCaused by:\n    " + EXTERNAL + "\n    extra cause\n")
         self.assertFalse(probe._exact_refusal(single, SECRETS, "external"), "single form has one cause")
+        # Indexes must run from `0:`; a well-formed block that does not is
+        # still not the exact refusal, and never `barrier message`.
+        offset = self.root / "not-starting-at-zero"
+        offset.write_text("Error: " + FAILURE + "\nCaused by:\n    1: " + EXTERNAL + "\n    2: " + AUTO + "\n")
+        self.assertFalse(probe._exact_refusal(offset, SECRETS, "external"))
+        self.assertFalse(probe._exact_refusal(offset, SECRETS, "auto"))
+        self.assertEqual(probe.own_lines(offset, SECRETS),
+                         ["startup refusal context (" + FAILURE + ")", "cause lifecycle barrier"])
 
     def test_single_cause_diagnostics_stay_fixed_vocabulary(self):
         # The real shape: context + one unnumbered cause. A barrier cause is a
         # fixed label; any other cause keeps only its product category.
         refused = self.root / "single-barrier"
         refused.write_text("Error: " + FAILURE + "\nCaused by:\n    " + EXTERNAL + "\n")
-        self.assertEqual(probe.own_lines(refused, SECRETS),
-                         ["startup refusal context (" + FAILURE + ")", "barrier message"])
+        self.assertEqual(probe.own_lines(refused, SECRETS), [
+            "startup refusal context (" + FAILURE + ")",
+            "cause lifecycle barrier",
+            "barrier message"])
         other = self.root / "single-other"
         other.write_text("Error: " + FAILURE + "\nCaused by:\n    lifecycle barrier failed at " + DSN + "\n")
         diagnostics = probe.own_lines(other, SECRETS)
