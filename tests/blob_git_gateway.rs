@@ -755,6 +755,7 @@ async fn lost_receive_pack_ack_after_commit_resolves_committed_via_operation_get
 
 async fn lost_ack_case(case: &Case, git: &'static Git) -> Result<Value> {
     let seed_dir = case.clone_seed(git, "seed", Some("0")).await?;
+    git.commit(&seed_dir, "seed.txt", "seed\n", "seed commit").await?;
     git.ok(&seed_dir, &["push", "origin", "HEAD:refs/heads/main"]).await?;
     let (client_dir, advertised) = case.clone_protocol(git, "push", "0").await?;
     let pushed = git.commit(&client_dir, "ack.txt", "committed before the ACK was lost\n", "ack commit").await?;
