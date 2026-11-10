@@ -5,7 +5,8 @@ use crate::{
         git_read,
         models::{AppliedRefUpdate, RefTransactionRequest, RefTransactionResponse},
     },
-    db::{self, Identity}, events, journal, reliability, storage,
+    db::{self, Identity}, events, journal,
+    members::models::RepoAccess, reliability, storage,
 };
 use axum::{
     Json,
@@ -25,9 +26,11 @@ use std::{
 };
 use uuid::Uuid;
 
+// The key namespace is scoped to the repository owner (its tenant), never to
+// the actor: any authorized collaborator may replay the owner's stored key.
 async fn creation_replay(
     tx: &Transaction<'_>,
-    actor: Uuid,
+    tenant: Uuid,
     repo: Uuid,
     key: &str,
     request: &Value,
@@ -35,7 +38,7 @@ async fn creation_replay(
     let inserted = tx
         .execute(
             "INSERT INTO forge_creation_requests (tenant_id,repository_id,idempotency_key,request) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
-            &[&actor, &repo, &key, &request],
+            &[&tenant, &repo, &key, &request],
         )
         .await
         .map_err(Error::internal)?;
@@ -45,7 +48,7 @@ async fn creation_replay(
     let row = tx
         .query_one(
             "SELECT request,response FROM forge_creation_requests WHERE tenant_id=$1 AND repository_id=$2 AND idempotency_key=$3",
-            &[&actor, &repo, &key],
+            &[&tenant, &repo, &key],
         )
         .await
         .map_err(Error::internal)?;
@@ -59,7 +62,7 @@ async fn creation_replay(
 
 async fn record_creation(
     tx: &Transaction<'_>,
-    actor: Uuid,
+    tenant: Uuid,
     repo: Uuid,
     key: Option<&str>,
     response: &Value,
@@ -68,7 +71,7 @@ async fn record_creation(
         let changed = tx
             .execute(
                 "UPDATE forge_creation_requests SET response=$4 WHERE tenant_id=$1 AND repository_id=$2 AND idempotency_key=$3 AND response IS NULL",
-                &[&actor, &repo, &key, &response],
+                &[&tenant, &repo, &key, &response],
             )
             .await
             .map_err(Error::internal)?;
@@ -194,7 +197,8 @@ async fn execute_ref_transaction_inner(
 
     let mut client = state.pool.get().await.map_err(Error::internal)?;
     let tx = client.transaction().await.map_err(Error::internal)?;
-    let repo_id = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?.repo_id;
+    let access = auth::authorize_repo_with_role(&tx, &actor, &owner, &name, auth::Role::Write, crate::token_scopes::RepoAction::ContentsWrite).await?;
+    let RepoAccess { repo_id, owner_id: tenant_id, .. } = access;
     let current_generation: i64 = tx
         .query_one(
             "SELECT storage_generation FROM repositories WHERE id=$1 FOR SHARE",
@@ -212,7 +216,7 @@ async fn execute_ref_transaction_inner(
     });
     if let Some(ref key) = idem_key
         && let Some(saved_response) =
-            creation_replay(&tx, actor.id, repo_id, key, &request_json).await?
+            creation_replay(&tx, tenant_id, repo_id, key, &request_json).await?
         {
             auth::finish_tx(tx, &actor, true).await?;
             return Ok((
@@ -293,9 +297,7 @@ async fn execute_ref_transaction_inner(
         ref_name: u.ref_name.clone(), old_oid: u.old_oid.clone(), new_oid: u.new_oid.clone(),
     }).collect();
     crate::browse::policy::validate(&*tx, repo_id, &requested, &state.config.git, &repo_path, state.config.git_timeout).await?;
-    let owner_id: Uuid = tx.query_one("SELECT owner_id FROM repositories WHERE id=$1", &[&repo_id])
-        .await.map_err(Error::internal)?.get(0);
-    Box::pin(crate::lfs::publication::validate_new_refs(&state, &tx, repo_id, owner_id, &requested)).await?;
+    Box::pin(crate::lfs::publication::validate_new_refs(&state, &tx, repo_id, tenant_id, &requested)).await?;
     Box::pin(crate::lfs::locks::validate_new_refs_with_client(&*tx, &repo_path,
         &state.config.git, state.config.git_timeout, repo_id, actor.id, &requested)).await?;
 
@@ -446,7 +448,14 @@ async fn execute_ref_transaction_inner(
         updates: normalized_updates,
     };
     let response_value = serde_json::to_value(&response_body).map_err(Error::internal)?;
-    record_creation(&tx, actor.id, repo_id, idem_key.as_deref(), &response_value).await?;
+    record_creation(
+        &tx,
+        tenant_id,
+        repo_id,
+        idem_key.as_deref(),
+        &response_value,
+    )
+    .await?;
     // The exact-ref CAS may have waited behind another writer. Re-read the
     // caller's token and effective role inside this same transaction so a
     // revocation during the transfer cannot publish refs or outbox events.
