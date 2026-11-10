@@ -472,20 +472,43 @@ class teams:
                 "expected_base_oid": base, "storage_generation": 1,
                 "strategy": "fast_forward"}
         key = {"Idempotency-Key": "team-merge-" + user}
+        base_name = "refs/heads/" + base_ref
+        # The baseline is the real pre-merge state: the base ref already exists and
+        # carries the owner's or writer's push receipt, so event ids and counts are
+        # captured here instead of assuming the ref starts with no events.
+        base_events_before = self.events_for(base_name)
+        event_ids_before = [event["id"] for event in base_events_before]
+        ops_before, events_before = len(self.operations()), len(self.events())
+        refs_before = {name: self.ref(name) for name in
+                       ("refs/heads/" + base_ref, "refs/heads/" + head_ref)}
         status, raw, _ = self.http(merge, token=token, method="POST", body=body,
                                    extra_headers=key)
-        assert status == 200, (user, status, raw[:300])
+        assert status == 200, (user, "merge", status, raw[:300])
         result = json.loads(raw)
         assert (result["state"], result["merge_commit_oid"]) == ("merged", head), result
         assert result["version"] == pull["version"] + 1 and result["author_id"] == pull["author_id"]
-        assert self.ref("refs/heads/" + base_ref) == head
         merged = self.team_assert_operation(self.last_operation("recorded"), user, "demo")
         assert merged["evidence"]["kind"] == "pull_merge", merged["evidence"]
-        [event] = self.events_for("refs/heads/" + base_ref, merged["id"])
+        assert len(self.operations()) == ops_before + 1, (user, len(self.operations()), ops_before)
+        assert len(self.events()) == events_before + 1, (user, len(self.events()), events_before)
+        events_after = self.events_for(base_name, merged["id"])
+        assert len(events_after) == 1, (user, "merge emitted", len(events_after), "events")
+        event = events_after[0]
         assert (event["old_oid"], event["new_oid"]) == (base, head), event
+        assert [self.ref("refs/heads/" + base_ref), self.ref("refs/heads/" + head_ref)] == [
+            head, refs_before["refs/heads/" + head_ref]], user
         replay = self.expect(merge, 200, token=token, method="POST", body=body,
                              extra_headers=key)
-        assert replay == raw and len(self.events_for("refs/heads/" + base_ref)) == 1
+        assert replay == raw, (user, "replay differs from the first merge response")
+        after = self.events_for(base_name)
+        assert [event["id"] for event in after] == event_ids_before + [event["id"]], \
+            (user, "replay changed the base ref's event ids")
+        assert len(self.events_for(base_name, merged["id"])) == 1, \
+            (user, "replay duplicated the merge event")
+        assert (len(self.operations()), len(self.events())) == (
+            ops_before + 1, events_before + 1), (user, "replay emitted events or operations")
+        assert [self.ref("refs/heads/" + base_ref), self.ref("refs/heads/" + head_ref)] == [
+            head, refs_before["refs/heads/" + head_ref]], (user, "replay moved a ref")
         assert self.http(merge, token=token, method="POST", body=body)[0] == 409
         return {"number": pull["number"], "author": user, "merged_by": user,
                 "merge_commit_oid": head, "operation": merged["id"]}
