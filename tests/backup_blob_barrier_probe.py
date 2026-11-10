@@ -21,6 +21,7 @@ so a live child at the end of the window is reported as ``unknown`` with
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -228,11 +229,18 @@ def serving_barrier_probe(binary, env, mode, root, secrets=(), window=OBSERVATIO
     child_env["ROOTYARD_BIND"] = prebound or loopback_bind()
     directory = Path(tempfile.mkdtemp(prefix=label + "-", dir=root))
     directory.chmod(0o700)
+    outcome = {"mode": mode, "window_seconds": window, "data_dir": str(directory / "data")}
     stdout_path, stderr_path = directory / "stdout.log", directory / "stderr.log"
     child = None
     started = time.monotonic()
-    outcome = {"mode": mode, "window_seconds": window}
     try:
+        # The child reads ROOTYARD_DATA_DIR before the PostgreSQL barrier. A
+        # target under restore carries a guard there, so point the child at a
+        # private, guard-free data directory of this probe instead of the real
+        # one; DATABASE_URL still names the very database under restore/backup.
+        data_dir = directory / "data"
+        data_dir.mkdir(mode=0o700)
+        child_env["ROOTYARD_DATA_DIR"] = str(data_dir)
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
             child = subprocess.Popen([binary, "serve-blob"], env=child_env, stdout=stdout, stderr=stderr,
                                      start_new_session=True)
@@ -258,10 +266,14 @@ def serving_barrier_probe(binary, env, mode, root, secrets=(), window=OBSERVATIO
             outcome.update(status="refused", exit=child.returncode, expected=BARRIER_REFUSALS[mode])
         else:
             outcome.update(status="unknown", exit=child.returncode, reason="exit without the exact barrier refusal")
+    except BaseException:
+        child = None  # an unclassified failure keeps its raised error, not a probe outcome
+        raise
     finally:
         if child is not None:
             outcome["quiescent"] = outcome["reaped"] = _reap_owned(child)
             outcome["ran_seconds"] = round(time.monotonic() - started, 4)
+            shutil.rmtree(directory, ignore_errors=True)
     assert outcome["status"] in ("refused", "started", "unknown"), "probe outcome is not classified"
     return outcome
 

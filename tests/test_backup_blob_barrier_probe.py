@@ -241,6 +241,40 @@ class ProbeTest(unittest.TestCase):
         for leaked in (unknown_dsn, "Sup3rNewPass", SECRET, DSN, "db.internal", "lifecycle barrier failed"):
             self.assertNotIn(leaked, text)
 
+    def test_a_guarded_target_data_dir_is_never_used_by_the_child(self):
+        # The watched target carries .rootyard-restore.guard; the child must see
+        # a private guard-free data dir, the same DATABASE_URL, and no leak.
+        target = self.root / "target"
+        target.mkdir()
+        (target / ".rootyard-restore.guard").write_text("bkp-1\n")
+        record = self.root / "record"
+        script = self.stand_in(
+            'printf "%s\\n%s\\n" "$ROOTYARD_DATA_DIR" "$DATABASE_URL" > ' + quote(str(record)) + '\n'
+            'find "$ROOTYARD_DATA_DIR" -mindepth 1 > ' + quote(str(record)) + '.entries\n'
+            'stat -c %a "$ROOTYARD_DATA_DIR" > ' + quote(str(record)) + '.mode 2>/dev/null'
+            ' || stat -f %Lp "$ROOTYARD_DATA_DIR" > ' + quote(str(record)) + '.mode\n'
+            + refusal_body(FAILURE, EXTERNAL, 1, ""))
+        env = dict(PROBE_ENV, ROOTYARD_DATA_DIR=str(self.root / "real-data"))
+        previous = os.environ.get("ROOTYARD_DATA_DIR")
+        os.environ["ROOTYARD_DATA_DIR"] = str(target)
+        try:
+            outcome = probe.serving_barrier_probe(script, env, "external", self.owned, secrets=SECRETS, window=5)
+        finally:
+            if previous is None:
+                os.environ.pop("ROOTYARD_DATA_DIR", None)
+            else:
+                os.environ["ROOTYARD_DATA_DIR"] = previous
+        self.assertEqual(outcome["status"], "refused", outcome)
+        self.assertEqual(record.read_text().splitlines(),
+                         [str(Path(outcome["data_dir"])), DSN])
+        self.assertNotEqual(Path(outcome["data_dir"]), target)
+        self.assertEqual(Path(str(record) + ".mode").read_text().strip(), "700")
+        self.assertEqual(Path(str(record) + ".entries").read_text(), "")
+        self.assertEqual(target.joinpath(".rootyard-restore.guard").read_text(), "bkp-1\n")
+        for leaked in SECRETS:
+            self.assertNotIn(leaked, repr(outcome["diagnostics"]))
+        self.assertFalse(Path(outcome["data_dir"]).exists(), "probe temp dir must be cleaned after the group exits")
+
     def test_scrub_removes_an_unlisted_dsn_and_credentials(self):
         for raw in (DSN, "postgres://u:p@h:1/d", "s3://bucket/key?X-Amz-Credential=c",
                     "ROOTYARD_TEST_DATABASE_URL=postgres://u:p@h/d", "password=hunter2-unknown",
