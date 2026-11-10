@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Rootyard native suite dispatcher and explicit reference models (F1-F51).
 
-With --reference-only, executes 591 historical reference-model tests across 4 tiers:
+With --reference-only, executes 597 active reference-model tests across 4 tiers
+(591 existing historical tests plus six additional Tier 2 F20 CI regression tests):
 - Tier 1 (`TestTier1FeatureCoverage`): 255 tests (5 per feature F1-F51)
-- Tier 2 (`TestTier2BoundaryAndCornerCases`): 255 tests (5 per feature F1-F51)
+- Tier 2 (`TestTier2BoundaryAndCornerCases`): 261 tests (5 per feature F1-F51, plus six
+  additional F20 CI regression tests: 11 total for F20)
 - Tier 3 (`TestTier3CrossFeatureCombinations`): 54 cross-feature integration tests
 - Tier 4 (`TestTier4RealWorldScenarios`): 27 multi-step real-world scenarios (S1-S27)
 
@@ -7466,7 +7468,7 @@ class SchemaBoundaryIntegrationFixture:
         simulated_skip_or_placeholder: bool = False,
         simulated_unmapped_tier3_or_tier4: Optional[str] = None,
     ) -> dict[str, Any]:
-        """F41: Verifies 4-tier E2E harness completeness across all 51 features (F1-F51) and 591 tests."""
+        """F41: Verifies 4-tier E2E harness completeness across all 51 features (F1-F51) and 597 tests."""
         if simulated_missing_feature is not None:
             raise AssertionError(f"Missing feature {simulated_missing_feature} in FEATURE_CATALOG")
         if simulated_insufficient_tier_tests is not None:
@@ -7491,9 +7493,9 @@ class SchemaBoundaryIntegrationFixture:
         t3_methods = [m for m in sorted(dir(TestTier3CrossFeatureCombinations)) if m.startswith("test_")]
         t4_methods = [m for m in sorted(dir(TestTier4RealWorldScenarios)) if m.startswith("test_")]
 
-        if len(t1_methods) != 255 or len(t2_methods) != 255 or len(t3_methods) != 54 or len(t4_methods) != 27:
+        if len(t1_methods) != 255 or len(t2_methods) != 261 or len(t3_methods) != 54 or len(t4_methods) != 27:
             raise AssertionError(
-                f"Expected (255, 255, 54, 27) tests across Tiers 1-4, got "
+                f"Expected (255, 261, 54, 27) tests across Tiers 1-4, got "
                 f"({len(t1_methods)}, {len(t2_methods)}, {len(t3_methods)}, {len(t4_methods)})"
             )
 
@@ -7505,7 +7507,8 @@ class SchemaBoundaryIntegrationFixture:
             prefixes = FEATURE_TO_TIER3_AND_TIER4[fid]
             c3 = sum(1 for m in t3_methods if tag in m or any(m.startswith(p) for p in prefixes))
             c4 = sum(1 for m in t4_methods if any(m.startswith(p) for p in prefixes))
-            if c1 != 5 or c2 != 5 or c3 < 2 or c4 < 2:
+            expected_c2 = 11 if fid == "F20" else 5
+            if c1 != 5 or c2 != expected_c2 or c3 < 2 or c4 < 2:
                 raise AssertionError(f"Feature {fid} tier counts invalid: T1={c1}, T2={c2}, T3={c3}, T4={c4}")
             suite_f = build_suite("all", feature=fid)
             total_f = suite_f.countTestCases()
@@ -7514,8 +7517,8 @@ class SchemaBoundaryIntegrationFixture:
             per_feature_counts[fid] = {"t1": c1, "t2": c2, "t3": c3, "t4": c4, "total": total_f}
 
         total_all = build_suite("all").countTestCases()
-        if total_all != 591:
-            raise AssertionError(f"Total suite count {total_all} != 591")
+        if total_all != 597:
+            raise AssertionError(f"Total suite count {total_all} != 597")
 
         return {
             "feature_count": len(expected_fids),
@@ -16858,17 +16861,17 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
         info = SchemaBoundaryIntegrationFixture.verify_tier3_e2e_suite_completeness()
         for fid, counts in info["per_feature_counts"].items():
             self.assertEqual(counts["t1"], 5, msg=fid)
-            self.assertEqual(counts["t2"], 5, msg=fid)
+            self.assertEqual(counts["t2"], 11 if fid == "F20" else 5, msg=fid)
             self.assertGreaterEqual(counts["t3"], 2, msg=fid)
             self.assertGreaterEqual(counts["t4"], 2, msg=fid)
             self.assertGreaterEqual(counts["total"], 14, msg=fid)
 
     def test_t1_f41_03_build_suite_tier_counts_match_210_210_44_22_and_486_total(self) -> None:
         self.assertEqual(build_suite("1").countTestCases(), 255)
-        self.assertEqual(build_suite("2").countTestCases(), 255)
+        self.assertEqual(build_suite("2").countTestCases(), 261)
         self.assertEqual(build_suite("3").countTestCases(), 54)
         self.assertEqual(build_suite("4").countTestCases(), 27)
-        self.assertEqual(build_suite("all").countTestCases(), 591)
+        self.assertEqual(build_suite("all").countTestCases(), 597)
 
     def test_t1_f41_04_feature_filter_cli_selector_resolves_tier1_tier2_tier3_and_tier4_tests_for_all_new_features(self) -> None:
         for idx in range(32, 52):
@@ -17428,7 +17431,7 @@ class TestTier1FeatureCoverage(BaseRootyardTestCase):
 
 
 class TestTier2BoundaryAndCornerCases(BaseRootyardTestCase):
-    """Tier 2: Boundary & Corner Cases (255 tests = 5 per feature F1-F51)."""
+    """Tier 2: Boundary & Corner Cases (261 tests = 5 per feature F1-F51, plus six additional F20 CI contract cases)."""
 
 
     # =========================================================================
@@ -21171,7 +21174,7 @@ class TestTier3CrossFeatureCombinations(BaseRootyardTestCase):
         e2e = SchemaBoundaryIntegrationFixture.verify_tier3_e2e_suite_completeness()
         self.assertEqual(p1["tables_050_count"], 30)
         self.assertEqual(p3["expected_060_table_count"], 34)
-        self.assertEqual(e2e["total_count"], 591)
+        self.assertEqual(e2e["total_count"], 597)
 
     def test_t3_44_f32_f37_f38_f41_f42_full_42_feature_486_test_matrix_and_paired_backup_34_table_contract(self) -> None:
         wfx = WorkspaceManifestIgnoreViewFixture(self.tmp_path / "t3_44_vfs")
@@ -22050,7 +22053,7 @@ class TestTier4RealWorldScenarios(BaseRootyardTestCase):
         self.assertTrue(pando.object_store_verify()["valid"])
 
     def test_t4_22_scenario_phase2_part1_and_part3_full_42_feature_486_test_convergence_and_schema_060_gate(self) -> None:
-        """S22: Phase 2 Part 1 (050 Closure) & Part 3 (51-Feature 591-Test Suite + Schema 060 + 11-Domain Governance) Gate (F30, F31, F32, F41, F42)."""
+        """S22: Phase 2 Part 1 (050 Closure) & Part 3 (51-Feature 597-Test Suite + Schema 060 + 11-Domain Governance) Gate (F30, F31, F32, F41, F42)."""
         p1_info = SchemaBoundaryIntegrationFixture.verify_part1_schema_050_closure()
         p3_info = SchemaBoundaryIntegrationFixture.verify_part3_convergence_and_tier3_governance()
         e2e_info = SchemaBoundaryIntegrationFixture.verify_tier3_e2e_suite_completeness()
@@ -22059,7 +22062,7 @@ class TestTier4RealWorldScenarios(BaseRootyardTestCase):
         self.assertEqual(p1_info["tables_050_count"], 30)
         self.assertEqual(p3_info["expected_060_table_count"], 34)
         self.assertEqual(e2e_info["feature_count"], 51)
-        self.assertEqual(e2e_info["total_count"], 591)
+        self.assertEqual(e2e_info["total_count"], 597)
         self.assertGreaterEqual(ci_info["suites_verified"], 11)
 
     def test_t4_23_scenario_view_lab_multi_repo_namespace_3way_changeset_recovery_and_signed_history_projection(self) -> None:
@@ -22200,7 +22203,7 @@ class TestTier4RealWorldScenarios(BaseRootyardTestCase):
             self.assertFalse(rec["index_lock_exists"], msg=win)
 
     def test_t4_27_scenario_tier5_full_51_feature_591_test_five_track_convergence_gate(self) -> None:
-        """S27: Tier 5 Full 51-Feature 591-Test Five-Track Convergence Gate Across View-Lab, SHA-256, Sharding & Overlay/WAL (F43, F44, F45, F46, F47, F48, F49, F50, F51)."""
+        """S27: Tier 5 Full 51-Feature 597-Test Five-Track Convergence Gate Across View-Lab, SHA-256, Sharding & Overlay/WAL (F43, F44, F45, F46, F47, F48, F49, F50, F51)."""
         mod_info = Tier5ViewLabHistoryAndSignatureFixture.verify_view_lab_modularity()
         self.assertLess(mod_info["root_lines"], 120)
 
@@ -22229,7 +22232,7 @@ class TestTier4RealWorldScenarios(BaseRootyardTestCase):
 
         e2e_info = SchemaBoundaryIntegrationFixture.verify_tier3_e2e_suite_completeness()
         self.assertEqual(e2e_info["feature_count"], 51)
-        self.assertEqual(e2e_info["total_count"], 591)
+        self.assertEqual(e2e_info["total_count"], 597)
 
 
 FEATURE_CATALOG: dict[str, dict[str, Any]] = {
@@ -22273,7 +22276,7 @@ FEATURE_CATALOG: dict[str, dict[str, Any]] = {
     "F38": {"id": "F38", "track": "M15 (Track 3 Sparse VFS)", "name": "Workspace-Lab Copy-on-Write Dirty File Tracking, Ignore-Aware Status & Clean Blob Eviction"},
     "F39": {"id": "F39", "track": "M16 (Track 4 Sharding)", "name": "Multi-Node Repository Sharding Catalog, Deterministic Bucket Placement & Routing"},
     "F40": {"id": "F40", "track": "M16 (Track 4 Fencing)", "name": "Epoch Storage Write Fencing, Automated Node Failover & Read-Only Degradation Drills"},
-    "F41": {"id": "F41", "track": "M12.5 (Track 5 E2E Harness)", "name": "4-Tier E2E Test Harness Expansion & Per-Feature Filter Verification (591 Tests)"},
+    "F41": {"id": "F41", "track": "M12.5 (Track 5 E2E Harness)", "name": "4-Tier E2E Test Harness Expansion & Per-Feature Filter Verification (597 Tests)"},
     "F42": {"id": "F42", "track": "M17 (Part 3 Integration)", "name": "Cross-Track Schema 060, 11-Domain Router Non-Collision, Anti-Monolith Caps & Paired Backup"},
     "F43": {"id": "F43", "track": "Tier 5 Track 1 (view_lab)", "name": "View-Lab Anti-Monolith Split, Namespace Pins & 3-Way Changeset Failpoint Recovery"},
     "F44": {"id": "F44", "track": "Tier 5 Track 1 (view_lab)", "name": "Long-Term History Projection Strategies (deterministic_history vs task_snapshot)"},
