@@ -228,6 +228,24 @@ class HarnessContract(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "with a warning"):
                 base.checkout_head(Path(root), {}, shared)
 
+    def test_source_binding_compares_production_bytes_not_ancestry(self):
+        """A build from a sibling tests-only branch binds when production bytes match."""
+        import source_bound_binary
+        self.assertNotIn("merge-base", Path(source_bound_binary.__file__).read_text())
+        self.assertNotIn("checkout_head", Path(source_bound_binary.__file__).read_text())
+        for path in ("Cargo.toml", "Cargo.lock", "src/main.rs", "migrations/110_audit_sequence.sql",
+                     "schema/147_catalog.json", "vendor/x/y.rs", "build.rs"):
+            self.assertTrue(source_bound_binary._production_path(path), path)
+        for path in ("tests/test_collaborator_transport.py", "docs/README.md", "srcx/y.rs"):
+            self.assertFalse(source_bound_binary._production_path(path), path)
+        digest = source_bound_binary.production_source_digest()
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        builder = (ROOT / "scripts" / "build_native.py").read_text()
+        self.assertIn("for directory in ('src', 'migrations', 'schema', 'vendor')", builder)
+        # No receipt: the bind fails, it never degrades to a bare HEAD match.
+        with self.assertRaises(source_bound_binary.SourceBindingError):
+            source_bound_binary.bind(ROOT / "target" / "does-not-exist-rootyard", environ={})
+
     def test_initialization_and_merge_contracts_are_fixed(self):
         contract = ROOT / "tests" / "collaborator_contract.py"
         lifecycle = ROOT / "tests" / "collaborator_lifecycle.py"
