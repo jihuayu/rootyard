@@ -4,6 +4,22 @@
 //! [`MaterializedPackRead`] is an opaque owned local view; it grants no new
 //! serving or write authority and claims no physical Blob-byte backup.
 //!
+//! # Session proof (#174): NOT wired
+//!
+//! [`PgPackSnapshotMaterializer::materialize_serving_read_sealed`] returns the
+//! view together with an internal [`VerifiedReadViewProof`] (non-empty
+//! captures only). **No gateway route consumes it.** It is not proof that a
+//! response was served: a later task must, in the gateway, copy packs/index,
+//! check checksums and `verify_refs`, fully encode the body, run the final
+//! authorization and the cluster-incarnation fence, restore the incarnation
+//! and only then seal/issue. The proof's realm has no cluster incarnation, so
+//! "response and token share the same PG snapshot/final fence" is a consumer
+//! requirement that is still unimplemented here.
+//!
+//! `snapshot::build_view` still materializes through the unsealed
+//! [`PgPackSnapshotMaterializer::materialize_serving_read`]; dead code remains
+//! until that wiring lands, so this module is not strict-clippy clean.
+//!
 //! Serving-read addition (#107/#114/#144): [`PgServingReads`] is a separate,
 //! bounded **transient** read-pin family (migration 146). One GET captures the
 //! current refs/HEAD/registered membership under the same strict `pg_refstore`
@@ -54,6 +70,7 @@ mod query;
 mod read_snapshot;
 mod receipt;
 mod request;
+mod serving_proof;
 mod serving_read;
 mod serving_read_request;
 mod serving_read_sql;
@@ -69,11 +86,15 @@ pub use contract::{
     TENANT_MAX_PACK_LOGICAL_BYTES, TENANT_MAX_PACK_PINS, TENANT_MAX_PACK_RECEIPTS, TENANT_MAX_PACK_REFS,
     TENANT_MAX_PACK_SNAPSHOTS, TENANT_PACK_FACTOR,
 };
+pub(crate) use materialize::MaterializedServingRead;
 pub use materialize::{MaterializedPackRead, PgPackSnapshotMaterializer};
 pub use pg::PgPackSnapshot;
 pub use read_snapshot::{PackReadSnapshot, ReadSnapshotSourceKind};
 pub use receipt::{PackPinReceipt, PackSnapshotLookup, PackSnapshotOutcome, PackSnapshotReceipt};
 pub use request::{CreatePackSnapshotRequest, PackSnapshotExpectation, PackSnapshotReceiptQuery, PackSnapshotRef};
+pub(crate) use serving_proof::VerifiedReadViewProof;
+#[cfg(test)]
+pub(crate) use serving_proof::{ProvenScope, seal_for_test, test_scope};
 pub use serving_read::{PgServingReads, ServingReadCapture};
 pub use serving_read_request::{
     MAX_EXPIRED_SERVING_READ_RECLAIM, MAX_SERVING_READ_LEASE_SECONDS, MIN_SERVING_READ_LEASE_SECONDS,

@@ -43,8 +43,10 @@ use super::super::pack_commit::{
 use super::super::snapshot_contract::MetadataSnapshotScope;
 use super::contract as pack_contract;
 use super::pg::PgPackSnapshot;
-use super::read_snapshot::{PackReadSnapshot, ReadSnapshotSourceKind};
+use super::read_snapshot::PackReadSnapshot;
 use super::request::PackSnapshotRef;
+use super::serving_proof::VerifiedReadView;
+use super::serving_proof::VerifiedReadViewProof;
 use super::serving_read::{RegisteredServingRead, ServingReadCapture, revalidate_serving_capture};
 use crate::blob_store::opendal::BlobStore;
 use crate::ref_store::contract::{RefStoreError, RequestDigest};
@@ -246,11 +248,7 @@ impl PgPackSnapshotMaterializer {
         let deadline = effective_deadline(deadline)?;
         let (snapshot, binding) = capture.registered_parts()?;
         let registered = RegisteredServingRead { snapshot, binding };
-        if registered.snapshot.source_kind() != ReadSnapshotSourceKind::ServingTransient
-            || registered.snapshot.pack_mode() != pack_contract::PACK_MODE_VERIFIED
-            || !registered.snapshot.complete_registered_pack_membership()
-            || registered.snapshot.pack_count() <= 0
-        {
+        if !registered.snapshot.complete_transient_pack_read() {
             return Err(RefStoreError::Unsupported(
                 "serving read materialization requires a transient complete pack-verified capture",
             ));
@@ -284,7 +282,27 @@ impl PgPackSnapshotMaterializer {
         {
             return Err(RefStoreError::Unsupported("materialized view exceeds its workspace bound"));
         }
-        self.revalidate_serving(pool, &registered, native, deadline).await.map(Some)
+        self.revalidate_serving(pool, &registered, native, deadline).await
+    }
+
+    /// The proof-producing form of [`Self::materialize_serving_read`] (#174).
+    ///
+    /// Exactly the same download, verification, native `fsck` and fresh T2
+    /// recheck, but the returned value keeps the verified native view and the
+    /// sealed [`VerifiedReadViewProof`] alive together. A checked empty capture
+    /// still returns `Ok(None)`: no bytes, no proof. This is an internal
+    /// materialization proof only; no gateway route consumes it yet (the
+    /// `serving_proof` module docs list what a consumer must still enforce).
+    pub(crate) async fn materialize_serving_read_sealed(
+        &self,
+        pool: &Pool,
+        capture: &ServingReadCapture,
+        deadline: Instant,
+    ) -> Result<Option<MaterializedServingRead>, RefStoreError> {
+        let Some(view) = self.materialize_serving_read(pool, capture, deadline).await? else {
+            return Ok(None);
+        };
+        serving_materialization(view, capture).map(Some)
     }
 
     /// T2 for the transient serving read source kind.
@@ -436,7 +454,53 @@ pub struct MaterializedPackRead {
     read_digest: String,
 }
 
+/// Pure binding step of the sealed builder: the capture must be the very
+/// snapshot T2 revalidated, and only the native closure's A5b digest — compared
+/// with the capture's own A5b binding — may seal.
+fn serving_materialization(
+    view: MaterializedPackRead,
+    capture: &ServingReadCapture,
+) -> Result<MaterializedServingRead, RefStoreError> {
+    let (captured, binding) = capture.registered_parts()?;
+    if *view.snapshot() != captured {
+        return Err(RefStoreError::MetadataScopeMismatch("materialized serving read is not its capture"));
+    }
+    let proof = VerifiedReadView::of_revalidated(view.snapshot(), binding)?.seal();
+    Ok(MaterializedServingRead { view, proof })
+}
+
+/// One proof-producing materialization: the verified native view and the sealed
+/// proof of exactly that view travel together and cannot be separated. Not
+/// `Clone`, no public constructor; only
+/// [`PgPackSnapshotMaterializer::materialize_serving_read_sealed`] builds it.
+pub(crate) struct MaterializedServingRead {
+    view: MaterializedPackRead,
+    proof: VerifiedReadViewProof,
+}
+
+impl MaterializedServingRead {
+    /// The verified native view (packs, refs, local bytes). Not `Clone`; it must
+    /// live as long as the proof describes it.
+    pub(crate) fn view(&self) -> &MaterializedPackRead {
+        &self.view
+    }
+
+    /// The sealed internal materialization proof of [`Self::view`].
+    pub(crate) fn proof(&self) -> &VerifiedReadViewProof {
+        &self.proof
+    }
+}
+
 impl MaterializedPackRead {
+    pub(super) fn snapshot(&self) -> &PackReadSnapshot {
+        &self.snapshot
+    }
+    /// The actual A5b binding: the native closure's digest, which T2 compared
+    /// with its freshly recomputed materialization digest before this view
+    /// existed. Never the narrower A5a read digest.
+    pub(super) fn proven_binding(&self) -> RequestDigest {
+        self.native.read_digest()
+    }
     pub fn snapshot_id(&self) -> Uuid {
         self.snapshot.snapshot_id()
     }
@@ -593,3 +657,6 @@ fn map_native_error(error: PackCommitError) -> RefStoreError {
         PackCommitError::CommitUnknown { .. } => RefStoreError::Unsupported("materialized read never commits"),
     }
 }
+
+#[cfg(test)]
+mod serving_tests;

@@ -231,6 +231,21 @@ impl PackReadSnapshot {
     pub fn read_digest_hex(&self) -> String {
         self.read_digest.as_hex()
     }
+
+    /// The complete shape of a transient pack-verified serving read: transient
+    /// source, verified pack mode, complete registered membership, at least one
+    /// pack and a positive pin generation. Never `Some` for a retained A5a
+    /// snapshot, and never by itself proof that bytes were verified — that is
+    /// the materializer's T2 step.
+    pub(in crate::ref_store::core) fn complete_transient_pack_read(&self) -> Option<()> {
+        (self.source == ReadSnapshotSourceKind::ServingTransient
+            && self.pack_mode() == PACK_MODE_VERIFIED
+            && self.complete_registered_pack_membership()
+            && self.pack_count() > 0
+            && self.pin_generation > 0)
+            .then_some(())
+    }
+
     /// Complete A5b canonical binding. Unlike the narrower A5a `read_digest`
     /// (which is kept for A5a compatibility and omits scope/expiry), this binds
     /// the full historical scope, snapshot/pin id, generation and expiry,

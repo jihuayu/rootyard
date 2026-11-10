@@ -88,9 +88,18 @@ fn a_bound_is_scored_against_gate_revisions_only() {
     assert_eq!(compare(&session, &live, 10), Ok(VersionComparison::Satisfied { bound: 10 }));
     assert_eq!(compare(&session, &live, 12), Ok(VersionComparison::Satisfied { bound: 10 }));
     // The gateway verify path delegates to the same scoring.
-    assert_eq!(codec.verify(issued.token.as_str(), 1_001, &live, 9), Ok(VersionComparison::Behind { live_revision: 9 }));
-    assert_eq!(codec.verify(issued.token.as_str(), 1_001, &live, 10), Ok(VersionComparison::Satisfied { bound: 10 }));
-    assert_eq!(codec.verify(issued.token.as_str(), 1_001, &live, 12), Ok(VersionComparison::Satisfied { bound: 10 }));
+    assert_eq!(
+        codec.verify(issued.token.as_str(), 1_001, &live, 9),
+        Ok(VersionComparison::Behind { live_revision: 9 })
+    );
+    assert_eq!(
+        codec.verify(issued.token.as_str(), 1_001, &live, 10),
+        Ok(VersionComparison::Satisfied { bound: 10 })
+    );
+    assert_eq!(
+        codec.verify(issued.token.as_str(), 1_001, &live, 12),
+        Ok(VersionComparison::Satisfied { bound: 10 })
+    );
     assert_eq!(SessionTokenError::Behind.for_repo().status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
 }
 
