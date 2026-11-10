@@ -216,13 +216,15 @@ def _exercise_dispatch_api(h, actor, repo, primary_path):
         webhook_sql = webhook_id.replace("'", "''")
         scheduled = int(time.time()) + 120
         changed = h.sql(
-            "UPDATE forge_webhook_deliveries SET next_attempt_unix = "
+            "WITH updated AS ("
+            " UPDATE forge_webhook_deliveries SET next_attempt_unix = "
             + str(scheduled)
             + " WHERE id='"
             + delivery_sql
-            + "' AND webhook_id='"
+            + "'::uuid AND webhook_id='"
             + webhook_sql
-            + "' RETURNING next_attempt_unix"
+            + "'::uuid RETURNING next_attempt_unix"
+            + ") SELECT next_attempt_unix::text FROM updated"
         )
         assert changed == str(scheduled), changed
     finally:
