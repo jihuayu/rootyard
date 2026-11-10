@@ -795,7 +795,10 @@ class Drill(BlobOnlyHarness):
         source with the source-bound fixture."""
         source = self.new_database(self.admin)
         env = self.env.copy()
-        env.pop("ROOTYARD_BLOB_ROOT", None)
+        # The seed binds ROOTYARD_BLOB_ROOT to exactly --blob-root (==
+        # self.base_suffix); the saved env, and so backup, verify and restore,
+        # must serve from that same root and no other.
+        env["ROOTYARD_BLOB_ROOT"] = self.base_suffix
         env.update(DATABASE_URL=source, ROOTYARD_TEST_DATABASE_URL=source,
                    ROOTYARD_DATA_DIR=str(self.root / "format22-data"),
                    ROOTYARD_EXPECTED_SOURCE_COMMIT=self.profile.build["workspace_commit"])
@@ -807,16 +810,14 @@ class Drill(BlobOnlyHarness):
         seed = self.root / "format22-seed.json"
         request = NativeFixtureRequest(self.args.format22_fixture, source, self.profile.git, seed,
                                        self.root / "format22-data", self.base_suffix)
-        fixture_env = request.env(env)
-        fixture_env["ROOTYARD_BLOB_ROOT"] = self.base_suffix
+        fixture_env = dict(request.env(env), ROOTYARD_BLOB_ROOT=env["ROOTYARD_BLOB_ROOT"])
         fixture = subprocess.run(request.argv(fixture_env), env=fixture_env, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, timeout=900)
         assert fixture.returncode == 0, "format22 fixture refused: " + self.redact(fixture.stderr[-4000:])
         self.format22_marker = json.loads(seed.read_text())
         native_marker_checks(self.format22_marker)
-        self.use_blob_suffix("format22")
         self.format22_available = True
-        return env
+        return self.format22_env
 
     def format22_archive(self):
         """Archive the API-produced source and check the format22 contract."""
