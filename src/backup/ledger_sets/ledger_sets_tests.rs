@@ -301,7 +301,7 @@ fn seal_root(sets: &mut SourceSets) {
 
 /// A legal pair retained by a released root whose producer owner (`PRODUCER`)
 /// differs from the repository tenant (`TENANT`).
-fn valid_source() -> SourceSets {
+pub(super) fn valid_source() -> SourceSets {
     let mut sets = SourceSets {
         declared: vec![pair(base_artifacts())],
         roots: vec![root_capture()],
@@ -318,7 +318,7 @@ fn assert_refused(lines: &[String], prefix: &str) {
 }
 
 /// A root violation carries its root id between the prefix and the reason.
-fn assert_root_refused(lines: &[String], prefix: &str, reason: &str) {
+pub(super) fn assert_root_refused(lines: &[String], prefix: &str, reason: &str) {
     let expected = format!("{prefix}:{REPO}:{ROOT}:{reason}");
     assert!(lines.contains(&expected), "expected {expected} in {lines:?}");
 }
@@ -620,6 +620,7 @@ fn a_present_capture_that_disagrees_with_its_head_is_never_release_before_regist
 }
 
 // Every stored tombstone row of a key is judged: see `tombstone_tests`.
+// The file is a sibling of this one, hence the explicit `#[path]`.
 #[cfg(test)]
 #[path = "tombstone_tests.rs"]
 mod tombstone_tests;

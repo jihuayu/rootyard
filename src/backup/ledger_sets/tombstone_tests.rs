@@ -1,4 +1,8 @@
-use super::shared::*;
+//! Tombstone-fence regressions, compiled as `ledger_sets_tests::tombstone_tests`.
+//!
+//! A child module of `ledger_sets_tests` reaches rows through `super::*`; the
+//! `#[test]` harness and `Uuid` come from the prelude and the parent's glob.
+use super::*;
 
 /// The single legal generation-2 release fence of `valid_source`.
 fn base_tombstone() -> RootTombstone {
