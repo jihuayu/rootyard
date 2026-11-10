@@ -626,3 +626,9 @@ fn a_present_capture_that_disagrees_with_its_head_is_never_release_before_regist
 #[cfg(test)]
 #[path = "tombstone_tests.rs"]
 mod tombstone_tests;
+
+// Membership-only declared pairs still have to be the canonical A4 set: see
+// `membership_tests`. A sibling file, hence the explicit `#[path]`.
+#[cfg(test)]
+#[path = "membership_tests.rs"]
+mod membership_tests;

@@ -354,6 +354,15 @@ pub(super) fn check_declared(declared: &[DeclaredPair]) -> Vec<String> {
             lines.push(format!("unregistered_publication:{}:{key}", pair.declared_by.join(",")));
             continue;
         };
+        // The pair must be the canonical A4 set: `canonical` rebuilds it with
+        // `RegisteredPack::new`, which recomputes `ArtifactSetDigest::of` over the
+        // rows and refuses a stored publication digest that disagrees. Without
+        // this check a pair declared only by membership, and never restated by a
+        // snapshot or root, could carry a `declared_sets` digest equal to a wrong
+        // publication digest and never be refused.
+        if canonical(pair).is_err() {
+            lines.push(format!("canonical_pair_mismatch:{key}"));
+        }
         match pair.artifacts.len() {
             0 => lines.push(format!("missing_artifacts:{key}")),
             1 => lines.push(format!("incomplete_pair:{key}")),
