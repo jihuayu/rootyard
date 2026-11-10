@@ -26,11 +26,14 @@ for a valid ``write``-level PR command, so a denial cannot pass as a ``400``.
 Earlier cases of the direct collaborator matrix leave a ``repository_collaborators``
 row on mona (triage), nina (write) and olga (read); an inherited role could then
 not be told apart from ``max(direct, team)``. Before the role matrix the owner
-removes those three direct rows through the real ``DELETE /api/repos/{owner}/
-{name}/collaborators/{user}`` call, reads the absence back from the permissions
-API, the collaborator API and the owner's audit log (``collaborator.removed``),
-and only then does the row's own before-check require no direct role. The
-read actor never pushes: the owner prepares its distinct base/head refs, and
+reads each actor's real ``GET /permissions/{user}`` row and only when its
+``direct_role`` is present removes that row through the real ``DELETE
+/api/repos/{owner}/{name}/collaborators/{user}`` call, reading the absence back
+from the permissions API, the collaborator API and the owner's audit log
+(``collaborator.removed``). A row an earlier case already revoked (olga) sends
+no DELETE: its read-back must show no direct source. Only then does the row's
+own before-check require no direct role.
+The read actor never pushes: the owner prepares its distinct base/head refs, and
 the read actor's own push is only an expected failure verified as a server-side
 ``receive-pack`` 403 with no ref, object or receipt left behind. The write/admin
 actors push their own base/head commits, with ``ops_before``/``events_before``
@@ -133,23 +136,37 @@ class teams:
             "WHERE repository_id='" + repo_id + "' AND user_id='" + self.users[user]["user_id"] + "'))"))
 
     def team_clear_direct(self, user):
-        """Owner removes the actor's earlier direct row through the real API and reads it back.
+        """Owner clears the actor's earlier direct row only when one still exists.
 
-        No SQL row is deleted or forged here: the owner's ``DELETE /collaborators/
-        {user}`` is the only revoker, the permissions API must then resolve no
-        role at all, the direct-row lookup must be 404, and the owner's audit
-        log must attribute one ``collaborator.removed`` for that user. The row
-        above it is the prior direct grant the direct matrix made; a missing row
-        or an unexpected prior role fails instead of being cleared silently.
+        Earlier cases may already have revoked that row (olga is removed by the
+        admin case), so the owner first reads the real ``GET /permissions/{user}``
+        row. With no ``direct_role`` there is nothing to revoke: no ``DELETE`` is
+        sent, and the read must resolve no role or one whose ``team_role``
+        accounts for it, so nothing but the team source remains.
+        A ``direct_role`` on that read means the DELETE path is the only one
+        allowed; it must be 200, the read-back null on every field, and the
+        owner's audit log must attribute one ``collaborator.removed``. The
+        DELETE is only sent after this read showed the direct role, so a 404
+        from it is a failure, not an accepted outcome.
         """
         assert user in PRIOR_DIRECT_ROLES, (user, "not an actor of the direct matrix")
-        removed = json.loads(self.expect("/api/repos/alice/demo/collaborators/" + user, 200,
-                                         method="DELETE", token=self.owner_account("alice")))
+        path = "/api/repos/alice/demo/collaborators/" + user
+        prior = self.inherited_permission("alice", "demo", user)
+        if prior["direct_role"] is None:
+            # The earlier cases already revoked this row; the effective role, if
+            # any, is inherited from a team, so the matrix grant stays the only
+            # direct source to clear and no DELETE is sent.
+            assert (prior["role"] is None) == (prior["team_role"] is None), prior
+            return {"cleared": user, "prior_direct_role": None, "delete": "not_sent",
+                    "effective_after": prior["role"], "team_after": prior["team_role"],
+                    "read_back": "no_direct_source"}
+        assert prior["direct_role"] == PRIOR_DIRECT_ROLES[user], (user, prior)
+        removed = json.loads(self.expect(path, 200, method="DELETE",
+                                         token=self.owner_account("alice")))
         assert (removed["removed"], removed["username"]) == (True, user), removed
         after = self.inherited_permission("alice", "demo", user)
-        assert (after["role"], after["direct_role"], after["team_role"]) == (None, None, None), after
-        assert self.http("/api/repos/alice/demo/collaborators/" + user,
-                         token=self.owner_account("alice"))[0] == 404
+        assert after["direct_role"] is None, after
+        assert self.http(path, token=self.owner_account("alice"))[0] == 404
         # The owner's own audit rows (target filters do not exist; actor does).
         events = json.loads(self.expect("/api/repos/alice/demo/audit?actor=alice&limit=100", 200,
                                         token=self.owner_account("alice")))["items"]
@@ -159,9 +176,9 @@ class teams:
         latest = attributions[-1]
         assert (latest["actor_name"], latest["actor_id"]) == ("alice", self.alice["user_id"]), latest
         assert latest["repository_id"] == self.repo["id"], latest
-        return {"cleared": user, "prior_direct_role": PRIOR_DIRECT_ROLES[user],
-                "effective_after": after["role"], "audit_id": latest["id"],
-                "read_back": "no_role"}
+        return {"cleared": user, "prior_direct_role": PRIOR_DIRECT_ROLES[user], "delete": 200,
+                "effective_after": after["role"], "team_after": after["team_role"],
+                "audit_id": latest["id"], "read_back": "no_direct_role"}
 
     # ---- fast-forward relation -------------------------------------------
     def rev_list(self, work, tip, not_rev=None):
