@@ -216,7 +216,15 @@ pub(super) async fn read_backend_head<R: AsyncBufReadExt + Unpin>(
     };
     let status: u16 = code.parse().map_err(|_| anyhow!("backend status code is invalid"))?;
     let mut headers = Vec::new();
-    for line in lines {
+    let mut lines = lines.peekable();
+    while let Some(line) = lines.next() {
+        // `read_backend_head` stops before the empty terminator line, so the
+        // last header still carries its CRLF: that one empty line is the
+        // head's real terminator. Any other line without ':' is malformed.
+        if line.is_empty() {
+            ensure!(lines.peek().is_none(), "backend header is malformed");
+            break;
+        }
         let (name, value) = line.split_once(':').ok_or_else(|| anyhow!("backend header is malformed"))?;
         headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
     }
@@ -370,5 +378,74 @@ pub(super) fn pkt_lines_until_flush(body: &[u8]) -> Result<(Vec<Vec<u8>>, usize)
         ensure!(length >= 4 && position + length <= body.len(), "pkt-line is malformed");
         lines.push(body[position + 4..position + length].to_vec());
         position += length;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn read(raw: &[u8]) -> Result<(String, u16, Vec<(String, String)>)> {
+        let mut reader = BufReader::new(raw);
+        read_backend_head(&mut reader, Instant::now() + Duration::from_secs(5)).await
+    }
+
+    /// A real backend head as Git's smart HTTP server sends it: status line,
+    /// headers and the terminating CRLF that `read_backend_head` consumes.
+    const REAL: &[u8] = b"HTTP/1.1 200 OK\r\n\
+        Server: Apache\r\n\
+        Expires: Fri, 01 Jan 1980 00:00:00 GMT\r\n\
+        Pragma: no-cache\r\n\
+        Cache-Control: no-cache, max-age=0, must-revalidate\r\n\
+        Content-Type: application/x-git-upload-pack-result\r\n\
+        Transfer-Encoding: chunked\r\n\
+        \r\n";
+
+    #[tokio::test]
+    async fn real_response_head_with_terminating_crlf_parses() {
+        let (status_line, status, headers) = read(REAL).await.unwrap();
+        assert_eq!(status_line, "HTTP/1.1 200 OK");
+        assert_eq!(status, 200);
+        assert_eq!(headers.len(), 6);
+        assert_eq!(header(&headers, "content-type"), Some("application/x-git-upload-pack-result"));
+        assert_eq!(header(&headers, "cache-control"), Some("no-cache, max-age=0, must-revalidate"));
+        assert_eq!(header(&headers, "transfer-encoding"), Some("chunked"));
+        assert!(headers.iter().all(|(name, _)| name == &name.to_ascii_lowercase()));
+    }
+
+    #[tokio::test]
+    async fn other_real_statuses_parse() {
+        let (_, status, headers) = read(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(header(&headers, "content-length"), Some("0"));
+        let (_, status, headers) = read(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"x\"\r\n\r\n")
+            .await
+            .unwrap();
+        assert_eq!(status, 401);
+        assert_eq!(header(&headers, "www-authenticate"), Some("Basic realm=\"x\""));
+        let (_, status, headers) = read(b"HTTP/1.1 204 No Content\r\n\r\n").await.unwrap();
+        assert_eq!(status, 204);
+        assert!(headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn header_line_without_colon_is_rejected() {
+        let bad: [&[u8]; 3] = [
+            b"HTTP/1.1 200 OK\r\nno-colon-here\r\nContent-Type: x\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Type: x\r\nno-colon-here\r\n\r\n",
+            // Two empty lines: only the final one is the terminator.
+            b"HTTP/1.1 200 OK\r\nContent-Type: x\r\n\r\nY: z\r\n\r\n",
+        ];
+        for raw in bad {
+            let error = read(raw).await.unwrap_err().to_string();
+            assert_eq!(error, "backend header is malformed", "{raw:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_status_lines_are_rejected() {
+        assert_eq!(read(b"HTTP/1.1\r\n\r\n").await.unwrap_err().to_string(), "backend status line is malformed");
+        assert_eq!(read(b"HTTP/1.1 abc OK\r\n\r\n").await.unwrap_err().to_string(), "backend status code is invalid");
+        assert_eq!(read(b"").await.unwrap_err().to_string(), "backend closed before any response");
     }
 }
