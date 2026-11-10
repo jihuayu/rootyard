@@ -324,8 +324,13 @@ def verify_ref_scale(harness):
         heads = sorted(name for name, _oid in baseline if name.startswith("refs/heads/"))
         assert heads, "fixture has no main/heads ref"
         expected_large = _expected_public(large_records)
-        # Every ref in these fixtures is public, so the walk must see all of them.
-        assert len(expected_large) == len(large_records) == len(set(expected_large))
+        # Expected public names must be unique. Packed records may exceed them
+        # by design: the fixture's controller-owned refs/rootyard-ci/jobs/<id>
+        # is never public, so it must not enter the expected set.
+        assert len(expected_large) == len(set(expected_large)), (
+            f"expected public refs are not unique: {len(expected_large)} names, "
+            f"{len(set(expected_large))} distinct among {len(large_records)} packed records"
+        )
 
         _expected_small, small_native = git_checks(small_records, "small", require_large=False)
         _expected, large_native = git_checks(large_records, "large", require_large=True)
