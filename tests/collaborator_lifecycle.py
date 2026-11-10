@@ -36,11 +36,15 @@ class lifecycle:
                 "name": self.repo["name"]}
 
     def worker(self, user):
-        """A fresh clone for ``user`` so Git never reads or writes a peer's tree."""
-        work = self.root / ("owned-work-" + user)
-        self.git("clone", self.remote, str(work), token=self.users[user])
-        self.git("config", "user.name", user.title(), cwd=work)
-        self.git("config", "user.email", user + "@collaborator.invalid", cwd=work)
+        """A fresh clone for ``user`` so Git never reads or writes a peer's tree.
+
+        ``user`` names the fixture identity (as in ``self.users[user]``).
+        """
+        name = user if isinstance(user, str) else user.name
+        work = self.root / ("owned-work-" + name)
+        self.git("clone", self.remote, str(work), token=self.users[name])
+        self.git("config", "user.name", name.title(), cwd=work)
+        self.git("config", "user.email", name + "@collaborator.invalid", cwd=work)
         return work
 
     def commit(self, work, filename, message):
@@ -180,7 +184,7 @@ class lifecycle:
         received = {}
         for user, role in (("carol", "read"), ("dave", "triage"), ("erin", "write"),
                            ("frank", "maintain"), ("grace", "admin")):
-            peer = self.worker("fetch-" + user)
+            peer = self.worker(Path(user))
             if role in ("read", "triage"):
                 denied = self.git("push", "origin", "HEAD:refs/heads/fetch-" + user, cwd=peer,
                                   token=self.users[user], check=False)
@@ -292,7 +296,7 @@ class lifecycle:
         assert self.rules() == []
         results = {}
         for user, role in (("erin", "write"), ("grace", "admin")):
-            work = self.worker("ff-" + user)
+            work = self.worker(Path(user))
             self.git("checkout", "-B", "ff-" + user, cwd=work)
             self.commit(work, "ff.txt", "first " + user)
             first = self.push_branch(work, self.users[user], "ff-" + user)
