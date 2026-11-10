@@ -147,6 +147,23 @@ PASSTHROUGH_VARIABLES = (
     'CARGO_PROFILE_DEV_STRIP',
     'CARGO_PROFILE_TEST_STRIP',
 )
+#: Compiler or toolchain selectors that would replace the pinned build.
+REJECTED_COMPILER_VARIABLES = (
+    'RUSTC',
+    'RUSTC_WRAPPER',
+    'RUSTC_WORKSPACE_WRAPPER',
+    'RUSTDOC',
+    'RUSTDOCFLAGS',
+    'RUSTUP_TOOLCHAIN',
+    'RUSTC_BOOTSTRAP',
+)
+#: Namespace prefixes whose every variable changes the profile or build.
+REJECTED_VARIABLE_PREFIXES = (
+    'CARGO_PROFILE_',
+    'CARGO_BUILD_',
+)
+#: Exact name: it defines the batch's canonical target directory.
+ALLOWED_TARGET_DIR = 'CARGO_TARGET_DIR'
 
 
 def canonical_target():
@@ -196,8 +213,21 @@ def toolchain_channel():
     raise BuildError('no pinned Rust toolchain: rust-toolchain.toml is missing and rustup reports no override')
 
 
+def is_rejected_environment_name(name):
+    """Whether this variable name would change the compiler, profile, workspace or target."""
+    if name in PASSTHROUGH_VARIABLES or name in REJECTED_COMPILER_VARIABLES:
+        return True
+    if name == ALLOWED_TARGET_DIR:
+        return False
+    if name.startswith(REJECTED_VARIABLE_PREFIXES):
+        return True
+    return (name.startswith('CARGO_TARGET_') and
+            (name.endswith('_LINKER') or name.endswith('_RUSTFLAGS')))
+
+
 def reject_passthrough_environment():
-    found = sorted(name for name in PASSTHROUGH_VARIABLES if os.environ.get(name))
+    found = sorted(name for name in os.environ if os.environ.get(name) and
+                   is_rejected_environment_name(name))
     if found:
         raise BuildError('refusing inherited profile/target environment: ' + ', '.join(found) +
                          '; pass the batch options instead so the recorded command is the build')

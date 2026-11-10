@@ -240,6 +240,9 @@ class BatchTest(unittest.TestCase):
         mock.patch.dict(os.environ, {'CARGO_TARGET_DIR': 'target'}).start()
         for name in batch.PASSTHROUGH_VARIABLES:
             os.environ.pop(name, None)
+        for name in list(os.environ):
+            if name != 'CARGO_TARGET_DIR' and batch.is_rejected_environment_name(name):
+                os.environ.pop(name, None)
         mock.patch.object(build_native, 'ROOT', self.root).start()
         # The production digest is not stubbed (the fixture is a few files):
         # it runs for real, so the source checks fire on their own path.
@@ -1054,6 +1057,32 @@ class BatchTest(unittest.TestCase):
         self.assertIn('RUSTFLAGS', str(caught.exception))
         self.assertEqual(self.clean_calls(), [])
         self.assertEqual(self.popen_calls, [])
+
+    def test_inherited_environment_names_are_rejected_before_metadata_clean_or_build(self):
+        sentinel = 'sentinel-do-not-display'
+        rejected = (
+            'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTDOC', 'RUSTDOCFLAGS',
+            'RUSTUP_TOOLCHAIN', 'RUSTC_BOOTSTRAP',
+            'CARGO_PROFILE_RELEASE_LTO', 'CARGO_PROFILE_DEV_OVERFLOW_CHECKS',
+            'CARGO_BUILD_JOBS', 'CARGO_BUILD_TARGET',
+            'CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER',
+            'CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS',
+        )
+        self.assertIn('CARGO_TARGET_DIR', os.environ)
+        self.assertFalse(batch.is_rejected_environment_name('CARGO_TARGET_DIR'))
+        for name in rejected:
+            with self.subTest(name=name):
+                self.metadata_calls = []
+                self.clean_commands = []
+                self.popen_calls = []
+                with mock.patch.dict(os.environ, {name: sentinel}):
+                    with self.assertRaises(batch.BuildError) as caught:
+                        batch.run_batch(self.args())
+                self.assertIn(name, str(caught.exception))
+                self.assertNotIn(sentinel, str(caught.exception))
+                self.assertEqual(self.metadata_calls, [])
+                self.assertEqual(self.clean_calls(), [])
+                self.assertEqual(self.popen_calls, [])
 
     def test_toolchain_mismatch_is_rejected_before_clean_or_build(self):
         with mock.patch.object(batch, 'toolchain_channel', lambda: ('1.99.1', 'rust-toolchain.toml')), \
