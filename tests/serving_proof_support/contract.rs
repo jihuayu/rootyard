@@ -548,7 +548,11 @@ async fn sealed_materialization_carries_a5b_binding_and_keeps_the_native_view() 
             return Err(error);
         }
     };
-    let checked = with_sealed_capture(&fixture, &repo, move |capture| async move {
+    let fixture_ref = &fixture;
+    let repo_ref = &repo;
+    let checked = with_sealed_capture(fixture_ref, repo_ref, move |capture| async move {
+        let fixture = fixture_ref;
+        let repo = repo_ref;
         let result = async {
             // A pack_verified gate with one registered pack never captures as empty.
         ensure!(!capture.is_empty(), "a pack_verified gate with one registered pack must not capture as empty");
@@ -647,7 +651,11 @@ async fn a_restore_rotation_between_capture_and_t2_refuses_the_sealed_materializ
             return Err(error);
         }
     };
-    let checked = with_sealed_capture(&fixture, &repo, move |capture| async move {
+    let fixture_ref = &fixture;
+    let repo_ref = &repo;
+    let checked = with_sealed_capture(fixture_ref, repo_ref, move |capture| async move {
+        let fixture = fixture_ref;
+        let repo = repo_ref;
         let result = async {
             ensure!(!capture.is_empty(), "the rotation case needs a real non-empty capture");
             let captured_incarnation = capture.capture_incarnation();
