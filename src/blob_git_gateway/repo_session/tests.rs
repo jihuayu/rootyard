@@ -408,7 +408,8 @@ mod committed_write {
         db::Repository,
         ref_store::{
             CommitRejectCode, CoreGate, GitObjectFormat, RefCommitResult, RefName,
-            core::pack_commit::{PackCommitTerminal, PackMode}, serving::ServingRepository,
+            core::pack_commit::{PackCommitTerminal, PackMode},
+            serving::ServingRepository,
         },
     };
     use uuid::Uuid;
