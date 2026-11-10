@@ -46,6 +46,18 @@ use catalog::{
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_MANIFEST: u64 = 256 * 1024 * 1024;
 
+/// Sequences the genuine format4/schema007 archive declares but whose owning
+/// columns arrive later: migration 110 gives `repository_audit_log.id` its
+/// default and `OWNED BY` binding, and migration 120 makes
+/// `organization_audit_log.id` an identity column. At schema007 no column owns
+/// them, so `pg_restore --clean --if-exists` emits no drop for them and the
+/// legacy dump recreates them beside the frozen format4 tables. Restore
+/// expects exactly these two relations, nothing derived from the running
+/// binary; every column, constraint, index, trigger and function is still
+/// checked against the frozen schema007 catalog, and the reviewed upgrade
+/// owns them exactly as a fresh database does.
+const FORMAT4_RESTORE_SEQUENCES: &[&str] = &["organization_audit_log_id_seq", "repository_audit_log_id_seq"];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Entry {

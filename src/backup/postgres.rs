@@ -124,14 +124,37 @@ pub(super) async fn database_scope(client: &(impl GenericClient + Sync), empty: 
     ensure!(extras == 0, "dedicated Rootyard database must not contain extra schemas, routines, types or extensions");
     Ok(())
 }
-pub(super) async fn schema(client: &(impl GenericClient + Sync), format: u32) -> Result<Vec<i32>> {
+/// `expected` is the complete set of public relations the exact format must
+/// contain and nothing else.
+///
+/// It is the format's own frozen catalog (`catalog::relations(format, false)`)
+/// for every format except the restored format4/schema007 target. The genuine
+/// schema007 archive declares `repository_audit_log_id_seq` and
+/// `organization_audit_log_id_seq` before migrations 110/120 attach them to a
+/// column, so `pg_restore --clean --if-exists` can emit no drop for them and
+/// the restore keeps those two sequences beside the exact format4 relations
+/// (see `FORMAT4_RESTORE_SEQUENCES`). That allowance is never a
+/// relaxed match: every column, constraint, index, trigger and function of the
+/// 15 format4 tables is still reconciled against the frozen schema007 catalog,
+/// and no other relation name is accepted.
+pub(super) async fn schema(client: &(impl GenericClient + Sync), format: u32, expected: &[String]) -> Result<Vec<i32>> {
     database_scope(client, false).await?;
     let tables = catalog::relations(format, true)?;
-    let expected_relations = catalog::relations(format, false)?;
     let names: Vec<String> = client.query("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f','S') ORDER BY c.relname", &[]).await?.iter().map(|r| r.get(0)).collect();
-    ensure!(names == expected_relations, "backup supports only the exact Rootyard public schema");
+    ensure!(names == expected, "backup supports only the exact Rootyard public schema");
     let regular: i64 = client.query_one("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='r' AND c.relpersistence='p'", &[]).await?.get(0);
     ensure!(regular == tables.len() as i64, "only permanent Rootyard tables supported");
+    if expected != catalog::relations(format, false)?.as_slice() {
+        // Only the format4/schema007 restore path supplies any expectation
+        // beyond its frozen catalog: exactly that catalog plus the pinned
+        // leftover sequences, and nothing else.
+        let mut allowed = catalog::relations(format, false)?;
+        if format == 4 {
+            allowed.extend(FORMAT4_RESTORE_SEQUENCES.iter().map(|name| (*name).to_owned()));
+            allowed.sort();
+        }
+        ensure!(expected == allowed, "backup supports only the exact Rootyard public schema");
+    }
     let versions: Vec<i32> = client
         .query("SELECT version FROM public.schema_migrations ORDER BY version", &[])
         .await?
