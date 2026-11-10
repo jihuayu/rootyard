@@ -28,7 +28,21 @@
 //! -> `/commits`, each presenting the previous successful read's session token.
 //! Every answer must carry a nonempty token and a positive revision that never
 //! regresses. A final `/refs` without any session header proves the token-free
-//! request still succeeds. The negative/refusal matrix is NOT covered here.
+//! request still succeeds.
+//!
+//! Refusals over the same real routes, never through handler calls:
+//!
+//! * a malformed `x-rootyard-session` from the owner is an explicit `400`;
+//! * a live foreign actor (`support::actor::stranger`) sending malformed and no
+//!   session header to the owner's repository gets the same refusal and body,
+//!   so actor/repository authorization runs before any version-token error;
+//! * a correctly MACed lower bound `live_revision + 1` minted through the
+//!   crate-private test-only `SessionRealm::new` + `SessionTokens::issue_for_test`
+//!   for a fresh authorized `serving::lookup` realm is the generic `503`
+//!   `BEHIND_MESSAGE`.
+//!
+//! Every refusal body is checked against the pushed OID/ref so it discloses
+//! neither repository content nor another repository's details.
 //!
 //! Messages are generic on purpose: Git URLs carry credentials, so neither a
 //! URL, Git stderr, a token, the key, the database URL nor Blob secrets are
@@ -62,7 +76,7 @@ use zeroize::Zeroizing;
 
 use super::{
     BlobGitConfig, BlobGitState,
-    repo_session::{SessionTokenCodec, SessionTokens},
+    repo_session::{BEHIND_MESSAGE, SessionRealm, SessionTokenCodec, SessionTokens},
 };
 use crate::{
     blob_store::{BlobBackendIdentity, BlobProvider, config::BlobProfile, opendal::BlobStore},
@@ -89,6 +103,8 @@ const BOUNDED_LIFETIME: u32 = 120;
 const COMMIT_FILE: &str = "readme.txt";
 const COMMIT_CONTENT: &str = "session-bound fixture file\n";
 const PUSHED_REF: &str = "refs/heads/main";
+/// A syntactically invalid session header value: never a framed token.
+const MALFORMED_SESSION: &str = "not-a-session-token";
 
 #[tokio::test]
 #[ignore = "requires real PostgreSQL, S3-compatible Blob and Git"]
@@ -100,9 +116,12 @@ async fn push_token_bounds_repeated_http_reads() -> Result<()> {
 
 async fn case(db: &Db) -> Result<()> {
     let store = open_store()?;
+    let tokens = open_test_tokens(store.backend_identity())?;
     let git = Git::new()?;
     let scratch = tempfile::tempdir().context("temporary gateway scratch root")?;
     let owner = actor::owner(&db.pool).await?;
+    // A live real actor with no role on the owner's repository.
+    let stranger = actor::stranger(&db.pool).await?;
     let state = Arc::new(
         BlobGitState::new(BlobGitConfig {
             pool: db.pool.clone(),
@@ -117,7 +136,7 @@ async fn case(db: &Db) -> Result<()> {
             native_limits: Default::default(),
         })
         .map_err(|error| anyhow!("gateway configuration was refused: {error}"))?
-        .with_sessions(open_test_tokens(store.backend_identity())?),
+        .with_sessions(tokens.clone()),
     );
     let push = Arc::new(Mutex::new(PushSession::default()));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -185,8 +204,78 @@ async fn case(db: &Db) -> Result<()> {
     // still a complete, non-regressing bound against the last presented one.
     drop(answer.session.admit_at_least(&commits_bound)?);
 
+    let secrets = [oid.as_str(), PUSHED_REF];
+
+    // 5. The authorized owner's malformed session header is an explicit 400.
+    let malformed = raw_get(&client, &format!("{base}/refs"), &owner.token, Some(MALFORMED_SESSION)).await?;
+    ensure!(malformed.status == 400, "malformed session header was not refused with 400");
+    ensure!(!malformed.body.is_empty(), "malformed session refusal carried no body");
+    ensure_no_disclosure(&malformed.body, &secrets, "malformed session refusal");
+
+    // 6. The live foreign actor is refused identically with a malformed and no
+    // session header: actor/repository authorization precedes token errors.
+    let foreign = format!("http://{address}/api/repos/{owner_name}/{name}/refs");
+    let mut denied = Vec::new();
+    for session in [Some(MALFORMED_SESSION), None] {
+        let answer = raw_get(&client, &foreign, &stranger.token, session).await?;
+        ensure!(!status_succeeds(answer.status), "foreign actor was not denied on the owner's repository");
+        ensure!(is_denial(answer.status), "foreign actor denial was not an authorization refusal");
+        ensure!(!answer.body.is_empty(), "foreign actor denial carried no body");
+        ensure!(!looks_like_refs(&answer.body), "foreign actor denial looked like a successful refs answer");
+        ensure_no_disclosure(&answer.body, &secrets, "foreign actor denial");
+        ensure_no_disclosure(&answer.body, &[&stranger.username, &owner.username], "foreign actor denial");
+        denied.push(answer);
+    }
+    ensure!(denied[0].status == denied[1].status, "foreign actor denial status depended on the session header");
+    ensure!(denied[0].body == denied[1].body, "foreign actor denial body depended on the session header");
+
+    // 7. A correctly MACed lower bound one past the live revision, minted for
+    // the exact realm a fresh authorized lookup states, is the generic 503.
+    let live = lookup(&db.pool, &owner.identity, &owner.username, &name, true, state.store().backend_identity(), deadline())
+        .await
+        .map_err(|error| anyhow!("authorized serving lookup refused: {}", error.1))?;
+    let gate = &live.gate;
+    let realm = SessionRealm::new(
+        gate.tenant_id(),
+        gate.repository_id(),
+        gate.object_format(),
+        gate.history_incarnation(),
+        gate.authority_epoch(),
+        gate.group_epoch(),
+        live.cluster_incarnation,
+    )
+    .map_err(|error| anyhow!("live session realm refused: {error}"))?;
+    let future_revision = gate.revision().checked_add(1).context("live gate revision overflow")?;
+    let future = tokens
+        .issue_for_test(&realm, future_revision)
+        .map_err(|error| anyhow!("future-bound session issue refused: {error}"))?;
+    let ahead = raw_get(&client, &format!("{base}/refs"), &owner.token, Some(future.token())).await?;
+    ensure!(ahead.status == 503, "future session bound was not refused with 503");
+    ensure!(contains(&ahead.body, BEHIND_MESSAGE), "future session refusal did not carry BEHIND_MESSAGE");
+    ensure!(!looks_like_refs(&ahead.body), "future session refusal looked like a successful refs answer");
+    ensure_no_disclosure(&ahead.body, &secrets, "future session refusal");
+
     drop(server);
     Ok(())
+}
+
+fn is_denial(status: u16) -> bool {
+    matches!(status, 401 | 403 | 404)
+}
+
+fn status_succeeds(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
+/// A body of a successful refs answer names refs; a refusal body must not.
+fn looks_like_refs(body: &str) -> bool {
+    body.contains("refs/") || body.contains("\"refs\"")
+}
+
+fn ensure_no_disclosure(body: &str, needles: &[&str], what: &str) {
+    for needle in needles {
+        ensure!(!needle.is_empty() && !contains(body, needle), "{what} disclosed a repository or actor detail");
+    }
 }
 
 fn open_store() -> Result<BlobStore> {
@@ -271,21 +360,37 @@ struct JsonAnswer {
     session: RawSession,
 }
 
-/// One real JSON read over TCP with the owner bearer token, presenting
-/// `session` when given, and returning the complete body with the session
-/// headers this response carried.
-async fn json_read(client: &reqwest::Client, url: &str, bearer: &str, session: Option<&str>) -> Result<JsonAnswer> {
+/// One real GET's raw answer: status code, complete body and the session
+/// headers it carried, whether or not it succeeded.
+struct RawAnswer {
+    status: u16,
+    body: String,
+    session: RawSession,
+}
+
+/// One real GET over TCP with the bearer token of `bearer`, presenting
+/// `session` as the session header when given (even a malformed value).
+async fn raw_get(client: &reqwest::Client, url: &str, bearer: &str, session: Option<&str>) -> Result<RawAnswer> {
+    // The bearer and the session header are sent as header values only, never
+    // in the URL, and are never printed here.
     let mut request = client.get(url).bearer_auth(bearer);
     if let Some(session) = session {
         request = request.header(SESSION_HEADER, session);
     }
     let response = request.send().await.context("real gateway TCP request failed")?;
-    let status = response.status();
+    let status = response.status().as_u16();
     let session = RawSession::from_headers(response.headers());
     let bytes = response.bytes().await.context("real gateway response body failed")?;
-    ensure!(status.is_success(), "gateway read returned {status}");
-    ensure!(!bytes.is_empty(), "gateway read returned an empty body");
-    Ok(JsonAnswer { body: String::from_utf8_lossy(&bytes).into_owned(), session })
+    Ok(RawAnswer { status, body: String::from_utf8_lossy(&bytes).into_owned(), session })
+}
+
+/// One successful real JSON read with the bearer token, presenting `session`
+/// when given, returning the complete body with the session headers.
+async fn json_read(client: &reqwest::Client, url: &str, bearer: &str, session: Option<&str>) -> Result<JsonAnswer> {
+    let RawAnswer { status, body, session } = raw_get(client, url, bearer, session).await?;
+    ensure!(status_succeeds(status), "gateway read returned {status}");
+    ensure!(!body.is_empty(), "gateway read returned an empty body");
+    Ok(JsonAnswer { body, session })
 }
 
 /// The push response's session headers, captured in memory only.
