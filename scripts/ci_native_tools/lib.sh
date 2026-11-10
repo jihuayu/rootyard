@@ -49,6 +49,8 @@ ubuntu_archive_keyring() {
 # Add deb-src-only entries for the signed Ubuntu Noble archive. Noble is the
 # first Ubuntu release whose Git source is the required 2.43 family; 22.04's
 # own archive only offers 2.34. Binary packages from Noble are never enabled.
+# The refresh is bounded and fails closed when the signed index cannot be
+# acquired; the pinned source version is selected only from that index.
 prepare_ubuntu_archive_source() {
   local keyring list want current
   require_command sudo
@@ -56,20 +58,27 @@ prepare_ubuntu_archive_source() {
   keyring=$(ubuntu_archive_keyring)
   [ -f "$keyring" ] || fail "trusted Ubuntu archive keyring is missing: $keyring"
   list=/etc/apt/sources.list.d/rootyard-ubuntu-noble-src.list
+  # Reviewed HTTPS endpoints, not the plain-HTTP hostnames: hosted runners
+  # resolve archive.ubuntu.com to CDN edges that reset connections, while
+  # azure.archive.ubuntu.com offers only jammy. The signed-by keyring and the
+  # Release/InRelease signature checks are unchanged.
   want=$(cat <<EOF
-deb-src [signed-by=$keyring] http://archive.ubuntu.com/ubuntu noble main universe
-deb-src [signed-by=$keyring] http://archive.ubuntu.com/ubuntu noble-updates main universe
-deb-src [signed-by=$keyring] http://security.ubuntu.com/ubuntu noble-security main universe
+deb-src [signed-by=$keyring] https://archive.ubuntu.com/ubuntu noble main universe
+deb-src [signed-by=$keyring] https://archive.ubuntu.com/ubuntu noble-updates main universe
+deb-src [signed-by=$keyring] https://security.ubuntu.com/ubuntu noble-security main universe
 EOF
 )
   current=$(sudo cat "$list" 2>/dev/null || true)
   if [ "$current" = "$want" ]; then
     log "signed Ubuntu Noble source index already configured (deb-src only)"
-    return 0
+  else
+    printf '%s\n' "$want" | sudo tee -- "$list" >/dev/null
+    log "configured deb-src-only signed Ubuntu Noble source index: $list"
   fi
-  printf '%s\n' "$want" | sudo tee "$list" >/dev/null
-  log "configured deb-src-only signed Ubuntu Noble source index: $list"
-  sudo apt-get update
+  # Refresh even when the list was already current: a hosted runner can
+  # carry an owned list from a previous attempt without its indexes, and the
+  # pinned source versions below are selected from the refreshed index.
+  apt_update
 }
 
 # Install the signed PGDG repository and key exactly as the manual
@@ -114,16 +123,57 @@ prepare_pgdg_repository() {
   current=$(sudo cat "$list" 2>/dev/null || true)
   if [ "$current" = "$want" ]; then
     log "signed PGDG repository already configured"
-    return 0
+  else
+    printf '%s\n' "$want" | sudo tee -- "$list" >/dev/null
+    log "configured signed PGDG repository for ${codename}"
   fi
-  printf '%s\n' "$want" | sudo tee "$list" >/dev/null
-  log "configured signed PGDG repository for ${codename}"
-  sudo apt-get update
+  # A re-run on a hosted runner can start from an owned list whose indexes
+  # were never fetched; refresh bounded here as well as before the install.
+  apt_update
 }
 
-apt_install() {
+# Hosted Ubuntu runners reach their archive through the image's own (mirror
+# list / sources) configuration, over plain HTTP. These helpers must not
+# rewrite that image configuration, so bound every acquisition instead of
+# inheriting apt's multi-minute defaults. These are the top-level keys from the
+# apt.conf(5) acquire group; Acquire::http(s)::Timeout abandons a transfer
+# after that many seconds without progress, Acquire::Retries reconnects after
+# a method error, and pipelining is off so a stalled connection is retried
+# rather than holding a pipelined request. They are per-invocation -o options
+# only: no apt configuration file is written or changed.
+APT_TIMEOUT_SECONDS=30
+APT_RETRIES=3
+APT_NETWORK_OPTIONS=(
+  -o "Acquire::http::Timeout=$APT_TIMEOUT_SECONDS"
+  -o "Acquire::https::Timeout=$APT_TIMEOUT_SECONDS"
+  -o "Acquire::Retries=$APT_RETRIES"
+  -o Acquire::http::Pipeline-Depth=0
+)
+
+# Every acquisition is non-interactive so a daemon restart prompt cannot hold
+# a CI runner.
+apt_run() {
   require_command sudo
-  sudo apt-get install -y --no-install-recommends "$@"
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get "${APT_NETWORK_OPTIONS[@]}" "$@"
+}
+
+# A plain `apt-get update` exits 0 when some indexes fail, keeping their stale
+# local copies; these helpers need every signed index they read to be current,
+# so the update reports any hash-sum or other transient index failure.
+apt_update() {
+  apt_run update --error-on=any
+}
+
+# Indexes and packages change system state, so they run through sudo.
+apt_install() {
+  apt_run install -y --no-install-recommends "$@"
+}
+
+# Source packages are downloaded and extracted as the invoking runner user,
+# with the same bounded options and apt Release/signature verification, so the
+# extracted tree stays writable for the following unprivileged build.
+apt_source() {
+  apt-get "${APT_NETWORK_OPTIONS[@]}" source "$@"
 }
 
 source_versions() {
@@ -148,7 +198,7 @@ fetch_source() {
   mkdir -p -- "$work"
   [ -z "$(find "$work" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
     fail "source work directory is not empty: $work"
-  (cd "$work" && apt-get source "$package=$version")
+  (cd "$work" && apt_source "$package=$version")
 }
 
 find_source_directory() {

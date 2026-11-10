@@ -3,7 +3,7 @@
 Two layers cover the native acceptance suites. Neither layer replaces the
 specialised cgroup VM gate in `.github/workflows/native-kernel-acceptance.yml`.
 
-## Layer 1 — every push and pull request (`.github/workflows/ci.yml`)
+## Layer 1 — every pull request and every push to `main` (`.github/workflows/ci.yml`)
 
 The verify job runs on a plain `ubuntu-22.04` host, not in the former
 `rust:1-trixie` container. That is the same host profile on which the manual
@@ -48,17 +48,45 @@ the binary built once by `scripts/build_native.py --features pando-lab --bins`:
 | `tests/web_sessions.py` | Session exchange, CSRF binding, expiry and parent-token revocation over the real Rust service and PostgreSQL 17 | `test-results/web-sessions.json` |
 | `tests/ci_webhook_regressions.py` | 201-event batching, concurrent claim fencing, verified TLS delivery and untrusted-CA rejection (no `--report`; the stdout log is the evidence) | `test-results/ci-webhook-regressions.log` |
 | `tests/webhook_worker_recovery.py` | Background worker recovery across SIGKILL at the enqueue and ack boundaries, lease overlap and backoff/dead-letter, with no manual dispatch | `test-results/webhook-worker-recovery.json` |
+| `tests/repository_pagination.py` | Real API/PostgreSQL traversal of 1,001 repositories with keyset ordering, actor scope and mutations | `test-results/repository-pagination.json` |
+| `tests/organization_pagination.py` | Real API/PostgreSQL traversal of 101 members and 101 teams with authorization, cursor scope and mutation resume | `test-results/organization-pagination.json` |
+| `tests/web_detail_pagination.py` | Real web Issue comments and PR reviews across the 100-row page boundary (105 rows seeded plus the 106th written through real HTTP/Git), including cursor/actor/revocation checks | `test-results/web-detail-pagination.json` |
 
 A final step, `scripts/native_report_manifest.py --mode job`, fails the job
 unless every report was produced by the exact binary whose SHA-256 appears in
 `target/debug/rootyard.build.json`, every declared case passed, the
 `ci_webhook_regressions` log is non-empty and contains each expected phase
 marker, and the receipt's commit and compiled source-input digest were recorded.
+The manifest also binds the `repository-pagination.json`,
+`organization-pagination.json` and `web-detail-pagination.json` reports and
+their harness sources to that same build receipt, so none of the three can be
+produced by a different binary. These three harnesses are real functional
+regressions over real API, PostgreSQL, HTTP and Git state, not scalability
+benchmarks.
 The manifest (`test-results/native-pr-gate.json`) also stores harness SHA-256
 digests, `postgres=postgres:17`, the exact `rustc -V` string, `git --version`,
 `git lfs version`, `bwrap --version`, the `/dev/fuse` stat and the SHA-256 of
 the native tool provenance file. Injecting any of those defects turns the pull
 request red instead of leaving the regression to manual re-verification.
+
+## 专项与完整 candidate 分层 (specialised suites vs. the complete gate)
+
+The existing workflows already carry the layering; no new orchestrator, suite input or
+externally-triggered dependency is added. Choosing a layer:
+
+| Situation | What runs |
+| --- | --- |
+| Opening or updating any pull request | `CI` → `verify`, `container`; Pando → `isolated-lab`; Redis → `redis-contract`; plus `native` / `log-storage` automatically when their `pull_request.paths` match. This is the **full required gate** and is never skipped by default. |
+| Working on one affected area before the PR is ready | Dispatch the affected specialised workflow on the branch: `refstore-protocol-acceptance.yml`, `refcas-log.yml`, `native-kernel-acceptance.yml` (cgroup VM profile), `candidate-release-acceptance.yml` (Chromium + Garage candidate), or `pando-lab.yml` / `redis-contract.yml` (now also dispatachable). Dispatch is additive; it does not change the PR's required result. |
+| Merging to `main` | The `push` on `main` re-runs every full-gate workflow on the merged commit (the PR head is a different commit), so the complete gate is re-verified after merge. |
+
+Trigger policy: full-gate workflows (`ci.yml`, `pando-lab.yml`, `redis-contract.yml`) run
+`pull_request` on every PR head and `push` only for `main`. An unfiltered `push` duplicated the
+whole gate for each feature-branch head (before/after evidence and the limits of what has been
+observed are in `docs/acceptance/ci-trigger-dedup-20261110.md`). Do not add `paths:` filters to
+those workflows: a required check that is filtered out stays "expected" forever on a PR. The
+path-filtered suites above intentionally have none of their jobs as `main` required checks;
+their `workflow_dispatch` makes them available at any time.
 
 ## Layer 2 — candidate release gate (`.github/workflows/candidate-release-acceptance.yml`)
 
@@ -147,6 +175,9 @@ python3 scripts/build_native.py --features pando-lab --bins
 python3 tests/web_sessions.py --binary target/debug/rootyard --report test-results/web-sessions.json
 python3 tests/ci_webhook_regressions.py --binary target/debug/rootyard | tee test-results/ci-webhook-regressions.log
 python3 tests/webhook_worker_recovery.py --binary target/debug/rootyard --report test-results/webhook-worker-recovery.json
+python3 tests/repository_pagination.py --binary target/debug/rootyard --report test-results/repository-pagination.json
+python3 tests/organization_pagination.py --binary target/debug/rootyard --report test-results/organization-pagination.json
+python3 tests/web_detail_pagination.py --binary target/debug/rootyard --report test-results/web-detail-pagination.json
 ```
 
 The native host profile in this change was validated locally only: workflow

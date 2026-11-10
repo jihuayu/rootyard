@@ -32,7 +32,7 @@ pub async fn run_from_env() -> Result<()> {
         tokio::time::Instant::now() + Duration::from_secs(30),
     )
     .await
-    .map_err(|_| anyhow!("Blob service schema or lifecycle barrier is unavailable"))?;
+    .map_err(startup_barrier_error)?;
     let store = crate::blob_store::opendal::BlobStore::open(
         crate::blob_store::config::BlobProfile::from_env().map_err(|_| anyhow!("invalid Blob profile"))?,
     )
@@ -53,6 +53,16 @@ pub async fn run_from_env() -> Result<()> {
         }
     };
     serve(router, pool, bind, check).await
+}
+
+/// Only the typed lifecycle-barrier refusal keeps its fixed cause; a busy
+/// barrier is not a startup failure. Every other error keeps the generic
+/// startup message with nothing of its (possibly sensitive) text passed on.
+pub(crate) fn startup_barrier_error(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<crate::backup::BarrierBusy>().is_some() {
+        return error.context("Blob service schema or lifecycle barrier is unavailable");
+    }
+    anyhow!("Blob service schema or lifecycle barrier is unavailable")
 }
 
 async fn serve(

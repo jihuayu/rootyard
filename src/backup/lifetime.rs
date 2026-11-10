@@ -100,7 +100,9 @@ impl BackupMutex {
         .context("backup barrier wait exceeded; serving processes are still holding it")?
         .context("backup barrier could not be requested")?
         .get(0);
-        anyhow::ensure!(granted, "serve-blob or another offline backup/restore already holds the lifecycle barrier");
+        if !granted {
+            return Err(BarrierBusy::Exclusive.into());
+        }
         Ok(BackupMutex { pid })
     }
 
@@ -127,6 +129,38 @@ impl BackupMutex {
     }
 }
 
+/// The lifecycle barrier is held by the other side. Only a real
+/// `pg_try_advisory_lock*` answer of `false` constructs this error; the fixed
+/// cause text is the only thing it carries, never a DSN, database or other
+/// dynamic value. Startup maps exactly this typed error to a visible refusal
+/// and leaves every other failure under its generic message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BarrierBusy {
+    /// The offline side could not take the exclusive lock: a serving session
+    /// still holds the shared lifetime barrier.
+    Exclusive,
+    /// Serving could not take the shared lock: an offline backup or restore
+    /// holds the exclusive barrier.
+    Serving,
+}
+
+impl BarrierBusy {
+    pub(crate) const fn cause(self) -> &'static str {
+        match self {
+            Self::Exclusive => "serve-blob or another offline backup/restore already holds the lifecycle barrier",
+            Self::Serving => "an offline backup or restore holds the lifecycle barrier; refuse to serve this database",
+        }
+    }
+}
+
+impl std::fmt::Display for BarrierBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.cause())
+    }
+}
+
+impl std::error::Error for BarrierBusy {}
+
 /// Shared serving barrier held for the whole serviced lifetime.
 ///
 /// Owns no reference to the pool or client; the serving entry point creates the
@@ -147,10 +181,9 @@ impl ServingBarrier {
         .map_err(|_| anyhow::anyhow!("serving barrier wait exceeded"))?
         .map_err(|_| anyhow::anyhow!("serving barrier could not be requested"))?
         .get(0);
-        anyhow::ensure!(
-            granted,
-            "an offline backup or restore holds the lifecycle barrier; refuse to serve this database"
-        );
+        if !granted {
+            return Err(BarrierBusy::Serving.into());
+        }
         Ok(ServingBarrier { pid })
     }
 
@@ -220,5 +253,69 @@ pub(crate) async fn prepare_serving_database(
             Ok(shared)
         }
         _ => anyhow::bail!("ROOTYARD_SCHEMA_MODE must be external or auto"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BarrierBusy;
+    use crate::standalone::startup_barrier_error;
+
+    // Simulated database URL and password; they must never surface in a
+    // displayed or explained error. The tests only compare against them.
+    const SECRET: &str = "postgresql://rootyard:simulated-secret-value@db.internal:5432/rootyard";
+    const STARTUP_FAILURE: &str = "Blob service schema or lifecycle barrier is unavailable";
+
+    fn checked(error: &anyhow::Error) -> String {
+        let text = format!("{error:?}");
+        assert!(!text.contains("simulated-secret-value") && !text.contains(SECRET), "secret leaked");
+        text
+    }
+
+    #[test]
+    fn typed_busy_modes_display_the_fixed_causes_and_survive_startup_mapping() {
+        let expected = [
+            (
+                BarrierBusy::Exclusive,
+                "serve-blob or another offline backup/restore already holds the lifecycle barrier",
+            ),
+            (
+                BarrierBusy::Serving,
+                "an offline backup or restore holds the lifecycle barrier; refuse to serve this database",
+            ),
+        ];
+        for (busy, cause) in expected {
+            assert_eq!(busy.to_string(), cause);
+            let error: anyhow::Error = busy.into();
+            assert_eq!(error.downcast_ref::<BarrierBusy>(), Some(&busy));
+            let mapped = startup_barrier_error(error);
+            let text = checked(&mapped);
+            assert!(mapped.downcast_ref::<BarrierBusy>().is_some(), "typed busy lost");
+            assert_eq!(mapped.chain().next().map(ToString::to_string).as_deref(), Some(STARTUP_FAILURE));
+            assert!(text.contains(STARTUP_FAILURE) && text.contains(cause), "{text}");
+        }
+    }
+
+    #[test]
+    fn unknown_errors_are_shadowed_by_the_generic_startup_message() {
+        let unknown = anyhow::anyhow!("connection failed for {SECRET}").context("barrier request failed");
+        for error in [unknown, anyhow::anyhow!("statement timeout"), anyhow::anyhow!("invalid DSN")] {
+            let mapped = startup_barrier_error(error);
+            let text = checked(&mapped);
+            assert_eq!(text, STARTUP_FAILURE, "only the generic message may remain");
+            assert!(mapped.chain().count() == 1 && mapped.downcast_ref::<BarrierBusy>().is_none());
+        }
+    }
+
+    #[test]
+    fn a_string_that_reads_like_a_refusal_can_never_masquerade_as_busy() {
+        for busy in [BarrierBusy::Exclusive, BarrierBusy::Serving] {
+            // Same text as the real refusal, but only a string, even below the
+            // real startup context.
+            let imitated = anyhow::anyhow!("{}", busy).context(STARTUP_FAILURE);
+            let mapped = startup_barrier_error(imitated);
+            assert!(mapped.downcast_ref::<BarrierBusy>().is_none());
+            assert_eq!(checked(&mapped), STARTUP_FAILURE, "an untyped imitation must stay generic");
+        }
     }
 }

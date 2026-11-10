@@ -45,6 +45,17 @@ CHECK_CONCLUSIONS = frozenset(
     {"success", "failure", "neutral", "cancelled", "timed_out", "skipped"}
 )
 CHECK_DIAGNOSTIC_LIMIT = 8
+# The only 409 errors `upsert_check_inner` in `src/pulls/checks.rs` raises when
+# the row's `(attempt, sequence)` changed after the caller's read. Either one is
+# retried by `advance_check` against a re-read row; every other 409 is fatal.
+ADVANCE_CHECK_CAS_CONFLICTS = frozenset(
+    {
+        "conflicting check run state for same attempt and sequence",
+        "stale check run attempt or sequence",
+    }
+)
+ADVANCE_CHECK_MAX_CONFLICTS = 5
+ADVANCE_CHECK_DEADLINE_SECONDS = 5.0
 
 
 def migration_009_path() -> Path:
@@ -118,6 +129,22 @@ class PullsHarness(ForgeHarness):
         assert norm_headers.get("cache-control") == "no-store", norm_headers
         assert "application/json" in norm_headers.get("content-type", ""), norm_headers
         return json.loads(body)
+
+    def json_exchange(self, path, code, **kwargs):
+        """Return `(status, body, headers)` without raising when `code` is unexpected.
+
+        `document` assert-fails on the first unexpected status, which hides the
+        error body needed to decide whether it is retryable. `(status, headers,
+        body)` is checked here exactly as `document` checks it, so no-store and
+        JSON are still required on every response.
+        """
+        status, body, resp_headers = self.http(path, **kwargs)
+        norm_headers = {k.lower(): v for k, v in resp_headers.items()}
+        expected = code if isinstance(code, tuple) else (code,)
+        assert status in expected, f"{path}: expected {code}, got {status}: {body[:200]!r}"
+        assert norm_headers.get("cache-control") == "no-store", norm_headers
+        assert "application/json" in norm_headers.get("content-type", ""), norm_headers
+        return status, body, norm_headers
 
     def check_contexts(self, items: list) -> list:
         """Assert the check contexts recorded for one commit.
@@ -486,7 +513,32 @@ class PullsHarness(ForgeHarness):
         )
         return synced
 
-    def advance_check(self, commit_oid: str, context: str, status: str, conclusion, output) -> dict:
+    def listed_check_row(self, commit_oid: str, context: str):
+        """Return the exact row `/commits/{oid}/checks` lists for one context.
+
+        The listing is fenced on `commit_oid` and must contain the context at
+        most once; any other shape is a contract failure, not a retry signal.
+        """
+        path = f"/api/repos/alice/forge/commits/{commit_oid}/checks"
+        listed = self.document(path, token=self.reader)
+        assert listed.get("commit_oid") == commit_oid, listed
+        items = listed.get("items")
+        assert isinstance(items, list), listed
+        matches = [item for item in items if item["context"] == context]
+        assert len(matches) <= 1, (commit_oid, context, items)
+        return matches[0] if matches else None
+
+    def advance_check(
+        self,
+        commit_oid: str,
+        context: str,
+        status: str,
+        conclusion,
+        output,
+        *,
+        max_conflicts: int = ADVANCE_CHECK_MAX_CONFLICTS,
+        deadline_seconds: float = ADVANCE_CHECK_DEADLINE_SECONDS,
+    ) -> dict:
         """Advance one check run from the state the service currently records.
 
         A branch rule exists for the base ref now, so the synchronizer may already
@@ -494,28 +546,74 @@ class PullsHarness(ForgeHarness):
         synchronized head. Ordering is server-validated on `(attempt, sequence)`,
         so the next transition is derived from the observed row instead of a
         hardcoded sequence that would collide with the service's placeholder.
+
+        The GET and the POST are not one transaction: the always-on pull-ref
+        synchronizer can insert or advance the row in between, and the write then
+        answers 409 `conflicting check run state for same attempt and sequence`
+        (or `stale check run attempt or sequence`). Only those exact CAS conflicts
+        retry, bounded by `max_conflicts` attempts and a monotonic deadline; each
+        one re-reads the same commit/context and asks for a strictly greater
+        `(1, sequence)`, so an already completed success is never accepted as the
+        requested failure. Any other status, error, malformed body, wrong commit,
+        context or attempt fails immediately.
         """
         path = f"/api/repos/alice/forge/commits/{commit_oid}/checks"
-        listed = self.document(path, token=self.reader)
-        existing = [item for item in listed["items"] if item["context"] == context]
-        sequence = 1 if not existing else existing[0]["sequence"] + 1
-        run = self.document(
-            path,
-            (200, 201),
-            method="POST",
-            body={
-                "context": context,
-                "status": status,
-                "conclusion": conclusion,
-                "output": output,
-                "attempt": 1,
-                "sequence": sequence,
-            },
-        )
-        assert run["context"] == context and run["status"] == status, run
-        assert run["conclusion"] == conclusion and run["attempt"] == 1, run
-        assert run["sequence"] == sequence, run
-        return run
+        attempt = 1
+        floor = 0
+        started = time.monotonic()
+        conflicts = 0
+        while True:
+            existing = self.listed_check_row(commit_oid, context)
+            if existing is not None:
+                assert isinstance(existing.get("attempt"), int), existing
+                assert existing["attempt"] == attempt, (
+                    f"{context} on {commit_oid}: expected attempt {attempt}, "
+                    f"observed attempt {existing['attempt']}: {existing}"
+                )
+                assert isinstance(existing.get("sequence"), int), existing
+                floor = max(floor, existing["sequence"])
+            sequence = floor + 1
+            status_code, body, _headers = self.json_exchange(
+                path,
+                (200, 201, 409),
+                token=self.alice,
+                method="POST",
+                body={
+                    "context": context,
+                    "status": status,
+                    "conclusion": conclusion,
+                    "output": output,
+                    "attempt": attempt,
+                    "sequence": sequence,
+                },
+            )
+            if status_code in (200, 201):
+                run = json.loads(body)
+                assert run.get("commit_oid") == commit_oid, run
+                assert run["context"] == context and run["status"] == status, run
+                assert run["conclusion"] == conclusion and run["attempt"] == attempt, run
+                assert run["output"] == output, run
+                assert run["sequence"] == sequence, run
+                return run
+            error = json.loads(body)
+            assert isinstance(error, dict), error
+            assert error.get("error") in ADVANCE_CHECK_CAS_CONFLICTS, (
+                f"{path}: expected an exact check CAS 409, got {error}"
+            )
+            conflicts += 1
+            if conflicts >= max_conflicts:
+                raise AssertionError(
+                    f"{path}: {context} at sequence > {floor} still conflicted after "
+                    f"{conflicts} attempts with {error['error']!r}"
+                )
+            remaining = deadline_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                raise AssertionError(
+                    f"{path}: {context} check CAS conflicts persisted past the "
+                    f"{deadline_seconds}s deadline ({conflicts} attempts, "
+                    f"last {error['error']!r})"
+                )
+            time.sleep(min(0.05, remaining))
 
     def ensure_migration_009(self):
         if self.sql("SELECT to_regclass('forge_pulls') IS NOT NULL") != "t":
