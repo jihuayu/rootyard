@@ -184,7 +184,7 @@ class lifecycle:
         received = {}
         for user, role in (("carol", "read"), ("dave", "triage"), ("erin", "write"),
                            ("frank", "maintain"), ("grace", "admin")):
-            peer = self.worker(Path(user))
+            peer = self.worker(user)
             if role in ("read", "triage"):
                 denied = self.git("push", "origin", "HEAD:refs/heads/fetch-" + user, cwd=peer,
                                   token=self.users[user], check=False)
@@ -296,7 +296,7 @@ class lifecycle:
         assert self.rules() == []
         results = {}
         for user, role in (("erin", "write"), ("grace", "admin")):
-            work = self.worker(Path(user))
+            work = self.worker(user)
             self.git("checkout", "-B", "ff-" + user, cwd=work)
             self.commit(work, "ff.txt", "first " + user)
             first = self.push_branch(work, self.users[user], "ff-" + user)
