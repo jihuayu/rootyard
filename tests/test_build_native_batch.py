@@ -90,7 +90,13 @@ tempfile = "3"
 """
 
 PACKAGE_ID = 'path+file:///ws#rootyard@0.1.0'
-BINS = ('rootyard', 'rootyard-vfs-mount', 'rootyard-pando-lab')
+#: ``[[bin]]`` targets of the fixture manifest: the --bin names most tests select.
+BINS = ('rootyard', 'rootyard-pando-lab', 'rootyard-vfs-mount')
+#: Bins Cargo auto-discovers from src/bin/*.rs: no [[bin]] table names them.
+AUTO_BINS = ('rootyard-view-lab', 'rootyard-workspace-lab')
+#: Every bin Cargo metadata lists for the package, in metadata order: the
+#: auto-discovered src/bin labs sit between the [[bin]] tables' bins.
+ALL_BINS = ('rootyard', 'rootyard-pando-lab') + AUTO_BINS + ('rootyard-vfs-mount',)
 TESTS = ('ref_store_snapshot_backup_fixture', 'ref_store_holds_backup_fixture')
 HELPER = 'tests/helper/mod.rs'
 UNTRACKED_HELPER = 'tests/helper/untracked.rs'
@@ -186,7 +192,7 @@ class BatchTest(unittest.TestCase):
         (self.root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "1.99.1"\n')
         (self.root / 'src' / 'lib.rs').write_text('pub fn hello() {}\n')
         (self.root / 'src' / 'main.rs').write_text('fn main() {}\n')
-        for name in ('rootyard-pando-lab', 'rootyard-vfs-mount'):
+        for name in ('rootyard-pando-lab', 'rootyard-vfs-mount') + AUTO_BINS:
             (self.root / 'src' / 'bin' / (name + '.rs')).write_text('fn main() {}\n')
         for name in TESTS:
             (self.root / 'tests' / (name + '.rs')).write_text('#[test]\nfn one() {}\n')
@@ -236,9 +242,17 @@ class BatchTest(unittest.TestCase):
         ``CARGO_TARGET_DIR``/``[build].target-dir`` and never from the batch's
         ``--config``, so omitting it would be a document Cargo cannot print.
         """
+        targets = [self.metadata_target('lib', 'rootyard', 'src/lib.rs')]
+        targets += [self.metadata_target('bin', name, self.bin_source(name),
+                                         ['pando-lab'] if name == 'rootyard-pando-lab' else None)
+                    for name in ALL_BINS]
+        targets += [self.metadata_target('test', name, 'tests/' + name + '.rs') for name in TESTS]
+        document = getattr(self, 'metadata_document', None)
+        if document is not None:
+            return json.dumps(document)
         return json.dumps({
             'packages': [{'name': 'rootyard', 'version': '0.1.0', 'id': PACKAGE_ID,
-                          'manifest_path': str(self.root / 'Cargo.toml')}],
+                          'manifest_path': str(self.root / 'Cargo.toml'), 'targets': targets}],
             'workspace_members': [PACKAGE_ID],
             'workspace_default_members': [PACKAGE_ID],
             'resolve': None,
@@ -247,6 +261,15 @@ class BatchTest(unittest.TestCase):
             'version': 1,
             'metadata': None,
         })
+
+    def bin_source(self, name):
+        return 'src/bin/' + name + '.rs' if name != 'rootyard' else 'src/main.rs'
+
+    def metadata_target(self, kind, name, source, required_features=None):
+        """One entry of the ``targets`` array a real cargo metadata prints."""
+        return {'kind': [kind], 'crate_types': [kind], 'name': name,
+                'src_path': str(self.root / source), 'edition': '2024', 'doc': True, 'doctest': False,
+                'test': True, 'required-features': list(required_features or [])}
 
     def fake_cargo_metadata(self, command, *args, **kwargs):
         """The cargo process: it only ever answers the ``cargo metadata`` probe.
@@ -281,9 +304,32 @@ class BatchTest(unittest.TestCase):
     def binary(self, name):
         return str(os.path.join(self.target, 'debug', name))
 
-    def default_events(self, bins=None, tests=None, fresh=False, lib=True):
+    def implicit_bins(self, bins, tests, features='pando-lab', no_default_features=False):
+        """What real Cargo also builds for these ``--bin``/``--test`` selections.
+
+        Cargo names no bin when a ``--test`` is selected, so it builds every
+        other *enabled* metadata bin of the package as an implicit build; a
+        bin whose required-features the selection does not enable (the
+        pando-lab one without pando-lab) is never built.
+        """
+        if not tests:
+            return ()
+        enabled = set(features.split(',')) if features else set()
+        if enabled:
+            enabled.add('kafka-wake')
+        if not no_default_features:
+            enabled.add('kafka-wake')
+        enabled.discard('')
+        return tuple(name for name in ALL_BINS if name not in bins
+                     and (name != 'rootyard-pando-lab' or 'pando-lab' in enabled))
+
+    def default_events(self, bins=None, tests=None, fresh=False, lib=True, implicit=True,
+                       features='pando-lab', no_default_features=False):
         bins = BINS if bins is None else bins
         tests = TESTS if tests is None else tests
+        if implicit:
+            bins = tuple(bins) + self.implicit_bins(tuple(bins), tuple(tests), features,
+                                                    no_default_features)
         events = [artifact('lib', 'rootyard', fresh=fresh)] if lib else []
         events += [artifact('bin', name, fresh=fresh, executable=self.binary(name)) for name in bins]
         events += [artifact('test', name, fresh=fresh, executable=self.compiled_test(name)) for name in tests]
@@ -382,10 +428,19 @@ class BatchTest(unittest.TestCase):
         Path(args.manifest_out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.manifest_out).write_text('{"stale": true}\n')
 
+    def implicit_receipts(self, bins=None, tests=None, manifest_out=None):
+        """Where the receipts of the implicitly built bins live (beside the manifest)."""
+        bins = BINS if bins is None else bins
+        tests = TESTS if tests is None else tests
+        manifest_out = Path(manifest_out or self.outdir / 'native-build-batch.json')
+        directory = manifest_out.parent / (manifest_out.stem + '.receipts')
+        return [directory / (name + '.build.json') for name in self.implicit_bins(tuple(bins), tuple(tests))]
+
     def assert_nothing_published(self, args=None):
         args = args or self.args()
         receipts = [self.target / 'debug' / (name + '.build.json') for name in args.bin]
         receipts += [Path(output + '.build.json') for output in args.output]
+        receipts += self.implicit_receipts(args.bin, args.test, args.manifest_out)
         leftovers = receipts + [Path(args.manifest_out)] + [Path(output) for output in args.output]
         leftovers += [path.with_name('.' + path.name + '.batch-new') for path in leftovers]
         self.assertEqual([str(path) for path in leftovers if path.exists()],
@@ -413,8 +468,9 @@ class BatchTest(unittest.TestCase):
                                                 'executable': self.binary(name), 'package_id': PACKAGE_ID,
                                                 'profile': {'opt_level': '0', 'debuginfo': 2,
                                                             'debug_assertions': True,
-                                                            'overflow_checks': True, 'test': False}}
-                                               for name in BINS]})
+                                                            'overflow_checks': True, 'test': False},
+                                                'source': str((self.root / self.bin_source(name)).resolve())}
+                                               for name in BINS + self.implicit_bins(BINS, TESTS)]})
         self.assertEqual(report['status'], 'passed')
         self.assertEqual(report['kind'], 'rootyard/native-build-batch')
         self.assertEqual(report['source_commit'], 'c0ffee')
@@ -438,7 +494,7 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(receipt['clean_command'], ['cargo', 'clean', '--package', 'rootyard'])
         self.assertIs(receipt['package_rebuilt'], True)
         self.assertEqual([(item['kind'], item['target']) for item in receipt['fresh_false_artifacts']],
-                         [('lib', 'rootyard')] + [('bin', name) for name in BINS])
+                         [('lib', 'rootyard')] + [('bin', name) for name in BINS + AUTO_BINS])
         self.assertEqual(receipt['fresh_false_artifacts'][1]['executable'], self.binary('rootyard'))
         self.assertTrue(all(item['fresh'] is False for item in receipt['fresh_false_artifacts']))
         self.assertEqual(receipt['binary_sha256'], batch.sha256_file(self.binary('rootyard')))
@@ -506,13 +562,19 @@ class BatchTest(unittest.TestCase):
             receipt = json.loads((self.target / 'debug' / (name + '.build.json')).read_text())
             self.assertEqual(receipt['command'], report['build']['command'])
             self.assertTrue(receipt['binary_sha256'])
+            # Cargo also built every other enabled metadata bin for the tests.
             self.assertEqual([item['target'] for item in receipt['fresh_false_artifacts']],
-                             ['rootyard', 'rootyard', 'rootyard-vfs-mount'])
+                             ['rootyard', 'rootyard', 'rootyard-vfs-mount', 'rootyard-pando-lab',
+                              *AUTO_BINS])
             self.assertTrue(all(item['fresh'] is False for item in receipt['fresh_false_artifacts']))
             entries = receipt['fresh_false_artifacts']
             executables = [item.get('executable') for item in entries]
             self.assertIn(self.binary(name), executables)
-        self.assertEqual([entry['kind'] for entry in report['artifacts']], ['bin', 'bin', 'test', 'test'])
+        # Requested bins first, then one record per implicitly built bin, then the tests.
+        self.assertEqual([entry['kind'] for entry in report['artifacts']],
+                         ['bin', 'bin', 'bin', 'bin', 'bin', 'test', 'test'])
+        self.assertEqual([entry['target'] for entry in report['artifacts'] if entry['kind'] == 'bin'],
+                         ['rootyard', 'rootyard-vfs-mount', 'rootyard-pando-lab', *AUTO_BINS])
 
     def test_previous_batch_receipts_are_replaced_atomically(self):
         args = self.args()
@@ -718,7 +780,7 @@ class BatchTest(unittest.TestCase):
         self.assert_failure(self.default_events(tests=TESTS[:1]), 'did not report the requested test artifacts')
 
     def test_missing_binary_artifact_is_rejected(self):
-        events = [artifact('lib', 'rootyard')] + self.default_events(bins=())[1:]
+        events = [artifact('lib', 'rootyard')] + self.default_events(bins=(), implicit=False)[1:]
         self.assert_failure(events, 'did not report the requested binaries')
 
     def test_duplicate_and_extra_artifacts_are_rejected(self):
@@ -736,7 +798,7 @@ class BatchTest(unittest.TestCase):
         self.assert_failure(events, 'has no executable path')
         events = self.default_events()
         events[1] = artifact('bin', 'rootyard', executable=str(self.root / 'elsewhere' / 'rootyard'))
-        self.assert_failure(events, 'does not match')
+        self.assert_failure(events, 'not at its canonical location')
 
     def test_foreign_package_artifacts_are_skipped_not_receipted(self):
         # Real Cargo reports the dependency it rebuilt before the selected
@@ -749,7 +811,7 @@ class BatchTest(unittest.TestCase):
         report = self.build(events=events)
         recorded = report['build']['fresh_false_artifacts']
         self.assertEqual([(item['kind'], item['target']) for item in recorded],
-                         [('lib', 'rootyard')] + [('bin', name) for name in BINS])
+                         [('lib', 'rootyard')] + [('bin', name) for name in BINS + AUTO_BINS])
         self.assertTrue(all(item['package_id'] == PACKAGE_ID for item in recorded))
         receipt = json.loads((self.target / 'debug' / 'rootyard.build.json').read_text())
         self.assertEqual(receipt['fresh_false_artifacts'], recorded)
@@ -757,6 +819,7 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(
             sorted(Path(entry['receipt']).resolve() for entry in report['artifacts']),
             sorted([(self.target / 'debug' / (name + '.build.json')).resolve() for name in BINS] +
+                   [path.resolve() for path in self.implicit_receipts(BINS, TESTS)] +
                    [(self.outdir / (name.replace('_', '-') + '.build.json')).resolve() for name in TESTS]))
         self.assertFalse(list(self.outdir.rglob('*depcrate*.build.json')))
 
@@ -771,7 +834,7 @@ class BatchTest(unittest.TestCase):
         lib, bins, tests, skipped = batch.artifact_index(events, PACKAGE_ID)
         self.assertEqual(lib, {'target': 'rootyard', 'kind': 'lib', 'fresh': False,
                                'package_id': PACKAGE_ID})
-        self.assertEqual(sorted(bins), sorted(BINS))
+        self.assertEqual(sorted(bins), sorted(BINS + AUTO_BINS))
         self.assertEqual(sorted(tests), sorted(TESTS))
         self.assertEqual(skipped, {foreign: 3})
         self.assertTrue(all(item['package_id'] == PACKAGE_ID
@@ -789,7 +852,7 @@ class BatchTest(unittest.TestCase):
         report = self.build(events=fresh_foreign)
         self.assertEqual([(item['kind'], item['target'], item['fresh'])
                           for item in report['build']['fresh_false_artifacts']],
-                         [('lib', 'rootyard', False)] + [('bin', name, False) for name in BINS])
+                         [('lib', 'rootyard', False)] + [('bin', name, False) for name in BINS + AUTO_BINS])
         # Duplicate, unexpected-kind, renamed-lib and Fresh=true artifacts of
         # the selected package stay fatal even when a foreign event is present.
         foreign_lib = artifact('lib', 'depcrate', package=foreign)
@@ -806,8 +869,14 @@ class BatchTest(unittest.TestCase):
         stale_bin.insert(-1, foreign_lib)
         self.assert_failure(stale_bin, 'Fresh rootyard artifact of rootyard')
         # A selected bin is still required when only a foreign lib was reported.
-        missing_bin = [foreign_lib] + self.default_events(bins=BINS[1:])
+        missing_bin = [foreign_lib] + self.default_events(bins=BINS[1:], implicit=False)
         self.assert_failure(missing_bin, 'did not report the requested binaries')
+        # An implicit build (the tests are selected) cannot fill a requested
+        # bin's slot: only the requested bins plus enabled metadata bins pass.
+        implicit_missing = [artifact('lib', 'rootyard')] + \
+            [artifact('bin', name, executable=self.binary(name)) for name in BINS[1:]] + \
+            [artifact('test', name, executable=self.compiled_test(name)) for name in TESTS] + [finished()]
+        self.assert_failure(implicit_missing, 'did not report the requested binaries: rootyard')
 
     def test_harness_false_test_is_classified_by_kind_not_profile_test(self):
         # Real Cargo 1.99.1 for a [[test]] harness = false fixture: target
@@ -944,6 +1013,9 @@ class BatchTest(unittest.TestCase):
         with self.assertRaises(batch.BuildError) as caught:
             batch.run_batch(args)
         self.assertIn(message, str(caught.exception))
+        # Metadata was read before planning (no other probe beyond it is
+        # needed to refuse); no clean or build ran.
+        self.assertGreaterEqual(len(self.metadata_calls), 1)
         self.assertEqual(self.clean_calls(), [])
         self.assertEqual(self.popen_calls, [])
 
@@ -952,7 +1024,14 @@ class BatchTest(unittest.TestCase):
         self.planning_failure(self.args(tests=(TESTS[0], TESTS[0]),
                                         outputs=[str(self.outdir / 'a'), str(self.outdir / 'b')]), 'repeats')
         self.planning_failure(self.args(features='pando-lab,nope'), 'unknown features')
-        self.planning_failure(self.args(features=None), 'requires features pando-lab')
+        # pando-lab is an empty feature, so the [[bin]] gate is exercised as a plan.
+        without_lab = batch.parse_cargo_toml(CARGO_TOML.replace('required-features = ["pando-lab"]',
+                                                                'required-features = ["state-redis"]'))
+        no_pando_lab = without_lab['features'].pop('pando-lab')
+        self.assertEqual(no_pando_lab, [])
+        with self.assertRaises(batch.BuildError) as caught:
+            batch.plan_batch(self.args(bins=BINS, features='kafka-wake'), without_lab)
+        self.assertIn('bin rootyard-pando-lab requires features state-redis', str(caught.exception))
         self.planning_failure(self.args(features='pando-lab --release'), 'comma-separated')
         empty = self.args(tests=(), outputs=[], bins=(), all_bins=False)
         self.planning_failure(empty, 'sel')
@@ -961,10 +1040,10 @@ name = "rootyard-view-lab"
 path = "src/bin/rootyard-view-lab.rs"
 
 [dependencies]''')
+        # For the TOML parser a lab is just a `[[bin]]`; whether it exists as a
+        # target is metadata's answer (the metadata tests below cover it).
         manifest = batch.parse_cargo_toml(cargo)
-        with self.assertRaises(batch.BuildError) as caught:
-            batch.plan_batch(self.args(bins=('rootyard-view-lab',)), manifest)
-        self.assertIn('not built here', str(caught.exception))
+        self.assertIn('rootyard-view-lab', {entry['name'] for entry in manifest['bins']})
         self.planning_failure(self.args(bins=('no-such-bin',)), 'not a bin target')
 
     def test_outputs_must_be_outside_target_unique_and_one_per_test(self):
@@ -975,17 +1054,222 @@ path = "src/bin/rootyard-view-lab.rs"
         self.planning_failure(self.args(tests=(), outputs=[], bins=(), all_bins=False), 'select at least one')
 
     def test_missing_test_source_is_rejected(self):
-        self.planning_failure(self.args(tests=('no_such_integration_test',),
-                                        outputs=[str(self.outdir / 'x')]), 'integration-test source is missing')
+        # metadata lists it (the fixture file exists) but the source is gone.
+        (self.root / 'tests' / (TESTS[1] + '.rs')).unlink()
+        self.planning_failure(self.args(tests=(TESTS[1],), outputs=[str(self.outdir / 'x')]),
+                              'integration-test source is missing')
 
-    def test_all_bins_selects_every_bin_with_enabled_features(self):
+    def test_all_bins_selects_every_metadata_bin_with_enabled_features(self):
         args = self.args(all_bins=True, bins=())
-        report = self.build(args=args, events=self.default_events(bins=BINS))
+        report = self.build(args=args)
+        # Every bin metadata lists, auto-discovered labs included, each named
+        # explicitly: nothing is left to Cargo's implicit build.
         self.assertEqual([entry['target'] for entry in report['artifacts'] if entry['kind'] == 'bin'],
-                         ['rootyard', 'rootyard-pando-lab', 'rootyard-vfs-mount'])
+                         list(ALL_BINS))
         self.assertEqual([self.popen_calls[0][0][index + 1] for index, token in
                           enumerate(self.popen_calls[0][0]) if token == '--bin'],
-                         ['rootyard', 'rootyard-pando-lab', 'rootyard-vfs-mount'])
+                         list(ALL_BINS))
+        self.assertEqual({entry['implicit'] for entry in report['artifacts'] if entry['kind'] == 'bin'},
+                         {False})
+
+    # -- the Cargo metadata target set --------------------------------------
+    def test_an_auto_discovered_bin_is_named_from_metadata_not_the_toml(self):
+        # No [[bin]] table names the labs; only cargo metadata does. A --bin for
+        # one is selected like any metadata bin, by its metadata path.
+        args = self.args(bins=('rootyard', 'rootyard-view-lab'), tests=())
+        report = self.build(args=args)
+        self.assertEqual(self.popen_calls[0][0], self.expected_command(args))
+        self.assertIn(['--bin', 'rootyard-view-lab'], [self.popen_calls[0][0][index:index + 2]
+                                                      for index in range(len(self.popen_calls[0][0]))])
+        bin_entries = [entry for entry in report['artifacts'] if entry['kind'] == 'bin']
+        self.assertEqual([entry['target'] for entry in bin_entries], ['rootyard', 'rootyard-view-lab'])
+        self.assertEqual({entry['implicit'] for entry in bin_entries}, {False})
+        self.assertEqual(bin_entries[1]['target_source'], str((self.root / 'src/bin/rootyard-view-lab.rs').resolve()))
+        receipt = json.loads((self.target / 'debug' / 'rootyard-view-lab.build.json').read_text())
+        # A requested lab receipt is a full bin receipt and does not claim to be
+        # the server binary; nothing implicit is folded into it.
+        self.assertNotIn('implicit_build', receipt)
+        self.assertEqual(receipt['binary_sha256'], batch.sha256_file(self.binary('rootyard-view-lab')))
+        self.assertEqual(receipt['batch']['binary'], 'rootyard-view-lab')
+        # Without a --test the command names every bin: nothing extra was built.
+        self.assertEqual(self.clean_calls(), [['cargo', 'clean', '--package', 'rootyard']])
+
+    def test_a_test_selection_accepts_and_receipts_cargo_implicit_bins(self):
+        args = self.args(bins=('rootyard',), tests=TESTS[:1], outputs=[str(self.outdir / 'fixture')])
+        report = self.build(args=args, events=self.default_events(bins=('rootyard',), tests=TESTS[:1]))
+        # The command still names the requested test and no other bin...
+        command = self.popen_calls[0][0]
+        self.assertEqual(command, self.expected_command(args))
+        # ...and Cargo's implicit build of every other enabled metadata bin is
+        # recorded, flagged implicit, at its real executable with Fresh=false.
+        bins = [entry for entry in report['artifacts'] if entry['kind'] == 'bin']
+        self.assertEqual([(entry['target'], entry['implicit']) for entry in bins],
+                         [('rootyard', False)] + [(name, True) for name in ALL_BINS[1:]])
+        implicit = [entry for entry in bins if entry['implicit']]
+        self.assertEqual([entry['target'] for entry in implicit],
+                         ['rootyard-pando-lab', 'rootyard-view-lab', 'rootyard-workspace-lab',
+                          'rootyard-vfs-mount'])
+        for entry in implicit:
+            self.assertIs(entry['fresh'], False)
+            self.assertEqual(entry['artifact'], self.binary(entry['target']))
+            self.assertEqual(entry['target_source'], str((self.root / self.bin_source(entry['target'])).resolve()))
+            receipt = json.loads(Path(entry['receipt']).read_text())
+            # A full, standalone-shaped receipt, stored beside the manifest.
+            for field in ('binary_sha256', 'source_inputs_sha256', 'workspace_commit', 'rustc', 'command'):
+                self.assertTrue(receipt[field], field)
+            self.assertEqual(receipt['rustc'], report['toolchain']['rustc'])
+            self.assertEqual(receipt['command'], report['build']['command'])
+            self.assertEqual(receipt['binary_sha256'], batch.sha256_file(self.binary(entry['target'])))
+            self.assertEqual(receipt['clean_command'], ['cargo', 'clean', '--package', 'rootyard'])
+            self.assertIs(receipt['package_rebuilt'], True)
+            self.assertEqual(receipt['batch']['binary'], entry['target'])
+            self.assertEqual(receipt['fresh_false_artifacts'], report['build']['fresh_false_artifacts'])
+            marker = receipt['implicit_build']
+            self.assertEqual(marker['acceptance'], 'not-server-acceptance')
+            self.assertEqual(marker['requested_by'], '--test')
+            self.assertEqual(marker['target_source'], entry['target_source'])
+            # The lab is recorded as a lab: no receipt calls it the server.
+            self.assertNotEqual(receipt['batch']['binary'], 'rootyard')
+        # One receipt per recorded bin; none of them is the server's name.
+        self.assertEqual(len({str(Path(entry['receipt']).resolve()) for entry in bins}), len(bins))
+        self.assertEqual(bins[0]['receipt'], str(self.target / 'debug' / 'rootyard.build.json'))
+        self.assertEqual([entry['target'] for entry in report['build']['fresh_false_artifacts']],
+                         ['rootyard', 'rootyard'] + list(ALL_BINS[1:]))
+        # A requested bin receipt stays free of the implicit marker.
+        requested = json.loads((self.target / 'debug' / 'rootyard.build.json').read_text())
+        self.assertNotIn('implicit_build', requested)
+
+    def test_implicit_bins_without_a_test_are_rejected(self):
+        # Without a --test every bin is named, so Cargo has no reason to build
+        # another one; accepting it would widen the selection silently.
+        events = self.default_events(bins=BINS, tests=(), implicit=False)
+        events += [artifact('bin', 'rootyard-view-lab', executable=self.binary('rootyard-view-lab'))]
+        self.assert_failure(events, 'binaries that were not selected: rootyard-view-lab',
+                            args=self.args(tests=(), outputs=[]))
+
+    def test_unknown_and_metadata_only_targets_are_rejected(self):
+        self.planning_failure(self.args(bins=('rootyard-ghost-lab',)), 'not a bin target of the rootyard package')
+        # A tests/*.rs file Cargo metadata does not list (autotests = false)
+        # is not a target Cargo can build by that name.
+        self.write('tests/metadata_hidden.rs', '#[test]\nfn hidden() {}\n')
+        self.planning_failure(self.args(tests=('metadata_hidden',), outputs=[str(self.outdir / 'x')]),
+                              'metadata does not list the test target metadata_hidden')
+        # A build-script or tool target is a kind outside this batch.
+        document = json.loads(self.metadata_json())
+        document['packages'][0]['targets'].append(self.metadata_target('custom-build', 'build-script-build',
+                                                                       'build.rs'))
+        self.metadata_document = document
+        with self.assertRaises(batch.BuildError) as caught:
+            batch.run_batch(self.args())
+        self.assertIn('only lib, bin and test targets', str(caught.exception))
+        self.assertEqual(self.clean_calls(), [])
+        self.assertEqual(self.popen_calls, [])
+
+    def test_an_unlisted_bin_artifact_is_an_unknown_extra(self):
+        args = self.args(tests=TESTS[:1], outputs=[str(self.outdir / 'fixture')])
+        # A bin metadata does not list, reported with an implicit bin present.
+        events = self.default_events(bins=('rootyard',), tests=TESTS[:1], implicit=False)
+        events += [artifact('bin', name, executable=self.binary(name)) for name in ALL_BINS[1:]]
+        events.insert(-1, artifact('bin', 'rootyard-sneaky-lab', executable=self.binary('rootyard-sneaky-lab')))
+        self.assert_failure(events, 'that cargo metadata does not list for the rootyard package', args=args)
+        # Without pando-lab the lab is not an enabled metadata bin, so it is
+        # neither selected nor accepted implicitly (the other enabled bins are).
+        report = self.build(events=self.default_events(bins=('rootyard',), tests=TESTS[:1],
+                                                       features='kafka-wake'),
+                            args=self.args(bins=(), tests=TESTS[:1], outputs=[str(self.outdir / 'fixture')],
+                                           features='kafka-wake'))
+        self.assertEqual([entry['target'] for entry in report['artifacts'] if entry['kind'] == 'bin'],
+                         ['rootyard', 'rootyard-view-lab', 'rootyard-workspace-lab', 'rootyard-vfs-mount'])
+
+    def test_a_not_enabled_metadata_bin_is_not_accepted_implicitly(self):
+        # Asking for a bin whose required features this selection lacks is
+        # refused at planning, before any clean or build...
+        self.planning_failure(self.args(bins=('rootyard', 'rootyard-pando-lab'), tests=TESTS[:1],
+                                        outputs=[str(self.outdir / 'fixture')], features='kafka-wake'),
+                              'bin rootyard-pando-lab requires features pando-lab')
+        # Implicitly, it must never slip in: a test-only selection without
+        # pando-lab accepts the other enabled bins and refuses this report.
+        events = self.default_events(bins=('rootyard',), tests=TESTS[:1], implicit=False)
+        events += [artifact('bin', name, executable=self.binary(name))
+                   for name in ALL_BINS[1:] if name != 'rootyard-pando-lab']
+        events.insert(-1, artifact('bin', 'rootyard-pando-lab', executable=self.binary('rootyard-pando-lab')))
+        # A pando-lab artifact in a selection without pando-lab is an unknown
+        # extra, not an implicit bin.
+        self.assert_failure(events, 'binaries that were not selected: rootyard-pando-lab',
+                            args=self.args(bins=(), tests=TESTS[:1], outputs=[str(self.outdir / 'fixture')],
+                                           features='kafka-wake'))
+
+    def test_a_metadata_bin_must_arrive_with_its_metadata_source(self):
+        args = self.args(tests=TESTS[:1], outputs=[str(self.outdir / 'fixture')])
+        events = self.default_events(bins=('rootyard',), tests=TESTS[:1], implicit=False)
+        events += [artifact('bin', name, executable=self.binary(name)) for name in ALL_BINS[1:]]
+        # The name is metadata's, but Cargo reports an artifact built from
+        # another source (e.g. a build script output): not this bin.
+        sneaky = next(index for index, event in enumerate(events)
+                      if event.get('target', {}).get('name') == 'rootyard-view-lab')
+        events[sneaky]['executable'] = str(self.target / 'debug' / 'build' / 'rootyard' / 'out' /
+                                           'rootyard-view-lab')
+        self.assert_failure(events, 'not at its canonical location', args=args)
+
+    def test_missing_fresh_and_duplicate_implicit_bins_are_rejected(self):
+        args = self.args(tests=TESTS[:1], outputs=[str(self.outdir / 'fixture')])
+        fresh = self.default_events(bins=('rootyard',), tests=TESTS[:1])
+        fresh[2] = artifact('bin', 'rootyard-pando-lab', fresh=True, executable=self.binary('rootyard-pando-lab'))
+        self.assert_failure(fresh, 'Fresh rootyard-pando-lab artifact', args=args)
+        duplicate = self.default_events(bins=('rootyard',), tests=TESTS[:1]) + [
+            artifact('bin', 'rootyard-view-lab', executable=self.binary('rootyard-view-lab'))]
+        self.assert_failure(duplicate, 'duplicate', args=args)
+        no_executable = self.default_events(bins=('rootyard',), tests=TESTS[:1])
+        index = next(index for index, event in enumerate(no_executable)
+                     if event['target']['name'] == 'rootyard-workspace-lab')
+        no_executable[index] = artifact('bin', 'rootyard-workspace-lab')
+        self.assert_failure(no_executable, 'has no executable path', args=args)
+        as_unit_test = self.default_events(bins=('rootyard',), tests=TESTS[:1])
+        index = next(index for index, event in enumerate(as_unit_test)
+                     if event['target']['name'] == 'rootyard-workspace-lab')
+        as_unit_test[index] = artifact('bin', 'rootyard-workspace-lab', test_profile=True,
+                                       executable=self.binary('rootyard-workspace-lab'))
+        self.assert_failure(as_unit_test, 'built as a test unit', args=args)
+        # An always-enabled implicit bin simply missing from the stream is not
+        # refused by itself: Cargo may omit a bin unit, and nothing receipted
+        # it. The requested bins and tests stay required.
+        absent = [event for event in self.default_events(bins=('rootyard',), tests=TESTS[:1])
+                  if event.get('target', {}).get('name') != 'rootyard-workspace-lab']
+        report = self.build(args=args, events=absent)
+        self.assertEqual([entry['target'] for entry in report['artifacts'] if entry['kind'] == 'bin'],
+                         ['rootyard', 'rootyard-pando-lab', 'rootyard-vfs-mount', 'rootyard-view-lab'])
+
+    def test_implicit_bin_receipts_are_withdrawn_on_a_late_failure(self):
+        # Receipts of an earlier batch (implicit ones beside the manifest
+        # included) never survive a run that is refused after Cargo built.
+        args = self.args(tests=TESTS[:1], outputs=[str(self.outdir / 'fixture')])
+        self.seed_previous_batch(args)
+        for path in self.implicit_receipts(args.bin, args.test, args.manifest_out):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"stale": true}\n')
+        events = self.default_events(bins=('rootyard',), tests=TESTS[:1])
+        self.assert_failure(events, 'integration-test source',
+                            args=args,
+                            mutate=lambda: (self.root / 'tests' / (TESTS[0] + '.rs')).write_text(
+                                '#[test]\nfn changed() {}\n'))
+
+    def test_metadata_features_gate_autodiscovered_bins_with_the_existing_selection(self):
+        # metadata lists required-features; the batch's own --features /
+        # --no-default-features selection decides whether a bin is enabled.
+        document = json.loads(self.metadata_json())
+        lab = next(target for target in document['packages'][0]['targets']
+                   if target['name'] == 'rootyard-view-lab')
+        lab['required-features'] = ['state-redis']
+        self.metadata_document = document
+        with self.assertRaises(batch.BuildError) as caught:
+            batch.run_batch(self.args(all_bins=True, bins=()))
+        self.assertIn('bin rootyard-view-lab requires features state-redis', str(caught.exception))
+        self.assertEqual(self.popen_calls, [])
+        self.assertEqual(self.clean_calls(), [])
+        # Enabling it makes --all-bins select it, named explicitly.
+        report = self.build(args=self.args(all_bins=True, bins=(), features='pando-lab,state-redis'))
+        self.assertIn('rootyard-view-lab',
+                      [entry['target'] for entry in report['artifacts'] if entry['kind'] == 'bin'])
 
     # -- bound build inputs -------------------------------------------------
     def bound_record(self, with_blobs=False):
@@ -1017,6 +1301,12 @@ path = "src/bin/rootyard-view-lab.rs"
         path = self.root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
+
+    def manifest(self, text=None):
+        """The batch's plan manifest exactly as run_batch derives it (Cargo.toml view + metadata targets)."""
+        if text is not None:
+            (self.root / 'Cargo.toml').write_text(text)
+        return batch.batch_manifest(batch.metadata_record(json.loads(self.metadata_json())))
 
     def assert_run_rejected(self, steps, message, args=None):
         """Run one batch whose launch ``i`` performs ``steps[i]``; it must be refused.
@@ -1051,7 +1341,7 @@ path = "src/bin/rootyard-view-lab.rs"
         mutate()
         # The changed inputs as one pre-run snapshot measures them: the next
         # run's recorded identity must be that of what it compiled.
-        changed_snapshot = batch.source_snapshot(batch.plan_batch(args, batch.parse_cargo_toml(CARGO_TOML)))
+        changed_snapshot = batch.source_snapshot(batch.plan_batch(args, self.manifest()))
         shutil.rmtree(self.target, ignore_errors=True)
         self.assertFalse(self.target.exists())
         clean_before, popen_before = len(self.clean_commands), len(self.popen_calls)
@@ -1233,20 +1523,44 @@ path = "src/bin/rootyard-view-lab.rs"
         self.changed_entry(entries, old_entries, UNTRACKED_HELPER, edited)
     # -- helpers ------------------------------------------------------------
     def test_manifest_parser_reads_features_bins_optional_dependencies(self):
-        manifest = batch.parse_cargo_toml(CARGO_TOML + '\n[[test]]\nname = "declared"\npath = "tests/declared.rs"\n'
-                                          'required-features = ["pando-lab"]\n')
+        manifest = self.manifest()
         self.assertEqual(manifest['default_features'], ['kafka-wake'])
         self.assertEqual(manifest['features']['kafka-wake'], [])
         self.assertEqual(manifest['optional_features'], {})
-        self.assertEqual([entry['name'] for entry in manifest['bins']],
-                         ['rootyard', 'rootyard-pando-lab', 'rootyard-vfs-mount'])
-        self.assertTrue(manifest['bins'][0]['implicit'])
-        self.assertEqual(manifest['bins'][1]['required_features'], ['pando-lab'])
-        self.assertEqual(manifest['tests'], [{'name': 'declared', 'path': 'tests/declared.rs',
-                                              'required_features': ['pando-lab']}])
+        self.assertEqual([entry['name'] for entry in manifest['bins']], list(ALL_BINS))
+        # A bin is declared by [[bin]] (required-features, the manifest naming
+        # it) or by a source outside Cargo's auto-discovery roots; [[bin]]
+        # metadata gives none of these for a bin with no required-features.
+        self.assertFalse(manifest['bins'][0]['declared'])
+        self.assertEqual({entry['name']: entry['required_features'] for entry in manifest['bins']},
+                         {'rootyard': [], 'rootyard-pando-lab': ['pando-lab'],
+                          'rootyard-view-lab': [], 'rootyard-workspace-lab': [], 'rootyard-vfs-mount': []})
+        self.assertFalse(manifest['bins'][2]['declared'])
+        self.assertEqual({entry['name']: entry['declared'] for entry in manifest['bins']},
+                         {'rootyard': False, 'rootyard-pando-lab': True, 'rootyard-view-lab': False,
+                          'rootyard-workspace-lab': False, 'rootyard-vfs-mount': True})
+        # ...and a [[bin]] table that names a bin (or a source outside Cargo's
+        # auto-discovery roots) makes it declared; metadata stays the source.
+        self.write('Cargo.toml', CARGO_TOML.replace('[[bin]]\nname = "rootyard-vfs-mount"',
+                                                    '[[bin]]\nname = "rootyard-view-lab"'))
+        named = self.manifest()
+        self.assertEqual({entry['name']: entry['declared'] for entry in named['bins']},
+                         {'rootyard': False, 'rootyard-pando-lab': True, 'rootyard-view-lab': True,
+                          'rootyard-workspace-lab': False, 'rootyard-vfs-mount': False})
+        self.write('Cargo.toml', CARGO_TOML)
+        # A [[test]] table Cargo metadata reports with its required-features.
+        self.write('Cargo.toml', CARGO_TOML + '\n[[test]]\nname = "declared"\npath = "tests/declared.rs"\n'
+                   'required-features = ["pando-lab"]\n')
+        document = json.loads(self.metadata_json())
+        document['packages'][0]['targets'].append(
+            self.metadata_target('test', 'declared', 'tests/declared.rs', ['pando-lab']))
+        with_test = batch.batch_manifest(batch.metadata_record(document))
+        declared = next(entry for entry in with_test['tests'] if entry['name'] == 'declared')
+        self.assertEqual((declared['source'], declared['required_features']),
+                         (str(self.root / 'tests/declared.rs'), ['pando-lab']))
 
     def test_optional_dependency_without_explicit_feature_fails_closed(self):
-        manifest = batch.parse_cargo_toml(CARGO_TOML.replace('kafka-wake = ["dep:rdkafka"]', 'kafka-wake = []'))
+        manifest = self.manifest(CARGO_TOML.replace('kafka-wake = ["dep:rdkafka"]', 'kafka-wake = []'))
         self.assertEqual(manifest['optional_features'], {'rdkafka': 'rdkafka'})
         with self.assertRaises(batch.BuildError) as caught:
             batch.plan_batch(self.args(), manifest)

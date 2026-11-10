@@ -17,6 +17,26 @@ property of those two transactions but pays for the clean once:
   ``--test`` in one invocation, so the application binaries and the selected
   integration tests come from one compiler run (``cargo rustc --profile
   test`` takes a single target and cannot);
+* the bin and test target set is Cargo's own: one
+  ``cargo metadata --no-deps`` is the authority for the ``rootyard`` package's
+  targets, their paths and their ``required-features``, so a bin Cargo
+  auto-discovers from ``src/bin/*.rs`` is selected exactly like a ``[[bin]]``.
+  ``--all-bins`` builds every metadata bin whose required features are enabled
+  by this batch's ``--features``/``--no-default-features``; a ``--bin`` or
+  ``--test`` name Cargo does not list for the package is refused;
+* with any ``--test`` selected, Cargo also builds the other enabled bins of the
+  package *without* a ``--bin`` flag of its own (an implicit build: a bin
+  integration test runs through its package's bins). Each such bin is accepted
+  only when metadata confirms it exists in this package, requires nothing this
+  selection lacks, is reported Fresh=false with its own executable at
+  ``<canonical target>/debug/<name>``, and is typed ``bin`` by Cargo. It gets
+  the same full bin receipt as a requested bin and is marked ``implicit`` in
+  that receipt and in the manifest instead of a receipt path; any other
+  unselected bin artifact is still refused. Without a ``--test`` the command
+  names every bin, so Cargo builds no extra bin and only requested bins are
+  accepted. ``rootyard-view-lab`` and ``rootyard-workspace-lab`` are such
+  bins: compiling them is part of this package's build, but installing them is
+  not acceptance of the ``rootyard`` server, and their receipts say so;
 * Cargo events are filtered by package: artifacts of the selected rootyard
   package are indexed by their real ``target.kind`` (``lib``/``bin``/``test``),
   name, executable and profile; artifacts of dependencies Cargo happens to
@@ -58,7 +78,10 @@ property of those two transactions but pays for the clean once:
   ``native_report_manifest.py``, ``NativeProfile`` (``blob_only_service.py``)
   and the RefStore backup drills accept them unchanged. ``command`` is the
   exact one cargo invocation and ``clean_command`` the single clean, so no
-  receipt pretends each artifact was cleaned and built on its own;
+  receipt pretends each artifact was cleaned and built on its own. A bin Cargo
+  built implicitly alongside a selected test also carries ``implicit_build``:
+  it is a real artifact of this package's build, but not one this batch
+  requested, and the batch records it rather than dropping it;
 * receipts and the batch manifest are published only after *all* requirements
   hold and the sources are still unchanged, each by one ``os.replace`` of its
   own staged sibling onto its own destination; a failure removes every
@@ -105,11 +128,8 @@ def _root():
 
 
 NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]{0,127}$')
-IDENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_-]*$')
 PACKAGE = 'rootyard'
 DEFAULT_BIN = 'rootyard'
-#: Program names ``src/main.rs`` dispatches on that are deliberately not built here.
-KNOWN_FORBIDDEN_BINS = ('rootyard-view-lab', 'rootyard-workspace-lab')
 KIND = 'rootyard/native-build-batch'
 RECEIPT_VERSION = 1
 MANIFEST_NAME = 'rootyard-native-build-batch.json'
@@ -297,7 +317,76 @@ def enabled_features(manifest, args):
     return enabled
 
 
+#: Cargo's auto-discovery roots for bins that no ``[[bin]]`` names
+#: (``src/main.rs`` and ``src/bin/*.rs``/``src/bin/*/main.rs``). They are
+#: defaults, not the target set: ``cargo metadata`` decides what exists, here
+#: including ``rootyard-view-lab`` and ``rootyard-workspace-lab`` (opt-in local
+#: experiments, not network services). Those labs are real bin artifacts of
+#: this package's build and are recorded as such, but a receipt for a lab is
+#: not acceptance of ``rootyard``: only ``rootyard`` (``src/main.rs``) is the
+#: server binary.
+AUTODISCOVERED_BIN_SOURCES = ('src/main.rs', 'src/bin')
+
+
+def metadata_targets(document):
+    """The rootyard package's targets as ``cargo metadata`` lists them, in Cargo's order.
+
+    ``document`` is what :func:`cargo_metadata` returns; each target keeps the
+    kind, name, canonical source path and ``required-features`` Cargo reports,
+    so an auto-discovered ``src/bin/*.rs`` bin is a target exactly like a
+    ``[[bin]]`` one. A bin is marked ``declared`` when a ``[[bin]]`` table or a
+    build script must have produced it (it has required-features, the manifest
+    names it, or its source is outside Cargo's auto-discovery roots); every
+    other bin was auto-discovered. Non-lib/bin/test kinds are refused here.
+    """
+    root = _root().resolve()
+    targets = []
+    for raw in document.get('targets') or []:
+        kinds = list(raw.get('kind') or [])
+        name, source = raw.get('name'), raw.get('src_path')
+        if len(kinds) != 1 or not name or not source:
+            raise BuildError('cargo metadata listed a target this batch cannot bind: ' + repr(name))
+        if kinds[0] not in ('lib', 'bin', 'test'):
+            raise BuildError('cargo metadata listed a ' + kinds[0] + ' target ' + name +
+                             '; this batch builds only lib, bin and test targets')
+        source = Path(source).resolve()
+        autodiscovered = source == root / AUTODISCOVERED_BIN_SOURCES[0] or \
+            (root / AUTODISCOVERED_BIN_SOURCES[1]) in source.parents
+        targets.append({'kind': kinds[0], 'name': name, 'source': str(source),
+                        'required_features': [str(feature) for feature in raw.get('required-features') or []],
+                        'declared': kinds[0] != 'bin' or bool(raw.get('required-features')) or
+                        not autodiscovered or _named_by_manifest(name)})
+    return targets
+
+
+def _named_by_manifest(name):
+    """Whether a ``[[bin]]`` table in Cargo.toml names ``name``.
+
+    Cargo reports a ``[[bin]]`` bin and a build-script bin with the same
+    fields; only the manifest text tells them apart. This looks for the name
+    inside ``[[bin]]`` tables and never interprets them (``required-features``
+    and the source path stay ``cargo metadata``'s). Without a Cargo.toml to
+    read the bin counts as declared, the conservative side: it is never
+    accepted implicitly.
+    """
+    path = _root() / 'Cargo.toml'
+    if not path.is_file():
+        return True
+    section = None
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith('[') and stripped.endswith(']'):
+            section = stripped[1:-1].strip()
+            continue
+        key, separator, value = stripped.partition('=')
+        if section == '[bin]' and separator and key.strip() == 'name' and \
+                value.strip().strip('"') == name:
+            return True
+    return False
+
+
 def bin_specs_for(manifest, args):
+    """The requested bins, from the metadata target list and this batch's features."""
     enabled = enabled_features(manifest, args)
     bins = unique_identifiers(args.bin, '--bin')
     if args.all_bins and bins:
@@ -309,32 +398,36 @@ def bin_specs_for(manifest, args):
     else:
         for name in bins:
             if name not in listed:
-                raise BuildError(name + ' is not a bin target of the rootyard package')
+                raise BuildError(name + ' is not a bin target of the rootyard package (cargo metadata lists: ' +
+                                 ', '.join(sorted(listed)) + ')')
             selected.append(listed[name])
     for entry in selected:
         if not set(entry['required_features']) <= enabled:
             raise BuildError('bin ' + entry['name'] + ' requires features ' +
                              ', '.join(entry['required_features']))
-        if entry['name'] in KNOWN_FORBIDDEN_BINS:
-            raise BuildError(entry['name'] + ' is not built here; it needs its own toolchain/profile and '
-                             'cannot share this batch')
     return selected
 
 
 def test_specs_for(manifest, args):
+    """The requested integration tests, from the metadata test targets only.
+
+    Cargo builds an integration test by target name from ``cargo metadata``
+    (an implicit ``tests/<name>.rs`` is such a target unless ``autotests`` or
+    a ``[[test]]`` table removes it), so a ``tests/*.rs`` file metadata does
+    not list is refused rather than guessed at.
+    """
     enabled = enabled_features(manifest, args)
     listed = {entry['name']: entry for entry in manifest['tests']}
     specs = []
     for name in unique_identifiers(args.test, '--test'):
-        if name in listed:
-            if not set(listed[name]['required_features']) <= enabled:
-                raise BuildError('test ' + name + ' requires features ' +
-                                 ', '.join(listed[name]['required_features']))
-            specs.append({'name': name, 'source': _root() / listed[name]['path'], 'declared': True})
-            continue
-        if not IDENT.match(name):
-            raise BuildError(name + ' is neither a declared test target nor a tests/*.rs file')
-        specs.append({'name': name, 'source': _root() / 'tests' / (name + '.rs'), 'declared': False})
+        if name not in listed:
+            raise BuildError('cargo metadata does not list the test target ' + name + ' for the ' + PACKAGE +
+                             ' package (it lists: ' + ', '.join(sorted(listed)) + ')')
+        if not set(listed[name]['required_features']) <= enabled:
+            raise BuildError('test ' + name + ' requires features ' +
+                             ', '.join(listed[name]['required_features']))
+        specs.append({'name': name, 'source': Path(listed[name]['source']), 'declared': True,
+                      'implicit': False})
     for spec in specs:
         if not spec['source'].is_file():
             raise BuildError('integration-test source is missing: ' + str(spec['source']))
@@ -372,6 +465,37 @@ class Plan:
     tests: list
     outputs: list
     manifest_out: Path
+    #: Enabled metadata bins no ``--bin``/``--all-bins`` requested.
+    implicit_bins: list
+    #: Metadata bin names that ``--bin``/``--all-bins`` may have received.
+    requested_bin_names: tuple
+
+
+def enabled_bins(manifest, args):
+    """Every metadata bin whose required-features the batch's own selection enables."""
+    enabled = enabled_features(manifest, args)
+    return [entry for entry in manifest['bins'] if set(entry['required_features']) <= enabled]
+
+
+def implicit_bins_for(manifest, args):
+    """Enabled metadata bins Cargo also builds when ``--test`` selects tests.
+
+    With any ``--test`` the invocation names no bin, and Cargo builds the other
+    enabled bins of the selected package as a side effect (an integration test
+    runs its package's binaries). That set is exactly the metadata bins whose
+    required-features this selection enables (:func:`enabled_bins`) and which
+    were not requested; everything else Cargo may report as a bin is unknown
+    and refused later. For this package that includes the auto-discovered
+    ``rootyard-view-lab`` and ``rootyard-workspace-lab``: they are compiled
+    into ``target/debug`` like any bin artifact, but a receipt for them
+    (marked ``implicit_build``) does not accept them as the ``rootyard``
+    server.
+    """
+    if not args.test:
+        return []
+    requested = {entry['name'] for entry in manifest['bins']} \
+        if args.all_bins else set(unique_identifiers(args.bin, '--bin'))
+    return [entry for entry in enabled_bins(manifest, args) if entry['name'] not in requested]
 
 
 def resolve_output(raw):
@@ -383,7 +507,9 @@ def plan_batch(args, manifest):
     """Validate one batch request completely before any Cargo command runs."""
     if args.features and not FEATURES.match(args.features):
         raise BuildError('--features must be comma-separated Rust feature identifiers')
-    bin_specs = bin_specs_for(manifest, args)
+    # Explicit requests are validated whether or not --test is given: a bin
+    # this selection cannot enable is refused here, not mistaken for implicit.
+    bin_specs = bin_specs_for(manifest, args) if args.bin or args.all_bins else []
     test_specs = test_specs_for(manifest, args)
     if not bin_specs and not test_specs:
         raise BuildError('select at least one --bin, --test or --all-bins')
@@ -427,8 +553,11 @@ def plan_batch(args, manifest):
     manifest_out = manifest_out if manifest_out.suffix == '.json' else manifest_out / MANIFEST_NAME
     if manifest_out == target or target in manifest_out.parents:
         raise BuildError('--manifest-out must be outside CARGO_TARGET_DIR')
+    implicit = implicit_bins_for(manifest, args)
+    requested_names = tuple(entry['name'] for entry in manifest['bins']) if args.all_bins else \
+        tuple(spec['name'] for spec in bin_specs)
     return Plan(Selection(args.features, args.no_default_features, args.package_debug, args.strip_debuginfo),
-                bin_specs, test_specs, outputs, manifest_out)
+                bin_specs, test_specs, outputs, manifest_out, implicit, requested_names)
 
 
 # -- Cargo events -------------------------------------------------------------
@@ -487,7 +616,7 @@ def _profile(event):
                                                'overflow_checks', 'test')}
 
 
-def artifact_index(events, package):
+def artifact_index(events, package, binaries=()):
     """Index the fresh=False lib/bin/test compiler artifacts of exactly one selected package.
 
     Cargo reports every unit it built or found fresh in this invocation, so a
@@ -499,8 +628,12 @@ def artifact_index(events, package):
     dependency is Cargo's own concern, not a receipt for a selected target),
     so it is skipped rather than failed on. Inside the selected package the
     checks stay closed: any Fresh=true selected artifact, a lib other than
-    the package-named one, a duplicate, a kind other than lib/bin/test, or a
-    bin/test without an executable is rejected.
+    the package-named one, a duplicate, a kind other than lib/bin/test, a
+    bin/test without an executable, or a bin the event lists as ``test``
+    (which Cargo would run as a unit test) is rejected. When ``binaries``
+    (the metadata bins) is given, a bin artifact must be one of them and its
+    source path must be that bin's: Cargo cannot mean another program by a
+    known name.
 
     ``target.kind`` (``["test"]``) is the classification of a target, not
     ``profile.test``: a ``harness = false`` integration test has kind
@@ -511,6 +644,7 @@ def artifact_index(events, package):
     lib = None
     bins, tests = {}, {}
     skipped = {}
+    binaries = {entry['name']: entry for entry in binaries}
     for event in events:
         if event.get('reason') != 'compiler-artifact':
             continue
@@ -535,9 +669,20 @@ def artifact_index(events, package):
                 raise BuildError(f'{PACKAGE} binary artifact {name} has no executable path')
             if not name or name in bins:
                 raise BuildError(f'Cargo reported a duplicate or unnamed {PACKAGE} bin artifact: {name!r}')
-            bins[name] = {'target': name, 'kind': 'bin', 'fresh': False,
-                          'executable': str(Path(executable).resolve()),
-                          'package_id': event.get('package_id'), 'profile': _profile(event)}
+            if event.get('profile', {}).get('test') is not False:
+                raise BuildError(f'{PACKAGE} bin artifact {name} was built as a test unit, not the binary')
+            record = {'target': name, 'kind': 'bin', 'fresh': False,
+                      'executable': str(Path(executable).resolve()),
+                      'package_id': event.get('package_id'), 'profile': _profile(event)}
+            if binaries:
+                if name not in binaries:
+                    raise BuildError('Cargo reported binary ' + name + ' that cargo metadata does not list for '
+                                     'the ' + PACKAGE + ' package')
+                if str(Path(executable).resolve().with_suffix('')) != str(canonical_target() / 'debug' / name):
+                    raise BuildError('binary ' + name + ' was built at ' + str(executable) +
+                                     ', not at its canonical location')
+                record['source'] = binaries[name]['source']
+            bins[name] = record
         elif kinds == ['test']:
             executable = event.get('executable')
             if not executable:
@@ -562,22 +707,32 @@ def require_build_finished(events):
         raise BuildError('Cargo did not report exactly one successful build-finished event')
 
 
-def select_artifacts(events, package, bin_specs, test_specs):
-    """Return ``(lib, [bin artifacts], [test artifacts])`` for exactly the selected targets.
+def select_artifacts(events, package, plan, binaries=()):
+    """Return ``(lib, [(bin artifact, implicit)], [test artifacts])`` for the real targets.
 
     Foreign-package artifacts (dependencies Cargo rebuilt alongside the
     selected package) are skipped by artifact_index and never receipted.
+    Requested, enabled metadata bins come first (in selection order), then the
+    implicit ones Cargo also built for a ``--test`` in metadata order; a bin
+    that is in neither set is an unknown extra and fails the batch. Every
+    selected bin is bound to its canonical ``<target>/debug/<name>`` path.
     """
-    lib, bins, tests, _ = artifact_index(events, package)
+    bin_specs, test_specs = plan.bins, plan.tests
+    lib, bins, tests, _ = artifact_index(events, package, binaries)
     require_build_finished(events)
     wanted_bins = [spec['name'] for spec in bin_specs]
     missing = [name for name in wanted_bins if name not in bins]
     if missing:
         raise BuildError('Cargo did not report the requested binaries: ' + ', '.join(missing))
-    extra = sorted(set(bins) - set(wanted_bins))
-    if extra:
-        raise BuildError('Cargo reported binaries that were not selected: ' + ', '.join(extra))
-    selected_bins = [bins[name] for name in wanted_bins]
+    unknown = sorted(set(bins) - set(wanted_bins) - {spec['name'] for spec in plan.implicit_bins})
+    if unknown:
+        raise BuildError('Cargo reported binaries that were not selected: ' + ', '.join(unknown))
+    selected = [(bins[name], False) for name in wanted_bins]
+    # An implicit bin is only accepted when Cargo built it here: after a clean
+    # every enabled bin unit is rebuilt, so a Fresh=false bin event is Cargo's
+    # own report of the implicit build, not an inspection this batch lacks.
+    selected += [(bins[spec['name']], True) for spec in plan.implicit_bins if spec['name'] in bins]
+    selected_bins = [artifact for artifact, _ in selected]
     for artifact in selected_bins:
         expected = str(canonical_target() / 'debug' / artifact['target'])
         if artifact['executable'] != expected:
@@ -600,7 +755,7 @@ def select_artifacts(events, package, bin_specs, test_specs):
         if not Path(artifact['executable']).is_file():
             raise BuildError('built test executable is missing: ' + artifact['executable'])
         selected_tests.append(artifact)
-    return lib, selected_bins, selected_tests
+    return lib, selected, selected_tests
 
 
 class Publisher:
@@ -694,10 +849,22 @@ def verified_copy(source, destination):
 
 
 def cargo_metadata():
+    """The Cargo metadata document this batch plans and verifies from.
+
+    It is the authority for the package id, the target directory the lock
+    covers, and the ``rootyard`` targets (bins included: auto-discovery is
+    Cargo's, not this script's). Cargo's own resolution is used (no extra
+    ``--config``), exactly as before; the document is read once when the
+    batch is planned and once after the build, under the lock.
+    """
     output = subprocess.check_output(
         ['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1', '--offline'],
         cwd=_root(), text=True)
-    metadata = json.loads(output)
+    return metadata_record(json.loads(output))
+
+
+def metadata_record(metadata):
+    """``(target_directory, package_id, targets)`` of the one rootyard package, from one document."""
     packages = [package for package in metadata.get('packages') or [] if package.get('name') == PACKAGE]
     if len(packages) != 1 or not packages[0].get('id'):
         raise BuildError('cargo metadata does not list exactly one rootyard package')
@@ -705,7 +872,29 @@ def cargo_metadata():
     if resolved.resolve() != canonical_target():
         raise BuildError('cargo resolved target directory ' + str(resolved) + ' but the build lock is in ' +
                          str(canonical_target()) + '; the build would not be serialized by this lock')
-    return {'target_directory': metadata.get('target_directory'), 'package_id': packages[0]['id']}
+    return {'target_directory': metadata.get('target_directory'), 'package_id': packages[0]['id'],
+            'targets': packages[0].get('targets')}
+
+
+def batch_manifest(document):
+    """The Cargo.toml feature/optional-dependency view, with Cargo's target list.
+
+    Target names, paths and required-features come from metadata; the
+    features and optional dependencies the batch gates on still come from
+    ``parse_cargo_toml`` (metadata lists neither).
+    """
+    manifest = parse_cargo_toml((_root() / 'Cargo.toml').read_text())
+    targets = metadata_targets(document)
+    if len({entry['name'] for entry in targets if entry['kind'] == 'bin'}) != \
+            sum(1 for entry in targets if entry['kind'] == 'bin'):
+        raise BuildError('cargo metadata lists two bins of the ' + PACKAGE + ' package with one name')
+    for entry in targets:
+        if entry['kind'] in ('bin', 'test') and not Path(entry['source']).is_relative_to(_root().resolve()):
+            raise BuildError(entry['kind'] + ' target ' + entry['name'] + ' has a source outside the workspace: ' +
+                             entry['source'])
+    manifest['bins'] = [entry for entry in targets if entry['kind'] == 'bin']
+    manifest['tests'] = [entry for entry in targets if entry['kind'] == 'test']
+    return manifest
 
 
 # -- bound build inputs -------------------------------------------------------
@@ -970,8 +1159,14 @@ def toolchain_record(selection):
             **selection.as_record(), 'architecture': host_architecture()}
 
 
-def binary_receipt(*, path, digests, toolchain, command, targets, lock_path, timings, bound):
-    """The ``build_native.py`` receipt fields, bound to this batch's single build."""
+def binary_receipt(*, path, digests, toolchain, command, targets, lock_path, timings, bound,
+                   implicit=None):
+    """The ``build_native.py`` receipt fields, bound to this batch's single build.
+
+    ``implicit`` (``None`` for a requested bin) is the ``implicit_build``
+    record of a bin Cargo also built for a selected test: a real artifact of
+    this build that was neither requested nor part of the server acceptance.
+    """
     path = Path(path)
     return {
         'version': RECEIPT_VERSION,
@@ -1006,6 +1201,7 @@ def binary_receipt(*, path, digests, toolchain, command, targets, lock_path, tim
         'batch': {'kind': KIND, 'receipt_version': RECEIPT_VERSION, 'binary': path.name,
                   'targets': [item['target'] for item in targets],
                   'bound_inputs_sha256': bound['bound_inputs']['digest']},
+        **({'implicit_build': implicit} if implicit is not None else {}),
     }
 
 
@@ -1043,14 +1239,17 @@ def test_receipt(*, path, artifact, digests, toolchain, command, targets, lock_p
 def run_batch(args):
     """Run the whole transaction and return the published batch manifest."""
     reject_passthrough_environment()
-    manifest = parse_cargo_toml((_root() / 'Cargo.toml').read_text())
+    # The target set is Cargo's: the metadata document is read before the
+    # request is planned, so --all-bins, a --bin name, a --test that is a
+    # metadata test and the implicit bins all come from one target list.
+    metadata_before = cargo_metadata()
+    manifest = batch_manifest(metadata_before)
     plan = plan_batch(args, manifest)
     selection = plan.selection
     target = canonical_target()
     started = time.monotonic()
 
     prepare_destinations(plan)
-    metadata_before = cargo_metadata()
     toolchain = toolchain_record(selection)
     command = emit_command(selection)
     for spec in plan.bins:
@@ -1063,10 +1262,13 @@ def run_batch(args):
         command += ['--no-default-features']
     command += ['--message-format=json-render-diagnostics']
 
-    bin_receipts = [(spec, target / 'debug' / (spec['name'] + '.build.json')) for spec in plan.bins]
+    # Requested bins keep their receipts at <target>/debug/<bin>.build.json;
+    # an implicitly built bin's receipt (it has no slot in that fixed
+    # scheme) is filed with the batch manifest instead of being dropped.
+    bin_receipts = bin_receipt_locations(plan, target)
     test_receipts = list(zip(plan.tests, plan.outputs, [Path(str(output) + '.build.json')
                                                         for output in plan.outputs]))
-    owned = [path for _, path in bin_receipts] + [path for _, _, path in test_receipts] + \
+    owned = [path for _, path, _ in bin_receipts] + [path for _, _, path in test_receipts] + \
         [plan.manifest_out] + list(plan.outputs)
     with build_lock(target) as lock_path:
         # A failed or interrupted batch never leaves a receipt, manifest or
@@ -1083,22 +1285,34 @@ def run_batch(args):
             raise
 
 
+def bin_receipt_locations(plan, target):
+    """``(spec, receipt path, implicit)`` for every bin receipt of one batch, in plan order."""
+    requested = [(spec, target / 'debug' / (spec['name'] + '.build.json'), False) for spec in plan.bins]
+    directory = plan.manifest_out.parent / (plan.manifest_out.stem + '.receipts')
+    implicit = [(spec, directory / (spec['name'] + '.build.json'), True) for spec in plan.implicit_bins]
+    return requested + implicit
+
+
 def publish_transaction(plan, owned, lock_path, metadata_before, toolchain, command, started):
     """Clean, build, verify and publish one batch; it runs under the canonical lock."""
     selection = plan.selection
     target = canonical_target()
     # Bin receipts stay in CARGO_TARGET_DIR (the single clean was the only
-    # destructive step on it); test receipts sit beside their relocated output.
-    bin_receipts = [(spec, target / 'debug' / (spec['name'] + '.build.json')) for spec in plan.bins]
+    # destructive step on it), implicitly built bins' beside the manifest, and
+    # test receipts beside their relocated output.
+    locations = bin_receipt_locations(plan, target)
+    bin_receipts = [(spec, path) for spec, path, _ in locations]
     test_receipts = list(zip(plan.tests, plan.outputs, [Path(str(output) + '.build.json')
                                                         for output in plan.outputs]))
     # ``owned`` is every final path of this transaction, in the order run_batch
-    # names them: bin receipts, test receipts, the manifest, then the outputs.
-    assert bin_receipts == list(zip(plan.bins, owned[:len(plan.bins)]))
+    # names them: bin receipts (requested, then implicit), test receipts, the
+    # manifest, then the outputs.
+    assert bin_receipts == list(zip(plan.bins + plan.implicit_bins, owned[:len(locations)]))
+    bins_count = len(locations)
     assert test_receipts == list(zip(plan.tests, plan.outputs,
-                                     owned[len(plan.bins):len(plan.bins) + len(plan.tests)]))
-    assert owned[len(plan.bins) + len(plan.tests)] == plan.manifest_out
-    assert owned[len(plan.bins) + len(plan.tests) + 1:] == list(plan.outputs)
+                                     owned[bins_count:bins_count + len(plan.tests)]))
+    assert owned[bins_count + len(plan.tests)] == plan.manifest_out
+    assert owned[bins_count + len(plan.tests) + 1:] == list(plan.outputs)
     before = source_snapshot(plan)
     clean_started = time.monotonic()
     subprocess.run(CLEAN_COMMAND, cwd=_root(), check=True)
@@ -1108,10 +1322,14 @@ def publish_transaction(plan, owned, lock_path, metadata_before, toolchain, comm
     build_seconds = round(time.monotonic() - build_started, 3)
     after = source_snapshot(plan)
     require_unchanged(before, after)
-    lib, bins, tests = select_artifacts(events, metadata_before['package_id'], plan.bins, plan.tests)
+    lib, bins, tests = select_artifacts(events, metadata_before['package_id'], plan,
+                                        [entry for entry in metadata_targets(metadata_before)
+                                         if entry['kind'] == 'bin'])
     metadata_after = cargo_metadata()
-    if metadata_after['target_directory'] != metadata_before['target_directory'] or \
-            metadata_after['package_id'] != metadata_before['package_id']:
+    # The target set is planned from the first document, so a target added or
+    # removed while building is a mismatch like a redirected target directory.
+    if {key: metadata_after[key] for key in ('target_directory', 'package_id', 'targets')} != \
+            {key: metadata_before[key] for key in ('target_directory', 'package_id', 'targets')}:
         raise BuildError('cargo metadata (package id or target directory) changed during build')
     require_unchanged(before, after)
     if tests:
@@ -1126,20 +1344,29 @@ def publish_transaction(plan, owned, lock_path, metadata_before, toolchain, comm
     timings = {'clean_seconds': clean_seconds, 'build_seconds': build_seconds}
     # The one frozen bound-input record of this batch, re-measured now.
     bound = bind_inputs(plan, before)
-    targets = [lib] + bins
+    selected_bins = [artifact for artifact, _ in bins]
+    targets = [lib] + selected_bins
     publisher = Publisher()
     artifacts = []
     # Receipts describe the sources and artifacts after everything that can
     # change them was measured; their digests are taken when they are staged.
-    for (spec, path), artifact in zip(bin_receipts, bins):
+    for (spec, path), (artifact, implicit) in zip(bin_receipts, bins):
+        marker = {'requested_by': '--test', 'reason': 'Cargo also builds the selected package\'s enabled bins '
+                  'when an integration test is selected (an integration test runs through its package\'s '
+                  'bins); this bin was reported by that same build, not selected by this batch',
+                  'acceptance': 'not-server-acceptance', 'target_source': artifact['source']} \
+            if implicit else None
         publisher.text(path, binary_receipt(path=artifact['executable'], digests=digests,
                                             toolchain=toolchain, command=command, targets=targets,
-                                            lock_path=lock_path, timings=timings, bound=bound))
+                                            lock_path=lock_path, timings=timings, bound=bound,
+                                            implicit=marker))
         stat = os.stat(artifact['executable'])
         artifacts.append({'kind': 'bin', 'target': spec['name'], 'artifact': artifact['executable'],
                           'receipt': str(path), 'fresh': False,
                           'sha256': sha256_file(artifact['executable']), 'size': stat.st_size,
-                          'mtime_ns': stat.st_mtime_ns, 'duration_seconds': build_seconds})
+                          'mtime_ns': stat.st_mtime_ns, 'duration_seconds': build_seconds}
+                         | ({'implicit': True, 'target_source': artifact['source']} if implicit else
+                            {'implicit': False, 'target_source': artifact['source']}))
     copy_receipts = []
     for (spec, output, path), artifact in zip(test_receipts, tests):
         original = artifact['executable']
@@ -1224,7 +1451,8 @@ def parse_args(argv):
     selection.add_argument('--strip-debuginfo', action='store_true',
                            help='strip rootyard dev/test debug information')
     selection.add_argument('--all-bins', action='store_true',
-                           help='select every [[bin]] whose required features are enabled')
+                           help='select every bin cargo metadata lists for the package whose required '
+                                'features are enabled ([[bin]] tables and auto-discovered src/bin/*.rs)')
     parser.add_argument('--bin', action='append', default=[], help='bin target name (repeatable)')
     parser.add_argument('--bin-destination', action='append', default=[],
                         help='only for explicit records; must be <target>/debug/<bin>')
