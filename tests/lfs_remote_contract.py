@@ -10,6 +10,7 @@ failure text.
 import hashlib
 import http.server
 import os
+import pathlib
 import shutil
 import socket
 import tempfile
@@ -242,6 +243,7 @@ def _server_path(harness, oid):
 
 def _has_exact_bytes(path, data):
     try:
+        path = pathlib.Path(path)
         return path.is_file() and not path.is_symlink() and path.read_bytes() == data
     except OSError:
         return False
