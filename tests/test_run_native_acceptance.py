@@ -559,6 +559,33 @@ class RunnerContractTest(unittest.TestCase):
         self.assertIn("dbpass123", log.read_text())  # raw failure evidence stays outside the report
         self.assertIn("deliberate failure", log.read_text())
 
+    def test_selftest_failure_prints_and_writes_only_the_minimal_safe_report(self):
+        """A detected value must not reach stdout when the minimal report replaces the full one."""
+        leaked = "plan-secret-marker-7741"
+        suite = self.fx.suite("smoke-safe", {"loopback:free": "exclusive"})
+        plan = self.fx.plan(
+            [suite],
+            environment={"ROOTYARD_TEST_ACCESS_TOKEN": leaked},  # non-URL value: validation permits it
+            not_run=[{"suite": "browser-native", "reason": "deferred until " + leaked}])  # report-visible
+        path = self.fx.write(plan)
+        command, environment, report_path = self.fx.command(path, "run-selftest")
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=180, env=environment)
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("start smoke-safe", self.fx.markers.read_text())  # the safe suite really ran
+        report_text = report_path.read_text()
+        self.assertEqual(completed.stdout, report_text)  # stdout is exactly the on-disk report
+        report = json.loads(report_text)
+        self.assertEqual(set(report), {"kind", "version", "run_id", "selftest", "gate"})
+        self.assertEqual(report["kind"], "rootyard/native-acceptance-run")
+        self.assertEqual(report["version"], 1)
+        self.assertEqual(report["run_id"], "run-selftest")
+        self.assertEqual(report["gate"], "failed")
+        self.assertEqual(report["selftest"]["status"], "failed")
+        self.assertEqual(report["selftest"]["matches"], [acceptance.safe_key(leaked)])
+        for text in (completed.stdout, report_text, completed.stderr):
+            self.assertNotIn(leaked, text)
+        self.assertNotIn("not_run", report)  # no full-rendered fallback on either channel
+
     def test_inherited_sensitive_environment_is_redacted(self):
         url_value = "postgresql://db.invalid/parent-db-secret-marker-6392"
         token_value = "parent-env-token-secret-marker-8261"

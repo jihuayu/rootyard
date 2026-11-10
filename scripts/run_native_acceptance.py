@@ -1175,13 +1175,20 @@ def main(argv=None):
         report["selftest"] = self_test(plan, run_id, run_dir, report)
         failing = [entry["id"] for entry in report["suites"] if entry["status"] != "passed"]
         report["gate"] = "failed" if failing or report["selftest"]["status"] != "passed" else "passed"
-        rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
         if report["selftest"]["status"] == "passed":
-            report_path.write_text(rendered)
+            # Both channels are built from this one text, so they can never disagree.
+            rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
         else:
-            # Never persist a leaking report; the hashed match list is the only output.
-            report_path.write_text(json.dumps({"kind": report["kind"], "version": 1, "run_id": run_id,
-                                               "selftest": report["selftest"], "gate": "failed"}) + "\n")
+            # Never persist or print a leaking report: the hashed match list is the
+            # only output, and the file and stdout carry the exact same minimal text.
+            rendered = json.dumps({"kind": report["kind"], "version": 1, "run_id": run_id,
+                                   "selftest": report["selftest"], "gate": "failed"}) + "\n"
+        try:
+            report_path.write_text(rendered)
+        except OSError:
+            # A report that cannot be persisted has no gate: say nothing about it.
+            print("error: cannot write report; the run was not gated", file=sys.stderr)
+            return 1
         sys.stdout.write(rendered)
         for suite_id in failing:
             print(f"suite {suite_id}: {runner.results[suite_id]['status']}", file=sys.stderr)
