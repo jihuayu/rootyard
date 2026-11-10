@@ -22,6 +22,9 @@ blob-azblob = ["opendal/services-azblob"]
 # Opt-in, default-OFF phase instrumentation for #106 baseline evidence. Adds no
 # dependencies; a default build compiles no recording code.
 state-baseline-metrics = []
+# Optional mature Redis client for the advisory cache/wake boundary. Default
+# builds are standalone Memory only and do not compile or link Redis.
+state-redis = ["dep:redis"]
 
 [[bin]]
 name = "rootyard-pando-lab"
@@ -54,6 +57,9 @@ hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
 rand = "0.9"
+# Optional exact-pinned advisory cache/wake client. Root validates this pin and
+# regenerates Cargo.lock; implementers must not hand-edit the lockfile.
+redis = { version = "=0.32.7", optional = true, default-features = false, features = ["tokio-rustls-comp", "connection-manager", "acl"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"

@@ -1,0 +1,11 @@
+
+running 6 tests
+test cache_wake::redis::cancel_tests::real_redis_cancelled_inflight_connections_are_closed ... ok
+test cache_wake::redis::tests::real_redis_bad_acl_credentials_are_rejected_bounded_and_redacted ... ok
+test cache_wake::redis::tests::real_redis_cache_contract_round_trip_and_bounded_read ... ok
+test cache_wake::redis::tests::real_redis_flushall_is_authoritative_cache_miss ... ok
+test cache_wake::redis::tests::real_redis_noeviction_policy_fails_connect_closed_and_restores ... ok
+test cache_wake::redis::tests::real_redis_wake_publishes_only_a_hint ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 282 filtered out; finished in 1.13s
+

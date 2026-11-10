@@ -12,6 +12,7 @@ pub mod baseline_metrics;
 pub mod blob_store;
 #[rustfmt::skip]
 pub mod browse;
+pub mod cache_wake;
 #[rustfmt::skip]
 pub mod ci_checkouts;
 #[rustfmt::skip]

@@ -1,0 +1,56 @@
+name: Redis contract
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  redis-contract:
+    # Disposable real-Redis contract gate for the optional state-redis feature.
+    # It is separate from the ordinary verify job and never changes host trust.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Redis contract native prerequisites
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates openssl libssl-dev pkg-config cmake clang \
+            libfuse3-dev fuse3 build-essential
+      - name: Install pinned Rust 1.99.1 gate tools
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+          rustup default 1.99.1
+          rustc -V && cargo -V && cargo clippy -V
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: state-redis-contract
+          workspaces: ". -> target"
+      - name: Pull the official Redis 7.2.6 image
+        run: docker pull redis:7.2.6-alpine
+      - name: Unit-test the contract runner without Docker
+        run: python3 -m unittest discover -s tests -p 'test_check_redis_contract.py'
+      - name: Clippy all targets with state-redis and warnings denied
+        run: cargo clippy --locked --all-targets --features state-redis -- -D warnings
+      - name: Run owned plaintext, TLS, untrusted-CA and restored-trust contract
+        run: |
+          mkdir -p test-results/state-redis
+          python3 scripts/check_redis_contract.py \
+            --report test-results/state-redis/contract.json \
+            --log-dir test-results/state-redis/logs
+      - name: Upload Redis contract report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redis-contract-report
+          path: |
+            test-results/state-redis/contract.json
+            test-results/state-redis/logs/*.log
+          if-no-files-found: warn
