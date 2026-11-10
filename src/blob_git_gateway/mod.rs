@@ -32,6 +32,7 @@ mod process_guard;
 mod protocol;
 mod publish;
 mod receive;
+mod repo_session;
 mod resource;
 mod serving;
 mod session;

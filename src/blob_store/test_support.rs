@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    UploadIntent,
+    BlobBackendIdentity, UploadIntent,
     budget::{ResourceContext, ResourceLimits},
     config::BlobProfile,
     opendal::BlobStore,
@@ -34,6 +34,16 @@ pub(crate) fn store(limits: ResourceLimits) -> (BlobStore, Arc<ResourceContext>)
     let resources = Arc::new(ResourceContext::new(limits));
     let store = BlobStore::open_memory(BlobProfile::memory_profile(limits), Arc::clone(&resources));
     (store, resources)
+}
+
+/// Two distinct real `cfg(test)` memory-store identities from one shared
+/// private budget. Callers that need a stable identity per test compare the
+/// returned values instead of opening a new store per call.
+pub(crate) fn distinct_backend_identities() -> (BlobBackendIdentity, BlobBackendIdentity) {
+    let limits = ResourceLimits::new(2, 2, 1 << 20).expect("test budget");
+    let (first, _) = store(limits);
+    let (second, _) = store(limits);
+    (first.backend_identity().clone(), second.backend_identity().clone())
 }
 
 pub(crate) fn payload(len: usize) -> Vec<u8> {
