@@ -167,6 +167,22 @@ jobs:
           export ROOTYARD_BLOB_ROOT="standalone-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           export ROOTYARD_GIT="$(command -v git)"
           binary="$GITHUB_WORKSPACE/target/debug/rootyard"
+          # tests/blob_only_service.py -> e2e.Harness.setup() migrates only a random search_path
+          # schema, so the job-owned service database needs the production public migration first.
+          # The DSN is passed only through the environment and never echoed.
+          if ! env DATABASE_URL="$ROOTYARD_TEST_DATABASE_URL" "$binary" migrate \
+              > test-results/refstore/standalone-migrate.log 2>&1; then
+            # The raw log stays in test-results/ and is collected by the artifact upload;
+            # never print it here because diagnostics can include the DSN/credentials.
+            echo "standalone Blob gate: production CLI migrate failed on the job-owned database" >&2
+            exit 1
+          fi
+          authority="$(psql "$ROOTYARD_TEST_DATABASE_URL" -X -t -A -v ON_ERROR_STOP=1 -c \
+            "SELECT to_regclass('public.cluster_authority') IS NOT NULL")"
+          if [ "$authority" != "t" ]; then
+            echo "standalone Blob gate: public.cluster_authority is absent from the job-owned database" >&2
+            exit 1
+          fi
           python3 tests/blob_only_service.py --binary "$binary" --git "$ROOTYARD_GIT" \
             --report test-results/refstore/standalone-http.json
           python3 tests/blob_gateway_browse.py --binary "$binary" --git "$ROOTYARD_GIT" \
