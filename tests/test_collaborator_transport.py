@@ -192,24 +192,28 @@ class HarnessContract(unittest.TestCase):
         base.env = {}
         calls = []
 
+        def ok(argv):
+            return subprocess.CompletedProcess(argv, 0, b"a" * 40 + b"\n", b"")
+
         def fake_git(*argv, cwd=None, check=True, env=None):
             calls.append(dict(env or {}))
-            if calls[-1].get("GIT_DIR"):
+            if (env or {}).get("GIT_DIR"):
                 return subprocess.CompletedProcess(argv, 0, b"b" * 40 + b"\n",
                                                    b"warning: ignoring ref storage format\n")
-            return subprocess.CompletedProcess(argv, 0, b"a" * 40 + b"\n", b"")
+            return ok(argv)
         base.git = fake_git
-        with tempfile.TemporaryDirectory() as root:
-            (Path(root) / ".git").write_text("gitdir: /srv/repo/.git/worktrees/x\n")
-            head, env, via = base.checkout_head(Path(root), {})
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as shared:
+            (Path(root) / ".git").write_text(f"gitdir: {shared}/worktrees/x\n")
+            head, env, via = base.checkout_head(Path(root), {}, shared)
         self.assertEqual((head, via, env), ("a" * 40, "discovery", {}))
         self.assertEqual(len(calls), 1)
+        # A shared dir that answers with a warning is not evidence of this HEAD.
         base.git = lambda *argv, cwd=None, check=True, env=None: subprocess.CompletedProcess(
             argv, 0, b"a" * 40 + b"\n", b"warning: ignoring ref storage format\n")
-        with tempfile.TemporaryDirectory() as root:
-            (Path(root) / ".git").write_text("gitdir: /srv/repo/.git/worktrees/x\n")
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as shared:
+            (Path(root) / ".git").write_text(f"gitdir: {shared}/worktrees/x\n")
             with self.assertRaisesRegex(AssertionError, "with a warning"):
-                base.checkout_head(Path(root), {})
+                base.checkout_head(Path(root), {}, shared)
 
     def test_initialization_and_merge_contracts_are_fixed(self):
         contract = ROOT / "tests" / "collaborator_contract.py"

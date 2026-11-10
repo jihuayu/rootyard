@@ -151,7 +151,7 @@ class prerequisite:
             return True
         return {"sys.platform": sys.platform, "machine": os.uname().machine}
 
-    def checkout_head(self, root, env):
+    def checkout_head(self, root, env, shared):
         """HEAD of the mounted checkout, discovered the way Git itself would.
 
         Plain discovery honours the checkout's ``.git`` file (a run sandbox may
@@ -165,12 +165,11 @@ class prerequisite:
             pointer = (Path(root) / ".git").read_text().strip()
         except OSError:
             pointer = ""
-        if pointer.startswith("gitdir:"):
-            target = Path(pointer.split(":", 1)[1].strip())
-            common = target.parent.parent
-            if common.name == ".git":
-                strategies["shared " + str(common)] = {"GIT_DIR": str(common),
-                                                       "GIT_WORK_TREE": str(root)}
+        linked = pointer.startswith("gitdir:")
+        if linked:
+            strategies["linked worktree " + pointer.split(":", 1)[1].strip()] = {}
+            if Path(shared).is_dir():
+                strategies["shared " + shared] = {"GIT_DIR": shared, "GIT_WORK_TREE": str(root)}
         tried = []
         for label, extra in strategies.items():
             proc = self.git("rev-parse", "HEAD", cwd=root, check=False, env={**env, **extra})
@@ -205,7 +204,20 @@ class prerequisite:
         assert current == receipt["source_inputs_sha256"], (
             "current src/Cargo/migrations/schema/vendor inputs differ from the binary's build")
         checkout_env = dict(self.env, GIT_OPTIONAL_LOCKS="0")
-        head, checkout_env, discovered_via = self.checkout_head(root, checkout_env)
+        # First: is the mounted .git really this checkout's? rev-parse can walk
+        # into a repository through cwd even when GIT_DIR names nothing, so a
+        # lookup must not count as evidence until --git-common-dir agrees.
+        probe = self.git("rev-parse", "--git-common-dir", cwd=root, check=False, env=checkout_env)
+        shared = probe.stdout.decode().strip() if probe.returncode == 0 else ""
+        if shared and not shared.startswith("/"):
+            shared = str((root / shared).resolve())
+        if not shared or not Path(shared).is_dir():
+            raise AssertionError("required dependency missing: mount the shared .git dir (" +
+                                 (probe.stderr.decode(errors="replace").strip()[-200:] or
+                                  shared or "no git metadata"))
+        assert probe.stderr.decode().strip() == "", (
+            "checkout metadata reported: " + probe.stderr.decode(errors="replace").strip()[-300:])
+        head, checkout_env, discovered_via = self.checkout_head(root, checkout_env, shared)
         tracked = self.git("status", "--porcelain", "--untracked-files=no", cwd=root,
                            env=checkout_env).stdout
         assert not tracked.strip(), "tracked inputs are dirty: console builds embed differing debug paths"
