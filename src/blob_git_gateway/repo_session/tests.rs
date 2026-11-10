@@ -401,14 +401,14 @@ fn the_gateway_entry_and_compare_agree_without_global_state() {
 /// gates and repository rows are assembled in memory from fixed ids.
 mod committed_write {
     use super::{
-        CommittedWriteSessionProof, SessionRealm, SessionTokenError, SessionTokens, VersionComparison, codec, header,
-        key, presented_for_test,
+        SessionRealm, SessionTokenError, SessionTokens, VersionComparison, codec, header, key, presented_for_test,
     };
     use crate::{
+        blob_git_gateway::repo_session::{CommittedWriteSessionProof, codec::Presented},
         db::Repository,
         ref_store::{
-            CommitRejectCode, CoreGate, GitObjectFormat, RefCommitResult, RefName, ServingRepository,
-            core::pack_commit::{PackCommitTerminal, PackMode},
+            CommitRejectCode, CoreGate, GitObjectFormat, RefCommitResult, RefName,
+            core::pack_commit::{PackCommitTerminal, PackMode}, serving::ServingRepository,
         },
     };
     use uuid::Uuid;

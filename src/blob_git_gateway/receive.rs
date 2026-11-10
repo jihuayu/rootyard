@@ -31,7 +31,7 @@ use super::{
     operation::{self, Claim},
     protocol::{self, PushRequest},
     publish::{self, Pair, PushOutcome},
-    repo_session::{CommittedWriteSessionProof, SessionTokenError},
+    repo_session::CommittedWriteSessionProof,
     serving::{ServingRepository, lookup},
     session::{authenticate, authorize_write, operation_id, validate_git_protocol},
     snapshot,
