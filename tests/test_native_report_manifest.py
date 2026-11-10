@@ -137,6 +137,19 @@ class ManifestFixture:
                 if target.exists() or target.is_symlink():
                     target.unlink()
                 target.write_bytes(source.read_bytes())
+        receipt = data.get("build_receipt") or {}
+        receipt_source = Path(receipt["file"])
+        receipt_target = directory / receipt_source.name
+        if receipt_target.exists() or receipt_target.is_symlink():
+            receipt_target.unlink()
+        receipt_target.write_bytes(receipt_source.read_bytes())
+        batch = receipt.get("batch_manifest")
+        if isinstance(batch, dict):
+            source = Path(batch["file"])
+            target = directory / source.name
+            if target.exists() or target.is_symlink():
+                target.unlink()
+            target.write_bytes(source.read_bytes())
         return directory
 
     def run(self, *arguments, expect=0, env=None):
@@ -375,6 +388,64 @@ class TestReleaseGate(unittest.TestCase):
         process = self.fixture.run(*command, *arguments, expect=expect)
         return process, output
 
+    def enable_batch_jobs(self):
+        self.fixture.enable_batch_receipt()
+        self.browser = self.fixture.job(
+            "browser.json",
+            reports={"browser_ui": self.fixture.report("browser_ui")},
+        )
+        self.store = self.fixture.job(
+            "object-store.json",
+            reports={
+                "lfs_hydration": self.fixture.report("lfs_hydration"),
+                "lfs_retention": self.fixture.report("lfs_retention"),
+            },
+            extra=(
+                "--fixture", "garage=garage 2.1.0",
+                "--fixture", "git_lfs=git-lfs/3.6.1",
+            ),
+        )
+        self.staged = {
+            "browser": self.fixture.artifact_directory("browser", self.browser),
+            "object-store": self.fixture.artifact_directory("object-store", self.store),
+        }
+
+    def test_release_verifies_downloaded_batch_manifest(self):
+        self.enable_batch_jobs()
+        process, gate_path = self.release()
+        self.assertEqual(process.returncode, 0)
+        gate = json.loads(gate_path.read_text())
+        self.assertIn(
+            "build:batch_manifest",
+            gate["jobs"]["browser"]["artifacts"],
+        )
+        self.assertIn(
+            "build:receipt",
+            gate["jobs"]["browser"]["artifacts"],
+        )
+        batch_path = self.staged["browser"] / "native-build-batch.json"
+        original = batch_path.read_bytes()
+        try:
+            batch_path.unlink()
+            process, _ = self.release(expect=1)
+            self.assertIn("batch manifest", process.stderr)
+            batch_path.write_bytes(original + b"\n")
+            process, _ = self.release(expect=1)
+            self.assertIn("downloaded file does not match the manifest sha256", process.stderr)
+        finally:
+            batch_path.write_bytes(original)
+
+    def test_release_rejects_removed_batch_manifest_pointer(self):
+        self.enable_batch_jobs()
+        data = json.loads(self.browser.read_text())
+        del data["build_receipt"]["batch_manifest"]
+        self.browser.write_text(json.dumps(data))
+        process, _ = self.release(expect=1)
+        self.assertIn(
+            "requires a build_receipt.batch_manifest object",
+            process.stderr,
+        )
+
     def test_accepts_consistent_job_manifests(self):
         _, output = self.release()
         gate = json.loads(output.read_text())
@@ -387,7 +458,7 @@ class TestReleaseGate(unittest.TestCase):
         self.assertEqual(gate["reports"], ["browser_ui", "lfs_hydration", "lfs_retention"])
         self.assertEqual(
             sorted(gate["jobs"]["browser"]["artifacts"]),
-            ["log:webhook_regressions", "report:browser_ui"],
+            ["build:receipt", "log:webhook_regressions", "report:browser_ui"],
         )
 
     def test_rejects_missing_required_report_and_wrong_fixture_pin(self):
