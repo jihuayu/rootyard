@@ -337,14 +337,27 @@ class Drill(BlobOnlyHarness):
                 "no_persistent_bare": True, "archive_volume_initialized_by_real_reconcile_cli": True,
                 "closure_artifacts": self.closure_rows["count"], "shared_barrier_loss_stops_service": True}
 
-    def wait_for_advisory_holder(self, database, exclusive, timeout=15):
-        """Wait until a real session on `database` holds the lifecycle key."""
+    def wait_for_advisory_holder(self, database, exclusive, timeout=15, *, child=None, exited=None):
+        """Wait until a real session on `database` holds the lifecycle key.
+
+        Only observing that exact advisory lock satisfies the wait. An optional
+        owned `child` process is polled between attempts: if it exits before the
+        lock is observed, fail at once with only its exit status (never stderr,
+        argv, DSN, credentials or exception text). `exited` optionally names the
+        owned work the child does before taking the lock (e.g. "archive
+        checksum verification") and only annotates the timeout message.
+        """
         mode = "ExclusiveLock" if exclusive else "ShareLock"
         deadline = time.monotonic() + timeout
         sql = ("SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND classid=0 AND objid=738390103"
                " AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND objsubid=1 AND mode='" + mode + "' AND granted")
         while int(self.query(database, sql)) == 0:
-            assert time.monotonic() < deadline, "lifecycle barrier was not taken"
+            if child is not None:
+                status = child.poll()
+                assert status is None, "owned child exited before taking the lifecycle barrier (exit " + str(status) + ")"
+            assert time.monotonic() < deadline, (
+                ("lifecycle barrier was not taken within " + str(timeout) + "s of the " + exited)
+                if child is not None and exited else "lifecycle barrier was not taken")
             time.sleep(0.05)
 
     def advisory_holds(self, database):
@@ -504,7 +517,12 @@ class Drill(BlobOnlyHarness):
             with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
                 restore = subprocess.Popen([self.args.binary, "restore", str(self.backup), "--isolated", "--trust-backup"],
                                            env=env, stdout=stdout, stderr=stderr)
-            self.wait_for_advisory_holder(self.target_db, exclusive=True)
+            # Restore verifies the whole archive inventory before acquiring the
+            # lifecycle lock; hashing this 858MB archive can outlast the default
+            # wait, so bound it by archive checksum verification and fail early
+            # (status only) if the owned restore child exits before the lock.
+            self.wait_for_advisory_holder(self.target_db, exclusive=True, timeout=120,
+                                          child=restore, exited="archive checksum verification")
             self.serving_barrier_refused(env, "restore")
             status = restore.wait(timeout=180)
             assert status == 0, "paired restore from the archive failed (exit " + str(status) + ")"
