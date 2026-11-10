@@ -53,6 +53,71 @@ def requests_for_delivery(requests: list[dict], delivery_id: str) -> list[dict]:
     ]
 
 
+def assert_dispatch_pull_delivery(
+    summary,
+    delivery,
+    receiver_requests,
+    *,
+    webhook_id,
+    repository_id,
+    event_id,
+    expected_payload,
+    secret,
+):
+    """Require durable delivery and exact authenticated receiver evidence."""
+    assert isinstance(summary, dict), f"dispatch summary must be an object: {summary!r}"
+    delivered_count = summary.get("delivered_count")
+    assert type(delivered_count) is int and delivered_count >= 0, (
+        f"dispatch delivered_count must be a nonnegative int: {delivered_count!r}"
+    )
+    assert isinstance(delivery, dict), f"durable delivery must be an object: {delivery!r}"
+    delivery_id = delivery.get("id")
+    assert isinstance(delivery_id, str) and delivery_id, delivery
+    assert delivery.get("webhook_id") == webhook_id, delivery
+    assert delivery.get("repository_id") == repository_id, delivery
+    assert delivery.get("event_id") == event_id, delivery
+    assert delivery.get("event_type") == "pull_request", delivery
+    assert type(delivery.get("sequence")) is int and delivery["sequence"] >= 1, delivery
+    assert delivery.get("state") == "delivered", delivery
+    assert type(delivery.get("attempts")) is int and delivery["attempts"] >= 1, delivery
+    assert delivery.get("response_status") == 200, delivery
+    assert isinstance(delivery.get("delivered_at"), str) and delivery["delivered_at"], delivery
+    assert delivery.get("payload") == expected_payload, delivery
+
+    signature = delivery.get("signature_256")
+    assert isinstance(signature, str) and signature.startswith("sha256="), delivery
+    durable_headers = {
+        str(key).lower(): value
+        for key, value in delivery.get("request_headers", {}).items()
+    }
+    assert durable_headers.get("x-rootyard-event") == "pull_request", delivery
+    assert durable_headers.get("x-rootyard-delivery") == delivery_id, delivery
+    assert durable_headers.get("x-rootyard-hook-id") == webhook_id, delivery
+    assert durable_headers.get("x-rootyard-signature-256") == signature, delivery
+    assert durable_headers.get("x-rootyard-attempt") == str(delivery["attempts"]), delivery
+
+    matches = requests_for_delivery(receiver_requests, delivery_id)
+    assert len(matches) == 1, (
+        f"expected exactly one receiver request for {delivery_id}, got {len(matches)}"
+    )
+    request = matches[0]
+    request_headers = {
+        str(key).lower(): value for key, value in request.get("headers", {}).items()
+    }
+    assert request.get("signature_valid") is True, request
+    assert request.get("signature") == signature, request
+    assert request_headers.get("x-rootyard-event") == "pull_request", request
+    assert request_headers.get("x-rootyard-delivery") == delivery_id, request
+    assert request_headers.get("x-rootyard-hook-id") == webhook_id, request
+    assert request_headers.get("x-rootyard-signature-256") == signature, request
+    assert request_headers.get("x-rootyard-attempt") == str(delivery["attempts"]), request
+    assert request.get("json") == delivery["payload"], request
+    raw_body = request.get("raw_body")
+    assert isinstance(raw_body, bytes), request
+    assert compute_hmac_sha256_header(secret, raw_body) == signature, request
+    assert request.get("response_status") == 200, request
+
+
 class LocalWebhookReceiver:
     """Thread-safe local loopback HTTP/1.1 receiver for testing webhook deliveries and retries."""
 
@@ -172,6 +237,34 @@ class WebhooksHarness(PullsHarness):
             c["context"]: c
             for c in self.document(f"{self.pr1_path}/checks", token=self.reader)["items"]
         }
+
+    def wait_for_pull_delivery(self, event_id: str, deadline: float = 10.0) -> dict:
+        """Poll one exact pull-request delivery until its durable row is delivered."""
+        stop = time.monotonic() + deadline
+        path = f"{self.hook_path}/deliveries?event_type=pull_request"
+        last = None
+        while True:
+            page = self.document(path)
+            rows = page.get("items")
+            assert isinstance(rows, list), page
+            matches = [row for row in rows if row.get("event_id") == event_id]
+            last = matches
+            assert len(matches) <= 1, f"Expected at most one delivery for {event_id}, got {matches}"
+            if matches:
+                row = matches[0]
+                state = row.get("state")
+                if state == "delivered":
+                    return row
+                assert state in ("pending", "leased"), (
+                    f"Delivery for {event_id} entered terminal state {state!r}: {row}"
+                )
+            remaining = stop - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    f"Delivery for {event_id} was not delivered before the "
+                    f"{deadline}s deadline: {last}"
+                )
+            time.sleep(min(0.1, remaining))
 
     def wait_for_queued_head(self, deadline: float = 10.0) -> dict:
         """Poll until PR #1 is exactly feat2/base and its required checks are queued.
@@ -439,25 +532,94 @@ class WebhooksHarness(PullsHarness):
         )
         self.pr1_path = f"{self.pullspath}/{self.pr1['number']}"
 
-        # Dispatch webhooks: scans open PRs + outbox events, creates CI pin & queued checks.
-        self.receiver.clear()
+        # Dispatch also synchronizes open PRs and sends due deliveries.
         summary = self.document(self.dispatchpath, 200, method="POST", body={})
         assert summary["orchestrated_pulls"] >= 1
-        assert summary["delivered_count"] >= 1
+        event_id = (
+            f"pull:{self.pr1['number']}:{self.pr1['version']}:{self.feat1_oid}:opened"
+        )
+        delivery = self.wait_for_pull_delivery(event_id)
 
-        # Verify CI Source Pin was created for feat1_oid.
+        # Verify the pin and queued runs belong to this exact pull orchestration job.
         pins = self.document(self.pins_path)
         pin_items = pins if isinstance(pins, list) else pins.get("items", [])
         matching_pins = [p for p in pin_items if p.get("target_oid") == self.feat1_oid]
         assert len(matching_pins) == 1, f"Expected 1 CI pin for {self.feat1_oid}, got {pin_items}"
-        assert matching_pins[0]["state"] == "pinned"
+        pin = matching_pins[0]
+        assert pin["state"] == "pinned", pin
+        assert pin["repository_id"] == self.repo["id"], pin
+        assert pin["job_id"] == delivery["payload"]["ci_job_id"], pin
+        assert pin["retention_ref"] == f"refs/rootyard-ci/jobs/{pin['job_id']}", pin
+        assert (
+            isinstance(pin["storage_generation"], int)
+            and not isinstance(pin["storage_generation"], bool)
+            and pin["storage_generation"] > 0
+        ), pin
 
-        # Verify queued check runs were automatically registered on feat1_oid.
+        expected_contexts = ["ci/test", "ci/lint"]
+        expected_payload = {
+            "event": "pull_request",
+            "action": "opened",
+            "repository_id": self.repo["id"],
+            "pull_number": self.pr1["number"],
+            "head_oid": self.feat1_oid,
+            "base_oid": self.base_oid,
+            "head_ref": "refs/heads/feature",
+            "base_ref": "refs/heads/main",
+            "ci_job_id": pin["job_id"],
+            "retention_ref": pin["retention_ref"],
+            "required_checks": expected_contexts,
+            "pull_request": self.pr1,
+            "ci_pin": {
+                "job_id": pin["job_id"],
+                "retention_ref": pin["retention_ref"],
+                "target_oid": self.feat1_oid,
+                "storage_generation": pin["storage_generation"],
+            },
+            "queued_checks": expected_contexts,
+        }
+        assert delivery["payload"] == expected_payload, delivery
+
         pr_checks = self.document(f"{self.pr1_path}/checks")["items"]
-        by_ctx = {c["context"]: c for c in pr_checks}
-        assert "ci/test" in by_ctx and "ci/lint" in by_ctx
-        assert by_ctx["ci/test"]["status"] == "queued"
-        assert by_ctx["ci/lint"]["status"] == "queued"
+        contexts = [row.get("context") for row in pr_checks]
+        assert len(contexts) == len(set(contexts)), pr_checks
+        assert set(contexts) == set(expected_contexts), pr_checks
+        for row in pr_checks:
+            assert row["repository_id"] == self.repo["id"], row
+            assert row["commit_oid"] == self.feat1_oid, row
+            assert row["status"] == "queued", row
+            assert row["conclusion"] is None, row
+
+        linkage = self.sql(
+            "SELECT count(*)::text || ':' || count(DISTINCT r.context)::text || ':' || "
+            "count(DISTINCT r.job_id)::text "
+            "FROM ci_runs r "
+            "JOIN ci_pull_sync_progress s ON s.repository_id=r.repository_id "
+            "AND s.pull_number=r.pull_number AND s.pull_version=r.pull_version "
+            "AND s.head_oid=r.head_oid AND s.base_oid=r.base_oid "
+            "AND s.storage_generation=r.storage_generation "
+            "JOIN forge_check_runs c ON c.repository_id=r.repository_id "
+            "AND c.commit_oid=r.head_oid AND c.context=r.context "
+            f"WHERE r.repository_id='{self.repo['id']}' "
+            f"AND r.job_id='{pin['job_id']}' "
+            f"AND r.pull_number={self.pr1['number']} "
+            f"AND r.pull_version={self.pr1['version']} "
+            f"AND r.head_oid='{self.feat1_oid}' AND r.base_oid='{self.base_oid}' "
+            "AND r.context IN ('ci/test','ci/lint') "
+            "AND c.status='queued' AND c.conclusion IS NULL"
+        )
+        assert linkage == "2:2:1", linkage
+
+        assert_dispatch_pull_delivery(
+            summary,
+            delivery,
+            receiver_request_snapshot(self.receiver),
+            webhook_id=self.hook["id"],
+            repository_id=self.repo["id"],
+            event_id=event_id,
+            expected_payload=expected_payload,
+            secret=self.webhook_secret,
+        )
 
     def idempotent_ci_callbacks_and_monotonic_check_runs(self):
         cb_path = f"{self.hook_path}/callback"
