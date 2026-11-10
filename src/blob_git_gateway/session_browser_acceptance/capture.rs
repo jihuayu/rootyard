@@ -352,7 +352,8 @@ pub(super) fn route_of(fixture_prefix: &str, path: &str) -> Route {
         ("/api/repos", Route::ApiRepos),
         ("/git/", Route::Git),
     ] {
-        if path == prefix || path.starts_with(&format!("{prefix}/")) {
+        let descendant = format!("{}/", prefix.trim_end_matches('/'));
+        if path == prefix || path.starts_with(&descendant) {
             return route;
         }
     }
