@@ -37,12 +37,12 @@
 //! executing in the pool checks the shutdown flag after its I/O and replies
 //! `EIO` instead of a late success. Joining that in-flight read is still a
 //! helper-phase responsibility, not something this dispatch loop can prove.
-use super::inner_ops::{ReadPlan, read_at};
 use super::owned_ops::OwnedOp;
 use super::*;
 use budget::{Budget, Permit, global_budget};
 use fuser::ReplyData;
-use read_pool::{ReadJob, ReadPool, global as global_read_pool};
+use read::DeferredRead;
+use read_pool::{ReadPool, global as global_read_pool};
 use std::collections::VecDeque;
 use std::sync::{
     Condvar, Mutex, MutexGuard, PoisonError,
@@ -50,9 +50,11 @@ use std::sync::{
 };
 
 #[path = "fuse_dispatch/budget.rs"]
-mod budget;
+pub(super) mod budget;
+#[path = "fuse_dispatch/read.rs"]
+pub(super) mod read;
 #[path = "fuse_dispatch/read_pool.rs"]
-mod read_pool;
+pub(super) mod read_pool;
 
 pub const MOUNT_QUEUE_OPS: usize = 128;
 pub const MOUNT_QUEUE_BYTES: usize = 8 * 1024 * 1024;
@@ -276,49 +278,6 @@ impl Shared {
     }
 }
 
-/// A lazy read whose reply and budget charge travel to the read pool together.
-struct DeferredRead {
-    relative: PathBuf,
-    source: Entry,
-    lazy: Arc<dyn LazySource>,
-    offset: i64,
-    size: u32,
-    reply: Option<ReplyData>,
-    /// RAII queue budget for the read reply; dropped when the reply is sent.
-    _permit: Permit,
-    shared: Arc<Shared>,
-}
-
-impl DeferredRead {
-    fn run(mut self) {
-        let reply = self.reply.take().expect("deferred read replies exactly once");
-        if self.shared.is_shutdown() {
-            reply.error(libc::EIO);
-            return;
-        }
-        let result = (|| {
-            let file = open_lower(Some(self.lazy.as_ref()), &self.relative, &self.source)?;
-            read_at(&file, self.offset, self.size)
-        })();
-        // The worker takes the reply out of the shared slot before I/O, so a
-        // shutdown drain cannot answer this read. Re-check the flag instead of
-        // returning a success after the mount has closed the queue.
-        let shutdown = self.shared.is_shutdown();
-        match result {
-            Ok(_) if shutdown => reply.error(libc::EIO),
-            Ok(data) => reply.data(&data),
-            Err(_) if shutdown => reply.error(libc::EIO),
-            Err(error) => reply.error(Overlay::err(error)),
-        }
-    }
-
-    fn reject(mut self, errno: i32) {
-        if let Some(reply) = self.reply.take() {
-            reply.error(errno);
-        }
-    }
-}
-
 struct Actor {
     overlay: Overlay,
     shared: Arc<Shared>,
@@ -500,50 +459,6 @@ impl Actor {
                     Ok(()) => reply.ok(),
                     Err(error) => reply.error(Overlay::err(error)),
                 }
-            }
-        }
-    }
-
-    fn read(&mut self, ino: u64, offset: i64, size: u32, reply: ReplyData, permit: Permit) {
-        match self.overlay.read_plan(ino) {
-            Err(error) => reply.error(Overlay::err(error)),
-            Ok(ReadPlan::Local(path)) => match self.overlay.read_local(&path, offset, size) {
-                Ok(data) => reply.data(&data),
-                Err(error) => reply.error(Overlay::err(error)),
-            },
-            Ok(ReadPlan::Lazy { relative, source, lazy }) => {
-                self.submit_deferred(DeferredRead {
-                    relative,
-                    source,
-                    lazy,
-                    offset,
-                    size,
-                    reply: Some(reply),
-                    _permit: permit,
-                    shared: self.shared.clone(),
-                });
-            }
-        }
-    }
-
-    /// Hand a lazy read to the global pool. If the pool is saturated the reply is
-    /// `EAGAIN`; the read is never executed inline on the actor.
-    fn submit_deferred(&self, deferred: DeferredRead) {
-        let slot = Arc::new(Mutex::new(Some(deferred)));
-        let request_id = self.shared.register_deferred(slot.clone());
-        let job_slot = slot.clone();
-        let shared = self.shared.clone();
-        let job: ReadJob = Box::new(move || {
-            if let Some(deferred) = job_slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
-                deferred.run();
-            }
-            shared.complete_deferred(request_id);
-        });
-        if let Err(job) = self.pool.execute(job) {
-            drop(job);
-            self.shared.complete_deferred(request_id);
-            if let Some(deferred) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
-                deferred.reject(libc::EAGAIN);
             }
         }
     }
