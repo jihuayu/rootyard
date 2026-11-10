@@ -163,6 +163,25 @@ class DrillWiringTest(unittest.TestCase):
             self.assertIn("self.walk_audit(", body)
             self.assertNotIn("?limit=1", body)
 
+    def test_concurrent_writes_use_unique_creates_and_the_saved_sequence(self):
+        body = method_source("restored_concurrent_audit_sequence_continues")
+        # One unique, previously absent branch per request: a shared main (or a
+        # reused rule) would make every request after the first a 409.
+        self.assertIn('self.race_prefix = "refs/heads/audit-race-" + os.urandom(4).hex()', body)
+        self.assertIn("len(set(branches))", body)
+        self.assertNotIn('"refs/heads/main"', body)
+        self.assertEqual(method_source("restored_concurrent_audit_sequence_continues").count(
+            "self.race_prefix + "), 1)
+        self.assertIn('"branch_ref": branch_ref', body)
+        self.assertIn("[row[\"id\"] for row in rows] == sorted(new) == new", body)
+        # The per-action SQL sequence is captured on the source and restored
+        # byte-identically, and only the 32 window rows extend it.
+        self.assertIn("self.source_sequence = self.action_sequence(self.db, self.saved_actions)",
+                      method_source("source_audit_writes_advance_sequence"))
+        self.assertIn("self.race_sequence == self.source_sequence", body)
+        self.assertIn("ids == sorted(set(ids))", body)
+        self.assertIn("window_ids == [row[\"id\"] for row in self.race_sequence[-count:]]", body)
+
     def test_git_push_is_not_claimed_as_an_audit_sequence_step(self):
         push = method_source("restored_git_push_and_audit_events_recovery")
         self.assertIn("audit_events", push)
