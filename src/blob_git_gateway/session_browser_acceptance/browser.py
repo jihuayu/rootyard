@@ -125,6 +125,19 @@ class Failure(Exception):
         self.reason = reason
 
 
+async def evaluate(page, expression, reason, arg=None):
+    """Run one `page.evaluate` under the fixed step bound.
+
+    A hanging in-page script (an unanswered fetch, a pending microtask) or a
+    throwing one is mapped to the caller's fixed reason; the exception text,
+    type and any argument stay behind this boundary.
+    """
+    try:
+        return await asyncio.wait_for(page.evaluate(expression, arg), timeout=STEP_MS / 1000)
+    except Exception:
+        raise Failure(reason) from None
+
+
 def summary(config, reason, extra):
     payload = {
         "result": "FAIL" if reason else "PASS",
@@ -301,10 +314,7 @@ class Client:
             raise Failure("DOM_READ_FAILED")
         if any(secret in content for secret in self.secrets()):
             raise Failure("CREDENTIAL_IN_DOM")
-        try:
-            answer = await page.evaluate(STORAGE_READ_SCRIPT)
-        except Exception:
-            raise Failure("STORAGE_EVALUATION_FAILED") from None
+        answer = await evaluate(page, STORAGE_READ_SCRIPT, "STORAGE_EVALUATION_FAILED")
         if not isinstance(answer, dict):
             raise Failure("STORAGE_READ_FAILED")
         status = answer.get("status")
@@ -391,7 +401,9 @@ class Client:
         # cookie is redirected by the same shared middleware from `/web/login`
         # itself), so the first hop alone is inspected.
         await self.goto(page, self.web + SHELL, "NAVIGATION_EXCEEDED")
-        request = await page.evaluate("() => ({path: location.pathname, search: location.search})")
+        request = await evaluate(
+            page, "() => ({path: location.pathname, search: location.search})", "ANONYMOUS_NOT_REDIRECTED"
+        )
         if request["path"] != "/web" + LOGIN or request["search"] != "?return_to=%2Fweb%2Fblob":
             raise Failure("ANONYMOUS_NOT_REDIRECTED")
         await page.wait_for_load_state("load", timeout=STEP_MS)
@@ -405,7 +417,7 @@ class Client:
         async with page.expect_navigation(wait_until="commit", timeout=STEP_MS):
             await page.get_by_role("button", name="Sign in").click()
         self.check_origin()
-        if await page.evaluate("() => location.pathname") != "/web" + SHELL:
+        if await evaluate(page, "() => location.pathname", "SIGN_IN_FAILED") != "/web" + SHELL:
             raise Failure("SIGN_IN_FAILED")
         await self.remember_cookies(context)
         jars = {cookie["name"]: cookie for cookie in await context.cookies(self.origin)}
@@ -421,19 +433,24 @@ class Client:
         # 4. The signed-in shell is a direct 200 under its CSP and loads only
         # its own script; the script lists the repository by name.
         await self.goto(page, self.web + SHELL, "SHELL_NOT_SERVED")
-        served = await page.evaluate(
+        served = await evaluate(
+            page,
             """async () => {
                 const response = await fetch(location.pathname, {credentials: 'same-origin'});
                 return {status: response.status,
                         csp: response.headers.get('content-security-policy') || '',
                         type: response.headers.get('content-type') || ''};
-            }"""
+            }""",
+            "SHELL_NOT_SERVED",
         )
         if served["status"] != 200 or "text/html" not in served["type"]:
             raise Failure("SHELL_NOT_SERVED")
         if "script-src 'self'" not in served["csp"]:
             raise Failure("SHELL_CSP_MISSING")
-        if await page.evaluate("() => Array.from(document.scripts).map((node) => node.src)") != [self.web + "/app.js"]:
+        scripts = await evaluate(
+            page, "() => Array.from(document.scripts).map((node) => node.src)", "SHELL_SCRIPT_INVALID"
+        )
+        if scripts != [self.web + "/app.js"]:
             raise Failure("SHELL_SCRIPT_INVALID")
         await self.rendered(page, "LIST_NOT_RENDERED")
         link = page.get_by_role("link", name=f"{self.owner}/{self.repo}", exact=True)
@@ -531,25 +548,19 @@ class Client:
         }
 
     async def cookie_only(self, page, path):
-        try:
-            return await page.evaluate(
-                """async (path) => {
-                    const response = await fetch(path, {credentials: 'same-origin',
-                        headers: {Accept: 'application/json'}});
-                    return response.status;
-                }""",
-                path,
-            )
-        except Failure:
-            raise
-        except Exception:
-            raise Failure("COOKIE_ONLY_DENIAL_MISSING") from None
+        return await evaluate(
+            page,
+            """async (path) => {
+                const response = await fetch(path, {credentials: 'same-origin',
+                    headers: {Accept: 'application/json'}});
+                return response.status;
+            }""",
+            "COOKIE_ONLY_DENIAL_MISSING",
+            path,
+        )
 
     async def no_shell(self, page, reason):
-        try:
-            scripts = await page.evaluate("() => Array.from(document.scripts).map((node) => node.src)")
-        except Exception:
-            raise Failure(reason) from None
+        scripts = await evaluate(page, "() => Array.from(document.scripts).map((node) => node.src)", reason)
         if any(script.endswith("/web/app.js") for script in scripts):
             raise Failure(reason)
 
