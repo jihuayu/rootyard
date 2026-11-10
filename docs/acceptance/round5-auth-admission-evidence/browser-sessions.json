@@ -1,0 +1,13 @@
+{
+  "passed": true,
+  "cases": [
+    {
+      "name": "browser_session_workflow",
+      "status": "passed",
+      "seconds": 9.6096,
+      "detail": null
+    }
+  ],
+  "binary_sha256": "7254781d8d56a6695561d4e242c8873f9f256574040a6f360bcc9295b977d610",
+  "failure_traceback": null
+}

@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "binary_sha256": "7254781d8d56a6695561d4e242c8873f9f256574040a6f360bcc9295b977d610",
+  "source_inputs_sha256": "9169002cee3e4f1751abc75a964d7a412f1bb0636ab6161fcaab31cfd1614327",
+  "workspace_commit": "4a1ca4def9807d96057dff2e8b0970ab732724f7",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--bin",
+    "rootyard",
+    "--message-format=json-render-diagnostics"
+  ],
+  "package_rebuilt": true,
+  "clean_command": [
+    "cargo",
+    "clean",
+    "--package",
+    "rootyard"
+  ],
+  "target_dir": "/workspace/rootyard/target",
+  "lock_file": "/workspace/rootyard/target/.rootyard-native-build.lock",
+  "fresh_false_artifacts": [
+    {
+      "target": "rootyard",
+      "kind": "lib",
+      "fresh": false,
+      "package_id": "path+file:///workspace/scratch/round5-implementation/auth-admission#rootyard@0.1.0"
+    },
+    {
+      "target": "rootyard",
+      "kind": "bin",
+      "fresh": false,
+      "executable": "/workspace/rootyard/target/debug/rootyard",
+      "package_id": "path+file:///workspace/scratch/round5-implementation/auth-admission#rootyard@0.1.0"
+    }
+  ]
+}

@@ -235,6 +235,9 @@ async fn run() -> Result<()> {
                 dispatch: rootyard::dispatch::Signals::default(),
                 git_slots: slots,
             });
+            // Fail startup on invalid admission settings before the listener
+            // accepts authentication traffic.
+            rootyard::auth_admission::init_for_state(&state)?;
             let configured_node = std::env::var("ROOTYARD_NODE_ID").ok();
             let local_fence = if std::env::var_os("ROOTYARD_LOCAL_FENCE_DIR").is_some() {
                 let node_id = configured_node.as_deref().context("local process fence requires ROOTYARD_NODE_ID")?;
@@ -339,7 +342,12 @@ async fn run() -> Result<()> {
             // before the runtime exits. \`router\` consumes the state Arc, so
             // the drain grace is computed before serving.
             let git_shutdown_grace = state.config.git_timeout + std::time::Duration::from_secs(30);
-            axum::serve(listener, rootyard::router(state)).with_graceful_shutdown(shutdown()).await?;
+            axum::serve(
+                listener,
+                rootyard::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown())
+            .await?;
             rootyard::workspaces::drain_git_jobs(git_shutdown_grace).await;
             // The helper is a real child process: normal shutdown fences and
             // unmounts inside it, then reaps it within a bounded grace. A helper

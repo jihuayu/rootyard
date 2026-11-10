@@ -6,6 +6,7 @@ pub mod blob_git_gateway;
 pub mod standalone;
 #[rustfmt::skip]
 pub mod auth;
+pub mod auth_admission;
 pub mod backup;
 pub mod blob_store;
 #[rustfmt::skip]
@@ -86,6 +87,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(members::routes())
         .merge(organizations::routes())
         .merge(token_management::routes())
+        .merge(auth_admission::routes())
         .merge(web::routes(state.clone()))
         .merge(sharding::routes())
         .merge(workspaces::routes())
@@ -94,5 +96,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .fallback(|State(state): State<Arc<AppState>>, request| async move { git_http::handle(state, request).await })
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(axum::middleware::from_fn(observability::middleware))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_admission::login_middleware))
         .with_state(state)
 }

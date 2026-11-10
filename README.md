@@ -6,12 +6,6 @@ Rootyard 是面向标准 Git 客户端、Forge 协作与 Agent 工作区的 Rust
 
 | 职责 | 轻量单机 | 分布式 |
 | --- | --- | --- |
-| 应用 | 一个 Rust 进程，内置可靠 worker | 多个计算/API 节点，可拆 worker |
-| Git 元数据 | 进程内调用 PgRefStore，持久化在 PostgreSQL | 开源 Raft 支撑的 Ref-CAS 服务 |
-| 用户、权限、Issue/PR、可靠业务任务 | PostgreSQL | PostgreSQL |
-| 内容字节 | Apache OpenDAL Blob | 同一 OpenDAL Blob 契约 |
-| 缓存与唤醒 | 有界内存 | Redis，可加本地缓存 |
-| 本地 Git 视图 | 可删除、可重建的临时计算目录 | 同左 |
 
 pack、idx、manifest、LFS、Workspace/checkpoint 和备份正文全部走 Blob。PG 与 Raft 的数据库/WAL 使用各自持久存储协议，普通 Blob API 不充当 WAL 设备。Redis 和内存不是 refs、权限、任务或保留根的唯一持久来源。
 
